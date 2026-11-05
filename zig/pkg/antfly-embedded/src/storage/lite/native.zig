@@ -8704,10 +8704,21 @@ pub const NativeFile = struct {
     }
 
     fn requireReplayCapacity(self: *NativeFile, consumer: bool) !void {
+        self.replay_wait_hint = null;
         if (try self.replayAdmission()) |state| {
             const limits = replayCapacityLimits(state.limits, consumer);
-            if (state.records >= limits.records or state.bytes >= limits.bytes)
+            if (state.records >= limits.records or state.bytes >= limits.bytes) {
+                // A new foreground coordinator needs an opportunity to enter,
+                // not permission to publish an estimated mutation. Its actual
+                // participant writes still perform exact capacity accounting.
+                // Consumer reserve refusals never use a producer wait hint.
+                if (!consumer) self.replay_wait_hint = .{
+                    .growth = .{ .bytes = 1, .records = 1 },
+                    .inode = (try self.file.stat(self.runtime())).inode,
+                    .metadata = self.activeCheckpoint().logical.metadata,
+                };
                 return error.LiteReplayBacklogExceeded;
+            }
         }
     }
 

@@ -4995,7 +4995,10 @@ pub fn antfly_db_write_transaction(
     return .ok;
 }
 
-/// No serving runtime, registry pin or file pin survives a capacity poll.
+/// A capacity poll retains no serving runtime or file lease. It drops its own
+/// registry pin before reading; SQL may separately retain its preparation's
+/// lifetime pins until that owned plan is freed. The remaining busy budget
+/// bounds that lifetime during waiting.
 /// A changed inode/catalog or absent aggregate requests normal revalidation;
 /// only the actual mutation transaction may admit and consume durable credits.
 pub var test_replay_capacity_polls: if (builtin.is_test) std.atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {};
@@ -6450,7 +6453,7 @@ pub fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out
     var refusal_receipt: ?[]u8 = if (is_commit) std.heap.c_allocator.alloc(u8, 2048) catch
         return capi.recordError(.internal, "{\"commit_outcome\":\"not_applied\",\"error\":{\"code\":\"53200\",\"message\":\"COMMIT was not executed: receipt allocation failed.\",\"retryable\":false}}") else null;
     defer if (refusal_receipt) |buffer| std.heap.c_allocator.free(buffer);
-    const guard = enterWithAdmissionRetry(entry, handle_ptr, .exclusive, intent, true).?;
+    const guard = enterSqlWithReplayAdmission(entry, handle_ptr, intent, if (prepared) |*value| value else |_| null);
     defer guard.leaveAccess();
     if (guard.entry_error) |code| {
         if (is_commit) out_buf.* = embeddedSqlNotAppliedReceipt(&refusal_receipt, .{
@@ -6542,6 +6545,61 @@ const PreparedEmbeddedSql = struct {
         self.parsed.deinit();
     }
 };
+
+/// Capacity waits precede SQL evaluation and coordinator locking. Never replay
+/// SQL to recover a capacity refusal: transforms, transaction state and receipts
+/// can already have changed once evaluation starts. An active session's DML
+/// only stages rows; its COMMIT is the operation that needs a new coordinator.
+fn sqlNeedsReplayAdmission(handle: *Handle, prepared: *const PreparedEmbeddedSql) bool {
+    const statement = prepared.compiled.statement;
+    const session = if (prepared.parsed.value.session_id) |id|
+        handle.sql_sessions.get(id) orelse return false
+    else
+        null;
+    return switch (statement) {
+        .insert, .update, .delete => if (session) |value| !value.active and !value.read_only else true,
+        .commit => if (session) |value| value.active and !value.failed and !value.read_only and value.entries.items.len != 0 else false,
+        else => false,
+    };
+}
+
+fn enterSqlWithReplayAdmission(entry: HandleEntry, ptr: ?*anyopaque, intent: StorageIntent, prepared: ?*const PreparedEmbeddedSql) HandleGuard {
+    var remaining: ?i96 = null;
+    var backoff: i96 = std.time.ns_per_ms;
+    var wait_path: ?[]u8 = null;
+    defer if (wait_path) |path| std.heap.c_allocator.free(path);
+    const io = handleLockIo();
+    while (true) {
+        const guard = enterWithAdmissionBudget(entry, ptr, .exclusive, intent, true, remaining).?;
+        if (guard.entry_error != null or prepared == null or guard.handle.parent_id != null) return guard;
+        const connection = guard.connection orelse return guard;
+        if (connection.options.profile != .native or !liteOpenModeCanWrite(connection.options.open_mode) or
+            !sqlNeedsReplayAdmission(guard.handle, prepared.?)) return guard;
+        const file = &guard.handle.owned_lite_backend.?.native_docstore.?.file;
+        file.requireReplayCoordinatorCapacity() catch |err| {
+            // Preserve ordinary execution's diagnostic for non-capacity errors
+            // and immediate-refusal handles. No SQL has executed in this loop.
+            if (err != error.LiteReplayBacklogExceeded or connection.options.busy_timeout_ms == 0) return guard;
+            const budget = guard.admission_budget_ns orelse 0;
+            if (budget <= 0) return guard;
+            const hint = file.replay_wait_hint orelse return guard;
+            if (wait_path == null) wait_path = std.heap.c_allocator.dupe(u8, connection.path) catch |copy_err| {
+                guard.leaveAccess();
+                return entry.failedGuard(.exclusive, capi.mapError(copy_err));
+            };
+            const deadline = std.Io.Clock.awake.now(io).nanoseconds + budget;
+            connection.owner.publication_stats.replay_backpressure_waits +|= 1;
+            connection.owner.wake.set(io);
+            guard.leaveAccess();
+            waitForReplayCapacity(ptr, wait_path.?, hint, deadline, &backoff) catch |wait_err|
+                return entry.failedGuard(.exclusive, capi.mapError(wait_err));
+            remaining = deadline - std.Io.Clock.awake.now(io).nanoseconds;
+            if (remaining.? <= 0) return entry.failedGuard(.exclusive, capi.mapError(error.LiteReplayBacklogExceeded));
+            continue;
+        };
+        return guard;
+    }
+}
 
 fn embeddedSqlPreparationFailure(handle: *Handle, request_json: []const u8, failure: anyerror) anyerror!void {
     // Preserve session validation and failed-transaction semantics even when

@@ -8265,6 +8265,106 @@ test "capi native replay admission refuses a transform before commit and returns
     }
 }
 
+test "capi native SQL waits for replay capacity before autocommit or session COMMIT" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    const Probe = ConstraintOverlayProbe;
+    const sessions = @import("sql_session.zig");
+    const Capacity = struct {
+        fn limit(fixture: *AdmissionFollowupFixture, full: bool) !void {
+            var lease = try fixture.connection.acquire();
+            defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            defer lease.close();
+            const root = try fixture.connection.owner.refresh();
+            const file = &root.owned_lite_backend.?.native_docstore.?.file;
+            var state = (try file.replayAdmission()).?;
+            try std.testing.expect(state.records != 0);
+            state.limits.records = if (full) state.records else 4096;
+            try file.putDocument(native.replay_admission.key, &state.encode());
+        }
+    };
+    for ([_]bool{ false, true }) |session_commit| {
+        var fixture = try AdmissionFollowupFixture.init("sql-replay-capacity", 2000, .sql);
+        defer fixture.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"seedtext\",\"type\":\"full_text\"}")));
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.sql));
+        var session: u64 = 0;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, sessions.antfly_db_sql_session_open(fixture.id, &session));
+        defer _ = sessions.antfly_db_sql_session_close(fixture.id, session);
+        if (session_commit) {
+            _ = try Probe.run(fixture.id, session, "BEGIN", null);
+            _ = try Probe.run(fixture.id, session, "UPDATE numbers SET n=n+1 WHERE _id='accepted'", null);
+        }
+        try Capacity.limit(&fixture, true);
+        const polls = api.test_replay_capacity_polls.load(.monotonic);
+        try std.testing.expectEqual(@as(?i64, 7), try Probe.run(fixture.id, null, "SELECT n FROM numbers WHERE _id='accepted'", null));
+        // Empty transaction control and reads must never wait behind producers.
+        if (!session_commit) {
+            _ = try Probe.run(fixture.id, session, "BEGIN", null);
+            _ = try Probe.run(fixture.id, session, "COMMIT", null);
+        }
+        try std.testing.expectEqual(polls, api.test_replay_capacity_polls.load(.monotonic));
+        const Consumer = struct {
+            fixture: *AdmissionFollowupFixture,
+            polls: u64,
+            failure: ?anyerror = null,
+            fn run(self: *@This()) void {
+                self.releaseCapacity() catch |err| {
+                    self.failure = err;
+                };
+            }
+            fn releaseCapacity(self: *@This()) !void {
+                const io = h.handleLockIo();
+                const deadline = std.Io.Clock.awake.now(io).nanoseconds + 3 * std.time.ns_per_s;
+                while (api.test_replay_capacity_polls.load(.monotonic) == self.polls) {
+                    if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return error.CapacityWaitDidNotStart;
+                    try io.sleep(.fromMilliseconds(1), .awake);
+                }
+                // This must acquire the same connection and writer gates that
+                // the waiting SQL call released, including for a live session.
+                try Capacity.limit(self.fixture, false);
+            }
+        };
+        var consumer = Consumer{ .fixture = &fixture, .polls = polls };
+        const worker = try std.Thread.spawn(.{}, Consumer.run, .{&consumer});
+        var joined = false;
+        defer if (!joined) worker.join();
+        const result = Probe.run(fixture.id, if (session_commit) session else null, if (session_commit) "COMMIT" else "UPDATE numbers SET n=n+1 WHERE _id='accepted'", null);
+        worker.join();
+        joined = true;
+        try std.testing.expectEqual(@as(?anyerror, null), consumer.failure);
+        _ = try result;
+        try std.testing.expect(api.test_replay_capacity_polls.load(.monotonic) > polls);
+        try std.testing.expectEqual(@as(?i64, 8), try Probe.run(fixture.id, null, "SELECT n FROM numbers WHERE _id='accepted'", null));
+        if (session_commit) {
+            _ = try Probe.run(fixture.id, session, "BEGIN", null);
+            try Capacity.limit(&fixture, true);
+            const before_stage = api.test_replay_capacity_polls.load(.monotonic);
+            _ = try Probe.run(fixture.id, session, "UPDATE numbers SET n=n+1 WHERE _id='accepted'", null);
+            try std.testing.expectEqual(before_stage, api.test_replay_capacity_polls.load(.monotonic));
+            const timeout_ms = fixture.connection.options.busy_timeout_ms;
+            fixture.connection.options.busy_timeout_ms = 20;
+            defer fixture.connection.options.busy_timeout_ms = timeout_ms;
+            const request = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .statement = "COMMIT", .session_id = session }, .{});
+            defer std.testing.allocator.free(request);
+            var out: h.capi.Buffer = .{};
+            defer api.antfly_buffer_free(&out);
+            try std.testing.expectEqual(h.capi.ErrorCode.busy, api.antfly_db_sql_json(fixture.id, .fromSlice(request), &out));
+            var receipt = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, out.ptr.?[0..out.len], .{});
+            defer receipt.deinit();
+            try std.testing.expectEqualStrings("not_applied", receipt.value.object.get("commit_outcome").?.string);
+            try std.testing.expectEqualStrings("55P03", receipt.value.object.get("error").?.object.get("code").?.string);
+            try std.testing.expect(fixture.connection.sql_sessions.get(session).?.active);
+            try std.testing.expect(!fixture.connection.sql_sessions.get(session).?.failed);
+            try std.testing.expectEqual(@as(?i64, 8), try Probe.run(fixture.id, null, "SELECT n FROM numbers WHERE _id='accepted'", null));
+            try Capacity.limit(&fixture, false);
+            fixture.connection.options.busy_timeout_ms = timeout_ms;
+            _ = try Probe.run(fixture.id, session, "COMMIT", null);
+            try std.testing.expectEqual(@as(?i64, 9), try Probe.run(fixture.id, null, "SELECT n FROM numbers WHERE _id='accepted'", null));
+        }
+    }
+}
+
 test "capi native replay admission preserves oversized record input ownership" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     const a = std.testing.allocator;

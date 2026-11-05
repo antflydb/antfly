@@ -77,11 +77,12 @@ include diagnostic work and rolled-back allocation attempts. Benchmark collectio
 is opt-in with `--allocator-diagnostics` and happens after all timed work; status
 reads can themselves refresh runtimes, so they are not passive idle probes.
 
-The owner creates revision-8 files (`AFLITE\x08P`) by default. Writable revision-3 and revision-7
-owners migrate through an explicitly identified compact image and atomic generation
-adoption. Read-only opens preserve revision 3. Raw native format primitives retain
+The owner creates revision-11 files (`AFLITE\x0bP`) by default. Writable owners
+migrate revisions 3, 7, 8, 9 and 10 through an explicitly identified compact image
+and atomic generation adoption. Read-only opens preserve their existing encoding.
+Raw native format primitives retain
 their revision-3 default for compatibility; `CreateOptions.indexed_reclamation`
-selects revision 8. Revision-4, revision-5 and revision-6 prototypes are rejected rather than silently mixing reader protocols;
+selects revision 11. Revision-4, revision-5 and revision-6 prototypes are rejected rather than silently mixing reader protocols;
 these formats have not shipped. Older binaries reject the new signature. `page_reuse = false`
 opts out of creating/migrating indexed files; an existing revision-7 file still uses
 its required ownership machinery.
@@ -516,7 +517,7 @@ from inheriting an open's deferred scan while retaining validation before reuse.
 Page reuse is the routine mechanism. Optional automatic shrinking retains the
 owner's conservative amplification, absolute-savings, hysteresis, resource,
 cancellation, and publication policy. Explicit vacuum is also available. Shrinking
-rewrites live indexed data into a compact revision-7 generation, bootstraps its
+rewrites live indexed data into a compact current-format generation, bootstraps its
 ownership ledger once, streams concurrent changes, and atomically adopts it.
 It therefore returns internal holes and packed-page slack to the filesystem
 independently of routine retirement. This implementation uses generation rewriting
@@ -699,3 +700,13 @@ Legacy conversion initializes totals once on the first tracked mutation; ordinar
 writes update only changed replay keys. Explicit integrity independently rescans
 the totals. See the native throughput section in `zig/LITE.md` for publication
 grouping, source snapshot lifetimes and sustained qualification requirements.
+
+Revision 9 adds namespace semantic revisions for scoped SQL dependency witnesses.
+Revision 10 stores canonical replay payloads with thin consumer references.
+Revision 11 makes those payloads seekable through authenticated document-family
+chunks. Continuations read only their bounded next window. Physical chunks retain
+their byte charge until every consumer and producer/resolver/replacement/repair
+fence permits deletion; advancing a replay cursor alone returns no credits.
+These revisions retain the revision-7 reader and logical-identity contracts and
+the revision-8 admission totals. See `zig/LITE.md` for current encoding and
+compatibility details.

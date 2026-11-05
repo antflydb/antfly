@@ -1289,7 +1289,12 @@ can accept one oversized atomic record, and an already-admitted distributed
 transaction can finish above the watermark rather than deadlocking recovery.
 Prepared votes reserve their future replay credits. Consumer work has reserved
 headroom; new producers wait with the configured Busy timeout while releasing
-registry, runtime and file leases. Refusal occurs before commit. Visibility errors
+runtime and file leases. Batch waits also release registry pins. SQL waits retain
+only the lifetime pins for their independently owned preparation, bounded by the
+remaining Busy budget. Autocommit DML and nonempty session commits check capacity
+before evaluation or coordinator locking; they never retry evaluated SQL. Active
+transaction staging, reads, rollback and empty commits do not wait for producer
+credits. The physical commit still checks exact admission. Refusal occurs before commit. Visibility errors
 after commit retain the committed outcome and must not trigger a blind retry.
 A refused batch carries an observed positive replay footprint. Waiting polls the
 small durable aggregate through a short read-only file pin, releasing that pin
