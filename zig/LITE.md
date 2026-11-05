@@ -1639,6 +1639,12 @@ foreign logical index change invalidates the detached artifact work, including a
 physical-root ABA. Hosted owners, legacy files without logical identities, and
 explicit idle drains preserve their existing complete maintenance lifecycle.
 
+Native database turns enqueue physical allocator/orphan service on the separate
+storage lane instead of executing it inline as well. The owner alternates that
+lane with database work while storage is pending, so sustained replay cannot
+starve reclamation. Physical service captures a fresh checkpoint after source
+pins are released; no extra physical pass is charged to each replay window.
+
 The native manual executor uses the same per-kind adaptive replay controller as
 other detached replay paths: one bounded window per worker, with a cooperative
 preparation target initially set to 25 ms and bounded record/payload budgets.

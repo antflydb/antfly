@@ -3534,16 +3534,23 @@ pub const Owner = struct {
         // namespace into source work. Keep its retry signal separate.
         const artifacts_finished = @import("antfly_platform").time.monotonicNs();
         const artifact_failed = maintenance_error != null;
-        if (comptime h.builtin.is_test) if (self.test_before_storage_service) |hook| hook.notify(hook.ptr, root, retain_source_runtime);
-        store.defer_background_vacuum = self.pending_text_merge != null;
-        defer store.defer_background_vacuum = false;
-        store.maintainBackgroundOnce(&self.verification_cancel) catch |err| {
-            if (maintenance_error == null) {
-                maintenance_error = err;
-                maintenance_error_phase = .storage;
-            }
-            pending = true;
-        };
+        if (!independent or !run_database) {
+            // Native database work queues the independent storage lane below.
+            // Running it here as well doubles allocator/orphan service per
+            // replay window and delays the next useful source publication.
+            // The separate lane releases all source pins and retains its
+            // alternating scheduling guarantee during sustained ingestion.
+            if (comptime h.builtin.is_test) if (self.test_before_storage_service) |hook| hook.notify(hook.ptr, root, retain_source_runtime);
+            store.defer_background_vacuum = self.pending_text_merge != null;
+            defer store.defer_background_vacuum = false;
+            store.maintainBackgroundOnce(&self.verification_cancel) catch |err| {
+                if (maintenance_error == null) {
+                    maintenance_error = err;
+                    maintenance_error_phase = .storage;
+                }
+                pending = true;
+            };
+        }
 
         self.gate.mutex.lockUncancelable(io);
         defer self.gate.mutex.unlock(io);
@@ -3710,6 +3717,7 @@ pub const Owner = struct {
         self.gate.mutex.unlock(io);
         gate_locked = false;
         const service_started = @import("antfly_platform").time.monotonicNs();
+        if (comptime h.builtin.is_test) if (self.test_before_storage_service) |hook| hook.notify(hook.ptr, root, false);
         store.defer_background_vacuum = self.pending_text_merge != null;
         defer store.defer_background_vacuum = false;
         const result = store.maintainBackgroundOnce(&self.verification_cancel);
@@ -7505,6 +7513,40 @@ test "capi native logical generations maintenance snapshot replacement carries t
     Owner.leaveMaintenanceWriter(second);
     held = false;
     try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.read));
+    try fixture.expectWritten(.batch, true);
+}
+
+test "capi native allocator proof issue1431 replay queues exactly one separate physical service" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("separate-physical-service", 1000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const owner = fixture.connection.owner;
+    const Probe = struct {
+        calls: usize = 0,
+        fn notify(ptr: *anyopaque, _: *h.Handle, _: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+        }
+    };
+    var probe: Probe = .{};
+    owner.test_before_storage_service = .{ .ptr = &probe, .notify = Probe.notify };
+    defer owner.test_before_storage_service = null;
+    var saw_source = false;
+    for (0..16) |_| {
+        const before_source = owner.publication_stats.maintenance_source_turns;
+        const before_service = probe.calls;
+        owner.maintenance_pending = true;
+        _ = try owner.maintenanceTurn();
+        if (owner.publication_stats.maintenance_source_turns == before_source) continue;
+        saw_source = true;
+        try std.testing.expectEqual(before_service, probe.calls);
+        try std.testing.expect(owner.maintenance_storage_pending);
+        _ = try owner.maintenanceTurn();
+        try std.testing.expectEqual(before_service + 1, probe.calls);
+        break;
+    }
+    try std.testing.expect(saw_source);
     try fixture.expectWritten(.batch, true);
 }
 
