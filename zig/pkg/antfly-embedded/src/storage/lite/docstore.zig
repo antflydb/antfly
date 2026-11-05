@@ -2858,7 +2858,12 @@ pub const Store = struct {
             // Start after publication: even one large final mutation crossing
             // the threshold must launch maintenance without another write.
             self.startMaintenance();
-            self.maintenance_wake.set(self.file.runtime());
+            // Only wake an already-running loop. One that never started has
+            // no reclamation debt worth a turn (that is exactly what
+            // startMaintenance() above just decided), and a loop the call
+            // above just spawned begins its first turn immediately without
+            // needing this event.
+            if (self.maintenance_started.load(.acquire)) self.maintenance_wake.set(self.file.runtime());
         }
         const io = self.file.runtime();
         var request = MutationRequest{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease };
@@ -2977,8 +2982,10 @@ pub const Store = struct {
         defer {
             self.writer_mutex.unlock(io);
             if (self.writer_admission) |admission| admission.leave(admission.ptr);
-            self.maintenance_wake.set(io);
+            // Decide first, then only wake a loop that is actually running;
+            // see the matching comment in submitScopedMutation's defer.
             self.startMaintenance();
+            if (self.maintenance_started.load(.acquire)) self.maintenance_wake.set(io);
         }
         std.debug.assert(self.writer_active);
         self.writer_active = false;
