@@ -1903,12 +1903,48 @@ pub fn resolveChunkParentId(
     return try alloc.dupe(u8, parent.string);
 }
 
-fn verifyArtifactIdentity(alloc: Allocator, existing: types.ArtifactRef, resolved: types.ArtifactRef) !void {
-    const a = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, existing);
-    defer alloc.free(a);
+const ArtifactIdentityMatch = enum {
+    /// The hit already carries exactly the resolved artifact.
+    same,
+    /// The hit carries the embedding it matched, whose source is the resolved
+    /// artifact (a dense hit on a chunk): report the source artifact.
+    embedding_of_resolved,
+};
+
+fn verifyArtifactIdentity(alloc: Allocator, existing: types.ArtifactRef, resolved: types.ArtifactRef) !ArtifactIdentityMatch {
     const b = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, resolved);
     defer alloc.free(b);
-    if (!std.mem.eql(u8, a, b)) return error.InvalidChunkArtifact;
+    const a = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, existing);
+    defer alloc.free(a);
+    if (std.mem.eql(u8, a, b)) return .same;
+    if (existing.kind == .embedding and resolved.kind != .embedding) if (existing.source) |source| {
+        const base = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, .{
+            .document_id = existing.document_id,
+            .name = source.name,
+            .kind = source.kind,
+            .chunk_id = source.chunk_id,
+            .unit_id = source.unit_id,
+            .window_index = source.window_index,
+        });
+        defer alloc.free(base);
+        if (std.mem.eql(u8, base, b)) return .embedding_of_resolved;
+    };
+    return error.InvalidChunkArtifact;
+}
+
+/// Keep a hit's artifact reference when it names the resolved artifact; use
+/// the resolved one when the hit carried that artifact's embedding.
+fn reconcileArtifactRef(alloc: Allocator, slot: *?types.ArtifactRef, resolved: types.ArtifactRef) !void {
+    if (slot.*) |*existing| {
+        switch (try verifyArtifactIdentity(alloc, existing.*, resolved)) {
+            .same => return,
+            .embedding_of_resolved => {
+                const replacement = try resolved.clone(alloc);
+                existing.deinit(alloc);
+                slot.* = replacement;
+            },
+        }
+    } else slot.* = try resolved.clone(alloc);
 }
 
 fn externalizeSearchHitIdentity(alloc: Allocator, hit: *types.SearchHit) !void {
@@ -1918,11 +1954,7 @@ fn externalizeSearchHitIdentity(alloc: Allocator, hit: *types.SearchHit) !void {
     const id = try alloc.dupe(u8, resolved.id);
     alloc.free(hit.id);
     hit.id = id;
-    if (resolved.artifact_ref) |artifact_ref| {
-        if (hit.artifact_ref) |existing| {
-            try verifyArtifactIdentity(alloc, existing, artifact_ref);
-        } else hit.artifact_ref = try artifact_ref.clone(alloc);
-    }
+    if (resolved.artifact_ref) |artifact_ref| try reconcileArtifactRef(alloc, &hit.artifact_ref, artifact_ref);
 
     for (hit.chunk_hits) |*chunk_hit| {
         try externalizeChunkHitIdentity(alloc, chunk_hit);
@@ -1937,9 +1969,7 @@ fn externalizeChunkHitIdentity(alloc: Allocator, hit: *types.ChunkHit) !void {
     alloc.free(hit.id);
     hit.id = id;
     if (resolved.artifact_ref) |artifact_ref| {
-        if (hit.artifact_ref) |existing| {
-            try verifyArtifactIdentity(alloc, existing, artifact_ref);
-        } else hit.artifact_ref = try artifact_ref.clone(alloc);
+        try reconcileArtifactRef(alloc, &hit.artifact_ref, artifact_ref);
     } else {
         if (hit.artifact_ref) |*artifact_ref| artifact_ref.deinit(alloc);
         hit.artifact_ref = null;

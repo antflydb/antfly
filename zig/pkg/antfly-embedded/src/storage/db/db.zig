@@ -51176,6 +51176,19 @@ fn filterVisibleSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
             parent_ids[i] = parent;
             continue;
         }
+        // Chunk-backed member searches project hit ids to public artifact ids
+        // before this filter runs; their parent is the artifact's document.
+        const public_ref = artifact_ids.decodeArtifactPublicIdAlloc(alloc, hit.id) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            // Not a well-formed public artifact id: handled below.
+            else => null,
+        };
+        if (public_ref) |decoded| {
+            var ref = decoded;
+            defer ref.deinit(alloc);
+            parent_ids[i] = try alloc.dupe(u8, ref.document_id);
+            continue;
+        }
         if (hit.stored_data != null) {
             parent_ids[i] = parseChunkParentIdFromStoredAlloc(alloc, hit.stored_data.?) catch {
                 fallback_to_hit[i] = true;
