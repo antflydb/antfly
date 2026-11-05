@@ -786,6 +786,19 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         return err;
     };
 
+    var generation_resources = try acquireCliGenerationResources(
+        &model_manager,
+        model.session,
+        if (draft_model) |draft| draft.session else null,
+        budget_components[0..budget_component_count],
+        budget_limits,
+        prompt_tokens,
+        budget_max_tokens,
+        &config.prefill_chunk_size,
+        &run_budget,
+    );
+    defer generation_resources.release();
+
     // The live executor is an alternate implementation of this admitted
     // route, not an admission bypass. Reuse the effective KV dtype, capacity
     // policy, scheduler lease, and selected prefill geometry above.
@@ -829,6 +842,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         kv_dtype,
     );
     if (fallback_kv_capacity_policy != kv_capacity_policy) {
+        generation_resources.release();
         budget_components[0].kv_capacity_policy = fallback_kv_capacity_policy;
         run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         config.prefill_chunk_size = runtime.tier.memory.reserveGptGenerationAtLargestChunk(
@@ -843,6 +857,17 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             }
             return err;
         };
+        generation_resources = try acquireCliGenerationResources(
+            &model_manager,
+            model.session,
+            if (draft_model) |draft| draft.session else null,
+            budget_components[0..budget_component_count],
+            budget_limits,
+            prompt_tokens,
+            budget_max_tokens,
+            &config.prefill_chunk_size,
+            &run_budget,
+        );
     }
 
     if (!graph_mode) {
@@ -8098,6 +8123,50 @@ fn a4bInferenceRequest(opts: Options) ?ops.A4bInferenceRequest {
     };
 }
 
+fn acquireCliGenerationResources(
+    manager: *model_manager_mod.ModelManager,
+    target: backends.Session,
+    draft: ?backends.Session,
+    components: []const runtime.tier.memory.GptGenerationBudgetComponent,
+    limits: runtime.tier.memory.Limits,
+    prompt_tokens: usize,
+    max_tokens: usize,
+    chunk: *usize,
+    budget: *runtime.tier.memory.RunBudget,
+) !model_manager_mod.GenerationAdmissionLease {
+    const memory = runtime.tier.memory;
+    var requests: [2]model_manager_mod.GenerationAdmissionRequest = undefined;
+    while (true) {
+        for (components, 0..) |component, i| {
+            requests[i] = .{
+                .session = if (i == 0) target else draft.?,
+                .resources = .{
+                    .backend_class = if (component.backend == .native) .cpu else .gpu,
+                    .limits = limits,
+                    .amounts = memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGenerationForKvPolicy(
+                        component.backend,
+                        component.kv_dtype,
+                        component.config,
+                        prompt_tokens,
+                        max_tokens,
+                        chunk.*,
+                        component.kv_capacity_policy,
+                    )),
+                },
+            };
+        }
+        return manager.acquireGenerationResources(requests[0..components.len]) catch |err| {
+            if (err != error.ResourceTemporarilyUnavailable and err != error.ResourceLimitExceeded) return err;
+            if (chunk.* <= 32) return err;
+            const ceiling = std.math.ceilPowerOfTwo(usize, chunk.*) catch chunk.*;
+            const smaller = @max(@as(usize, 32), ceiling / 2);
+            budget.* = runtime.tier.memory.RunBudget.init(limits);
+            chunk.* = try runtime.tier.memory.reserveGptGenerationAtLargestChunk(budget, components, prompt_tokens, max_tokens, smaller);
+            continue;
+        };
+    }
+}
+
 const ModelLoadBudget = struct {
     allocator: std.mem.Allocator,
     options: Options,
@@ -9524,4 +9593,80 @@ test "cuda gemma prefill prewarm defaults on with bidirectional env overrides" {
     try std.testing.expectEqual(@as(c_int, 0), unsetenv("ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM"));
     try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_DISABLE_GEMMA_PREFILL_PREWARM", "1", 1));
     try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
+}
+
+test "native generate artifact tokenizer admission rejects oversized parse before lookup" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = "x" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"llama\",\"hidden_size\":4,\"num_hidden_layers\":1,\"num_attention_heads\":2,\"intermediate_size\":8,\"vocab_size\":2}" });
+    const json = "{\"version\":\"1.0\",\"model\":{\"type\":\"BPE\",\"vocab\":{\"a\":0,\"b\":1},\"merges\":[]}}";
+    const padded = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(padded);
+    @memset(padded, ' ');
+    @memcpy(padded[0..json.len], json);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.json", .data = padded });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var budget = ModelLoadBudget{ .allocator = a, .options = .{
+        .model_dir = root,
+        .prompt = "a",
+        .backend = .xla,
+        .max_tokens = 1,
+        .host_budget_mb = 1,
+        .combined_budget_mb = 1,
+    } };
+    var resources = try model_manager_mod.ModelManager.SharedResources.init(a, try budgetOverrides(budget.options).toByteLimits());
+    defer resources.deinit();
+    budget.resources = &resources;
+    // Weights fit, but tokenizer construction must fail before parsing.
+    try std.testing.expectError(error.ResourceLimitExceeded, native_run_artifact.tryRunMatchingArtifact(a, std.testing.io, root, "xla", root, "a", true, true, try budget.policy()));
+    var observer = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    defer observer.deinit();
+    try budget.configure(&observer);
+    try std.testing.expectEqual(@as(usize, 0), observer.currentAdmissionAmounts().hostTotalBytes());
+}
+
+test "native generate admits target draft transients beside residency and shrinks prefill" {
+    const a = std.testing.allocator;
+    const memory = runtime.tier.memory;
+    const cfg = gpt_mod.Config{
+        .family = .llama,
+        .hidden_size = 128,
+        .num_hidden_layers = 4,
+        .num_attention_heads = 4,
+        .num_key_value_heads = 4,
+        .intermediate_size = 256,
+        .vocab_size = 1024,
+    };
+    const small = memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGeneration(.native, .f16, cfg, 256, 1, 32));
+    const large = memory.AdmissionAmounts.fromEstimate(try memory.estimateGptGeneration(.native, .f16, cfg, 256, 1, 256));
+    const resident_bytes = 4 * large.hostTotalBytes();
+    const limits = memory.Limits{ .host_limit_bytes = resident_bytes + 2 * small.hostTotalBytes(), .combined_limit_bytes = resident_bytes + 2 * small.hostTotalBytes() };
+    var resources = try model_manager_mod.ModelManager.SharedResources.init(a, limits);
+    defer resources.deinit();
+    var manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    defer manager.deinit();
+    try (model_manager_mod.ModelLoadPolicy{ .limits = limits, .resources = &resources }).configure(&manager);
+    var residency = try manager.admitHostPreflight(resident_bytes);
+    defer residency.release();
+    const session = backends.Session{ .ptr = undefined, .vtable = undefined };
+    const component = memory.GptGenerationBudgetComponent{ .backend = .native, .kv_dtype = .f16, .config = cfg };
+    const components = [_]memory.GptGenerationBudgetComponent{ component, component };
+    var budget = memory.RunBudget.init(limits);
+    var chunk = try memory.reserveGptGenerationAtLargestChunk(&budget, &components, 256, 1, 256);
+    try std.testing.expectEqual(@as(usize, 256), chunk);
+    {
+        var lease = try acquireCliGenerationResources(&manager, session, session, &components, limits, 256, 1, &chunk, &budget);
+        defer lease.release();
+        try std.testing.expectEqual(@as(usize, 32), chunk);
+        try std.testing.expectEqual(limits.host_limit_bytes, manager.currentAdmissionAmounts().hostTotalBytes());
+    }
+    try std.testing.expectEqual(resident_bytes, manager.currentAdmissionAmounts().hostTotalBytes());
+    var extra = try manager.admitHostPreflight(small.hostTotalBytes());
+    defer extra.release();
+    const before = manager.currentAdmissionAmounts();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, acquireCliGenerationResources(&manager, session, session, &components, limits, 256, 1, &chunk, &budget));
+    try std.testing.expectEqualDeep(before, manager.currentAdmissionAmounts());
 }

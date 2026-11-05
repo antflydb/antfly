@@ -28,6 +28,25 @@ pub const PjrtError = error{
     SymbolNotFound,
     NoDevices,
     UnsupportedPjrtFeature,
+    InvalidMemoryStats,
+};
+
+/// Compiler-reported single-device execution footprint. Keep inputs and
+/// outputs separate: our runtime retains inputs while outputs are returned,
+/// so donated/aliased bytes must not be subtracted from this upper bound.
+pub const CompiledMemoryStats = struct {
+    code: usize,
+    arguments: usize,
+    outputs: usize,
+    temporary: usize,
+    host_code: usize,
+    host_arguments: usize,
+    host_outputs: usize,
+    host_temporary: usize,
+    /// Optional aggregate statistics added by newer plugins. Older plugins
+    /// leave these zero; negative sentinels mean unavailable, not huge sizes.
+    peak: usize = 0,
+    total: usize = 0,
 };
 
 pub const ExecutableArtifactSupport = struct {
@@ -158,6 +177,30 @@ pub const LoadedExecutable = struct {
     device: *c.PjrtDevice,
     num_outputs: usize,
 
+    pub fn compiledMemoryStats(self: *const LoadedExecutable) PjrtError!CompiledMemoryStats {
+        if (!self.api.hasCompiledMemoryStats()) return error.UnsupportedPjrtFeature;
+        var get = std.mem.zeroes(c.LoadedExecutableGetExecutableArgs);
+        get.struct_size = @sizeOf(@TypeOf(get));
+        get.loaded_executable = self.handle;
+        try checkError(self.api, self.api.loadedExecutableGetExecutable(&get));
+        var stats = std.mem.zeroes(c.ExecutableGetCompiledMemoryStatsArgs);
+        stats.struct_size = @sizeOf(@TypeOf(stats));
+        stats.executable = get.executable orelse return error.InvalidMemoryStats;
+        try checkError(self.api, self.api.executableGetCompiledMemoryStats(&stats));
+        return .{
+            .code = std.math.cast(usize, stats.generated_code_size_in_bytes) orelse return error.InvalidMemoryStats,
+            .arguments = std.math.cast(usize, stats.argument_size_in_bytes) orelse return error.InvalidMemoryStats,
+            .outputs = std.math.cast(usize, stats.output_size_in_bytes) orelse return error.InvalidMemoryStats,
+            .temporary = std.math.cast(usize, stats.temp_size_in_bytes) orelse return error.InvalidMemoryStats,
+            .host_code = std.math.cast(usize, stats.host_generated_code_size_in_bytes) orelse return error.InvalidMemoryStats,
+            .host_arguments = std.math.cast(usize, stats.host_argument_size_in_bytes) orelse return error.InvalidMemoryStats,
+            .host_outputs = std.math.cast(usize, stats.host_output_size_in_bytes) orelse return error.InvalidMemoryStats,
+            .host_temporary = std.math.cast(usize, stats.host_temp_size_in_bytes) orelse return error.InvalidMemoryStats,
+            .peak = std.math.cast(usize, stats.peak_memory_in_bytes) orelse 0,
+            .total = std.math.cast(usize, stats.total_size_in_bytes) orelse 0,
+        };
+    }
+
     pub fn deinit(self: *LoadedExecutable) void {
         var args = c.LoadedExecutableDestroyArgs{
             .struct_size = @sizeOf(c.LoadedExecutableDestroyArgs),
@@ -262,6 +305,15 @@ pub const Client = struct {
     handle: *c.PjrtClient,
     device: *c.PjrtDevice,
     lib: std.DynLib,
+
+    pub fn isCpu(self: *const Client) PjrtError!bool {
+        var args = std.mem.zeroes(c.ClientPlatformNameArgs);
+        args.struct_size = @sizeOf(@TypeOf(args));
+        args.client = self.handle;
+        try checkError(self.api, self.api.clientPlatformName(&args));
+        const name = (args.platform_name orelse return error.PjrtApiError)[0..args.platform_name_size];
+        return std.ascii.eqlIgnoreCase(name, "cpu") or std.ascii.eqlIgnoreCase(name, "host");
+    }
 
     pub fn init(plugin_path: [:0]const u8) PjrtError!Client {
         // Load plugin shared library
@@ -789,4 +841,65 @@ test "executable artifact support default reports HLO compile only" {
     try std.testing.expect(!support.loaded_executable_serialize);
     try std.testing.expect(!support.loaded_executable_deserialize);
     try std.testing.expect(!support.loadOnlyExecutableArtifacts());
+}
+
+test "compiled memory statistics honor API extent and reject unknown sizes" {
+    const Fake = struct {
+        var unknown: bool = false;
+        fn get(args: *c.LoadedExecutableGetExecutableArgs) callconv(.c) ?*c.PjrtError {
+            args.executable = @ptrFromInt(1);
+            return null;
+        }
+        fn stats(args: *c.ExecutableGetCompiledMemoryStatsArgs) callconv(.c) ?*c.PjrtError {
+            std.debug.assert(args.struct_size == 144);
+            args.generated_code_size_in_bytes = 16;
+            args.argument_size_in_bytes = 32;
+            args.output_size_in_bytes = 64;
+            args.alias_size_in_bytes = 32;
+            args.temp_size_in_bytes = if (unknown) -1 else 128;
+            args.host_temp_size_in_bytes = 256;
+            args.peak_memory_in_bytes = 512;
+            return null;
+        }
+    };
+    var api = std.mem.zeroes(c.Api);
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[51] = @ptrCast(&Fake.get);
+    api._fns[96] = @ptrCast(&Fake.stats);
+    const executable = LoadedExecutable{ .api = &api, .handle = @ptrFromInt(1), .device = @ptrFromInt(1), .num_outputs = 1 };
+    Fake.unknown = false;
+    const stats = try executable.compiledMemoryStats();
+    try std.testing.expectEqual(@as(usize, 32), stats.arguments);
+    try std.testing.expectEqual(@as(usize, 128), stats.temporary);
+    try std.testing.expectEqual(@as(usize, 256), stats.host_temporary);
+    try std.testing.expectEqual(@as(usize, 512), stats.peak);
+    Fake.unknown = true;
+    try std.testing.expectError(error.InvalidMemoryStats, executable.compiledMemoryStats());
+    Fake.unknown = false;
+    // A non-null slot outside the advertised ABI extent must not be read.
+    api.struct_size = @offsetOf(c.Api, "_fns") + 96 * @sizeOf(?*const anyopaque);
+    try std.testing.expectError(error.UnsupportedPjrtFeature, executable.compiledMemoryStats());
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[96] = null;
+    try std.testing.expectError(error.UnsupportedPjrtFeature, executable.compiledMemoryStats());
+}
+
+test "compiled memory CPU placement follows the PJRT platform" {
+    const Fake = struct {
+        var cpu: bool = true;
+        fn name(args: *c.ClientPlatformNameArgs) callconv(.c) ?*c.PjrtError {
+            const value: []const u8 = if (cpu) "cpu" else "cuda";
+            args.platform_name = value.ptr;
+            args.platform_name_size = value.len;
+            return null;
+        }
+    };
+    var api = std.mem.zeroes(c.Api);
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[12] = @ptrCast(&Fake.name);
+    const client = Client{ .api = &api, .handle = @ptrFromInt(1), .device = @ptrFromInt(1), .lib = undefined };
+    Fake.cpu = true;
+    try std.testing.expect(try client.isCpu());
+    Fake.cpu = false;
+    try std.testing.expect(!try client.isCpu());
 }

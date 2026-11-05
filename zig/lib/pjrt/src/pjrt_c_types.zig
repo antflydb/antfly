@@ -170,6 +170,35 @@ pub const ExecutableDeserializeAndLoadArgs = extern struct {
     overridden_serialized_compile_options_size: usize,
 };
 
+pub const ExecutableGetCompiledMemoryStatsArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    executable: ?*PjrtExecutable,
+    generated_code_size_in_bytes: i64,
+    argument_size_in_bytes: i64,
+    output_size_in_bytes: i64,
+    alias_size_in_bytes: i64,
+    temp_size_in_bytes: i64,
+    host_generated_code_size_in_bytes: i64,
+    host_argument_size_in_bytes: i64,
+    host_output_size_in_bytes: i64,
+    host_alias_size_in_bytes: i64,
+    host_temp_size_in_bytes: i64,
+    peak_memory_in_bytes: i64,
+    total_size_in_bytes: i64,
+    total_allocation_bytes: i64,
+    indefinite_allocations: i64,
+    peak_unpadded_heap_bytes: i64,
+};
+
+pub const ClientPlatformNameArgs = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    client: ?*PjrtClient,
+    platform_name: ?[*]const u8,
+    platform_name_size: usize,
+};
+
 pub const LoadedExecutableGetExecutableArgs = extern struct {
     struct_size: usize,
     extension_start: ?*anyopaque,
@@ -285,6 +314,7 @@ pub const Api = extern struct {
     const FN_EVENT_AWAIT = 8;
     const FN_CLIENT_CREATE = 10;
     const FN_CLIENT_DESTROY = 11;
+    const FN_CLIENT_PLATFORM_NAME = 12;
     const FN_CLIENT_ADDRESSABLE_DEVICES = 16;
     const FN_CLIENT_COMPILE = 20;
     const FN_CLIENT_BUFFER_FROM_HOST = 22;
@@ -296,11 +326,31 @@ pub const Api = extern struct {
     const FN_BUFFER_DESTROY = 58;
     const FN_BUFFER_ON_DEVICE_SIZE = 64;
     const FN_BUFFER_TO_HOST = 70;
+    const FN_EXEC_COMPILED_MEMORY_STATS = 96;
 
     // ── Typed accessors ────────────────────────────────────────────
 
     fn castFn(comptime T: type, ptr: *const anyopaque) T {
         return @ptrCast(@alignCast(ptr));
+    }
+
+    fn hasFunction(self: *const Api, index: usize) bool {
+        const required = @offsetOf(Api, "_fns") + (index + 1) * @sizeOf(?*const anyopaque);
+        return self.struct_size >= required and self._fns[index] != null;
+    }
+
+    pub fn hasCompiledMemoryStats(self: *const Api) bool {
+        return self.hasFunction(FN_EXEC_COMPILED_MEMORY_STATS) and self.hasFunction(FN_LOADED_EXEC_GET_EXECUTABLE);
+    }
+
+    pub fn executableGetCompiledMemoryStats(self: *const Api, args: *ExecutableGetCompiledMemoryStatsArgs) ?*PjrtError {
+        const f = castFn(*const fn (*ExecutableGetCompiledMemoryStatsArgs) callconv(.c) ?*PjrtError, self._fns[FN_EXEC_COMPILED_MEMORY_STATS].?);
+        return f(args);
+    }
+
+    pub fn clientPlatformName(self: *const Api, args: *ClientPlatformNameArgs) ?*PjrtError {
+        const f = castFn(*const fn (*ClientPlatformNameArgs) callconv(.c) ?*PjrtError, self._fns[FN_CLIENT_PLATFORM_NAME].?);
+        return f(args);
     }
 
     pub fn errorDestroy(self: *const Api, args: *ErrorDestroyArgs) void {

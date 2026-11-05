@@ -4615,6 +4615,8 @@ pub const ModelLoadPolicy = struct {
         // compatibility policy. Include tokenizer construction and metadata,
         // not just weights, in the invocation's retained resource domain.
         manager.admission_enabled = true;
+        if (self.limits.combined_limit_bytes != 0)
+            (try manager.ensureResourceDomain()).admission.tightenUnifiedLimit(self.limits.combined_limit_bytes);
     }
 };
 
@@ -4632,6 +4634,11 @@ pub const ModelManager = struct {
             var policy = ModelManager.init(allocator, backends.SessionManager.init(allocator));
             policy.admission_limit_overrides = limits;
             policy.configureAdmissionController(domain);
+            // An invocation cap spans CPU tokenizers, GPU sessions and host
+            // staging even on discrete-memory systems. Physical topology only
+            // determines the automatic limit, never an explicit operator cap.
+            if (limits.combined_limit_bytes != 0)
+                domain.admission.tightenUnifiedLimit(limits.combined_limit_bytes);
             return .{ .domain = domain, .limits = limits };
         }
 
@@ -4657,6 +4664,97 @@ pub const ModelManager = struct {
             self.* = undefined;
         }
     };
+    /// Tokenizer-only preparation for offline artifacts. The retained domain
+    /// makes both metadata and BPE cache ownership independent of manager moves.
+    pub const TokenizerAssets = struct {
+        allocator: std.mem.Allocator,
+        hf_tok: ?*hf_tokenizer.HfTokenizer = null,
+        sp_tok: ?*sentencepiece.Processor = null,
+        chat_tmpl: ?*generation.ChatTemplate = null,
+        lease: ?runtime.tier.memory.AdmissionLease = null,
+        domain: *ResourceDomain,
+
+        pub fn tokenizer(self: *const @This()) tokenizer_mod.Tokenizer {
+            if (self.hf_tok) |tok| return tok.tokenizer();
+            return self.sp_tok.?.tokenizer();
+        }
+
+        pub fn deinit(self: *@This()) void {
+            if (self.hf_tok) |tok| tok.deinitSelf();
+            if (self.sp_tok) |tok| {
+                tok.deinit();
+                self.allocator.destroy(tok);
+            }
+            if (self.chat_tmpl) |ct| {
+                ct.deinit();
+                self.allocator.destroy(ct);
+            }
+            if (self.lease) |*lease| lease.release();
+            self.domain.release();
+        }
+    };
+
+    pub fn loadGenerationTokenizerAssets(self: *ModelManager, model_dir: []const u8, man: *const manifest_mod.ModelManifest) !TokenizerAssets {
+        try self.ensureResourceOwnerReady();
+        const kind = if (shouldPreferSentencePieceOverride(man.*, model_dir, self.allocator))
+            manifest_mod.TokenizerType.sentencepiece
+        else
+            man.tokenizer_type orelse return error.NoTokenizerFound;
+        const plan = try tokenizerLoadAdmissionPlan(self.allocator, model_dir, man, kind);
+        var lease = try self.acquireTokenizerAdmission(plan);
+        errdefer if (lease) |*active| active.release();
+        const domain = self.resource_domain.?;
+        if (!domain.retain()) return error.ResourceOwnerShuttingDown;
+        var assets = TokenizerAssets{ .allocator = self.allocator, .domain = domain };
+        errdefer assets.deinit();
+        // assets takes its domain reference immediately; keep the metadata
+        // lease separate until all parsing and cache configuration succeeds.
+        switch (kind) {
+            .huggingface => {
+                assets.hf_tok = try loadHuggingFaceTokenizerFromManifest(self.allocator, man);
+                try assets.hf_tok.?.configureBpeCache(self.tokenizer_cache_config);
+                try assets.hf_tok.?.configureParallelBpe(self.tokenizer_parallel_bpe_config);
+            },
+            .sentencepiece => {
+                assets.sp_tok = try loadSentencePieceTokenizerFromDirOrGguf(self.allocator, model_dir, man.gguf_path);
+                if (shouldEnableGemmaSentencePieceCompat(man.*, model_dir, self.allocator))
+                    assets.sp_tok.?.setPreserveInlineSpecialsAfterLiteralBos(true);
+                try loadSentencePieceAddedTokens(model_dir, self.allocator, assets.sp_tok.?);
+            },
+        }
+        if (man.chat_template) |source| {
+            const ct = try self.allocator.create(generation.ChatTemplate);
+            errdefer self.allocator.destroy(ct);
+            ct.* = try generation.ChatTemplate.init(self.allocator, source, man.bos_token, man.eos_token, man.unk_token, man.pad_token);
+            assets.chat_tmpl = ct;
+        }
+        if (lease) |*active| try active.retain(plan.resident);
+        assets.lease = lease;
+        return assets;
+    }
+
+    /// Load only the admitted backend session. Artifact callers already own
+    /// tokenizer assets and must not parse or retain a second tokenizer.
+    pub fn loadArtifactSession(self: *ModelManager, model_dir: []const u8, man: manifest_mod.ModelManifest) !ArtifactSession {
+        var managed = try loadSessionForPreferredBackends(self, &.{.native}, model_dir, man, &self.session_manager, null);
+        var result = ArtifactSession{ .allocator = self.allocator, .managed = managed.take(), .session = managed.session };
+        errdefer result.deinit();
+        // Preserve the normal generator's weight-prefetch and expert-cache
+        // behavior without allocating another tokenizer or serving scheduler.
+        if (session_factory.getGptConfig(result.session)) |cfg| {
+            if (cfg.usesMoe()) {
+                const cache = try self.allocator.create(runtime.moe.shared.SharedExpertCache);
+                cache.* = runtime.moe.shared.SharedExpertCache.init(self.allocator);
+                result.shared_moe_cache = cache;
+            }
+            const state = try self.allocator.create(runtime.tier.shared.SharedPrefetchState);
+            state.* = runtime.tier.shared.SharedPrefetchState.init(self.allocator);
+            result.shared_prefetch = state;
+            try session_factory.attachSharedPrefetchState(result.session, state);
+        }
+        return result;
+    }
+
     pub const HostCacheReclaimer = struct {
         context: *anyopaque,
         reclaim: *const fn (*anyopaque, usize) usize,
@@ -10171,6 +10269,31 @@ pub const ManagedSession = struct {
     pub fn disownSession(self: *ManagedSession) backends.Session {
         self.owns_session = false;
         return self.session;
+    }
+};
+
+/// Session-only generator assets used while materializing offline artifacts.
+/// Close the session before its borrowed prefetch/cache state, and keep its
+/// admission reservation until all retained model resources are destroyed.
+pub const ArtifactSession = struct {
+    allocator: std.mem.Allocator,
+    managed: ManagedSession,
+    session: backends.Session,
+    shared_moe_cache: ?*runtime.moe.shared.SharedExpertCache = null,
+    shared_prefetch: ?*runtime.tier.shared.SharedPrefetchState = null,
+
+    pub fn deinit(self: *@This()) void {
+        self.session.close();
+        self.managed.owns_session = false;
+        if (self.shared_moe_cache) |cache| {
+            cache.deinit();
+            self.allocator.destroy(cache);
+        }
+        if (self.shared_prefetch) |state| {
+            state.deinit();
+            self.allocator.destroy(state);
+        }
+        self.managed.deinit();
     }
 };
 
@@ -15992,4 +16115,47 @@ test "permanent memory admission failures retain estimates and release reservati
     try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
     try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireRequestsWithEviction(&.{.{ .backend_class = .cpu, .limits = limits, .amounts = .{ .host_scratch_bytes = 30 } }}));
     try std.testing.expectEqual(@as(u64, 2), manager.memoryAdmissionDiagnostic().denied_count);
+}
+
+test "shared model load admission combined cap spans CPU and GPU on every platform" {
+    const a = std.testing.allocator;
+    const mib: usize = 1024 * 1024;
+    const limits = runtime.tier.memory.Limits{ .host_limit_bytes = 8 * mib, .backend_limit_bytes = 8 * mib, .combined_limit_bytes = 8 * mib };
+    var resources = try ModelManager.SharedResources.init(a, limits);
+    defer resources.deinit();
+    var gpu = try resources.domain.admission.tryAcquire(.gpu, limits, .{ .backend_weight_bytes = 5 * mib }, false);
+    defer gpu.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, resources.domain.admission.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 5 * mib }, false));
+    gpu.release();
+    var cpu = try resources.domain.admission.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 5 * mib }, false);
+    cpu.release();
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, resources.domain.admission.snapshot());
+}
+
+test "shared model load admission artifact sessions do not construct a second tokenizer" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeCancellationTestModel(tmp.dir, a);
+    // Session-only preparation must work with no tokenizer file and a cap
+    // smaller than the tokenizer construction envelope.
+    try tmp.dir.deleteFile(std.testing.io, "tokenizer.json");
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var man = try manifest_mod.loadFromDir(a, root);
+    defer man.deinit();
+    const limits = runtime.tier.memory.Limits{ .host_limit_bytes = 3 * 1024 * 1024, .combined_limit_bytes = 3 * 1024 * 1024 };
+    var resources = try ModelManager.SharedResources.init(a, limits);
+    defer resources.deinit();
+    var manager = ModelManager.init(a, backends.SessionManager.init(a));
+    defer manager.deinit();
+    try (ModelLoadPolicy{ .limits = limits, .resources = &resources }).configure(&manager);
+    {
+        var session = try manager.loadArtifactSession(root, man);
+        defer session.deinit();
+        try std.testing.expectEqual(backends.BackendType.native, session.session.backend());
+        try std.testing.expect(manager.currentAdmissionAmounts().hostTotalBytes() > 0);
+        try std.testing.expectEqual(@as(usize, 0), manager.loaded.count());
+    }
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
 }
