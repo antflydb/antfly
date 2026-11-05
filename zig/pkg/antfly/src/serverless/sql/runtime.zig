@@ -161,7 +161,7 @@ pub const Service = struct {
         try self.immutable(self.a, key, bytes, 1024 * 1024);
         const query_key = try self.store().key(self.a, query, null, 0);
         defer self.a.free(query_key);
-        try self.store().create(self.a, query_key, query.id, specification.expires_ms);
+        _ = try self.store().ensureQuery(self.a, query_key, query.id, specification.expires_ms, specification.limits.max_attempts);
         self.notify(query);
         return query;
     }
@@ -450,31 +450,31 @@ pub const Service = struct {
         var scoped_service = self;
         scoped_service.context = context;
         const claim = (try scoped_service.store().claim(a, key, self.owner, 60_000)) orelse return;
-        var spec = scoped_service.loadPlan(a, ticket.query) catch |err| {
-            if (err == error.OutOfMemory and task_memory.exhausted) {
-                try self.store().terminate(self.a, key, claim, .failed, "SqlJoinBudgetExceeded");
-                return;
+        self.executeClaimed(ticket, a, task_allocator, &task_memory, query.value, key, claim, context) catch |raw_error| {
+            const err = if (raw_error == error.OutOfMemory and task_memory.exhausted) error.SqlJoinBudgetExceeded else raw_error;
+            switch (err) {
+                error.SqlJoinBudgetExceeded, error.SqlProgramLimitExceeded, error.InvalidSqlBackendResponse, error.InvalidSqlExchange, error.SqlExecutionUnauthorized, error.InvalidSqlExecutionState, error.InvalidSqlDistributedPlan, error.TaskRetryBudgetExceeded => {
+                    std.log.warn("distributed SQL task failed query={s} stage={d} task={d} err={s}", .{ ticket.query.id, ticket.stage, ticket.task, @errorName(err) });
+                    try self.store().terminate(self.a, key, claim, .failed, @errorName(err));
+                },
+                else => return err,
             }
-            return err;
         };
-        spec = try scoped_service.resolvePhysical(a, spec, query.value);
-        const task = try scoped_service.hydrateTask(a, spec, try taskFor(spec, ticket.stage, ticket.task));
-        if (task_memory.live > spec.limits.task_memory) {
-            try self.store().terminate(self.a, key, claim, .failed, "SqlJoinBudgetExceeded");
-            return;
-        }
+    }
+    fn executeClaimed(self: Service, ticket: plan.Ticket, a: A, task_allocator: A, task_memory: *local.sql_memory_budget, query: state.Record, key: []const u8, claim: state.Claim, task_context: Context) !void {
+        // Admission survives immutable-plan read failures; legacy records use the
+        // maximum admitted limit until their immutable plan can be read.
+        if (claim.epoch > (query.task_attempt_limit orelse 16)) return error.TaskRetryBudgetExceeded;
+        var context = task_context;
+        var scoped_service = self;
+        scoped_service.context = context;
+        var spec = try scoped_service.loadPlan(a, ticket.query);
+        if (claim.epoch > spec.limits.max_attempts) return error.TaskRetryBudgetExceeded;
+        if (task_memory.live > spec.limits.task_memory) return error.SqlJoinBudgetExceeded;
         task_memory.limit = @intCast(spec.limits.task_memory);
-        if (claim.epoch > spec.limits.max_attempts) {
-            try self.store().terminate(self.a, key, claim, .failed, "TaskRetryBudgetExceeded");
-            return;
-        }
-        const inputs = scoped_service.loadDependencies(a, spec, ticket.query, task) catch |err| {
-            if (err == error.OutOfMemory and task_memory.exhausted) {
-                try self.store().terminate(self.a, key, claim, .failed, "SqlJoinBudgetExceeded");
-                return;
-            }
-            return err;
-        };
+        spec = try scoped_service.resolvePhysical(a, spec, query);
+        const task = try scoped_service.hydrateTask(a, spec, try taskFor(spec, ticket.stage, ticket.task));
+        const inputs = try scoped_service.loadDependencies(a, spec, ticket.query, task);
         var objects = self.exchange_store;
         objects.context = context;
         var task_spill: ?local.sql_spill.Manager = if (self.spill) |parent| parent.scoped(task_allocator) else null;
@@ -490,17 +490,7 @@ pub const Service = struct {
             }.check;
         }
         const executor: runner.Runner = .{ .a = task_allocator, .source = self.source, .exchange_store = objects, .context = context, .spill = if (task_spill) |*manager| manager else null };
-        const output = executor.run(ticket.query.id, spec, task, inputs) catch |raw_error| {
-            const err = if (raw_error == error.OutOfMemory and task_memory.exhausted) error.SqlJoinBudgetExceeded else raw_error;
-            switch (err) {
-                error.SqlJoinBudgetExceeded, error.SqlProgramLimitExceeded, error.InvalidSqlBackendResponse, error.InvalidSqlExchange, error.SqlExecutionUnauthorized => {
-                    std.log.warn("distributed SQL task failed query={s} stage={d} task={d} err={s}", .{ ticket.query.id, ticket.stage, ticket.task, @errorName(err) });
-                    try self.store().terminate(self.a, key, claim, .failed, @errorName(err));
-                    return;
-                },
-                else => return err,
-            }
-        };
+        const output = try executor.run(ticket.query.id, spec, task, inputs);
         defer task_allocator.free(output.key);
         defer if (output.matches) |witness| task_allocator.free(witness.key);
         try context.ensureActive();

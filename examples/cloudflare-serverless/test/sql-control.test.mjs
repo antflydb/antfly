@@ -25,6 +25,7 @@ class Storage {
  async get(key){return this.values.get(key);}
  async put(key,value){this.values.set(key,structuredClone(value));}
  async delete(key){this.values.delete(key);}
+ async getAlarm(){return this.alarm;}
  async setAlarm(time){this.alarm=time;}
  async deleteAlarm(){this.alarm=null;}
  async deleteAll(){this.values.clear();}
@@ -49,7 +50,7 @@ test('SQL alarms precede queue delivery and a replacement coordinator replays du
  const run=async()=>{turns++;return{complete:done,tickets:done?[]:[ticket]};};
  const first=new SQLControl(ctx,env,run,{now:()=>100,owner:'old'});
  await assert.rejects(first.advance(locator),/queue response lost/);
- assert.equal(storage.alarm,2100);assert.equal(sent.length,1);
+ assert.equal(storage.alarm,1100);assert.equal(sent.length,1);
  const replacement=new SQLControl(ctx,env,run,{now:()=>200,owner:'new'});
  await replacement.alarm();assert.equal(sent.length,2);assert.equal(turns,2);assert.deepEqual(sent[0].body,sent[1].body);
  done=true;assert.deepEqual(await replacement.advance(),{complete:true});assert.equal(storage.alarm,null);assert.equal(storage.values.size,0);
@@ -117,4 +118,33 @@ test('SQL discovery drains completed backlogs through durable alarms after evict
  bucket.list=list;now=storage.alarm;await control().alarm();assert.equal(await storage.get('cursor'),undefined);
  assert.equal((await bucket.list({prefix:'state/sql-query-expiry/'})).objects.length,1);
  assert.equal(kicks.length,2);
+});
+
+test('SQL notifications retain earliest alarm across sustained traffic and eviction',async()=>{
+ const storage=new Storage();let now=0,turns=0;
+ const env={SQL_TASKS:{async sendBatch(){}}};
+ const run=async()=>{turns++;return{complete:false,tickets:[]};};
+ let control=new SQLControl({storage},env,run,{now:()=>now});
+ await control.kick(locator);
+ await Promise.all(Array.from({length:32},()=>control.kick(locator)));
+ assert.equal(storage.alarm,1000);
+ for(let i=0;i<64;i++){
+  now+=500;
+  if(storage.alarm!==null&&storage.alarm<=now)await control.alarm();
+  control=new SQLControl({storage},env,run,{now:()=>now});
+  await control.kick(locator);
+ }
+ assert.ok(turns>=16);
+});
+test('SQL alarms rearm during a long turn without starting overlapping turns',async()=>{
+ const storage=new Storage();let now=0,release,turns=0;
+ const control=new SQLControl({storage},{SQL_TASKS:{async sendBatch(){}}},async()=>{
+  turns++;await new Promise(resolve=>{release=resolve;});return{complete:false,tickets:[]};
+ },{now:()=>now});
+ const pending=control.advance(locator);
+ while(!release)await new Promise(resolve=>setImmediate(resolve));
+ now=storage.alarm;
+ await control.alarm();
+ assert.equal(turns,1);assert.equal(storage.alarm,now+1000);
+ release();await pending;
 });

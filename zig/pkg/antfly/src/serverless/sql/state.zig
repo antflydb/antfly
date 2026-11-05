@@ -68,6 +68,9 @@ pub const Status = enum { pending, running, succeeded, failed, cancelled };
 pub const Record = struct {
     /// Absent only on pre-scope records; services validate their immutable plan.
     tenant: ?Digest = null,
+    /// Query admission authority available even when immutable metadata is unavailable.
+    /// Legacy records retain the global retry cap until their plan is readable.
+    task_attempt_limit: ?u16 = null,
     version: u8 = 2,
     plan: Digest,
     expires_ms: u64,
@@ -259,6 +262,7 @@ pub const Store = struct {
         return true;
     }
     fn validateRecord(self: Store, value: Record) !void {
+        if (value.task_attempt_limit) |limit| if (limit == 0 or limit > 16) return error.InvalidSqlExecutionState;
         if (value.pending_after) |after| if (value.pending.len == 0 or after >= value.cursor) return error.InvalidSqlExecutionState;
         if (self.tenant) |scope| if (value.tenant) |admitted| {
             if (!std.meta.eql(scope, admitted)) return error.SqlExecutionUnauthorized;
@@ -279,8 +283,11 @@ pub const Store = struct {
         _ = try self.ensure(a, path, plan, expires_ms);
     }
     pub fn ensure(self: Store, a: A, path: []const u8, plan: Digest, expires_ms: u64) !bool {
+        return self.ensureQuery(a, path, plan, expires_ms, null);
+    }
+    pub fn ensureQuery(self: Store, a: A, path: []const u8, plan: Digest, expires_ms: u64, limit: ?u16) !bool {
         if (expires_ms <= self.now_ms) return error.SqlQueryExpired;
-        self.write(a, path, null, .{ .plan = plan, .expires_ms = expires_ms, .tenant = self.tenant }) catch |err| {
+        self.write(a, path, null, .{ .plan = plan, .expires_ms = expires_ms, .tenant = self.tenant, .task_attempt_limit = limit }) catch |err| {
             // Existing jobs and lost successful responses are both resolved by
             // identity. Never overwrite state advanced by another participant.
             var existing = (self.load(a, path) catch return err) orelse return err;

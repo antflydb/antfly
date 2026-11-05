@@ -2304,3 +2304,179 @@ test "distributed SQL expired task claims preserve durable routing epochs across
     try std.testing.expect(original.sameTask(capture.ticket.?));
     try std.testing.expectEqual(claim.epoch, capture.ticket.?.attempt);
 }
+
+test "distributed SQL layout failures obey the durable task attempt limit" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    var service = fixture.service(a, memory.client(), "owner");
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+    var right = input;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    var spec = try plan.choose(input, right, service.tenant, 1000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .max_attempts = 1 }, fixture.now);
+    spec.strategy = .shuffle;
+    const query = try service.submit(spec);
+    const coordinator = (try service.acquire(query)).?;
+    var records = service.state_store;
+    records.now_ms = fixture.now;
+    records.tenant = service.tenant;
+    const query_key = try records.key(a, query, null, 0);
+    defer a.free(query_key);
+    const layout = "{\"boundaries\":[0,1],\"skew\":[]}";
+    const hash = local.serverless_external_source_mod.lake_catalog.types.digestHex(layout);
+    const physical_key = try std.fmt.allocPrint(a, "{s}/sql-exchange/{d:0>20}/{s}/{s}.physical.json", .{ service.exchange_store.prefix, query.expires_ms, query.id, hash });
+    defer a.free(physical_key);
+    var client = memory.client();
+    try client.makeBucket(service.exchange_store.bucket);
+    var uploaded = try client.putObject(service.exchange_store.bucket, physical_key, layout, .{});
+    uploaded.deinit(a);
+    try records.checkpointResolved(a, query_key, coordinator, 1, 0, &.{}, null, null, .{ .key = physical_key, .hash = hash, .bytes = layout.len });
+    const Fault = struct {
+        var key: []const u8 = undefined;
+        var original: @FieldType(storage.Client.VTable, "get_object") = undefined;
+        fn get(raw: *anyopaque, allocator: A, bucket: []const u8, path: []const u8, options: storage.GetOptions) !storage.GetResult {
+            if (std.mem.eql(u8, path, key)) return error.NetworkUnreachable;
+            return original(raw, allocator, bucket, path, options);
+        }
+    };
+    Fault.key = physical_key;
+    Fault.original = service.exchange_store.client.vtable.get_object;
+    var table = service.exchange_store.client.vtable.*;
+    table.get_object = Fault.get;
+    service.exchange_store.client.vtable = &table;
+    const task_key = try records.key(a, query, 1, 0);
+    defer a.free(task_key);
+    try records.create(a, task_key, query.id, query.expires_ms);
+    const ticket: plan.Ticket = .{ .tenant = service.tenant, .query = query, .stage = 1, .task = 0 };
+    try std.testing.expectError(error.NetworkUnreachable, service.execute(ticket));
+    fixture.now += 91001;
+    try service.execute(ticket);
+    try service.execute(ticket);
+    var current = (try records.load(a, task_key)).?;
+    defer current.deinit(a);
+    try std.testing.expectEqual(state.Status.failed, current.value.status);
+    try std.testing.expectEqual(@as(u64, 2), current.value.epoch);
+    try std.testing.expectEqualStrings("TaskRetryBudgetExceeded", current.value.failure.?);
+}
+
+test "distributed SQL plan read failures obey the durable task attempt limit" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    var service = fixture.service(a, memory.client(), "owner");
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+    var right = input;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    var spec = try plan.choose(input, right, service.tenant, 1000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .max_attempts = 1 }, fixture.now);
+    spec.strategy = .shuffle;
+    const query = try service.submit(spec);
+    const coordinator = (try service.acquire(query)).?;
+    var records = service.state_store;
+    records.now_ms = fixture.now;
+    records.tenant = service.tenant;
+    const query_key = try records.key(a, query, null, 0);
+    defer a.free(query_key);
+    const layout = "{\"boundaries\":[0,1],\"skew\":[]}";
+    const hash = local.serverless_external_source_mod.lake_catalog.types.digestHex(layout);
+    const physical_key = try std.fmt.allocPrint(a, "{s}/sql-exchange/{d:0>20}/{s}/{s}.physical.json", .{ service.exchange_store.prefix, query.expires_ms, query.id, hash });
+    defer a.free(physical_key);
+    var client = memory.client();
+    try client.makeBucket(service.exchange_store.bucket);
+    var uploaded = try client.putObject(service.exchange_store.bucket, physical_key, layout, .{});
+    uploaded.deinit(a);
+    try records.checkpointResolved(a, query_key, coordinator, 1, 0, &.{}, null, null, .{ .key = physical_key, .hash = hash, .bytes = layout.len });
+    const Fault = struct {
+        var key: []const u8 = undefined;
+        var original: @FieldType(storage.Client.VTable, "get_object") = undefined;
+        fn get(raw: *anyopaque, allocator: A, bucket: []const u8, path: []const u8, options: storage.GetOptions) !storage.GetResult {
+            if (std.mem.eql(u8, path, key)) return error.NetworkUnreachable;
+            return original(raw, allocator, bucket, path, options);
+        }
+    };
+    const plan_key = try std.fmt.allocPrint(a, "{s}/sql-execution-v2/{d:0>20}/{s}/plan.json", .{ records.prefix, query.expires_ms, query.id });
+    defer a.free(plan_key);
+    Fault.key = plan_key;
+    Fault.original = service.state_store.client.vtable.get_object;
+    var table = service.state_store.client.vtable.*;
+    table.get_object = Fault.get;
+    service.state_store.client.vtable = &table;
+    const task_key = try records.key(a, query, 1, 0);
+    defer a.free(task_key);
+    try records.create(a, task_key, query.id, query.expires_ms);
+    const ticket: plan.Ticket = .{ .tenant = service.tenant, .query = query, .stage = 1, .task = 0 };
+    try std.testing.expectError(error.NetworkUnreachable, service.execute(ticket));
+    fixture.now += 91001;
+    try service.execute(ticket);
+    try service.execute(ticket);
+    var current = (try records.load(a, task_key)).?;
+    defer current.deinit(a);
+    try std.testing.expectEqual(state.Status.failed, current.value.status);
+    try std.testing.expectEqual(@as(u64, 2), current.value.epoch);
+    try std.testing.expectEqualStrings("TaskRetryBudgetExceeded", current.value.failure.?);
+}
+
+test "distributed SQL layout preparation allocation failures terminate within the admitted memory budget" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    var service = fixture.service(a, memory.client(), "owner");
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+    var right = input;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    var spec = try plan.choose(input, right, service.tenant, 1000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .max_attempts = 1, .task_memory = 1024 * 1024 }, fixture.now);
+    spec.strategy = .shuffle;
+    const query = try service.submit(spec);
+    const coordinator = (try service.acquire(query)).?;
+    var records = service.state_store;
+    records.now_ms = fixture.now;
+    records.tenant = service.tenant;
+    const query_key = try records.key(a, query, null, 0);
+    defer a.free(query_key);
+    const layout = "{\"boundaries\":[0,1],\"skew\":[]}";
+    const hash = local.serverless_external_source_mod.lake_catalog.types.digestHex(layout);
+    const physical_key = try std.fmt.allocPrint(a, "{s}/sql-exchange/{d:0>20}/{s}/{s}.physical.json", .{ service.exchange_store.prefix, query.expires_ms, query.id, hash });
+    defer a.free(physical_key);
+    var client = memory.client();
+    try client.makeBucket(service.exchange_store.bucket);
+    var uploaded = try client.putObject(service.exchange_store.bucket, physical_key, layout, .{});
+    uploaded.deinit(a);
+    try records.checkpointResolved(a, query_key, coordinator, 1, 0, &.{}, null, null, .{ .key = physical_key, .hash = hash, .bytes = layout.len });
+    const Fault = struct {
+        var key: []const u8 = undefined;
+        var original: @FieldType(storage.Client.VTable, "get_object") = undefined;
+        fn get(raw: *anyopaque, allocator: A, bucket: []const u8, path: []const u8, options: storage.GetOptions) !storage.GetResult {
+            if (std.mem.eql(u8, path, key)) {
+                const bytes = try allocator.alloc(u8, 2 * 1024 * 1024);
+                allocator.free(bytes);
+                return error.UnexpectedLayoutAllocation;
+            }
+            return original(raw, allocator, bucket, path, options);
+        }
+    };
+    Fault.key = physical_key;
+    Fault.original = service.exchange_store.client.vtable.get_object;
+    var table = service.exchange_store.client.vtable.*;
+    table.get_object = Fault.get;
+    service.exchange_store.client.vtable = &table;
+    const task_key = try records.key(a, query, 1, 0);
+    defer a.free(task_key);
+    try records.create(a, task_key, query.id, query.expires_ms);
+    const ticket: plan.Ticket = .{ .tenant = service.tenant, .query = query, .stage = 1, .task = 0 };
+    try service.execute(ticket);
+    try service.execute(ticket);
+    try service.execute(ticket);
+    var current = (try records.load(a, task_key)).?;
+    defer current.deinit(a);
+    try std.testing.expectEqual(state.Status.failed, current.value.status);
+    try std.testing.expectEqual(@as(u64, 1), current.value.epoch);
+    try std.testing.expectEqualStrings("SqlJoinBudgetExceeded", current.value.failure.?);
+}

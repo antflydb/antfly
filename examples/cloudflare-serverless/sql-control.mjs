@@ -64,25 +64,31 @@ export async function boundedSQLBody(request,reservation){
 }
 const retired=error=>/SqlQueryExpired|SqlExecutionFenced|SqlExecutionNotFound|SqlExecutionFailed/.test(String(error));
 export class SQLControl {
- constructor(ctx,env,run,{now=()=>Date.now(),owner=crypto.randomUUID()}={}){this.ctx=ctx;this.env=env;this.run=run;this.now=now;this.owner=owner;this.active=false;}
- async retire(){await this.ctx.storage.deleteAlarm();await this.ctx.storage.deleteAll();}
+ constructor(ctx,env,run,{now=()=>Date.now(),owner=crypto.randomUUID()}={}){this.ctx=ctx;this.env=env;this.run=run;this.now=now;this.owner=owner;this.active=false;this.updates=Promise.resolve();}
+ // Serialize only storage metadata, never a turn or external network I/O.
+ update(action){const next=this.updates.then(action);this.updates=next.catch(()=>{});return next;}
+ async schedule(time){return this.update(async()=>{const previous=await this.ctx.storage.getAlarm();if(previous===null||time<previous)await this.ctx.storage.setAlarm(time);});}
+ async retire(){return this.update(async()=>{await this.ctx.storage.deleteAlarm();await this.ctx.storage.deleteAll();});}
  async kick(locator){
   locatorName(locator);
-  const previous=await this.ctx.storage.get('query');
-  if(previous&&locatorName(previous)!==locatorName(locator))throw Error('SqlCoordinatorIdentityMismatch');
-  await this.ctx.storage.put('query',locator);
-  await this.ctx.storage.setAlarm(this.now()+1000);
+  return this.update(async()=>{
+   const previous=await this.ctx.storage.get('query');
+   if(previous&&locatorName(previous)!==locatorName(locator))throw Error('SqlCoordinatorIdentityMismatch');
+   await this.ctx.storage.put('query',locator);
+   const alarm=await this.ctx.storage.getAlarm(),next=this.now()+1000;
+   if(alarm===null||next<alarm)await this.ctx.storage.setAlarm(next);
+  });
  }
  async advance(locator){
   if(locator)await this.kick(locator);
-  if(this.active)return{complete:false};
+  if(this.active){await this.schedule(this.now()+1000);return{complete:false};}
   this.active=true;
   try{
    locator=await this.ctx.storage.get('query');
    if(!locator)return{complete:true};
    if(locator.query.expires_ms<=this.now()){await this.retire();return{complete:true};}
    // Schedule recovery before entering WASM or delivering any queue message.
-   await this.ctx.storage.setAlarm(this.now()+2000);
+   await this.schedule(this.now()+2000);
    const result=await this.run(this.env,{op:'sql_turn',...locator,owner:this.owner});
    for(let i=0;i<result.tickets.length;i+=100)await this.env.SQL_TASKS.sendBatch(result.tickets.slice(i,i+100).map(body=>({body,contentType:'json'})));
    if(result.complete)await this.retire();
@@ -90,7 +96,11 @@ export class SQLControl {
   }catch(error){if(retired(error)){await this.retire();return{complete:true};}throw error;}
   finally{this.active=false;}
  }
- async alarm(){if(await this.ctx.storage.get('discovery'))await this.recover();else await this.advance();}
+ async alarm(){
+  // Consume the fired alarm before rearming, including when a turn is active.
+  await this.update(()=>this.ctx.storage.deleteAlarm());
+  if(await this.ctx.storage.get('discovery'))await this.recover();else await this.advance();
+ }
  async recover(){
   if(this.active){await this.ctx.storage.setAlarm(this.now()+1000);return{recovered:0};}
   this.active=true;
