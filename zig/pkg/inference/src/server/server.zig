@@ -2656,6 +2656,25 @@ fn isOpenAiListTask(task: []const u8) bool {
     return std.mem.eql(u8, task, "generators") or std.mem.eql(u8, task, "embedders");
 }
 
+// The compatibility list is built before selector ownership is finalized.
+// Keep only IDs that still have an executable OpenAI task descriptor.
+fn filterOpenAiCatalogSelectors(catalog: *std.json.Value) void {
+    const data = catalog.object.getPtr("data") orelse return;
+    var count: usize = 0;
+    for (data.array.items) |entry| {
+        const id = entry.object.get("id").?.string;
+        var advertised = false;
+        inline for (.{ "generators", "embedders" }) |task| {
+            if (catalog.object.get(task)) |models| advertised = advertised or models.object.contains(id);
+        }
+        if (advertised) {
+            data.array.items[count] = entry;
+            count += 1;
+        }
+    }
+    data.array.items.len = count;
+}
+
 const CompatibilitySummary = model_manager_mod.CompatibilitySummary;
 const CompatibilitySignature = [std.crypto.hash.sha2.Sha256.digest_length]u8;
 const compatibility_sidecar_hash_limit: u64 = 4 * 1024 * 1024;
@@ -25731,19 +25750,39 @@ pub const Node = struct {
         }
         for (task_names) |task| {
             var owners = std.StringHashMapUnmanaged(SelectorOwner).empty;
-            for (discovered, selection_names) |entry, names| {
-                if (!self.discoveredModelInTaskScope(entry.path, task)) continue;
-                for (names) |selector| {
-                    // An exact legacy directory is the existing default.
-                    // Artifact constraints always require receipt ownership.
-                    const unqualified = std.mem.indexOfAny(u8, selector, ":@") == null;
-                    const default_path = if (unqualified) try std.fmt.allocPrint(ca, "{s}/{s}", .{ self.config.models_dir, selector }) else "";
-                    const task_path = if (unqualified) try std.fmt.allocPrint(ca, "{s}/{s}/{s}", .{ self.config.models_dir, task, selector }) else "";
-                    const default_priority: u2 = if (unqualified and std.mem.eql(u8, entry.path, default_path)) 2 else if (unqualified and std.mem.eql(u8, entry.path, task_path)) 1 else 0;
-                    const owner = try owners.getOrPut(ca, selector);
-                    if (!owner.found_existing or default_priority > owner.value_ptr.default_priority) {
-                        owner.value_ptr.* = .{ .path = entry.path, .default_priority = default_priority };
-                    } else if (owner.value_ptr.default_priority == 0 and (owner.value_ptr.path == null or !std.mem.eql(u8, owner.value_ptr.path.?, entry.path))) {
+            // Read execution searches all three physical scopes. Preserve each
+            // scope's legacy defaults, then reject different winners across scopes.
+            const scopes: []const []const u8 = if (std.mem.eql(u8, task, "readers"))
+                &.{ "readers", "transcribers", "generators" }
+            else
+                &.{task};
+            for (scopes) |scope| {
+                var scope_owners = std.StringHashMapUnmanaged(SelectorOwner).empty;
+                for (discovered, selection_names) |entry, names| {
+                    if (!self.discoveredModelInTaskScope(entry.path, scope)) continue;
+                    for (names) |selector| {
+                        // An exact legacy directory is the existing default.
+                        // Artifact constraints always require receipt ownership.
+                        const unqualified = std.mem.indexOfAny(u8, selector, ":@") == null;
+                        const default_path = if (unqualified) try std.fmt.allocPrint(ca, "{s}/{s}", .{ self.config.models_dir, selector }) else "";
+                        const task_path = if (unqualified) try std.fmt.allocPrint(ca, "{s}/{s}/{s}", .{ self.config.models_dir, scope, selector }) else "";
+                        const default_priority: u2 = if (unqualified and std.mem.eql(u8, entry.path, default_path)) 2 else if (unqualified and std.mem.eql(u8, entry.path, task_path)) 1 else 0;
+                        const owner = try scope_owners.getOrPut(ca, selector);
+                        if (!owner.found_existing or default_priority > owner.value_ptr.default_priority) {
+                            owner.value_ptr.* = .{ .path = entry.path, .default_priority = default_priority };
+                        } else if (owner.value_ptr.default_priority == 0 and (owner.value_ptr.path == null or !std.mem.eql(u8, owner.value_ptr.path.?, entry.path))) {
+                            owner.value_ptr.path = null;
+                        }
+                    }
+                }
+                var scope_iterator = scope_owners.iterator();
+                while (scope_iterator.next()) |candidate| {
+                    const owner = try owners.getOrPut(ca, candidate.key_ptr.*);
+                    if (!owner.found_existing) {
+                        owner.value_ptr.* = candidate.value_ptr.*;
+                    } else if (owner.value_ptr.path == null or candidate.value_ptr.path == null or
+                        !std.mem.eql(u8, owner.value_ptr.path.?, candidate.value_ptr.path.?))
+                    {
                         owner.value_ptr.path = null;
                     }
                 }
@@ -25763,6 +25802,7 @@ pub const Node = struct {
                 _ = models.object.swapRemove(owner.key_ptr.*);
             };
         }
+        filterOpenAiCatalogSelectors(&catalog.value);
         return std.json.Stringify.valueAlloc(a, catalog.value, .{});
     }
 
@@ -50227,4 +50267,76 @@ test "model selection activation refuses an uninstalled pin before loading" {
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 404), response.status.code);
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_NOT_FOUND") != null);
+}
+
+test "model selection OpenAI catalog removes selectors absent from finalized task maps" {
+    const a = std.testing.allocator;
+    var catalog = try std.json.parseFromSlice(std.json.Value, a,
+        \\{"data":[{"id":"ambiguous"},{"id":"generator"},{"id":"embedder"}],"generators":{"generator":{}},"embedders":{"embedder":{}}}
+    , .{});
+    defer catalog.deinit();
+    filterOpenAiCatalogSelectors(&catalog.value);
+    const data = catalog.value.object.get("data").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), data.len);
+    try std.testing.expectEqualStrings("generator", data[0].object.get("id").?.string);
+    try std.testing.expectEqualStrings("embedder", data[1].object.get("id").?.string);
+}
+
+fn installReaderSelectionFixture(dir: std.Io.Dir, leaf: []const u8) !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try dir.createDirPath(io, leaf);
+    const config = @embedFile("../models/testdata/lightonocr3/config.json");
+    const metadata = lightonocr3_reader_mod.manifest_json;
+    const weights = "\x02\x00\x00\x00\x00\x00\x00\x00{}";
+    inline for (.{ .{ "config.json", config }, .{ "model_manifest.json", metadata }, .{ "model.safetensors", weights } }) |file| {
+        const path = try std.fs.path.join(a, &.{ leaf, file[0] });
+        defer a.free(path);
+        try dir.writeFile(io, .{ .sub_path = path, .data = file[1] });
+    }
+    const receipt = try std.json.Stringify.valueAlloc(a, .{
+        .version = @as(u32, 2),
+        .source = .{ .owner = "acme", .name = "reader", .variant = "safetensors", .resolved_revision = "0123456789abcdef0123456789abcdef01234567" },
+        .artifacts = .{
+            .{ .path = "config.json", .size = config.len },
+            .{ .path = "model_manifest.json", .size = metadata.len },
+            .{ .path = "model.safetensors", .size = weights.len },
+        },
+    }, .{});
+    defer a.free(receipt);
+    const path = try std.fs.path.join(a, &.{ leaf, ".antfly-download-complete.json" });
+    defer a.free(path);
+    try dir.writeFile(io, .{ .sub_path = path, .data = receipt });
+}
+
+test "model selection reader aliases follow execution scopes and reject cross-scope ambiguity" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try installReaderSelectionFixture(tmp.dir, "models/generators/acme/reader");
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root });
+    defer node.deinit();
+    const selectors = [_][]const u8{ "acme/reader", "acme/reader:safetensors", "acme/reader@0123456789abcdef0123456789abcdef01234567", "acme/reader:safetensors@0123456789abcdef0123456789abcdef01234567" };
+    const body = try node.listModelsJsonAlloc(a, io);
+    defer a.free(body);
+    var catalog = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer catalog.deinit();
+    for (selectors) |selector| {
+        try std.testing.expect(catalog.value.object.get("readers").?.object.contains(selector));
+        const selected = try node.resolveReadingPath(a, io, selector, true);
+        a.free(selected);
+    }
+    // Even an exact legacy reader default must not hide a generator winner.
+    try installReaderSelectionFixture(tmp.dir, "models/readers/acme/reader");
+    const ambiguous_body = try node.listModelsJsonAlloc(a, io);
+    defer a.free(ambiguous_body);
+    var ambiguous = try std.json.parseFromSlice(std.json.Value, a, ambiguous_body, .{});
+    defer ambiguous.deinit();
+    for (selectors) |selector| {
+        try std.testing.expect(!ambiguous.value.object.get("readers").?.object.contains(selector));
+        try std.testing.expectError(error.AmbiguousModelIdentifier, node.resolveReadingPath(a, io, selector, true));
+    }
 }
