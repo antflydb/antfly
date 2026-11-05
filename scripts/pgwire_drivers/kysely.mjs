@@ -276,6 +276,9 @@ try {
     (error) => error.code === "0A000"
   );
 
+  const overriddenOids = [20, 23, 1007, 1009, 1016, 1231];
+  const previousParsers = overriddenOids.map((oid) => [oid, pg.types.getTypeParser(oid, "text")]);
+  for (const oid of overriddenOids) pg.types.setTypeParser(oid, () => "wrong before construction");
   const runtime = createAntflyPostgres({
     pg,
     client,
@@ -283,6 +286,7 @@ try {
     pool: { connectionString, max: 1 },
   });
   try {
+    for (const oid of overriddenOids) pg.types.setTypeParser(oid, () => "wrong after construction");
     const query = runtime.db.selectFrom("kysely_shapes").select(["amount", "amounts"]).where("_id", "=", "shape");
     assert.deepEqual(await query.execute(), [expectedDecimal]);
     const streamed = [];
@@ -379,7 +383,8 @@ try {
       ),
     );
   } finally {
-    await runtime.close();
+    try { await runtime.close(); }
+    finally { for (const [oid, parser] of previousParsers) pg.types.setTypeParser(oid, parser); }
   }
   for (const { migrationTables, table } of [
     { migrationTables: {}, table: "kysely_migrated" },

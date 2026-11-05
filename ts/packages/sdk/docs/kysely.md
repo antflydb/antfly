@@ -23,6 +23,9 @@ const antfly = createAntflyPostgres<Database>({
   pool: { connectionString: process.env.ANTFLY_PGWIRE_URL! },
   client: new AntflyClient({ baseUrl: process.env.ANTFLY_HTTP_URL! }),
   values: "exact",
+  onPoolError(error) {
+    console.error("Antfly background pool error", error);
+  },
 });
 const db = antfly.db;
 try {
@@ -41,12 +44,25 @@ Install `pg`, `kysely`, and optionally `pg-cursor` alongside the SDK. Supply the
 same database and credentials to HTTP and pgwire. The factory supports the default
 database/public namespace. `exact` (the default) preserves BIGINT and NUMERIC
 values, including nested arrays, as strings. `pg-default` keeps numeric arrays
-as numbers. Neither preset changes global pg parsers. Generate types through the
+as numbers. Neither preset changes global pg parsers. Managed text codecs for
+booleans,
+numbers, exact integers/decimals, strings/UUIDs, and their arrays are independent
+of global parser changes before or after construction. Binary results for these
+types are rejected; the managed runtime uses text results. Other OIDs, such as
+JSON and date/time types, retain the supplied registry's behavior and generate as
+`unknown`. Use the low-level dialect and explicit generation options if you need
+custom mappings. Generate types through the
 runtime so the output uses its parser policy. Keep generated files current as
 the schema changes. `Database` is the interface exported by that generated file.
 
 `close()` waits for runtime migration and metadata operations, then ends the
-owned pool, including when no queries ran. Finish direct `db` queries before
+owned pool, including when no queries ran. Background errors on idle pooled
+connections go to `onPoolError`; the default emits a Node warning instead of an
+unhandled pool error. This listener remains installed during shutdown. Query
+errors still reject the corresponding query. The callback may be synchronous or
+async. If it throws or rejects, the runtime emits warnings for both the original
+pool error and the handler failure, preventing an unhandled rejection. Finish
+direct `db` queries before
 closing; use `antfly.close()` for lifecycle management.
 
 ### Persistent migration ownership

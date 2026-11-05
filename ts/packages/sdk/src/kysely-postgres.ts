@@ -1,5 +1,6 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+import process from "node:process";
 import { Kysely, type PostgresPool } from "kysely";
 import { type MigrationResultSet, Migrator, type MigratorProps } from "kysely/migration";
 import type { AntflyClient } from "./client.js";
@@ -9,13 +10,18 @@ import {
 } from "./kysely-migration-lock.js";
 import { prepareKyselyMigrationTables } from "./kysely-migrations.js";
 import { type AntflyMigrationLock, AntflyPostgresDialect } from "./kysely-postgres-dialect.js";
+import { createManagedPostgresTypes } from "./kysely-postgres-policy.js";
 import {
   type AntflyConfigurablePostgresCursor,
   type AntflyPostgresTypes,
   createAntflyPostgresCursor,
-  createAntflyPostgresTypes,
 } from "./kysely-postgres-types.js";
 import { createAntflyIntrospector, generateKyselyTypes } from "./kysely-schema.js";
+/** Owned pg pool, including its asynchronous idle-client error channel. */
+export interface AntflyPostgresPool extends PostgresPool {
+  on(event: "error", listener: (error: Error) => void): unknown;
+}
+
 export interface AntflyPostgresOptions {
   pg: {
     Pool: new (options: {
@@ -24,7 +30,7 @@ export interface AntflyPostgresOptions {
       max?: number;
       idleTimeoutMillis?: number;
       connectionTimeoutMillis?: number;
-    }) => PostgresPool;
+    }) => AntflyPostgresPool;
     types: AntflyPostgresTypes;
   };
   pool: {
@@ -36,6 +42,8 @@ export interface AntflyPostgresOptions {
   cursor?: AntflyConfigurablePostgresCursor;
   client: Pick<AntflyClient, "tables" | "executeSQL">;
   values?: "exact" | "pg-default";
+  /** Background idle-client errors; defaults to a Node warning. Query errors still reject their query. */
+  onPoolError?: (error: Error) => void | Promise<void>;
 }
 export type AntflyPostgresMigrationOptions = Pick<
   MigratorProps,
@@ -72,29 +80,30 @@ export function createAntflyPostgres<DB>(
     throw new TypeError(
       "Antfly HTTP introspection requires the default database and public namespace"
     );
-  const base = options.pg.types;
-  const textArray = base.getTypeParser(1009, "text") as (value: string) => unknown;
-  const numericArray = (value: unknown): unknown =>
-    Array.isArray(value) ? value.map(numericArray) : value === null ? null : Number(value);
-  const policy: AntflyPostgresTypes = {
-    getTypeParser(oid, format = "text") {
-      if (format === "text" && (oid === 20 || oid === 1700)) return (value: string) => value;
-      if (format === "text" && (oid === 1016 || oid === 1231)) {
-        return (value: string) =>
-          oid === 1231 && values === "pg-default"
-            ? numericArray(textArray(value))
-            : textArray(value);
-      }
-      return base.getTypeParser(oid, format);
-    },
-  };
-  const types = values === "exact" ? createAntflyPostgresTypes(policy) : policy;
+  const types = createManagedPostgresTypes(options.pg.types, values);
   const pool = new options.pg.Pool({
     connectionString: options.pool.connectionString,
     max: options.pool.max,
     idleTimeoutMillis: options.pool.idleTimeoutMillis,
     connectionTimeoutMillis: options.pool.connectionTimeoutMillis,
     types,
+  });
+  // Keep this listener installed through pool.end(), including shutdown errors.
+  const onPoolError = options.onPoolError;
+  pool.on("error", (error) => {
+    if (!onPoolError) {
+      process.emitWarning(error);
+      return;
+    }
+    const reportFailure = (failure: unknown) => {
+      process.emitWarning(error);
+      process.emitWarning(failure instanceof Error ? failure : new Error(String(failure)));
+    };
+    try {
+      Promise.resolve(onPoolError(error)).catch(reportFailure);
+    } catch (failure) {
+      reportFailure(failure);
+    }
   });
   const borrowed: PostgresPool = {
     connect: () => pool.connect(),

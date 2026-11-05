@@ -2071,7 +2071,7 @@ jobs:
           pnpm install --frozen-lockfile --filter @antfly/sdk...
           pnpm --filter @antfly/sdk build
           pnpm --filter @antfly/sdk typecheck
-          pnpm --filter @antfly/sdk exec vitest run test/kysely.test.ts
+          pnpm --filter @antfly/sdk exec vitest run test/kysely
       - name: Test standard PostgreSQL drivers and Kysely against candidate runtime
         run: >-
           uv run --no-project --with requests --with pytest

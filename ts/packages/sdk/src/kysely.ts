@@ -17,6 +17,7 @@ export {
 export {
   type AntflyPostgresMigrationOptions,
   type AntflyPostgresOptions,
+  type AntflyPostgresPool,
   type AntflyPostgresRuntime,
   createAntflyPostgres,
 } from "./kysely-postgres.js";

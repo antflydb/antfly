@@ -1,5 +1,6 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+import { EventEmitter } from "node:events";
 import pg from "pg";
 import Cursor from "pg-cursor";
 import { expect, it, vi } from "vitest";
@@ -22,10 +23,11 @@ it.each([
 ] as const)("binds %s generation and parsers and closes an unused owned pool once", async (values) => {
   const end = vi.fn(async () => {});
   let parsers: AntflyPostgresOptions["pg"]["types"] | undefined;
-  class Pool {
+  class Pool extends EventEmitter {
     options = {};
     end = end;
     constructor(config: { types: AntflyPostgresOptions["pg"]["types"] }) {
+      super();
       parsers = config.types;
     }
     async connect(): Promise<never> {
@@ -67,7 +69,7 @@ it("waits for active metadata work before closing its pool", async () => {
     resolve = done;
   });
   const end = vi.fn(async () => {});
-  class Pool {
+  class Pool extends EventEmitter {
     options = {};
     end = end;
     async connect(): Promise<never> {
@@ -97,4 +99,81 @@ it.each([
   expect(() =>
     createAntflyPostgres({ pg, client: {} as AntflyClient, pool: { connectionString } })
   ).toThrow("default database");
+});
+
+it.each([
+  false,
+  true,
+])("handles idle-pool errors, including shutdown (custom handler: %s)", async (custom) => {
+  let pool!: Pool;
+  const failure = new Error("idle connection lost");
+  const handler = vi.fn();
+  const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+  class Pool extends EventEmitter {
+    options = {};
+    constructor() {
+      super();
+      pool = this;
+    }
+    async connect(): Promise<never> {
+      throw new Error("unused");
+    }
+    async end() {
+      this.emit("error", failure);
+    }
+  }
+  const runtime = createAntflyPostgres({
+    pg: { Pool, types: pg.types },
+    client: {} as AntflyClient,
+    pool: { connectionString: "postgres://localhost/default" },
+    ...(custom ? { onPoolError: handler } : {}),
+  });
+  try {
+    expect(() => pool.emit("error", failure)).not.toThrow();
+    await runtime.close();
+    expect(custom ? handler : warning).toHaveBeenCalledTimes(2);
+    expect(custom ? handler : warning).toHaveBeenCalledWith(failure);
+    expect(custom ? warning : handler).not.toHaveBeenCalled();
+  } finally {
+    warning.mockRestore();
+  }
+});
+
+it.each([
+  false,
+  true,
+])("reports failed pool-error handlers without unhandled exceptions (async: %s)", async (async) => {
+  let pool!: Pool;
+  const original = new Error("idle connection lost");
+  const failure = new Error("telemetry unavailable");
+  const warning = vi.spyOn(process, "emitWarning").mockImplementation(() => {});
+  class Pool extends EventEmitter {
+    options = {};
+    constructor() {
+      super();
+      pool = this;
+    }
+    async connect(): Promise<never> {
+      throw new Error("unused");
+    }
+    async end() {}
+  }
+  const runtime = createAntflyPostgres({
+    pg: { Pool, types: pg.types },
+    client: {} as AntflyClient,
+    pool: { connectionString: "postgres://localhost/default" },
+    onPoolError: () => {
+      if (async) return Promise.reject(failure);
+      throw failure;
+    },
+  });
+  try {
+    expect(() => pool.emit("error", original)).not.toThrow();
+    await Promise.resolve();
+    expect(warning).toHaveBeenCalledWith(original);
+    expect(warning).toHaveBeenCalledWith(failure);
+    await runtime.close();
+  } finally {
+    warning.mockRestore();
+  }
 });
