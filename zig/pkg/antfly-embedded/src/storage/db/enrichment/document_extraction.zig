@@ -2576,7 +2576,7 @@ fn dupeOptionalStringField(alloc: Allocator, object: std.json.ObjectMap, field: 
     return try alloc.dupe(u8, value.string);
 }
 
-pub const native_text_extraction_identity = "native-text-v3";
+pub const native_text_extraction_identity = "native-text-v4";
 
 pub fn metadataFingerprintAlloc(
     alloc: Allocator,
@@ -2935,6 +2935,7 @@ const PdfPageTextCandidate = struct {
 fn extractPdfPageTextBestEffort(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: usize) !PdfPageTextCandidate {
     var analysis = parsed.extractPageTextAnalysisAlloc(page_num) catch |err| {
         switch (err) {
+            error.Canceled,
             error.OutOfMemory,
             error.DecodedStreamTooLarge,
             error.PdfDecodeWorkingSetTooLarge,

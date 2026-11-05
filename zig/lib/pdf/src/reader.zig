@@ -23,6 +23,7 @@ fn repeatBytesComptime(comptime bytes: []const u8, comptime count: usize) [bytes
     return repeated;
 }
 const syntax = @import("syntax.zig");
+const inline_image = @import("inline_image.zig");
 const text_encoding = @import("text_encoding.zig");
 const jbig2 = @import("jbig2.zig");
 const image_lib = @import("antfly_image");
@@ -1523,7 +1524,7 @@ fn contentHasNontextPaint(alloc: Allocator, bytes: []const u8, cancellation: Can
     while (true) {
         if (count & 255 == 0) try cancellation.check();
         count +|= 1;
-        var token = (try readContentLexeme(&scanner)) orelse continue;
+        var token = (try readContentLexemeRaw(&scanner)) orelse continue;
         defer syntax.Scanner.freeLexeme(alloc, &token);
         if (token == .eof) return false;
         if (token != .keyword) continue;
@@ -3112,11 +3113,6 @@ fn actualTextFromBdcAlloc(
     return try text_encoding.pdfDocDecodeAlloc(alloc, actual.string);
 }
 
-fn hasEffectiveActualText(scopes: []const ActualTextScope) bool {
-    for (scopes) |scope| if (scope.effective) return true;
-    return false;
-}
-
 const PageForm = struct {
     text_image: bool = false,
     name: []u8,
@@ -3535,7 +3531,13 @@ const SemanticTextContext = struct {
         if (isShapePaintOperator(op)) {
             const fill = !std.mem.eql(u8, op, "S") and !std.mem.eql(u8, op, "s");
             const stroke = !std.mem.eql(u8, op, "f") and !std.mem.eql(u8, op, "F") and !std.mem.eql(u8, op, "f*");
+            // No path is known absence of paint, not unknown geometry.
+            if (!path.has_path) return;
             var bounds = path.paint_box;
+            if (!stroke) {
+                const hull = bounds orelse return;
+                if (hull.min_x >= hull.max_x or hull.min_y >= hull.max_y) return;
+            }
             // Stroke joins, miter limits, and device-space hairlines can
             // exceed the path hull. Retain unknown bounds rather than falsely
             // excluding semantic text using an underestimated paint extent.
@@ -3552,6 +3554,8 @@ const SemanticTextContext = struct {
 /// Keep this constant-space and leave arbitrary paths unknown instead of
 /// retaining/vectorizing paint paths on the text-only hot path.
 const TextClipPath = struct {
+    has_path: bool = false,
+    pending_clip: bool = false,
     paint_box: ?PageBox = null,
     box: ?PageBox = null,
     unknown: bool = false,
@@ -3563,18 +3567,28 @@ const TextClipPath = struct {
             const w = numericObjectValue(&operands[operands.len - 2]) orelse return;
             const h = numericObjectValue(&operands[operands.len - 1]) orelse return;
             const rect = transformPageBox(.{ .min_x = @min(x, x + w), .min_y = @min(y, y + h), .max_x = @max(x, x + w), .max_y = @max(y, y + h) }, state.matrix);
-            self.paint_box = unionTextBox(self.paint_box, rect);
-            if (self.box) |box| {
-                self.box = .{ .min_x = @min(box.min_x, rect.min_x), .min_y = @min(box.min_y, rect.min_y), .max_x = @max(box.max_x, rect.max_x), .max_y = @max(box.max_y, rect.max_y) };
-            } else self.box = rect;
+            self.has_path = true;
+            // Degenerate rectangular subpaths have no fill area. Including
+            // them in a union can fabricate on-page paint or a nonempty clip.
+            const has_area = w != 0 and h != 0 and state.matrix.a * state.matrix.d != state.matrix.b * state.matrix.c;
+            if (has_area) {
+                self.paint_box = unionTextBox(self.paint_box, rect);
+                const previous = if (self.box) |box| if (box.min_x < box.max_x and box.min_y < box.max_y) self.box else null else null;
+                self.box = unionTextBox(previous, rect);
+            } else if (self.box == null) self.box = .{ .min_x = rect.min_x, .max_x = rect.min_x, .min_y = rect.min_y, .max_y = rect.min_y };
         } else if (std.mem.eql(u8, op, "W") or std.mem.eql(u8, op, "W*")) {
-            if (!self.unknown) if (self.box) |box| {
-                state.clip_box = if (state.clip_box) |clip| intersectPageBoxes(clip, box) else box;
-            };
+            self.pending_clip = true;
         } else if (std.mem.eql(u8, op, "n") or isShapePaintOperator(op)) {
+            // W/W* take effect after the terminating paint (or n), not before
+            // it. A known empty path establishes an empty clip.
+            if (self.pending_clip and !self.unknown) {
+                const box = self.box orelse PageBox{ .min_x = 0, .max_x = 0, .min_y = 0, .max_y = 0 };
+                state.clip_box = if (state.clip_box) |clip| intersectPageBoxes(clip, box) else box;
+            }
             self.* = .{};
         } else if (std.mem.eql(u8, op, "m") or std.mem.eql(u8, op, "l") or std.mem.eql(u8, op, "c") or std.mem.eql(u8, op, "v") or std.mem.eql(u8, op, "y")) {
             self.unknown = true;
+            self.has_path = true;
             var i: usize = 0;
             while (i + 1 < operands.len) : (i += 2) {
                 const x = numericObjectValue(&operands[i]) orelse continue;
@@ -3652,7 +3666,7 @@ const PositionedTextParser = struct {
         while (true) {
             if (lexeme_count & 255 == 0) try self.cancellation.check();
             lexeme_count +|= 1;
-            var lex = (try readContentLexeme(&scanner)) orelse {
+            var lex = (try readContentLexemeCancelable(&scanner, self.cancellation)) orelse {
                 clearContentOperands(self.alloc, &self.operands);
                 continue;
             };
@@ -3802,7 +3816,7 @@ fn extractImageRunsFromContentAppendWithStateCancelable(
     while (true) {
         if (lexeme_count & 255 == 0) try cancellation.check();
         lexeme_count +|= 1;
-        var lex = (try readContentLexeme(&scanner)) orelse {
+        var lex = (try readContentLexemeCancelable(&scanner, cancellation)) orelse {
             clearContentOperands(alloc, &operands);
             continue;
         };
@@ -3958,7 +3972,7 @@ fn extractShadingRunsFromContentAppendWithStateCancelable(
     while (true) {
         if (lexeme_count & 255 == 0) try cancellation.check();
         lexeme_count +|= 1;
-        var lex = (try readContentLexeme(&scanner)) orelse {
+        var lex = (try readContentLexemeCancelable(&scanner, cancellation)) orelse {
             clearContentOperands(alloc, &operands);
             continue;
         };
@@ -4048,7 +4062,7 @@ fn extractPatternRunsFromContentAppendWithStateCancelable(
     while (true) {
         if (lexeme_count & 255 == 0) try cancellation.check();
         lexeme_count +|= 1;
-        var lex = (try readContentLexeme(&scanner)) orelse {
+        var lex = (try readContentLexemeCancelable(&scanner, cancellation)) orelse {
             clearContentOperands(alloc, &operands);
             continue;
         };
@@ -4137,7 +4151,7 @@ fn extractShapeRunsFromContentAppendWithStateCancelable(
     while (true) {
         if (lexeme_count & 255 == 0) try cancellation.check();
         lexeme_count +|= 1;
-        var lex = (try readContentLexeme(&scanner)) orelse {
+        var lex = (try readContentLexemeCancelable(&scanner, cancellation)) orelse {
             clearContentOperands(alloc, &operands);
             continue;
         };
@@ -6742,6 +6756,7 @@ pub const Reader = struct {
         run_parser.semantic.page_box = page_box;
         var text_parser = TextContentParser.init(alloc, &text);
         defer text_parser.deinit();
+        text_parser.cancellation = self.cancellation;
 
         for (ranges) |range| {
             const stream_content = decoded[range.start..range.end];
@@ -7922,7 +7937,7 @@ pub const Reader = struct {
     }
 
     fn collectColorSpacesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, referenced_content: []const u8) ![]PageColorSpace {
-        var references = try collectReferencedResourceNamesAlloc(self.alloc, referenced_content, &.{ "cs", "CS" });
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, referenced_content, &.{ "cs", "CS" }, self.cancellation);
         defer references.deinit(self.alloc);
         {
             const content = referenced_content;
@@ -8042,7 +8057,7 @@ pub const Reader = struct {
 
     fn collectTextPropertiesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) ![]PageTextProperty {
         const properties_obj = resources.get("Properties") orelse return try self.alloc.alloc(PageTextProperty, 0);
-        var references = try collectReferencedResourceNamesAlloc(self.alloc, content, &.{"BDC"});
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, content, &.{"BDC"}, self.cancellation);
         defer references.deinit(self.alloc);
         if (references.names.count() == 0) return try self.alloc.alloc(PageTextProperty, 0);
         var properties = try self.resolveValue(properties_obj);
@@ -8122,7 +8137,7 @@ pub const Reader = struct {
         var resolved_fonts = try self.resolveValue(fonts_obj);
         defer resolved_fonts.deinit(self.alloc);
         if (resolved_fonts != .dict) return try self.alloc.alloc(PageFont, 0);
-        var references = try collectReferencedFontNamesAlloc(self.alloc, content);
+        var references = try collectReferencedFontNamesCancelableAlloc(self.alloc, content, self.cancellation);
         defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageFont).empty;
@@ -8176,7 +8191,7 @@ pub const Reader = struct {
         var resolved_fonts = try self.resolveValue(fonts_obj);
         defer resolved_fonts.deinit(self.alloc);
         if (resolved_fonts != .dict) return try self.alloc.alloc(PageFont, 0);
-        var references = try collectReferencedFontNamesAlloc(self.alloc, content);
+        var references = try collectReferencedFontNamesCancelableAlloc(self.alloc, content, self.cancellation);
         defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageFont).empty;
@@ -8345,7 +8360,7 @@ pub const Reader = struct {
         var resolved_xobjects = try self.resolveValue(xobject_obj);
         defer resolved_xobjects.deinit(self.alloc);
         if (resolved_xobjects != .dict) return try self.alloc.alloc(PageImage, 0);
-        var references = try collectReferencedResourceNamesAlloc(self.alloc, content, &.{"Do"});
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, content, &.{"Do"}, self.cancellation);
         defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageImage).empty;
@@ -8446,7 +8461,7 @@ pub const Reader = struct {
         var resolved_shadings = try self.resolveValue(shadings_obj);
         defer resolved_shadings.deinit(self.alloc);
         if (resolved_shadings != .dict) return try self.alloc.alloc(PageShading, 0);
-        var references = try collectReferencedResourceNamesAlloc(self.alloc, content, &.{"sh"});
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, content, &.{"sh"}, self.cancellation);
         defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageShading).empty;
@@ -8482,7 +8497,7 @@ pub const Reader = struct {
         var resolved_ext = try self.resolveValue(ext_obj);
         defer resolved_ext.deinit(self.alloc);
         if (resolved_ext != .dict) return try self.alloc.alloc(PageExtGState, 0);
-        var references = try collectReferencedResourceNamesAlloc(self.alloc, content, &.{"gs"});
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, content, &.{"gs"}, self.cancellation);
         defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageExtGState).empty;
@@ -8683,7 +8698,7 @@ pub const Reader = struct {
         var resolved_patterns = try self.resolveValue(pattern_obj);
         defer resolved_patterns.deinit(self.alloc);
         if (resolved_patterns != .dict) return try self.alloc.alloc(PagePattern, 0);
-        var references = try collectReferencedResourceNamesAlloc(self.alloc, parent_content, &.{ "scn", "SCN" });
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, parent_content, &.{ "scn", "SCN" }, self.cancellation);
         defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PagePattern).empty;
@@ -8822,7 +8837,7 @@ pub const Reader = struct {
         var resolved_xobjects = try self.resolveValue(xobject_obj);
         defer resolved_xobjects.deinit(self.alloc);
         if (resolved_xobjects != .dict) return try self.alloc.alloc(PageForm, 0);
-        var references = try collectReferencedResourceNamesAlloc(self.alloc, parent_content, &.{"Do"});
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, parent_content, &.{"Do"}, self.cancellation);
         defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageForm).empty;
@@ -8957,7 +8972,7 @@ pub const Reader = struct {
         var resolved_xobjects = try self.resolveValue(xobject_obj);
         defer resolved_xobjects.deinit(self.alloc);
         if (resolved_xobjects != .dict) return try self.alloc.alloc(PageForm, 0);
-        var references = try collectReferencedResourceNamesAlloc(self.alloc, parent_content, &.{"Do"});
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, parent_content, &.{"Do"}, self.cancellation);
         defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageForm).empty;
@@ -15825,6 +15840,8 @@ const TextContentParser = struct {
     operands: std.ArrayList(syntax.Object) = .empty,
     state: TextExtractionState = .{},
     marked_content: std.ArrayList(ActualTextScope) = .empty,
+    active_actual_text: bool = false,
+    cancellation: CancellationProbe = .{},
 
     fn init(alloc: Allocator, out: *std.ArrayList(u8)) TextContentParser {
         return .{ .alloc = alloc, .out = out };
@@ -15850,8 +15867,11 @@ const TextContentParser = struct {
         var scanner = syntax.Scanner.init(self.alloc, bytes);
         defer scanner.deinit();
 
+        var lexeme_count: usize = 0;
         while (true) {
-            var lex = (try readContentLexeme(&scanner)) orelse {
+            if (lexeme_count % 256 == 0) try self.cancellation.check();
+            lexeme_count +|= 1;
+            var lex = (try readContentLexemeCancelable(&scanner, self.cancellation)) orelse {
                 clearContentOperands(self.alloc, &self.operands);
                 continue;
             };
@@ -15867,6 +15887,8 @@ const TextContentParser = struct {
                     forms,
                     properties,
                     &self.marked_content,
+                    &self.active_actual_text,
+                    self.cancellation,
                     form_depth,
                     lex.keyword,
                     self.operands.items,
@@ -15894,15 +15916,41 @@ fn extractTextFromContentAlloc(
     properties: []const PageTextProperty,
     form_depth: usize,
 ) anyerror![]u8 {
+    return extractTextFromContentCancelableAlloc(alloc, bytes, fonts, forms, properties, form_depth, .{});
+}
+
+fn extractTextFromContentCancelableAlloc(
+    alloc: Allocator,
+    bytes: []const u8,
+    fonts: []const PageFont,
+    forms: []const PageForm,
+    properties: []const PageTextProperty,
+    form_depth: usize,
+    cancellation: CancellationProbe,
+) anyerror![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
     var parser = TextContentParser.init(alloc, &out);
     defer parser.deinit();
+    parser.cancellation = cancellation;
     try parser.consume(bytes, fonts, forms, properties, form_depth);
     return try out.toOwnedSlice(alloc);
 }
 
 fn readContentLexeme(scanner: *syntax.Scanner) anyerror!?syntax.Lexeme {
+    return readContentLexemeCancelable(scanner, .{});
+}
+
+fn readContentLexemeCancelable(scanner: *syntax.Scanner, cancellation: CancellationProbe) anyerror!?syntax.Lexeme {
+    var token = (try readContentLexemeRaw(scanner)) orelse return null;
+    errdefer syntax.Scanner.freeLexeme(scanner.alloc, &token);
+    if (token == .keyword and std.mem.eql(u8, token.keyword, "BI"))
+        try inline_image.skip(scanner, cancellation, 64 * 1024 * 1024);
+    return token;
+}
+
+// Coverage/safety probes that stop immediately at BI need no payload scan.
+fn readContentLexemeRaw(scanner: *syntax.Scanner) anyerror!?syntax.Lexeme {
     return scanner.readLexeme() catch |err| {
         if (isRecoverableContentSyntaxError(err)) return null;
         return err;
@@ -16016,6 +16064,8 @@ fn applyTextOperator(
     forms: []const PageForm,
     properties: []const PageTextProperty,
     marked_content: *std.ArrayList(ActualTextScope),
+    active_actual_text: *bool,
+    cancellation: CancellationProbe,
     form_depth: usize,
     op: []const u8,
     operands: []const syntax.Object,
@@ -16026,13 +16076,14 @@ fn applyTextOperator(
         else
             null;
         errdefer if (replacement) |text| alloc.free(text);
-        const effective = replacement != null and !hasEffectiveActualText(marked_content.items);
+        const effective = replacement != null and !active_actual_text.*;
         try marked_content.append(alloc, .{
             .replacement = replacement,
             .output_start = out.items.len,
             .effective = effective,
         });
         replacement = null;
+        if (effective) active_actual_text.* = true;
         return;
     }
     if (std.mem.eql(u8, op, "EMC")) {
@@ -16040,6 +16091,7 @@ fn applyTextOperator(
             var scope = popped;
             defer scope.deinit(alloc);
             if (scope.effective) {
+                active_actual_text.* = false;
                 out.shrinkRetainingCapacity(scope.output_start);
                 try out.appendSlice(alloc, scope.replacement.?);
             }
@@ -16090,7 +16142,7 @@ fn applyTextOperator(
         if (operands.len == 0 or operands[operands.len - 1] != .name) return;
         const form = findPageForm(forms, operands[operands.len - 1].name) orelse return;
         if (form.text_image) return;
-        const nested = try extractTextFromContentAlloc(alloc, form.content, form.fonts, form.forms, form.text_properties, form_depth + 1);
+        const nested = try extractTextFromContentCancelableAlloc(alloc, form.content, form.fonts, form.forms, form.text_properties, form_depth + 1, cancellation);
         defer alloc.free(nested);
         if (nested.len == 0) return;
         try appendNewline(alloc, out);
@@ -18643,12 +18695,16 @@ fn textRunAxesCompatible(left: anytype, right: anytype) bool {
 fn pageBoxesOverlap(left: PageBox, right: PageBox) bool {
     // Intersecting disjoint clips produces an empty (possibly inverted) box.
     // A large text bound spanning both endpoints must not make it nonempty.
-    if (right.min_x >= right.max_x or right.min_y >= right.max_y) return false;
+    if (left.min_x >= left.max_x or left.min_y >= left.max_y or
+        right.min_x >= right.max_x or right.min_y >= right.max_y) return false;
     return left.max_x > right.min_x and left.min_x < right.max_x and
         left.max_y > right.min_y and left.min_y < right.max_y;
 }
 
 fn textRunOutsidePageOrClip(run: anytype, page_box: PageBox) bool {
+    // A known empty page/clip intersection excludes every glyph, even
+    // when its own extent is unknown (for example vertical writing).
+    if (run.clip_box) |clip| if (!pageBoxesOverlap(clip, page_box)) return true;
     const bounds = run.bounds() orelse return false;
     if (!pageBoxesOverlap(bounds, page_box)) return true;
     if (run.clip_box) |clip_box| if (!pageBoxesOverlap(bounds, clip_box)) return true;
@@ -19857,55 +19913,67 @@ fn reconstructTextItemsCancelableAlloc(alloc: Allocator, runs: anytype, source_r
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
     var previous_index: ?usize = null;
+    var deleted_content = false;
+    var deletion_exit_index: ?usize = null;
     for (ordered_indices, 0..) |run_index, emitted_index| {
         if (emitted_index % 256 == 0) try cancellation.check();
         const run = &runs[run_index];
         if (run.text.len == 0) {
-            previous_index = run_index; // Intentional deletion bridges authored text.
+            // Retain the last surviving line context. Deletion suppresses
+            // horizontal spacing, while independent line boundaries remain.
+            if (run.semantic_span_index < spans.len and spans[run.semantic_span_index].entry_run != null) {
+                if (previous_index) |survivor| {
+                    const prior = textRunExitGeometry(runs[deletion_exit_index orelse survivor], source_runs, spans);
+                    const exit = textRunExitGeometry(run.*, source_runs, spans);
+                    deleted_content = (deletion_exit_index == null or deleted_content) and
+                        textRunsShareLine(prior, run.*) and textRunsShareLine(run.*, exit);
+                    deletion_exit_index = run_index;
+                }
+            }
             continue;
         }
         if (previous_index) |prior_index| {
             const prior = textRunExitGeometry(runs[prior_index], source_runs, spans);
-            if (prior.text.len == 0) {
-                // Explicit empty ActualText removes content, not an inferred separator.
-            } else {
-                const layer_boundary = invisibleTextRun(prior) != invisibleTextRun(run.*) and
-                    (textRunForwardGap(prior, run.*) < 0 or
-                        textBoundsOverlap(textRunBounds(prior), textRunBounds(run.*)));
-                const authored_ocr_boundary = invisibleTextRun(prior) and invisibleTextRun(run.*) and
-                    independentTextCopies(prior, run.*) and
-                    textRunForwardGap(prior, run.*) < 0 and
-                    textBoundsOverlap(textRunBounds(prior), textRunBounds(run.*));
-                const track_boundary = if (boundaries) |flags| flags[run_index] else false;
-                if (track_boundary or authored_ocr_boundary or layer_boundary or !textRunsShareLine(prior, run.*)) {
-                    try appendLayoutNewline(alloc, &out, runs, ordered_indices[0..emitted_index]);
-                } else if (!std.ascii.isWhitespace(out.items[out.items.len - 1]) and
-                    !std.ascii.isWhitespace(run.text[0]))
-                {
-                    const axis = textRunAxisLength(prior);
-                    const font_scale = @abs(prior.font_size) * axis;
-                    const gap = textRunForwardGap(prior, run.*);
-                    // Tz scales advances and TJ gaps, including sub-point spaces.
-                    const word_gap = @max(0.5, font_scale * 0.12) * @abs(prior.horizontal_scale);
-                    const caption_boundary =
-                        prior.paint_order != run.paint_order and
-                        endsWithColon(prior.text) and
-                        startsWithAsciiUpper(run.text);
-                    // A text-showing operator boundary can split a single word.
-                    // Infer separators from geometry, not content-stream chunking.
-                    // Suppress a geometric boundary only when its gap matches
-                    // tracking measured around authored whitespace in this TJ.
-                    // Unrelated table-cell gaps retain their geometric boundaries.
-                    const tracked_glyph_fragments =
-                        prior.paint_order == run.paint_order and
-                        prior.text_show_tracking_gap != null and
-                        run.text_show_tracking_gap != null and
-                        @abs(gap - prior.text_show_tracking_gap.?) <= font_scale * @abs(prior.horizontal_scale) * 0.01 and
-                        textHasSingleTrackingCodepoint(prior.text) and
-                        textHasSingleTrackingCodepoint(run.text);
-                    if ((!tracked_glyph_fragments and gap > word_gap) or caption_boundary) {
-                        try out.append(alloc, ' ');
-                    }
+            const bridges_deletion = deleted_content and if (deletion_exit_index) |index|
+                textRunsShareLine(textRunExitGeometry(runs[index], source_runs, spans), run.*)
+            else
+                false;
+            const layer_boundary = invisibleTextRun(prior) != invisibleTextRun(run.*) and
+                (textRunForwardGap(prior, run.*) < 0 or
+                    textBoundsOverlap(textRunBounds(prior), textRunBounds(run.*)));
+            const authored_ocr_boundary = invisibleTextRun(prior) and invisibleTextRun(run.*) and
+                independentTextCopies(prior, run.*) and
+                textRunForwardGap(prior, run.*) < 0 and
+                textBoundsOverlap(textRunBounds(prior), textRunBounds(run.*));
+            const track_boundary = if (boundaries) |flags| flags[run_index] else false;
+            if (track_boundary or authored_ocr_boundary or layer_boundary or !textRunsShareLine(prior, run.*)) {
+                try appendLayoutNewline(alloc, &out, runs, ordered_indices[0..emitted_index]);
+            } else if (!bridges_deletion and !std.ascii.isWhitespace(out.items[out.items.len - 1]) and
+                !std.ascii.isWhitespace(run.text[0]))
+            {
+                const axis = textRunAxisLength(prior);
+                const font_scale = @abs(prior.font_size) * axis;
+                const gap = textRunForwardGap(prior, run.*);
+                // Tz scales advances and TJ gaps, including sub-point spaces.
+                const word_gap = @max(0.5, font_scale * 0.12) * @abs(prior.horizontal_scale);
+                const caption_boundary =
+                    prior.paint_order != run.paint_order and
+                    endsWithColon(prior.text) and
+                    startsWithAsciiUpper(run.text);
+                // A text-showing operator boundary can split a single word.
+                // Infer separators from geometry, not content-stream chunking.
+                // Suppress a geometric boundary only when its gap matches
+                // tracking measured around authored whitespace in this TJ.
+                // Unrelated table-cell gaps retain their geometric boundaries.
+                const tracked_glyph_fragments =
+                    prior.paint_order == run.paint_order and
+                    prior.text_show_tracking_gap != null and
+                    run.text_show_tracking_gap != null and
+                    @abs(gap - prior.text_show_tracking_gap.?) <= font_scale * @abs(prior.horizontal_scale) * 0.01 and
+                    textHasSingleTrackingCodepoint(prior.text) and
+                    textHasSingleTrackingCodepoint(run.text);
+                if ((!tracked_glyph_fragments and gap > word_gap) or caption_boundary) {
+                    try out.append(alloc, ' ');
                 }
             }
         }
@@ -19914,6 +19982,8 @@ fn reconstructTextItemsCancelableAlloc(alloc: Allocator, runs: anytype, source_r
         const end = out.items.len;
         if (start < end) run.output_span = .{ .start = start, .end = end };
         previous_index = run_index;
+        deleted_content = false;
+        deletion_exit_index = null;
     }
     try appendNewline(alloc, &out);
     return try out.toOwnedSlice(alloc);
@@ -19972,7 +20042,7 @@ fn type3CharProcIsVectorizableAlloc(alloc: Allocator, bytes: []const u8) !bool {
     var scanner = syntax.Scanner.init(alloc, bytes);
     defer scanner.deinit();
     while (true) {
-        var lex = (try readContentLexeme(&scanner)) orelse continue;
+        var lex = (try readContentLexemeRaw(&scanner)) orelse continue;
         defer syntax.Scanner.freeLexeme(alloc, &lex);
         switch (lex) {
             .eof => return true,
@@ -20001,7 +20071,7 @@ fn type3CharProcIsNativelyRenderableAlloc(alloc: Allocator, bytes: []const u8) !
     var scanner = syntax.Scanner.init(alloc, bytes);
     defer scanner.deinit();
     while (true) {
-        var lex = (try readContentLexeme(&scanner)) orelse continue;
+        var lex = (try readContentLexemeRaw(&scanner)) orelse continue;
         defer syntax.Scanner.freeLexeme(alloc, &lex);
         switch (lex) {
             .eof => return true,
@@ -20038,7 +20108,7 @@ fn contentIsSingleImageSoftMaskAlloc(alloc: Allocator, bytes: []const u8) !bool 
     defer scanner.deinit();
     var image_count: usize = 0;
     while (true) {
-        var lex = (try readContentLexeme(&scanner)) orelse return false;
+        var lex = (try readContentLexemeRaw(&scanner)) orelse return false;
         defer syntax.Scanner.freeLexeme(alloc, &lex);
         switch (lex) {
             .eof => return image_count == 1,
@@ -20092,6 +20162,15 @@ fn collectReferencedResourceNamesAlloc(
     bytes: []const u8,
     operators: []const []const u8,
 ) !ReferencedResourceNames {
+    return collectReferencedResourceNamesCancelableAlloc(alloc, bytes, operators, .{});
+}
+
+fn collectReferencedResourceNamesCancelableAlloc(
+    alloc: Allocator,
+    bytes: []const u8,
+    operators: []const []const u8,
+    cancellation: CancellationProbe,
+) !ReferencedResourceNames {
     var scanner = syntax.Scanner.init(alloc, bytes);
     defer scanner.deinit();
     var result = ReferencedResourceNames{};
@@ -20099,8 +20178,11 @@ fn collectReferencedResourceNamesAlloc(
     var previous_name: ?[]u8 = null;
     defer if (previous_name) |name| alloc.free(name);
 
+    var token_count: usize = 0;
     while (true) {
-        var lex = (try readContentLexeme(&scanner)) orelse {
+        if (token_count % 256 == 0) try cancellation.check();
+        token_count +|= 1;
+        var lex = (try readContentLexemeCancelable(&scanner, cancellation)) orelse {
             if (previous_name) |name| alloc.free(name);
             previous_name = null;
             continue;
@@ -20151,6 +20233,10 @@ fn collectReferencedResourceNamesAlloc(
 /// immediate-name collector cannot identify it. Retain the last name in the
 /// current operator's operand list and clear it at every operator boundary.
 fn collectReferencedFontNamesAlloc(alloc: Allocator, bytes: []const u8) !ReferencedResourceNames {
+    return collectReferencedFontNamesCancelableAlloc(alloc, bytes, .{});
+}
+
+fn collectReferencedFontNamesCancelableAlloc(alloc: Allocator, bytes: []const u8, cancellation: CancellationProbe) !ReferencedResourceNames {
     var scanner = syntax.Scanner.init(alloc, bytes);
     defer scanner.deinit();
     var result = ReferencedResourceNames{};
@@ -20158,8 +20244,11 @@ fn collectReferencedFontNamesAlloc(alloc: Allocator, bytes: []const u8) !Referen
     var operand_name: ?[]u8 = null;
     defer if (operand_name) |name| alloc.free(name);
 
+    var token_count: usize = 0;
     while (true) {
-        var lex = (try readContentLexeme(&scanner)) orelse {
+        if (token_count % 256 == 0) try cancellation.check();
+        token_count +|= 1;
+        var lex = (try readContentLexemeCancelable(&scanner, cancellation)) orelse {
             if (operand_name) |name| alloc.free(name);
             operand_name = null;
             continue;
@@ -33929,6 +34018,10 @@ test "reader semantic scopes preserve punctuation deletion and authored anchors"
     const cases = [_]struct { content: []const u8, expected: []const u8, glyphs: usize }{
         .{ .content = "BT /F1 10 Tf 10 100 Td /Span << /ActualText (Hello) >> BDC (H) Tj (ello) Tj EMC (.) Tj ET", .expected = "Hello.\n", .glyphs = 3 },
         .{ .content = "BT /F1 10 Tf 10 100 Td (pre) Tj /Span << /ActualText () >> BDC (delete) Tj EMC (post) Tj ET", .expected = "prepost\n", .glyphs = 3 },
+        .{ .content = "BT /F1 10 Tf 10 150 Td (Before) Tj ET /Span << /ActualText () >> BDC BT /F1 10 Tf 10 100 Td (delete) Tj ET EMC BT /F1 10 Tf 10 50 Td (After) Tj ET", .expected = "Before\nAfter\n", .glyphs = 3 },
+        .{ .content = "BT /F1 10 Tf 10 150 Td (Before) Tj ET /Span << /ActualText () >> BDC 10 100 20 20 re f EMC BT /F1 10 Tf 10 50 Td (After) Tj ET", .expected = "Before\nAfter\n", .glyphs = 2 },
+        .{ .content = "BT /F1 10 Tf 10 100 Td (Left) Tj ET /Span << /ActualText () >> BDC 10 50 20 20 re f EMC BT /F1 10 Tf 200 100 Td (Right) Tj ET", .expected = "Left Right\n", .glyphs = 2 },
+        .{ .content = "BT /F1 10 Tf 10 100 Td (Left) Tj ET /Span << /ActualText () >> BDC BT /F1 10 Tf 10 50 Td (delete) Tj ET EMC BT /F1 10 Tf 200 100 Td (Right) Tj ET", .expected = "Left Right\n", .glyphs = 3 },
         .{ .content = "BT /F1 10 Tf 10 150 Td (Before) Tj ET /Span << /ActualText (Middle semantic label) >> BDC 10 100 20 20 re f EMC BT /F1 10 Tf 10 50 Td (After) Tj ET", .expected = "Before\nMiddle semantic label\nAfter\n", .glyphs = 2 },
     };
     for (cases) |case| {
@@ -33962,6 +34055,7 @@ test "reader semantic paint policies use individual paints and conservative boun
         .{ .content = "/Span << /ActualText (Label) >> BDC BT /F1 10 Tf 3 Tr 10 100 Td (hidden) Tj 0 Tr (visible) Tj ET EMC", .page = true, .visible = true },
         // Device hairlines and unrestricted miter joins have no safe path-only bound.
         .{ .content = "/Span << /ActualText (Label) >> BDC 0 w 1000 1000 10 10 re S EMC", .page = true, .visible = true, .unknown = true },
+        .{ .content = "/Span << /ActualText (Label) >> BDC q 100 w 410 100 10 10 re W S Q EMC", .page = true, .visible = true, .unknown = true },
     };
     for (cases) |case| {
         const sample = try buildTextOrderingTestPdfAlloc(alloc, case.content);
@@ -34012,5 +34106,179 @@ test "reader semantic image evidence needs no pixel decoding and inherits form s
         try std.testing.expectEqual(@as(usize, 0), analysis.runs.len);
         try std.testing.expectEqual(@as(usize, 1), analysis.diagnostics.invisible_spans);
         try std.testing.expectEqual(PageBox{ .min_x = 10, .min_y = 10, .max_x = 30, .max_y = 30 }, analysis.semantic_spans[0].paint.source_bounds.?);
+    }
+}
+
+test "reader page clips exclude every glyph when their intersection is empty" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "q 450 100 50 50 re W n BT /F1 1000 Tf 0 0 Td (A) Tj ET Q",
+        "q W n BT /F1 10 Tf 10 100 Td (A) Tj ET Q",
+        "q 10 10 0 0 re 30 30 0 0 re W n BT /F1 100 Tf 0 0 Td (A) Tj ET Q",
+    }) |content| {
+        const sample = try buildTextOrderingTestPdfAlloc(a, content);
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer a.free(plain);
+            try std.testing.expectEqualStrings(if (policy == .source) "A\n" else "", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expectEqual(@as(usize, 1), analysis.diagnostics.outside_page_runs);
+        }
+    }
+    var unknown = TextRun{ .text = "vertical", .x = 0, .y = 0, .font_size = 10, .vertical = true, .clip_box = .{ .min_x = 500, .min_y = 0, .max_x = 600, .max_y = 100 } };
+    const page = PageBox{ .min_x = 0, .min_y = 0, .max_x = 400, .max_y = 300 };
+    try std.testing.expect(textRunOutsidePageOrClip(unknown, page));
+    unknown.clip_box = .{ .min_x = 20, .max_x = 20, .min_y = 0, .max_y = 100 };
+    try std.testing.expect(textRunOutsidePageOrClip(unknown, page));
+}
+
+test "reader visible semantic text requires a potentially painting path" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "f", "S", "10 10 0 0 re f", "10 10 0 5 re 30 30 0 5 re f", "10 10 m 10 30 l f" }) |paint| {
+        const content = try std.fmt.allocPrint(a, "/Span << /ActualText (Label) >> BDC {s} EMC", .{paint});
+        defer a.free(content);
+        const sample = try buildTextOrderingTestPdfAlloc(a, content);
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer a.free(plain);
+            try std.testing.expectEqualStrings(if (policy == .visible) "" else "Label\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+        }
+    }
+    // Zero-area subpaths cannot pull an exterior fill or clip onto the page.
+    const sample = try buildTextOrderingTestPdfAlloc(a, "/Span << /ActualText (Label) >> BDC 10 10 0 0 re 1000 1000 10 10 re f EMC");
+    defer a.free(sample);
+    var parsed = try Reader.init(a, sample);
+    defer parsed.deinit();
+    parsed.setTextExtractionPolicy(.page);
+    const text = try parsed.extractPageTextAlloc(1);
+    defer a.free(text);
+    try std.testing.expectEqualStrings("", text);
+}
+
+test "reader inline image bytes cannot alter scopes resources or extraction" {
+    const a = std.testing.allocator;
+    const pixels = " EI EMC BT /Fake 10 Tf (PIXELS) Tj ET /Ghost Do ";
+    const content = try std.fmt.allocPrint(a, "/Real Do BT /F1 10 Tf 10 150 Td (Before) Tj ET /Span << /ActualText (Image label) >> BDC q 20 0 0 20 10 10 cm BI /W {d} /H 1 /BPC 8 /CS /G ID {s} EI Q EMC BT /F1 10 Tf 10 50 Td (After) Tj ET", .{ pixels.len, pixels });
+    defer a.free(content);
+    var refs = try collectReferencedResourceNamesAlloc(a, content, &.{ "Tf", "Do" });
+    defer refs.deinit(a);
+    try std.testing.expect(refs.contains("Real"));
+    try std.testing.expect(!refs.contains("Ghost"));
+    var fonts = try collectReferencedFontNamesAlloc(a, content);
+    defer fonts.deinit(a);
+    try std.testing.expect(fonts.contains("F1") and !fonts.contains("Fake"));
+    const sample = try buildTextOrderingTestPdfAlloc(a, content);
+    defer a.free(sample);
+    var parsed = try Reader.init(a, sample);
+    defer parsed.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        parsed.setTextExtractionPolicy(policy);
+        var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        const plain = try parsed.extractPageTextAlloc(1);
+        defer a.free(plain);
+        try std.testing.expectEqualStrings("Before\nImage label\nAfter\n", analysis.text);
+        try std.testing.expectEqualStrings(analysis.text, plain);
+        try std.testing.expectEqual(@as(usize, 2), analysis.runs.len);
+        try std.testing.expectEqual(@as(usize, 1), analysis.semantic_spans.len);
+        try std.testing.expectEqual(PageBox{ .min_x = 10, .min_y = 10, .max_x = 30, .max_y = 30 }, analysis.semantic_spans[0].output_bounds.?);
+    }
+}
+
+test "reader canonical scope state is constant time and cancellation crosses consumes" {
+    const a = std.testing.allocator;
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(a);
+    var parser = TextContentParser.init(a, &out);
+    defer parser.deinit();
+    try parser.consume(&repeatBytesComptime("/Layer BMC ", 4096), &.{}, &.{}, &.{}, 0);
+    try parser.consume(&repeatBytesComptime("/Span << /ActualText (X) >> BDC EMC ", 256), &.{}, &.{}, &.{}, 0);
+    try std.testing.expectEqual(@as(usize, 256), out.items.len);
+    try std.testing.expect(!parser.active_actual_text);
+    try parser.consume("/Span << /ActualText (Outer) >> BDC", &.{}, &.{}, &.{}, 0);
+    try std.testing.expect(parser.active_actual_text);
+    try parser.consume("/Span << /ActualText (Inner) >> BDC EMC EMC " ++ repeatBytesComptime("EMC ", 4096), &.{}, &.{}, &.{}, 0);
+    try std.testing.expectEqualStrings("Outer", out.items[256..]);
+    try std.testing.expect(!parser.active_actual_text);
+    try std.testing.expectEqual(@as(usize, 0), parser.marked_content.items.len);
+    const Cancel = struct {
+        fn canceled(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    parser.cancellation = .{ .is_cancelled_fn = Cancel.canceled };
+    try std.testing.expectError(error.Canceled, parser.consume("BT (ignored) Tj ET", &.{}, &.{}, &.{}, 0));
+}
+
+test "reader inline LZW framing agrees with decoding across code widths and resets" {
+    const a = std.testing.allocator;
+    const Encoder = struct {
+        bytes: []u8,
+        bit: usize = 0,
+        fn code(self: *@This(), value: u16, width: u4) void {
+            var shift: usize = width;
+            while (shift > 0) {
+                shift -= 1;
+                const bit: u8 = @intCast((value >> @as(u4, @intCast(shift))) & 1);
+                self.bytes[self.bit / 8] |= bit << @as(u3, @intCast(7 - self.bit % 8));
+                self.bit += 1;
+            }
+        }
+    };
+    for ([_]i64{ 0, 1 }) |early_change| {
+        const count = 7000;
+        const encoded = try a.alloc(u8, (count + 4) * 12 / 8 + 1);
+        defer a.free(encoded);
+        @memset(encoded, 0);
+        var encoder = Encoder{ .bytes = encoded };
+        var width: u4 = 9;
+        var next: usize = 258;
+        var previous = false;
+        encoder.code(256, width);
+        for (0..count) |index| {
+            if (index == 1500) {
+                encoder.code(256, width);
+                width = 9;
+                next = 258;
+                previous = false;
+            }
+            encoder.code(@as(u8, @truncate(index)), width);
+            if (previous and next < 4096) {
+                next += 1;
+                if (width < 12 and next >= (@as(usize, 1) << width) - @as(usize, @intCast(early_change))) width += 1;
+            }
+            previous = true;
+        }
+        encoder.code(257, width);
+        const bytes = encoded[0 .. (encoder.bit + 7) / 8];
+        const entries = [_]syntax.DictEntry{.{ .key = @constCast("EarlyChange"), .value = .{ .integer = early_change } }};
+        const parameters = syntax.Object{ .dict = @constCast(&entries) };
+        const decoded = try lzwDecodeAlloc(a, bytes, &parameters, count, count, .{});
+        defer a.free(decoded);
+        try std.testing.expectEqual(@as(usize, count), decoded.len);
+        for (decoded, 0..) |byte, index| try std.testing.expectEqual(@as(u8, @truncate(index)), byte);
+        const content = try std.fmt.allocPrint(a, "BI /W {d} /H 1 /F /LZW /DP << /EarlyChange {d} >> ID {s} EI BT (After) Tj ET", .{ count, early_change, bytes });
+        defer a.free(content);
+        var scanner = syntax.Scanner.init(a, content);
+        defer scanner.deinit();
+        var bi = (try readContentLexeme(&scanner)).?;
+        defer syntax.Scanner.freeLexeme(a, &bi);
+        try std.testing.expectEqualStrings("BI", bi.keyword);
+        var after = (try readContentLexeme(&scanner)).?;
+        defer syntax.Scanner.freeLexeme(a, &after);
+        try std.testing.expectEqualStrings("BT", after.keyword);
     }
 }

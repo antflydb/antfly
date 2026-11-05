@@ -1912,3 +1912,25 @@ geometry. `source_run_count` and `emitted_run_count` count original glyph runs;
 report nonempty semantic replacements. Empty replacements intentionally delete
 their covered glyph text. Extraction identity and unit fingerprints version the
 resulting text, geometry, and diagnostics together.
+
+Native text scanners frame inline-image payloads before interpreting content
+operators. Raw rows use exact dimensions, component counts, sample depth, and
+row padding; ASCIIHex, ASCII85, RunLength, LZW, and JPEG use their outer codec
+boundaries. Flate framing discards decoded bytes through a fixed history window
+with cancellation and a 64 MiB work ceiling. No pixel plane is materialized.
+The same framing protects font/resource discovery and marked-content scopes.
+Unsupported or ambiguous boundaries (including unfiltered named color spaces
+and CCITT without a supported framing path) fail with
+`UnsupportedPdfInlineImage`; truncated payloads fail with
+`InvalidPdfInlineImage`. Native completion remains false on such failures;
+encoded pixels are never guessed to be text. This does not add inline-image
+raster rendering support.
+
+Canonical ActualText tracking retains an active-scope bit across content
+streams, so sibling replacements do not rescan the marked-content stack.
+Cancellation is polled during canonical decoding and resource discovery.
+Empty replacements bridge spacing only along a deleted glyph sequence on the
+same line; unrelated line/column boundaries and empty vector labels retain the
+surviving text's layout context. Page/clip intersections exclude every glyph
+when empty, including unknown glyph extents. Degenerate rectangular subpaths
+do not establish fill visibility or enlarge clip bounds.
