@@ -4267,9 +4267,30 @@ pub const Cursor = struct {
     owned_value: ?[]u8 = null,
     disk_candidate: ?native.DocumentIndexEntry = null,
     last_direction: ?Direction = null,
+    // WS5: a third mode alongside full/keys-only. Set by `setLengthOnly`.
+    // `readValue` then asks the native layer for the document's real
+    // logical size (one bounded page read; never the external value's own
+    // pages, same cost class as `documentIsLive`) and stashes it here for
+    // the caller to read back via `lastValueLen`.
+    length_only: bool = false,
+    last_value_len: usize = 0,
 
     pub fn setKeysOnly(self: *Cursor) void {
         self.load_values = false;
+    }
+
+    /// Like `setKeysOnly`, but additionally records each visited entry's
+    /// real value length (see `last_value_len`) via a page read that never
+    /// touches external value pages. Call before the first move.
+    pub fn setLengthOnly(self: *Cursor) void {
+        self.load_values = false;
+        self.length_only = true;
+    }
+
+    /// The real value length of the entry last returned by this cursor,
+    /// valid only when `setLengthOnly` was called. Zero otherwise.
+    pub fn lastValueLen(self: *const Cursor) usize {
+        return self.last_value_len;
     }
 
     pub fn close(self: *Cursor) void {
@@ -4454,6 +4475,11 @@ pub const Cursor = struct {
     fn readValue(self: *Cursor, file: *native.NativeFile, indexed: native.DocumentIndexEntry) !?[]u8 {
         if (self.load_values)
             return try self.records.documentValueAlloc(file, self.txn.allocator, self.txn.checkpoint, indexed);
+        if (self.length_only) {
+            const len = (try self.records.documentValueLen(file, self.txn.allocator, self.txn.checkpoint, indexed)) orelse return null;
+            self.last_value_len = len;
+            return try self.txn.allocator.alloc(u8, 0);
+        }
         if (!try self.records.documentIsLive(file, self.txn.allocator, self.txn.checkpoint, indexed)) return null;
         return try self.txn.allocator.alloc(u8, 0);
     }
@@ -4515,6 +4541,9 @@ pub const Cursor = struct {
     ) !backend_adapter.Entry {
         var disk = buffered_disk;
         errdefer if (disk) |*candidate| candidate.deinit(self.txn.allocator);
+        // Overlay values are already in memory: no page read is needed to
+        // know their length, unlike the disk path in `readValue`.
+        if (self.length_only) self.last_value_len = value.len;
         const owned_key = try self.txn.allocator.dupe(u8, full_key);
         errdefer self.txn.allocator.free(owned_key);
         const owned_value = try self.txn.allocator.dupe(u8, if (self.load_values) value else "");
@@ -4704,25 +4733,20 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     }
 
     // WS5: this append is charged against the journal credit ledger in the
-    // same transaction that grows the journal. Admission is checked against
-    // an upper bound (every lane gets a full entry) before any key is
-    // written, so a refused append leaves no partial state behind.
-    //
-    // The ledger's "bytes" counts the fixed replay-key footprint per lane
-    // entry, not the payload content: retirement scans this store's own
-    // Store/RuntimeStore API with a keys-only cursor specifically to avoid
-    // materializing a large document's value just to delete its replay
-    // entry (see "lite replay cleanup avoids external values..."), so
-    // nothing on the release side can cheaply recover payload length either.
-    // `records` is the precise, meaningful backpressure signal here; true
-    // byte-accurate accounting needs a native length-only accessor, which
-    // the `DocStore` layer (storage/docstore.zig) already has today only
-    // because its generic cursor materializes entries either way.
+    // same transaction that grows the journal, using the entry's real
+    // key+payload bytes (already in hand here, no extra read needed).
+    // Admission is checked against an upper bound (every lane gets the full
+    // unfiltered payload) before any key is written, so a refused append
+    // leaves no partial state behind. Retirement recovers the same real
+    // bytes cheaply too -- via `documentValueLen`, a page read that never
+    // touches external value pages -- so the ledger can equal a scan of
+    // real bytes without ever materializing a large document's value just
+    // to account for its deletion.
     const consumer_mask = if (txn.store) |store| store.active_consumer_hint_mask.load(.acquire) else replay_reference.all_hints_mask;
     const mask_all = change_journal_mod.encodedRecordHintMask(payload) catch 0;
     const mask = mask_all & consumer_mask;
     const lane_count: u64 = 1 + @popCount(mask);
-    const upper_bound_charge: u64 = lane_count * internal_keys.replay_key_len;
+    const upper_bound_charge: u64 = lane_count * (internal_keys.replay_key_len + payload.len);
     if (txn.store) |store| {
         const ledger = try loadJournalCreditLedger(txn);
         const admissible = store.journal_credit_capacity_bytes -| store.journal_credit_progress_reserve_bytes;
@@ -4739,7 +4763,7 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
     const all_latest_key = internal_keys.replayLatestSequenceKey(internal_keys.replay_all_kind);
     try txn.put(all_latest_key[0..], latest_raw[0..]);
 
-    var charged_bytes: u64 = internal_keys.replay_key_len;
+    var charged_bytes: u64 = internal_keys.replay_key_len + payload.len;
     var charged_records: u64 = 1;
 
     write_hints: {
@@ -4747,7 +4771,7 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
 
         var decoded = change_journal_mod.decodeRecord(alloc, payload) catch {
             try writeOriginalReplayHintEntries(txn, sequence, mask, payload);
-            charged_bytes += @as(u64, @popCount(mask)) * internal_keys.replay_key_len;
+            charged_bytes += @as(u64, @popCount(mask)) * (internal_keys.replay_key_len + payload.len);
             charged_records += @popCount(mask);
             break :write_hints;
         };
@@ -4761,7 +4785,7 @@ fn writeReplayEntries(alloc: Allocator, txn: anytype, sequence: u64, payload: []
             try txn.put(key[0..], lane_payload);
             const latest_key = internal_keys.replayLatestSequenceKey(replayHintOrdinal(hint));
             try txn.put(latest_key[0..], latest_raw[0..]);
-            charged_bytes += internal_keys.replay_key_len;
+            charged_bytes += internal_keys.replay_key_len + lane_payload.len;
             charged_records += 1;
         }
     }
@@ -4887,22 +4911,26 @@ fn retireReplaySlice(
             continue;
         }
 
-        // Keys only: a retirement turn must never materialize a large
-        // document's replay value just to delete its entry.
-        var cursor = try write.openKeyCursor();
+        // Length-only: a retirement turn must never materialize a large
+        // document's replay value just to delete its entry, but it still
+        // needs the entry's real size for the credit-ledger release. One
+        // bounded page read per entry (never the external value's own
+        // pages) gives us that for free.
+        var cursor = try write.openCursor();
+        cursor.setLengthOnly();
         defer cursor.close();
         const lower = internal_keys.replayRangeLower(kind, 0);
         const upper = internal_keys.replayEntryKey(kind, up_to_sequence);
         cursor.setUpperBound(&upper);
-        var key = cursor.seekAtOrAfter(&lower) catch |err| switch (err) {
+        var entry = cursor.seekAtOrAfter(&lower) catch |err| switch (err) {
             error.NotFound => continue,
             else => return err,
         };
         while (true) {
-            const sequence = internal_keys.parseReplayEntrySequence(key, kind) orelse return error.InvalidReplayEntryKey;
+            const sequence = internal_keys.parseReplayEntrySequence(entry.key, kind) orelse return error.InvalidReplayEntryKey;
             if (sequence >= up_to_sequence) break;
-            const entry_bytes: u64 = internal_keys.replay_key_len;
-            try write.delete(key);
+            const entry_bytes: u64 = entry.key.len + cursor.lastValueLen();
+            try write.delete(entry.key);
             freed_bytes += entry_bytes;
             freed_records += 1;
             stats.keys_deleted += 1;
@@ -4913,7 +4941,7 @@ fn retireReplaySlice(
                 all_lanes_done = false;
                 break;
             }
-            key = cursor.next() catch |err| switch (err) {
+            entry = cursor.next() catch |err| switch (err) {
                 error.NotFound => break,
                 else => return err,
             };
@@ -6654,9 +6682,9 @@ fn expectLedgerMatchesScanForTest(store: *Store) !void {
     const Collector = struct {
         bytes: u64 = 0,
         records: u64 = 0,
-        fn collect(ptr: *anyopaque, _: u64, _: []const u8) !void {
+        fn collect(ptr: *anyopaque, _: u64, payload: []const u8) !void {
             const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.bytes += internal_keys.replay_key_len;
+            self.bytes += internal_keys.replay_key_len + payload.len;
             self.records += 1;
         }
     };
