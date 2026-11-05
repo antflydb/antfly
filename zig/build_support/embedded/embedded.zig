@@ -588,6 +588,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi native marker sweep",
         "capi native unbounded writer admits reusable pool before a large request",
         "capi native allocator proof",
+        "capi native readonly lease timing",
         "capi native artifact maintenance",
         "capi native asynchronous text merge",
         "capi native SQL constraint overlay",

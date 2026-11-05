@@ -1859,12 +1859,18 @@ pub const Owner = struct {
         self.wake.set(h.handleLockIo());
     }
 
+    /// Shared and plain fallback leases have no queue acquisition timestamp.
+    /// Every telemetry attachment, including initial open, establishes one.
+    fn attachPathLeaseStats(self: *Owner, lease: *native.PathWriterLock) void {
+        if (lease.acquired_ns == 0) lease.acquired_ns = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds;
+        lease.stats = &self.gate.lease_stats;
+    }
+
     /// Scope registration reuse to admission; closing the path lease also
     /// releases idle anchors before another process can publish.
     fn withReadRegistrationBatch(self: *Owner, lease: native.PathWriterLock) native.PathWriterLock {
         var held = lease;
-        if (held.acquired_ns == 0) held.acquired_ns = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds;
-        held.stats = &self.gate.lease_stats;
+        self.attachPathLeaseStats(&held);
         if (self.options.reader_coordinator) |coordinator| {
             std.debug.assert(held.reader_registration_batch == null);
             held.reader_registration_batch = coordinator.beginRegistrationBatch();
@@ -4545,7 +4551,7 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
                 native.lockReaderPathWithIo(alloc, io, gate.path);
             if (attempt) |held| {
                 var lease = held;
-                lease.stats = &gate.lease_stats;
+                owner.attachPathLeaseStats(&lease);
                 defer lease.close();
                 if (owner.refresh()) |_| {} else |err| switch (err) {
                     // A peer proving an unverified tip owns index opening.
@@ -4582,6 +4588,35 @@ pub fn open(path: []const u8, options: api.LiteResolvedOpenOptions, create: bool
         models_dir = null;
     }
     return wrapper;
+}
+
+test "capi native readonly lease timing accounts only for the initial open" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    @import("io_lifetime.zig").acquire();
+    defer @import("io_lifetime.zig").release();
+    const a = std.testing.allocator;
+    const io = h.handleLockIo();
+    var tmp = try api.TestDirectory.init("readonly-initial-lease-timing");
+    defer tmp.cleanup();
+    try std.Io.Dir.cwd().createDirPath(io, tmp.path());
+    const path = try std.fmt.allocPrint(a, "{s}/database.aflite", .{tmp.path()});
+    defer a.free(path);
+    {
+        const seed = try open(path, .{ .profile = .native, .no_sync = true }, true);
+        h.closeHandle(seed);
+    }
+    inline for (.{ h.db_mod.OpenMode.query_readonly, h.db_mod.OpenMode.status_only }) |mode| {
+        const started = std.Io.Clock.awake.now(io).nanoseconds;
+        const reader = try open(path, .{ .profile = .native, .open_mode = mode, .no_sync = true }, false);
+        defer h.closeHandle(reader);
+        const snapshot = reader.lite_connection.?.gate.lease_stats.snapshot();
+        const elapsed = std.Io.Clock.awake.now(io).nanoseconds - started;
+        try std.testing.expect(snapshot.leases > 0);
+        // No machine-speed limit: every measured lease was inside this open,
+        // even if the test process was descheduled or the filesystem was slow.
+        try std.testing.expect(snapshot.hold_ns <= elapsed);
+        try std.testing.expect(snapshot.hold_max_ns <= elapsed);
+    }
 }
 
 test "capi native create coordinates its initial read generation" {
