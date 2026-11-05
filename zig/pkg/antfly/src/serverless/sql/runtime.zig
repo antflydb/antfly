@@ -284,9 +284,17 @@ pub const Service = struct {
         }
         const scan_start = scan;
         var work = self;
-        work.context = self.metadataWorkContext();
-        while (scan < current.value.pending.len) {
-            if (scan != scan_start) work.context.ensureActive() catch break;
+        const admission_context = self.metadataWorkContext();
+        work.context = admission_context;
+        const admission_turn = current.value.pending.len == 0 or (current.value.pending_admission and cursor < count and current.value.pending.len < spec.limits.concurrency);
+        var wave_ns: u64 = 0;
+        var deferred_read = false;
+        while (!admission_turn and scan < current.value.pending.len) {
+            if (scan != scan_start) {
+                work.context.ensureActive() catch break;
+                if (wave_ns > work.context.deadline_ns.? -| @import("antfly_platform").time.monotonicNs()) break;
+            }
+            const wave_started = @import("antfly_platform").time.monotonicNs();
             const width: usize = if (work.context.io != null and !@import("builtin").single_threaded) 16 else if (work.state_store.client.vtable.get_objects != null) 8 else 1;
             const end = @min(current.value.pending.len, scan + width);
             const statuses = work.store().taskStatuses(a, query, current.value.stage, current.value.pending[scan..end], work.context.io) catch |err| {
@@ -297,12 +305,29 @@ pub const Service = struct {
                 return err;
             };
             for (current.value.pending[scan..end], statuses, scan..) |id, status, index| {
+                if (status.read_error) |err| {
+                    if (err == error.DeadlineExceeded or err == error.Canceled or err == error.Cancelled) {
+                        try self.context.ensureActive();
+                        // Only our exhausted work quantum is a deferred read.
+                        // Immediate backend failures keep the driver's backoff.
+                        var exhausted = false;
+                        work.context.ensureActive() catch {
+                            exhausted = true;
+                        };
+                        if (exhausted) {
+                            deferred_read = true;
+                            continue;
+                        }
+                    }
+                    return err;
+                }
                 if (status.status == .failed or status.status == .cancelled) {
                     try self.store().terminate(a, query_key, claim, .failed, status.failure orelse "TaskFailed");
                     return true;
                 }
                 if (status.status == .succeeded) keep[index] = false else if (status.status != .running or status.until_ms +| 30_000 < self.clock.now()) try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = id });
             }
+            wave_ns = @import("antfly_platform").time.monotonicNs() -| wave_started;
             scan = end;
             pending_after = if (scan == current.value.pending.len) null else current.value.pending[scan - 1];
         }
@@ -314,9 +339,12 @@ pub const Service = struct {
         const admission_end = @min(count, cursor +| @as(u32, @intCast(@min(free, if (self.coordination != null) @as(usize, 8) else 256))));
         const ids = try a.alloc(u32, admission_end - cursor);
         for (ids, cursor..) |*id, value| id.* = @intCast(value);
+        var admission_check = false;
+        work.context = admission_context;
         // Admission shares the work budget and advances only after each
         // completed wave. Partial CAS success is replayable from the old cursor.
         admission: while (cursor < admission_end) {
+            if (!admission_turn and wave_ns > work.context.deadline_ns.? -| @import("antfly_platform").time.monotonicNs()) break;
             work.context.ensureActive() catch |err| {
                 if (scan != scan_start or cursor != current.value.cursor) break :admission;
                 return err;
@@ -340,9 +368,10 @@ pub const Service = struct {
                 }
                 if (status.status == .succeeded) continue;
                 try pending.append(a, id);
-                if (status.status != .running or status.until_ms +| 30_000 < self.clock.now()) try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = id });
+                if (status.needs_check) admission_check = true else if (status.status != .running or status.until_ms +| 30_000 < self.clock.now()) try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = id });
             }
         }
+        const pending_admission = !admission_turn and cursor == current.value.cursor and cursor < count and pending.items.len < spec.limits.concurrency;
         // Persist the dispatch intent first. Lost acknowledgements and process
         // loss replay only this bounded set, without relying on queue delivery.
         if (pending.items.len == 0 and cursor == count) {
@@ -372,9 +401,9 @@ pub const Service = struct {
                 }
             }
             try self.store().checkpointResolved(a, query_key, claim, current.value.stage + 1, 0, &.{}, null, null, resolved);
-        } else try self.store().checkpointTasksProgress(a, query_key, claim, current.value.stage, cursor, pending.items, pending_after);
+        } else try self.store().checkpointTasksPhase(a, query_key, claim, current.value.stage, cursor, pending.items, pending_after, pending_admission);
         if (tickets.items.len != 0) try dispatcher.dispatch(dispatcher.ptr, tickets.items, self.context);
-        if (pending_after != null or (cursor < count and pending.items.len < spec.limits.concurrency)) if (self.coordination) |coordination| coordination.retry(coordination.ptr, query);
+        if (pending_admission or deferred_read or admission_check or pending_after != null or (cursor < count and pending.items.len < spec.limits.concurrency)) if (self.coordination) |coordination| coordination.retry(coordination.ptr, query);
         return false;
     }
     /// Invoke only after authenticating the internal caller. Tickets contain no
@@ -986,7 +1015,7 @@ pub const Service = struct {
         // dispatch window is outstanding, avoid rereading every task on each
         // foreground poll. Keep twenty seconds of lease margin and always let
         // durable cancellation through. Hosted dispatch has no local registry.
-        if (current.value.pending_after == null and !current.value.cancel_requested and current.value.pending.len != 0 and current.value.status == .running and std.mem.eql(u8, current.value.owner, self.owner) and current.value.until_ms > self.clock.now() +| 20_000) {
+        if (!current.value.pending_admission and current.value.pending_after == null and !current.value.cancel_requested and current.value.pending.len != 0 and current.value.status == .running and std.mem.eql(u8, current.value.owner, self.owner) and current.value.until_ms > self.clock.now() +| 20_000) {
             if (self.coordination) |coordination| if (!coordination.delivery_ready(coordination.ptr, query)) return false;
         }
         const claim: state.Claim = if (current.value.status == .running and std.mem.eql(u8, current.value.owner, self.owner) and current.value.until_ms > self.clock.now()) .{ .owner = self.owner, .epoch = current.value.epoch } else (try self.store().claim(self.a, key, self.owner, 60_000)) orelse return false;

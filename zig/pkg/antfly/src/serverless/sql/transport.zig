@@ -67,6 +67,7 @@ pub const Client = struct {
     io: ?std.Io = null,
     discovery: ?Discovery = null,
     control_attempt_ms: u32 = 5_000,
+    submit_attempt_ms: u32 = 20_000,
     pub fn dispatcher(self: *Client) runtime.Dispatcher {
         return .{ .ptr = self, .dispatch = dispatch };
     }
@@ -110,7 +111,7 @@ pub const Client = struct {
         const first = try firstControlWorker(self.a, self.workers.len, path, body);
         const attempts = @min(@max(self.workers.len, 2), 8);
         for (0..attempts) |attempt| {
-            const scoped = try self.controlContext(context, attempts - attempt);
+            const scoped = try self.controlContext(context, attempt == 0 and self.workers.len > 1, std.mem.eql(u8, path, submit_path));
             return self.queryCallAt((first + attempt) % self.workers.len, path, body, scoped) catch |err| {
                 // A worker's timeout/cancellation is not the caller's deadline.
                 // Check the parent first, including on the last failed attempt.
@@ -131,12 +132,16 @@ pub const Client = struct {
             else => last_error,
         };
     }
-    fn controlContext(self: Client, parent: Context, attempts: usize) !Context {
+    fn controlContext(self: Client, parent: Context, reserve_peer: bool, submission: bool) !Context {
         try parent.ensureActive();
         var scoped = parent;
         const now = @import("antfly_platform").time.monotonicNs();
-        var budget = @as(u64, @max(@as(u32, 1), @min(self.control_attempt_ms, 60_000))) * std.time.ns_per_ms;
-        if (parent.deadline_ns) |deadline| budget = @min(budget, @max(@as(u64, 1), (deadline -| now) / @max(@as(usize, 1), attempts)));
+        const cap = if (submission) self.submit_attempt_ms else self.control_attempt_ms;
+        var budget = @as(u64, @max(@as(u32, 1), @min(cap, 60_000))) * std.time.ns_per_ms;
+        // Reserve a backup attempt without shrinking every healthy request's
+        // budget in proportion to the cluster's pod count. Submit also retains
+        // two source cuts and legitimately needs more time than a compact poll.
+        if (parent.deadline_ns) |deadline| budget = @min(budget, @max(@as(u64, 1), (deadline -| now) / @as(u64, if (reserve_peer) 2 else 1)));
         scoped.deadline_ns = now +| budget;
         if (parent.deadline_ns) |deadline| scoped.deadline_ns = @min(deadline, scoped.deadline_ns.?);
         return scoped;
@@ -347,4 +352,19 @@ test "distributed SQL control routing is stable and spreads healthy queries" {
         seen[chosen] = true;
     }
     for (seen) |used| try std.testing.expect(used);
+}
+
+test "distributed SQL control budgets reserve a backup and allow source retention work" {
+    const client: Client = .{ .a = std.testing.allocator, .executor = undefined, .authentication = undefined, .workers = &.{} };
+    const now = @import("antfly_platform").time.monotonicNs();
+    const parent: Context = .{ .deadline_ns = now + 60 * std.time.ns_per_s };
+    const poll = try client.controlContext(parent, true, false);
+    const submit_ = try client.controlContext(parent, true, true);
+    try std.testing.expect(submit_.deadline_ns.? > poll.deadline_ns.?);
+    try std.testing.expect(submit_.deadline_ns.? <= parent.deadline_ns.?);
+    const short: Context = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s };
+    const first = try client.controlContext(short, true, false);
+    try std.testing.expect(first.deadline_ns.? < short.deadline_ns.?);
+    const backup = try client.controlContext(short, false, false);
+    try std.testing.expectEqual(short.deadline_ns, backup.deadline_ns);
 }

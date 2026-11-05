@@ -80,6 +80,7 @@ pub const Record = struct {
     pending: []const u32 = &.{},
     /// Last reconciled task ID; absent on legacy records and after a full pass.
     pending_after: ?u32 = null,
+    pending_admission: bool = false,
     reduce_boundaries: []const u16 = &.{},
     skew: []const @import("physical.zig").Part = &.{},
     physical: ?Output = null,
@@ -129,7 +130,13 @@ pub const Store = struct {
         try self.validateRecord(value);
         return .{ .object = object, .value = value, .parsed = parsed };
     }
-    pub const TaskStatus = struct { status: Status, until_ms: u64, failure: ?[]const u8 };
+    pub const TaskStatus = struct {
+        status: Status,
+        until_ms: u64,
+        failure: ?[]const u8,
+        needs_check: bool = false,
+        read_error: ?anyerror = null,
+    };
     /// Native waves overlap at most sixteen GETs using private response arenas.
     /// Hosted stores use their bounded eight-object batch ABI instead.
     pub fn taskStatuses(self: Store, a: A, query: Query, stage: u32, ids: []const u32, io: ?std.Io) ![]TaskStatus {
@@ -157,14 +164,14 @@ pub const Store = struct {
             fn run(self_: *@This()) void {
                 const allocator = self_.arena.allocator();
                 if (self_.create) {
-                    const created = self_.store.ensure(allocator, self_.path, self_.query.id, self_.query.expires_ms) catch |err| {
+                    const created = self_.store.registerTask(allocator, self_.path, self_.query) catch |err| {
                         self_.failure = err;
                         return;
                     };
-                    if (created) {
-                        self_.value = .{ .status = .pending, .until_ms = 0, .failure = null };
-                        return;
-                    }
+                    // Existing intent is inspected by the next reconciliation
+                    // pass, not by a second storage round-trip in this quantum.
+                    self_.value = .{ .status = .pending, .until_ms = 0, .failure = null, .needs_check = !created };
+                    return;
                 }
                 var value = (self_.store.load(allocator, self_.path) catch |err| {
                     self_.failure = err;
@@ -174,6 +181,10 @@ pub const Store = struct {
                     return;
                 };
                 defer value.deinit(allocator);
+                self_.store.validateTaskRecord(value.value, self_.query) catch |err| {
+                    self_.failure = err;
+                    return;
+                };
                 self_.value = .{ .status = value.value.status, .until_ms = value.value.until_ms, .failure = if (value.value.failure) |failure| allocator.dupe(u8, failure) catch |err| {
                     self_.failure = err;
                     return;
@@ -212,18 +223,39 @@ pub const Store = struct {
                     const value = object orelse return error.InvalidSqlExecutionState;
                     const parsed = try std.json.parseFromSlice(Record, job.arena.allocator(), value.body, .{});
                     defer parsed.deinit();
-                    try self.validateRecord(parsed.value);
+                    try self.validateTaskRecord(parsed.value, query);
                     job.value = .{ .status = parsed.value.status, .until_ms = parsed.value.until_ms, .failure = if (parsed.value.failure) |failure| try job.arena.allocator().dupe(u8, failure) else null };
                 }
             } else for (jobs[0..count]) |*job| job.run();
             for (jobs[0..count]) |job| {
-                if (job.failure) |err| return err;
+                if (job.failure) |err| {
+                    if (admission) return err;
+                    // A slow sibling must not discard successful reads. The
+                    // caller decides whether an error permits deferring this ID.
+                    result[done] = .{ .status = .pending, .until_ms = 0, .failure = null, .read_error = err };
+                    done += 1;
+                    continue;
+                }
                 const value = job.value.?;
-                result[done] = .{ .status = value.status, .until_ms = value.until_ms, .failure = if (value.failure) |failure| try a.dupe(u8, failure) else null };
+                result[done] = .{ .status = value.status, .until_ms = value.until_ms, .failure = if (value.failure) |failure| try a.dupe(u8, failure) else null, .needs_check = value.needs_check };
                 done += 1;
             }
         }
         return result;
+    }
+    fn validateTaskRecord(self: Store, value: Record, query: Query) !void {
+        try self.validateRecord(value);
+        if (!std.meta.eql(value.plan, query.id) or value.expires_ms != query.expires_ms) return error.SqlExecutionIdReused;
+    }
+    /// One conditional write per task admission. Existing records are inspected
+    /// in a later read phase before they can be dispatched or counted complete.
+    fn registerTask(self: Store, a: A, path: []const u8, query: Query) !bool {
+        if (query.expires_ms <= self.now_ms) return error.SqlQueryExpired;
+        self.write(a, path, null, .{ .plan = query.id, .expires_ms = query.expires_ms, .tenant = self.tenant }) catch |err| switch (err) {
+            error.PreconditionFailed => return false,
+            else => return err,
+        };
+        return true;
     }
     fn validateRecord(self: Store, value: Record) !void {
         if (value.pending_after) |after| if (value.pending.len == 0 or after >= value.cursor) return error.InvalidSqlExecutionState;
@@ -302,12 +334,15 @@ pub const Store = struct {
         return self.checkpointResolved(a, path, claim_, stage, cursor, pending, boundaries, skew, null);
     }
     pub fn checkpointResolved(self: Store, a: A, path: []const u8, claim_: Claim, stage: u32, cursor: u32, pending: []const u32, boundaries: ?[]const u16, skew: ?[]const @import("physical.zig").Part, physical_ref: ?Output) !void {
-        return self.checkpointProgress(a, path, claim_, stage, cursor, pending, null, boundaries, skew, physical_ref);
+        return self.checkpointProgress(a, path, claim_, stage, cursor, pending, null, false, boundaries, skew, physical_ref);
     }
     pub fn checkpointTasksProgress(self: Store, a: A, path: []const u8, claim_: Claim, stage: u32, cursor: u32, pending: []const u32, after: ?u32) !void {
-        return self.checkpointProgress(a, path, claim_, stage, cursor, pending, after, null, null, null);
+        return self.checkpointProgress(a, path, claim_, stage, cursor, pending, after, false, null, null, null);
     }
-    fn checkpointProgress(self: Store, a: A, path: []const u8, claim_: Claim, stage: u32, cursor: u32, pending: []const u32, after: ?u32, boundaries: ?[]const u16, skew: ?[]const @import("physical.zig").Part, physical_ref: ?Output) !void {
+    pub fn checkpointTasksPhase(self: Store, a: A, path: []const u8, claim_: Claim, stage: u32, cursor: u32, pending: []const u32, after: ?u32, admission: bool) !void {
+        return self.checkpointProgress(a, path, claim_, stage, cursor, pending, after, admission, null, null, null);
+    }
+    fn checkpointProgress(self: Store, a: A, path: []const u8, claim_: Claim, stage: u32, cursor: u32, pending: []const u32, after: ?u32, admission: bool, boundaries: ?[]const u16, skew: ?[]const @import("physical.zig").Part, physical_ref: ?Output) !void {
         if (after) |id| if (pending.len == 0 or id >= cursor) return error.InvalidSqlExecutionState;
         if (pending.len > 256) return error.InvalidSqlExecutionState;
         for (pending, 0..) |id, index| {
@@ -316,12 +351,13 @@ pub const Store = struct {
         var old = try self.owned(a, path, claim_);
         defer old.deinit(a);
         if (stage < old.value.stage or (stage == old.value.stage and cursor < old.value.cursor)) return error.InvalidSqlExecutionState;
-        if (after != null and stage != old.value.stage) return error.InvalidSqlExecutionState;
+        if ((after != null or admission) and stage != old.value.stage) return error.InvalidSqlExecutionState;
         var next = old.value;
         next.stage = stage;
         next.cursor = cursor;
         next.pending = pending;
         next.pending_after = after;
+        next.pending_admission = admission;
         if (physical_ref) |ref| {
             if (old.value.stage != 0 or stage != 1 or old.value.physical != null) return error.InvalidSqlExecutionState;
             next.physical = ref;
@@ -491,10 +527,11 @@ test "distributed SQL pending scan checkpoints survive lost ACKs and fence takeo
     const first = (try store.claim(scratch, key_, "first", 1000)).?;
     try store.checkpointTasks(scratch, key_, first, 0, 8, &.{ 0, 2, 7 });
     faults.next_put = .{ .commit_then_fail = error.ConnectionResetByPeer };
-    try std.testing.expectError(error.ConnectionResetByPeer, store.checkpointTasksProgress(scratch, key_, first, 0, 8, &.{ 0, 7 }, 3));
+    try std.testing.expectError(error.ConnectionResetByPeer, store.checkpointTasksPhase(scratch, key_, first, 0, 8, &.{ 0, 7 }, 3, true));
     var accepted = (try store.load(scratch, key_)).?;
     defer accepted.deinit(scratch);
     try std.testing.expectEqual(@as(?u32, 3), accepted.value.pending_after);
+    try std.testing.expect(accepted.value.pending_admission);
     try std.testing.expectEqualSlices(u32, &.{ 0, 7 }, accepted.value.pending);
     store.now_ms = 32001;
     const second = (try store.claim(scratch, key_, "second", 1000)).?;
@@ -505,4 +542,32 @@ test "distributed SQL pending scan checkpoints survive lost ACKs and fence takeo
     defer next.deinit(scratch);
     try std.testing.expect(next.value.pending_after == null);
     try std.testing.expectEqual(@as(u32, 1), next.value.stage);
+}
+
+test "distributed SQL admission ACK replay does not couple creation and status reads" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var faults = storage.ScriptedFaultClient.init(a, memory.client());
+    defer faults.deinit();
+    const store: Store = .{ .client = faults.client(), .bucket = "queries", .prefix = "tenant", .now_ms = 1000 };
+    const query: Query = .{ .id = @splat('a'), .expires_ms = 1000000 };
+    faults.next_put = .{ .commit_then_fail = error.ConnectionResetByPeer };
+    try std.testing.expectError(error.ConnectionResetByPeer, store.admitTasks(scratch, query, 0, &.{0}, null));
+    const before = faults.get_attempts;
+    const admitted = try store.admitTasks(scratch, query, 0, &.{0}, null);
+    try std.testing.expect(admitted[0].needs_check);
+    try std.testing.expectEqual(before, faults.get_attempts);
+    const statuses = try store.taskStatuses(scratch, query, 0, &.{0}, null);
+    try std.testing.expectEqual(Status.pending, statuses[0].status);
+    try std.testing.expect(statuses[0].read_error == null);
+    const conflicting = try store.key(scratch, query, 1, 0);
+    try store.create(scratch, conflicting, @splat('b'), query.expires_ms);
+    const unknown = try store.admitTasks(scratch, query, 1, &.{0}, null);
+    try std.testing.expect(unknown[0].needs_check);
+    const checked = try store.taskStatuses(scratch, query, 1, &.{0}, null);
+    try std.testing.expectEqual(@as(?anyerror, error.SqlExecutionIdReused), checked[0].read_error);
 }

@@ -267,10 +267,17 @@ passes resume after takeover and continue without a fresh delivery notification.
 Completed passes wrap to revisit earlier unresolved tasks, and stage changes
 clear the reconciliation cursor. Admission also yields between completed waves.
 
-Native control requests use per-attempt deadlines capped at five seconds and
-share the caller's remaining budget across the bounded failover list. Both the
+Native control requests use per-attempt deadlines capped at five seconds
+(twenty seconds for submissions, which retain both source cuts). The first
+attempt reserves time for a backup within the caller's remaining budget. Both the
 HTTP timeout and cancellation guard enforce each attempt's budget. A worker
 504 or transport cancellation can fail over while the parent remains active;
 durable query cancellation, authorization failures and terminal query errors
 remain terminal. Exhausted worker timeouts report worker unavailability rather
 than claiming that an otherwise active statement has expired.
+Creation replay registers existing task IDs for a subsequent status check,
+without redispatching them or requiring a conditional write and GET in the same
+quantum. Native status waves retain successful sibling reads when one task times
+out. Known free window slots persist admission priority for the next turn when a
+scan consumes the work phase. Recent wave latency avoids launching another
+scan wave that is unlikely to fit.

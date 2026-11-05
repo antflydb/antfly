@@ -1862,13 +1862,18 @@ fn reconcileWindow(early_running: bool) !void {
     try records.checkpointTasks(a, query_key, claim, spec.outputStage(), 256, &ids);
     const Slow = struct {
         var base_get: @FieldType(storage.Client.VTable, "get_object") = undefined;
+        var slow_first: std.atomic.Value(bool) = .init(false);
         fn get(raw: *anyopaque, allocator: A, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
-            if (std.mem.indexOf(u8, key, "/stage/") != null) try std.Io.sleep(std.testing.io, .fromMilliseconds(100), .awake);
+            if (std.mem.indexOf(u8, key, "/stage/") != null) {
+                const delay: i64 = if (std.mem.endsWith(u8, key, "/task/0.json") and slow_first.swap(false, .acq_rel)) 600 else 100;
+                try std.Io.sleep(std.testing.io, .fromMilliseconds(delay), .awake);
+            }
             if (options.cancellation) |token| try token.check();
             return base_get(raw, allocator, bucket, key, options);
         }
     };
     Slow.base_get = service.state_store.client.vtable.get_object;
+    Slow.slow_first.store(early_running, .release);
     var table = service.state_store.client.vtable.*;
     table.get_object = Slow.get;
     service.state_store.client.vtable = &table;
@@ -2022,4 +2027,174 @@ test "distributed SQL control attempt deadlines leave time for healthy peers and
     fake = .{ .cancel_parent = true };
     try std.testing.expectError(error.Canceled, client.turn(query, context));
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "distributed SQL admission replay separates creation from status inspection within a short quantum" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    var service = fixture.service(a, memory.client(), "owner");
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+    var right = input;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    const spec = try plan.choose(input, right, service.tenant, 1000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .concurrency = 1 }, fixture.now);
+    const query = try service.submit(spec);
+    var records = service.state_store;
+    records.tenant = service.tenant;
+    const task_key = try records.key(a, query, 0, 0);
+    defer a.free(task_key);
+    try records.create(a, task_key, query.id, query.expires_ms);
+    const worker = (try records.claim(a, task_key, "worker", 60000)).?;
+    try records.complete(a, task_key, worker, .{ .key = "accepted", .hash = @splat('c'), .bytes = 0 });
+    const Slow = struct {
+        var base_get: @FieldType(storage.Client.VTable, "get_object") = undefined;
+        var base_put: @FieldType(storage.Client.VTable, "put_object") = undefined;
+        fn delay(key: []const u8) !void {
+            if (std.mem.indexOf(u8, key, "/stage/") != null) try std.Io.sleep(std.testing.io, .fromMilliseconds(200), .awake);
+        }
+        fn get(raw: *anyopaque, allocator: A, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            try delay(key);
+            if (options.cancellation) |token| try token.check();
+            return base_get(raw, allocator, bucket, key, options);
+        }
+        fn put(raw: *anyopaque, allocator: A, bucket: []const u8, key: []const u8, body: []const u8, options: storage.PutOptions) !storage.PutResult {
+            try delay(key);
+            if (options.cancellation) |token| try token.check();
+            return base_put(raw, allocator, bucket, key, body, options);
+        }
+    };
+    Slow.base_get = service.state_store.client.vtable.get_object;
+    Slow.base_put = service.state_store.client.vtable.put_object;
+    var table = service.state_store.client.vtable.*;
+    table.get_object = Slow.get;
+    table.put_object = Slow.put;
+    service.state_store.client.vtable = &table;
+    service.context.io = std.testing.io;
+    const Scheduler = @import("scheduler.zig");
+    var scheduler: Scheduler.Scheduler = .{ .io = std.testing.io, .delivery = undefined };
+    defer scheduler.stop();
+    const queue = scheduler.dispatcher();
+    try queue.dispatch(queue.ptr, &.{.{ .tenant = service.tenant, .query = query, .stage = 0, .task = 0 }}, .{});
+    var turns: Scheduler.Turns = .{ .scheduler = &scheduler };
+    service.coordination = turns.port();
+    const Reject = struct {
+        fn dispatch(_: *anyopaque, _: []const plan.Ticket, _: Context) !void {
+            return error.CompletedTaskWasRedispatched;
+        }
+    };
+    const dispatcher: runtime.Dispatcher = .{ .ptr = &fixture, .dispatch = Reject.dispatch };
+    const key = try records.key(a, query, null, 0);
+    defer a.free(key);
+    for (0..2) |turn| {
+        service.context.deadline_ns = @import("antfly_platform").time.monotonicNs() + 700 * std.time.ns_per_ms;
+        _ = try service.turn(query, dispatcher);
+        var value = (try records.load(a, key)).?;
+        defer value.deinit(a);
+        if (turn == 0) {
+            try std.testing.expectEqual(@as(u32, 1), value.value.cursor);
+            try std.testing.expectEqualSlices(u32, &.{0}, value.value.pending);
+        } else {
+            try std.testing.expectEqual(@as(u32, 1), value.value.stage);
+            try std.testing.expectEqual(@as(usize, 0), value.value.pending.len);
+        }
+    }
+}
+
+test "distributed SQL admission priority advances a slow partially filled window" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    var service = fixture.service(a, memory.client(), "owner");
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+    var right = input;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    right.splits = 2;
+    const spec = try plan.choose(input, right, service.tenant, 1000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .concurrency = 2 }, fixture.now);
+    const query = try service.submit(spec);
+    const claim = (try service.acquire(query)).?;
+    var records = service.state_store;
+    records.tenant = service.tenant;
+    const key = try records.key(a, query, null, 0);
+    defer a.free(key);
+    const task_key = try records.key(a, query, 0, 0);
+    defer a.free(task_key);
+    try records.create(a, task_key, query.id, query.expires_ms);
+    _ = (try records.claim(a, task_key, "worker", 60000)).?;
+    try records.checkpointTasks(a, key, claim, 0, 1, &.{0});
+    const Slow = struct {
+        var get_base: @FieldType(storage.Client.VTable, "get_object") = undefined;
+        var put_base: @FieldType(storage.Client.VTable, "put_object") = undefined;
+        fn wait(key_: []const u8) !void {
+            if (std.mem.indexOf(u8, key_, "/stage/") != null) try std.Io.sleep(std.testing.io, .fromMilliseconds(200), .awake);
+        }
+        fn get(raw: *anyopaque, allocator: A, bucket: []const u8, key_: []const u8, options: storage.GetOptions) !storage.GetResult {
+            try wait(key_);
+            if (options.cancellation) |token| try token.check();
+            return get_base(raw, allocator, bucket, key_, options);
+        }
+        fn put(raw: *anyopaque, allocator: A, bucket: []const u8, key_: []const u8, body: []const u8, options: storage.PutOptions) !storage.PutResult {
+            try wait(key_);
+            if (options.cancellation) |token| try token.check();
+            return put_base(raw, allocator, bucket, key_, body, options);
+        }
+    };
+    Slow.get_base = service.state_store.client.vtable.get_object;
+    Slow.put_base = service.state_store.client.vtable.put_object;
+    var table = service.state_store.client.vtable.*;
+    table.get_object = Slow.get;
+    table.put_object = Slow.put;
+    service.state_store.client.vtable = &table;
+    service.context.io = std.testing.io;
+    var turns: @import("scheduler.zig").Turns = .{};
+    service.coordination = turns.port();
+    const Delivery = struct {
+        tasks: usize = 0,
+        fn dispatch(raw: *anyopaque, tickets: []const plan.Ticket, _: Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (tickets) |ticket| {
+                try std.testing.expectEqual(@as(u32, 1), ticket.task);
+                self.tasks += 1;
+            }
+        }
+    };
+    var delivery: Delivery = .{};
+    const dispatcher: runtime.Dispatcher = .{ .ptr = &delivery, .dispatch = Delivery.dispatch };
+    for (0..2) |turn| {
+        service.context.deadline_ns = @import("antfly_platform").time.monotonicNs() + 700 * std.time.ns_per_ms;
+        _ = try service.turn(query, dispatcher);
+        var value = (try records.load(a, key)).?;
+        defer value.deinit(a);
+        if (turn == 0) {
+            try std.testing.expect(value.value.pending_admission);
+            try std.testing.expectEqual(@as(u32, 1), value.value.cursor);
+        } else {
+            try std.testing.expect(!value.value.pending_admission);
+            try std.testing.expectEqual(@as(u32, 2), value.value.cursor);
+            try std.testing.expectEqualSlices(u32, &.{ 0, 1 }, value.value.pending);
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), delivery.tasks);
+}
+
+test "distributed SQL single worker control does not reserve a nonexistent peer budget" {
+    const a = std.testing.allocator;
+    const transport = @import("transport.zig");
+    const Http = local.common_http_http_common;
+    const Fake = struct {
+        fn execute(_: *anyopaque, allocator: A, request_: Http.HttpRequest) !Http.HttpResponse {
+            try std.testing.expect(request_.timeout_ms.? > 1000);
+            return .{ .status = 200, .owner_allocator = allocator, .body = try allocator.dupe(u8, "{\"complete\":false}") };
+        }
+    };
+    var marker: u8 = 0;
+    var client: transport.Client = .{ .a = a, .executor = .{ .ptr = &marker, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{"http://only"} };
+    const request: transport.QueryRequest = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1000000 } };
+    const context: Context = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s };
+    try std.testing.expect(!try client.turn(request, context));
 }
