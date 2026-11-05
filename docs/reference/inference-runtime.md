@@ -260,8 +260,7 @@ These encoder/boundary brokers work independently of `generation_batching`.
 The shipped write profile enables LightOnOCR's separate continuous scheduler
 with two decoder rows and a four-page active window. Internal Node callers can
 override the executor collection delay, including zero; omission uses the
-backend stage's default. See the
-[write serving qualification](../design/inference/write-pool-production.md).
+backend stage's default.
 
 The cooperative policy prefers shorter contexts for up to eight consecutive turns, then grants
 the next round-robin owner. Manual final-prefill turns participate in that

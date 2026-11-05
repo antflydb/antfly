@@ -39,7 +39,7 @@ import time
 import qualify_read_pool_40g as q
 
 
-def serving_identity(args, campaign, *, check_cooperative_mode=True):
+def serving_identity(args, campaign):
     if not args.cgroup or not args.binary or not args.config:
         raise q.EvidenceUnavailable(
             "controlled qualification requires --cgroup, --binary and --config"
@@ -72,10 +72,7 @@ def serving_identity(args, campaign, *, check_cooperative_mode=True):
             for x in (proc / "environ").read_bytes().split(b"\0")
             if b"=" in x
         )
-        keys.update(
-            k for k in values
-            if k.startswith(("ANTFLY_INFERENCE_CUDA_", "ANTFLY_LIGHTONOCR3_", "TERMITE_WHISPER_"))
-        )
+        keys.update(k for k in values if k.startswith("ANTFLY_INFERENCE_CUDA_"))
         selected = {k: values.get(k) for k in sorted(keys)}
         assert not environment or selected == environment
         environment = selected
@@ -91,9 +88,8 @@ def serving_identity(args, campaign, *, check_cooperative_mode=True):
             "expected serving binary is absent from the requested service cgroup"
         )
     configuration = json.loads(args.config.read_text())
-    if check_cooperative_mode:
-        expected = "on" if args.mode == "cooperative" else "off"
-        assert configuration["inference"]["cooperative_execution"]["mode"] == expected
+    expected = "on" if args.mode == "cooperative" else "off"
+    assert configuration["inference"]["cooperative_execution"]["mode"] == expected
     gpu = campaign.gpu
     if gpu is None:
         raise q.EvidenceUnavailable(campaign.gpu_error)
