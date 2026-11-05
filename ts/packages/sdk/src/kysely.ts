@@ -34,6 +34,8 @@ export {
 
 export {
   type AntflyColumnMetadata,
+  type AntflyIntrospectorOptions,
+  type AntflyKyselyClient,
   createAntflyIntrospector,
   type GenerateKyselyTypesOptions,
   generateKyselyTypes,

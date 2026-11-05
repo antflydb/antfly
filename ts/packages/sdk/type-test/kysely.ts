@@ -29,6 +29,7 @@ antflySearch("articles", { table: "other" });
 antflySearch("articles", { full_text_search: { nonexistent_query: true } });
 
 const migrationTables: PrepareKyselyMigrationTablesOptions = {
+  migrationTableSchema: "deployment_history",
   migrationTableName: "app_migrations",
   migrationLockTableName: "app_migration_lock",
 };

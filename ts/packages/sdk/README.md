@@ -481,11 +481,13 @@ standalone-only credential installation and legacy whole-profile operations.
 
 ## Kysely
 
-The optional `@antfly/sdk/kysely` subpath provides `antflySearch`,
-`AntflyPostgresDialect`, `createAntflyIntrospector`, `generateKyselyTypes`, and
-`prepareKyselyMigrationTables`.
-`createAntflyPostgresTypes` and `createAntflyPostgresCursor` configure lossless
-NUMERIC results for PostgreSQL queries and streams without changing global parsers.
-Install Kysely 0.29.6+ separately. See the
-[Kysely reference](docs/kysely.md) for connections,
-typed search composition, migrations, integer mappings, and backend capabilities.
+The optional `@antfly/sdk/kysely` subpath includes `createAntflyPostgres`, which
+owns the server pool, parser policy, scoped introspection/type generation, and
+migration lifecycle. Named databases, ordered namespace lookup, qualified table
+types, and migration history in separate schemas follow Antfly's native catalog.
+
+Low-level dialect, introspection, type generation, bootstrap, and exact NUMERIC
+parser/cursor helpers remain available, alongside `antflySearch` for embedded
+SQL search composition. Install Kysely 0.29.6+ separately. See the
+[Kysely reference](docs/kysely.md) for setup, scopes, migrations, integer mappings,
+and native backend capabilities.

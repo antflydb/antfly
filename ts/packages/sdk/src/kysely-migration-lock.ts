@@ -12,6 +12,8 @@ export interface AntflyMigrationClaim {
 }
 
 export interface AntflyMigrationLockSettings {
+  /** All runners in a database must use the same claim namespace. Defaults to public. */
+  namespace?: string;
   /** Acquisition deadline only; claims never expire or transfer automatically. */
   waitTimeoutMs?: number;
   owner?: string;
@@ -52,65 +54,69 @@ export interface MigrationClaimStore {
   remove(db: Kysely<unknown>, ownerToken: string): Promise<boolean>;
 }
 
-const store: MigrationClaimStore = {
-  async ensure(db) {
-    try {
-      await sql`SELECT owner_token, owner_label, acquired_at FROM ${sql.table(MIGRATION_CLAIMS_TABLE)} LIMIT 0`.execute(
+function claimStore(namespace: string): MigrationClaimStore {
+  const tableName = `${namespace}.${MIGRATION_CLAIMS_TABLE}`;
+  return {
+    async ensure(db) {
+      try {
+        await sql`SELECT owner_token, owner_label, acquired_at FROM ${sql.table(tableName)} LIMIT 0`.execute(
+          db
+        );
+        return;
+      } catch (error) {
+        if (state(error) !== "42P01") throw error;
+      }
+      // _id is the engine's unique physical row key. No SQL secondary-index
+      // assumption or client-side check-then-insert is used to claim ownership.
+      await db.schema
+        .withSchema(namespace)
+        .createTable(MIGRATION_CLAIMS_TABLE)
+        .ifNotExists()
+        .addColumn("owner_token", "text", (column) => column.notNull())
+        .addColumn("owner_label", "text", (column) => column.notNull())
+        .addColumn("acquired_at", "text", (column) => column.notNull())
+        .execute();
+      await sql`SELECT owner_token, owner_label, acquired_at FROM ${sql.table(tableName)} LIMIT 0`.execute(
         db
       );
-      return;
-    } catch (error) {
-      if (state(error) !== "42P01") throw error;
-    }
-    // _id is the engine's unique physical row key. No SQL secondary-index
-    // assumption or client-side check-then-insert is used to claim ownership.
-    await db.schema
-      .createTable(MIGRATION_CLAIMS_TABLE)
-      .ifNotExists()
-      .addColumn("owner_token", "text", (column) => column.notNull())
-      .addColumn("owner_label", "text", (column) => column.notNull())
-      .addColumn("acquired_at", "text", (column) => column.notNull())
-      .execute();
-    await sql`SELECT owner_token, owner_label, acquired_at FROM ${sql.table(MIGRATION_CLAIMS_TABLE)} LIMIT 0`.execute(
-      db
-    );
-  },
-  async read(db) {
-    let rows: AntflyMigrationClaim[];
-    try {
-      ({ rows } =
-        await sql<AntflyMigrationClaim>`SELECT owner_token AS "ownerToken", owner_label AS "owner", acquired_at AS "acquiredAt"
-        FROM ${sql.table(MIGRATION_CLAIMS_TABLE)} WHERE _id = ${CLAIM_KEY}`.execute(db));
-    } catch (error) {
-      if (state(error) === "42P01") return null;
-      throw error;
-    }
-    if (!rows.length) return null;
-    const claim = rows[0];
-    if (
-      rows.length !== 1 ||
-      !claim ||
-      typeof claim.ownerToken !== "string" ||
-      !validToken(claim.ownerToken) ||
-      typeof claim.owner !== "string" ||
-      typeof claim.acquiredAt !== "string"
-    ) {
-      throw new Error("Invalid Antfly migration claim metadata");
-    }
-    return claim;
-  },
-  async insert(db, claim) {
-    await sql`INSERT INTO ${sql.table(MIGRATION_CLAIMS_TABLE)} (_id, owner_token, owner_label, acquired_at)
+    },
+    async read(db) {
+      let rows: AntflyMigrationClaim[];
+      try {
+        ({ rows } =
+          await sql<AntflyMigrationClaim>`SELECT owner_token AS "ownerToken", owner_label AS "owner", acquired_at AS "acquiredAt"
+        FROM ${sql.table(tableName)} WHERE _id = ${CLAIM_KEY}`.execute(db));
+      } catch (error) {
+        if (state(error) === "42P01") return null;
+        throw error;
+      }
+      if (!rows.length) return null;
+      const claim = rows[0];
+      if (
+        rows.length !== 1 ||
+        !claim ||
+        typeof claim.ownerToken !== "string" ||
+        !validToken(claim.ownerToken) ||
+        typeof claim.owner !== "string" ||
+        typeof claim.acquiredAt !== "string"
+      ) {
+        throw new Error("Invalid Antfly migration claim metadata");
+      }
+      return claim;
+    },
+    async insert(db, claim) {
+      await sql`INSERT INTO ${sql.table(tableName)} (_id, owner_token, owner_label, acquired_at)
       VALUES (${CLAIM_KEY}, ${claim.ownerToken}, ${claim.owner}, ${claim.acquiredAt})`.execute(db);
-  },
-  async remove(db, ownerToken) {
-    const result =
-      await sql`DELETE FROM ${sql.table(MIGRATION_CLAIMS_TABLE)} WHERE _id = ${CLAIM_KEY} AND owner_token = ${ownerToken}`.execute(
-        db
-      );
-    return result.numAffectedRows === 1n;
-  },
-};
+    },
+    async remove(db, ownerToken) {
+      const result =
+        await sql`DELETE FROM ${sql.table(tableName)} WHERE _id = ${CLAIM_KEY} AND owner_token = ${ownerToken}`.execute(
+          db
+        );
+      return result.numAffectedRows === 1n;
+    },
+  };
+}
 
 /** Internal protocol implementation, allowing storage failures to be exercised independently. */
 export function persistentMigrationLock(
@@ -238,8 +244,13 @@ export function persistentMigrationLock(
 /** Cross-process, persistent, non-expiring ownership for one catalog's migrations. */
 export class AntflyPersistentMigrationLock implements AntflyMigrationLock {
   private readonly protocol;
+  private readonly store;
   constructor(options: AntflyMigrationLockSettings = {}) {
-    this.protocol = persistentMigrationLock(store, options);
+    const namespace = options.namespace ?? "public";
+    if (!/^[_a-zA-Z][_a-zA-Z0-9-]{0,127}$/.test(namespace))
+      throw new TypeError("Invalid migration claim namespace");
+    this.store = claimStore(namespace);
+    this.protocol = persistentMigrationLock(this.store, options);
   }
   acquire(db: Kysely<unknown>): Promise<void> {
     return this.protocol.acquire(db);
@@ -248,7 +259,7 @@ export class AntflyPersistentMigrationLock implements AntflyMigrationLock {
     return this.protocol.release(db);
   }
   inspect(db: Kysely<unknown>): Promise<AntflyMigrationClaim | null> {
-    return store.read(db);
+    return this.store.read(db);
   }
   async recover(
     db: Kysely<unknown>,
@@ -259,7 +270,7 @@ export class AntflyPersistentMigrationLock implements AntflyMigrationLock {
         "Recovery requires the observed owner token and confirmation that the previous runner stopped"
       );
     try {
-      return await store.remove(db, options.ownerToken);
+      return await this.store.remove(db, options.ownerToken);
     } catch (error) {
       if (state(error) === "42P01") return false;
       throw error;

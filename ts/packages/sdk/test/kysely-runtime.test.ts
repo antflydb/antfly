@@ -92,13 +92,12 @@ it("waits for active metadata work before closing its pool", async () => {
 });
 
 it.each([
-  "postgres://localhost/other",
   "postgres://localhost/default?options=-csearch_path%3Dother",
   "postgres://localhost/default?database=other",
 ])("rejects unsupported catalog selection: %s", (connectionString) => {
   expect(() =>
     createAntflyPostgres({ pg, client: {} as AntflyClient, pool: { connectionString } })
-  ).toThrow("default database");
+  ).toThrow("connection URL path");
 });
 
 it.each([
@@ -175,5 +174,72 @@ it.each([
     await runtime.close();
   } finally {
     warning.mockRestore();
+  }
+});
+
+it("releases a checked-out client if namespace initialization fails", async () => {
+  const release = vi.fn();
+  const query = vi.fn(async () => {
+    throw new Error("namespace permission denied");
+  });
+  class Pool extends EventEmitter {
+    options = {};
+    async connect() {
+      return { query, release };
+    }
+    async end() {}
+  }
+  const runtime = createAntflyPostgres({
+    pg: { Pool, types: pg.types },
+    client: {} as AntflyClient,
+    pool: { connectionString: "postgres://localhost/default" },
+  });
+  try {
+    await expect(
+      runtime.db.selectNoFrom((expression) => expression.val(1).as("n")).execute()
+    ).rejects.toThrow("namespace permission denied");
+    expect(release).toHaveBeenCalledTimes(1);
+    expect(query).toHaveBeenCalledWith('SET search_path TO "public"', []);
+  } finally {
+    await runtime.close();
+  }
+});
+
+it("pins an ordered namespace path on every checkout in a named database", async () => {
+  const statements: string[] = [];
+  let connectionString = "";
+  const query = vi.fn(async (statement: string) => {
+    statements.push(statement);
+    return { rows: [], command: "SELECT", rowCount: 0 };
+  });
+  const release = vi.fn();
+  class Pool extends EventEmitter {
+    options = {};
+    constructor(options: { connectionString: string }) {
+      super();
+      connectionString = options.connectionString;
+    }
+    async connect() {
+      return { query, release };
+    }
+    async end() {}
+  }
+  const runtime = createAntflyPostgres({
+    pg: { Pool, types: pg.types },
+    client: { api: {} } as AntflyClient,
+    searchPath: ["app", "public"],
+    pool: { connectionString: "postgres://localhost/tenant" },
+  });
+  try {
+    await runtime.db.selectNoFrom((expression) => expression.val(1).as("n")).execute();
+    await runtime.db.selectNoFrom((expression) => expression.val(2).as("n")).execute();
+    expect(new URL(connectionString).pathname).toBe("/tenant");
+    expect(statements.filter((statement) => statement.startsWith("SET search_path"))).toEqual([
+      'SET search_path TO "app", "public"',
+      'SET search_path TO "app", "public"',
+    ]);
+    expect(release).toHaveBeenCalledTimes(2);
+  } finally {
+    await runtime.close();
   }
 });

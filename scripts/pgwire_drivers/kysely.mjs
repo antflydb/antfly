@@ -435,6 +435,63 @@ try {
       2
     );
   }
+  await sql`CREATE DATABASE kysely_tenant`.execute(db);
+  const tenantUrl = new URL(connectionString);
+  tenantUrl.pathname = "/kysely_tenant";
+  const setup = createAntflyPostgres({ pg, client, pool: { connectionString: tenantUrl.toString() } });
+  try {
+    await setup.db.schema.createSchema("app").execute();
+    await setup.db.schema.withSchema("app").createTable("shadow").addColumn("value", "text", (column) => column.notNull()).execute();
+    await setup.db.schema.withSchema("public").createTable("shadow").addColumn("value", "double precision", (column) => column.notNull()).execute();
+    await setup.db.insertInto("app.shadow").values({ value: "app" }).execute();
+    await setup.db.insertInto("public.shadow").values({ value: 7 }).execute();
+  } finally { await setup.close(); }
+  const tenant = createAntflyPostgres({ pg, client, searchPath: ["app", "public"], pool: { connectionString: tenantUrl.toString(), max: 1 } });
+  const tenantPublic = createAntflyPostgres({ pg, client, pool: { connectionString: tenantUrl.toString(), max: 1 } });
+  try {
+    assert.deepEqual(await tenant.db.selectFrom("shadow").selectAll().execute(), [{ value: "app" }]);
+    assert.deepEqual(await tenant.db.selectFrom("public.shadow").selectAll().execute(), [{ value: 7 }]);
+    const source = await tenant.generateTypes();
+    assert.match(source, /"app.shadow": \{\s+"value": string;/);
+    assert.match(source, /"public.shadow": \{\s+"value": number;/);
+    assert.match(source, /"shadow": \{\s+"value": string;/);
+    assert.ok(!source.includes('"kysely_people"'));
+    const provider = { async getMigrations() { return {
+      "001": {
+        async up(tx) { await tx.schema.withSchema("app").createTable("scoped_migration").addColumn("value", "text").execute(); },
+        async down(tx) { await tx.schema.withSchema("app").dropTable("scoped_migration").execute(); },
+      },
+    }; } };
+    const settings = { provider, migrationTableSchema: "history" };
+    // A claim in another database must not block this database's migrations.
+    const rootLock = new AntflyPersistentMigrationLock({ waitTimeoutMs: 0 });
+    await rootLock.acquire(db);
+    try { assert.ifError((await tenant.migrateToLatest(settings)).error); }
+    finally { await rootLock.release(db); }
+    assert.ok((await tenant.db.introspection.getSchemas()).some((schema) => schema.name === "history"));
+    assert.ifError((await tenant.migrateDown(settings)).error);
+    assert.ifError((await tenant.migrateUp(settings)).error);
+    assert.ifError((await tenant.migrateTo("001", settings)).error);
+    const shared = new AntflyPersistentMigrationLock({ waitTimeoutMs: 0 });
+    await shared.acquire(tenant.db);
+    try {
+      const blocked = await tenantPublic.migrateToLatest({ ...settings, lock: { waitTimeoutMs: 0 } });
+      assert.equal(blocked.error?.code, "ANTFLY_MIGRATION_LOCK_BUSY");
+    } finally { await shared.release(tenant.db); }
+    const localClaims = createAntflyPostgres({ pg, client, searchPath: ["app", "public"], migrationLockNamespace: "app", pool: { connectionString: tenantUrl.toString(), max: 1 } });
+    const appLock = new AntflyPersistentMigrationLock({ namespace: "app" });
+    try {
+      await appLock.acquire(localClaims.db);
+      assert.ok((await localClaims.inspectMigrationLock())?.ownerToken);
+      await appLock.release(localClaims.db);
+      assert.ifError((await localClaims.migrateToLatest(settings)).error);
+      assert.equal(await localClaims.inspectMigrationLock(), null);
+    } finally { await localClaims.close(); }
+    await assert.rejects(tenant.db.transaction().execute(async (tx) => {
+      await tx.schema.createTable("transactional_ddl").addColumn("n", "integer").execute();
+    }));
+    assert.ok(!(await tenant.db.introspection.getTables()).some((table) => table.name === "transactional_ddl"));
+  } finally { await Promise.all([tenant.close(), tenantPublic.close()]); }
   const visible = (await introspector.getTables()).map((table) => table.name);
   assert.ok(visible.includes("kysely_people"));
   assert.ok(!visible.includes("kysely_migration"));
@@ -445,7 +502,7 @@ try {
   assert.ok(allTables.includes("kysely_migration"));
   assert.ok(allTables.includes("kysely_migration_lock"));
   console.log(
-    "Kysely pgwire: CRUD, joins, exact integers, transactions, streaming, introspection, migrations: PASS"
+    "Kysely pgwire: CRUD, streaming, scoped databases/search paths, introspection, migration directions and lock isolation: PASS"
   );
 } finally {
   for (const worker of workers) worker.kill("SIGKILL");

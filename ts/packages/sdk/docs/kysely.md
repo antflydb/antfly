@@ -29,20 +29,22 @@ const antfly = createAntflyPostgres<Database>({
 });
 const db = antfly.db;
 try {
-  await writeFile("database.ts", await antfly.generateTypes());
   const result = await antfly.migrateToLatest({
     provider, // any Kysely MigrationProvider
     lock: { waitTimeoutMs: 30_000, owner: "deploy-job" },
   });
   if (result.error) throw result.error;
+  await writeFile("database.ts", await antfly.generateTypes());
 } finally {
   await antfly.close();
 }
 ```
 
 Install `pg`, `kysely`, and optionally `pg-cursor` alongside the SDK. Supply the
-same database and credentials to HTTP and pgwire. The factory supports the default
-database/public namespace. `exact` (the default) preserves BIGINT and NUMERIC
+same credentials to HTTP and pgwire. The factory derives the database from the
+connection URL path (for example `/tenant_ops`); an omitted database means
+`default`. Introspection uses explicit HTTP catalog and SQL scopes for that same
+database. `exact` (the default) preserves BIGINT and NUMERIC
 values, including nested arrays, as strings. `pg-default` keeps numeric arrays
 as numbers. Neither preset changes global pg parsers. Managed text codecs for
 booleans,
@@ -65,11 +67,86 @@ pool error and the handler failure, preventing an unhandled rejection. Finish
 direct `db` queries before
 closing; use `antfly.close()` for lifecycle management.
 
+### Databases, namespaces, and qualified SQL
+
+Antfly namespaces are PostgreSQL schemas. Configure the ordered lookup path for
+unqualified tables; use qualified table keys such as `"analytics.events"` for
+explicit namespace references. Every pool checkout restores the configured path, so a previous
+borrower's session setting cannot leak into the next operation. A transaction or
+reserved connection retains its own session settings until released.
+
+```ts
+const antfly = createAntflyPostgres<Database>({
+  pg,
+  client,
+  pool: { connectionString: process.env.ANTFLY_PGWIRE_URL! }, // URL path: /tenant_ops
+  searchPath: ["app", "analytics", "public"],
+  migrationLockNamespace: "public",
+});
+await antfly.db.selectFrom("orders").selectAll().execute();
+await antfly.db.selectFrom("analytics.events").selectAll().execute();
+const result = await antfly.migrateToLatest({
+  provider,
+  migrationTableSchema: "deployment_history",
+});
+if (result.error) throw result.error;
+await writeFile("database.ts", await antfly.generateTypes());
+```
+
+The database and lookup namespaces must exist and be visible to the principal.
+The migration history schema is created if needed under the migration claim.
+Use SQL `CREATE DATABASE`, Kysely's schema builder for `CREATE SCHEMA`, or the
+SDK's typed `client.api` catalog endpoints to provision them. The native pgwire
+search path accepts up to eight existing namespaces, each at most 128 bytes.
+Pass it through `searchPath` rather than unchecked startup `options`.
+
+HTTP introspection discovers every visible namespace in the selected database,
+including tables outside the lookup path, and follows catalog pagination even
+when an authorization-filtered page is empty. Generated types contain qualified
+keys such as `"app.orders"` plus unqualified aliases for the first matching table
+on the lookup path. A shadowed table remains available through its qualified key. Use qualified keys
+for queries against a namespace outside the lookup path or one shadowed by an
+earlier namespace: Kysely's `.withSchema()` changes SQL qualification, not the
+TypeScript table mapping. Use the same path when compiling code against that
+generated interface.
+
+Low-level tools can use `createAntflyIntrospector(client, { database: "tenant_ops",
+namespaces: ["app", "analytics"] })` to select a subset, and
+`generateKyselyTypes(metadata, { integerMode: "string", searchPath: ["app", "public"] })`
+to select aliases. Omitting `namespaces` discovers all visible namespaces.
+
+The integration forwards Antfly's supported SQL shapes through Kysely's compiler;
+it does not reduce them to a subset of CRUD. Native table/schema/database and
+tablespace DDL, indexes, defaults, generated columns, transactions, savepoints,
+and supported expressions remain available. Use `sql` for native syntax without
+a Kysely builder. For a native cross-database relation, construct its components
+separately rather than passing a three-part string to Kysely's table parser:
+
+```ts
+import { sql } from "kysely";
+
+const source = sql<{ id: string }>`
+  ${sql.id("other_database", "analytics", "events")}
+`.as("source");
+await antfly.db.selectFrom(source).select("source.id").execute();
+```
+
+Admission, authorization, provider capabilities, and SQL errors remain native.
+In particular, the native runtime rejects DDL inside an explicit transaction;
+the dialect reports that capability accurately and runs schema migrations
+outside transactions. It does not emulate rollback for committed schema changes.
+
 ### Persistent migration ownership
 
 `migrateToLatest` bootstraps Kysely's tables and holds a catalog-wide persistent
-claim throughout bootstrap and migration execution. Different custom migration
-history names share the same claim. All deployment runners must use this lock
+claim throughout bootstrap and migration execution. The same guarded path backs
+`migrateUp`, `migrateDown`, and `migrateTo(target, options)` as well. Migration
+history defaults to the first namespace on `searchPath`; set
+`migrationTableSchema` to store it elsewhere. Different custom history names and
+schemas share the same claim in `migrationLockNamespace` (default `public`),
+independent of lookup path. All runners in one database must use the same claim
+namespace, which must already exist and permit claim-table access. Different
+databases have independent claims. All deployment runners must use this lock
 protocol; unrelated SQL writers are not fenced by it. DDL is nontransactional,
 so a failed migration can leave partial changes.
 
@@ -207,10 +284,10 @@ introspection, and require explicit migration locking. Standard `PostgresDialect
 also works for ordinary SQL queries, but its PostgreSQL introspection and advisory
 locks are not supported by Antfly.
 
-The HTTP introspector currently describes the default database's `public`
-namespace. Its HTTP client and pg pool must use the same principal, deployment,
-and scope. Other database/namespace configurations require a matching custom
-`DatabaseIntrospector`; do not pair them with default-scope metadata.
+For a low-level pool, use `createAntflyIntrospector(client, { database })` with
+the same database, principal, and deployment. Its catalog calls enumerate visible
+namespaces in that database, and every SQL description carries an explicit
+database/namespace scope. The managed factory wires this automatically.
 
 ## Search as a SQL relation
 
@@ -330,13 +407,15 @@ DDL uses `varchar(255)`, which Antfly does not accept. This helper creates only
 the bookkeeping tables with native `TEXT` columns, under the dialect's migration
 lock. It does not rewrite application DDL. If you customize migration table names,
 pass the same `migrationTableName` and `migrationLockTableName` options to the helper
-and to `Migrator`. The setup helper supports the default namespace.
+and to `Migrator`. The helper also shares `migrationTableSchema`, creates that
+schema if needed, and supplies its value as `lockTableSchema` to custom locks.
 
 ```ts
 import { prepareKyselyMigrationTables } from "@antfly/sdk/kysely";
 import { Migrator } from "kysely/migration";
 
 const migrationTables = {
+  migrationTableSchema: "deployment_history",
   migrationTableName: "app_migrations",
   migrationLockTableName: "app_migration_lock",
 };
@@ -376,7 +455,7 @@ Do not infer PostgreSQL extension or catalog compatibility from the wire protoco
 | SQL NULL and exact integers | Integers as bigint | BIGINT strings with default pg parsers |
 | Commit, rollback, savepoints | READ COMMITTED | Native provider isolation contracts |
 | Result streaming beyond a page | Native cursors | Supply pg-cursor |
-| Schema introspection and type generation | Native catalog | HTTP metadata provider, default/public scope |
+| Schema introspection and type generation | Native container catalog | Scoped HTTP catalog, all visible namespaces, ordered lookup aliases |
 | Kysely migrations | Queue shared by Database object | Factory includes persistent ownership and bootstrap |
 | Transactional schema DDL | Unsupported | Unsupported |
 | Search relation with SQL composition | Supported | Explicitly unsupported |

@@ -1,9 +1,8 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 import process from "node:process";
-import { Kysely, type PostgresPool } from "kysely";
+import { CompiledQuery, Kysely, type PostgresPool } from "kysely";
 import { type MigrationResultSet, Migrator, type MigratorProps } from "kysely/migration";
-import type { AntflyClient } from "./client.js";
 import {
   type AntflyMigrationLockSettings,
   AntflyPersistentMigrationLock,
@@ -16,7 +15,11 @@ import {
   type AntflyPostgresTypes,
   createAntflyPostgresCursor,
 } from "./kysely-postgres-types.js";
-import { createAntflyIntrospector, generateKyselyTypes } from "./kysely-schema.js";
+import {
+  type AntflyKyselyClient,
+  createAntflyIntrospector,
+  generateKyselyTypes,
+} from "./kysely-schema.js";
 /** Owned pg pool, including its asynchronous idle-client error channel. */
 export interface AntflyPostgresPool extends PostgresPool {
   on(event: "error", listener: (error: Error) => void): unknown;
@@ -40,7 +43,11 @@ export interface AntflyPostgresOptions {
     connectionTimeoutMillis?: number;
   };
   cursor?: AntflyConfigurablePostgresCursor;
-  client: Pick<AntflyClient, "tables" | "executeSQL">;
+  client: AntflyKyselyClient;
+  /** Ordered namespace lookup, pinned whenever a pooled connection is reserved. */
+  searchPath?: readonly string[];
+  /** Shared claim storage for every migration runner in this database. Defaults to public. */
+  migrationLockNamespace?: string;
   values?: "exact" | "pg-default";
   /** Background idle-client errors; defaults to a Node warning. Query errors still reject their query. */
   onPoolError?: (error: Error) => void | Promise<void>;
@@ -48,15 +55,22 @@ export interface AntflyPostgresOptions {
 export type AntflyPostgresMigrationOptions = Pick<
   MigratorProps,
   | "provider"
+  | "migrationTableSchema"
   | "migrationTableName"
   | "migrationLockTableName"
   | "allowUnorderedMigrations"
   | "nameComparator"
-> & { lock?: AntflyMigrationLockSettings };
+> & { lock?: Omit<AntflyMigrationLockSettings, "namespace"> };
 export interface AntflyPostgresRuntime<DB> {
   db: Kysely<DB>;
   generateTypes(): Promise<string>;
   migrateToLatest(options: AntflyPostgresMigrationOptions): Promise<MigrationResultSet>;
+  migrateUp(options: AntflyPostgresMigrationOptions): Promise<MigrationResultSet>;
+  migrateDown(options: AntflyPostgresMigrationOptions): Promise<MigrationResultSet>;
+  migrateTo(
+    target: Parameters<Migrator["migrateTo"]>[0],
+    options: AntflyPostgresMigrationOptions
+  ): Promise<MigrationResultSet>;
   inspectMigrationLock(): ReturnType<AntflyPersistentMigrationLock["inspect"]>;
   recoverMigrationLock(options: {
     ownerToken: string;
@@ -74,15 +88,38 @@ export function createAntflyPostgres<DB>(
   const url = new URL(options.pool.connectionString);
   if (
     !["postgres:", "postgresql:"].includes(url.protocol) ||
-    !["/default"].includes(url.pathname) ||
     ["options", "database", "dbname"].some((key) => url.searchParams.has(key))
-  )
+  ) {
     throw new TypeError(
-      "Antfly HTTP introspection requires the default database and public namespace"
+      "Select the database in the connection URL path and namespaces through searchPath"
     );
+  }
+  const database = decodeURIComponent(url.pathname.slice(1)) || "default";
+  if (
+    Buffer.byteLength(database) > 128 ||
+    [...database].some(
+      (character) => character.charCodeAt(0) < 32 || character.charCodeAt(0) === 127
+    )
+  )
+    throw new TypeError("Invalid Antfly database name");
+  url.pathname = `/${encodeURIComponent(database)}`;
+  const searchPath = [...(options.searchPath ?? ["public"])];
+  if (!searchPath.length || searchPath.length > 8)
+    throw new RangeError("searchPath requires 1 to 8 namespaces");
+  const lockNamespace = options.migrationLockNamespace ?? "public";
+  for (const name of [...searchPath, lockNamespace]) {
+    if (!/^[_a-zA-Z][_a-zA-Z0-9-]{0,127}$/.test(name))
+      throw new TypeError("Invalid Antfly search-path namespace");
+  }
+  const introspector = createAntflyIntrospector(options.client, { database });
+  if (!options.client.api && searchPath.some((name) => name !== "public"))
+    throw new TypeError("Scoped introspection requires the Antfly client's catalog API");
+  const pathStatement = CompiledQuery.raw(
+    `SET search_path TO ${searchPath.map((name) => `"${name}"`).join(", ")}`
+  );
   const types = createManagedPostgresTypes(options.pg.types, values);
   const pool = new options.pg.Pool({
-    connectionString: options.pool.connectionString,
+    connectionString: url.toString(),
     max: options.pool.max,
     idleTimeoutMillis: options.pool.idleTimeoutMillis,
     connectionTimeoutMillis: options.pool.connectionTimeoutMillis,
@@ -106,12 +143,23 @@ export function createAntflyPostgres<DB>(
     }
   });
   const borrowed: PostgresPool = {
-    connect: () => pool.connect(),
+    connect: async () => {
+      const connection = await pool.connect();
+      try {
+        await connection.query(pathStatement.sql, []);
+        return connection;
+      } catch (error) {
+        connection.release();
+        throw error;
+      }
+    },
+    Client: pool.Client,
     end: async () => {},
     options: pool.options,
   };
-  const introspector = createAntflyIntrospector(options.client);
-  const makeDb = (lock: AntflyMigrationLock = new AntflyPersistentMigrationLock()) =>
+  const makeDb = (
+    lock: AntflyMigrationLock = new AntflyPersistentMigrationLock({ namespace: lockNamespace })
+  ) =>
     new Kysely<DB>({
       dialect: new AntflyPostgresDialect({
         pool: borrowed,
@@ -121,7 +169,7 @@ export function createAntflyPostgres<DB>(
       }),
     });
   const db = makeDb();
-  const lock = new AntflyPersistentMigrationLock();
+  const lock = new AntflyPersistentMigrationLock({ namespace: lockNamespace });
   const active = new Set<Promise<unknown>>();
   let closing: Promise<void> | undefined;
   const checkOpen = () => {
@@ -137,53 +185,68 @@ export function createAntflyPostgres<DB>(
     );
     return pending;
   };
+  const migrate = (
+    settings: AntflyPostgresMigrationOptions,
+    action: (migrator: Migrator) => Promise<MigrationResultSet>
+  ) =>
+    track(async () => {
+      const { lock: lockSettings, ...provided } = settings;
+      const props = {
+        ...provided,
+        migrationTableSchema: provided.migrationTableSchema ?? searchPath[0],
+      };
+      const runLock = new AntflyPersistentMigrationLock({
+        ...lockSettings,
+        namespace: lockNamespace,
+      });
+      // The outer claim covers bootstrap and Kysely's pre-lock bookkeeping too.
+      // This private adapter is used only inside the already-locked connection.
+      const migrationDb = makeDb({ acquire: async () => {}, release: async () => {} });
+      try {
+        return await migrationDb.connection().execute(async (connection) => {
+          await runLock.acquire(connection as Kysely<unknown>);
+          let result: MigrationResultSet;
+          try {
+            await prepareKyselyMigrationTables(connection, props);
+            result = await action(new Migrator({ db: connection, ...props }));
+          } catch (error) {
+            result = { error };
+          }
+          try {
+            await runLock.release(connection as Kysely<unknown>);
+          } catch (releaseError) {
+            return {
+              ...result,
+              error: result.error
+                ? Object.assign(new Error("Migration failed and claim release also failed"), {
+                    cause: result.error,
+                    releaseError,
+                  })
+                : releaseError,
+            };
+          }
+          return result;
+        });
+      } catch (error) {
+        return { error };
+      } finally {
+        await migrationDb.destroy();
+      }
+    });
   return {
     db,
     generateTypes: () =>
       track(async () =>
         generateKyselyTypes(await introspector.getTables(), {
           integerMode: "string",
+          searchPath,
           numericArrayMode: values === "exact" ? "string" : "number",
         })
       ),
-    migrateToLatest: (settings) =>
-      track(async () => {
-        const { lock: lockSettings, ...props } = settings;
-        const runLock = new AntflyPersistentMigrationLock(lockSettings);
-        // The outer claim covers bootstrap and Kysely's pre-lock bookkeeping too.
-        // This private adapter is used only inside the already-locked connection.
-        const migrationDb = makeDb({ acquire: async () => {}, release: async () => {} });
-        try {
-          return await migrationDb.connection().execute(async (connection) => {
-            await runLock.acquire(connection as Kysely<unknown>);
-            let result: MigrationResultSet;
-            try {
-              await prepareKyselyMigrationTables(connection, props);
-              result = await new Migrator({ db: connection, ...props }).migrateToLatest();
-            } catch (error) {
-              result = { error };
-            }
-            try {
-              await runLock.release(connection as Kysely<unknown>);
-            } catch (releaseError) {
-              return {
-                ...result,
-                error: result.error
-                  ? Object.assign(new Error("Migration failed and claim release also failed"), {
-                      cause: result.error,
-                      releaseError,
-                    })
-                  : releaseError,
-              };
-            }
-            return result;
-          });
-        } catch (error) {
-          return { error };
-        } finally {
-          await migrationDb.destroy();
-        }
-      }),
+    migrateToLatest: (settings) => migrate(settings, (migrator) => migrator.migrateToLatest()),
+    migrateUp: (settings) => migrate(settings, (migrator) => migrator.migrateUp()),
+    migrateDown: (settings) => migrate(settings, (migrator) => migrator.migrateDown()),
+    migrateTo: (target, settings) => migrate(settings, (migrator) => migrator.migrateTo(target)),
     inspectMigrationLock: () => track(() => lock.inspect(db as Kysely<unknown>)),
     recoverMigrationLock: (settings) => {
       checkOpen();

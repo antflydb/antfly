@@ -12,7 +12,7 @@ import {
 /** Share these options directly with Kysely's Migrator. */
 export type PrepareKyselyMigrationTablesOptions = Pick<
   MigratorProps,
-  "migrationTableName" | "migrationLockTableName"
+  "migrationTableName" | "migrationLockTableName" | "migrationTableSchema"
 >;
 
 /**
@@ -30,18 +30,30 @@ export async function prepareKyselyMigrationTables<DB>(
   if (!migrationTable || !lockTable || migrationTable === lockTable) {
     throw new TypeError("Migration and lock table names must be nonempty and distinct");
   }
-  const lockOptions: MigrationLockOptions = { lockTable, lockRowId: MIGRATION_LOCK_ID };
+  const lockOptions: MigrationLockOptions = {
+    lockTable,
+    lockRowId: MIGRATION_LOCK_ID,
+    ...(options.migrationTableSchema ? { lockTableSchema: options.migrationTableSchema } : {}),
+  };
   await db.connection().execute(async (connection) => {
     const adapter = connection.getExecutor().adapter;
     await adapter.acquireMigrationLock(connection, lockOptions);
     try {
-      await connection.schema
+      const schema = options.migrationTableSchema;
+      if (
+        schema &&
+        !(await connection.introspection.getSchemas()).some((entry) => entry.name === schema)
+      ) {
+        await connection.schema.createSchema(schema).ifNotExists().execute();
+      }
+      const builder = schema ? connection.schema.withSchema(schema) : connection.schema;
+      await builder
         .createTable(migrationTable)
         .ifNotExists()
         .addColumn("name", "text", (column) => column.notNull().primaryKey())
         .addColumn("timestamp", "text", (column) => column.notNull())
         .execute();
-      await connection.schema
+      await builder
         .createTable(lockTable)
         .ifNotExists()
         .addColumn("id", "text", (column) => column.notNull().primaryKey())

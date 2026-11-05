@@ -5,86 +5,148 @@ import type { ColumnMetadata, DatabaseIntrospector, TableMetadata } from "kysely
 import { DEFAULT_MIGRATION_LOCK_TABLE, DEFAULT_MIGRATION_TABLE } from "kysely/migration";
 import type { AntflyClient } from "./client.js";
 import { MIGRATION_CLAIMS_TABLE } from "./kysely-internals.js";
+import type { Table } from "./types.js";
 
 export interface AntflyColumnMetadata extends ColumnMetadata {
   /** Output-only generated column, unlike a default that callers can override. */
   isGeneratedAlways?: boolean;
 }
 
-/**
- * Introspect the HTTP API's default database/public namespace. Use the same
- * principal and database as the pg pool. This reads metadata, not table rows,
- * and does not create durable prepared-statement resources.
- */
+export type AntflyKyselyClient = Pick<AntflyClient, "tables" | "executeSQL"> &
+  Partial<Pick<AntflyClient, "api">>;
+
+export interface AntflyIntrospectorOptions {
+  database?: string;
+  /** Omit to enumerate every visible namespace in the database. */
+  namespaces?: readonly string[];
+}
+
+/** Read scoped HTTP catalog metadata and bounded, non-mutating SQL descriptions. */
 export function createAntflyIntrospector(
-  client: Pick<AntflyClient, "tables" | "executeSQL">
+  client: AntflyKyselyClient,
+  options: AntflyIntrospectorOptions = {}
 ): DatabaseIntrospector {
+  const database = options.database ?? "default";
+  const selected = options.namespaces ? [...options.namespaces] : undefined;
+  if (!client.api && (database !== "default" || selected?.some((name) => name !== "public"))) {
+    throw new TypeError("Scoped introspection requires the Antfly client's catalog API");
+  }
+  const schemas = async () => {
+    if (!client.api) return [{ name: "public" }];
+    const { data, response } = await client.api.GET("/db/v1/databases/{databaseName}/namespaces", {
+      params: { path: { databaseName: database } },
+    });
+    if (!response.ok || !data)
+      throw new Error(`Failed to list namespaces (HTTP ${response.status})`);
+    return data.map((entry) => ({ name: entry.name }));
+  };
   return {
-    async getSchemas() {
-      return [{ name: "public" }];
-    },
-    async getTables(options) {
-      const tables = await client.tables.list();
+    getSchemas: schemas,
+    async getTables(metadataOptions) {
       const result: TableMetadata[] = [];
-      for (const entry of tables) {
-        if (
-          !options?.withInternalKyselyTables &&
-          (entry.name === DEFAULT_MIGRATION_TABLE ||
-            entry.name === DEFAULT_MIGRATION_LOCK_TABLE ||
-            entry.name === MIGRATION_CLAIMS_TABLE)
-        )
-          continue;
-        const table = await client.tables.get(entry.name);
-        if (!table) throw new Error(`Missing Antfly metadata for ${JSON.stringify(entry.name)}`);
-        const schema = table.migration?.read_schema ?? table.schema;
-        const documents = Object.values(schema?.document_schemas ?? {}).map(
-          (document) =>
-            document.schema as
-              | {
-                  properties?: Record<string, { type?: string | string[]; nullable?: boolean }>;
-                  required?: string[];
-                }
-              | undefined
-        );
-        const described = await client.executeSQL({
-          statement: `SELECT * FROM "${entry.name.replace(/"/g, '""')}" LIMIT 0`,
-        });
-        const columns: AntflyColumnMetadata[] = described.columns.map((column) => {
-          return {
-            name: column.name,
-            dataType:
-              column.type === "array"
-                ? `${column.element_type ?? "unknown"}[]`
-                : (column.element_type ?? column.type),
-            isNullable:
-              column.name !== "_id" &&
-              (documents.length === 0 ||
-                documents.some((document) => {
-                  const property = document?.properties?.[column.name];
-                  // Missing fields become SQL NULL, even if explicit JSON null
-                  // is forbidden. A column must be required in every row type.
-                  return (
-                    !property ||
-                    !document?.required?.includes(column.name) ||
-                    property.nullable === true ||
-                    property?.type === "null" ||
-                    (Array.isArray(property?.type) && property.type.includes("null"))
-                  );
-                })),
-            isAutoIncrementing: false,
-            hasDefaultValue:
-              schema?.column_defaults?.some((value) => value.column === column.name) ?? false,
-            isGeneratedAlways:
-              schema?.generated_columns?.some((value) => value.column === column.name) ?? false,
-          };
-        });
-        result.push({
-          name: entry.name,
-          schema: "public",
-          isView: false,
-          isForeign: false,
-          columns,
-        });
+      const namespaces = selected ?? (await schemas()).map((schema) => schema.name);
+      for (const namespace of namespaces) {
+        const tables: { name: string }[] = [];
+        if (!client.api) tables.push(...(await client.tables.list()));
+        else {
+          let cursor: string | undefined;
+          const cursors = new Set<string>();
+          do {
+            const { data, response } = await client.api.GET(
+              "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables",
+              {
+                params: {
+                  path: { databaseName: database, namespaceName: namespace },
+                  query: { limit: 1000, cursor },
+                },
+              }
+            );
+            if (!response.ok || !data)
+              throw new Error(`Failed to list namespace tables (HTTP ${response.status})`);
+            tables.push(...data);
+            cursor = response.headers.get("X-Antfly-Next-Cursor") ?? undefined;
+            if (cursor && cursors.has(cursor))
+              throw new Error("Repeated namespace table pagination cursor");
+            if (cursor) cursors.add(cursor);
+          } while (cursor);
+        }
+        for (const entry of tables) {
+          if (
+            !metadataOptions?.withInternalKyselyTables &&
+            (entry.name === DEFAULT_MIGRATION_TABLE ||
+              entry.name === DEFAULT_MIGRATION_LOCK_TABLE ||
+              entry.name === MIGRATION_CLAIMS_TABLE)
+          )
+            continue;
+          let table: Table | undefined;
+          if (!client.api) table = await client.tables.get(entry.name);
+          else {
+            const { data, response } = await client.api.GET(
+              "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}",
+              {
+                params: {
+                  path: { databaseName: database, namespaceName: namespace, tableName: entry.name },
+                },
+              }
+            );
+            if (!response.ok)
+              throw new Error(`Failed to get namespace table (HTTP ${response.status})`);
+            table = data;
+          }
+          if (!table) throw new Error(`Missing Antfly metadata for ${JSON.stringify(entry.name)}`);
+          const schema = table.migration?.read_schema ?? table.schema;
+          const documents = Object.values(schema?.document_schemas ?? {}).map(
+            (document) =>
+              document.schema as
+                | {
+                    properties?: Record<string, { type?: string | string[]; nullable?: boolean }>;
+                    required?: string[];
+                  }
+                | undefined
+          );
+          const described = await client.executeSQL({
+            statement: `SELECT * FROM "${entry.name.replace(/"/g, '""')}" LIMIT 0`,
+            ...(client.api || database !== "default" || namespace !== "public"
+              ? { database, namespace }
+              : {}),
+          });
+          const columns: AntflyColumnMetadata[] = described.columns.map((column) => {
+            return {
+              name: column.name,
+              dataType:
+                column.type === "array"
+                  ? `${column.element_type ?? "unknown"}[]`
+                  : (column.element_type ?? column.type),
+              isNullable:
+                column.name !== "_id" &&
+                (documents.length === 0 ||
+                  documents.some((document) => {
+                    const property = document?.properties?.[column.name];
+                    // Missing fields become SQL NULL, even if explicit JSON null
+                    // is forbidden. A column must be required in every row type.
+                    return (
+                      !property ||
+                      !document?.required?.includes(column.name) ||
+                      property.nullable === true ||
+                      property?.type === "null" ||
+                      (Array.isArray(property?.type) && property.type.includes("null"))
+                    );
+                  })),
+              isAutoIncrementing: false,
+              hasDefaultValue:
+                schema?.column_defaults?.some((value) => value.column === column.name) ?? false,
+              isGeneratedAlways:
+                schema?.generated_columns?.some((value) => value.column === column.name) ?? false,
+            };
+          });
+          result.push({
+            name: entry.name,
+            schema: namespace,
+            isView: false,
+            isForeign: false,
+            columns,
+          });
+        }
       }
       return result;
     },
@@ -94,6 +156,8 @@ export function createAntflyIntrospector(
 export interface GenerateKyselyTypesOptions {
   /** Match the actual driver/parser configuration. No runtime conversion is performed. */
   integerMode: "bigint" | "string";
+  /** Emit qualified keys plus unqualified aliases following this ordered path. */
+  searchPath?: readonly string[];
   /** pg defaults to numbers for NUMERIC[]; use string with createAntflyPostgresTypes. */
   numericArrayMode?: "number" | "string";
 }
@@ -160,9 +224,29 @@ export function generateKyselyTypes(
   const imports = new Set<string>();
   let hasArrays = false;
   const names = new Set<string>();
-  for (const table of [...tables].sort((a, b) => a.name.localeCompare(b.name, "en"))) {
-    const name =
-      table.schema && table.schema !== "public" ? `${table.schema}.${table.name}` : table.name;
+  const entries: { table: TableMetadata; name: string }[] = [];
+  const ordered = [...tables].sort((a, b) =>
+    `${a.schema ?? "public"}.${a.name}`.localeCompare(`${b.schema ?? "public"}.${b.name}`, "en")
+  );
+  for (const table of ordered) {
+    const schema = table.schema ?? "public";
+    entries.push({
+      table,
+      name: options.searchPath || schema !== "public" ? `${schema}.${table.name}` : table.name,
+    });
+  }
+  if (options.searchPath) {
+    const aliases = new Set<string>();
+    for (const schema of options.searchPath) {
+      for (const table of ordered.filter((table) => (table.schema ?? "public") === schema)) {
+        if (!aliases.has(table.name)) {
+          aliases.add(table.name);
+          entries.push({ table, name: table.name });
+        }
+      }
+    }
+  }
+  for (const { table, name } of entries) {
     if (names.has(name)) throw new Error(`Duplicate table ${JSON.stringify(name)}`);
     names.add(name);
     lines.push(`  ${JSON.stringify(name)}: {`);
