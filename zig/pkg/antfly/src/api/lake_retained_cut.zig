@@ -98,7 +98,7 @@ fn leaseKey(identity: [32]u8, envelope: LeaseEnvelope) [32]u8 {
 fn stateKey(descriptor: Descriptor, identity: [32]u8) [32]u8 {
     // Hash the small immutable authority/recipe view. The accepted image has
     // its own authenticated head identity; do not encode its rows on a hit.
-    return @import("lake_wal_image.zig").digest(.{ .format = "retained-state-v3-native", .store = identity, .table = descriptor.table_id, .object_generation = descriptor.object_generation, .desired = descriptor.desired, .publication = descriptor.publication, .pending_identity = descriptor.pending.cut_identity orelse @import("lake_wal_image.zig").digest(descriptor.pending), .base_lsn = descriptor.pending.base_lsn, .lsn = descriptor.pending.lsn, .key_identity = descriptor.pending.key_identity, .catalog_metadata = if (descriptor.catalog_metadata) |value| .{ .version = value.version, .record_key = value.record_key, .metadata_location = value.metadata_location, .retirement_root = value.retirement_root, .metadata_json = if (value.version == null) value.metadata_json else null } else null, .published_only = descriptor.published_only, .recent = descriptor.recent, .recent_cloud = descriptor.recent_cloud, .recent_runs = descriptor.recent_runs });
+    return @import("lake_wal_image.zig").digest(.{ .format = "retained-state-v3-native", .store = identity, .table = descriptor.table_id, .object_generation = descriptor.object_generation, .desired = descriptor.desired, .publication = descriptor.publication, .pending_identity = descriptor.pending.cut_identity orelse @import("lake_wal_image.zig").digest(descriptor.pending), .base_lsn = descriptor.pending.base_lsn, .lsn = descriptor.pending.lsn, .catalog_metadata = if (descriptor.catalog_metadata) |value| .{ .version = value.version, .record_key = value.record_key, .metadata_location = value.metadata_location, .retirement_root = value.retirement_root, .metadata_json = if (value.version == null) value.metadata_json else null } else null, .published_only = descriptor.published_only, .recent = descriptor.recent, .recent_cloud = descriptor.recent_cloud, .recent_runs = descriptor.recent_runs });
 }
 fn upload(a: A, store: *stores.ArtifactStore, scope: stores.UploadScope, value: anytype, cancellation: Token) !StateRef {
     const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
@@ -154,7 +154,7 @@ fn saveReference(a: A, store: *stores.ArtifactStore, store_identity: catalog.Dig
             } else {
                 const flat = try pending.materialized(a);
                 for (flat.changes) |change| {
-                    const id = try ingestion.rowId(a, pending.key_fields, change.row, pending.key_identity);
+                    const id = try ingestion.rowId(a, pending.key_fields, change.row);
                     defer a.free(id);
                     const group = @import("lake_wal_image.zig").partition(id) >> 4;
                     present[group] = true;
@@ -166,7 +166,7 @@ fn saveReference(a: A, store: *stores.ArtifactStore, store_identity: catalog.Dig
                 if (!exists) continue;
                 var fingerprint: [32]u8 = undefined;
                 hash.final(&fingerprint);
-                const part_key = @import("lake_wal_image.zig").digest(.{ .format = "retained-row-group-v2-native", .cache_scope = cache_scope, .domain = scope.domain, .keys = pending.key_fields, .key_identity = pending.key_identity, .prefix = index, .content = fingerprint });
+                const part_key = @import("lake_wal_image.zig").digest(.{ .format = "retained-row-group-v2-native", .cache_scope = cache_scope, .domain = scope.domain, .keys = pending.key_fields, .prefix = index, .content = fingerprint });
                 const part = (if (cache) |memo| try memo.get(a, part_key, descriptor.expires_ms) else null) orelse new: {
                     const part_flight = if (cache) |memo| try memo.claim(part_key, io, cancellation) else null;
                     defer if (part_flight) |held| held.deinit();
@@ -306,7 +306,7 @@ fn readParts(a: A, store: *stores.ArtifactStore, state: *State, expected_domain:
                 bodies[i] = try running.await(io.?);
             }
             try cancellation.check();
-            const part = if (state.version == 2) try decodeChanges(a, bodies[i].?) else try std.json.parseFromSliceLeaky([]const ingestion.Batch.Change, a, bodies[i].?, .{ .allocate = .alloc_always });
+            const part = try decodeChanges(a, bodies[i].?);
             if (part.len > 65536 -| changes.items.len) return error.LakeOverlayTooLarge;
             try changes.appendSlice(a, part);
             std.heap.page_allocator.free(bodies[i].?);
@@ -344,9 +344,7 @@ const DecodedGroup = struct {
 const GroupLoader = struct {
     store: stores.ArtifactStore,
     ref: StateRef,
-    version: u8,
     keys: []const []const u8,
-    encoding: ingestion.KeyIdentity,
     cancellation: Token,
     fn decode(raw: *anyopaque, item: *local.serverless_query_lake_decoded_cache.Item) !void {
         const self: *@This() = @ptrCast(@alignCast(raw));
@@ -358,11 +356,11 @@ const GroupLoader = struct {
         defer backend.allocator.free(bytes);
         const a = item.arena.allocator();
         const value = try a.create(DecodedGroup);
-        value.* = .{ .changes = if (self.version == 2) try decodeChanges(a, bytes) else try std.json.parseFromSliceLeaky([]const ingestion.Batch.Change, a, bytes, .{ .allocate = .alloc_always }) };
+        value.* = .{ .changes = try decodeChanges(a, bytes) };
         if (value.changes.len > 65536) return error.LakeOverlayTooLarge;
         item.payload = .{ .extension = value };
         item.extension_deinit = DecodedGroup.close;
-        if (self.version == 2 and self.encoding == .canonical) value.image = try Image.fromBorrowedChanges(item.budget.allocator(), .{ .key_fields = self.keys, .lsn = 0, .changes = value.changes, .key_identity = .canonical });
+        value.image = try Image.fromBorrowedChanges(item.budget.allocator(), .{ .key_fields = self.keys, .lsn = 0, .changes = value.changes });
     }
 };
 fn readSharedParts(item: *local.serverless_query_lake_decoded_cache.Item, cache: *local.serverless_query_lake_decoded_cache.Cache, store: stores.ArtifactStore, state: *State, expected_domain: [32]u8, expiry: u64, token: Token, context: local.serverless_query_lake_read_context.Context) !?*Image {
@@ -374,7 +372,7 @@ fn readSharedParts(item: *local.serverless_query_lake_decoded_cache.Item, cache:
     const blocks = try a.alloc([]const ingestion.Batch.Change, state.change_parts.len);
     const view = try a.create(Image);
     view.* = .{ .a = a, .borrowed = true, .key_fields = state.pending.key_fields };
-    var complete_view = state.version == 2 and state.pending.key_identity == .canonical and state.change_parts.len != 0;
+    var complete_view = state.change_parts.len != 0;
     const scheduler = local.sql_parallel_scheduler;
     var rows: usize = 0;
     var retained_bytes: usize = 0;
@@ -394,8 +392,8 @@ fn readSharedParts(item: *local.serverless_query_lake_decoded_cache.Item, cache:
             try validateStateRef(part, expected_domain, expiry);
             try context.ensureActive();
             try token.check();
-            if (context.io) |io| tasks[i] = scheduler.global().submitIoTransient(io, groupLimit(part), acquireGroup, .{ cache, store, part, state.version, state.pending.key_fields, state.pending.key_identity, expected_domain, token, context });
-            if (tasks[i] == null) results[i] = try acquireGroup(cache, store, part, state.version, state.pending.key_fields, state.pending.key_identity, expected_domain, token, context);
+            if (context.io) |io| tasks[i] = scheduler.global().submitIoTransient(io, groupLimit(part), acquireGroup, .{ cache, store, part, state.pending.key_fields, expected_domain, token, context });
+            if (tasks[i] == null) results[i] = try acquireGroup(cache, store, part, state.pending.key_fields, expected_domain, token, context);
         }
         for (0..count) |i| {
             if (tasks[i]) |pending| {
@@ -436,9 +434,9 @@ fn readSharedParts(item: *local.serverless_query_lake_decoded_cache.Item, cache:
 fn groupLimit(part: StateRef) usize {
     return @min(64 * 1024 * 1024, @as(usize, part.bytes) *| 32 +| 1024 * 1024);
 }
-fn acquireGroup(cache: *local.serverless_query_lake_decoded_cache.Cache, store: stores.ArtifactStore, part: StateRef, version: u8, keys: []const []const u8, encoding: ingestion.KeyIdentity, expected_domain: [32]u8, token: Token, context: local.serverless_query_lake_read_context.Context) anyerror!local.serverless_query_lake_decoded_cache.Lease {
-    const key_ = @import("lake_wal_image.zig").digest(.{ .format = "decoded-retained-row-group-v1", .cache_scope = store.cacheScope(expected_domain), .domain = expected_domain, .version = version, .keys = keys, .encoding = encoding, .ref = part });
-    var loader: GroupLoader = .{ .store = store, .ref = part, .version = version, .keys = keys, .encoding = encoding, .cancellation = token };
+fn acquireGroup(cache: *local.serverless_query_lake_decoded_cache.Cache, store: stores.ArtifactStore, part: StateRef, keys: []const []const u8, expected_domain: [32]u8, token: Token, context: local.serverless_query_lake_read_context.Context) anyerror!local.serverless_query_lake_decoded_cache.Lease {
+    const key_ = @import("lake_wal_image.zig").digest(.{ .format = "decoded-retained-row-group-v1", .cache_scope = store.cacheScope(expected_domain), .domain = expected_domain, .keys = keys, .ref = part });
+    var loader: GroupLoader = .{ .store = store, .ref = part, .keys = keys, .cancellation = token };
     return cache.acquire(key_, groupLimit(part), context, .{ .ptr = &loader, .load = GroupLoader.decode }) catch |err| switch (err) {
         error.OutOfMemory, error.SqlMemoryLimitExceeded => private: {
             const value = try cache.create(256 * 1024 * 1024);
@@ -473,15 +471,15 @@ fn decodeState(a: A, store: *stores.ArtifactStore, ref: StateRef, expected_domai
     const body = try readRetained(store, ref, cancellation);
     defer store.allocator.free(body);
     var state = try std.json.parseFromSliceLeaky(State, a, body, .{ .allocate = .alloc_always });
-    if (state.version != 1 and state.version != 2) return error.InvalidQueryRequest;
+    if (state.version != 2) return error.InvalidQueryRequest;
     var retained_bytes: usize = body.len;
     for (state.change_parts) |part| {
         retained_bytes = std.math.add(usize, retained_bytes, part.bytes) catch return error.QueryCandidateBudgetExceeded;
         if (retained_bytes > max_bytes) return error.QueryCandidateBudgetExceeded;
     }
-    const image = if (groups) |owner| try readSharedParts(owner.item, owner.cache, store.*, &state, expected_domain, expiry, cancellation, owner.context) else legacy: {
+    const image = if (groups) |owner| try readSharedParts(owner.item, owner.cache, store.*, &state, expected_domain, expiry, cancellation, owner.context) else uncached: {
         try readParts(a, store, &state, expected_domain, expiry, cancellation, if (store.providerStore()) |object| object.cloud_io else null);
-        break :legacy null;
+        break :uncached null;
     };
     const overlay: ?@import("lake_search_overlay.zig").Overlay = if (image) |view| .{ .pending = state.pending, .rows = .{ .image = view }, .key_filter = "" } else if (state.pending.count() != 0) try @import("lake_search_overlay.zig").Overlay.init(a, state.pending) else null;
     return .{ .state = state, .overlay = overlay };
@@ -512,9 +510,7 @@ fn loadImpl(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, 
     const bytes = try readRetained(store, envelope, cancellation);
     defer store.allocator.free(bytes);
     const version = (try std.json.parseFromSliceLeaky(struct { version: u16 }, a, bytes, .{ .ignore_unknown_fields = true })).version;
-    const result: Descriptor = if (version == 1)
-        try std.json.parseFromSliceLeaky(Descriptor, a, bytes, .{ .allocate = .alloc_always })
-    else if (version == 2) modern: {
+    const result: Descriptor = if (version == 2) modern: {
         const lease = try std.json.parseFromSliceLeaky(LeaseEnvelope, a, bytes, .{ .allocate = .alloc_always });
         if (lease.expires_ms <= now or lease.expires_ms > now +| max_ttl_ms or lease.expires_ms != scope.fencingToken() or lease.table_id != table.table_id or lease.object_generation != table.object_storage_generation or !std.mem.eql(u8, &lease.desired, &catalog.desiredFingerprint(table))) return error.CatalogGenerationChanged;
         try validateStateRef(lease.state, expected_domain, lease.expires_ms);
@@ -534,8 +530,8 @@ fn loadImpl(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, 
             var checked = context;
             checked.checkpoint = .{ .ptr = &check, .check = Check.check };
             loader.context = checked;
-            // Cache admission is optional. Legacy JSON can need a larger
-            // bounded workspace than native values or cache residency allows.
+            // Cache admission is optional. A valid cut can need more bounded
+            // workspace than current shared cache residency allows.
             // Private items still use the cache's process-accounted allocator.
             held = memo.acquire(key, 64 * 1024 * 1024, checked, .{ .ptr = &loader, .load = StateLoader.decode }) catch |err| switch (err) {
                 error.OutOfMemory, error.SqlMemoryLimitExceeded => private: {
@@ -562,29 +558,12 @@ fn loadImpl(a: A, store: *stores.ArtifactStore, store_identity: catalog.Digest, 
     try result.publication.validate();
     try context.ensureActive();
     try cancellation.check();
-    if (version == 1 and result.pending.count() != 0) overlay = try @import("lake_search_overlay.zig").Overlay.init(a, result.pending);
     return .{ .descriptor = result, .overlay = overlay, .lease = held };
 }
 /// Bounded discovery over a dedicated domain; archive generations use a
 /// different domain and cannot be collected by this path.
 pub fn collect(store: *stores.ArtifactStore, table: u64, store_identity: catalog.Digest, now: u64, cancellation: @import("antfly_cancellation").CancellationToken) !void {
-    const Visitor = struct {
-        store: *stores.ArtifactStore,
-        now: u64,
-        deleted: usize = 0,
-        fn visit(raw: *anyopaque, scope: stores.UploadScope, artifact_id: []const u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            if (scope.fencingToken() +| 30_000 >= self.now) return;
-            if (self.deleted == 128) return error.RetainedCutCollectionBound;
-            try self.store.delete(artifact_id);
-            self.deleted += 1;
-        }
-    };
-    var visitor: Visitor = .{ .store = store, .now = now };
-    store.visitScopedUploads(domain(table, store_identity), .{ .ptr = &visitor, .visit = Visitor.visit, .fencing_cutoff = now -| 30_000, .max_entries = 128 }, cancellation) catch |err| switch (err) {
-        error.RetainedCutCollectionBound => {},
-        else => return err,
-    };
+    try @import("lake_cleanup_budget.zig").collectExpiredScopes(store, domain(table, store_identity), now -| 30_000, cancellation);
 }
 
 const CursorEnvelope = struct { version: u16 = 1, expires_ms: u64, payload: []const u8 };
@@ -649,7 +628,7 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
     const last = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"id\":1000,\"body\":\"last\"}", .{});
     const image = try images.Image.update(a, null, .{ .lsn = 8, .key_fields = &.{"id"}, .changes = &.{ .{ .op = .upsert, .row = first }, .{ .op = .upsert, .row = last } } });
     defer image.release();
-    var descriptor: Descriptor = .{ .expires_ms = now + ttl_ms, .table_id = 4, .object_generation = 0, .desired = catalog.desiredFingerprint(table), .publication = publication, .reader_token = @splat(5), .pending = .{ .lsn = 8, .cut_identity = @splat(1), .key_identity = .canonical, .key_fields = image.key_fields, .change_blocks = &image.blocks, .block_digests = &image.block_digests }, .published_only = false };
+    var descriptor: Descriptor = .{ .expires_ms = now + ttl_ms, .table_id = 4, .object_generation = 0, .desired = catalog.desiredFingerprint(table), .publication = publication, .reader_token = @splat(5), .pending = .{ .lsn = 8, .cut_identity = @splat(1), .key_fields = image.key_fields, .change_blocks = &image.blocks, .block_digests = &image.block_digests }, .published_only = false };
     var cache: Cache = .{ .budget = .{ .backing = a, .limit = 1024 * 1024 } };
     defer cache.deinit();
     const token = try saveCached(a, &artifacts, identity, std.testing.io, descriptor, .none, &cache);
@@ -756,7 +735,7 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
         const warm = try loadCached(sa, &artifacts, identity, fresh, table, now + 1, .none, &decoded, .{ .io = std.testing.io });
         defer warm.deinit();
         try std.testing.expect(cold.lease.?.item == warm.lease.?.item);
-        try std.testing.expect(cold.overlay.?.rows.local_rows.getEntry(try ingestion.rowId(sa, &.{"id"}, first, .canonical)).?.value_ptr == warm.overlay.?.rows.local_rows.getEntry(try ingestion.rowId(sa, &.{"id"}, first, .canonical)).?.value_ptr);
+        try std.testing.expect(cold.overlay.?.rows.local_rows.getEntry(try ingestion.rowId(sa, &.{"id"}, first)).?.value_ptr == warm.overlay.?.rows.local_rows.getEntry(try ingestion.rowId(sa, &.{"id"}, first)).?.value_ptr);
         try std.testing.expectEqual(descriptor.reader_token, warm.descriptor.reader_token);
         try std.testing.expectEqual(descriptor.expires_ms, warm.descriptor.expires_ms);
         try std.testing.expectError(error.DeadlineExceeded, loadCached(sa, &artifacts, identity, fresh, table, now + 1, .none, &decoded, .{ .deadline_ns = 1 }));
@@ -820,7 +799,7 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
         try std.testing.expectError(error.DeadlineExceeded, loadWithGroups(sa, &artifacts, identity, next_token, table, now + 1, .none, &states, &groups, .{ .deadline_ns = 1 }));
     }
     {
-        // Legacy issued cuts can exceed cache residency while remaining valid.
+        // Issued cuts can exceed cache residency while remaining valid.
         // The same image uses preallocated native values in new row groups.
         var wide_arena = std.heap.ArenaAllocator.init(a);
         defer wide_arena.deinit();
@@ -845,53 +824,52 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
         };
         try std.testing.expect(image_bytes < 16 * 1024 * 1024);
         var wide = descriptor;
-        wide.pending = .{ .lsn = 10, .cut_identity = @splat(77), .key_identity = .canonical, .key_fields = big.key_fields, .change_blocks = &big.blocks, .block_digests = &big.block_digests };
+        wide.pending = .{ .lsn = 10, .cut_identity = @splat(77), .key_fields = big.key_fields, .change_blocks = &big.blocks, .block_digests = &big.block_digests };
         var decoded: local.serverless_query_lake_decoded_cache.Cache = .{ .a = a };
         defer decoded.deinit();
         const native_token = try save(wa, &artifacts, identity, std.testing.io, wide, .none);
         const native_pin = try loadCached(wa, &artifacts, identity, native_token, table, now + 1, .none, &decoded, .{ .io = std.testing.io });
         defer native_pin.deinit();
-        try std.testing.expectEqual(@as(usize, 125000), native_pin.overlay.?.row(try ingestion.rowId(wa, &.{"id"}, row, .canonical)).?.object.get("payload").?.array.items.len);
+        try std.testing.expectEqual(@as(usize, 125000), native_pin.overlay.?.row(try ingestion.rowId(wa, &.{"id"}, row)).?.object.get("payload").?.array.items.len);
         try std.testing.expect(native_pin.lease.?.item.budget.live < 16 * 1024 * 1024);
         try std.testing.expect(native_pin.lease.?.item.cached);
-        // Fill residency with the pinned native cut. Whether the legacy JSON
-        // parser fits its workspace must not decide if this pressure test runs.
+        // Fill residency with a pinned cut, then decode an independent current
+        // state through the bounded private fallback.
         decoded.max_bytes = decoded.bytes;
         const native_envelope = try Read.envelope(wa, &artifacts, native_token);
-        var legacy_state = try Read.state(wa, &artifacts, native_envelope.state);
+        var private_state = try Read.state(wa, &artifacts, native_envelope.state);
         const scope = try stores.UploadScope.forPublication(domain(table.table_id, identity), now + payload_ttl_ms, std.testing.io);
-        legacy_state.version = 1;
-        legacy_state.change_parts = try wa.dupe(StateRef, &.{try upload(wa, &artifacts, scope, changes, .none)});
-        var legacy_envelope = native_envelope;
-        legacy_envelope.state = try upload(wa, &artifacts, scope, legacy_state, .none);
-        const legacy_ref = try upload(wa, &artifacts, try stores.UploadScope.forPublication(scope.domain, descriptor.expires_ms, std.testing.io), legacy_envelope, .none);
-        const legacy_token = try generations.encode(wa, prefix, .{ .artifact_id = @constCast(legacy_ref.id), .checksum = @constCast(try stores.sha256ChecksumFromArtifactId(legacy_ref.id)), .byte_len = legacy_ref.bytes, .provider_version = legacy_ref.generation });
-        const legacy_pin = try loadCached(wa, &artifacts, identity, legacy_token, table, now + 1, .none, &decoded, .{ .io = std.testing.io });
-        defer legacy_pin.deinit();
-        try std.testing.expectEqual(@as(usize, 1), legacy_pin.descriptor.pending.count());
-        try std.testing.expect(legacy_pin.lease.?.item != native_pin.lease.?.item);
-        try std.testing.expectEqual(@as(usize, 125000), legacy_pin.overlay.?.row(try ingestion.rowId(wa, &.{"id"}, row, .canonical)).?.object.get("payload").?.array.items.len);
-        try std.testing.expect(!legacy_pin.lease.?.item.cached);
+        private_state.pending.cut_identity = @splat(78);
+        var private_envelope = native_envelope;
+        private_envelope.state = try upload(wa, &artifacts, scope, private_state, .none);
+        const private_ref = try upload(wa, &artifacts, try stores.UploadScope.forPublication(scope.domain, descriptor.expires_ms, std.testing.io), private_envelope, .none);
+        const private_token = try generations.encode(wa, prefix, .{ .artifact_id = @constCast(private_ref.id), .checksum = @constCast(try stores.sha256ChecksumFromArtifactId(private_ref.id)), .byte_len = private_ref.bytes, .provider_version = private_ref.generation });
+        const private_pin = try loadCached(wa, &artifacts, identity, private_token, table, now + 1, .none, &decoded, .{ .io = std.testing.io });
+        defer private_pin.deinit();
+        try std.testing.expectEqual(@as(usize, 1), private_pin.descriptor.pending.count());
+        try std.testing.expect(private_pin.lease.?.item != native_pin.lease.?.item);
+        try std.testing.expectEqual(@as(usize, 125000), private_pin.overlay.?.row(try ingestion.rowId(wa, &.{"id"}, row)).?.object.get("payload").?.array.items.len);
+        try std.testing.expect(!private_pin.lease.?.item.cached);
         // The requested shared-decode reservation is 64 MiB. Reject it with
         // an explicit smaller limit to exercise the bounded private fallback,
         // independently of the parser's allocator-dependent peak footprint.
         decoded.max_loading_bytes = 32 * 1024 * 1024;
-        const constrained = try loadCached(wa, &artifacts, identity, legacy_token, table, now + 1, .none, &decoded, .{ .io = std.testing.io });
+        const constrained = try loadCached(wa, &artifacts, identity, private_token, table, now + 1, .none, &decoded, .{ .io = std.testing.io });
         defer constrained.deinit();
         try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), constrained.lease.?.item.budget.limit);
         try std.testing.expect(!constrained.lease.?.item.cached);
-        try std.testing.expect(constrained.lease.?.item != legacy_pin.lease.?.item);
+        try std.testing.expect(constrained.lease.?.item != private_pin.lease.?.item);
         try std.testing.expectEqual(@as(usize, 0), decoded.loading_bytes);
         try std.testing.expectEqual(@as(usize, 0), decoded.flights.count());
-        try std.testing.expectEqual(@as(usize, 125000), constrained.overlay.?.row(try ingestion.rowId(wa, &.{"id"}, row, .canonical)).?.object.get("payload").?.array.items.len);
+        try std.testing.expectEqual(@as(usize, 125000), constrained.overlay.?.row(try ingestion.rowId(wa, &.{"id"}, row)).?.object.get("payload").?.array.items.len);
         // Neither fallback may invalidate the original pinned native cut.
         try std.testing.expect(native_pin.lease.?.item.cached);
-        try std.testing.expectEqual(@as(usize, 125000), native_pin.overlay.?.row(try ingestion.rowId(wa, &.{"id"}, row, .canonical)).?.object.get("payload").?.array.items.len);
+        try std.testing.expectEqual(@as(usize, 125000), native_pin.overlay.?.row(try ingestion.rowId(wa, &.{"id"}, row)).?.object.get("payload").?.array.items.len);
     }
     const changed_row = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"id\":1000,\"body\":\"changed\"}", .{});
     const next = try images.Image.update(a, image, .{ .lsn = 9, .key_fields = image.key_fields, .changes = &.{.{ .op = .upsert, .row = changed_row }} });
     defer next.release();
-    descriptor.pending = .{ .lsn = 9, .cut_identity = @splat(2), .key_identity = .canonical, .key_fields = next.key_fields, .change_blocks = &next.blocks, .block_digests = &next.block_digests };
+    descriptor.pending = .{ .lsn = 9, .cut_identity = @splat(2), .key_fields = next.key_fields, .change_blocks = &next.blocks, .block_digests = &next.block_digests };
     const updated = try saveCached(a, &artifacts, identity, std.testing.io, descriptor, .none, &cache);
     defer a.free(updated);
     const updated_envelope = try Read.envelope(sa, &artifacts, updated);
@@ -902,12 +880,12 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
     };
     try std.testing.expectEqual(@as(usize, 1), reused);
     try std.testing.expectEqual(@as(u64, 8), cache.puts);
-    // A legacy descriptor retains its original JSON-array row IDs.
-    var legacy = descriptor;
-    const legacy_row = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"id\":-0.0,\"body\":\"legacy\"}", .{});
-    legacy.pending = .{ .lsn = 8, .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = legacy_row }} };
-    const legacy_ref = try upload(sa, &artifacts, try stores.UploadScope.forPublication(domain(4, identity), legacy.expires_ms, std.testing.io), legacy, .none);
-    const legacy_token = try generations.encode(sa, prefix, .{ .artifact_id = @constCast(legacy_ref.id), .checksum = @constCast(try stores.sha256ChecksumFromArtifactId(legacy_ref.id)), .byte_len = legacy_ref.bytes, .provider_version = legacy_ref.generation });
+    // Obsolete monolithic descriptor envelopes are rejected.
+    var obsolete = descriptor;
+    const obsolete_row = try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"id\":-0.0,\"body\":\"legacy\"}", .{});
+    obsolete.pending = .{ .lsn = 8, .key_fields = &.{"id"}, .changes = &.{.{ .op = .upsert, .row = obsolete_row }} };
+    const private_ref = try upload(sa, &artifacts, try stores.UploadScope.forPublication(domain(4, identity), obsolete.expires_ms, std.testing.io), obsolete, .none);
+    const private_token = try generations.encode(sa, prefix, .{ .artifact_id = @constCast(private_ref.id), .checksum = @constCast(try stores.sha256ChecksumFromArtifactId(private_ref.id)), .byte_len = private_ref.bytes, .provider_version = private_ref.generation });
     store.deinit();
     store_open = false;
     var reopened = try @import("lake_index_store.zig").Store.open(a, &config, null, false);
@@ -926,24 +904,14 @@ test "external lake bounded WAL retained cuts survive reopening and fence expira
     try std.testing.expectError(error.CatalogGenerationChanged, loadCursor(scratch, &reads, identity, cursor_token, now + ttl_ms, .none));
     const loaded = try load(scratch, &reads, identity, token, table, now + 1, .none);
     try std.testing.expectEqual(@as(u64, 8), loaded.pending.lsn);
-    try std.testing.expectEqual(ingestion.KeyIdentity.canonical, loaded.pending.key_identity);
     try std.testing.expectEqual(@as(usize, 2), loaded.pending.changes.len);
     const old_overlay = try @import("lake_search_overlay.zig").Overlay.init(scratch, loaded.pending);
-    const last_id = try ingestion.rowId(scratch, &.{"id"}, last, .canonical);
+    const last_id = try ingestion.rowId(scratch, &.{"id"}, last);
     try std.testing.expectEqualStrings("last", old_overlay.row(last_id).?.object.get("body").?.string);
     const latest = try load(scratch, &reads, identity, updated, table, now + 2, .none);
     const latest_overlay = try @import("lake_search_overlay.zig").Overlay.init(scratch, latest.pending);
     try std.testing.expectEqualStrings("changed", latest_overlay.row(last_id).?.object.get("body").?.string);
-    const recovered_legacy = try load(scratch, &reads, identity, legacy_token, table, now + 2, .none);
-    try std.testing.expectEqual(ingestion.KeyIdentity.legacy_json, recovered_legacy.pending.key_identity);
-    const legacy_overlay = try @import("lake_search_overlay.zig").Overlay.init(scratch, recovered_legacy.pending);
-    const legacy_id = try ingestion.rowId(scratch, &.{"id"}, legacy_row, .legacy_json);
-    const canonical_id = try ingestion.rowId(scratch, &.{"id"}, legacy_row, .canonical);
-    try std.testing.expect(!std.mem.eql(u8, legacy_id, canonical_id));
-    try std.testing.expectEqualStrings("legacy", legacy_overlay.row(legacy_id).?.object.get("body").?.string);
-    try std.testing.expect(legacy_overlay.row(canonical_id) == null);
-    const old_pending = try std.json.parseFromSliceLeaky(ingestion.Pending, scratch, "{\"lsn\":8,\"key_fields\":[\"id\"],\"changes\":[]}", .{});
-    try std.testing.expectEqual(ingestion.KeyIdentity.legacy_json, old_pending.key_identity);
+    try std.testing.expectError(error.InvalidQueryRequest, load(scratch, &reads, identity, private_token, table, now + 2, .none));
     // Expired envelopes can be collected while a later envelope still shares
     // their immutable state and row groups, including after process restart.
     try collect(&reads, 4, identity, now + ttl_ms + 30_001, .none);
@@ -974,3 +942,63 @@ test "external lake retained cursor cohorts preserve requested retention and max
     try std.testing.expectError(error.InvalidQueryRequest, cursorExpiry(now, 0));
     try std.testing.expectError(error.InvalidQueryRequest, cursorExpiry(now, max_ttl_ms + 1));
 }
+
+test "external lake vacuum cursor cleanup propagates cancellation into version deletion" {
+    var fixture: CollectionFixture = .{ .cancel_during_delete = true };
+    var store = fixture.store();
+    try std.testing.expectError(error.Canceled, collect(&store, 4, @splat(1), 100_000, @import("antfly_cancellation").CancellationToken.fromAtomic(&fixture.canceled)));
+    try std.testing.expectEqual(@as(usize, 0), fixture.deleted);
+    fixture.cancel_during_delete = false;
+    fixture.canceled.store(false, .release);
+    try collect(&store, 4, @splat(1), 100_000, @import("antfly_cancellation").CancellationToken.fromAtomic(&fixture.canceled));
+    try std.testing.expectEqual(@as(usize, 1), fixture.deleted);
+}
+
+test "external lake vacuum cursor cleanup yields normally at its enumeration bound" {
+    var fixture: CollectionFixture = .{ .entries = 129 };
+    var store = fixture.store();
+    try collect(&store, 4, @splat(1), 100_000, .none);
+    try std.testing.expectEqual(@as(usize, 128), fixture.deleted);
+}
+
+const CollectionFixture = struct {
+    entries: usize = 1,
+    deleted: usize = 0,
+    cancel_during_delete: bool = false,
+    canceled: std.atomic.Value(bool) = .init(false),
+    fn store(self: *@This()) stores.ArtifactStore {
+        return .{ .allocator = std.testing.allocator, .ptr = self, .vtable = &.{ .deinit = deinit, .put = put, .get_alloc = get, .get_range_alloc = range, .stat = stat, .delete = legacyDelete, .delete_with_cancellation = delete, .visit_scoped_uploads = visit } };
+    }
+    fn deinit(_: A, _: *anyopaque) void {}
+    fn put(_: *anyopaque, _: A, _: []const u8) !stores.ArtifactMetadata {
+        return error.TestUnexpectedResult;
+    }
+    fn get(_: *anyopaque, _: A, _: []const u8) ![]u8 {
+        return error.TestUnexpectedResult;
+    }
+    fn range(_: *anyopaque, _: A, _: []const u8, _: u64, _: usize) ![]u8 {
+        return error.TestUnexpectedResult;
+    }
+    fn stat(_: *anyopaque, _: A, _: []const u8) !stores.ArtifactMetadata {
+        return error.TestUnexpectedResult;
+    }
+    fn legacyDelete(_: *anyopaque, _: []const u8) !void {
+        return error.UncancelableDeletion;
+    }
+    fn delete(raw: *anyopaque, _: []const u8, token: @import("antfly_cancellation").CancellationToken) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.cancel_during_delete) self.canceled.store(true, .release);
+        try token.check();
+        self.deleted += 1;
+    }
+    fn visit(raw: *anyopaque, domain_: [32]u8, visitor: stores.ScopedUploadVisitor, token: @import("antfly_cancellation").CancellationToken) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const scope = try stores.UploadScope.forPublication(domain_, 1, std.testing.io);
+        const id = try scope.artifactId(&@as([64]u8, @splat('a')));
+        for (0..self.entries) |i| {
+            try token.check();
+            if (visitor.max_entries) |maximum| if (i == maximum) return error.ArtifactEnumerationPaused;
+            try visitor.visit(visitor.ptr, scope, &id);
+        }
+    }
+};

@@ -37,6 +37,10 @@ pub const Client = struct {
     vtable: *const VTable,
 
     pub const VTable = struct {
+        /// Provider state supports overlapping requests when its construction
+        /// allocator and each result allocator are also concurrency-safe.
+        /// Custom transports and in-memory implementations opt in explicitly.
+        supports_concurrent_requests: bool = false,
         supports_guarded_put: bool = false,
         put_at_revision: ?*const fn (*anyopaque, Allocator, []const u8, []const u8, []const u8, types.ObjectRevision, types.PutOptions) anyerror!types.PutResult = null,
         delete_at_revision: ?*const fn (*anyopaque, []const u8, []const u8, types.ObjectRevision, types.DeleteOptions) anyerror!void = null,

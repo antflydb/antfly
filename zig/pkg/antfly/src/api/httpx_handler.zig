@@ -2266,16 +2266,28 @@ pub const AntflyApiHandler = struct {
     }
 
     fn requestCancellation(ctx: *const httpx.Context) http_common.RequestCancellation {
-        return .{
-            .borrowed = ctx.cancellation,
-            .borrowed_context = if (ctx.cancellation_probe != null) ctx else null,
-            .borrowed_is_cancelled = if (ctx.cancellation_probe != null) struct {
-                fn call(raw: *const anyopaque) bool {
-                    const context: *const httpx.Context = @ptrCast(@alignCast(raw));
-                    return context.isCancellationRequested();
-                }
-            }.call else null,
+        const Control = struct {
+            fn probe(raw: *const anyopaque) bool {
+                check(raw) catch return true;
+                return false;
+            }
+            fn check(raw: *const anyopaque) !void {
+                const context: *const httpx.Context = @ptrCast(@alignCast(raw));
+                if (context.isCancellationRequested()) return error.Canceled;
+                // Keep the ingress clock: simulated executors and native
+                // owners need not share an absolute monotonic epoch.
+                const control: operation_contract.RequestContext = .{
+                    .deadline_ns = context.application_deadline_ns,
+                    .deadline_io = if (context.application_deadline_io) |io| @import("antfly_runtime_abi").io_abi.Borrow.init(&io) else null,
+                };
+                try control.ensureActive();
+            }
         };
+        return http_common.RequestCancellation.fromToken(.{
+            .ptr = ctx,
+            .is_cancelled_fn = Control.probe,
+            .check_fn = Control.check,
+        });
     }
 
     fn tableMutationContext(ctx: *httpx.Context, identity: *const ?AuthenticatedIdentity) operation_contract.RequestContext {
@@ -21200,6 +21212,108 @@ test "public execution deadlines use the ingress clock and preserve earlier boun
     try request.setHeader(limits.timeout_header, "0");
     try AntflyApiHandler.establishPublicExecutionDeadline(&ctx);
     try std.testing.expect(ctx.application_deadline_invalid);
+}
+
+test "public execution query cancellation preserves ingress deadline and clock" {
+    var sim = try @import("vopr").vopr_io.VoprIo.init(.{});
+    defer sim.deinit();
+    var request = try httpx.Request.init(std.testing.allocator, .POST, "http://node/db/v1/tables/docs/query");
+    defer request.deinit();
+    var ctx = httpx.Context.init(std.testing.allocator, sim.io(), &request);
+    defer ctx.deinit();
+    ctx.application_deadline_io = sim.io();
+    ctx.application_deadline_ns = 250 * std.time.ns_per_ms;
+    var cancellation = AntflyApiHandler.requestCancellation(&ctx);
+    // The ingress executor has a different epoch from native monotonic time.
+    try cancellation.token().check();
+    try std.testing.expect(!cancellation.isCancelled());
+    ctx.application_deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, cancellation.token().check());
+    try std.testing.expect(cancellation.isCancelled());
+    ctx.application_deadline_ns = null;
+    var listener = std.atomic.Value(bool).init(false);
+    ctx.cancellation = &listener;
+    cancellation = AntflyApiHandler.requestCancellation(&ctx);
+    try cancellation.token().check();
+    listener.store(true, .release);
+    try std.testing.expectError(error.Canceled, cancellation.token().check());
+}
+
+test "public execution query routes distinguish ingress expiry from client cancellation" {
+    const a = std.testing.allocator;
+    const Source = struct {
+        fn catalog(_: *anyopaque, _: std.mem.Allocator, context: operation_contract.RequestContext, _: @import("../system_catalog/server_call.zig").Call) ![]u8 {
+            try context.ensureActive();
+            return error.TestUnexpectedResult;
+        }
+    };
+    var unused: u8 = 0;
+    var server = ApiHttpServer.init(a, .{}, .{ .ptr = &unused, .vtable = &.{ .status = undefined, .system_catalog = Source.catalog } }, null, null);
+    defer server.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &server };
+    const Route = enum { table, global, ndjson, composed };
+    for ([_]Route{ .table, .global, .ndjson, .composed }) |route| {
+        for ([_]bool{ false, true }) |disconnected| {
+            var request = try httpx.Request.init(a, .POST, if (route == .global or route == .composed) "http://node/db/v1/query" else "http://node/db/v1/tables/docs/query");
+            defer request.deinit();
+            request.body = switch (route) {
+                .global => "{\"table\":\"docs\"}",
+                .composed => "{\"source\":{\"union\":[{\"table\":\"docs\"},{\"table\":\"docs\"}]},\"source_ranking\":\"rrf\"}",
+                else => "{}",
+            };
+            if (route == .ndjson) try request.setHeader("content-type", "application/x-ndjson");
+            var ctx = httpx.Context.init(a, std.testing.io, &request);
+            defer ctx.deinit();
+            var listener = std.atomic.Value(bool).init(disconnected);
+            ctx.cancellation = &listener;
+            // No socket has disconnected in the expiry case. Only the
+            // ingress budget ends, before native catalog admission begins.
+            if (!disconnected) ctx.application_deadline_ns = 0;
+            var response = if (route == .global or route == .composed) try handler.globalQuery(&ctx) else try handler.queryTable(&ctx, "docs");
+            defer response.deinit();
+            try std.testing.expectEqual(@as(u16, if (disconnected) 499 else 504), response.status.code);
+            if (!disconnected) {
+                var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+                defer parsed.deinit();
+                try std.testing.expectEqualStrings("query_timeout", parsed.value.object.get("code").?.string);
+                try std.testing.expect(parsed.value.object.get("retryable").?.bool);
+            }
+        }
+    }
+}
+
+test "public execution request cancellation retains foreign checkpoints without probing them" {
+    const abi = @import("antfly_runtime_abi");
+    const Foreign = struct {
+        fn dispatch(_: *const abi.native_abi.CallContract, _: *const anyopaque, _: *const anyopaque, _: ?*anyopaque) callconv(.c) abi.error_abi.Status {
+            return abi.error_abi.statusFromError(error.DeadlineExceeded);
+        }
+        fn forbidden(_: *const anyopaque) !void {
+            return error.TestUnexpectedResult;
+        }
+        fn probe(_: *const anyopaque) bool {
+            return false;
+        }
+    };
+    var state: u8 = 0;
+    var cancellation = http_common.RequestCancellation.fromToken(.{
+        .ptr = &state,
+        .is_cancelled_fn = Foreign.probe,
+        .check_fn = Foreign.forbidden,
+        .check_dispatch = Foreign.dispatch,
+    });
+    try std.testing.expect(!cancellation.isCancelled());
+    try std.testing.expectError(error.DeadlineExceeded, cancellation.token().check());
+    const operation: operation_contract.RequestContext = .{ .cancellation = cancellation.token() };
+    // A transport probe must not execute the fallible foreign checkpoint.
+    try std.testing.expect(!operation.isCancellationRequested());
+    const guard: @import("../serverless/api/http_types.zig").RequestGuard = .{ .context = operation };
+    try std.testing.expect(!guard.token().isCancelled());
+    try std.testing.expectError(error.DeadlineExceeded, guard.token().check());
+    try std.testing.expectError(error.DeadlineExceeded, operation.ensureActive());
+    cancellation.cancel();
+    try std.testing.expect(cancellation.isCancelled());
+    try std.testing.expectError(error.Canceled, cancellation.token().check());
 }
 
 test "public execution SQL budgets can only tighten engine limits" {

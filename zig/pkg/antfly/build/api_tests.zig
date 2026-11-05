@@ -187,6 +187,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api query contract serializes mention evidence hierarchy",
         "api query contract validates canonical hierarchy controls",
         "native member traversal requires producer and private parent admission",
+        "native member ancestry ignores payload source and unit identities",
+        "reshapeChunkBackedResult hydrates direct chunk ancestors",
         "native member parent admission uses exact source candidates",
         "native member value verification retains scan policy and work budgets",
         "native member verification preserves candidate provenance after native filtering",

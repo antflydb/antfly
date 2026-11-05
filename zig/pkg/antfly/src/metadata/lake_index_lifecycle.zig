@@ -45,9 +45,6 @@ pub const State = struct {
     generation: u64 = 0,
     namespace: ?catalog.Digest = null,
     stores: []const StoreBinding = &.{},
-    /// Uploads before this fence may have unleased rolling-upgrade readers.
-    /// They remain protected until an independent drain proof can retire them.
-    reader_upload_floor: ?u64 = null,
     current: ?u64 = null,
     pending: ?catalog.Attempt = null,
     checkpoint: ?catalog.Publication = null,
@@ -83,7 +80,6 @@ pub const State = struct {
             if (std.mem.allEqual(u8, &store.identity, 0)) return error.InvalidLakeIndexLifecycle;
             for (self.stores[0..index]) |other| if (std.mem.eql(u8, &store.identity, &other.identity)) return error.InvalidLakeIndexLifecycle;
         }
-        if (self.reader_upload_floor) |floor| if (floor == 0 or floor > self.generation) return error.InvalidLakeIndexLifecycle;
         if (self.namespace) |namespace| if (std.mem.allEqual(u8, &namespace, 0)) return error.InvalidLakeIndexLifecycle;
         if (self.checkpoint) |saved| {
             try saved.validate();
@@ -130,14 +126,6 @@ pub const State = struct {
         next.pending = catalog_state.pending;
         next.checkpoint = catalog_state.checkpoint;
         if (catalog_state.checkpoint) |saved| if (saved.store_locator) |locator| try next.retainStore(a, saved.signature.store, locator);
-        if (next.reader_upload_floor == null) {
-            if (catalog_state.pending) |pending| if (pending.reader_protocol >= 24) {
-                next.reader_upload_floor = pending.generation;
-            };
-            if (next.reader_upload_floor == null) if (catalog_state.published) |publication| if (publication.reader_protocol >= 24) {
-                next.reader_upload_floor = publication.generation;
-            };
-        }
         next.current = if (catalog_state.published) |publication| publication.generation else null;
         if (catalog_state.pending) |pending| if (pending.store_locator) |locator| try next.retainStore(a, pending.signature.store, locator);
         if (catalog_state.published) |publication| if (publication.store_locator) |locator| try next.retainStore(a, publication.signature.store, locator);
@@ -231,7 +219,7 @@ pub const State = struct {
         }
         var retired_generations: std.ArrayList(u64) = .empty;
         for (self.publications) |publication| {
-            if (publication.reader_protocol < 24 or !std.meta.eql(publication.namespace, self.namespace) or !std.mem.eql(u8, &publication.signature.store, &store) or self.current == publication.generation) continue;
+            if (!std.meta.eql(publication.namespace, self.namespace) or !std.mem.eql(u8, &publication.signature.store, &store) or self.current == publication.generation) continue;
             const protected = for (self.readers) |reader| {
                 if (reader.generation == publication.generation and reader.expires_ms +| grace_ms >= now) break true;
             } else false;
@@ -241,7 +229,7 @@ pub const State = struct {
         var next = try self.advance();
         var cutoff = if (self.pending) |pending| pending.generation else self.generation +| 1;
         if (self.checkpoint) |saved| cutoff = @min(cutoff, saved.generation);
-        next.collection = .{ .token = token, .store = store, .namespace = self.namespace, .expires_ms = std.math.add(u64, now, lease_ms) catch return error.InvalidLakeIndexLifecycle, .upload_cutoff = cutoff, .upload_floor = self.reader_upload_floor orelse cutoff, .retired = try retired_generations.toOwnedSlice(a) };
+        next.collection = .{ .token = token, .store = store, .namespace = self.namespace, .expires_ms = std.math.add(u64, now, lease_ms) catch return error.InvalidLakeIndexLifecycle, .upload_cutoff = cutoff, .upload_floor = 1, .retired = try retired_generations.toOwnedSlice(a) };
         try next.validate();
         return next;
     }
@@ -374,7 +362,7 @@ pub fn encode(a: A, state: State) ![]u8 {
 
 fn testPublication(generation: u64) catalog.Publication {
     return .{
-        .reader_protocol = 24,
+        .reader_protocol = catalog.native_reader_protocol,
         .generation = generation,
         .token = @splat(@intCast(generation)),
         .signature = .{ .desired = @splat(1), .source = @splat(2), .credentials = @splat(3), .store = @splat(4) },
@@ -430,22 +418,12 @@ test "external lake native collection preserves pending uploads and cannot switc
     try std.testing.expectError(error.LakeIndexCollectionStoreMismatch, state.beginCollection(a, @splat(6), @splat(5), state.collection.?.expires_ms));
 }
 
-test "external lake native collection protects unleased legacy upload generations during upgrade" {
+test "external lake native collection rejects obsolete reader authority" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
-    var legacy = testPublication(5);
-    legacy.reader_protocol = 0;
-    var state = try (State{}).synchronize(a, .{ .generation = 5, .published = legacy });
-    state = try state.synchronize(a, .{ .generation = 6, .published = legacy, .pending = .{ .reader_protocol = 24, .generation = 6, .token = @splat(6), .signature = legacy.signature, .started_at_ms = 1, .lease_expires_at_ms = 100 } });
-    state = try state.synchronize(a, .{ .generation = 6, .published = testPublication(6) });
-    state = try state.drop();
-    state = try state.beginCollection(a, @splat(7), @splat(4), 101);
-    try std.testing.expectEqual(@as(u64, 6), state.collection.?.upload_floor);
-    try std.testing.expectEqualSlices(u64, &.{6}, state.collection.?.retired);
-    state = try state.finishCollection(a, @splat(7), 102);
-    try std.testing.expectEqual(@as(usize, 1), state.publications.len);
-    try std.testing.expectEqual(@as(u64, 5), state.publications[0].generation);
+    var obsolete = testPublication(5);
+    obsolete.reader_protocol = 0;
+    try std.testing.expectError(error.InvalidLakeIndexCatalog, (State{}).synchronize(arena.allocator(), .{ .generation = 5, .published = obsolete }));
 }
 
 test "external lake collection retains failed upload stores through DROP and rotation" {

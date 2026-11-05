@@ -981,8 +981,7 @@ pub const Adapter = struct {
         final_ordered: bool = false,
         fn canceled(raw: *const anyopaque) bool {
             const self: *const @This() = @ptrCast(@alignCast(raw));
-            self.adapter.context.ensureActive() catch return true;
-            return false;
+            return self.adapter.context.isCancellationRequested();
         }
         fn next(raw: *anyopaque, a: std.mem.Allocator, maximum: u32) !?[]const @import("antfly_local_sources").sql_operators.GroupResult {
             const self: *@This() = @ptrCast(@alignCast(raw));
