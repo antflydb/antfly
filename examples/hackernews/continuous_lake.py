@@ -87,10 +87,56 @@ def distribution(values):
 
 
 def accepted_sql_versions(rows):
-    actual = {int(row[0]): int(row[1]) for row in rows}
-    if len(actual) != len(rows):
-        raise AssertionError("accepted SQL returned duplicate HN keys")
+    if not isinstance(rows, (list, tuple)):
+        raise AssertionError("accepted SQL returned invalid rows")
+    actual = {}
+    for row in rows:
+        if (
+            not isinstance(row, (list, tuple))
+            or len(row) != 2
+            or any(type(value) is not int for value in row)
+        ):
+            raise AssertionError("accepted SQL requires two integer columns")
+        key, version = row
+        if key in actual:
+            raise AssertionError("accepted SQL returned duplicate HN keys")
+        actual[key] = version
     return actual
+
+
+def search_versions(hits):
+    if not isinstance(hits, (list, tuple)):
+        raise AssertionError("query returned invalid hits")
+    actual = {}
+    for hit in hits:
+        row = hit.get("_source") if isinstance(hit, dict) else None
+        if not isinstance(row, dict) or any(
+            type(row.get(name)) is not (int if kind == "integer" else str)
+            for name, kind in KINDS.items()
+        ):
+            raise AssertionError("query returned an invalid typed row image")
+        key = row["hn_id"]
+        if key in actual:
+            raise AssertionError("query returned duplicate HN keys")
+        actual[key] = row["qual_version"]
+    return actual
+
+
+def qualification_result(args, checks, coverage):
+    checks = dict(checks)
+    for operation in ("update", "delete"):
+        for phase in ("acknowledged", "accepted_verified"):
+            checks[f"search_{operation}_{phase}"] = coverage[phase][operation] > 0
+    full_profile = (
+        args.history_commits >= 100
+        and args.burst_transactions >= 2
+        and args.duration_seconds >= 660
+    )
+    return {
+        "checks": checks,
+        "full_profile": full_profile,
+        "qualified": full_profile and all(value is True for value in checks.values()),
+    }
 
 
 def require_accepted_snapshot(baseline, intents, actual):
@@ -328,6 +374,9 @@ class Run:
         self.transactions = {name: [] for name in TABLES}
         self.expected = {}
         self.search_intents = []
+        self.search_mutations = []
+        self.latest_search_mutations = {}
+        self.verified_search_operations = set()
         self.known = {}
         self.catalog_seen = set()
         self.publication_seen = set()
@@ -619,23 +668,95 @@ class Run:
                         "pending transaction retained after cancellation"
                     ) from None
                 time.sleep(1)
-        if receipt.get("state") != "accepted" or not isinstance(
-            receipt.get("wal_lsn"), int
+        if (
+            receipt.get("state") != "accepted"
+            or type(receipt.get("wal_lsn")) is not int
+            or receipt["wal_lsn"] <= 0
         ):
             raise AssertionError("change request did not return a durable receipt")
         with self.lock:
             record.update(accepted=time.monotonic(), receipt=receipt)
             self.transactions[name].append(record)
             if name == TABLES[1]:
+                before = {
+                    change["row"]["hn_id"]: self.expected.get(change["row"]["hn_id"])
+                    for change in changes
+                }
                 for change in changes:
                     key = change["row"]["hn_id"]
                     if change["op"] == "delete":
                         self.expected.pop(key, None)
                     else:
                         self.expected[key] = dict(change["row"])
+                mutations = []
+                for key, prior in before.items():
+                    current = self.expected.get(key)
+                    if prior == current:
+                        continue
+                    # Classify the net atomic batch, excluding seed inserts,
+                    # missing-key deletes and intermediate delete/upsert pairs.
+                    self.latest_search_mutations.pop(key, None)
+                    if prior is None:
+                        continue
+                    mutation = {
+                        "operation": "delete" if current is None else "update",
+                        "hn_id": key,
+                        "qual_version": current["qual_version"] if current else None,
+                        "transaction": number,
+                        "wal_lsn": receipt["wal_lsn"],
+                        "accepted_at": record["accepted"],
+                    }
+                    mutations.append(mutation)
+                    self.search_mutations.append(mutation)
+                    self.latest_search_mutations[key] = mutation
+                record["search_mutations"] = mutations
         self.event("accepted", table=name, number=number, wal_lsn=receipt["wal_lsn"])
         (self.state / (name + "-pending.json")).unlink()
         return record
+
+    def search_churn_coverage(self):
+        with self.lock:
+            return {
+                "acknowledged": {
+                    operation: sum(
+                        m["operation"] == operation for m in self.search_mutations
+                    )
+                    for operation in ("update", "delete")
+                },
+                "accepted_verified": {
+                    operation: sum(
+                        m["operation"] == operation and "accepted_query_observed" in m
+                        for m in self.search_mutations
+                    )
+                    for operation in ("update", "delete")
+                },
+            }
+
+    def verify_search_churn(self, receipt):
+        with self.lock:
+            needs_witness = any(
+                m["operation"] not in self.verified_search_operations
+                for m in receipt["search_mutations"]
+            )
+        if not needs_witness:
+            return
+        # At most two successful extra reads: verify the first update and
+        # delete before this writer can supersede their row image.
+        try:
+            sample = self.query("accepted")
+        except RequestFailure as failure:
+            with self.lock:
+                self.samples.append(
+                    {
+                        "visibility": "accepted",
+                        "purpose": "search_churn_verification",
+                        "failure": failure.record,
+                    }
+                )
+            raise
+        sample["purpose"] = "search_churn_verification"
+        with self.lock:
+            self.samples.append(sample)
 
     def wait_coverage(self, name, lsn, limit=300):
         deadline = min(self.deadline, time.monotonic() + limit)
@@ -798,6 +919,11 @@ class Run:
                 if visibility == "accepted"
                 else None
             )
+            mutations = (
+                tuple(self.latest_search_mutations.values())
+                if baseline is not None
+                else ()
+            )
         body = {
             "full_text_search": {"match": "database", "field": "body"},
             "full_text_index": "body_text",
@@ -810,12 +936,11 @@ class Run:
         result = self.call("POST", f"/tables/{TABLES[1]}/query", body)["responses"][0]
         now = time.monotonic()
         hits = result["hits"]["hits"]
-        if len({int(hit["_source"]["hn_id"]) for hit in hits}) != len(hits):
-            raise AssertionError("query returned duplicate HN keys")
+        versions = search_versions(hits)
         with self.lock:
             for hit in hits:
                 row = hit["_source"]
-                key = (int(row["hn_id"]), int(row["qual_version"]))
+                key = (row["hn_id"], row["qual_version"])
                 known = self.known.get(key)
                 if known is None or any(
                     row.get(field) != known.get(field) for field in KINDS
@@ -836,16 +961,17 @@ class Run:
                 if baseline is not None
                 else ()
             )
-        versions = {
-            int(hit["_source"]["hn_id"]): int(hit["_source"]["qual_version"])
-            for hit in hits
-        }
         if baseline is not None:
             require_accepted_snapshot(baseline, intents, versions)
-        if self.anchor_id not in {int(hit["_source"]["hn_id"]) for hit in hits}:
+        if self.anchor_id not in versions:
             raise AssertionError("query lost the stable seed anchor")
         if hits and not all(h.get("_highlights", {}).get("body") for h in hits):
             raise AssertionError("query omitted requested highlights")
+        with self.lock:
+            for mutation in mutations:
+                if versions.get(mutation["hn_id"]) == mutation["qual_version"]:
+                    mutation.setdefault("accepted_query_observed", now)
+                    self.verified_search_operations.add(mutation["operation"])
         return {
             "row_versions": {str(key): version for key, version in versions.items()},
             "visibility": visibility,
@@ -947,7 +1073,8 @@ class Run:
                     if number % 5 == 0
                     else [{"op": "upsert", "row": row}]
                 )
-                self.transaction(TABLES[1], changes)
+                receipt = self.transaction(TABLES[1], changes)
+                self.verify_search_churn(receipt)
                 number += 1
                 self.stop.wait(self.args.update_interval)
 
@@ -1275,6 +1402,7 @@ class Run:
                 for item in self.metadata
                 if item["table"] == TABLES[0] and "manifest_count" in item
             ]
+            report["search_churn"] = self.search_churn_coverage()
             report["checks"] = {
                 "final_rows": bool(report.get("complete")),
                 "queries_succeeded": report["query_failures"] == 0
@@ -1310,13 +1438,10 @@ class Run:
                 if self.args.duration_seconds >= 660
                 else None,
             }
-            report["full_profile"] = (
-                self.args.history_commits >= 100
-                and self.args.burst_transactions >= 2
-                and self.args.duration_seconds >= 660
-            )
-            report["qualified"] = report["full_profile"] and all(
-                value is True for value in report["checks"].values()
+            report.update(
+                qualification_result(
+                    self.args, report["checks"], report["search_churn"]
+                )
             )
             atomic_json(self.state / "report.json", report)
             self.events.close()

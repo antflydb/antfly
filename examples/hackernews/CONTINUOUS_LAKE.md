@@ -138,3 +138,36 @@ with zero failures or leaks. Embedded and WAL each retained one expected opt-in
 skip. Python qualification/recovery/metrics passed 65 tests and 11 subtests.
 These local Debug checks do not replace current-source ReleaseFast provider,
 full-archive or Cloud qualification.
+
+
+## Logical churn and scalar verification
+
+A full qualification now requires actual acknowledged updates and deletes in
+`hn_search_churn`, with an accepted search verifying at least one of each after
+its ACK. Requested duration and vacuum object deletion alone cannot satisfy this
+coverage. `report.json` includes `search_churn.acknowledged` and
+`search_churn.accepted_verified` counts for `update` and `delete`; each search
+transaction retains its net `search_mutations`, receipt LSN, ACK time and, when
+verified, `accepted_query_observed` time. Seed inserts, missing-key deletes and
+intermediate operations within one atomic batch do not fabricate coverage.
+
+Each read captures the latest acknowledged mutations before sending the request.
+Only a complete, valid accepted result can verify those mutations. Published
+reads, reads started before the ACK, failed reads and superseded delete images
+cannot establish that evidence. The producer checks the first actual update and
+delete before superseding them, adding at most two successful accepted reads.
+These probes may overlap background queries; their samples are labeled
+`purpose: search_churn_verification` and included in query distributions.
+
+`full_profile` still describes the requested manifest/burst/duration profile;
+`qualified` additionally requires all observed checks. For example,
+`--max-updates 1` can complete but cannot qualify because no logical delete was
+exercised. A short smoke remains useful without satisfying full qualification.
+
+SQL verification requires exactly two integer columns without coercion. Strings,
+fractional or integral floats, booleans and malformed rows are rejected. Search
+images likewise require their declared integer/string field types; invalid
+numbers cannot be truncated into an expected identity or version. The follow-up
+passes 101 focused Python tests and 11 subtests. Earlier runs do not establish
+these stronger coverage/type checks retrospectively. Engine, provider and archive
+qualification remain separate from these harness regressions.
