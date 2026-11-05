@@ -277,7 +277,14 @@ pub const Collector = struct {
     }
     /// Borrow the selected families for one final encoding/projection.
     pub fn record(self: *const Collector, manifest: Manifest, hints: []const journal.TargetHint) journal.Record {
-        return .{ .version = manifest.version, .sequence = manifest.sequence, .target_hints = hints, .changed_doc_keys = self.lists[0].items, .deleted_doc_keys = self.lists[1].items, .overwritten_doc_keys = self.lists[2].items, .changed_artifact_keys = self.lists[3].items };
+        var result = self.recordAtSequence(manifest.sequence, hints);
+        result.version = manifest.version;
+        return result;
+    }
+    /// Normalized, ephemeral derived window; canonical records and versions
+    /// have already been independently authenticated/decoded before joining.
+    pub fn recordAtSequence(self: *const Collector, sequence: u64, hints: []const journal.TargetHint) journal.Record {
+        return .{ .sequence = sequence, .target_hints = hints, .changed_doc_keys = self.lists[0].items, .deleted_doc_keys = self.lists[1].items, .overwritten_doc_keys = self.lists[2].items, .changed_artifact_keys = self.lists[3].items };
     }
 };
 

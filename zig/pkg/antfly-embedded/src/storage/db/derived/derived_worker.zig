@@ -332,8 +332,10 @@ pub fn catchUpIndexFromMatchingCursor(
             if (monotonicTimeNs() >= deadline) return error.CatchUpDeadlineExceeded;
         }
         var builder = ReplayChunkBuilder.init(alloc, index_ref, options.resource_manager, options.max_chunk_bytes);
-        if (options.max_call_bytes != 0)
-            builder.max_chunk_bytes = @min(builder.max_chunk_bytes, options.max_call_bytes -| call_bytes);
+        if (options.max_call_bytes != 0) {
+            const remaining = options.max_call_bytes -| call_bytes;
+            builder.max_chunk_bytes = if (builder.max_chunk_bytes == 0) remaining else @min(builder.max_chunk_bytes, remaining);
+        }
         builder.max_items = options.max_items_per_window;
         const item_cap = if (fragments)
             if (options.max_collected_items_per_window == 0) options.max_fragment_families else @min(options.max_fragment_families, options.max_collected_items_per_window)
@@ -364,11 +366,17 @@ pub fn catchUpIndexFromMatchingCursor(
             collection_limit = 1;
         };
         var retry_stats = replay_source_mod.MatchingRecordStats{};
-        const seekable_slice = if (fragments) try replay_cursor.readFamilySliceWithBudget(scratch_alloc, index_ref.name, saved_fragment, options.max_fragment_families, options.max_chunk_bytes, options.target_sequence) else null;
+        const seekable_slice = if (fragments)
+            if (options.apply_fragment_fn != null)
+                try replay_cursor.readFamilyWindowWithBudget(scratch_alloc, index_ref.name, saved_fragment, options.max_fragment_families, builder.max_chunk_bytes, options.target_sequence, collection_limit)
+            else
+                try replay_cursor.readFamilySliceWithBudget(scratch_alloc, index_ref.name, saved_fragment, options.max_fragment_families, builder.max_chunk_bytes, options.target_sequence)
+        else
+            null;
         defer if (seekable_slice) |slice| scratch_alloc.free(slice.payload);
         const chunk_stats = if (seekable_slice) |slice| bounded: {
             try replayChunkConsumeRecord(&builder, slice.position.sequence, slice.payload);
-            break :bounded replay_source_mod.MatchingRecordStats{ .scan_batches = 1, .scanned_entries = 1, .matched_entries = 1, .last_sequence = slice.position.sequence };
+            break :bounded replay_source_mod.MatchingRecordStats{ .scan_batches = 1, .scanned_entries = slice.records, .matched_entries = slice.records, .last_sequence = slice.position.sequence };
         } else collect: while (true) {
             const collected = (if (fragments)
                 replay_cursor.forEachWholeRecordWindow(collection_limit, &builder, replayChunkConsumeRecord)

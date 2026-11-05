@@ -450,7 +450,18 @@ const ManualRuntime = struct {
             return err;
         };
         completed = true;
-        if (wait.replay_budget) |controller| controller.observePreparedWindow(lane, budget, replayWorkElapsedNs(wait, worker.kind.kind, started, waited_before, preparation_before) +| (if (fragments != null) stats.window_collect_ns else 0), if (wait.publication_overhead_ns) |counter| counter.load(.monotonic) -| waited_before else 0, stats.collection_budget_exhausted or stats.budgetWorkItems(fragments != null) >= budget.records, false);
+        if (wait.replay_budget) |controller| {
+            const preparation_ns = replayWorkElapsedNs(wait, worker.kind.kind, started, waited_before, preparation_before) +| (if (fragments != null) stats.window_collect_ns else 0);
+            // Native text profiles measure preparation directly. Amortize all
+            // remaining window cost, including staging outside writer leases.
+            const fixed_ns = if (fragments != null and wait.full_text_preparation_ns != null)
+                (@import("antfly_platform").time.monotonicNs() -| started) -| preparation_ns
+            else if (wait.publication_overhead_ns) |counter|
+                counter.load(.monotonic) -| waited_before
+            else
+                0;
+            controller.observePreparedWindow(lane, budget, preparation_ns, fixed_ns, stats.collection_budget_exhausted or stats.budgetWorkItems(fragments != null) >= budget.records, false);
+        }
         catch_up_open = false;
         return .{ .stats = stats, .token = token };
     }
@@ -1186,4 +1197,155 @@ test "manual replay coalesces complete records atomically and recovers before th
     try std.testing.expectEqual(@as(u64, 4), probe.scalar);
     try std.testing.expectEqual(@as(usize, 2), probe.publications);
     for (probe.seen) |count| try std.testing.expectEqual(@as(usize, 1), count);
+}
+
+test "manual replay canonical windows publish complete records and recover a lost mirror exactly once" {
+    @import("antfly_test_error_logs").expectErrorLogs(1);
+    const a = std.testing.allocator;
+    const fragment = @import("replay_fragment.zig");
+    const journal = @import("change_journal.zig");
+    const chunks = @import("replay_chunks.zig");
+    const references = @import("replay_reference.zig");
+    const keys_mod = @import("../../internal_keys.zig");
+    var backend = @import("../../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try @import("../../docstore.zig").DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var keys: [384][]const u8 = undefined;
+    for (&keys, 0..) |*key, i| key.* = try std.fmt.allocPrint(arena.allocator(), "doc-{d:0>4}", .{i});
+    for (0..4) |ordinal| {
+        const sequence = ordinal + 1;
+        const record: journal.Record = .{ .sequence = sequence, .changed_doc_keys = keys[ordinal * 96 ..][0..96], .target_hints = &.{.full_text} };
+        const payload = try journal.encodeRecord(a, record);
+        defer a.free(payload);
+        var prepared = (try chunks.prepare(a, record)).?;
+        defer prepared.deinit();
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.setReplayOpaque(sequence, payload);
+        const canonical = keys_mod.replayEntryKey(keys_mod.replay_all_kind, sequence);
+        const hint = keys_mod.replayEntryKey(@intCast(@backingInt(@as(journal.TargetHint, .full_text))), sequence);
+        try write.put(&canonical, &prepared.manifest.encode());
+        try write.put(&hint, &references.encodeReference(sequence, .full_text));
+        for (prepared.chunks, 0..) |raw, index| try write.put(&chunks.chunkKey(sequence, @intCast(index)), raw);
+        try write.commit();
+    }
+    const Probe = struct {
+        preparation_ns: std.atomic.Value(u64) = .init(0),
+        physical: ?fragment.Position = null,
+        scalar: u64 = 0,
+        seen: [384]u8 = @splat(0),
+        sizes: [2]usize = @splat(0),
+        publications: usize = 0,
+        fail_mirror: bool = true,
+        fn supports(_: *anyopaque, _: []const u8) !bool {
+            return true;
+        }
+        fn load(ptr: *anyopaque, _: []const u8) !?fragment.Position {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).physical;
+        }
+        fn save(ptr: *anyopaque, _: []const u8, position: fragment.Position) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualDeep(self.physical.?, position);
+            if (self.fail_mirror) {
+                self.fail_mirror = false;
+                return error.TestFragmentPersistFailure;
+            }
+        }
+        fn ordinary(_: *anyopaque, _: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken) !bool {
+            return error.UnexpectedNonAtomicPublication;
+        }
+        fn publish(ptr: *anyopaque, batch: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, proposed: fragment.Position) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.publications >= self.sizes.len) return error.UnexpectedExtraPublication;
+            self.sizes[self.publications] = batch.documents.len;
+            self.publications += 1;
+            for (batch.documents) |doc| self.seen[try std.fmt.parseInt(usize, doc.key[4..], 10)] += 1;
+            var position = proposed;
+            position.applied = true;
+            self.physical = position;
+            return true;
+        }
+        fn persist(ptr: *anyopaque, _: []const u8, sequence: u64, _: bool) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.scalar = sequence;
+            return true;
+        }
+        fn truncate(_: *anyopaque, _: u64) !void {}
+    };
+    var probe: Probe = .{};
+    var budget: @import("replay_budget.zig").Controller = .{};
+    budget.lanes[0].records = 192;
+    const wait: VisibilityWait = .{ .replay_budget = &budget, .replay_record_cap = 192, .full_text_preparation_ns = &probe.preparation_ns, .fragments = .{ .ptr = &probe, .supports = Probe.supports, .apply = Probe.publish, .load = Probe.load, .save = Probe.save } };
+    const source = replay_source_mod.Source.fromPrimaryStore(&store, null, null);
+    {
+        var executor = try initManual(a, source, &probe, Probe.ordinary, Probe.persist, Probe.truncate, null, null, null, null, null);
+        defer executor.deinit(a);
+        try executor.addWorker("text", .{ .name = "text", .kind = .full_text }, 0);
+        try std.testing.expectError(error.TestFragmentPersistFailure, executor.waitForAllWithVisibilityWait(4, wait));
+        try std.testing.expectEqual(@as(u64, 2), probe.physical.?.sequence);
+        try std.testing.expectEqual(@as(u64, 96), probe.physical.?.next_item);
+        try std.testing.expectEqual(@as(u64, 96), probe.physical.?.total_items);
+        try std.testing.expectEqual(@as(u64, 0), probe.scalar);
+    }
+    var replacement = try initManual(a, source, &probe, Probe.ordinary, Probe.persist, Probe.truncate, null, null, null, null, null);
+    defer replacement.deinit(a);
+    try replacement.addWorker("text", .{ .name = "text", .kind = .full_text }, 0);
+    for (0..4) |_| if (probe.scalar < 4) try replacement.waitForAllWithVisibilityWait(4, wait);
+    try std.testing.expectEqual(@as(u64, 4), probe.scalar);
+    try std.testing.expectEqual(@as(usize, 2), probe.publications);
+    try std.testing.expectEqualDeep([_]usize{ 192, 192 }, probe.sizes);
+    for (probe.seen) |seen| try std.testing.expectEqual(@as(u8, 1), seen);
+}
+
+test "manual replay feedback amortizes fixed publication work outside writer leases" {
+    const a = std.testing.allocator;
+    const fragment = @import("replay_fragment.zig");
+    var backend = @import("../../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try @import("../../docstore.zig").DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const payload = try @import("change_journal.zig").encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{"doc"}, .target_hints = &.{.full_text} });
+    defer a.free(payload);
+    try store.appendReplayOpaque(a, 1, payload);
+    const Probe = struct {
+        preparation: std.atomic.Value(u64) = .init(0),
+        lease_time: std.atomic.Value(u64) = .init(0),
+        saved: ?fragment.Position = null,
+        fn supports(_: *anyopaque, _: []const u8) !bool {
+            return true;
+        }
+        fn load(ptr: *anyopaque, _: []const u8) !?fragment.Position {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).saved;
+        }
+        fn save(_: *anyopaque, _: []const u8, _: fragment.Position) !void {}
+        fn ordinary(_: *anyopaque, _: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken) !bool {
+            return error.UnexpectedNonAtomicPublication;
+        }
+        fn publish(ptr: *anyopaque, _: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, proposed: fragment.Position) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.preparation.fetchAdd(std.time.ns_per_ms, .monotonic);
+            // Artifact staging/sync outside a writer lease still costs one
+            // fixed interval per publication. Its lease counter stays zero.
+            try std.testing.io.sleep(.fromMilliseconds(60), .awake);
+            var position = proposed;
+            position.applied = true;
+            self.saved = position;
+            return true;
+        }
+        fn persist(_: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+            return true;
+        }
+        fn truncate(_: *anyopaque, _: u64) !void {}
+    };
+    var probe: Probe = .{};
+    var budget: @import("replay_budget.zig").Controller = .{};
+    var executor = try initManual(a, replay_source_mod.Source.fromPrimaryStore(&store, null, null), &probe, Probe.ordinary, Probe.persist, Probe.truncate, null, null, null, null, null);
+    defer executor.deinit(a);
+    try executor.addWorker("text", .{ .name = "text", .kind = .full_text }, 0);
+    try executor.waitForAllWithVisibilityWait(1, .{ .replay_budget = &budget, .full_text_preparation_ns = &probe.preparation, .publication_overhead_ns = &probe.lease_time, .fragments = .{ .ptr = &probe, .supports = Probe.supports, .apply = Probe.publish, .load = Probe.load, .save = Probe.save } });
+    try std.testing.expectEqual(@as(u64, 0), probe.lease_time.load(.monotonic));
+    try std.testing.expect(budget.snapshot().effective_quantum_ns[0] > @import("replay_budget.zig").Controller.quantum_ns);
 }

@@ -87,7 +87,7 @@ pub const MatchingCursor = struct {
         self.* = undefined;
     }
 
-    pub const FamilySlice = struct { payload: []u8, position: replay_fragment.Position, families: usize, budget_exhausted: bool };
+    pub const FamilySlice = struct { payload: []u8, position: replay_fragment.Position, families: usize, budget_exhausted: bool, records: usize = 1 };
 
     pub fn readFamilySlice(self: *MatchingCursor, a: Allocator, index_name: []const u8, saved: ?replay_fragment.Position, max_families: usize, target_sequence: u64) !?FamilySlice {
         return self.readFamilySliceWithBudget(a, index_name, saved, max_families, 0, target_sequence);
@@ -98,6 +98,52 @@ pub const MatchingCursor = struct {
     /// One oversized family may progress alone; every family's effects stay together.
     /// Null preserves the portable/legacy record iterator.
     pub fn readFamilySliceWithBudget(self: *MatchingCursor, a: Allocator, index_name: []const u8, saved: ?replay_fragment.Position, max_families: usize, max_payload_bytes: u64, target_sequence: u64) !?FamilySlice {
+        return self.readFamilySlicePart(a, index_name, saved, max_families, max_payload_bytes, target_sequence, true, false);
+    }
+
+    /// Coalesce complete canonical records under one atomic publication.
+    /// Unfinished continuations remain isolated, including scan-only no-ops:
+    /// their existing witness must complete before changing record identity.
+    pub fn readFamilyWindowWithBudget(self: *MatchingCursor, a: Allocator, index_name: []const u8, saved: ?replay_fragment.Position, max_families: usize, max_payload_bytes: u64, target_sequence: u64, max_records: usize) !?FamilySlice {
+        var result = (try self.readFamilySlicePart(a, index_name, saved, max_families, max_payload_bytes, target_sequence, true, false)) orelse return null;
+        errdefer a.free(result.payload);
+        if (max_records != 0 and result.records >= max_records) result.budget_exhausted = true;
+        if (result.budget_exhausted or result.position.next_item != result.position.total_items or
+            (if (saved) |position| position.next_item != position.total_items else false)) return result;
+        var collected = replay_chunks.Collector.init(a);
+        defer collected.deinit();
+        try collected.append(result.payload);
+        var bytes: u64 = result.payload.len;
+        while (result.families < max_families and (max_payload_bytes == 0 or bytes < max_payload_bytes)) {
+            const slice = (self.readFamilySlicePart(a, index_name, null, max_families - result.families, if (max_payload_bytes == 0) 0 else max_payload_bytes - bytes, target_sequence, false, true) catch |err| switch (err) {
+                error.ReplayWindowFull => {
+                    result.budget_exhausted = true;
+                    break;
+                },
+                else => return err,
+            }) orelse break;
+            defer a.free(slice.payload);
+            try collected.append(slice.payload);
+            bytes +|= slice.payload.len;
+            result.families += slice.families;
+            result.records += 1;
+            result.position = slice.position;
+            result.budget_exhausted = slice.budget_exhausted or result.families == max_families or (max_payload_bytes != 0 and bytes >= max_payload_bytes) or (max_records != 0 and result.records >= max_records);
+            if (result.budget_exhausted or result.position.next_item != result.position.total_items) break;
+        }
+        if (result.records != 1) {
+            const hints = [_]TargetHint{switch (self.state) {
+                .journal => unreachable,
+                .primary_store => |cursor| cursor.hint,
+            }};
+            const payload = try replay_reference.encodeForHint(a, collected.recordAtSequence(result.position.sequence, &hints), hints[0]);
+            a.free(result.payload);
+            result.payload = payload;
+        }
+        return result;
+    }
+
+    fn readFamilySlicePart(self: *MatchingCursor, a: Allocator, index_name: []const u8, saved: ?replay_fragment.Position, max_families: usize, max_payload_bytes: u64, target_sequence: u64, allow_oversized_family: bool, require_complete: bool) !?FamilySlice {
         if (max_families == 0) return error.InvalidArgument;
         const cursor = switch (self.state) {
             .journal => return null,
@@ -121,6 +167,9 @@ pub const MatchingCursor = struct {
             if (cursor.fallback_all) return null;
             return error.InvalidReplayChunk;
         }
+        // Look ahead only at the manifest when another whole record cannot
+        // fit. Do not reconstruct its chunks or invent a combined partial ID.
+        if (require_complete and manifest.families > max_families) return error.ReplayWindowFull;
         const fingerprint = manifest.fingerprint(index_name);
         var start: u64 = 0;
         var applied = false;
@@ -158,6 +207,9 @@ pub const MatchingCursor = struct {
                     a.free(slice.payload);
                     slice = smaller;
                 }
+                // The oversized-family exception belongs to an empty window,
+                // never to a later record following already collected work.
+                if (families == 0 and slice.payload.len > max_payload_bytes and !allow_oversized_family) return error.ReplayWindowFull;
             }
             if (slice.families == 0) return error.InvalidReplayChunk;
             try collected.append(slice.payload);
@@ -167,6 +219,7 @@ pub const MatchingCursor = struct {
             if (next > manifest.families) return error.InvalidReplayChunk;
             if (max_payload_bytes != 0 and bytes >= max_payload_bytes) break;
         }
+        if (require_complete and next != manifest.families) return error.ReplayWindowFull;
         const hints = [_]TargetHint{cursor.hint};
         const payload = try replay_reference.encodeForHint(a, collected.record(manifest, &hints), cursor.hint);
         errdefer a.free(payload);
@@ -2018,4 +2071,70 @@ test "replay source whole record windows leave chunked lookahead unhydrated" {
     try std.testing.expectEqual(@as(usize, 1), stats.matched_entries);
     try std.testing.expectEqual(@as(u64, 1), stats.last_sequence);
     try std.testing.expectError(error.NotFound, cursor.readFamilySlice(a, "text", null, 64, 0));
+}
+
+test "seekable replay window keeps a later oversized family out of a nonempty publication" {
+    const a = std.testing.allocator;
+    var backend = mem_backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var keys: [96][]const u8 = undefined;
+    for (&keys, 0..) |*key, i| key.* = try std.fmt.allocPrint(arena.allocator(), "z-{d:0>4}", .{i});
+    for (1..5) |sequence| {
+        if (sequence == 2) {
+            const huge = try arena.allocator().alloc(u8, 64 * 1024);
+            @memset(huge, 'a');
+            keys[0] = huge;
+        } else if (sequence == 3) keys[0] = "z-0000";
+        const record: change_journal_mod.Record = .{ .sequence = sequence, .changed_doc_keys = &keys, .target_hints = &.{.full_text} };
+        const encoded = try change_journal_mod.encodeRecord(a, record);
+        defer a.free(encoded);
+        var prepared = (try replay_chunks.prepare(a, record)).?;
+        defer prepared.deinit();
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.setReplayOpaque(sequence, encoded);
+        try write.put(&internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence), &prepared.manifest.encode());
+        try write.put(&internal_keys.replayEntryKey(@intCast(@backingInt(@as(TargetHint, .full_text))), sequence), &replay_reference.encodeReference(sequence, .full_text));
+        for (prepared.chunks, 0..) |raw, ordinal| try write.put(&replay_chunks.chunkKey(sequence, @intCast(ordinal)), raw);
+        try write.commit();
+    }
+    var source = Source.fromPrimaryStore(&store, null, null);
+    var cursor = try source.openMatchingCursor(a, 0, .full_text);
+    defer cursor.deinit(a);
+    const first = (try cursor.readFamilyWindowWithBudget(a, "text", null, 192, 4096, 0, 0)).?;
+    defer a.free(first.payload);
+    try std.testing.expectEqual(@as(u64, 1), first.position.sequence);
+    try std.testing.expectEqual(first.position.total_items, first.position.next_item);
+    try std.testing.expectEqual(@as(usize, 96), first.families);
+    try std.testing.expect(first.payload.len <= 4096 and first.budget_exhausted);
+    const second = (try cursor.readFamilyWindowWithBudget(a, "text", null, 192, 4096, 0, 0)).?;
+    defer a.free(second.payload);
+    try std.testing.expectEqual(@as(u64, 2), second.position.sequence);
+    try std.testing.expectEqual(@as(usize, 1), second.families);
+    try std.testing.expectEqual(@as(u64, 1), second.position.next_item);
+    try std.testing.expect(second.payload.len > 4096 and second.budget_exhausted);
+    const tail = (try cursor.readFamilyWindowWithBudget(a, "text", second.position, 192, 4096, 0, 0)).?;
+    defer a.free(tail.payload);
+    try std.testing.expectEqual(@as(usize, 95), tail.families);
+    try std.testing.expectEqual(@as(u64, 2), tail.position.sequence);
+    try std.testing.expectEqual(@as(usize, 1), tail.records);
+    try std.testing.expectEqual(tail.position.total_items, tail.position.next_item);
+    // A continuation completes its own identity, even when the following
+    // whole record would fit. This also preserves scan-only no-op witnesses.
+    const following = (try cursor.readFamilyWindowWithBudget(a, "text", null, 192, 4096, 0, 1)).?;
+    defer a.free(following.payload);
+    try std.testing.expectEqual(@as(u64, 3), following.position.sequence);
+    try std.testing.expectEqual(@as(usize, 96), following.families);
+    try std.testing.expectEqual(@as(usize, 1), following.records);
+    try std.testing.expect(following.budget_exhausted);
+    // Record count is an independent cap, even when another record fits both
+    // the family and byte budgets.
+    const last = (try cursor.readFamilyWindowWithBudget(a, "text", null, 192, 4096, 0, 0)).?;
+    defer a.free(last.payload);
+    try std.testing.expectEqual(@as(u64, 4), last.position.sequence);
+    try std.testing.expectEqual(@as(usize, 96), last.families);
 }

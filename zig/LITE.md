@@ -1412,13 +1412,17 @@ as workerless replay. Their budgets bound complete document families within a
 large journal record. A replacement worker loads the durable continuation;
 neither partial index output nor a failed continuation write advances the
 complete-record watermark or releases that record's retention credits. Complete
-small records share one atomic window, bounded by effect count and payload bytes.
-A chunked lookahead remains unhydrated for the next seekable window; unfinished
-record continuations retain their individual fingerprint and offset. A durable
+records share one atomic window, bounded by family/effect count and payload
+bytes. Seekable canonical records can share a window when each additional
+record fits completely; a manifest that cannot fit remains unhydrated. An
+unfinished record completes under its own fingerprint and offset before another
+record can join, preserving scan-only no-op recovery witnesses too. A durable
 complete-window receipt recovers progress even if its coarse metadata mirror
 fails, without publishing the window twice.
 Native text-window sizing measures document collection, projection and segment
-preparation directly. Cursor setup, capacity waits, publication and continuation
+preparation directly. Its bounded publication-cost feedback includes the entire
+remaining window interval, including staging and sync outside writer leases;
+lease timing alone omits those fixed costs. Cursor setup, capacity waits, publication and continuation
 sync remain fixed service costs, rather than reasons to shrink cheap preparation
 windows. The call still obeys its wall-clock yield and cancellation checks, and
 memory failures and allocator-retention pressure retain their existing bounds.
