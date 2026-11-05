@@ -35,7 +35,7 @@ const DirectoryKey = [@sizeOf(DocumentScope) + 33]u8;
 
 fn documentScope(root: u128, authority: publication.Authority, document: []const u8) !DocumentScope {
     if (root == 0) return error.DurableRootIncarnationUnavailable;
-    if (document.len == 0 or document.len > max_document_identity_bytes) return error.InvalidBatchRequest;
+    if (document.len > max_document_identity_bytes) return error.InvalidBatchRequest;
     var result: DocumentScope = undefined;
     @memcpy(result[0..directory_prefix.len], directory_prefix);
     @memcpy(result[directory_prefix.len..][0..24], &authority.namespace);
@@ -303,7 +303,7 @@ pub const Job = struct {
     fn encodeAlloc(self: Job, alloc: std.mem.Allocator, selected: JobKey) ![]u8 {
         var size: usize = 80;
         for ([_][]const u8{ self.document, self.child, self.unit }, 0..) |name, i| {
-            if (name.len == 0 or name.len > (if (i == 1) max_identity_bytes else max_document_identity_bytes)) return error.ResourceBudgetExceeded;
+            if ((i != 0 and name.len == 0) or name.len > (if (i == 1) max_identity_bytes else max_document_identity_bytes)) return error.ResourceBudgetExceeded;
             size += name.len;
         }
         const raw = try alloc.alloc(u8, size);
@@ -321,13 +321,13 @@ pub const Job = struct {
 
     /// Borrowed identities, bound to the root/scope, generation and unit key.
     pub fn decode(selected: JobKey, raw: []const u8) !Job {
-        if (raw.len < 83 or raw.len > max_job_bytes or !std.mem.eql(u8, raw[0..4], "AUJ1") or
+        if (raw.len < 82 or raw.len > max_job_bytes or !std.mem.eql(u8, raw[0..4], "AUJ1") or
             !std.mem.eql(u8, raw[raw.len - 32 ..], &checksum(&selected, raw[0 .. raw.len - 32]))) return error.ArtifactCatalogCorrupt;
         var names: [3][]const u8 = undefined;
         var offset: usize = 48;
         for (&names, 0..) |*name, i| {
             const count: usize = std.mem.readInt(u32, raw[36 + i * 4 ..][0..4], .little);
-            if (count == 0 or count > (if (i == 1) max_identity_bytes else max_document_identity_bytes) or count > raw.len - 32 - offset) return error.ArtifactCatalogCorrupt;
+            if ((i != 0 and count == 0) or count > (if (i == 1) max_identity_bytes else max_document_identity_bytes) or count > raw.len - 32 - offset) return error.ArtifactCatalogCorrupt;
             name.* = raw[offset..][0..count];
             offset += count;
         }
@@ -915,4 +915,21 @@ test "privacy unit directory and persisted jobs admit large document identities"
     const restored = try Job.decode(key, raw);
     try std.testing.expectEqualSlices(u8, document, restored.document);
     try std.testing.expectEqualSlices(u8, document, restored.unit);
+}
+
+test "privacy persisted unit jobs distinguish empty documents from missing names" {
+    const a = std.testing.allocator;
+    const authority: publication.Authority = .{ .namespace = @splat(1), .epoch = 3, .catalog_digest = @splat(4) };
+    _ = try documentScope(7, authority, "");
+    const selected = try scope(7, authority, @splat(5));
+    const job: Job = .{ .generation = @splat(6), .document = "", .child = "c", .unit = "u" };
+    const key = jobKey(selected, job.generation, job.unit);
+    const raw = try job.encodeAlloc(a, key);
+    defer a.free(raw);
+    const restored = try Job.decode(key, raw);
+    try std.testing.expectEqualStrings("", restored.document);
+    try std.testing.expectEqualStrings("c", restored.child);
+    var invalid = job;
+    invalid.child = "";
+    try std.testing.expectError(error.ResourceBudgetExceeded, invalid.encodeAlloc(a, key));
 }

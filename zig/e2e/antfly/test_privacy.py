@@ -1573,6 +1573,34 @@ def test_privacy_multifield_batches_release_detector_scratch(stateful_api):
         server.server_close()
 
 
+@pytest.mark.parametrize("mode", ["monitor", "redact_for_search_and_ai"])
+def test_privacy_discovery_resumes_after_empty_identifier(stateful_api, mode):
+    api = stateful_api
+    table = "privacy_empty_id_" + uuid4().hex[:8]
+    api.create_table(table, num_shards=2)
+    ids = ["", "\x00", "é-after"]
+    api.batch_write(
+        table,
+        inserts={key: {"ordinal": i} for i, key in enumerate(ids)},
+        sync_level="full_index",
+    )
+    path = f"/tables/{table}/privacy"
+    api.put(path, {"mode": mode, "fields": ["body"]})
+    scan = api.post(path + "/scans", {"limit": 1})
+
+    def finished():
+        progress = api.get(path + "/scans/" + scan["scan_id"])
+        assert progress["phase"] not in ("failed", "superseded"), progress
+        # A repeated empty cursor would keep queuing the first row forever.
+        assert progress["scanned"] <= len(ids), progress
+        return progress if progress["phase"] == "succeeded" else None
+
+    completed = wait_until(finished, timeout_s=120, interval_s=0.2)
+    assert completed, (api.get(path), api.debug_logs()[-12000:])
+    assert completed["scanned"] == len(ids)
+    assert api.get(path)["coverage"]["current"] == len(ids)
+
+
 def test_privacy_execution_override_retries_without_changing_identity(stateful_api):
     calls = []
     behavior = {"recover_after": None}

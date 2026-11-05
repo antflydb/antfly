@@ -405,7 +405,7 @@ const Start = struct { state: State, selected: Key, expected: ?Encoded };
 
 fn start(alloc: std.mem.Allocator, txn: anytype, root: u128, plan: *const Plan, document: []const u8, limits: Limits) !?Start {
     if (root == 0) return error.DurableRootIncarnationUnavailable;
-    if (document.len == 0 or document.len > obligations.max_cursor_bytes or plan.nodes.len == 0 or plan.nodes.len > std.math.maxInt(u32) or limits.visits == 0 or limits.visits > 128 or limits.bytes == 0 or limits.bytes > 64 * 1024) return error.InvalidBatchRequest;
+    if (document.len > obligations.max_cursor_bytes or plan.nodes.len == 0 or plan.nodes.len > std.math.maxInt(u32) or limits.visits == 0 or limits.visits > 128 or limits.bytes == 0 or limits.bytes > 64 * 1024) return error.InvalidBatchRequest;
     const observation = try Observation.capture(txn, document);
     const item = (try obligations.lookupWork(alloc, txn, observation.authority, document)) orelse return null;
     const selected = domainKey(observation, root, limits.group_producers);

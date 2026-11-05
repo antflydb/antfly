@@ -212,7 +212,7 @@ fn scanResponse(a: A, code: u16, scan: catalog.Scan) !Response {
     });
 }
 
-fn coverageForRange(server: anytype, a: A, table: []const u8, resource: catalog.Resource, collect: bool, request: operation.RequestContext, from_key: []const u8, to_key: []const u8, limit: u32) ![]const u8 {
+fn coverageForRange(server: anytype, a: A, table: []const u8, resource: catalog.Resource, collect: bool, request: operation.RequestContext, from_key: []const u8, to_key: []const u8, limit: u32, resume_from_key: bool) ![]const u8 {
     const unknown = "{\"available\":false,\"total\":null,\"current\":null,\"pending\":null,\"failed\":null,\"with_findings\":null,\"protected_ready\":null,\"protected_blocked\":null}";
     if (!collect) return unknown;
     const reads = server.table_reads orelse return unknown;
@@ -234,6 +234,7 @@ fn coverageForRange(server: anytype, a: A, table: []const u8, resource: catalog.
     const complete = reads.scanStream(a, table, from_key, to_key, .{
         .privacy_original = true,
         .privacy_status = true,
+        .resume_from_key = resume_from_key,
         .privacy_policy_version = resource.policy_version,
         .include_documents = true,
         .limit = limit,
@@ -977,7 +978,7 @@ pub fn advanceOnce(server: anytype, a: A) !void {
         if (chosen.scan == null) {
             if (resource.coverage.started_at_millis == 0) resource.coverage.started_at_millis = now;
             const cursor = try checkpoint.decode(resource.coverage.cursor orelse "");
-            const page = try coverageForRange(server, a, table.name, resource, true, .{}, cursor, "", resource.coverage.page_size);
+            const page = try coverageForRange(server, a, table.name, resource, true, .{}, cursor, "", resource.coverage.page_size, resource.coverage.cursor != null);
             const completed_at: i64 = @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_ms));
             try catalog.coverage.accept(a, &resource.coverage, page, completed_at);
             try checkpoint.encodeResource(&resource);
@@ -1002,7 +1003,7 @@ pub fn advanceOnce(server: anytype, a: A) !void {
                 const available = if (scan.from_key.len == 0 and scan.to_key.len == 0)
                     acceptCoverageVerification(updated, resource.coverage, now)
                 else blk: {
-                    const raw_status = try coverageForRange(server, a, table.name, resource, true, .{}, scan.verification_cursor orelse scan.from_key, scan.to_key, scan.verification_page_size);
+                    const raw_status = try coverageForRange(server, a, table.name, resource, true, .{}, scan.verification_cursor orelse scan.from_key, scan.to_key, scan.verification_page_size, scan.verification_cursor != null);
                     verification = try std.json.parseFromSlice(std.json.Value, a, raw_status, .{});
                     break :blk try acceptVerification(a, updated, verification.?.value.object, now);
                 };
@@ -1039,15 +1040,16 @@ pub fn advanceOnce(server: anytype, a: A) !void {
                 const shard_resumes = if (parsed_resumes) |value| value.value else &.{};
                 const result = writes.reprocessDocumentArtifactRange(a, table.name, resource.artifact_name, .{
                     .from_key = if (shard_resumes.len != 0) "" else scan.next_key orelse scan.from_key,
+                    .resume_from_key = shard_resumes.len == 0 and scan.next_key != null,
                     .to_key = scan.to_key,
                     .limit = scan.limit,
                     .shard_cursors = shard_resumes,
                 }) catch |err| {
                     switch (err) {
                         error.Canceled, error.Cancelled, error.OutOfMemory => return err,
-                        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => {
-                            // A shard election is not loss of this metadata
-                            // worker's authority. Yield its queue position;
+                        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress, error.ArtifactPublicationPending => {
+                            // A shard election or pending catalog does not lose
+                            // metadata authority or advance the cursor. Yield;
                             // persistScan independently fences our own term.
                             verificationUnavailable(updated, now, @errorName(err));
                             try checkpoint.encodeResource(&resource);
@@ -1473,7 +1475,7 @@ test "privacy readiness transport failures persist backoff and release the globa
         }
     };
     const Mode = enum { standalone };
-    for ([_]@FieldType(catalog.Scan, "phase"){ .processing, .running }) |phase| for ([_]anyerror{ error.Timeout, error.DeadlineExceeded, error.CatalogRoutingSnapshotTimeout, error.NotLeader, error.StorageReadTemporarilyUnavailable }) |err| {
+    for ([_]@FieldType(catalog.Scan, "phase"){ .processing, .running }) |phase| for ([_]anyerror{ error.Timeout, error.DeadlineExceeded, error.CatalogRoutingSnapshotTimeout, error.NotLeader, error.ArtifactPublicationPending, error.StorageReadTemporarilyUnavailable }) |err| {
         var resource = try catalog.next(a, null, .{ .mode = .redact_for_search_and_ai, .fields = &.{"body"} }, null);
         _ = try catalog.startScan(a, &resource, "", "", 100);
         const scans = @constCast(resource.scans);

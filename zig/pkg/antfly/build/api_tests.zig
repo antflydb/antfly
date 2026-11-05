@@ -73,7 +73,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .optimize = optimize,
     });
     test_imports.configure(b, privacy_mod, true, true);
-    const privacy_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{ "privacy", "artifact publication upload", "ordered artifact inventory publication queue", "snappy", "lsm.table_file" } });
+    const privacy_tests = b.addTest(.{ .root_module = privacy_mod, .filters = &.{ "privacy", "artifact publication upload", "ordered artifact inventory publication queue", "snappy", "lsm.table_file", "vector replay coalescing cancels and revives" } });
     const privacy_step = b.step("antfly-privacy-test", "Run privacy scan, evidence and transport fence contracts");
     privacy_step.dependOn(&b.addRunArtifact(privacy_tests).step);
     const public_api_parity_default_filters = [_][]const u8{

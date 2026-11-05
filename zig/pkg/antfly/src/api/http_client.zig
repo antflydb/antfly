@@ -3053,7 +3053,7 @@ pub const ApiHttpClient = struct {
             200, 202 => return .{ .body = try self.alloc.dupe(u8, resp.body) },
             404 => return error.NotFound,
             409 => return remoteGroupConflictError(resp.body),
-            else => return error.UnexpectedHttpStatus,
+            else => return remoteArtifactReprocessError(resp.status, resp.body),
         }
     }
 
@@ -6788,4 +6788,15 @@ fn documentKeyNeedsBody(key: []const u8) bool {
         if (bytes > 1024) return true;
     }
     return false;
+}
+
+fn remoteArtifactReprocessError(status: u16, body: []const u8) anyerror {
+    if (status == 503 and std.mem.eql(u8, body, "artifact publication pending")) return error.ArtifactPublicationPending;
+    return error.UnexpectedHttpStatus;
+}
+
+test "privacy reprocess transport preserves pending catalog retries without accepting unrelated failures" {
+    try std.testing.expectEqual(error.ArtifactPublicationPending, remoteArtifactReprocessError(503, "artifact publication pending"));
+    try std.testing.expectEqual(error.UnexpectedHttpStatus, remoteArtifactReprocessError(500, "artifact publication pending"));
+    try std.testing.expectEqual(error.UnexpectedHttpStatus, remoteArtifactReprocessError(503, "internal server error"));
 }

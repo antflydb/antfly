@@ -341,7 +341,7 @@ pub fn advance(alloc: std.mem.Allocator, store_handle: anytype, root: u128, plan
                 break;
             }
             if (items.items.len != 0 and (items.items.len >= 32 or bytes >= 64 * 1024 or @import("antfly_platform").time.monotonicNs() >= deadline)) break;
-            if (row.key.len <= prefix.len + 32) return error.ArtifactCatalogCorrupt;
+            if (row.key.len < prefix.len + 32) return error.ArtifactCatalogCorrupt;
             const id = row.key[prefix.len..][0..32];
             const node = for (requirements.nodes) |*node| {
                 if (std.mem.eql(u8, &node.id, id)) break node;
@@ -397,7 +397,7 @@ pub fn pending(alloc: std.mem.Allocator, store_handle: anytype, root: u128) !boo
 fn settle(txn: anytype, authority: publication.Authority, root: u128, selected: []const u8, revision: u64) !bool {
     if (try optionalRevision(txn, selected) != revision) return false;
     const prefix = scopedPrefix(pending_prefix, authority, root);
-    if (!std.mem.startsWith(u8, selected, &prefix) or selected.len <= prefix.len + 32) return error.ArtifactCatalogCorrupt;
+    if (!std.mem.startsWith(u8, selected, &prefix) or selected.len < prefix.len + 32) return error.ArtifactCatalogCorrupt;
     const counter = counterKey(authority, root, selected[prefix.len..][0..32].*);
     try putNumber(txn, &counter, std.math.sub(u64, try count(txn, &counter), 1) catch return error.ArtifactCatalogCorrupt);
     try txn.delete(selected);
@@ -536,13 +536,13 @@ test "privacy ordered artifact inventory producer readiness isolates streams and
     try putNumber(&memory, &scopedPrefix(revision_prefix, authority, 1), 0);
     for (ids) |id| try putNumber(&memory, &counterKey(authority, 1, id), 0);
     const prefix = scopedPrefix(pending_prefix, authority, 1);
-    const text = try std.mem.concat(a, u8, &.{ &prefix, &ids[0], "doc" });
+    const text = try std.mem.concat(a, u8, &.{ &prefix, &ids[0], "" });
     defer a.free(text);
-    const graph = try std.mem.concat(a, u8, &.{ &prefix, &ids[1], "doc" });
+    const graph = try std.mem.concat(a, u8, &.{ &prefix, &ids[1], "" });
     defer a.free(graph);
-    try mark(a, &memory, authority, "doc");
+    try mark(a, &memory, authority, "");
     const first = (try optionalRevision(&memory, text)).?;
-    try mark(a, &memory, authority, "doc");
+    try mark(a, &memory, authority, "");
     try std.testing.expectEqual(@as(u64, 1), try count(&memory, &counterKey(authority, 1, ids[0])));
     try std.testing.expect(!try settle(&memory, authority, 1, text, first));
     const current = (try optionalRevision(&memory, text)).?;
@@ -562,7 +562,7 @@ test "privacy ordered artifact inventory producer readiness isolates streams and
     try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "relations", false));
     try std.testing.expect(!try sourceComplete(a, &memory, &plan, 2, "text", false));
     try std.testing.expect(try sourceComplete(a, &memory, &plan, 1, "authored", false));
-    try mark(a, &memory, authority, "doc");
+    try mark(a, &memory, authority, "");
     try std.testing.expect(!try sourceComplete(a, &memory, &plan, 1, "text", false));
     try std.testing.expectEqual(@as(u64, 1), try count(&memory, &counterKey(authority, 1, ids[0])));
     try std.testing.expectEqual(@as(u64, 1), try count(&memory, &counterKey(authority, 1, ids[1])));

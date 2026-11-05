@@ -913,9 +913,36 @@ fn documentArtifactReprocessRequestForCursor(
 ) db_mod.types.DocumentArtifactTableReprocessRequest {
     return .{
         .from_key = cursor.next_key,
+        .resume_from_key = true,
         .to_key = req.to_key,
         .limit = if (cursor.limit != 0) cursor.limit else req.limit,
     };
+}
+
+test "privacy reprocess continuations preserve empty IDs across shard and owner transport" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "", "\x00", "after" }) |key| {
+        const req = documentArtifactReprocessRequestForCursor(.{ .to_key = "end", .limit = 100 }, .{ .group_id = 1, .next_key = key, .limit = 1 });
+        try std.testing.expect(req.resume_from_key);
+        try std.testing.expectEqual(@as(u32, 1), req.limit);
+        const raw = try encodeStorageKernelArtifactRangeRequest(a, "_privacy_document", req);
+        defer a.free(raw);
+        var decoded = try std.json.parseFromSlice(StorageKernelArtifactRangeRequest, a, raw, .{});
+        defer decoded.deinit();
+        try std.testing.expect(decoded.value.request.resume_from_key);
+        try std.testing.expectEqualStrings(key, decoded.value.request.from_key);
+        try std.testing.expectEqualStrings("end", decoded.value.request.to_key);
+    }
+    const initial = try encodeStorageKernelArtifactRangeRequest(a, "_privacy_document", .{});
+    defer a.free(initial);
+    try std.testing.expect(std.mem.indexOf(u8, initial, "resume_from_key") == null);
+    const id = try a.alloc(u8, 64 * 1024);
+    defer a.free(id);
+    @memset(id, 'x');
+    const request = documentArtifactReprocessRequestForCursor(.{}, .{ .next_key = id });
+    const bounded = try encodeStorageKernelArtifactRangeRequest(a, "_privacy_document", request);
+    defer a.free(bounded);
+    try std.testing.expect(bounded.len < id.len + 512);
 }
 
 fn appendOwnedArtifactRepairIssues(
@@ -27028,11 +27055,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 documentArtifactReprocessRequestForCursor(req, req.shard_cursors[i])
             else
                 req;
-            const body = try std.json.Stringify.valueAlloc(alloc, .{
-                .from_key = group_req.from_key,
-                .to_key = group_req.to_key,
-                .limit = group_req.limit,
-            }, .{});
+            const body = try std.json.Stringify.valueAlloc(alloc, group_req, .{});
             defer alloc.free(body);
 
             var resolved_route = try table_router.resolveGroupRoute(alloc, self.catalog, self.router, group_id, .prefer_leader);

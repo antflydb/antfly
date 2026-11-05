@@ -167,7 +167,7 @@ pub const CensusPage = struct {
     before: Digest,
     after: Digest,
     pub fn validate(self: CensusPage) !void {
-        if (self.document_key.len == 0 or self.document_key.len > max_cursor_bytes or self.chunk_name.len == 0 or self.chunk_name.len > 1024 * 1024 or
+        if (self.document_key.len > max_cursor_bytes or self.chunk_name.len == 0 or self.chunk_name.len > 1024 * 1024 or
             self.visits == 0 or self.visits > 128 or self.bytes == 0 or self.bytes > 64 * 1024 or std.mem.eql(u8, &self.before, &self.after)) return error.InvalidBatchRequest;
     }
 };
@@ -183,7 +183,7 @@ pub const CompletionPage = struct {
     after: Digest,
     pub fn validate(self: CompletionPage) !void {
         if (self.group_producers and !@import("group_source_identity.zig").isAnchor(self.document_key)) return error.InvalidBatchRequest;
-        if (self.document_key.len == 0 or self.document_key.len > max_cursor_bytes or
+        if (self.document_key.len > max_cursor_bytes or
             self.visits == 0 or self.visits > 128 or self.bytes == 0 or self.bytes > 64 * 1024 or
             std.mem.eql(u8, &self.before, &self.after)) return error.InvalidBatchRequest;
     }
@@ -442,7 +442,7 @@ pub const Command = struct {
         var documents: std.StringHashMapUnmanaged(void) = .empty;
         defer documents.deinit(alloc);
         for (self.sources, 0..) |source, source_order| {
-            if (source.document_key.len == 0 or source.document_key.len > max_cursor_bytes) return error.InvalidBatchRequest;
+            if (source.document_key.len > max_cursor_bytes) return error.InvalidBatchRequest;
             if (source.exists) {
                 if (source.timestamp == 0) return error.InvalidBatchRequest;
             } else if (source.timestamp != 0 or !std.mem.allEqual(u8, &source.content_digest, 0) or source.input_position == null) return error.InvalidBatchRequest;
@@ -1594,6 +1594,8 @@ test "privacy publication control pages admit one large key within bounded ident
     try (ValidationPage{ .mutation_epoch = 1, .expected_cursor = "", .next_cursor = "x", .at_end = true, .repair_documents = &.{document} }).validate();
     try (CompletionPage{ .document_key = document, .visits = 1, .bytes = 1024, .before = @splat(1), .after = @splat(2) }).validate();
     try (CensusPage{ .document_key = document, .chunk_name = "chunk", .visits = 1, .bytes = 1024, .before = @splat(1), .after = @splat(2) }).validate();
+    try (CompletionPage{ .document_key = "", .visits = 1, .bytes = 1024, .before = @splat(1), .after = @splat(2) }).validate();
+    try (CensusPage{ .document_key = "", .chunk_name = "chunk", .visits = 1, .bytes = 1024, .before = @splat(1), .after = @splat(2) }).validate();
     try std.testing.expectEqual(@as(usize, 64 * 1024 * 1024), max_payload_bytes);
     try std.testing.expect(max_identity_bytes >= 4 * physical.len);
 }

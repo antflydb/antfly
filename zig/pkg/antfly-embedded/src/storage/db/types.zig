@@ -1616,6 +1616,10 @@ pub const ScanOptions = struct {
     execution_deadline_ns: ?u64 = null,
     cancellation: ?CancellationToken = null,
 
+    /// Private maintenance continuation: exclude from_key even when empty.
+    /// Only trusted internal transports preserve this marker.
+    resume_from_key: bool = false,
+
     pub fn isRelational(self: ScanOptions) bool {
         return self.relational_query != null or self.relational_query_json.len != 0;
     }
@@ -1703,6 +1707,23 @@ pub const DocumentArtifactTableReprocessRequest = struct {
     to_key: []const u8 = "",
     limit: u32 = 100,
     shard_cursors: []const DocumentArtifactReprocessShardResume = &.{},
+    /// Private continuation marker: from_key is the last admitted identifier,
+    /// even when empty. Keep the identifier in one place on the owner wire.
+    resume_from_key: bool = false,
+
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        // Preserve the legacy initial-request envelope. Only actual resumes
+        // add the marker; an empty cursor remains distinct from an open bound.
+        inline for (comptime std.meta.fieldNames(@This())) |name| {
+            const emit = if (comptime std.mem.eql(u8, name, "resume_from_key")) self.resume_from_key else true;
+            if (emit) {
+                try writer.objectField(name);
+                try writer.write(@field(self, name));
+            }
+        }
+        try writer.endObject();
+    }
 };
 
 pub const DocumentArtifactReprocessFailure = struct {

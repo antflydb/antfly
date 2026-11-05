@@ -16735,6 +16735,25 @@ fn encodeLookupFields(alloc: std.mem.Allocator, opts: db_mod.types.LookupOptions
     return try out.toOwnedSlice(alloc);
 }
 
+test "privacy scan continuations preserve empty keys through internal and owner codecs" {
+    const a = std.testing.allocator;
+    const opts = db_mod.types.ScanOptions{ .privacy_original = true, .privacy_status = true, .resume_from_key = true, .limit = 1 };
+    const raw = try encodeScanRequest(a, "", "", opts);
+    defer a.free(raw);
+    var trusted = try http_route_helpers.parseInternalScanKeysRequest(a, raw);
+    defer trusted.deinit(a);
+    try std.testing.expect(trusted.opts.resume_from_key and trusted.opts.privacy_status);
+    try std.testing.expectEqualStrings("", trusted.from);
+    var public = try http_route_helpers.parseScanKeysRequest(a, raw);
+    defer public.deinit(a);
+    try std.testing.expect(!public.opts.resume_from_key and !public.opts.privacy_status and !public.opts.privacy_original);
+    const packet = try encodeStorageKernelScanRequest(a, "", "", opts);
+    defer a.free(packet);
+    var decoded = try std.json.parseFromSlice(StorageKernelScanWireRequest, a, packet, .{});
+    defer decoded.deinit();
+    try std.testing.expect(decoded.value.options().resume_from_key);
+}
+
 fn encodeScanRequest(
     alloc: std.mem.Allocator,
     from_key: []const u8,
@@ -16764,6 +16783,7 @@ fn encodeScanRequest(
     if (opts.privacy_policy_version) |version| try appendJsonFieldString(alloc, &out, &first, "_privacy_policy_version", if (std.mem.allEqual(u8, &version, 0)) "none" else &version);
     if (opts.privacy_original) try appendJsonFieldBool(alloc, &out, &first, "_privacy_original", true);
     if (opts.privacy_status) try appendJsonFieldBool(alloc, &out, &first, "_privacy_status", true);
+    if (opts.resume_from_key) try appendJsonFieldBool(alloc, &out, &first, "_resume_from_key", true);
     if (opts.inclusive_from) try appendJsonFieldBool(alloc, &out, &first, "inclusive_from", true);
     if (opts.exclusive_to) try appendJsonFieldBool(alloc, &out, &first, "exclusive_to", true);
     if (opts.include_content_hashes) {

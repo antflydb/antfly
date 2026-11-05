@@ -494,14 +494,15 @@ fn parseScanKeysRequestImpl(alloc: std.mem.Allocator, body: []const u8, allow_in
         break :blk version;
     } else null;
 
-    const privacy_status = if (allow_internal_options) blk: {
+    const private_scan: struct { status: bool = false, resuming: bool = false } = if (allow_internal_options) blk: {
         var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
         defer raw.deinit();
-        if (raw.value != .object) break :blk false;
-        const flag = raw.value.object.get("_privacy_status") orelse break :blk false;
-        if (flag != .bool) return error.InvalidQueryRequest;
-        break :blk flag.bool;
-    } else false;
+        if (raw.value != .object) break :blk .{};
+        const status = raw.value.object.get("_privacy_status") orelse std.json.Value{ .bool = false };
+        const resuming = raw.value.object.get("_resume_from_key") orelse std.json.Value{ .bool = false };
+        if (status != .bool or resuming != .bool) return error.InvalidQueryRequest;
+        break :blk .{ .status = status.bool, .resuming = resuming.bool };
+    } else .{};
     const privacy_original = if (allow_internal_options) blk: {
         var raw = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
         defer raw.deinit();
@@ -565,7 +566,8 @@ fn parseScanKeysRequestImpl(alloc: std.mem.Allocator, body: []const u8, allow_in
             .filter_query_json = filter_query_json,
             .privacy_policy_version = privacy_version,
             .privacy_original = privacy_original,
-            .privacy_status = privacy_status,
+            .privacy_status = private_scan.status,
+            .resume_from_key = private_scan.resuming,
             .include_content_hashes = include_content_hashes,
             .relational_query_json = relational_query_json,
         },

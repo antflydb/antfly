@@ -226,7 +226,7 @@ pub const ExtractionClosure = struct {
 
 pub fn prepareExtractionClosure(alloc: std.mem.Allocator, txn: anytype, root: u128, request: Request, plan: *const Plan) !ExtractionClosure {
     if (root == 0) return error.DurableRootIncarnationUnavailable;
-    if (request.doc_key.len == 0 or request.doc_key.len > checkpoints.max_cursor_bytes or request.artifact_name.len == 0 or request.kind != .asset) return error.InvalidBatchRequest;
+    if (request.doc_key.len > checkpoints.max_cursor_bytes or request.artifact_name.len == 0 or request.kind != .asset) return error.InvalidBatchRequest;
     const authorized = (try @import("artifact_producer_input.zig").authorizeTemplate(alloc, txn, request, plan)) orelse return error.ArtifactCatalogDrift;
     if (authorized.requirement.scope != .producer_defined) return error.ArtifactCatalogDrift;
     const extraction = @import("artifact_extraction_generation.zig");
@@ -289,7 +289,7 @@ pub fn prepareExtractionClosure(alloc: std.mem.Allocator, txn: anytype, root: u1
 /// scope census and cannot borrow this boundary.
 pub fn prepareEnrichmentClosure(alloc: std.mem.Allocator, txn: anytype, root: u128, request: Request, plan: *const Plan) !DocumentClosure {
     if (root == 0) return error.DurableRootIncarnationUnavailable;
-    if (request.doc_key.len == 0 or request.doc_key.len > checkpoints.max_cursor_bytes) return error.InvalidBatchRequest;
+    if (request.doc_key.len > checkpoints.max_cursor_bytes) return error.InvalidBatchRequest;
     const authorized = (try @import("artifact_asset_publication.zig").authorize(alloc, txn, request, plan)) orelse return error.ArtifactCatalogDrift;
     if (authorized.requirement.scope != .document) return error.ArtifactCatalogDrift;
     const name = if (request.artifact_name.len != 0) request.artifact_name else request.index_name;
@@ -330,7 +330,7 @@ pub fn prepareEnrichmentClosure(alloc: std.mem.Allocator, txn: anytype, root: u1
 
 pub fn prepareDocumentClosure(alloc: std.mem.Allocator, txn: anytype, root: u128, request: Request, plan: *const Plan) !DocumentClosure {
     if (root == 0) return error.DurableRootIncarnationUnavailable;
-    if (request.doc_key.len == 0 or request.doc_key.len > checkpoints.max_cursor_bytes) return error.InvalidBatchRequest;
+    if (request.doc_key.len > checkpoints.max_cursor_bytes) return error.InvalidBatchRequest;
     const input = @import("artifact_producer_input.zig");
     const authorized = (try input.authorizeDocument(alloc, txn, request, plan)) orelse return error.ArtifactCatalogDrift;
     var arena = std.heap.ArenaAllocator.init(alloc);

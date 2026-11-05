@@ -57,6 +57,7 @@ pub const Error = operation.ApiError || @import("relational_integrity_errors.zig
     GenerationTransitionActive,
     HierarchyCursorStale,
     DocumentArtifactPublicationFailed,
+    ArtifactPublicationPending,
     DocIdentityNamespaceMismatch,
     StorageReadTemporarilyUnavailable,
     ReadIndexTimeout,
@@ -968,6 +969,7 @@ pub const Operations = struct {
             input,
         ) catch |err| switch (err) {
             error.InvalidBatchRequest, error.InvalidArgument => return error.InvalidArgument,
+            error.ArtifactPublicationPending => return error.ArtifactPublicationPending,
             error.DocIdentityNamespaceMismatch => return error.DocIdentityNamespaceMismatch,
             error.UnsupportedOperation => return error.Unsupported,
             error.UnknownGroup, error.TableNotFound, error.NotFound => return error.NotFound,

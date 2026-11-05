@@ -3259,6 +3259,7 @@ pub const AntflyApiHandler = struct {
 
     fn internalArtifactWriteErrorResponse(ctx: *httpx.Context, err: internal_group_operations.Error, invalid_message: []const u8) !httpx.Response {
         return switch (err) {
+            error.ArtifactPublicationPending => textResponse(ctx, 503, "artifact publication pending"),
             error.InvalidArgument => textResponse(ctx, 400, invalid_message),
             error.DocIdentityNamespaceMismatch => textResponse(ctx, 409, "doc identity namespace mismatch"),
             error.Unsupported => textResponse(ctx, 405, "method not allowed"),

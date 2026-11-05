@@ -3219,7 +3219,7 @@ const ScopedReplay = struct {
         const pending = self.state.tickets.items.len != 0;
         const scanned = self.state.scanned_sequence;
         const full = self.state.tickets.items.len >= scoped_retries.max_documents;
-        const has_tail = self.state.scan_document.len != 0;
+        const has_tail = self.state.hasScanDocument();
         const deadline = self.state.deadline();
         self.mutex.unlock(scheduler_io);
         const io = lockRuntime(runtime);
@@ -4106,7 +4106,7 @@ fn restoreScopedRetryCache(runtime: anytype) !void {
         runtime.next_retry_at_ms = 0;
     }
     runtime.scoped_retry_full = state.tickets.items.len >= scoped_retries.max_documents;
-    runtime.scoped_retry_has_tail = state.scan_document.len != 0;
+    runtime.scoped_retry_has_tail = state.hasScanDocument();
     runtime.scoped_retry_wait = runtime.scoped_retry_pending and runtime.retry_failure_fingerprint == 0 and runtime.consecutive_retry_count == 0;
     if (runtime.scoped_retry_wait) {
         runtime.retrying = true;
@@ -10021,7 +10021,7 @@ fn runForegroundCatchUpPassOwned(
     // No new window is admitted while every durable scheduling slot is in use.
     // One slot is reserved per document before any external invocation begins.
     const replay_window: @import("../derived/replay_source.zig").Source.EnrichmentWindow = if (available_documents != 0)
-        try runtime.replay_source.collectEnrichmentDocumentGroupsWindow(runtime.alloc, scheduler.state.scanned_sequence -| @as(u64, if (scheduler.state.scan_document.len != 0) 1 else 0), .{
+        try runtime.replay_source.collectEnrichmentDocumentGroupsWindow(runtime.alloc, scheduler.state.scanned_sequence -| @as(u64, if (scheduler.state.hasScanDocument()) 1 else 0), .{
             .max_records = 4096,
             .max_document_groups = available_documents,
             .max_input_bytes = 4 * 1024 * 1024,
@@ -10032,7 +10032,7 @@ fn runForegroundCatchUpPassOwned(
     const scan_key = try scheduler.state.scanDocumentAlloc(runtime.alloc);
     defer runtime.alloc.free(scan_key);
     var start: usize = 0;
-    if (scan_key.len != 0) while (start < replay_window.groups.len) : (start += 1) {
+    if (scheduler.state.hasScanDocument()) while (start < replay_window.groups.len) : (start += 1) {
         const group = replay_window.groups[start];
         if (group.sequence > scheduler.state.scanned_sequence or
             (group.sequence == scheduler.state.scanned_sequence and std.mem.order(u8, group.doc_key, scan_key) == .gt)) break;

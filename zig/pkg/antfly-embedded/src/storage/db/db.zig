@@ -18858,7 +18858,7 @@ pub const DB = struct {
     fn collectPrivacyDiscovery(self: *DB, alloc: Allocator, artifact_name: []const u8, req: types.DocumentArtifactTableReprocessRequest) !PrivacyDiscoveryPage {
         var page = try PrivacyDiscoveryPage.init(self.alloc, artifact_name, if (req.limit == 0) 100 else req.limit);
         errdefer page.deinit();
-        self.scanVisit(alloc, req.from_key, req.to_key, .{ .privacy_original = true, .include_documents = false }, .{ .context = &page, .visit = PrivacyDiscoveryPage.visit }) catch |err| {
+        self.scanVisit(alloc, req.from_key, req.to_key, .{ .privacy_original = true, .include_documents = false, .resume_from_key = req.resume_from_key }, .{ .context = &page, .visit = PrivacyDiscoveryPage.visit }) catch |err| {
             if (!page.more or err != error.Canceled) return err;
         };
         return page;
@@ -18905,9 +18905,10 @@ pub const DB = struct {
                 const encoded = try std.mem.concat(alloc, u8, &.{ "ACP1", body });
                 defer alloc.free(encoded);
                 try dispatcher.submit(catalog.namespace, encoded);
-                // Retain the exact page cursor while ordered admission
-                // progresses. Waiting for a catalog is not a failed scan.
-                return .{ .limit = req.limit, .next_key = try alloc.dupe(u8, req.from_key) };
+                // Waiting is not an admitted page: do not manufacture an
+                // exclusive continuation from the initial (possibly empty)
+                // bound. The coordinator retries its unchanged checkpoint.
+                return error.ArtifactPublicationPending;
             }
         }
         var cfg = (try self.getEnrichment(alloc, .asset, artifact_name)) orelse
@@ -18921,6 +18922,7 @@ pub const DB = struct {
             if (cursor.group_id != null) return error.InvalidArgument;
             effective_req = .{
                 .from_key = cursor.next_key,
+                .resume_from_key = true,
                 .to_key = req.to_key,
                 .limit = if (cursor.limit != 0) cursor.limit else req.limit,
             };
@@ -18933,6 +18935,7 @@ pub const DB = struct {
         var scanned = try self.scan(alloc, effective_req.from_key, effective_req.to_key, .{
             .include_documents = true,
             .limit = scan_limit,
+            .resume_from_key = effective_req.resume_from_key,
         });
         defer scanned.deinit(alloc);
 
@@ -41803,7 +41806,7 @@ pub const DB = struct {
                 if (state.resume_after_key) |key| if (std.mem.order(u8, raw_key, key) != .gt) return .@"continue";
 
                 if (!state.byte_range.contains(raw_key)) return .@"continue";
-                if (state.from_key.len > 0 and !state.opts.inclusive_from and std.mem.eql(u8, raw_key, state.from_key))
+                if ((state.opts.resume_from_key or (state.from_key.len > 0 and !state.opts.inclusive_from)) and std.mem.eql(u8, raw_key, state.from_key))
                     return .@"continue";
                 if (state.to_key.len > 0) {
                     const order = std.mem.order(u8, raw_key, state.to_key);
@@ -145202,6 +145205,31 @@ test "privacy discovery bounds reference bytes and row count while advancing ove
     try std.testing.expect(rows.more);
     try std.testing.expectEqual(@as(usize, 1), rows.references.items.len);
     try std.testing.expectError(error.InvalidPrivacyScan, DB.PrivacyDiscoveryPage.init(a, name, 1001));
+}
+
+test "privacy discovery resumes after empty document IDs without skipping NUL IDs" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("privacy-empty-id-discovery");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .open_mode = .writer_no_replay, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    const ids = [_][]const u8{ "", "\x00", "after" };
+    for (ids) |id| try db.batch(.{ .writes = &.{.{ .key = id, .value = "{\"ordinal\":1}" }}, .sync_level = .write });
+    for (ids, 0..) |id, index| {
+        var page = try db.collectPrivacyDiscovery(a, @import("../../privacy/document.zig").artifact_name, .{
+            .from_key = if (index == 0) "" else ids[index - 1],
+            .resume_from_key = index != 0,
+            .limit = 1,
+        });
+        defer page.deinit();
+        try std.testing.expect(page.more);
+        try std.testing.expectEqual(@as(usize, 1), page.references.items.len);
+        try std.testing.expectEqualStrings(id, page.references.items[0].doc_key);
+    }
+    var eof = try db.collectPrivacyDiscovery(a, @import("../../privacy/document.zig").artifact_name, .{ .from_key = ids[ids.len - 1], .resume_from_key = true, .limit = 1 });
+    defer eof.deinit();
+    try std.testing.expect(!eof.more);
+    try std.testing.expectEqual(@as(usize, 0), eof.references.items.len);
 }
 
 test "public graph metric borrowed wire document scan producers preserve projection and cancellation" {
