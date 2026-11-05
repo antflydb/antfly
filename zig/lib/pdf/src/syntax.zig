@@ -204,6 +204,7 @@ pub const Projection = enum {
     resources,
     required_resources,
     resource_container,
+    container_properties,
     resource_properties,
     property_table,
     property,
@@ -222,7 +223,8 @@ pub const Projection = enum {
                 }
                 break :blk .{ .keep = false };
             },
-            .resource_container => .{ .keep = true, .child = if (std.mem.eql(u8, key, "Resources")) .resources else .full },
+            .resource_container => .{ .keep = std.mem.eql(u8, key, "Parent") or std.mem.eql(u8, key, "Resources"), .child = if (std.mem.eql(u8, key, "Resources")) .required_resources else .full },
+            .container_properties => .{ .keep = std.mem.eql(u8, key, "Resources"), .child = .resource_properties },
             .resource_properties => .{ .keep = std.mem.eql(u8, key, "Properties"), .child = .property_table },
             .property_table => .{ .keep = true, .child = .property },
             .property => if (std.mem.eql(u8, key, "ActualText")) .{ .keep = true, .child = .text } else if (std.mem.eql(u8, key, "MCID")) .{ .keep = true, .child = .integer } else .{ .keep = false },
@@ -1407,5 +1409,37 @@ test "scanner projected object ownership is safe under allocation failure" {
     };
     for ([_]Projection{ .resources, .required_resources, .resource_properties }) |projection| {
         try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{projection});
+    }
+}
+
+test "scanner inherited resource projections defer properties and discard unrelated parent fields" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 55 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const input = try std.fmt.allocPrint(a, "<< /Parent 9 0 R /Kids [({s})] /Resources << /Font << /F1 5 0 R >> /Properties << /Tag << /MCID 2 /ActualText (Label) /Private (\\n{s}) >> >> >> >>", .{ padding, padding });
+    defer a.free(input);
+    for ([_]Projection{ .resource_container, .container_properties }) |projection| {
+        var storage: [8 * 1024]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&storage);
+        var scanner = Scanner.init(bounded.allocator(), input);
+        scanner.max_object_depth = 128;
+        defer scanner.deinit();
+        var object = try scanner.readObjectProjected(projection);
+        defer object.deinit(bounded.allocator());
+        try std.testing.expect(object.get("Kids") == null);
+        const resources = object.get("Resources").?;
+        if (projection == .resource_container) {
+            try std.testing.expectEqual(@as(u32, 9), object.get("Parent").?.obj_ref.id);
+            try std.testing.expect(resources.get("Properties").?.* == .null);
+            try std.testing.expectEqual(@as(u32, 5), resources.get("Font").?.get("F1").?.obj_ref.id);
+        } else {
+            try std.testing.expect(object.get("Parent") == null);
+            try std.testing.expect(resources.get("Font") == null);
+            const tag = resources.get("Properties").?.get("Tag").?;
+            try std.testing.expectEqualStrings("Label", tag.get("ActualText").?.string);
+            try std.testing.expectEqual(@as(i64, 2), tag.get("MCID").?.integer);
+            try std.testing.expect(tag.get("Private") == null);
+        }
     }
 }

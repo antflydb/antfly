@@ -1928,19 +1928,26 @@ The resource cache retains recognized resource fields and only MCID/ActualText
 from property dictionaries. Metadata parsing skips unknown values without allocating
 their strings or object graphs, while preserving token validation and depth limits.
 Temporary per-object parsing and retained metadata share one live-byte ceiling,
-with separate cumulative-allocation
-allowances. Required fields from indirect resources retain only a small source
+with separate cumulative-allocation allowances. Required fields from indirect resources retain only a small source
 reference for Properties; the optional table is projected on first selected use.
-Inherited resource references preserve this behavior. Direct table retention that
+Inherited direct resources retain their parent reference as a source locator,
+so their Properties values are also deferred until selected. Only Parent and
+Resources fields are parsed during resource inheritance; unrelated parent data
+is skipped. Inheritance traversal is depth-bounded. Direct table retention that
 exceeds its allowance becomes an invalid optional value, diagnosed only if used.
 Indirect property tables and dictionaries are resolved only when a selected
 scope needs them; overridden scopes do not read their object streams.
 Fonts, graphics states, and color spaces share the projected resource root.
 The syntax scanner transfers owned tokens through lookahead and into objects,
 avoiding a second full payload allocation while an object stream remains decoded.
+Compressed object headers validate increasing offsets and parse integer pairs
+without object lookahead. Each object scanner is bounded by the next offset,
+so lookahead cannot materialize an adjacent object's payload.
 Cache entries reserve capacity before parsing. Successful projections and
 deterministic failures then commit without allocating; a saturated cache rejects
-a new entry before spending work on metadata it cannot retain.
+a new entry before spending work on metadata it cannot retain. Property-name
+index caches also reserve capacity before allocating and sorting shared indexes,
+then commit without allocation.
 Selected missing or malformed property dictionaries retain native glyph text and
 report incomplete ActualText, including when selected optional metadata exceeds
 a decode or allocation allowance. Actual allocator failures and cancellation
