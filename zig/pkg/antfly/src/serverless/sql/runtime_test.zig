@@ -2264,3 +2264,43 @@ test "distributed SQL cancellation stops active delivery and immediately serves 
     _ = try service.turn(next, scheduler.dispatcher());
     try gate.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } });
 }
+
+test "distributed SQL expired task claims preserve durable routing epochs across coordinator takeover" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    var service = fixture.service(a, memory.client(), "owner");
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+    var right = input;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    const spec = try plan.choose(input, right, service.tenant, 1000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .concurrency = 1 }, fixture.now);
+    const query = try service.submit(spec);
+    const Capture = struct {
+        ticket: ?plan.Ticket = null,
+        fn dispatch(raw: *anyopaque, tickets: []const plan.Ticket, _: Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(@as(usize, 1), tickets.len);
+            self.ticket = tickets[0];
+        }
+    };
+    var capture: Capture = .{};
+    const delivery: runtime.Dispatcher = .{ .ptr = &capture, .dispatch = Capture.dispatch };
+    _ = try service.turn(query, delivery);
+    const original = capture.ticket.?;
+    try std.testing.expectEqual(@as(u64, 0), original.attempt);
+    var records = service.state_store;
+    records.now_ms = fixture.now;
+    records.tenant = service.tenant;
+    const key = try records.key(a, query, original.stage, original.task);
+    defer a.free(key);
+    const claim = (try records.claim(a, key, "stalled-worker", 60000)).?;
+    fixture.now = 92001;
+    capture.ticket = null;
+    service.owner = "replacement-coordinator";
+    _ = try service.turn(query, delivery);
+    try std.testing.expect(original.sameTask(capture.ticket.?));
+    try std.testing.expectEqual(claim.epoch, capture.ticket.?.attempt);
+}

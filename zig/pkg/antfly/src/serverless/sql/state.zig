@@ -132,6 +132,7 @@ pub const Store = struct {
     }
     pub const TaskStatus = struct {
         status: Status,
+        epoch: u64 = 0,
         until_ms: u64,
         failure: ?[]const u8,
         needs_check: bool = false,
@@ -185,7 +186,7 @@ pub const Store = struct {
                     self_.failure = err;
                     return;
                 };
-                self_.value = .{ .status = value.value.status, .until_ms = value.value.until_ms, .failure = if (value.value.failure) |failure| allocator.dupe(u8, failure) catch |err| {
+                self_.value = .{ .status = value.value.status, .epoch = value.value.epoch, .until_ms = value.value.until_ms, .failure = if (value.value.failure) |failure| allocator.dupe(u8, failure) catch |err| {
                     self_.failure = err;
                     return;
                 } else null };
@@ -224,7 +225,7 @@ pub const Store = struct {
                     const parsed = try std.json.parseFromSlice(Record, job.arena.allocator(), value.body, .{});
                     defer parsed.deinit();
                     try self.validateTaskRecord(parsed.value, query);
-                    job.value = .{ .status = parsed.value.status, .until_ms = parsed.value.until_ms, .failure = if (parsed.value.failure) |failure| try job.arena.allocator().dupe(u8, failure) else null };
+                    job.value = .{ .status = parsed.value.status, .epoch = parsed.value.epoch, .until_ms = parsed.value.until_ms, .failure = if (parsed.value.failure) |failure| try job.arena.allocator().dupe(u8, failure) else null };
                 }
             } else for (jobs[0..count]) |*job| job.run();
             for (jobs[0..count]) |job| {
@@ -237,7 +238,7 @@ pub const Store = struct {
                     continue;
                 }
                 const value = job.value.?;
-                result[done] = .{ .status = value.status, .until_ms = value.until_ms, .failure = if (value.failure) |failure| try a.dupe(u8, failure) else null, .needs_check = value.needs_check };
+                result[done] = .{ .status = value.status, .epoch = value.epoch, .until_ms = value.until_ms, .failure = if (value.failure) |failure| try a.dupe(u8, failure) else null, .needs_check = value.needs_check };
                 done += 1;
             }
         }

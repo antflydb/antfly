@@ -41,6 +41,7 @@ pub const Client = struct {
     discovery: ?*Discovery = null,
     control_attempt_ms: u32 = 5_000,
     submit_attempt_ms: u32 = 20_000,
+    recovery_attempt_ms: u32 = 1000,
     pub fn dispatcher(self: *Client) runtime.Dispatcher {
         return .{ .ptr = self, .dispatch = dispatch };
     }
@@ -206,7 +207,7 @@ pub const Client = struct {
     pub fn execute(self: *Client, ticket: plan.Ticket, context: Context) !void {
         try context.ensureActive();
         if (self.workers.len == 0) return error.SqlWorkerUnavailable;
-        const first = (std.hash.Wyhash.hash(ticket.stage, &ticket.query.id) +% ticket.task) % self.workers.len;
+        const first = (std.hash.Wyhash.hash(ticket.stage, &ticket.query.id) +% ticket.task +% ticket.attempt) % self.workers.len;
         var last_error: anyerror = error.SqlWorkerUnavailable;
         var attempts: usize = 0;
         for (0..self.workers.len) |offset| {
@@ -214,7 +215,7 @@ pub const Client = struct {
             const url = self.workers[index];
             const admission = self.routing.admit(url, @import("antfly_platform").time.monotonicNs());
             if (admission.kind == .blocked) continue;
-            self.executeAt(index, ticket, context) catch |err| {
+            self.executeAdmitted(index, ticket, context, admission) catch |err| {
                 // Record an unresponsive endpoint even when it consumed the
                 // delivery quantum. The next durable replay must try a peer.
                 // Explicit query/caller cancellation says nothing about health.
@@ -235,10 +236,32 @@ pub const Client = struct {
         }
         return last_error;
     }
+    fn executeAdmitted(self: *Client, index: usize, ticket: plan.Ticket, context: Context, admission: Routing.Admission) !void {
+        if (admission.kind == .probe) {
+            // Recovery is a cheap, bounded authenticated metadata read. Never
+            // give a previously unresponsive peer another full task quantum
+            // merely because its quarantine expired during backoff/a lease.
+            var scoped = context;
+            const now = @import("antfly_platform").time.monotonicNs();
+            var budget: u64 = @as(u64, @max(@as(u32, 1), @min(self.recovery_attempt_ms, 1000))) * std.time.ns_per_ms;
+            if (context.deadline_ns) |deadline| budget = @min(budget, (deadline -| now) / 2);
+            scoped.deadline_ns = now +| budget;
+            const body = try std.json.Stringify.valueAlloc(self.a, QueryRequest{ .tenant = ticket.tenant, .query = ticket.query }, .{});
+            defer self.a.free(body);
+            var response = self.queryCallAt(index, result_path, body, scoped) catch |err| switch (err) {
+                error.SqlExecutionCancelled, error.SqlExecutionFailed, error.SqlJoinBudgetExceeded, error.SqlQueryExpired => return self.executeAt(index, ticket, context),
+                else => return err,
+            };
+            response.deinit(self.a);
+        }
+        try self.executeAt(index, ticket, context);
+    }
     fn executeAt(self: *Client, index: usize, ticket: plan.Ticket, context: Context) !void {
         const uri = try std.fmt.allocPrint(self.a, "{s}{s}", .{ std.mem.trimEnd(u8, self.workers[index], "/"), task_path });
         defer self.a.free(uri);
-        const body = try std.json.Stringify.valueAlloc(self.a, ticket, .{});
+        // Routing hints stay process-local; the worker RPC remains compatible
+        // with existing ticket readers and accepts only execution identity.
+        const body = try std.json.Stringify.valueAlloc(self.a, .{ .tenant = ticket.tenant, .query = ticket.query, .stage = ticket.stage, .task = ticket.task }, .{});
         defer self.a.free(body);
         const Guard = struct {
             value: Context,
@@ -367,11 +390,15 @@ test "distributed SQL control budgets reserve a backup and allow source retentio
 test "distributed SQL task replay avoids a stalled endpoint across routing snapshots" {
     const Fake = struct {
         stalled: usize = 0,
+        probes: usize = 0,
         healthy: usize = 0,
         fn execute(raw: *anyopaque, allocator: A, request_: http.HttpRequest) !http.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(raw));
+            const wire = try std.json.parseFromSlice(std.json.Value, allocator, request_.body, .{});
+            defer wire.deinit();
+            try std.testing.expect(wire.value.object.get("attempt") == null);
             if (std.mem.startsWith(u8, request_.uri, "http://stalled/")) {
-                self.stalled += 1;
+                if (std.mem.endsWith(u8, request_.uri, result_path)) self.probes += 1 else self.stalled += 1;
                 while (!request_.cancellation.?.isCancelled()) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
                 return error.Canceled;
             }
@@ -381,7 +408,7 @@ test "distributed SQL task replay avoids a stalled endpoint across routing snaps
     };
     var fake: Fake = .{};
     var routing: Routing = .{ .cooldown_ms = 5000 };
-    var client: Client = .{ .routing = &routing, .a = std.testing.allocator, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{ "http://stalled", "http://healthy" } };
+    var client: Client = .{ .routing = &routing, .a = std.testing.allocator, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{ "http://stalled", "http://healthy" }, .recovery_attempt_ms = 20 };
     var ticket: plan.Ticket = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1000000 }, .stage = 0, .task = 0 };
     ticket.task = @intCast(std.hash.Wyhash.hash(ticket.stage, &ticket.query.id) % 2);
     const expired: Context = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 20 * std.time.ns_per_ms };
@@ -392,6 +419,21 @@ test "distributed SQL task replay avoids a stalled endpoint across routing snaps
     try client.execute(ticket, live);
     try std.testing.expectEqual(@as(usize, 1), fake.stalled);
     try std.testing.expectEqual(@as(usize, 2), fake.healthy);
+    // Lease-expired replay moves peers even after quarantine expiry/restart.
+    routing = .{};
+    var replay = ticket;
+    replay.attempt = 1;
+    try client.execute(replay, live);
+    try std.testing.expectEqual(@as(usize, 1), fake.stalled);
+    try std.testing.expectEqual(@as(usize, 3), fake.healthy);
+    // An expired quarantine gets a short metadata probe, not another whole
+    // delivery timeout. A healthy peer remains reachable in this same call.
+    routing.failure("http://stalled", 0);
+    try client.execute(ticket, live);
+    try live.ensureActive();
+    try std.testing.expectEqual(@as(usize, 1), fake.stalled);
+    try std.testing.expectEqual(@as(usize, 1), fake.probes);
+    try std.testing.expectEqual(@as(usize, 4), fake.healthy);
 }
 
 test "distributed SQL caller cancellation never quarantines a healthy endpoint" {

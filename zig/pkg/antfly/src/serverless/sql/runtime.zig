@@ -333,7 +333,7 @@ pub const Service = struct {
                     try self.store().terminate(a, query_key, claim, .failed, status.failure orelse "TaskFailed");
                     return true;
                 }
-                if (status.status == .succeeded) keep[index] = false else if (status.status != .running or status.until_ms +| 30_000 < self.clock.now()) try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = id });
+                if (status.status == .succeeded) keep[index] = false else if (status.status != .running or status.until_ms +| 30_000 < self.clock.now()) try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = id, .attempt = status.epoch });
             }
             wave_ns = @import("antfly_platform").time.monotonicNs() -| wave_started;
             scan = end;
@@ -376,7 +376,7 @@ pub const Service = struct {
                 }
                 if (status.status == .succeeded) continue;
                 try pending.append(a, id);
-                if (status.needs_check) admission_check = true else if (status.status != .running or status.until_ms +| 30_000 < self.clock.now()) try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = id });
+                if (status.needs_check) admission_check = true else if (status.status != .running or status.until_ms +| 30_000 < self.clock.now()) try tickets.append(a, .{ .tenant = self.tenant, .query = query, .stage = current.value.stage, .task = id, .attempt = status.epoch });
             }
         }
         const pending_admission = !admission_turn and cursor == current.value.cursor and cursor < count and pending.items.len < spec.limits.concurrency;

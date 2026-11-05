@@ -306,10 +306,15 @@ Query expiry still bounds work when the status store is unavailable.
 
 Native task routing retains endpoint health across DNS snapshots and delivery
 replay. Failed workers are quarantined with one- to thirty-second exponential
-cooldowns; at most one recovery probe runs per endpoint. Query/caller cancellation
+cooldowns; at most one recovery probe runs per endpoint. Recovery first performs
+an authenticated query-status read capped at one second, so an expired
+quarantine cannot hand a still-unresponsive peer another whole task quantum. Query/caller cancellation
 and local allocator/executor capacity failures do not penalize worker health. A delivery that exhausts its entire deadline
 still records the unresponsive endpoint, allowing the next replay to use a
-healthy peer. Native connections have a separate two-second setup deadline;
+healthy peer. Replay routing also incorporates the durable task claim epoch,
+so lease-expired tasks rotate peers after coordinator restart or quarantine
+expiry. Local delivery retries advance the routing hint too. Queue deduplication
+uses task identity and retains the newest hint. Native connections have a separate two-second setup deadline;
 established tasks retain their full execution budget.
 
 Headless-service discovery uses one process-owned refresh, with sorted,

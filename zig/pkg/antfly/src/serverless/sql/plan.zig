@@ -331,7 +331,18 @@ pub const Task = struct {
 };
 /// No row payload travels through the dispatcher. The worker loads the durable
 /// plan and accepted dependency records using these deterministic identities.
-pub const Ticket = struct { tenant: Digest, query: @import("state.zig").Query, stage: u32, task: u32 };
+pub const Ticket = struct {
+    tenant: Digest,
+    query: @import("state.zig").Query,
+    stage: u32,
+    task: u32,
+    /// Durable claim epoch rotates lease-expired replay, including after a
+    /// coordinator restart or endpoint quarantine expiry. Not task identity.
+    attempt: u64 = 0,
+    pub fn sameTask(self: Ticket, other: Ticket) bool {
+        return self.stage == other.stage and self.task == other.task and std.meta.eql(self.query, other.query) and std.meta.eql(self.tenant, other.tenant);
+    }
+};
 /// Parquet compression does not bound the resident typed rows or hash metadata.
 /// Include the fixed per-row representation before selecting a build strategy.
 pub fn estimatedRetained(input: Input) u64 {

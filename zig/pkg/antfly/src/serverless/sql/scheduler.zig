@@ -205,7 +205,8 @@ pub const Scheduler = struct {
             var free_node: ?usize = null;
             for (self.nodes, 0..) |node, i| {
                 if (node.ticket) |queued| {
-                    if (std.meta.eql(queued, ticket)) {
+                    if (queued.sameTask(ticket)) {
+                        self.nodes[i].ticket.?.attempt = @max(queued.attempt, ticket.attempt);
                         duplicate = true;
                         break;
                     }
@@ -288,6 +289,7 @@ pub const Scheduler = struct {
             return;
         }
         node.failures += 1;
+        node.ticket.?.attempt +|= 1;
         const delay_ms = @min(@as(u64, 5000), @as(u64, 250) << @as(u6, @intCast(node.failures - 1)));
         const jitter = std.hash.Wyhash.hash(node.failures, &node.ticket.?.query.id) % @max(@as(u64, 1), delay_ms / 4);
         node.not_before_ns = @import("antfly_platform").time.monotonicNs() +| (delay_ms + jitter) * std.time.ns_per_ms;
@@ -578,4 +580,26 @@ test "distributed SQL cancellation drains queues and defeats a racing retry with
     for (scheduler.slots) |slot| try std.testing.expect(slot.query == null);
     try port.dispatch(port.ptr, &.{other}, .{});
     scheduler.finish(scheduler.take().?);
+}
+
+test "distributed SQL ticket replay upgrades routing without duplicating queued or active work" {
+    var scheduler: Scheduler = .{ .io = std.testing.io, .clock = .{ .read = testClock }, .delivery = undefined };
+    defer scheduler.stop();
+    var ticket: plan.Ticket = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 100000 }, .stage = 0, .task = 0 };
+    const port = scheduler.dispatcher();
+    try port.dispatch(port.ptr, &.{ticket}, .{});
+    ticket.attempt = 3;
+    try port.dispatch(port.ptr, &.{ticket}, .{});
+    const id = scheduler.take().?;
+    try std.testing.expectEqual(@as(u64, 3), scheduler.nodes[id].ticket.?.attempt);
+    ticket.attempt = 4;
+    try port.dispatch(port.ptr, &.{ticket}, .{});
+    try std.testing.expect(scheduler.take() == null);
+    scheduler.deferDelivery(id);
+    scheduler.nodes[id].not_before_ns = 0;
+    const replay = scheduler.take().?;
+    try std.testing.expectEqual(id, replay);
+    try std.testing.expectEqual(@as(u64, 5), scheduler.nodes[replay].ticket.?.attempt);
+    scheduler.finish(replay);
+    try std.testing.expect(scheduler.take() == null);
 }
