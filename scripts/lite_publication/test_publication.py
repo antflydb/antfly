@@ -166,7 +166,7 @@ class Runtime(unittest.TestCase):
         return self.cmd("search", "--generation", generation, "--input", inp)["hits"]
 
     def test_manual_publication_and_reader(self):
-        q = {"embedding": contract.PROFILE, "vector": [0, 1] + [0] * 766}
+        q = native.load_json(FIXTURES / "solar-query.json")
         for previous, name in enumerate(("zero", "partial", "full")):
             generation = previous + 1
             with self.subTest(name=name):
@@ -192,7 +192,7 @@ class Runtime(unittest.TestCase):
                 if previous == 2:
                     self.assertEqual(
                         self.query(generation, **q)[0]["_source"]["document_id"],
-                        "drive-fixture-2",
+                        "drive-fixture-1",
                     )
                 row = self.cmd(
                     "read", "--generation", generation, "--key", "d:drive-fixture-1"
@@ -293,6 +293,18 @@ class Runtime(unittest.TestCase):
         self.stage("partial", "retry", 1, error="operation_conflict")
         self.assertEqual(self.cmd("cleanup")["generation"], 1)
         self.assertFalse(self.artifact("retry").exists())
+
+    def test_staged_file_changed_after_validation(self):
+        self.publish("zero", "first", 0)
+        self.stage("full", "op", 1)
+        self.cmd("validate", "--operation", "op")
+        path = self.artifact("op")
+        path.chmod(0o600)
+        with path.open("r+b") as f:
+            f.truncate(4096)
+        path.chmod(0o400)
+        self.cmd("activate", "--operation", "op", error="storage_error")
+        self.assertTrue(self.query(1, text="solar"))
 
     def test_process_death_before_and_after_commit(self):
         self.publish("zero", "first", 0)

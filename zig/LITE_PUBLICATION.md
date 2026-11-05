@@ -4,7 +4,8 @@ The owner freezes the selected Drive extraction results and the vectors already 
 for those revisions into a single input view. The runtime builds a fresh native Lite file
 using that view. Each explicit build has an independent output path. A build has no
 network or hosted update step. See [fixture inputs and table schema](testdata/publication-v1/).
-The test vectors are orthogonal unit vectors for verifying storage and retrieval.
+The partial and full fixtures contain local EmbeddingGemma document vectors.
+The `solar-query.json` fixture holds the matching retrieval-query vector.
 
 SearchAF's source table is `files`. Its `file` and `source_document` records, generated
 `full_text_index_v<N>`, `document_chunks_v1` text and completed `document_chunkvec_v1`

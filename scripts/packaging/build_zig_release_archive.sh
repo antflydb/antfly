@@ -370,6 +370,7 @@ python3 "$repo_root/scripts/packaging/create_reproducible_tar.py" \
 tar -tzf "$out_dir/$archive_name" > "$work_root/archive-contents.txt"
 if [ "$product" = server ]; then
   grep -Fx "./antfly" "$work_root/archive-contents.txt" >/dev/null
+  grep -Fx "./antfly-publication" "$work_root/archive-contents.txt" >/dev/null
 fi
 
 if [ "$product" = embedded ] && grep -Eq '^\./(antfly|antfly-lite|antfly-inference|antfly-inference-worker|antfly-inference-dev)$' "$work_root/archive-contents.txt"; then

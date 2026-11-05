@@ -83,8 +83,9 @@ RUN apt-get update && \
     mkdir -p /antflydb && chown 10001:10001 /antflydb
 
 WORKDIR /
-COPY antfly /antfly
-COPY antfly-publication /usr/local/bin/antfly-publication
+# Release archives made before publication v1 only contain the native CLI.
+COPY antfly* /
+RUN if [ -x /antfly-publication ]; then ln -s /antfly-publication /usr/local/bin/antfly-publication; fi
 ENV ANTFLY_BIN=/antfly
 COPY share/antfly /usr/share/antfly
 COPY --from=runtime-libraries /opt/wasmtime/lib/libwasmtime.so /usr/local/lib/libwasmtime.so

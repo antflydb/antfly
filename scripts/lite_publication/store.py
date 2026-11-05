@@ -110,7 +110,7 @@ class Destination:
                      generation INTEGER NOT NULL, active TEXT)""")
                 db.execute("""CREATE TABLE operations
                     (id TEXT PRIMARY KEY, digest TEXT NOT NULL, expected INTEGER NOT NULL,
-                     phase TEXT NOT NULL, committed INTEGER, metadata TEXT)""")
+                     phase TEXT NOT NULL, committed INTEGER, metadata TEXT, file_seal TEXT)""")
                 db.execute("""CREATE UNIQUE INDEX one_pending ON operations ((1))
                     WHERE phase IN ('preparing','prepared','validated')""")
                 db.execute(
@@ -133,6 +133,15 @@ class Destination:
     def path(self, op):
         require(ID.fullmatch(op), "Invalid operation ID")
         return self.root / ("op-" + hashlib.sha256(op.encode()).hexdigest() + ".aflite")
+
+    def file_seal(self, op):
+        info = self.path(op).lstat()
+        require(
+            stat.S_ISREG(info.st_mode) and not info.st_mode & 0o222,
+            "Expected an immutable prepared file",
+            "storage_error",
+        )
+        return f"{info.st_ino}:{info.st_size}:{info.st_ctime_ns}"
 
     def status(self, op=None):
         # A single read transaction snapshots destination and operation receipts
@@ -187,7 +196,7 @@ class Destination:
                 ).fetchone()
                 require(pending is None, "Another update is pending", "operation_busy")
                 self.db.execute(
-                    "INSERT INTO operations VALUES(?,?,?,'preparing',NULL,NULL)",
+                    "INSERT INTO operations(id,digest,expected,phase) VALUES(?,?,?,'preparing')",
                     (op, digest, expected),
                 )
         if self.operation(op)["phase"] != "preparing":
@@ -248,11 +257,17 @@ class Destination:
         with locked(self.root / "readers.lock", fcntl.LOCK_SH):
             row = self.operation(op)
             if row["phase"] == "prepared":
+                seal = self.file_seal(op)
                 metadata = native.inspect(self.path(op), row["digest"])
+                require(
+                    self.file_seal(op) == seal,
+                    "Prepared file changed during validation",
+                    "storage_error",
+                )
                 with write(self.db):
                     self.db.execute(
-                        "UPDATE operations SET phase='validated', metadata=? WHERE id=? AND phase='prepared'",
-                        (json.dumps(metadata, separators=(",", ":")), op),
+                        "UPDATE operations SET phase='validated', metadata=?, file_seal=? WHERE id=? AND phase='prepared'",
+                        (json.dumps(metadata, separators=(",", ":")), seal, op),
                     )
         return self.status(op)
 
@@ -271,8 +286,8 @@ class Destination:
                     "stale_generation",
                 )
                 require(
-                    self.path(op).is_file(),
-                    "Validated artifact missing",
+                    self.file_seal(op) == row["file_seal"],
+                    "Prepared file changed after validation",
                     "storage_error",
                 )
                 generation = row["expected"] + 1

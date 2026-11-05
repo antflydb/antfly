@@ -268,6 +268,8 @@ def inspect(path, expected=None):
     # corpus or duplicate its entire vector set while inspecting an upload.
     parents, children = {}, {}
     vectors = count = total_text = 0
+    keyword_key = None
+    query_vector = None
     for key, row in scan(path):
         count += 1
         require(count <= 100000, "Too many publication rows")
@@ -326,6 +328,7 @@ def inspect(path, expected=None):
                 and row["filename_tokens"] == row["filename"],
                 "Invalid passage identity",
             )
+            keyword_key = keyword_key or key
             start, end = row["start_byte"], row["end_byte"]
             number(start, "chunk start", 0, MAX_DOCUMENT)
             number(end, "chunk end", start + 1, min(MAX_DOCUMENT, start + MAX_CHUNK))
@@ -358,6 +361,8 @@ def inspect(path, expected=None):
                     vector(row["_embeddings"][DENSE]) == row.get("vector_sha256"),
                     "Stored vector checksum mismatch",
                 )
+                if query_vector is None:
+                    query_vector = row["_embeddings"][DENSE]
                 vectors += 1
             else:
                 require(
@@ -381,6 +386,38 @@ def inspect(path, expected=None):
         counts == {FT: count, DENSE: vectors},
         "Native index counts disagree with stored content",
     )
+    # Prove the reopened native indexes actually serve their postings before
+    # changing the destination. Counts alone can come from a stored catalog.
+    keyword_hits = query_hits(
+        path,
+        {
+            "full_text_search": {"term": keyword_key or "empty", "field": "chunk_id"},
+            "indexes": [FT],
+            "limit": 1,
+            "fields": ["chunk_id", "content"],
+        },
+    )
+    require(
+        (
+            [hit["_id"] for hit in keyword_hits]
+            == ([keyword_key] if keyword_key else [])
+        ),
+        "Keyword index failed its publication read probe",
+    )
+    if query_vector is not None:
+        vector_hits = query_hits(
+            path,
+            {
+                "embeddings": {DENSE: query_vector},
+                "indexes": [DENSE],
+                "limit": 1,
+                "fields": ["chunk_id", "content", "vector_sha256"],
+            },
+        )
+        require(
+            len(vector_hits) == 1 and vector_hits[0]["_source"].get("vector_sha256"),
+            "Dense index failed its publication read probe",
+        )
     final = path.stat()
     require(
         (initial.st_dev, initial.st_ino, initial.st_size, initial.st_ctime_ns)
@@ -427,6 +464,10 @@ def search(path, query):
             "filter_query": {"term": "passage", "field": "_type"},
         }
     )
+    return query_hits(path, body)
+
+
+def query_hits(path, body):
     result = lite("query", path, body=body)["responses"][0]
     require(result["status"] == 200, "Native query failed", "native_error")
     return result["hits"]["hits"]
