@@ -449,6 +449,7 @@ pub fn encodedImagePixels(content_type: []const u8, bytes: []const u8) !u64 {
 test "inference capabilities measure physical image pixels and MIME" {
     var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 7, .big);
     std.mem.writeInt(u32, png[20..24], 5, .big);
     try std.testing.expectEqual(@as(u64, 35), try encodedImagePixels("image/png;charset=binary", &png));

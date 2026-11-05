@@ -32161,8 +32161,8 @@ test "generate batch releases materialized media between executor windows" {
     resetRequestWorkTestCounters();
     const batch_body =
         \\{"requests":[
-        \\{"custom_id":"page-1","body":{"model":"owner/model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD"}}]}]}},
-        \\{"custom_id":"page-2","body":{"model":"owner/model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD"}}]}]}}
+        \\{"custom_id":"page-1","body":{"model":"owner/model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD"}}]}]}},
+        \\{"custom_id":"page-2","body":{"model":"owner/model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD"}}]}]}}
         \\]}
     ;
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate/batch");
@@ -32182,9 +32182,9 @@ test "generate batch releases materialized media between executor windows" {
 
 test "generate parser consumes generic image and audio media parts strictly" {
     const alloc = std.testing.allocator;
-    const png_data_uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+    const png_data_uri = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD";
     const request_json =
-        \\{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"inspect"},{"type":"media","mime_type":"image/png","data":"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD"},{"type":"media","mime_type":"audio/wav","data":"AwQ="}]}]}
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"inspect"},{"type":"media","mime_type":"image/png","data":"data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD"},{"type":"media","mime_type":"audio/wav","data":"AwQ="}]}]}
     ;
     var parsed = try std.json.parseFromSlice(api.GenerateRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
@@ -32231,7 +32231,7 @@ test "generate parser consumes generic image and audio media parts strictly" {
     );
 
     const mismatched_json =
-        \\{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"image/jpeg","data":"iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD"}]}]}
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"image/jpeg","data":"iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD"}]}]}
     ;
     var mismatched = try std.json.parseFromSlice(api.GenerateRequest, alloc, mismatched_json, .{ .ignore_unknown_fields = true });
     defer mismatched.deinit();
@@ -33389,7 +33389,7 @@ test "generate HTTP enforces resolved manifest media limits before model loading
     var node = try Node.init(allocator, .{ .models_dir = models_root });
     defer node.deinit();
     const body =
-        \\{"model":"owner/model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD"}}]}]}
+        \\{"model":"owner/model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD"}}]}]}
     ;
     var request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate");
     defer request.deinit();
@@ -33402,7 +33402,7 @@ test "generate HTTP enforces resolved manifest media limits before model loading
     try std.testing.expect(std.mem.indexOf(u8, response.body.?, "DECODED_PIXELS_EXCEEDED") != null);
 
     const batch_body =
-        \\{"requests":[{"custom_id":"page-1","body":{"model":"owner/model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD"}}]}]}}]}
+        \\{"requests":[{"custom_id":"page-1","body":{"model":"owner/model","messages":[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD"}}]}]}}]}
     ;
     var batch_request = try httpx.Request.init(allocator, .POST, "/ai/v1/generate/batch");
     defer batch_request.deinit();

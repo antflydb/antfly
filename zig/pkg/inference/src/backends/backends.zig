@@ -626,25 +626,27 @@ pub fn automaticBackends() []const BackendType {
     return &.{ .metal, .native };
 }
 
-var cuda_probe_once = std.once(probeCudaDevice);
-var cuda_device_available = false;
+const CudaProbe = enum(u8) { unknown, absent, present };
+var cuda_probe = std.atomic.Value(CudaProbe).init(.unknown);
 
-fn probeCudaDevice() void {
-    if (comptime !build_options.enable_cuda) return;
+fn probeCudaDevice() bool {
     const context = @import("../ops/cuda/context.zig");
-    const info = context.probeDefault() catch |err| {
+    _ = context.probeDefault() catch |err| {
         std.log.info("CUDA is not in the automatic backend order: {s}", .{@errorName(err)});
-        return;
+        return false;
     };
-    _ = info;
-    cuda_device_available = true;
+    return true;
 }
 
 /// Initializes a device once per process, not on every backend selection.
+/// Racing first callers may each probe; the answer is the same.
 pub fn cudaDeviceAvailable() bool {
     if (comptime !build_options.enable_cuda) return false;
-    cuda_probe_once.call();
-    return cuda_device_available;
+    const known = cuda_probe.load(.acquire);
+    if (known != .unknown) return known == .present;
+    const present = probeCudaDevice();
+    cuda_probe.store(if (present) .present else .absent, .release);
+    return present;
 }
 
 fn preferredBackendsForOverride(backend: BackendType) []const BackendType {
