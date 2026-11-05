@@ -116,6 +116,15 @@ admission also requires a dedicated internal-service signing identity.
 
 ## Jobs and coverage
 
+Backfill discovery streams original identifiers and queues ordinary generated
+asset references directly. It does not retain complete source pages or map
+source documents before admission. Each page has a 1,000-row maximum and an
+8 MiB budget for owned identifiers, producer names and reference storage; one
+oversized identifier may advance alone. A page ending exactly at its ceiling
+may require an empty follow-up page to establish EOF. Source capture, mapping
+and detector admission remain owned by ordinary replay, with the same durable
+retry floors and publication requirements.
+
 Automatic and explicit scans retain durable identities, bounded cursors,
 per-shard progress, failures and transport backoff in metadata. The metadata
 leader's supervisor owns distributed scans; standalone uses its local catalog
@@ -406,7 +415,120 @@ partial reclamation progress survive snapshots and restart.
 
 ## Validation
 
-### Latest retry, projection and disclosure fixes (2026-11-04)
+### Latest discovery, preview and identifier fixes (2026-11-04)
+
+- The initial main fetch was already incorporated through `4bb2b815aa`.
+  Main advanced during qualification; merged
+  `8c1eddf12be59f4f14672d5f63c9d2fbadb232d9`, including resumable full-text
+  replay. The benchmark conflict retains main's multi-document calls and the
+  branch's existing diagnostics; all 18 benchmark helper tests pass.
+- Discovery now retains references instead of full source pages and cleaned
+  document copies. The real-store memory regression exercises discovery over
+  twelve 1 MiB documents; separate cases cover byte limits, row limits and
+  progress for an oversized identifier.
+- Preview computes one policy version for response construction and reuses it
+  across findings. The HTTP fixture includes 2,000 findings and a 16 KiB category
+  description, checking every finding's version against the response.
+- The review's claim that saved execution controls were discarded was incorrect:
+  the existing policy-bound override intentionally keeps controls outside the
+  immutable producer. The new HTTP regression tunes from one to five attempts,
+  preserves identity/generation/scan, restarts, and requires the fifth response
+  to recover during an explicit rescan. No producer-identity change is needed.
+- Pre-merge integrated build: 106/106 steps, 58 API/metadata tests, 151 native
+  storage/privacy tests and two ABI checks passed. Formatting and license
+  checks passed.
+- The synthetic 2,000-finding preview with a 16 KiB category description took
+  0.091 seconds on the qualified build, compared with 0.712 seconds in the review
+  reproduction. The 341,433-byte response shape is unchanged. This measures
+  synthetic HTTP/response processing, not model inference or customer throughput.
+- Pre-merge regression server SHA-256:
+  `7342d8158de254d7ae123b8c9f4d98ad7af55b2e498475c5997295ff869337ec`.
+- Model-weight, Metal and CUDA execution are unchanged; this qualification
+  does not repeat those backend runs.
+- The initial standalone suite hit the existing 60-second replacement wait:
+  receipts were current and the named text/vector indexes were ready, while
+  the implicit text index still reported source publication/backfill pending.
+  On the unchanged binary, the isolated case passed (60.28 seconds including
+  setup), as did the preceding one-shard monitor/protective sequence (114.94
+  seconds). No timeout was widened or publication check bypassed.
+- The complete pre-merge Raft HTTP suite passed 21 cases with one optional
+  model-weight skip (749.57 seconds), including the 1,000-row rescan whose two
+  5 MB identifiers force byte-bound continuation.
+- The complete unchanged-binary standalone rerun passed 21 cases with one
+  optional model-weight skip (475.36 seconds); the replacement lifecycle passed
+  in 55.85 seconds. The initial timeout remains recorded above.
+- Merged-main build before the empty-ID follow-up: 106/106 steps, 58 API/metadata tests, 151 native
+  storage/privacy tests and two ABI checks passed. The execution-control fixture
+  now uses four documents to verify serial physical batches as well as recovery
+  on the fifth configured attempt after tuning and restart.
+- On the merged binary, the same 2,000-finding preview took 0.078 seconds with
+  either an empty or 16 KiB category description; the per-finding policy-size
+  cost is removed. Server SHA-256 before the empty-ID follow-up:
+  `09dfd1572ee6f52579d2ba841fe5995250e6fa9d92ba9d9d4ba3ba6dfd7483ac`.
+- That merged binary passed the complete standalone suite (21 passed, one
+  optional model-weight skip, 468.94 seconds) and Raft suite (21 passed, one
+  optional model-weight skip, 758.70 seconds).
+- A final boundary check found that empty document IDs were admitted but an
+  empty continuation key was indistinguishable from the initial open bound.
+  Discovery, coverage and range verification now explicitly preserve exclusive
+  continuation through local scans, shard routing and trusted internal/owner
+  transports. A boolean marker keeps large identifiers on the wire only once;
+  public scan requests cannot enable this private option. Native and HTTP
+  regressions cover empty, NUL and non-ASCII IDs with one-row discovery pages.
+- The new HTTP boundary regression also exposed inconsistent artifact validators:
+  the primary store admitted empty IDs while artifact manifests, publication and
+  completion rejected them. Document identities now follow the store's key
+  contract; producer and unit names remain nonempty, and byte, ordering,
+  authority and checksum checks remain enforced. Retry state records a present
+  empty cursor explicitly; existing nonempty/absent cursor framing is preserved,
+  and readers accept both header forms. Focused tests cover empty retry tickets,
+  replay cursors, scope keys and unit-job round trips.
+- The first Raft boundary run detected an additional remote shard encoder that
+  reconstructed only three request fields and dropped the continuation marker.
+  It now serializes the typed request, matching the local/owner path.
+- Catalog-install waiting preserves the original checkpoint instead of returning
+  an unadmitted exclusive cursor. The internal HTTP route/client preserve the
+  pending-publication error identity, and the coordinator yields without
+  consuming its failure budget. Scheduler and transport regressions cover this
+  retry path.
+- HTTP completion then exposed two more pre-existing empty-ID omissions: producer
+  readiness rejected a valid zero-length document suffix, and journal/index
+  replay dropped empty document keys. Readiness now validates the encoded prefix
+  and producer digest independently of document length. Journal/replay retain
+  empty IDs; existing tombstone slot metadata distinguishes a real empty delete
+  from a canceled nonempty artifact delete without another map or allocation.
+  The stream-readiness fencing regression now uses an empty ID, and dedicated
+  native cases cover journal references/deletes and all index replay kinds.
+- The completed production build passed all 106 steps, with 61 API/metadata,
+  158 native privacy/storage and two owner/ABI tests. Adding the existing vector
+  tombstone cancellation/revival regression to the permanent privacy target
+  then passed all 57 target steps, 61 API/metadata, 159 native and two owner/ABI
+  tests. The separate compatibility run passed all 11 selected retry-workset,
+  replay-cursor and journal tests, including healthy progress across restart,
+  allocation failures and maximum durable metadata budgets.
+- The final empty-ID HTTP cases pass for monitor and protective modes in both
+  standalone (38.48 seconds) and two-shard Raft (46.35 seconds). Each discovers
+  exactly three empty/NUL/non-ASCII IDs and reaches current coverage.
+- Final production server SHA-256:
+  `62a8ba8c821d23fa9f8f107b49e276d658b82ccf3363eb798fa0978a22b6f6cb`.
+- Final complete HTTP suites on that binary: standalone **23 passed**, one
+  optional model-weight skip (488.93 seconds); Raft **23 passed**, one optional
+  model-weight skip (739.60 seconds). The final runs include serial cohort/retry
+  tuning across restart, dense 2,000-finding previews, byte-bound discovery with
+  5 MB identifiers, empty-ID completion and monitor/protective lifecycle cases.
+- Final synthetic preview recheck: 2,000 findings took 0.083 seconds with an
+  empty category description and 0.065 seconds with a 16 KiB description,
+  compared with 0.712 seconds in the original large-policy reproduction. Both
+  responses remain 341,433 bytes. These individual synthetic samples establish
+  removal of the policy-size multiplier, not a production throughput guarantee.
+- Final Zig/Python formatting, Python lint, diff and license checks pass;
+  the Apache boundary covers 2,407 source files. Required cache cleanup completed
+  successfully, preserving active builds and leaving 100.8 GB free at completion.
+- Review fixes are committed through `704547d306`; main remains merged through
+  `8c1eddf12b`. Model-weight/backend qualification was not repeated because
+  inference execution and model math are unchanged.
+
+### Previous retry, projection and disclosure fixes (2026-11-04)
 
 - Merged main through `4bb2b815aa7d359d979d28cb9a4f4fa6205e70fc`. The merge
   keeps compact producer enrollment separate from mutable readiness cursors,

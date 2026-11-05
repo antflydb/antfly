@@ -167,10 +167,18 @@ Scan history retains at most 16 jobs. Completed, failed, and superseded jobs can
 be retired; active jobs are preserved. When all 16 are active, another scan
 request returns HTTP 409 (`privacy_scan_limit_exceeded`) without losing work.
 
+Backfill discovery queues document references without retaining source bodies.
+The requested scan limit is a row ceiling; discovery also limits retained
+identifiers and reference metadata to an 8 MiB page. One oversized identifier
+can advance alone. Replay captures current sources and admits detector work
+after discovery; discovery does not rewrite originals or renew TTLs.
+
 Policy saves acknowledge the installed resource version. Background scan and
 coverage updates do not change its ETag or delay acknowledgement. Equivalent
 field/category ordering and producer object-key ordering keep the executable
 producer unchanged; execution tuning still updates runtime controls separately.
+The policy-bound runtime override survives restart and governs subsequent
+inspection attempts without invalidating accepted receipts.
 
 Findings enumerate document IDs and inspect one source and manifest at a time.
 Pages stop between documents after an 8 MiB inspection budget, or within a
