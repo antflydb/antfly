@@ -57703,7 +57703,12 @@ fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     }
     effective = try ctx.index_manager.clampReplayForGraphReplacementBuilds(ctx.store, effective);
     effective = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint, effective);
-    try ctx.store.truncateReplayUpTo(ctx.alloc, effective);
+    // WS5: this runs as the derived executor's `truncate_fn`, reached from
+    // the foreground `waitForAll`/`waitForIndexes` catch-up paths -- it only
+    // raises the watermark now. Physical retirement is the owner-only
+    // `DocStore.serviceRetirement`, called from the owning maintenance turn
+    // (not yet wired here; see the WS5 handoff notes).
+    ctx.store.requestRetirement(effective);
 }
 
 const truncateReplayJournalIfSafeContext = local_mutation.truncateReplayJournalIfSafeContext;
@@ -100102,9 +100107,15 @@ test "db batch truncates replay logs after managed indexes catch up" {
 
     _ = try waitForAppliedSequenceAdvance(alloc, &db, "ft_v1", 0);
 
+    // WS5: the index-catch-up path only raises the retirement watermark now
+    // -- it never physically deletes journal entries itself. Physical
+    // retirement is the owner-only `DocStore.serviceRetirement`, normally
+    // driven by the owning maintenance turn; this single-process test
+    // stands in for that turn directly.
     var remaining_journal_entries: usize = std.math.maxInt(usize);
     var attempts: usize = 0;
     while (attempts < default_test_wait_attempts) : (attempts += 1) {
+        _ = try db.core.store.serviceRetirement(alloc, true, .{});
         const journal_entries = try db.core.store.iterateReplayFrom(alloc, 1);
         defer {
             for (journal_entries) |*entry| entry.deinit(alloc);
@@ -100158,7 +100169,14 @@ test "db async replay truncation retains durable enrichment debt" {
     // Repair-pin contention is covered with actual scheduled tasks in
     // "db replay truncation waits for repair pins through borrowed VoprIo".
     // This fixture verifies durable retention using the owner's native Io.
+    //
+    // WS5: `truncateReplaySequenceAsync` only raises the retirement
+    // watermark through its clamp (still bounded by the enrichment debt
+    // below) -- it no longer deletes. Drive the owner-only retirement
+    // service directly to exercise the clamp's effect on what actually
+    // survives.
     try truncateReplaySequenceAsync(db.async_context, target_sequence);
+    _ = try db.core.store.serviceRetirement(alloc, true, .{});
 
     const retained = try replay_stream_mod.iterateFrom(alloc, db.core.store, 1);
     defer {
