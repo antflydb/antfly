@@ -1,6 +1,6 @@
 # Distributed lake SQL execution
 
-This module implements the native execution service proposed in
+This module implements the native and hosted execution service described in
 [the distributed join design](../../../../../../docs/design/serverless-distributed-joins.md).
 It is opt-in through host capabilities; it does not change small-query routing
 or enable an unauthenticated worker API by default.
@@ -48,11 +48,11 @@ signed task/control RPCs. Terminal CAS operations retire discovery hints; expiry
 GC uses the actual state/exchange roots independently. Recovery skips live foreign
 leases, drains discovery pages promptly, and backs off empty sweeps to about
 30 seconds with boot-specific jitter. Active owners retain fast recovery.
-Submissions, cancellations, and foreground ownership acquisition signal an interruptible
-local event after durable admission. An allocation-free, coalescing FIFO retains
+Submissions, cancellations, completed deliveries, and restoration of a missing
+scheduling hint signal an interruptible local event after durable admission. An allocation-free, coalescing FIFO retains
 up to 256 query hints, with at most 16 processed per turn. Hinted queries bypass
-the discovery cursor and remain queued until complete. Internal progress never
-self-signals; notification overflow and process loss fall back to durable
+the discovery cursor and remain queued until complete. Coordinator requeues do not
+self-signal; notification overflow and process loss fall back to durable
 round-robin discovery. Embeddings wire `Driver.notification()` into their
 `Service.notification` when they use the native recovery driver. Maintenance
 pools collect expired execution records and exchange objects. API gateways never execute worker tasks.
@@ -65,9 +65,12 @@ bounded by `ANTFLY_SQL_CONCURRENCY`. Queue saturation never blocks coordinator
 progress: persisted pending tasks replay omitted hints. Delivery completion wakes
 the owning driver, and slow RPCs do not delay new admissions, cancellation, or
 lease renewal. While delivery is pending, hints use ten-second heartbeats;
-completion/cancellation notifications override that delay. Foreground polling
-skips task enumeration until progress or the lease's twenty-second renewal
-margin, avoiding repeated task GETs during slow RPCs. A process-local turn registry prevents foreground/recovery turns
+completion/cancellation notifications override that delay. Gateway result polls
+are read-only and do not send turn RPCs. Explicit turn requests restore missing
+hints without shortening a queued heartbeat or provider backoff or duplicating
+an active turn. Coordinator turns skip task enumeration until delivery progress
+or the lease's twenty-second renewal margin, avoiding repeated task GETs during
+slow RPCs. A process-local turn registry prevents foreground/recovery turns
 from overlapping under the same owner/epoch. Shutdown joins delivery before
 releasing the transport and stores. Transient delivery failures retain deduplication
 identity and retry with jittered exponential backoff (250 ms through 5 seconds,

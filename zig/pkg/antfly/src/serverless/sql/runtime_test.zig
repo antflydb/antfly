@@ -578,6 +578,42 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
             return .{ .ptr = self, .vtable = &.{ .resolve = resolve, .scan = scan, .mutate = mutate, .open_statement = open, .checkpoint = checkpoint } };
         }
     };
+    const Remote = struct {
+        service: runtime.Service,
+        dispatcher: runtime.Dispatcher,
+        polls: usize = 0,
+        turns: usize = 0,
+        fn execute(raw: *anyopaque, allocator: A, request_: local.common_http_http_common.HttpRequest) !local.common_http_http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const transport = @import("transport.zig");
+            var arena = std.heap.ArenaAllocator.init(allocator);
+            defer arena.deinit();
+            const scratch = arena.allocator();
+            if (std.mem.endsWith(u8, request_.uri, transport.submit_path)) {
+                const input = try std.json.parseFromSliceLeaky(plan.Plan, scratch, request_.body, .{});
+                const query = try self.service.submit(input);
+                // Simulate an independent remote driver completing the work.
+                // Visibility is delayed for several status polls below, so a
+                // foreground turn cannot be hidden by immediate completion.
+                var done = false;
+                for (0..128) |_| {
+                    done = try self.service.turn(query, self.dispatcher);
+                    if (done) break;
+                }
+                try std.testing.expect(done);
+                return .{ .status = 200, .owner_allocator = allocator, .body = try std.json.Stringify.valueAlloc(allocator, .{ .query = query }, .{}) };
+            }
+            if (std.mem.endsWith(u8, request_.uri, transport.result_path)) {
+                self.polls += 1;
+                if (self.polls < 4) return .{ .status = 200, .owner_allocator = allocator, .body = try allocator.dupe(u8, "null") };
+                const input = try std.json.parseFromSliceLeaky(transport.QueryRequest, scratch, request_.body, .{});
+                const result = try self.service.pollResult(scratch, input.query);
+                return .{ .status = 200, .owner_allocator = allocator, .body = try std.json.Stringify.valueAlloc(allocator, result, .{}) };
+            }
+            if (std.mem.endsWith(u8, request_.uri, transport.turn_path)) self.turns += 1;
+            return error.UnexpectedForegroundControl;
+        }
+    };
     const queries = [_][]const u8{
         "SELECT l.id, r.id FROM l JOIN r ON l.id=r.id ORDER BY l.id, r.id",
         "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id>5 ORDER BY l.id NULLS LAST, r.id NULLS LAST",
@@ -585,13 +621,17 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id WHERE l.id>1 ORDER BY l.id, r.id",
         "SELECT count(*) AS n FROM l LEFT JOIN r ON l.id=r.id",
     };
-    for (queries) |sql| {
+    for ([_]bool{ false, true }) |remote| for (queries) |sql| {
         var memory = storage.MemoryClient.init(a);
         defer memory.deinit();
         var fixture: Fixture = .{};
         var backend: Backend = .{ .fixture = &fixture };
         var dispatch: Dispatch = .{ .workers = .{ fixture.service(a, memory.client(), "worker-a"), fixture.service(a, memory.client(), "worker-b") }, .drop_once = false };
         var bridge: @import("bridge.zig").Bridge = .{ .service = fixture.service(a, memory.client(), "coordinator"), .dispatcher = .{ .ptr = &dispatch, .dispatch = Dispatch.run }, .local_bytes = 0, .limits = .{ .task_output_bytes = 16384 } };
+        var remote_service: Remote = .{ .service = bridge.service, .dispatcher = bridge.dispatcher };
+        var routing: @import("routing.zig").Routing = .{};
+        var client: @import("transport.zig").Client = .{ .a = a, .routing = &routing, .executor = .{ .ptr = &remote_service, .vtable = &.{ .execute = Remote.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{"http://query"} };
+        if (remote) bridge.gateway = &client;
         var compiled = try local.sql_compiler.compile(a, sql, .{});
         defer compiled.deinit();
         var ordinary = try local.sql_runtime.execute(a, backend.backend(), &compiled, &.{}, .{});
@@ -634,6 +674,10 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         const result = try std.json.Stringify.valueAlloc(a, actual.output.rows, .{});
         defer a.free(result);
         try std.testing.expectEqualStrings(baseline, result);
+        if (remote) {
+            try std.testing.expectEqual(@as(usize, 4), remote_service.polls);
+            try std.testing.expectEqual(@as(usize, 0), remote_service.turns);
+        }
         try std.testing.expect(ReadGuard.reads > 0);
         try std.testing.expect(backend.captures >= 2);
         var canceled: bool = true;
@@ -644,7 +688,7 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         }.check };
         try std.testing.expectError(error.Canceled, local.sql_runtime.execute(a, distributed, &compiled, &.{}, .{}));
         try std.testing.expectEqual(@as(usize, 0), backend.scanned);
-    }
+    };
 }
 
 test "distributed SQL coordinator fills idle capacity while an earlier task remains leased" {

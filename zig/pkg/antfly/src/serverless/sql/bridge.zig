@@ -117,9 +117,11 @@ pub const Bridge = struct {
                 transferred = true;
                 return .{ .ptr = owner, .next = Owner.next, .close = Owner.close };
             }
-            if (self.gateway) |gateway| {
-                _ = try gateway.turn(.{ .tenant = service.tenant, .query = query }, service.context);
-            } else _ = try service.turn(query, self.dispatcher);
+            // Remote submission durably schedules execution. Native recovery
+            // drivers and hosted alarms own progress; status polls must not
+            // reset their heartbeat or failure backoff. Inline embedders still
+            // drive their coordinator when no remote gateway is installed.
+            if (self.gateway == null) _ = try service.turn(query, self.dispatcher);
             if (service.context.io) |io| try std.Io.sleep(io, .fromMilliseconds(@intCast(poll_delay_ms)), .awake);
             poll_delay_ms = @min(poll_delay_ms * 2, 100);
         }

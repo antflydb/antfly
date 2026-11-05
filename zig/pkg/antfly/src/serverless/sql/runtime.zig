@@ -62,6 +62,12 @@ pub const Factory = struct {
 pub const Notification = struct {
     ptr: *anyopaque,
     notify: *const fn (*anyopaque, state.Digest, state.Query) void,
+    /// A liveness nudge restores missing work without overriding an active
+    /// turn, heartbeat, or provider backoff. Legacy embedders retain notify.
+    ensure_scheduled: ?*const fn (*anyopaque, state.Digest, state.Query) void = null,
+    pub fn ensureScheduled(self: Notification, tenant: state.Digest, query: state.Query) void {
+        (self.ensure_scheduled orelse self.notify)(self.ptr, tenant, query);
+    }
 };
 /// Process-local exclusion supplements durable epoch fencing: foreground and
 /// recovery turns must not race using the same boot owner and lease epoch.
@@ -1048,7 +1054,7 @@ pub const Service = struct {
             if (current.value.terminal()) self.retire(query);
             if (current.value.status == .succeeded) return true;
             if (current.value.terminal()) return error.SqlExecutionFailed;
-            self.notify(query);
+            if (self.notification) |notification| notification.ensureScheduled(self.tenant, query);
             return false;
         }
         var scoped = self;

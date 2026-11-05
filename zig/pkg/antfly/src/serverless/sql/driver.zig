@@ -49,7 +49,12 @@ pub const Driver = struct {
                 const driver: *Driver = @ptrCast(@alignCast(raw));
                 driver.enqueue(.{ .tenant = tenant, .query = query }, true);
             }
-        }.notify };
+        }.notify, .ensure_scheduled = struct {
+            fn ensure(raw: *anyopaque, tenant: state.Digest, query: state.Query) void {
+                const driver: *Driver = @ptrCast(@alignCast(raw));
+                driver.enqueueWithPolicy(.{ .tenant = tenant, .query = query }, true, true);
+            }
+        }.ensure };
     }
     fn enqueue(self: *Driver, hint: Hint, signal: bool) void {
         self.enqueueWithPolicy(hint, signal, false);
@@ -57,13 +62,13 @@ pub const Driver = struct {
     fn enqueueDiscovered(self: *Driver, query: state.Query) void {
         self.enqueueWithPolicy(.{ .tenant = self.service.tenant, .query = query, .discover = true }, false, true);
     }
-    fn enqueueWithPolicy(self: *Driver, hint: Hint, signal: bool, discovery_only: bool) void {
+    fn enqueueWithPolicy(self: *Driver, hint: Hint, signal: bool, missing_only: bool) void {
         if (self.stopping.load(.acquire)) return;
         while (!self.hint_mutex.tryLock()) std.atomic.spinLoopHint();
-        // Discovery restores missing work; it is not a progress notification.
+        // Discovery and liveness nudges restore missing work; neither proves progress.
         // Selection and this check share a lock so an active turn cannot gain
         // an immediate duplicate between dequeue and its delayed requeue.
-        if (discovery_only) {
+        if (missing_only) {
             const known = for (self.active) |active| {
                 if (active) |query| if (std.meta.eql(query, hint.query)) break true;
             } else for (0..self.hint_count) |i| {
@@ -564,4 +569,73 @@ test "distributed SQL discovery preserves active and queued backoff while progre
     driver.active[lane] = null;
     driver.enqueueDiscovered(hint.query);
     try std.testing.expectEqual(hint.query, driver.take(lane, &delay).?.query);
+}
+
+test "distributed SQL foreground liveness preserves heartbeat and failure backoff without metadata turns" {
+    const a = std.testing.allocator;
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    var records: state.Store = .{ .client = memory.client(), .bucket = "state", .prefix = "sql", .now_ms = 1000, .tenant = @splat('a') };
+    const query: state.Query = .{ .id = @splat('b'), .expires_ms = 200000 };
+    const key = try records.key(a, query, null, 0);
+    defer a.free(key);
+    try records.create(a, key, query.id, query.expires_ms);
+    const claim = (try records.claim(a, key, "owner", 60000)).?;
+    try records.checkpointTasks(a, key, claim, 0, 1, &.{0});
+    const Mock = struct {
+        fn clock(_: ?*anyopaque) u64 {
+            return 1000;
+        }
+        fn yes(_: *anyopaque, _: state.Query) bool {
+            return true;
+        }
+        fn no(_: *anyopaque, _: state.Query) bool {
+            return false;
+        }
+        fn nop(_: *anyopaque, _: state.Query) void {}
+    };
+    var dummy: u8 = 0;
+    var driver: Driver = .{ .service = .{ .a = a, .state_store = records, .exchange_store = undefined, .source = undefined, .retention = undefined, .role = .query_only, .owner = "owner", .tenant = @splat('a'), .clock = .{ .read = Mock.clock }, .coordination = .{ .ptr = &dummy, .enter = Mock.yes, .leave = Mock.nop, .delivery_pending = Mock.yes, .delivery_ready = Mock.no, .has_progress = Mock.no, .retry = Mock.nop } }, .dispatcher = undefined, .io = std.testing.io };
+    defer driver.stop();
+    try driver.process(.{ .tenant = @splat('a'), .query = query }, false);
+    var api = driver.service;
+    api.async_control = true;
+    api.notification = driver.notification();
+    var delay: u64 = 0;
+    const lane = Driver.lease_workers;
+    const before = memory.operationCount();
+    for (0..10) |_| {
+        try std.testing.expect(!try api.turn(query, undefined));
+        try std.testing.expectEqual(@as(u64, 11000), driver.hints[driver.hint_head].not_before_ms);
+        try std.testing.expect(driver.take(lane, &delay) == null);
+    }
+    // Only each explicit request's authorization GET remains. No coordinator
+    // metadata turn ran, and a gateway's result poll needs no turn RPC at all.
+    try std.testing.expectEqual(@as(u64, 10), memory.operationCount() - before);
+    driver.hints[driver.hint_head].not_before_ms = 6000;
+    driver.hints[driver.hint_head].failures = 4;
+    try std.testing.expect(!try api.turn(query, undefined));
+    try std.testing.expectEqual(@as(u64, 6000), driver.hints[driver.hint_head].not_before_ms);
+    try std.testing.expectEqual(@as(u8, 4), driver.hints[driver.hint_head].failures);
+    // A nudge racing an active turn must not insert an immediate duplicate.
+    driver.hint_count = 0;
+    driver.active[lane] = query;
+    try std.testing.expect(!try api.turn(query, undefined));
+    try std.testing.expectEqual(@as(usize, 0), driver.hint_count);
+    driver.active[lane] = null;
+    // Lost hints remain repairable, retaining the authenticated principal scope.
+    try std.testing.expect(!try api.turn(query, undefined));
+    const restored = driver.take(lane, &delay).?;
+    try std.testing.expectEqual(api.tenant, restored.tenant);
+    try std.testing.expect(!restored.discover);
+    try driver.process(restored, false);
+    driver.active[lane] = null;
+    driver.notification().notify(driver.notification().ptr, api.tenant, query);
+    try std.testing.expectEqual(query, driver.take(lane, &delay).?.query);
+    driver.active[lane] = null;
+    driver.hint_count = 0;
+    try driver.process(restored, false);
+    // Durable cancellation remains an immediate progress notification.
+    try api.requestCancel(query);
+    try std.testing.expectEqual(query, driver.take(lane, &delay).?.query);
 }
