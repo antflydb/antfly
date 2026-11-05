@@ -34,6 +34,8 @@ pub const Cache = struct {
     rejected_hand: usize = 0,
     const Entry = struct {
         key: [32]u8,
+        cache: *Cache,
+        backing_failed: std.atomic.Value(bool) = .init(false),
         budget: local.sql_memory_budget,
         hash: ?*Hash = null,
         filter: ?*Filter = null,
@@ -41,6 +43,28 @@ pub const Cache = struct {
         used: u64,
         refs: usize = 1,
         ready: bool = false,
+        fn allocator(self: *Entry) A {
+            return .{ .ptr = self, .vtable = &.{ .alloc = Entry.alloc, .resize = Entry.resize, .remap = Entry.remap, .free = Entry.free } };
+        }
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *Entry = @ptrCast(@alignCast(raw));
+            return self.cache.sharedAllocator().rawAlloc(len, alignment, ra) orelse {
+                self.backing_failed.store(true, .monotonic);
+                return null;
+            };
+        }
+        fn resize(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) bool {
+            const self: *Entry = @ptrCast(@alignCast(raw));
+            return self.cache.sharedAllocator().rawResize(memory, alignment, len, ra);
+        }
+        fn remap(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ra: usize) ?[*]u8 {
+            const self: *Entry = @ptrCast(@alignCast(raw));
+            return self.cache.sharedAllocator().rawRemap(memory, alignment, len, ra);
+        }
+        fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *Entry = @ptrCast(@alignCast(raw));
+            self.cache.sharedAllocator().rawFree(memory, alignment, ra);
+        }
     };
     pub const Lease = struct {
         cache: *Cache,
@@ -62,6 +86,14 @@ pub const Cache = struct {
             for (owned) |*column| column.name = try a.dupe(u8, column.name);
             self.entry.filter = try Filter.create(self.allocator(), owned, 64 * 1024);
             return self.entry.filter.?;
+        }
+        /// Only a private, unfinished build can request an uncached retry.
+        /// Task scratch, source I/O, and all post-publication errors propagate.
+        pub fn buildError(self: Lease, err: anyerror) anyerror {
+            if (!self.hit and !self.entry.ready and
+                (err == error.SqlProgramLimitExceeded or (err == error.OutOfMemory and
+                    (self.entry.backing_failed.load(.monotonic) or self.entry.budget.isLocallyExhausted() or self.hash().budget.isLocallyExhausted())))) return error.SqlBuildCacheAdmissionFailed;
+            return err;
         }
         pub fn complete(self: *Lease) void {
             if (self.hit) return;
@@ -160,7 +192,8 @@ pub const Cache = struct {
             self.mutex.unlock();
             return null;
         };
-        entry.* = .{ .key = key, .budget = .{ .backing = self.sharedAllocator(), .limit = limit }, .names = undefined, .used = self.clock };
+        entry.* = .{ .key = key, .cache = self, .budget = .{ .backing = undefined, .limit = limit }, .names = undefined, .used = self.clock };
+        entry.budget.backing = entry.allocator();
         entry.names = .init(entry.budget.allocator());
         self.entries[index] = entry;
         self.mutex.unlock();
@@ -386,4 +419,24 @@ test "distributed SQL prepared residency preserves in-place growth and exact rem
     build.complete();
     build.release();
     try std.testing.expect(cache.peak <= cache.bytes);
+}
+
+test "distributed SQL prepared cache retries only private build admission failures" {
+    const a = std.testing.allocator;
+    var cache: Cache = .{ .a = a, .bytes = 1024 * 1024 };
+    defer cache.deinit();
+    var private = (cache.acquire(@splat('a'), 1024 * 1024, 100)).?;
+    try std.testing.expectEqual(error.OutOfMemory, private.buildError(error.OutOfMemory));
+    try std.testing.expectEqual(error.Canceled, private.buildError(error.Canceled));
+    try std.testing.expectError(error.OutOfMemory, private.allocator().alloc(u8, 2 * 1024 * 1024));
+    try std.testing.expectEqual(error.SqlBuildCacheAdmissionFailed, private.buildError(error.OutOfMemory));
+    private.release();
+    var ready = (cache.acquire(@splat('b'), 1024 * 1024, 100)).?;
+    ready.complete();
+    try std.testing.expectEqual(error.SqlProgramLimitExceeded, ready.buildError(error.SqlProgramLimitExceeded));
+    ready.release();
+    var hit = (cache.acquire(@splat('b'), 1024 * 1024, 100)).?;
+    defer hit.release();
+    try std.testing.expect(hit.hit);
+    try std.testing.expectEqual(error.OutOfMemory, hit.buildError(error.OutOfMemory));
 }

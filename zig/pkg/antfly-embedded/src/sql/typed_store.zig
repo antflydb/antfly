@@ -930,37 +930,44 @@ pub const Store = struct {
             lease.generation = 1;
         }
         var bytes: usize = 0;
-        for (0..batch.width()) |column| for (0..batch.len()) |index| {
-            const payload: ?JsonPayload = if (try batch.frozenJson(index, column)) |frozen|
-                .{ .frozen = frozen }
-            else if (try batch.encodedJson(index, column)) |text|
-                .{ .text = text }
-            else
-                null;
-            if (payload) |native| {
-                bytes +|= @sizeOf(?*JsonPayload) + 1;
-                if (bytes > maximum) return bytes;
-                const source = if (native.frozen) |frozen| frozen.bytes else native.text.?;
-                if (source.len >= 256) {
-                    const resolved = try lease.resolve(self, native);
-                    if (resolved.estimated == lease.generation) continue;
-                    resolved.estimated = lease.generation;
-                    if (resolved.owned == null) resolved.owned = self.json_payloads.get(resolved.key);
-                    if (resolved.owned != null) continue;
-                    if (self.json_pool) |pool| if (pool.bodies.contains(resolved.key)) continue;
-                    const prior_growth = if (self.json_pool) |pool| pool.growthBytes(incoming.count()) else @as(usize, 0);
-                    const entry = try incoming.getOrPut(work, resolved.key);
-                    if (entry.found_existing) continue;
-                    if (self.json_pool) |pool| bytes +|= pool.growthBytes(incoming.count()) -| prior_growth;
+        for (0..batch.width()) |column| {
+            const decimal = try batch.decimalColumnSelected(work, column, null);
+            const physical = if (decimal == null) try batch.physicalColumnSelected(work, column, null) else null;
+            for (0..batch.len()) |index| {
+                const payload: ?JsonPayload = if (try batch.frozenJson(index, column)) |frozen|
+                    .{ .frozen = frozen }
+                else if (try batch.encodedJson(index, column)) |text|
+                    .{ .text = text }
+                else
+                    null;
+                if (payload) |native| {
+                    bytes +|= @sizeOf(?*JsonPayload) + 1;
+                    if (bytes > maximum) return bytes;
+                    const source = if (native.frozen) |frozen| frozen.bytes else native.text.?;
+                    if (source.len >= 256) {
+                        const resolved = try lease.resolve(self, native);
+                        if (resolved.estimated == lease.generation) continue;
+                        resolved.estimated = lease.generation;
+                        if (resolved.owned == null) resolved.owned = self.json_payloads.get(resolved.key);
+                        if (resolved.owned != null) continue;
+                        if (self.json_pool) |pool| if (pool.bodies.contains(resolved.key)) continue;
+                        const prior_growth = if (self.json_pool) |pool| pool.growthBytes(incoming.count()) else @as(usize, 0);
+                        const entry = try incoming.getOrPut(work, resolved.key);
+                        if (entry.found_existing) continue;
+                        if (self.json_pool) |pool| bytes +|= pool.growthBytes(incoming.count()) -| prior_growth;
+                    }
+                    bytes +|= source.len +| @sizeOf(JsonPayload) +| 64;
+                } else {
+                    _ = cell_region.reset(.retain_capacity);
+                    var coefficient: @import("numeric_value.zig").ScaledInteger = undefined;
+                    var number: @import("numeric_value.zig").Value = undefined;
+                    const datum = if (decimal) |view| try view.cell(index, &coefficient, &number) else if (physical) |view| try view.cell(index) else try batch.cell(cell_region.allocator(), index, column);
+                    bytes +|= try self.cellAppendBytes(column, datum);
                 }
-                bytes +|= source.len +| @sizeOf(JsonPayload) +| 64;
-            } else {
-                _ = cell_region.reset(.retain_capacity);
-                bytes +|= try self.cellAppendBytes(column, try batch.cell(cell_region.allocator(), index, column));
+                // Reject before temporary identity state can outgrow admission.
+                if (bytes > maximum) return bytes;
             }
-            // Reject before temporary identity state can outgrow admission.
-            if (bytes > maximum) return bytes;
-        };
+        }
         return bytes;
     }
 
@@ -1056,6 +1063,10 @@ pub const Store = struct {
             if (try batch.dictionaryColumn(scratch.allocator(), ordinal)) |encoded| {
                 if (encoded.len() != batch.len()) return error.InvalidSqlBackendResponse;
                 if (try column.appendDictionary(self.a, self.arena.allocator(), self.len, encoded)) continue;
+            }
+            if (try batch.physicalColumnSelected(scratch.allocator(), ordinal, null)) |physical| {
+                for (0..batch.len()) |index| try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, try physical.cell(index));
+                continue;
             }
             _ = scratch.reset(.free_all);
             for (0..batch.len()) |index| {

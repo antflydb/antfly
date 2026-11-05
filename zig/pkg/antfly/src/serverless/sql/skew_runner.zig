@@ -81,7 +81,7 @@ pub fn pair(self: anytype, query: plan.Digest, spec: plan.Plan, task: plan.Task,
             _ = scratch.reset(.free_all);
             const batch = block.batch();
             const build_keys = try runner.batchKeys(scratch.allocator(), batch, spec.join.right_keys);
-            try hash.addBatch(scratch.allocator(), batch, build_keys);
+            hash.addBatch(scratch.allocator(), batch, build_keys) catch |err| return if (lease) |value| value.buildError(err) else err;
             right_rows += block.count();
         }
     }

@@ -64,17 +64,17 @@ pub const Program = struct {
 };
 
 const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
-const Regex = @import("antfly_sql_regex");
-/// One task owns all predicate caches and one serial regex lane. Row scratch
+const RegexExecution = @import("antfly_local_sources").sql_regex_execution;
+/// One task owns predicate caches and quota-controlled regex lanes. Row scratch
 /// retains capacity but is reset between evaluations; it never owns output rows.
 pub const Task = struct {
     pub const Kind = enum { left, right, condition };
     left: ?Prepared = null,
     right: ?Prepared = null,
     condition: ?Prepared = null,
-    regex: Regex.Session,
+    regex: RegexExecution,
     pub fn init(a: A, context: Context, memory: u64, left: ?Program, right: ?Program, condition: ?Program) !Task {
-        var result: Task = .{ .regex = Regex.Session.init(a, .{ .heap_bytes = @intCast(@min(@as(u64, 8 * 1024 * 1024), memory / 4)) }, @intCast(@min(@as(u64, 16 * 1024 * 1024), memory / 2))) };
+        var result: Task = .{ .regex = RegexExecution.init(a, @intCast(@min(@as(u64, 16 * 1024 * 1024), memory / 2))) };
         errdefer result.deinit();
         const constants: usize = @intCast(@min(@as(u64, 4 * 1024 * 1024), memory / 32));
         if (left) |ir| result.left = try Prepared.init(a, ir, context, constants);
@@ -114,10 +114,13 @@ pub const Prepared = struct {
         const context: *const Context = @ptrCast(@alignCast(raw.?));
         try context.ensureActive();
     }
-    fn matches(self: *Prepared, cells: []const scalar.Datum, session: *Regex.Session) !bool {
+    pub fn evalLimits(self: *Prepared, session: *RegexExecution) scalar.EvalLimits {
+        return .{ .regex_execution = session, .regex_checkpoint = checkpoint, .regex_context = &self.context, .checkpoint = checkpoint, .checkpoint_context = &self.context };
+    }
+    fn matches(self: *Prepared, cells: []const scalar.Datum, session: *RegexExecution) !bool {
         try self.context.ensureActive();
         _ = self.scratch.reset(.retain_capacity);
-        const value = try self.program.evaluate(self.scratch.allocator(), cells, self.parameters, .{ .regex_session = session, .regex_checkpoint = checkpoint, .regex_context = &self.context, .checkpoint = checkpoint, .checkpoint_context = &self.context });
+        const value = try self.program.evaluate(self.scratch.allocator(), cells, self.parameters, self.evalLimits(session));
         if (value.sql_null) return false;
         if (value.value != .bool) return error.InvalidSqlDistributedPlan;
         return value.value.bool;
@@ -152,8 +155,8 @@ test "distributed SQL prepared predicates reuse regex state and bound warm alloc
     const warm_bytes = counted.allocated_bytes;
     const started = @import("antfly_platform").time.monotonicNs();
     for (0..999) |_| try std.testing.expect(try task.matches(.condition, &cells));
-    try std.testing.expectEqual(@as(u64, 1), task.regex.compilations);
-    try std.testing.expectEqual(@as(u64, 999), task.regex.hits);
+    try std.testing.expectEqual(@as(u64, 1), task.regex.snapshot().compilations);
+    try std.testing.expectEqual(@as(u64, 999), task.regex.snapshot().hits);
     try std.testing.expect(counted.allocated_bytes - warm_bytes < 64 * 1024);
     std.debug.print("prepared predicate: warm_rows=999 allocations={d} total_bytes={d} warm_extra_bytes={d} elapsed_ns={d}\n", .{ counted.allocations, counted.allocated_bytes, counted.allocated_bytes - warm_bytes, @import("antfly_platform").time.monotonicNs() - started });
     const Cancel = struct {

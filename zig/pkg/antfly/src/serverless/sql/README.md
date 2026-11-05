@@ -149,8 +149,11 @@ workers validate the capability, schema incarnation, and snapshot on reopen.
   immutable byte cache.
 - Clean retained base scans (including dynamic-filter selections), map
   partitioning, hash/Grace admission, and hash probe seeding use borrowed typed batches. WAL reconciliation and residual
-  expressions retain scalar fallbacks. Join matches append in bounded cohorts
-  of up to 256 coordinates, sharing JSON sizing/insertion leases. Tight
+  expressions retain scalar fallbacks. Hash matches, unmatched build rows, and
+  native Grace output append in bounded cohorts
+  of up to 256 coordinates, sharing JSON sizing/insertion leases. Projections
+  forward physical dictionaries and exact decimal vectors through admission
+  and retention, including duplicate selections. Tight
   budgets admit smaller prefixes before sizing the remaining cohort against
   updated dictionaries. Aggregate cohorts read only grouping/input columns
   and retire row scratch immediately. Output accumulates in typed columns;
@@ -166,15 +169,19 @@ workers validate the capability, schema incarnation, and snapshot on reopen.
   aggregate byte budget and may consume spare capacity rather than fixed
   quarters; allocation pressure evicts only unpinned entries. These are
   additional worker-level residency budgets, separate from task allocation ceilings. Hosted physical binding changes clear
-  residency. Oversized cache builds retry under the ordinary task budget and
-  enter a bounded negative cache to avoid repeatedly paying the failed build.
+  residency. Private build allocation failures can retry under the ordinary
+  task budget; source, scratch, probe, and output failures propagate directly.
+  Locally oversized builds enter a bounded negative cache; shared pressure
+  remains retryable.
 - Adaptive coalescing groups adjacent small partitions from accepted map
   statistics. Recovery checkpoints at most eight map directories per turn;
   immutable progress objects and the final boundary list are fenced by the
   query CAS. Workers never infer a layout from changing pod counts. Aggregation
   fan-in uses the resolved reducer count.
 - Native reducers with a supplied spill manager reuse the existing grace/skew
-  join kernel. Without local spill, oversized tasks fail their explicit budget.
+  join kernel. Residual scratch is retired between rows, and parallel workers
+  lease independent regex matcher lanes under one task quota. Without local
+  spill, oversized tasks fail their explicit budget.
   Semi/anti reducers use the bounded hash kernel.
 - Plans submitted directly to the service can push grouped aggregate partials
   above joins. These use the existing aggregate interchange and a fan-in-32

@@ -201,13 +201,11 @@ pub const Runner = struct {
         var prepared = self;
         prepared.predicates = &predicates;
         return prepared.runPrepared(query, specification, task, dependencies) catch |err| {
-            // Residency is optional. A build exceeding its shared cache slot
-            // retries under the original task budget, without retaining failure.
-            if (prepared.build_cache != null and (err == error.OutOfMemory or err == error.SqlProgramLimitExceeded)) {
-                prepared.build_cache = null;
-                return prepared.runPrepared(query, specification, task, dependencies);
-            }
-            return err;
+            // Only private cache builders emit this admission signal. All task
+            // scratch, source, probe, and output failures retain their meaning.
+            if (err != error.SqlBuildCacheAdmissionFailed or prepared.build_cache == null) return err;
+            prepared.build_cache = null;
+            return prepared.runPrepared(query, specification, task, dependencies);
         };
     }
     pub fn predicate(self: Runner, kind: @import("expression.zig").Task.Kind, cells: []const Datum) !bool {
@@ -312,7 +310,7 @@ pub const Runner = struct {
         defer self.a.free(columns);
         for (columns, spec.join.left_keys) |*column, ordinal| column.* = spec.left.columns[ordinal];
         const building_filter = if ((broadcast or bucketed) and spec.join.mayFilterProbe())
-            (if (lease) |value| (if (value.hit) null else try value.createFilter(columns)) else try local.sql_dynamic_filter.Filter.create(self.a, columns, 64 * 1024))
+            (if (lease) |value| (if (value.hit) null else value.createFilter(columns) catch |err| return value.buildError(err)) else try local.sql_dynamic_filter.Filter.create(self.a, columns, 64 * 1024))
         else
             null;
         defer if (lease == null) {
@@ -361,8 +359,8 @@ pub const Runner = struct {
                     if (input_rows > spec.limits.task_scan_rows) return error.SqlJoinBudgetExceeded;
                     const batch = block.batch();
                     const build_keys = try batchKeys(row_arena.allocator(), batch, spec.join.right_keys);
-                    try hash.addBatch(row_arena.allocator(), batch, build_keys);
-                    if (building_filter) |value| for (build_keys) |key| try value.add(key);
+                    hash.addBatch(row_arena.allocator(), batch, build_keys) catch |err| return if (lease) |value| value.buildError(err) else err;
+                    if (building_filter) |value| for (build_keys) |key| value.add(key) catch |err| return if (lease) |cached| cached.buildError(err) else err;
                 }
             }
         }
@@ -403,11 +401,21 @@ pub const Runner = struct {
         }
         if (spec.join.preservesBuild()) {
             var next: usize = 0;
+            var rights: [256]?local.sql_execution_batch.Batch = undefined;
+            const positions: [256]usize = @splat(0);
+            var count: usize = 0;
             while (try hash.unmatched(&next)) |match| {
                 try self.context.ensureActive();
-                _ = row_arena.reset(.free_all);
-                try self.emit(spec, null, try match.materializeValues(row_arena.allocator()), &output, row_arena.allocator());
+                const batch = try match.valuesBatch(row_arena.allocator());
+                rights[count] = batch;
+                count += 1;
+                if (count == rights.len or batch != .retained) {
+                    try self.emitCohort(spec, null, positions[0..count], rights[0..count], &output, row_arena.allocator());
+                    count = 0;
+                    _ = row_arena.reset(.free_all);
+                }
             }
+            if (count != 0) try self.emitCohort(spec, null, positions[0..count], rights[0..count], &output, row_arena.allocator());
         }
         return output.publish(self.a, self.exchange_store, query, spec.expires_ms, @intCast(spec.limits.task_output_bytes));
     }
@@ -445,19 +453,18 @@ pub const Runner = struct {
             output.aggregation = aggregate;
             if (aggregate.groups.len == 0) try output.grouped.?.ensureGlobalGroup();
         }
-        while (try join_.next()) |pair| {
+        join_.evaluation = .{ .left_width = spec.left.columns.len, .right_width = spec.right.columns.len };
+        if (self.predicates) |predicates| if (predicates.condition) |*condition| {
+            join_.evaluation.?.condition = &condition.program;
+            join_.evaluation.?.parameters = condition.parameters;
+            join_.evaluation.?.limits = condition.evalLimits(&predicates.regex);
+        };
+        while (true) {
             try self.context.ensureActive();
             _ = scratch.reset(.free_all);
-            if (pair.left != null and pair.right != null) {
-                if (spec.join.condition != null) {
-                    const cells = try scratch.allocator().alloc(Datum, pair.left.?.len + pair.right.?.len);
-                    @memcpy(cells[0..pair.left.?.len], pair.left.?);
-                    @memcpy(cells[pair.left.?.len..], pair.right.?);
-                    if (!try self.predicate(.condition, cells)) continue;
-                }
-                if (pair.match) |match| try join_.accept(match);
-            }
-            try self.emit(spec, pair.left, pair.right, &output, scratch.allocator());
+            const batch = try join_.nextBatch(scratch.allocator(), 256, null);
+            if (batch.len() == 0) break;
+            try self.emitProjected(spec, &batch, &output, scratch.allocator());
         }
         return output.publish(self.a, self.exchange_store, query, spec.expires_ms, @intCast(spec.limits.task_output_bytes));
     }
@@ -558,6 +565,12 @@ pub const Runner = struct {
         }
         if (count != 0) try self.emitCohort(spec, batch, positions[0..count], rights[0..count], output, matches.allocator());
     }
+    fn emitProjected(_: Runner, spec: plan.Plan, batch: *const local.sql_execution_batch.Batch, output: *OutputRows, a: A) !void {
+        if (spec.join.projection.len == 0) return output.addBatch(a, 0, batch.*);
+        const columns = try a.alloc(local.sql_execution_batch.Batch, spec.join.projection.len);
+        for (columns, spec.join.projection) |*column, ordinal| column.* = try batch.project(a, ordinal);
+        try output.addBatch(a, 0, try local.sql_execution_batch.Batch.combine(a, columns, batch.len()));
+    }
     pub fn emitBatch(self: Runner, spec: plan.Plan, left: ?local.sql_execution_batch.Batch, right: ?local.sql_execution_batch.Batch, output: *OutputRows, a: A) !void {
         return self.emitCohort(spec, left, &.{0}, &.{right}, output, a);
     }
@@ -567,11 +580,51 @@ pub const Runner = struct {
             left: ?Batch,
             positions: []const usize,
             rights: []const ?Batch,
+            right_store: ?*const local.sql_typed_store.Store,
+            right_positions: []const usize,
             left_width: usize,
             projection: []const u16,
             fn column(self: *@This(), row: usize, ordinal: usize) struct { batch: ?Batch, row: usize, index: usize } {
                 const index = if (self.projection.len == 0) ordinal else self.projection[ordinal];
                 return if (index < self.left_width) .{ .batch = self.left, .row = self.positions[row], .index = index } else .{ .batch = self.rights[row], .row = 0, .index = index - self.left_width };
+            }
+            fn selectedSource(self: *@This(), alloc: A, ordinal: usize, selection: ?[]const usize) !?struct { batch: Batch, index: usize, rows: []const usize } {
+                const index = if (self.projection.len == 0) ordinal else self.projection[ordinal];
+                const left_side = index < self.left_width;
+                const source: Batch = if (left_side) self.left orelse return null else if (self.right_store) |store|
+                    .{ .retained = .{ .store = store, .begin = 0, .count = store.len } }
+                else if (self.positions.len == 1) self.rights[0] orelse return null else return null;
+                const source_rows = if (left_side) self.positions else if (self.right_store != null) self.right_positions else &[_]usize{0};
+                const rows = if (selection) |selected| mapped: {
+                    const mapped = try alloc.alloc(usize, selected.len);
+                    for (mapped, selected) |*row, lane| row.* = source_rows[lane];
+                    break :mapped mapped;
+                } else source_rows;
+                return .{ .batch = source, .index = if (left_side) index else index - self.left_width, .rows = rows };
+            }
+            fn physical(raw: *anyopaque, alloc: A, ordinal: usize, selection: ?[]const usize) anyerror!?local.sql_execution_batch.PhysicalColumn {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const source = (try self.selectedSource(alloc, ordinal, selection)) orelse return null;
+                return source.batch.physicalColumnSelected(alloc, source.index, source.rows);
+            }
+            fn decimal(raw: *anyopaque, alloc: A, ordinal: usize, selection: ?[]const usize) anyerror!?local.sql_execution_batch.DecimalColumn {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const source = (try self.selectedSource(alloc, ordinal, selection)) orelse return null;
+                return source.batch.decimalColumnSelected(alloc, source.index, source.rows);
+            }
+            fn identity(raw: *anyopaque, row: usize, ordinal: usize) anyerror!?u64 {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const index = if (self.projection.len == 0) ordinal else self.projection[ordinal];
+                if (index >= self.left_width and self.right_store == null and self.positions.len != 1) return null;
+                const value = self.column(row, ordinal);
+                return if (value.batch) |source| source.dictionaryIdentity(value.row, value.index) else null;
+            }
+            fn dictionary(raw: *anyopaque, alloc: A, ordinal: usize) anyerror!?Batch {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const source = (try self.selectedSource(alloc, ordinal, null)) orelse return null;
+                const selected = try alloc.create(Batch);
+                selected.* = try source.batch.select(alloc, source.rows);
+                return selected.dictionaryColumn(alloc, source.index);
             }
             fn cell(raw: *anyopaque, alloc: A, row: usize, ordinal: usize) anyerror!Datum {
                 const self: *@This() = @ptrCast(@alignCast(raw));
@@ -590,8 +643,23 @@ pub const Runner = struct {
             }
         };
         const width = spec.left.columns.len + (if (spec.join.kind == .semi or spec.join.kind == .anti) @as(usize, 0) else spec.right.columns.len);
-        var view: View = .{ .left = left, .positions = positions, .rights = rights, .left_width = spec.left.columns.len, .projection = spec.join.projection };
-        try output.addBatch(a, 0, .{ .reader = .{ .ptr = &view, .read = View.cell, .read_frozen = View.frozen, .read_json = View.json, .count = positions.len, .width = if (spec.join.projection.len == 0) width else spec.join.projection.len } });
+        const right_store: ?*const local.sql_typed_store.Store = common: {
+            if (rights.len == 0) break :common null;
+            const first = rights[0] orelse break :common null;
+            if (first != .retained) break :common null;
+            for (rights) |right| {
+                const batch = right orelse break :common null;
+                if (batch != .retained or batch.retained.store != first.retained.store) break :common null;
+            }
+            break :common first.retained.store;
+        };
+        std.debug.assert(positions.len <= 256);
+        var right_positions: [256]usize = undefined;
+        if (right_store != null) for (rights, 0..) |right, row| {
+            right_positions[row] = right.?.retained.begin;
+        };
+        var view: View = .{ .left = left, .positions = positions, .rights = rights, .right_store = right_store, .right_positions = right_positions[0..positions.len], .left_width = spec.left.columns.len, .projection = spec.join.projection };
+        try output.addBatch(a, 0, .{ .reader = .{ .ptr = &view, .read = View.cell, .read_physical_selected = View.physical, .read_decimal_selected = View.decimal, .read_dictionary = View.dictionary, .read_identity = View.identity, .read_frozen = View.frozen, .read_json = View.json, .count = positions.len, .width = if (spec.join.projection.len == 0) width else spec.join.projection.len } });
     }
     pub fn emit(self: Runner, spec: plan.Plan, left: ?[]const Datum, right: ?[]const Datum, output: *OutputRows, a: A) !void {
         const width = spec.left.columns.len + (if (spec.join.kind == .semi or spec.join.kind == .anti) @as(usize, 0) else spec.right.columns.len);
@@ -719,4 +787,142 @@ test "distributed SQL aggregate cohorts read only referenced columns and skip un
     try output.addBatch(region.allocator(), 0, batch);
     const result = (try output.grouped.?.nextResult(region.allocator())).?;
     try std.testing.expectEqual(@as(i64, 256), result.aggregates[0].value.integer);
+}
+
+test "distributed SQL cache fallback never retries source or completed probe failures" {
+    const a = std.testing.allocator;
+    const Failing = struct {
+        opens: usize = 0,
+        failure: anyerror,
+        fn open(raw: *anyopaque, _: A, _: plan.Digest, _: plan.Input, _: u32, _: ?*const local.sql_dynamic_filter.Filter, _: Context) !Stream {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.opens += 1;
+            return self.failure;
+        }
+    };
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "snapshot", .wal_cut = 0, .cut = "cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 1, .estimated_rows = 1, .splits = 1 };
+    var spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = 1000, .left = input, .right = input, .join = .{ .left_keys = &.{0}, .right_keys = &.{0} }, .strategy = .broadcast, .partitions = 1, .limits = .{} };
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const sa = region.allocator();
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    const objects: exchange.Store = .{ .client = memory.client(), .bucket = "queries", .prefix = "tenant" };
+    var build = try OutputRows.init(a, 1, 1024 * 1024);
+    defer build.deinit(a);
+    try build.addBatch(sa, 0, .{ .rows = &.{&.{Datum.json(.{ .integer = 7 })}} });
+    const ref = try build.publish(sa, objects, @splat('a'), 1000, 1024 * 1024);
+    for ([_]anyerror{ error.OutOfMemory, error.SqlProgramLimitExceeded }) |failure| {
+        var cache: @import("build_cache.zig").Cache = .{ .a = a, .bytes = 4 * 1024 * 1024 };
+        defer cache.deinit();
+        var source: Failing = .{ .failure = failure };
+        const executor: Runner = .{ .a = a, .source = .{ .ptr = &source, .open = Failing.open }, .exchange_store = objects, .context = .{}, .build_cache = &cache };
+        try std.testing.expectError(failure, executor.run(@splat('a'), spec, .{ .kind = .map_left, .stage = 0, .task = 0 }, &.{}));
+        try std.testing.expectEqual(@as(usize, 1), source.opens);
+        source.opens = 0;
+        try std.testing.expectError(failure, executor.run(@splat('a'), spec, .{ .kind = .broadcast_probe, .stage = 1, .task = 0 }, &.{ref}));
+        try std.testing.expectEqual(@as(usize, 1), source.opens);
+        var cached = (try executor.cachedBuild(@splat('a'), spec, &.{ref}, 0, 1)).?;
+        try std.testing.expect(cached.hit);
+        cached.release();
+    }
+    // A failed optional filter allocation really does fall back before probing.
+    var small: @import("build_cache.zig").Cache = .{ .a = a, .bytes = 8192 };
+    defer small.deinit();
+    var source: Failing = .{ .failure = error.ExpectedProbeFailure };
+    const executor: Runner = .{ .a = a, .source = .{ .ptr = &source, .open = Failing.open }, .exchange_store = objects, .context = .{}, .build_cache = &small };
+    spec.limits.task_memory = 1024 * 1024;
+    try std.testing.expectError(error.ExpectedProbeFailure, executor.run(@splat('b'), spec, .{ .kind = .broadcast_probe, .stage = 1, .task = 0 }, &.{ref}));
+    try std.testing.expectEqual(@as(usize, 1), source.opens);
+    try std.testing.expectEqual(@as(usize, 0), small.live);
+}
+
+test "distributed SQL grace typed cohorts preserve residual rejection and unmatched sides across batches" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const sa = region.allocator();
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    const objects: exchange.Store = .{ .client = memory.client(), .bucket = "queries", .prefix = "tenant" };
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "snapshot", .wal_cut = 0, .cut = "cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 1, .estimated_rows = 300, .splits = 1 };
+    const condition: @import("expression.zig").Program = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = false } } }}, .root = 0, .output = .{ .kind = .boolean } };
+    const spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = 1000, .left = input, .right = input, .join = .{ .kind = .full, .left_keys = &.{0}, .right_keys = &.{0}, .condition = condition, .projection = &.{ 1, 0, 1 } }, .strategy = .shuffle, .partitions = 1, .limits = .{} };
+    var build = try OutputRows.init(a, 1, 1024 * 1024);
+    defer build.deinit(a);
+    for (0..300) |i| try build.add(a, 0, &.{Datum.json(.{ .integer = @intCast(i) })});
+    const ref = try build.publish(sa, objects, @splat('a'), 1000, 1024 * 1024);
+    var directory = try local.common_test_directory.TestDirectory.init("sql-grace-cohorts");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    var marker: u8 = 0;
+    var spill: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &marker, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .root = directory.path() };
+    defer spill.deinit();
+    const executor: Runner = .{ .a = a, .source = undefined, .exchange_store = objects, .context = .{}, .spill = &spill };
+    const result = try executor.run(@splat('a'), spec, .{ .kind = .reduce, .stage = 1, .task = 0, .partition_end = 1 }, &.{ ref, ref });
+    defer a.free(result.key);
+    var data = try objects.read(sa, result, 0, 1024 * 1024);
+    var left: usize = 0;
+    var right: usize = 0;
+    while (try data.next(sa, 1024 * 1024)) |block| {
+        defer block.deinit();
+        for (0..block.count()) |row| {
+            const l = try block.cell(row, 1);
+            const r = try block.cell(row, 0);
+            try std.testing.expect(l.sql_null != r.sql_null);
+            try std.testing.expectEqual(r.sql_null, (try block.cell(row, 2)).sql_null);
+            if (l.sql_null) right += 1 else left += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 300), left);
+    try std.testing.expectEqual(@as(usize, 300), right);
+}
+
+test "distributed SQL typed join cohorts preserve physical dictionaries decimals and duplicate selections through admission" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const sa = region.allocator();
+    const Batch = local.sql_execution_batch.Batch;
+    const Reader = struct {
+        fn cell(_: *anyopaque, _: A, _: usize, _: usize) anyerror!Datum {
+            return error.UnexpectedMaterialization;
+        }
+        fn physical(_: *anyopaque, alloc: A, ordinal: usize, selected: ?[]const usize) anyerror!?local.sql_execution_batch.PhysicalColumn {
+            if (ordinal != 1) return null;
+            const view: local.sql_execution_batch.PhysicalColumn = .{ .kind = .string, .range = .{ .count = 3 }, .vector = .{ .name = "label", .values = .{ .dictionary_bytes = .{ .values = &.{ "alpha", "beta" }, .indices = &.{ 0, 1, 0 } } } } };
+            return if (selected) |rows| try view.select(alloc, rows) else view;
+        }
+        fn decimal(_: *anyopaque, alloc: A, ordinal: usize, selected: ?[]const usize) anyerror!?local.sql_execution_batch.DecimalColumn {
+            if (ordinal != 0) return null;
+            const view: local.sql_execution_batch.PhysicalColumn = .{ .kind = .number, .element = .numeric, .range = .{ .count = 3 }, .vector = .{ .name = "amount", .values = .{ .decimal128 = .{ .values = &.{ 123, -456, 789 }, .scale = 2, .precision = 38 } }, .nulls = .{ .bytes = &.{ 0, 0, 1 } } } };
+            return .{ .physical = if (selected) |rows| try view.select(alloc, rows) else view, .scales = &.{ 2, 3, 4 } };
+        }
+    };
+    var marker: u8 = 0;
+    const source: Batch = .{ .reader = .{ .ptr = &marker, .read = Reader.cell, .read_physical_selected = Reader.physical, .read_decimal_selected = Reader.decimal, .count = 3, .width = 2 } };
+    var build = local.sql_typed_store.Store.init(a);
+    defer build.deinit();
+    try build.appendBatch(source);
+    const right0: Batch = .{ .retained = .{ .store = &build, .begin = 2, .count = 1 } };
+    const right1: Batch = .{ .retained = .{ .store = &build, .begin = 0, .count = 1 } };
+    const right2: Batch = .{ .retained = .{ .store = &build, .begin = 1, .count = 1 } };
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "snapshot", .wal_cut = 0, .cut = "cut", .columns = &.{ .{ .name = "amount", .type = .number, .element_type = .numeric }, .{ .name = "label", .type = .string } }, .estimated_bytes = 1, .estimated_rows = 3, .splits = 1 };
+    const spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = 1000, .left = input, .right = input, .join = .{ .left_keys = &.{0}, .right_keys = &.{0}, .projection = &.{ 3, 0, 2, 1, 3 } }, .strategy = .shuffle, .partitions = 1, .limits = .{} };
+    const executor: Runner = .{ .a = a, .source = undefined, .exchange_store = undefined, .context = .{} };
+    var output = try OutputRows.init(a, 1, 1024 * 1024);
+    defer output.deinit(a);
+    try executor.emitCohort(spec, source, &.{ 1, 0, 1 }, &.{ right0, right1, right2 }, &output, sa);
+    try std.testing.expectEqual(@as(usize, 1), output.append_batches);
+    const left_decimal = (try output.partitions[0].decimalColumn(1, 0, 3)).?;
+    try std.testing.expectEqual(@as(i128, -456), left_decimal.physical.vector.values.decimal128.values[0]);
+    try std.testing.expectEqual(@as(u16, 3), try left_decimal.scaleAt(0));
+    try std.testing.expectEqual(@as(u16, 2), try left_decimal.scaleAt(1));
+    const right_decimal = (try output.partitions[0].decimalColumn(2, 0, 3)).?;
+    try std.testing.expect(right_decimal.physical.vector.nulls.isNull(right_decimal.physical.rowAt(0)));
+    try std.testing.expectEqual(@as(i128, 123), right_decimal.physical.vector.values.decimal128.values[1]);
+    try std.testing.expectEqualStrings("beta", (try output.partitions[0].cell(sa, 2, 0)).value.string);
+    try std.testing.expectEqualStrings("beta", (try output.partitions[0].cell(sa, 0, 3)).value.string);
 }
