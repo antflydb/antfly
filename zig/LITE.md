@@ -340,6 +340,11 @@ document-identity namespace of that future `default` table from creation, so
 adoption is O(1) rather than rewriting every live document; an identity mismatch
 fails closed. Subsequent standalone tables use isolated
 namespaces in the same artifact. This allows a file populated by `lite batch` to be served by standalone.
+A published shared search uses the [read-only publication worker](LITE_PUBLICATION.md).
+Its prepared generation retains the embedded root, including its external dense
+index. The worker checks the native catalog and reads the selected immutable
+generation for each authorized request.
+
 Direct adoption currently accepts one embedded root table with full-text indexes
 and supported enrichments. Native dense, sparse, graph and algebraic indexes,
 resolver catalogs, and additional embedded tables fail before the alias is

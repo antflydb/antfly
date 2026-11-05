@@ -1,0 +1,111 @@
+#!/usr/bin/env python3
+"""Local worker entry point. The caller authenticates every operation."""
+
+import argparse
+import json
+import os
+import sqlite3
+import subprocess
+import sys
+from pathlib import Path
+
+from lite_publication import native
+from lite_publication.contract import ID, SHA, Error, require
+from lite_publication.store import Destination
+
+
+def parse():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    build = commands.add_parser("build")
+    build.add_argument("--input", required=True, type=Path)
+    build.add_argument("--out", required=True, type=Path)
+    inspect = commands.add_parser("inspect")
+    inspect.add_argument("--artifact", required=True, type=Path)
+    inspect.add_argument("--digest")
+    for name in (
+        "prepare",
+        "validate",
+        "activate",
+        "status",
+        "cancel",
+        "cleanup",
+        "read",
+        "search",
+    ):
+        cmd = commands.add_parser(name)
+        cmd.add_argument("--root", required=True, type=Path)
+        cmd.add_argument("--destination", required=True)
+        if name in ("prepare", "validate", "activate", "cancel", "status"):
+            cmd.add_argument("--operation", required=name != "status")
+        if name == "prepare":
+            cmd.add_argument("--artifact", required=True, type=Path)
+            cmd.add_argument("--digest", required=True)
+            cmd.add_argument("--expected-generation", required=True, type=int)
+        if name in ("read", "search"):
+            cmd.add_argument("--generation", required=True, type=int)
+        if name == "read":
+            cmd.add_argument("--key", required=True)
+        if name == "search":
+            cmd.add_argument("--input", required=True, type=Path)
+    return parser.parse_args()
+
+
+def run(args):
+    if args.command == "build":
+        return native.build(args.input, args.out)
+    if args.command == "inspect":
+        return native.inspect(args.artifact, args.digest)
+    store = Destination(args.root, args.destination)
+    try:
+        if args.command == "prepare":
+            return store.prepare(
+                args.operation, args.expected_generation, args.digest, args.artifact
+            )
+        if args.command in ("activate", "cancel", "status", "validate"):
+            return getattr(store, args.command)(args.operation)
+        if args.command == "cleanup":
+            return store.cleanup()
+        with store.reader(args.generation) as path:
+            if args.command == "search":
+                return native.search_page(
+                    path,
+                    args.destination,
+                    args.generation,
+                    native.load_json(args.input, 65536),
+                )
+            key = args.key
+            require(
+                (key.startswith("d:") and ID.fullmatch(key[2:]))
+                or (key.startswith("c:") and SHA.fullmatch(key[2:])),
+                "Invalid published row key",
+            )
+            result = native.lite("lookup", path, "--key", key)
+            require(result.get("found"), "Row missing in this generation", "not_found")
+            return {
+                "generation": args.generation,
+                "_id": key,
+                "_source": result["_source"],
+            }
+    finally:
+        store.db.close()
+
+
+if __name__ == "__main__":
+    os.umask(0o077)
+    try:
+        print(json.dumps(run(parse()), ensure_ascii=False, allow_nan=False))
+    except (
+        Error,
+        OSError,
+        ValueError,
+        TypeError,
+        KeyError,
+        OverflowError,
+        RecursionError,
+        sqlite3.Error,
+        subprocess.SubprocessError,
+    ) as exc:
+        code = getattr(exc, "code", "runtime_error")
+        print(json.dumps({"error": code, "message": str(exc)[:512]}), file=sys.stderr)
+        sys.exit(1)

@@ -732,14 +732,9 @@ fn freeKeyValueEntries(allocator: Allocator, entries: []backup_codec.KeyValueEnt
     allocator.free(entries);
 }
 
-// Adoption must publish the embedded definitions before reconciliation opens
-// the table. Defaults here would replace its schema and drop its producers.
-pub fn embeddedTableDefinition(
-    alloc: std.mem.Allocator,
-    store: *@import("../backend_erased.zig").Store,
-) !tables_api.CreateTableRequest {
-    var txn = try store.beginRead();
-    defer txn.abort();
+/// Both native publication and standalone catalog adoption require a single
+/// embedded table and a root that carries no active resolver definitions.
+pub fn requireSingleEmbeddedTable(alloc: std.mem.Allocator, txn: *@import("../backend_erased.zig").ReadTxn) !void {
     const embedded_tables = txn.get(embedded_catalog.key) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
@@ -747,6 +742,7 @@ pub fn embeddedTableDefinition(
     if (embedded_tables) |raw| {
         var catalog = try std.json.parseFromSlice(embedded_catalog.Catalog, alloc, raw, .{ .ignore_unknown_fields = true });
         defer catalog.deinit();
+        try embedded_catalog.validate(catalog.value);
         if (catalog.value.tables.len != 0) {
             std.log.err("embedded Lite adoption supports only the default root table; transfer additional embedded tables through a supported explicit restore", .{});
             return error.UnsupportedEmbeddedLiteTables;
@@ -768,6 +764,17 @@ pub fn embeddedTableDefinition(
             return error.UnsupportedEmbeddedLiteResolvers;
         }
     }
+}
+
+// Adoption must publish the embedded definitions before reconciliation opens
+// the table. Defaults here would replace its schema and drop its producers.
+pub fn embeddedTableDefinition(
+    alloc: std.mem.Allocator,
+    store: *@import("../backend_erased.zig").Store,
+) !tables_api.CreateTableRequest {
+    var txn = try store.beginRead();
+    defer txn.abort();
+    try requireSingleEmbeddedTable(alloc, &txn);
     var definition: tables_api.CreateTableRequest = .{};
     errdefer definition.deinit(alloc);
     const schema = txn.get("\x00\x00__metadata__:schema_json") catch |err| switch (err) {

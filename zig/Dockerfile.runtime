@@ -75,7 +75,7 @@ LABEL org.opencontainers.image.licenses=Elastic-2.0
 ARG TARGETARCH
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates wget libstdc++6 && \
+    apt-get install -y --no-install-recommends ca-certificates wget libstdc++6 python3 && \
     if [ "${TARGETARCH}" = amd64 ]; then apt-get install -y --no-install-recommends libopenblas0-pthread; fi && \
     rm -rf /var/lib/apt/lists/* && \
     groupadd --gid 10001 antfly && \
@@ -84,6 +84,8 @@ RUN apt-get update && \
 
 WORKDIR /
 COPY antfly /antfly
+COPY antfly-publication /usr/local/bin/antfly-publication
+ENV ANTFLY_BIN=/antfly
 COPY share/antfly /usr/share/antfly
 COPY --from=runtime-libraries /opt/wasmtime/lib/libwasmtime.so /usr/local/lib/libwasmtime.so
 COPY --from=runtime-libraries /opt/cublas/lib/ /usr/local/lib/

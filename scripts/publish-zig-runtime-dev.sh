@@ -152,7 +152,8 @@ echo "Building $arch Zig runtime artifact for $zig_target"
 test -x "$out_dir/bin/antfly"
 test -d "$out_dir/share/antfly"
 cp "$out_dir/bin/antfly" "$out_dir/antfly"
-tar -C "$out_dir" -czf "$tmpdir/antfly-zig-${arch}-gnu.tar.gz" antfly share
+python3 "$repo_root/scripts/packaging/package_lite_publication.py" "$out_dir/antfly-publication"
+tar -C "$out_dir" -czf "$tmpdir/antfly-zig-${arch}-gnu.tar.gz" antfly antfly-publication share
 
 echo "Uploading $artifact_uri"
 gcloud storage cp "$tmpdir/antfly-zig-${arch}-gnu.tar.gz" "$artifact_uri" --project="$gcp_project"

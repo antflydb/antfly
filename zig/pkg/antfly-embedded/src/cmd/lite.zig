@@ -99,9 +99,11 @@ fn dispatchSubcommand(init: std.process.Init, argv0: []const u8, subcommand: []c
     const allocator = init.gpa;
     const io = init.io;
     if (std.mem.eql(u8, subcommand, "init")) return try initLite(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "root-catalog")) return try rootCatalog(allocator, io, args);
     if (isStatusSubcommand(subcommand)) return try status(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "batch")) return try batch(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "lookup")) return try lookup(allocator, io, args);
+    if (std.mem.eql(u8, subcommand, "scan-stream")) return try scanStream(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "scan")) return try scan(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "query")) return try query(allocator, io, args);
     if (std.mem.eql(u8, subcommand, "index")) return try indexCommand(allocator, io, args);
@@ -153,6 +155,22 @@ fn status(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !v
     const json = try statusJson(allocator, &lite, .native);
     defer allocator.free(json);
     writeJsonLine(io, json);
+}
+
+/// Inspect a transfer candidate without translating its native index definitions
+/// or starting a writable standalone runtime. Refuse multi-table, adopted and
+/// resolver-bearing roots before a caller can mistake them for a portable root.
+fn rootCatalog(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+    requireNoMoreArgs(args);
+    var backend = try antfly.lite.backend.Handle.open(allocator, path, .{ .read_only = true });
+    defer backend.deinit();
+    try backend.requireEmbeddedCatalogOwnership();
+    var txn = try backend.native_runtime_store.?.beginRead();
+    defer txn.abort();
+    try lite_restore_staging.requireSingleEmbeddedTable(allocator, &txn);
+    writeJsonLine(io, "{\"tables\":[\"default\"],\"owner\":\"embedded\"}");
 }
 
 fn openEmbeddedDataSurface(allocator: Allocator, path: []const u8, mode: db_mod.OpenOptions.OpenMode) !LiteDb {
@@ -231,6 +249,44 @@ fn scan(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !voi
     const json = try scanJson(allocator, &lite.db, body);
     defer allocator.free(json);
     writeJsonLine(io, json);
+}
+
+/// Visit a frozen file with one read-only engine handle. Escape the stored
+/// JSON as a string so embedded newlines cannot split the framing.
+fn scanStream(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
+    const path = args.next() orelse cli.fatal("database path is required", .{});
+    try requireAflitePath(path);
+    const file_path = parseReadFileFlag(args);
+    const body = try cli.readFileAlloc(io, allocator, file_path, max_json_file_bytes);
+    defer allocator.free(body);
+    var request = try parseScanRequest(allocator, body);
+    defer request.deinit(allocator);
+    var lite = try openEmbeddedDataSurface(allocator, path, .query_readonly);
+    defer lite.close();
+    var after: ?[]u8 = null;
+    defer if (after) |key| allocator.free(key);
+    var remaining: usize = if (request.scan_opts.limit == 0) std.math.maxInt(usize) else request.scan_opts.limit;
+    request.scan_opts.include_documents = true;
+    while (remaining > 0) {
+        request.scan_opts.limit = @intCast(@min(4, remaining));
+        var page = try lite.db.scan(allocator, after orelse request.from, request.to, request.scan_opts);
+        defer page.deinit(allocator);
+        if (page.documents.len == 0) return;
+        for (page.documents) |doc| {
+            const line = try std.json.Stringify.valueAlloc(allocator, .{ ._id = doc.id, .document_json = doc.json }, .{});
+            defer allocator.free(line);
+            writeJsonLine(io, line);
+        }
+        remaining -= page.documents.len;
+        const last = page.documents[page.documents.len - 1].id;
+        if (after) |key| {
+            if (std.mem.order(u8, last, key) != .gt) return error.InvalidScanContinuation;
+        }
+        const next = try allocator.dupe(u8, last);
+        if (after) |key| allocator.free(key);
+        after = next;
+        request.scan_opts.inclusive_from = false;
+    }
 }
 
 fn query(allocator: Allocator, io: std.Io, args: *std.process.Args.Iterator) !void {
@@ -1379,6 +1435,8 @@ fn printUsage(argv0: []const u8) void {
         \\  query <db.aflite> --file request.json [--readonly]
         \\  index list <db.aflite>
         \\  index create <db.aflite> --file index.json
+        \\  scan-stream <db.aflite> --file <request.json>
+        \\  root-catalog <db.aflite>
         \\  index drop <db.aflite> --index <name>
         \\  enrichment list <db.aflite>
         \\  enrichment create <db.aflite> --file enrichment.json

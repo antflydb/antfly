@@ -54,7 +54,7 @@ auth, storage credentials, application sessions or ownership records are importe
 
 ## Process interface
 
-Use Python 3.10+ and a compatible native Antfly binary. Executable
+Use Python 3.9+ and a compatible native Antfly binary. Executable
 `scripts/antfly-publication` takes the following subcommands. Configure the worker-owned
 absolute executable with `ANTFLY_BIN` or install `antfly` on PATH. JSON responses go to
 stdout. A failure exits nonzero with a JSON error on stderr.
@@ -99,3 +99,42 @@ Read returns `generation`, `_id`, `_source`. Readers request only the current
 generation. In-flight reads finish on their pinned data; a later read or continuation
 with a stale generation fails with `stale_generation`. The gateway must reauthorize
 each call including continuations; this local interface opens no network listener.
+
+## Compatibility and recovery
+
+V1 requires a native reader/writer supporting indexed Lite format 7, external
+embeddings, `lite root-catalog` and `lite scan-stream` from this branch. The worker's
+contract version is independent of the engine-owned table schema version (0). Package
+`antfly-publication` beside its matching native binary with
+`python3 scripts/packaging/package_lite_publication.py OUTPUT`. It runs on POSIX
+with Python 3.9+ and SQLite. The server archive includes the packed worker. Set
+`ANTFLY_BIN` to the matching executable on the Mac or in the job container.
+
+Use a new, empty PVC subdirectory per destination. An already running shared-search
+worker can continue serving during staging, validation and activation. The runtime
+atomically records the selected immutable artifact and the committed receipt in
+`publication.sqlite`. The data filename is derived from a hash of the operation ID.
+The service takes a shared filesystem lock while pinning and reading its chosen data
+file. Cleanup takes the exclusive lock without waiting; retry `operation_busy` after
+readers finish. Old receipts survive cleanup. All processes must share POSIX locks,
+atomic renames and durable SQLite filesystem semantics. Never mount a published
+copy as the data file of an ordinary writer. A configured runtime account is the only
+writer to this directory. The boundary trusts the local builder's assertion of which
+Drive folder and model produced the text/vector; validation checks revision bindings,
+bytes, shape, physical postings counts and model compatibility. Grant checks remain
+with Colony. Its gateway should map `stale_generation` / `stale_cursor` to HTTP 409.
+
+The producer input limit is 64 MiB, each extracted document 4 MiB, each passage 64
+KiB, the artifact 2 GiB and the row limit 100,000. These are engineering limits.
+The validator scans live rows and keeps a digest and provenance per pending passage.
+Search returns at most 100 candidates per arm. Set `page_size` below `limit` to
+page that window and pass the returned `next_cursor` back as `cursor` with the same
+query. A cursor binds destination, generation, query and ordered candidate IDs;
+authorization is repeated by the caller. Reader-local ordering across sources belongs
+to SearchAF.
+
+Recovery uses the same root, destination and operation ID. On `preparing` retry
+prepare with the original bytes and SHA-256. On `prepared` retry validation. On
+`validated` retry activation. A committed receipt remains authoritative even if a
+later operation has superseded it. A failed checksum, unsupported catalog, disk
+error or process exit before commit leaves the previous generation selected.

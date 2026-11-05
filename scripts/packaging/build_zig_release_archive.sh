@@ -327,6 +327,7 @@ fi
 if [ "$product" = server ]; then
   test -x "$prefix/bin/antfly"
   cp "$prefix/bin/antfly" "$stage/antfly"
+  python3 "$repo_root/scripts/packaging/package_lite_publication.py" "$stage/antfly-publication"
 fi
 if [ "$apple_providers" = true ] && [ ! -f "$prefix/lib/libantfly-apple.dylib" ]; then
   echo "missing native Apple bridge: $prefix/lib/libantfly-apple.dylib" >&2
