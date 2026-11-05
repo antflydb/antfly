@@ -1368,6 +1368,14 @@ that reader's allocator and freed with it. Compaction replaces those inputs
 with persisted routing. A process or reader reconstruction can rebuild this
 compatibility routing; this fallback is not a persistent migration cache.
 
+Persisted routing tables up to 256 KiB can also use the artifact owner's
+bounded decoded-navigation cache. Their exact source identity, section bounds
+and interpretation bind the cached entries; private deletion bitmaps remain
+runtime-local. Chunked decoding validates entry bounds and ordering once, so
+repeated hash probes and runtime reopening reuse navigation without repeated
+native range reads. A refused cache admission or larger table uses persisted
+seeks. Empty deletion sets do not open routing or touch segment storage.
+
 When providers require ending the old runtime before replacement, a separate
 handoff pins individual immutable text readers. Its independent file-wide
 limits are 256 MiB of admitted reader memory, 1,024 segment visits, and protected

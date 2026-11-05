@@ -310,9 +310,14 @@ test "segment admission avoids per field reads while fencing replacement and pre
     var contiguous = try segment.SegmentReader.init(a, fixture.bytes);
     defer contiguous.deinit();
     const reads_before_stats = source.reads;
+    // Admission sorts its field directory; physical segment order can differ.
+    // Ordinals are local capabilities, so check each reader's own directory.
+    for (contiguous.fields, 0..) |field, ordinal| {
+        const expected = try admitted.invertedFieldStats(field.name);
+        try std.testing.expectEqualDeep(expected, contiguous.invertedFieldStatsAt(ordinal));
+    }
     for (admitted.fields, 0..) |field, ordinal| {
         const expected = try contiguous.invertedFieldStats(field.name);
-        try std.testing.expectEqualDeep(expected, contiguous.invertedFieldStatsAt(ordinal));
         try std.testing.expectEqualDeep(expected, admitted.invertedFieldStatsAt(ordinal));
     }
     try std.testing.expectEqual(reads_before_stats, source.reads);

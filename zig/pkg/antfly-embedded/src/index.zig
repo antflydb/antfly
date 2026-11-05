@@ -3764,6 +3764,7 @@ pub const IndexWriter = struct {
         for (doc_ids) |key| if (key.len != 0) {
             try wanted.put(alloc, key, {});
         };
+        if (wanted.count() == 0) return alloc.alloc(DeleteInfo, 0);
         var infos = std.ArrayListUnmanaged(DeleteInfo).empty;
         errdefer {
             for (infos.items) |info| {
@@ -4119,6 +4120,11 @@ test "identity lookup source ownership reuses persisted routing across independe
         defer writer.deinit();
         try writer.addSegmentWithIdData(1, .fromNative(state.source()));
         const entry = &writer.snapshot().segments[0];
+        const before_empty = state.read_calls;
+        const empty = try writer.prepareDeleteInfos(a, &.{});
+        defer IndexWriter.freeDeleteInfos(a, empty);
+        try std.testing.expectEqual(@as(usize, 0), empty.len);
+        try std.testing.expectEqual(before_empty, state.read_calls);
         try std.testing.expect(!try writer.deleteById("absent"));
         if (turn == 2) {
             try std.testing.expect(entry.shared.identity_lookup_decoded == null);
