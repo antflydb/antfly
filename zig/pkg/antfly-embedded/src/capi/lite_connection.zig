@@ -8613,6 +8613,10 @@ test "capi native maintenance namespaces service new unindexed source generation
     var probe = try native.NativeFile.openWithIo(alloc, h.handleLockIo(), fixture.path, .{ .read_only = true, .internal_reader = true });
     defer probe.close();
     const debt = (try probe.replayAdmission()).?;
+    if (debt.records != 0) {
+        const state = try owner.groupSourceStateNamed(&owner.current.?.db, "default");
+        std.debug.print("unindexed retirement target={d} state={any} errors={d} failure={s}\n", .{ target, state.replay_retirement, owner.publication_stats.maintenance_errors, owner.publication_stats.last_maintenance_failure orelse "none" });
+    }
     try std.testing.expectEqual(@as(u64, 0), debt.records);
 }
 

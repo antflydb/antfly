@@ -1203,7 +1203,10 @@ generic storage facade as well as the native API; inline legacy records are
 not hydrated just to delete them. Namespaces with no managed index consumers
 still schedule separately admitted retirement, subject to producer, resolver,
 replacement and repair fences. Quota is returned by the physical transaction,
-not by scheduling a retirement watermark.
+not by scheduling a retirement watermark. A bounded batch may retire references
+and their canonical payload together, but only if every surviving reference is
+included in that same atomic deletion. Interrupted preparation preserves the
+retirement continuation and all previously retained credits.
 
 Revision 10 stores one canonical replay payload with checksummed hint-lane
 references. Readers resolve each reference in the same captured checkpoint.

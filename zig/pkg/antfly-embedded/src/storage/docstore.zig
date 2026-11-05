@@ -2927,8 +2927,10 @@ pub const DocStore = struct {
     // At most one atomic batch and one bounded sweep of lanes per turn. The watermark is reclamped by
     // the DB against current consumer/repair checkpoints under owner admission.
     fn truncateReplaySlice(self: *DocStore, alloc: Allocator, up_to_sequence: u64, state: *ReplayRetirement) !void {
-        state.runnable = false;
-        if (up_to_sequence == 0) return;
+        if (up_to_sequence == 0) {
+            state.runnable = false;
+            return;
+        }
         var lane = state.lane;
         var clean_lanes = if (state.sweep_bound == up_to_sequence) state.clean_lanes else 0;
         var deletes = std.ArrayListUnmanaged([]u8).empty;
@@ -2936,6 +2938,11 @@ pub const DocStore = struct {
             for (deletes.items) |key| alloc.free(key);
             deletes.deinit(alloc);
         }
+        // References selected below disappear atomically with this batch.
+        // Track only the bounded batch's lane masks so canonical inspection
+        // cannot mistake their old captured values for surviving consumers.
+        var deleted_lanes: std.AutoHashMapUnmanaged(u64, u8) = .empty;
+        defer deleted_lanes.deinit(alloc);
         // Skip empty lanes within the same bounded turn. A quiet lane must
         // not consume the service capacity needed by an active journal lane.
         for (0..replay_hints.len + 1) |_| {
@@ -2957,7 +2964,7 @@ pub const DocStore = struct {
                     const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
                     if (sequence > up_to_sequence) break;
                     if (ordinal == internal_keys.replay_all_kind and txn.current_scan.?.vtable.get != null and
-                        !try @import("db/derived/replay_reference.zig").canonicalMayRetire(&txn, sequence)) continue;
+                        !try @import("db/derived/replay_reference.zig").canonicalMayRetireAfterLaneDeletes(&txn, sequence, deleted_lanes.get(sequence) orelse 0)) continue;
                     const chunk_codec = @import("db/derived/replay_chunks.zig");
                     var manifest_buffer: [chunk_codec.manifest_size + 1]u8 = undefined;
                     const raw = if (ordinal == internal_keys.replay_all_kind and prefixes)
@@ -2973,6 +2980,11 @@ pub const DocStore = struct {
                             errdefer alloc.free(owned_chunk_key);
                             try deletes.append(alloc, owned_chunk_key);
                         }
+                    }
+                    if (ordinal <= 7) {
+                        const mask = try deleted_lanes.getOrPut(alloc, sequence);
+                        if (!mask.found_existing) mask.value_ptr.* = 0;
+                        mask.value_ptr.* |= @as(u8, 1) << @intCast(ordinal);
                     }
                     const key = try alloc.dupe(u8, kv.key);
                     errdefer alloc.free(key);
@@ -5439,6 +5451,7 @@ test "docstore replay retirement defers source work and bounds fair cleanup acro
     alloc.free(retained);
     try std.testing.expectEqual(cutoff, state.watermark);
     store.bounded_replay_retirement = true;
+    state.runnable = true;
     const before_failure = state;
     var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, store.truncateReplayUpTo(failing.allocator(), 300));
@@ -6710,4 +6723,49 @@ test "logical source certificates invalidate transaction and batch mutations inc
     try std.testing.expect(store.source_certificates.capture() == null);
     try store.finishBulkIngestSessionWithOptions(.{});
     try std.testing.expect(store.source_certificates.capture() != null);
+}
+
+test "docstore replay retirement atomically removes selected references and canonical rows" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    const refs = @import("db/derived/replay_reference.zig");
+    const canonical = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    const lane = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 1);
+    {
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.put(&internal_keys.replay_meta_init_key, "1");
+        try write.put(&canonical, "canonical");
+        try write.put(&lane, &refs.encodeReference(1, .full_text));
+        try write.commit();
+    }
+    var state: ReplayRetirement = .{ .watermark = 1, .runnable = true };
+    store.deferred_replay_retirement = &state;
+    defer store.deferred_replay_retirement = null;
+    store.bounded_replay_retirement = true;
+    var completed = false;
+    for (0..64) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        const before = state;
+        store.truncateReplayUpTo(failing.allocator(), 1) catch |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+            try std.testing.expectEqualDeep(before, state);
+            const reference = try store.get(a, &lane);
+            defer a.free(reference);
+            const payload = try store.get(a, &canonical);
+            defer a.free(payload);
+            try std.testing.expect(refs.isReference(reference));
+            try std.testing.expectEqualStrings("canonical", payload);
+            continue;
+        };
+        completed = true;
+        break;
+    }
+    try std.testing.expect(completed);
+    try std.testing.expectError(error.NotFound, store.get(a, &lane));
+    try std.testing.expectError(error.NotFound, store.get(a, &canonical));
 }

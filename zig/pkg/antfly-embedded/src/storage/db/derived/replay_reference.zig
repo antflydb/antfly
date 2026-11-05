@@ -147,7 +147,14 @@ pub fn encodeForHint(
 /// Bounded retirement can rotate away from a partially deleted lane. The
 /// canonical row remains charged until every referring lane is physically gone.
 pub fn canonicalMayRetire(txn: anytype, sequence: u64) !bool {
+    return canonicalMayRetireAfterLaneDeletes(txn, sequence, 0);
+}
+
+/// Only references deleted in the same atomic publication may be ignored.
+/// A scan cursor or a consumer watermark is never evidence of physical deletion.
+pub fn canonicalMayRetireAfterLaneDeletes(txn: anytype, sequence: u64, deleted_lanes: u8) !bool {
     for (0..8) |lane| {
+        if (deleted_lanes & (@as(u8, 1) << @intCast(lane)) != 0) continue;
         const key = keys.replayEntryKey(@intCast(lane), sequence);
         const raw = txn.get(&key) catch |err| switch (err) {
             error.NotFound => continue,
@@ -189,6 +196,8 @@ test "replay references validate sequence lane checksum and canonical ownership"
     try std.testing.expectError(error.InvalidReplayReference, resolve(a, &fixture, 11, 0, &reference));
     fixture.reference = &reference;
     try std.testing.expect(!try canonicalMayRetire(&fixture, 11));
+    try std.testing.expect(!try canonicalMayRetireAfterLaneDeletes(&fixture, 11, 1));
+    try std.testing.expect(try canonicalMayRetireAfterLaneDeletes(&fixture, 11, 2));
     fixture.reference = null;
     try std.testing.expect(try canonicalMayRetire(&fixture, 11));
 }
