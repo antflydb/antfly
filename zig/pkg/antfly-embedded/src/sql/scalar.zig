@@ -483,6 +483,17 @@ pub const Program = struct {
         errdefer arena.deinit();
         var program: Program = .{ .arena = arena, .instructions = instructions, .root = root, .output_type = output, .parameter_types = &.{}, .parameter_descriptors = &.{}, .required_columns = &.{} };
         errdefer program.releaseConstants();
+        // Serialized fragments carry instructions, not binder-owned metadata.
+        // Rebuild dependencies before publishing to sparse/vector consumers.
+        var seen: std.AutoHashMapUnmanaged(u32, void) = .empty;
+        defer seen.deinit(arena.allocator());
+        var required: std.ArrayList(u32) = .empty;
+        for (instructions) |instruction| if (instruction.operation == .column) {
+            const column = instruction.operation.column;
+            const entry = try seen.getOrPut(arena.allocator(), column);
+            if (!entry.found_existing) try required.append(arena.allocator(), column);
+        };
+        program.required_columns = try required.toOwnedSlice(arena.allocator());
         try program.prepareConstantArrays(arena.allocator(), limits);
         try program.prepareConcatNodes(arena.allocator());
         program.decimal_plan = try @import("decimal_program.zig").compile(arena.allocator(), instructions, root);
@@ -7083,4 +7094,15 @@ test "SQL quantified JSONB compatibility inputs are logical while text casts sti
     defer arena.deinit();
     try std.testing.expect((try program.evaluate(arena.allocator(), &.{ .json(.{ .string = "\"alpha\"" }), .typedArray(&source) }, &.{}, .{})).value.bool);
     try std.testing.expectError(error.SqlInvalidTextRepresentation, program.evaluate(arena.allocator(), &.{ .json(.{ .string = "alpha" }), .typedArray(&source) }, &.{}, .{}));
+}
+
+test "SQL serialized scalar fragments reconstruct unique column dependencies for sparse readers" {
+    const instructions: []const Instruction = &.{
+        .{ .type = .{ .kind = .boolean }, .operation = .{ .column = 5 } },
+        .{ .type = .{ .kind = .boolean }, .operation = .{ .column = 5 } },
+        .{ .type = .{ .kind = .boolean }, .operation = .{ .binary = .{ .op = .@"or", .left = 0, .right = 1 } } },
+    };
+    var program = try Program.fromTypedInstructions(std.testing.allocator, instructions, 2, .{ .kind = .boolean }, .{});
+    defer program.deinit();
+    try std.testing.expectEqualSlices(u32, &.{5}, program.required_columns);
 }

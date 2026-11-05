@@ -81,14 +81,36 @@ pub const OutputRows = struct {
     }
     pub fn addBatch(self: *OutputRows, a: A, partition: usize, batch: local.sql_execution_batch.Batch) !void {
         if (self.aggregation) |aggregate| {
+            var metadata = std.heap.ArenaAllocator.init(a);
+            defer metadata.deinit();
+            const work = metadata.allocator();
+            var ordinals: [96]u16 = undefined;
+            var count: usize = 0;
+            for (aggregate.groups) |column| {
+                if (std.mem.indexOfScalar(u16, ordinals[0..count], column) != null) continue;
+                ordinals[count] = column;
+                count += 1;
+            }
+            for (aggregate.inputs) |input| if (input) |column| {
+                if (std.mem.indexOfScalar(u16, ordinals[0..count], column) != null) continue;
+                ordinals[count] = column;
+                count += 1;
+            };
+            const columns = try work.alloc(local.sql_execution_batch.Batch, count);
+            for (columns, ordinals[0..count]) |*column, ordinal| column.* = try batch.project(work, ordinal);
+            var numeric = try local.sql_execution_batch.NumericScratch.init(work, columns);
+            var group_slots: [32]usize = undefined;
+            var input_slots: [64]?usize = undefined;
+            for (aggregate.groups, 0..) |column, i| group_slots[i] = std.mem.indexOfScalar(u16, ordinals[0..count], column).?;
+            for (aggregate.inputs, 0..) |input, i| input_slots[i] = if (input) |column| std.mem.indexOfScalar(u16, ordinals[0..count], column).? else null;
             var scratch = std.heap.ArenaAllocator.init(a);
             defer scratch.deinit();
             for (0..batch.len()) |row| {
-                _ = scratch.reset(.free_all);
+                _ = scratch.reset(.{ .retain_with_limit = 64 * 1024 });
                 var groups: [32]Datum = undefined;
                 var inputs: [64]Datum = undefined;
-                for (aggregate.groups, 0..) |column, i| groups[i] = try batch.cell(scratch.allocator(), row, column);
-                for (aggregate.inputs, 0..) |column, i| inputs[i] = if (column) |ordinal| try batch.cell(scratch.allocator(), row, ordinal) else Datum.json(.{ .integer = 1 });
+                for (group_slots[0..aggregate.groups.len], 0..) |slot, i| groups[i] = try numeric.cell(scratch.allocator(), columns, row, slot);
+                for (input_slots[0..aggregate.inputs.len], 0..) |slot, i| inputs[i] = if (slot) |index| try numeric.cell(scratch.allocator(), columns, row, index) else Datum.json(.{ .integer = 1 });
                 try self.grouped.?.add(groups[0..aggregate.groups.len], inputs[0..aggregate.inputs.len]);
             }
             return;
@@ -211,6 +233,9 @@ pub const Runner = struct {
     pub fn predicate(self: Runner, kind: @import("expression.zig").Task.Kind, cells: []const Datum) !bool {
         return (self.predicates orelse return error.InvalidSqlExecutionState).matches(kind, cells);
     }
+    pub fn predicateBatch(self: Runner, kind: @import("expression.zig").Task.Kind, left: local.sql_execution_batch.Batch, row: usize, right: ?local.sql_execution_batch.Batch) !bool {
+        return (self.predicates orelse return error.InvalidSqlExecutionState).matchesBatch(kind, left, row, right);
+    }
     fn runPrepared(self: Runner, query: plan.Digest, specification: plan.Plan, task: plan.Task, dependencies: []const state.Output) !state.Output {
         return switch (task.kind) {
             .merge_probe_matches, .merge_build_matches => @import("skew_runner.zig").merge(self, query, specification, task, dependencies),
@@ -274,7 +299,7 @@ pub const Runner = struct {
             const selections = try page.allocator().alloc(std.ArrayList(usize), output.partitions.len);
             @memset(selections, .empty);
             for (batch_keys, 0..) |key, row| {
-                if (input.filter != null) if (!try self.predicate(if (task.kind == .map_left) .left else .right, try batch.row(page.allocator(), row))) continue;
+                if (input.filter != null) if (!try self.predicateBatch(if (task.kind == .map_left) .left else .right, batch, row, null)) continue;
                 const hashed = try operators.HashJoin.keyHash(key);
                 if (hashed == null and (if (task.kind == .map_left) !spec.join.preservesProbe() else !spec.join.preservesBuild())) continue;
                 const partition = if (task.kind == .scan_build) 0 else (hashed orelse 0) & (spec.partitions - 1);
@@ -332,19 +357,24 @@ pub const Runner = struct {
             while (true) {
                 try self.context.ensureActive();
                 _ = decode.reset(.free_all);
-                const rows = (try stream.next_fn(stream.ptr, decode.allocator(), 256)) orelse break;
-                if (rows.len == 0 or rows.len > 256) return error.InvalidSqlBackendResponse;
-                for (rows) |cells| {
-                    if (cells.len != spec.right.columns.len) return error.InvalidSqlBackendResponse;
-                    input_rows += 1;
-                    if (input_rows > spec.limits.task_scan_rows) return error.SqlJoinBudgetExceeded;
-                    if (spec.right.filter != null) if (!try self.predicate(.right, cells)) continue;
-                    var key: [32]Datum = undefined;
-                    const values = try keys(cells, spec.join.right_keys, &key);
+                const batch = (try stream.nextBatch(decode.allocator(), 256)) orelse break;
+                if (batch.len() == 0 or batch.len() > 256 or batch.width() != spec.right.columns.len) return error.InvalidSqlBackendResponse;
+                input_rows += batch.len();
+                if (input_rows > spec.limits.task_scan_rows) return error.SqlJoinBudgetExceeded;
+                const build_keys = try batchKeys(decode.allocator(), batch, spec.join.right_keys);
+                var positions: [256]usize = undefined;
+                var selected_keys: [256][]const Datum = undefined;
+                var count: usize = 0;
+                for (build_keys, 0..) |values, row| {
+                    if (spec.right.filter != null) if (!try self.predicateBatch(.right, batch, row, null)) continue;
                     if (!spec.join.preservesBuild() and try operators.HashJoin.keyHash(values) == null) continue;
-                    try hash.add(cells, values);
-                    if (building_filter) |value| try value.add(values);
+                    positions[count] = row;
+                    selected_keys[count] = values;
+                    count += 1;
                 }
+                if (count == 0) continue;
+                try hash.addBatch(decode.allocator(), try batch.select(decode.allocator(), positions[0..count]), selected_keys[0..count]);
+                if (building_filter) |value| for (selected_keys[0..count]) |values| try value.add(values);
             }
         } else if (lease == null or !lease.?.hit) {
             for (dependencies[0..build_count]) |ref| {
@@ -512,11 +542,23 @@ pub const Runner = struct {
         return output.publish(self.a, self.exchange_store, query, spec.expires_ms, @intCast(spec.limits.task_output_bytes));
     }
     fn probeBatch(self: Runner, spec: plan.Plan, hash: *operators.HashJoin, batch: local.sql_execution_batch.Batch, output: *OutputRows, arena: A, apply_filter: bool) !void {
+        return self.probeBatchWitness(spec, hash, batch, output, arena, apply_filter, null);
+    }
+    pub const Witness = struct {
+        left: []u8,
+        right: []u8,
+        left_begin: usize,
+        fn accept(self: Witness, row: usize, build: usize) !void {
+            const probe = self.left_begin + row;
+            if (probe / 8 >= self.left.len or build / 8 >= self.right.len) return error.InvalidSqlExchange;
+            self.left[probe / 8] |= @as(u8, 1) << @as(u3, @truncate(probe));
+            self.right[build / 8] |= @as(u8, 1) << @as(u3, @truncate(build));
+        }
+    };
+    pub fn probeBatchWitness(self: Runner, spec: plan.Plan, hash: *operators.HashJoin, batch: local.sql_execution_batch.Batch, output: *OutputRows, arena: A, apply_filter: bool, witness: ?Witness) !void {
         if (batch.width() != spec.left.columns.len) return error.InvalidSqlBackendResponse;
         const probe_keys = try batchKeys(arena, batch, spec.join.left_keys);
         const probes = try hash.probeBatch(arena, probe_keys);
-        var rows = std.heap.ArenaAllocator.init(self.a);
-        defer rows.deinit();
         var matches = std.heap.ArenaAllocator.init(self.a);
         defer matches.deinit();
         var positions: [256]usize = undefined;
@@ -524,23 +566,19 @@ pub const Runner = struct {
         var count: usize = 0;
         for (probes, 0..) |*iterator, row| {
             try self.context.ensureActive();
-            _ = rows.reset(.free_all);
-            const left_cells = if ((apply_filter and spec.left.filter != null) or spec.join.condition != null) try batch.row(rows.allocator(), row) else &.{};
-            if (apply_filter and spec.left.filter != null) if (!try self.predicate(.left, left_cells)) continue;
+            if (apply_filter and spec.left.filter != null) if (!try self.predicateBatch(.left, batch, row, null)) continue;
+            if (self.predicates) |predicates| predicates.beginProbe();
+            defer if (self.predicates) |predicates| predicates.endProbe();
             var matched = false;
             while (try iterator.next()) |match| {
                 try self.context.ensureActive();
                 _ = matches.reset(.free_all);
-                const right = if (spec.join.kind == .semi or spec.join.kind == .anti) null else try match.valuesBatch(matches.allocator());
-                if (spec.join.condition != null) {
-                    const right_cells = try match.materializeValues(matches.allocator());
-                    const cells = try matches.allocator().alloc(Datum, left_cells.len + right_cells.len);
-                    @memcpy(cells[0..left_cells.len], left_cells);
-                    @memcpy(cells[left_cells.len..], right_cells);
-                    if (!try self.predicate(.condition, cells)) continue;
-                }
+                const right = if ((spec.join.kind == .semi or spec.join.kind == .anti) and spec.join.condition == null) null else try match.valuesBatch(matches.allocator());
+                if (spec.join.condition != null) if (!try self.predicateBatch(.condition, batch, row, right)) continue;
                 matched = true;
-                if (spec.join.preservesBuild()) try hash.markMatched(match.index);
+                if (witness) |bits| try bits.accept(row, match.index) else if (spec.join.preservesBuild()) try hash.markMatched(match.index);
+                // Skew semi/anti output belongs to the global witness finalizer.
+                if (witness != null and (spec.join.kind == .semi or spec.join.kind == .anti)) break;
                 if (spec.join.kind == .anti) break;
                 positions[count] = row;
                 rights[count] = right;
@@ -553,7 +591,7 @@ pub const Runner = struct {
                 }
                 if (spec.join.kind == .semi) break;
             }
-            if (!matched and spec.join.preservesProbe()) {
+            if (witness == null and !matched and spec.join.preservesProbe()) {
                 positions[count] = row;
                 rights[count] = null;
                 count += 1;
@@ -570,6 +608,24 @@ pub const Runner = struct {
         const columns = try a.alloc(local.sql_execution_batch.Batch, spec.join.projection.len);
         for (columns, spec.join.projection) |*column, ordinal| column.* = try batch.project(a, ordinal);
         try output.addBatch(a, 0, try local.sql_execution_batch.Batch.combine(a, columns, batch.len()));
+    }
+    /// Project one selected side while the other side is SQL NULL. Used by
+    /// witness finalizers without scalar reconstruction of the retained tile.
+    pub fn emitUnmatched(_: Runner, spec: plan.Plan, source: *const local.sql_execution_batch.Batch, positions: []const usize, build: bool, output: *OutputRows, a: A) !void {
+        const Batch = local.sql_execution_batch.Batch;
+        const selected = try a.create(Batch);
+        selected.* = try source.select(a, positions);
+        const width = if (spec.join.projection.len != 0) spec.join.projection.len else spec.left.columns.len + (if (spec.join.kind == .semi or spec.join.kind == .anti) @as(usize, 0) else spec.right.columns.len);
+        const columns = try a.alloc(Batch, width);
+        const nulls = try a.alloc(u32, positions.len);
+        @memset(nulls, 0);
+        for (columns, 0..) |*column, index| {
+            const ordinal = if (spec.join.projection.len == 0) index else spec.join.projection[index];
+            const left = ordinal < spec.left.columns.len;
+            column.* = if (left != build) try selected.project(a, if (left) ordinal else ordinal - spec.left.columns.len) else .{ .dictionary = .{ .values = &.{.{}}, .indices = nulls } };
+        }
+        const joined = try Batch.combine(a, columns, positions.len);
+        try output.addBatch(a, 0, joined);
     }
     pub fn emitBatch(self: Runner, spec: plan.Plan, left: ?local.sql_execution_batch.Batch, right: ?local.sql_execution_batch.Batch, output: *OutputRows, a: A) !void {
         return self.emitCohort(spec, left, &.{0}, &.{right}, output, a);
@@ -925,4 +981,152 @@ test "distributed SQL typed join cohorts preserve physical dictionaries decimals
     try std.testing.expectEqual(@as(i128, 123), right_decimal.physical.vector.values.decimal128.values[1]);
     try std.testing.expectEqualStrings("beta", (try output.partitions[0].cell(sa, 2, 0)).value.string);
     try std.testing.expectEqualStrings("beta", (try output.partitions[0].cell(sa, 0, 3)).value.string);
+    var missing = try OutputRows.init(a, 1, 1024 * 1024);
+    defer missing.deinit(a);
+    try executor.emitUnmatched(spec, &source, &.{ 2, 0, 1 }, true, &missing, sa);
+    const selected_decimal = (try missing.partitions[0].decimalColumn(2, 0, 3)).?;
+    try std.testing.expect(selected_decimal.physical.vector.nulls.isNull(selected_decimal.physical.rowAt(0)));
+    try std.testing.expectEqual(@as(u16, 2), try selected_decimal.scaleAt(1));
+    for (0..3) |row| {
+        try std.testing.expect((try missing.partitions[0].cell(sa, row, 1)).sql_null);
+        try std.testing.expect((try missing.partitions[0].cell(sa, row, 3)).sql_null);
+    }
+    try std.testing.expectEqualStrings("beta", (try missing.partitions[0].cell(sa, 2, 0)).value.string);
+}
+
+test "distributed SQL filtered probe projects keys without reading unrelated payloads" {
+    const ProbeFixture = struct {
+        payload_reads: usize = 0,
+        sent: bool = false,
+        fn cell(raw: *anyopaque, _: A, _: usize, column: usize) anyerror!Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (column == 0) return Datum.json(.{ .integer = 7 });
+            self.payload_reads += 1;
+            return Datum.json(.{ .string = "unused payload" });
+        }
+        fn nextBatch(raw: *anyopaque, _: A, _: usize) anyerror!?local.sql_execution_batch.Batch {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.sent) return null;
+            self.sent = true;
+            return .{ .reader = .{ .ptr = self, .read = cell, .count = 64, .width = 2 } };
+        }
+        fn next(_: *anyopaque, _: A, _: usize) anyerror!?[]const []const Datum {
+            return error.UnexpectedScalarPull;
+        }
+        fn close(_: *anyopaque) void {}
+        fn open(raw: *anyopaque, _: A, _: plan.Digest, _: plan.Input, _: u32, _: ?*const local.sql_dynamic_filter.Filter, _: Context) anyerror!Stream {
+            return .{ .ptr = raw, .next_fn = next, .next_batch_fn = nextBatch, .close_fn = close };
+        }
+    };
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const sa = region.allocator();
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    const objects: exchange.Store = .{ .client = memory.client(), .bucket = "queries", .prefix = "tenant" };
+    const right: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "s", .wal_cut = 0, .cut = "cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 1, .estimated_rows = 1, .splits = 1 };
+    var left = right;
+    left.columns = &.{ .{ .name = "id", .type = .integer }, .{ .name = "payload", .type = .json } };
+    left.filter = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = true } } }}, .root = 0, .output = .{ .kind = .boolean } };
+    const spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = 1000, .left = left, .right = right, .join = .{ .left_keys = &.{0}, .right_keys = &.{0}, .projection = &.{0} }, .strategy = .broadcast, .partitions = 1, .limits = .{} };
+    var build = try OutputRows.init(sa, 1, 1024 * 1024);
+    defer build.deinit(sa);
+    try build.addBatch(sa, 0, .{ .rows = &.{&.{Datum.json(.{ .integer = 7 })}} });
+    const ref = try build.publish(sa, objects, @splat('a'), 1000, 1024 * 1024);
+    var source: ProbeFixture = .{};
+    const executor: Runner = .{ .a = sa, .source = .{ .ptr = &source, .open = ProbeFixture.open }, .exchange_store = objects, .context = .{} };
+    _ = try executor.run(@splat('a'), spec, .{ .kind = .broadcast_probe, .stage = 1, .task = 0 }, &.{ref});
+    try std.testing.expectEqual(@as(usize, 0), source.payload_reads);
+}
+
+test "distributed SQL skew probe cohorts batch matches and preserve global witnesses without scalar payload reads" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const sa = region.allocator();
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "snapshot", .wal_cut = 0, .cut = "cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 1, .estimated_rows = 1, .splits = 1 };
+    var spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = 1000, .left = input, .right = input, .join = .{ .kind = .full, .left_keys = &.{0}, .right_keys = &.{0}, .projection = &.{ 0, 2 } }, .strategy = .shuffle, .partitions = 1, .limits = .{} };
+    spec.right.columns = &.{ .{ .name = "id", .type = .integer }, .{ .name = "payload", .type = .json } };
+    const Reader = struct {
+        const payload = "{\"shared\":\"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\"}";
+        fn cell(_: *anyopaque, _: A, _: usize, column: usize) anyerror!Datum {
+            if (column != 0) return error.UnexpectedMaterialization;
+            return Datum.json(.{ .integer = 7 });
+        }
+        fn json(_: *anyopaque, _: usize, column: usize) anyerror!?[]const u8 {
+            return if (column == 1) payload else null;
+        }
+    };
+    var marker: u8 = 0;
+    const build: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &marker, .read = Reader.cell, .read_json = Reader.json, .count = 3, .width = 2 } };
+    const hash = try operators.HashJoin.create(a, .{ .bytes = 4 * 1024 * 1024, .rows = 1024 });
+    defer hash.deinit();
+    const key = [_]Datum{Datum.json(.{ .integer = 7 })};
+    try hash.addBatch(sa, build, &.{ &key, &key, &key });
+    const rows = try sa.alloc([]const Datum, 128);
+    for (rows, 0..) |*row, i| {
+        const cells = try sa.alloc(Datum, 1);
+        cells[0] = Datum.json(.{ .integer = if (i == 0) 8 else 7 });
+        row.* = cells;
+    }
+    hash.freezeShared();
+    spec.join.condition = .{ .instructions = &.{
+        .{ .type = .{ .kind = .integer }, .operation = .{ .column = 0 } },
+        .{ .type = .{ .kind = .integer }, .operation = .{ .column = 1 } },
+        .{ .type = .{ .kind = .boolean }, .operation = .{ .binary = .{ .op = .eq, .left = 0, .right = 1 } } },
+    }, .root = 2, .output = .{ .kind = .boolean } };
+    var predicates = try @import("expression.zig").Task.init(a, .{}, spec.limits.task_memory, null, null, spec.join.condition);
+    defer predicates.deinit();
+    const executor: Runner = .{ .a = a, .source = undefined, .exchange_store = undefined, .context = .{}, .predicates = &predicates };
+    var output = try OutputRows.init(a, 1, 1024 * 1024);
+    defer output.deinit(a);
+    var left_bits: [16]u8 = @splat(0);
+    var right_bits: [1]u8 = @splat(0);
+    try executor.probeBatchWitness(spec, hash, .{ .rows = rows }, &output, sa, false, .{ .left = &left_bits, .right = &right_bits, .left_begin = 0 });
+    try std.testing.expectEqual(@as(u8, 0xfe), left_bits[0]);
+    for (left_bits[1..]) |byte| try std.testing.expectEqual(@as(u8, 0xff), byte);
+    try std.testing.expectEqual(@as(u8, 7), right_bits[0]);
+    try std.testing.expectEqual(@as(usize, 381), output.partitions[0].len);
+    try std.testing.expectEqual(@as(usize, 2), output.append_batches);
+    try std.testing.expectEqualStrings(Reader.payload, (try output.partitions[0].encodedJson(1, 1)).?);
+    for ([_]@FieldType(plan.Join, "kind"){ .semi, .anti }) |kind| {
+        spec.join.kind = kind;
+        spec.join.projection = &.{0};
+        @memset(&left_bits, 0);
+        @memset(&right_bits, 0);
+        var existence = try OutputRows.init(a, 1, 1024 * 1024);
+        defer existence.deinit(a);
+        try executor.probeBatchWitness(spec, hash, .{ .rows = rows }, &existence, sa, false, .{ .left = &left_bits, .right = &right_bits, .left_begin = 0 });
+        try std.testing.expectEqual(@as(usize, 0), existence.partitions[0].len);
+        try std.testing.expectEqual(@as(u8, 0xfe), left_bits[0]);
+        for (left_bits[1..]) |byte| try std.testing.expectEqual(@as(u8, 0xff), byte);
+    }
+}
+
+test "distributed SQL numeric aggregate cohorts consume native decimal lanes including nulls" {
+    const a = std.testing.allocator;
+    const Batch = local.sql_execution_batch.Batch;
+    const Reader = struct {
+        fn cell(_: *anyopaque, _: A, _: usize, _: usize) anyerror!Datum {
+            return error.UnexpectedNumericBoxing;
+        }
+        fn decimal(_: *anyopaque, alloc: A, _: usize, selected: ?[]const usize) anyerror!?local.sql_execution_batch.DecimalColumn {
+            const view: local.sql_execution_batch.PhysicalColumn = .{ .kind = .number, .element = .numeric, .range = .{ .count = 3 }, .vector = .{ .name = "n", .values = .{ .decimal128 = .{ .values = &.{ 123, -456, 789 }, .scale = 2, .precision = 38 } }, .nulls = .{ .bytes = &.{ 0, 1, 0 } } } };
+            return .{ .physical = if (selected) |rows| try view.select(alloc, rows) else view };
+        }
+    };
+    var marker: u8 = 0;
+    const batch: Batch = .{ .reader = .{ .ptr = &marker, .read = Reader.cell, .read_decimal_selected = Reader.decimal, .width = 1, .count = 3 } };
+    const aggregate: plan.Aggregation = .{ .groups = &.{}, .inputs = &.{0}, .specs = &.{.{ .kind = .sum, .input_type = .number, .input_element = .numeric }} };
+    var output = try OutputRows.init(a, 1, 1024 * 1024);
+    defer output.deinit(a);
+    output.aggregation = aggregate;
+    output.grouped = try operators.Grouped.create(a, aggregate.specs, .{ .groups = 1, .bytes = 1024 * 1024 });
+    try output.grouped.?.ensureGlobalGroup();
+    try output.addBatch(a, 0, batch);
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const result = (try output.grouped.?.nextResult(region.allocator())).?;
+    try std.testing.expectEqual(@as(?i128, 912), local.sql_numeric_value.coefficientAtScale(result.aggregates[0].numeric.?.*, 2));
 }

@@ -440,3 +440,69 @@ test "distributed SQL prepared cache retries only private build admission failur
     try std.testing.expect(hit.hit);
     try std.testing.expectEqual(error.OutOfMemory, hit.buildError(error.OutOfMemory));
 }
+
+test "distributed SQL sealed numeric builds use consumer scratch without growing shared residency" {
+    const a = std.testing.allocator;
+    const Batch = local.sql_execution_batch.Batch;
+    var input = std.heap.ArenaAllocator.init(a);
+    defer input.deinit();
+    const sa = input.allocator();
+    const count = 16384;
+    const values = try sa.alloc(i128, count);
+    @memset(values, 12300);
+    const nulls = try sa.alloc(u8, count);
+    @memset(nulls, 0);
+    nulls[15] = 1;
+    const column = try Batch.fromDecimal(sa, values, nulls, 4);
+    const columns: [4]Batch = @splat(column);
+    const batch = try Batch.combine(sa, &columns, count);
+    const key = [_]local.sql_scalar.Datum{local.sql_scalar.Datum.json(.{ .integer = 7 })};
+    const keys = try sa.alloc([]const local.sql_scalar.Datum, count);
+    @memset(keys, &key);
+    var cache: Cache = .{ .a = a, .bytes = 4 * 1024 * 1024 };
+    defer cache.deinit();
+    var lease = cache.acquire(@splat('n'), 16 * 1024 * 1024, count).?;
+    try lease.hash().addBatch(sa, batch, keys);
+    lease.complete();
+    lease.release();
+    var hit = cache.acquire(@splat('n'), 16 * 1024 * 1024, count).?;
+    defer hit.release();
+    try std.testing.expect(hit.hit);
+    const resident = cache.live;
+    const Read = struct {
+        a: A,
+        hash: *Hash,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.read() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn read(self: *@This()) !void {
+            var budget: local.sql_memory_budget = .{ .backing = self.a, .limit = 256 * 1024 };
+            defer std.debug.assert(budget.live == 0);
+            var scratch = std.heap.ArenaAllocator.init(budget.allocator());
+            defer scratch.deinit();
+            for (0..16384) |row| {
+                _ = scratch.reset(.retain_capacity);
+                for (0..4) |ordinal| {
+                    const value = try self.hash.value_columns.cell(scratch.allocator(), row, ordinal);
+                    if (row == 15) {
+                        if (!value.sql_null) return error.InvalidNumericNull;
+                    } else if (value.sql_null or local.sql_numeric_value.coefficientAtScale(value.numeric.?.*, 4) != 12300) return error.InvalidNumericRead;
+                }
+            }
+        }
+    };
+    var readers = [_]Read{ .{ .a = a, .hash = hit.hash() }, .{ .a = a, .hash = hit.hash() } };
+    const first = try std.Thread.spawn(.{}, Read.run, .{&readers[0]});
+    const second = std.Thread.spawn(.{}, Read.run, .{&readers[1]}) catch |err| {
+        first.join();
+        return err;
+    };
+    first.join();
+    second.join();
+    for (readers) |reader| try std.testing.expect(reader.failure == null);
+    try std.testing.expectEqual(resident, cache.live);
+    for (hit.hash().value_columns.columns) |stored| try std.testing.expectEqual(@as(u32, 0), stored.fixed.?.cells.count());
+}

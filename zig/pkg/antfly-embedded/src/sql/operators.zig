@@ -1591,6 +1591,8 @@ pub const HashJoin = struct {
         std.debug.assert(self.disk == null);
         self.sealed = true;
         self.shared = true;
+        self.value_columns.freezeShared();
+        self.key_columns.freezeShared();
     }
     /// Borrow immutable in-memory build keys.
     pub fn buildKeys(self: *const HashJoin) @import("execution_batch.zig").Batch {

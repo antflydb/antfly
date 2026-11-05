@@ -149,7 +149,12 @@ workers validate the capability, schema incarnation, and snapshot on reopen.
   immutable byte cache.
 - Clean retained base scans (including dynamic-filter selections), map
   partitioning, hash/Grace admission, and hash probe seeding use borrowed typed batches. WAL reconciliation and residual
-  expressions retain scalar fallbacks. Hash matches, unmatched build rows, and
+  expressions retain scalar fallbacks. Predicate fragments rebuild column
+  dependencies from typed instructions; lazy loaders read only executed
+  references and borrow exact decimal lanes from per-invocation scratch.
+  Demanded probe values are retained once per probe row across duplicate matches;
+  build values and expression temporaries retire after each match.
+  Hash matches, skew tile matches and finalizers, unmatched build rows, and
   native Grace output append in bounded cohorts
   of up to 256 coordinates, sharing JSON sizing/insertion leases. Projections
   forward physical dictionaries and exact decimal vectors through admission
@@ -163,7 +168,9 @@ workers validate the capability, schema incarnation, and snapshot on reopen.
   descriptors, exchange location, partition range and join keys. Leases are
   reference-counted: completed immutable indexes support concurrent probes;
   unfinished builds may fall back without waiting. Probe cursors and skew match
-  witnesses remain task-local. Sealed dynamic filters own their column names
+  witnesses remain task-local. Sealed NUMERIC indexes never allocate persistent
+  scalar memo entries during reads; scalar consumers own their temporary values.
+  Sealed dynamic filters own their column names
   and are reused with the build. Native build residency is capped at 32 MiB
   across four entries; each hosted kernel caps it at 4 MiB. Entries share the
   aggregate byte budget and may consume spare capacity rather than fixed

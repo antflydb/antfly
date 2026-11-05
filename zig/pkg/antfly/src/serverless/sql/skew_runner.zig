@@ -24,13 +24,6 @@ const runner = @import("runner.zig");
 const operators = local.sql_operators;
 const Datum = local.sql_scalar.Datum;
 const A = std.mem.Allocator;
-fn key(cells: []const Datum, ordinals: []const u16, buffer: *[32]Datum) ![]const Datum {
-    for (ordinals, 0..) |ordinal, i| {
-        if (ordinal >= cells.len) return error.InvalidSqlExchange;
-        buffer[i] = cells[ordinal];
-    }
-    return buffer[0..ordinals.len];
-}
 fn output(self: anytype, spec: plan.Plan) !runner.OutputRows {
     var result = try runner.OutputRows.init(self.a, 1, @min(spec.limits.task_output_bytes / 2, spec.limits.task_memory / 8));
     errdefer result.deinit(self.a);
@@ -40,15 +33,6 @@ fn output(self: anytype, spec: plan.Plan) !runner.OutputRows {
         if (aggregate.groups.len == 0) try result.grouped.?.ensureGlobalGroup();
     }
     return result;
-}
-fn blockRow(a: A, block: local.sql_spill.ColumnarBlock, row: usize) ![]const Datum {
-    const cells = try a.alloc(Datum, block.values.len);
-    for (cells, 0..) |*cell, column| cell.* = try block.cell(row, column);
-    return cells;
-}
-fn set(bits: []u8, ordinal: usize) !void {
-    if (ordinal / 8 >= bits.len) return error.InvalidSqlExchange;
-    bits[ordinal / 8] |= @as(u8, 1) << @as(u3, @truncate(ordinal));
 }
 fn contains(bits: []const u8, ordinal: usize) bool {
     return ordinal / 8 < bits.len and bits[ordinal / 8] & (@as(u8, 1) << @as(u3, @truncate(ordinal))) != 0;
@@ -103,36 +87,10 @@ pub fn pair(self: anytype, query: plan.Digest, spec: plan.Plan, task: plan.Task,
         var data = try self.exchange_store.read(decode.allocator(), dependencies[0], part.partition, @intCast(spec.limits.task_memory / 4));
         while (try data.nextBlock(&block_arena, @intCast(spec.limits.task_memory / 4))) |block| {
             defer block.deinit();
-            for (0..block.count()) |row| {
-                try self.context.ensureActive();
-                _ = scratch.reset(.free_all);
-                const cells = try blockRow(scratch.allocator(), block, row);
-                var keys: [32]Datum = undefined;
-                var iterator = try hash.probe(try key(cells, spec.join.left_keys, &keys));
-                var matched = false;
-                // Match scratch must not invalidate the borrowed probe row.
-                var matches = std.heap.ArenaAllocator.init(self.a);
-                defer matches.deinit();
-                while (try iterator.next()) |match| {
-                    try self.context.ensureActive();
-                    _ = matches.reset(.free_all);
-                    const right_cells = try match.materializeValues(matches.allocator());
-                    if (spec.join.condition != null) {
-                        const joined = try matches.allocator().alloc(Datum, cells.len + right_cells.len);
-                        @memcpy(joined[0..cells.len], cells);
-                        @memcpy(joined[cells.len..], right_cells);
-                        if (!try self.predicate(.condition, joined)) continue;
-                    }
-                    matched = true;
-                    if (match.index >= right_rows) return error.InvalidSqlExchange;
-                    try set(right_bits, match.index);
-                    if (spec.join.kind != .semi and spec.join.kind != .anti) try self.emit(spec, cells, right_cells, &result, matches.allocator());
-                    // All build matches are needed for right/full ownership.
-                    if (!spec.join.preservesBuild() and (spec.join.kind == .semi or spec.join.kind == .anti)) break;
-                }
-                if (matched) try set(left_bits, left_rows);
-                left_rows += 1;
-            }
+            if (block.count() > left.rows -| left_rows) return error.InvalidSqlExchange;
+            _ = scratch.reset(.free_all);
+            try self.probeBatchWitness(spec, hash, block.batch(), &result, scratch.allocator(), false, .{ .left = left_bits, .right = right_bits, .left_begin = left_rows });
+            left_rows += block.count();
         }
     }
     if (left_rows != left.rows) return error.InvalidSqlExchange;
@@ -207,15 +165,24 @@ pub fn finalize(self: anytype, query: plan.Digest, spec: plan.Plan, task: plan.T
         var ordinal: usize = 0;
         while (try data.nextBlock(&blocks, @intCast(spec.limits.task_memory / 4))) |block| {
             defer block.deinit();
+            const batch = block.batch();
+            var selected: [256]usize = undefined;
+            var selected_count: usize = 0;
+            _ = scratch.reset(.free_all);
             for (0..block.count()) |row| {
                 try self.context.ensureActive();
                 const matched = contains(bits, ordinal);
                 ordinal += 1;
                 if (matched != (!build and spec.join.kind == .semi)) continue;
-                _ = scratch.reset(.free_all);
-                const cells = try blockRow(scratch.allocator(), block, row);
-                try self.emit(spec, if (build) null else cells, if (build) cells else null, &result, scratch.allocator());
+                selected[selected_count] = row;
+                selected_count += 1;
+                if (selected_count == selected.len) {
+                    try self.emitUnmatched(spec, &batch, selected[0..selected_count], build, &result, scratch.allocator());
+                    selected_count = 0;
+                    _ = scratch.reset(.free_all);
+                }
             }
+            if (selected_count != 0) try self.emitUnmatched(spec, &batch, selected[0..selected_count], build, &result, scratch.allocator());
         }
         if (ordinal != tile.rows) return error.InvalidSqlExchange;
     }
