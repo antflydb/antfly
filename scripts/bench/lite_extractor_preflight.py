@@ -33,6 +33,42 @@ MODEL = "fastino/gliner2.5-base-v1"
 TEXT = "John Smith works at Microsoft in Seattle."
 
 
+def require_completed_projection(stats, pending, expected_documents):
+    # Request counters belong to one runtime and are not durable completion
+    # witnesses: a fresh observer or replacement runtime can legitimately see 0.
+    # Require the published per-document coverage and projection checkpoint.
+    enrichment = pending["enrichment"]
+    if (
+        stats["enrichment"]["error_count"]
+        or enrichment["error_count"]
+        or enrichment["retrying"]
+        or enrichment["worker_failed"]
+        or enrichment["stalled"]
+        or enrichment["projection_checkpoint_status"] != "clean"
+        or not enrichment["projection_checkpoint_identity_consistent"]
+        or enrichment["applied_sequence"] < enrichment["target_sequence"]
+        or enrichment["projection_checkpoint_applied_sequence"]
+        < pending["derived_target_sequence"]
+    ):
+        raise RuntimeError("Database extractor did not complete cleanly")
+    if not stats["indexes_available"]:
+        raise RuntimeError("Database index completion evidence is unavailable")
+    graph = next(index for index in stats["indexes"] if index["name"] == "knowledge")
+    if (
+        not graph["coverage_summary_ready"]
+        or graph["coverage_produced_count"] != expected_documents
+        or graph["coverage_skipped_count"]
+        or graph["coverage_terminal_failed_count"]
+    ):
+        raise RuntimeError("Database graph producer did not publish its result")
+    for index in stats["indexes"]:
+        if index["replay_catch_up_required"] or (
+            index["replay_applied_sequence"] < index["replay_target_sequence"]
+        ):
+            raise RuntimeError("Database index replay did not catch up")
+    return graph
+
+
 def run(library, directory, history_windows=False):
     af = sdk(str(Path(library).resolve()))
     directory = Path(directory)
@@ -150,21 +186,16 @@ def run(library, directory, history_windows=False):
         db.run_until_idle()
         stats = db.stats()
         enrichment = stats["enrichment"]
-        if enrichment["processed_requests"] < len(inserts) or enrichment["error_count"]:
-            raise RuntimeError("Database extractor did not complete cleanly")
-        graph = next(
-            index for index in stats["indexes"] if index["name"] == "knowledge"
+        pending = db.pending_work_stats()
+        graph = require_completed_projection(
+            stats, pending, expected_documents=len(inserts)
         )
-        if graph["coverage_produced_count"] != len(inserts):
-            raise RuntimeError("Database graph producer did not publish its result")
-        for index in stats["indexes"]:
-            if index["replay_catch_up_required"] or (
-                index["replay_applied_sequence"] < index["replay_target_sequence"]
-            ):
-                raise RuntimeError("Database index replay did not catch up")
         if not db.check()["valid"]:
             raise RuntimeError("Preflight database failed integrity")
     with af.open_readonly(database) as db:
+        require_completed_projection(
+            db.stats(), db.pending_work_stats(), expected_documents=len(inserts)
+        )
         if (
             any(
                 db.lookup(key)["body"] != value["body"]
@@ -182,8 +213,10 @@ def run(library, directory, history_windows=False):
         "standalone_entities_verified": True,
         "history_window_cases": window_cases,
         "database_processed_requests": enrichment["processed_requests"],
+        "processed_requests_scope": "Runtime-local diagnostic; not a completion witness",
         "database_errors": enrichment["error_count"],
         "graph_coverage_produced": graph["coverage_produced_count"],
+        "durable_checkpoint_and_reopened_coverage_verified": True,
         "index_catchup_integrity_reopen": True,
         "seconds": time.monotonic() - started,
     }
