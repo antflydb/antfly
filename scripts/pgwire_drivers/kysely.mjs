@@ -24,6 +24,8 @@ import {
   AntflyPostgresDialect,
   antflySearch,
   createAntflyIntrospector,
+  createAntflyPostgresCursor,
+  createAntflyPostgresTypes,
   generateKyselyTypes,
   prepareKyselyMigrationTables,
 } from "../../ts/packages/sdk/dist/kysely.js";
@@ -53,11 +55,13 @@ const migrationLock = () => {
     },
   };
 };
+const numericTypes = createAntflyPostgresTypes(pg.types);
+const ExactCursor = createAntflyPostgresCursor(Cursor, numericTypes);
 const makeDatabase = () =>
   new Kysely({
     dialect: new AntflyPostgresDialect({
-      pool: new pg.Pool({ connectionString }),
-      cursor: Cursor,
+      pool: new pg.Pool({ connectionString, types: numericTypes }),
+      cursor: ExactCursor,
       introspector,
       migrationLock: migrationLock(),
     }),
@@ -182,6 +186,8 @@ try {
               body: { type: ["string", "null"] },
               optional_nonnull: { type: "string", nullable: false },
               matrix: { type: "sql_array", "x-antfly-sql-type": "int32", nullable: false },
+              amount: { type: "number", "x-antfly-sql-type": "numeric", nullable: true },
+              amounts: { type: "sql_array", "x-antfly-sql-type": "numeric", nullable: true },
             },
           },
         },
@@ -212,13 +218,68 @@ try {
       },
     ]
   );
+  const decimals = [
+    ["9007199254740993.1200", null, "1.2300"],
+    ["-0.000001", "NaN", "Infinity"],
+  ];
+  await db
+    .updateTable("kysely_shapes")
+    .set({ amount: "9007199254740993.1200", amounts: decimals })
+    .where("_id", "=", "shape")
+    .execute();
+  const decimalQuery = db
+    .selectFrom("kysely_shapes")
+    .select(["amount", "amounts"])
+    .where("_id", "=", "shape");
+  const expectedDecimal = { amount: "9007199254740993.1200", amounts: decimals };
+  assert.deepEqual(await decimalQuery.execute(), [expectedDecimal]);
+  const streamedDecimals = [];
+  for await (const row of decimalQuery.stream(1)) streamedDecimals.push(row);
+  assert.deepEqual(streamedDecimals, [expectedDecimal]);
+  // A separate, unmodified pool keeps pg's default behavior. The exact
+  // registry must not change process-global parsers or claim their types.
+  const defaultDecimals = await standard
+    .selectFrom("kysely_shapes")
+    .select(["amount", "amounts"])
+    .where("_id", "=", "shape")
+    .executeTakeFirstOrThrow();
+  assert.equal(defaultDecimals.amount, expectedDecimal.amount);
+  assert.equal(typeof defaultDecimals.amounts[0][0], "number");
+  await db
+    .insertInto("kysely_shapes")
+    .values([
+      { _id: "empty", body: null, matrix: [[0]], amounts: [] },
+      { _id: "null", body: null, matrix: [[0]], amounts: null },
+    ])
+    .execute();
+  assert.deepEqual(
+    await db
+      .selectFrom("kysely_shapes")
+      .select(["_id", "amounts"])
+      .where("_id", "in", ["empty", "null"])
+      .orderBy("_id")
+      .execute(),
+    [
+      { _id: "empty", amounts: [] },
+      { _id: "null", amounts: null },
+    ]
+  );
+
   const metadata = await introspector.getTables({ withInternalKyselyTables: true });
   assert.ok(metadata.find((table) => table.name === "kysely_people"));
   assert.match(generateKyselyTypes(metadata, { integerMode: "string" }), /"n": string \| null;/);
-  const generated = generateKyselyTypes(metadata, { integerMode: "string" });
+  const generated = generateKyselyTypes(metadata, {
+    integerMode: "string",
+    numericArrayMode: "string",
+  });
   assert.match(generated, /"body": string \| null;/);
   assert.match(generated, /"matrix": SQLArray<number>;/);
   assert.match(generated, /"optional_nonnull": string \| null;/);
+  assert.match(generated, /"amounts": SQLArray<string> \| null;/);
+  assert.match(
+    generateKyselyTypes(metadata, { integerMode: "string" }),
+    /"amounts": SQLArray<number> \| null;/
+  );
 
   // Server search support is an explicit capability boundary, never an
   // application-side search plus join fallback.

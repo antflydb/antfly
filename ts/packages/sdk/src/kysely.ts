@@ -17,6 +17,11 @@ export {
   type PrepareKyselyMigrationTablesOptions,
   prepareKyselyMigrationTables,
 } from "./kysely-migrations.js";
+export {
+  type AntflyPostgresTypes,
+  createAntflyPostgresCursor,
+  createAntflyPostgresTypes,
+} from "./kysely-postgres-types.js";
 
 export {
   type AntflyColumnMetadata,

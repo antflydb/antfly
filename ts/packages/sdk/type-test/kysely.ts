@@ -3,8 +3,13 @@
 
 import type { Kysely } from "kysely";
 import { Migrator } from "kysely/migration";
+import pg from "pg";
+import Cursor from "pg-cursor";
 import {
+  AntflyPostgresDialect,
   antflySearch,
+  createAntflyPostgresCursor,
+  createAntflyPostgresTypes,
   type PrepareKyselyMigrationTablesOptions,
   prepareKyselyMigrationTables,
 } from "../src/kysely.js";
@@ -41,3 +46,9 @@ new Migrator({
 prepareKyselyMigrationTables(db, { migrationTable: "old_name" });
 // @ts-expect-error Use migrationLockTableName for both setup and Migrator.
 prepareKyselyMigrationTables(db, { migrationLockTable: "old_name" });
+
+const numericTypes = createAntflyPostgresTypes(pg.types);
+new AntflyPostgresDialect({
+  pool: new pg.Pool({ types: numericTypes }),
+  cursor: createAntflyPostgresCursor(Cursor, numericTypes),
+});

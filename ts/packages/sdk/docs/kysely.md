@@ -73,9 +73,12 @@ the [pgwire contract](https://github.com/antflydb/antfly/blob/main/zig/pkg/antfl
 
 ```ts
 import { AntflyClient } from "@antfly/sdk";
-import { AntflyPostgresDialect, createAntflyIntrospector } from "@antfly/sdk/kysely";
+import {
+  AntflyPostgresDialect, createAntflyIntrospector,
+  createAntflyPostgresTypes, createAntflyPostgresCursor,
+} from "@antfly/sdk/kysely";
 import { Kysely } from "kysely";
-import { Pool } from "pg";
+import { Pool, types } from "pg";
 import Cursor from "pg-cursor";
 
 const credentials = new URL(process.env.ANTFLY_PGWIRE_URL!);
@@ -87,10 +90,11 @@ const client = new AntflyClient({
   },
 });
 
+const numericTypes = createAntflyPostgresTypes(types);
 const db = new Kysely<Tables>({
   dialect: new AntflyPostgresDialect({
-    pool: new Pool({ connectionString: process.env.ANTFLY_PGWIRE_URL }),
-    cursor: Cursor,
+    pool: new Pool({ connectionString: process.env.ANTFLY_PGWIRE_URL, types: numericTypes }),
+    cursor: createAntflyPostgresCursor(Cursor, numericTypes),
     introspector: createAntflyIntrospector(client),
   }),
 });
@@ -181,6 +185,9 @@ types, JSON, and timestamps remain `unknown` for application-specific refinement
 Only imports that the generated source uses are included. Run this against a
 stable schema; metadata reads are not an atomic catalog export.
 
+For the server connection configured above, generate with
+`{ integerMode: "string", numericArrayMode: "string" }`.
+
 Nullable unions such as `type: ["string", "null"]` retain `null` even when the
 field is required. Optional fields also retain SQL NULL when absent, even if
 explicit JSON null is forbidden with `nullable: false`. Columns must be required
@@ -195,9 +202,21 @@ type identity. Embedded SQL arrays retain their native envelope and generate as
 
 Integer mode describes driver behavior; it does not convert results. Embedded
 SQL returns integer columns as `bigint`; pg returns BIGINT as strings and smaller
-integer widths as numbers. Exact NUMERIC is decimal text. Do not coerce BIGINT to
-`number` unless you enforce JavaScript's safe integer range. If you customize pg
-parsers, match the generated types to your scalar and array parsers explicitly.
+integer widths as numbers. NUMERIC scalars return decimal text. Unmodified `pg`
+parses NUMERIC array elements as JavaScript numbers, which can lose precision;
+type generation therefore defaults to `numericArrayMode: "number"`.
+
+The server recipe uses `createAntflyPostgresTypes(types)` to preserve NUMERIC
+scalar and array elements as exact decimal strings, including scale and special
+values. Pass its registry to both the pool and `createAntflyPostgresCursor`:
+pg-cursor does not inherit pool-local parsers. These helpers do not change global
+`pg.types` settings, BIGINT parsing, or other OIDs. With this configuration, set
+`numericArrayMode: "string"` when generating types. Embedded SQL arrays keep their
+native envelopes and are unaffected by this option.
+
+Do not coerce BIGINT to `number` unless you enforce JavaScript's safe integer
+range. If you customize parsers, match the generated scalar and array types to
+the actual parser configuration.
 
 ## Transactions and migrations
 

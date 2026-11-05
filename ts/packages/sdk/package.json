@@ -67,9 +67,13 @@
   "homepage": "https://github.com/antflydb/antfly/tree/main/ts/packages/sdk#readme",
   "devDependencies": {
     "@types/node": "^25.9.3",
+    "@types/pg": "8.15.6",
+    "@types/pg-cursor": "2.7.2",
     "@vitest/ui": "^4.1.9",
     "kysely": "^0.29.6",
     "openapi-typescript": "^7.13.0",
+    "pg": "8.16.3",
+    "pg-cursor": "2.15.3",
     "tsup": "^8.5.1",
     "tsx": "^4.22.4",
     "typescript": "~5.9.3",

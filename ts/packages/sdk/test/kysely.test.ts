@@ -3,6 +3,7 @@
 
 import { fileURLToPath } from "node:url";
 import { DummyDriver, Kysely, PostgresDialect } from "kysely";
+import pg from "pg";
 import ts from "typescript";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import type { AntflyClient } from "../src/client.js";
@@ -11,6 +12,7 @@ import {
   AntflyPostgresDialect,
   antflySearch,
   createAntflyIntrospector,
+  createAntflyPostgresTypes,
   generateKyselyTypes,
 } from "../src/kysely.js";
 
@@ -117,7 +119,10 @@ describe("server capabilities", () => {
 });
 
 describe("schema tooling", () => {
-  it("generates valid TypeScript with required, defaulted and output-only columns", () => {
+  it.each([
+    "number",
+    "string",
+  ] as const)("generates valid TypeScript with %s NUMERIC arrays", (numericArrayMode) => {
     const column = (
       name: string,
       dataType: string,
@@ -143,11 +148,13 @@ describe("schema tooling", () => {
             column("computed", "string", { isGeneratedAlways: true }),
             column("matrix", "int32[]", { hasDefaultValue: true }),
             column("exact", "int64[]", { hasDefaultValue: true }),
+            column("amounts", "numeric[]", { hasDefaultValue: true }),
+            column("amount", "numeric", { hasDefaultValue: true }),
             column('quote"; injected: never; //', "unknown", { isNullable: true }),
           ],
         },
       ],
-      { integerMode: "bigint" }
+      { integerMode: "bigint", numericArrayMode }
     );
     const fileName = fileURLToPath(new URL("./generated-kysely.ts", import.meta.url));
     const input = `${source}
@@ -159,6 +166,10 @@ export const matrix: Updateable<Database["items"]> = { matrix: [[1, null], [2, 3
 export const cube: Updateable<Database["items"]> = { matrix: [[[1]], [[2]]] };
 export const empty: Updateable<Database["items"]> = { matrix: [] };
 export const exact: Updateable<Database["items"]> = { exact: [[9007199254740993n, null]] };
+export const amounts: Updateable<Database["items"]> = { amounts: [[${numericArrayMode === "string" ? '"9007199254740993.1200"' : "1.25"}, null]] };
+export const amount: Updateable<Database["items"]> = { amount: "9007199254740993.1200" };
+// @ts-expect-error Array types must match the selected NUMERIC parser mode.
+export const wrongNumeric: Updateable<Database["items"]> = { amounts: [[${numericArrayMode === "string" ? "1.25" : '"1.25"'}]] };
 // @ts-expect-error Array elements must retain their scalar type at every rank.
 export const wrongElement: Updateable<Database["items"]> = { matrix: [["x"]] };
 // @ts-expect-error A required column cannot be omitted.
@@ -254,5 +265,48 @@ export const invalid: Insertable<Database["items"]> = { id: "1", computed: "x" }
     expect(generateKyselyTypes(tables, { integerMode: "bigint" })).toContain(
       '"n": Generated<bigint>;'
     );
+  });
+});
+
+describe("PostgreSQL NUMERIC parsing", () => {
+  it("preserves decimal spelling, nested arrays, SQL NULLs and special values locally", () => {
+    const defaultNumericArray = pg.types.getTypeParser(1231);
+    const types = createAntflyPostgresTypes(pg.types);
+    const parse = types.getTypeParser(1231) as (value: string) => unknown;
+    expect(parse("{{9007199254740993.1200,NULL,1.2300},{-0.000001,NaN,Infinity}}")).toEqual([
+      ["9007199254740993.1200", null, "1.2300"],
+      ["-0.000001", "NaN", "Infinity"],
+    ]);
+    expect(parse("{}")).toEqual([]);
+    expect(parse("[0:1]={1.2300,-Infinity}")).toEqual(["1.2300", "-Infinity"]);
+    expect((types.getTypeParser(1700) as (value: string) => unknown)("9007199254740993.1200")).toBe(
+      "9007199254740993.1200"
+    );
+    expect(types.getTypeParser(23)).toBe(pg.types.getTypeParser(23));
+    expect(types.getTypeParser(1231, "binary")).toBe(pg.types.getTypeParser(1231, "binary"));
+    expect(pg.types.getTypeParser(1231)).toBe(defaultNumericArray);
+    expect(defaultNumericArray("{1.2300}")).toEqual([1.23]);
+    const tables = [
+      {
+        name: "items",
+        isView: false,
+        isForeign: false,
+        columns: [
+          {
+            name: "amounts",
+            dataType: "numeric[]",
+            isNullable: true,
+            isAutoIncrementing: false,
+            hasDefaultValue: false,
+          },
+        ],
+      },
+    ];
+    expect(generateKyselyTypes(tables, { integerMode: "string" })).toContain(
+      '"amounts": SQLArray<number> | null;'
+    );
+    expect(
+      generateKyselyTypes(tables, { integerMode: "string", numericArrayMode: "string" })
+    ).toContain('"amounts": SQLArray<string> | null;');
   });
 });

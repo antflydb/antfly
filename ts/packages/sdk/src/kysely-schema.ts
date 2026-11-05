@@ -91,22 +91,24 @@ export function createAntflyIntrospector(
 export interface GenerateKyselyTypesOptions {
   /** Match the actual driver/parser configuration. No runtime conversion is performed. */
   integerMode: "bigint" | "string";
+  /** pg defaults to numbers for NUMERIC[]; use string with createAntflyPostgresTypes. */
+  numericArrayMode?: "number" | "string";
 }
 
-function scalarType(type: string, integerMode: "bigint" | "string"): string {
+function scalarType(type: string, options: GenerateKyselyTypesOptions): string {
   if (type.endsWith("[]")) {
     // PostgreSQL's [] type identity does not constrain rank. pg returns nested
     // arrays for multidimensional values, with null at SQL NULL elements.
     let element = type;
     while (element.endsWith("[]")) element = element.slice(0, -2);
-    return `SQLArray<${scalarType(element, integerMode)}>`;
+    return `SQLArray<${element.toLowerCase() === "numeric" ? (options.numericArrayMode ?? "number") : scalarType(element, options)}>`;
   }
   switch (type.toLowerCase()) {
     case "integer":
     case "int64":
     case "int8":
     case "bigint":
-      return integerMode;
+      return options.integerMode;
     case "int16":
     case "int32":
     case "int2":
@@ -141,6 +143,13 @@ export function generateKyselyTypes(
   if (options.integerMode !== "bigint" && options.integerMode !== "string") {
     throw new TypeError("integerMode must match the driver: bigint or string");
   }
+  if (
+    options.numericArrayMode !== undefined &&
+    options.numericArrayMode !== "number" &&
+    options.numericArrayMode !== "string"
+  ) {
+    throw new TypeError("numericArrayMode must match the driver: number or string");
+  }
   const lines = [
     "// Generated from Antfly metadata. Review unknown types and driver mappings.",
     "export interface Database {",
@@ -160,7 +169,7 @@ export function generateKyselyTypes(
         throw new Error(`Duplicate column ${JSON.stringify(column.name)}`);
       columns.add(column.name);
       hasArrays ||= column.dataType.endsWith("[]");
-      let type = scalarType(column.dataType, options.integerMode);
+      let type = scalarType(column.dataType, options);
       if (column.isNullable && type !== "unknown") type += " | null";
       if (column.isGeneratedAlways) {
         imports.add("GeneratedAlways");
