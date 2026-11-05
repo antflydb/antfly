@@ -940,6 +940,8 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         .io = io,
         .cb = cb,
         .session = model.session,
+        .media_run_budget = &run_budget,
+        .explicit_scratch_limit = if (opts.scratch_budget_mb != 0) budget_limits.scratch_limit_bytes else 0,
         .gpt_config = gpt_config,
         .kv_dtype = kv_dtype,
         .shared_moe_cache = model.shared_moe_cache,
