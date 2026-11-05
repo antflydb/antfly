@@ -625,6 +625,9 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "capi lite run until idle drains a standalone chunk enrichment with no owning index",
         "capi lite AddIndexJSON registers a graph config",
         "inline resolver replacement",
+        "catchUpWindow preserves a bounded fallback prefix before a late match",
+        "db manual resolver observations follow durable peer control progress",
+        "db detached replay leaves optional maintenance to its retained continuation",
         "capi lite AddIndexJSON restores the enrichment catalog when admission rejects the index",
     };
     const memory_capi_check = linked_tests.add(b, .{ .name = "memory-capi-check", .root_module = capi_root_mod, .filters = &.{"capi native memory"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
