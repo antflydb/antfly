@@ -81,15 +81,15 @@ const RequestContext = execution_context.RequestContext;
 const provider_limits = @import("common/provider_limits.zig");
 const Allocator = std.mem.Allocator;
 const local_reader_batch_ceiling: usize = 64;
-const test_png_data_uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+const test_png_data_uri = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD";
 const test_png_2x3 = [_]u8{
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x0d, 'I',  'H',  'D',  'R',
     0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03,
 };
 const test_png_3x3 = [_]u8{
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
-    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x00, 0x0d, 'I',  'H',  'D',  'R',
     0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x03,
 };
 const max_asset_provider_timeout_ms: u64 = 300_000;
@@ -2724,6 +2724,7 @@ pub const Runtime = struct {
             var body = try antflyGenerateBatchRequestAlloc(alloc, cfg, chunk, attachment_transport);
             defer body.deinit(alloc);
             var request_options = httpx.RequestOptions{
+                .follow_redirects = false,
                 .attempt_observer = quota.limiter().observer(
                     try generating_runtime.generationOutputTokenBudget(cfg, chunk.len),
                 ),
@@ -5004,7 +5005,7 @@ test "asset producer runtime generator admission accepts PDF only for document-c
 }
 
 test "asset producer runtime generator admission accounts for resident inline media" {
-    const data_uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+    const data_uri = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD";
     const capabilities = inference_work.InferenceCapabilities{
         .task = .generate,
         .input_modalities = .{ .text = true, .image = true },
@@ -5014,8 +5015,8 @@ test "asset producer runtime generator admission accounts for resident inline me
         .output = .generated_text,
     };
     const requests = [_]asset_producer.Request{
-        .{ .producer_type = .generator, .config_json = "{}", .source_text = "", .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD\"}}]" },
-        .{ .producer_type = .generator, .config_json = "{}", .source_text = "", .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD\"}}]" },
+        .{ .producer_type = .generator, .config_json = "{}", .source_text = "", .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD\"}}]" },
+        .{ .producer_type = .generator, .config_json = "{}", .source_text = "", .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD\"}}]" },
     };
     try std.testing.expectEqual(@as(usize, 1), try generatorBatchEnd(std.testing.allocator, capabilities, .base64_payload, &requests, 0));
     try validateGeneratorInvocation(std.testing.allocator, capabilities, .base64_payload, requests[0..1]);
@@ -5036,6 +5037,7 @@ test "asset producer runtime generator admission accounts for resident inline me
 test "asset producer runtime media accounting follows attachment transport" {
     var bytes = @as([24]u8, @splat(0));
     @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(bytes[12..16], "IHDR");
     std.mem.writeInt(u32, bytes[16..20], 2, .big);
     std.mem.writeInt(u32, bytes[20..24], 3, .big);
     const request = asset_producer.Request{
@@ -5162,6 +5164,7 @@ test "asset producer runtime remote planning uses resolved framed transport" {
             defer alloc.free(config);
             var png = @as([24]u8, @splat(0));
             @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+            @memcpy(png[12..16], "IHDR");
             std.mem.writeInt(u32, png[16..20], 2, .big);
             std.mem.writeInt(u32, png[20..24], 3, .big);
             const request = asset_producer.Request{ .producer_type = kind, .config_json = config, .source_text = "", .inline_media_trusted = true, .media = &.{.{ .bytes = &png, .mime_type = "image/png" }} };
@@ -5236,7 +5239,7 @@ test "asset producer runtime validates the complete base64 representation" {
 
 test "asset producer runtime reader URI admission measures data payloads before execution" {
     const request = readers.Request{
-        .images = &.{"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD"},
+        .images = &.{"data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD"},
         .inline_content_trust = .trusted_internal,
     };
     var capabilities = inference_work.InferenceCapabilities{
@@ -5354,6 +5357,7 @@ fn extractorBatchEnd(
 test "asset producer runtime extractor windows obey resolved item and encoded-byte ceilings" {
     var bytes = @as([24]u8, @splat(0));
     @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(bytes[12..16], "IHDR");
     std.mem.writeInt(u32, bytes[16..20], 2, .big);
     std.mem.writeInt(u32, bytes[20..24], 3, .big);
     const requests = [_]asset_producer.Request{
@@ -5381,8 +5385,8 @@ test "asset producer runtime extractor windows obey resolved item and encoded-by
 }
 
 test "asset producer runtime extractor admission accounts for resident inline source parts" {
-    const first_uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
-    const second_uri = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+    const first_uri = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD";
+    const second_uri = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD";
     const capabilities = inference_work.InferenceCapabilities{
         .task = .extract,
         .input_modalities = .{ .image = true },
@@ -5393,8 +5397,8 @@ test "asset producer runtime extractor admission accounts for resident inline so
         .prompt_policy = .structured_schema,
     };
     const requests = [_]asset_producer.Request{
-        .{ .producer_type = .extractor, .config_json = "{}", .source_text = "", .content_type = "application/json", .inline_media_trusted = true, .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD\"}]" },
-        .{ .producer_type = .extractor, .config_json = "{}", .source_text = "", .content_type = "application/json", .inline_media_trusted = true, .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD\"}]" },
+        .{ .producer_type = .extractor, .config_json = "{}", .source_text = "", .content_type = "application/json", .inline_media_trusted = true, .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD\"}]" },
+        .{ .producer_type = .extractor, .config_json = "{}", .source_text = "", .content_type = "application/json", .inline_media_trusted = true, .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD\"}]" },
     };
     try std.testing.expectEqual(first_uri.len, second_uri.len);
     try std.testing.expectEqual(@as(usize, 1), try extractorBatchEnd(std.testing.allocator, capabilities, .base64_payload, &requests, 0));
@@ -5441,7 +5445,7 @@ test "asset producer runtime extractor shape is allocation-failure safe" {
                 .config_json = "{}",
                 .source_text = "",
                 .inline_media_trusted = true,
-                .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD\"}]",
+                .source_parts_json = "[{\"type\":\"text\",\"text\":\"ocr\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD\"}]",
             }, capabilities.batch.max_encoded_media_bytes);
             defer shape.deinit(alloc);
         }
@@ -5459,6 +5463,7 @@ test "asset producer runtime local reader chunks stop at source boundaries befor
 test "encoded reader chunks obey model item and byte limits" {
     var bytes = @as([24]u8, @splat(0));
     @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(bytes[12..16], "IHDR");
     std.mem.writeInt(u32, bytes[16..20], 2, .big);
     std.mem.writeInt(u32, bytes[20..24], 3, .big);
     const images = [_]readers.EncodedImage{
@@ -7459,6 +7464,7 @@ fn testRemoteReaderIdentity(comptime framed: bool) !void {
     defer alloc.free(cfg_json);
     var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 2, .big);
     std.mem.writeInt(u32, png[20..24], 3, .big);
     const media = [_][1]asset_producer.EncodedMedia{
@@ -7660,7 +7666,7 @@ test "asset producer runtime routes antfly reader without url to local provider"
         .producer_type = .reader,
         .config_json = "{\"provider\":\"antfly\",\"model\":\"local-reader\"}",
         .source_text = "",
-        .source_parts_json = "[{\"type\":\"text\",\"text\":\"extract\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD\"}]",
+        .source_parts_json = "[{\"type\":\"text\",\"text\":\"extract\"},{\"type\":\"media\",\"url\":\"data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD\"}]",
         .content_type = "text/plain",
     });
     defer alloc.free(result);

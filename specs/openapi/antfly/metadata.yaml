@@ -11633,6 +11633,9 @@ components:
         remote_snapshot:
           type: string
           description: Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409.
+        live_read:
+          type: boolean
+          description: True when an ordered query read live state because this deployment's storage (Lite) cannot retain a snapshot. No remote_snapshot is returned, so the page cannot be continued with search_after or search_before.
         evaluation:
           type: object
           additionalProperties: true

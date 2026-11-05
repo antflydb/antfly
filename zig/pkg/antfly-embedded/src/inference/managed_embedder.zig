@@ -6159,7 +6159,7 @@ fn validateDensePartsMimeTypes(
 }
 
 pub fn testSingleMultimodalEmbeddingAdmission() !void {
-    const image_url = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+    const image_url = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD";
     const parts = [_]template_mod.ContentPart{
         .{ .text = "ocr" },
         .{ .media_url = image_url },
@@ -6175,6 +6175,7 @@ pub fn testSingleMultimodalEmbeddingAdmission() !void {
 
     var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 2, .big);
     std.mem.writeInt(u32, png[20..24], 3, .big);
     const binary_parts = [_]template_mod.ContentPart{.{
@@ -6694,6 +6695,7 @@ test "managed embedder metadata envelope sizing includes binary framing and payl
     const alloc = std.testing.allocator;
     var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 2, .big);
     std.mem.writeInt(u32, png[20..24], 3, .big);
     const part = template_mod.ContentPart{ .binary = .{ .mime_type = "image/png", .data = &png } };
@@ -6719,6 +6721,7 @@ test "managed embedder metadata ceiling splits mixed batches before dispatch" {
     const alloc = std.testing.allocator;
     var png = @as([24]u8, @splat(0));
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 2, .big);
     std.mem.writeInt(u32, png[20..24], 3, .big);
     const binary = template_mod.ContentPart{ .binary = .{ .mime_type = "image/png", .data = &png } };
@@ -6759,6 +6762,7 @@ test "managed embedder metadata ceiling splits mixed batches before dispatch" {
 test "managed embedder admission follows the selected attachment transport" {
     var bytes = @as([24]u8, @splat(0));
     @memcpy(bytes[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(bytes[12..16], "IHDR");
     std.mem.writeInt(u32, bytes[16..20], 2, .big);
     std.mem.writeInt(u32, bytes[20..24], 3, .big);
     const items = [_]template_mod.ContentPart{
@@ -6806,7 +6810,7 @@ test "managed embedder admission follows the selected attachment transport" {
 }
 
 test "managed embedder partitions and validates inline image data URIs" {
-    const first = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD";
+    const first = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD";
     // The second payload is valid base64 but not an image. The encoded-byte
     // window closes before it, proving partitioning does not materialize or
     // inspect a payload that cannot fit the current invocation.
@@ -7726,6 +7730,7 @@ fn embedBatchWithCohereRequest(
     defer if (fallback_http) |*client| client.deinit();
     const client = try entry.httpClient(alloc, &fallback_http);
     var response = try client.post(url, .{
+        .follow_redirects = false,
         .attempt_observer = embeddingAttemptObserver(entry),
         .json = body,
         .headers = &headers,
@@ -7885,6 +7890,7 @@ fn embedBatchWithOpenAiCompatible(
     const client = try entry.httpClient(alloc, &fallback_http);
 
     var response = try client.post(url, .{
+        .follow_redirects = false,
         .attempt_observer = embeddingAttemptObserver(entry),
         .json = json_body,
         .headers = headers_buf[0..header_count],
@@ -8287,7 +8293,7 @@ test "managed embedder owned numeric lease executes without cache residency and 
     const planned = managed.denseInterface().withPartLease(lease);
     const items = [_]template_mod.ContentPart{.{ .binary = .{
         .mime_type = "image/png",
-        .data = &.{ 0x89, 'P', 'N', 'G', 13, 10, 26, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3 },
+        .data = &.{ 0x89, 'P', 'N', 'G', 13, 10, 26, 10, 0, 0, 0, 0, 'I', 'H', 'D', 'R', 0, 0, 0, 2, 0, 0, 0, 3 },
     } }};
     const vectors = try planned.embedDensePartItems(alloc, "visual", &items, 2);
     defer db_embedder.freeDenseEmbeddingBatch(alloc, vectors);
@@ -9639,7 +9645,7 @@ pub fn testRemoteEmbeddingCancellation() !void {
         fn run(target: *ManagedEmbedder, err_out_ptr: *?anyerror, finished: *std.atomic.Value(bool)) void {
             defer finished.store(true, .release);
             const parts = [_]template_mod.ContentPart{.{
-                .media_url = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD",
+                .media_url = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD",
             }};
             const vector = target.denseInterface().embedDenseParts(
                 alloc,
@@ -11207,7 +11213,7 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
             try std.testing.expectEqualStrings("local-model", model);
             try std.testing.expectEqual(@as(usize, 3), parts_slice.len);
             try std.testing.expectEqualStrings("caption", parts_slice[0].text);
-            try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD", parts_slice[1].media_url);
+            try std.testing.expectEqualStrings("data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD", parts_slice[1].media_url);
             try std.testing.expectEqualStrings("image/png", parts_slice[2].binary.mime_type);
             self.saw_parts = true;
 
@@ -11248,10 +11254,10 @@ pub fn testAntflyEmbedPartSelectionAndCardinality() !void {
     defer bedrock_managed.deinit();
     try std.testing.expectEqual(@as(?usize, null), bedrock_managed.denseInterface().mediaPartLimit("bedrock_idx"));
 
-    const png_header = "\x89PNG\r\n\x1a\n\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x00\x00\x03";
+    const png_header = "\x89PNG\r\n\x1a\n\x00\x00\x00\x00IHDR\x00\x00\x00\x02\x00\x00\x00\x03";
     const parts = [_]template_mod.ContentPart{
         .{ .text = "caption" },
-        .{ .media_url = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD" },
+        .{ .media_url = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD" },
         .{ .binary = .{ .mime_type = "image/png", .data = png_header } },
     };
     const vector = try embedWithEntryParts(std.testing.allocator, &managed.entries[0], &parts, 3);
@@ -11754,6 +11760,71 @@ test "managed embedder endpoint access denial survives HTTP probing and runtime 
     }
     const abi = @import("antfly_runtime_abi").error_abi;
     try std.testing.expectEqual(error.InferenceEndpointAccessDenied, abi.errorFromStatus(abi.statusFromError(error.InferenceEndpointAccessDenied)));
+}
+
+test "managed embedder rejects provider redirects without forwarding credentials or input" {
+    const a = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+    const Check = struct {
+        fn request(req: httpx.testing_mod.RequestInfo) !void {
+            try std.testing.expectEqualStrings("Bearer dummy-managed-provider-key", req.header("Authorization") orelse return error.MissingProviderCredential);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "private-managed-embedding-input") != null);
+        }
+
+        fn serve(server: *httpx.TestServer, failure: *?anyerror) std.Io.Cancelable!void {
+            server.handleOne() catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => failure.* = err,
+            };
+        }
+    };
+
+    for ([_][]const u8{ "openai", "cohere" }) |provider| {
+        for ([_]u16{ 307, 308 }) |status| {
+            errdefer std.debug.print("managed embedding redirect: provider={s}, status={d}\n", .{ provider, status });
+            var destination = try httpx.TestServer.start(a, io, &.{.{ .method = .POST, .path = "/capture", .respond = .{ .status = 400 } }});
+            defer destination.deinit();
+            const location = try destination.url("/capture");
+            defer a.free(location);
+            const response_headers: []const httpx.testing_mod.HeaderPair = &.{.{ .name = "Location", .value = location }};
+            var origin = try httpx.TestServer.start(a, io, &.{.{
+                .method = .POST,
+                .path = if (std.mem.eql(u8, provider, "openai")) "/v1/embeddings" else "/v2/embed",
+                .assert_request = Check.request,
+                .respond = .{ .status = status, .headers = response_headers },
+            }});
+            defer origin.deinit();
+            const config = try std.fmt.allocPrint(a,
+                \\{{"semantic":{{"type":"embeddings","field":"body","dimension":2,"embedder":{{"provider":"{s}","model":"model","url":"{s}","api_key":"dummy-managed-provider-key"}}}}}}
+            , .{ provider, origin.baseUrl() });
+            defer a.free(config);
+            var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(a, config, .{ .io = io, .bounded_http_request = true });
+            defer managed.deinit();
+            // Exercise the production managed path with its own permissive
+            // client, independently of the direct OpenAI provider adapter.
+            managed.owned_http_client.?.config.redirect_policy.follow_redirects = true;
+            var origin_failure: ?anyerror = null;
+            var destination_failure: ?anyerror = null;
+            var group: std.Io.Group = .init;
+            defer group.cancel(io);
+            try group.concurrent(io, Check.serve, .{ &origin, &origin_failure });
+            try group.concurrent(io, Check.serve, .{ &destination, &destination_failure });
+            try std.testing.expectError(error.EmbedRequestFailed, managed.denseInterface().embedDenseBatchWithContext(
+                a,
+                "semantic",
+                &.{"private-managed-embedding-input"},
+                2,
+                .{ .io = io, .deadline_ns = monotonicNowNs() + 5 * std.time.ns_per_s },
+            ));
+            group.cancel(io);
+            if (origin_failure) |err| return err;
+            if (destination_failure) |err| return err;
+            try std.testing.expectEqual(@as(usize, 1), origin.route_hits[0]);
+            try std.testing.expectEqual(@as(usize, 0), destination.route_hits[0]);
+        }
+    }
 }
 
 test "managed embedder Cloudflare compatibility preserves indexed results without resizing" {
@@ -12517,7 +12588,7 @@ test "managed embedder HTTP revision pins fence text grouped framed and numeric 
     var managed = ManagedEmbedder{ .alloc = a, .entries = &entries };
     const parts = [_]template_mod.ContentPart{
         .{ .text = "caption" },
-        .{ .binary = .{ .mime_type = "image/png", .data = &.{ 0x89, 'P', 'N', 'G', 13, 10, 26, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0, 0, 3 } } },
+        .{ .binary = .{ .mime_type = "image/png", .data = &.{ 0x89, 'P', 'N', 'G', 13, 10, 26, 10, 0, 0, 0, 0, 'I', 'H', 'D', 'R', 0, 0, 0, 2, 0, 0, 0, 3 } } },
     };
     for (0..3) |transport| for ([_]bool{ false, true }) |numeric| {
         app.numeric.store(numeric, .release);

@@ -1722,6 +1722,9 @@ pub const ApiHttpServerConfig = struct {
     /// Loaded node config, used by /connections to enumerate configured
     /// providers and object stores. Must outlive the server.
     node_config: ?*const common_config.Config = null,
+    /// Lite storage cannot publish the directory snapshot behind a retained
+    /// native cut, so its ordered first pages read live state instead.
+    native_retained_cuts: bool = true,
     /// Borrowed engine-owned local durability root for standalone/embedded
     /// native lake artifacts. Distributed serving requires storage.artifacts.
     native_lake_artifact_base_dir: ?[]const u8 = null,
@@ -15911,7 +15914,9 @@ pub const ApiHttpServer = struct {
             const context: api_operation.RequestContext = .{ .deadline_ns = request_deadline_ns, .cancellation = cancellation orelse .none };
             if (try self.queryTableDefinition(resolver.arena, resolver, table_name, context)) |table| {
                 const external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(resolver.arena, table.schema_json);
-                if (external == null and table.storage.engine != .object) {
+                if (external == null and table.storage.engine != .object and !self.cfg.native_retained_cuts) {
+                    query_req.req.response_live_read = true;
+                } else if (external == null and table.storage.engine != .object) {
                     var store = try @import("lake_index_store.zig").Store.openNative(resolver.arena, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
                     var capture = (try self.source.linearizableSnapshot(context)) orelse return error.CatalogGenerationChanged;
@@ -15972,7 +15977,7 @@ pub const ApiHttpServer = struct {
             // happen to be present.
             error.InvalidArgument => return error.InvalidQueryRequest,
             else => return err,
-        }) orelse error.TableNotFound;
+        }) orelse return error.TableNotFound;
     }
 
     const CatalogGraphReadContext = struct {

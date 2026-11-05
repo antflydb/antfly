@@ -232,19 +232,23 @@ func (w *SyncWriter) Finish(ctx context.Context) (MergeResult, error) {
 	}
 	sort.Strings(ids)
 	// A fresh absence proof avoids replaying an already committed cleanup when
-	// a prior run lost its acknowledgement. No-op syncs perform no merges.
-	clean, err := w.rangeIsClean(ctx, ids)
+	// a prior run lost its acknowledgement. Retained snapshots let no-op syncs
+	// avoid a merge; live reads require primary-store reconciliation below.
+	clean, retained, err := w.rangeIsClean(ctx, ids)
 	if err != nil {
 		return MergeResult{}, err
 	}
-	if clean {
+	if clean && retained {
 		if err := w.verifyRetainedIDs(ctx, ids); err != nil {
 			return MergeResult{}, err
 		}
 		w.finished = true
 		return MergeResult{Status: "success", Skipped: len(ids)}, nil
 	}
-	page := ScopedMergePage{KeyRange: w.bounds, Records: map[string]any{}, RetainIDs: ids, LastMergedID: w.bounds.From, DeleteMissing: true, SyncLevel: "write"}
+	// Lite cannot prove absence through a lagging live index. Reconcile against
+	// primary storage even when its query is empty, and wait for index visibility
+	// before using a subsequent live read to confirm the cleanup.
+	page := ScopedMergePage{KeyRange: w.bounds, Records: map[string]any{}, RetainIDs: ids, LastMergedID: w.bounds.From, DeleteMissing: true, SyncLevel: "full_index"}
 	result, err := w.merge(ctx, page, w.bounds.To, len(ids))
 	if err != nil {
 		return result, err
@@ -326,23 +330,28 @@ func decodeSyncJSON(raw []byte, target any) error {
 	return nil
 }
 func decodeSyncHits(raw []byte) ([]syncHit, error) {
+	hits, _, err := decodeSyncPage(raw)
+	return hits, err
+}
+
+func decodeSyncPage(raw []byte) ([]syncHit, queryFreshness, error) {
 	var result struct {
 		Responses []struct {
-			Status   int             `json:"status"`
-			Error    json.RawMessage `json:"error"`
-			Snapshot string          `json:"remote_snapshot"`
-			Hits     struct {
+			Status int             `json:"status"`
+			Error  json.RawMessage `json:"error"`
+			queryFreshness
+			Hits struct {
 				Hits []syncHit `json:"hits"`
 			} `json:"hits"`
 		} `json:"responses"`
 	}
 	if err := decodeSyncJSON(raw, &result); err != nil {
-		return nil, err
+		return nil, queryFreshness{}, err
 	}
-	if len(result.Responses) != 1 || result.Responses[0].Status != 200 || result.Responses[0].Snapshot == "" || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
-		return nil, fmt.Errorf("source sync requires a successful fresh snapshot")
+	if len(result.Responses) != 1 || result.Responses[0].Status != 200 || !result.Responses[0].readable() || len(result.Responses[0].Error) > 0 && string(result.Responses[0].Error) != "null" {
+		return nil, queryFreshness{}, fmt.Errorf("source sync requires a successful query with an explicit read source")
 	}
-	return result.Responses[0].Hits.Hits, nil
+	return result.Responses[0].Hits.Hits, result.Responses[0].queryFreshness, nil
 }
 
 // A no-op cleanup still needs the retained-ID existence guard ordinarily
@@ -376,7 +385,7 @@ func (w *SyncWriter) verifyRetainedIDs(ctx context.Context, ids []string) error 
 	return nil
 }
 
-func (w *SyncWriter) rangeIsClean(ctx context.Context, ids []string) (bool, error) {
+func (w *SyncWriter) rangeIsClean(ctx context.Context, ids []string) (clean, retained bool, err error) {
 	query := map[string]any{"match_all": map[string]any{}}
 	if len(ids) > 0 {
 		query = map[string]any{"bool": map[string]any{"must_not": []any{documentIDsQuery(ids)}}}
@@ -384,24 +393,24 @@ func (w *SyncWriter) rangeIsClean(ctx context.Context, ids []string) (bool, erro
 	body, _ := json.Marshal(map[string]any{"filter_prefix": RecordPrefix(w.sourceID), "query": query, "fields": []string{"_id"}, "limit": 1, "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
 	raw, err := w.client.Query(ctx, w.table, body)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
-	hits, err := decodeSyncHits(raw)
+	hits, freshness, err := decodeSyncPage(raw)
 	if err != nil {
-		return false, err
+		return false, false, err
 	}
 	for _, hit := range hits {
 		if !strings.HasPrefix(hit.ID, RecordPrefix(w.sourceID)) {
-			return false, fmt.Errorf("source range query returned foreign identity")
+			return false, false, fmt.Errorf("source range query returned foreign identity")
 		}
 	}
-	return len(hits) == 0, nil
+	return len(hits) == 0, freshness.Snapshot != "", nil
 }
 func (w *SyncWriter) waitForCleanRange(ctx context.Context, ids []string) error {
 	wait, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	for {
-		clean, err := w.rangeIsClean(wait, ids)
+		clean, _, err := w.rangeIsClean(wait, ids)
 		if err != nil {
 			return err
 		}
