@@ -61,6 +61,10 @@ pub fn create(ctx: Context) Suite {
         .filters = main_test_filters,
         .test_runner = runtime_filter_test_runner,
     });
+    // Large AArch64 ELF Debug suites exceed the call range within one text
+    // section. Separate functions let the linker insert range-extension thunks.
+    tests.link_function_sections = ctx.optimize == .debug and
+        ctx.target.result.cpu.arch == .aarch64 and ctx.target.result.ofmt == .elf;
     tests.root_module.strip = ctx.strip;
     tests.root_module.addImport("build_info", ctx.graph.build_info_mod);
     tests.root_module.addImport("antfly_cloudflare", ctx.graph.inference_mod.import_table.get("antfly_cloudflare").?);
