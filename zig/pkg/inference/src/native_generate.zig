@@ -435,7 +435,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
     var load_budget = ModelLoadBudget{ .allocator = allocator, .options = opts };
-    model_manager.model_load_preflight = .{ .context = &load_budget, .check = ModelLoadBudget.check };
+    try load_budget.configure(&model_manager);
 
     var draft_session_manager = backends.SessionManager.initWithIo(allocator, io);
     configureBackendPreference(&draft_session_manager, opts.backend);
@@ -448,7 +448,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
     draft_session_manager.kernel_jit_load_context = .startup_preload;
     var draft_model_manager = model_manager_mod.ModelManager.init(allocator, draft_session_manager);
     defer draft_model_manager.deinit();
-    draft_model_manager.model_load_preflight = .{ .context = &load_budget, .check = ModelLoadBudget.check };
+    try load_budget.configure(&draft_model_manager);
 
     if (artifact_backend != null and effective_draft_model == null and opts.max_tokens == 1 and opts.video_path == null and opts.image_count == 0 and opts.audio_count == 0) {
         var artifact_arena = std.heap.ArenaAllocator.init(allocator);
@@ -8096,11 +8096,18 @@ const ModelLoadBudget = struct {
     allocator: std.mem.Allocator,
     options: Options,
 
-    fn check(raw: *anyopaque, model_dir: []const u8, manifest: *const manifest_mod.ModelManifest, backend: backends.BackendType, a4b_request: ?ops.A4bInferenceRequest) !void {
+    fn configure(self: *ModelLoadBudget, manager: *model_manager_mod.ModelManager) !void {
+        // Pass selective overrides, not defaults: the exact plan must widen
+        // its envelope before the operator's caps are applied.
+        manager.configureAdmissionLimits(try budgetOverrides(self.options).toByteLimits());
+        manager.model_load_preflight = .{ .context = self, .check = check };
+    }
+
+    fn check(raw: *anyopaque, model_dir: []const u8, manifest: *const manifest_mod.ModelManifest, backend: backends.BackendType, a4b_request: ?ops.A4bInferenceRequest) !model_manager_mod.ModelLoadAdmission {
         const self: *const ModelLoadBudget = @ptrCast(@alignCast(raw));
         var opts = self.options;
         opts.model_dir = model_dir;
-        try preflightModelLoadBudget(self.allocator, manifest, opts, backend, a4b_request);
+        return preflightModelLoadBudget(self.allocator, manifest, opts, backend, a4b_request);
     }
 };
 
@@ -8114,7 +8121,7 @@ fn preflightModelLoadBudget(
     opts: Options,
     backend: backends.BackendType,
     a4b_request: ?ops.A4bInferenceRequest,
-) !void {
+) !model_manager_mod.ModelLoadAdmission {
     const reservation_tier = loadWeightTier(backend);
     if (backend == .metal or backend == .cuda) {
         const a4b_config = if (backend == .cuda)
@@ -8132,19 +8139,19 @@ fn preflightModelLoadBudget(
                 a4b_request,
             );
         if (a4b_config != null) {
-            // Exact A4B loads are leased as one bounded weights+KV+scratch
-            // envelope by ModelManager. Reserving the full encoded GGUF here
-            // would reject the compact path before that authoritative gate.
-            return;
+            // Require the exact weights+KV+scratch construction plan and a
+            // retained lease, including in offline managers without a serving
+            // policy. The encoded GGUF size is not the resident GPU envelope.
+            return .managed;
         }
     }
     const weight_bytes = estimatePreflightWeightBytes(allocator, manifest, backend) catch 0;
-    if (weight_bytes == 0) return;
+    if (weight_bytes == 0) return .preflight_checked;
 
     var limits = runtime.tier.memory.defaultLimitsForBackend(switch (reservation_tier) {
         .host => .cpu,
         .backend => .gpu,
-        .disk => return,
+        .disk => return .preflight_checked,
     });
     limits = try session_factory.widenBudgetLimitsForModelPath(
         allocator,
@@ -8166,6 +8173,7 @@ fn preflightModelLoadBudget(
         }
         return err;
     };
+    return .preflight_checked;
 }
 
 fn estimateModelArtifactBytes(
@@ -8203,6 +8211,34 @@ fn validateVideoOptions(opts: Options) !void {
     if (opts.raw_prompt or opts.draft_model != null) return error.UnsupportedVideoGenerationOption;
 }
 
+test "native generate installs selective load caps for target and draft managers" {
+    const a = std.testing.allocator;
+    var budget = ModelLoadBudget{ .allocator = a, .options = .{
+        .model_dir = "target",
+        .prompt = "hello",
+        .backend_budget_mb = 8192,
+        .kv_budget_mb = 512,
+        .scratch_budget_mb = 256,
+    } };
+    var target = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    defer target.deinit();
+    var draft = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    defer draft.deinit();
+    for ([_]*model_manager_mod.ModelManager{ &target, &draft }) |manager| {
+        try budget.configure(manager);
+        try std.testing.expect(manager.model_load_preflight != null);
+        try std.testing.expect(!manager.admission_enabled);
+        const limits = manager.admission_limit_overrides;
+        try std.testing.expectEqual(@as(usize, 8192 * 1024 * 1024), limits.backend_limit_bytes);
+        try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), limits.kv_limit_bytes);
+        try std.testing.expectEqual(@as(usize, 256 * 1024 * 1024), limits.scratch_limit_bytes);
+        // The manager derives the combined cap from its resolved host and
+        // backend limits, after widening for the exact load plan.
+        try std.testing.expectEqual(@as(usize, 0), limits.host_limit_bytes);
+        try std.testing.expectEqual(@as(usize, 0), limits.combined_limit_bytes);
+    }
+}
+
 test "native generate load budget uses the resolved backend when options are automatic" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -8220,7 +8256,7 @@ test "native generate load budget uses the resolved backend when options are aut
     const options = Options{ .model_dir = root, .prompt = "hello", .backend = .auto, .host_budget_mb = 1, .backend_budget_mb = 8, .combined_budget_mb = 16 };
     // No device is loaded: preflight must charge the actual candidate's tier,
     // rather than rejecting the CUDA candidate against the CPU host cap.
-    try preflightModelLoadBudget(a, &manifest, options, .cuda, null);
+    try std.testing.expectEqual(.preflight_checked, try preflightModelLoadBudget(a, &manifest, options, .cuda, null));
     try std.testing.expectError(error.MemoryBudgetExceeded, preflightModelLoadBudget(a, &manifest, options, .native, null));
     var capped = options;
     capped.backend_budget_mb = 1;
@@ -8268,14 +8304,18 @@ fn printUsage() void {
     , .{});
 }
 
-fn applyBudgetOverrides(defaults: runtime.tier.memory.Limits, opts: Options) !runtime.tier.memory.Limits {
-    return (runtime.tier.memory.BudgetOverridesMib{
+fn budgetOverrides(opts: Options) runtime.tier.memory.BudgetOverridesMib {
+    return .{
         .host = opts.host_budget_mb,
         .backend = opts.backend_budget_mb,
         .combined = opts.combined_budget_mb,
         .kv = opts.kv_budget_mb,
         .scratch = opts.scratch_budget_mb,
-    }).apply(defaults);
+    };
+}
+
+fn applyBudgetOverrides(defaults: runtime.tier.memory.Limits, opts: Options) !runtime.tier.memory.Limits {
+    return budgetOverrides(opts).apply(defaults);
 }
 
 fn graphModeEnabled() bool {
