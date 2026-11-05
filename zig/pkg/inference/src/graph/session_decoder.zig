@@ -27,6 +27,7 @@ pub const CreateRuntime = *const fn (*Definition, std.mem.Allocator) anyerror!mo
 pub const Definition = struct {
     allocator: std.mem.Allocator,
     references: std.atomic.Value(usize) = .init(1),
+    native_template: @import("../execution/native_decoder_program.zig").TemplateSlot = .{},
     session: Session,
     configuration: gpt.OwnedConfig,
     kv_dtype: ?runtime.kv.pool.KvDType,
@@ -47,12 +48,25 @@ pub const Definition = struct {
     /// Share within one allocator lifetime; otherwise clone into the runtime's
     /// owner before retiring any request-scoped metadata or allocator state.
     pub fn acquireForRuntime(self: *Definition, allocator: std.mem.Allocator) !*Definition {
-        if (allocator.ptr == self.allocator.ptr and allocator.vtable == self.allocator.vtable) {
+        if (@import("../execution/program.zig").knownSameMetadataAllocator(allocator, self.allocator)) {
             const previous = self.references.fetchAdd(1, .acq_rel);
             std.debug.assert(previous != 0);
             return self;
         }
         return init(allocator, self.session, &self.configuration.value, self.kv_dtype, self.shared_moe_cache, self.create_runtime_fn);
+    }
+
+    /// Equality with a request allocator is not lifetime provenance. Only
+    /// globally stable metadata allocators and an independently retained Model
+    /// may share; clones and unknown wrappers keep original private preparation.
+    pub fn nativeTemplateSlot(self: *Definition, source: *Definition) ?*@import("../execution/native_decoder_program.zig").TemplateSlot {
+        if (self != source or self.model_retention == null) return null;
+        if (@import("../execution/program.zig").processMetadataAllocator(self.allocator)) return &self.native_template;
+        if (comptime @import("builtin").is_test) {
+            const allocator = std.testing.allocator;
+            if (@import("../execution/program.zig").knownSameMetadataAllocator(allocator, self.allocator)) return &self.native_template;
+        }
+        return null;
     }
 
     pub fn beginCleanup(self: *const Definition) Session.CloseScope {
@@ -68,6 +82,7 @@ pub const Definition = struct {
         if (previous != 1) return;
         const model_retention = self.model_retention;
         const cache_retention = self.shared_cache_retention;
+        self.native_template.deinit();
         self.configuration.deinit(self.allocator);
         self.allocator.destroy(self);
         if (cache_retention) |held| held.release();
@@ -226,4 +241,37 @@ test "session decoder definition retains independent model and expert-cache owne
     physical.deinit();
     physical_open = false;
     try std.testing.expect(probe.destroyed);
+}
+
+test "session decoder template sharing requires actual stable owner and rejects allocator wrappers and clones" {
+    const a = std.testing.allocator;
+    var marker: u8 = 0;
+    const Final = struct {
+        fn destroy(_: *anyopaque) void {
+            @panic("unexpected external lifetime destruction");
+        }
+    };
+    var lifetime = Session.ModelLifetime{ .owner = &marker, .destroy_fn = Final.destroy };
+    const table: Session.VTable = undefined;
+    const session = Session{ .ptr = &marker, .vtable = &table, .model_lifetime = &lifetime };
+    const configuration = gpt.Config{};
+    var stable = try createExecutor(a, session, &configuration, null, null, TestRuntime.create);
+    defer stable.deinit();
+    const definition: *Definition = @ptrCast(@alignCast(stable.ptr));
+    try std.testing.expect(definition.nativeTemplateSlot(definition) != null);
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var wrapped = try createExecutor(arena.allocator(), session, &configuration, null, null, TestRuntime.create);
+    defer wrapped.deinit();
+    const unknown: *Definition = @ptrCast(@alignCast(wrapped.ptr));
+    try std.testing.expect(unknown.nativeTemplateSlot(unknown) == null);
+    var migrated = try wrapped.createRuntime(a);
+    defer migrated.deinit();
+    const clone: *Definition = @ptrCast(@alignCast(migrated.ptr));
+    try std.testing.expect(clone != unknown);
+    try std.testing.expect(clone.nativeTemplateSlot(unknown) == null);
+    var unprotected = try createExecutor(a, .{ .ptr = &marker, .vtable = &table }, &configuration, null, null, TestRuntime.create);
+    defer unprotected.deinit();
+    const borrowed: *Definition = @ptrCast(@alignCast(unprotected.ptr));
+    try std.testing.expect(borrowed.nativeTemplateSlot(borrowed) == null);
 }

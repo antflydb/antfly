@@ -113,6 +113,7 @@ pub const Runtime = struct {
     fallback_native: ?*FallbackNativeBackend = null,
 
     pub const InitOptions = struct {
+        kernel_descriptors: ?[]const ?ops_mod.kernel_descriptor.Descriptor = null,
         tensor_descs: ?[]const ?@import("backend_contracts.zig").TensorDesc = null,
         analysis: ?interpreter.CachedAnalysis = null,
         region_costs: ?@import("../execution/placement.zig").RegionCosts = .{},
@@ -577,7 +578,7 @@ pub const Runtime = struct {
         self.buffer_plan = try buffer_plan_mod.build(self.allocator, graph, &self.plan.?.base, .{
             .output_layout = .{ .context = &output_layout, .resolve = &PhysicalOutputLayout.resolve },
         });
-        self.physical_pool = try @import("../execution/physical_buffers.zig").Pool.create(self.allocator, graph, &self.buffer_plan.?, physical_backends[0..device_count], self.plan.?.base.node_operator_plans);
+        self.physical_pool = try @import("../execution/physical_buffers.zig").Pool.createWithDescriptors(self.allocator, graph, &self.buffer_plan.?, physical_backends[0..device_count], self.plan.?.base.node_operator_plans, options.kernel_descriptors);
         try self.buffer_plan.?.validate(graph, &self.plan.?.base);
     }
 

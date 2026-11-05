@@ -205,6 +205,12 @@ pub const Pool = struct {
     storage_requirement_bounds: []usize = &.{},
 
     pub fn create(allocator: std.mem.Allocator, graph: *const Graph, plan: *buffers.BufferPlan, backends: []const *const ops.ComputeBackend, operator_plans: []const ?ops.OperatorPlan) !?*Pool {
+        return createWithDescriptors(allocator, graph, plan, backends, operator_plans, null);
+    }
+    /// Optional immutable descriptors only; actual provider support, workspace,
+    /// private physical assignments and ownership are prepared for this call.
+    pub fn createWithDescriptors(allocator: std.mem.Allocator, graph: *const Graph, plan: *buffers.BufferPlan, backends: []const *const ops.ComputeBackend, operator_plans: []const ?ops.OperatorPlan, descriptors: ?[]const ?kernels.Descriptor) !?*Pool {
+        if (descriptors) |items| if (items.len != graph.nodeCount()) return error.InvalidProgramDescriptorCount;
         const prepared = try allocator.alloc(?KernelPlan, graph.nodeCount());
         errdefer allocator.free(prepared);
         @memset(prepared, null);
@@ -216,7 +222,7 @@ pub const Pool = struct {
         for (prepared, 0..) |*entry, id| {
             const slot = plan.slotForNode(@intCast(id)) orelse continue;
             if (slot.kind != .allocation or slot.allocation == buffers.invalid_allocation or (slot.backend != .native and slot.backend != .cuda and slot.backend != .metal)) continue;
-            const descriptor = kernels.lower(graph, @intCast(id)) orelse continue;
+            const descriptor = (if (descriptors) |items| items[id] else kernels.lower(graph, @intCast(id))) orelse continue;
             for (backends, 0..) |backend, backend_index| {
                 if (backend.kind() != slot.backend) continue;
                 const functions = backend.vtable.kernels orelse continue;

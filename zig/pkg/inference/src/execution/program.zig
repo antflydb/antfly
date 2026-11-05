@@ -20,6 +20,30 @@ const ml = @import("ml");
 const interpreter = @import("../graph/interpreter.zig");
 const NodeId = ml.graph.NodeId;
 
+/// Known process-stable stateless implementations. Unknown vtables may also
+/// legitimately ignore an undefined context: absence here never proves state.
+pub fn processMetadataAllocator(allocator: std.mem.Allocator) bool {
+    if (allocator.vtable == &std.heap.SmpAllocator.vtable or allocator.vtable == &std.heap.PageAllocator.vtable) return true;
+    if (comptime @import("builtin").link_libc) {
+        if (allocator.vtable == std.heap.c_allocator.vtable) return true;
+        if (comptime @hasDecl(std.heap, "raw_c_allocator")) {
+            if (allocator.vtable == std.heap.raw_c_allocator.vtable) return true;
+        }
+    }
+    return false;
+}
+/// Conservative shared-owner identity, not arbitrary Allocator equality.
+/// Unknown implementations always clone; NEVER inspect their context field.
+pub fn knownSameMetadataAllocator(a: std.mem.Allocator, b: std.mem.Allocator) bool {
+    if (a.vtable != b.vtable) return false;
+    if (processMetadataAllocator(a)) return true;
+    if (comptime @import("builtin").is_test) {
+        const allocator = std.testing.allocator;
+        if (a.vtable == allocator.vtable) return a.ptr == allocator.ptr and b.ptr == allocator.ptr;
+    }
+    return false;
+}
+
 pub const Binding = struct {
     name: []const u8,
     node_id: NodeId,
@@ -78,6 +102,30 @@ pub const ModelProgram = struct {
         }
         const analysis = try interpreter.CachedAnalysis.compute(allocator, &optimized.graph);
         return .{ .graph = optimized.graph, .id_map = optimized.id_map, .bindings = mapped_bindings, .binding_names = names, .mutable_parameters = mutable_parameters, .analysis = analysis, .optimization_stats = optimized.stats };
+    }
+
+    /// Take an already normalized semantic graph without running another
+    /// optimizer. Native original-reduction normalization must remain final.
+    /// Failure leaves graph ownership with the caller.
+    pub fn takeOptimized(graph: *ml.graph.Graph, input: NodeId) !ModelProgram {
+        const allocator = graph.allocator;
+        if (input >= graph.nodeCount() or graph.node(input).op != .parameter) return error.InvalidProgramBinding;
+        const id_map = try allocator.alloc(NodeId, graph.nodeCount());
+        errdefer allocator.free(id_map);
+        for (id_map, 0..) |*id, index| id.* = @intCast(index);
+        const bindings = try allocator.alloc(Binding, 1);
+        errdefer allocator.free(bindings);
+        const names = try allocator.dupe(u8, graph.parameterName(graph.node(input)));
+        errdefer allocator.free(names);
+        bindings[0] = .{ .name = names, .node_id = input, .kind = .input };
+        const mutable_parameters = try allocator.alloc(bool, graph.nodeCount());
+        errdefer allocator.free(mutable_parameters);
+        @memset(mutable_parameters, false);
+        mutable_parameters[input] = true;
+        const analysis = try interpreter.CachedAnalysis.compute(allocator, graph);
+        const owned = graph.*;
+        graph.* = ml.graph.Graph.init(allocator);
+        return .{ .graph = owned, .id_map = id_map, .bindings = bindings, .binding_names = names, .mutable_parameters = mutable_parameters, .analysis = analysis, .optimization_stats = .{} };
     }
 
     pub fn deinit(self: *ModelProgram) void {
@@ -152,4 +200,82 @@ test "ModelProgram mutable binding roles clean up every preparation allocation f
         }
     };
     try std.testing.checkAllAllocationFailures(a, Prepare.run, .{ &graph, x });
+}
+
+test "ModelProgram normalized ownership preserves original nodes without another optimizer and all OOM" {
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var graph = ml.graph.Graph.init(a);
+            defer graph.deinit();
+            var builder = ml.graph.Builder.init(&graph);
+            const input = try builder.parameter("token", ml.graph.Shape.scalar(.f32));
+            const output = try builder.mul(input, try builder.scalarConst(.f32, 1));
+            try graph.markOutput(output);
+            const count = graph.nodeCount();
+            var program = try ModelProgram.takeOptimized(&graph, input);
+            defer program.deinit();
+            try std.testing.expectEqual(@as(usize, 0), graph.nodeCount());
+            try std.testing.expectEqual(count, program.graph.nodeCount());
+            try std.testing.expect(program.graph.node(output).op == .mul);
+            for (program.id_map, 0..) |id, index| try std.testing.expectEqual(@as(NodeId, @intCast(index)), id);
+            try std.testing.expect(program.mutable_parameters.?[input]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "ModelProgram metadata identity never reads stateless allocator context" {
+    var first = std.heap.smp_allocator;
+    var second = std.heap.smp_allocator;
+    first.ptr = @ptrFromInt(4096);
+    second.ptr = @ptrFromInt(8192);
+    try std.testing.expect(knownSameMetadataAllocator(first, second));
+    first = std.heap.page_allocator;
+    second = std.heap.page_allocator;
+    first.ptr = @ptrFromInt(4096);
+    second.ptr = @ptrFromInt(8192);
+    if (processMetadataAllocator(first)) try std.testing.expect(knownSameMetadataAllocator(first, second));
+    var arena_a = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_a.deinit();
+    var arena_b = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_b.deinit();
+    try std.testing.expect(!processMetadataAllocator(arena_a.allocator()));
+    try std.testing.expect(!knownSameMetadataAllocator(arena_a.allocator(), arena_a.allocator()));
+    try std.testing.expect(!knownSameMetadataAllocator(arena_a.allocator(), arena_b.allocator()));
+}
+
+/// Test-only genuinely stateless custom allocator. Its distinct table forwards
+/// to the global testing owner without reading its own undefined context.
+pub const Testing = if (@import("builtin").is_test) struct {
+    fn alloc(_: *anyopaque, len: usize, alignment: std.mem.Alignment, ret: usize) ?[*]u8 {
+        return std.testing.allocator.rawAlloc(len, alignment, ret);
+    }
+    fn resize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret: usize) bool {
+        return std.testing.allocator.rawResize(memory, alignment, len, ret);
+    }
+    fn remap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, len: usize, ret: usize) ?[*]u8 {
+        return std.testing.allocator.rawRemap(memory, alignment, len, ret);
+    }
+    fn free(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret: usize) void {
+        std.testing.allocator.rawFree(memory, alignment, ret);
+    }
+    const vtable = std.mem.Allocator.VTable{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+    pub fn statelessAllocator() std.mem.Allocator {
+        return .{ .ptr = undefined, .vtable = &vtable };
+    }
+} else struct {};
+
+test "ModelProgram normalized take derives exact custom stateless graph owner without context reads" {
+    const allocator = Testing.statelessAllocator();
+    try std.testing.expect(!processMetadataAllocator(allocator));
+    try std.testing.expect(!knownSameMetadataAllocator(allocator, allocator));
+    var graph = ml.graph.Graph.init(allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("token", ml.graph.Shape.scalar(.f32));
+    try graph.markOutput(try builder.mul(input, try builder.scalarConst(.f32, 1)));
+    var owned = try ModelProgram.takeOptimized(&graph, input);
+    defer owned.deinit();
+    try std.testing.expect(owned.graph.allocator.vtable == allocator.vtable);
+    try std.testing.expectEqual(@as(usize, 0), graph.nodeCount());
 }

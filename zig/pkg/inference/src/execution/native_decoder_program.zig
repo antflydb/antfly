@@ -54,61 +54,43 @@ fn eligible(config: gpt.Config) bool {
     return true;
 }
 
-pub const Program = struct {
+/// Definition-local immutable metadata. No CT, backend, Source, current-B,
+/// physical allocation or mutable execution state is retained by this owner.
+pub const Template = struct {
     allocator: std.mem.Allocator,
-    backend: ops.ComputeBackend,
-    config: gpt.Config,
-    cache: GraphCache,
-    graph: *ml.graph.Graph,
-    analysis: Analysis,
-    runtime: Runtime,
-    selected: *@import("prepared_routes.zig").PreparedRoutes,
-    bindings: []route.InputBinding,
-    weights: []?CT,
-    weight_planes: []@import("storage_ownership.zig").Plane,
-    source_queries: []SourceQuery,
-    values: []?CT,
+    references: std.atomic.Value(usize) = .init(1),
+    artifact: @import("program.zig").ModelProgram,
+    queries: []Native.AuthoredSourceQuery,
+    descriptors: []?ops.kernel_descriptor.Descriptor,
+    authored_descriptors: []?ops.kernel_descriptor.Descriptor,
     steps: []ml.graph.NodeId,
     input: ml.graph.NodeId,
-    mutex: std.atomic.Mutex = .unlocked,
-    busy: bool = false,
-    failed: bool = false,
-    calls: u64 = 0,
-    assigned_operations: u64 = 0,
-    source_identity: ?struct { ptr: *anyopaque, table: *const @import("../backends/session.zig").Session.VTable },
-    domain: ?@import("../runtime/tier/admission_domain.zig").Pin = null,
-    source_owner: ?*@import("../backends/session.zig").Session.ModelLifetime = null,
+    config_hash: u64,
+    // Versioned by this executable; never a guessed Model generation.
+    reduction_policy: enum { native_original_dense_v1 } = .native_original_dense_v1,
+    use_blas: bool,
 
-    pub const Statistics = struct { calls: u64, assigned_operations: u64, physical_frames: usize };
-    /// Nonblocking values only. The caller retains this program/runtime; a
-    /// numerical or cold preparation in progress makes the sample unavailable.
-    pub fn statistics(self: *Program) ?Statistics {
-        if (!self.mutex.tryLock()) return null;
-        defer self.mutex.unlock();
-        if (self.busy) return null;
-        return .{ .calls = self.calls, .assigned_operations = self.assigned_operations, .physical_frames = self.selected.pool.frames.items.len };
+    pub fn retain(self: *Template) *Template {
+        std.debug.assert(self.references.fetchAdd(1, .acq_rel) != 0);
+        return self;
     }
-
-    /// No numerical or SDK callback. The actual backend owner must outlive this
-    /// program, just as it outlives the existing GraphCache/executable bindings.
-    pub fn tryCreate(allocator: std.mem.Allocator, context: *const Context) !?*Program {
-        if (comptime !@import("build_options").enable_native) return null;
-        if (context.cb.vtable != &Native.vtable_impl or context.weights != null or !eligible(context.gpt_config.*)) return null;
-        if (context.session) |source| if (!@import("architecture_session.zig").nativeProgramSourceMatches(source, context.cb)) return null;
-        return create(allocator, context) catch |err| switch (err) {
-            error.UnsupportedAuthoredWeight, error.UnsupportedAuthoredNativeTarget, error.IncompleteNativeProgram, error.UnsupportedNativeProgramWorkspace, error.MissingPreparedKernelRoute, error.UnsupportedShape => null,
-            else => return err,
-        };
+    pub fn release(self: *Template) void {
+        const previous = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(previous != 0);
+        if (previous != 1) return;
+        const allocator = self.allocator;
+        for (self.queries) |query| allocator.free(query.name);
+        allocator.free(self.queries);
+        allocator.free(self.descriptors);
+        allocator.free(self.authored_descriptors);
+        allocator.free(self.steps);
+        self.artifact.deinit();
+        allocator.destroy(self);
     }
-    fn create(allocator: std.mem.Allocator, context: *const Context) !*Program {
-        const self = try allocator.create(Program);
-        errdefer allocator.destroy(self);
+    fn create(allocator: std.mem.Allocator, context: *const Context) !*Template {
         const backend = context.cb.withoutSynchronousBorrows();
-        self.allocator = allocator;
-        self.backend = backend;
-        self.config = context.gpt_config.*;
-        self.cache = GraphCache.init(allocator);
-        errdefer self.cache.deinitWithBackend(&self.backend);
+        var cache = GraphCache.init(allocator);
+        defer cache.deinitWithBackend(&backend);
         // This resolver wraps only the existing cold original-forward trace.
         // It refuses a nonresident/packed source before any lookup preparation.
         const Resolver = struct {
@@ -129,10 +111,9 @@ pub const Program = struct {
             fn get(raw: *anyopaque, name: []const u8) !CT {
                 const value: *@This() = @ptrCast(@alignCast(raw));
                 return value.getImpl(name) catch |err| {
-                    // Original lm-head selection catches all lookup errors.
-                    // It may preserve MissingWeight fallback, but must never
-                    // hide incomplete query bookkeeping or an unsupported
-                    // actual source behind a different authored model.
+                    // Preserve legitimate missing aliases. The latch also
+                    // defends against incomplete query bookkeeping hidden by
+                    // any future optional lookup in the original trace.
                     if (err != error.MissingWeight and err != error.WeightNotFound and value.failure == null) value.failure = err;
                     return err;
                 };
@@ -158,33 +139,196 @@ pub const Program = struct {
         var resolver = Resolver{ .original = context, .allocator = allocator };
         defer {
             for (resolver.queries.items) |query| {
-                if (query.witness) |witness| self.backend.free(witness);
+                if (query.witness) |witness| backend.free(witness);
                 allocator.free(query.fact.name);
             }
             resolver.queries.deinit(allocator);
         }
         var tracing_context = context.*;
-        tracing_context.cb = &self.backend;
+        tracing_context.cb = &backend;
         tracing_context.weights = .{ .ptr = &resolver, .get_fn = Resolver.get };
         var id = [_]i64{0};
         const trace_decode = gpt.DecodeContext{ .attention_mode = .paged_decode, .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 };
-        const entry = try @import("../graph/execution.zig").ensureGraphEntry(&tracing_context, &self.cache, &id, 1, 1, &trace_decode);
+        const entry = try @import("../graph/execution.zig").ensureGraphEntry(&tracing_context, &cache, &id, 1, 1, &trace_decode);
         if (resolver.failure) |err| return err;
-        self.graph = &entry.graph;
-        try normalizeDensePairTrace(self.graph);
-        try normalizeDenseGroupedTrace(self.graph);
+        const graph = &entry.graph;
+        try Program.normalizeDensePairTrace(graph);
+        try Program.normalizeDenseGroupedTrace(graph);
         var input: ?ml.graph.NodeId = null;
-        for (self.graph.nodes.items, 0..) |*node, index| if (node.op == .fused_from_float32) {
+        for (graph.nodes.items, 0..) |*node, index| if (node.op == .fused_from_float32) {
             if (input != null or node.output_shape.dtype != .i64 or node.output_shape.numElements() != 1) return error.IncompleteNativeProgram;
-            const name = try self.graph.internString("native.decoder.token");
+            const name = try graph.internString("native.decoder.token");
             node.op = .{ .parameter = .{ .name_offset = name.offset, .name_len = name.len } };
-            try self.graph.parameters.append(allocator, @intCast(index));
+            try graph.parameters.append(allocator, @intCast(index));
             input = @intCast(index);
         };
-        self.input = input orelse return error.IncompleteNativeProgram;
-        self.analysis = try Analysis.compute(allocator, self.graph);
-        errdefer self.analysis.deinit(allocator);
-        if (self.graph.outputs.items.len != 1 or self.graph.node(self.graph.outputs.items[0]).output_shape.dtype != .f32 or self.graph.node(self.graph.outputs.items[0]).output_shape.numElements() != self.config.vocab_size) return error.IncompleteNativeProgram;
+        const token_input = input orelse return error.IncompleteNativeProgram;
+        if (graph.outputs.items.len != 1 or graph.node(graph.outputs.items[0]).output_shape.dtype != .f32 or graph.node(graph.outputs.items[0]).output_shape.numElements() != context.gpt_config.vocab_size) return error.IncompleteNativeProgram;
+        try Native.NativeCompute.validateAuthoredSourceQueries(&backend, resolver.queries.items);
+        const queries = try allocator.alloc(Native.AuthoredSourceQuery, resolver.queries.items.len);
+        var query_count: usize = 0;
+        errdefer {
+            for (queries[0..query_count]) |query| allocator.free(query.name);
+            allocator.free(queries);
+        }
+        for (resolver.queries.items, queries) |query, *fact| {
+            fact.* = .{ .name = try allocator.dupe(u8, query.fact.name), .shape = query.fact.shape };
+            query_count += 1;
+        }
+        const descriptors = try allocator.alloc(?ops.kernel_descriptor.Descriptor, graph.nodeCount());
+        errdefer allocator.free(descriptors);
+        const authored = try allocator.alloc(?ops.kernel_descriptor.Descriptor, graph.nodeCount());
+        errdefer allocator.free(authored);
+        for (descriptors, authored, 0..) |*descriptor, *extra, index| {
+            descriptor.* = ops.kernel_descriptor.lower(graph, @intCast(index));
+            extra.* = if (descriptor.* == null) try Program.authoredDescriptor(graph, @intCast(index), context.gpt_config.*) else null;
+        }
+        // ModelProgram takes ONLY normalized IR; no second optimization may
+        // combine original independent GEMMs or change their reduction order.
+        var artifact = try @import("program.zig").ModelProgram.takeOptimized(graph, token_input);
+        errdefer artifact.deinit();
+        var steps: std.ArrayList(ml.graph.NodeId) = .empty;
+        defer steps.deinit(allocator);
+        for (artifact.graph.nodes.items, 0..) |node, index| {
+            if (!artifact.analysis.reachable[index] or node.op == .parameter) continue;
+            for (node.getInputs()) |source| if (source >= index) return error.IncompleteNativeProgram;
+            try steps.append(allocator, @intCast(index));
+        }
+        const ordered = try steps.toOwnedSlice(allocator);
+        errdefer allocator.free(ordered);
+        const self = try allocator.create(Template);
+        self.* = .{ .allocator = allocator, .artifact = artifact, .queries = queries, .descriptors = descriptors, .authored_descriptors = authored, .steps = ordered, .input = token_input, .config_hash = context.gpt_config.fingerprint(), .use_blas = Native.useBlas() };
+        return self;
+    }
+};
+
+/// One immutable specialization held by the existing Definition owner. The
+/// short metadata lock never encloses source lookup, allocation or retirement.
+/// Runtime-private candidates remain valid when another runtime replaces it.
+pub const TemplateSlot = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    value: ?*Template = null,
+    stats: @import("specialization_cache.zig").Stats = .{},
+
+    fn acquire(self: *TemplateSlot, context: *const Context) !?*Template {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        const candidate = if (self.value) |value| value.retain() else null;
+        self.mutex.unlock();
+        if (candidate) |value| {
+            errdefer value.release();
+            if (value.config_hash == context.gpt_config.fingerprint() and value.reduction_policy == .native_original_dense_v1 and value.use_blas == Native.useBlas()) {
+                Native.NativeCompute.validateAuthoredSourceQueries(context.cb, value.queries) catch |err| switch (err) {
+                    error.AuthoredResidentTopologyChanged => {
+                        value.release();
+                        return null;
+                    },
+                    else => return err,
+                };
+                return value;
+            }
+            value.release();
+        }
+        return null;
+    }
+    fn publish(self: *TemplateSlot, value: *Template, reused: bool) void {
+        @import("antfly_platform").sync.lockYielding(&self.mutex);
+        const previous = self.value;
+        self.value = value.retain();
+        if (reused) self.stats.hits +%= 1 else {
+            self.stats.misses +%= 1;
+            self.stats.builds +%= 1;
+            if (previous != null) self.stats.evictions +%= 1;
+        }
+        self.mutex.unlock();
+        if (previous) |old| old.release();
+    }
+    pub fn deinit(self: *TemplateSlot) void {
+        if (self.value) |value| value.release();
+        self.value = null;
+    }
+};
+
+pub const Program = struct {
+    allocator: std.mem.Allocator,
+    backend: ops.ComputeBackend,
+    config: gpt.Config,
+    template: *Template,
+    graph: *ml.graph.Graph,
+    analysis: Analysis,
+    runtime: Runtime,
+    selected: *@import("prepared_routes.zig").PreparedRoutes,
+    bindings: []route.InputBinding,
+    weights: []?CT,
+    weight_planes: []@import("storage_ownership.zig").Plane,
+    source_queries: []SourceQuery,
+    values: []?CT,
+    steps: []const ml.graph.NodeId,
+    input: ml.graph.NodeId,
+    mutex: std.atomic.Mutex = .unlocked,
+    busy: bool = false,
+    failed: bool = false,
+    calls: u64 = 0,
+    assigned_operations: u64 = 0,
+    source_identity: ?struct { ptr: *anyopaque, table: *const @import("../backends/session.zig").Session.VTable },
+    domain: ?@import("../runtime/tier/admission_domain.zig").Pin = null,
+    source_owner: ?*@import("../backends/session.zig").Session.ModelLifetime = null,
+
+    pub const Statistics = struct { calls: u64, assigned_operations: u64, physical_frames: usize };
+    /// Nonblocking values only. The caller retains this program/runtime; a
+    /// numerical or cold preparation in progress makes the sample unavailable.
+    pub fn statistics(self: *Program) ?Statistics {
+        if (!self.mutex.tryLock()) return null;
+        defer self.mutex.unlock();
+        if (self.busy) return null;
+        return .{ .calls = self.calls, .assigned_operations = self.assigned_operations, .physical_frames = self.selected.pool.frames.items.len };
+    }
+
+    /// No numerical or SDK callback. The actual backend owner must outlive this
+    /// program, just as it outlives the existing GraphCache/executable bindings.
+    pub fn tryCreate(allocator: std.mem.Allocator, context: *const Context) !?*Program {
+        return tryCreateWithTemplate(allocator, context, null);
+    }
+    pub fn tryCreateWithTemplate(allocator: std.mem.Allocator, context: *const Context, slot: ?*TemplateSlot) !?*Program {
+        if (comptime !@import("build_options").enable_native) return null;
+        if (context.cb.vtable != &Native.vtable_impl or context.weights != null or !eligible(context.gpt_config.*)) return null;
+        if (context.session) |source| if (!@import("architecture_session.zig").nativeProgramSourceMatches(source, context.cb)) return null;
+        return create(allocator, context, slot) catch |err| switch (err) {
+            error.UnsupportedAuthoredWeight, error.UnsupportedAuthoredNativeTarget, error.IncompleteNativeProgram, error.UnsupportedNativeProgramWorkspace, error.MissingPreparedKernelRoute, error.UnsupportedShape => null,
+            else => return err,
+        };
+    }
+    fn create(allocator: std.mem.Allocator, context: *const Context, template_slot: ?*TemplateSlot) !*Program {
+        const self = try allocator.create(Program);
+        errdefer allocator.destroy(self);
+        const backend = context.cb.withoutSynchronousBorrows();
+        self.allocator = allocator;
+        self.backend = backend;
+        self.config = context.gpt_config.*;
+        const existing = if (template_slot) |owner| try owner.acquire(context) else null;
+        const template = existing orelse try Template.create(allocator, context);
+        errdefer template.release();
+        self.template = template;
+        self.graph = &template.artifact.graph;
+        self.analysis = template.artifact.analysis;
+        self.input = template.input;
+        self.steps = template.steps;
+        // Every receiving program owns fresh witnesses, including parameters
+        // eliminated by graph optimization. Pure cached facts grant no payload
+        // authority and no workspace/admission credit.
+        self.source_queries = try allocator.alloc(SourceQuery, template.queries.len);
+        @memset(self.source_queries, .{ .fact = .{ .name = "", .shape = null } });
+        errdefer {
+            for (self.source_queries) |query| if (query.witness) |value| self.backend.free(value);
+            allocator.free(self.source_queries);
+        }
+        for (template.queries, self.source_queries) |fact, *query| {
+            query.fact = fact;
+            if (fact.shape != null) {
+                const witness = try context.graphWeight(fact.name);
+                query.witness = witness;
+                _ = try Native.NativeCompute.authoredResidentF32Plane(&self.backend, fact.name, witness);
+            }
+        }
         self.weights = try allocator.alloc(?CT, self.graph.nodeCount());
         @memset(self.weights, null);
         errdefer {
@@ -213,7 +357,7 @@ pub const Program = struct {
         errdefer allocator.free(self.bindings);
         self.values = try allocator.dupe(?CT, self.weights);
         errdefer allocator.free(self.values);
-        self.runtime = try Runtime.initWithOptions(allocator, self.graph, &self.backend, .partitioned, .{ .analysis = self.analysis, .region_costs = null });
+        self.runtime = try Runtime.initWithOptions(allocator, self.graph, &self.backend, .partitioned, .{ .analysis = self.analysis, .region_costs = null, .kernel_descriptors = template.descriptors });
         errdefer self.runtime.deinit();
         const pool = self.runtime.physical_pool orelse return error.IncompleteNativeProgram;
         if (pool.backends.len != 1 or pool.backends[0].ptr != self.backend.ptr or pool.backends[0].vtable != self.backend.vtable or pool.plan.transfers.len != 0) return error.IncompleteNativeProgram;
@@ -221,30 +365,24 @@ pub const Program = struct {
         pool.coverage_reachable = self.analysis.reachable;
         pool.coverage_backend = self.backend;
         pool.native_frame_dispatch = true;
-        var steps: std.ArrayList(ml.graph.NodeId) = .empty;
-        defer steps.deinit(allocator);
         for (self.graph.nodes.items, 0..) |node, index| {
             if (!self.analysis.reachable[index] or node.op == .parameter) continue;
             for (node.getInputs()) |source| if (source >= index) return error.IncompleteNativeProgram;
             const slot = pool.plan.slotForNode(@intCast(index)) orelse return error.IncompleteNativeProgram;
             if (pool.kernels[index] == null and node.op != .constant and node.op != .reshape) {
-                const descriptor = (try authoredDescriptor(self.graph, @intCast(index), self.config)) orelse return error.IncompleteNativeProgram;
+                const descriptor = template.authored_descriptors[index] orelse return error.IncompleteNativeProgram;
                 var sources: [3]ml.graph.NodeId = @splat(ml.graph.null_node);
                 @memcpy(sources[0..descriptor.input_count], node.getInputs());
                 pool.kernels[index] = .{ .descriptor = descriptor, .inputs = sources, .backend_index = 0, .output_allocation = slot.allocation, .workspace_bytes = 0 };
             }
             if (node.op == .reshape and (slot.kind != .view or !std.meta.eql(slot.desc.strides, @import("../graph/backend_contracts.zig").TensorStrides.dense(node.output_shape)))) return error.IncompleteNativeProgram;
-            try steps.append(allocator, @intCast(index));
         }
-        self.steps = try steps.toOwnedSlice(allocator);
-        errdefer allocator.free(self.steps);
         try pool.configureRoutes(bindings.items);
         self.selected = (try pool.prepareRoutesWithPolicy(self.bindings, .compatibility_regions)) orelse return error.MissingPreparedKernelRoute;
         errdefer self.selected.release();
         if (self.selected.pool.payload_coverage != .complete or self.selected.pool.regions.len != 0) return error.IncompleteNativeProgram;
         _ = try self.selected.storageRequirement();
-        try Native.NativeCompute.validateAuthoredSourceQueries(&self.backend, resolver.queries.items);
-        self.source_queries = try resolver.queries.toOwnedSlice(allocator);
+        try Native.NativeCompute.validateAuthoredSourceQueries(&self.backend, self.source_queries);
         self.mutex = .unlocked;
         self.busy = false;
         self.failed = false;
@@ -253,6 +391,9 @@ pub const Program = struct {
         self.source_identity = if (context.session) |source| .{ .ptr = source.ptr, .table = source.vtable } else null;
         self.domain = null;
         self.source_owner = if (context.session) |session| if (session.model_lifetime) |owner| owner.retain() else null else null;
+        // No incomplete physical candidate or failed query certificate becomes
+        // a cache hit. The metadata swap itself cannot allocate or call out.
+        if (template_slot) |owner| owner.publish(template, existing != null);
         return self;
     }
     /// The selected resident F32 Native pair executes exactly two ordinary
@@ -399,11 +540,8 @@ pub const Program = struct {
         for (self.weights) |maybe| if (maybe) |value| self.backend.freeWithCleanup(value, cleanup);
         for (self.source_queries) |query| {
             if (query.witness) |witness| self.backend.freeWithCleanup(witness, cleanup);
-            self.allocator.free(query.fact.name);
         }
         self.allocator.free(self.source_queries);
-        self.cache.deinitWithBackend(&self.backend);
-        self.analysis.deinit(self.allocator);
         const allocator = self.allocator;
         const source = self.source_owner;
         const domain = self.domain;
@@ -411,7 +549,7 @@ pub const Program = struct {
         allocator.free(self.weights);
         allocator.free(self.weight_planes);
         allocator.free(self.values);
-        allocator.free(self.steps);
+        self.template.release();
         allocator.destroy(self);
         if (source) |owner| owner.releaseWithCleanup(cleanup);
         if (domain) |pin| pin.release();
@@ -1122,4 +1260,103 @@ test "native authored full query cannot hide unsupported actual lm head behind e
     head.quantized = true;
     try std.testing.expectEqual(@as(?*Program, null), try Program.tryCreate(a, &context));
     head.quantized = false;
+}
+
+test "native Definition template shares only immutable graph and descriptors across private programs" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var model = try TestModel.init(a);
+    defer model.data.deinitOwned();
+    var compute = Native.NativeCompute.init(a, &model.data, null);
+    defer compute.deinit();
+    const backend = compute.computeBackend();
+    const cfg = TestModel.config();
+    const context = Context{ .allocator = a, .cb = &backend, .gpt_config = &cfg };
+    var slot = TemplateSlot{};
+    defer slot.deinit();
+    const first = (try Program.tryCreateWithTemplate(a, &context, &slot)) orelse return error.MissingAuthoredNativeProgram;
+    defer first.destroyWithCleanup(.{ .outside_execution = true });
+    const second = (try Program.tryCreateWithTemplate(a, &context, &slot)) orelse return error.MissingAuthoredNativeProgram;
+    defer second.destroyWithCleanup(.{ .outside_execution = true });
+    try std.testing.expect(first.template == second.template and first.graph == second.graph and first.steps.ptr == second.steps.ptr);
+    try std.testing.expect(first.source_queries.ptr != second.source_queries.ptr and first.values.ptr != second.values.ptr and first.weights.ptr != second.weights.ptr);
+    try std.testing.expect(first.selected.pool != second.selected.pool);
+    try std.testing.expectEqual(@as(u64, 1), slot.stats.builds);
+    try std.testing.expectEqual(@as(u64, 1), slot.stats.hits);
+    const Kv = @import("../runtime/root.zig").kv;
+    var manager = Kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 4 });
+    const cancelled_sequence = try manager.attachSequence(pool);
+    try manager.appendTokens(cancelled_sequence, 1);
+    const cancelled_decode = TestModel.decode(&manager, pool, cancelled_sequence, 1);
+    var cancelled = try first.beginCall(&.{2}, &cancelled_decode, null);
+    defer cancelled.close(.{ .outside_execution = true });
+    try cancelled.prepareInto(a, null, .{ .outside_execution = true });
+    const Cancel = struct {
+        checks: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            self.checks += 1;
+            if (self.checks == 3) return error.Cancelled;
+        }
+    };
+    var control = Cancel{};
+    var controlled = backend;
+    controlled.execution_control = .{ .ptr = &control, .check_fn = Cancel.check, .native_call_policy = .in_process };
+    try std.testing.expectError(error.Cancelled, cancelled.run(&controlled, cfg, &cancelled_decode, .{ .outside_execution = true }));
+    try std.testing.expect(cancelled.ran and first.failed and !second.failed);
+    try std.testing.expect(cancelled.frame.?.stats.dispatches > 0);
+    cancelled.close(.{ .outside_execution = true });
+    try manager.releaseSequence(cancelled_sequence);
+    try first.afterStateReset(.{ .outside_execution = true });
+    try std.testing.expect(!first.failed and second.calls == 0);
+    const reference_sequence = try manager.attachSequence(pool);
+    try manager.appendTokens(reference_sequence, 1);
+    const reference_decode = TestModel.decode(&manager, pool, reference_sequence, 1);
+    const expected = try gpt.forward(&backend, a, cfg, &.{2}, 1, 1, &reference_decode);
+    defer a.free(expected);
+    for ([_]*Program{ first, second }) |program| {
+        const sequence = try manager.attachSequence(pool);
+        try manager.appendTokens(sequence, 1);
+        const decode = TestModel.decode(&manager, pool, sequence, 1);
+        var owner = try @import("cleanup_owner.zig").Owner.beginOutsideCleanup();
+        defer owner.finishAfterUnlock();
+        const current = Cleanup{ .boundary = owner.epoch() };
+        var call = try program.beginCall(&.{2}, &decode, null);
+        defer call.close(current);
+        try call.prepareInto(a, null, current);
+        try call.run(&backend, cfg, &decode, current);
+        const actual = try call.takeOutput();
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
+    }
+    try std.testing.expectEqual(@as(u64, 1), first.calls);
+    try std.testing.expectEqual(@as(u64, 1), second.calls);
+    try std.testing.expect(!first.failed and !second.failed);
+}
+
+test "native Definition template cold and cache-hit constructors unwind all allocation failures" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            var model = try TestModel.init(a);
+            defer model.data.deinitOwned();
+            var compute = Native.NativeCompute.init(a, &model.data, null);
+            defer compute.deinit();
+            const backend = compute.computeBackend();
+            const cfg = TestModel.config();
+            const context = Context{ .allocator = a, .cb = &backend, .gpt_config = &cfg };
+            var slot = TemplateSlot{};
+            defer slot.deinit();
+            const first = (try Program.tryCreateWithTemplate(a, &context, &slot)) orelse return error.MissingAuthoredNativeProgram;
+            defer first.destroyWithCleanup(.{ .outside_execution = true });
+            const original = slot.value;
+            const second = (try Program.tryCreateWithTemplate(a, &context, &slot)) orelse return error.MissingAuthoredNativeProgram;
+            defer second.destroyWithCleanup(.{ .outside_execution = true });
+            try std.testing.expect(original == slot.value and first.template == second.template);
+            try std.testing.expectEqual(@as(u64, 1), slot.stats.builds);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

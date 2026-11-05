@@ -98,7 +98,7 @@ const RuntimeContext = struct {
         try ctx.decode_runtime.state.ensureQwen35LinearCache(gpt_config);
         if (cb.kind() == .native and kv_dtype == .f32) {
             const program_context = @import("execution.zig").Context{ .allocator = allocator, .cb = &ctx.cb, .gpt_config = &ctx.definition.configuration.value, .session = session };
-            ctx.native_program = try @import("../execution/native_decoder_program.zig").Program.tryCreate(allocator, &program_context);
+            ctx.native_program = try @import("../execution/native_decoder_program.zig").Program.tryCreateWithTemplate(allocator, &program_context, definition.nativeTemplateSlot(source));
         }
         return ctx;
     }
@@ -506,3 +506,11 @@ test "native whole model recurrent state preserves chunked prefill decode and wa
     };
     try std.testing.checkAllAllocationFailures(a, Construction.run, .{&executor});
 }
+
+pub const Testing = if (@import("builtin").is_test) struct {
+    pub fn program(instance: model_runtime.ModelRuntime) ?*@import("../execution/native_decoder_program.zig").Program {
+        if (instance.vtable != &runtime_vtable) return null;
+        const context: *RuntimeContext = @ptrCast(@alignCast(instance.ptr));
+        return context.native_program;
+    }
+} else struct {};

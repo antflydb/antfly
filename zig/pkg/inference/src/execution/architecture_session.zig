@@ -17234,3 +17234,83 @@ test "actual unpacked Native Laya Q8 declared MAX preserves original outputs exa
     try nativeLayaMatrixBankCase(a, path, &inputs, reference, geometry.bytes - 1, false);
     try nativeLayaMatrixBankCase(a, path, &inputs, reference, 0, false);
 }
+
+test "native Definition template actual two public runtimes preserve private KV and invalidate missing topology" {
+    try nativeDefinitionRuntimes148(std.testing.allocator, true);
+    try nativeDefinitionRuntimes148(std.heap.smp_allocator, true);
+    try nativeDefinitionRuntimes148(@import("program.zig").Testing.statelessAllocator(), false);
+}
+fn nativeDefinitionRuntimes148(a: std.mem.Allocator, expect_shared: bool) !void {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const authored = @import("native_decoder_program.zig");
+    const cfg = authored.Testing.config();
+    var weights = try authored.Testing.initWithoutQkNorms(a);
+    var weights_owned = true;
+    defer if (weights_owned) weights.data.deinitOwned();
+    const owner = try a.create(ArchSession);
+    owner.* = .{ .allocator = a, .arch_config = .{ .gpt = cfg }, .backend_type = .native, .backend_data = .{ .native = weights.data } };
+    owner.model_lifetime.prepareFinalResources() catch |err| {
+        a.destroy(owner);
+        return err;
+    };
+    weights_owned = false;
+    var session = archSessionHandle(owner);
+    var session_live = true;
+    defer if (session_live) session.close();
+    const live = @import("../graph/live_model_executor.zig");
+    var executor = try live.createModelExecutor(a, session, cfg, .f32, null);
+    var executor_live = true;
+    defer if (executor_live) executor.deinit();
+    var first = try executor.createRuntime(a);
+    defer first.deinit();
+    var second = try executor.createRuntime(a);
+    defer second.deinit();
+    const first_program = live.Testing.program(first).?;
+    const second_program = live.Testing.program(second).?;
+    try std.testing.expectEqual(expect_shared, first_program.template == second_program.template);
+    try std.testing.expect(first_program.selected.pool != second_program.selected.pool);
+    const definition: *@import("../graph/session_decoder.zig").Definition = @ptrCast(@alignCast(executor.ptr));
+    try std.testing.expectEqual(@as(u64, if (expect_shared) 1 else 0), definition.native_template.stats.builds);
+    try std.testing.expectEqual(@as(u64, if (expect_shared) 1 else 0), definition.native_template.stats.hits);
+    var first_output = try first.prefill(a, .{ .input_ids = &.{2}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
+    defer first_output.deinit(a);
+    var second_output = try second.prefill(a, .{ .input_ids = &.{2}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
+    defer second_output.deinit(a);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try first_output.hostLogits(a)), std.mem.sliceAsBytes(try second_output.hostLogits(a)));
+    var advanced = try first.decode(a, .{ .token_id = 3, .position = 1 });
+    defer advanced.deinit(a);
+    try std.testing.expectEqual(@as(u64, 2), first_program.calls);
+    try std.testing.expectEqual(@as(u64, 1), second_program.calls);
+    try second.reset();
+    var reset = try second.prefill(a, .{ .input_ids = &.{2}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
+    defer reset.deinit(a);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(try first_output.hostLogits(a)), std.mem.sliceAsBytes(try reset.hostLogits(a)));
+    // The existing maintained insertion changes previously absent facts. New
+    // binding builds a new immutable template; the old retained programs must
+    // refuse before their first subsequent kernel, without private replay.
+    for ([_][]const u8{ "model.layers.0.self_attn.q_norm.weight", "model.layers.0.self_attn.k_norm.weight" }) |name| {
+        var tensor = try Tensor.initFloat32(a, name, &.{4}, &.{ 1.2, 0.8, 1.1, 0.9 });
+        replaceBlasResidentWeight(session, name, .{ .tensor = tensor }) catch |err| {
+            tensor.deinit();
+            return err;
+        };
+    }
+    var fresh = try executor.createRuntime(a);
+    defer fresh.deinit();
+    const fresh_program = live.Testing.program(fresh).?;
+    try std.testing.expect(fresh_program.template != first_program.template);
+    try std.testing.expectEqual(@as(u64, if (expect_shared) 2 else 0), definition.native_template.stats.builds);
+    const before = first_program.assigned_operations;
+    try std.testing.expectError(error.AuthoredResidentTopologyChanged, first.decode(a, .{ .token_id = 4, .position = 2 }));
+    try std.testing.expectEqual(before, first_program.assigned_operations);
+    try std.testing.expect(!first_program.failed);
+    // Actual Runtime and its private program pins retain Model/Definition
+    // after both publishing owners retire. No new Model-global cache exists.
+    executor.deinit();
+    executor_live = false;
+    session.close();
+    session_live = false;
+    var after_retirement = try fresh.prefill(a, .{ .input_ids = &.{2}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
+    defer after_retirement.deinit(a);
+    for (try after_retirement.hostLogits(a)) |value| try std.testing.expect(std.math.isFinite(value));
+}
