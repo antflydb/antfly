@@ -75,6 +75,22 @@ pub const Stats = struct {
     }
 };
 
+/// Active execution and waiting capacity are separate policies. Null permits
+/// unlimited isolated execution; exclusive owners still fence every request.
+pub const Limits = struct {
+    active: ?usize,
+    queued: usize,
+
+    /// Node request admission uses zero for unlimited. Keep waiting bounded even
+    /// in that mode, since exclusive backend owners can still block execution.
+    pub fn forRequests(request_limit: usize, cooperative_limit: ?usize) Limits {
+        return .{
+            .active = cooperative_limit orelse (if (request_limit == 0) @as(?usize, null) else request_limit),
+            .queued = if (request_limit == 0) 64 else @min(request_limit, 64),
+        };
+    }
+};
+
 pub const Lane = struct {
     const Waiter = struct {
         next: ?*Waiter = null,
@@ -127,12 +143,14 @@ pub const Lane = struct {
         unreachable;
     }
 
-    pub fn acquire(self: *Lane, control: Control, exclusive: bool, active_limit: usize, queue_limit: usize) !Lease {
+    pub fn acquire(self: *Lane, control: Control, exclusive: bool, limits: Limits) !Lease {
+        std.debug.assert(limits.active == null or limits.active.? > 0);
+        std.debug.assert(limits.queued > 0);
         try control.check();
         const started = platform.time.monotonicNs();
         var waiter = Waiter{ .io = control.io };
         self.lock();
-        if (self.stats.waiting >= @max(queue_limit, 1)) {
+        if (self.stats.waiting >= limits.queued) {
             self.stats.rejected +|= 1;
             self.mutex.unlock();
             return error.GenerationQueueFull;
@@ -151,7 +169,7 @@ pub const Lane = struct {
         while (true) {
             try control.check();
             self.lock();
-            const available = !self.exclusive and self.stats.active < @max(active_limit, 1) and (!exclusive or self.stats.active == 0);
+            const available = !self.exclusive and (limits.active == null or self.stats.active < limits.active.?) and (!exclusive or self.stats.active == 0);
             if (self.head == &waiter and available) {
                 self.remove(&waiter);
                 self.stats.active += 1;
@@ -198,8 +216,8 @@ pub const Lane = struct {
 
 test "generation admission shares bounded slots and fences exclusive owners" {
     var lane = Lane{};
-    const first = try lane.acquire(.{}, false, 2, 4);
-    const second = try lane.acquire(.{}, false, 2, 4);
+    const first = try lane.acquire(.{}, false, .{ .active = 2, .queued = 4 });
+    const second = try lane.acquire(.{}, false, .{ .active = 2, .queued = 4 });
     const State = struct {
         first: Lane.Lease,
         second: Lane.Lease,
@@ -212,13 +230,13 @@ test "generation admission shares bounded slots and fences exclusive owners" {
         }
     };
     var state = State{ .first = first, .second = second };
-    const exclusive = try lane.acquire(.{ .ptr = &state, .check_fn = State.check }, true, 2, 4);
+    const exclusive = try lane.acquire(.{ .ptr = &state, .check_fn = State.check }, true, .{ .active = 2, .queued = 4 });
     try std.testing.expectEqual(@as(usize, 3), state.checks);
     try std.testing.expectEqual(@as(usize, 1), lane.snapshot().active);
     try std.testing.expect(lane.exclusive);
-    try std.testing.expectError(error.Timeout, lane.acquire(.{ .deadline_ns = 0 }, false, 2, 4));
+    try std.testing.expectError(error.Timeout, lane.acquire(.{ .deadline_ns = 0 }, false, .{ .active = 2, .queued = 4 }));
     exclusive.release();
-    const next = try lane.acquire(.{}, false, 2, 4);
+    const next = try lane.acquire(.{}, false, .{ .active = 2, .queued = 4 });
     next.release();
     try std.testing.expectEqual(@as(usize, 0), lane.snapshot().active);
     try std.testing.expectEqual(@as(usize, 0), lane.snapshot().waiting);
@@ -226,7 +244,7 @@ test "generation admission shares bounded slots and fences exclusive owners" {
 
 test "generation admission bounds waiting work and removes cancelled queue heads" {
     var lane = Lane{};
-    const owner = try lane.acquire(.{}, true, 1, 1);
+    const owner = try lane.acquire(.{}, true, .{ .active = 1, .queued = 1 });
     defer owner.release();
     const State = struct {
         lane: *Lane,
@@ -235,13 +253,13 @@ test "generation admission bounds waiting work and removes cancelled queue heads
             const self: *@This() = @ptrCast(@alignCast(raw.?));
             self.checks += 1;
             if (self.checks == 2) {
-                try std.testing.expectError(error.GenerationQueueFull, self.lane.acquire(.{}, false, 2, 1));
+                try std.testing.expectError(error.GenerationQueueFull, self.lane.acquire(.{}, false, .{ .active = 2, .queued = 1 }));
                 return error.Cancelled;
             }
         }
     };
     var state = State{ .lane = &lane };
-    try std.testing.expectError(error.Cancelled, lane.acquire(.{ .ptr = &state, .check_fn = State.check }, false, 2, 1));
+    try std.testing.expectError(error.Cancelled, lane.acquire(.{ .ptr = &state, .check_fn = State.check }, false, .{ .active = 2, .queued = 1 }));
     const stats = lane.snapshot();
     try std.testing.expectEqual(@as(usize, 0), stats.waiting);
     try std.testing.expectEqual(@as(u64, 1), stats.rejected);
