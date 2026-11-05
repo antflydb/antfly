@@ -393,6 +393,8 @@ fn renderParsedPagePngEffectiveWithRotationAllocators(
     return renderParsedPagePngNativeWithAllocators(scratch_alloc, output_alloc, parsed, page_number, dpi, max_pixels, rotation, profile) catch |err| switch (err) {
         error.UnsupportedStreamFilter,
         error.UnsupportedNativeDecode,
+        error.UnsupportedPdfInlineImage,
+        error.InvalidPdfInlineImage,
         error.UnsupportedPdfRendering,
         error.InvalidFlateStream,
         error.MissingEndStream,
@@ -563,6 +565,8 @@ fn renderParsedPageRgbaEffectiveWithRotationAllocators(
     return renderParsedPageRgbaNativeWithAllocators(scratch_alloc, output_alloc, parsed, page_number, dpi, max_pixels, rotation, profile) catch |err| switch (err) {
         error.UnsupportedStreamFilter,
         error.UnsupportedNativeDecode,
+        error.UnsupportedPdfInlineImage,
+        error.InvalidPdfInlineImage,
         error.UnsupportedPdfRendering,
         error.InvalidFlateStream,
         error.MissingEndStream,

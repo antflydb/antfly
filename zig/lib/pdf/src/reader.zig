@@ -3666,7 +3666,7 @@ const PositionedTextParser = struct {
         while (true) {
             if (lexeme_count & 255 == 0) try self.cancellation.check();
             lexeme_count +|= 1;
-            var lex = (try readContentLexemeCancelable(&scanner, self.cancellation)) orelse {
+            var lex = (try if (self.output.isTextOnly()) readContentLexemeCancelable(&scanner, self.cancellation) else readRenderContentLexeme(&scanner, self.cancellation)) orelse {
                 clearContentOperands(self.alloc, &self.operands);
                 continue;
             };
@@ -3816,7 +3816,7 @@ fn extractImageRunsFromContentAppendWithStateCancelable(
     while (true) {
         if (lexeme_count & 255 == 0) try cancellation.check();
         lexeme_count +|= 1;
-        var lex = (try readContentLexemeCancelable(&scanner, cancellation)) orelse {
+        var lex = (try readRenderContentLexeme(&scanner, cancellation)) orelse {
             clearContentOperands(alloc, &operands);
             continue;
         };
@@ -3972,7 +3972,7 @@ fn extractShadingRunsFromContentAppendWithStateCancelable(
     while (true) {
         if (lexeme_count & 255 == 0) try cancellation.check();
         lexeme_count +|= 1;
-        var lex = (try readContentLexemeCancelable(&scanner, cancellation)) orelse {
+        var lex = (try readRenderContentLexeme(&scanner, cancellation)) orelse {
             clearContentOperands(alloc, &operands);
             continue;
         };
@@ -4062,7 +4062,7 @@ fn extractPatternRunsFromContentAppendWithStateCancelable(
     while (true) {
         if (lexeme_count & 255 == 0) try cancellation.check();
         lexeme_count +|= 1;
-        var lex = (try readContentLexemeCancelable(&scanner, cancellation)) orelse {
+        var lex = (try readRenderContentLexeme(&scanner, cancellation)) orelse {
             clearContentOperands(alloc, &operands);
             continue;
         };
@@ -4151,7 +4151,7 @@ fn extractShapeRunsFromContentAppendWithStateCancelable(
     while (true) {
         if (lexeme_count & 255 == 0) try cancellation.check();
         lexeme_count +|= 1;
-        var lex = (try readContentLexemeCancelable(&scanner, cancellation)) orelse {
+        var lex = (try readRenderContentLexeme(&scanner, cancellation)) orelse {
             clearContentOperands(alloc, &operands);
             continue;
         };
@@ -15946,6 +15946,21 @@ fn readContentLexemeCancelable(scanner: *syntax.Scanner, cancellation: Cancellat
     errdefer syntax.Scanner.freeLexeme(scanner.alloc, &token);
     if (token == .keyword and std.mem.eql(u8, token.keyword, "BI"))
         try inline_image.skip(scanner, cancellation, 64 * 1024 * 1024);
+    return token;
+}
+
+// Inline pixels are framed for extraction, but are not represented in the
+// native raster IR. Reject the paint rather than silently producing a blank
+// raster; callers can use their existing compatibility backend or report it.
+fn readRenderContentLexeme(scanner: *syntax.Scanner, cancellation: CancellationProbe) anyerror!?syntax.Lexeme {
+    var token = (readContentLexemeCancelable(scanner, cancellation) catch |err| switch (err) {
+        error.UnsupportedPdfInlineImage, error.InvalidPdfInlineImage => return error.UnsupportedPdfRendering,
+        else => return err,
+    }) orelse return null;
+    if (token == .keyword and std.mem.eql(u8, token.keyword, "BI")) {
+        syntax.Scanner.freeLexeme(scanner.alloc, &token);
+        return error.UnsupportedPdfRendering;
+    }
     return token;
 }
 
@@ -34196,6 +34211,11 @@ test "reader inline image bytes cannot alter scopes resources or extraction" {
         try std.testing.expectEqual(@as(usize, 1), analysis.semantic_spans.len);
         try std.testing.expectEqual(PageBox{ .min_x = 10, .min_y = 10, .max_x = 30, .max_y = 30 }, analysis.semantic_spans[0].output_bounds.?);
     }
+    const raster_sample = try buildTextOrderingTestPdfAlloc(a, "BI /W 1 /H 1 /BPC 8 /CS /G ID x EI");
+    defer a.free(raster_sample);
+    var raster_reader = try Reader.init(a, raster_sample);
+    defer raster_reader.deinit();
+    try std.testing.expectError(error.UnsupportedPdfRendering, raster_reader.extractPageRenderRunsAlloc(1));
 }
 
 test "reader canonical scope state is constant time and cancellation crosses consumes" {

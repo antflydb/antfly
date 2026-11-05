@@ -1923,8 +1923,10 @@ Unsupported or ambiguous boundaries (including unfiltered named color spaces
 and CCITT without a supported framing path) fail with
 `UnsupportedPdfInlineImage`; truncated payloads fail with
 `InvalidPdfInlineImage`. Native completion remains false on such failures;
-encoded pixels are never guessed to be text. This does not add inline-image
-raster rendering support.
+encoded pixels are never guessed to be text. Native rendering explicitly
+rejects inline images rather than silently omitting them; the existing platform
+compatibility backend may render them where available. Other hosts report
+unsupported rendering. This does not add inline pixels to the native raster IR.
 
 Canonical ActualText tracking retains an active-scope bit across content
 streams, so sibling replacements do not rescan the marked-content stack.
