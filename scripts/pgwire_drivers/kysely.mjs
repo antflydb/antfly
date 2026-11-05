@@ -14,22 +14,25 @@
 // limitations under the License.
 
 // Run through test_pgwire_drivers.py after building @antfly/sdk.
+import { fork } from "node:child_process";
+import { once } from "node:events";
 import assert from "node:assert/strict";
 import { Kysely, PostgresDialect, sql } from "kysely";
-import { Migrator } from "kysely/migration";
 import pg from "pg";
 import Cursor from "pg-cursor";
 import { AntflyClient } from "../../ts/packages/sdk/dist/index.js";
 import {
   AntflyPostgresDialect,
+  createAntflyPostgres,
+  AntflyPersistentMigrationLock,
   antflySearch,
   createAntflyIntrospector,
   createAntflyPostgresCursor,
   createAntflyPostgresTypes,
   generateKyselyTypes,
-  prepareKyselyMigrationTables,
 } from "../../ts/packages/sdk/dist/kysely.js";
 
+const workers = new Set();
 const connectionString = process.env.ANTFLY_PGWIRE_URL;
 const url = new URL(connectionString);
 const client = new AntflyClient({
@@ -37,24 +40,6 @@ const client = new AntflyClient({
   auth: { username: decodeURIComponent(url.username), password: decodeURIComponent(url.password) },
 });
 const introspector = createAntflyIntrospector(client);
-// A deployment lock must be supplied for migrations. This single-process test
-// deliberately queues all its runners in memory; it is not a distributed lock.
-let tail = Promise.resolve();
-const migrationLock = () => {
-  let release;
-  return {
-    async acquire() {
-      const prior = tail;
-      tail = new Promise((resolve) => {
-        release = resolve;
-      });
-      await prior;
-    },
-    async release() {
-      release();
-    },
-  };
-};
 const numericTypes = createAntflyPostgresTypes(pg.types);
 const ExactCursor = createAntflyPostgresCursor(Cursor, numericTypes);
 const makeDatabase = () =>
@@ -63,7 +48,7 @@ const makeDatabase = () =>
       pool: new pg.Pool({ connectionString, types: numericTypes }),
       cursor: ExactCursor,
       introspector,
-      migrationLock: migrationLock(),
+      migrationLock: new AntflyPersistentMigrationLock(),
     }),
   });
 const db = makeDatabase();
@@ -291,6 +276,111 @@ try {
     (error) => error.code === "0A000"
   );
 
+  const runtime = createAntflyPostgres({
+    pg,
+    client,
+    cursor: Cursor,
+    pool: { connectionString, max: 1 },
+  });
+  try {
+    const query = runtime.db.selectFrom("kysely_shapes").select(["amount", "amounts"]).where("_id", "=", "shape");
+    assert.deepEqual(await query.execute(), [expectedDecimal]);
+    const streamed = [];
+    for await (const row of query.stream(1)) streamed.push(row);
+    assert.deepEqual(streamed, [expectedDecimal]);
+    const spawnWorker = (mode) => {
+      const child = fork(
+        new URL("./kysely-lock-worker.mjs", import.meta.url),
+        [mode],
+        { stdio: ["ignore", "inherit", "inherit", "ipc"] },
+      );
+      workers.add(child);
+      const message = once(child, "message", {
+        signal: AbortSignal.timeout(60_000),
+      }).then(([value]) => value);
+      const exited = once(child, "exit").then((value) => {
+        workers.delete(child);
+        return value;
+      });
+      return { child, message, exited };
+    };
+    const runners = [spawnWorker("migrate"), spawnWorker("migrate")];
+    const outcomes = await Promise.all(runners.map((runner) => runner.message));
+    await Promise.all(runners.map((runner) => runner.exited));
+    for (const outcome of outcomes) assert.equal(outcome.error, null);
+    assert.equal(
+      outcomes.reduce((total, outcome) => total + outcome.applied, 0),
+      1,
+    );
+    const crashed = spawnWorker("claim");
+    const abandoned = await crashed.message;
+    assert.ok(abandoned.claimed?.ownerToken, abandoned.error);
+    const liveContender = await runtime.migrateToLatest({
+      provider: {
+        async getMigrations() {
+          throw new Error("must not enter provider while locked");
+        },
+      },
+      lock: { waitTimeoutMs: 0 },
+    });
+    assert.equal(liveContender.error?.code, "ANTFLY_MIGRATION_LOCK_BUSY");
+    crashed.child.kill("SIGKILL");
+    await crashed.exited;
+    assert.equal(
+      (await runtime.inspectMigrationLock()).ownerToken,
+      abandoned.claimed.ownerToken,
+    );
+    assert.equal(
+      await runtime.recoverMigrationLock({
+        ownerToken: abandoned.claimed.ownerToken,
+        previousRunnerStopped: true,
+      }),
+      true,
+    );
+    const owner = new AntflyPersistentMigrationLock({ waitTimeoutMs: 0 });
+    const contender = new AntflyPersistentMigrationLock({ waitTimeoutMs: 0 });
+    await owner.acquire(runtime.db);
+    const claim = await runtime.inspectMigrationLock();
+    assert.ok(claim?.ownerToken);
+    await assert.rejects(contender.acquire(second), {
+      code: "ANTFLY_MIGRATION_LOCK_BUSY",
+    });
+    assert.equal(
+      await contender.recover(second, {
+        ownerToken: "00000000-0000-0000-0000-000000000000",
+        previousRunnerStopped: true,
+      }),
+      false,
+    );
+    await owner.release(runtime.db);
+    assert.equal(await runtime.inspectMigrationLock(), null);
+    const result = await runtime.migrateToLatest({
+      migrationTableName: "runtime_migrations",
+      migrationLockTableName: "runtime_lock",
+      provider: {
+        async getMigrations() {
+          return {
+            "001": {
+              async up(tx) {
+                await tx.schema
+                  .createTable("runtime_created")
+                  .addColumn("id", "text")
+                  .execute();
+              },
+            },
+          };
+        },
+      },
+    });
+    assert.ifError(result.error);
+    assert.ok(
+      !(await runtime.generateTypes()).includes(
+        '"_antfly_kysely_migration_claims"',
+      ),
+    );
+  } finally {
+    await runtime.close();
+  }
   for (const { migrationTables, table } of [
     { migrationTables: {}, table: "kysely_migrated" },
     {
@@ -320,12 +410,11 @@ try {
         };
       },
     };
-    const results = await Promise.all(
-      [db, second].map(async (database) => {
-        await prepareKyselyMigrationTables(database, migrationTables);
-        return new Migrator({ db: database, provider, ...migrationTables }).migrateToLatest();
-      })
-    );
+    const runtimes = [0, 1].map(() => createAntflyPostgres({ pg, client, pool: { connectionString, max: 1 } }));
+    let results;
+    try {
+      results = await Promise.all(runtimes.map((runtime) => runtime.migrateToLatest({ provider, ...migrationTables })));
+    } finally { await Promise.all(runtimes.map((runtime) => runtime.close())); }
     for (const result of results) assert.ifError(result.error);
     assert.equal(
       results.flatMap((r) => r.results ?? []).filter((r) => r.status === "Success").length,
@@ -354,5 +443,6 @@ try {
     "Kysely pgwire: CRUD, joins, exact integers, transactions, streaming, introspection, migrations: PASS"
   );
 } finally {
+  for (const worker of workers) worker.kill("SIGKILL");
   await Promise.all([db.destroy(), second.destroy(), standard.destroy()]);
 }

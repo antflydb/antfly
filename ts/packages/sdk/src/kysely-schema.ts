@@ -4,6 +4,7 @@
 import type { ColumnMetadata, DatabaseIntrospector, TableMetadata } from "kysely";
 import { DEFAULT_MIGRATION_LOCK_TABLE, DEFAULT_MIGRATION_TABLE } from "kysely/migration";
 import type { AntflyClient } from "./client.js";
+import { MIGRATION_CLAIMS_TABLE } from "./kysely-internals.js";
 
 export interface AntflyColumnMetadata extends ColumnMetadata {
   /** Output-only generated column, unlike a default that callers can override. */
@@ -28,7 +29,9 @@ export function createAntflyIntrospector(
       for (const entry of tables) {
         if (
           !options?.withInternalKyselyTables &&
-          (entry.name === DEFAULT_MIGRATION_TABLE || entry.name === DEFAULT_MIGRATION_LOCK_TABLE)
+          (entry.name === DEFAULT_MIGRATION_TABLE ||
+            entry.name === DEFAULT_MIGRATION_LOCK_TABLE ||
+            entry.name === MIGRATION_CLAIMS_TABLE)
         )
           continue;
         const table = await client.tables.get(entry.name);

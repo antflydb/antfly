@@ -5,6 +5,83 @@ database, or the PostgreSQL driver for a server. Optional helpers live in
 `@antfly/sdk/kysely`; importing the main SDK does not load Kysely. These APIs
 target Kysely 0.29.6 and later compatible 0.29 releases, and Node 24+.
 
+## Managed PostgreSQL connection
+
+Use the factory for an Antfly server. It owns the pool and shares one value
+policy between queries, cursor streams, and generated types.
+
+```ts
+import pg from "pg";
+import Cursor from "pg-cursor";
+import { writeFile } from "node:fs/promises";
+import { AntflyClient } from "@antfly/sdk";
+import { createAntflyPostgres } from "@antfly/sdk/kysely";
+
+const antfly = createAntflyPostgres<Database>({
+  pg,
+  cursor: Cursor,
+  pool: { connectionString: process.env.ANTFLY_PGWIRE_URL! },
+  client: new AntflyClient({ baseUrl: process.env.ANTFLY_HTTP_URL! }),
+  values: "exact",
+});
+const db = antfly.db;
+try {
+  await writeFile("database.ts", await antfly.generateTypes());
+  const result = await antfly.migrateToLatest({
+    provider, // any Kysely MigrationProvider
+    lock: { waitTimeoutMs: 30_000, owner: "deploy-job" },
+  });
+  if (result.error) throw result.error;
+} finally {
+  await antfly.close();
+}
+```
+
+Install `pg`, `kysely`, and optionally `pg-cursor` alongside the SDK. Supply the
+same database and credentials to HTTP and pgwire. The factory supports the default
+database/public namespace. `exact` (the default) preserves BIGINT and NUMERIC
+values, including nested arrays, as strings. `pg-default` keeps numeric arrays
+as numbers. Neither preset changes global pg parsers. Generate types through the
+runtime so the output uses its parser policy. Keep generated files current as
+the schema changes. `Database` is the interface exported by that generated file.
+
+`close()` waits for runtime migration and metadata operations, then ends the
+owned pool, including when no queries ran. Finish direct `db` queries before
+closing; use `antfly.close()` for lifecycle management.
+
+### Persistent migration ownership
+
+`migrateToLatest` bootstraps Kysely's tables and holds a catalog-wide persistent
+claim throughout bootstrap and migration execution. Different custom migration
+history names share the same claim. All deployment runners must use this lock
+protocol; unrelated SQL writers are not fenced by it. DDL is nontransactional,
+so a failed migration can leave partial changes.
+
+Claims **never expire**. The acquisition timeout only limits how long a runner
+waits; a crashed runner leaves a claim that requires explicit recovery:
+
+```ts
+const claim = await antfly.inspectMigrationLock();
+// Stop the previous runner and reconcile any partially applied migration first.
+if (claim) {
+  const removed = await antfly.recoverMigrationLock({
+    ownerToken: claim.ownerToken,
+    previousRunnerStopped: true,
+  });
+  if (!removed) throw new Error("Claim changed; inspect it again");
+}
+```
+
+Recovery conditionally removes only the observed token. The stopped-runner
+assertion is an operator responsibility; automatic lease takeover requires
+server-side fencing and is unavailable. Do not recover a live runner. Ownership
+errors include `code` and `claim`; an uncertain claim or release must be reconciled
+before retrying application migrations. The SDK never replays an uncertain
+migration write. The private `_antfly_kysely_migration_claims` table is hidden
+from default introspection. Low-level dialect users can configure
+`AntflyPersistentMigrationLock` directly, while retaining responsibility for
+bootstrap and pool lifecycle.
+
 ## Embedded connection
 
 ```sh
@@ -191,8 +268,9 @@ For the server connection configured above, generate with
 Nullable unions such as `type: ["string", "null"]` retain `null` even when the
 field is required. Optional fields also retain SQL NULL when absent, even if
 explicit JSON null is forbidden with `nullable: false`. Columns must be required
-in every document type to be non-nullable. Default introspection excludes only
-`kysely_migration` and `kysely_migration_lock`; other `kysely_` names and custom
+in every document type to be non-nullable. Default introspection excludes
+`kysely_migration`, `kysely_migration_lock`, and the private
+`_antfly_kysely_migration_claims` table; other `kysely_` names and custom
 bookkeeping table names remain visible, matching Kysely's standard introspector.
 PostgreSQL array columns use a generated recursive
 `SQLArray<T>` type: `pg` can return one-dimensional or nested arrays for the same
@@ -230,7 +308,8 @@ Import `Migrator` from `kysely/migration` with Kysely 0.29. The embedded dialect
 queues migrators that share the same native `Database` object. That queue is not
 a distributed lock or a guarantee across independent handles.
 
-First call `prepareKyselyMigrationTables(db)`. Kysely's automatic bookkeeping
+With the managed PostgreSQL factory, use `antfly.migrateToLatest` above.
+For embedded or low-level dialect usage, first call `prepareKyselyMigrationTables(db)`. Kysely's automatic bookkeeping
 DDL uses `varchar(255)`, which Antfly does not accept. This helper creates only
 the bookkeeping tables with native `TEXT` columns, under the dialect's migration
 lock. It does not rewrite application DDL. If you customize migration table names,
@@ -261,7 +340,7 @@ const result = await migrator.migrateToLatest();
 if (result.error) throw result.error;
 ```
 
-For server migrations, supply `migrationLock` with asynchronous `acquire(db,
+For low-level server migrations, supply `migrationLock` with asynchronous `acquire(db,
 options)` and `release(db, options)` methods. Its implementation must exclude
 **all** runners for the database, including other processes. A deployment lock
 or exclusive migration job can provide that contract. The adapter throws when a
@@ -282,7 +361,7 @@ Do not infer PostgreSQL extension or catalog compatibility from the wire protoco
 | Commit, rollback, savepoints | READ COMMITTED | Native provider isolation contracts |
 | Result streaming beyond a page | Native cursors | Supply pg-cursor |
 | Schema introspection and type generation | Native catalog | HTTP metadata provider, default/public scope |
-| Kysely migrations | Queue shared by Database object | Requires explicit deployment lock |
+| Kysely migrations | Queue shared by Database object | Factory includes persistent ownership and bootstrap |
 | Transactional schema DDL | Unsupported | Unsupported |
 | Search relation with SQL composition | Supported | Explicitly unsupported |
 
