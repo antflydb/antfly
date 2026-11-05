@@ -207,6 +207,64 @@ pub const Inspector = struct {
     }
 };
 
+/// Validate the whole source (including duplicate keys) while decoding only
+/// selected strings. Wide maps/arrays never become a retained source DOM.
+/// The returned strings/slice are owned by the caller's preparation arena.
+pub fn selectedTexts(a: A, source: []const u8, fields: []const []const u8) ![][]const u8 {
+    if (fields.len > 64) return error.InvalidPrivacyFields;
+    const trimmed = std.mem.trim(u8, source, " \r\n\t");
+    if (trimmed.len == 0 or trimmed[0] != '{') return error.InvalidPrivacyDocument;
+    var names: [65][]const u8 = undefined;
+    @memcpy(names[0..fields.len], fields);
+    names[fields.len] = "_privacy";
+    var values: [65]?[]const u8 = undefined;
+    var backing = @import("antfly_inference_work").ReclaimingInvocationAllocator.init(a);
+    var arena = std.heap.ArenaAllocator.init(backing.allocator());
+    defer arena.deinit();
+    try @import("antfly-json").objectFields(arena.allocator(), source, names[0 .. fields.len + 1], values[0 .. fields.len + 1]);
+    if (values[fields.len] != null) return error.InvalidPrivacyDocument;
+    const result = try a.alloc([]const u8, fields.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (result[0..initialized]) |text| a.free(text);
+        a.free(result);
+    }
+    for (result, values[0..fields.len]) |*text, raw| {
+        const value = std.mem.trim(u8, raw orelse "null", " \r\n\t");
+        if (std.mem.eql(u8, value, "null")) {
+            text.* = "";
+        } else {
+            if (value.len == 0 or value[0] != '"') return error.InvalidPrivacyFieldType;
+            text.* = try std.json.parseFromSliceLeaky([]const u8, a, value, .{ .allocate = .alloc_always });
+        }
+        initialized += 1;
+    }
+    return result;
+}
+
+/// Container workspace is independent of encoded string length. Generic JSON
+/// maps/arrays retain growth buffers in arenas; compact keys, scalars and deep
+/// containers therefore need a structural allowance as well as the byte charge.
+/// This allocation-free lexical pass is deliberately conservative, including
+/// duplicate-key/scanner state. Strings use the caller's separate byte budget.
+pub fn jsonStructureBytes(bytes: []const u8) !usize {
+    var total: usize = 0;
+    var offset: usize = 0;
+    while (std.mem.indexOfAnyPos(u8, bytes, offset, "\"{[:,")) |at| {
+        offset = at + 1;
+        if (bytes[at] == '"') {
+            while (std.mem.indexOfAnyPos(u8, bytes, offset, "\"\\")) |special| {
+                offset = @min(bytes.len, special + 1);
+                if (bytes[special] == '"') break;
+                offset = @min(bytes.len, special + 2);
+            } else break;
+        } else {
+            total = try std.math.add(usize, total, if (bytes[at] == '{' or bytes[at] == '[') 1024 else 256);
+        }
+    }
+    return total;
+}
+
 /// Normalized field JSON retains selected source text as well as evidence.
 /// Source bytes never consume the independent detector/evidence allowance.
 pub fn normalizedLimit(source_bytes: usize, evidence_bytes: usize) !usize {
@@ -233,17 +291,10 @@ pub fn produce(a: A, config_json: []const u8, source: []const u8, invoke: Invoke
     defer arena.deinit();
     const scratch = arena.allocator();
     const inspector = try Inspector.init(scratch, config_json);
-    const document = try std.json.parseFromSliceLeaky(std.json.Value, scratch, source, .{ .parse_numbers = false });
-    if (document != .object or document.object.contains("_privacy")) return error.InvalidPrivacyDocument;
     const fields = try scratch.alloc([]const u8, inspector.policy.fields.len);
+    const texts = try selectedTexts(scratch, source, inspector.policy.fields);
     var normalized_bytes: usize = 0;
-    for (inspector.policy.fields, fields) |field, *result| {
-        const value = document.object.get(field) orelse .null;
-        const text = switch (value) {
-            .null => "",
-            .string => |v| v,
-            else => return error.InvalidPrivacyFieldType,
-        };
+    for (inspector.policy.fields, texts, fields) |field, text, *result| {
         result.* = try inspector.inspect(scratch, field, text, invoke);
         normalized_bytes = std.math.add(usize, normalized_bytes, result.*.len) catch return error.InferenceResultTooLarge;
         if (normalized_bytes > invoke.max_normalized_bytes) return error.InferenceResultTooLarge;
@@ -329,4 +380,19 @@ test "privacy execution tuning is policy bound and leaves semantic identity unch
     try std.testing.expectEqual(version, try tuned.value.identity(scratch));
     const stale = try std.json.Stringify.valueAlloc(scratch, ExecutionOverride{ .policy_version = contract.fingerprint("old"), .execution = .{ .batch_items = 1 } }, .{});
     try std.testing.expect(try withExecutionOverride(a, config, stale) == null);
+}
+
+test "privacy selected source streaming preserves literal fields escapes and strict duplicate validation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const texts = try selectedTexts(a, "{\"b\\u006fdy\":\"hi\\n\\u00e9\",\"nullish\":null,\"a\":{\"b\":\"nested\"},\"a.b\":\"literal\"}", &.{ "body", "nullish", "absent", "a.b" });
+    try std.testing.expectEqualStrings("hi\né", texts[0]);
+    try std.testing.expectEqualStrings("", texts[1]);
+    try std.testing.expectEqualStrings("", texts[2]);
+    try std.testing.expectEqualStrings("literal", texts[3]);
+    try std.testing.expectError(error.DuplicateField, selectedTexts(a, "{\"ignored\":{\"x\":0,\"x\":1}}", &.{"absent"}));
+    try std.testing.expectError(error.InvalidPrivacyDocument, selectedTexts(a, "{\"_pri\\u0076acy\":{}}", &.{"absent"}));
+    try std.testing.expectError(error.InvalidPrivacyDocument, selectedTexts(a, "[]", &.{"absent"}));
+    try std.testing.expectError(error.InvalidPrivacyFieldType, selectedTexts(a, "{\"body\":false}", &.{"body"}));
 }

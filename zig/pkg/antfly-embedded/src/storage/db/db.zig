@@ -42075,6 +42075,10 @@ pub const DB = struct {
         policy: row_policy_gate_mod.Gate.Lease,
         window: DocumentPrimaryReadWindow,
         metadata: std.heap.ArenaAllocator,
+        // Heap-owned to keep parser allocator pointers stable if this reader
+        // moves into a SQL cursor. The query lease fences this catalog cut.
+        privacy_arena: *std.heap.ArenaAllocator,
+        privacy_policy: ?@import("privacy_read.zig").PolicySnapshot,
         keys: [64][]const u8 = undefined,
         ids: [64][]const u8 = undefined,
         sizes: [64]?u64 = undefined,
@@ -42149,9 +42153,7 @@ pub const DB = struct {
             if (documents.len == 0 or documents.len > 64 or max_bytes == 0) return error.InvalidBatch;
             self.window.retire();
             errdefer self.window.retire();
-            var privacy_arena = std.heap.ArenaAllocator.init(self.window.arena.child_allocator);
-            defer privacy_arena.deinit();
-            const policy = try @import("privacy_read.zig").capture(self.db, privacy_arena.allocator());
+            const policy = self.privacy_policy;
             if (policy != null and policy.?.prepared.policy.mode != .monitor) {
                 self.values[0] = try self.lookup(documents[0]);
                 self.sources[0] = .{ .bytes = self.values[0].? };
@@ -42328,7 +42330,7 @@ pub const DB = struct {
                 else => return err,
             };
             const privacy = @import("privacy_read.zig");
-            const policy = try privacy.capture(self.db, a) orelse return raw;
+            const policy = self.privacy_policy orelse return raw;
             return privacy.project(a, policy, key, raw, &self.read);
         }
         /// Page cells already own their selected payloads. Retire the last
@@ -42347,6 +42349,9 @@ pub const DB = struct {
             self.retireDirectories();
             self.directory_arena.deinit();
             self.metadata.deinit();
+            const privacy_backing = self.privacy_arena.child_allocator;
+            self.privacy_arena.deinit();
+            privacy_backing.destroy(self.privacy_arena);
             self.read.abort();
             self.schema.release();
             self.policy.release();
@@ -42380,9 +42385,17 @@ pub const DB = struct {
             var view = self.db.core.acquireSchemaView() orelse return error.PreparedGenerationChanged;
             errdefer view.release();
             if (view.storageMode() != .document or view.version() != schema_version) return error.PreparedGenerationChanged;
+            const privacy_backing = @import("antfly_platform").allocator.reclaimingScratch(alloc);
+            const privacy_arena = try privacy_backing.create(std.heap.ArenaAllocator);
+            privacy_arena.* = .init(privacy_backing);
+            errdefer {
+                privacy_arena.deinit();
+                privacy_backing.destroy(privacy_arena);
+            }
+            const privacy_policy = try @import("privacy_read.zig").capture(self.db, privacy_arena.allocator());
             var read = try self.db.core.store.beginReadTxn();
             errdefer read.abort();
-            return .{ .db = self.db, .read = read, .schema = view, .policy = self.row_policy_lease.clone(), .window = .init(alloc), .directory_arena = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)), .metadata = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)) };
+            return .{ .db = self.db, .read = read, .schema = view, .policy = self.row_policy_lease.clone(), .privacy_arena = privacy_arena, .privacy_policy = privacy_policy, .window = .init(alloc), .directory_arena = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)), .metadata = .init(@import("antfly_platform").allocator.reclaimingScratch(alloc)) };
         }
 
         pub fn search(self: QueryReadLease, alloc: Allocator, req: types.SearchRequest) !SearchWithDenseProfileResult {
@@ -48675,20 +48688,31 @@ fn loadStoredSearchDocumentsMany(
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse continue;
         if (policy != null and policy.?.prepared.policy.mode != .monitor) {
+            var row_backing = inference_work.ReclaimingInvocationAllocator.init(alloc);
+            var row_arena = std.heap.ArenaAllocator.init(row_backing.allocator());
+            defer row_arena.deinit();
+            const row = row_arena.allocator();
             const id = keys[item.original_index];
-            if (internal_keys.isInternalUserKey(id)) {
-                const safe = privacy.projectArtifact(privacy_arena.allocator(), policy.?, item.store_key, &txn) catch |err| {
-                    if (privacy.pending(err)) continue;
-                    return err;
-                };
-                loaded[item.original_index] = try alloc.dupe(u8, safe);
-                continue;
-            }
-            const safe = privacy.project(privacy_arena.allocator(), policy.?, id, value, &txn) catch |err| {
+            const safe = (if (internal_keys.isInternalUserKey(id))
+                privacy.projectArtifact(row, policy.?, item.store_key, &txn)
+            else
+                privacy.project(row, policy.?, id, value, &txn)) catch |err| {
                 if (privacy.pending(err)) continue;
                 return err;
             };
-            loaded[item.original_index] = try alloc.dupe(u8, safe);
+            // Authenticate the complete document, then retain only the selected
+            // output. Unselected bodies and validation DOMs expire per row.
+            loaded[item.original_index] = if (direct_fields) |fields|
+                try db_query_projection.projectLookupStoredBytesWithOutput(row, alloc, id, safe, .{ .fields = fields, .include_all_fields = false }, .{
+                    .ctx = self,
+                    .load_chunks = loadChunkFieldValueCallback,
+                    .load_embeddings = loadEmbeddingFieldValueCallback,
+                    .open_embeddings = openEmbeddingStreamCallback,
+                    .load_embeddings_compact = loadEmbeddingFieldsCallback,
+                    .load_artifacts = loadArtifactFieldValueCallback,
+                })
+            else
+                try alloc.dupe(u8, safe);
             continue;
         }
         loaded[item.original_index] = try schema_plans.materialize(
@@ -147928,4 +147952,104 @@ test "privacy discovery regenerates completed artifacts whose local publication 
     var read = try db.core.store.beginReadTxn();
     defer read.abort();
     try local.require(a, &read, artifact, try policy.identity(a), "{\"ordinal\":1}", try read.get(artifact));
+}
+
+/// Produces real privacy receipts without a model: these fixtures deliberately
+/// select an absent field. Keep the ordinary publication/skip-state pipeline.
+const PrivacyAbsentFieldProducer = struct {
+    fn check(_: *anyopaque) !void {}
+    fn detect(_: *anyopaque, _: Allocator, _: @import("../../privacy/contract.zig").Producer, _: []const u8) ![]u8 {
+        return error.UnexpectedInference;
+    }
+    fn produce(ptr: *anyopaque, out: Allocator, request: asset_producer_mod.Request) ![]u8 {
+        return @import("../../privacy/document.zig").produce(out, request.config_json, request.source_text, .{ .ptr = ptr, .produce = detect, .check = check });
+    }
+    fn interface(self: *@This()) asset_producer_mod.Producer {
+        return .{ .ptr = self, .vtable = &.{ .produce = produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } };
+    }
+};
+
+fn addPrivacyAbsentFieldProducer(a: Allocator, db: *DB, description: []const u8) !void {
+    const privacy = @import("../../privacy/document.zig");
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const policy = privacy.contract.Policy{ .mode = .redact_for_search_and_ai, .fields = &.{"absent"}, .category_groups = &.{}, .categories = &.{.{ .name = "email", .description = description }} };
+    const resolved = try privacy.resolve(scratch, policy, true);
+    const producer_json = try std.json.Stringify.valueAlloc(scratch, .{ .type = "extractor", .config = resolved.config }, .{});
+    const name = try privacy.protectedArtifactName(scratch, try policy.identity(scratch));
+    try db.addEnrichment(.{ .name = name, .kind = .asset, .field = privacy.source_field, .content_type = "application/json", .producer_json = producer_json });
+}
+
+test "privacy delayed SQL reader retains one prepared binding across row and page lifetimes" {
+    const a = std.testing.allocator;
+    var producer: PrivacyAbsentFieldProducer = .{};
+    var directory = try TestDirectory.init("privacy-sql-policy-binding");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = producer.interface() } });
+    defer db.close();
+    try db.setSchemaJson(a, "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"ordinal\":{\"type\":\"integer\"}},\"additionalProperties\":true}}}}");
+    const description = try a.alloc(u8, 128 * 1024);
+    defer a.free(description);
+    @memset(description, 'x');
+    try addPrivacyAbsentFieldProducer(a, &db, description);
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"ordinal\":1}" }}, .sync_level = .write });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    var lease = try db.beginQueryReadLease();
+    defer lease.release();
+    var budget = inference_work.BoundedInvocationAllocator.init(a, 16 * 1024 * 1024);
+    {
+        var reader = try lease.documentRows(budget.allocator(), 1);
+        defer reader.deinit();
+        // Capturing another copy of the policy cannot fit this allowance.
+        // Row hydration must reuse its immutable lease-owned binding.
+        budget.max_live_bytes = budget.live_bytes + 192 * 1024;
+        for (0..32) |_| {
+            const rows = try reader.lookupProjectedBatch(&.{"doc"}, &.{"ordinal"}, 256 * 1024);
+            try std.testing.expectEqual(@as(usize, 1), rows.consumed);
+            try std.testing.expectEqualStrings("{\"ordinal\":1}", rows.values[0].bytes);
+            reader.releasePage();
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+}
+
+test "privacy protected hit hydration bounds row scratch and retains only selected output" {
+    const a = std.testing.allocator;
+    var producer: PrivacyAbsentFieldProducer = .{};
+    var directory = try TestDirectory.init("privacy-projection-working-memory");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = producer.interface() } });
+    defer db.close();
+    try addPrivacyAbsentFieldProducer(a, &db, "");
+    const padding = try a.alloc(u8, 128 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'x');
+    const source = try std.json.Stringify.valueAlloc(a, .{ .ordinal = 1, .ignored = padding }, .{});
+    defer a.free(source);
+    var keys: [20][]const u8 = undefined;
+    var initialized: usize = 0;
+    defer for (keys[0..initialized]) |key| a.free(key);
+    for (&keys, 0..) |*key, i| {
+        key.* = try std.fmt.allocPrint(a, "doc-{d}", .{i});
+        initialized += 1;
+        try db.batch(.{ .writes = &.{.{ .key = key.*, .value = source }}, .sync_level = .write });
+        try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    }
+    var single_peak: usize = 0;
+    for ([_]usize{ 1, keys.len }) |count| {
+        // Include the ordinary store batch read, but leave room for only one
+        // row's validation workspace, independently of the hit count.
+        var budget = inference_work.BoundedInvocationAllocator.init(a, 8 * 1024 * 1024);
+        {
+            const values = try loadStoredSearchDocumentsMany(&db, budget.allocator(), keys[0..count], &.{"ordinal"});
+            defer freeOptionalOwnedBytes(budget.allocator(), values);
+            for (values) |value| try std.testing.expectEqualStrings("{\"ordinal\":1}", value.?);
+        }
+        try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+        if (count == 1) single_peak = budget.peak_live_bytes else {
+            try std.testing.expect(budget.peak_live_bytes < single_peak + 4 * 1024 * 1024);
+        }
+        std.debug.print("\nPrivacy projected hydration rows={d} peak_bytes={d}\n", .{ count, budget.peak_live_bytes });
+    }
 }

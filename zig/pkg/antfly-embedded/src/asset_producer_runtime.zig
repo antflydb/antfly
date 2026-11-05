@@ -762,12 +762,11 @@ pub const Runtime = struct {
             var document_backing = inference_work.ReclaimingInvocationAllocator.init(alloc);
             var document_arena = std.heap.ArenaAllocator.init(document_backing.allocator());
             defer document_arena.deinit();
-            const source = try std.json.parseFromSliceLeaky(std.json.Value, document_arena.allocator(), request.source_text, .{ .parse_numbers = false });
-            if (source != .object) return false;
-            for (policy.fields) |field| {
-                const value = source.object.get(field) orelse .null;
-                if (value != .null and (value != .string or value.string.len != 0)) return false;
-            }
+            const texts = privacy.selectedTexts(document_arena.allocator(), request.source_text, policy.fields) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return false;
+            };
+            for (texts) |text| if (text.len != 0) return false;
         }
         return true;
     }
@@ -793,19 +792,22 @@ pub const Runtime = struct {
         const capacity: usize = policy.execution.batch_items;
         var source_bytes: usize = 0;
         var largest_source: usize = 0;
+        var source_structure: usize = 0;
         for (requests) |request| {
             source_bytes = try std.math.add(usize, source_bytes, request.source_text.len);
             largest_source = @max(largest_source, request.source_text.len);
+            source_structure = @max(source_structure, try privacy.jsonStructureBytes(request.source_text));
             var document_backing = inference_work.ReclaimingInvocationAllocator.init(alloc);
             var document_arena = std.heap.ArenaAllocator.init(document_backing.allocator());
             defer document_arena.deinit();
-            const source = try std.json.parseFromSliceLeaky(std.json.Value, document_arena.allocator(), request.source_text, .{ .parse_numbers = false });
-            if (source != .object) return error.InvalidPrivacyDocument;
-            for (policy.fields) |field| {
-                const value = source.object.get(field) orelse .null;
-                // Invalid field types become per-document failures at execution.
-                if (value != .string or value.string.len == 0) continue;
-                const input: asset_producer.Request = .{ .producer_type = if (resolved_producer.type == .extractor) .extractor else .generator, .config_json = config, .source_text = value.string, .content_type = "application/json" };
+            const texts = privacy.selectedTexts(document_arena.allocator(), request.source_text, policy.fields) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                // Execution reports malformed source/field types per document.
+                continue;
+            };
+            for (texts) |text| {
+                if (text.len == 0) continue;
+                const input: asset_producer.Request = .{ .producer_type = if (resolved_producer.type == .extractor) .extractor else .generator, .config_json = config, .source_text = text, .content_type = "application/json" };
                 var index: usize = 0;
                 while (index < count and largest[index].source_text.len >= input.source_text.len) : (index += 1) {}
                 if (index >= capacity) continue;
@@ -842,7 +844,10 @@ pub const Runtime = struct {
         plan.fixed_bytes = try std.math.add(usize, plan.fixed_bytes, growth);
         plan.allocator_limit_bytes = try std.math.add(usize, plan.allocator_limit_bytes, growth);
         const cells = try std.math.mul(usize, requests.len, policy.fields.len);
-        const control = try std.math.add(usize, try std.math.mul(usize, requests[0].config_json.len, invocation_nonmedia_allocator_multiplier), try std.math.mul(usize, cells, 512));
+        // Configuration has several concurrent owned JSON views. Source DOMs
+        // are released per document, so charge the largest shape only once.
+        const shape = try std.math.add(usize, source_structure, try std.math.mul(usize, 4, try privacy.jsonStructureBytes(requests[0].config_json)));
+        const control = try std.math.add(usize, shape, try std.math.add(usize, try std.math.mul(usize, requests[0].config_json.len, invocation_nonmedia_allocator_multiplier), try std.math.mul(usize, cells, 512)));
         plan.fixed_bytes = try std.math.add(usize, plan.fixed_bytes, control);
         plan.allocator_limit_bytes = try std.math.add(usize, plan.allocator_limit_bytes, control);
         if (count != 0) {
@@ -1989,27 +1994,14 @@ pub const Runtime = struct {
         var inputs: std.ArrayList(asset_producer.Request) = .empty;
         var owners: std.ArrayList(usize) = .empty;
         for (requests, 0..) |request, index| {
-            const document = std.json.parseFromSlice(std.json.Value, a, request.source_text, .{ .parse_numbers = false }) catch |err| {
+            const texts = privacy.selectedTexts(a, request.source_text, policy.fields) catch |err| {
                 if (err == error.OutOfMemory) return err;
                 invalid[index] = err;
                 continue;
             };
-            if (document.value != .object or document.value.object.contains("_privacy")) {
-                invalid[index] = error.InvalidPrivacyDocument;
-                continue;
-            }
-            for (policy.fields) |field| {
-                const value = document.value.object.get(field) orelse .null;
-                if (value != .null and value != .string) {
-                    invalid[index] = error.InvalidPrivacyFieldType;
-                    break;
-                }
-            }
-            if (invalid[index] != null) continue;
-            for (policy.fields, 0..) |field, ordinal| {
-                const value = document.value.object.get(field) orelse .null;
-                if (value == .null or value.string.len == 0) continue;
-                try inputs.append(a, .{ .producer_type = if (resolved.type == .extractor) .extractor else .generator, .config_json = config, .source_text = value.string, .content_type = "application/json" });
+            for (texts, 0..) |text, ordinal| {
+                if (text.len == 0) continue;
+                try inputs.append(a, .{ .producer_type = if (resolved.type == .extractor) .extractor else .generator, .config_json = config, .source_text = text, .content_type = "application/json" });
                 try owners.append(a, index * field_count + ordinal);
             }
         }
@@ -9276,7 +9268,10 @@ test "privacy maximum field cohort planning releases document DOMs within the re
     const difference = large_source.len - source.len;
     try std.testing.expectEqual(plan.max_result_bytes + 3 * difference, mixed.max_result_bytes);
     try std.testing.expectEqual(try privacy.projectionLimit(large_source.len, 1 << 20), mixed.max_result_bytes_per_item);
-    try std.testing.expectEqual(plan.fixed_bytes + (invocation_nonmedia_allocator_multiplier + 4) * difference, mixed.fixed_bytes);
+    const byte_growth = (invocation_nonmedia_allocator_multiplier + 4) * difference;
+    try std.testing.expect(mixed.fixed_bytes >= plan.fixed_bytes + byte_growth);
+    // One large source must not inflate every sibling's reservation.
+    try std.testing.expect(mixed.fixed_bytes < plan.fixed_bytes + byte_growth + 16 * 1024);
 }
 
 test "privacy disclosure follows explicit default linked and generated execution routes" {
@@ -9349,4 +9344,68 @@ test "privacy large policy single and multi document execution fits its advertis
             budget.allocator().free(output);
         }
     }
+}
+
+test "privacy structurally wide sources fit planning and execution budgets independently of cohort size" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.init(a, &client);
+    defer runtime.deinit();
+    const privacy = @import("privacy/document.zig");
+    const resolved = try privacy.resolve(scratch, .{ .mode = .redact_for_search_and_ai, .fields = &.{"absent"} }, true);
+    const config = try std.json.Stringify.valueAlloc(scratch, resolved.config, .{});
+    for (0..3) |shape| {
+        var writer: std.Io.Writer.Allocating = .init(scratch);
+        try writer.writer.writeAll("{\"exact\":9007199254740993,\"wide\":");
+        switch (shape) {
+            0 => {
+                try writer.writer.writeByte('{');
+                for (0..10000) |i| {
+                    if (i != 0) try writer.writer.writeByte(',');
+                    try writer.writer.print("\"k{d}\":0", .{i});
+                }
+                try writer.writer.writeByte('}');
+            },
+            1 => {
+                try writer.writer.writeByte('[');
+                for (0..20000) |i| try writer.writer.writeAll(if (i == 0) "0" else ",0");
+                try writer.writer.writeByte(']');
+            },
+            else => {
+                for (0..128) |_| try writer.writer.writeByte('[');
+                try writer.writer.writeByte('0');
+                for (0..128) |_| try writer.writer.writeByte(']');
+            },
+        }
+        try writer.writer.writeByte('}');
+        for ([_]usize{ 1, 16 }) |count| {
+            const requests = try scratch.alloc(asset_producer.Request, count);
+            @memset(requests, .{ .producer_type = .extractor, .config_json = config, .source_text = writer.written(), .content_type = "application/json" });
+            const plan = try runtime.producer().invocationMemoryForRequests(a, requests);
+            try plan.validate();
+            var budget = inference_work.BoundedInvocationAllocator.init(a, plan.allocator_limit_bytes);
+            {
+                try std.testing.expect(try runtime.producer().canProduceBatch(budget.allocator(), requests));
+                try std.testing.expect(try runtime.producer().capabilitiesForRequests(budget.allocator(), requests) == null);
+                var batch = try runtime.producer().produceBatchReported(budget.allocator(), requests);
+                defer batch.deinit(budget.allocator());
+                try batch.validateForRequests(requests);
+                for (batch.items) |item| {
+                    try std.testing.expect(item.result == .value);
+                    try std.testing.expect(std.mem.indexOf(u8, item.result.value, "9007199254740993") != null);
+                    const output = try std.json.parseFromSlice(std.json.Value, scratch, item.result.value, .{});
+                    try std.testing.expectEqualStrings("inspected", output.value.object.get("_privacy").?.object.get("fields").?.array.items[0].object.get("receipt").?.object.get("state").?.string);
+                }
+            }
+            try std.testing.expectEqual(@as(usize, 0), budget.live_bytes);
+        }
+    }
+    const escaped = try std.json.Stringify.valueAlloc(scratch, .{ .body = "\\\"{[:,\\\"" }, .{});
+    try std.testing.expectEqual(try privacy.jsonStructureBytes("{\"body\":\"short\"}"), try privacy.jsonStructureBytes(escaped));
 }

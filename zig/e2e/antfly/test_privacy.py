@@ -1873,3 +1873,66 @@ def test_privacy_large_policy_empty_fields_preview_and_backfill(stateful_api, co
     assert coverage["current"] == count and coverage["failed"] == 0, coverage
     assert coverage["protected_ready"] == count, coverage
     assert len(api.scan_keys(table, {"limit": 10, "include_documents": True})) == count
+
+
+@pytest.mark.parametrize("sample", [{}, {"keys": ["missing"]}])
+def test_privacy_rejects_pre_storage_preview_before_sampling(stateful_api, sample):
+    api = stateful_api
+    table = "privacy_sync_preview_" + uuid4().hex[:8]
+    api.create_table(table)
+    path = f"/tables/{table}/privacy"
+    response = api.s.post(
+        api.url + path + "/preview",
+        json={
+            "policy": {"mode": "redact_before_storage", "fields": ["body"]},
+            "sample": sample,
+        },
+        timeout=30,
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["code"] == "privacy_synchronous_ingestion_required"
+    assert not api.get(path)["configured"]
+
+
+@pytest.mark.parametrize("shape", ["object", "array"])
+def test_privacy_wide_json_preview_backfill_and_new_writes(stateful_api, shape):
+    api = stateful_api
+    table = "privacy_wide_" + uuid4().hex[:8]
+    api.create_table(table)
+    wide = (
+        {f"k{i}": i for i in range(10000)} if shape == "object" else list(range(20000))
+    )
+    exact = 9007199254740993
+    source = {"wide": wide, "exact": exact}
+    api.batch_write(table, inserts={"doc": source}, sync_level="full_text")
+    path = f"/tables/{table}/privacy"
+    policy = {"mode": "redact_for_search_and_ai", "fields": ["absent"]}
+    preview = api.post(
+        path + "/preview", {"policy": policy, "sample": {"keys": ["doc"]}}
+    )
+    field = preview["documents"][0]["fields"][0]
+    assert field["text"] == "" and field["findings"] == []
+    assert field["receipt"]["state"] == "inspected"
+    saved = api.put(path, policy)
+    assert saved["policy_version"] == preview["policy_version"]
+    assert wait_until(
+        lambda: api.get(path + "/scans/" + saved["scan_id"])["phase"] == "succeeded",
+        timeout_s=90,
+        interval_s=0.2,
+    ), (api.get(path), api.debug_logs()[-6000:])
+    assert api.get(path)["coverage"]["current"] == 1
+    assert api.get(path)["coverage"]["failed"] == 0
+    assert api.get(f"/tables/{table}/documents/doc") == source
+    source["exact"] += 1
+    api.batch_write(table, inserts={"doc": source}, sync_level="write")
+
+    def updated():
+        result = api.s.get(api.url + f"/tables/{table}/documents/doc", timeout=30)
+        if result.status_code in (404, 409, 503):
+            return None
+        assert result.status_code == 200, result.text
+        return result.json() if result.json().get("exact") == source["exact"] else None
+
+    assert wait_until(updated, timeout_s=90, interval_s=0.2) == source, (
+        api.debug_logs()[-6000:]
+    )

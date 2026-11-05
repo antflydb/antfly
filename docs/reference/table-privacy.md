@@ -3,8 +3,10 @@
 Privacy inspects selected string fields for configured entity categories. A
 policy can report findings (`monitor`) or redact the documents consumed by
 search and AI (`redact_for_search_and_ai`). Originals remain stored. The
-`redact_before_storage` mode returns a typed unsupported response until a
-synchronous ingestion implementation is available. Policies, previews, and rescans
+`redact_before_storage` mode returns HTTP 422
+(`privacy_synchronous_ingestion_required`) on preview and policy installation,
+before sampling or provider execution, until synchronous ingestion is available.
+Policies, previews, and rescans
 require document storage without an external base source; unsupported storage
 returns `PrivacyRelationalStorageUnsupported` before inspection or mutation.
 

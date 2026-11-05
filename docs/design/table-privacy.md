@@ -445,7 +445,54 @@ rather than serializing/reparsing full descriptions for every field. Memory
 planning reserves the largest physical field batch even for one document and
 releases evicted planning candidates instead of retaining the whole input history.
 
+Source preparation validates complete JSON with the shared streaming validator,
+including duplicate keys in unselected nested values, and decodes only selected
+literal field names. Planning and execution account for container structure as
+well as encoded bytes: compact, wide maps and arrays must not exhaust a budget
+sized only from their small wire representation. The source structural allowance
+uses the largest document in a cohort, while retained selected strings and results
+remain charged across the cohort. Composition preserves exact numeric lexemes.
+
+Protected search hydration releases source/receipt validation scratch after each
+hit. When a supported positive field selection is available, only its sanitized
+output survives that row. Delayed embedded SQL readers own a stable prepared
+privacy binding for their query read lease; releasing a result page does not
+reparse or copy the policy. Each row still checks its source, artifact and
+publication against the pinned transaction. Preview rejects unsupported
+`redact_before_storage` before provider resolution or sample lookup, including
+empty samples, using the same typed error as policy installation.
+
 ## Validation
+
+### Wide JSON and protected reader lifetimes (2026-11-04)
+
+- Fetched main; the branch already contains
+  `616117cc78ba29dcd6c0212abd78ac076201ee3f` and needs no additional merge.
+- Integrated build: 106/106 steps, 62 API/metadata tests, 168 native
+  privacy/storage checks and both ABI checks pass without leaks. New cases
+  exercise wide maps/arrays and deep containers in one/16-document cohorts,
+  capability preflight, exact integers, escaped/literal selected field names,
+  Unicode, nested duplicate rejection, and allocation ownership.
+- Real-store protected hydration peaks at 4,712,210 allocated bytes for one
+  128 KiB document and 4,715,173 bytes for twenty, selecting one small field.
+  The deterministic regression also enforces an 8 MiB ceiling. The SQL reader
+  retains one 128 KiB-description policy binding across 32 row/page cycles;
+  the remaining row budget cannot accommodate another policy copy.
+- Scoped retry, change-journal and enrichment replay checks pass all 11 cases
+  across 58 build steps.
+- The pinned PII model's two-field long-document HTTP case passes with Metal
+  required (24.49 s), covering preview, backfill, findings and serving. Model
+  weights and CUDA kernels are unchanged; CUDA qualification was not repeated.
+- All three original HTTP reproducers pass (42.65 s): the 10,000-property
+  preview, protective backfill, and unsupported preview with a real document.
+- Repeating the reviewed 20-hit/1 MiB-padding workload reduces sampled
+  incremental RSS from 224.8 MiB to 85.4 MiB; the final monitor control uses
+  81.0 MiB. The response remains approximately 1.3 KiB. Protected query latency
+  is essentially unchanged (1.034 s reviewed, 1.036 s final); this measures
+  Debug serving memory, not model inference or production throughput.
+- Formatting, license headers and the Apache boundary check pass (2,407 files).
+- Qualified server binary SHA-256:
+  `a7cbdc91aa3588868686923ba61ab4486e3406efb7c76d0c5e5c6aa1f09c6048`.
 
 ### Restore, invocation memory and prepared reads (2026-11-04)
 

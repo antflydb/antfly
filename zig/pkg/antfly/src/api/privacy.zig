@@ -557,6 +557,7 @@ fn preview(server: anytype, a: A, table: []const u8, body: []const u8, request: 
     defer arena.deinit();
     const scratch = arena.allocator();
     const input = try std.json.parseFromSlice(Preview, scratch, body, .{});
+    if (input.value.policy.mode == .redact_before_storage) return error.PrivacySynchronousIngestionRequired;
     try input.value.policy.validate();
     const version = try scratch.dupe(u8, &(try input.value.policy.identity(scratch)));
     const producer = try projection.resolve(scratch, input.value.policy, true);
