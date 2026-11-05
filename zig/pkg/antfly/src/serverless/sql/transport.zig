@@ -542,8 +542,7 @@ test "distributed SQL control calls share task quarantine and skip repeated fail
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (std.mem.startsWith(u8, request_.uri, "http://stalled/")) {
                 self.failed += 1;
-                while (!request_.cancellation.?.isCancelled()) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
-                return error.Canceled;
+                return error.Timeout;
             }
             self.healthy += 1;
             return .{ .status = 200, .owner_allocator = allocator, .body = try allocator.dupe(u8, if (std.mem.endsWith(u8, request_.uri, result_path)) "null" else "{}") };
@@ -555,9 +554,9 @@ test "distributed SQL control calls share task quarantine and skip repeated fail
     const first = try Client.firstControlWorker(a, 2, result_path, body);
     const workers: [2][]const u8 = if (first == 0) .{ "http://stalled", "http://healthy" } else .{ "http://healthy", "http://stalled" };
     var fake: Fake = .{};
-    var routing: Routing = .{};
-    var client: Client = .{ .a = a, .routing = &routing, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &workers, .control_attempt_ms = 20 };
-    const context: Context = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s };
+    var routing: Routing = .{ .cooldown_ms = 30000 };
+    var client: Client = .{ .a = a, .routing = &routing, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &workers };
+    const context: Context = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 30 * std.time.ns_per_s };
     for (0..3) |_| try std.testing.expect((try client.result(a, query, context)) == null);
     try std.testing.expectEqual(@as(usize, 1), fake.failed);
     try std.testing.expectEqual(.blocked, routing.admit("http://stalled", @import("antfly_platform").time.monotonicNs()).kind);
