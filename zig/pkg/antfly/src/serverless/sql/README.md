@@ -55,7 +55,10 @@ the discovery cursor and remain queued until complete. Coordinator requeues do n
 self-signal; notification overflow and process loss fall back to durable
 round-robin discovery. Embeddings wire `Driver.notification()` into their
 `Service.notification` when they use the native recovery driver. Maintenance
-pools collect expired execution records and exchange objects. API gateways never execute worker tasks.
+pools collect expired execution records, discovery hints, and exchange objects
+with an independent 64-object page per namespace. Each pass returns per-lane
+continuation information; healthy lanes are attempted even when a sibling fails.
+API gateways never execute worker tasks.
 
 Native coordinator turns enqueue task tickets without waiting for task RPCs.
 A fixed 1,024-ticket queue includes in-flight tickets for deduplication and

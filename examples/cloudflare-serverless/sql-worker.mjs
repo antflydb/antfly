@@ -14,7 +14,7 @@
 // limitations under the License.
 
 import {DurableObject} from 'cloudflare:workers';
-import {SQLControl,authenticateSQL,boundedSQLBody,consumeSQL,locatorName} from './sql-control.mjs';
+import {SQLControl,authenticateSQL,boundedSQLBody,consumeSQL,locatorName,scheduleSQLMaintenance} from './sql-control.mjs';
 import {runSQL} from './sql-kernel.mjs';
 import {IngressBudget} from './ingress-budget.mjs';
 const ingress=new IngressBudget(2*1024*1024);
@@ -24,6 +24,7 @@ export class SQLCoordinator extends DurableObject {
  async kick(locator){return this.control.kick(locator);}
  async advance(locator){return this.control.advance(locator);}
  async recover(){return this.control.recover();}
+ async collect(){return this.control.collect();}
  async alarm(){return this.control.alarm();}
 }
 const paths=new Map([
@@ -61,13 +62,6 @@ export default {
  },
  async queue(batch,env){await consumeSQL(batch,env,runSQL);},
  async scheduled(_controller,env,ctx){
-  ctx.waitUntil((async()=>{
-   // Start/resume discovery; durable alarms drain its bounded pages between cron ticks.
-   await env.SQL_COORDINATORS.getByName('discovery').recover();
-   for(let turn=0;turn<4;turn++){
-    const result=await runSQL(env,{op:'sql_collect',tenant:Array(64).fill(97),owner:crypto.randomUUID()});
-    if(result.deleted<128)break;
-   }
-  })());
+  scheduleSQLMaintenance(env,ctx);
  },
 };

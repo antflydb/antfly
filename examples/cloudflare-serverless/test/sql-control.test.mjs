@@ -16,7 +16,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {createHmac,createHash} from 'node:crypto';
-import {SQLControl,authenticateSQL,consumeSQL,locatorName} from '../sql-control.mjs';
+import {SQLControl,authenticateSQL,consumeSQL,locatorName,scheduleSQLMaintenance} from '../sql-control.mjs';
 import {Bucket} from './object-fixture.mjs';
 const digest=c=>Array(64).fill(c.charCodeAt(0));
 const locator={tenant:digest('a'),query:{id:digest('b'),expires_ms:1000000}};
@@ -203,4 +203,124 @@ test('SQL discovery validates compact records and overlaps bounded reads without
  assert.deepEqual(await control.recover(),{recovered:12});
  assert.equal(kicks.length,24);assert.equal(planReads,0);assert.equal(maximum,4);assert.equal(active,0);
  for(const kick of kicks)assert.equal(kick.name,locatorName(kick.value));
+});
+
+
+test('SQL collector drains a single-lane backlog through durable alarms across eviction',async()=>{
+ const storage=new Storage();let now=100000,calls=0,remaining=1000;
+ const run=async(_env,input)=>{
+  assert.equal(input.op,'sql_collect');calls++;
+  assert.ok(storage.alarm!==null,'collection must arm recovery before external I/O');
+  const deleted=Math.min(64,remaining);remaining-=deleted;
+  return{deleted,more:remaining>0,lanes:{state:{deleted,more:remaining>0},discovery:{deleted:0,more:false},exchange:{deleted:0,more:false}}};
+ };
+ let control=new SQLControl({storage},{},run,{now:()=>now});
+ const first=await control.collect();
+ assert.equal(first.deleted,64);assert.equal(first.more,true);assert.equal(remaining,936);
+ while(storage.alarm!==null){
+  now=storage.alarm;
+  control=new SQLControl({storage},{},run,{now:()=>now});
+  await storage.fire(control);
+  assert.ok(calls<=16,'collector must stop when the last nontruncated page drains');
+ }
+ assert.equal(remaining,0);assert.equal(calls,16);
+ assert.equal(await storage.get('collection'),true);
+});
+
+test('SQL collector preserves bounded continuation on every alarm metadata failure',async()=>{
+ for(const method of ['getAlarm','setAlarm','get','put','delete','deleteAlarm']){
+  class FaultStorage extends Storage{
+   failure=null;
+   check(name){if(this.failure===name){this.failure=null;throw Error('injected '+name);}}
+   async getAlarm(){this.check('getAlarm');return super.getAlarm();}
+   async setAlarm(time){this.check('setAlarm');return super.setAlarm(time);}
+   async get(key){if(key==='collection')this.check('get');return super.get(key);}
+   async put(key,value){this.check('put');return super.put(key,value);}
+   async delete(key){this.check('delete');return super.delete(key);}
+   async deleteAlarm(){this.check('deleteAlarm');return super.deleteAlarm();}
+  }
+  const storage=new FaultStorage();let now=100000,calls=0;
+  const run=async()=>({deleted:++calls===1?64:0,more:calls===1});
+  let control=new SQLControl({storage},{},run,{now:()=>now});
+  await control.collect();storage.failure=method;now=storage.alarm;
+  control=new SQLControl({storage},{},run,{now:()=>now});
+  await assert.rejects(storage.fire(control),/injected/);
+  assert.notEqual(storage.alarm,null,method+' suppressed recovery');
+  now=storage.alarm;control=new SQLControl({storage},{},run,{now:()=>now});
+  await storage.fire(control);
+  assert.equal(storage.alarm,null,method+' did not retire after recovery');
+ }
+});
+
+test('SQL collector persists failure backoff and does not overlap racing cron nudges',async()=>{
+ const storage=new Storage();let now=100000,calls=0,failing=true;
+ const run=async()=>{calls++;if(failing)throw Error('provider unavailable');return{deleted:0,more:false};};
+ let control=new SQLControl({storage},{},run,{now:()=>now});
+ for(let attempt=0;attempt<3;attempt++){
+  const start=now;
+  await assert.rejects(control.collect(),/provider unavailable/);
+  assert.equal(storage.alarm,start+1000*2**attempt);
+  const deferred=new SQLControl({storage},{},run,{now:()=>now});
+  assert.equal((await deferred.collect()).deferred,true);
+  assert.equal(calls,attempt+1,'a nudge/eviction bypassed durable failure backoff');
+  now=storage.alarm;control=new SQLControl({storage},{},run,{now:()=>now});
+ }
+ failing=false;await storage.fire(control);assert.equal(storage.alarm,null);
+ assert.equal(await storage.get('gc_failures'),undefined);
+ let entered,release;
+ const started=new Promise(resolve=>entered=resolve),gate=new Promise(resolve=>release=resolve);
+ let active=0,peak=0;
+ control=new SQLControl({storage},{},async()=>{
+  active++;peak=Math.max(peak,active);entered();await gate;active--;
+  return{deleted:0,more:false};
+ },{now:()=>now});
+ const first=control.collect();await started;
+ assert.equal((await control.collect()).more,true);
+ release();assert.equal((await first).more,true,'a racing nudge lost its followup');
+ assert.equal(peak,1);assert.notEqual(storage.alarm,null);
+ now=storage.alarm;
+ const resumed=new SQLControl({storage},{},async()=>({deleted:0,more:false}),{now:()=>now});
+ await storage.fire(resumed);assert.equal(storage.alarm,null);
+});
+
+test('SQL collector supports old kernel counts and stops on an explicit drained page',async()=>{
+ const storage=new Storage();let now=100000,calls=0;
+ const run=async()=>({deleted:++calls===1?64:0});
+ let control=new SQLControl({storage},{},run,{now:()=>now});
+ assert.equal((await control.collect()).more,true);
+ now=storage.alarm;await storage.fire(control);assert.equal(storage.alarm,null);
+ control=new SQLControl({storage},{},async()=>({deleted:64,more:false}),{now:()=>now});
+ assert.equal((await control.collect()).more,false);assert.equal(storage.alarm,null);
+});
+
+test('SQL cron starts collection independently of failing or blocked discovery',async()=>{
+ const jobs=[];let collected=0,release;
+ const gate=new Promise(resolve=>release=resolve);
+ const env={SQL_COORDINATORS:{getByName:name=>name==='discovery'?{recover:()=>gate}:{collect:async()=>{collected++;}}}};
+ scheduleSQLMaintenance(env,{waitUntil:job=>jobs.push(job)});
+ await jobs[1];assert.equal(collected,1);
+ release();await Promise.all(jobs);
+ jobs.length=0;
+ env.SQL_COORDINATORS.getByName=name=>{
+  if(name==='discovery')throw Error('discovery unavailable');
+  return{collect:async()=>{collected++;}};
+ };
+ scheduleSQLMaintenance(env,{waitUntil:job=>jobs.push(job)});
+ const results=await Promise.allSettled(jobs);
+ assert.equal(results[0].status,'rejected');assert.equal(results[1].status,'fulfilled');
+ assert.equal(collected,2);
+});
+
+
+test('SQL collector recovery alarms do not keep a slow empty collector alive',async()=>{
+ const storage=new Storage();let now=100000,entered,release,calls=0;
+ const started=new Promise(resolve=>entered=resolve),gate=new Promise(resolve=>release=resolve);
+ const control=new SQLControl({storage},{},async()=>{
+  calls++;entered();await gate;return{deleted:0,more:false};
+ },{now:()=>now});
+ const pass=control.collect();await started;
+ now=storage.alarm;await storage.fire(control);
+ assert.equal(calls,1,'the recovery alarm overlapped external cleanup');
+ release();assert.equal((await pass).more,false);
+ assert.equal(storage.alarm,null,'an overlapping recovery alarm caused an idle busy loop');
 });

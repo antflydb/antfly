@@ -152,7 +152,8 @@ fn executeIn(a: A, client: storage.Client, io: std.Io, context: Context, raw: []
         },
         .sql_collect => blk: {
             const collector: @import("collector.zig").Collector = .{ .state_store = service.state_store, .exchange_store = service.exchange_store };
-            break :blk std.json.Stringify.valueAlloc(a, .{ .deleted = try collector.run(a, context) }, .{});
+            const progress = try collector.runProgress(a, context);
+            break :blk std.json.Stringify.valueAlloc(a, .{ .deleted = progress.deleted(), .more = progress.more(), .lanes = progress }, .{});
         },
     };
 }

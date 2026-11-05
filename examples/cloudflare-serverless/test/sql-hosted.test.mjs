@@ -223,3 +223,34 @@ test('WASM retry admission survives plan failures without spending epochs during
  assert.equal(failed.epoch,2);assert.equal(failed.failure,'TaskRetryBudgetExceeded');
  assert.equal(failed.task_attempt_limit,undefined);assert.equal(planReads,1);assert.equal(admissionReads,2);
 });
+
+test('WASM collection independently drains thousand-object expiry lanes and preserves live/source data',async()=>{
+ const fixture=JSON.parse(await readFile(new URL('../dist/sql-fixture.json',import.meta.url)));
+ const kinds=['state','discovery','exchange'];
+ for(const kind of kinds){
+  const buckets={source:new Bucket(),execution:new Bucket()};
+  const state=fixture.config.state.prefix,exchange=fixture.config.exchange.prefix;
+  const prefix=kind==='exchange'?`${exchange}/sql-exchange/`:kind==='discovery'?`${state}/sql-query-expiry/`:`${state}/sql-execution-v2/`;
+  for(let i=0;i<1000;i++){
+   const id=i.toString(16).padStart(64,'0');
+   await buckets.execution.put(prefix+'00000000000000000001/'+id+(kind==='discovery'?'.json':'/expired.json'),'{}');
+  }
+  const live=prefix+String(Date.now()+3600000).padStart(20,'0')+'/'+'b'.repeat(64)+(kind==='discovery'?'.json':'/live.json');
+  await buckets.execution.put(live,'live');await buckets.source.put('artifacts/keep','source');
+  const transport=createR2Transport(buckets),host=await instantiateHost(module,transport);
+  let total=0,turns=0,more;
+  do{
+   const result=await host.request({config:fixture.config,tenant:fixture.tenant,owner:'gc',op:'sql_collect'});
+   assert.equal(result.deleted,result.lanes[kind].deleted);
+   assert.ok(result.deleted>0&&result.deleted<=64);
+   for(const other of kinds)if(other!==kind)assert.deepEqual(result.lanes[other],{deleted:0,more:false});
+   total+=result.deleted;more=result.more;turns++;
+   assert.ok(turns<=16,'a full single lane must not terminate or spin indefinitely');
+  }while(more);
+  assert.equal(total,1000);assert.equal(turns,16);
+  assert.equal(buckets.execution.objects.size,1);assert.ok(buckets.execution.objects.has(live));
+  assert.equal(buckets.source.objects.size,1);
+  const idle=await host.request({config:fixture.config,tenant:fixture.tenant,owner:'gc',op:'sql_collect'});
+  assert.equal(idle.deleted,0);assert.equal(idle.more,false);
+ }
+});

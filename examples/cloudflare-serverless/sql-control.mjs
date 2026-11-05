@@ -64,7 +64,7 @@ export async function boundedSQLBody(request,reservation){
 }
 const retired=error=>/SqlQueryExpired|SqlExecutionFenced|SqlExecutionNotFound|SqlExecutionFailed/.test(String(error));
 export class SQLControl {
- constructor(ctx,env,run,{now=()=>Date.now(),owner=crypto.randomUUID()}={}){this.ctx=ctx;this.env=env;this.run=run;this.now=now;this.owner=owner;this.active=false;this.updates=Promise.resolve();}
+ constructor(ctx,env,run,{now=()=>Date.now(),owner=crypto.randomUUID()}={}){this.ctx=ctx;this.env=env;this.run=run;this.now=now;this.owner=owner;this.active=false;this.collectAgain=false;this.updates=Promise.resolve();}
  // Serialize only storage metadata, never a turn or external network I/O.
  update(action){const next=this.updates.then(action);this.updates=next.catch(()=>{});return next;}
  async schedule(time){return this.update(async()=>{const previous=await this.ctx.storage.getAlarm();if(previous===null||time<previous)await this.ctx.storage.setAlarm(time);});}
@@ -100,7 +100,52 @@ export class SQLControl {
   // The runtime consumes the firing alarm. Deleting it here suppresses its
   // automatic retries. Arm recovery before even the first durable-state read.
   await this.schedule(this.now()+2000);
-  if(await this.ctx.storage.get('discovery'))await this.recover();else await this.advance();
+  if(await this.ctx.storage.get('collection'))await this.collect(true);
+  else if(await this.ctx.storage.get('discovery'))await this.recover();else await this.advance();
+ }
+ // The named collector DO shares the deployed class/binding, but owns separate
+ // durable state, alarms, and an active guard from query/discovery objects.
+ async collect(fromAlarm=false){
+  // A recovery alarm overlapping its own slow pass is not new work. Only an
+  // external cron/RPC nudge requests a followup after a drained result.
+  if(this.active){if(!fromAlarm)this.collectAgain=true;await this.schedule(this.now()+1000);return{deleted:0,more:true};}
+  this.active=true;this.collectAgain=false;
+  try{
+   await this.ctx.storage.put('collection',true);
+   // Retain a continuation before kernel/R2 I/O, including on eviction/failure.
+   await this.schedule(this.now()+2000);
+   const notBefore=await this.ctx.storage.get('gc_not_before')??0;
+   if(notBefore>this.now()){
+    await this.update(()=>this.ctx.storage.setAlarm(notBefore));
+    return{deleted:0,more:true,deferred:true};
+   }
+   const result=await this.run(this.env,{op:'sql_collect',tenant:Array(64).fill(97),owner:this.owner});
+   if(!Number.isSafeInteger(result?.deleted)||result.deleted<0||result.more!==undefined&&typeof result.more!=='boolean')throw Error('InvalidSqlCollectionResult');
+   // Compatibility with a pre-progress kernel is conservative: a nonempty
+   // pass may have filled only one of its independently bounded lanes.
+   const more=(result.more??result.deleted>0)||this.collectAgain;
+   await this.update(async()=>{
+    await this.ctx.storage.delete('gc_failures');
+    await this.ctx.storage.delete('gc_not_before');
+    if(!more)await this.ctx.storage.deleteAlarm();
+   });
+   if(more)await this.schedule(this.now()+1);
+   return{...result,more};
+  }catch(error){
+   // Backoff is durable: a cron nudge or eviction cannot turn a failing store
+   // into a hot loop. If metadata itself fails, the prearmed alarm/platform
+   // retry or the next cron repairs it; never delete a firing alarm on failure.
+   try{await this.update(async()=>{
+    const old=await this.ctx.storage.get('gc_failures');
+    const failures=Math.min(6,(Number.isSafeInteger(old)&&old>=0?old:0)+1);
+    const next=this.now()+Math.min(30000,1000*2**(failures-1));
+    await this.ctx.storage.put('collection',true);
+    await this.ctx.storage.put('gc_failures',failures);
+    await this.ctx.storage.put('gc_not_before',next);
+    await this.ctx.storage.setAlarm(next);
+   });}catch{}
+   throw error;
+  }finally{this.active=false;}
  }
  async recover(){
   if(this.active){await this.schedule(this.now()+1000);return{recovered:0};}
@@ -173,4 +218,11 @@ export async function consumeSQL(batch,env,run,{now=()=>Date.now()}={}){
    }else message.retry({delaySeconds:Math.min(120,Math.max(1,Math.ceil((result.until_ms+30000-now())/1000)))});
   }catch(error){if(retired(error))message.ack();else message.retry({delaySeconds:2});}
  }
+}
+
+// Separate waitUntil jobs prevent discovery failures or slow pages from
+// suppressing collector admission. Each owner persists its own continuation.
+export function scheduleSQLMaintenance(env,ctx){
+ ctx.waitUntil(Promise.resolve().then(()=>env.SQL_COORDINATORS.getByName('discovery').recover()));
+ ctx.waitUntil(Promise.resolve().then(()=>env.SQL_COORDINATORS.getByName('collector').collect()));
 }

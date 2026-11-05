@@ -123,8 +123,12 @@ remote gateway continue to drive their own coordinator.
 Cloudflare uses the same execution contracts through WASM and R2. A Durable
 Object owns coordinator turns and arms recovery before execution or Queue
 submission. Queue consumers acknowledge accepted terminal task records and wake
-orchestration. Durable discovery continuations, alarms, and periodic collection
-repair missed delivery and process eviction. The checked-in Wrangler profile
+orchestration. Separate named discovery and collector objects persist bounded
+alarm continuations; cron starts them independently as a repair backstop. The
+collector drains each expiry lane independently, preserves failure backoff across
+eviction, and stops once only live objects remain. These continuations repair
+missed delivery and process eviction without making cron the cleanup throughput
+limit. The checked-in Wrangler profile
 binds the coordinator class, task Queue, source/execution R2 buckets, and cron.
 
 ## Resource admission

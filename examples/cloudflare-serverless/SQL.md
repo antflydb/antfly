@@ -41,7 +41,10 @@ stable while retained queries remain live.
   retry active leases and wake the coordinator after completion.
 - A bounded round-robin cron page repairs a lost submission-to-alarm handoff.
   It authenticates stored plan bytes against their SHA-256 identity and isolates
-  failed queries. The same cron performs bounded expiry cleanup.
+  failed queries. Cron independently starts a named collector Durable Object;
+  discovery failures cannot suppress cleanup admission. The existing
+  `SQL_COORDINATORS` binding hosts both isolated owners, so no additional binding
+  or class migration is required.
 - Version-2 query references include the full content digest and expiry. Every
   state object lives under an expiry-first namespace. Delayed PUTs remain
   discoverable after discovery-marker cleanup. Expired namespaces cannot become
@@ -171,3 +174,20 @@ future alarms. Discovery reads at most four queries concurrently from each
 16-query page and validates compact v2 record identity, expiry, status and tenant
 before waking a coordinator. Only legacy unscoped records require downloading
 and authenticating the full immutable plan.
+
+
+Execution cleanup reports separate `deleted`/`more` results for execution state,
+discovery hints, and exchange objects. Each invocation lists at most 64 objects
+per lane and deletes at most 192 expired objects total. A truncated, fully
+expired page schedules another collector alarm even when the other lanes are
+empty. Fully drained or live-only pages stop the continuation. Live execution
+objects and source retention namespaces are never deleted by this collector.
+
+The named `collector` object persists its mode and arms recovery before R2 I/O.
+Its alarm survives eviction; successful backlog pages continue promptly without
+waiting for another minute cron. Provider failures retain durable exponential
+backoff from one through 30 seconds, which subsequent nudges and eviction cannot
+bypass. Healthy cleanup lanes are still attempted when a sibling lane fails.
+The cron remains a repair backstop for late uploads and initially unavailable
+metadata storage. Older kernels that return only a deletion count continue
+conservatively until an empty pass, preserving rolling bundle compatibility.

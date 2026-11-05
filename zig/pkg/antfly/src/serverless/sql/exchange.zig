@@ -70,6 +70,9 @@ fn hash(bytes: []const u8) [32]u8 {
     std.crypto.hash.sha2.Sha256.hash(bytes, &result, .{});
     return result;
 }
+/// One expiry lane's bounded cleanup result. A truncated, fully expired page
+/// needs another pass even when every other lane is empty.
+pub const Collection = struct { deleted: usize = 0, more: bool = false };
 pub const Store = struct {
     client: storage.Client,
     bucket: []const u8,
@@ -226,6 +229,9 @@ pub const Store = struct {
         return .{ .store = self, .ref = ref, .blocks = blocks, .rows = rows };
     }
     pub fn collect(self: Store, a: A, now_ms: u64, max_keys: u32) !usize {
+        return (try self.collectPage(a, now_ms, max_keys)).deleted;
+    }
+    pub fn collectPage(self: Store, a: A, now_ms: u64, max_keys: u32) !Collection {
         if (max_keys == 0 or max_keys > 256) return error.InvalidSqlExchange;
         const prefix = try std.fmt.allocPrint(a, "{s}/sql-exchange/", .{self.prefix});
         defer a.free(prefix);
@@ -243,7 +249,7 @@ pub const Store = struct {
             try client.deleteObject(self.bucket, entry.key, .{ .cancellation = catalog.types.contextCancellation(&self.context) });
             deleted += 1;
         }
-        return deleted;
+        return .{ .deleted = deleted, .more = deleted != 0 and deleted == listed.entries.len and listed.next_continuation_token != null };
     }
 };
 

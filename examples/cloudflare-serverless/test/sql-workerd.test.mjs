@@ -61,3 +61,50 @@ test('workerd coordinates retained lake SQL through alarms, Queues and R2 across
   assert.equal(entries.objects.length,0,'cancellation before the first turn must not dispatch tasks');
  }finally{await mf.dispose();await rm(persist,{recursive:true,force:true});}
 });
+
+test('workerd drains single-lane GC backlogs through alarms after restart and cron',{timeout:120000},async()=>{
+ const state=fileURLToPath(new URL('../dist/sql-gc-workerd-state/',import.meta.url));
+ await rm(state,{recursive:true,force:true});
+ const wasm=(await readdir(output)).filter(name=>name.endsWith('.wasm'));
+ const harness=`import worker,{SQLCoordinator} from './sql-worker.js';
+ export {SQLCoordinator};
+ export default {async fetch(request,env,ctx){
+  if(new URL(request.url).pathname==='/collect')return Response.json(await env.SQL_COORDINATORS.getByName('collector').collect());
+  await worker.scheduled({},env,ctx);return new Response('scheduled');
+ }};`;
+ const options={modulesRoot:output,modules:[{type:'ESModule',path:join(output,'sql-gc-harness.mjs'),contents:harness},{type:'ESModule',path:join(output,'sql-worker.js')},...wasm.map(name=>({type:'CompiledWasm',path:join(output,name)}))],compatibilityDate:'2026-10-19',bindings:{SQL_SERVICE_SECRET:secret,SQL_SERVICE_ISSUER:'sql:workerd',SQL_CONFIG:JSON.stringify(fixture.config),SQL_BUCKET_BINDINGS:JSON.stringify({execution:'SQL_EXECUTION',source:'SQL_SOURCE'})},resourcePersistencePath:join(state,'resources'),isolatedResourcePersistencePath:join(state,'isolated'),r2Buckets:['SQL_EXECUTION','SQL_SOURCE'],durableObjects:{SQL_COORDINATORS:{className:'SQLCoordinator',useSQLite:true}},queueProducers:{SQL_TASKS:'sql-tasks'},queueConsumers:{'sql-tasks':{maxBatchSize:1,maxBatchTimeout:0,maxRetries:10}}};
+ let mf=new Miniflare(convertV4MiniflareOptions(options));
+ const expiredState=`${fixture.config.state.prefix}/sql-execution-v2/00000000000000000001/`;
+ const expiredExchange=`${fixture.config.exchange.prefix}/sql-exchange/00000000000000000001/`;
+ const seed=async(bucket,prefix,count)=>{
+  for(let i=0;i<count;i++)await bucket.put(prefix+i.toString(16).padStart(64,'0')+'/expired.json','{}');
+ };
+ const drain=async(bucket,prefix)=>{
+  const deadline=Date.now()+60000;
+  while(Date.now()<deadline){
+   if((await bucket.list({prefix,limit:1})).objects.length===0)return;
+   await new Promise(resolve=>setTimeout(resolve,50));
+  }
+  assert.fail('persisted collector alarms did not drain '+prefix);
+ };
+ try{
+  let bucket=await mf.getR2Bucket('SQL_EXECUTION');
+  const source=await mf.getR2Bucket('SQL_SOURCE');
+  await source.put('artifacts/keep','source');
+  await seed(bucket,expiredState,1000);
+  const live=`${fixture.config.state.prefix}/sql-execution-v2/${String(Date.now()+3600000).padStart(20,'0')}/${'b'.repeat(64)}/query.json`;
+  await bucket.put(live,'live');
+  const first=await(await mf.dispatchFetch('https://sql/collect')).json();
+  assert.equal(first.deleted,64);assert.equal(first.more,true);
+  await mf.dispose();mf=new Miniflare(convertV4MiniflareOptions(options));
+  bucket=await mf.getR2Bucket('SQL_EXECUTION');
+  // No second kick: the persisted continuation must survive process restart.
+  await drain(bucket,expiredState);
+  assert.ok(await bucket.head(live));
+  assert.ok(await(await mf.getR2Bucket('SQL_SOURCE')).head('artifacts/keep'));
+  await seed(bucket,expiredExchange,129);
+  assert.equal((await mf.dispatchFetch('https://sql/schedule')).status,200);
+  await drain(bucket,expiredExchange);
+  assert.ok(await bucket.head(live));
+ }finally{await mf.dispose();await rm(state,{recursive:true,force:true});}
+});
