@@ -1907,8 +1907,11 @@ does not become invisible through multiplication or quantization underflow.
 
 Structure-backed replacements resolve container-scoped MCIDs through a lazy
 ParentTree number-tree index. Parsed metadata and validated number-tree nodes
-are cached per Reader; render forks own independent caches. Container arrays,
-ancestor decisions, stream container keys, and decoded owner text are reused
+are cached per Reader; render forks own independent caches.
+Changing either decode limit releases the structure metadata cache; an identical
+limit update preserves it. Subsequent lookups rebuild under the current limits,
+including recovery from a previously exhausted metadata allowance.
+Container arrays, ancestor decisions, stream container keys, and decoded owner text are reused
 within each page. Indirect MCID values in named properties and marked-content
 references use the same bounded, memoized resolver. Named property tables are
 sorted once per resource scope and searched in logarithmic time, without

@@ -4769,14 +4769,25 @@ pub const Reader = struct {
     /// must not mutate limits while a fork or decode is active.
     pub fn setDecodeLimits(self: *Reader, decode_limits: DecodeLimits) !void {
         try decode_limits.validate();
+        if (std.meta.eql(self.decode_limits, decode_limits)) return;
+        // Metadata may have been retained or rejected under the old stream,
+        // live-byte, or cumulative limits. Rebuild lazily under the new limits;
+        // unchanged limits retain the warm cache and its work accounting.
+        self.clearStructureMetadataCache();
         self.decode_limits = decode_limits;
     }
 
-    pub fn deinit(self: *Reader) void {
+    fn clearStructureMetadataCache(self: *Reader) void {
         if (self.structure_cache) |cache| {
             cache.document.deinit();
+            std.debug.assert(cache.shared_budget.live_bytes == @sizeOf(StructureMetadataCache));
             self.alloc.destroy(cache);
+            self.structure_cache = null;
         }
+    }
+
+    pub fn deinit(self: *Reader) void {
+        self.clearStructureMetadataCache();
         if (self.owns_document_metadata) {
             if (self.page_index) |pages| {
                 for (pages) |*page| page.deinit(self.alloc);
@@ -35114,6 +35125,63 @@ test "reader structure metadata is reused across extractions and isolated in ren
     try std.testing.expectEqualStrings(first, fork_text);
     try std.testing.expect(fork.structure_cache.? != parsed.structure_cache.?);
     try std.testing.expectEqual(retained, cache.budget.cumulative_growth_bytes);
+}
+
+test "reader decode limit changes reset structure metadata and unchanged limits retain it" {
+    const a = std.testing.allocator;
+    const label = try a.alloc(u8, 32 * 1024);
+    defer a.free(label);
+    @memset(label, 'X');
+    const element = try std.fmt.allocPrint(a, "/P 9 0 R /K 0 /ActualText ({s})", .{label});
+    defer a.free(element);
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "/Span /Tag BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC", .element = element });
+    defer a.free(sample);
+    const low_limits = DecodeLimits{ .max_decoded_stream_bytes = 64 * 1024, .max_working_set_bytes = 8 * 1024 };
+    const high_limits = DecodeLimits{ .max_decoded_stream_bytes = 64 * 1024, .max_working_set_bytes = 256 * 1024 };
+    var parsed = try Reader.initWithDecodeLimits(a, sample, low_limits);
+    defer parsed.deinit();
+    var low = try parsed.extractPageTextAnalysisAlloc(1);
+    defer low.deinit(a);
+    try std.testing.expectEqualStrings("SOURCE\n", low.text);
+    try std.testing.expect(low.diagnostics.structure_text_incomplete);
+
+    try parsed.setDecodeLimits(high_limits);
+    try std.testing.expect(parsed.structure_cache == null);
+    var high = try parsed.extractPageTextAnalysisAlloc(1);
+    defer high.deinit(a);
+    try std.testing.expectEqualStrings(label, std.mem.trimEnd(u8, high.text, "\n"));
+    try std.testing.expect(!high.diagnostics.structure_text_incomplete);
+    const cache = parsed.structure_cache.?;
+    const retained = cache.budget.cumulative_growth_bytes;
+    try parsed.setDecodeLimits(high_limits);
+    try std.testing.expectEqual(cache, parsed.structure_cache.?);
+    const plain = try parsed.extractPageTextAlloc(1);
+    defer a.free(plain);
+    try std.testing.expectEqualStrings(high.text, plain);
+    try std.testing.expectEqual(retained, cache.budget.cumulative_growth_bytes);
+    try std.testing.expectError(error.InvalidPdfDecodeLimits, parsed.setDecodeLimits(.{ .max_working_set_bytes = 0 }));
+    try std.testing.expectEqual(cache, parsed.structure_cache.?);
+    try std.testing.expectEqual(high_limits, parsed.decode_limits);
+
+    // Lowering a limit releases retained metadata before a fresh lookup.
+    try parsed.setDecodeLimits(low_limits);
+    try std.testing.expect(parsed.structure_cache == null);
+    var lowered = try parsed.extractPageTextAnalysisAlloc(1);
+    defer lowered.deinit(a);
+    try std.testing.expectEqualStrings(low.text, lowered.text);
+    try std.testing.expect(lowered.diagnostics.structure_text_incomplete);
+    try std.testing.expectEqual(low_limits.max_working_set_bytes, parsed.structure_cache.?.shared_budget.max_live_bytes);
+    try std.testing.expect(parsed.structure_cache.?.shared_budget.live_bytes <= low_limits.max_working_set_bytes);
+    // Returned analyses own their replacement bytes independently of the cache.
+    try std.testing.expectEqualStrings(label, high.semantic_spans[0].text);
+
+    // A stream ceiling change must also discard previously decoded metadata.
+    try parsed.setDecodeLimits(high_limits);
+    const recovered = try parsed.extractPageTextAlloc(1);
+    defer a.free(recovered);
+    try std.testing.expectEqualStrings(high.text, recovered);
+    try parsed.setDecodeLimits(.{ .max_decoded_stream_bytes = 32 * 1024, .max_working_set_bytes = high_limits.max_working_set_bytes });
+    try std.testing.expect(parsed.structure_cache == null);
 }
 
 test "reader bounded metadata resolution keeps encryption registry mutations local" {
