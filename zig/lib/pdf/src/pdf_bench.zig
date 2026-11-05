@@ -269,7 +269,7 @@ fn dumpExtraction(alloc: std.mem.Allocator, path: []const u8, output_path: []con
 }
 
 fn dumpPageAnalysis(alloc: std.mem.Allocator, writer: *std.Io.Writer, page_num: usize, analysis: *const pdf.reader.PageTextAnalysis) !void {
-    const blocks = try pdf.text_structure.blocksFromRunsAlloc(alloc, analysis.text, analysis.runs);
+    const blocks = try pdf.text_structure.blocksFromAnalysisAlloc(alloc, analysis.text, analysis.runs, analysis.semantic_spans, .{});
     defer alloc.free(blocks);
     try writer.writeAll("{\"page\":");
     try std.json.Stringify.value(page_num, .{}, writer);
@@ -285,6 +285,8 @@ fn dumpPageAnalysis(alloc: std.mem.Allocator, writer: *std.Io.Writer, page_num: 
     try std.json.Stringify.value(analysis.has_unrendered_annotations, .{}, writer);
     try writer.writeAll(",\"blocks\":");
     try std.json.Stringify.value(blocks, .{}, writer);
+    try writer.writeAll(",\"semantic_spans\":");
+    try std.json.Stringify.value(analysis.semantic_spans, .{}, writer);
     try writer.writeAll(",\"runs\":[");
     for (analysis.runs, 0..) |run, index| {
         if (index > 0) try writer.writeByte(',');
@@ -292,6 +294,7 @@ fn dumpPageAnalysis(alloc: std.mem.Allocator, writer: *std.Io.Writer, page_num: 
         try std.json.Stringify.value(.{
             .text = run.text,
             .span = run.output_span,
+            .semantic_span_index = if (run.semantic_span_index == std.math.maxInt(usize)) null else @as(?usize, run.semantic_span_index),
             .raw_text = run.raw_text,
             .render_mode = run.render_mode,
             .fill_alpha = run.alpha,

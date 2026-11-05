@@ -1,5 +1,17 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 const std = @import("std");
 const reader = @import("reader.zig");
@@ -51,12 +63,17 @@ fn canJoin(text: []const u8, left: Block, right: Block, upright: bool) bool {
 /// Output order follows emitted spans rather than PDF paint order. Filtered or
 /// unaligned runs have no span and cannot leak back into the structural output.
 pub fn blocksFromRunsAlloc(alloc: std.mem.Allocator, text: []const u8, runs: []const reader.TextRun) ![]Block {
+    return blocksFromAnalysisAlloc(alloc, text, runs, &.{}, .{});
+}
+
+pub fn blocksFromAnalysisAlloc(alloc: std.mem.Allocator, text: []const u8, runs: []const reader.TextRun, spans: []const reader.SemanticTextSpan, cancellation: reader.CancellationProbe) ![]Block {
     var entries = std.ArrayList(Entry).empty;
     defer entries.deinit(alloc);
     for (runs, 0..) |run, index| {
+        if (index % 256 == 0) try cancellation.check();
+        if (spans.len > 0 and run.semantic_span_index != std.math.maxInt(usize)) continue;
         const span = run.output_span orelse continue;
         if (span.start >= span.end or span.end > text.len) continue;
-        if (std.mem.trim(u8, text[span.start..span.end], &std.ascii.whitespace).len == 0) continue;
         const start = std.math.cast(u32, span.start) orelse return error.Overflow;
         const end = std.math.cast(u32, span.end) orelse return error.Overflow;
         const box = run.bounds() orelse continue;
@@ -75,12 +92,41 @@ pub fn blocksFromRunsAlloc(alloc: std.mem.Allocator, text: []const u8, runs: []c
             .upright = axis > 0 and run.a / axis >= 0.984807753 and @abs(run.b) / axis <= 0.173648178,
         });
     }
+    for (spans, 0..) |span, index| {
+        if (index % 256 == 0) try cancellation.check();
+        const output = span.output_span orelse continue;
+        const box = span.output_bounds orelse continue;
+        if (output.start >= output.end or output.end > text.len) continue;
+        try entries.append(alloc, .{
+            .block = .{
+                .span = .{ std.math.cast(u32, output.start) orelse return error.Overflow, std.math.cast(u32, output.end) orelse return error.Overflow },
+                .bbox = .{ box.min_x, box.min_y, box.max_x, box.max_y },
+                .reading_order = 0,
+                .font_size = span.font_size,
+                .bold = span.bold,
+                .italic = span.italic,
+            },
+            .source_index = span.run_start,
+            .upright = if (span.entry_run) |run| runs[run].a > 0 and @abs(runs[run].b) < @abs(runs[run].a) * 0.176327 else false,
+        });
+    }
+    try cancellation.check();
     std.mem.sort(Entry, entries.items, {}, entryLess);
     var blocks = std.ArrayList(Block).empty;
     errdefer blocks.deinit(alloc);
     var previous_upright = false;
     var previous_span: [2]u32 = undefined;
-    for (entries.items) |entry| {
+    var checked_span: ?[2]u32 = null;
+    var has_content = false;
+    for (entries.items, 0..) |entry, index| {
+        if (index % 256 == 0) try cancellation.check();
+        // Text is inspected once per distinct emitted span, including legacy
+        // callers whose multiple glyph runs share the same output span.
+        if (checked_span == null or !std.mem.eql(u32, &checked_span.?, &entry.block.span)) {
+            checked_span = entry.block.span;
+            has_content = try spanHasContent(text[entry.block.span[0]..entry.block.span[1]], cancellation);
+        }
+        if (!has_content) continue;
         if (blocks.items.len > 0) {
             const previous = &blocks.items[blocks.items.len - 1];
             const same_span = previous_span[0] == entry.block.span[0] and previous_span[1] == entry.block.span[1];
@@ -109,6 +155,14 @@ pub fn blocksFromRunsAlloc(alloc: std.mem.Allocator, text: []const u8, runs: []c
         previous_span = entry.block.span;
     }
     return blocks.toOwnedSlice(alloc);
+}
+
+fn spanHasContent(text: []const u8, cancellation: reader.CancellationProbe) !bool {
+    for (text, 0..) |byte, index| {
+        if (index % 4096 == 0) try cancellation.check();
+        if (!std.ascii.isWhitespace(byte)) return true;
+    }
+    return false;
 }
 
 fn fixtureRun(text: []const u8, start: usize, end: usize, x: f64, y: f64) reader.TextRun {
@@ -196,4 +250,38 @@ test "native block grouping releases partial allocations" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "native block content scan is linear in shared semantic text and cancellable" {
+    const alloc = std.testing.allocator;
+    const text = try alloc.alloc(u8, 1_000_001);
+    defer alloc.free(text);
+    @memset(text, ' ');
+    text[text.len - 1] = 'X';
+    const runs = try alloc.alloc(reader.TextRun, 5000);
+    defer alloc.free(runs);
+    for (runs) |*run| run.* = fixtureRun("original glyph", 0, text.len, 10, 20);
+    const Probe = struct {
+        calls: usize = 0,
+        cancel_at: usize = std.math.maxInt(usize),
+        fn canceled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.calls >= self.cancel_at;
+        }
+    };
+    var probe = Probe{};
+    const blocks = try blocksFromAnalysisAlloc(alloc, text, runs, &.{}, .{ .context = &probe, .is_cancelled_fn = Probe.canceled });
+    defer alloc.free(blocks);
+    try std.testing.expectEqual(@as(usize, 1), blocks.len);
+    // 245 text checks + 40 run/entry checks, independent of run count * text length.
+    try std.testing.expect(probe.calls < 300);
+    probe = .{ .cancel_at = 50 };
+    try std.testing.expectError(error.Canceled, blocksFromAnalysisAlloc(alloc, text, runs, &.{}, .{ .context = &probe, .is_cancelled_fn = Probe.canceled }));
+    for (runs) |*run| run.semantic_span_index = 0;
+    const spans = [_]reader.SemanticTextSpan{.{ .text = text, .run_start = 0, .run_end = runs.len, .output_span = .{ .start = 0, .end = text.len }, .output_bounds = .{ .min_x = 10, .min_y = 18, .max_x = 50, .max_y = 28 } }};
+    const semantic_blocks = try blocksFromAnalysisAlloc(alloc, text, runs, &spans, .{});
+    defer alloc.free(semantic_blocks);
+    try std.testing.expectEqual(@as(usize, 1), semantic_blocks.len);
+    try std.testing.expectEqual([4]f64{ 10, 18, 50, 28 }, semantic_blocks[0].bbox);
 }

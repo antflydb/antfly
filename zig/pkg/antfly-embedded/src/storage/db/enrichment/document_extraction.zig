@@ -35,6 +35,11 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or bu
                 italic: ?bool = null,
             };
 
+            pub fn blocksFromAnalysisAlloc(alloc: Allocator, text: []const u8, runs: []const reader.TextRun, _: []const reader.SemanticTextSpan, cancellation: reader.CancellationProbe) ![]Block {
+                try cancellation.check();
+                return blocksFromRunsAlloc(alloc, text, runs);
+            }
+
             pub fn blocksFromRunsAlloc(alloc: Allocator, text: []const u8, runs: []const reader.TextRun) ![]Block {
                 var blocks = std.ArrayListUnmanaged(Block).empty;
                 defer blocks.deinit(alloc);
@@ -80,6 +85,9 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or bu
                 unsupported_ordering_runs: usize = 0,
                 source_run_count: usize = 0,
                 emitted_run_count: usize = 0,
+                outside_page_spans: usize = 0,
+                invisible_spans: usize = 0,
+                unpositioned_spans: usize = 0,
             };
 
             pub const DecodeLimits = struct {
@@ -186,16 +194,31 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or bu
                 ascent: f64 = 0,
                 descent: f64 = 0,
                 output_span: ?TextOutputSpan = null,
-                semantic_only: bool = false,
+                semantic_span_index: usize = std.math.maxInt(usize),
                 bold: ?bool = null,
                 italic: ?bool = null,
 
                 pub fn deinit(_: *TextRun, _: Allocator) void {}
             };
 
+            pub const SemanticTextSpan = struct {
+                text: []const u8,
+                run_start: usize,
+                run_end: usize,
+                output_span: ?TextOutputSpan = null,
+                output_bounds: ?PageBox = null,
+                font_size: ?f64 = null,
+                bold: ?bool = null,
+                italic: ?bool = null,
+                pub fn deinit(self: *@This(), alloc: Allocator) void {
+                    alloc.free(self.text);
+                }
+            };
+
             pub const PageTextAnalysis = struct {
                 text: []u8,
                 runs: []TextRun,
+                semantic_spans: []SemanticTextSpan = &.{},
                 outline_fallback: bool = false,
                 has_nontext_visual: bool = false,
                 has_unrendered_annotations: bool = false,
@@ -204,6 +227,8 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or bu
                 pub fn deinit(self: *PageTextAnalysis, alloc: Allocator) void {
                     alloc.free(self.text);
                     alloc.free(self.runs);
+                    for (self.semantic_spans) |*span| span.deinit(alloc);
+                    if (self.semantic_spans.len > 0) alloc.free(self.semantic_spans);
                 }
             };
         };
@@ -843,6 +868,9 @@ pub const NativeTextDiagnostics = struct {
     unsupported_ordering_runs: usize = 0,
     source_run_count: usize = 0,
     emitted_run_count: usize = 0,
+    outside_page_spans: usize = 0,
+    invisible_spans: usize = 0,
+    unpositioned_spans: usize = 0,
     outline_fallback: bool = false,
     has_nontext_visual: bool = false,
     has_unrendered_annotations: bool = false,
@@ -2548,7 +2576,7 @@ fn dupeOptionalStringField(alloc: Allocator, object: std.json.ObjectMap, field: 
     return try alloc.dupe(u8, value.string);
 }
 
-pub const native_text_extraction_identity = "native-text-v2";
+pub const native_text_extraction_identity = "native-text-v3";
 
 pub fn metadataFingerprintAlloc(
     alloc: Allocator,
@@ -2947,6 +2975,7 @@ fn nativeTextDiagnostics(
             .unknown
         else if (diagnostics.unaligned_runs > 0 or
             diagnostics.unsupported_ordering_runs > 0 or
+            diagnostics.unpositioned_spans > 0 or
             analysis.outline_fallback or
             analysis.has_nontext_visual or
             analysis.has_unrendered_annotations)
@@ -2960,6 +2989,9 @@ fn nativeTextDiagnostics(
         .unsupported_ordering_runs = diagnostics.unsupported_ordering_runs,
         .source_run_count = diagnostics.source_run_count,
         .emitted_run_count = diagnostics.emitted_run_count,
+        .outside_page_spans = diagnostics.outside_page_spans,
+        .invisible_spans = diagnostics.invisible_spans,
+        .unpositioned_spans = diagnostics.unpositioned_spans,
         .outline_fallback = analysis.outline_fallback,
         .has_nontext_visual = analysis.has_nontext_visual,
         .has_unrendered_annotations = analysis.has_unrendered_annotations,
@@ -3005,21 +3037,23 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         // embedded candidate in order to retain whichever text is better.
         const candidate = try extractPdfPageTextBestEffort(alloc, &parsed, page_num);
         const analysis = candidate.analysis;
+        const extraction_warning: ?[]u8 = candidate.warning;
+        errdefer if (extraction_warning) |value| alloc.free(value);
         defer {
             for (analysis.runs) |*run| run.deinit(alloc);
             if (analysis.runs.len > 0) alloc.free(analysis.runs);
+            for (analysis.semantic_spans) |*span| span.deinit(alloc);
+            if (analysis.semantic_spans.len > 0) alloc.free(analysis.semantic_spans);
         }
         const text = analysis.text;
         errdefer alloc.free(text);
-        const text_regions: []TextRegion = try extractPdfTextRegionsFromRunsAlloc(alloc, analysis.runs, text);
+        const text_regions: []TextRegion = try extractPdfTextRegionsFromAnalysisAlloc(alloc, analysis.runs, analysis.semantic_spans, text, parsed.cancellationProbe());
         errdefer if (text_regions.len > 0) alloc.free(text_regions);
-        const text_blocks = try pdf.text_structure.blocksFromRunsAlloc(alloc, text, analysis.runs);
+        const text_blocks = try pdf.text_structure.blocksFromAnalysisAlloc(alloc, text, analysis.runs, analysis.semantic_spans, parsed.cancellationProbe());
         errdefer if (text_blocks.len > 0) alloc.free(text_blocks);
         const native_diagnostics = nativeTextDiagnostics(native_text.policy, analysis, candidate.extraction_complete);
         const assessment = NativeTextAssessment.init(text, native_text, ocr_mode);
         const native_quality = assessment.quality;
-        const extraction_warning: ?[]u8 = candidate.warning;
-        errdefer if (extraction_warning) |value| alloc.free(value);
         const page_box = parsed.extractPageBox(page_num) catch null;
         const page_rotation = parsed.extractPageRotation(page_num) catch null;
         const char_start = std.math.cast(u32, cursor);
@@ -3151,6 +3185,8 @@ fn inspectPdfPageText(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: us
     defer {
         for (analysis.runs) |*run| run.deinit(alloc);
         if (analysis.runs.len > 0) alloc.free(analysis.runs);
+        for (analysis.semantic_spans) |*span| span.deinit(alloc);
+        if (analysis.semantic_spans.len > 0) alloc.free(analysis.semantic_spans);
     }
     var result = PdfPageText{
         .text = analysis.text,
@@ -3158,8 +3194,8 @@ fn inspectPdfPageText(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: us
         .native_text_diagnostics = nativeTextDiagnostics(policy, analysis, candidate.extraction_complete),
     };
     errdefer result.deinit(alloc);
-    result.text_regions = try extractPdfTextRegionsFromRunsAlloc(alloc, analysis.runs, result.text);
-    result.text_blocks = try pdf.text_structure.blocksFromRunsAlloc(alloc, result.text, analysis.runs);
+    result.text_regions = try extractPdfTextRegionsFromAnalysisAlloc(alloc, analysis.runs, analysis.semantic_spans, result.text, parsed.cancellationProbe());
+    result.text_blocks = try pdf.text_structure.blocksFromAnalysisAlloc(alloc, result.text, analysis.runs, analysis.semantic_spans, parsed.cancellationProbe());
     const box = parsed.extractPageBox(page_num) catch null;
     result.bbox = if (box) |b| .{ b.min_x, b.min_y, b.max_x, b.max_y } else null;
     result.rotation = parsed.extractPageRotation(page_num) catch null;
@@ -3259,12 +3295,23 @@ fn extractPdfTextRegionsFromRunsAlloc(
     runs: []const pdf.reader.TextRun,
     page_text: []const u8,
 ) ![]TextRegion {
+    return extractPdfTextRegionsFromAnalysisAlloc(alloc, runs, &.{}, page_text, .{});
+}
+
+fn extractPdfTextRegionsFromAnalysisAlloc(
+    alloc: Allocator,
+    runs: []const pdf.reader.TextRun,
+    spans: []const pdf.reader.SemanticTextSpan,
+    page_text: []const u8,
+    cancellation: pdf.reader.CancellationProbe,
+) ![]TextRegion {
     if (page_text.len == 0) return &.{};
 
     var regions = std.ArrayListUnmanaged(TextRegion).empty;
     defer regions.deinit(alloc);
-    for (runs) |run| {
-        if (run.semantic_only) continue;
+    for (runs, 0..) |run, index| {
+        if (index % 256 == 0) try cancellation.check();
+        if (spans.len > 0 and run.semantic_span_index != std.math.maxInt(usize)) continue;
         // A null span means reconstruction could not align this positioned run
         // with the canonical page text. Substring matching is unsafe here: a
         // degraded run can match unrelated text and receive the wrong bounds.
@@ -3297,6 +3344,25 @@ fn extractPdfTextRegionsFromRunsAlloc(
             .italic = run.italic,
         });
     }
+    for (spans, 0..) |span, index| {
+        if (index % 256 == 0) try cancellation.check();
+        const output = span.output_span orelse continue;
+        const box = span.output_bounds orelse continue;
+        if (output.start >= output.end or output.end > page_text.len) continue;
+        try regions.append(alloc, .{
+            .span = .{ std.math.cast(u32, output.start) orelse continue, std.math.cast(u32, output.end) orelse continue },
+            .bbox = .{ box.min_x, box.min_y, box.max_x, box.max_y },
+            .font_size = span.font_size,
+            .bold = span.bold,
+            .italic = span.italic,
+        });
+    }
+    try cancellation.check();
+    std.mem.sort(TextRegion, regions.items, {}, struct {
+        fn less(_: void, left: TextRegion, right: TextRegion) bool {
+            return left.span[0] < right.span[0];
+        }
+    }.less);
     return try regions.toOwnedSlice(alloc);
 }
 
@@ -3417,6 +3483,18 @@ test "PDF text regions use reconstructed output spans" {
     try std.testing.expect(replacement_regions[0].bold == null);
     try std.testing.expect(replacement_regions[0].italic == null);
 
+    var semantic_runs = replacement_runs;
+    for (&semantic_runs) |*run| run.semantic_span_index = 0;
+    const semantic_spans = [_]pdf.reader.SemanticTextSpan{
+        .{ .text = "Semantic", .run_start = 0, .run_end = 2, .output_span = .{ .start = 0, .end = 8 }, .output_bounds = .{ .min_x = 10, .min_y = 18, .max_x = 60, .max_y = 28 } },
+        .{ .text = " unpositioned", .run_start = 2, .run_end = 2, .output_span = .{ .start = 8, .end = 21 } },
+    };
+    const semantic_regions = try extractPdfTextRegionsFromAnalysisAlloc(alloc, &semantic_runs, &semantic_spans, "Semantic unpositioned", .{});
+    defer alloc.free(semantic_regions);
+    try std.testing.expectEqual(@as(usize, 1), semantic_regions.len);
+    try std.testing.expectEqual([4]f64{ 10, 18, 60, 28 }, semantic_regions[0].bbox);
+    try std.testing.expectEqual([2]u32{ 0, 8 }, semantic_regions[0].span);
+
     const unaligned_runs = [_]pdf.reader.TextRun{.{
         .text = "FR",
         .x = 100,
@@ -3449,6 +3527,9 @@ test "native text diagnostics distinguish extraction completion and semantic cov
             .unsupported_ordering_runs = 5,
             .source_run_count = 9,
             .emitted_run_count = 6,
+            .outside_page_spans = 7,
+            .invisible_spans = 8,
+            .unpositioned_spans = 9,
         },
     };
     const partial = nativeTextDiagnostics(.page, analysis, true);
@@ -3456,6 +3537,9 @@ test "native text diagnostics distinguish extraction completion and semantic cov
     try std.testing.expectEqual(NativeTextSemanticCoverage.partial, partial.semantic_coverage);
     try std.testing.expect(partial.outline_fallback and partial.has_nontext_visual and partial.has_unrendered_annotations);
     try std.testing.expectEqual(@as(usize, 3), partial.outside_page_runs);
+    try std.testing.expectEqual(@as(usize, 7), partial.outside_page_spans);
+    try std.testing.expectEqual(@as(usize, 8), partial.invisible_spans);
+    try std.testing.expectEqual(@as(usize, 9), partial.unpositioned_spans);
     const failed = nativeTextDiagnostics(.visible, analysis, false);
     try std.testing.expect(!failed.extraction_complete);
     try std.testing.expectEqual(NativeTextSemanticCoverage.unknown, failed.semantic_coverage);
@@ -3465,6 +3549,12 @@ test "native text diagnostics distinguish extraction completion and semantic cov
         .runs = @constCast(&[_]pdf.reader.TextRun{}),
     }, true);
     try std.testing.expectEqual(NativeTextSemanticCoverage.text_only, text_only.semantic_coverage);
+    const unpositioned = nativeTextDiagnostics(.page, .{
+        .text = @constCast("semantic label"),
+        .runs = &.{},
+        .diagnostics = .{ .unpositioned_spans = 1 },
+    }, true);
+    try std.testing.expectEqual(NativeTextSemanticCoverage.partial, unpositioned.semantic_coverage);
 }
 
 test "OCR Reader regions align repeated UTF-8 text monotonically and require native pixel geometry" {

@@ -166,7 +166,8 @@ Every PDF unit records `native_text_quality` and `native_text_diagnostics`, even
 without an `ocr` block. Quality flags describe short text, sampled character/word
 corruption, and replacement characters; they are heuristics, not an accuracy
 score. Diagnostics record the selected policy, ActualText replacement count,
-exterior/invisible runs, alignment and ordering limitations, and nontext or
+exterior/invisible glyph runs and semantic spans, unpositioned semantic spans,
+alignment and ordering limitations, and nontext or
 annotation evidence. `extraction_complete` describes decoding, not correctness.
 `semantic_coverage` is `partial` when unresolved coverage is known, `unknown`
 when extraction is incomplete, or `text_only` otherwise; it never certifies
@@ -202,8 +203,12 @@ ANTFLY_ZIG_MAX_RSS=12884901888 python3 tools/run_bounded_zig_build.py --zig zig 
 ```
 
 These targets do not build the Antfly server. `dump-analysis` includes emitted
-text, diagnostics, blocks, and positioned runs; `raw_text` retains original glyph
-text when `/ActualText` supplies different semantic text. Its optional final
+text, diagnostics, blocks, original positioned glyph runs, and `semantic_spans`.
+Each `/ActualText` replacement is stored once with its source run range, output
+span, and policy-selected bounds. Glyph `text` and `raw_text` retain their source
+values; covered glyphs refer to the replacement by `semantic_span_index`.
+Unknown paint bounds are retained conservatively and omitted from geometry
+metadata rather than assigned invented coordinates. Its optional final
 argument selects `source`, `page`, or `visible` (default `page`). The broader
 `lib-pdf-test` target also includes OCR integration and is not PDF-only.
 

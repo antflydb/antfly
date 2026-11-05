@@ -1890,3 +1890,25 @@ removing this lease.
 - Whether the attempt spool should eventually use a compact versioned binary
   unit codec instead of JSON after corpus measurements quantify serialization
   CPU and temporary storage size.
+
+### Native semantic replacements
+
+Native extraction retains decoded glyph runs unchanged. Each effective
+`/ActualText` scope owns one semantic span, its source run range (including
+zero-glyph scopes), and a constant-space summary of glyph, vector, and image
+paint evidence. Nested Forms inherit active scopes and graphics state. Image
+eligibility uses transformed bounds without decoding pixels. Page and visible
+eligibility are evaluated per paint before bounds are unioned; unknown paint
+extents remain conservative. Stroke joins and device hairlines do not receive
+an underestimated path-only bound.
+
+Layout consumes each replacement once. Entry and exit glyphs preserve spacing
+at scope boundaries; unpositioned or multiline replacements fence geometric
+reordering at their authored source slot. Blocks and regions consume semantic
+spans directly rather than rescanning replacement bytes for every covered
+source run. Unknown bounds produce text and diagnostics without invented
+geometry. `source_run_count` and `emitted_run_count` count original glyph runs;
+`outside_page_spans`, `invisible_spans`, and `unpositioned_spans` separately
+report nonempty semantic replacements. Empty replacements intentionally delete
+their covered glyph text. Extraction identity and unit fingerprints version the
+resulting text, geometry, and diagnostics together.

@@ -1315,6 +1315,9 @@ pub const NativeTextDiagnostics = struct {
     unsupported_ordering_runs: usize = 0,
     source_run_count: usize = 0,
     emitted_run_count: usize = 0,
+    outside_page_spans: usize = 0,
+    invisible_spans: usize = 0,
+    unpositioned_spans: usize = 0,
 };
 
 const TextExtractionState = struct {
@@ -1430,11 +1433,8 @@ pub const TextRun = struct {
     /// Policy filtering leaves source text and geometry intact for auditing.
     /// Reconstruction skips these runs and leaves `output_span` null.
     policy_excluded: bool = false,
-    semantic_only: bool = false,
-    /// ActualText is emitted once, while every covered source run shares its
-    /// final output span so downstream geometry can retain the whole scope.
-    actual_text_leader: ?usize = null,
-    actual_text_end: usize = 0,
+    /// Index into PageTextAnalysis.semantic_spans; source glyphs stay intact.
+    semantic_span_index: usize = no_semantic_span,
 
     blend_mode: BlendMode = .normal,
     group_id: ?u32 = null,
@@ -1492,11 +1492,11 @@ const LayoutTextRun = struct {
     text_object_id: ?usize = null,
     render_mode: i64 = 0,
     policy_excluded: bool = false,
-    semantic_only: bool = false,
     text_show_tracking_gap: ?f64 = null,
     output_span: ?TextOutputSpan = null,
-    actual_text_leader: ?usize = null,
-    actual_text_end: usize = 0,
+    semantic_span_index: usize = no_semantic_span,
+    source_index: usize = 0,
+    ordering_fence: bool = false,
     alpha: u8 = 0xff,
     stroke_alpha: u8 = 0xff,
     group_alpha: u8 = 0xff,
@@ -1536,6 +1536,7 @@ fn contentHasNontextPaint(alloc: Allocator, bytes: []const u8, cancellation: Can
 pub const PageTextAnalysis = struct {
     text: []u8,
     runs: []TextRun,
+    semantic_spans: []SemanticTextSpan = &.{},
     outline_fallback: bool = false,
     has_nontext_visual: bool = false,
     has_unrendered_annotations: bool = false,
@@ -1545,6 +1546,8 @@ pub const PageTextAnalysis = struct {
         alloc.free(self.text);
         for (self.runs) |*run| run.deinit(alloc);
         if (self.runs.len > 0) alloc.free(self.runs);
+        for (self.semantic_spans) |*span| span.deinit(alloc);
+        if (self.semantic_spans.len > 0) alloc.free(self.semantic_spans);
         self.* = undefined;
     }
 };
@@ -3115,6 +3118,7 @@ fn hasEffectiveActualText(scopes: []const ActualTextScope) bool {
 }
 
 const PageForm = struct {
+    text_image: bool = false,
     name: []u8,
     content: []u8,
     matrix: GraphicsMatrix = .{},
@@ -3392,59 +3396,163 @@ const PositionedTextOutput = union(enum) {
         };
     }
 };
-fn replacePositionedActualTextAlloc(
-    alloc: Allocator,
-    output: PositionedTextOutput,
-    start: usize,
-    replacement: []const u8,
-    cancellation: CancellationProbe,
-) !void {
-    switch (output) {
-        .layout => |out| {
-            if (start >= out.items.len) {
-                if (replacement.len == 0) return;
-                const text = try alloc.dupe(u8, replacement);
-                errdefer alloc.free(text);
-                try out.append(alloc, .{ .text = text, .x = 0, .y = 0, .font_size = 0, .horizontal_scale = 1, .semantic_only = true, .actual_text_leader = start, .actual_text_end = start + 1 });
-                return;
-            }
-            const end = out.items.len;
-            for (out.items[start..], 0..) |*run, index| {
-                if (index % 256 == 0) try cancellation.check();
-                run.actual_text_leader = start;
-                run.actual_text_end = end;
-                const text = try alloc.dupe(u8, if (index == 0) replacement else "");
-                alloc.free(run.text);
-                run.text = text;
-            }
-        },
-        .analysis => |analysis| {
-            if (start >= analysis.runs.items.len) {
-                if (replacement.len == 0) return;
-                if (analysis.runs.items.len >= analysis.max_runs) return error.TextRunLimitExceeded;
-                const text = try alloc.dupe(u8, replacement);
-                errdefer alloc.free(text);
-                try analysis.runs.append(alloc, .{ .text = text, .x = 0, .y = 0, .font_size = 0, .semantic_only = true, .actual_text_leader = start, .actual_text_end = start + 1 });
-                return;
-            }
-            const end = analysis.runs.items.len;
-            for (analysis.runs.items[start..], 0..) |*run, index| {
-                if (index % 256 == 0) try cancellation.check();
-                run.actual_text_leader = start;
-                run.actual_text_end = end;
-                const text = try alloc.dupe(u8, if (index == 0) replacement else "");
-                alloc.free(run.text);
-                run.text = text;
-            }
-        },
-        .render => {},
-    }
+const no_semantic_span = std.math.maxInt(usize);
+
+fn unionTextBox(left: ?PageBox, right: PageBox) PageBox {
+    const box = left orelse return right;
+    return .{ .min_x = @min(box.min_x, right.min_x), .min_y = @min(box.min_y, right.min_y), .max_x = @max(box.max_x, right.max_x), .max_y = @max(box.max_y, right.max_y) };
 }
+
+/// Constant-space summary of the actual source paints. Eligibility is tested
+/// per paint, before unioning bounds, so two exterior paints cannot invent an
+/// on-page intersection by straddling the page.
+const SemanticPaint = struct {
+    has_paint: bool = false,
+    any_visible: bool = false,
+    page_eligible: bool = false,
+    visible_eligible: bool = false,
+    source_unknown: bool = false,
+    page_unknown: bool = false,
+    visible_unknown: bool = false,
+    source_bounds: ?PageBox = null,
+    page_bounds: ?PageBox = null,
+    visible_bounds: ?PageBox = null,
+
+    fn add(self: *@This(), bounds: ?PageBox, clip: ?PageBox, visible: bool, page: ?PageBox) void {
+        self.has_paint = true;
+        self.any_visible = self.any_visible or visible;
+        if (bounds) |box| self.source_bounds = unionTextBox(self.source_bounds, box) else self.source_unknown = true;
+        if (clip) |box| if (page) |page_box| if (!pageBoxesOverlap(box, page_box)) return;
+        if (clip) |box| if (box.min_x >= box.max_x or box.min_y >= box.max_y) return;
+        if (bounds) |box| {
+            if (page) |page_box| if (!pageBoxesOverlap(box, page_box)) return;
+            if (clip) |clip_box| if (!pageBoxesOverlap(box, clip_box)) return;
+            self.page_bounds = unionTextBox(self.page_bounds, box);
+            if (visible) self.visible_bounds = unionTextBox(self.visible_bounds, box);
+        } else {
+            self.page_unknown = true;
+            self.visible_unknown = self.visible_unknown or visible;
+        }
+        self.page_eligible = true;
+        self.visible_eligible = self.visible_eligible or visible;
+    }
+};
+
+/// One authored semantic replacement, independent of its source glyphs.
+/// run_start/run_end retain the source-order slot even when no glyphs exist.
+/// Entry/exit indices and output bounds are selected once for the active policy.
+pub const SemanticTextSpan = struct {
+    text: []const u8,
+    run_start: usize,
+    run_end: usize,
+    paint: SemanticPaint = .{},
+    output_span: ?TextOutputSpan = null,
+    output_bounds: ?PageBox = null,
+    entry_run: ?usize = null,
+    exit_run: ?usize = null,
+    policy_excluded: bool = false,
+    font_size: ?f64 = null,
+    bold: ?bool = null,
+    italic: ?bool = null,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.text);
+        self.* = undefined;
+    }
+};
+
+const SemanticTextContext = struct {
+    marked: std.ArrayList(ActualTextScope) = .empty,
+    owned_spans: std.ArrayList(SemanticTextSpan) = .empty,
+    shared_spans: ?*std.ArrayList(SemanticTextSpan) = null,
+    active: ?SemanticPaint = null,
+    inherited: ?*SemanticPaint = null,
+    suppress: bool = false,
+    page_box: ?PageBox = null,
+
+    fn spans(self: *@This()) *std.ArrayList(SemanticTextSpan) {
+        return self.shared_spans orelse &self.owned_spans;
+    }
+
+    fn paint(self: *@This()) ?*SemanticPaint {
+        return if (self.active) |*active| active else self.inherited;
+    }
+
+    fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.marked.items) |*scope| scope.deinit(alloc);
+        self.marked.deinit(alloc);
+        for (self.owned_spans.items) |*span| span.deinit(alloc);
+        self.owned_spans.deinit(alloc);
+    }
+
+    fn markedOperator(self: *@This(), alloc: Allocator, out: PositionedTextOutput, op: []const u8, operands: []const syntax.Object, properties: []const PageTextProperty, cancellation: CancellationProbe) !bool {
+        const opening = std.mem.eql(u8, op, "BMC") or std.mem.eql(u8, op, "BDC");
+        if (!opening and !std.mem.eql(u8, op, "EMC")) return false;
+        if (!out.isTextOnly()) return true;
+        if (opening) {
+            var replacement = if (std.mem.eql(u8, op, "BDC")) try actualTextFromBdcAlloc(alloc, operands, properties) else null;
+            errdefer if (replacement) |text| alloc.free(text);
+            const effective = replacement != null and !self.suppress and self.active == null;
+            try self.marked.append(alloc, .{ .replacement = replacement, .run_start = out.len(), .effective = effective });
+            replacement = null;
+            if (effective) self.active = .{};
+        } else if (self.marked.pop()) |popped| {
+            var scope = popped;
+            defer scope.deinit(alloc);
+            if (scope.effective) {
+                const index = self.spans().items.len;
+                if (out == .analysis and index >= out.analysis.max_runs) return error.TextRunLimitExceeded;
+                try self.spans().append(alloc, .{ .text = scope.replacement.?, .run_start = scope.run_start, .run_end = out.len(), .paint = self.active.? });
+                scope.replacement = null;
+                self.active = null;
+                switch (out) {
+                    .layout => |runs| for (runs.items[scope.run_start..], 0..) |*run, i| {
+                        if (i % 256 == 0) try cancellation.check();
+                        run.semantic_span_index = index;
+                    },
+                    .analysis => |analysis| for (analysis.runs.items[scope.run_start..], 0..) |*run, i| {
+                        if (i % 256 == 0) try cancellation.check();
+                        run.semantic_span_index = index;
+                    },
+                    .render => unreachable,
+                }
+            }
+        }
+        return true;
+    }
+
+    fn glyphs(self: *@This(), out: PositionedTextOutput, start: usize) void {
+        const evidence = self.paint() orelse return;
+        switch (out) {
+            .layout => |runs| for (runs.items[start..]) |run| evidence.add(run.bounds(), run.clip_box, !textRunInvisible(run), self.page_box),
+            .analysis => |analysis| for (analysis.runs.items[start..]) |run| evidence.add(run.bounds(), run.clip_box, !textRunInvisible(run), self.page_box),
+            .render => {},
+        }
+    }
+
+    fn sourcePaint(self: *@This(), state: *const TextRunState, path: *const TextClipPath, op: []const u8) void {
+        const evidence = self.paint() orelse return;
+        if (isShapePaintOperator(op)) {
+            const fill = !std.mem.eql(u8, op, "S") and !std.mem.eql(u8, op, "s");
+            const stroke = !std.mem.eql(u8, op, "f") and !std.mem.eql(u8, op, "F") and !std.mem.eql(u8, op, "f*");
+            var bounds = path.paint_box;
+            // Stroke joins, miter limits, and device-space hairlines can
+            // exceed the path hull. Retain unknown bounds rather than falsely
+            // excluding semantic text using an underestimated paint extent.
+            if (stroke) bounds = null;
+            evidence.add(bounds, state.clip_box, state.group_alpha != 0 and ((fill and state.alpha != 0) or (stroke and state.stroke_alpha != 0)), self.page_box);
+        } else if (std.mem.eql(u8, op, "sh") or std.mem.eql(u8, op, "BI")) {
+            const bounds = if (std.mem.eql(u8, op, "BI")) transformPageBox(.{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }, state.matrix) else null;
+            evidence.add(bounds, state.clip_box, state.alpha != 0 and state.group_alpha != 0, self.page_box);
+        }
+    }
+};
 
 /// Text extraction only needs a conservative bound for rectangular clips.
 /// Keep this constant-space and leave arbitrary paths unknown instead of
 /// retaining/vectorizing paint paths on the text-only hot path.
 const TextClipPath = struct {
+    paint_box: ?PageBox = null,
     box: ?PageBox = null,
     unknown: bool = false,
 
@@ -3455,6 +3563,7 @@ const TextClipPath = struct {
             const w = numericObjectValue(&operands[operands.len - 2]) orelse return;
             const h = numericObjectValue(&operands[operands.len - 1]) orelse return;
             const rect = transformPageBox(.{ .min_x = @min(x, x + w), .min_y = @min(y, y + h), .max_x = @max(x, x + w), .max_y = @max(y, y + h) }, state.matrix);
+            self.paint_box = unionTextBox(self.paint_box, rect);
             if (self.box) |box| {
                 self.box = .{ .min_x = @min(box.min_x, rect.min_x), .min_y = @min(box.min_y, rect.min_y), .max_x = @max(box.max_x, rect.max_x), .max_y = @max(box.max_y, rect.max_y) };
             } else self.box = rect;
@@ -3466,6 +3575,13 @@ const TextClipPath = struct {
             self.* = .{};
         } else if (std.mem.eql(u8, op, "m") or std.mem.eql(u8, op, "l") or std.mem.eql(u8, op, "c") or std.mem.eql(u8, op, "v") or std.mem.eql(u8, op, "y")) {
             self.unknown = true;
+            var i: usize = 0;
+            while (i + 1 < operands.len) : (i += 2) {
+                const x = numericObjectValue(&operands[i]) orelse continue;
+                const y = numericObjectValue(&operands[i + 1]) orelse continue;
+                const point = applyMatrixToPoint(state.matrix, x, y);
+                self.paint_box = unionTextBox(self.paint_box, .{ .min_x = point[0], .max_x = point[0], .min_y = point[1], .max_y = point[1] });
+            }
         }
     }
 };
@@ -3478,7 +3594,7 @@ const PositionedTextParser = struct {
     retained_pattern_names: ContentNameInterner = .{},
     state: TextRunState = .{},
     stack: std.ArrayList(TextRunStackEntry) = .empty,
-    marked_content: std.ArrayList(ActualTextScope) = .empty,
+    semantic: SemanticTextContext = .{},
     text_clip_path: TextClipPath = .{},
     current_path: std.ArrayList([2]f64) = .empty,
     current_path_closed: bool = false,
@@ -3490,8 +3606,6 @@ const PositionedTextParser = struct {
     /// local font resources and outline its text before those resources are
     /// released. Public text-analysis APIs leave this disabled.
     vectorize_form_text: bool = false,
-    suppress_actual_text: bool = false,
-    actual_text_replacements: usize = 0,
 
     fn init(
         alloc: Allocator,
@@ -3517,8 +3631,7 @@ const PositionedTextParser = struct {
         self.retained_pattern_names.deinit(self.alloc);
         for (self.stack.items) |*entry| entry.deinit(self.alloc);
         self.stack.deinit(self.alloc);
-        for (self.marked_content.items) |*scope| scope.deinit(self.alloc);
-        self.marked_content.deinit(self.alloc);
+        self.semantic.deinit(self.alloc);
         self.current_path.deinit(self.alloc);
         self.current_clip_points.deinit(self.alloc);
         self.* = undefined;
@@ -3547,6 +3660,12 @@ const PositionedTextParser = struct {
 
             if (lex == .eof) break;
             if (lex == .keyword and !isContentObjectStartKeyword(lex.keyword)) {
+                if (try self.semantic.markedOperator(self.alloc, self.output, lex.keyword, self.operands.items, properties, self.cancellation)) {
+                    clearContentOperands(self.alloc, &self.operands);
+                    continue;
+                }
+                if (self.output.isTextOnly()) self.semantic.sourcePaint(&self.state, &self.text_clip_path, lex.keyword);
+                const run_start = self.output.len();
                 try applyTextRunOperator(
                     self.alloc,
                     self.output,
@@ -3562,9 +3681,7 @@ const PositionedTextParser = struct {
                     gstates,
                     forms,
                     properties,
-                    &self.marked_content,
-                    self.suppress_actual_text,
-                    &self.actual_text_replacements,
+                    &self.semantic,
                     &self.paint_order,
                     &self.next_group_id,
                     self.cancellation,
@@ -3572,6 +3689,7 @@ const PositionedTextParser = struct {
                     lex.keyword,
                     self.operands.items,
                 );
+                if (isTextShowOperator(lex.keyword)) self.semantic.glyphs(self.output, run_start);
                 clearContentOperands(self.alloc, &self.operands);
                 continue;
             }
@@ -4865,6 +4983,8 @@ pub const Reader = struct {
         const text = analysis.text;
         for (analysis.runs) |*run| run.deinit(self.alloc);
         if (analysis.runs.len > 0) self.alloc.free(analysis.runs);
+        for (analysis.semantic_spans) |*span| span.deinit(self.alloc);
+        if (analysis.semantic_spans.len > 0) self.alloc.free(analysis.semantic_spans);
         return text;
     }
 
@@ -6610,9 +6730,16 @@ pub const Reader = struct {
             runs.deinit(alloc);
         };
         const output: PositionedTextOutput = if (positioned) .{ .analysis = .{ .runs = &runs, .max_runs = max_runs } } else .{ .layout = &runs };
+        var spans = std.ArrayList(SemanticTextSpan).empty;
+        errdefer if (positioned) {
+            for (spans.items) |*span| span.deinit(alloc);
+            spans.deinit(alloc);
+        };
         var run_parser = try PositionedTextParser.init(alloc, output, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
         defer run_parser.deinit();
         run_parser.cancellation = self.cancellation;
+        run_parser.semantic.shared_spans = &spans;
+        run_parser.semantic.page_box = page_box;
         var text_parser = TextContentParser.init(alloc, &text);
         defer text_parser.deinit();
 
@@ -6627,30 +6754,39 @@ pub const Reader = struct {
             try text_parser.consume(stream_content, fonts, forms, properties, 0);
         }
 
-        var diagnostics = NativeTextDiagnostics{
-            .actual_text_replacements = run_parser.actual_text_replacements,
-        };
-        if (positioned or self.text_extraction_policy != .source) {
-            applyTextExtractionPolicy(runs.items, page_box, self.text_extraction_policy, &diagnostics);
-            try rehomeActualTextForPolicy(runs.items, self.cancellation);
-        }
+        var diagnostics = NativeTextDiagnostics{ .actual_text_replacements = spans.items.len };
+        if (positioned or self.text_extraction_policy != .source) applyTextExtractionPolicy(runs.items, page_box, self.text_extraction_policy, &diagnostics);
         var owned_text = try text.toOwnedSlice(alloc);
         errdefer alloc.free(owned_text);
-        const canonical_matches = sameNonWhitespaceBytesAsTextRuns(owned_text, runs.items);
-        if (runs.items.len > 0 and
-            (canonical_matches or self.text_extraction_policy != .source))
-        {
+        if (spans.items.len > 0) {
+            const items = try semanticTextItemsAlloc(alloc, runs.items, spans.items, self.text_extraction_policy, self.cancellation);
+            defer alloc.free(items);
+            if (sameNonWhitespaceBytesAsTextRuns(owned_text, items) or self.text_extraction_policy != .source) {
+                const reconstructed = try reconstructTextItemsCancelableAlloc(alloc, items, runs.items, spans.items, self.cancellation);
+                alloc.free(owned_text);
+                owned_text = reconstructed;
+                try propagateSemanticTextSpans(runs.items, spans.items, items, self.cancellation);
+            }
+        } else if (runs.items.len > 0 and (sameNonWhitespaceBytesAsTextRuns(owned_text, runs.items) or self.text_extraction_policy != .source)) {
             const reconstructed = try reconstructTextFromRunsCancelableAlloc(alloc, runs.items, self.cancellation);
             alloc.free(owned_text);
             owned_text = reconstructed;
-        } else {
-            clearTextRunOutputSpans(runs.items);
         }
         if (positioned) {
-            propagateActualTextOutputSpans(runs.items);
             finalizeNativeTextDiagnostics(runs.items, &diagnostics);
+            for (spans.items) |span| {
+                if (span.text.len == 0) continue;
+                if (span.paint.has_paint and !span.paint.page_eligible) diagnostics.outside_page_spans +|= 1;
+                if (span.paint.has_paint and !span.paint.any_visible) diagnostics.invisible_spans +|= 1;
+                if (span.output_span != null and span.output_bounds == null) diagnostics.unpositioned_spans +|= 1;
+            }
             const owned_runs = try runs.toOwnedSlice(alloc);
-            return .{ .text = owned_text, .runs = owned_runs, .diagnostics = diagnostics };
+            errdefer {
+                for (owned_runs) |*run| run.deinit(alloc);
+                alloc.free(owned_runs);
+            }
+            const owned_spans = try spans.toOwnedSlice(alloc);
+            return .{ .text = owned_text, .runs = owned_runs, .semantic_spans = owned_spans, .diagnostics = diagnostics };
         } else {
             return .{ .text = try self.alloc.dupe(u8, owned_text), .runs = &.{} };
         }
@@ -8834,6 +8970,14 @@ pub const Reader = struct {
             defer xobj.deinit(self.alloc);
             if (xobj != .stream) continue;
             const subtype = xobj.get("Subtype") orelse continue;
+            if (std.mem.eql(u8, subtype.asName() orelse continue, "Image")) {
+                const name = try self.alloc.dupe(u8, entry.key);
+                errdefer self.alloc.free(name);
+                const content = try self.alloc.dupe(u8, "");
+                errdefer self.alloc.free(content);
+                try out.append(self.alloc, .{ .name = name, .content = content, .text_image = true });
+                continue;
+            }
             if (!std.mem.eql(u8, subtype.asName() orelse continue, "Form")) continue;
 
             var content: ?[]u8 = try self.readDecodedStreamData(&xobj);
@@ -15945,6 +16089,7 @@ fn applyTextOperator(
     if (std.mem.eql(u8, op, "Do")) {
         if (operands.len == 0 or operands[operands.len - 1] != .name) return;
         const form = findPageForm(forms, operands[operands.len - 1].name) orelse return;
+        if (form.text_image) return;
         const nested = try extractTextFromContentAlloc(alloc, form.content, form.fonts, form.forms, form.text_properties, form_depth + 1);
         defer alloc.free(nested);
         if (nested.len == 0) return;
@@ -15968,10 +16113,8 @@ fn applyTextRunOperator(
     fonts: []const PageFont,
     gstates: []const PageExtGState,
     forms: []const PageForm,
-    properties: []const PageTextProperty,
-    marked_content: *std.ArrayList(ActualTextScope),
-    suppress_actual_text: bool,
-    actual_text_replacements: *usize,
+    _: []const PageTextProperty,
+    semantic: *SemanticTextContext,
     paint_order: *usize,
     next_group_id: *u32,
     cancellation: CancellationProbe,
@@ -15979,36 +16122,6 @@ fn applyTextRunOperator(
     op: []const u8,
     operands: []const syntax.Object,
 ) anyerror!void {
-    if (std.mem.eql(u8, op, "BMC") or std.mem.eql(u8, op, "BDC")) {
-        if (!out.isTextOnly()) return;
-        var replacement = if (std.mem.eql(u8, op, "BDC"))
-            try actualTextFromBdcAlloc(alloc, operands, properties)
-        else
-            null;
-        errdefer if (replacement) |text| alloc.free(text);
-        const effective = replacement != null and
-            !suppress_actual_text and
-            !hasEffectiveActualText(marked_content.items);
-        try marked_content.append(alloc, .{
-            .replacement = replacement,
-            .run_start = out.len(),
-            .effective = effective,
-        });
-        replacement = null;
-        return;
-    }
-    if (std.mem.eql(u8, op, "EMC")) {
-        if (!out.isTextOnly()) return;
-        if (marked_content.pop()) |popped| {
-            var scope = popped;
-            defer scope.deinit(alloc);
-            if (scope.effective) {
-                try replacePositionedActualTextAlloc(alloc, out, scope.run_start, scope.replacement.?, cancellation);
-                actual_text_replacements.* +|= 1;
-            }
-        }
-        return;
-    }
     if (isShapePaintOperator(op) or std.mem.eql(u8, op, "sh")) paint_order.* += 1;
     if (std.mem.eql(u8, op, "Do") and
         (operands.len == 0 or operands[operands.len - 1] != .name or findPageForm(forms, operands[operands.len - 1].name) == null))
@@ -16480,7 +16593,14 @@ fn applyTextRunOperator(
     if (std.mem.eql(u8, op, "Do")) {
         if (operands.len == 0 or operands[operands.len - 1] != .name) return;
         const name = operands[operands.len - 1].name;
-        const form = findPageForm(forms, name) orelse return;
+        const form = findPageForm(forms, name) orelse {
+            if (semantic.paint()) |evidence| evidence.add(null, state.clip_box, state.alpha != 0 and state.group_alpha != 0, semantic.page_box);
+            return;
+        };
+        if (form.text_image) {
+            if (semantic.paint()) |evidence| evidence.add(transformPageBox(.{ .min_x = 0, .min_y = 0, .max_x = 1, .max_y = 1 }, state.matrix), state.clip_box, state.alpha != 0 and state.group_alpha != 0, semantic.page_box);
+            return;
+        }
         const start_len = out.len();
         var nested_state = buildFormTextState(state.*, form);
         if (form.transparency_group)
@@ -16492,11 +16612,13 @@ fn applyTextRunOperator(
         nested_parser.paint_order = paint_order.*;
         nested_parser.next_group_id = next_group_id.*;
         nested_parser.vectorize_form_text = vectorize_form_text;
-        nested_parser.suppress_actual_text = suppress_actual_text or hasEffectiveActualText(marked_content.items);
+        nested_parser.semantic.shared_spans = semantic.spans();
+        nested_parser.semantic.suppress = semantic.suppress or semantic.active != null;
+        nested_parser.semantic.inherited = semantic.paint();
+        nested_parser.semantic.page_box = semantic.page_box;
         try nested_parser.consume(form.content, form.fonts, form.gstates, form.forms, form.text_properties);
         paint_order.* = nested_parser.paint_order;
         next_group_id.* = nested_parser.next_group_id;
-        actual_text_replacements.* +|= nested_parser.actual_text_replacements;
         switch (out) {
             .layout => {},
             .analysis, .render => for (out.textRuns().items[start_len..]) |*run| {
@@ -18568,49 +18690,123 @@ fn applyTextExtractionPolicy(
     }
 }
 
-fn rehomeActualTextForPolicy(
-    runs: anytype,
-    cancellation: CancellationProbe,
-) !void {
-    for (runs, 0..) |*leader_run, leader| {
-        if (leader % 256 == 0) try cancellation.check();
-        const group_leader = leader_run.actual_text_leader orelse continue;
-        if (group_leader != leader or
-            !leader_run.policy_excluded or
-            leader_run.text.len == 0) continue;
-        const end = @min(leader_run.actual_text_end, runs.len);
-        var replacement_index: ?usize = null;
-        for (leader + 1..end) |index| {
-            if ((index - leader) % 256 == 0) try cancellation.check();
-            if (!runs[index].policy_excluded) {
-                replacement_index = index;
-                break;
-            }
-        }
-        const target_index = replacement_index orelse continue;
-        // Both strings are already owned by the runs. Moving the replacement
-        // requires no allocation or error cleanup after ownership changes.
-        std.mem.swap([]const u8, &leader_run.text, &runs[target_index].text);
-        for (leader..end) |index| {
-            if ((index - leader) % 256 == 0) try cancellation.check();
-            runs[index].actual_text_leader = target_index;
-        }
+fn compactTextRun(run: anytype, source_index: usize) LayoutTextRun {
+    var item = LayoutTextRun{ .text = run.text, .x = run.x, .y = run.y, .font_size = run.font_size, .horizontal_scale = run.horizontal_scale };
+    inline for (@typeInfo(LayoutTextRun).@"struct".field_names) |name| {
+        if (comptime @hasField(@TypeOf(run), name)) @field(item, name) = @field(run, name);
     }
+    item.source_index = source_index;
+    return item;
 }
 
-fn propagateActualTextOutputSpans(runs: []TextRun) void {
-    for (runs) |*run| {
-        const leader = run.actual_text_leader orelse continue;
-        if (run.policy_excluded or leader >= runs.len or runs[leader].policy_excluded) continue;
-        run.output_span = runs[leader].output_span;
+fn semanticTextItemsAlloc(alloc: Allocator, runs: anytype, spans: []SemanticTextSpan, policy: TextExtractionPolicy, cancellation: CancellationProbe) ![]LayoutTextRun {
+    var items = std.ArrayList(LayoutTextRun).empty;
+    errdefer items.deinit(alloc);
+    var run_index: usize = 0;
+    var span_index: usize = 0;
+    while (run_index < runs.len or span_index < spans.len) {
+        if ((run_index + span_index) % 256 == 0) try cancellation.check();
+        if (span_index < spans.len and spans[span_index].run_start == run_index) {
+            const span = &spans[span_index];
+            span.policy_excluded = switch (policy) {
+                .source => false,
+                .page => span.paint.has_paint and !span.paint.page_eligible,
+                .visible => !span.paint.visible_eligible,
+            };
+            span.output_bounds = switch (policy) {
+                .source => if (span.paint.source_unknown) null else span.paint.source_bounds,
+                .page => if (span.paint.page_unknown) null else span.paint.page_bounds,
+                .visible => if (span.paint.visible_unknown) null else span.paint.visible_bounds,
+            };
+            if (!span.policy_excluded) {
+                var item = LayoutTextRun{ .text = span.text, .x = 0, .y = 0, .font_size = 0, .horizontal_scale = 1, .ordering_fence = true, .semantic_span_index = span_index };
+                var same_line = true;
+                var style_initialized = false;
+                for (runs[span.run_start..span.run_end], span.run_start..) |run, index| {
+                    if ((index - span.run_start) % 256 == 0) try cancellation.check();
+                    if (run.policy_excluded) continue;
+                    if (span.entry_run) |entry| {
+                        same_line = same_line and textRunsShareLine(runs[entry], run) and textRunAxesCompatible(runs[entry], run) and textRunHasSupportedOrderingGeometry(run);
+                    } else {
+                        span.entry_run = index;
+                        item = compactTextRun(run, index);
+                        item.text = span.text;
+                        item.semantic_span_index = span_index;
+                        same_line = textRunHasSupportedOrderingGeometry(run);
+                    }
+                    span.exit_run = index;
+                    if (comptime @hasField(@TypeOf(run), "bold")) {
+                        const size = @abs(run.font_size) * textRunVerticalScale(run);
+                        const font_size: ?f64 = if (std.math.isFinite(size) and size > 0) size else null;
+                        if (!style_initialized) {
+                            span.font_size = font_size;
+                            span.bold = run.bold;
+                            span.italic = run.italic;
+                            style_initialized = true;
+                        } else {
+                            if (span.font_size != font_size) span.font_size = null;
+                            if (span.bold != run.bold) span.bold = null;
+                            if (span.italic != run.italic) span.italic = null;
+                        }
+                    }
+                }
+                if (span.exit_run) |exit| {
+                    if (same_line) {
+                        const last = runs[exit];
+                        // Layout sees the whole scope, while spacing after it uses
+                        // the exact last glyph's endpoint below.
+                        item.advance_width += textRunForwardGap(item, last) + last.advance_width;
+                    }
+                }
+                item.ordering_fence = !same_line or span.entry_run == null or span.text.len == 0 or std.mem.indexOfScalar(u8, span.text, '\n') != null;
+                try items.append(alloc, item);
+            }
+            run_index = span.run_end;
+            span_index += 1;
+        } else {
+            std.debug.assert(run_index < runs.len);
+            if (!runs[run_index].policy_excluded) try items.append(alloc, compactTextRun(runs[run_index], run_index));
+            run_index += 1;
+        }
     }
+    return items.toOwnedSlice(alloc);
+}
+
+fn propagateSemanticTextSpans(runs: anytype, spans: []SemanticTextSpan, items: []const LayoutTextRun, cancellation: CancellationProbe) !void {
+    for (items, 0..) |item, index| {
+        if (index % 256 == 0) try cancellation.check();
+        if (item.semantic_span_index == no_semantic_span) {
+            runs[item.source_index].output_span = item.output_span;
+        } else spans[item.semantic_span_index].output_span = item.output_span;
+    }
+    for (spans) |span| for (runs[span.run_start..span.run_end], 0..) |*run, index| {
+        if (index % 256 == 0) try cancellation.check();
+        if (!run.policy_excluded) run.output_span = span.output_span;
+    };
+}
+
+fn textRunOrderingFence(run: anytype) bool {
+    return if (comptime @hasField(@TypeOf(run), "ordering_fence")) run.ordering_fence else false;
+}
+
+fn textRunExitGeometry(run: anytype, source_runs: anytype, spans: []const SemanticTextSpan) @TypeOf(run) {
+    if (comptime @hasField(@TypeOf(run), "source_index")) {
+        if (run.semantic_span_index != no_semantic_span and run.semantic_span_index < spans.len) {
+            if (spans[run.semantic_span_index].exit_run) |index| {
+                var exit = compactTextRun(source_runs[index], index);
+                exit.text = run.text;
+                return exit;
+            }
+        }
+    }
+    return run;
 }
 
 fn finalizeNativeTextDiagnostics(runs: []const TextRun, diagnostics: *NativeTextDiagnostics) void {
     for (runs) |run| {
         if (run.output_span != null) {
             diagnostics.emitted_run_count +|= 1;
-        } else if (!run.policy_excluded and
+        } else if (!run.policy_excluded and run.semantic_span_index == no_semantic_span and
             std.mem.trim(u8, run.text, &std.ascii.whitespace).len > 0)
         {
             diagnostics.unaligned_runs +|= 1;
@@ -19515,7 +19711,7 @@ fn orderedTextRunIndicesWithBreaksAlloc(alloc: Allocator, runs: anytype, cancell
     defer original.deinit(alloc);
     for (runs, 0..) |run, run_index| {
         if (run_index % 256 == 0) try cancellation.check();
-        if (run.text.len == 0 or textRunPolicyExcluded(run)) continue;
+        if ((run.text.len == 0 and !textRunOrderingFence(run)) or textRunPolicyExcluded(run)) continue;
         try original.append(alloc, run_index);
     }
     // Above this bound, preserve authored order. Both line clustering and
@@ -19524,8 +19720,23 @@ fn orderedTextRunIndicesWithBreaksAlloc(alloc: Allocator, runs: anytype, cancell
     if (original.items.len <= 1 or original.items.len > 2048 or runs.len > 2048)
         return try original.toOwnedSlice(alloc);
 
+    var ordered = std.ArrayList(usize).empty;
+    errdefer ordered.deinit(alloc);
+    var start: usize = 0;
+    for (original.items, 0..) |run_index, ordinal| {
+        if (!textRunOrderingFence(runs[run_index])) continue;
+        try appendOrientationTextOrder(alloc, &ordered, runs, original.items[start..ordinal], cancellation, break_before);
+        try ordered.append(alloc, run_index);
+        start = ordinal + 1;
+    }
+    try appendOrientationTextOrder(alloc, &ordered, runs, original.items[start..], cancellation, break_before);
+    return ordered.toOwnedSlice(alloc);
+}
+
+fn appendOrientationTextOrder(alloc: Allocator, ordered: *std.ArrayList(usize), runs: anytype, indices: []const usize, cancellation: CancellationProbe, break_before: ?[]bool) !void {
+    if (indices.len == 0) return;
     const no_group = std.math.maxInt(usize);
-    const membership = try alloc.alloc(usize, runs.len);
+    const membership = try alloc.alloc(usize, indices.len);
     defer alloc.free(membership);
     @memset(membership, no_group);
     var groups = std.ArrayList(TextOrientationGroup).empty;
@@ -19533,7 +19744,7 @@ fn orderedTextRunIndicesWithBreaksAlloc(alloc: Allocator, runs: anytype, cancell
         for (groups.items) |*group| group.deinit(alloc);
         groups.deinit(alloc);
     }
-    for (original.items, 0..) |run_index, ordinal| {
+    for (indices, 0..) |run_index, ordinal| {
         if (ordinal % 256 == 0) try cancellation.check();
         if (!textRunHasSupportedOrderingGeometry(runs[run_index])) continue;
         var group_index: ?usize = null;
@@ -19548,13 +19759,11 @@ fn orderedTextRunIndicesWithBreaksAlloc(alloc: Allocator, runs: anytype, cancell
             group_index = groups.items.len - 1;
         }
         try groups.items[group_index.?].indices.append(alloc, run_index);
-        membership[run_index] = group_index.?;
+        membership[ordinal] = group_index.?;
     }
 
-    var ordered = std.ArrayList(usize).empty;
-    errdefer ordered.deinit(alloc);
-    for (original.items) |run_index| {
-        const group_index = membership[run_index];
+    for (indices, 0..) |run_index, ordinal| {
+        const group_index = membership[ordinal];
         if (group_index == no_group) {
             try ordered.append(alloc, run_index);
             continue;
@@ -19567,10 +19776,8 @@ fn orderedTextRunIndicesWithBreaksAlloc(alloc: Allocator, runs: anytype, cancell
             continue;
         }
         const metrics = try textLayoutMetricsAlloc(alloc, runs, group.indices.items);
-        try appendPartitionedTextRunOrder(alloc, &ordered, runs, group.indices.items, metrics, 0, cancellation, break_before);
+        try appendPartitionedTextRunOrder(alloc, ordered, runs, group.indices.items, metrics, 0, cancellation, break_before);
     }
-    std.debug.assert(ordered.items.len == original.items.len);
-    return try ordered.toOwnedSlice(alloc);
 }
 
 fn clearTextRunOutputSpans(runs: anytype) void {
@@ -19637,6 +19844,10 @@ fn reconstructTextFromRunsAlloc(alloc: Allocator, runs: anytype) ![]u8 {
 }
 
 fn reconstructTextFromRunsCancelableAlloc(alloc: Allocator, runs: anytype, cancellation: CancellationProbe) ![]u8 {
+    return reconstructTextItemsCancelableAlloc(alloc, runs, runs, &.{}, cancellation);
+}
+
+fn reconstructTextItemsCancelableAlloc(alloc: Allocator, runs: anytype, source_runs: anytype, spans: []const SemanticTextSpan, cancellation: CancellationProbe) ![]u8 {
     try cancellation.check();
     clearTextRunOutputSpans(runs);
     var boundary_storage: [2048]bool = @splat(false);
@@ -19649,44 +19860,52 @@ fn reconstructTextFromRunsCancelableAlloc(alloc: Allocator, runs: anytype, cance
     for (ordered_indices, 0..) |run_index, emitted_index| {
         if (emitted_index % 256 == 0) try cancellation.check();
         const run = &runs[run_index];
+        if (run.text.len == 0) {
+            previous_index = run_index; // Intentional deletion bridges authored text.
+            continue;
+        }
         if (previous_index) |prior_index| {
-            const prior = runs[prior_index];
-            const layer_boundary = invisibleTextRun(prior) != invisibleTextRun(run.*) and
-                (textRunForwardGap(prior, run.*) < 0 or
-                    textBoundsOverlap(textRunBounds(prior), textRunBounds(run.*)));
-            const authored_ocr_boundary = invisibleTextRun(prior) and invisibleTextRun(run.*) and
-                independentTextCopies(prior, run.*) and
-                textRunForwardGap(prior, run.*) < 0 and
-                textBoundsOverlap(textRunBounds(prior), textRunBounds(run.*));
-            const track_boundary = if (boundaries) |flags| flags[run_index] else false;
-            if (track_boundary or authored_ocr_boundary or layer_boundary or !textRunsShareLine(prior, run.*)) {
-                try appendLayoutNewline(alloc, &out, runs, ordered_indices[0..emitted_index]);
-            } else if (!std.ascii.isWhitespace(out.items[out.items.len - 1]) and
-                !std.ascii.isWhitespace(run.text[0]))
-            {
-                const axis = textRunAxisLength(prior);
-                const font_scale = @abs(prior.font_size) * axis;
-                const gap = textRunForwardGap(prior, run.*);
-                // Tz scales advances and TJ gaps, including sub-point spaces.
-                const word_gap = @max(0.5, font_scale * 0.12) * @abs(prior.horizontal_scale);
-                const caption_boundary =
-                    prior.paint_order != run.paint_order and
-                    endsWithColon(prior.text) and
-                    startsWithAsciiUpper(run.text);
-                // A text-showing operator boundary can split a single word.
-                // Infer separators from geometry, not content-stream chunking.
-                // Suppress a geometric boundary only when its gap matches
-                // tracking measured around authored whitespace in this TJ.
-                // Unrelated table-cell gaps retain their geometric boundaries.
-                const tracked_glyph_fragments =
-                    prior.paint_order == run.paint_order and
-                    prior.text_show_tracking_gap != null and
-                    run.text_show_tracking_gap != null and
-                    @abs(gap - prior.text_show_tracking_gap.?) <= font_scale * @abs(prior.horizontal_scale) * 0.01 and
-                    textHasSingleTrackingCodepoint(prior.text) and
-                    textHasSingleTrackingCodepoint(run.text);
-                if ((!tracked_glyph_fragments and gap > word_gap) or caption_boundary) {
-                    try out.append(alloc, ' ');
+            const prior = textRunExitGeometry(runs[prior_index], source_runs, spans);
+            if (prior.text.len == 0) {
+                // Explicit empty ActualText removes content, not an inferred separator.
+            } else {
+                const layer_boundary = invisibleTextRun(prior) != invisibleTextRun(run.*) and
+                    (textRunForwardGap(prior, run.*) < 0 or
+                        textBoundsOverlap(textRunBounds(prior), textRunBounds(run.*)));
+                const authored_ocr_boundary = invisibleTextRun(prior) and invisibleTextRun(run.*) and
+                    independentTextCopies(prior, run.*) and
+                    textRunForwardGap(prior, run.*) < 0 and
+                    textBoundsOverlap(textRunBounds(prior), textRunBounds(run.*));
+                const track_boundary = if (boundaries) |flags| flags[run_index] else false;
+                if (track_boundary or authored_ocr_boundary or layer_boundary or !textRunsShareLine(prior, run.*)) {
+                    try appendLayoutNewline(alloc, &out, runs, ordered_indices[0..emitted_index]);
+                } else if (!std.ascii.isWhitespace(out.items[out.items.len - 1]) and
+                    !std.ascii.isWhitespace(run.text[0]))
+                {
+                    const axis = textRunAxisLength(prior);
+                    const font_scale = @abs(prior.font_size) * axis;
+                    const gap = textRunForwardGap(prior, run.*);
+                    // Tz scales advances and TJ gaps, including sub-point spaces.
+                    const word_gap = @max(0.5, font_scale * 0.12) * @abs(prior.horizontal_scale);
+                    const caption_boundary =
+                        prior.paint_order != run.paint_order and
+                        endsWithColon(prior.text) and
+                        startsWithAsciiUpper(run.text);
+                    // A text-showing operator boundary can split a single word.
+                    // Infer separators from geometry, not content-stream chunking.
+                    // Suppress a geometric boundary only when its gap matches
+                    // tracking measured around authored whitespace in this TJ.
+                    // Unrelated table-cell gaps retain their geometric boundaries.
+                    const tracked_glyph_fragments =
+                        prior.paint_order == run.paint_order and
+                        prior.text_show_tracking_gap != null and
+                        run.text_show_tracking_gap != null and
+                        @abs(gap - prior.text_show_tracking_gap.?) <= font_scale * @abs(prior.horizontal_scale) * 0.01 and
+                        textHasSingleTrackingCodepoint(prior.text) and
+                        textHasSingleTrackingCodepoint(run.text);
+                    if ((!tracked_glyph_fragments and gap > word_gap) or caption_boundary) {
+                        try out.append(alloc, ' ');
+                    }
                 }
             }
         }
@@ -23544,18 +23763,19 @@ test "reader ActualText spans preserve source geometry across content streams" {
     try parser.consume("(IBLE) Tj ET EMC", &.{}, &.{}, &.{}, &.{});
 
     try std.testing.expectEqual(@as(usize, 2), runs.items.len);
-    try std.testing.expectEqualStrings("Semantic \xE2\x9C\x93", runs.items[0].text);
-    try std.testing.expectEqualStrings("", runs.items[1].text);
+    try std.testing.expectEqualStrings("VIS", runs.items[0].text);
+    try std.testing.expectEqualStrings("Semantic \xE2\x9C\x93", parser.semantic.spans().items[0].text);
+    try std.testing.expectEqualStrings("IBLE", runs.items[1].text);
     try std.testing.expectEqualStrings("VIS", runs.items[0].raw_text.?);
     try std.testing.expectEqualStrings("IBLE", runs.items[1].raw_text.?);
     try std.testing.expect(runs.items[1].x > runs.items[0].x);
     try std.testing.expect(runs.items[0].advance_width > 0);
     try std.testing.expect(runs.items[1].advance_width > 0);
-    try std.testing.expectEqual(@as(usize, 1), parser.actual_text_replacements);
-    try std.testing.expectEqual(@as(?usize, 0), runs.items[0].actual_text_leader);
-    try std.testing.expectEqual(@as(?usize, 0), runs.items[1].actual_text_leader);
-    try std.testing.expectEqual(@as(usize, 2), runs.items[0].actual_text_end);
-    try std.testing.expectEqual(@as(usize, 2), runs.items[1].actual_text_end);
+    try std.testing.expectEqual(@as(usize, 1), parser.semantic.spans().items.len);
+    try std.testing.expectEqual(@as(usize, 0), runs.items[0].semantic_span_index);
+    try std.testing.expectEqual(@as(usize, 0), runs.items[1].semantic_span_index);
+    try std.testing.expectEqual(@as(usize, 0), parser.semantic.spans().items[0].run_start);
+    try std.testing.expectEqual(@as(usize, 2), parser.semantic.spans().items[0].run_end);
 
     var canonical = std.ArrayList(u8).empty;
     defer canonical.deinit(alloc);
@@ -23641,12 +23861,14 @@ test "reader named ActualText in forms and nested scopes replaces once" {
     try parser.consume("/Span /Outer BDC /Fm0 Do EMC", &.{}, &.{}, &.{form}, &page_properties);
 
     try std.testing.expectEqual(@as(usize, 4), runs.items.len);
-    try std.testing.expectEqualStrings("Form Semantic", runs.items[0].text);
-    try std.testing.expectEqualStrings("", runs.items[1].text);
-    try std.testing.expectEqualStrings("Outer Semantic", runs.items[2].text);
-    try std.testing.expectEqualStrings("", runs.items[3].text);
+    try std.testing.expectEqualStrings("VISIBLE", runs.items[0].text);
+    try std.testing.expectEqualStrings("GLYPHS", runs.items[1].text);
+    try std.testing.expectEqualStrings("VISIBLE", runs.items[2].text);
+    try std.testing.expectEqualStrings("GLYPHS", runs.items[3].text);
+    try std.testing.expectEqualStrings("Form Semantic", parser.semantic.spans().items[0].text);
+    try std.testing.expectEqualStrings("Outer Semantic", parser.semantic.spans().items[1].text);
     for (runs.items) |run| try std.testing.expect(run.raw_text != null);
-    try std.testing.expectEqual(@as(usize, 2), parser.actual_text_replacements);
+    try std.testing.expectEqual(@as(usize, 2), parser.semantic.spans().items.len);
 
     const canonical = try extractTextFromContentAlloc(
         alloc,
@@ -23719,7 +23941,7 @@ test "reader page policy retains hidden OCR while visible policy excludes nonpai
 test "reader native diagnostics ignore whitespace-only unaligned runs" {
     const runs = [_]TextRun{
         .{ .text = " \n\t", .x = 0, .y = 0, .font_size = 10 },
-        .{ .text = "", .x = 0, .y = 0, .font_size = 10, .actual_text_leader = 1, .actual_text_end = 2 },
+        .{ .text = "", .x = 0, .y = 0, .font_size = 10 },
         .{ .text = "Meaningful", .x = 0, .y = 0, .font_size = 10 },
     };
     var diagnostics = NativeTextDiagnostics{};
@@ -33572,7 +33794,7 @@ test "reader ambiguous overlap keeps interleaved text objects coherent" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
 
-test "reader policies preserve vector ActualText with unknown geometry in both APIs" {
+test "reader policies preserve vector ActualText without synthetic glyphs in both APIs" {
     const alloc = std.testing.allocator;
     const sample = try buildTextOrderingTestPdfAlloc(
         alloc,
@@ -33592,9 +33814,9 @@ test "reader policies preserve vector ActualText with unknown geometry in both A
         try std.testing.expectEqualStrings(analysis.text, text);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Vector label"));
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Visible"));
-        try std.testing.expect(analysis.runs[0].semantic_only);
-        try std.testing.expect(analysis.runs[0].bounds() == null);
-        try std.testing.expect(analysis.runs[0].output_span != null);
+        try std.testing.expect(analysis.semantic_spans[0].entry_run == null);
+        try std.testing.expect(analysis.semantic_spans[0].output_bounds != null);
+        try std.testing.expect(analysis.semantic_spans[0].output_span != null);
     }
     try std.testing.expectError(error.TextRunLimitExceeded, parsed.extractPageTextAnalysisWithRunLimitAlloc(1, 0));
 }
@@ -33637,13 +33859,15 @@ test "reader rectangular clip policy is constant space and respects transforms a
     try std.testing.expect(!pageBoxesOverlap(.{ .min_x = 0, .min_y = 0, .max_x = 200, .max_y = 200 }, empty_clip));
 }
 
-test "reader ActualText policy relocation preserves ownership through cancellation" {
+test "reader semantic selection preserves source ownership through cancellation" {
     const alloc = std.testing.allocator;
     var runs = [_]TextRun{
-        .{ .text = try alloc.dupe(u8, "replacement"), .x = 300, .y = 10, .font_size = 10, .policy_excluded = true, .actual_text_leader = 0, .actual_text_end = 2 },
-        .{ .text = try alloc.dupe(u8, ""), .x = 10, .y = 10, .font_size = 10, .actual_text_leader = 0, .actual_text_end = 2 },
+        .{ .text = try alloc.dupe(u8, "source one"), .x = 300, .y = 10, .font_size = 10, .policy_excluded = true, .semantic_span_index = 0 },
+        .{ .text = try alloc.dupe(u8, "source two"), .x = 10, .y = 10, .font_size = 10, .semantic_span_index = 0 },
     };
     defer for (&runs) |*run| run.deinit(alloc);
+    var spans = [_]SemanticTextSpan{.{ .text = try alloc.dupe(u8, "replacement"), .run_start = 0, .run_end = 2 }};
+    defer spans[0].deinit(alloc);
     const Probe = struct {
         calls: usize = 0,
         fn canceled(raw: ?*const anyopaque) bool {
@@ -33653,9 +33877,10 @@ test "reader ActualText policy relocation preserves ownership through cancellati
         }
     };
     var probe = Probe{};
-    try std.testing.expectError(error.Canceled, rehomeActualTextForPolicy(&runs, .{ .context = &probe, .is_cancelled_fn = Probe.canceled }));
-    try std.testing.expectEqualStrings("replacement", runs[1].text);
-    try std.testing.expectEqualStrings("", runs[0].text);
+    try std.testing.expectError(error.Canceled, semanticTextItemsAlloc(alloc, &runs, &spans, .page, .{ .context = &probe, .is_cancelled_fn = Probe.canceled }));
+    try std.testing.expectEqualStrings("source one", runs[0].text);
+    try std.testing.expectEqualStrings("source two", runs[1].text);
+    try std.testing.expectEqualStrings("replacement", spans[0].text);
 }
 
 test "reader visibility preserves partial alpha state and nonzero alpha" {
@@ -33697,4 +33922,95 @@ test "reader plain text scratch releases all allocations and returns owned outpu
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
+}
+
+test "reader semantic scopes preserve punctuation deletion and authored anchors" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { content: []const u8, expected: []const u8, glyphs: usize }{
+        .{ .content = "BT /F1 10 Tf 10 100 Td /Span << /ActualText (Hello) >> BDC (H) Tj (ello) Tj EMC (.) Tj ET", .expected = "Hello.\n", .glyphs = 3 },
+        .{ .content = "BT /F1 10 Tf 10 100 Td (pre) Tj /Span << /ActualText () >> BDC (delete) Tj EMC (post) Tj ET", .expected = "prepost\n", .glyphs = 3 },
+        .{ .content = "BT /F1 10 Tf 10 150 Td (Before) Tj ET /Span << /ActualText (Middle semantic label) >> BDC 10 100 20 20 re f EMC BT /F1 10 Tf 10 50 Td (After) Tj ET", .expected = "Before\nMiddle semantic label\nAfter\n", .glyphs = 2 },
+    };
+    for (cases) |case| {
+        const sample = try buildTextOrderingTestPdfAlloc(alloc, case.content);
+        defer alloc.free(sample);
+        var parsed = try Reader.init(alloc, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(alloc);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer alloc.free(plain);
+            try std.testing.expectEqualStrings(case.expected, analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expectEqual(case.glyphs, analysis.runs.len);
+            try std.testing.expectEqual(@as(usize, 1), analysis.semantic_spans.len);
+            for (analysis.runs) |run| try std.testing.expectEqualStrings(run.raw_text.?, run.text);
+        }
+    }
+}
+
+test "reader semantic paint policies use individual paints and conservative bounds" {
+    const alloc = std.testing.allocator;
+    const cases = [_]struct { content: []const u8, page: bool, visible: bool, unknown: bool = false, outside: usize = 0, invisible: usize = 0 }{
+        .{ .content = "/Span << /ActualText (Label) >> BDC 1000 1000 10 10 re f EMC", .page = false, .visible = false, .outside = 1 },
+        // A union that crosses the page does not establish any on-page paint.
+        .{ .content = "/Span << /ActualText (Label) >> BDC -100 10 10 10 re f 1000 10 10 10 re f EMC", .page = false, .visible = false, .outside = 1 },
+        .{ .content = "/Span << /ActualText (Label) >> BDC q 1000 1000 10 10 re W n 10 10 10 10 re f Q EMC", .page = false, .visible = false, .outside = 1 },
+        .{ .content = "/Span << /ActualText (Label) >> BDC BT /F1 10 Tf 3 Tr 10 100 Td (hidden) Tj ET EMC", .page = true, .visible = false, .invisible = 1 },
+        .{ .content = "/Span << /ActualText (Label) >> BDC BT /F1 10 Tf 3 Tr 10 100 Td (hidden) Tj 0 Tr (visible) Tj ET EMC", .page = true, .visible = true },
+        // Device hairlines and unrestricted miter joins have no safe path-only bound.
+        .{ .content = "/Span << /ActualText (Label) >> BDC 0 w 1000 1000 10 10 re S EMC", .page = true, .visible = true, .unknown = true },
+    };
+    for (cases) |case| {
+        const sample = try buildTextOrderingTestPdfAlloc(alloc, case.content);
+        defer alloc.free(sample);
+        var parsed = try Reader.init(alloc, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            const present = policy == .source or (if (policy == .page) case.page else case.visible);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(alloc);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer alloc.free(plain);
+            try std.testing.expectEqualStrings(if (present) "Label\n" else "", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expectEqual(case.outside, analysis.diagnostics.outside_page_spans);
+            try std.testing.expectEqual(case.invisible, analysis.diagnostics.invisible_spans);
+            try std.testing.expectEqual(@as(usize, if (present and case.unknown) 1 else 0), analysis.diagnostics.unpositioned_spans);
+            try std.testing.expectEqual(@as(usize, 1), analysis.semantic_spans.len);
+        }
+    }
+}
+
+test "reader semantic image evidence needs no pixel decoding and inherits form state" {
+    const alloc = std.testing.allocator;
+    const content = "/Span << /ActualText (Image label) >> BDC /Fm Do EMC";
+    const objects = [_][]const u8{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /XObject << /Fm 5 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content }),
+        "5 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 200 200] /Resources << /XObject << /Im 6 0 R >> /ExtGState << /Hidden << /ca 0 >> >> >> /Length 41 >>\nstream\nq /Hidden gs 20 0 0 20 10 10 cm /Im Do Q\nendstream\nendobj\n",
+        "6 0 obj\n<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /Filter /Unsupported /Length 7 >>\nstream\ngarbage\nendstream\nendobj\n",
+    };
+    defer alloc.free(objects[3]);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &objects);
+    defer alloc.free(sample);
+    var parsed = try Reader.init(alloc, sample);
+    defer parsed.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        parsed.setTextExtractionPolicy(policy);
+        var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(alloc);
+        const plain = try parsed.extractPageTextAlloc(1);
+        defer alloc.free(plain);
+        try std.testing.expectEqualStrings(if (policy == .visible) "" else "Image label\n", analysis.text);
+        try std.testing.expectEqualStrings(analysis.text, plain);
+        try std.testing.expectEqual(@as(usize, 0), analysis.runs.len);
+        try std.testing.expectEqual(@as(usize, 1), analysis.diagnostics.invisible_spans);
+        try std.testing.expectEqual(PageBox{ .min_x = 10, .min_y = 10, .max_x = 30, .max_y = 30 }, analysis.semantic_spans[0].paint.source_bounds.?);
+    }
 }

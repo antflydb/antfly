@@ -22,9 +22,9 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 /// Persisted prefix for the canonical, injective unit-fingerprint encoding.
 /// Keeping the version in the value makes payload markers self-describing and
 /// lets readers distinguish them from the unversioned legacy digest.
-pub const current_prefix = "duf3:";
-pub const current_state_version: u8 = 3;
-const current_domain = "antfly-document-unit-fingerprint-v3";
+pub const current_prefix = "duf4:";
+pub const current_state_version: u8 = 4;
+const current_domain = "antfly-document-unit-fingerprint-v4";
 
 // Adding extraction metadata is a persisted-format change: update the encoder,
 // assign a new stable tag, and bump the fingerprint version deliberately.
@@ -514,6 +514,9 @@ fn hashTaggedNativeTextDiagnostics(hasher: *Sha256, diagnostics: ?document_extra
         hashU64(hasher, @intCast(value.unsupported_ordering_runs));
         hashU64(hasher, @intCast(value.source_run_count));
         hashU64(hasher, @intCast(value.emitted_run_count));
+        hashU64(hasher, @intCast(value.outside_page_spans));
+        hashU64(hasher, @intCast(value.invisible_spans));
+        hashU64(hasher, @intCast(value.unpositioned_spans));
         hasher.update(&.{
             @intFromBool(value.outline_fallback),
             @intFromBool(value.has_nontext_visual),
@@ -636,6 +639,7 @@ test "document unit fingerprint distinguishes absent and empty optional fields" 
 
 test "document unit fingerprint state version rejects legacy encodings" {
     try std.testing.expect(!stateVersionIsCurrent(.{ .integer = 1 }));
+    try std.testing.expect(!stateVersionIsCurrent(.{ .integer = current_state_version - 1 }));
     try std.testing.expect(stateVersionIsCurrent(.{ .integer = current_state_version }));
     try std.testing.expect(!stateVersionIsCurrent(.{ .string = "2" }));
 }
@@ -686,6 +690,14 @@ test "document unit fingerprint includes native quality diagnostics region style
     const metadata = try fingerprintAlloc(alloc, enriched);
     defer alloc.free(metadata);
     try std.testing.expect(!std.mem.eql(u8, baseline, metadata));
+
+    inline for (.{ "outside_page_spans", "invisible_spans", "unpositioned_spans" }) |field| {
+        var changed = enriched;
+        @field(changed.native_text_diagnostics.?, field) = 1;
+        const fingerprint = try fingerprintAlloc(alloc, changed);
+        defer alloc.free(fingerprint);
+        try std.testing.expect(!std.mem.eql(u8, metadata, fingerprint));
+    }
 
     var regions = [_]document_extraction.TextRegion{.{ .span = .{ 0, 7 }, .bbox = .{ 1, 2, 3, 4 }, .font_size = 12, .bold = true }};
     var blocks = [_]document_extraction.TextBlock{.{ .span = .{ 0, 7 }, .bbox = .{ 1, 2, 3, 4 }, .reading_order = 0, .font_size = 12, .bold = true }};
