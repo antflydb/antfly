@@ -1915,15 +1915,23 @@ Container arrays, ancestor decisions, stream container keys, and decoded owner
 text are reused within each page. MCIDs, number-tree keys, Limits endpoints,
 and root type names use the same bounded, memoized resolver for direct and
 indirect values. Unassigned ParentTree slots treat direct and indirect null
-equally; parent links still require real structure elements. Named property tables are
-sorted once per resource scope and searched in logarithmic time, without
-allocating a separate lookup table or scanning all properties for each BDC.
+equally; parent links still require real structure elements. Named property
+lookups at BDC remain logarithmic. Sparse scopes select names through a shared
+dictionary index; dense scopes reuse its sorted order in one pass.
 Named replacement strings retain their encoded bytes and decode only when
 selected. A bounded page-local cache shares each decoded string, including
-indirect values; overridden malformed properties are never decoded or resolved.
+indirect values; overridden replacement values are never decoded or resolved.
+Indirect resource and property dictionaries are retained once per page. Form
+records borrow their raw strings, and property-name indexes are sorted once per
+dictionary. Repeated Form scopes cannot multiply a shared replacement's storage.
+Resource metadata has a page-local byte and cumulative-allocation allowance.
+Selected missing or malformed property dictionaries retain native glyph text and
+report incomplete ActualText; overridden scopes do not report irrelevant errors.
+UTF-16 text-string BOM detection precedes payload-length validation, so odd or
+truncated replacements use the same explicit fallback as invalid surrogate pairs.
 Optional null ActualText, MCID, Pg, and Stm values behave like omitted entries.
 Known current-page references preserve identity without cloning page resources.
-Retained metadata and page-local lookup allocations share
+Retained structure metadata and page-local structure lookup allocations share
 one live-byte allowance. ParentTree bindings are checked against the owner's declared
 content. An outer replacement wins over its descendants; repeated MCIDs owned
 by the same replacement merge paint evidence and emit text once, preserving
