@@ -1,0 +1,10 @@
+{
+  "model": "google/embeddinggemma-2:safetensors@914f7f89142e33e77833254d9c9b90c3cef7303b",
+  "dimensions": 768,
+  "document_task": "RETRIEVAL_DOCUMENT",
+  "query_task": "RETRIEVAL_QUERY",
+  "pooling": "mean",
+  "normalization": "l2",
+  "max_tokens": 8192,
+  "overflow": "reject"
+}
