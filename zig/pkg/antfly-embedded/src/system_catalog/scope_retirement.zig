@@ -209,6 +209,30 @@ pub const Manifest = struct {
         return false;
     }
 
+    /// Stable merge of both sorted retirement sets. Held/rewritten tables
+    /// never acquire deletion identities. Shared by admission and recovery so
+    /// registration is one linear pass, rather than one manifest walk per child.
+    pub const RetiringTables = struct {
+        manifest: Manifest,
+        direct: usize = 0,
+        extra: usize = 0,
+        pub fn next(self: *RetiringTables) ?Table {
+            while (self.extra < self.manifest.dependencies.len and
+                (self.manifest.dependencies[self.extra].kind != .table or self.manifest.dependencies[self.extra].action != .retire)) : (self.extra += 1)
+            {}
+            const left = if (self.direct < self.manifest.tables.len) self.manifest.tables[self.direct] else null;
+            const right = if (self.extra < self.manifest.dependencies.len) self.manifest.dependencies[self.extra].table else null;
+            if (left == null and right == null) return null;
+            const take_left = right == null or (left != null and left.?.id < right.?.id);
+            const selected = if (take_left) left.? else right.?;
+            if (take_left) self.direct += 1 else self.extra += 1;
+            return selected;
+        }
+    };
+    pub fn retiringTables(self: Manifest) RetiringTables {
+        return .{ .manifest = self };
+    }
+
     pub fn tableById(self: Manifest, id: u64) ?Table {
         var first: usize = 0;
         var last = self.tables.len;
@@ -665,6 +689,19 @@ fn exerciseDependencyFootprint(a: A) !void {
     };
     const reference = try manifest.reference(a, @splat(5));
     try std.testing.expectEqual(@as(u16, 2), reference.tables);
+    var children = manifest.retiringTables();
+    try std.testing.expectEqual(@as(u64, 111), children.next().?.id);
+    try std.testing.expectEqual(@as(u64, 112), children.next().?.id);
+    try std.testing.expect(children.next() == null);
+    // The union is ordered by immutable table ID, independent of whether a
+    // child is directly contained or a materialized backing reached outside.
+    var interleaved = manifest;
+    interleaved.tables = &.{ tables[0], .{ .id = 300, .physical_name = "later", .preimage = primary, .definition = @splat(7), .ranges = @splat(8) } };
+    children = interleaved.retiringTables();
+    try std.testing.expectEqual(@as(u64, 111), children.next().?.id);
+    try std.testing.expectEqual(@as(u64, 112), children.next().?.id);
+    try std.testing.expectEqual(@as(u64, 300), children.next().?.id);
+    try std.testing.expect(children.next() == null);
     try std.testing.expectEqual(@as(u16, 5), reference.resources);
     try std.testing.expect(manifest.contains(.view, 90));
     try std.testing.expect(manifest.contains(.table, 212));

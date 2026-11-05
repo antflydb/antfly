@@ -52,9 +52,20 @@ ordered work reference and exact leases on selected identities. Namespace jobs
 can coexist; an intersecting database job conflicts. Exact replay observes its
 original result before vacancy checks and cannot reacquire released leases.
 Admission rejects an occupied queue slot if its counter is inconsistent.
-Terminal progress releases leases, body and work rows atomically while keeping
-the compact outcome. Native tests abort every staged admission and terminal
-write and reopen the store between progress steps.
+Root admission registers every physical deletion child in that same native
+transaction. A linear merge of the selected tables and retiring materialized
+backings assigns stable ordinals, root-derived child IDs and exact definition/range
+commitments. Held and rewritten tables never receive deletion children. The
+cyclic work read returns the next compact registration using point reads; it does
+not decode the immutable membership body on every idle/coordinator poll. This
+requires metadata capability 166. Registrations identify proposed child work;
+they grant no physical execution or completion authority.
+
+Terminal progress releases leases, body, work and child registrations atomically
+while keeping the compact outcome. Native tests abort every staged admission and
+terminal write, including every child-registration write, and reopen the store
+between progress steps. Streamed snapshot/checkpoint verification rejects missing,
+substituted and orphan registrations before publication.
 
 The private reservation command now crosses the ordinary metadata ingress,
 coordinated decoder floor, opaque storage-owner ABI and Raft apply transaction.
@@ -135,8 +146,8 @@ workers and final publication must verify each independently before advancing.
    routines. Finish connection/data admission and physical-owner barriers without
    a global query lock. The current metadata footprint and fences do not supply
    deletion authority for those still-unimplemented effects.
-2. Register each deterministic child before its proposal so lost replies
-   recover the admitted child rather than allocating another operation. A
+2. Drive proposals from the child identities already registered atomically at
+   admission, and join each physical child to its root custody. A
    constant-size cyclic native work feed and verified immutable manifest read
    already cross the storage-owner and private metadata boundaries. Reservation
    and cancellation retain exact outcomes under the decoder capability and

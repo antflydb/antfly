@@ -106,6 +106,21 @@ const Campaign = struct {
         try std.testing.expectEqual(@as(usize, 1), rewrites);
         try std.testing.expectEqual(@as(usize, 1), held);
         try std.testing.expectEqual(@as(usize, 2), retired_views);
+        if (self.admitted) |admitted| {
+            var remote = ctx.catalogClient();
+            const work_bytes = try remote.forwardSystemCatalog(ctx.metadata_uri, .{ .scope_retirement_work = 0 }, .{ .remaining_ms = 10000, .forwards_remaining = 0, .campaign_allowed = false }, true);
+            defer ctx.alloc.free(work_bytes);
+            const work = (try std.json.parseFromSliceLeaky(?@import("../metadata/scope_retirement_ledger.zig").Work, a, work_bytes, .{})) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqualDeep(admitted.result.accepted, work.head);
+            const child = work.child orelse return error.TestUnexpectedResult;
+            try child.validate();
+            try std.testing.expectEqualDeep(admitted.query.lookup, child.lookup);
+            try std.testing.expectEqual(@as(u16, 0), child.ordinal);
+            try std.testing.expectEqual(manifest.tables[0].id, child.table);
+            try std.testing.expectEqualSlices(u8, &manifest.tables[0].definition, &child.definition);
+            try std.testing.expectEqualSlices(u8, &manifest.tables[0].ranges, &child.ranges);
+            try std.testing.expectEqualSlices(u8, &try admitted.query.lookup.reference.childId(child.table), &child.id);
+        }
         const identity = try manifest.digest(a);
         if (self.identity) |expected| {
             try std.testing.expectEqual(self.table_id, manifest.tables[0].id);

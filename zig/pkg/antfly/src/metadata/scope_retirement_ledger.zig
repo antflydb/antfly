@@ -93,6 +93,56 @@ pub fn key(buffer: []u8, lookup: Lookup, kind: Kind) ![]const u8 {
 pub fn memberKey(buffer: []u8, group: u64, kind: local.system_catalog_domain.Kind, id: u64) ![]const u8 {
     return @import("scope_retirement_fence.zig").memberKey(buffer, group, @tagName(kind), id);
 }
+/// Every deletion child is registered atomically with root admission, before
+/// any proposal to a data owner. A compact identity survives a lost child reply;
+/// membership is never reconstructed from a mutable display name. Registration
+/// is not a physical completion receipt or permission to skip owner barriers.
+pub const Child = struct {
+    lookup: Lookup,
+    ordinal: u16,
+    table: u64,
+    id: contract.Id,
+    definition: contract.Digest,
+    ranges: contract.Digest,
+    pub fn validate(self: Child) !void {
+        try self.lookup.validate();
+        if (self.ordinal >= self.lookup.reference.tables or self.table == 0 or
+            !std.mem.eql(u8, &self.id, &try self.lookup.reference.childId(self.table)) or
+            std.mem.allEqual(u8, &self.definition, 0) or std.mem.allEqual(u8, &self.ranges, 0)) return error.InvalidScopeRetirement;
+    }
+    fn fromTable(lookup: Lookup, ordinal: u16, table: contract.Table) !Child {
+        const result: Child = .{ .lookup = lookup, .ordinal = ordinal, .table = table.id, .id = try lookup.reference.childId(table.id), .definition = table.definition, .ranges = table.ranges };
+        try result.validate();
+        return result;
+    }
+};
+pub const ChildRecord = records.Record(Child, "SRCH", 2048);
+pub fn childKey(buffer: []u8, lookup: Lookup, ordinal: u16) ![]const u8 {
+    try lookup.validate();
+    if (ordinal >= lookup.reference.tables) return error.InvalidScopeRetirement;
+    var base: [128]u8 = undefined;
+    return std.fmt.bufPrint(buffer, "{s}{s}:{x:0>16}:{s}:child:{x:0>4}", .{ try prefix(&base, lookup.group), @tagName(lookup.reference.kind), lookup.reference.root, std.fmt.bytesToHex(lookup.reference.id, .lower), ordinal });
+}
+pub fn child(reader: anytype, lookup: Lookup, ordinal: u16) !?Child {
+    var buffer: [320]u8 = undefined;
+    const bytes = (try optional(reader, try childKey(&buffer, lookup, ordinal))) orelse return null;
+    const result = try ChildRecord.decode(bytes);
+    try result.validate();
+    if (!std.meta.eql(result.lookup, lookup) or result.ordinal != ordinal) return error.InvalidScopeRetirement;
+    return result;
+}
+/// One compact feed response. A live job with remaining children always carries
+/// its exact next registered identity; reading it does not load the manifest.
+pub const Work = struct { head: Head, child: ?Child };
+pub fn nextOwnerWork(reader: anytype, group: u64, after: u64) !?Work {
+    const value = (try nextWork(reader, group, after)) orelse return null;
+    const selected = if (value.progress.completed_tables < value.lookup.reference.tables)
+        (try child(reader, value.lookup, value.progress.completed_tables)) orelse return error.InvalidScopeRetirement
+    else
+        null;
+    return .{ .head = value, .child = selected };
+}
+
 pub fn queuePrefix(buffer: []u8, group: u64) ![]const u8 {
     if (group == 0) return error.InvalidScopeRetirement;
     return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:system_catalog:{d}:scope-retirement-queue:", .{group});
@@ -223,6 +273,9 @@ pub fn stageBegin(txn: anytype, prepared: *const Prepared) !Head {
     if (try optional(txn, try queueKey(&buffer, prepared.lookup.group, sequence)) != null) return error.InvalidScopeRetirement;
     const value: Head = .{ .lookup = prepared.lookup, .metadata_incarnation = prepared.manifest.metadata_incarnation, .creator = prepared.manifest.creator, .sequence = sequence, .progress = .{ .reference = prepared.lookup.reference } };
     try value.validate();
+    for (0..prepared.lookup.reference.tables) |ordinal| {
+        if (try child(txn, prepared.lookup, @intCast(ordinal)) != null) return error.InvalidScopeRetirement;
+    }
     const encoded_head = try HeadRecord.init(value);
     const encoded_queue = try QueueRecord.init(prepared.lookup);
     const lease = try LeaseRecord.init(.{ .lookup = prepared.lookup, .metadata_incarnation = value.metadata_incarnation });
@@ -239,6 +292,14 @@ pub fn stageBegin(txn: anytype, prepared: *const Prepared) !Head {
         const participant = try LeaseRecord.init(.{ .lookup = prepared.lookup, .metadata_incarnation = value.metadata_incarnation, .intent = dependency.action });
         try txn.put(try memberKey(&buffer, prepared.lookup.group, dependency.kind, dependency.id), participant.slice());
     }
+    var tables = prepared.manifest.retiringTables();
+    var ordinal: u16 = 0;
+    while (tables.next()) |table| : (ordinal += 1) {
+        const registered = try ChildRecord.init(try Child.fromTable(prepared.lookup, ordinal, table));
+        var child_buffer: [320]u8 = undefined;
+        try txn.put(try childKey(&child_buffer, prepared.lookup, ordinal), registered.slice());
+    }
+    if (ordinal != prepared.lookup.reference.tables) return error.InvalidScopeRetirement;
     return value;
 }
 pub fn requireMembers(reader: anytype, prepared: *const Prepared, value: Head) !void {
@@ -256,6 +317,13 @@ pub fn requireMembers(reader: anytype, prepared: *const Prepared, value: Head) !
         const lease = (try member(reader, value.lookup.group, dependency.kind, dependency.id)) orelse return error.InvalidScopeRetirement;
         if (!std.meta.eql(lease, participant)) return error.InvalidScopeRetirement;
     }
+    var tables = prepared.manifest.retiringTables();
+    var ordinal: u16 = 0;
+    while (tables.next()) |table| : (ordinal += 1) {
+        const registered = (try child(reader, prepared.lookup, ordinal)) orelse return error.InvalidScopeRetirement;
+        if (!std.meta.eql(registered, try Child.fromTable(prepared.lookup, ordinal, table))) return error.InvalidScopeRetirement;
+    }
+    if (ordinal != prepared.lookup.reference.tables) return error.InvalidScopeRetirement;
     var buffer: [256]u8 = undefined;
     const queued = (try optional(reader, try queueKey(&buffer, value.lookup.group, value.sequence))) orelse return error.InvalidScopeRetirement;
     if (!std.meta.eql(try QueueRecord.decode(queued), value.lookup)) return error.InvalidScopeRetirement;
@@ -284,6 +352,8 @@ pub fn stageAdvance(txn: anytype, prepared: *const Prepared, before: Head, next:
         for (prepared.manifest.dependencies) |dependency| try txn.delete(try memberKey(&buffer, result.lookup.group, dependency.kind, dependency.id));
         try txn.delete(try queueKey(&buffer, result.lookup.group, result.sequence));
         try txn.delete(try key(&buffer, result.lookup, .manifest));
+        var child_buffer: [320]u8 = undefined;
+        for (0..result.lookup.reference.tables) |ordinal| try txn.delete(try childKey(&child_buffer, result.lookup, @intCast(ordinal)));
     }
     try txn.put(try key(&buffer, result.lookup, .head), encoded.slice());
     return result;

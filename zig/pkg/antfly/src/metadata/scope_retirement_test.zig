@@ -67,6 +67,7 @@ fn absent(store: *native.RaftApplyStore, lookup: ledger.Lookup) !void {
     defer read.abort();
     try std.testing.expect(try ledger.head(&read, lookup) == null);
     try std.testing.expect(try ledger.member(&read, group, .database, lookup.reference.database) == null);
+    for (0..lookup.reference.tables) |ordinal| try std.testing.expect(try ledger.child(&read, lookup, @intCast(ordinal)) == null);
 }
 
 test "SQL scope retirement journal atomically owns membership exact retries cold custody and terminal release" {
@@ -89,7 +90,7 @@ test "SQL scope retirement journal atomically owns membership exact retries cold
         var prepared = try ledger.prepare(a, group, @splat(6), encoded);
         defer prepared.deinit();
         if (pass == 0) {
-            const puts = 5 + prepared.manifest.resources.len;
+            const puts = 5 + prepared.manifest.resources.len + prepared.lookup.reference.tables;
             for (0..puts) |fail_at| {
                 var txn = try store.store.beginWriteTxn();
                 var open = true;
@@ -136,7 +137,7 @@ test "SQL scope retirement journal atomically owns membership exact retries cold
     // The native apply owner separately verifies actual publication. Here the
     // journal only proves atomic terminal custody, not a fabricated owner ACK.
     const next = try expected.progress.published(prepared.manifest.catalog_revision + 1, prepared.manifest.catalog_revision);
-    const writes = 4 + prepared.manifest.resources.len;
+    const writes = 4 + prepared.manifest.resources.len + prepared.lookup.reference.tables;
     for (0..writes) |fail_at| {
         var txn = try store.store.beginWriteTxn();
         var open = true;
@@ -266,8 +267,37 @@ test "SQL scope retirement native admission retains exact outcomes and cancellat
                 original = observed.outcome.?;
                 try std.testing.expectEqual(contract.Phase.draining_connections, original.result.accepted.progress.phase);
                 try std.testing.expectEqualDeep(original, (try AdmissionHarness.apply(&store, scratch, request, 101, replicated)).outcome.?);
-                const work = (try std.json.parseFromSliceLeaky(?ledger.Head, scratch, try store.scopeRetirementWorkJson(scratch, group, std.math.maxInt(u64)), .{})).?;
-                try std.testing.expectEqualDeep(original.result.accepted, work);
+                const work = (try std.json.parseFromSliceLeaky(?ledger.Work, scratch, try store.scopeRetirementWorkJson(scratch, group, std.math.maxInt(u64)), .{})).?;
+                try std.testing.expectEqualDeep(original.result.accepted, work.head);
+                {
+                    const PointReader = struct {
+                        txn: *docstore.DocStore.Txn,
+                        gets: usize = 0,
+                        cursors: usize = 0,
+                        pub fn get(self: *@This(), name: []const u8) ![]const u8 {
+                            // Hot polling must remain independent of manifest
+                            // bytes and membership cardinality.
+                            if (std.mem.endsWith(u8, name, ":manifest")) return error.TestUnexpectedResult;
+                            self.gets += 1;
+                            return self.txn.get(name);
+                        }
+                        pub fn openCursor(self: *@This()) !docstore.DocStore.Txn.CursorAdapter {
+                            self.cursors += 1;
+                            return self.txn.openCursor();
+                        }
+                    };
+                    var read = try store.store.beginReadTxn();
+                    defer read.abort();
+                    var measured: PointReader = .{ .txn = &read };
+                    const polled = (try ledger.nextOwnerWork(&measured, group, 0)).?;
+                    try std.testing.expectEqualDeep(work, polled);
+                    try std.testing.expect(measured.gets <= 3);
+                    try std.testing.expectEqual(@as(usize, 1), measured.cursors);
+                }
+                const selected = work.child orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(u16, 0), selected.ordinal);
+                try std.testing.expectEqual(@as(u64, 101), selected.table);
+                try std.testing.expectEqualSlices(u8, &try original.query.lookup.reference.childId(101), &selected.id);
                 const retained = try std.json.parseFromSliceLeaky(contract.Manifest, scratch, try store.scopeRetirementManifestJson(scratch, group, original.query.lookup), .{});
                 try std.testing.expectEqualDeep(original.query.lookup.reference, try retained.reference(scratch, original.query.lookup.reference.id));
                 try std.testing.expectError(error.CatalogPublicationProofPending, store.exportSystemCatalog(scratch, group));
@@ -276,7 +306,7 @@ test "SQL scope retirement native admission retains exact outcomes and cancellat
                 var active_copy = try native.RaftApplyStore.init(a, .{ .root_dir = active_copy_path });
                 defer active_copy.deinit();
                 try std.testing.expect(try active_copy.snapshotBuilder().installSnapshot(scratch, group, 101, active_snapshot));
-                const active_work = try std.json.parseFromSliceLeaky(?ledger.Head, scratch, try active_copy.scopeRetirementWorkJson(scratch, group, 0), .{});
+                const active_work = try std.json.parseFromSliceLeaky(?ledger.Work, scratch, try active_copy.scopeRetirementWorkJson(scratch, group, 0), .{});
                 try std.testing.expectEqualDeep(work, active_work.?);
                 try std.testing.expectEqualStrings(try store.scopeRetirementManifestJson(scratch, group, original.query.lookup), try active_copy.scopeRetirementManifestJson(scratch, group, original.query.lookup));
                 cancel = AdmissionHarness.cancel(original.query.lookup, 72);
@@ -378,7 +408,7 @@ test "SQL scope retirement admission and outcome writes abort as one native tran
     defer input.deinit();
     var prepared = try ledger.prepare(a, group, request.admission.nonce, try std.json.Stringify.valueAlloc(scratch, request.operation.reserve, .{}));
     defer prepared.deinit();
-    for (0..6 + prepared.manifest.resources.len) |fail_at| {
+    for (0..6 + prepared.manifest.resources.len + prepared.lookup.reference.tables) |fail_at| {
         var txn = try store.store.beginWriteTxn();
         var open = true;
         defer if (open) txn.abort();
@@ -398,7 +428,7 @@ test "SQL scope retirement admission and outcome writes abort as one native tran
     defer cancellation.deinit();
     // Cancellation releases all active custody and retains both the exact
     // result and its per-job receipt link in one abortable native transaction.
-    for (0..6 + prepared.manifest.resources.len) |fail_at| {
+    for (0..6 + prepared.manifest.resources.len + prepared.lookup.reference.tables) |fail_at| {
         var txn = try store.store.beginWriteTxn();
         var open = true;
         defer if (open) txn.abort();
@@ -492,6 +522,32 @@ test "SQL scope retirement recovery rejects every orphan missing owner overlap a
     var prepared = try ledger.prepare(a, group, head.lookup.reference.id, try std.json.Stringify.valueAlloc(scratch, request.operation.reserve, .{}));
     defer prepared.deinit();
     var buffer: [320]u8 = undefined;
+    // Each registered child is an exact member, with a root-derived ID and
+    // independently bound physical definition/ranges. Both snapshot encodings
+    // must refuse missing children, substitutions and orphaned registrations.
+    for (0..head.lookup.reference.tables) |ordinal| {
+        const child_key = try ledger.childKey(&buffer, head.lookup, @intCast(ordinal));
+        try rejectDamagedCustody(&store, a, checkpoint, child_key, null);
+        var read = try store.store.beginReadTxn();
+        var selected = (try ledger.child(&read, head.lookup, @intCast(ordinal))).?;
+        read.abort();
+        selected.definition[0] ^= 1;
+        const wrong_definition = try ledger.ChildRecord.init(selected);
+        try rejectDamagedCustody(&store, a, checkpoint, child_key, wrong_definition.slice());
+        selected.definition[0] ^= 1;
+        selected.ranges[0] ^= 1;
+        const wrong_ranges = try ledger.ChildRecord.init(selected);
+        try rejectDamagedCustody(&store, a, checkpoint, child_key, wrong_ranges.slice());
+        selected.ranges[0] ^= 1;
+        selected.id[0] ^= 1;
+        const wrong_id = try ledger.ChildRecord.init(selected);
+        try rejectDamagedCustody(&store, a, checkpoint, child_key, wrong_id.slice());
+        selected.id[0] ^= 1;
+        selected.table += 1000;
+        selected.id = try selected.lookup.reference.childId(selected.table);
+        const swapped = try ledger.ChildRecord.init(selected);
+        try rejectDamagedCustody(&store, a, checkpoint, child_key, swapped.slice());
+    }
     // Required forward images, work and immutable admission cannot disappear.
     try rejectDamagedCustody(&store, a, checkpoint, try ledger.key(&buffer, head.lookup, .head), null);
     try rejectDamagedCustody(&store, a, checkpoint, try ledger.key(&buffer, head.lookup, .manifest), null);
@@ -514,6 +570,15 @@ test "SQL scope retirement recovery rejects every orphan missing owner overlap a
     try rejectDamagedCustody(&store, a, checkpoint, try ledger.key(&buffer, head.lookup, .terminal_outcome), extra_link.slice());
     var orphan = head.lookup;
     orphan.reference.id = @splat(82);
+    {
+        var read = try store.store.beginReadTxn();
+        var stray = (try ledger.child(&read, head.lookup, 0)).?;
+        read.abort();
+        stray.lookup = orphan;
+        stray.id = try orphan.reference.childId(stray.table);
+        const encoded_child = try ledger.ChildRecord.init(stray);
+        try rejectDamagedCustody(&store, a, checkpoint, try ledger.childKey(&buffer, orphan, 0), encoded_child.slice());
+    }
     try rejectDamagedCustody(&store, a, checkpoint, try ledger.key(&buffer, orphan, .manifest), prepared.encoded);
     try rejectDamagedCustody(&store, a, checkpoint, try std.fmt.bufPrint(&buffer, "\x00\x00__metadata__:system_catalog:{d}:scope-retirement-unknown", .{group}), "unknown");
     var altered = head;
@@ -665,7 +730,7 @@ test "SQL scope retirement dependency intents abort every journal write and surv
         var prepared = try ledger.prepare(a, group, @splat(93), encoded);
         defer prepared.deinit();
         if (pass == 0) {
-            const writes = 5 + prepared.manifest.resources.len + prepared.manifest.dependencies.len;
+            const writes = 5 + prepared.manifest.resources.len + prepared.manifest.dependencies.len + prepared.lookup.reference.tables;
             for (0..writes) |fail_at| {
                 var txn = try store.store.beginWriteTxn();
                 var fault: Fault = .{ .txn = &txn, .remaining = fail_at };
@@ -701,7 +766,7 @@ test "SQL scope retirement dependency intents abort every journal write and surv
                 }
             }
             const canceled = try admitted.progress.cancelBeforeEffects();
-            const writes = 4 + prepared.manifest.resources.len + prepared.manifest.dependencies.len;
+            const writes = 4 + prepared.manifest.resources.len + prepared.manifest.dependencies.len + prepared.lookup.reference.tables;
             for (0..writes) |fail_at| {
                 var txn = try store.store.beginWriteTxn();
                 var fault: Fault = .{ .txn = &txn, .remaining = fail_at };

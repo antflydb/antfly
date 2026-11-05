@@ -22971,7 +22971,7 @@ pub const RaftApplyStore = struct {
     pub fn scopeRetirementWorkJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, after: u64) ![]u8 {
         var read = try self.store.beginReadTxn();
         defer read.abort();
-        return std.json.Stringify.valueAlloc(a, try scope_retirement.nextWork(&read, group, after), .{});
+        return std.json.Stringify.valueAlloc(a, try scope_retirement.nextOwnerWork(&read, group, after), .{});
     }
     pub fn scopeRetirementManifestJson(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, lookup: scope_retirement.Lookup) ![]u8 {
         try lookup.validate();

@@ -27,8 +27,8 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
     const base = try ledger.prefix(&base_buffer, group);
     // The sibling member/queue/counter namespaces share this exact stem.
     const stem = base[0 .. base.len - 1];
-    var expected: [6]u64 = @splat(0); // body, member, queue, cancellation outcome/link, view edges
-    var received: [6]u64 = @splat(0);
+    var expected: [7]u64 = @splat(0); // body, member, queue, cancellation outcome/link, view edges, children
+    var received: [7]u64 = @splat(0);
     var heads: u64 = 0;
     var maximum_sequence: u64 = 0;
     var counter: ?u64 = null;
@@ -55,6 +55,13 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
             const head = (try ledger.head(reader, lookup)) orelse return error.InvalidScopeRetirement;
             if (!head.active() or !std.mem.eql(u8, row.key, try ledger.queueKey(&buffer, group, head.sequence))) return error.InvalidScopeRetirement;
             try increment(&received[2], 1);
+        } else if (std.mem.startsWith(u8, suffix, ":") and std.mem.indexOf(u8, suffix, ":child:") != null) {
+            const child = try ledger.ChildRecord.decode(row.value);
+            try child.validate();
+            if (child.lookup.group != group or !std.mem.eql(u8, row.key, try ledger.childKey(&buffer, child.lookup, child.ordinal))) return error.InvalidScopeRetirement;
+            const head = (try ledger.head(reader, child.lookup)) orelse return error.InvalidScopeRetirement;
+            if (!head.active()) return error.InvalidScopeRetirement;
+            try increment(&received[6], 1);
         } else if (std.mem.startsWith(u8, suffix, ":outcome:")) {
             const outcome = try wire.OutcomeRecord.decode(row.value);
             try outcome.validate();
@@ -130,6 +137,7 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
                 try increment(&expected[1], 1 + prepared.manifest.resources.len + prepared.manifest.dependencies.len);
                 try increment(&expected[2], 1);
                 try increment(&expected[5], prepared.manifest.view_edges.len);
+                try increment(&expected[6], head.lookup.reference.tables);
             } else {
                 if (body != null) return error.InvalidScopeRetirement;
                 if ((reader.get(try ledger.queueKey(&buffer, group, head.sequence)) catch |err| switch (err) {
