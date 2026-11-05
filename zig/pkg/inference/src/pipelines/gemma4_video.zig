@@ -47,7 +47,7 @@ const Observer = struct {
         try self.cb.checkExecutionControl();
         var displayed = try frame.display(self.a, options, control);
         defer displayed.deinit(self.a);
-        try self.frames.prepare(slot, displayed.view());
+        try self.frames.prepare(slot, displayed.view(), options.presentation_width, options.presentation_height);
     }
 };
 
@@ -172,4 +172,35 @@ test "gemma4 video reserves portable memory through generation admission" {
     try std.testing.expectEqual(@as(usize, 0), cuda.host_scratch_bytes);
     const text = [_]generation.Message{.{ .role = "user", .content = "describe" }};
     try std.testing.expectEqual(@as(usize, 0), (try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &text, .{ .family = .gemma }, .generic)).host_scratch_bytes);
+}
+
+test "gemma4 video reports presentation size for anamorphic containers" {
+    const a = std.testing.allocator;
+    inline for (.{ "anamorphic-2x1.mp4", "anamorphic-2x1.webm", "bframes.mp4" }, .{ true, true, false }) |name, anamorphic| {
+        const Record = struct {
+            width: u32 = 0,
+            height: u32 = 0,
+            raster_width: u32 = 0,
+            raster_height: u32 = 0,
+            fn accept(raw: *anyopaque, _: usize, frame: video.preparation.BorrowedFrame, options: video.preparation.Options, control: media.source.Control) anyerror!void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                var displayed = try frame.display(std.testing.allocator, options, control);
+                defer displayed.deinit(std.testing.allocator);
+                self.width = options.presentation_width;
+                self.height = options.presentation_height;
+                self.raster_width = displayed.width;
+                self.raster_height = displayed.height;
+            }
+        };
+        var record: Record = .{};
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes } };
+        try embedding_video.observeConfigured(a, @embedFile("../testdata/video/" ++ name), null, .{}, .{ .observer = .{ .context = &record, .accept = Record.accept }, .sampling = sampling, .pool = &pool });
+        try std.testing.expectEqual(record.raster_height, record.height);
+        if (anamorphic) {
+            try std.testing.expectEqual(@as(u32, 64), record.raster_width);
+            try std.testing.expectEqual(@as(u32, 128), record.width);
+        } else {
+            try std.testing.expectEqual(record.raster_width, record.width);
+        }
+    }
 }

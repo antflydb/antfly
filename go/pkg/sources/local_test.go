@@ -103,6 +103,29 @@ func BenchmarkLocalRangeDelivery(b *testing.B) {
 	}
 }
 
+func TestLocalDeliveryHashesWhenPinnedDigestDiffers(t *testing.T) {
+	root := t.TempDir()
+	object := localPut(t, root, "", ".bin", "0123456789")
+	c := &LocalConnector{Root: root}
+	request := localRequest(t, "")
+	inventory, err := c.Enumerate(context.Background(), request)
+	require.NoError(t, err)
+	item := inventory.Objects[0]
+	serve := func(digest string) *httptest.ResponseRecorder {
+		r := httptest.NewRequest("GET", "/media", nil)
+		r.Header.Set("Range", "bytes=2-5")
+		w := httptest.NewRecorder()
+		ServeMedia(w, r, c, request, item, digest)
+		return w
+	}
+	ok := serve(object.SHA256)
+	require.Equal(t, 206, ok.Code)
+	require.Equal(t, "2345", ok.Body.String())
+	wrong := serve(strings.Repeat("a", 64))
+	require.NotEqual(t, 206, wrong.Code, "a pinned digest the connector did not verify must be checked")
+	require.NotContains(t, wrong.Body.String(), "2345")
+}
+
 // One-byte responses through the complete delivery path, after the first read.
 func BenchmarkLocalRangeResponse(b *testing.B) {
 	root := b.TempDir()

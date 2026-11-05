@@ -310,6 +310,10 @@ func (c *LocalConnector) AcquireMedia(ctx context.Context, r Request, o Item) ([
 	return data, true, nil
 }
 
+// AcquiredMediaDigest is the revision AcquireMedia verified, or that its snapshot
+// key already binds. A digest-named object has one valid content.
+func (*LocalConnector) AcquiredMediaDigest(o Item) string { return o.Revision }
+
 // MediaContentScope binds verified digests to the resolved store directory.
 func (c *LocalConnector) MediaContentScope() string { return ProviderLocal + "|" + c.Root }
 

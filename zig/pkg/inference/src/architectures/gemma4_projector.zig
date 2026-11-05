@@ -316,9 +316,11 @@ pub const PortableVideoFrames = struct {
         self.allocator.free(self.prepared);
         self.weights.deinit();
     }
-    pub fn prepare(self: *PortableVideoFrames, slot: usize, frame: image.ImageU8) !void {
+    /// Model geometry follows the presentation size, so one resample corrects
+    /// non-square pixels without an intermediate stretched raster.
+    pub fn prepare(self: *PortableVideoFrames, slot: usize, frame: image.ImageU8, presentation_width: u32, presentation_height: u32) !void {
         if (slot >= self.prepared.len or self.prepared[slot] != null) return error.InvalidVideoFrame;
-        self.prepared[slot] = try prepareImageView(self.allocator, &self.weights, self.cfg, frame);
+        self.prepared[slot] = try prepareImageViewAtGeometry(self.allocator, &self.weights, self.cfg, frame, portableFrameGeometry(self.cfg, frame, presentation_width, presentation_height));
     }
     /// Consumes `timestamps_us`. A repeated selection is delivered once, so its
     /// later slots stay empty and leave the prompt rather than repeat a frame.
@@ -358,6 +360,29 @@ pub const PortableVideoFrames = struct {
         return .{ .images = .{ .allocator = a, .backend = cb, .embeddings = embeddings, .tokens_per_image = counts, .hidden_size = self.cfg.text_hidden, .batches_executed = (kept + 7) / 8, .max_batch_executed = @min(kept, 8) }, .timestamps_us = timestamps, .stats = .{ .decoded_frames = kept, .selected_frames = kept } };
     }
 };
+fn portableFrameGeometry(cfg: Config, frame: image.ImageU8, presentation_width: u32, presentation_height: u32) Geometry {
+    if (presentation_width == 0 or presentation_height == 0) return targetGeometry(cfg, frame.width, frame.height);
+    return targetGeometry(cfg, presentation_width, presentation_height);
+}
+
+test "gemma4 video frame geometry follows presentation size for non-square pixels" {
+    var cfg = embeddingGemma2ImageConfig();
+    cfg.max_image_tokens = 70;
+    const raster: image.ImageU8 = .{ .data = &.{}, .width = 640, .height = 480, .format = .rgb8 };
+    const coded = portableFrameGeometry(cfg, raster, 0, 0);
+    const anamorphic = portableFrameGeometry(cfg, raster, 1280, 480);
+    const square_ratio = @as(f64, @floatFromInt(coded.width)) / @as(f64, @floatFromInt(coded.height));
+    const wide_ratio = @as(f64, @floatFromInt(anamorphic.width)) / @as(f64, @floatFromInt(anamorphic.height));
+    try std.testing.expect(square_ratio < 1.5);
+    try std.testing.expect(wide_ratio > 2.3 and wide_ratio < 3.0);
+    const same = portableFrameGeometry(cfg, raster, 640, 480);
+    try std.testing.expectEqual(coded.width, same.width);
+    try std.testing.expectEqual(coded.height, same.height);
+    // Rotated presentation swaps the axes the model sees.
+    const rotated = portableFrameGeometry(cfg, raster, 480, 640);
+    try std.testing.expect(rotated.height > rotated.width);
+}
+
 fn sumUsize(values: []const usize) usize {
     var total: usize = 0;
     for (values) |value| total += value;
@@ -2648,7 +2673,10 @@ pub const PreparedImage = struct {
 };
 
 fn prepareImageView(allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, decoded: image.ImageU8) !PreparedImage {
-    const geometry = targetGeometry(cfg, decoded.width, decoded.height);
+    return prepareImageViewAtGeometry(allocator, store, cfg, decoded, targetGeometry(cfg, decoded.width, decoded.height));
+}
+
+fn prepareImageViewAtGeometry(allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, decoded: image.ImageU8, geometry: Geometry) !PreparedImage {
     try decoded.validate();
     if (store.cb.kind() == .metal and store.gguf == null and cfg.embedding_gemma2_f32_attention) return .{ .allocator = allocator, .pixels = &.{}, .geometry = geometry, .source = decoded, .source_owned = false };
     const pixel_values = try image.preprocessImageViewRectScaledWithResample(
