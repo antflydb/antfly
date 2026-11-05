@@ -1971,24 +1971,28 @@ test "document durable admission never waits for failed or untracked reservation
         var pixels = PixelMeter{};
         try std.testing.expectError(error.DocumentPixelLimitExceeded, pixels.charge(&session, 1));
         const after = try store.load(work, "wait", "alice");
-        try std.testing.expectEqual(upper, after.used);
+        // Computation remains charged; output was never eligible for upload.
+        var abandoned = upper;
+        abandoned.output_bytes = 0;
+        const settled = mode == .dispatch_failure or mode == .ambiguous_reservation;
+        try std.testing.expectEqual(if (settled) abandoned else upper, after.used);
         if (mode == .dispatch_failure or mode == .ambiguous_reservation) {
             try std.testing.expectEqual(@as(usize, 0), after.pending.len);
-            try std.testing.expectEqual(upper, after.uncertain);
+            try std.testing.expectEqual(abandoned, after.uncertain);
             // A partial result can finish with conservative failed-work usage.
             const final = try session.publish(work, @splat(3), "", "");
             try store.finish(work, lease, final, 1);
             const finished = try store.load(work, "wait", "alice");
             try std.testing.expectEqual(.succeeded, finished.state);
-            try std.testing.expectEqual(upper, finished.used);
-            try std.testing.expectEqual(upper, finished.uncertain);
+            try std.testing.expectEqual(abandoned, finished.used);
+            try std.testing.expectEqual(abandoned, finished.uncertain);
             continue;
         }
         try std.testing.expectEqual(@as(usize, 1), after.pending.len);
         const next = try store.claim(work, "wait", "alice", identity, 12, 100);
         const reclaimed = try store.load(work, next.run_id, next.owner);
-        try std.testing.expectEqual(upper, reclaimed.used);
-        try std.testing.expectEqual(upper, reclaimed.uncertain);
+        try std.testing.expectEqual(abandoned, reclaimed.used);
+        try std.testing.expectEqual(abandoned, reclaimed.uncertain);
     }
 }
 
