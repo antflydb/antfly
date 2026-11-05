@@ -147616,6 +147616,30 @@ test "inline resolver replacement background replay yields within a large record
         try std.testing.expect(runtime.replay_progress != null);
         try std.testing.expect(runtime.replay_progress.?.next_key > 0);
         try std.testing.expectEqual(@as(usize, 1), runtime.replay_progress.?.next_key);
+        // A detached driver completes the rest while the original keeps a
+        // decoded partial record. Taking the original over again must adopt
+        // that durable cursor instead of replaying already completed sources.
+        var peer = try resolution_runtime_mod.ResolutionRuntime.init(a, runtime.store_handle.store, runtime.replay_source, runtime.index_manager, runtime.write_ctx, runtime.write_fn, db.backend_runtime, runtime.candidate_source, runtime.embedder);
+        defer peer.deinit();
+        try peer.catchUp();
+        try std.testing.expect(peer.stats().applied_sequence >= sequence);
+        try std.testing.expect(runtime.stats().applied_sequence < sequence);
+        const Counter = struct {
+            calls: usize = 0,
+            fn process(ptr: *anyopaque, _: Allocator, _: []const resolution_runtime_mod.ResolverConfig, _: resolver_lib.ArtifactStore, _: ?resolver_lib.CandidateProvider, _: []const []const u8, _: ?resolution_runtime_mod.CandidateSource, _: ?embedder_mod.DenseEmbedder) anyerror!bool {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.calls += 1;
+                return false;
+            }
+        };
+        var counter: Counter = .{};
+        runtime.ordered_writer = .{ .ptr = &counter, .process = Counter.process };
+        defer if (db.resolution_runtime == runtime) {
+            runtime.ordered_writer = null;
+        };
+        try db.runUntilIdle();
+        try std.testing.expectEqual(@as(usize, 0), counter.calls);
+        try std.testing.expectEqual(runtime, db.resolution_runtime.?);
     }
     {
         var db = try DB.open(a, directory.path(), options);

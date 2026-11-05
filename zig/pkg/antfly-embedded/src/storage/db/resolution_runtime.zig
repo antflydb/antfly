@@ -2876,8 +2876,28 @@ pub const ResolutionRuntime = struct {
         return self.catchUpTurnLocked(deadline_ns, prefer_backfill);
     }
 
+    /// A dormant manual driver can survive a detached owner's publication.
+    /// Reload its durable continuation under the same catch-up mutex before
+    /// borrowing a record. Preserve decoded inputs when the cut did not move.
+    fn reloadManualProgressLocked(self: *ResolutionRuntime) !void {
+        if (self.worker_started.load(.acquire)) return;
+        const applied = try enrichment_state.loadAppliedSequence(self.alloc, self.store_handle.store, scope_name);
+        if (applied < self.applied_sequence.load(.acquire)) return;
+        const progress = try loadReplayProgress(self.alloc, &self.store_handle.store, applied);
+        const backfill = try hasDurableReresolveBacklog(&self.store_handle.store);
+        // Complete every fallible read before changing the cached cursor.
+        if (applied != self.applied_sequence.load(.acquire) or !std.meta.eql(progress, self.replay_progress)) {
+            self.clearPendingReplayRecord();
+            self.replay_progress = progress;
+            self.applied_sequence.store(applied, .release);
+            self.notifySequence(applied);
+        }
+        self.backfill_pending.store(backfill, .release);
+    }
+
     fn catchUpTurnLocked(self: *ResolutionRuntime, deadline_ns: u64, prefer_backfill: bool) !void {
         if (replayNowNs() >= deadline_ns) return;
+        try self.reloadManualProgressLocked();
         const applied = self.applied_sequence.load(.acquire);
         // Waiting for the moving replay head before touching backfill can
         // leave an accepted curation pending forever. The scheduling owner
@@ -2998,6 +3018,7 @@ pub const ResolutionRuntime = struct {
     }
 
     fn catchUpLocked(self: *ResolutionRuntime, single_window: bool, max_records: usize) !void {
+        try self.reloadManualProgressLocked();
         while (true) {
             const target = self.target_sequence.load(.acquire);
             const applied = self.applied_sequence.load(.acquire);

@@ -860,6 +860,16 @@ pub const PromotionRuntime = struct {
 
     fn catchUpLockedWithLimit(self: *PromotionRuntime, single_window: bool, max_records: usize) !void {
         errdefer _ = self.error_count.fetchAdd(1, .monotonic);
+        if (!self.worker_started.load(.acquire)) {
+            // A different manual owner may have completed this cut while the
+            // serving driver remained dormant. Never replay or overwrite an
+            // older applied watermark when taking that driver over again.
+            const applied = try enrichment_state.loadAppliedSequence(self.alloc, self.store_handle.store, scope_name);
+            if (applied > self.applied_sequence.load(.acquire)) {
+                self.applied_sequence.store(applied, .release);
+                self.notifySequence(applied);
+            }
+        }
 
         while (true) {
             const target = self.target_sequence.load(.acquire);
@@ -1493,6 +1503,7 @@ test "processResolutionArtifact fails closed on malformed resolution artifacts" 
 const FakeSource = struct {
     const Rec = struct { sequence: u64, payload: []const u8 };
     records: []const Rec,
+    scan_calls: std.atomic.Value(usize) = .init(0),
 
     fn source(self: *FakeSource) replay_source_mod.Source {
         return .{ .ptr = self, .vtable = &vtable };
@@ -1518,6 +1529,7 @@ const FakeSource = struct {
         _ = alloc;
         _ = hint;
         const self: *FakeSource = @ptrCast(@alignCast(ptr));
+        _ = self.scan_calls.fetchAdd(1, .monotonic);
         var matched: usize = 0;
         var last: u64 = 0;
         for (self.records) |rec| {
@@ -1941,7 +1953,15 @@ test "inline resolver replacement promotion bounded turns commit one record and 
     try runtime.catchUpOnce(std.math.maxInt(u64));
     try testing.expectEqual(@as(u64, 1), runtime.applied_sequence.load(.acquire));
     try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
+    var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer host.deinit();
+    var peer = try PromotionRuntime.init(a, store.store, source.source(), host.ptr(), null, capture.sink(), .wait);
+    defer peer.deinit();
+    try peer.catchUpOnce(std.math.maxInt(u64));
+    try testing.expectEqual(@as(u64, 2), peer.applied_sequence.load(.acquire));
+    const scans = source.scan_calls.load(.monotonic);
     try runtime.catchUpOnce(std.math.maxInt(u64));
+    try testing.expectEqual(scans, source.scan_calls.load(.monotonic));
     try testing.expectEqual(@as(u64, 2), runtime.applied_sequence.load(.acquire));
     try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
     try runtime.catchUp();

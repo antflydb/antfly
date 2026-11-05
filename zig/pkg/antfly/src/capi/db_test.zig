@@ -6871,14 +6871,18 @@ test "capi native resolver maintenance retries transient inference and survives 
     try std.testing.expect(settled);
     try std.testing.expectEqual(@as(usize, 2), fixture.failures);
     try std.testing.expect(fixture.successful >= 30);
-    const guard = public.enterHandle(handle, .read).?;
-    defer guard.leave();
-    const stats = guard.handle.db.pendingWorkStats();
-    try std.testing.expect(stats.enrichment.applied_sequence >= stats.enrichment.target_sequence);
-    try std.testing.expect(!stats.resolution.catch_up_required);
-    if (stats.promotion.catch_up_required) std.debug.print("resolver reopen stats={f} publications={f}\n", .{ std.json.fmt(stats, .{}), std.json.fmt(owner.publication_stats, .{}) });
-    try std.testing.expect(!stats.promotion.catch_up_required);
-    try std.testing.expectEqual(@as(?[]const u8, null), owner.publication_stats.last_maintenance_error);
+    {
+        const guard = public.enterHandle(handle, .read).?;
+        defer guard.leave();
+        const stats = guard.handle.db.pendingWorkStats();
+        try std.testing.expect(stats.enrichment.applied_sequence >= stats.enrichment.target_sequence);
+        try std.testing.expect(!stats.resolution.catch_up_required);
+        try std.testing.expect(!stats.promotion.catch_up_required);
+        try std.testing.expectEqual(@as(?[]const u8, null), owner.publication_stats.last_maintenance_error);
+    }
+    const completed = fixture.successful;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_run_until_idle(handle));
+    try std.testing.expectEqual(completed, fixture.successful);
 }
 
 test "capi native bounded admission coalesces allocator proof outside publication gates" {
