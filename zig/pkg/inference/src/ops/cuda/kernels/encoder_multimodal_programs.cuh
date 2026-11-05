@@ -623,6 +623,9 @@ extern "C" __global__ void termite_embedding_gemma2_attention_softmax_bf16(
         __syncthreads();
     }
     float row_max = reduce[0], local_sum = 0.0f;
+    // Every warp must snapshot the maximum before any warp reuses reduce[0]
+    // for its local sum; the preceding reduction barrier does not order this.
+    __syncthreads();
     for (unsigned int key = lane; key < sequence; key += blockDim.x) {
         bool visible = query_valid && (!mask || mask[(size_t)batch_index * sequence + key]);
         float value = visible ? expf(scores[matrix_offset + (size_t)row * sequence + key] - row_max) : 0.0f;
@@ -733,6 +736,9 @@ extern "C" __global__ void termite_embedding_gemma2_contrastive_prob_f32(
     antfly_warp_block_statistics<true>(maxima, maxima_planes, [&](const float* totals) { scratch[0] = totals[0]; }, -positive_infinity);
     __syncthreads();
     float row_max = scratch[0], local_sum = 0.0f;
+    // Complete all maximum reads before the next block-statistics invocation
+    // lets warp leaders overwrite this same shared scratch with sum partials.
+    __syncthreads();
     for (unsigned int c = threadIdx.x; c < candidate_count; c += blockDim.x) {
         float score = probabilities[(size_t)q * candidate_count + c];
         float value = isfinite(score) ? expf(score - row_max) : 0.0f;
@@ -746,6 +752,9 @@ extern "C" __global__ void termite_embedding_gemma2_contrastive_prob_f32(
     for (unsigned int c = threadIdx.x; c < candidate_count; c += blockDim.x)
         probabilities[(size_t)q * candidate_count + c] = total > 0.0f
             ? probabilities[(size_t)q * candidate_count + c] / total : 0.0f;
+    // A target may belong to any warp; finish normalization before lane0
+    // reads that other thread's probability for the scalar loss.
+    __syncthreads();
     if (threadIdx.x == 0) {
         unsigned int target = targets[q];
         bool target_valid = target < candidate_count &&

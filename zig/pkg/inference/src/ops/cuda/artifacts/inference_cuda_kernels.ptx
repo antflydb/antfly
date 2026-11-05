@@ -10344,6 +10344,8 @@ $L__BB19_17:
 
 $L__BB19_18:
 	setp.ge.u32 	%p14, %r58, %r25;
+	ld.shared.f32 	%f7, [reduce];
+	bar.sync 	0;
 	mov.f32 	%f59, 0f00000000;
 	@%p14 bra 	$L__BB19_30;
 
@@ -10354,7 +10356,6 @@ $L__BB19_18:
 	bra.uni 	$L__BB19_20;
 
 $L__BB19_22:
-	ld.shared.f32 	%f7, [reduce];
 	cvt.u64.u32 	%rd45, %r27;
 	mul.lo.s64 	%rd10, %rd45, %rd4;
 	mov.f32 	%f59, 0f00000000;
@@ -11532,10 +11533,11 @@ $L__BB24_31:
 
 $L__BB24_33:
 	bar.sync 	0;
+	ld.shared.f32 	%f28, [scratch];
+	bar.sync 	0;
 	mov.f32 	%f206, 0f00000000;
 	@%p2 bra 	$L__BB24_38;
 
-	ld.shared.f32 	%f28, [scratch];
 	mul.wide.u32 	%rd16, %r33, %r1;
 	mov.f32 	%f117, 0f00000000;
 	mov.u32 	%r24, %ntid.x;
@@ -11699,6 +11701,7 @@ $L__BB24_48:
 	@%p52 bra 	$L__BB24_48;
 
 $L__BB24_51:
+	bar.sync 	0;
 	setp.ne.s32 	%p54, %r2, 0;
 	mov.f32 	%f208, 0f00000000;
 	@%p54 bra 	$L__BB24_61;

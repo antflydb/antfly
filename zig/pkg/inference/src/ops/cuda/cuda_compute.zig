@@ -53755,3 +53755,60 @@ test "CUDA KV explicit cleanup retires actual prepared captured lease outside ph
     new_guard.finish();
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, source.controller.snapshot());
 }
+
+test "embeddinggemma2 CUDA generic full batch attention keeps read operands disjoint and repeats exactly" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try CudaCompute.testing.init(a);
+    defer compute.deinit();
+    if (compute.cublaslt == null or compute.ctx.info.compute_major < 8) return error.SkipZigTest;
+    compute.capability_profile = .embedding_gemma2;
+    // Unit targets the unchanged generic Lt+softmax family used in130
+    // (attention_ws=0). This does not alter the public campaign/optin policy.
+    compute.embedding_gemma2_cudnn_unavailable = true;
+    compute.embedding_gemma2_policy = .{};
+    const cb = compute.computeBackend();
+    const batch = 4;
+    const sequence = 846;
+    const heads = 12;
+    const dim = 64;
+    const width = heads * dim;
+    const count = batch * sequence * width;
+    const host = try a.alloc(f32, count);
+    defer a.free(host);
+    errdefer compute.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+    @memset(host, 0);
+    const q = try cb.fromFloat32Shape(host, &.{ batch * sequence, width });
+    defer cb.free(q);
+    const k = try cb.fromFloat32Shape(host, &.{ batch * sequence, width });
+    defer cb.free(k);
+    try compute.ctx.synchronize(); // Original host upload must finish before source mutation.
+    for (host, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 17)) - 8)) / 8;
+    const v = try cb.fromFloat32Shape(host, &.{ batch * sequence, width });
+    defer cb.free(v);
+    var expected: ?[]f32 = null;
+    defer if (expected) |values| a.free(values);
+    var scratch: u64 = 0;
+    for (0..12) |_| {
+        const output = (try sdpaEmbeddingGemma2Vision(&compute, q, k, v, batch, sequence, heads, dim)) orelse return error.ExpectedGenericAttention;
+        defer cb.free(output);
+        try buffer_mod.validateRegions(4, .{ tensorFromCt(q).buffer, tensorFromCt(k).buffer, tensorFromCt(v).buffer, tensorFromCt(output).buffer }, @splat(count * 4), @splat(4), 3);
+        const actual = try cb.toFloat32(output, a);
+        defer a.free(actual);
+        if (expected) |values| {
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(values), std.mem.sliceAsBytes(actual));
+        } else expected = try a.dupe(f32, actual);
+        const current_scratch = compute.embedding_gemma2_vision_attention_scratch.buffer.ptr;
+        try std.testing.expect(current_scratch != 0);
+        if (scratch == 0) scratch = current_scratch else try std.testing.expectEqual(scratch, current_scratch);
+    }
+    // Returned attention writes never clobber any original F32 input.
+    const actual_v = try cb.toFloat32(v, a);
+    defer a.free(actual_v);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(host), std.mem.sliceAsBytes(actual_v));
+    for ([_]CT{ q, k }) |input| {
+        const actual = try cb.toFloat32(input, a);
+        defer a.free(actual);
+        for (actual) |value| try std.testing.expectEqual(@as(f32, 0), value);
+    }
+}

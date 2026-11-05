@@ -958,6 +958,13 @@ pub const Module = struct {
         try require(scores, try std.math.mul(usize, elements, 4));
         try require(probs, try std.math.mul(usize, elements, 2));
         if (mask.ptr != 0) try require(mask, (@as(usize, batch_index) + 1) * sequence * 8);
+        // Scores/mask are read-only until normalization finishes. Writable
+        // BF16 probabilities cannot alias either input, including partial views.
+        try @import("buffer.zig").validateRegions(3, .{ scores, mask, probs }, .{
+            try std.math.mul(usize, elements, 4),
+            if (mask.ptr == 0) 0 else try std.math.mul(usize, try std.math.mul(usize, @as(usize, batch_index) + 1, sequence), 8),
+            try std.math.mul(usize, elements, 2),
+        }, .{ 4, 8, 2 }, 2);
         var pp = probs.ptr;
         var sp = scores.ptr;
         var mp = mask.ptr;
@@ -1573,6 +1580,270 @@ test "CUDA BF16 GELU product preserves PLE and FFN adapter outputs and tails" {
             const rounded = Round.f32Value(Round.bf16(@floatCast(gelu)));
             const expected = Round.f32Value(Round.bf16(rounded * Round.f32Value(right[i])));
             try std.testing.expectApproxEqAbs(expected, Round.f32Value(actual), 0.008 * (1 + @abs(expected)));
+        }
+    }
+}
+
+test "embeddinggemma2 CUDA attention softmax refuses read operand overlap before SDK" {
+    var ctx: Context = undefined;
+    var module: Module = undefined;
+    // No SDK state is touched: each invalid output aliases a declared read.
+    const scores: Buffer = .{ .ptr = 4096, .len = 4 * 1024 * 8 };
+    const mask: Buffer = .{ .ptr = 65536, .len = 8 * 8 };
+    try std.testing.expectError(error.InvalidShape, module.launchAttentionSoftmax(&ctx, .{ .ptr = scores.ptr, .len = 2 * 1024 * 8 }, scores, .{}, 8, 0, 8, 0, 1, 1024));
+    try std.testing.expectError(error.InvalidShape, module.launchAttentionSoftmax(&ctx, .{ .ptr = scores.ptr + scores.len - 2, .len = 2 * 1024 * 8 }, scores, .{}, 8, 0, 8, 0, 1, 1024));
+    try std.testing.expectError(error.InvalidShape, module.launchAttentionSoftmax(&ctx, .{ .ptr = mask.ptr + 2, .len = 2 * 1024 * 8 }, scores, mask, 8, 0, 8, 0, 1, 1024));
+}
+
+test "embeddinggemma2 CUDA attention softmax shared reduction reuse preserves uniform tail rows" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try Module.init(&ctx);
+    defer module.deinit(&ctx);
+    const a = std.testing.allocator;
+    const sequence = 846;
+    const rows = sequence;
+    const heads = 12;
+    const tile = 1024;
+    const elements = heads * tile * sequence;
+    const zero = try a.alloc(f32, elements);
+    defer a.free(zero);
+    @memset(zero, 0);
+    var scores = try Buffer.alloc(&ctx, elements * 4);
+    defer scores.free(&ctx);
+    var probs = try Buffer.alloc(&ctx, elements * 2);
+    defer probs.free(&ctx);
+    const actual = try a.alloc(u16, elements);
+    defer a.free(actual);
+    // Exact CPU oracle: exp(0)==1, integer row sum846, one BF16 rounding.
+    // Original arithmetic rounds exponentials before division; ones are exact.
+    const inverse: f32 = 1.0 / @as(f32, sequence);
+    const bits: u32 = @bitCast(inverse);
+    const expected: u16 = @intCast((bits +% (0x7fff + ((bits >> 16) & 1))) >> 16);
+    errdefer ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    try scores.copyFromHost(&ctx, std.mem.sliceAsBytes(zero));
+    for (0..4) |iteration| for (0..4) |batch_index| {
+        // Same generic fullB4 family: four serial single-frame softmax launches,
+        // full846 tail rows and all12heads. No production flags are altered.
+        try module.launchAttentionSoftmax(&ctx, probs, scores, .{}, sequence, 0, rows, 0, heads, tile);
+        try probs.copyToHost(&ctx, std.mem.sliceAsBytes(actual));
+        try ctx.synchronize();
+        for (0..heads) |head| for (0..rows) |row| for (0..sequence) |key| {
+            const value = actual[(head * tile + row) * sequence + key];
+            if (value != expected) {
+                std.debug.print("softmax shared reuse mismatch iteration={} batch={} head={} row={} key={}\n", .{ iteration, batch_index, head, row, key });
+                try std.testing.expectEqual(expected, value);
+            }
+        };
+    };
+}
+
+test "embeddinggemma2 CUDA contrastive shared reduction reuse preserves masked uniform objective and gradients" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try Module.init(&ctx);
+    defer module.deinit(&ctx);
+    const a = std.testing.allocator;
+    const queries = 64;
+    const capacity = 384;
+    const zeros: [capacity]f32 = @splat(0);
+    var targets: [queries]u32 = undefined;
+    const valid = try a.alloc(u8, queries * capacity);
+    defer a.free(valid);
+    const actual = try a.alloc(f32, queries * capacity);
+    defer a.free(actual);
+    const baseline = try a.alloc(f32, queries * capacity);
+    defer a.free(baseline);
+    var buffers: [8]Buffer = @splat(.{});
+    defer for (&buffers) |*buffer| buffer.free(&ctx);
+    const lengths = [_]usize{ queries * 4, capacity * 4, queries * 4, queries * capacity, queries * capacity * 4, queries * 4, queries * 4, capacity * 4 };
+    for (&buffers, lengths) |*buffer, bytes| buffer.* = try Buffer.alloc(&ctx, bytes);
+    errdefer ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    try buffers[0].copyFromHost(&ctx, std.mem.sliceAsBytes(zeros[0..queries]));
+    try buffers[1].copyFromHost(&ctx, std.mem.sliceAsBytes(&zeros));
+    for ([_]bool{ false, true }) |masked| {
+        const candidates: usize = if (masked) capacity else 257;
+        var visible: [queries]usize = @splat(0);
+        for (0..queries) |row| {
+            // Targets cover other warps and candidate tails; lane0 cannot
+            // assume the owning thread has finished probability normalization.
+            targets[row] = @intCast((37 * row + 65) % candidates);
+            for (0..candidates) |c| {
+                const allowed = !masked or c % 7 != 6 or c == targets[row];
+                if (allowed) visible[row] += 1;
+                valid[row * candidates + c] = @intFromBool(allowed);
+            }
+        }
+        try buffers[2].copyFromHost(&ctx, std.mem.sliceAsBytes(&targets));
+        if (masked) try buffers[3].copyFromHost(&ctx, valid[0 .. queries * candidates]);
+        var loss_baseline: [queries]f32 = undefined;
+        for (0..32) |iteration| {
+            try module.launchContrastive(&ctx, buffers[4], buffers[5], buffers[6], buffers[7], buffers[0], buffers[1], if (masked) buffers[3] else .{}, buffers[2], .{ .queries = queries, .candidates = @intCast(candidates), .width = 1, .temperature = 1, .objective_weight = 1 }, 1);
+            try buffers[4].copyToHost(&ctx, std.mem.sliceAsBytes(actual[0 .. queries * candidates]));
+            var losses: [queries]f32 = undefined;
+            var dqueries: [queries]f32 = undefined;
+            var dcandidates: [capacity]f32 = undefined;
+            // Drain earlier D2H submissions before these loop-local stack
+            // arrays can unwind on a later SDK error; success keeps one wait.
+            errdefer ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            try buffers[5].copyToHost(&ctx, std.mem.sliceAsBytes(&losses));
+            try buffers[6].copyToHost(&ctx, std.mem.sliceAsBytes(&dqueries));
+            try buffers[7].copyToHost(&ctx, std.mem.sliceAsBytes(dcandidates[0..candidates]));
+            try ctx.synchronize();
+            // Dot products are exactly0, exp(0)==1, integer sums exact: every
+            // visible F32 probability has an exact CPU division oracle.
+            for (0..queries) |row| {
+                const expected: f32 = 1.0 / @as(f32, @floatFromInt(visible[row]));
+                for (0..candidates) |c| try std.testing.expectEqual(if (valid[row * candidates + c] != 0) expected else @as(f32, 0), actual[row * candidates + c]);
+                // Match the actual loss boundary: F32 normalized probability,
+                // then logf/negation at objective_weight1, not log(N) fusion.
+                const expected_loss: f32 = -@log(expected);
+                // Existing F32 log-softmax/scalar-reference bound from
+                // backends/activations.zig; same-device repeats stay byte exact.
+                try std.testing.expect(@abs(expected_loss - losses[row]) < 1e-5);
+            }
+            for (dqueries) |value| try std.testing.expectEqual(@as(f32, 0), value);
+            for (dcandidates[0..candidates]) |value| try std.testing.expectEqual(@as(f32, 0), value);
+            for (losses) |value| try std.testing.expect(std.math.isFinite(value) and value > 0);
+            if (iteration == 0) {
+                @memcpy(baseline[0 .. queries * candidates], actual[0 .. queries * candidates]);
+                loss_baseline = losses;
+            } else {
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(baseline[0 .. queries * candidates]), std.mem.sliceAsBytes(actual[0 .. queries * candidates]));
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(&loss_baseline), std.mem.sliceAsBytes(&losses));
+            }
+        }
+    }
+}
+
+test "embeddinggemma2 CUDA nonzero contrastive objective and both VJPs match independent CPU reference across masked tails" {
+    if (comptime !@import("build_options").enable_cuda) return error.SkipZigTest;
+    var ctx = Context.initDefault() catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer ctx.deinit();
+    var module = try Module.init(&ctx);
+    defer module.deinit(&ctx);
+    const a = std.testing.allocator;
+    const queries = 9;
+    const capacity = 384;
+    const width = 17;
+    const temperature: f32 = 0.5;
+    const objective_weight: f32 = 0.75;
+    const loss_scale: f32 = 1.25;
+    var random = std.Random.DefaultPrng.init(0x133d_846_17);
+    var query_values: [queries * width]f32 = undefined;
+    var candidate_values: [capacity * width]f32 = undefined;
+    // Dyadic inputs make all17-term dots and inverse-temperature2 exact,
+    // independently of CPU/GPU FMA contraction. No host math from GPU output.
+    for (&query_values) |*value| value.* = @as(f32, @floatFromInt(random.random().intRangeLessThan(i32, -8, 9))) / 32;
+    for (&candidate_values) |*value| value.* = @as(f32, @floatFromInt(random.random().intRangeLessThan(i32, -8, 9))) / 32;
+    var targets: [queries]u32 = undefined;
+    var valid: [queries * capacity]u8 = undefined;
+    const offsets = [_]usize{ 0, queries * capacity, queries * capacity + queries, queries * capacity + queries + queries * width };
+    const host_elements = offsets[3] + capacity * width;
+    const actual = try a.alloc(f32, host_elements);
+    defer a.free(actual);
+    const baseline = try a.alloc(f32, host_elements);
+    defer a.free(baseline);
+    const reference = try a.alloc(f64, host_elements);
+    defer a.free(reference);
+    var buffers: [8]Buffer = @splat(.{});
+    defer for (&buffers) |*buffer| buffer.free(&ctx);
+    const allocation_bytes = [_]usize{ queries * width * 4, capacity * width * 4, queries * 4, queries * capacity, queries * capacity * 4, queries * 4, queries * width * 4, capacity * width * 4 };
+    for (&buffers, allocation_bytes) |*buffer, bytes| buffer.* = try Buffer.alloc(&ctx, bytes);
+    // All DMA destinations and input sources have function scope; this drain
+    // runs before any heap free or function-scope input lifetime can end.
+    errdefer ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    try buffers[0].copyFromHost(&ctx, std.mem.sliceAsBytes(&query_values));
+    try buffers[1].copyFromHost(&ctx, std.mem.sliceAsBytes(&candidate_values));
+    const cases = [_]struct { candidates: usize, masked: bool }{
+        .{ .candidates = 257, .masked = false },
+        .{ .candidates = 257, .masked = true },
+        .{ .candidates = 384, .masked = true },
+    };
+    for (cases) |case| {
+        const candidates = case.candidates;
+        const lengths = [_]usize{ queries * candidates, queries, queries * width, candidates * width };
+        @memset(reference, 0);
+        for (0..queries) |row| {
+            targets[row] = @intCast(if (row + 1 == queries) candidates - 1 else (37 * row + 65) % candidates);
+            for (0..candidates) |column| valid[row * candidates + column] = @intFromBool(!case.masked or (row + column) % 11 != 0 or column == targets[row]);
+            // Independent stable F64 softmax; preserve the actual stored F32
+            // probability boundary before loss and derivative calculations.
+            var scores: [capacity]f64 = undefined;
+            var maximum: f64 = -std.math.inf(f64);
+            for (0..candidates) |column| {
+                var dot: f64 = 0;
+                for (0..width) |d| dot += @as(f64, query_values[row * width + d]) * @as(f64, candidate_values[column * width + d]);
+                const score = if (valid[row * candidates + column] != 0) dot / @as(f64, temperature) else -std.math.inf(f64);
+                scores[column] = score;
+                maximum = @max(maximum, score);
+            }
+            var total: f64 = 0;
+            for (0..candidates) |column| {
+                scores[column] = if (valid[row * candidates + column] != 0) @exp(scores[column] - maximum) else 0;
+                total += scores[column];
+            }
+            for (0..candidates) |column| {
+                const probability: f32 = @floatCast(scores[column] / total);
+                reference[row * candidates + column] = probability;
+            }
+            reference[offsets[1] + row] = -@log(reference[row * candidates + targets[row]]) * @as(f64, objective_weight);
+        }
+        // Per-row losses above are weighted but NOT averaged/loss-scaled.
+        // Actual VJPs differentiate the MEAN weighted objective, then apply
+        // loss_scale and inverse temperature exactly once at the final boundary.
+        const gradient_scale: f64 = @as(f64, loss_scale) * @as(f64, objective_weight) / @as(f64, temperature) / queries;
+        for (0..queries) |row| for (0..width) |d| {
+            var sum: f64 = 0;
+            for (0..candidates) |column| {
+                const coefficient = reference[row * candidates + column] - @as(f64, @floatFromInt(@intFromBool(column == targets[row])));
+                sum += coefficient * @as(f64, candidate_values[column * width + d]);
+            }
+            reference[offsets[2] + row * width + d] = sum * gradient_scale;
+        };
+        for (0..candidates) |column| for (0..width) |d| {
+            var sum: f64 = 0;
+            for (0..queries) |row| {
+                const coefficient = reference[row * candidates + column] - @as(f64, @floatFromInt(@intFromBool(column == targets[row])));
+                sum += coefficient * @as(f64, query_values[row * width + d]);
+            }
+            reference[offsets[3] + column * width + d] = sum * gradient_scale;
+        };
+        inline for (.{ 2, 3 }) |role| {
+            var nonzero = false;
+            for (reference[offsets[role]..][0..lengths[role]]) |value| if (@abs(value) > 0.0001) {
+                nonzero = true;
+            };
+            try std.testing.expect(nonzero); // Neither VJP oracle is trivial0.
+        }
+        try buffers[2].copyFromHost(&ctx, std.mem.sliceAsBytes(&targets));
+        if (case.masked) try buffers[3].copyFromHost(&ctx, valid[0 .. queries * candidates]);
+        for (0..16) |iteration| {
+            try module.launchContrastive(&ctx, buffers[4], buffers[5], buffers[6], buffers[7], buffers[0], buffers[1], if (case.masked) buffers[3] else .{}, buffers[2], .{ .queries = queries, .candidates = @intCast(candidates), .width = width, .temperature = temperature, .objective_weight = objective_weight }, loss_scale);
+            for (buffers[4..8], offsets, lengths) |buffer, offset, length| try buffer.copyToHost(&ctx, std.mem.sliceAsBytes(actual[offset..][0..length]));
+            try ctx.synchronize();
+            for (offsets, lengths, 0..) |offset, length, role| {
+                for (reference[offset..][0..length], actual[offset..][0..length], 0..) |expected, got, index| {
+                    if (!std.math.isFinite(got) or @abs(@as(f64, got) - expected) >= 1e-5) {
+                        std.debug.print("contrastive nonzero CPU mismatch C={} masked={} iteration={} role={} index={}\n", .{ candidates, case.masked, iteration, role, index });
+                        try std.testing.expectApproxEqAbs(@as(f32, @floatCast(expected)), got, 1e-5);
+                    }
+                }
+                if (iteration == 0) {
+                    @memcpy(baseline[offset..][0..length], actual[offset..][0..length]);
+                } else try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(baseline[offset..][0..length]), std.mem.sliceAsBytes(actual[offset..][0..length]));
+            }
         }
     }
 }
