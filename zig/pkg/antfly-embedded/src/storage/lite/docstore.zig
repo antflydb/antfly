@@ -6378,7 +6378,11 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
     var vtable = std.Options.debug_io.vtable.*;
     vtable.fileSync = Fault.sync;
     const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
-    for (1..4) |barrier| {
+    // A durable commit now costs 2 syncs, not 3: the on-disk
+    // active_checkpoint hint byte is no longer written/synced per commit
+    // (selectActiveCheckpoint already recovers the newest valid slot from
+    // its own commit_sequence). So there are only two barriers to fail.
+    for (1..3) |barrier| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(alloc, tmp, "group-sync-failure.aflite");
@@ -6393,8 +6397,9 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
             defer Fault.remaining = 0;
             var context: u8 = 0;
             // The first barrier precedes checkpoint publication, so nothing
-            // committed. Later barriers fail while the checkpoint is being
-            // published, which leaves the commit's durability unknown.
+            // committed. The second barrier fails while the checkpoint slot
+            // is being published, which leaves the commit's durability
+            // unknown.
             const expected: anyerror = if (barrier == 1) error.InputOutput else error.OutcomeUnknown;
             try std.testing.expectError(expected, store.submitMutation(&context, Fault.apply));
             try std.testing.expectEqual(@as(usize, 0), Fault.remaining);

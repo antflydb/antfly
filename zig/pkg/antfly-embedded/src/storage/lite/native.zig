@@ -546,15 +546,18 @@ test "lite allocator v4 certificate uncertain publication never rolls back publi
     var vtable = std.testing.io.vtable.*;
     vtable.fileWritePositional = Fault.write;
     const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
-    for ([_]bool{ false, true }) |after_selector| {
-        const path = try testPath(a, tmp, if (after_selector) "certificate-selector.aflite" else "certificate-slot.aflite");
+    // Publication now has a single slot write (the on-disk active_checkpoint
+    // hint byte is no longer persisted per commit), so there is only one
+    // fallible write left inside the publication window to fail.
+    {
+        const path = try testPath(a, tmp, "certificate-slot.aflite");
         defer a.free(path);
         {
             var file = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true, .no_sync = true });
             defer file.close();
             try file.putDocument("doc", "durable");
             const size = (try file.file.stat(io)).size;
-            Fault.fail_offset = if (after_selector) active_checkpoint_offset else checkpointOffset(1 - file.header.active_checkpoint);
+            Fault.fail_offset = checkpointOffset(1 - file.header.active_checkpoint);
             defer Fault.fail_offset = null;
             // Cancelled inside the publication window: the outcome is unknown.
             try std.testing.expectError(error.OutcomeUnknown, file.certifyAllocator());
@@ -567,10 +570,6 @@ test "lite allocator v4 certificate uncertain publication never rolls back publi
         defer reopened.close();
         const prefix = try checkpointPrefixSize(reopened.activeCheckpoint(), reopened.header.page_size);
         try std.testing.expect((try reopened.checkAtFileSizeWithCancel(prefix, null)).valid);
-        if (after_selector) {
-            try std.testing.expect((try reopened.check()).valid);
-            try std.testing.expect(try reopened.inheritAllocatorCertificate());
-        }
         const value = (try reopened.getDocumentAlloc(a, "doc")).?;
         defer a.free(value);
         try std.testing.expectEqualStrings("durable", value);
@@ -1434,7 +1433,9 @@ test "lite coordinator publication cancellation never performs fallible notifica
                 return error.Canceled;
             }
             const written = try std.testing.io.vtable.fileWritePositional(userdata, handle, header, data, splat, offset);
-            if (cancel_after_commit and offset == active_checkpoint_offset) cancel_stat = true;
+            // The slot write is now the last write of the publication window
+            // (there is no trailing active_checkpoint hint write).
+            if (cancel_after_commit and (offset == checkpointOffset(0) or offset == checkpointOffset(1))) cancel_stat = true;
             return written;
         }
     };
@@ -1568,6 +1569,64 @@ test "lite allocator v4 external readers and deferred durability fence reuse" {
     defer a.free(persisted);
     try std.testing.expectEqualStrings("barrier", persisted);
     try file.sync();
+    try std.testing.expect((try file.check()).valid);
+}
+
+// WS1(d): a page retired by a not-yet-durable commit must stay out of the
+// reusable pool until a durability barrier actually makes that commit
+// durable. Without `durable_header` folded into the reuse frontier
+// (`metadataReuseFrontier`/`reuseFrontier`), reclamation driven purely off
+// `self.header` (which a deferred commit already advances in memory) would
+// promote these pages for reuse before the generation that retired them is
+// durable — unsafe once a future pipelined group commit lets the next
+// group stage while the current one's fsync is still outstanding, since a
+// crash mid-fsync must still recover a prior checkpoint whose pages were
+// never overwritten.
+test "lite allocator v4 reuse frontier withholds pages retired by undurable commits" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reuse-durable-epoch.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true });
+    defer file.close();
+    const first: [32768]u8 = @splat('a');
+    const second: [32768]u8 = @splat('b');
+    // A durable baseline: "doc" occupies a whole page, not a packed record.
+    try file.putDocument("doc", &first);
+    try std.testing.expect(try file.certifyAllocator());
+
+    // Many deferred (non-durable) overwrites retire that page's successive
+    // replacements, all at epochs above the durable checkpoint, without
+    // ever crossing a durability barrier.
+    for (0..48) |i| {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("doc", if (i % 2 == 0) &second else &first);
+        try file.commitTransactionWithDurability(false);
+    }
+    try std.testing.expect(file.durable_header != null);
+    const pending_before = (try file.allocatorStats()).?.pending_data_objects;
+    try std.testing.expect(pending_before > 0);
+
+    // Reclamation must not free any of those pages yet: at the moment its
+    // own drain runs, `durable_header` still pins the frontier at the
+    // pre-barrier checkpoint, even though reclaimPages's own commit will
+    // itself cross the barrier by the time it returns.
+    _ = try file.reclaimPages(4096);
+    try std.testing.expectEqual(@as(u64, 0), (try file.allocatorStats()).?.reusable_pages);
+    try std.testing.expect(file.durable_header == null);
+    try std.testing.expect((try file.check()).valid);
+
+    // Now that the barrier crossed, the same backlog is eligible: drive
+    // reclamation until the ledger reports no more service is due, and
+    // confirm pages were actually freed for reuse.
+    var rounds: usize = 0;
+    while (try file.retirementNeedsService()) : (rounds += 1) {
+        try std.testing.expect(rounds < 1000);
+        _ = try file.reclaimPages(4096);
+    }
+    try std.testing.expect((try file.allocatorStats()).?.reusable_pages > 0);
     try std.testing.expect((try file.check()).valid);
 }
 
@@ -4755,6 +4814,18 @@ pub const NativeFile = struct {
     change_capture: ?*ChangeCapture = null,
     read_only: bool = false,
     no_sync: bool = false,
+    /// When set, durability barriers (`syncIfRequired`) call
+    /// `antfly_platform.filesystem.syncData` directly on the raw handle
+    /// instead of `self.file.sync(io)`: `fdatasync` on Linux instead of
+    /// `fsync`, skipping metadata the data does not need to be retrievable.
+    /// Null (the default) keeps going through the `std.Io` vtable, which
+    /// every backend (including an evented/fiber scheduler) already knows
+    /// how to run without blocking its reactor. Set this only when the
+    /// runtime backing this file's `Io` is known to run blocking ops
+    /// synchronously on the calling thread (e.g. the default `Threaded`
+    /// backend embedded Lite normally opens with), since this bypasses the
+    /// vtable (and its cancellation support) entirely.
+    durability_policy: ?antfly_platform.filesystem.DurabilityPolicy = null,
     // An error after slot publication may leave disk ahead of header. Do not
     // elide a subsequent write based on the old in-memory checkpoint then.
     checkpoint_publication_uncertain: bool = false,
@@ -4827,6 +4898,9 @@ pub const NativeFile = struct {
 
     test_page_write_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_page_write_fail_after: if (builtin.is_test) ?usize else void = if (builtin.is_test) null else {},
+    /// Counts durability barriers (`syncIfRequired`'s underlying `file.sync`
+    /// calls), independent of filesystem speed. Used to assert syncs/commit.
+    test_sync_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     /// Fails the next checkpoint publication inside its uncertain window
     /// (after the flag is set, before the slot write), then disarms.
     test_fail_checkpoint_publication: if (builtin.is_test) ?anyerror else void = if (builtin.is_test) null else {},
@@ -11795,6 +11869,13 @@ pub const NativeFile = struct {
         // From here until the flag clears, a failure leaves the commit's
         // durability unknown: report exactly that, not a raw I/O error a
         // caller might retry as if nothing had been written.
+        //
+        // The on-disk `active_checkpoint` hint byte is never written here.
+        // `selectActiveCheckpoint` already picks the valid slot with the
+        // highest `commit_sequence`, which is monotonic across commits, so
+        // the hint can only matter as a tie-break at file creation (where it
+        // is still written once by `encodeHeader`). Persisting it again on
+        // every commit cost a second, redundant fsync.
         (blk: {
             if (comptime builtin.is_test) if (self.test_fail_checkpoint_publication) |err| {
                 self.test_fail_checkpoint_publication = null;
@@ -11803,9 +11884,6 @@ pub const NativeFile = struct {
             if (self.header.indexed_reclamation)
                 self.file.writePositionalAll(io, &identities, logicalGenerationsOffset(next_slot)) catch |err| break :blk err;
             self.file.writePositionalAll(io, &encoded_slot, checkpointOffset(next_slot)) catch |err| break :blk err;
-            self.syncIfRequired() catch |err| break :blk err;
-            const active_checkpoint: [1]u8 = .{next_slot};
-            self.file.writePositionalAll(io, &active_checkpoint, active_checkpoint_offset) catch |err| break :blk err;
             self.syncIfRequired() catch |err| break :blk err;
             break :blk {};
         }) catch {
@@ -11832,8 +11910,21 @@ pub const NativeFile = struct {
         if (self.publication_observer) |observer| observer.notify(observer.context, self.activeCheckpoint(), self.checkpoint_publication_uncertain);
     }
 
+    /// Opts this handle's durability barriers into the raw `syncData`
+    /// primitive. See the `durability_policy` field doc for when that is
+    /// safe to call.
+    pub fn setDurabilityPolicy(self: *NativeFile, policy: ?antfly_platform.filesystem.DurabilityPolicy) void {
+        self.durability_policy = policy;
+    }
+
     fn syncIfRequired(self: *NativeFile) !void {
-        if (!self.no_sync and self.transaction_header == null) try self.file.sync(self.runtimeIo());
+        if (!self.no_sync and self.transaction_header == null) {
+            if (self.durability_policy) |policy|
+                try antfly_platform.filesystem.syncData(self.file.handle, policy)
+            else
+                try self.file.sync(self.runtimeIo());
+            if (builtin.is_test) _ = self.test_sync_calls.fetchAdd(1, .monotonic);
+        }
     }
 
     pub fn sync(self: *NativeFile) !void {
@@ -13775,11 +13866,13 @@ test "lite native file publishes checkpoint without rewriting static header" {
         var after: [header_size]u8 = undefined;
         try readExactAt(file.file, file.io_impl.io(), &after, 0);
 
-        try std.testing.expectEqualSlices(u8, before[0..active_checkpoint_offset], after[0..active_checkpoint_offset]);
-        try std.testing.expectEqualSlices(u8, before[active_checkpoint_offset + 1 .. checkpoint_slots_offset], after[active_checkpoint_offset + 1 .. checkpoint_slots_offset]);
+        // The active_checkpoint hint byte is no longer rewritten per commit:
+        // the whole prefix up to the checkpoint slots, including that byte,
+        // stays untouched. Only the inactive slot (slot 1) changes.
+        try std.testing.expectEqualSlices(u8, before[0..checkpoint_slots_offset], after[0..checkpoint_slots_offset]);
         try std.testing.expectEqualSlices(u8, before[checkpointOffset(0)..][0..checkpoint_slot_size], after[checkpointOffset(0)..][0..checkpoint_slot_size]);
         try std.testing.expectEqualSlices(u8, before[checkpoint_slots_end..header_size], after[checkpoint_slots_end..header_size]);
-        try std.testing.expectEqual(@as(u8, 1), after[active_checkpoint_offset]);
+        try std.testing.expectEqual(@as(u8, 0), after[active_checkpoint_offset]);
         try std.testing.expect(!std.mem.eql(u8, before[checkpointOffset(1)..][0..checkpoint_slot_size], after[checkpointOffset(1)..][0..checkpoint_slot_size]));
     }
 
@@ -13787,6 +13880,49 @@ test "lite native file publishes checkpoint without rewriting static header" {
     defer reopened.close();
     try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
     try std.testing.expectEqual(@as(u64, 3), reopened.activeCheckpoint().page_count);
+}
+
+test "lite native durable commit costs two syncs after dropping the active_checkpoint hint" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "native-commit-sync-count.aflite");
+    defer allocator.free(path);
+
+    var file = try NativeFile.createWithIo(allocator, std.testing.io, path, .{ .indexed_reclamation = true });
+    defer file.close();
+    const before = file.test_sync_calls.load(.monotonic);
+    try file.putDocument("doc", "durable");
+    // One sync for the data pages (flushTransactionWrites/syncIfRequired in
+    // commitTransactionWithDurability), one for the inactive recovery slot
+    // (publishCheckpoint). The active_checkpoint hint byte is no longer
+    // written or synced, so this is 2, not the historical 3.
+    try std.testing.expectEqual(@as(u64, 2), file.test_sync_calls.load(.monotonic) - before);
+}
+
+test "lite native durability_policy durable commit survives reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    for ([_]antfly_platform.filesystem.DurabilityPolicy{ .default, .full_fsync }) |policy| {
+        const path = try testPath(allocator, tmp, if (policy == .default) "native-sync-data-default.aflite" else "native-sync-data-full.aflite");
+        defer allocator.free(path);
+        {
+            var file = try NativeFile.createWithIo(allocator, std.testing.io, path, .{ .indexed_reclamation = true, .exclusive = true });
+            defer file.close();
+            file.setDurabilityPolicy(policy);
+            const before = file.test_sync_calls.load(.monotonic);
+            try file.putDocument("doc", "durable via syncData");
+            try std.testing.expectEqual(@as(u64, 2), file.test_sync_calls.load(.monotonic) - before);
+            try std.testing.expect((try file.check()).valid);
+        }
+        var reopened = try NativeFile.open(allocator, path, true);
+        defer reopened.close();
+        const value = (try reopened.getDocumentAlloc(allocator, "doc")).?;
+        defer allocator.free(value);
+        try std.testing.expectEqualStrings("durable via syncData", value);
+    }
 }
 
 test "lite native file recovers older complete checkpoint when newest prefix is truncated" {
