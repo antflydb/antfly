@@ -170,6 +170,72 @@ test "SQL default lifecycle retries only definite read admission" {
     try std.testing.expect(!definiteReadAdmission(changed));
 }
 
+// Explicit SQL timeout probes need response/cleanup headroom on every
+// attempt. A fresh server timeout must never outlive the remaining transport
+// budget after a proven pre-admission retry.
+const TimeoutHeaders = struct {
+    headers: []http.RequestHeader,
+    index: usize,
+    requested_ms: u64,
+    value: [20]u8 = undefined,
+
+    fn init(a: std.mem.Allocator, headers: []const http.RequestHeader) !?@This() {
+        const budgets = @import("antfly_public_limits").Execution;
+        var index: ?usize = null;
+        for (headers, 0..) |header, i| {
+            if (!std.ascii.eqlIgnoreCase(header.name, budgets.timeout_header)) continue;
+            // Leave malformed and duplicate probes intact for server validation.
+            if (index != null) return null;
+            index = i;
+        }
+        const slot = index orelse return null;
+        const requested = budgets.positive(headers[slot].value, budgets.max_timeout_ms) catch return null;
+        return .{ .headers = try a.dupe(http.RequestHeader, headers), .index = slot, .requested_ms = requested };
+    }
+    fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        a.free(self.headers);
+        self.* = undefined;
+    }
+    fn forRemaining(self: *@This(), remaining_ms: u64) []const http.RequestHeader {
+        // Keep at least half the remaining time for bounded rollback, command
+        // completion and response delivery. The caller's smaller limit wins.
+        const timeout = @min(self.requested_ms, @max(1, remaining_ms / 2));
+        self.headers[self.index].value = std.fmt.bufPrint(&self.value, "{d}", .{timeout}) catch unreachable;
+        return self.headers;
+    }
+};
+
+test "SQL implicit lock cleanup timeout probes retain parent transport headroom" {
+    const a = std.testing.allocator;
+    const headers = [_]http.RequestHeader{
+        .{ .name = "authorization", .value = "fixture-credential" },
+        .{ .name = "X-Antfly-Timeout-Ms", .value = "5000" },
+        .{ .name = "x-other-probe", .value = "preserved" },
+    };
+    var timeout = (try TimeoutHeaders.init(a, &headers)).?;
+    defer timeout.deinit(a);
+    for ([_]struct { remaining: u64, expected: []const u8 }{
+        .{ .remaining = 15000, .expected = "5000" },
+        .{ .remaining = 8000, .expected = "4000" },
+        .{ .remaining = 3000, .expected = "1500" },
+        .{ .remaining = 1000, .expected = "500" },
+        .{ .remaining = 2, .expected = "1" },
+        .{ .remaining = 1, .expected = "1" },
+    }) |case| {
+        const forwarded = timeout.forRemaining(case.remaining);
+        try std.testing.expectEqualStrings(case.expected, forwarded[1].value);
+        try std.testing.expectEqualStrings(headers[0].value, forwarded[0].value);
+        try std.testing.expectEqualStrings(headers[2].value, forwarded[2].value);
+        try std.testing.expectEqualStrings("5000", headers[1].value);
+    }
+    try std.testing.expect((try TimeoutHeaders.init(a, &.{})) == null);
+    try std.testing.expect((try TimeoutHeaders.init(a, headers[0..1])) == null);
+    for ([_][]const u8{ "0", "-1", "invalid", "1800001" }) |invalid| {
+        try std.testing.expect((try TimeoutHeaders.init(a, &.{.{ .name = "x-antfly-timeout-ms", .value = invalid }})) == null);
+    }
+    try std.testing.expect((try TimeoutHeaders.init(a, &.{ headers[1], headers[1] })) == null);
+}
+
 pub fn execute(ctx: *fixture.Context, statement: []const u8, retry: Retry) !http.HttpResponse {
     return executeIn(ctx, null, statement, retry);
 }
@@ -222,11 +288,15 @@ pub fn executeConnected(
 
 fn executeBody(ctx: *fixture.Context, connection: ?[]const u8, body: []const u8, retry: Retry) !http.HttpResponse {
     const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    var timeout_headers = try TimeoutHeaders.init(ctx.alloc, ctx.headers);
+    defer if (timeout_headers) |*owned| owned.deinit(ctx.alloc);
     while (true) {
         try ctx.checkDrivers();
         const remaining = deadline -| platform.time.monotonicNs();
         if (remaining == 0) return error.SqlOwnerTestRequestTimeout;
-        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, ctx.headers, ctx.base, "/db/v1/sql", .POST, body, @intCast(@max(1, remaining / std.time.ns_per_ms)));
+        const remaining_ms = @max(1, remaining / std.time.ns_per_ms);
+        const headers = if (timeout_headers) |*owned| owned.forRemaining(remaining_ms) else ctx.headers;
+        var response = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, headers, ctx.base, "/db/v1/sql", .POST, body, @intCast(remaining_ms));
         // 53300 alone also covers post-commit visibility waits. Only the
         // specific no-admission statement-read failure can repeat preparation.
         if (retry != .never and response.status == 503) {

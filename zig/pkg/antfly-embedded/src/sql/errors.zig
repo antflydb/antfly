@@ -94,7 +94,7 @@ pub fn isRowEvaluationError(err: anyerror) bool {
 /// Errors whose identity already means "the outcome is unknown".
 pub fn isUnknownOutcome(err: anyerror) bool {
     return switch (err) {
-        error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.CommitDecisionUnknown, error.DurabilityOutcomeUnknown => true,
+        error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.CommitDecisionUnknown, error.DurabilityOutcomeUnknown, error.RaftBatchWriteOutcomeUnknown => true,
         else => false,
     };
 }
@@ -404,7 +404,7 @@ pub fn describe(err: anyerror) Diagnostic {
         error.SqlStatementReadUnavailable, error.CatalogRoutingUnavailable, error.CatalogRoutingSnapshotTimeout => .{ .code = "53300", .message = "A consistent SQL statement read is temporarily unavailable.", .hint = "Retry the complete statement after a bounded delay.", .retryable = true },
         error.RestoreValidationPending => .{ .code = "53300", .message = "The source owner is not ready to admit a schema rewrite.", .hint = "No rewrite job was admitted; wait for the table owner to become ready before retrying the DDL.", .retryable = true },
         error.HAReadOnlyStandby, error.HAPromotedStandbyRequiresPrimaryOpen, error.HAFencedPrimary => .{ .code = "25006", .message = "This server is not accepting writes in its current standby or fencing state.", .hint = "Send the mutation to an active writable primary.", .retryable = false },
-        error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.CommitDecisionUnknown, error.DurabilityOutcomeUnknown => .{ .code = "40003", .message = "The mutation outcome is unknown; it may already have committed.", .hint = "Do not replay the statement. Use its transaction receipt to reconcile the outcome.", .retryable = false },
+        error.SqlTransactionOutcomeUnknown, error.SqlMutationOutcomeUnknown, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.CommitDecisionUnknown, error.DurabilityOutcomeUnknown, error.RaftBatchWriteOutcomeUnknown => .{ .code = "40003", .message = "The mutation outcome is unknown; it may already have committed.", .hint = "Do not replay the statement. Use its transaction receipt to reconcile the outcome.", .retryable = false },
         error.OutOfMemory => .{ .code = "53200", .message = "The server could not reserve enough memory for this SQL operation.", .hint = "Reduce result size or concurrent load." },
         else => .{ .code = "XX000", .message = "The SQL operation could not be completed because of an internal error.", .hint = "Contact the operator with the request or transaction receipt; do not assume a failed mutation was rolled back." },
     };
@@ -464,6 +464,7 @@ test "SQL diagnostics retain definite constraints conflicts and unknown outcomes
         .{ .err = error.SqlConstraintAlreadyExists, .code = "42710", .retryable = false },
         .{ .err = error.SettingAuthorityUnavailable, .code = "53300", .retryable = false },
         .{ .err = error.SqlMutationOutcomeUnknown, .code = "40003", .retryable = false },
+        .{ .err = error.RaftBatchWriteOutcomeUnknown, .code = "40003", .retryable = false },
         .{ .err = error.SqlConstraintOwnedIndex, .code = "2BP01", .retryable = false },
         .{ .err = error.QueryCanceled, .code = "57014", .retryable = null },
         .{ .err = error.RowPolicyUnsupported, .code = "0A000", .retryable = false },

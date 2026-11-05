@@ -7335,6 +7335,17 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("lite-merge-publication-runtime-test", "Verify incremental merge publication handoff and shutdown")
         .dependOn(&addFilteredTestRunArtifact(b, lite_merge_publication_runtime_tests).step);
 
+    const sql_ordered_lock_apply_tests = b.addTest(.{
+        .root_module = db_test_mod,
+        .filters = &.{ "SQL ordered lock admission yields without holding snapshot or writer ownership", "storage.db snapshot admission nonblocking mutation yields to capture" },
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    const sql_ordered_lock_apply_run = addFilteredTestRunArtifact(b, sql_ordered_lock_apply_tests);
+    sql_ordered_lock_apply_run.addArg("--require-no-skips");
+    sql_ordered_lock_apply_run.addArg("--timeout-ms=30000");
+    b.step("antfly-sql-lock-apply-test", "Verify ordered lock admission never waits on native owner fences")
+        .dependOn(&sql_ordered_lock_apply_run.step);
+
     const bounded_read_integration_tests = b.addTest(.{
         .root_module = db_test_mod,
         .filters = &.{

@@ -1016,6 +1016,7 @@ pub const Detail = enum(c_int) {
     undefined_column = 892,
     foreign_key_validation_required = 893,
     materialized_view_read_only = 894,
+    raft_apply_writer_unavailable = 895,
 };
 
 test "partial index proof rejection preserves exact callback error identity" {
@@ -1644,6 +1645,7 @@ pub fn statusFromError(err: anyerror) Status {
         error.CommittedPending => status(.retryable, .committed_pending),
         error.WriteOutcomeUnknown => status(.retryable, .write_outcome_unknown),
         error.RaftBatchWriteOutcomeUnknown => status(.retryable, .raft_batch_write_outcome_unknown),
+        error.RaftApplyWriterUnavailable => status(.retryable, .raft_apply_writer_unavailable),
         error.RaftBatchWriteTransportOutcomeUnknown => status(.retryable, .raft_batch_write_transport_outcome_unknown),
         error.HttpConnectionClosing => status(.unavailable, .http_connection_closing),
         error.RaftBatchWritePartialOutcome => status(.retryable, .raft_batch_write_partial_outcome),
@@ -2739,6 +2741,7 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .commit_visibility_not_satisfied => "CommitVisibilityNotSatisfied",
         .leader_unavailable => "LeaderUnavailable",
         .raft_batch_write_outcome_unknown => "RaftBatchWriteOutcomeUnknown",
+        .raft_apply_writer_unavailable => "RaftApplyWriterUnavailable",
         .raft_batch_write_transport_outcome_unknown => "RaftBatchWriteTransportOutcomeUnknown",
         .http_connection_closing => "HttpConnectionClosing",
         .raft_batch_write_partial_outcome => "RaftBatchWritePartialOutcome",
@@ -3582,4 +3585,11 @@ test "invalid persisted extraction policy retains identity across storage callba
         try std.testing.expectEqual(@backingInt(Code.invalid_argument), transported.code);
         try std.testing.expectEqual(expected, errorFromStatus(transported));
     }
+}
+
+test "native locking callback admission preserves retryable ordered apply identity" {
+    const transported = statusFromError(error.RaftApplyWriterUnavailable);
+    try std.testing.expectEqual(@backingInt(Code.retryable), transported.code);
+    try std.testing.expectEqual(error.RaftApplyWriterUnavailable, errorFromStatus(transported));
+    try std.testing.expectEqual(@as(c_int, 895), @backingInt(Detail.raft_apply_writer_unavailable));
 }

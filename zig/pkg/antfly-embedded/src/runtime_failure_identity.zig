@@ -921,6 +921,7 @@ const mappings = [_]Mapping{
     .{ .status = .invalid_row_policy_bundle, .err = error.InvalidRowPolicyBundle },
     .{ .status = .row_policy_unsupported, .err = error.RowPolicyUnsupported },
     .{ .status = .raft_batch_write_outcome_unknown, .err = error.RaftBatchWriteOutcomeUnknown },
+    .{ .status = .raft_apply_writer_unavailable, .err = error.RaftApplyWriterUnavailable },
     .{ .status = .unsupported_raft_batch_protocol_version, .err = error.UnsupportedRaftBatchProtocolVersion },
     .{ .status = .enrichment_retry_in_progress, .err = error.EnrichmentRetryInProgress },
     .{ .status = .enrichment_wait_canceled, .err = error.EnrichmentWaitCanceled },
@@ -1390,7 +1391,7 @@ test "reader failures and scoped GCS failures retain exact storage boundary iden
 }
 
 test "native locking control failures preserve exact stable identities" {
-    inline for (.{ error.InvalidLockClass, error.InvalidLockEffect, error.InvalidLockOwner, error.InvalidLockRecord, error.InvalidLockResource, error.InvalidLockScope, error.LockEffectChanged, error.LockEffectExpired, error.LockEffectOutOfOrder, error.LockLimitExceeded, error.LockOwnerBusy, error.LockOwnerChanged, error.LockOwnerNotRegistered, error.LockPlanLimitExceeded }) |err| {
+    inline for (.{ error.RaftApplyWriterUnavailable, error.InvalidLockClass, error.InvalidLockEffect, error.InvalidLockOwner, error.InvalidLockRecord, error.InvalidLockResource, error.InvalidLockScope, error.LockEffectChanged, error.LockEffectExpired, error.LockEffectOutOfOrder, error.LockLimitExceeded, error.LockOwnerBusy, error.LockOwnerChanged, error.LockOwnerNotRegistered, error.LockPlanLimitExceeded }) |err| {
         const transported = statusFromError(err);
         try std.testing.expect(transported != .internal);
         try std.testing.expectError(err, statusToError(transported));

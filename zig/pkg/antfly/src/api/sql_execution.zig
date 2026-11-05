@@ -37,11 +37,24 @@ fn statementReadAdmissionError(context: operation.RequestContext, err: anyerror)
         error.ReadUnavailable, error.DistributedQueryUnavailable => error.SqlStatementReadUnavailable,
         else => |unchanged| unchanged,
     };
-    // An exhausted statement must report cancellation, not invite a new read
-    // attempt. Preserve corruption, permission and uncertain write outcomes.
-    if (normalized == error.SqlStatementReadUnavailable)
+    return statementFailure(context, normalized);
+}
+
+/// Give scoped cancellation priority over temporary availability at the final
+/// error boundary. This does not turn an admitted operation into a retryable
+/// pre-admission failure: live requests retain their exact original error.
+fn statementFailure(context: operation.RequestContext, err: anyerror) anyerror {
+    const operational = @import("table_reads.zig").normalizeDistributedQueryOperationalError(err);
+    if (operational == error.ReadUnavailable or operational == error.DistributedQueryUnavailable or operational == error.SqlStatementReadUnavailable)
         context.ensureActive() catch |expired| return expired;
-    return normalized;
+    return err;
+}
+
+fn statementNeedsReconciliation(err: anyerror) bool {
+    // Include purpose-specific sequence, prepared-decision and lease outcomes,
+    // not only generic mutation uncertainty. Private metadata ambiguity is
+    // normalized by the owning SQL operation before it reaches the wire.
+    return std.mem.eql(u8, diagnostic(err).code, "40003") or err == error.MetadataMutationOutcomeUnknown;
 }
 
 /// A bound logical table is already known to exist. Missing physical serving
@@ -58,13 +71,18 @@ test "SQL statement read admission distinguishes availability from corruption an
     var canceled = std.atomic.Value(bool).init(true);
     const stopped: operation.RequestContext = .{ .cancellation = operation.CancellationToken.fromAtomic(&canceled) };
     for ([_]anyerror{ error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.TopologyChanged, error.ReadIndexTimeout, error.ReadUnavailable, error.ConnectionRefused, error.StorageReadTemporarilyUnavailable, error.SqlStatementReadUnavailable }) |err| {
+        try std.testing.expectEqual(err, statementFailure(live, err));
+        try std.testing.expectEqual(error.DeadlineExceeded, statementFailure(expired, err));
+        try std.testing.expectEqual(error.Canceled, statementFailure(stopped, err));
         try std.testing.expectEqual(error.SqlStatementReadUnavailable, statementReadAdmissionError(live, err));
         try std.testing.expectEqual(error.DeadlineExceeded, statementReadAdmissionError(expired, err));
         try std.testing.expectEqual(error.Canceled, statementReadAdmissionError(stopped, err));
     }
     for ([_]operation.RequestContext{ live, expired, stopped }) |context| {
-        for ([_]anyerror{ error.TableNotFound, error.DeadlineExceeded, error.Cancelled, error.Forbidden, error.InvalidRetainedReadQuery, error.SqlRangeTrackingRequired, error.SqlMutationOutcomeUnknown, error.OutOfMemory, error.InternalFailure }) |err|
+        for ([_]anyerror{ error.TableNotFound, error.DeadlineExceeded, error.Cancelled, error.Forbidden, error.InvalidRetainedReadQuery, error.SqlRangeTrackingRequired, error.SqlMutationOutcomeUnknown, error.SqlTransactionOutcomeUnknown, error.MetadataMutationOutcomeUnknown, error.OutOfMemory, error.InternalFailure }) |err| {
+            try std.testing.expectEqual(err, statementFailure(context, err));
             try std.testing.expectEqual(err, statementReadAdmissionError(context, err));
+        }
     }
     try std.testing.expectEqual(error.SqlStatementReadUnavailable, physicalReadAdmissionError(live, error.TableNotFound));
     try std.testing.expectEqual(error.DeadlineExceeded, physicalReadAdmissionError(expired, error.TableNotFound));
@@ -285,7 +303,12 @@ const ImplicitAdvisory = struct {
                 try @import("sql_prepared_coordinator.zig").drainSessionCompletion(self.root.server, commit.reconciliation_id, self.coordinator.context);
                 self.phase = .done;
             },
-            .aborted => return @import("antfly_local_sources").sql_session.abortError(commit),
+            .aborted => {
+                try @import("sql_prepared_coordinator.zig").drainSessionCompletion(self.root.server, commit.reconciliation_id, self.coordinator.context);
+                self.phase = .done;
+                self.root.outcome_transaction_id = null;
+                return @import("antfly_local_sources").sql_session.abortError(commit);
+            },
             .unknown => return error.SqlTransactionOutcomeUnknown,
         }
     }
@@ -309,6 +332,30 @@ const ImplicitAdvisory = struct {
         _ = try self.session.execute(.rollback);
         try @import("sql_prepared_coordinator.zig").drainSessionCompletion(self.root.server, id, self.coordinator.context);
         self.phase = .done;
+        // The exact native decision, scope release and delivery ACK have all
+        // completed. Do not advertise reconciliation debt for a known abort.
+        self.root.outcome_transaction_id = null;
+    }
+
+    fn failure(self: *ImplicitAdvisory, err: anyerror) anyerror {
+        // A proposed decision may never be contradicted by a fresh rollback.
+        // Likewise, losing the cleanup reply cannot prove lock release. Its
+        // durable receipt and source outbox retain recovery ownership.
+        if (self.phase == .deciding) return error.SqlTransactionOutcomeUnknown;
+        if (statementNeedsReconciliation(err)) {
+            if (self.phase == .active) {
+                if (self.root.outcome_transaction_id == null) {
+                    if (self.session.transaction_id) |id|
+                        self.root.outcome_transaction_id = std.fmt.bytesToHex(id, .lower);
+                }
+                self.phase = .deciding;
+            }
+            return if (err == error.MetadataMutationOutcomeUnknown) error.SqlTransactionOutcomeUnknown else err;
+        }
+        self.abort() catch return error.SqlTransactionOutcomeUnknown;
+        // Cleanup proves transaction completion, not that a cursor never
+        // advanced. Preserve the original admission/iteration distinction.
+        return statementFailure(self.root.context, err);
     }
     fn retireFailedOwner(self: *ImplicitAdvisory) void {
         // An implicit transaction must not become a client-owned explicit
@@ -538,8 +585,7 @@ pub const Adapter = struct {
             return @import("sql_copy_server.zig").execute(self, alloc, compiled, parameters, limits, guarded_backend);
         defer self.releaseExecutionOwners();
         var result = self.executeInner(alloc, compiled, parameters, limits, guarded_backend) catch |err| {
-            try @import("sql_sequence_execution.zig").flush(self);
-            return err;
+            return self.finishFailure(err);
         };
         errdefer result.deinit();
         try @import("sql_sequence_execution.zig").flush(self);
@@ -548,6 +594,21 @@ pub const Adapter = struct {
             self.routine_owner = null;
         }
         return result;
+    }
+
+    fn finishFailure(self: *Adapter, err: anyerror) anyerror {
+        // Sequence effects survive known statement failures. An unresolved
+        // decision forbids another state write, which could also mask its
+        // original diagnostic or reconciliation identity.
+        if (statementNeedsReconciliation(err)) {
+            // Explicit statements may lose a native lock reply before reaching
+            // COMMIT. Keep their existing session receipt, never a fresh ID.
+            if (self.outcome_transaction_id == null)
+                self.outcome_transaction_id = self.result_session_id;
+        } else @import("sql_sequence_execution.zig").flush(self) catch |flush_err| return flush_err;
+        // Native lock admission can fail outside a physical row cursor.
+        // Recheck after cleanup without reclassifying a live admitted error.
+        return statementFailure(self.context, err);
     }
 
     pub fn releaseExecutionOwners(self: *Adapter) void {
@@ -1022,28 +1083,29 @@ pub const Adapter = struct {
         std.debug.assert(self.implicit_advisory == null);
         self.implicit_advisory = &advisory_scope;
         defer self.implicit_advisory = null;
-        errdefer advisory_scope.abort() catch {};
         var statement_backend = guarded_backend orelse self.backend();
         statement_backend.statement_clock = .{ .source = statement_source, .statement = statement_instant, .transaction = statement_instant };
         statement_backend.transaction_start = statement_instant;
         statement_backend.decision_provider = self.decision_provider;
         if (compiled.uses_current_setting and statement_backend.setting_capture == null) statement_backend.setting_capture = self.settingCapture();
+        return self.executeImplicit(alloc, compiled, parameters, limits, statement_backend, &advisory_scope) catch |err| {
+            const failure = advisory_scope.failure(err);
+            zig017_return_error = failure;
+            return failure;
+        };
+    }
+
+    fn executeImplicit(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, statement_backend: catalog.Backend, advisory_scope: *ImplicitAdvisory) !@import("antfly_local_sources").sql_runtime.Result {
         if (self.read_delivery) |delivery| if (self.session_id == null and compiled.statement == .select) {
             if (try @import("antfly_local_sources").sql_read_stream.Stream.openOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), statement_backend, compiled, parameters, limits)) |stream| {
                 defer stream.close();
-                var result = delivery.deliver(delivery.ptr, alloc, stream) catch |err| {
-                    zig017_return_error = err;
-                    return err;
-                };
+                var result = try delivery.deliver(delivery.ptr, alloc, stream);
                 errdefer result.deinit();
                 try advisory_scope.finish();
                 return result;
             }
         };
-        var result = @import("antfly_local_sources").sql_runtime.executeOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), statement_backend, compiled, parameters, limits) catch |err| {
-            zig017_return_error = err;
-            return err;
-        };
+        var result = try @import("antfly_local_sources").sql_runtime.executeOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), statement_backend, compiled, parameters, limits);
         errdefer result.deinit();
         try advisory_scope.finish();
         return result;
@@ -3320,6 +3382,123 @@ fn adapterTestServer() http_server.ApiHttpServer {
         }
     };
     return http_server.ApiHttpServer.init(std.testing.allocator, .{}, .{ .ptr = &Poison.token, .vtable = &.{ .status = Poison.status, .system_catalog = Poison.resolve } }, null, null);
+}
+
+test "SQL implicit lock cleanup preserves uncertain receipts and never contradicts proposed decisions" {
+    const sql = @import("antfly_local_sources").sql_session;
+    const Fake = struct {
+        coordinator: *@import("sql_session.zig").Coordinator,
+        rollback_failure: bool = false,
+        outcome: sql.CommitOutcome = .committed,
+        commits: usize = 0,
+        rollbacks: usize = 0,
+        fn begin(_: *anyopaque, _: sql.Scope, _: sql.Begin) !sql.Transaction {
+            return error.TestUnexpectedAuthorityAccess;
+        }
+        fn inspect(_: *anyopaque, _: sql.Scope, id: sql.Id) !sql.Transaction {
+            return .{ .id = id, .state = .active, .isolation = .read_committed, .mode = .read_write };
+        }
+        fn commit(raw: *anyopaque, _: sql.Scope, id: sql.Id) !sql.CommitResult {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.commits += 1;
+            return .{ .outcome = self.outcome, .reconciliation_id = id };
+        }
+        fn rollback(raw: *anyopaque, _: sql.Scope, _: sql.Id) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.rollbacks += 1;
+            // The canceled statement cannot cancel its bounded cleanup loan.
+            try self.coordinator.context.ensureActive();
+            if (self.rollback_failure) return error.InjectedSessionStoreFailure;
+        }
+        fn named(_: *anyopaque, _: sql.Scope, _: sql.Id, _: []const u8) !void {
+            return error.TestUnexpectedAuthorityAccess;
+        }
+        fn fail(_: *anyopaque, _: sql.Scope, _: sql.Id) !void {
+            return error.TestUnexpectedAuthorityAccess;
+        }
+        fn abandon(_: *anyopaque, _: sql.Scope, _: sql.Id) void {}
+        fn owner(self: *@This()) sql.Owner {
+            return .{ .ptr = self, .vtable = &.{ .begin = begin, .inspect = inspect, .commit = commit, .rollback = rollback, .savepoint = named, .rollback_to = named, .release = named, .mark_failed = fail, .abandon = abandon } };
+        }
+    };
+    var server = adapterTestServer();
+    defer server.deinit();
+    var identity: ?http_server.AuthenticatedIdentity = null;
+    var canceled = std.atomic.Value(bool).init(true);
+    const context: operation.RequestContext = .{ .deadline_ns = 0, .cancellation = operation.CancellationToken.fromAtomic(&canceled) };
+    var root: Adapter = .{ .server = &server, .identity = &identity, .context = context };
+    var coordinator: @import("sql_session.zig").Coordinator = .{ .server = &server, .identity = &identity, .context = context };
+    var fake: Fake = .{ .coordinator = &coordinator };
+    var session: sql.Session = .{ .owner = fake.owner(), .scope = .{ .principal = "alice" } };
+    var scope: ImplicitAdvisory = .{ .root = &root, .session = &session, .coordinator = &coordinator };
+    try std.testing.expectEqual(error.Canceled, scope.failure(error.ReadIndexTimeout));
+    try std.testing.expectEqual(error.Forbidden, scope.failure(error.Forbidden));
+    root.context = .{};
+    for ([_]anyerror{ error.ReadIndexTimeout, error.GroupLeaderUnavailable, error.SqlStatementReadUnavailable }) |err|
+        try std.testing.expectEqual(err, scope.failure(err));
+    root.context = context;
+    try std.testing.expectEqual(@as(usize, 0), fake.rollbacks);
+    const id: sql.Id = @splat(0x42);
+    const receipt = std.fmt.bytesToHex(id, .lower);
+    for ([_]bool{ true, false }) |rollback_failure| {
+        fake.rollback_failure = rollback_failure;
+        session.transaction_id = id;
+        scope.phase = .active;
+        root.outcome_transaction_id = null;
+        // A successful local ROLLBACK alone is insufficient: this fixture
+        // deliberately has no durable delivery ACK store. Both an uncertain
+        // rollback and a missing ACK must retain the same recovery identity.
+        try std.testing.expectEqual(error.SqlTransactionOutcomeUnknown, scope.failure(error.ReadIndexTimeout));
+        try std.testing.expectEqualSlices(u8, &receipt, &root.outcome_transaction_id.?);
+        try std.testing.expectError(error.Canceled, coordinator.context.ensureActive());
+        try std.testing.expectEqual(@as(?sql.Id, if (rollback_failure) id else null), session.transaction_id);
+    }
+    try std.testing.expectEqual(@as(usize, 2), fake.rollbacks);
+    const uncertain = [_]anyerror{ error.SqlMutationOutcomeUnknown, error.SqlTransactionOutcomeUnknown, error.SqlSequenceOutcomeUnknown, error.RaftBatchWriteOutcomeUnknown, error.InvalidPreparedTransactionPhase, error.ExternalTransactionDecisionChanged, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.CommitDecisionUnknown, error.DurabilityOutcomeUnknown, error.SessionLeaseLost, error.MetadataMutationOutcomeUnknown };
+    for (uncertain) |err| {
+        const distinct_receipt = std.fmt.bytesToHex(@as(sql.Id, @splat(0x71)), .lower);
+        for ([_]bool{ false, true }) |has_receipt| {
+            session.transaction_id = id;
+            scope.phase = .active;
+            root.outcome_transaction_id = if (has_receipt) distinct_receipt else null;
+            try std.testing.expectEqual(if (err == error.MetadataMutationOutcomeUnknown) error.SqlTransactionOutcomeUnknown else err, scope.failure(err));
+            try std.testing.expectEqualSlices(u8, if (has_receipt) &distinct_receipt else &receipt, &root.outcome_transaction_id.?);
+            try std.testing.expectEqual(@as(usize, 2), fake.rollbacks);
+        }
+    }
+    for ([_]sql.CommitOutcome{ .committed, .committed_pending, .committed_repair_required, .aborted, .unknown }) |outcome| {
+        fake.outcome = outcome;
+        session.transaction_id = id;
+        scope.phase = .active;
+        root.outcome_transaction_id = null;
+        scope.finish() catch |err| {
+            // A missing decision ACK must not be reported as cancellation,
+            // nor turn a committed/aborted proposal into another rollback.
+            try std.testing.expectEqual(error.SqlTransactionOutcomeUnknown, scope.failure(err));
+            try std.testing.expectEqualSlices(u8, &receipt, &root.outcome_transaction_id.?);
+            try std.testing.expectEqual(@as(usize, 2), fake.rollbacks);
+            continue;
+        };
+        return error.TestUnexpectedResult;
+    }
+    try std.testing.expectEqual(@as(usize, 5), fake.commits);
+
+    // A real sequence owner with dirty state and a missing native transaction
+    // would fail its flush. Unknown outcomes must not call it or replace their
+    // distinct receipt; known failures must still attempt sequence persistence.
+    var sequence_state: @import("antfly_local_sources").sql_sequence_session.State = .{ .dirty = true };
+    defer sequence_state.deinit(std.testing.allocator);
+    const sequence_owner = try std.testing.allocator.create(@import("sql_sequence_execution.zig").Owner);
+    sequence_owner.* = .{ .root = &root, .arena = .init(std.testing.allocator), .state = &sequence_state, .state_allocator = std.testing.allocator, .transaction = id };
+    root.sequence_owner = sequence_owner;
+    defer root.releaseExecutionOwners();
+    for (uncertain) |err| {
+        root.outcome_transaction_id = receipt;
+        try std.testing.expectEqual(err, root.finishFailure(err));
+        try std.testing.expectEqualSlices(u8, &receipt, &root.outcome_transaction_id.?);
+        try std.testing.expect(sequence_state.dirty and !sequence_owner.flushed);
+    }
+    try std.testing.expectEqual(error.SqlSequenceOutcomeUnknown, root.finishFailure(error.Forbidden));
 }
 
 /// Immutable fixture cuts use copied data, independent per-cursor iteration,

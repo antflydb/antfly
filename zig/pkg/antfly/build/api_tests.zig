@@ -2328,6 +2328,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "SQL catalog DDL authorizes before lookup and handles atomic conditional outcomes",
             "SQL statement read admission calls native capture once without write authority",
             "SQL statement read admission distinguishes availability from corruption and unknown outcomes",
+            "SQL implicit lock cleanup",
             "native metadata job state projections",
             "SQL drop retirement",
             "relational row query primary digest transport preserves snapshot proof and rejects missing or invalid headers",
@@ -2497,7 +2498,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("antfly-api-sql-join-read-test", "Qualify original joins through native catalog cuts, policy filters and cold owners").dependOn(&sql_join_read_run.step);
     const sql_locking_tests = b.addTest(.{
         .root_module = sql_owner_lifecycle_test_mod,
-        .filters = &.{ "mounted SQL original advisory locks", "mounted SQL original table and row locks", "mounted SQL native sync controls", "mounted SQL original prepared transactions", "pgwire transaction preparation", "SQL statement read admission distinguishes availability from corruption and unknown outcomes" },
+        .filters = &.{ "mounted SQL original advisory locks", "mounted SQL original table and row locks", "mounted SQL native sync controls", "mounted SQL original prepared transactions", "pgwire transaction preparation", "SQL statement read admission distinguishes availability from corruption and unknown outcomes", "SQL implicit lock cleanup" },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) (if (optimize == .debug) 21 else 12) else 7) * 1024 * 1024 * 1024,
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });

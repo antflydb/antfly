@@ -17056,10 +17056,19 @@ pub const ProvisionedTableWriteSource = struct {
     /// runtime-status scheduling owned by the control process.
     pub fn publishStorageOwnerDataChange(
         self: *ProvisionedTableWriteSource,
-        alloc: std.mem.Allocator,
         table_name: []const u8,
+        req: db_mod.types.BatchRequest,
     ) void {
-        self.publishStorageOwnerChange(alloc, table_name, .data);
+        // Validated native lock controls change only durable lock ownership.
+        // They neither invalidate serving rows nor advance index/status work.
+        // In particular they must not borrow cache ownership from a reader
+        // that can already be waiting for this entry's Raft read barrier.
+        if (req.sql_lock != null) return;
+        // This callback runs under data-Raft ownership. Status sampling can
+        // resolve catalog routes and borrow storage owners, so only invalidate
+        // caches and schedule the existing coalesced control-plane refresh.
+        self.invalidateStorageOwnerCaches(table_name);
+        self.notifyLocalChange(table_name, .data);
     }
 
     /// Publish the same control-plane invalidation as the legacy HA apply
@@ -17079,12 +17088,16 @@ pub const ProvisionedTableWriteSource = struct {
         table_name: []const u8,
         kind: LocalChangeKind,
     ) void {
+        self.invalidateStorageOwnerCaches(table_name);
+        self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+        self.notifyLocalChange(table_name, kind);
+    }
+
+    fn invalidateStorageOwnerCaches(self: *ProvisionedTableWriteSource, table_name: []const u8) void {
         lockAtomic(&self.local_db_mutex);
         self.invalidateReadCache(table_name);
         self.markWriteCacheDirty(table_name);
         self.local_db_mutex.unlock();
-        self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
-        self.notifyLocalChange(table_name, kind);
     }
 
     /// Publish a lifecycle-only wake after an owner-side visibility barrier.
@@ -22685,14 +22698,19 @@ pub const ProvisionedTableWriteSource = struct {
         if (comptime control_only_storage_sources) {
             const owner = self.groupLocalWriteSource() orelse
                 return error.StorageKernelOwnerUnavailable;
-            lockAtomic(&self.local_db_mutex);
-            self.invalidateReadCache(table_name);
-            self.markWriteCacheDirty(table_name);
-            self.local_db_mutex.unlock();
+            if (apply_req.sql_lock == null) {
+                lockAtomic(&self.local_db_mutex);
+                self.invalidateReadCache(table_name);
+                self.markWriteCacheDirty(table_name);
+                self.local_db_mutex.unlock();
+            }
             _ = (try owner.replicatedBatchGroupLocal(alloc, group_id, table_name, apply_req, metadata_source == .local_persisted, raft_entry)) orelse
                 return error.StorageKernelOwnerUnavailable;
-            self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
-            self.notifyLocalChange(table_name, .data);
+            if (apply_req.sql_lock == null) {
+                if (metadata_source == .catalog)
+                    self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+                self.notifyLocalChange(table_name, .data);
+            }
             return {};
         }
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -22777,7 +22795,8 @@ pub const ProvisionedTableWriteSource = struct {
                 defer self.local_db_mutex.unlock();
                 self.markWriteCacheDirty(table_name);
             }
-            self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
+            if (metadata_source == .catalog)
+                self.publishDirtyWriteCacheRuntimeStatusesBestEffort(alloc, table_name);
             self.notifyLocalChange(table_name, .data);
         } else {
             const prepared_identity_namespace = split_identity_namespace orelse merge_identity_namespace;
@@ -34534,7 +34553,7 @@ fn consumerTests() type {
                 .on_change = Hook.onChange,
             });
 
-            source.publishStorageOwnerDataChange(std.testing.allocator, "docs");
+            source.publishStorageOwnerDataChange("docs", .{});
 
             try std.testing.expectEqual(@as(usize, 1), hook.calls);
             try std.testing.expectEqualStrings("docs", hook.table_name.?);

@@ -74,7 +74,9 @@ fn open(ctx: *fixture.Context) ![32]u8 {
 }
 
 fn rows(ctx: *fixture.Context, connection: []const u8, sql: []const u8, expected: []const []const u8) !void {
+    const started = @import("antfly_platform").time.monotonicNs();
     var response = try send(ctx, connection, sql);
+    errdefer std.debug.print("table/row lock failure elapsed_ms={d}\n", .{(@import("antfly_platform").time.monotonicNs() -| started) / std.time.ns_per_ms});
     defer response.deinit(ctx.alloc);
     errdefer std.debug.print("table/row lock SQL={s} status={d} body={s}\n", .{ sql, response.status, response.body });
     try std.testing.expectEqual(@as(u16, 200), response.status);
@@ -109,9 +111,24 @@ const Campaign = struct {
     authorization_server: *@import("../data/runtime.zig").DataServer = undefined,
     authorization_io: std.Io = undefined,
     authorization_checks: std.atomic.Value(usize) = .init(0),
+    admission_failures: std.atomic.Value(usize) = .init(0),
+    lose_reply: std.atomic.Value(bool) = .init(false),
     fn observeAuthorization(raw: *anyopaque, event: @import("../data/runtime.zig").DataRequestLifecycleEvent) !void {
-        if (event.phase != .sql_lock_authorization) return;
         const self: *@This() = @ptrCast(@alignCast(raw));
+        // Recovery may submit controls concurrently. Only the selected SQL
+        // connection's row acquisition may consume either injected fault.
+        const target_row = if (event.sql_lock_command) |lock_command|
+            lock_command.operation == .row and std.mem.eql(u8, &lock_command.admission.source.connection, &self.holder)
+        else
+            false;
+        if (event.phase == .apply_confirmed and target_row and
+            self.lose_reply.swap(false, .acq_rel)) return error.InjectedSqlLockReplyLost;
+        if (event.phase != .sql_lock_authorization) return;
+        const failures = self.admission_failures.load(.acquire);
+        if (target_row and failures != 0) {
+            self.admission_failures.store(failures - 1, .release);
+            return error.StorageBusy;
+        }
         const until = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s;
         while (!self.authorization_server.data_raft_mutex.tryLock()) {
             try std.testing.expect(@import("antfly_platform").time.monotonicNs() < until);
@@ -176,6 +193,35 @@ const Campaign = struct {
         ctx.reader_headers = &self.credentials.reader;
         try command(ctx, &self.contender, "BEGIN", "BEGIN");
         try unavailable(ctx, &self.contender, "SELECT id FROM usage_records WHERE id='a' FOR UPDATE NOWAIT");
+        try command(ctx, &self.contender, "ROLLBACK", "ROLLBACK");
+        try command(ctx, &self.holder, "ROLLBACK", "ROLLBACK");
+        try rows(ctx, &self.contender, "SELECT id FROM usage_records WHERE id='a' FOR UPDATE NOWAIT", &.{"a"});
+        // Native admission retries retain one SQL evaluation and one effect
+        // identity. A lost post-apply reply must instead expose uncertainty.
+        try command(ctx, &self.holder, "BEGIN", "BEGIN");
+        self.admission_failures.store(3, .release);
+        try rows(ctx, &self.holder, "SELECT id FROM usage_records WHERE id='a' FOR UPDATE NOWAIT", &.{"a"});
+        try std.testing.expectEqual(@as(usize, 0), self.admission_failures.load(.acquire));
+        self.lose_reply.store(true, .release);
+        var lost = try send(ctx, &self.holder, "SELECT id FROM usage_records WHERE id='b' FOR UPDATE NOWAIT");
+        defer lost.deinit(ctx.alloc);
+        errdefer std.debug.print("lost lock reply status={d} body={s}\n", .{ lost.status, lost.body });
+        try std.testing.expectEqual(@as(u16, 409), lost.status);
+        var diagnostic = try std.json.parseFromSlice(struct { code: []const u8, transaction_id: ?[]const u8 = null, retryable: ?bool = null, transaction_status: ?[]const u8 = null }, ctx.alloc, lost.body, .{ .ignore_unknown_fields = true });
+        defer diagnostic.deinit();
+        try std.testing.expectEqualStrings("40003", diagnostic.value.code);
+        try std.testing.expectEqual(@as(?bool, false), diagnostic.value.retryable);
+        if (diagnostic.value.transaction_status) |status|
+            try std.testing.expectEqualStrings("failed", status);
+        try std.testing.expect(diagnostic.value.transaction_id != null);
+        try std.testing.expectEqual(@as(usize, 32), diagnostic.value.transaction_id.?.len);
+        try std.testing.expect(!self.lose_reply.load(.acquire));
+        // Failed-root cleanup durably retires both the earlier grant and the
+        // acquisition whose reply was lost. The error still carries the exact
+        // owner receipt; the statement itself is never replayed.
+        try command(ctx, &self.contender, "BEGIN", "BEGIN");
+        try rows(ctx, &self.contender, "SELECT id FROM usage_records WHERE id='a' FOR UPDATE NOWAIT", &.{"a"});
+        try rows(ctx, &self.contender, "SELECT id FROM usage_records WHERE id='b' FOR UPDATE NOWAIT", &.{"b"});
         try command(ctx, &self.contender, "ROLLBACK", "ROLLBACK");
         try command(ctx, &self.holder, "ROLLBACK", "ROLLBACK");
         try rows(ctx, &self.contender, "SELECT id FROM usage_records WHERE id='a' FOR UPDATE NOWAIT", &.{"a"});
@@ -325,9 +371,10 @@ const ReadBarrierCampaign = struct {
         var blocked = try client.executeConnected(&waiting, null, &self.holder, "SELECT id FROM usage_records", .read);
         defer blocked.deinit(ctx.alloc);
         errdefer std.debug.print("blocked read cancellation status={d} body={s}\n", .{ blocked.status, blocked.body });
-        var parsed = try std.json.parseFromSlice(struct { code: []const u8 }, ctx.alloc, blocked.body, .{ .ignore_unknown_fields = true });
+        var parsed = try std.json.parseFromSlice(struct { code: []const u8, transaction_id: ?[]const u8 = null }, ctx.alloc, blocked.body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         try std.testing.expectEqualStrings("57014", parsed.value.code);
+        try std.testing.expect(parsed.value.transaction_id == null);
         try command(ctx, &self.contender, "ROLLBACK", "ROLLBACK");
         try rows(ctx, &self.holder, "SELECT id FROM usage_records", &.{});
         // Explicit read ownership survives the same complete process restart
@@ -421,4 +468,102 @@ const ErrorReleaseCampaign = struct {
 };
 test "mounted SQL original table and row locks release failed root and child ownership before rollback across cold recovery" {
     try fixture.run(ErrorReleaseCampaign);
+}
+
+// Status sampling may resolve catalog routes or acquire storage owners. The
+// committed apply callback must schedule it without entering that IO path.
+test "mounted SQL original table and row locks defer observability outside Raft apply" {
+    const writes = @import("table_writes.zig");
+    const statuses = local.api_local_table_writes.runtime_status;
+    const Probe = struct {
+        raft: std.Io.Mutex = .init,
+        samples: usize = 0,
+        sampled_under_raft: bool = false,
+        scheduled: usize = 0,
+        applies: usize = 0,
+        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: local.storage_db_types.BatchRequest) !?void {
+            return error.TestUnexpectedOrdinaryMutation;
+        }
+        fn apply(raw: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: local.storage_db_types.BatchRequest, prepared: bool, entry: ?local.api_local_table_writes.db_mod.OrderedApplyReceipt) !?void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expect(prepared and entry != null);
+            self.applies += 1;
+            return {};
+        }
+        fn sample(raw: *anyopaque, _: std.mem.Allocator, _: []const u8) !?statuses.LocalTableRuntimeStatuses {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.samples += 1;
+            if (self.raft.tryLock()) self.raft.unlock(std.testing.io) else self.sampled_under_raft = true;
+            return null;
+        }
+        fn changed(raw: *anyopaque, _: []const u8, kind: writes.ProvisionedTableWriteSource.LocalChangeKind) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (kind == .data) self.scheduled += 1;
+        }
+    };
+    var probe: Probe = .{};
+    var cache = statuses.TableRuntimeSnapshotCache.init(std.testing.allocator);
+    defer cache.deinit();
+    var write_cache = writes.ProvisionedTableWriteCache.init(std.testing.allocator);
+    defer write_cache.deinit();
+    var source = writes.ProvisionedTableWriteSource.init("/tmp/unused-sql-raft-status-guard", @import("table_catalog.zig").emptyCatalogSource());
+    defer source.deinit();
+    source.write_cache = &write_cache;
+    const port: writes.TableWriteSource = .{ .ptr = &probe, .vtable = &.{ .batch = Probe.batch, .replicated_batch_group_local = Probe.apply, .local_runtime_statuses = Probe.sample } };
+    source.local_write_source = port;
+    source.runtime_status_cache = &cache;
+    source.setLocalChangeHook(.{ .ptr = &probe, .on_change = Probe.changed });
+    probe.raft.lockUncancelable(std.testing.io);
+    source.publishStorageOwnerDataChange("docs", .{});
+    probe.raft.unlock(std.testing.io);
+    try std.testing.expectEqual(@as(usize, 0), probe.samples);
+    try std.testing.expectEqual(@as(usize, 1), probe.scheduled);
+    // Descriptor-free replay uses the same deferred status rule.
+    probe.raft.lockUncancelable(std.testing.io);
+    const applied = source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(std.testing.allocator, 7, "docs", .{}, .{ .term = 1, .index = 1 }) catch |err| {
+        probe.raft.unlock(std.testing.io);
+        return err;
+    };
+    probe.raft.unlock(std.testing.io);
+    try std.testing.expect(applied != null);
+    try std.testing.expectEqual(@as(usize, 1), probe.applies);
+    try std.testing.expectEqual(@as(usize, 0), probe.samples);
+    try std.testing.expectEqual(@as(usize, 2), probe.scheduled);
+    // A row reader may retain cache ownership while waiting for Raft apply.
+    // Pure lock controls must finish under that exact ownership inversion,
+    // without invalidating unchanged rows or scheduling another status scan.
+    const lock_only: local.storage_db_types.BatchRequest = .{ .sql_lock = .{
+        .admission = std.mem.zeroes(@FieldType(local.storage_pessimistic_lock_control.Command, "admission")),
+        .operation = .begin,
+    } };
+    {
+        try std.testing.expect(source.local_db_mutex.shared == null);
+        try std.testing.expect(source.local_db_mutex.owned.tryLock());
+        defer source.local_db_mutex.owned.unlock();
+        probe.raft.lockUncancelable(std.testing.io);
+        defer probe.raft.unlock(std.testing.io);
+        source.publishStorageOwnerDataChange("docs", lock_only);
+        try std.testing.expect((try source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(std.testing.allocator, 7, "docs", lock_only, .{ .term = 1, .index = 2 })) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), probe.applies);
+    try std.testing.expectEqual(@as(usize, 0), probe.samples);
+    try std.testing.expectEqual(@as(usize, 2), probe.scheduled);
+    // The exact same owner/status capability is available to maintenance
+    // after consensus ownership is released; the refresh was not discarded.
+    try std.testing.expect((try port.localRuntimeStatuses(std.testing.allocator, "docs")) == null);
+    try std.testing.expectEqual(@as(usize, 1), probe.samples);
+    try std.testing.expect(!probe.sampled_under_raft);
+}
+
+test "SQL implicit lock cleanup preserves native admission across failure envelopes" {
+    const identity = @import("kernel_error_identity");
+    const failure = @import("runtime_failure_abi");
+    const callbacks = @import("antfly_runtime_abi").error_abi;
+    const status = identity.statusFromError(error.RaftApplyWriterUnavailable);
+    try std.testing.expectEqual(failure.Status.raft_apply_writer_unavailable, status);
+    try std.testing.expectEqual(@as(u32, 956), @backingInt(status));
+    try std.testing.expectError(error.RaftApplyWriterUnavailable, identity.statusToError(status));
+    const callback = callbacks.statusFromError(error.RaftApplyWriterUnavailable);
+    try std.testing.expectEqual(@backingInt(callbacks.Code.retryable), callback.code);
+    try std.testing.expectEqual(error.RaftApplyWriterUnavailable, callbacks.errorFromStatus(callback));
 }

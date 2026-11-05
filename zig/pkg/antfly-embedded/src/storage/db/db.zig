@@ -8112,8 +8112,11 @@ pub const DB = struct {
 
     pub fn orderedMutationAlreadyApplied(self: *DB, identity: OrderedApplyReceipt) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("orderedMutationAlreadyApplied", .{ self, identity });
-        lockApply(self);
-        defer self.core.unlockApply();
+        // Replay inspection runs under data-Raft ownership. It is read-only,
+        // and batchInternal rechecks the marker under its mutation fence.
+        // Never wait for a foreground writer while holding consensus progress.
+        if (!self.core.tryLockApplyShared()) return error.RaftApplyWriterUnavailable;
+        defer self.core.unlockApplyShared();
         return switch (try orderedApplyDisposition(
             try readOrderedApplyReceipt(self.alloc, self.core.store),
             identity,
@@ -10753,6 +10756,30 @@ pub const DB = struct {
         }
     }
 
+    const SqlLockMutationLease = struct {
+        snapshot: snapshot_admission_mod.SnapshotAdmission.MutationLease,
+        core: *db_core.DBCore,
+        fn release(self: *@This()) void {
+            self.core.unlockApply();
+            self.snapshot.release();
+        }
+    };
+
+    fn acquireSqlLockMutation(self: *DB, ordered: bool) !SqlLockMutationLease {
+        var snapshot_mutation = if (ordered)
+            self.core.snapshot_admission.tryAcquireMutation() orelse return error.RaftApplyWriterUnavailable
+        else
+            self.core.snapshot_admission.acquireMutation();
+        errdefer snapshot_mutation.release();
+        if (ordered) {
+            try self.enforcePortableRuntimeGate();
+            if (!self.core.tryLockApplyExclusive()) return error.RaftApplyWriterUnavailable;
+            errdefer self.core.unlockApply();
+            try self.enforcePortableRuntimeGate();
+        } else try self.lockApplyForPortableRuntime();
+        return .{ .snapshot = snapshot_mutation, .core = self.core };
+    }
+
     fn applySqlLockBatch(self: *DB, req: types.BatchRequest, opts: BatchExecutionOptions) !void {
         const locks = @import("../pessimistic_lock_control.zig");
         try locks.validateBatch(req);
@@ -10771,10 +10798,10 @@ pub const DB = struct {
             null;
         defer if (payload) |bytes| self.alloc.free(bytes);
         {
-            var admission = self.core.snapshot_admission.acquireMutation();
+            // Both admissions precede every mutation. A busy native owner
+            // leaves the exact Raft entry pending for the progress driver.
+            var admission = try self.acquireSqlLockMutation(opts.ordered_apply_receipt != null);
             defer admission.release();
-            try self.lockApplyForPortableRuntime();
-            defer self.core.unlockApply();
             if (self.local_execution.initial_child_hidden.load(.acquire)) return error.InitialChildNotPublished;
             if (opts.ordered_apply_receipt) |entry| if (try orderedApplyDisposition(try readOrderedApplyReceipt(self.alloc, self.core.store), entry) == .already_applied) return;
             const command = req.sql_lock.?;
@@ -150383,4 +150410,43 @@ test "db algebraic relational replay materializes typed rows and preserves docum
             for ([_][]const u8{ "left", "right" }) |name| try Check.run(&db, name, null);
         }
     }
+}
+
+test "SQL ordered lock admission yields without holding snapshot or writer ownership" {
+    var directory = try TestDirectory.init("sql-ordered-lock-admission");
+    defer directory.cleanup();
+    var db = try DB.open(std.testing.allocator, directory.path(), .{ .start_optional_runtimes = false, .start_index_workers = false });
+    defer db.close();
+    const identity: OrderedApplyReceipt = .{ .term = 1, .index = 1 };
+    {
+        db.core.lockApplyShared();
+        defer db.core.unlockApplyShared();
+        // Replay inspection coexists with readers. Mutation admission yields,
+        // without leaking its independently acquired snapshot lease.
+        try std.testing.expect(!try db.orderedMutationAlreadyApplied(identity));
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, db.acquireSqlLockMutation(true));
+        var capture = db.core.snapshot_admission.tryAcquireCapture().?;
+        capture.release();
+    }
+    {
+        db.core.lockApplyExclusive();
+        defer db.core.unlockApply();
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, db.orderedMutationAlreadyApplied(identity));
+    }
+    {
+        var capture = db.core.snapshot_admission.acquireCapture();
+        defer capture.release();
+        try std.testing.expectError(error.RaftApplyWriterUnavailable, db.acquireSqlLockMutation(true));
+    }
+    {
+        var mutation = try db.acquireSqlLockMutation(true);
+        defer mutation.release();
+        try std.testing.expect(!db.core.tryLockApplyShared());
+        try std.testing.expect(db.core.snapshot_admission.tryAcquireCapture() == null);
+    }
+    // Exact receipt replay remains visible under concurrent read ownership.
+    try db.recordOrderedApplyReceipt(identity);
+    db.core.lockApplyShared();
+    defer db.core.unlockApplyShared();
+    try std.testing.expect(try db.orderedMutationAlreadyApplied(identity));
 }

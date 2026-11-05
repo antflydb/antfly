@@ -83,6 +83,13 @@ pub const SnapshotAdmission = struct {
         return .{ .admission = self };
     }
 
+    /// Committed apply must yield instead of retaining consensus ownership
+    /// while another operation owns or is waiting for a snapshot capture.
+    pub fn tryAcquireMutation(self: *@This()) ?MutationLease {
+        if (!self.lock.tryLockShared()) return null;
+        return .{ .admission = self };
+    }
+
     pub fn acquireMutationIo(self: *@This(), io: std.Io, cancellation: anytype) !MutationLease {
         try self.lock.lockSharedIo(io, cancellation);
         return .{ .admission = self };
@@ -281,4 +288,20 @@ test "storage.db snapshot admission lease can be released by another Io worker" 
     task.await(std.testing.io);
     try std.testing.expect(admission.lock.tryLockExclusive());
     admission.lock.unlockExclusive();
+}
+
+test "storage.db snapshot admission nonblocking mutation yields to capture" {
+    var admission: SnapshotAdmission = .{};
+    var first = admission.tryAcquireMutation().?;
+    var second = admission.tryAcquireMutation().?;
+    try std.testing.expect(admission.tryAcquireCapture() == null);
+    first.release();
+    second.release();
+    var capture = admission.tryAcquireCapture().?;
+    try std.testing.expect(admission.tryAcquireMutation() == null);
+    capture.release();
+    var resumed = admission.tryAcquireMutation().?;
+    resumed.release();
+    var complete = admission.tryAcquireCapture().?;
+    complete.release();
 }

@@ -6864,8 +6864,19 @@ pub const AntflyApiHandler = struct {
                 }
             }
             if (connection_admission) |*lease| {
-                if (try command_scope.start(self.adapter.server, self.adapter.context, self.adapter.identity.*, lease, .{ .mode = @tagName(self.prepared_mode), .statement = self.statement, .prepared_id = self.prepared_id, .parameters = self.parameters, .database = self.database, .namespace = self.namespace }))
-                    self.adapter.context = command_scope.attach(self.adapter.context);
+                const started = command_scope.start(self.adapter.server, self.adapter.context, self.adapter.identity.*, lease, .{ .mode = @tagName(self.prepared_mode), .statement = self.statement, .prepared_id = self.prepared_id, .parameters = self.parameters, .database = self.database, .namespace = self.namespace }) catch |err| {
+                    // Taking the next command can finish a previous native
+                    // lock scope. A lost reply there precedes SQL execution,
+                    // but still belongs to the existing durable transaction.
+                    if (std.mem.eql(u8, sql_execution.diagnostic(err).code, "40003") and self.adapter.outcome_transaction_id == null) {
+                        if (self.connection_owned) |owned| {
+                            if (owned.value.active_txn) |id|
+                                self.adapter.outcome_transaction_id = std.fmt.bytesToHex(id, .lower);
+                        }
+                    }
+                    return err;
+                };
+                if (started) self.adapter.context = command_scope.attach(self.adapter.context);
             }
             if (self.prepared_mode != .statement) {
                 const store = self.adapter.server.txn_sessions.durable orelse return error.SqlPreparedDurabilityUnavailable;

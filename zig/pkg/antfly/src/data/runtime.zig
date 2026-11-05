@@ -2019,7 +2019,7 @@ const RaftTableApplyStateMachine = struct {
             // ProvisionedTableWriteSource mutation vtable. Publish the
             // corresponding control-plane cache invalidation and status wake
             // only after the committed mutation succeeds.
-            self.write_source.publishStorageOwnerDataChange(self.alloc, table_name);
+            self.write_source.publishStorageOwnerDataChange(table_name, req);
         } else {
             _ = try self.write_source.applyPreparedReplicatedBatchGroupLocalAtRaftEntry(
                 self.alloc,
@@ -4324,6 +4324,8 @@ pub const DataRequestLifecycleEvent = struct {
     transition_id: u64 = 0,
     table_name: []const u8 = "",
     response_bytes: usize = 0,
+    /// Borrowed for the synchronous hook invocation; never retained by hooks.
+    sql_lock_command: ?*const @import("antfly_local_sources").storage_pessimistic_lock_control.Command = null,
 };
 
 pub const DataRequestLifecycleHook = struct {
@@ -15160,7 +15162,7 @@ pub const DataServer = struct {
     }
 
     fn authorizeRaftSqlLock(self: *DataServer, input: @import("../api/sql_data_locks.zig").AuthorizationInput) !@import("antfly_local_sources").storage_pessimistic_lock_control.Command {
-        try self.reachDataRequestLifecycle(.{ .phase = .sql_lock_authorization, .group_id = input.group, .table_name = input.table });
+        try self.reachDataRequestLifecycle(.{ .phase = .sql_lock_authorization, .group_id = input.group, .table_name = input.table, .sql_lock_command = &input.command });
         const server = if (self.http_server) |*value| value else return error.UnsupportedOperation;
         return server.authorizeSqlLock(input);
     }
@@ -15689,6 +15691,7 @@ pub const DataServer = struct {
                     }
                     self.reachDataRequestLifecycle(.{
                         .phase = .apply_confirmed,
+                        .sql_lock_command = if (proposal_req.sql_lock) |*command| command else null,
                         .group_id = group_id,
                         .log_index = index,
                         .table_name = table_name,

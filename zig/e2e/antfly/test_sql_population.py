@@ -39,7 +39,17 @@ def test_distributed_population_and_lock_ownership_survive_restart():
                 body["connection_id"] = connection
             deadline = time.monotonic() + 30
             while True:
-                response = requests.post(server.api_url + "/sql", json=body, timeout=30)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    pytest.fail("SQL request budget expired before admission")
+                # Safe preparation retries share one outer budget. Leave room
+                # for durable completion and response delivery on every attempt.
+                response = requests.post(
+                    server.api_url + "/sql",
+                    json=body,
+                    headers={"x-antfly-timeout-ms": str(max(1, int(remaining * 500)))},
+                    timeout=remaining,
+                )
                 result = response.json()
                 # Listening precedes initial catalog publication. Only these
                 # explicit pre-admission witnesses permit resubmission; a lost
@@ -189,6 +199,56 @@ def test_distributed_population_and_lock_ownership_survive_restart():
             unavailable(originals["sql-0434"], other)
             sql("ROLLBACK", other)
             sql("ROLLBACK", connection)
+        sql("BEGIN", connection)
+        sql("LOCK TABLE usage_records IN ACCESS EXCLUSIVE MODE", connection)
+        for statement, explicit in (
+            ("SELECT id FROM usage_records", False),
+            ("SELECT id FROM usage_records FOR UPDATE", False),
+            ("SELECT id FROM usage_records", True),
+            ("SELECT id FROM usage_records FOR UPDATE", True),
+        ):
+            for attempt in range(3):
+                if explicit:
+                    sql("BEGIN", other)
+                blocked = requests.post(
+                    server.api_url + "/sql",
+                    json={"statement": statement, "connection_id": other},
+                    headers={"x-antfly-timeout-ms": "5000"},
+                    timeout=15,
+                )
+                diagnostic = blocked.json()
+                # Retry these side-effect-free lock probes only after known
+                # cleanup. Explicit transactions keep their failed status until
+                # ROLLBACK. An uncertain decision must fail this test.
+                assert diagnostic.get("transaction_status") == (
+                    "failed" if explicit else "idle"
+                ), blocked.text
+                for key in (
+                    "transaction_id",
+                    "mutation_outcome",
+                    "admission_outcome",
+                    "status",
+                    "ddl_receipt",
+                    "catalog_receipt",
+                ):
+                    assert diagnostic.get(key) is None, blocked.text
+                if explicit:
+                    sql("ROLLBACK", other)
+                if diagnostic.get("code") == "53300" and attempt < 2:
+                    assert blocked.status_code == 503, blocked.text
+                    assert diagnostic.get("retryable") is True, blocked.text
+                    if not explicit:
+                        assert diagnostic.get("message", "").startswith(
+                            "A consistent SQL statement read is temporarily unavailable."
+                        ), blocked.text
+                    continue
+                assert diagnostic.get("code") == "57014", blocked.text
+                break
+        sql("ROLLBACK", connection)
+        assert sql("SELECT id FROM usage_records ORDER BY id", other)["rows"] == [
+            ["a"],
+            ["b"],
+        ]
         sql(originals["sql-0089"], connection)
         sql(originals["sql-0090"], connection)
         assert sql(originals["sql-0091"], connection)["rows"] == [[True]]

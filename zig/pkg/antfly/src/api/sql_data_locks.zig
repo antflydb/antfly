@@ -87,6 +87,30 @@ pub fn authorize(server: *Server, a: A, context: operation.RequestContext, group
 }
 
 pub fn submit(server: *Server, a: A, context: operation.RequestContext, table: []const u8, input: native.Command) !void {
+    var attempt: u4 = 0;
+    while (true) {
+        try context.ensureActive();
+        return submitOnce(server, a, context, table, input) catch |err| {
+            // These owner-admission failures precede a proposal. Ambiguous
+            // transport/proposal errors are never replayed here.
+            if (!retryOwnerAdmission(err) or attempt == 8) return err;
+            try pauseAdmission(server, context, attempt);
+            attempt += 1;
+            continue;
+        };
+    }
+}
+
+fn retryOwnerAdmission(err: anyerror) bool {
+    return err == error.StorageBusy or err == error.StorageReadTemporarilyUnavailable;
+}
+fn pauseAdmission(server: *Server, context: operation.RequestContext, attempt: u4) !void {
+    try context.ensureActive();
+    try server.embedding_provider_runtime.io.sleep(.fromMilliseconds(@as(i64, 1) << @min(attempt, 4)), .awake);
+    try context.ensureActive();
+}
+
+fn submitOnce(server: *Server, a: A, context: operation.RequestContext, table: []const u8, input: native.Command) !void {
     const group = input.admission.binding.namespace.group;
     const checked = try authorize(server, a, context, group, table, input);
     const request: local.storage_db_types.BatchRequest = .{ .sql_lock = checked, .sync_level = .write };
@@ -126,6 +150,23 @@ pub fn submit(server: *Server, a: A, context: operation.RequestContext, table: [
 }
 
 pub fn observe(server: *Server, a: A, context: operation.RequestContext, table: []const u8, query: native.Query) !native.Snapshot {
+    var attempt: u4 = 0;
+    while (true) {
+        try context.ensureActive();
+        return observeOnce(server, a, context, table, query) catch |err| {
+            // Resume only the immutable native query, not SQL evaluation or
+            // effect allocation. Owner publication can briefly fence a read
+            // immediately after the preceding lock effect was committed.
+            const operational = @import("table_reads.zig").normalizeDistributedQueryOperationalError(err);
+            if ((!retryOwnerAdmission(err) and operational != error.DistributedQueryUnavailable) or attempt == 8) return err;
+            try pauseAdmission(server, context, attempt);
+            attempt += 1;
+            continue;
+        };
+    }
+}
+
+fn observeOnce(server: *Server, a: A, context: operation.RequestContext, table: []const u8, query: native.Query) !native.Snapshot {
     try context.ensureActive();
     const raw = try std.json.Stringify.valueAlloc(a, query, .{});
     defer a.free(raw);

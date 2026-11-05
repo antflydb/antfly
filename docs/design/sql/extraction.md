@@ -77,6 +77,7 @@ bounded retirement and owner-incarnation isolation:
 ```sh
 cd zig
 zig build antfly-api-sql-locking-test \
+  antfly-sql-lock-apply-test \
   antfly-pessimistic-lock-contract-test \
   antfly-pessimistic-lock-authority-test \
   antfly-pessimistic-lock-ledger-test \
@@ -133,6 +134,61 @@ The plan-cache gate checks all four row-lock strengths, including NOWAIT and
 SKIP LOCKED, retain write admission on cache hits and unwind every allocation
 failure. Invalid SQL, rather than supported FOR UPDATE syntax, exercises failed
 compilation diagnostics and admission cleanup.
+
+Implicit lock-bearing reads share one completion boundary for streamed and
+materialized execution. After an error, bounded cancellation-independent
+rollback must drain the native scope and durable delivery ACK before removing
+the reconciliation ID. Failure to prove that completion returns `40003` and
+retains recovery ownership. A proposed decision is never followed by a fresh
+rollback; even a known abort must finish its scope/ACK barrier before becoming
+an ordinary statement failure. Cancellation is checked again after cleanup,
+including admission failures from native lock controls rather than row cursors.
+Only proven read-admission errors receive that classification; corruption,
+permission failures and uncertain mutations keep their own outcomes.
+Explicit transactions use the same final deadline check without changing a live
+admitted operation into a pre-admission error; the failed transaction still
+requires ROLLBACK. The process campaign covers both read forms in both lifetimes.
+Reconciliation-required errors also bypass error-path sequence flushing: a new
+session-state write must not mask the original uncertain outcome or receipt.
+Known failures continue to preserve PostgreSQL's nontransactional sequence state.
+Transport-borrowed sequence state retains its existing publication owner on
+both clean and dirty completion; the SQL adapter must not inspect connection
+publication fences it never captured. The sequence regression gate exercises
+this error path through pgwire as well as direct owner qualification.
+Timeout probes keep one outer transport deadline across proven pre-admission
+retries and cap each forwarded SQL deadline to leave completion headroom. Neither
+budget is extended, and ambiguous operations are never replayed.
+Native lock transport handles brief owner-publication contention inside the
+existing request budget: bounded admission retries allocate no new effect, and
+readback retries repeat only the exact immutable native query. Unknown proposals
+are not retried. A lost Raft reply maps to non-retryable `40003`, retains the
+existing explicit or implicit transaction receipt, and never triggers an
+error-path sequence write. The original-case campaign injects both admission
+contention and a lost post-apply row-acquisition reply on the selected connection.
+Background recovery controls cannot consume those faults. Failed-root cleanup
+must durably retire both the earlier grant and the acquisition whose reply was
+lost, while retaining the error's reconciliation receipt and failed SQL shell
+until explicit ROLLBACK.
+Committed compiled-owner apply invalidates reader caches and enqueues the
+existing coalesced status refresh. It never synchronously samples runtime status:
+that path may resolve catalog routing or borrow other storage owners while the
+caller holds the data-Raft mutex. The existing maintenance lane refreshes those
+facts after consensus ownership is released. Native lock controls change only
+durable lock ownership: they neither invalidate unchanged serving rows nor
+schedule index/status work. A deterministic guard holds the row-cache mutex
+across descriptor-pinned notification and descriptor-free lock apply, proving
+these controls cannot deadlock a reader waiting for its Raft read barrier.
+Ordinary mutations still invalidate caches and schedule status refresh.
+Native ordered replay inspection uses a nonblocking shared apply lease. SQL
+lock mutation admission also tries both snapshot and exclusive apply ownership
+before touching the store; contention returns `RaftApplyWriterUnavailable` and
+releases every acquired lease. The progress driver retains the exact entry and
+its receipt, rather than waiting on a foreground owner with the Raft mutex held.
+`antfly-sql-lock-apply-test` exercises these fences and receipt replay with real
+storage ownership; ordinary non-Raft lock mutations retain blocking admission.
+Retryable writer admission is a declared, lossless identity across both native
+failure envelopes. The locking gate checks both mappings, so ordinary contention
+cannot silently become an undeclared error and stop the progress driver.
 
 Native view-resource filters share the storage compiler's logical value
 predicates, including nested arrays, Unicode matching and boolean composition.

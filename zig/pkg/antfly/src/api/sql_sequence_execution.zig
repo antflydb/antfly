@@ -361,6 +361,15 @@ pub const Owner = struct {
         if (self.flushed) return;
         const root = self.root;
         const a = root.server.alloc;
+        // The transport owns publication of borrowed sequence state. Such an
+        // owner never captured a connection generation or sequence epoch, even
+        // when pgwire also supplied the logical connection ID. Treat clean
+        // and dirty borrowed state consistently before checking owned fences.
+        if (root.sequence_state != null) {
+            self.state.dirty = false;
+            self.flushed = true;
+            return;
+        }
         if (!self.state.dirty) {
             if (root.connection_id) |id| {
                 const store = root.server.txn_sessions.durable orelse return error.SequenceProviderUnavailable;
@@ -371,7 +380,7 @@ pub const Owner = struct {
             self.flushed = true;
             return;
         }
-        if (root.sequence_state != null or (root.connection_id == null and self.transaction == null)) {
+        if (root.connection_id == null and self.transaction == null) {
             self.state.dirty = false;
             self.flushed = true;
             return;
@@ -477,6 +486,35 @@ fn allocateColumnWithTable(root: *execution.Adapter, a: A, scope: local.system_c
 pub fn flush(raw: *anyopaque) !void {
     const root: *execution.Adapter = @ptrCast(@alignCast(raw));
     if (root.sequence_owner) |owner| owner.flush() catch return error.SqlSequenceOutcomeUnknown;
+}
+
+test "SQL sequence allocator borrowed state never claims connection publication" {
+    const a = std.testing.allocator;
+    const Poison = struct {
+        fn status(_: *anyopaque) !@import("../metadata/api.zig").MetadataStatus {
+            return error.TestUnexpectedAuthorityAccess;
+        }
+    };
+    var server = http.ApiHttpServer.init(a, .{}, .{ .ptr = undefined, .vtable = &.{ .status = Poison.status } }, null, null);
+    defer server.deinit();
+    var identity: ?http.AuthenticatedIdentity = null;
+    for ([_]bool{ false, true }) |dirty| {
+        var state: session.State = .{ .dirty = dirty };
+        defer state.deinit(a);
+        var root: execution.Adapter = .{
+            .server = &server,
+            .identity = &identity,
+            .context = .{},
+            .connection_id = @splat('a'),
+            .sequence_state = .{ .state = &state, .allocator = a },
+        };
+        const owner = try Owner.create(&root);
+        defer owner.deinit();
+        try std.testing.expect(owner.connection_generation == null and owner.connection_sequence_epoch == null);
+        try owner.flush();
+        try owner.flush();
+        try std.testing.expect(owner.flushed and !state.dirty);
+    }
 }
 
 test "SQL sequence allocator observes the exact lost acknowledgement without replay or forged leases" {
