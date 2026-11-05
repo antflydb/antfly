@@ -196,8 +196,8 @@ func (s *Service) validateProfile(p Profile) error {
 	}
 	for _, source := range p.Sources {
 		provider := p.Connections[source.Connection].Provider
-		if source.Publication == "media" && provider != "" && provider != ProviderS3 && provider != ProviderGCS && provider != ProviderGoogleWorkspace {
-			return fmt.Errorf("media publication supports S3, GCS and Drive sources")
+		if source.Publication == "media" && provider != "" && provider != ProviderS3 && provider != ProviderLocal && provider != ProviderGCS && provider != ProviderGoogleWorkspace {
+			return fmt.Errorf("media publication supports S3, GCS, local and Drive sources")
 		}
 	}
 	return nil

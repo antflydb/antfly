@@ -5,7 +5,8 @@ frame selection, surface lifetime and CPU/Metal preparation. It consumes
 [lib/media](../media/MEDIA.md). Inference adapters own model geometry, tokens,
 normalization and embedding policy. Runtime codec paths use maintained Zig source
 or explicit Apple platform APIs; FFmpeg, libvpx and dav1d are offline reference
-tools only. CUDA/NVDEC remains planned.
+tools only. CUDA/NVDEC remains planned for this library. Gemma 4 generation uses
+these routes on CPU and Metal, and its own NVDEC route on CUDA.
 
 See [the completion audit](../../../docs/plans/native-video-noncuda-audit.md) for
 qualification results, reproduction and limitations. This document describes the

@@ -46,6 +46,7 @@ const gemma3_mm = @import("gemma3_multimodal.zig");
 const gemma4_mm = @import("../architectures/gemma4_multimodal.zig");
 const gemma4_mtp = @import("../architectures/gemma4_mtp.zig");
 const gemma4_projector = @import("../architectures/gemma4_projector.zig");
+const gemma4_video = @import("gemma4_video.zig");
 const qwen3vl_projector = @import("../architectures/qwen3vl_projector.zig");
 const qwen2vl_mm = @import("qwen2vl_multimodal.zig");
 const projector_format_mod = @import("../architectures/projector_format.zig");
@@ -108,8 +109,9 @@ pub const Message = struct {
     /// Raw image bytes for multimodal messages (decoded from data URIs).
     /// Null or empty for text-only messages.
     image_bytes: ?[]const []const u8 = null,
-    /// One H.264 MP4 clip, sampled on CUDA at one frame per second (max 60s).
-    /// Video currently occupies its own message without image/audio parts.
+    /// One video clip, sampled at one frame per second. CUDA takes H.264 MP4 up
+    /// to 60s; CPU and Metal take the portable codecs, capped at 32 uniform frames.
+    /// A request has one video, in its own message, with no image or audio parts.
     video_bytes: ?[]const u8 = null,
     /// Raw encoded audio bytes for multimodal messages.
     /// Null or empty for text/image-only messages.
@@ -245,7 +247,12 @@ pub fn nativeGenerationMediaAdmissionForBackend(
         const max_image_tokens = try qwen2vl_mm.maxImageTokenCount(prep_config);
         return .{ .token_allowance = image_count *| (max_image_tokens +| 1) };
     }
-    return .{ .token_allowance = nativeGenerationMediaTokenAllowance(messages, config) };
+    var admission: NativeGenerationMediaAdmission = .{ .token_allowance = nativeGenerationMediaTokenAllowance(messages, config) };
+    // CUDA decodes on the device. Portable decoding runs in host memory.
+    if (backend != .cuda) for (messages) |message| if (message.video_bytes != null) {
+        admission.host_scratch_bytes = gemma4_video.portable_host_bytes;
+    };
+    return admission;
 }
 
 /// Conservative media-token count used for scheduling and memory admission.
@@ -5590,9 +5597,9 @@ pub const NativeGenerationPipeline = struct {
             video_bytes = bytes;
         };
         if (video_bytes != null) {
-            if (self.cb.kind() != .cuda or self.gpt_config.family != .gemma or !self.gpt_config.usesGemma4Channels() or self.gguf_projector_path == null) return error.UnsupportedVideoBackend;
+            if (!self.cb.supportsCopyRows2D() or self.gpt_config.family != .gemma or !self.gpt_config.usesGemma4Channels() or self.gguf_projector_path == null) return error.UnsupportedVideoBackend;
             for (messages) |message| {
-                if (message.content_parts != null or message.hasAudio() or (if (message.image_bytes) |imgs| imgs.len > 0 else false)) return error.UnsupportedMixedVideoInput;
+                if ((message.video_bytes != null and message.content_parts != null) or message.hasAudio() or (if (message.image_bytes) |imgs| imgs.len > 0 else false)) return error.UnsupportedMixedVideoInput;
             }
         }
         const has_images = messagesHaveImages(messages);
@@ -5843,7 +5850,7 @@ pub const NativeGenerationPipeline = struct {
                         null;
                     defer if (request_projector) |store| store.close();
                     const projector = self.projector_store orelse request_projector.?;
-                    var projected_video = if (video_bytes) |bytes| try gemma4_projector.encodeProjectedVideoResident(&self.cb, allocator, projector, bytes) else null;
+                    var projected_video = if (video_bytes) |bytes| try gemma4_video.encode(&self.cb, allocator, projector, bytes) else null;
                     defer if (projected_video) |*video| video.deinit();
                     const resident_images_enabled = images.len <= 8 and self.cb.supportsCopyRows2D() and self.cb.vtable.concatRows2D != null and
                         self.cb.vtable.multiplyScalar != null and !platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GENERATION_IMAGE_HOST", false);

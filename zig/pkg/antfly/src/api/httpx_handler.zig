@@ -4621,7 +4621,20 @@ pub const AntflyApiHandler = struct {
         ctx: *httpx.Context,
         identity: ?AuthenticatedIdentity,
         fn port(self: *@This()) inference_gateway.source_media.Port {
-            return .{ .ptr = self, .lookup = lookup, .lookup_many = lookupMany };
+            return .{ .ptr = self, .lookup = lookup, .lookup_many = lookupMany, .fetch = fetch };
+        }
+        fn fetch(raw: *anyopaque, a: std.mem.Allocator, resource: inference_gateway.source_media.Resource) ![]const u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const now = @import("antfly_platform").time.monotonicNs();
+            const deadline = self.ctx.application_deadline_ns orelse (now + 120 * std.time.ns_per_s);
+            if (deadline <= now) return error.Timeout;
+            const cancelled = struct {
+                fn call(ptr: *const anyopaque) bool {
+                    const context: *const httpx.Context = @ptrCast(@alignCast(ptr));
+                    return context.isCancellationRequested();
+                }
+            }.call;
+            return inference_gateway.source_media.fetchResource(a, self.server.inferenceIo(), self.server.cfg.remote_content, resource, .{ .ptr = self.ctx, .is_cancelled_fn = cancelled }, (deadline - now) / std.time.ns_per_ms);
         }
         fn at(value: std.json.Value, path: []const u8) ?std.json.Value {
             var current = value;

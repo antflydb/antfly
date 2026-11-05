@@ -801,7 +801,7 @@ func UsesNativeResource(source Source, item Item) bool {
 	if source.Publication == "text" {
 		return false
 	}
-	if item.SourceKind != ProviderS3 && item.SourceKind != ProviderGCS && item.SourceKind != ProviderGoogleDrive && item.SourceKind != ProviderGoogleWorkspace && configString(item.Metadata, "attachment_id") == "" {
+	if item.SourceKind != ProviderS3 && item.SourceKind != ProviderLocal && item.SourceKind != ProviderGCS && item.SourceKind != ProviderGoogleDrive && item.SourceKind != ProviderGoogleWorkspace && configString(item.Metadata, "attachment_id") == "" {
 		return false
 	}
 	if configString(item.Metadata, "acquisition") != "" && configString(item.Metadata, "attachment_id") == "" {

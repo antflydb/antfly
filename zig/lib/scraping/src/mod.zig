@@ -105,12 +105,16 @@ pub const ContentSecurityConfig = struct {
     max_image_dimension: ?u32 = null,
     /// Local file downloads require an explicit, nonempty path allowlist.
     allowed_paths: ?[]const []u8 = null,
+    /// Exact source companion base URLs a chat `source` part may fetch, including
+    /// private addresses. Every other `source` URL keeps private-IP blocking.
+    source_media_base_urls: ?[]const []u8 = null,
     user_agent: ?[]u8 = null,
 
     pub fn deinit(self: *ContentSecurityConfig, alloc: std.mem.Allocator) void {
         if (self.allowed_hosts) |values| freeOwnedStringSlice(alloc, values);
         if (self.nat64_prefixes) |values| freeOwnedStringSlice(alloc, values);
         if (self.allowed_paths) |values| freeOwnedStringSlice(alloc, values);
+        if (self.source_media_base_urls) |values| freeOwnedStringSlice(alloc, values);
         if (self.user_agent) |value| alloc.free(value);
         self.* = undefined;
     }
@@ -489,6 +493,7 @@ pub fn isEmptyContentSecurity(value: ContentSecurityConfig) bool {
         value.download_timeout_seconds == null and
         value.max_image_dimension == null and
         value.allowed_paths == null and
+        value.source_media_base_urls == null and
         value.user_agent == null;
 }
 
