@@ -361,16 +361,26 @@ pub const Source = struct {
         return try self.vtable.collect_enrichment_document_groups(self.ptr, alloc, from_sequence);
     }
 
-    /// Stop only between complete replay records. Every key in a sequence
-    /// must be processed before advancing the durable applied checkpoint.
-    /// Bound discovery rather than rebuilding the remaining backlog. The
-    /// document limit is soft: a single record must retain all of its keys.
+    /// A complete sequence is certified only after all its families settle.
+    /// Seekable discovery returns an authenticated continuation separately.
+    /// Portable/legacy records retain their complete-record soft limit.
     pub const EnrichmentWindow = struct {
         groups: []PendingDocumentGroup,
         last_sequence: u64,
+        fragment: ?replay_fragment.Position = null,
+    };
+
+    pub const EnrichmentDocumentFilter = struct {
+        ptr: *anyopaque,
+        accepts: *const fn (*anyopaque, []const u8) anyerror!bool,
     };
 
     pub const EnrichmentWindowLimits = struct {
+        seekable: bool = false,
+        fragment: ?replay_fragment.Position = null,
+        /// Exclude catalog-inapplicable rows before they occupy durable retry
+        /// slots. The owner must retain documents with unfinished outbox work.
+        document_filter: ?EnrichmentDocumentFilter = null,
         max_records: usize = 0,
         max_document_groups: usize = 0,
         max_input_bytes: usize = 0,
@@ -401,10 +411,55 @@ pub const Source = struct {
             }
         };
         var ctx: Context = .{
-            .groups = .{ .alloc = alloc, .pending = &pending, .scratch = &scratch },
+            .groups = .{ .alloc = alloc, .pending = &pending, .scratch = &scratch, .document_filter = limits.document_filter },
             .max_document_groups = limits.max_document_groups,
             .max_input_bytes = limits.max_input_bytes,
         };
+        if (limits.seekable and self.vtable == &primary_store_vtable) {
+            var cursor = try self.openMatchingCursor(alloc, from_sequence, .enrichment);
+            defer cursor.deinit(alloc);
+            const can_seek = if (cursor.state.primary_store.scan_txn) |txn| txn.current_scan.?.vtable.get != null else false;
+            if (can_seek) {
+                var fragment = limits.fragment;
+                var records: usize = @intFromBool(limits.fragment != null);
+                var scanned_families: usize = 0;
+                var last_sequence = from_sequence;
+                while (true) {
+                    const remaining = if (limits.max_document_groups == 0) 128 else limits.max_document_groups -| pending.count();
+                    if (remaining == 0 or scanned_families >= 4096 or (limits.max_input_bytes != 0 and ctx.input_bytes >= limits.max_input_bytes) or
+                        (fragment == null and limits.max_records != 0 and records >= limits.max_records)) break;
+                    const bytes_left: u64 = if (limits.max_input_bytes == 0) 0 else limits.max_input_bytes - ctx.input_bytes;
+                    if (try cursor.readFamilySliceWithBudget(alloc, "generated-discovery", fragment, @min(remaining, 4096 - scanned_families), bytes_left, 0)) |slice| {
+                        defer alloc.free(slice.payload);
+                        try EnrichmentGroupContext.consume(&ctx.groups, slice.position.sequence, slice.payload);
+                        ctx.input_bytes +|= slice.payload.len;
+                        scanned_families += slice.families;
+                        if (fragment == null) records += 1;
+                        const complete = slice.position.next_item == slice.position.total_items;
+                        fragment = if (complete) null else slice.position;
+                        last_sequence = if (complete) slice.position.sequence else slice.position.sequence - 1;
+                        continue;
+                    }
+                    // A saved physical position must never silently fall back
+                    // to a different record, encoding or unavailable history.
+                    if (fragment != null) return error.InvalidDerivedApplyState;
+                    const stats = try cursor.forEachWholeRecordWindow(1, &ctx, Context.consume);
+                    last_sequence = @max(last_sequence, @max(stats.last_sequence, ctx.last_sequence));
+                    records += @max(stats.matched_entries, @intFromBool(ctx.last_sequence > stats.last_sequence));
+                    if (pending.count() >= limits.max_document_groups and limits.max_document_groups != 0) break;
+                    if (stats.scanned_entries == 0 and ctx.last_sequence <= last_sequence) {
+                        // A chunk manifest stops the whole-record iterator
+                        // without consuming it. Inspect that lookahead next.
+                        const entry = cursor.state.primary_store.entry orelse break;
+                        const sequence = internal_keys.parseReplayEntrySequence(entry.key, cursor.state.primary_store.scan_lane_ordinal) orelse return error.InvalidReplayEntryKey;
+                        const raw = try replay_reference.canonicalRaw(&cursor.state.primary_store.scan_txn.?, sequence, cursor.state.primary_store.scan_lane_ordinal, entry.value);
+                        if (!replay_chunks.isManifest(raw)) break;
+                    }
+                }
+                return .{ .groups = try pendingDocumentGroupsToOwnedSlice(alloc, &pending), .last_sequence = if (last_sequence > from_sequence) last_sequence else 0, .fragment = fragment };
+            }
+            if (limits.fragment != null) return error.InvalidDerivedApplyState;
+        }
         const stats = try self.forEachMatchingRecord(alloc, from_sequence, .enrichment, limits.max_records, &ctx, Context.consume);
         return .{ .groups = try pendingDocumentGroupsToOwnedSlice(alloc, &pending), .last_sequence = @max(stats.last_sequence, ctx.last_sequence) };
     }
@@ -863,6 +918,11 @@ const EnrichmentGroupContext = struct {
     alloc: Allocator,
     pending: *std.StringHashMapUnmanaged(PendingDocumentGroup),
     scratch: *change_journal_mod.BorrowedBinaryRecordScratch,
+    document_filter: ?Source.EnrichmentDocumentFilter = null,
+
+    fn accepts(self: @This(), key: []const u8) !bool {
+        return if (self.document_filter) |filter| try filter.accepts(filter.ptr, key) else true;
+    }
 
     fn consume(ctx_ptr: *anyopaque, sequence: u64, payload: []const u8) !void {
         const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
@@ -876,12 +936,16 @@ const EnrichmentGroupContext = struct {
             if (!recordHasEnrichmentHint(record)) return;
             // Retain only the returned group's unique keys; input payloads
             // and scratch descriptors are borrowed through this callback.
-            for (record.changed_doc_keys) |key| try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, key);
+            for (record.changed_doc_keys) |key| {
+                if (try ctx.accepts(key)) try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, key);
+            }
         } else {
             var record = try change_journal_mod.decodeRecord(ctx.alloc, payload);
             defer record.deinit();
             if (!recordHasEnrichmentHint(record.record)) return;
-            for (record.record.changed_doc_keys) |key| try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, key);
+            for (record.record.changed_doc_keys) |key| {
+                if (try ctx.accepts(key)) try appendPendingDocumentGroup(ctx.alloc, ctx.pending, sequence, key);
+            }
         }
     }
 };
@@ -2137,4 +2201,61 @@ test "seekable replay window keeps a later oversized family out of a nonempty pu
     defer a.free(last.payload);
     try std.testing.expectEqual(@as(u64, 4), last.position.sequence);
     try std.testing.expectEqual(@as(usize, 96), last.families);
+}
+
+test "enrichment discovery filters inapplicable rows before retry window sizing" {
+    var allocator_state: @import("../../test_allocator.zig").TestAllocator = .{};
+    defer allocator_state.deinit();
+    const a = allocator_state.allocator();
+    var journal = try change_journal_mod.Journal.open("filtered-enrichment-window", .{ .backend = .lsm_memory });
+    defer journal.close();
+    var backend = mem_backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var keys: [1025][]const u8 = undefined;
+    for (keys[0..1024], 0..) |*key, i| key.* = try std.fmt.allocPrint(a, "ordinary:{d}", .{i});
+    defer for (keys[0..1024]) |key| a.free(key);
+    keys[1024] = "applicable";
+    for (1..4) |sequence| {
+        const encoded = try change_journal_mod.encodeRecord(a, .{
+            .sequence = sequence,
+            .changed_doc_keys = if (sequence == 2) &keys else keys[0..1024],
+            .target_hints = &.{.enrichment},
+        });
+        defer a.free(encoded);
+        _ = try journal.appendOpaque(encoded);
+        try store.appendReplayOpaque(a, sequence, encoded);
+    }
+    const Filter = struct {
+        visits: usize = 0,
+        fail: bool = false,
+        fn accepts(ptr: *anyopaque, key: []const u8) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.visits += 1;
+            if (self.fail) return error.InjectedDiscoveryFailure;
+            return std.mem.eql(u8, key, "applicable");
+        }
+    };
+    for ([_]Source{ Source.fromJournal(&journal), Source.fromPrimaryStore(&store, null, null) }) |source| {
+        var filter = Filter{};
+        const limits: Source.EnrichmentWindowLimits = .{ .max_records = 2, .max_document_groups = 8, .document_filter = .{ .ptr = &filter, .accepts = Filter.accepts } };
+        const window = try source.collectEnrichmentDocumentGroupsWindow(a, 0, limits);
+        defer freePendingDocumentGroups(a, window.groups);
+        try std.testing.expectEqual(@as(u64, 2), window.last_sequence);
+        try std.testing.expectEqual(@as(usize, 1), window.groups.len);
+        try std.testing.expectEqualStrings("applicable", window.groups[0].doc_key);
+        try std.testing.expectEqual(@as(usize, 2049), filter.visits);
+        const rest = try source.collectEnrichmentDocumentGroupsWindow(a, window.last_sequence, limits);
+        defer freePendingDocumentGroups(a, rest.groups);
+        try std.testing.expectEqual(@as(u64, 3), rest.last_sequence);
+        try std.testing.expectEqual(@as(usize, 0), rest.groups.len);
+        filter.fail = true;
+        try std.testing.expectError(error.InjectedDiscoveryFailure, source.collectEnrichmentDocumentGroupsWindow(a, 0, limits));
+        filter.fail = false;
+        const retried = try source.collectEnrichmentDocumentGroupsWindow(a, 0, limits);
+        defer freePendingDocumentGroups(a, retried.groups);
+        try std.testing.expectEqual(@as(u64, 2), retried.last_sequence);
+        try std.testing.expectEqual(@as(usize, 1), retried.groups.len);
+    }
 }

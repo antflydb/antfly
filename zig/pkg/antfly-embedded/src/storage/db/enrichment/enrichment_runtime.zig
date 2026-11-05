@@ -3200,7 +3200,7 @@ const ScopedReplay = struct {
         const pending = self.state.tickets.items.len != 0;
         const scanned = self.state.scanned_sequence;
         const full = self.state.tickets.items.len >= scoped_retries.max_documents;
-        const has_tail = self.state.scan_document.len != 0;
+        const has_tail = self.state.scan_document.len != 0 or self.state.scan_fragment != null;
         const deadline = self.state.deadline();
         self.mutex.unlock(scheduler_io);
         const io = lockRuntime(runtime);
@@ -4087,7 +4087,7 @@ fn restoreScopedRetryCache(runtime: anytype) !void {
         runtime.next_retry_at_ms = 0;
     }
     runtime.scoped_retry_full = state.tickets.items.len >= scoped_retries.max_documents;
-    runtime.scoped_retry_has_tail = state.scan_document.len != 0;
+    runtime.scoped_retry_has_tail = state.scan_document.len != 0 or state.scan_fragment != null;
     runtime.scoped_retry_wait = runtime.scoped_retry_pending and runtime.retry_failure_fingerprint == 0 and runtime.consecutive_retry_count == 0;
     if (runtime.scoped_retry_wait) {
         runtime.retrying = true;
@@ -9903,6 +9903,23 @@ fn runForegroundCatchUpPassGuarded(
     };
 }
 
+const EnrichmentDiscoveryFilter = struct {
+    runtime: *EnrichmentRuntime,
+    templates: []const enrichment_types.GeneratedEnrichmentRequest,
+
+    fn accepts(ptr: *anyopaque, document: []const u8) !bool {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        for (self.templates) |request| {
+            if (enrichment_types.appliesToDocument(request, document)) return true;
+        }
+        const store = self.runtime.artifact_store orelse return false;
+        if (self.runtime.config.root_incarnation == 0) return false;
+        var probe = try store.beginProbeTxnWithBlockCacheAdmission(.transient);
+        defer probe.abort();
+        return try @import("../artifact_unit_jobs.zig").documentMayHaveJobs(&probe, self.runtime.config.root_incarnation, document);
+    }
+};
+
 fn runForegroundCatchUpPassOwned(
     runtime: *EnrichmentRuntime,
     io: Io,
@@ -9968,9 +9985,13 @@ fn runForegroundCatchUpPassOwned(
     if (config_changed) {
         scheduler.state.scanned_sequence = runtime.applied_sequence;
         scheduler.state.clearScanDocument(runtime.alloc);
+        scheduler.state.scan_fragment = null;
     }
     scheduler.state.config_hash = config_hash;
     scheduler.state.scanned_sequence = @max(scheduler.state.scanned_sequence, runtime.applied_sequence);
+    if (scheduler.state.scan_fragment) |fragment| if (fragment.sequence <= runtime.applied_sequence) {
+        scheduler.state.scan_fragment = null;
+    };
     // Explicit repair may already have certified a later applied boundary.
     var stale: usize = 0;
     while (stale < scheduler.state.tickets.items.len) {
@@ -9999,11 +10020,22 @@ fn runForegroundCatchUpPassOwned(
         scheduler.state.retire(runtime.alloc, due.tokens);
         try scheduler.save(runtime);
     }
+    // Discovery uses the pinned catalog, independently of document contents.
+    // Group-only producer DAGs do not apply to ordinary primary rows. Letting
+    // those rows fill the retry window repeatedly reconstructs large journal
+    // records and performs primary reads/planning for work which cannot run.
+    // Outboxes survive catalog changes and must still acquire their own turn.
+    var discovery_plan = try runtime.index_manager.acquireWritePlanSnapshot();
+    defer discovery_plan.release();
+    var discovery_filter = EnrichmentDiscoveryFilter{ .runtime = runtime, .templates = discovery_plan.plan().generated_templates };
     const available_documents = scoped_retries.max_documents - scheduler.state.tickets.items.len;
     // No new window is admitted while every durable scheduling slot is in use.
     // One slot is reserved per document before any external invocation begins.
     const replay_window: @import("../derived/replay_source.zig").Source.EnrichmentWindow = if (available_documents != 0)
         try runtime.replay_source.collectEnrichmentDocumentGroupsWindow(runtime.alloc, scheduler.state.scanned_sequence -| @as(u64, if (scheduler.state.scan_document.len != 0) 1 else 0), .{
+            .seekable = true,
+            .fragment = scheduler.state.scan_fragment,
+            .document_filter = .{ .ptr = &discovery_filter, .accepts = EnrichmentDiscoveryFilter.accepts },
             .max_records = if (guard.cooperative and guard.replay_limits.max_records != 0) @min(4096, guard.replay_limits.max_records) else 4096,
             .max_document_groups = @min(available_documents, if (guard.cooperative and guard.replay_limits.max_document_groups != 0) guard.replay_limits.max_document_groups else 128),
             .max_input_bytes = if (guard.cooperative and guard.replay_limits.max_input_bytes != 0) @min(4 * 1024 * 1024, guard.replay_limits.max_input_bytes) else 4 * 1024 * 1024,
@@ -10045,11 +10077,21 @@ fn runForegroundCatchUpPassOwned(
     try replay_lease_guard.check();
     if (available_documents != 0) {
         if (end < replay_window.groups.len) {
+            std.debug.assert(replay_window.fragment == null);
+            scheduler.state.scan_fragment = null;
             try scheduler.state.setScanDocument(runtime.alloc, pending[pending.len - 1]);
         } else {
-            max_seen = @max(max_seen, replay_window.last_sequence);
-            if (pending.len == 0 and replay_window.last_sequence == 0) max_seen = target_sequence;
-            scheduler.state.scanned_sequence = @max(scheduler.state.scanned_sequence, max_seen);
+            if (replay_window.fragment) |fragment| {
+                // A successful partial window owns only its authenticated
+                // family prefix. It cannot certify the record's sequence.
+                scheduler.state.scanned_sequence = fragment.sequence - 1;
+                scheduler.state.scan_fragment = fragment;
+            } else {
+                max_seen = @max(max_seen, replay_window.last_sequence);
+                if (pending.len == 0 and replay_window.last_sequence == 0) max_seen = target_sequence;
+                scheduler.state.scanned_sequence = @max(scheduler.state.scanned_sequence, max_seen);
+                scheduler.state.scan_fragment = null;
+            }
             scheduler.state.clearScanDocument(runtime.alloc);
         }
     }
@@ -29755,6 +29797,20 @@ test "grouped sources production plans deleted unit descendants without source b
     defer alloc.free(anchor);
     const unit = try std.fmt.allocPrint(alloc, "{s}/p/segment/0/u/unit", .{anchor});
     defer alloc.free(unit);
+    {
+        var snapshot = try manager.acquireWritePlanSnapshot();
+        defer snapshot.release();
+        var discovery = EnrichmentDiscoveryFilter{ .runtime = &runtime, .templates = snapshot.plan().generated_templates };
+        try std.testing.expect(try EnrichmentDiscoveryFilter.accepts(&discovery, unit));
+        try std.testing.expect(!try EnrichmentDiscoveryFilter.accepts(&discovery, "ordinary-primary"));
+        const other = try @import("../group_source_identity.zig").anchor(alloc, 1, @splat(0), @splat(2));
+        defer alloc.free(other);
+        try std.testing.expect(!try EnrichmentDiscoveryFilter.accepts(&discovery, other));
+        const ordinary_template = enrichment_types.GeneratedEnrichmentRequest{ .kind = .asset, .index_name = "ordinary", .doc_key = "", .source_field = "text" };
+        discovery.templates = &.{ordinary_template};
+        try std.testing.expect(try EnrichmentDiscoveryFilter.accepts(&discovery, "ordinary-primary"));
+        try std.testing.expect(!try EnrichmentDiscoveryFilter.accepts(&discovery, unit));
+    }
     var cache = RequestPlanCache{};
     defer freeRequestPlanCache(alloc, &cache);
     const planned = try getOrCreatePlannedRequests(&runtime, unit, &cache);

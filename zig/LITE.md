@@ -2361,3 +2361,14 @@ result set, never its historical versions; legacy indexed tombstones are filtere
 before returning. Regressions cover allocation churn, scattered pages, distinct
 file/output allocators, pinned external values, mixed tombstones, and exhaustive
 allocation-failure cleanup.
+
+
+Producer discovery uses the canonical journal's authenticated family chunks as
+well as index replay. Its durable retry header (`ESQ3`, with `ESQ2` read
+compatibility) carries the exact manifest fingerprint and next family position.
+Partial discovery never advances the complete-record watermark or releases
+journal credits. Restart, provider failure and cancellation can repeat an
+unfinished window; they cannot skip its unchecked suffix. Discovery filters
+catalog-inapplicable documents before assigning retry slots, while preserving
+rows with durable artifact-unit outbox work. Record, byte and family scan limits
+also bound turns whose documents are all inapplicable.

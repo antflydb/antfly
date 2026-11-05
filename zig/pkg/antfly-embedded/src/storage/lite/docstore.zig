@@ -12649,3 +12649,88 @@ test "lite reclamation defers optional shrink before admission while replay is p
     try std.testing.expectEqual(reclamation.State.deferred, store.maintenance_policy.status.state);
     try std.testing.expectEqual(@as(u64, 1), (try store.file.replayAdmission()).?.records);
 }
+
+test "lite seekable producer discovery persists authenticated bounded continuations" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "seekable-producer.aflite");
+    defer a.free(path);
+    var native_store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer native_store.close();
+    var runtime = try native_store.runtimeStoreWithPrefix(a, "\x02db/producer\x00");
+    defer runtime.deinit();
+    const facade = @import("../docstore.zig");
+    var store = try facade.DocStore.openRuntime(a, &runtime);
+    defer store.close();
+    var buffers: [1024][32]u8 = undefined;
+    var names: [1024][]const u8 = undefined;
+    for (&names, 0..) |*name, i| name.* = try std.fmt.bufPrint(&buffers[i], "document-{d:0>4}", .{i});
+    const payload = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &names, .target_hints = &.{.enrichment} });
+    defer a.free(payload);
+    {
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.setReplayOpaque(1, payload);
+        const later = try change_journal_mod.encodeRecord(a, .{ .sequence = 2, .changed_doc_keys = &.{"later"}, .target_hints = &.{.enrichment} });
+        defer a.free(later);
+        try write.setReplayOpaque(2, later);
+        try write.commit();
+    }
+    const charged = (try native_store.file.replayAdmission()).?;
+    const chunk_key = replay_chunks.chunkKey(1, 15);
+    const last_chunk = blk: {
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        break :blk try a.dupe(u8, try read.get(&chunk_key));
+    };
+    defer a.free(last_chunk);
+    {
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.put(&chunk_key, "unreadable later chunk");
+        try write.commit();
+    }
+    const source_mod = @import("../db/derived/replay_source.zig");
+    const source = source_mod.Source.fromPrimaryStore(&store, null, null);
+    const State = @import("../db/enrichment/scoped_retries.zig").State;
+    var state: State = .{};
+    defer state.deinit(a);
+    var seen: usize = 0;
+    while (seen < names.len) {
+        const window = try source.collectEnrichmentDocumentGroupsWindow(a, state.scanned_sequence, .{ .seekable = true, .fragment = state.scan_fragment, .max_document_groups = 9, .max_records = 1 });
+        defer source_mod.freePendingDocumentGroups(a, window.groups);
+        try std.testing.expectEqual(@min(@as(usize, 9), names.len - seen), window.groups.len);
+        for (window.groups) |group| {
+            try std.testing.expectEqualStrings(names[seen], group.doc_key);
+            try std.testing.expectEqual(@as(u64, 1), group.sequence);
+            seen += 1;
+        }
+        if (seen == 9) {
+            // The first turn succeeded without reading a deliberately damaged
+            // distant chunk. Whole-record reconstruction would reject it.
+            var write = try store.beginWriteBatch();
+            errdefer write.abort();
+            try write.put(&chunk_key, last_chunk);
+            try write.commit();
+            var wrong = window.fragment.?;
+            wrong.fingerprint[0] ^= 1;
+            try std.testing.expectError(error.InvalidDerivedApplyState, source.collectEnrichmentDocumentGroupsWindow(a, 0, .{ .seekable = true, .fragment = wrong, .max_document_groups = 9 }));
+        }
+        if (seen < names.len) {
+            try std.testing.expectEqual(@as(u64, 0), window.last_sequence);
+            try std.testing.expectEqual(@as(u64, seen), window.fragment.?.next_item);
+        } else {
+            try std.testing.expectEqual(@as(u64, 1), window.last_sequence);
+            try std.testing.expect(window.fragment == null);
+        }
+        state.scanned_sequence = if (window.fragment) |fragment| fragment.sequence - 1 else window.last_sequence;
+        state.scan_fragment = window.fragment;
+        const encoded = try state.encode(a);
+        defer a.free(encoded);
+        const restored = try State.decode(a, encoded);
+        state.deinit(a);
+        state = restored;
+    }
+    try std.testing.expectEqualDeep(charged, (try native_store.file.replayAdmission()).?);
+}

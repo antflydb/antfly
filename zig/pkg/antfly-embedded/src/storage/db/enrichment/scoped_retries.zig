@@ -32,11 +32,13 @@ pub const SourceStamp = struct {
         return self.incarnation == other.incarnation and std.mem.eql(u8, &self.digest, &other.digest);
     }
 };
-const header_magic = "ESQ2";
+const fragment_mod = @import("../derived/replay_fragment.zig");
+const header_magic = "ESQ3";
+const legacy_header_magic = "ESQ2";
 const snapshot_magic = "ESR2";
 const ticket_magic = "EST2";
 pub const max_ticket_bytes = 4 + 4 + max_document_key_bytes + 8 + 1 + 32 + 1 + 48 + 8 + 8 + 2 + max_budgets * 40;
-const max_header_bytes = 4 + 8 + 8 + 4 + max_document_key_bytes + 2 + max_documents;
+const max_header_bytes = 4 + 8 + 8 + 4 + max_document_key_bytes + 2 + max_documents + 57;
 comptime {
     // Every admitted combination fits, including maximum opaque keys, every
     // producer budget, both source identities, and a partial-record cursor.
@@ -91,6 +93,7 @@ pub const State = struct {
     config_hash: u64 = 0,
     scanned_sequence: u64 = 0,
     scan_document: []const u8 = "",
+    scan_fragment: ?fragment_mod.Position = null,
     tickets: std.ArrayListUnmanaged(Ticket) = .empty,
     persisted_slots: std.StaticBitSet(max_documents) = .empty,
     logical_budgets: std.AutoHashMapUnmanaged(BudgetKey, BudgetCounts) = .empty,
@@ -200,7 +203,7 @@ pub const State = struct {
         return bytes;
     }
     pub fn isHeader(bytes: []const u8) bool {
-        return std.mem.startsWith(u8, bytes, header_magic);
+        return std.mem.startsWith(u8, bytes, header_magic) or std.mem.startsWith(u8, bytes, legacy_header_magic);
     }
     pub const Header = struct { state: State, slots: [max_documents]u8 = undefined, count: usize };
     pub fn decodeHeader(a: A, raw: []const u8) !Header {
@@ -220,14 +223,32 @@ pub const State = struct {
             if (slot.* >= max_documents or used.isSet(slot.*)) return error.InvalidEnrichmentState;
             used.set(slot.*);
         }
+        if (std.mem.startsWith(u8, raw, header_magic)) {
+            const has_fragment = try reader.int(u8);
+            if (has_fragment > 1) return error.InvalidEnrichmentState;
+            if (has_fragment == 1) {
+                var fragment: fragment_mod.Position = .{ .sequence = try reader.int(u64), .next_item = try reader.int(u64), .total_items = try reader.int(u64), .fingerprint = undefined };
+                @memcpy(&fragment.fingerprint, try reader.take(32));
+                result.state.scan_fragment = fragment;
+            }
+        }
+        try result.state.validateFragment();
         try reader.end();
         return result;
+    }
+    fn validateFragment(self: State) !void {
+        if (self.scan_fragment) |position| {
+            if (self.scan_document.len != 0 or position.sequence == 0 or position.sequence - 1 != self.scanned_sequence or
+                position.next_item == 0 or position.next_item >= position.total_items or position.applied)
+                return error.InvalidEnrichmentState;
+        }
     }
     fn encodeHeader(self: State, a: A) ![]u8 {
         if (self.tickets.items.len > max_documents) return error.InvalidEnrichmentState;
         const cursor_len = try binary.keyLength(self.scan_document);
         if (cursor_len > max_document_key_bytes) return error.InvalidEnrichmentState;
-        const bytes = try a.alloc(u8, 4 + 8 + 8 + 4 + cursor_len + 2 + self.tickets.items.len);
+        try self.validateFragment();
+        const bytes = try a.alloc(u8, 4 + 8 + 8 + 4 + cursor_len + 2 + self.tickets.items.len + 1 + @as(usize, if (self.scan_fragment != null) 56 else 0));
         errdefer a.free(bytes);
         var writer = binary.Writer{ .bytes = bytes };
         writer.put(header_magic);
@@ -240,6 +261,13 @@ pub const State = struct {
             if (ticket.slot >= max_documents or used.isSet(ticket.slot)) return error.InvalidEnrichmentState;
             used.set(ticket.slot);
             writer.int(u8, ticket.slot);
+        }
+        writer.int(u8, @intFromBool(self.scan_fragment != null));
+        if (self.scan_fragment) |fragment| {
+            writer.int(u64, fragment.sequence);
+            writer.int(u64, fragment.next_item);
+            writer.int(u64, fragment.total_items);
+            writer.put(&fragment.fingerprint);
         }
         return bytes;
     }
@@ -758,4 +786,27 @@ test "scoped retry workset indexed budgets survive replacement retirement and al
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "scoped retry workset persists seekable discovery and accepts legacy headers" {
+    const a = std.testing.allocator;
+    var state = State{ .scanned_sequence = 9, .scan_fragment = .{ .sequence = 10, .next_item = 128, .total_items = 1024, .fingerprint = @splat(7) } };
+    const encoded = try state.encode(a);
+    defer a.free(encoded);
+    var restored = try State.decode(a, encoded);
+    defer restored.deinit(a);
+    try std.testing.expectEqualDeep(state.scan_fragment, restored.scan_fragment);
+    try std.testing.expectEqual(@as(u64, 9), restored.completedSequence());
+    var legacy: [26]u8 = @splat(0);
+    @memcpy(legacy[0..4], "ESQ2");
+    std.mem.writeInt(u64, legacy[12..20], 9, .little);
+    var old = try State.decodeHeader(a, &legacy);
+    defer old.state.deinit(a);
+    try std.testing.expect(old.state.scan_fragment == null);
+    try std.testing.expectEqual(@as(u64, 9), old.state.completedSequence());
+    state.scan_fragment.?.sequence = 11;
+    try std.testing.expectError(error.InvalidEnrichmentState, state.encode(a));
+    state.scan_fragment.?.sequence = 10;
+    state.scan_fragment.?.next_item = 1024;
+    try std.testing.expectError(error.InvalidEnrichmentState, state.encode(a));
 }
