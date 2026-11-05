@@ -1047,7 +1047,15 @@ fn hydrateArtifactRevisions(alloc: Allocator, result: *types.SearchResult, paylo
         defer state_key.deinit(alloc);
         try internal_keys.appendDocumentPrefix(&state_key, alloc, ref.document_id);
         try state_key.append(alloc, internal_keys.asset_state_kind);
-        const producer = if (ref.kind == .chunk and ref.source != null and ref.source.?.kind == .asset) ref.source.?.name else ref.name;
+        // An embedding hit reports its source chunk (see reconcileArtifactRef),
+        // and its payload above is that chunk's: fingerprint the chunk
+        // producer's state too, so both revisions describe the reported member.
+        const producer = if (ref.kind == .chunk and ref.source != null and ref.source.?.kind == .asset)
+            ref.source.?.name
+        else if (ref.kind == .embedding and ref.source != null and ref.source.?.kind == .chunk)
+            ref.source.?.name
+        else
+            ref.name;
         try internal_keys.appendEncodedComponent(&state_key, alloc, producer);
         const state_digest: ?[32]u8 = if (states.getEntry(state_key.items)) |cached| cached.value_ptr.* else blk: {
             const state = try load(shaper.ctx, alloc, state_key.items);
@@ -1931,7 +1939,16 @@ fn reconcileArtifactRef(alloc: Allocator, slot: *?types.ArtifactRef, resolved: t
         switch (try verifyArtifactIdentity(alloc, existing.*, resolved)) {
             .same => return,
             .embedding_of_resolved => {
-                const replacement = try resolved.clone(alloc);
+                var replacement = try resolved.clone(alloc);
+                // Member hydration computed both revisions for the source
+                // artifact (its payload and its producer's state): they
+                // describe the reported artifact. Move them across.
+                if (replacement.revision) |value| alloc.free(value);
+                if (replacement.derivation_revision) |value| alloc.free(value);
+                replacement.revision = existing.revision;
+                replacement.derivation_revision = existing.derivation_revision;
+                existing.revision = null;
+                existing.derivation_revision = null;
                 existing.deinit(alloc);
                 slot.* = replacement;
             },
@@ -3677,6 +3694,53 @@ test "native asset members hydrate source authority and revision identity" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Runner.run, .{});
 }
 
+test "a dense chunk member reports its chunk with the chunk's revisions" {
+    const alloc = std.testing.allocator;
+    const Loader = struct {
+        chunk: []const u8,
+        state: []const u8,
+        fn load(raw: ?*anyopaque, a: Allocator, key: []const u8) !?[]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (std.mem.eql(u8, key, self.chunk)) return try a.dupe(u8, "{\"_parent_doc_key\":\"doc:a\",\"text\":\"chunk words\"}");
+            if (std.mem.eql(u8, key, self.state)) return try a.dupe(u8, "chunk-producer-state");
+            if (std.mem.eql(u8, key, "doc:a")) return try a.dupe(u8, "{}");
+            return null;
+        }
+        fn parent(_: ?*anyopaque, a: Allocator, _: types.SearchRequest, key: []const u8) !?[]u8 {
+            if (!std.mem.eql(u8, key, "doc:a")) return error.TestUnexpectedResult;
+            return try a.dupe(u8, "{}");
+        }
+    };
+    const chunk_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "body_chunks_v1", 0);
+    defer alloc.free(chunk_key);
+    var state = std.ArrayListUnmanaged(u8).empty;
+    defer state.deinit(alloc);
+    try internal_keys.appendDocumentPrefix(&state, alloc, "doc:a");
+    try state.append(alloc, internal_keys.asset_state_kind);
+    try internal_keys.appendEncodedComponent(&state, alloc, "body_chunks_v1");
+    var loader = Loader{ .chunk = chunk_key, .state = state.items };
+
+    // The same chunk, once as a text member and once as the dense member that
+    // carries the embedding it matched.
+    const hits = try alloc.alloc(types.SearchHit, 2);
+    hits[0] = .{ .id = try alloc.dupe(u8, chunk_key), .artifact_ref = try artifact_ids.decodeArtifactRefAlloc(alloc, chunk_key) };
+    hits[1] = .{ .id = try alloc.dupe(u8, chunk_key), .artifact_ref = .{
+        .document_id = try alloc.dupe(u8, "doc:a"),
+        .name = try alloc.dupe(u8, "body_dense_v1"),
+        .kind = .embedding,
+        .source = .{ .kind = .chunk, .name = try alloc.dupe(u8, "body_chunks_v1"), .chunk_id = 0 },
+    } };
+    var result = try reshapeChunkBackedResult(alloc, .{ .return_mode = .member, .include_stored = true }, .{ .alloc = alloc, .hits = hits, .total_hits = 2 }, .{ .ctx = &loader, .load_stored = Loader.load, .load_parent_stored = Loader.parent, .resolve_parent_id = TestChunkParentShaper.resolveParentId });
+    defer result.deinit();
+    try externalizeSearchResultArtifactIds(alloc, &result);
+    for (result.hits) |hit| try std.testing.expectEqual(types.ArtifactKind.chunk, hit.artifact_ref.?.kind);
+    const text_ref = result.hits[0].artifact_ref.?;
+    const dense_ref = result.hits[1].artifact_ref.?;
+    try std.testing.expect(text_ref.derivation_revision != null);
+    try std.testing.expectEqualStrings(text_ref.revision.?, dense_ref.revision.?);
+    try std.testing.expectEqualStrings(text_ref.derivation_revision.?, dense_ref.derivation_revision.?);
+}
+
 test "native unit ancestry uses its configured producer name" {
     const alloc = std.testing.allocator;
     const key = try internal_keys.documentUnitArtifactKeyAlloc(alloc, "doc:a", "interview_transcripts", "speech:1");
@@ -3737,4 +3801,41 @@ test "native member ancestry ignores payload source and unit identities" {
     defer scalar.deinit(a);
     try std.testing.expectEqualStrings("allowed", scalar.parent_doc_key);
     try std.testing.expect(scalar.unit_key == null);
+}
+
+test "artifact identity reports the source of a dense hit's embedding and keeps its revisions" {
+    const alloc = std.testing.allocator;
+    const chunk = struct {
+        fn ref(a: Allocator, doc: []const u8) !types.ArtifactRef {
+            return .{ .document_id = try a.dupe(u8, doc), .name = try a.dupe(u8, "body_chunks_v1"), .kind = .chunk, .chunk_id = 0 };
+        }
+    }.ref;
+    var resolved = try chunk(alloc, "doc:a");
+    defer resolved.deinit(alloc);
+
+    // A dense hit carries its embedding, sourced from the resolved chunk, with
+    // revisions that member hydration computed from the chunk payload.
+    var slot: ?types.ArtifactRef = .{
+        .document_id = try alloc.dupe(u8, "doc:a"),
+        .name = try alloc.dupe(u8, "body_dense_v1"),
+        .kind = .embedding,
+        .source = .{ .kind = .chunk, .name = try alloc.dupe(u8, "body_chunks_v1"), .chunk_id = 0 },
+        .revision = try alloc.dupe(u8, "sha256:member"),
+        .derivation_revision = try alloc.dupe(u8, "sha256:state"),
+    };
+    defer if (slot) |*ref| ref.deinit(alloc);
+    try reconcileArtifactRef(alloc, &slot, resolved);
+    try std.testing.expectEqual(types.ArtifactKind.chunk, slot.?.kind);
+    try std.testing.expectEqualStrings("body_chunks_v1", slot.?.name);
+    try std.testing.expectEqualStrings("sha256:member", slot.?.revision.?);
+    try std.testing.expectEqualStrings("sha256:state", slot.?.derivation_revision.?);
+
+    // An exact match is kept as is.
+    try reconcileArtifactRef(alloc, &slot, resolved);
+    try std.testing.expectEqualStrings("sha256:member", slot.?.revision.?);
+
+    // Anything else is still refused.
+    var other: ?types.ArtifactRef = try chunk(alloc, "doc:b");
+    defer if (other) |*ref| ref.deinit(alloc);
+    try std.testing.expectError(error.InvalidChunkArtifact, reconcileArtifactRef(alloc, &other, resolved));
 }
