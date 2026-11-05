@@ -511,6 +511,47 @@ operator header lists remain replacements for those defaults.
 
 ## Validation
 
+### Post-apply observations and browser conditional saves (2026-11-05)
+
+- Fix `8a674eebe7` places all fallible post-apply table observations behind one
+  outcome boundary. Projection, receipt and semantic comparison failures now
+  report an unknown mutation outcome after admission; definite rejection still
+  reports a generation conflict. Successful mutations add no reads or retries.
+  Fault tests cover twelve stage/error combinations and malformed policy JSON.
+- Default CORS permits `If-Match` and exposes `ETag`, `Retry-After` and
+  `X-Antfly-Raft-Mutation-Outcome`. Explicit operator header lists remain
+  authoritative. Native tests cover both defaults and explicit overrides; the
+  HTTP regression creates, conditionally replaces and rereads a policy from an
+  allowed origin and rejects a disallowed origin.
+- Main through `6c0b004e95ad947587cbc4bbb60f4812fb714b28` is incorporated.
+  Full generation, Zig/Python formatting, license and Apache boundary checks
+  pass. The Mac build passes all 135 steps: 71 API/metadata tests, 172
+  storage/privacy tests, two ABI checks, two transport checks and two CORS
+  tests. Compact binding capture still allocates zero bytes for 100 warm reads
+  against a 14,768,412-byte catalog.
+- Selected Mac HTTP lifecycle, CAS, retry and curation cases pass in standalone
+  (eight including CORS, 275.43 s) and Raft (seven, 338.30 s). The binary SHA-256
+  is `01df1990ca9aec8815e433596fa665d4215d8171e01516e2496318b0532fb1d6`.
+  Logs use the `.privacy-outcome-cors-` prefix.
+- Glowworm's native ARM64 Linux CPU build passes all 132 steps with the same
+  native test counts. Selected HTTP cases pass in standalone (eight, 296.89 s)
+  and Raft (seven, 390.67 s), including the browser CORS case in standalone.
+- Native ARM64 Linux qualification exposed an undersized API compile claim.
+  Fix `78c36799ee` reserves 20 GiB for the measured Zig 0.17.0 CPU Debug
+  profile, providing at least 25% margin above its 15,947,554,816-byte peak.
+  All 19 build-policy tests pass on both Mac and Linux, including profile
+  exclusions and aggregate scheduling limits. The corrected Linux rebuild
+  passes all 132 steps without a memory-bound error; its API archive reports
+  a rounded 15G MaxRSS. See `zig/COMPILATION.md`.
+- `make gc` completes on both hosts, preserving active and protected caches.
+  The Mac run leaves 90.0 GiB free; Glowworm removes 233.9 GiB of idle output
+  and leaves 2979.3 GiB free.
+  Linux evidence is retained locally under
+  `.benchmark-results/privacy/outcome-cors-main-6c0/linux/`; the temporary
+  Glowworm qualification worktree and branch have been removed.
+- Inference and batching code is unchanged; this qualification does not
+  remeasure Metal or CUDA throughput.
+
 ### Committed acceptance and compact read bindings (2026-11-05)
 
 - Fix `adc07ca4f1` keeps successful policy/scan CAS responses caller-owned before
