@@ -59,6 +59,7 @@ def test_retry_preserves_pending_intent_until_durable_ack(run, monkeypatch):
     run.transaction(lake.TABLES[1], [{"op": "upsert", "row": row}])
     assert calls[0] == calls[1]
     assert run.expected == {42: row}
+    assert [batch for _, batch in run.search_intents] == [((42, 1),)]
     assert not (run.state / (lake.TABLES[1] + "-pending.json")).exists()
 
 
@@ -585,3 +586,87 @@ def test_final_accepted_sql_oracle_rejects_duplicate_keys(duplicate_version):
     with pytest.raises(AssertionError, match="duplicate HN keys"):
         lake.accepted_sql_versions([[7, 3], [7, duplicate_version]])
     assert lake.accepted_sql_versions([[7, 3], [8, 4]]) == {7: 3, 8: 4}
+
+
+@pytest.mark.parametrize("deleted", [False, True])
+def test_live_accepted_search_rejects_acknowledged_stale_or_deleted_rows(
+    run, monkeypatch, deleted
+):
+    def row(key, version):
+        return {
+            name: key
+            if name == "hn_id"
+            else version
+            if name == "qual_version"
+            else 0
+            if kind == "integer"
+            else "database"
+            for name, kind in lake.KINDS.items()
+        }
+
+    anchor, old, new = row(1, 0), row(2, 0), row(2, 1)
+    run.anchor_id = 1
+    run.known = {(1, 0): anchor, (2, 0): old, (2, 1): new}
+    run.expected = {1: anchor} if deleted else {1: anchor, 2: new}
+    run.transactions[lake.TABLES[1]] = [{}, {}]
+    run.search_intents = [(0, ((1, 0), (2, 0))), (0, ((2, None if deleted else 1),))]
+    monkeypatch.setattr(
+        run,
+        "call",
+        lambda *_: {
+            "responses": [
+                {
+                    "hits": {
+                        "hits": [
+                            {"_source": value, "_highlights": {"body": ["database"]}}
+                            for value in (anchor, old)
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    with pytest.raises(AssertionError, match="consistent acknowledged snapshot"):
+        run.query("accepted")
+    assert run.query("published")["hits"] == 2
+
+
+def test_accepted_snapshot_allows_pending_atomic_writes_but_rejects_torn_batches():
+    baseline = {1: 0, 2: 0, 3: 0}
+    intents = [((2, 1), (3, 1)), ((2, None),), ((2, 3),)]
+    for actual in (baseline, {1: 0, 2: 1, 3: 1}, {1: 0, 3: 1}, {1: 0, 2: 3, 3: 1}):
+        lake.require_accepted_snapshot(baseline, intents, actual)
+    with pytest.raises(AssertionError, match="consistent acknowledged snapshot"):
+        lake.require_accepted_snapshot(baseline, intents, {1: 0, 2: 1, 3: 0})
+    assert baseline == {1: 0, 2: 0, 3: 0}
+
+
+def test_live_accepted_search_allows_a_write_in_flight_at_invocation(run, monkeypatch):
+    anchor = {
+        name: 1 if kind == "integer" else "database"
+        for name, kind in lake.KINDS.items()
+    }
+    old = dict(anchor, hn_id=2, qual_version=0)
+    new = dict(old, qual_version=1)
+    run.anchor_id = 1
+    run.expected = {1: anchor, 2: old}
+    run.known = {(1, 1): anchor, (2, 0): old, (2, 1): new}
+    run.transactions[lake.TABLES[1]] = [{}]
+    run.search_intents = [(0, ((1, 1), (2, 0))), (0, ((2, 1),))]
+    monkeypatch.setattr(
+        run,
+        "call",
+        lambda *_: {
+            "responses": [
+                {
+                    "hits": {
+                        "hits": [
+                            {"_source": value, "_highlights": {"body": ["database"]}}
+                            for value in (anchor, new)
+                        ]
+                    }
+                }
+            ]
+        },
+    )
+    assert run.query("accepted")["row_versions"] == {"1": 1, "2": 1}

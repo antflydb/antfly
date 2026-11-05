@@ -15,7 +15,10 @@ The default bounded profile uses two dedicated object tables:
   and accepted highlighted searches run. It has a stored-source text index and
   scalar indexes. A stable seed anchor must survive every query. Final accepted
   SQL and published search must match acknowledged writes exactly, including
-  deletions, before and after restart/maintenance.
+  deletions, before and after restart/maintenance. During churn, every accepted
+  search must also match its acknowledged baseline or an atomic prefix of
+  concurrent submitted batches; stale historical images cannot pass merely
+  because the driver has seen them before.
 
 Both tables use the Antfly-managed Iceberg catalog. Vacuum runs with its normal
 minimum ten-minute retention and a bounded deletion budget. Incomplete operations
@@ -119,3 +122,19 @@ records the initial failures, their diagnosis, and subsequent full filesystem/GC
 passes at the explicitly identified bounded-cleanup revision. Later engine changes
 have separate checks; a pass at an earlier revision does not qualify the final
 source or full-archive performance.
+
+The fresh review follow-up strengthens live accepted-search verification and
+packs vacuum parent frontiers into authenticated pages of up to 32 frames.
+Execution checkpoints require version 4. In a bounded cold traversal diagnostic,
+checkpoint object operations fell from 87 to 26; this is an operation-count
+control, not a measured GCS latency improvement. Optional retirement hints reserve
+one second for required reads/checkpointing and skip warming when that time is
+unavailable. New attempts require fresh state. See the qualification record for
+reproductions, validation and the limits of earlier evidence.
+
+The follow-up passed all 620 native integration controls, 270 local SQL/lake,
+37 maintenance, 332 embedded-lake, 59 object-WAL and 15 catalog-owner controls,
+with zero failures or leaks. Embedded and WAL each retained one expected opt-in
+skip. Python qualification/recovery/metrics passed 65 tests and 11 subtests.
+These local Debug checks do not replace current-source ReleaseFast provider,
+full-archive or Cloud qualification.

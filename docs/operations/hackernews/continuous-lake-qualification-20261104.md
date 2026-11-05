@@ -956,3 +956,63 @@ qualification/metrics suite passed 50 tests; Ruff, Zig formatting, documentation
 links and diff checks passed. Earlier interrupted runs, compilation errors and
 obsolete-format fixture failures remain investigation evidence. These local
 controls do not replace final-source provider or full-archive qualification.
+
+
+## Fresh review: accepted-search evidence and bounded frontier checkpoints
+
+A fresh performance/correctness review of PR #1493 at `bc19d04543` found three
+additional issues. The corrections keep one current prerelease format; no lake
+migration readers are introduced.
+
+The live accepted-search oracle previously admitted any known historical row
+image. A response containing a superseded acknowledged update or a resurrected
+acknowledged delete could pass, even though final SQL/catch-up checks eventually
+verified the current state. Both false passes reproduced independently. Each
+accepted search now captures its acknowledged baseline before submission and
+must return exactly that baseline or an atomic prefix of concurrent submitted
+batches. Concurrent writes may become visible before their ACK; torn batches,
+missing acknowledged rows, stale images and resurrected deletes are rejected.
+The comparison is linear in result size plus concurrent changes, using a rolling
+mismatch count rather than copying/rechecking the complete snapshot per batch.
+Published searches still allow publication lag. Earlier qualification runs do not
+establish this stronger live accepted-search check retrospectively.
+
+A cold traversal over the normal nested shape of incrementally planned manifest
+inventories previously required one serial write per surviving parent frame.
+In a 128-root diagnostic, 64 traversal steps used 63 reads, then checkpointing
+required 87 additional object operations. A modeled 100-operation request budget
+expired before durable progress could be saved. Vacuum now packs up to 32 parent
+frames into each content-addressed frontier page. An authenticated prefix count
+pops entries without rewriting the page; only surviving new pages are uploaded,
+with descendants durable before their checkpoint reference. The same diagnostic
+used 26 checkpoint operations, 89 total, and completed within the budget. Cold
+pops from one page share one read. Execution checkpoints now require version 4;
+job format 4 is unchanged. Existing deep-frontier, restart and lost-ACK controls
+continue to cover durable progress. These are Debug operation counts, not new
+ReleaseFast latency or real-provider qualification results.
+
+Optional retirement hints previously capped their deadline at the parent request
+deadline, leaving no guaranteed time for a required read or progress checkpoint.
+Hints now reserve one second for required work, decline without I/O when that
+reserve is unavailable, and apply their shorter deadline during validation,
+cache admission and encoding as well as provider I/O. Required reads retain their
+parent context and remain the fallback. A regression verifies both hint load and
+save decline near the deadline while the required membership read succeeds.
+
+
+Final follow-up validation passed all 620 native integration controls, including
+the previously obsolete sparse-metadata fixture, with zero skips, failures or
+leaks. All 270 local SQL/lake, 332 embedded-lake, 59 object-WAL and 15 catalog-owner
+controls also passed; the embedded and WAL owners each skipped one opt-in
+benchmark/scale control. The dedicated maintenance run passed all 37 controls.
+The focused Python qualification, recovery and metrics suite passed 65 tests and
+11 subtests. Ruff, Python/Zig formatting, documentation links and diff checks
+passed. The full current Debug regression build completed successfully on the
+contended developer host. Repository cache cleanup completed and preserved
+active builds. Temporary probe source and allocator tracing are absent from the
+PR; raw diagnostic output remains private.
+
+Final-source ReleaseFast filesystem/GCS, full-archive and Cloud qualification
+remain outstanding. No cloud jobs, exports, provisioning or additional cloud
+spend were initiated for this review. Full CI still requires a maintainer's
+exact-revision approval under the repository's CI policy.

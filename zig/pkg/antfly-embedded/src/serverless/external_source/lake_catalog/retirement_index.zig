@@ -96,11 +96,15 @@ pub const Index = struct {
             if (i != 0 and std.mem.order(u8, node.items[i - 1], item) != .lt) return error.InvalidLakeRetirementIndex;
         }
     }
-    fn hintContext(self: *Index) types.Context {
+    fn hintContext(self: *Index) !types.Context {
         var context = self.context;
-        // Optional warming must leave time for the required read/checkpoint.
-        const deadline = @import("antfly_platform").time.monotonicNs() +| std.time.ns_per_s;
-        context.deadline_ns = @min(context.deadline_ns orelse deadline, deadline);
+        const now = @import("antfly_platform").time.monotonicNs();
+        // Optional work must retain a required-read/checkpoint lane. A live
+        // parent with less than that reserve declines warming without I/O.
+        const reserve = std.time.ns_per_s;
+        const limit = if (context.deadline_ns) |parent| parent -| reserve else std.math.maxInt(u64);
+        if (now >= limit) return error.LakeRetirementHintBudgetExceeded;
+        context.deadline_ns = @min(limit, now +| std.time.ns_per_s);
         return context;
     }
     /// One bounded, replaceable hint object survives worker restarts. Every
@@ -109,22 +113,23 @@ pub const Index = struct {
     /// or deletion authority depends on the cache.
     pub fn loadHints(self: *Index) !void {
         try self.context.ensureActive();
+        var context = try self.hintContext();
         const a = self.arena.allocator();
         const path = try std.fmt.allocPrint(a, "{s}/warm-v1.json", .{self.prefix});
-        var context = self.hintContext();
         var object = try self.client.getObject(self.bucket, path, .{ .skip_metadata_probe = true, .max_response_bytes = hint_bytes, .cancellation = types.contextCancellation(&context) });
         defer object.deinit(self.client.allocator);
         const hints = try std.json.parseFromSliceLeaky(Hints, a, try decodeHint(a, object.body), .{ .allocate = .alloc_always });
         if (hints.version != 1 or hints.nodes.len > hint_nodes) return error.InvalidLakeRetirementIndex;
         // Validate the entire hint before making any of it available.
         for (hints.nodes) |hint| {
-            try self.context.ensureActive();
+            try context.ensureActive();
             try validate(hint.node);
             const bytes = try std.json.Stringify.valueAlloc(a, hint.node, .{});
             defer a.free(bytes);
             if (!std.mem.eql(u8, &digest(bytes), &hint.hash)) return error.InvalidLakeRetirementIndex;
         }
         for (hints.nodes) |hint| {
+            try context.ensureActive();
             if (self.cache.contains(hint.hash)) continue;
             const bytes = try std.json.Stringify.valueAlloc(a, hint.node, .{});
             defer a.free(bytes);
@@ -136,6 +141,7 @@ pub const Index = struct {
     }
     pub fn saveHints(self: *Index, roots: []const ?Digest) !void {
         try self.context.ensureActive();
+        var context = try self.hintContext();
         const a = self.arena.allocator();
         var queue: std.ArrayList(Digest) = .empty;
         for (0..roots.len) |i| if (roots[roots.len - 1 - i]) |hash| try queue.append(a, hash);
@@ -146,7 +152,7 @@ pub const Index = struct {
         // lose their leaves to a larger object-membership tree. Export cached
         // nodes only; warming never fetches additional source objects.
         while (queue.items.len != 0 and hints.items.len < hint_nodes) {
-            try self.context.ensureActive();
+            try context.ensureActive();
             const hash = queue.pop().?;
             if ((try seen.getOrPut(a, hash)).found_existing) continue;
             const node = (self.cache.get(hash) orelse continue).node;
@@ -167,7 +173,7 @@ pub const Index = struct {
         const bytes = encoded: {
             var count = hints.items.len;
             while (true) {
-                try self.context.ensureActive();
+                try context.ensureActive();
                 const plain = try std.json.Stringify.valueAlloc(a, Hints{ .nodes = hints.items[0..count] }, .{});
                 defer a.free(plain);
                 if (plain.len > decoded_hint_bytes) return error.LakeRetirementIndexBudgetExceeded;
@@ -184,7 +190,6 @@ pub const Index = struct {
         };
         const hash = digest(bytes);
         if (self.hint_digest) |previous| if (std.mem.eql(u8, &hash, &previous)) return;
-        var context = self.hintContext();
         const path = try std.fmt.allocPrint(a, "{s}/warm-v1.json", .{self.prefix});
         // Last-writer-wins is intentional: this bounded cache owns no progress,
         // roots or authority, and all restored nodes retain their hash checks.
@@ -918,4 +923,24 @@ test "external lake retirement hint selection shrinks incompressible cohorts wit
     try std.testing.expect(cold.cache.count() > 0);
     try std.testing.expect(cold.cache.count() < index.cache.count());
     for (uris) |uri| try std.testing.expect(try cold.contains(root, uri));
+}
+
+test "external lake retirement optional hints preserve required reads near a deadline" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var writer = Index.init(a, memory.client(), "archive", "hint-reserve", .{});
+    defer writer.deinit();
+    const root = try writer.insert(null, "required");
+    const context: types.Context = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() +| std.time.ns_per_s / 2 };
+    var reader = Index.init(a, memory.client(), "archive", "hint-reserve", context);
+    defer reader.deinit();
+    const before = memory.operationCount();
+    try std.testing.expectError(error.LakeRetirementHintBudgetExceeded, reader.loadHints());
+    try std.testing.expectEqual(before, memory.operationCount());
+    try std.testing.expect(try reader.contains(root, "required"));
+    const after = memory.operationCount();
+    try std.testing.expectError(error.LakeRetirementHintBudgetExceeded, reader.saveHints(&.{root}));
+    try std.testing.expectEqual(after, memory.operationCount());
+    try context.ensureActive();
 }

@@ -207,7 +207,7 @@ fn planningTurn(a: A, client_value: @import("objectstore").Client, bucket: []con
     return if (!progress.spilling and (progress.candidate == progress.candidates.len or progress.retired.len == progress.max_expired)) progress else null;
 }
 const Execution = struct {
-    version: u8 = 3,
+    version: u8 = 4,
     job: []const u8,
     pinned: usize = 0,
     cursor: plan.Cursor = .{},
@@ -237,7 +237,7 @@ fn executeJob(a: A, binding: local.serverless_external_source_catalog_binding.Bi
     var queued_bytes: ?[]u8 = null;
     defer if (queued_bytes) |bytes| a.free(bytes);
     var progress: Execution = if (saved) |value| try std.json.parseFromSliceLeaky(Execution, a, value.body, .{ .allocate = .alloc_always }) else .{ .job = job_hash };
-    if (progress.version != 3 or !std.mem.eql(u8, progress.job, job_hash) or progress.pinned > job.retired.len or progress.approved_index > progress.approved.len or progress.pending.len > catalog.types.max_reference_steps) return error.InvalidLakeVacuumPlan;
+    if (progress.version != 4 or !std.mem.eql(u8, progress.job, job_hash) or progress.pinned > job.retired.len or progress.approved_index > progress.approved.len or progress.pending.len > catalog.types.max_reference_steps) return error.InvalidLakeVacuumPlan;
     if (progress.complete and progress.pending.len != 0) return error.InvalidLakeVacuumPlan;
     const input_store = try inputs.Store.init(a, client, plans.bucket, plans.prefix, request.operation_id, context);
     var result: Result = .{ .expired_snapshots = job.retired.len };
@@ -1335,7 +1335,7 @@ fn verifyBufferedSelection(owned_count: usize) !void {
             const progress = try std.json.parseFromSliceLeaky(Execution, scratch.allocator(), saved.body, .{});
             try std.testing.expectEqual(@min(16, owned_count), progress.approved.len);
             try std.testing.expectEqual(owned_count - @min(16, owned_count), progress.pending.len);
-            try std.testing.expectEqual(@as(u8, 3), progress.version);
+            try std.testing.expectEqual(@as(u8, 4), progress.version);
             try std.testing.expectEqual(@as(usize, 0), progress.approved_index);
         }
         try std.testing.expectEqual(turn + 1 == turns, result.complete);

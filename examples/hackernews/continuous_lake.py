@@ -93,6 +93,34 @@ def accepted_sql_versions(rows):
     return actual
 
 
+def require_accepted_snapshot(baseline, intents, actual):
+    """A complete accepted result must be one atomic cut since invocation.
+
+    The acknowledged baseline is private to this read. In-flight write intents
+    may become visible before their ACK; only complete ordered batches may move
+    the cut. A rolling mismatch count avoids comparing every row per intent.
+    """
+    state = dict(baseline)
+    mismatches = sum(
+        state.get(key) != actual.get(key) for key in state.keys() | actual.keys()
+    )
+    if mismatches == 0:
+        return
+    for batch in intents:
+        for key, version in batch:
+            before = state.get(key) != actual.get(key)
+            if version is None:
+                state.pop(key, None)
+            else:
+                state[key] = version
+            mismatches += (state.get(key) != actual.get(key)) - before
+        if mismatches == 0:
+            return
+    raise AssertionError(
+        "accepted search did not return a consistent acknowledged snapshot"
+    )
+
+
 def manifest_entries(payload):
     from pyiceberg.io import InputFile
     from pyiceberg.manifest import read_manifest_list
@@ -299,6 +327,7 @@ class Run:
         self.metadata = []
         self.transactions = {name: [] for name in TABLES}
         self.expected = {}
+        self.search_intents = []
         self.known = {}
         self.catalog_seen = set()
         self.publication_seen = set()
@@ -555,6 +584,21 @@ class Run:
                 if name == TABLES[1] and change["op"] == "upsert":
                     row = change["row"]
                     self.known[(row["hn_id"], row["qual_version"])] = dict(row)
+            if name == TABLES[1]:
+                self.search_intents.append(
+                    (
+                        time.monotonic(),
+                        tuple(
+                            (
+                                change["row"]["hn_id"],
+                                None
+                                if change["op"] == "delete"
+                                else change["row"]["qual_version"],
+                            )
+                            for change in changes
+                        ),
+                    )
+                )
             atomic_json(self.state / (name + "-pending.json"), body)
         while True:
             try:
@@ -747,6 +791,13 @@ class Run:
 
     def query(self, visibility):
         started = time.monotonic()
+        with self.lock:
+            accepted_floor = len(self.transactions[TABLES[1]])
+            baseline = (
+                {key: row["qual_version"] for key, row in self.expected.items()}
+                if visibility == "accepted"
+                else None
+            )
         body = {
             "full_text_search": {"match": "database", "field": "body"},
             "full_text_index": "body_text",
@@ -776,15 +827,27 @@ class Run:
                         self.transactions[TABLES[1]][key[1] - 1].setdefault(
                             "publication_observed", now
                         )
+            intents = (
+                tuple(
+                    batch
+                    for submitted, batch in self.search_intents[accepted_floor:]
+                    if submitted <= now
+                )
+                if baseline is not None
+                else ()
+            )
+        versions = {
+            int(hit["_source"]["hn_id"]): int(hit["_source"]["qual_version"])
+            for hit in hits
+        }
+        if baseline is not None:
+            require_accepted_snapshot(baseline, intents, versions)
         if self.anchor_id not in {int(hit["_source"]["hn_id"]) for hit in hits}:
             raise AssertionError("query lost the stable seed anchor")
         if hits and not all(h.get("_highlights", {}).get("body") for h in hits):
             raise AssertionError("query omitted requested highlights")
         return {
-            "row_versions": {
-                str(hit["_source"]["hn_id"]): int(hit["_source"]["qual_version"])
-                for hit in hits
-            },
+            "row_versions": {str(key): version for key, version in versions.items()},
             "visibility": visibility,
             "elapsed_ms": (now - started) * 1000,
             "hits": len(hits),
