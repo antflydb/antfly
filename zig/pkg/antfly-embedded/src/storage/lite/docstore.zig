@@ -1824,13 +1824,20 @@ pub const Store = struct {
         return (try self.artifactRegistry()).beginConstruction();
     }
 
-    fn artifactRegistry(self: *Store) !*artifact_source.Registry {
+    pub fn artifactRegistry(self: *Store) !*artifact_source.Registry {
         lockStore(self);
         defer self.mutex.unlock();
         if (self.artifact_registry) |registry| return registry;
         const created = try artifact_source.Registry.create(self.allocator, self);
         self.artifact_registry = created;
         return created;
+    }
+
+    pub fn fenceUncertainPublication(self: *Store) void {
+        lockStore(self);
+        defer self.mutex.unlock();
+        self.file.checkpoint_publication_uncertain = true;
+        self.publishReadCheckpointAssumeLocked();
     }
 
     pub fn recordArtifactSourceOpen(self: *Store, reused: bool) void {
@@ -5366,6 +5373,22 @@ test "lite seekable replay resumes bounded families and retires charged chunks a
     try std.testing.expectEqual(@as(usize, 17), slices);
     try std.testing.expectEqual(@as(usize, 130), seen.count());
     try std.testing.expectEqual(@as(usize, 1), deletion_families);
+    {
+        // An unrelated hint falls back to the canonical lane. It must skip
+        // this manifest without resolving the prefix released by its consumers.
+        const Unrelated = struct {
+            fn consume(_: *anyopaque, _: u64, _: []const u8) !void {
+                return error.UnexpectedReplayHint;
+            }
+        };
+        var token: u8 = 0;
+        var unrelated = try source.openMatchingCursor(a, 0, .graph);
+        defer unrelated.deinit(a);
+        try std.testing.expect((try unrelated.readFamilySlice(a, "graph", null, 8, 0)) == null);
+        const skipped = try unrelated.forEachNext(8, &token, Unrelated.consume);
+        try std.testing.expectEqual(@as(usize, 1), skipped.hint_filter_skips);
+        try std.testing.expect((try unrelated.readFamilySlice(a, "graph", null, 8, 0)) == null);
+    }
     const before_retirement = try native_store.checkWithCancel(null);
     if (!before_retirement.valid) std.debug.print("before chunk retirement: {f}\n", .{std.json.fmt(before_retirement, .{})});
     try std.testing.expect(before_retirement.valid);

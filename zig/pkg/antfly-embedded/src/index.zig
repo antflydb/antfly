@@ -2675,6 +2675,7 @@ pub const IndexWriter = struct {
         writer: *IndexWriter,
         snapshot: *IndexSnapshot,
         retired: []SegmentEntry,
+        reused_ids: std.AutoHashMapUnmanaged(u64, void) = .empty,
         staging_alloc: Allocator,
         carried_count: usize,
         next_segment_id: u64,
@@ -2687,10 +2688,14 @@ pub const IndexWriter = struct {
 
             for (self.snapshot.segments[0..self.carried_count]) |*seg| seg.retain();
             for (self.retired) |*seg| {
+                // A deletion-only replacement keeps this physical artifact.
+                // Its new shared cell owns an independent Source reference.
+                if (self.reused_ids.contains(seg.id)) continue;
                 seg.data.madviseDiscardCleanPages();
                 std.debug.assert(seg.shared.retired_cleanup == null);
                 seg.shared.retired_cleanup = if (writer.retired_segment_cleanup) |cleanup| cleanup.retained() else null;
             }
+            self.reused_ids.deinit(self.staging_alloc);
             if (self.retired.len > 0) self.staging_alloc.free(self.retired);
 
             writer.next_segment_id = @max(writer.next_segment_id, self.next_segment_id);
@@ -2711,6 +2716,7 @@ pub const IndexWriter = struct {
             writer.alloc.free(self.snapshot.segments);
             self.snapshot.global_total_field_len.deinit(writer.alloc);
             writer.alloc.destroy(self.snapshot);
+            self.reused_ids.deinit(self.staging_alloc);
             if (self.retired.len > 0) self.staging_alloc.free(self.retired);
             writer.mu.unlock();
             self.active = false;
@@ -3472,18 +3478,20 @@ pub const IndexWriter = struct {
             replacement_readers_initialized += 1;
         }
 
+        var old_set = std.AutoHashMapUnmanaged(u64, void).empty;
+        defer old_set.deinit(scratch_alloc);
+        for (old_ids) |id| try old_set.put(scratch_alloc, id, {});
+        var reused_ids = std.AutoHashMapUnmanaged(u64, void).empty;
+        errdefer reused_ids.deinit(scratch_alloc);
+        for (replacements) |replacement| if (old_set.contains(replacement.id)) {
+            try reused_ids.put(scratch_alloc, replacement.id, {});
+        };
         const old = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
 
         var keep_count: usize = 0;
         var retire_count: usize = 0;
         for (old.segments) |*seg| {
-            var is_old = false;
-            for (old_ids) |oid| {
-                if (seg.id == oid) {
-                    is_old = true;
-                    break;
-                }
-            }
+            const is_old = old_set.contains(seg.id);
             if (is_old) {
                 retire_count += 1;
             } else {
@@ -3498,13 +3506,7 @@ pub const IndexWriter = struct {
         var idx: usize = 0;
         var ret_idx: usize = 0;
         for (old.segments) |seg| {
-            var is_old = false;
-            for (old_ids) |oid| {
-                if (seg.id == oid) {
-                    is_old = true;
-                    break;
-                }
-            }
+            const is_old = old_set.contains(seg.id);
             if (is_old) {
                 retired[ret_idx] = seg;
                 ret_idx += 1;
@@ -3594,6 +3596,7 @@ pub const IndexWriter = struct {
             .writer = self,
             .snapshot = new_snap,
             .retired = retired,
+            .reused_ids = reused_ids,
             .staging_alloc = scratch_alloc,
             .carried_count = keep_count,
             .next_segment_id = next_segment_id,
@@ -3713,6 +3716,76 @@ pub const IndexWriter = struct {
                 break;
             }
         }
+    }
+
+    /// Stage deletion bitmaps without changing a reader-visible shared cell.
+    /// Persistent replay publishes them with a complete replacement snapshot.
+    pub fn prepareDeleteInfos(self: *IndexWriter, alloc: Allocator, doc_ids: []const []const u8) ![]DeleteInfo {
+        self.lockMutex();
+        defer self.mu.unlock();
+        var wanted = std.StringHashMapUnmanaged(void).empty;
+        defer wanted.deinit(alloc);
+        for (doc_ids) |key| if (key.len != 0) {
+            try wanted.put(alloc, key, {});
+        };
+        var infos = std.ArrayListUnmanaged(DeleteInfo).empty;
+        errdefer {
+            for (infos.items) |info| {
+                alloc.free(info.bitmap_bytes);
+                alloc.free(info.local_ids);
+            }
+            infos.deinit(alloc);
+        }
+        const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
+        for (snap.segments) |*seg| {
+            var local_ids = std.ArrayListUnmanaged(u32).empty;
+            defer local_ids.deinit(alloc);
+            {
+                seg.shared.lockDeletionShared();
+                defer seg.shared.unlockDeletionShared();
+                var identities = @import("segment_source.zig").Scratch.init(alloc, 64 * 1024);
+                defer identities.deinit();
+                const lookup = @import("document_identity_lookup.zig");
+                const view = try seg.reader.documentIdentityLookup();
+                const legacy = if (view == null) try seg.shared.legacyIdentityLookup(&seg.reader) else &.{};
+                var keys = wanted.keyIterator();
+                while (keys.next()) |key| {
+                    const hash = lookup.hash(key.*);
+                    var cursor: usize = if (view) |data| try lookup.seek(data, seg.reader.doc_count, hash) else lookup.lowerBound(legacy, hash);
+                    const count = if (view != null) seg.reader.doc_count else legacy.len;
+                    while (cursor < count) : (cursor += 1) {
+                        const entry = if (view) |data| try lookup.readEntry(data, @intCast(cursor), seg.reader.doc_count) else legacy[cursor];
+                        if (entry.hash != hash) break;
+                        if (seg.shared.deleted) |d| if (d.contains(entry.doc)) continue;
+                        // Hash collisions are harmless only when the exact
+                        // stored external identity is checked before mutation.
+                        identities.reset();
+                        if (@import("builtin").is_test) seg.shared.identity_lookup_reads += 1;
+                        const id = (try seg.reader.storedIdAlloc(identities.allocator(), entry.doc)) orelse return error.InvalidSegment;
+                        if (std.mem.eql(u8, id, key.*)) try local_ids.append(alloc, entry.doc);
+                    }
+                }
+                // Keep mutation/rollback deltas deterministic even though the
+                // input hash set and ID routing use different iteration orders.
+                std.sort.pdq(u32, local_ids.items, {}, std.sort.asc(u32));
+            }
+            if (local_ids.items.len == 0) continue;
+
+            const ids = try local_ids.toOwnedSlice(alloc);
+            errdefer alloc.free(ids);
+            seg.shared.lockDeletionShared();
+            var bitmap = if (seg.shared.deleted) |*deleted| deleted.clone(alloc) catch |err| {
+                seg.shared.unlockDeletionShared();
+                return err;
+            } else roaring.RoaringBitmap.init(alloc);
+            seg.shared.unlockDeletionShared();
+            defer bitmap.deinit();
+            for (ids) |id| try bitmap.add(id);
+            const bytes = try bitmap.toBytes(alloc);
+            errdefer alloc.free(bytes);
+            try infos.append(alloc, .{ .seg_id = seg.id, .bitmap_bytes = bytes, .local_ids = ids, .applied_count = ids.len, .created_bitmap = false, .deleted_count_incremented = false });
+        }
+        return infos.toOwnedSlice(alloc);
     }
 
     /// Delete every live copy of a document and return one updated deletion

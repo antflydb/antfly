@@ -389,10 +389,16 @@ const ManualRuntime = struct {
         const ApplySession = struct {
             runtime: *ManualRuntime,
             token: CatchUpSessionToken,
+            fragments: ?runtime_types.ReplayFragments = null,
 
             fn apply(ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef) anyerror!bool {
                 const session: *@This() = @ptrCast(@alignCast(ptr));
                 return session.runtime.apply_fn(session.runtime.ctx, batch, index_ref, session.token);
+            }
+            fn applyFragment(ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, position: derived_worker.replay_fragment.Position) !bool {
+                const session: *@This() = @ptrCast(@alignCast(ptr));
+                const port = session.fragments.?;
+                return port.apply.?(port.ptr, batch, index_ref, position);
             }
         };
         var session = ApplySession{ .runtime = self, .token = token };
@@ -409,6 +415,7 @@ const ManualRuntime = struct {
             const port = wait.fragments orelse break :enabled null;
             break :enabled if (try port.supports(port.ptr, worker.name)) port else null;
         } else null;
+        session.fragments = fragments;
         const started = @import("antfly_platform").time.monotonicNs();
         const waited_before = if (wait.publication_overhead_ns) |counter| counter.load(.monotonic) else 0;
         const preparation_before = if (wait.full_text_preparation_ns) |counter| counter.load(.monotonic) else 0;
@@ -428,6 +435,7 @@ const ManualRuntime = struct {
                 .fragment_ctx = if (fragments) |port| port.ptr else null,
                 .load_fragment_fn = if (fragments) |port| port.load else null,
                 .save_fragment_fn = if (fragments) |port| port.save else null,
+                .apply_fragment_fn = if (fragments) |port| if (port.apply != null) ApplySession.applyFragment else null else null,
                 .max_records_per_window = if (wait.replay_budget != null) budget.records else derived_worker.catch_up_max_records_per_window_default,
                 .max_collected_items_per_window = if (wait.replay_budget != null) budget.records else 0,
                 .max_chunk_bytes = if (wait.replay_budget != null) budget.bytes else derived_worker.catch_up_max_chunk_bytes_default,

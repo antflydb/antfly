@@ -30,6 +30,7 @@ const platform_time = @import("antfly_platform").time;
 
 pub const replay_fragment = @import("replay_fragment.zig");
 pub const LoadFragmentFn = *const fn (*anyopaque, []const u8) anyerror!?replay_fragment.Position;
+pub const ApplyFragmentFn = *const fn (*anyopaque, derived_types.DerivedBatch, index_manager_mod.ManagedIndexRef, replay_fragment.Position) anyerror!bool;
 pub const SaveFragmentFn = *const fn (*anyopaque, []const u8, replay_fragment.Position) anyerror!void;
 
 pub const ApplyFn = batcher.ApplyFn;
@@ -133,6 +134,7 @@ pub const CatchUpOptions = struct {
     fragment_ctx: ?*anyopaque = null,
     load_fragment_fn: ?LoadFragmentFn = null,
     save_fragment_fn: ?SaveFragmentFn = null,
+    apply_fragment_fn: ?ApplyFragmentFn = null,
     /// Bound expanded work across complete journal records, without splitting
     /// an apply callback's input-ownership boundary. One oversized record is
     /// still admitted so the cursor can always advance.
@@ -422,7 +424,7 @@ pub fn catchUpIndexFromMatchingCursor(
                 saved = null;
             };
             const total = batch.documents.len + batch.deleted_keys.len + batch.overwritten_doc_keys.len + batch.changed_artifact_keys.len;
-            if (saved != null or total > options.max_fragment_families) {
+            if (options.apply_fragment_fn != null or saved != null or total > options.max_fragment_families) {
                 fragment_plan = try replay_fragment.Plan.init(scratch_alloc, batch, index_ref.name);
                 const continuation = try fragment_plan.?.startPosition(saved);
                 previously_applied = continuation.applied;
@@ -452,7 +454,11 @@ pub fn catchUpIndexFromMatchingCursor(
         }
 
         const apply_started_ns = monotonicTimeNs();
-        const new_effects = applyBatchBounded(apply_ctx, apply_fn, apply_batch, index_ref, if (fragments) 0 else options.max_items_per_window) catch |err| {
+        const application = if (fragment_position != null and options.apply_fragment_fn != null)
+            options.apply_fragment_fn.?(apply_ctx, apply_batch, index_ref, fragment_position.?)
+        else
+            applyBatchBounded(apply_ctx, apply_fn, apply_batch, index_ref, if (fragments) 0 else options.max_items_per_window);
+        const new_effects = application catch |err| {
             stats.apply_ns += monotonicTimeNs() - apply_started_ns;
             logCatchUpError(index_ref, "journal_apply", chunk_stats.last_sequence, stats.scanned_entries, stats.applied_entries, err);
             return err;

@@ -1108,6 +1108,7 @@ const ReplayApplyContext = struct {
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
     dense_capture_lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease = null,
     dense_window_sequence: u64 = 0,
+    fragment_position: ?apply_state.replay_fragment.Position = null,
 };
 
 const ReplayApplyContextBatch = struct {
@@ -1115,6 +1116,7 @@ const ReplayApplyContextBatch = struct {
     dense_bulk_session_scope: DenseBulkSessionScope = .auto,
     dense_capture_lease: ?index_manager_mod.IndexManager.DensePostingCaptureLease = null,
     dense_window_sequence: u64 = 0,
+    fragment_position: ?apply_state.replay_fragment.Position = null,
 };
 
 const TtlCleanupContext = execution_resources.TtlCleanupContext;
@@ -1455,6 +1457,7 @@ fn logReplayCatchUpProfile(index_ref: index_manager_mod.ManagedIndexRef, applied
 }
 
 fn logBatchProfile(req: types.BatchRequest, profile: BatchProfile) void {
+    std.log.info("antfly_bench_foreground_preparation writes={d} prepared_documents_consumed={d} unprepared_document_rows={d}", .{ req.writes.len, profile.prepared_documents_consumed, profile.unprepared_document_rows });
     std.log.info(
         "antfly_bench_row_pipeline writes={d} prepared_rows={d} logical_bytes={d} encoded_bytes={d} prepare_ms={d} apply_lock_wait_ms={d} apply_lock_held_ms={d}",
         .{
@@ -7579,6 +7582,13 @@ pub const DB = struct {
     /// with the primary write (see `apply_receipts.OutcomeMarker`).
     pub fn batchTrackedWithMarker(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker) anyerror!void {
         return self.batchTrackedWithPreparedDocuments(req, primary_committed, marker, null);
+    }
+
+    /// Current continuation authority, including native activation WAL state.
+    /// Callers must retain this DB's ordinary runtime/lifecycle admission.
+    pub fn loadReplayFragmentState(self: *DB, name: []const u8) !?apply_state.replay_fragment.Position {
+        if (comptime storage_engine.enabled) return storage_engine.call("loadReplayFragmentState", .{ self, name });
+        return loadReplayFragmentAsync(self.async_context, name);
     }
 
     pub fn batchTrackedWithPreparedDocuments(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker, prepared: ?*@import("prepared_document_batch.zig").Plan) anyerror!void {
@@ -32231,6 +32241,7 @@ pub const DB = struct {
                 .fragments = if (self.core.store.runtime_store.capabilities().bounded_replay_admission) .{
                     .ptr = self.async_context,
                     .supports = supportsReplayFragmentsAsync,
+                    .apply = applyReplayFragmentAsync,
                     .load = loadReplayFragmentAsync,
                     .save = saveReplayFragmentAsync,
                 } else null,
@@ -55900,6 +55911,7 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
                 .fragment_ctx = ctx.async_context,
                 .load_fragment_fn = if (fragments) loadReplayFragmentAsync else null,
                 .save_fragment_fn = if (fragments) saveReplayFragmentAsync else null,
+                .apply_fragment_fn = if (fragments) applyReplayFragmentBatch else null,
                 .persist_ctx = ctx.async_context,
                 .persist_progress_fn = if (fragments) persistFragmentRecordProgress else null,
             },
@@ -55961,6 +55973,30 @@ fn canAdvanceDerivedReplayTargetContext(
     return try canAdvanceDerivedToTargetAsync(&async_ctx, index_ref, from_sequence, target_sequence);
 }
 
+fn applyReplayFragmentBatch(ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, position: apply_state.replay_fragment.Position) !bool {
+    const request: *ReplayApplyContextBatch = @ptrCast(@alignCast(ptr));
+    request.fragment_position = position;
+    defer request.fragment_position = null;
+    return applyDerivedBatchToIndexReplayContext(ptr, batch, index_ref);
+}
+
+fn applyReplayFragmentDB(ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, position: apply_state.replay_fragment.Position) !bool {
+    const request: *ReplayApplyContext = @ptrCast(@alignCast(ptr));
+    request.fragment_position = position;
+    defer request.fragment_position = null;
+    return applyDerivedBatchToIndexReplay(ptr, batch, index_ref);
+}
+
+fn applyReplayFragmentAsync(ptr: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, position: apply_state.replay_fragment.Position) !bool {
+    const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
+    if (index_ref.kind != .full_text) return error.Unsupported;
+    if (!try batchAffectsManagedIndexForReplay(ctx.index_manager, batch, index_ref)) return false;
+    var profile: BatchProfile = .{};
+    defer _ = ctx.full_text_preparation_ns.fetchAdd(profile.full_text_collect_ns + profile.full_text_plan_ns + profile.full_text_prepare_ns, .monotonic);
+    try local_mutation.applyDerivedBatchToIndexContextProfiledWithFragment(ctx, batch, index_ref, &profile, true, null, position);
+    return true;
+}
+
 fn applyDerivedBatchToIndexReplayContext(
     ctx_ptr: *anyopaque,
     batch: derived_types.DerivedBatch,
@@ -55988,12 +56024,13 @@ fn applyDerivedBatchToIndexReplayContext(
         .snapshot_replay_admission = ctx.snapshot_replay_admission,
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
         .require_graph_resolution_contract = true,
+        .replay_index_publication = if (ctx.async_context) |active| active.replay_index_publication else null,
         .text_merge_runtime = if (ctx.async_context) |active| active.text_merge_runtime else null,
     };
     if (benchMetricsEnabled()) {
         var profile = BatchProfile{};
         const total_start_ns = monotonicTimeNs();
-        try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, &profile, true, null);
+        try local_mutation.applyDerivedBatchToIndexContextProfiledWithFragment(&async_ctx, batch, index_ref, &profile, true, null, replay_ctx.fragment_position);
         const index_sync_start_ns = monotonicTimeNs();
         try ctx.index_manager.syncReplayStateByName(ctx.store, index_ref.name);
         recordProfileNs(&profile, &profile.index_sync_ns, index_sync_start_ns);
@@ -56005,7 +56042,7 @@ fn applyDerivedBatchToIndexReplayContext(
         // the same explicit borrowing capability as the profiled path; routing
         // it through the ordinary foreground helper would correctly reject
         // the already-active capture as unrelated ownership.
-        try applyDerivedBatchToIndexContextProfiled(&async_ctx, batch, index_ref, null, true, null);
+        try local_mutation.applyDerivedBatchToIndexContextProfiledWithFragment(&async_ctx, batch, index_ref, null, true, null, replay_ctx.fragment_position);
         try ctx.index_manager.syncReplayStateByName(ctx.store, index_ref.name);
     }
     return true;
@@ -56178,6 +56215,7 @@ fn replayVisibilityWait(ctx: *AsyncContext, requested: derived_executor_mod.Visi
     if (wait.fragments == null and ctx.store.runtime_store.capabilities().bounded_replay_admission) wait.fragments = .{
         .ptr = ctx,
         .supports = supportsReplayFragmentsAsync,
+        .apply = applyReplayFragmentAsync,
         .load = loadReplayFragmentAsync,
         .save = saveReplayFragmentAsync,
     };
@@ -56198,18 +56236,39 @@ fn replayFragmentIdentityAsync(ctx: *AsyncContext, name: []const u8) !apply_stat
 
 fn loadReplayFragmentAsync(ptr: *anyopaque, name: []const u8) !?apply_state.replay_fragment.Position {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
-    return apply_state.loadReplayFragment(ctx.alloc, ctx.store, name, try replayFragmentIdentityAsync(ctx, name));
+    const identity = try replayFragmentIdentityAsync(ctx, name);
+    const primary = try apply_state.loadReplayProgress(ctx.alloc, ctx.store, name, identity);
+    if (ctx.index_manager.textIndex(name)) |index| if (try index.loadReplayFragment(identity)) |physical| {
+        if (physical.sequence > primary.applied_sequence) {
+            if (primary.fragment) |saved| {
+                if (saved.sequence == physical.sequence and (saved.total_items != physical.total_items or
+                    !std.mem.eql(u8, &saved.fingerprint, &physical.fingerprint))) return error.InvalidDerivedApplyState;
+                if (saved.sequence > physical.sequence or (saved.sequence == physical.sequence and saved.next_item > physical.next_item)) return saved;
+            }
+            return physical;
+        }
+    };
+    return primary.fragment;
 }
 
 fn saveReplayFragmentAsync(ptr: *anyopaque, name: []const u8, position: apply_state.replay_fragment.Position) !void {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ptr));
-    // Partial output is durable, but grants no complete-record visibility seal.
-    // Share this ordering across registered and workerless replay owners.
+    const identity = try replayFragmentIdentityAsync(ctx, name);
+    if (ctx.index_manager.textIndex(name)) |index| if (try index.loadReplayFragment(identity)) |physical| {
+        if (std.meta.eql(physical, position)) {
+            // Activation and continuation already share a durable WAL record.
+            // A duplicate primary metadata commit buys no stronger guarantee.
+            if (ctx.store.deferred_replay_retirement) |state| state.partial_pending = true;
+            return;
+        }
+    };
+    // Portable/legacy output retains the conservative output-before-cursor
+    // order. Native partial output grants no complete-record visibility seal.
     try ctx.index_manager.syncAppliedReplayBoundaryForManagedIndex(.{ .name = name, .kind = .full_text });
     const port = ctx.replay_metadata_publication;
     if (port) |publication| try publication.enter(publication.ptr);
     defer if (port) |publication| publication.leave(publication.ptr);
-    try apply_state.saveReplayFragment(ctx.alloc, ctx.store, name, try replayFragmentIdentityAsync(ctx, name), position);
+    try apply_state.saveReplayFragment(ctx.alloc, ctx.store, name, identity, position);
     if (ctx.store.deferred_replay_retirement) |state| state.partial_pending = true;
 }
 
@@ -56495,6 +56554,7 @@ fn replayPendingDerivedBatches(
                 .fragment_ctx = &persist_progress_ctx,
                 .load_fragment_fn = if (fragment_replay) PersistReplayProgress.loadFragment else null,
                 .save_fragment_fn = if (fragment_replay) PersistReplayProgress.saveFragment else null,
+                .apply_fragment_fn = if (fragment_replay) applyReplayFragmentDB else null,
                 .max_windows_per_call = if (options.bounded_replay) 1 else options.max_windows_per_index,
                 .target_sequence = if (options.bounded_replay) target_sequence else 0,
                 .max_call_ns = if (options.bounded_replay) @import("derived/replay_budget.zig").Controller.quantum_ns else 0,
@@ -57815,13 +57875,15 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
         .snapshot_replay_admission = resources.snapshot_replay_admission,
         .dense_bulk_session_scope = replay_ctx.dense_bulk_session_scope,
         .require_graph_resolution_contract = true,
+        .replay_index_publication = self.async_context.replay_index_publication,
+        .text_merge_runtime = self.async_context.text_merge_runtime,
     };
     const measure_preparation = index_ref.kind == .full_text and resources.store.runtime_store.capabilities().bounded_replay_admission;
     var profile: BatchProfile = .{};
     defer if (measure_preparation) {
         _ = self.async_context.full_text_preparation_ns.fetchAdd(profile.full_text_collect_ns + profile.full_text_plan_ns + profile.full_text_prepare_ns, .monotonic);
     };
-    applyDerivedBatchToIndexContextProfiled(&ctx, batch, index_ref, if (measure_preparation) &profile else null, true, null) catch |err| switch (err) {
+    local_mutation.applyDerivedBatchToIndexContextProfiledWithFragment(&ctx, batch, index_ref, if (measure_preparation) &profile else null, true, null, replay_ctx.fragment_position) catch |err| switch (err) {
         // External-vector dense indexes can discover a missing artifact while
         // replaying an otherwise valid journal window. Existing generations
         // turn that into durable repair debt; initial materialization keeps it
@@ -58137,20 +58199,29 @@ fn retireConsumedReplayChunkPrefix(ctx: *AsyncContext) !bool {
         minimum = @min(minimum, sequence.*);
     }
     if (minimum == std.math.maxInt(u64)) return false;
-    const candidate = minimum + 1;
-    if (try clampReplayForNonIndexConsumers(ctx, candidate) < candidate) return false;
     const chunks = @import("derived/replay_chunks.zig");
     var txn = try ctx.store.beginWriteTxn();
     var committed = false;
     defer if (!committed) txn.abort();
-    const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, candidate);
-    const raw = txn.get(&key) catch |err| switch (err) {
-        error.NotFound => return false,
-        else => return err,
+    // Reserved/aborted source sequences may leave holes. Find the first
+    // actual canonical record after the coarse frontier rather than waiting
+    // for an entry at minimum+1 that will never exist.
+    const manifest = manifest: {
+        var cursor = try txn.openCursor();
+        defer cursor.close();
+        const lower = internal_keys.replayRangeLower(internal_keys.replay_all_kind, minimum + 1);
+        const upper = internal_keys.replayRangeUpper(internal_keys.replay_all_kind);
+        cursor.setUpperBound(&upper);
+        const entry = (try cursor.seekAtOrAfter(&lower)) orelse return false;
+        if (std.mem.order(u8, entry.key, &upper) != .lt) return false;
+        const sequence = internal_keys.parseReplayEntrySequence(entry.key, internal_keys.replay_all_kind) orelse return error.InvalidReplayEntryKey;
+        if (!chunks.isManifest(entry.value)) return false;
+        const value = try chunks.Manifest.decode(entry.value);
+        if (value.sequence != sequence) return error.InvalidReplayChunk;
+        break :manifest value;
     };
-    if (!chunks.isManifest(raw)) return false;
-    const manifest = try chunks.Manifest.decode(raw);
-    if (manifest.sequence != candidate) return error.InvalidReplayChunk;
+    const candidate = manifest.sequence;
+    if (try clampReplayForNonIndexConsumers(ctx, candidate) < candidate) return false;
     var families: u64 = manifest.families;
     for (managed, applied) |ref, sequence| {
         if (sequence >= candidate) continue;
@@ -77216,7 +77287,131 @@ test "db owned document preparation transfers effects and rejects changed identi
     defer a.free(value);
     try std.testing.expectEqualStrings("{\"message\":\"κόσμος\"}", value);
     prepared.incarnation ^= 1;
-    try std.testing.expect(!try prepared.matches(&database));
+    try std.testing.expectError(error.TableNotFound, prepared.matches(&database));
+}
+
+test "db native chunk retirement waits for every text consumer across index replacement and vacuum" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    const chunks = @import("derived/replay_chunks.zig");
+    var directory = try TestDirectory.init("native-consumer-chunk-frontier");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrint(a, "{s}/consumers.aflite", .{directory.path()});
+    defer a.free(path);
+    var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer host.deinit();
+    var backend = try lite.Handle.createWithOptions(a, path, .{ .exclusive = true, .externally_locked = true, .no_sync = true, .io = std.testing.io });
+    defer backend.deinit();
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    var options: OpenOptions = .{ .backend_runtime = host.ptr(), .executor = .{ .backend = .manual }, .start_index_workers = true, .start_optional_runtimes = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false, .text_merge = .{ .enabled = false } };
+    try backend.configureDbOpenOptions(&options);
+    var db = try DB.open(a, path, options);
+    var db_live = true;
+    defer if (db_live) db.close();
+    var state: DB.GroupSourceMaintenanceState = .{};
+    defer {
+        if (db_live) {
+            db.borrowed_group_source_state = null;
+            db.core.store.deferred_replay_retirement = null;
+        }
+        state.deinit();
+    }
+    db.borrowed_group_source_state = &state;
+    db.core.store.deferred_replay_retirement = &state.replay_retirement;
+    try db.addIndex(.{ .name = "fast", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{ .name = "slow", .kind = .full_text, .config_json = "{}" });
+    var keys: [130][32]u8 = undefined;
+    var writes: [130]types.BatchWrite = undefined;
+    for (&writes, 0..) |*write, i| write.* = .{ .key = try std.fmt.bufPrint(&keys[i], "family-{d}", .{i}), .value = "{\"text\":\"bounded consumer frontier\"}" };
+    // Model source numbers reserved by an aborted participant. Retirement
+    // must use the next live record, not assume contiguous source numbers.
+    try db.core.store.ensureReplayNextSequenceAtLeast(17);
+    try db.batch(.{ .writes = &writes, .sync_level = .write });
+    const target = db.core.nextDerivedSequence();
+    const canonical_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, target);
+    const chunk_key = chunks.chunkKey(target, 0);
+    try db.runDerivedUntilTargets(target, &.{"fast"});
+    try std.testing.expect(try db.core.loadAppliedSequence(a, "fast") >= target);
+    try std.testing.expect(try db.core.loadAppliedSequence(a, "slow") < target);
+    _ = try db.runBackgroundTurnWithCancellation(.none, .retirement);
+    {
+        const raw = try db.core.store.get(a, &canonical_key);
+        defer a.free(raw);
+        try std.testing.expectEqual(@as(u32, 0), (try chunks.Manifest.decode(raw)).retired_chunks);
+        const kept = try db.core.store.get(a, &chunk_key);
+        a.free(kept);
+    }
+    state.replay_budget.max_records = 64;
+    state.replay_budget.lanes[0].records = 64;
+    try db.runDerivedUntilTargetsWithVisibilityWait(target, &.{"slow"}, .{ .replay_budget = &state.replay_budget });
+    try std.testing.expectEqual(@as(u64, 64), ((try db.loadReplayFragmentState("slow")) orelse return error.TestExpectedFragmentContinuation).next_item);
+    const partial = db.core.index_manager.textIndex("slow").?.acquireSnapshot();
+    defer partial.release();
+    try std.testing.expectEqual(@as(u32, 64), partial.liveDocCount());
+    const before = (try backend.native_docstore.?.file.replayAdmission()).?;
+    _ = try db.runBackgroundTurnWithCancellation(.none, .retirement);
+    {
+        const raw = try db.core.store.get(a, &canonical_key);
+        defer a.free(raw);
+        try std.testing.expectEqual(@as(u32, 1), (try chunks.Manifest.decode(raw)).retired_chunks);
+        try std.testing.expectError(error.NotFound, db.core.store.get(a, &chunk_key));
+        const after = (try backend.native_docstore.?.file.replayAdmission()).?;
+        try std.testing.expect(after.bytes < before.bytes);
+        try std.testing.expectEqual(before.records, after.records);
+    }
+    // New/recreated generations build the current primary cut, not a retired
+    // prefix of the journal. They cannot invalidate the sibling's continuation.
+    try db.addIndex(.{ .name = "new", .kind = .full_text, .config_json = "{}" });
+    try std.testing.expectEqual(@as(u32, 130), db.core.index_manager.textIndex("new").?.snapshot().liveDocCount());
+    try std.testing.expect(try db.deleteIndex("fast"));
+    try db.addIndex(.{ .name = "fast", .kind = .full_text, .config_json = "{}" });
+    try std.testing.expectEqual(@as(u32, 130), db.core.index_manager.textIndex("fast").?.snapshot().liveDocCount());
+    db.core.store.deferred_replay_retirement = null;
+    db.borrowed_group_source_state = null;
+    db.close();
+    db_live = false;
+    _ = try backend.vacuum();
+    // A physical replacement retains the logical replay identity and its
+    // physical activation checkpoint, including a partially retired manifest.
+    options.open_mode = .writer_no_replay;
+    try backend.configureDbOpenOptions(&options);
+    db = try DB.open(a, path, options);
+    db_live = true;
+    try std.testing.expectEqual(@as(u64, 64), ((try db.loadReplayFragmentState("slow")) orelse return error.TestExpectedFragmentContinuation).next_item);
+    try db.runDerivedUntilTargets(db.core.nextDerivedSequence(), &.{"slow"});
+    try std.testing.expectEqual(@as(u32, 130), db.core.index_manager.textIndex("slow").?.snapshot().liveDocCount());
+    try std.testing.expectEqual(@as(u32, 64), partial.liveDocCount());
+    try std.testing.expect((try backend.check()).valid);
+}
+
+test "db atomic text producer admission charges oversized groups and retains backoff" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("atomic-text-producer-admission");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .text_merge = .{ .enabled = false } });
+    defer db.close();
+    try db.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    const resources = db.core.batchExecutionResources();
+    var runtime = try text_merge_runtime_mod.TextMergeRuntime.init(a, resources.index_manager, resources.apply_mutex, db.backend_runtime, .{
+        .enabled = true,
+        .max_pending_segments = 4,
+        .resume_pending_segments = 2,
+        .max_pending_bytes = 0,
+        .backpressure_max_wait_ms = 1000,
+        .defer_producer_to_owner = true,
+    });
+    defer runtime.deinit();
+    try std.testing.expectError(error.TextPublicationExceedsSegmentLimit, runtime.acquireProducerPermit("text", 8, 0));
+    var atomic = try runtime.acquireAtomicProducerPermit("text", 8, 0);
+    defer atomic.release();
+    try std.testing.expectEqual(@as(u64, 8), runtime.producer_segment_reservations);
+    try std.testing.expectError(error.EnrichmentWaitCanceled, runtime.acquireProducerPermit("text", 1, 0));
+    atomic.release();
+    try std.testing.expectEqual(@as(u64, 0), runtime.producer_segment_reservations);
+    var normal = try runtime.acquireProducerPermit("text", 1, 0);
+    normal.release();
 }
 
 test "db detached replay leaves optional maintenance to its retained continuation" {

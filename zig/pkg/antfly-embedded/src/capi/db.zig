@@ -1261,6 +1261,47 @@ pub fn writeIntentsInternal(
     });
 }
 
+const StructBatchRequest = struct {
+    arena: std.heap.ArenaAllocator,
+    req: db_mod.types.BatchRequest,
+
+    fn parse(a: Allocator, writes_ptr: ?[*]const capi.WriteIntent, count: usize, predicates_ptr: ?[*]const capi.VersionPredicate, predicate_count: usize, timestamp: u64, sync: u8) !@This() {
+        const level: db_mod.types.SyncLevel = switch (sync) {
+            0 => .write,
+            1 => .full_index,
+            else => return error.InvalidArgument,
+        };
+        var arena = std.heap.ArenaAllocator.init(a);
+        errdefer arena.deinit();
+        const scratch = arena.allocator();
+        const writes = try scratch.alloc(db_mod.types.BatchWrite, count);
+        const deletes = try scratch.alloc([]const u8, count);
+        const predicates = try scratch.alloc(db_mod.types.TransactionVersionPredicate, predicate_count);
+        var write_count: usize = 0;
+        var delete_count: usize = 0;
+        for (0..count) |i| {
+            const src = writes_ptr.?[i];
+            if (src.is_delete) {
+                deletes[delete_count] = src.key.bytes();
+                delete_count += 1;
+            } else {
+                writes[write_count] = .{ .key = src.key.bytes(), .value = src.value.bytes() };
+                write_count += 1;
+            }
+        }
+        for (predicates, 0..) |*predicate, i| predicate.* = .{
+            .key = predicates_ptr.?[i].key.bytes(),
+            .expected_version = predicates_ptr.?[i].expected_version,
+        };
+        return .{ .arena = arena, .req = .{ .writes = writes[0..write_count], .deletes = deletes[0..delete_count], .predicates = predicates, .timestamp_ns = timestamp, .sync_level = level } };
+    }
+
+    fn deinit(self: *@This()) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+
 pub fn batchInternal(
     handle: *Handle,
     writes_ptr: ?[*]const capi.WriteIntent,
@@ -1272,44 +1313,9 @@ pub fn batchInternal(
     primary_committed: *bool,
 ) !void {
     primary_committed.* = false;
-    var writes = std.ArrayListUnmanaged(db_mod.types.BatchWrite).empty;
-    defer writes.deinit(handle.alloc);
-    var deletes = std.ArrayListUnmanaged([]const u8).empty;
-    defer deletes.deinit(handle.alloc);
-    var predicates = try handle.alloc.alloc(db_mod.types.TransactionVersionPredicate, predicate_count);
-    defer handle.alloc.free(predicates);
-
-    for (0..write_count) |i| {
-        const src = writes_ptr.?[i];
-        if (src.is_delete) {
-            try deletes.append(handle.alloc, src.key.bytes());
-        } else {
-            try writes.append(handle.alloc, .{
-                .key = src.key.bytes(),
-                .value = src.value.bytes(),
-            });
-        }
-    }
-    for (0..predicate_count) |i| {
-        predicates[i] = .{
-            .key = predicates_ptr.?[i].key.bytes(),
-            .expected_version = predicates_ptr.?[i].expected_version,
-        };
-    }
-
-    const level: db_mod.types.SyncLevel = switch (sync_level) {
-        0 => .write,
-        1 => .full_index,
-        else => return error.InvalidArgument,
-    };
-
-    try trackedBatch(handle.database(), .{
-        .writes = writes.items,
-        .deletes = deletes.items,
-        .predicates = predicates,
-        .timestamp_ns = timestamp_ns,
-        .sync_level = level,
-    }, primary_committed, handle.selected_table_name);
+    var owned = try StructBatchRequest.parse(handle.alloc, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level);
+    defer owned.deinit();
+    try trackedBatch(handle.database(), owned.req, primary_committed, handle.selected_table_name);
 }
 
 /// A tracked exported batch. When this thread runs an exported write (see
@@ -5075,20 +5081,36 @@ pub fn antfly_db_batch(
         return @call(.auto, @extern(*const @TypeOf(antfly_db_batch), .{ .name = "antfly_db_batch" }), .{ handle_ptr, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level });
     capi.clearLastError();
     if ((write_count > 0 and writes_ptr == null) or (predicate_count > 0 and predicates_ptr == null)) return capi.mapErrorContext(error.InvalidArgument, @src().fn_name ++ ": write and predicate pointers must not be null when their counts are nonzero");
+    const a = std.heap.c_allocator;
+    var owned = StructBatchRequest.parse(a, writes_ptr, write_count, predicates_ptr, predicate_count, timestamp_ns, sync_level) catch |err| return capi.mapError(err);
+    defer owned.deinit();
+    const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
+    var prepared: ?Prepared = null;
+    defer if (prepared) |*plan| plan.deinit();
+    if (owned.req.writes.len != 0) {
+        const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
+        defer guard.leave();
+        if (guard.entry_error) |code| {
+            // Optional preparation must not turn ordinary mutation admission
+            // retry into a one-shot read refusal. The mutation path rechecks it.
+            if (code != .busy) return capi.ensureError(code, @src().fn_name);
+        } else prepared = Prepared.capture(guard.handle.database().alloc, guard.handle.database()) catch |err| return capi.mapError(err);
+    }
+    if (prepared) |*plan| plan.prepare(owned.req) catch |err| return capi.mapError(err);
     const Request = struct {
-        writes: ?[*]const capi.WriteIntent,
-        count: usize,
-        predicates: ?[*]const capi.VersionPredicate,
-        predicate_count: usize,
-        timestamp: u64,
-        sync: u8,
+        owned: *StructBatchRequest,
+        prepared: ?*Prepared,
+        fn prepare(raw: *anyopaque) !void {
+            const request: *@This() = @ptrCast(@alignCast(raw));
+            if (request.prepared) |plan| try plan.prepareAttempt();
+        }
         fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            return batchInternal(handle, self.writes, self.count, self.predicates, self.predicate_count, self.timestamp, self.sync, primary_committed);
+            const request: *@This() = @ptrCast(@alignCast(raw));
+            try trackedBatchWithPreparedDocuments(handle.database(), request.owned.req, primary_committed, handle.selected_table_name, request.prepared);
         }
     };
-    var request = Request{ .writes = writes_ptr, .count = write_count, .predicates = predicates_ptr, .predicate_count = predicate_count, .timestamp = timestamp_ns, .sync = sync_level };
-    return executeBatchWithReplayAdmissionRetry(handle_ptr, &request, Request.apply);
+    var request: Request = .{ .owned = &owned, .prepared = if (prepared) |*plan| plan else null };
+    return executeBatchWithReplayPreparation(handle_ptr, &request, Request.prepare, Request.apply);
 }
 
 var test_batch_response_allocator: if (builtin.is_test) ?Allocator else void = if (builtin.is_test) null else {};
@@ -5141,8 +5163,9 @@ pub fn antfly_db_batch_json(
         // without either process gate or native writer lease.
         const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
         defer guard.leave();
-        if (guard.entry_error) |code| return capi.ensureError(code, @src().fn_name);
-        prepared = Prepared.capture(a, guard.handle.database()) catch |err| return capi.mapError(err);
+        if (guard.entry_error) |code| {
+            if (code != .busy) return capi.ensureError(code, @src().fn_name);
+        } else prepared = Prepared.capture(guard.handle.database().alloc, guard.handle.database()) catch |err| return capi.mapError(err);
     }
     if (prepared) |*plan| plan.prepare(owned.req) catch |err| return capi.mapError(err);
     const Request = struct {

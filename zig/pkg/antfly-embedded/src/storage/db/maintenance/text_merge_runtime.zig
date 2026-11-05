@@ -153,6 +153,10 @@ const UnsupportedTextMergeRuntime = struct {
         return .{};
     }
 
+    pub fn acquireAtomicProducerPermit(self: *@This(), name: []const u8, count: u64, bytes: u64) !ProducerPermit {
+        return self.acquireProducerPermit(name, count, bytes);
+    }
+
     pub fn producerSegmentReservationLimit(_: *const @This()) usize {
         return std.math.maxInt(usize);
     }
@@ -768,6 +772,25 @@ const PlatformTextMergeRuntime = struct {
         segment_count: u64,
         byte_count: u64,
     ) !ProducerPermit {
+        return acquireProducerPermitWithOptions(self, index_name, segment_count, byte_count, false);
+    }
+
+    pub fn acquireAtomicProducerPermit(
+        self: *TextMergeRuntime,
+        index_name: []const u8,
+        segment_count: u64,
+        byte_count: u64,
+    ) !ProducerPermit {
+        return acquireProducerPermitWithOptions(self, index_name, segment_count, byte_count, true);
+    }
+
+    fn acquireProducerPermitWithOptions(
+        self: *TextMergeRuntime,
+        index_name: []const u8,
+        segment_count: u64,
+        byte_count: u64,
+        allow_oversized: bool,
+    ) !ProducerPermit {
         const producer_io = self.io;
         if (producer_io) |io| {
             self.mutex.lockUncancelable(io);
@@ -806,7 +829,7 @@ const PlatformTextMergeRuntime = struct {
         {
             return .{ .runtime = self, .index_name = null, .segment_count = 0, .byte_count = 0, .active = false };
         }
-        if (self.config.max_pending_segments > 0 and segment_count > self.config.max_pending_segments)
+        if (!allow_oversized and self.config.max_pending_segments > 0 and segment_count > self.config.max_pending_segments)
             return error.TextPublicationExceedsSegmentLimit;
 
         const started_ns = self.backpressureNowNs();
@@ -893,7 +916,14 @@ const PlatformTextMergeRuntime = struct {
             const request_oversized_bytes = self.config.max_pending_bytes > 0 and byte_count > self.config.max_pending_bytes;
             const no_existing_debt = stats_snapshot.pending_heap_bytes == 0 and
                 self.producer_segment_reservations == 0 and self.producer_byte_reservations == 0;
-            const segments_admissible = self.config.max_pending_segments == 0 or admitted_segments <= self.config.max_pending_segments;
+            // A bounded atomic fragment cannot be split after activation. As
+            // with an oversized byte request, admit one explicitly charged
+            // group only while no producer debt exists and this index is below
+            // its segment watermark. The next producer waits for its merge.
+            const oversized_atomic = allow_oversized and self.config.max_pending_segments > 0 and
+                segment_count > self.config.max_pending_segments and no_existing_debt and
+                active_segments < self.config.max_pending_segments;
+            const segments_admissible = self.config.max_pending_segments == 0 or admitted_segments <= self.config.max_pending_segments or oversized_atomic;
             const bytes_admissible = self.config.max_pending_bytes == 0 or admitted_bytes <= self.config.max_pending_bytes;
             const request_bytes_admissible = if (request_oversized_bytes) no_existing_debt else bytes_admissible;
             if (segments_admissible and request_bytes_admissible) {

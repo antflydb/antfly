@@ -1177,6 +1177,14 @@ and older binaries reject the revision-11 signature before checkpoint selection.
 Unreleased revision-4/5/6 prototypes are rejected rather than mixing reader,
 logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-11 image.
 
+Struct and JSON document batches capture an owned catalog plan under a short
+lifetime guard, then map document, graph-field and direct embedding inputs before
+writer admission. The commit validates exact catalog and namespace identities;
+transforms and predicates still resolve against the authoritative transaction.
+Prepared allocations use the database owner's allocator, including across the
+shared-library boundary. Benchmark profiles report consumed and fallback document
+counts so an unused preparation plan cannot masquerade as a performance gain.
+
 Revision 11 adds seekable canonical family chunks with a fixed-size Merkle-root
 manifest. A replay turn decodes at most 64 families before selecting its bounded
 application slice. All effects of one document family remain together. Chunk
@@ -1275,8 +1283,14 @@ accounting, including prepared-decision and consumer rules. Polls and admission
 share one deadline, cancellation stops re-entry, and close retains no registry
 pins while a batch waits.
 
-Replay prepares full-text inputs outside writer admission, then publishes each
-prepared chunk and its progress metadata in separate bounded admission groups.
+Replay prepares full-text inputs and stages immutable artifacts outside writer
+admission. Native publication selects fresh segment aliases under admission,
+then commits the complete activation set, private deletion bitmaps and family
+continuation in one index-metadata WAL record. Readers adopt the prepared snapshot
+only after that commit. An uncertain commit retains the referenced artifacts and
+fences the owner until close/reopen. Portable backends retain output-before-cursor
+ordering. Native continuation reads prefer the identity-checked activation record;
+a duplicate primary progress write is unnecessary.
 The source snapshot remains pinned until the replay turn returns and all journal
 cursors close; preparing the last segment does not end those cursors' borrowing
 lifetimes. Native publication

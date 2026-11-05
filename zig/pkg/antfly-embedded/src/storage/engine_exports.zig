@@ -653,6 +653,9 @@ fn tryEmbeddedBackupReadFence(self: *DB) engine.Outcome(?DB.StatementReadFence) 
     return .{ .value = self.tryEmbeddedBackupReadFence() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn loadReplayFragmentState(self: *DB, name: []const u8) engine.Outcome(?@import("db/derived/replay_fragment.zig").Position) {
+    return .{ .value = self.loadReplayFragmentState(name) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
 fn catchUpPendingDerivedReplay(self: *DB) engine.Outcome(void) {
     return .{ .value = self.catchUpPendingDerivedReplay() catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

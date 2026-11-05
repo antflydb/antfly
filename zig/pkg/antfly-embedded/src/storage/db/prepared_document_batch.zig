@@ -117,7 +117,9 @@ pub const Plan = struct {
     /// reuse across a serving-runtime refresh. Process-local counters alone
     /// cannot establish equality between two independently opened runtimes.
     pub fn matches(self: *const Plan, database: anytype) !bool {
-        if (!std.meta.eql(self.namespace, database.core.identity_namespace) or self.incarnation != database.root_incarnation) return false;
+        // This request was bound to a specific namespace at capture. Falling
+        // back on a replacement table/database would silently retarget it.
+        if (!std.meta.eql(self.namespace, database.core.identity_namespace) or self.incarnation != database.root_incarnation) return error.TableNotFound;
         var schema = database.core.acquireSchemaView();
         defer if (schema) |*view| view.release();
         if (schema) |view| if (view.storageMode() == .relational) return false;

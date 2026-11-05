@@ -89,6 +89,7 @@ pub const DecodeRequest = struct {
     }
 };
 const SourceBoundary = callback_abi.Boundary(struct {
+    retain_owned: ?*const fn (*anyopaque) anyerror!Source,
     read_into: *const fn (*anyopaque, u64, []u8) anyerror!void,
     acquire_decoded: ?*const fn (*anyopaque, DecodeRequest) anyerror!?Decoded,
     lookup_decoded: ?*const fn (*anyopaque, DecodeKey) anyerror!?Decoded,
@@ -112,6 +113,9 @@ pub const Source = union(enum) {
         read_into: *const fn (*anyopaque, u64, []u8) anyerror!void,
         boundary_dispatch: callback_abi.CallbackDispatch = SourceBoundary.local_dispatch,
         close: *const fn (*anyopaque) void,
+        /// Acquire an independent closeable reference to immutable bytes.
+        /// A use lease alone does not transfer descriptor ownership.
+        retain_owned: ?*const fn (*anyopaque) anyerror!Source = null,
         /// Advisory bounded lookahead; errors belong to subsequent required reads.
         prefetch: ?*const fn (*anyopaque, u64, u64) void = null,
         checksum: ?*const fn (*anyopaque, u64, u64) anyerror!u32 = null,
@@ -185,6 +189,12 @@ pub const Source = union(enum) {
 
     pub fn acquireUse(self: Source) bool {
         return if (self == .ranges) if (self.ranges.acquire_use) |acquire| acquire(self.ranges.ptr) else true else true;
+    }
+
+    pub fn retainOwned(self: Source) !Source {
+        if (self != .ranges) return error.Unsupported;
+        const retain = self.ranges.retain_owned orelse return error.Unsupported;
+        return SourceBoundary.call("retain_owned", self.ranges.boundary_dispatch, retain, .{self.ranges.ptr});
     }
     pub fn releaseUse(self: Source) void {
         if (self == .ranges) if (self.ranges.release_use) |release| release(self.ranges.ptr);

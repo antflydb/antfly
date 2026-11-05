@@ -95,6 +95,7 @@ fn retainPooled(identity: ArtifactIdentity) ?*State {
 pub const WorkingSet = struct {
     const max_entries = 128;
     const max_bytes = 128 * 1024 * 1024;
+    pub const max_range_bytes = 128 * 1024 * 1024;
     const lifetime_ns = 5 * std.time.ns_per_s;
     entries: [max_entries]?*State = @splat(null),
     count: usize = 0,
@@ -135,32 +136,45 @@ pub const WorkingSet = struct {
             next = state.next;
             visited += 1;
             if (visited > max_entries or self.count == max_entries) break;
-            const identity = state.pool_identity orelse continue;
-            if (identity.inode != inode) continue;
-            var duplicate = false;
-            for (self.entries[0..self.count]) |entry| if (entry.? == state) {
-                duplicate = true;
-                break;
-            };
-            if (duplicate) continue;
-            @import("antfly_platform").sync.lockYielding(&state.lifetime_mutex);
-            defer state.lifetime_mutex.unlock();
-            if (state.marker == null or state.resources_closed.load(.monotonic)) continue;
-            const overhead = state.source().ranges.retention_overhead_bytes;
-            // File ranges and resident memory have independent bounds.
-            // The overhead reserves both source and decoded cache capacity.
-            const charge = overhead;
-            if (charge > max_bytes -| self.bytes or state.value.length > generation_bytes -| self.range_bytes) continue;
-            state.source_references += 1;
-            state.active_uses += 1;
-            self.entries[self.count] = state;
-            self.count += 1;
-            self.bytes += charge;
-            self.range_bytes += state.value.length;
-            self.inode = inode;
-            // Existing entries do not extend their deadline on every poll.
-            if (self.expires_ns == 0) self.expires_ns = now_ns +| lifetime_ns;
+            self.captureState(state, inode, generation_bytes, now_ns);
         }
+        // A pooled hit can belong to a detached prior registry. Remember only
+        // bounded copied identities here, never raw State pointers or strong
+        // Registry references. Resolve them while holding the pool mutex.
+        for (registry.borrowed[0..registry.borrowed_count]) |identity| {
+            if (self.count == max_entries) break;
+            if (source_pool.getContext(identity, identity)) |state|
+                self.captureState(state, inode, generation_bytes, now_ns);
+        }
+    }
+
+    // Caller holds pool and registry mutexes, in that order.
+    fn captureState(self: *WorkingSet, state: *State, inode: u64, generation_bytes: u64, now_ns: u64) void {
+        const identity = state.pool_identity orelse return;
+        if (identity.inode != inode) return;
+        var duplicate = false;
+        for (self.entries[0..self.count]) |entry| if (entry.? == state) {
+            duplicate = true;
+            break;
+        };
+        if (duplicate) return;
+        @import("antfly_platform").sync.lockYielding(&state.lifetime_mutex);
+        defer state.lifetime_mutex.unlock();
+        if (state.marker == null or state.resources_closed.load(.monotonic)) return;
+        const overhead = state.source().ranges.retention_overhead_bytes;
+        // File ranges and resident memory have independent bounds.
+        // The overhead reserves both source and decoded cache capacity.
+        const charge = overhead;
+        if (charge > max_bytes -| self.bytes or state.value.length > @min(generation_bytes, max_range_bytes) -| self.range_bytes) return;
+        state.source_references += 1;
+        state.active_uses += 1;
+        self.entries[self.count] = state;
+        self.count += 1;
+        self.bytes += charge;
+        self.range_bytes += state.value.length;
+        self.inode = inode;
+        // Existing entries do not extend their deadline on every poll.
+        if (self.expires_ns == 0) self.expires_ns = now_ns +| lifetime_ns;
     }
 };
 
@@ -175,6 +189,9 @@ pub const Registry = struct {
     callbacks: usize = 0,
     references: std.atomic.Value(usize) = .init(1),
     first: ?*State = null,
+    borrowed: [128]ArtifactIdentity = undefined,
+    borrowed_count: usize = 0,
+    borrowed_next: usize = 0,
     retired_bytes: std.atomic.Value(u64) = .init(0),
     coordinator: ?*native.ReaderCoordinator = null,
     owned_resources: ?struct { manager: *@import("../resource_manager.zig").ResourceManager, allocator: Allocator } = null,
@@ -217,6 +234,10 @@ pub const Registry = struct {
             owner.allocator.destroy(owner.manager);
         }
         if (self.coordinator) |coordinator| coordinator.release();
+        for (self.borrowed[0..self.borrowed_count]) |identity| {
+            self.allocator.free(identity.key);
+            self.allocator.free(identity.inline_bytes);
+        }
         self.allocator.free(self.path);
         self.allocator.destroy(self);
     }
@@ -256,7 +277,7 @@ pub const Registry = struct {
         _ = self.references.fetchAdd(1, .monotonic);
     }
 
-    fn beginCallback(self: *Registry) ?*docs.Store {
+    pub fn beginCallback(self: *Registry) ?*docs.Store {
         const runtime = self.io();
         self.mutex.lockUncancelable(runtime);
         defer self.mutex.unlock(runtime);
@@ -266,7 +287,7 @@ pub const Registry = struct {
         return owner;
     }
 
-    fn endCallback(self: *Registry) void {
+    pub fn endCallback(self: *Registry) void {
         const runtime = self.io();
         self.mutex.lockUncancelable(runtime);
         defer self.mutex.unlock(runtime);
@@ -418,7 +439,32 @@ pub const Registry = struct {
         var value = try file.openIndexValue(self.allocator, key, pin.checkpoint);
         defer value.deinit(self.allocator);
         const identity: ArtifactIdentity = .{ .path = self.path, .key = key, .inode = (try file.file.stat(file.runtime())).inode, .root = value.root, .length = value.length, .inline_bytes = value.inline_bytes };
-        return retainPooled(identity);
+        const state = retainPooled(identity) orelse return null;
+        // The returned source reference keeps the pooled identity alive while
+        // this optional cache bookkeeping runs, without holding the pool lock.
+        self.rememberBorrowed(identity) catch {};
+        return state;
+    }
+
+    fn rememberBorrowed(self: *Registry, identity: ArtifactIdentity) !void {
+        const runtime = self.io();
+        self.mutex.lockUncancelable(runtime);
+        defer self.mutex.unlock(runtime);
+        for (self.borrowed[0..self.borrowed_count]) |known|
+            if (identity.eql(known, identity)) return;
+        const key = try self.allocator.dupe(u8, identity.key);
+        errdefer self.allocator.free(key);
+        const inline_bytes = try self.allocator.dupe(u8, identity.inline_bytes);
+        const slot = if (self.borrowed_count < self.borrowed.len) self.borrowed_count else self.borrowed_next;
+        if (slot < self.borrowed_count) {
+            self.allocator.free(self.borrowed[slot].key);
+            self.allocator.free(self.borrowed[slot].inline_bytes);
+        } else self.borrowed_count += 1;
+        self.borrowed[slot] = identity;
+        self.borrowed[slot].path = self.path;
+        self.borrowed[slot].key = key;
+        self.borrowed[slot].inline_bytes = inline_bytes;
+        self.borrowed_next = (slot + 1) % self.borrowed.len;
     }
 
     pub fn open(self: *Registry, key: []const u8) !Source {
@@ -589,6 +635,46 @@ pub const Construction = struct {
     }
 };
 
+test "lite artifact working set recaptures pooled sources through a new registry" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/recapture.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var first = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    first.maintenance_start_suppressed = true;
+    var first_live = true;
+    defer if (first_live) first.close();
+    try first.file.putIndexCatalogRecord("/index/kept", "immutable payload");
+    var original = try first.openArtifactSource("/index/kept");
+    defer original.close();
+    const inode = (try first.file.file.stat(first.file.runtime())).inode;
+    var working: WorkingSet = .{};
+    defer working.clear();
+    working.capture(first.artifact_registry.?, inode, 1024 * 1024, 1);
+    try std.testing.expectEqual(@as(usize, 1), working.count);
+    first.close();
+    first_live = false;
+    var second = try docs.Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    second.maintenance_start_suppressed = true;
+    defer second.close();
+    var pooled = try second.openArtifactSource("/index/kept");
+    defer pooled.close();
+    try std.testing.expect(pooled.acquireUse());
+    defer pooled.releaseUse();
+    try std.testing.expectEqual(@as(usize, 1), second.artifact_registry.?.borrowed_count);
+    try std.testing.expect(second.artifact_registry.?.first == null);
+    const expiry = working.expires_ns;
+    working.capture(second.artifact_registry.?, inode, 1024 * 1024, expiry);
+    try std.testing.expectEqual(@as(usize, 1), working.count);
+    try std.testing.expect(working.expires_ns > expiry);
+    var bytes: [17]u8 = undefined;
+    try pooled.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("immutable payload", &bytes);
+    working.observe(inode + 1, expiry + 1);
+    try std.testing.expectEqual(@as(usize, 0), working.count);
+}
+
 test "lite artifact construction survives Store refresh and releases orphan ownership after close" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -712,7 +798,19 @@ const State = struct {
     resource_manager: ?*@import("../resource_manager.zig").ResourceManager = null,
 
     fn source(self: *State) Source {
-        return .{ .ranges = .{ .ptr = self, .length = self.value.length, .read_into = read, .visit_range = visit, .checksum = checksum, .read_authenticated = authenticate, .close = close, .retained_bytes = retainedBytes, .retention_overhead_bytes = 2 * source_cache_bytes + decoded_cache_bytes + DecodedCache.metadata_overhead + 64 * 1024 + @sizeOf(State) + self.value.inline_bytes.len + self.artifact_key.len + self.lease_key.len + self.marker_path.len, .retention_artifact_only = self.marker != null, .resource_manager = self.resource_manager, .acquire_use = acquireUse, .release_use = releaseUse, .enable_idle_expiry = enableIdleExpiry, .immutable_identity = self.immutable_identity, .acquire_decoded = acquireDecoded, .lookup_decoded = lookupDecoded } };
+        return .{ .ranges = .{ .ptr = self, .length = self.value.length, .read_into = read, .visit_range = visit, .checksum = checksum, .read_authenticated = authenticate, .close = close, .retain_owned = retainOwned, .retained_bytes = retainedBytes, .retention_overhead_bytes = 2 * source_cache_bytes + decoded_cache_bytes + DecodedCache.metadata_overhead + 64 * 1024 + @sizeOf(State) + self.value.inline_bytes.len + self.artifact_key.len + self.lease_key.len + self.marker_path.len, .retention_artifact_only = self.marker != null, .resource_manager = self.resource_manager, .acquire_use = acquireUse, .release_use = releaseUse, .enable_idle_expiry = enableIdleExpiry, .immutable_identity = self.immutable_identity, .acquire_decoded = acquireDecoded, .lookup_decoded = lookupDecoded } };
+    }
+
+    fn retainOwned(ptr: *anyopaque) !Source {
+        const self: *State = @ptrCast(@alignCast(ptr));
+        @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
+        defer source_pool_mutex.unlock();
+        @import("antfly_platform").sync.lockYielding(&self.lifetime_mutex);
+        defer self.lifetime_mutex.unlock();
+        if (self.resources_closed.load(.monotonic)) return error.EnrichmentWaitCanceled;
+        self.source_references += 1;
+        self.shared = true;
+        return self.source();
     }
 
     fn closeResources(self: *State) void {

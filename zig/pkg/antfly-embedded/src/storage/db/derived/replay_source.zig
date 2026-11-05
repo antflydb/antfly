@@ -97,14 +97,24 @@ pub const MatchingCursor = struct {
             .journal => return null,
             .primary_store => |*value| value,
         };
-        const entry = cursor.entry orelse return null;
+        const entry = (try filterLaneEntry(cursor.entry, cursor.scan_lane_ordinal)) orelse {
+            cursor.entry = null;
+            return null;
+        };
         if (cursor.scan_txn.?.current_scan.?.vtable.get == null) return null;
         const sequence = internal_keys.parseReplayEntrySequence(entry.key, cursor.scan_lane_ordinal) orelse return error.InvalidReplayEntryKey;
         if (target_sequence != 0 and sequence > target_sequence) return null;
         const canonical = try replay_reference.canonicalRaw(&cursor.scan_txn.?, sequence, cursor.scan_lane_ordinal, entry.value);
         if (!replay_chunks.isManifest(canonical)) return null;
         const manifest = try replay_chunks.Manifest.decode(canonical);
-        if (manifest.sequence != sequence or manifest.hints & change_journal_mod.singleHintMask(cursor.hint) == 0) return error.InvalidReplayChunk;
+        if (manifest.sequence != sequence) return error.InvalidReplayChunk;
+        if (manifest.hints & change_journal_mod.singleHintMask(cursor.hint) == 0) {
+            // Legacy canonical-lane fallback can encounter unrelated records.
+            // Its normal iterator accounts and skips this without reading any
+            // already-retired chunks. A hint-lane mismatch remains corruption.
+            if (cursor.fallback_all) return null;
+            return error.InvalidReplayChunk;
+        }
         const fingerprint = manifest.fingerprint(index_name);
         var start: u64 = 0;
         var applied = false;
@@ -129,7 +139,7 @@ pub const MatchingCursor = struct {
         if (next > manifest.families) return error.InvalidReplayChunk;
         if (next == manifest.families) {
             cursor.next_sequence = sequence;
-            cursor.entry = try cursor.cursor.?.next();
+            cursor.entry = try filterLaneEntry(try cursor.cursor.?.next(), cursor.scan_lane_ordinal);
         }
         return .{ .payload = payload, .position = .{ .sequence = sequence, .next_item = next, .total_items = manifest.families, .fingerprint = fingerprint, .applied = applied } };
     }
@@ -361,12 +371,19 @@ const PrimaryStoreMatchingCursor = struct {
         self.scan_lane_ordinal = lane_ordinal;
         self.scan_txn = txn;
         self.cursor = scan_cursor;
-        self.entry = if (entry) |kv|
-            if (internal_keys.parseReplayEntrySequence(kv.key, lane_ordinal) != null) kv else null
-        else
-            null;
+        self.entry = try filterLaneEntry(entry, lane_ordinal);
     }
 };
+
+// Cursor upper bounds are borrowed by some backends. Do not retain a pointer
+// to an openLane stack buffer; enforce the lane boundary on every advance.
+fn filterLaneEntry(entry: ?backend_erased.Entry, lane: u8) !?backend_erased.Entry {
+    const row = entry orelse return null;
+    const upper = internal_keys.replayRangeUpper(lane);
+    if (std.mem.order(u8, row.key, &upper) != .lt) return null;
+    if (internal_keys.parseReplayEntrySequence(row.key, lane) == null) return error.InvalidReplayEntryKey;
+    return row;
+}
 
 fn primaryStoreFallbackScanBudget(max_matched_entries: usize) usize {
     if (max_matched_entries == 0) return primary_store_fallback_scan_budget_max;
@@ -435,6 +452,22 @@ fn primaryStoreMatchingCursorForEachNext(
             cursor.entry = null;
             break;
         };
+        if (cursor.fallback_all) {
+            const canonical = try replay_reference.canonicalRaw(&cursor.scan_txn.?, sequence, cursor.scan_lane_ordinal, entry.value);
+            if (replay_chunks.isManifest(canonical)) {
+                const manifest = try replay_chunks.Manifest.decode(canonical);
+                if (manifest.sequence != sequence) return error.InvalidReplayChunk;
+                if (manifest.hints & change_journal_mod.singleHintMask(cursor.hint) == 0) {
+                    stats.scanned_entries += 1;
+                    stats.hint_filter_skips += 1;
+                    stats.last_sequence = sequence;
+                    cursor.next_sequence = sequence;
+                    cursor.entry = try filterLaneEntry(try cursor.cursor.?.next(), cursor.scan_lane_ordinal);
+                    if (stats.scanned_entries >= max_scanned_entries) return stats;
+                    continue;
+                }
+            }
+        }
         const resolved = try replay_reference.resolve(cursor.store.alloc, &cursor.scan_txn.?, sequence, cursor.scan_lane_ordinal, entry.value);
         defer if (resolved) |owned| cursor.store.alloc.free(owned);
         const payload = resolved orelse entry.value;
@@ -443,7 +476,7 @@ fn primaryStoreMatchingCursorForEachNext(
             stats.hint_filter_skips += 1;
             stats.last_sequence = sequence;
             cursor.next_sequence = sequence;
-            cursor.entry = try cursor.cursor.?.next();
+            cursor.entry = try filterLaneEntry(try cursor.cursor.?.next(), cursor.scan_lane_ordinal);
             if (stats.scanned_entries >= max_scanned_entries) return stats;
             continue;
         }
@@ -458,7 +491,7 @@ fn primaryStoreMatchingCursorForEachNext(
         stats.matched_entries += 1;
         stats.last_sequence = sequence;
         cursor.next_sequence = sequence;
-        cursor.entry = try cursor.cursor.?.next();
+        cursor.entry = try filterLaneEntry(try cursor.cursor.?.next(), cursor.scan_lane_ordinal);
         if (max_matched_entries != 0 and stats.matched_entries >= max_matched_entries) return stats;
     }
     cursor.hint_exhausted = true;

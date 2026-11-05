@@ -10004,9 +10004,9 @@ fn runForegroundCatchUpPassOwned(
     // One slot is reserved per document before any external invocation begins.
     const replay_window: @import("../derived/replay_source.zig").Source.EnrichmentWindow = if (available_documents != 0)
         try runtime.replay_source.collectEnrichmentDocumentGroupsWindow(runtime.alloc, scheduler.state.scanned_sequence -| @as(u64, if (scheduler.state.scan_document.len != 0) 1 else 0), .{
-            .max_records = if (guard.cooperative) guard.replay_limits.max_records else 4096,
-            .max_document_groups = @min(available_documents, if (guard.cooperative) guard.replay_limits.max_document_groups else 128),
-            .max_input_bytes = if (guard.cooperative) guard.replay_limits.max_input_bytes else 4 * 1024 * 1024,
+            .max_records = if (guard.cooperative and guard.replay_limits.max_records != 0) @min(4096, guard.replay_limits.max_records) else 4096,
+            .max_document_groups = @min(available_documents, if (guard.cooperative and guard.replay_limits.max_document_groups != 0) guard.replay_limits.max_document_groups else 128),
+            .max_input_bytes = if (guard.cooperative and guard.replay_limits.max_input_bytes != 0) @min(4 * 1024 * 1024, guard.replay_limits.max_input_bytes) else 4 * 1024 * 1024,
         })
     else
         .{ .groups = try runtime.alloc.alloc(enrichment_worker.PendingDocumentGroup, 0), .last_sequence = scheduler.state.scanned_sequence };

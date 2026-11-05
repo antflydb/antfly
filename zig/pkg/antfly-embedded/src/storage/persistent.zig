@@ -967,7 +967,27 @@ pub const PreparedMergeSegment = struct {
     }
 };
 
+pub const ReplayFragment = @import("db/derived/replay_fragment.zig");
+const immutable_artifact = @import("immutable_artifact.zig");
+pub const PreparedReplaySegment = struct {
+    artifact: immutable_artifact.Prepared,
+    key_range: SegmentKeyRange,
+    alloc: Allocator,
+    pub fn deinit(self: *@This()) void {
+        self.artifact.deinit();
+        self.key_range.deinit(self.alloc);
+        self.* = undefined;
+    }
+};
+
+pub fn prepareReplaySegment(alloc: Allocator, stager: immutable_artifact.Stager, bytes: []const u8) !PreparedReplaySegment {
+    var range = try extractSegmentKeyRange(alloc, bytes);
+    errdefer range.deinit(alloc);
+    return .{ .artifact = try stager.stage(bytes), .key_range = range, .alloc = alloc };
+}
+
 /// Meta keys in persistent storage.
+const meta_replay_fragment = "replay_fragment_v1";
 const meta_committed_lsn = "committed_lsn";
 const meta_rebuild_cursor = "rebuild_snapshot_cursor";
 const meta_next_seg_id = "next_seg_id";
@@ -1285,6 +1305,141 @@ pub const PersistentIndex = struct {
     pub fn supportsFileBackedSegmentArtifacts(self: *const PersistentIndex) bool {
         const store = self.segment_files orelse return false;
         return store.storage_owner != null or store.storage.vtable.open_leased_immutable_source != null or store.storage.vtable.map_immutable_artifact != null;
+    }
+
+    pub fn acquireReplayStager(self: *PersistentIndex, alloc: Allocator) !?immutable_artifact.Stager {
+        if (!self.main_store_owner.externallyPublishedWal()) return null;
+        const files = self.segment_files orelse return null;
+        return files.storage.acquireImmutableStager(alloc);
+    }
+
+    pub fn loadReplayFragment(self: *PersistentIndex, identity: ReplayFragment.Identity) !?ReplayFragment.Position {
+        self.lockStorage();
+        defer self.unlockStorage();
+        var txn = try self.beginReadMainTxn();
+        defer txn.abort();
+        const raw = txn.get(.meta, meta_replay_fragment) catch |err| return if (err == error.NotFound) null else err;
+        const checkpoint = try ReplayFragment.decode(raw);
+        if (!std.meta.eql(checkpoint.identity, identity)) return null;
+        return checkpoint.position;
+    }
+
+    /// Artifacts were staged outside admission. This commit activates every
+    /// replacement, its private deletion bitmap and its continuation in one WAL
+    /// record. Every allocation for reader publication precedes that commit.
+    pub fn publishReplay(
+        self: *PersistentIndex,
+        segments: []PreparedReplaySegment,
+        delete_keys: []const []const u8,
+        checkpoint: ReplayFragment.Checkpoint,
+    ) ![]index_mod.IndexWriter.DeleteInfo {
+        self.lockStorage();
+        defer self.unlockStorage();
+        if (!self.main_store_owner.externallyPublishedWal()) return error.Unsupported;
+        const files = if (self.segment_files) |*value| value else return error.Unsupported;
+        {
+            var previous_txn = try self.beginReadMainTxn();
+            defer previous_txn.abort();
+            const raw = previous_txn.get(.meta, meta_replay_fragment) catch |err|
+                if (err == error.NotFound) null else return err;
+            if (raw) |bytes| {
+                const previous = try ReplayFragment.decode(bytes);
+                if (std.meta.eql(previous.identity, checkpoint.identity)) {
+                    if (previous.position.sequence > checkpoint.position.sequence) return error.EnrichmentWaitCanceled;
+                    if (previous.position.sequence == checkpoint.position.sequence) {
+                        if (previous.position.total_items != checkpoint.position.total_items or
+                            !std.mem.eql(u8, &previous.position.fingerprint, &checkpoint.position.fingerprint)) return error.InvalidDerivedApplyState;
+                        if (previous.position.next_item > checkpoint.position.next_item) return error.EnrichmentWaitCanceled;
+                        if (previous.position.next_item == checkpoint.position.next_item) return self.alloc.alloc(index_mod.IndexWriter.DeleteInfo, 0);
+                    }
+                }
+            }
+        }
+        const infos = try self.writer.prepareDeleteInfos(self.alloc, delete_keys);
+        errdefer self.freeDeleteInfos(infos);
+        const count = infos.len + segments.len;
+        const replacements = try self.alloc.alloc(index_mod.ReplacementSegmentData, count);
+        defer self.alloc.free(replacements);
+        const deleted = try self.alloc.alloc(roaring.RoaringBitmap, infos.len);
+        var deleted_count: usize = 0;
+        defer {
+            for (deleted[0..deleted_count]) |*bitmap| bitmap.deinit();
+            self.alloc.free(deleted);
+        }
+        const old_ids = try self.alloc.alloc(u64, infos.len);
+        defer self.alloc.free(old_ids);
+        var initialized: usize = 0;
+        var published = false;
+        var uncertain = false;
+        defer if (!published) {
+            for (replacements[0..initialized], 0..) |*replacement, i| {
+                replacement.data.deinit(self.alloc);
+                // A possibly committed WAL can refer to these paths. Only a
+                // fresh owner may reconcile it; never remove its immutable data.
+                if (i >= infos.len and !uncertain) self.deleteSegmentFile(replacement.id);
+            }
+        };
+        const captured = self.writer.acquireSnapshot();
+        defer captured.release();
+        for (infos, 0..) |info, i| {
+            deleted[i] = try roaring.RoaringBitmap.fromBytes(self.alloc, info.bitmap_bytes);
+            deleted_count += 1;
+            old_ids[i] = info.seg_id;
+            const entry = for (captured.segments) |*entry| {
+                if (entry.id == info.seg_id) break entry;
+            } else return error.InvalidDeletionSnapshot;
+            if (entry.data != .native) return error.Unsupported;
+            const source = try entry.data.native.retainOwned();
+            replacements[initialized] = .{ .id = info.seg_id, .data = .fromNative(source), .deleted = &deleted[i] };
+            initialized += 1;
+        }
+        for (segments) |*segment| {
+            const id = self.reserveSegmentId();
+            const path = try files.pathAlloc(id);
+            defer self.alloc.free(path);
+            // Choosing the alias only under admission prevents a peer from
+            // assigning this id between staging and activation.
+            const source = segment.artifact.link(path) catch |err| {
+                self.deleteSegmentFile(id);
+                return err;
+            };
+            replacements[initialized] = .{ .id = id, .data = .fromNative(source) };
+            initialized += 1;
+        }
+        var publication: ?index_mod.IndexWriter.PreparedSegmentReplacement = if (count != 0)
+            try self.writer.prepareSegmentsManyData(old_ids, replacements)
+        else
+            null;
+        defer if (publication) |*prepared| prepared.abort();
+        var txn = try self.beginWriteMainTxn();
+        errdefer txn.abort();
+        for (infos) |info| {
+            const key = std.mem.toBytes(std.mem.nativeToBig(u64, info.seg_id));
+            try txn.put(.deletions, &key, info.bitmap_bytes);
+        }
+        for (segments, replacements[infos.len..]) |*segment, replacement| {
+            try self.saveSegmentRange(&txn, replacement.id, segment.key_range);
+            try self.updateActiveSegments(&txn, replacement.id, .add);
+        }
+        try saveNextSegmentId(&txn, self.writer.next_segment_id);
+        if (publication) |*prepared| try self.savePreparedSegmentAdmissions(&txn, prepared);
+        const encoded = ReplayFragment.encode(checkpoint);
+        try txn.put(.meta, meta_replay_fragment, &encoded);
+        var progress: backend_types.CommitProgress = .{};
+        const parent_progress = backend_types.commit_progress;
+        backend_types.commit_progress = &progress;
+        defer backend_types.commit_progress = parent_progress;
+        txn.commit() catch |err| {
+            uncertain = progress.maybe_applied;
+            if (uncertain) {
+                if (parent_progress) |parent| parent.maybe_applied = true;
+                files.storage.fenceUncertainPublication();
+            }
+            return err;
+        };
+        if (publication) |*prepared| prepared.publish();
+        published = true;
+        return infos;
     }
 
     pub fn attachResourceManager(self: *PersistentIndex, manager: *resource_manager_mod.ResourceManager) void {
@@ -7632,4 +7787,102 @@ test "lite persistent cache lifecycle preserves replayed WAL without publication
             try std.testing.expectEqual(before.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
         }
     }
+}
+
+test "lite atomic replay activates deletion segments and continuation together across uncertain commit" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/atomic-replay.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    docs.maintenance_start_suppressed = true;
+    docs.file.externally_locked = true;
+    var docs_live = true;
+    defer if (docs_live) docs.close();
+    var storage = lite_indexes.Store.init(a, &docs);
+    const opts: PersistentIndexOptions = .{
+        .path = "/atomic/index",
+        .io = std.testing.io,
+        .main_backend = .lsm,
+        .main_lsm_storage = storage.storage(),
+        .wal_backend = .lsm,
+        .wal_storage = storage.storage(),
+        .main_lsm_options = .{ .flush_threshold = 32 * 1024 * 1024 },
+        .main_no_sync = true,
+        .wal_no_sync = true,
+    };
+    var index = try PersistentIndex.open(a, opts);
+    var index_live = true;
+    defer if (index_live) index.close();
+    const alpha = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(alpha);
+    try index.indexSegment(alpha);
+    const old = index.acquireSnapshot();
+    defer old.release();
+    var stager = (try index.acquireReplayStager(a)).?;
+    defer stager.deinit();
+    const beta = try buildSimpleSegment(a, "doc:a", "beta");
+    defer a.free(beta);
+    const multilingual = try buildSimpleSegment(a, "doc:b", "κόσμος");
+    defer a.free(multilingual);
+    var staged = [_]PreparedReplaySegment{ try prepareReplaySegment(a, stager, beta), try prepareReplaySegment(a, stager, multilingual) };
+    defer for (&staged) |*segment| segment.deinit();
+    const identity: ReplayFragment.Identity = .{ .generation = 4, .config_hash = 5, .incarnation = 6 };
+    var checkpoint: ReplayFragment.Checkpoint = .{ .identity = identity, .position = .{ .sequence = 1, .next_item = 1, .total_items = 2, .fingerprint = @splat(7), .applied = true } };
+    lsm_backend.Backend.test_commit_fault = .{ .at = .before_wal_append, .err = error.TestAtomicReplayCommitFailure };
+    defer lsm_backend.Backend.test_commit_fault = null;
+    try std.testing.expectError(error.TestAtomicReplayCommitFailure, index.publishReplay(&staged, &.{"doc:a"}, checkpoint));
+    try std.testing.expectEqual(@as(?ReplayFragment.Position, null), try index.loadReplayFragment(identity));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    const before_publication = index.snapshotLsmWriteStats().?.wal_append_records;
+    const deletes = try index.publishReplay(&staged, &.{"doc:a"}, checkpoint);
+    try std.testing.expectEqual(before_publication + 1, index.snapshotLsmWriteStats().?.wal_append_records);
+    index.freeDeleteInfos(deletes);
+    try std.testing.expect(std.meta.eql(checkpoint.position, (try index.loadReplayFragment(identity)).?));
+    try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "κόσμος"));
+    var stale = checkpoint;
+    stale.position.next_item = 0;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, index.publishReplay(&.{}, &.{"doc:a"}, stale));
+    // A retained pre-commit reader sees neither the replacement nor its deletes.
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, old, "alpha"));
+    try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, old, "beta"));
+    const gamma = try buildSimpleSegment(a, "doc:a", "gamma");
+    defer a.free(gamma);
+    var uncertain = [_]PreparedReplaySegment{try prepareReplaySegment(a, stager, gamma)};
+    defer uncertain[0].deinit();
+    checkpoint.position.next_item = 2;
+    lsm_backend.Backend.test_commit_fault = .{ .at = .after_wal_append, .err = error.TestAtomicReplayCommitFailure };
+    try std.testing.expectError(error.TestAtomicReplayCommitFailure, index.publishReplay(&uncertain, &.{"doc:a"}, checkpoint));
+    try std.testing.expect(docs.file.checkpoint_publication_uncertain);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    index.prepareForCrashRollback();
+    index.abandonAfterCrash();
+    index_live = false;
+    docs.close();
+    docs_live = false;
+    docs = try lite_docs.Store.openWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    docs_live = true;
+    docs.maintenance_start_suppressed = true;
+    docs.file.externally_locked = true;
+    storage = lite_indexes.Store.init(a, &docs);
+    index = try PersistentIndex.open(a, opts);
+    index_live = true;
+    try std.testing.expect(std.meta.eql(checkpoint.position, (try index.loadReplayFragment(identity)).?));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "gamma"));
+    try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, old, "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "κόσμος"));
+    checkpoint.position = .{ .sequence = 2, .next_item = 1, .total_items = 1, .fingerprint = @splat(8), .applied = true };
+    const before_delete = index.snapshotLsmWriteStats().?.wal_append_records;
+    const delete_only = try index.publishReplay(&.{}, &.{"doc:b"}, checkpoint);
+    index.freeDeleteInfos(delete_only);
+    try std.testing.expectEqual(before_delete + 1, index.snapshotLsmWriteStats().?.wal_append_records);
+    try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "κόσμος"));
+    try std.testing.expect(std.meta.eql(checkpoint.position, (try index.loadReplayFragment(identity)).?));
 }

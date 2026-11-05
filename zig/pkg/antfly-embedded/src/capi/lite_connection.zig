@@ -408,7 +408,7 @@ const ImmutableTextHandoff = struct {
         defer indexes.catalog_mutex.unlockShared();
         for (indexes.text_indexes.items, 0..) |*entry, ordinal| {
             if (ordinal == 128 or result.pins.visited == max_segments or result.pins.bytes == max_bytes) break;
-            _ = try result.pins.appendWithSourceLimit(entry.persistent.acquireSnapshot(), max_bytes, max_segments, generation_bytes);
+            _ = try result.pins.appendWithSourceLimit(entry.persistent.acquireSnapshot(), max_bytes, max_segments, @min(generation_bytes, artifact_source.WorkingSet.max_range_bytes));
         }
         if (result.pins.leases.items.len == 0) {
             result.deinit();
@@ -2071,11 +2071,7 @@ pub const Owner = struct {
         fn fragment(database: *h.db_mod.DB, name: []const u8) !?Fragment {
             const cfg = database.core.index_manager.get(name) orelse return null;
             if (cfg.kind != .full_text or cfg.coverage_generation == 0) return null;
-            return @import("../storage/db/derived/apply_state.zig").loadReplayFragment(alloc, database.core.store, name, .{
-                .generation = cfg.coverage_generation,
-                .config_hash = h.db_mod.types.indexConfigHash(cfg.*),
-                .incarnation = database.root_incarnation,
-            });
+            return database.loadReplayFragmentState(name);
         }
     };
 
@@ -3515,9 +3511,9 @@ pub const Owner = struct {
         const merge_owns_root = if (self.pending_text_merge) |active| active.root == root else false;
         if (independent and root.db_live and !retain_artifact_runtime and !retain_source_runtime and !merge_owns_root) {
             // Provider/query actors and their primary observations still end
-            // here. Only a bounded immutable reader bridge survives to the
-            // next constructor, and only while this namespace has source debt.
-            if (run_source and source_more and maintenance_error == null) {
+            // here. Bounded immutable readers may bridge a later primary batch
+            // even when this turn caught up. TTL and byte caps bound retention.
+            if (run_source and maintenance_error == null) {
                 self.gate.mutex.lockUncancelable(io);
                 self.preserveImmutableTextHandoff(root, database);
                 self.gate.mutex.unlock(io);
@@ -9429,10 +9425,103 @@ test "capi native cooperative replay separates raw text from generated artifact 
     }
 }
 
-test "capi native registered replay fragments oversized batches across maintenance runtime replacement" {
+test "capi native staged replay rejects a dropped and recreated target before activation" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("staged-replay-replacement", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const owner = fixture.connection.owner;
+    const Probe = struct {
+        id: ?*anyopaque,
+        fired: bool = false,
+        deleted: bool = false,
+        result: h.capi.ErrorCode = .ok,
+        fn notify(raw: *anyopaque, _: *h.Handle) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.fired) return;
+            self.fired = true;
+            self.result = api.antfly_db_delete_index(self.id, .fromSlice("text"), &self.deleted);
+            if (self.result != .ok) return;
+            self.result = api.antfly_db_add_index_json(self.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}"));
+        }
+    };
+    var probe: Probe = .{ .id = fixture.id };
+    owner.test_before_replay_index_publication = .{ .ptr = &probe, .notify = Probe.notify };
+    defer owner.test_before_replay_index_publication = null;
+    for (0..32) |_| {
+        _ = owner.maintenanceTurnForTest() catch |err| switch (err) {
+            error.EnrichmentWaitCanceled => false,
+            else => return err,
+        };
+        if (probe.fired) break;
+    }
+    try std.testing.expect(probe.fired and probe.deleted);
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, probe.result);
+    try std.testing.expect(owner.publication_stats.refused > 0);
+    owner.test_before_replay_index_publication = null;
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(fixture.id));
+    var lease = try fixture.connection.acquire();
+    defer {
+        lease.close();
+        fixture.connection.gate.mutex.unlock(h.handleLockIo());
+    }
+    const root = try owner.refresh();
+    try std.testing.expect((try root.owned_lite_backend.?.native_docstore.?.checkWithCancel(null)).valid);
+    const snapshot = root.db.core.index_manager.textIndex("text").?.acquireSnapshot();
+    defer snapshot.release();
+    try std.testing.expectEqual(@as(u32, 1), snapshot.liveDocCount());
+}
+
+test "capi native mixed index turns retain bounded immutable sources after catching up" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var fixture = try AdmissionFollowupFixture.init("mixed-settled-source-cache", 5000, .batch);
+    defer fixture.deinit();
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+    const owner = fixture.connection.owner;
+    {
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const root = try owner.refresh();
+        try root.db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
+        try std.testing.expect(root.db.detachedTextSourceBlock() != null);
+    }
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    var complete = false;
+    for (0..128) |turn| {
+        // Clear prior partial-turn pins: this assertion concerns the turn
+        // that completes the target, rather than a cache left by earlier work.
+        owner.immutable_sources.clear();
+        owner.clearImmutableTextHandoff();
+        _ = try owner.maintenanceTurnForTest();
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const root = try owner.refresh();
+        const target = root.db.core.nextDerivedSequence();
+        const text_applied = try root.db.core.loadAppliedSequence(std.testing.allocator, "text");
+        const graph_applied = try root.db.core.loadAppliedSequence(std.testing.allocator, "graph");
+        if (turn == 127) std.debug.print("mixed cache target={d} text={d} graph={d} sources={d} actor_live={} pending_merge={}\n", .{ target, text_applied, graph_applied, owner.immutable_sources.count, if (owner.maintenance_snapshot) |actor| actor.db_live else false, owner.pending_text_merge != null });
+        if (text_applied < target or graph_applied < target) continue;
+        const actor = owner.maintenance_snapshot orelse continue;
+        if (actor.db_live) continue;
+        try std.testing.expect(owner.text_source_runtime_cache == null);
+        try std.testing.expect(owner.immutable_sources.count > 0);
+        try std.testing.expect(owner.immutable_sources.range_bytes <= artifact_source.WorkingSet.max_range_bytes);
+        complete = true;
+        break;
+    }
+    try std.testing.expect(complete);
+}
+
+test "capi native registered replay fragments oversized batches across maintenance runtime replacement" {
     const a = std.testing.allocator;
-    const fragments = @import("../storage/db/derived/apply_state.zig");
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("registered-replay-fragments", 5000, .batch);
     defer fixture.deinit();
     try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
@@ -9472,9 +9561,9 @@ test "capi native registered replay fragments oversized batches across maintenan
     var probe: Probe = .{};
     owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.notify };
     defer owner.test_after_capture = null;
-    for ([_]u64{ 8, 16 }) |expected| {
+    for ([_]u64{ 8, 16, 64, 72 }) |expected| {
         var observed: u64 = 0;
-        for (0..8) |_| {
+        for (0..64) |_| {
             _ = try owner.maintenanceTurnForTest();
             var lease = try fixture.connection.acquire();
             defer {
@@ -9482,9 +9571,7 @@ test "capi native registered replay fragments oversized batches across maintenan
                 fixture.connection.gate.mutex.unlock(h.handleLockIo());
             }
             const live = try owner.refresh();
-            const cfg = live.db.core.index_manager.get("text").?;
-            const identity: fragments.replay_fragment.Identity = .{ .generation = cfg.coverage_generation, .config_hash = h.db_mod.types.indexConfigHash(cfg.*), .incarnation = live.db.root_incarnation };
-            const position = (try fragments.loadReplayFragment(a, live.db.core.store, "text", identity)) orelse continue;
+            const position = (try live.db.loadReplayFragmentState("text")) orelse continue;
             try std.testing.expectEqual(target, position.sequence);
             try std.testing.expectEqual(@as(u64, 1024), position.total_items);
             try std.testing.expect(try live.db.core.loadAppliedSequence(a, "text") < target);

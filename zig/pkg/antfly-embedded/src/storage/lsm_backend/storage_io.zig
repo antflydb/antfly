@@ -626,6 +626,8 @@ pub const Storage = struct {
         /// descriptor/runtime ownership. Persistent readers use this capability.
         open_leased_immutable_source: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").Source = null,
         acquire_lease: ?*const fn (*anyopaque) anyerror!Lease = null,
+        acquire_immutable_stager: ?*const fn (*anyopaque, Allocator) anyerror!@import("../immutable_artifact.zig").Stager = null,
+        fence_uncertain_publication: ?*const fn (*anyopaque) void = null,
         create_dir_path: *const fn (*anyopaque, []const u8) anyerror!void,
         /// Directories are inferred from child files and have no independent
         /// entry to publish. Creating one needs no parent durability barrier.
@@ -679,6 +681,15 @@ pub const Storage = struct {
         supports_host_path_generation_publication: bool = false,
         supports_native_path_locks: bool = false,
     };
+    pub fn acquireImmutableStager(self: Storage, alloc: Allocator) !?@import("../immutable_artifact.zig").Stager {
+        const acquire = self.vtable.acquire_immutable_stager orelse return null;
+        return try BoundaryAbi.call("acquire_immutable_stager", self.boundary_dispatch, acquire, .{ self.ptr, alloc });
+    }
+
+    pub fn fenceUncertainPublication(self: Storage) void {
+        if (self.vtable.fence_uncertain_publication) |fence| fence(self.ptr);
+    }
+
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
     pub fn privateScratchDirectory(self: Storage, fallback: []const u8) ?[]const u8 {

@@ -1581,6 +1581,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     opts.prepared_documents.?.take(S.ownerField(self, "alloc").*, write.key, write.value)
                 else
                     null;
+                if (profile) |active_profile| {
+                    if (prepared_document != null) active_profile.prepared_documents_consumed += 1 else if (prepared_relational == null) active_profile.unprepared_document_rows += 1;
+                }
                 extracted[i] = if (prepared_relational) |*prepared|
                     prepared.takeExtracted()
                 else if (prepared_document) |prepared|

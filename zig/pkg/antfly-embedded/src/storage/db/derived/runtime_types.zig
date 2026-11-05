@@ -43,6 +43,7 @@ pub const AppliedSequenceAdvancedFn = *const fn (ctx: *anyopaque, index_name: []
 /// makes fragment output durable before publishing its continuation.
 pub const ReplayFragments = struct {
     ptr: *anyopaque,
+    apply: ?@import("derived_worker.zig").ApplyFragmentFn = null,
     supports: *const fn (*anyopaque, []const u8) anyerror!bool,
     load: *const fn (*anyopaque, []const u8) anyerror!?@import("replay_fragment.zig").Position,
     save: *const fn (*anyopaque, []const u8, @import("replay_fragment.zig").Position) anyerror!void,

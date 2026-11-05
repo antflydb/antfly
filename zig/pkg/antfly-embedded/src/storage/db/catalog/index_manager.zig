@@ -835,8 +835,12 @@ pub const PreparedTextMapperPublication = struct {
     segment_alloc: Allocator,
     segments: [][]u8 = &.{},
     observed_field_analyzers: []mapper.ObservedFieldAnalyzer = &.{},
+    staged: []persistent_mod.PreparedReplaySegment = &.{},
+    staged_bytes: u64 = 0,
 
     pub fn deinit(self: *PreparedTextMapperPublication) void {
+        for (self.staged) |*segment| segment.deinit();
+        if (self.staged.len > 0) self.alloc.free(self.staged);
         for (self.segments) |segment| {
             if (segment.len > 0) self.segment_alloc.free(segment);
         }
@@ -849,8 +853,30 @@ pub const PreparedTextMapperPublication = struct {
         self.* = undefined;
     }
 
+    pub fn stage(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager) !void {
+        if (self.staged.len != 0 or self.segments.len == 0) return;
+        const staged = try self.alloc.alloc(persistent_mod.PreparedReplaySegment, self.segments.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (staged[0..initialized]) |*segment| segment.deinit();
+            self.alloc.free(staged);
+        }
+        for (self.segments, 0..) |*bytes, i| {
+            staged[i] = try persistent_mod.prepareReplaySegment(self.alloc, stager, bytes.*);
+            initialized += 1;
+        }
+        // Staging succeeds as a unit. On refusal, the caller still owns all
+        // buffers; on success the immutable native values own their contents.
+        for (self.segments) |*bytes| {
+            self.staged_bytes +|= bytes.len;
+            self.segment_alloc.free(bytes.*);
+            bytes.* = &.{};
+        }
+        self.staged = staged;
+    }
+
     pub fn estimate(self: PreparedTextMapperPublication) TextPublicationEstimate {
-        var byte_count: u64 = 0;
+        var byte_count: u64 = self.staged_bytes;
         for (self.segments) |segment| byte_count +|= @intCast(segment.len);
         return .{ .segment_count = @intCast(self.segments.len), .byte_count = byte_count };
     }
@@ -861,8 +887,10 @@ pub const TextPublicationContext = struct {
     instance_id: u64,
     projection_revision: u64,
     chunk_backed: bool,
+    stager: ?@import("../../immutable_artifact.zig").Stager = null,
 
     pub fn deinit(self: *TextPublicationContext) void {
+        if (self.stager) |*stager| stager.deinit();
         self.* = undefined;
     }
 };
@@ -20131,6 +20159,23 @@ pub const IndexManager = struct {
         alloc: Allocator,
         index_name: []const u8,
     ) !TextPublicationContext {
+        return self.captureTextPublicationContext(alloc, index_name, false);
+    }
+
+    pub fn acquireTextReplayPublicationContext(
+        self: *IndexManager,
+        alloc: Allocator,
+        index_name: []const u8,
+    ) !TextPublicationContext {
+        return self.captureTextPublicationContext(alloc, index_name, true);
+    }
+
+    fn captureTextPublicationContext(
+        self: *IndexManager,
+        alloc: Allocator,
+        index_name: []const u8,
+        prepare_artifacts: bool,
+    ) !TextPublicationContext {
         self.catalog_mutex.lockShared();
         defer self.catalog_mutex.unlockShared();
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
@@ -20141,6 +20186,7 @@ pub const IndexManager = struct {
             .instance_id = entry.instance_id,
             .projection_revision = entry.projection_revision,
             .chunk_backed = textEntryHasExplicitArtifactSources(entry),
+            .stager = if (prepare_artifacts) try entry.persistent.acquireReplayStager(alloc) else null,
         };
     }
 
@@ -21376,6 +21422,34 @@ pub const IndexManager = struct {
             return;
         }
         return error.IndexNotFound;
+    }
+
+    pub fn applyPreparedTextReplayPublication(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        name: []const u8,
+        delete_keys: []const []const u8,
+        prepared: []PreparedTextMapperPublication,
+        checkpoint: persistent_mod.ReplayFragment.Checkpoint,
+    ) !void {
+        const entry = self.textIndexEntry(name) orelse return error.IndexNotFound;
+        var segments = std.ArrayListUnmanaged(persistent_mod.PreparedReplaySegment).empty;
+        defer segments.deinit(self.alloc);
+        var observed = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
+        defer observed.deinit(self.alloc);
+        for (prepared) |*item| {
+            try observed.appendSlice(self.alloc, item.observed_field_analyzers);
+            // These are borrowed immutable handles; the publications own and
+            // release their construction leases after activation or abort.
+            try segments.appendSlice(self.alloc, item.staged);
+        }
+        if (observed.items.len != 0) try mergeObservedTextFieldAnalyzers(self, store, entry, observed.items);
+        var checked_checkpoint = checkpoint;
+        checked_checkpoint.identity = .{ .generation = entry.config.coverage_generation, .config_hash = types.indexConfigHash(entry.config), .incarnation = self.artifact_projection_root };
+        const infos = try entry.persistent.publishReplay(segments.items, delete_keys, checked_checkpoint);
+        defer entry.persistent.freeDeleteInfos(infos);
+        entry.recordCommittedDeletes(infos);
+        try self.finalizeTextBatchMutations(entry, .{ .compact_text = false, .defer_text_compaction = true }, .{ .indexed_any = segments.items.len != 0, .deleted_any = infos.len != 0 });
     }
 
     pub fn indexDenseBatchByName(self: *IndexManager, store: *docstore_mod.DocStore, index_name: []const u8, writes: []const types.BatchWrite) !void {

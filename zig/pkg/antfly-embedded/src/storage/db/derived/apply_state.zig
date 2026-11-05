@@ -189,20 +189,26 @@ fn fragmentKey(buffer: []u8, name: []const u8) ![]const u8 {
     return std.fmt.bufPrint(buffer, "{s}{s}", .{ replay_fragment.prefix, name });
 }
 
-pub fn loadReplayFragment(alloc: Allocator, store: anytype, index_name: []const u8, identity: replay_fragment.Identity) !?replay_fragment.Position {
+pub const ReplayProgress = struct { applied_sequence: u64, fragment: ?replay_fragment.Position = null };
+
+/// Read coarse and partial progress from one metadata snapshot. A second
+/// independent scalar probe can otherwise turn a current partial witness stale.
+pub fn loadReplayProgress(alloc: Allocator, store: anytype, index_name: []const u8, identity: replay_fragment.Identity) !ReplayProgress {
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
     var txn = try runtime.store.beginProbe();
     defer txn.abort();
+    var result: ReplayProgress = .{ .applied_sequence = try loadScalarAppliedSequenceTxn(&txn, index_name) orelse 0 };
     var buffer: [256]u8 = undefined;
-    const raw = txn.get(try fragmentKey(&buffer, index_name)) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
+    const raw = txn.get(try fragmentKey(&buffer, index_name)) catch |err| return if (err == error.NotFound) result else err;
     const checkpoint = try replay_fragment.decode(raw);
-    if (!std.meta.eql(checkpoint.identity, identity)) return null;
-    if (checkpoint.position.sequence <= (try loadScalarAppliedSequenceTxn(&txn, index_name) orelse 0)) return null;
-    return checkpoint.position;
+    if (std.meta.eql(checkpoint.identity, identity) and checkpoint.position.sequence > result.applied_sequence)
+        result.fragment = checkpoint.position;
+    return result;
+}
+
+pub fn loadReplayFragment(alloc: Allocator, store: anytype, index_name: []const u8, identity: replay_fragment.Identity) !?replay_fragment.Position {
+    return (try loadReplayProgress(alloc, store, index_name, identity)).fragment;
 }
 
 /// The caller first checkpoints index output, then enters its checked metadata

@@ -60,6 +60,8 @@ pub const Store = struct {
         .wal_checkpoint_completed = walCheckpointCompleted,
         .private_scratch_directory = privateScratchDirectory,
         .create_dir_path = createDirPath,
+        .acquire_immutable_stager = if (supports_native_artifact_leases) acquireImmutableStager else null,
+        .fence_uncertain_publication = fenceUncertainPublication,
         .virtual_directories = true,
         .read_file_alloc = readFileAlloc,
         .read_file_range_alloc = readFileRangeAlloc,
@@ -169,6 +171,8 @@ fn acquireReadSnapshot(ptr: *anyopaque) !StorageIo.Lease {
             value.loaded_wal_metadata_revision = null;
             value.open_immutable_source = null;
             value.open_leased_immutable_source = null;
+            value.acquire_immutable_stager = null;
+            value.fence_uncertain_publication = null;
             value.map_immutable_artifact = null;
             break :blk value;
         };
@@ -386,6 +390,88 @@ fn appendFileAbsolute(ptr: *anyopaque, path: []const u8, contents: []const u8, s
     try validateWritePath(self, path);
     var mutation = CatalogWrite{ .kind = .append, .path = path, .value = contents };
     try self.docs.submitIndexMutation(&mutation, CatalogWrite.apply, sync);
+}
+
+const immutable_artifact = @import("../immutable_artifact.zig");
+const artifacts = @import("artifact_source.zig");
+
+const NativeArtifactStager = struct {
+    alloc: Allocator,
+    registry: *artifacts.Registry,
+    prefix: []u8,
+    const vtable: immutable_artifact.Stager.VTable = .{ .stage = stage, .deinit = deinit };
+
+    fn stage(raw: *anyopaque, bytes: []const u8) !immutable_artifact.Prepared {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const pending = try self.alloc.create(NativePreparedArtifact);
+        errdefer self.alloc.destroy(pending);
+        const prefix = try self.alloc.dupe(u8, self.prefix);
+        errdefer self.alloc.free(prefix);
+        var construction = try self.registry.beginConstruction();
+        errdefer construction.deinit();
+        // Each turn publishes only bounded, unreferenced bytes. Foreground
+        // writers can run between appends; no catalog or index apply lock is held.
+        var offset: usize = 0;
+        while (offset < bytes.len) {
+            const owner = self.registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
+            defer self.registry.endCallback();
+            const end = offset + @min(bytes.len - offset, 1024 * 1024);
+            try construction.append(owner, bytes[offset..end]);
+            offset = end;
+        }
+        try construction.seal(bytes.len);
+        pending.* = .{ .alloc = self.alloc, .prefix = prefix, .construction = construction };
+        return .{ .ptr = pending, .vtable = &NativePreparedArtifact.vtable };
+    }
+
+    fn deinit(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.registry.releaseOwner();
+        self.alloc.free(self.prefix);
+        self.alloc.destroy(self);
+    }
+};
+
+const NativePreparedArtifact = struct {
+    alloc: Allocator,
+    prefix: []u8,
+    construction: artifacts.Construction,
+    const vtable: immutable_artifact.Prepared.VTable = .{ .link = link, .deinit = deinit };
+
+    fn link(raw: *anyopaque, path: []const u8) !SegmentSource {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const registry = self.construction.registry orelse return error.InvalidArtifactConstructionState;
+        const owner = registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
+        defer registry.endCallback();
+        var adapter: Store = .{ .allocator = self.alloc, .docs = owner, .namespace_prefix = self.prefix };
+        try validateWritePath(&adapter, path);
+        try self.construction.link(owner, path);
+        return owner.openArtifactSource(path);
+    }
+
+    fn deinit(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.construction.deinit();
+        self.alloc.free(self.prefix);
+        self.alloc.destroy(self);
+    }
+};
+
+fn acquireImmutableStager(raw: *anyopaque, alloc: Allocator) !immutable_artifact.Stager {
+    const self: *Store = @ptrCast(@alignCast(raw));
+    if (self.docs.read_only or self.read_snapshot != null) return error.ReadOnly;
+    const registry = try self.docs.artifactRegistry();
+    const state = try alloc.create(NativeArtifactStager);
+    errdefer alloc.destroy(state);
+    const prefix = try alloc.dupe(u8, self.namespace_prefix);
+    registry.retainOwner();
+    state.* = .{ .alloc = alloc, .registry = registry, .prefix = prefix };
+    return .{ .ptr = state, .vtable = &NativeArtifactStager.vtable };
+}
+
+fn fenceUncertainPublication(raw: *anyopaque) void {
+    const self: *Store = @ptrCast(@alignCast(raw));
+    self.docs.fenceUncertainPublication();
 }
 
 fn beginAtomicWrite(ptr: *anyopaque, allocator: Allocator, path: []const u8) !AtomicWriteSink {

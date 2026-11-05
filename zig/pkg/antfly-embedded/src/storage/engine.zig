@@ -362,6 +362,7 @@ pub const VTable = struct {
     openRelationalReadSessionAtSnapshot: *const fn (self: *DB, alloc: std.mem.Allocator, from_key: []const u8, to_key: []const u8, opts: types.ScanOptions, statement: ?*DB.RelationalStatementSnapshot) Outcome(*DB.RelationalReadSession),
     tryStatementReadFence: *const fn (self: *DB) Outcome(?DB.StatementReadFence),
     tryEmbeddedBackupReadFence: *const fn (self: *DB) Outcome(?DB.StatementReadFence),
+    loadReplayFragmentState: *const fn (self: *DB, name: []const u8) Outcome(?@import("db/derived/replay_fragment.zig").Position),
     catchUpPendingDerivedReplay: *const fn (self: *DB) Outcome(void),
     derivedAsyncAppendDerivedBatchRecord: *const fn (self: *DB, derived_batch: @import("db/derived/derived_types.zig").DerivedBatch) Outcome(u64),
     runDerivedUntil: *const fn (self: *DB, sequence: u64) Outcome(void),

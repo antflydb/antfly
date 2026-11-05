@@ -3450,6 +3450,72 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             try applyDerivedBatchToIndexContextProfiled(ctx, batch, index_ref, null, false, null);
         }
 
+        fn applyAtomicTextReplayFragment(
+            ctx: *const AsyncContext,
+            batch: derived_types.DerivedBatch,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            context: *index_manager_mod.TextPublicationContext,
+            docs: []const mapper.MapperDoc,
+            position: apply_state.replay_fragment.Position,
+            profile: ?*BatchProfile,
+        ) !void {
+            // The family piece is already bounded by replay admission. Keep
+            // source-byte windows for projection residency, but stage all of
+            // this piece's immutable output before a single activation commit.
+            var publications = std.ArrayListUnmanaged(index_manager_mod.PreparedTextMapperPublication).empty;
+            defer {
+                for (publications.items) |*item| item.deinit();
+                publications.deinit(ctx.alloc);
+            }
+            const expected_revision = context.projection_revision;
+            var estimate: index_manager_mod.TextPublicationEstimate = .{};
+            var offset: usize = 0;
+            while (true) {
+                const planned_at = monotonicTimeNs();
+                var plan = try ctx.index_manager.planTextMapperDocsPublication(ctx.store, index_ref.name, context, docs[offset..], std.math.maxInt(usize));
+                if (profile) |p| recordProfileNs(profile, &p.full_text_plan_ns, planned_at);
+                defer plan.deinit();
+                if (context.projection_revision != expected_revision) return error.TextProjectionChanged;
+                const prepared_at = monotonicTimeNs();
+                var prepared = try ctx.index_manager.preparePlannedTextMapperPublication(ctx.alloc, index_ref.name, context, &plan, 0, plan.input_end);
+                var prepared_owned = true;
+                defer if (prepared_owned) prepared.deinit();
+                if (profile) |p| recordProfileNs(profile, &p.full_text_prepare_ns, prepared_at);
+                const size = prepared.estimate();
+                estimate.segment_count +|= size.segment_count;
+                estimate.byte_count +|= size.byte_count;
+                try prepared.stage(context.stager.?);
+                try publications.append(ctx.alloc, prepared);
+                prepared_owned = false;
+                offset += plan.input_end;
+                if (offset == docs.len) break;
+                if (plan.input_end == 0) return error.InvalidTextProjection;
+            }
+            var permit: ?text_merge_runtime_mod.TextMergeRuntime.ProducerPermit = if (ctx.text_merge_runtime) |runtime|
+                try runtime.acquireAtomicProducerPermit(index_ref.name, estimate.segment_count, estimate.byte_count)
+            else
+                null;
+            defer if (permit) |*value| value.release();
+            // No catalog lock survives waiting for the owner writer gate.
+            const port = ctx.replay_index_publication;
+            if (port) |publication| try publication.enter(publication.ptr);
+            defer if (port) |publication| publication.leave(publication.ptr);
+            var guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
+            defer guard.unlock();
+            if (try ctx.index_manager.refreshTextPublicationContextAssumeCatalogLocked(index_ref.name, context) != .current)
+                return error.TextProjectionChanged;
+            const delete_keys = try collectTextReplayDeleteKeys(ctx.alloc, ctx.index_manager, batch, index_ref.name, context.*);
+            defer if (delete_keys.len > 0) ctx.alloc.free(delete_keys);
+            const cfg = ctx.index_manager.get(index_ref.name) orelse return error.IndexNotFound;
+            var committed_position = position;
+            committed_position.applied = true;
+            try ctx.index_manager.applyPreparedTextReplayPublication(ctx.store, index_ref.name, delete_keys, publications.items, .{
+                .identity = .{ .generation = cfg.coverage_generation, .config_hash = types.indexConfigHash(cfg.*), .incarnation = ctx.index_manager.artifact_projection_root },
+                .position = committed_position,
+            });
+            if (ctx.text_merge_runtime) |runtime| runtime.notify();
+        }
+
         pub fn applyDerivedBatchToIndexContextProfiled(
             ctx: *const AsyncContext,
             batch: derived_types.DerivedBatch,
@@ -3457,6 +3523,18 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             profile: ?*BatchProfile,
             borrow_active_source_capture: bool,
             admitted_replay: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease,
+        ) !void {
+            return applyDerivedBatchToIndexContextProfiledWithFragment(ctx, batch, index_ref, profile, borrow_active_source_capture, admitted_replay, null);
+        }
+
+        pub fn applyDerivedBatchToIndexContextProfiledWithFragment(
+            ctx: *const AsyncContext,
+            batch: derived_types.DerivedBatch,
+            index_ref: index_manager_mod.ManagedIndexRef,
+            profile: ?*BatchProfile,
+            borrow_active_source_capture: bool,
+            admitted_replay: ?*const snapshot_admission_mod.SnapshotAdmission.MutationLease,
+            fragment: ?apply_state.replay_fragment.Position,
         ) !void {
             // Generated files and their publication metadata are one physical
             // generation. Native capture takes the exclusive side of this admission
@@ -3476,7 +3554,10 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .compact_text_segment_threshold = null,
                     .defer_text_compaction = true,
                 };
-                var publication_context = try ctx.index_manager.acquireTextPublicationContext(ctx.alloc, index_ref.name);
+                var publication_context = if (fragment != null)
+                    try ctx.index_manager.acquireTextReplayPublicationContext(ctx.alloc, index_ref.name)
+                else
+                    try ctx.index_manager.acquireTextPublicationContext(ctx.alloc, index_ref.name);
                 defer publication_context.deinit();
                 if (!ctx.projection_only) try invalidateLocalArtifactProducerCoverage(ctx, batch, index_ref);
                 // A document that can never gain visible content (issue #938: an
@@ -3520,6 +3601,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 if (collected.missing_required != 0) return error.ReplayDocumentNotVisible;
                 if (ctx.index_manager.resource_manager) |manager|
                     manager.clearReplayDocumentNotVisibleEscalation(replay_owner, index_ref.name, batch.sequence);
+
+                if (fragment) |position| if (publication_context.stager != null) {
+                    try applyAtomicTextReplayFragment(ctx, batch, index_ref, &publication_context, collected.docs.items, position, profile);
+                    if (!ctx.projection_only) try clearPublishedAssetArtifactRepairIssuesContext(ctx, index_ref.name, batch.changed_artifact_keys, batch.sequence);
+                    return;
+                };
 
                 const reservation_limit = if (ctx.text_merge_runtime) |runtime| runtime.producerSegmentReservationLimit() else std.math.maxInt(usize);
                 var write_start: usize = 0;
