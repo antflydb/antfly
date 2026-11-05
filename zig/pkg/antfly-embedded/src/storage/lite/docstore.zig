@@ -12692,7 +12692,9 @@ test "lite seekable producer discovery persists authenticated bounded continuati
         try write.commit();
     }
     const source_mod = @import("../db/derived/replay_source.zig");
-    const source = source_mod.Source.fromPrimaryStore(&store, null, null);
+    const original_source = source_mod.Source.fromPrimaryStore(&store, null, null);
+    const forwarded_vtable = original_source.vtable.*;
+    const source = source_mod.Source{ .ptr = original_source.ptr, .vtable = &forwarded_vtable };
     const State = @import("../db/enrichment/scoped_retries.zig").State;
     var state: State = .{};
     defer state.deinit(a);
@@ -12748,4 +12750,39 @@ test "lite seekable producer discovery persists authenticated bounded continuati
     try std.testing.expectEqual(@as(u64, 1), filtered.last_sequence);
     try std.testing.expect(filtered.fragment == null);
     try std.testing.expectEqualDeep(charged, (try native_store.file.replayAdmission()).?);
+}
+
+test "lite seekable producer fallback bounds unrelated journal scans" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "producer-fallback-bounds.aflite");
+    defer a.free(path);
+    var native_store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    defer native_store.close();
+    var runtime = try native_store.runtimeStoreWithPrefix(a, "\x02db/no-producer-hints\x00");
+    defer runtime.deinit();
+    var store = try @import("../docstore.zig").DocStore.openRuntime(a, &runtime);
+    defer store.close();
+    {
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        for (1..514) |sequence| {
+            const encoded = try change_journal_mod.encodeRecord(a, .{ .sequence = sequence, .changed_doc_keys = &.{"ordinary"}, .target_hints = &.{.full_text} });
+            defer a.free(encoded);
+            try write.setReplayOpaque(sequence, encoded);
+        }
+        try write.commit();
+    }
+    const source_mod = @import("../db/derived/replay_source.zig");
+    const source = source_mod.Source.fromPrimaryStore(&store, null, null);
+    var completed: u64 = 0;
+    for ([_]u64{ 256, 512, 513 }) |expected| {
+        const window = try source.collectEnrichmentDocumentGroupsWindow(a, completed, .{ .seekable = true, .max_records = 1, .max_document_groups = 8 });
+        defer source_mod.freePendingDocumentGroups(a, window.groups);
+        try std.testing.expectEqual(expected, window.last_sequence);
+        try std.testing.expectEqual(@as(usize, 0), window.groups.len);
+        try std.testing.expect(window.fragment == null);
+        completed = window.last_sequence;
+    }
 }

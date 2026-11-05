@@ -415,10 +415,15 @@ pub const Source = struct {
             .max_document_groups = limits.max_document_groups,
             .max_input_bytes = limits.max_input_bytes,
         };
-        if (limits.seekable and self.vtable == &primary_store_vtable) {
+        if (limits.seekable) {
             var cursor = try self.openMatchingCursor(alloc, from_sequence, .enrichment);
             defer cursor.deinit(alloc);
-            const can_seek = if (cursor.state.primary_store.scan_txn) |txn| txn.current_scan.?.vtable.get != null else false;
+            // Capability belongs to the opened cursor, not the address of
+            // its factory vtable (which can be forwarded across source owners).
+            const can_seek = switch (cursor.state) {
+                .journal => false,
+                .primary_store => |primary| if (primary.scan_txn) |txn| txn.current_scan.?.vtable.get != null else false,
+            };
             if (can_seek) {
                 var fragment = limits.fragment;
                 var records: usize = @intFromBool(limits.fragment != null);
@@ -446,6 +451,10 @@ pub const Source = struct {
                     const stats = try cursor.forEachWholeRecordWindow(1, &ctx, Context.consume);
                     last_sequence = @max(last_sequence, @max(stats.last_sequence, ctx.last_sequence));
                     records += @max(stats.matched_entries, @intFromBool(ctx.last_sequence > stats.last_sequence));
+                    // The fallback cursor already capped this page of
+                    // unrelated records. Return its certified prefix instead
+                    // of repeatedly reopening that budget within one turn.
+                    if (stats.matched_entries == 0 and stats.scanned_entries != 0) break;
                     if (pending.count() >= limits.max_document_groups and limits.max_document_groups != 0) break;
                     if (stats.scanned_entries == 0 and ctx.last_sequence <= last_sequence) {
                         // A chunk manifest stops the whole-record iterator
