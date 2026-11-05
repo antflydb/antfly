@@ -348,6 +348,9 @@ pub const Store = struct {
     pub const RetryAdmission = struct {
         ptr: *anyopaque,
         load: *const fn (*anyopaque) anyerror!u16,
+        /// Local capacity is acquired only after durable duplicate/live-lease
+        /// checks, and before spending an execution epoch or publishing a lease.
+        prepare: ?*const fn (*anyopaque, u64, u16) anyerror!void = null,
     };
     pub const TaskClaim = struct { claim: Claim, attempt_limit: u16 };
     pub fn claim(self: Store, a: A, path: []const u8, owner: []const u8, ttl_ms: u64) !?Claim {
@@ -369,9 +372,11 @@ pub const Store = struct {
         // Exhaustion of the hard cap itself needs no metadata read.
         const limit = if (admission != null and next.epoch != 0 and next.epoch < max_task_attempts) try admission.?.load(admission.?.ptr) else max_task_attempts;
         if (limit == 0 or limit > max_task_attempts) return error.InvalidSqlExecutionState;
+        const epoch = try std.math.add(u64, next.epoch, 1);
+        if (admission) |value| if (value.prepare) |prepare| try prepare(value.ptr, epoch, limit);
         next.status = .running;
         next.owner = owner;
-        next.epoch = try std.math.add(u64, next.epoch, 1);
+        next.epoch = epoch;
         next.until_ms = @min(next.expires_ms, self.now_ms +| ttl_ms);
         self.write(a, path, old, next) catch |err| switch (err) {
             error.PreconditionFailed => return null,

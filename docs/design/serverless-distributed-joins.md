@@ -196,6 +196,21 @@ engine over the same Iceberg tables. This is the documented boundary in
   `retained_bytes` and `spill_bytes` apply to each task. The query-level total
   is the sum across tasks and is checked against the tenant budget.
 
+Native query pods admit spill-capable tasks before acquiring a durable task
+lease. Admission reserves the task's complete spill byte envelope (capped by
+the pod's spill budget) and 64 file slots; every admitted task gets an independent
+spill manager. The process file envelope is 64 times worker concurrency, while
+the configured spill byte budget remains shared across all admitted tasks. Map
+stages stream bounded blocks without taking spill reservations. Capacity pressure
+returns HTTP 429 and tries another worker, without quarantining a healthy endpoint
+or consuming durable task attempts. Reservations are released on every exit,
+including preparation errors, cancellation, and lost claim races. Per-task quota
+violations remain permanent failures.
+
+Discovery coalesces against both queued and active coordinator turns under the
+selection lock. It cannot shorten heartbeat delays or provider backoff; explicit
+progress and cancellation notifications still wake the query immediately.
+
 ## Cloudflare profile
 
 - **Memory.** WASM isolates have no local spill and about 128 MiB of memory.

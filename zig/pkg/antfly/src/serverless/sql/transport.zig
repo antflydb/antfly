@@ -283,7 +283,9 @@ pub const Client = struct {
                 // delivery quantum. The next durable replay must try a peer.
                 // Explicit query/caller cancellation says nothing about health.
                 const cancelled = if (context.cancellation) |token| token.isCancelled() else false;
-                if (!cancelled and err != error.SqlExecutionUnauthorized and !localFailure(err))
+                if (err == error.SqlTaskAdmissionUnavailable)
+                    self.routing.success(url)
+                else if (!cancelled and err != error.SqlExecutionUnauthorized and !localFailure(err))
                     self.routing.failure(url, @import("antfly_platform").time.monotonicNs())
                 else
                     self.routing.abandon(url, admission);
@@ -297,7 +299,7 @@ pub const Client = struct {
             self.routing.success(url);
             return;
         }
-        return last_error;
+        return if (last_error == error.SqlTaskAdmissionUnavailable) error.SqlWorkerUnavailable else last_error;
     }
     fn executeAdmitted(self: *Client, index: usize, ticket: plan.Ticket, context: Context, admission: Routing.Admission) !void {
         if (admission.kind == .probe) {
@@ -331,6 +333,7 @@ pub const Client = struct {
         defer response.deinit(self.a);
         try context.ensureActive();
         if (response.status == 401 or response.status == 403) return error.SqlExecutionUnauthorized;
+        if (response.status == 429) return error.SqlTaskAdmissionUnavailable;
         if (response.status != 200 and response.status != 204) return error.SqlWorkerUnavailable;
     }
 };
@@ -359,6 +362,7 @@ pub const Server = struct {
             if (err == error.Canceled or err == error.Cancelled) context.ensureActive() catch return response(a, 504, "{}");
             return response(a, switch (err) {
                 error.SqlExecutionUnauthorized => 403,
+                error.SqlTaskAdmissionUnavailable => 429,
                 error.SqlQueryRoleRequired, error.SqlExecutionFenced, error.PreconditionFailed, error.SqlWorkerUnavailable => 503,
                 error.SqlQueryExpired => 410,
                 error.SqlExecutionFailed => 409,
@@ -661,4 +665,32 @@ test "distributed SQL cancelled control probes release reservations without pois
     try std.testing.expectError(error.Canceled, client.result(a, query, .{ .cancellation = .{ .ptr = &fake, .is_cancelled_fn = Fake.check } }));
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
     try std.testing.expectEqual(.probe, routing.admit("http://recovered", @import("antfly_platform").time.monotonicNs()).kind);
+}
+
+test "distributed SQL spill pressure fails over without quarantining responsive workers" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        busy: usize = 0,
+        accepted: usize = 0,
+        all_busy: bool = false,
+        fn execute(raw: *anyopaque, allocator: A, request_: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const busy = self.all_busy or std.mem.startsWith(u8, request_.uri, "http://busy/");
+            if (busy) self.busy += 1 else self.accepted += 1;
+            return .{ .status = if (busy) 429 else 200, .owner_allocator = allocator, .body = try allocator.dupe(u8, "{}") };
+        }
+    };
+    var fake: Fake = .{};
+    var routing: Routing = .{};
+    var ticket: plan.Ticket = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1000000 }, .stage = 0, .task = 0 };
+    if (std.hash.Wyhash.hash(ticket.stage, &ticket.query.id) % 2 != 0) ticket.task = 1;
+    var client: Client = .{ .a = a, .routing = &routing, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{ "http://busy", "http://ready" } };
+    for (0..3) |_| try client.execute(ticket, .{});
+    try std.testing.expectEqual(@as(usize, 3), fake.busy);
+    try std.testing.expectEqual(@as(usize, 3), fake.accepted);
+    try std.testing.expectEqual(.healthy, routing.admit("http://busy", @import("antfly_platform").time.monotonicNs()).kind);
+    fake.all_busy = true;
+    try std.testing.expectError(error.SqlWorkerUnavailable, client.execute(ticket, .{}));
+    try std.testing.expectEqual(.healthy, routing.admit("http://busy", @import("antfly_platform").time.monotonicNs()).kind);
+    try std.testing.expectEqual(.healthy, routing.admit("http://ready", @import("antfly_platform").time.monotonicNs()).kind);
 }

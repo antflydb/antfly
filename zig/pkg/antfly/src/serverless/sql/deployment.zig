@@ -148,7 +148,7 @@ pub const Owned = struct {
         self.artifact_port = if (self.artifacts) |*store| store.artifactStore() else undefined;
         self.cache = local.serverless_query_lake_serving_cache.Cache.initWithMemoryLimit(a, 64 * 1024 * 1024);
         errdefer self.cache.deinit();
-        self.spill = .{ .alloc = a, .io = io, .root = self.config.spill_dir orelse "", .max_bytes = cfg.spill_bytes, .context = self, .checkpoint = struct {
+        self.spill = .{ .alloc = a, .io = io, .root = self.config.spill_dir orelse "", .max_bytes = cfg.spill_bytes, .max_files = @as(usize, cfg.concurrency) * 64, .context = self, .checkpoint = struct {
             fn check(_: *anyopaque) !void {}
         }.check };
         if (cfg.spill_dir) |path| {

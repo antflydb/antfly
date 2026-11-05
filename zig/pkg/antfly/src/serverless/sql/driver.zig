@@ -52,8 +52,28 @@ pub const Driver = struct {
         }.notify };
     }
     fn enqueue(self: *Driver, hint: Hint, signal: bool) void {
+        self.enqueueWithPolicy(hint, signal, false);
+    }
+    fn enqueueDiscovered(self: *Driver, query: state.Query) void {
+        self.enqueueWithPolicy(.{ .tenant = self.service.tenant, .query = query, .discover = true }, false, true);
+    }
+    fn enqueueWithPolicy(self: *Driver, hint: Hint, signal: bool, discovery_only: bool) void {
         if (self.stopping.load(.acquire)) return;
         while (!self.hint_mutex.tryLock()) std.atomic.spinLoopHint();
+        // Discovery restores missing work; it is not a progress notification.
+        // Selection and this check share a lock so an active turn cannot gain
+        // an immediate duplicate between dequeue and its delayed requeue.
+        if (discovery_only) {
+            const known = for (self.active) |active| {
+                if (active) |query| if (std.meta.eql(query, hint.query)) break true;
+            } else for (0..self.hint_count) |i| {
+                if (std.meta.eql(self.hints[(self.hint_head + i) % self.hints.len].query, hint.query)) break true;
+            } else false;
+            if (known) {
+                self.hint_mutex.unlock();
+                return;
+            }
+        }
         const duplicate = for (0..self.hint_count) |i| {
             const queued = &self.hints[(self.hint_head + i) % self.hints.len];
             if (std.meta.eql(queued.query, hint.query)) {
@@ -168,7 +188,7 @@ pub const Driver = struct {
             const expires = try std.fmt.parseInt(u64, entry.key[prefix.len..][0..20], 10);
             if (expires <= self.service.clock.now()) continue;
             const query: state.Query = .{ .id = entry.key[prefix.len + 21 ..][0..64].*, .expires_ms = expires };
-            if (!self.hasHint(query)) self.enqueue(.{ .tenant = self.service.tenant, .query = query, .discover = true }, false);
+            self.enqueueDiscovered(query);
         }
         const next = if (listed.entries.len != 0) try self.service.a.dupe(u8, listed.entries[listed.entries.len - 1].key) else null;
         if (self.after) |old| self.service.a.free(old);
@@ -512,4 +532,36 @@ test "distributed SQL renewal-only turns do not load plans or pending tasks" {
     var delay: u64 = 0;
     try std.testing.expect(driver.take(0, &delay) == null);
     try std.testing.expectEqual(query, driver.take(Driver.lease_workers, &delay).?.query);
+}
+
+test "distributed SQL discovery preserves active and queued backoff while progress wakes immediately" {
+    const Clock = struct {
+        fn read(_: ?*anyopaque) u64 {
+            return 1000;
+        }
+    };
+    var driver: Driver = .{ .service = undefined, .dispatcher = undefined, .io = std.testing.io };
+    driver.service.clock = .{ .read = Clock.read };
+    driver.service.tenant = @splat('a');
+    const hint: Driver.Hint = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 100000 }, .not_before_ms = 11000 };
+    const lane = Driver.lease_workers;
+    driver.active[lane] = hint.query;
+    driver.enqueueDiscovered(hint.query);
+    try std.testing.expectEqual(@as(usize, 0), driver.hint_count);
+    driver.enqueue(hint, false);
+    driver.active[lane] = null;
+    driver.enqueueDiscovered(hint.query);
+    var delay: u64 = 0;
+    try std.testing.expect(driver.take(lane, &delay) == null);
+    try std.testing.expectEqual(@as(u64, 10000), delay);
+    driver.notification().notify(driver.notification().ptr, hint.tenant, hint.query);
+    try std.testing.expectEqual(hint.query, driver.take(lane, &delay).?.query);
+    // A real notification arriving during execution must also survive requeue.
+    driver.enqueue(.{ .tenant = hint.tenant, .query = hint.query }, false);
+    driver.enqueue(hint, false);
+    driver.active[lane] = null;
+    try std.testing.expectEqual(hint.query, driver.take(lane, &delay).?.query);
+    driver.active[lane] = null;
+    driver.enqueueDiscovered(hint.query);
+    try std.testing.expectEqual(hint.query, driver.take(lane, &delay).?.query);
 }

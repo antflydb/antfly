@@ -444,6 +444,11 @@ pub const Service = struct {
             return err;
         };
     }
+    const TaskPreparation = struct {
+        spec: ?plan.Plan = null,
+        failure: ?anyerror = null,
+        spill: ?*local.sql_spill.Manager = null,
+    };
     fn executeTask(self: Service, ticket: plan.Ticket, watch: *@import("cancellation.zig").Task) !void {
         try self.requireQueryRole();
         if (!std.mem.eql(u8, &ticket.tenant, &self.tenant)) return error.SqlExecutionUnauthorized;
@@ -469,20 +474,52 @@ pub const Service = struct {
         context = watch.scoped(context);
         var scoped_service = self;
         scoped_service.context = context;
+        var preparation: TaskPreparation = .{};
+        var task_spill: ?local.sql_spill.Manager = null;
+        defer if (task_spill) |*manager| manager.deinit();
         const Retry = struct {
             service: Service,
             allocator: A,
-            query: state.Query,
+            task_allocator: A,
+            ticket: plan.Ticket,
             record: state.Record,
+            preparation: *TaskPreparation,
+            spill: *?local.sql_spill.Manager,
             fn load(raw: *anyopaque) !u16 {
                 const value: *const @This() = @ptrCast(@alignCast(raw));
-                return value.service.retryLimit(value.allocator, value.query, value.record);
+                return value.service.retryLimit(value.allocator, value.ticket.query, value.record);
+            }
+            fn prepare(raw: *anyopaque, epoch: u64, limit: u16) !void {
+                const value: *@This() = @ptrCast(@alignCast(raw));
+                const parent = value.service.spill orelse return;
+                // Exhausted tasks must terminate without waiting for capacity.
+                if (epoch > limit) return;
+                const spec = value.service.loadPlan(value.allocator, value.ticket.query) catch |err| {
+                    // The durable execution failure path accounts for plan
+                    // errors. No reservation is needed when execution cannot run.
+                    value.preparation.failure = err;
+                    return;
+                };
+                value.preparation.spec = spec;
+                // Logical map stages are invariant under physical skew layout
+                // hydration and stream bounded blocks without local spill.
+                if (value.ticket.stage != 0 or spec.strategy == .bucket)
+                    value.spill.* = parent.admit(value.task_allocator, spec.limits.task_spill_bytes) orelse return error.SqlTaskAdmissionUnavailable;
             }
         };
-        var retry: Retry = .{ .service = scoped_service, .allocator = a, .query = ticket.query, .record = query.value };
-        const admitted = (try scoped_service.store().claimTask(a, key, self.owner, 60_000, .{ .ptr = &retry, .load = Retry.load })) orelse return;
+        var retry: Retry = .{ .service = scoped_service, .allocator = a, .task_allocator = task_allocator, .ticket = ticket, .record = query.value, .preparation = &preparation, .spill = &task_spill };
+        const admitted = (try scoped_service.store().claimTask(a, key, self.owner, 60_000, .{ .ptr = &retry, .load = Retry.load, .prepare = Retry.prepare })) orelse return;
+        if (task_spill) |*manager| {
+            manager.context = &context;
+            manager.checkpoint = struct {
+                fn check(raw: *anyopaque) !void {
+                    const value: *const Context = @ptrCast(@alignCast(raw));
+                    try value.ensureActive();
+                }
+            }.check;
+        }
         const claim = admitted.claim;
-        self.executeClaimed(ticket, a, task_allocator, &task_memory, query.value, key, claim, admitted.attempt_limit, context) catch |raw_error| {
+        self.executeClaimed(ticket, a, task_allocator, &task_memory, query.value, key, claim, admitted.attempt_limit, context, .{ .spec = preparation.spec, .failure = preparation.failure, .spill = if (task_spill) |*manager| manager else null }) catch |raw_error| {
             const err = if (raw_error == error.OutOfMemory and task_memory.exhausted) error.SqlJoinBudgetExceeded else raw_error;
             switch (err) {
                 error.SqlJoinBudgetExceeded, error.SqlProgramLimitExceeded, error.InvalidSqlBackendResponse, error.InvalidSqlExchange, error.SqlExecutionUnauthorized, error.InvalidSqlExecutionState, error.InvalidSqlDistributedPlan, error.TaskRetryBudgetExceeded => {
@@ -493,14 +530,15 @@ pub const Service = struct {
             }
         };
     }
-    fn executeClaimed(self: Service, ticket: plan.Ticket, a: A, task_allocator: A, task_memory: *local.sql_memory_budget, query: state.Record, key: []const u8, claim: state.Claim, attempt_limit: u16, task_context: Context) !void {
+    fn executeClaimed(self: Service, ticket: plan.Ticket, a: A, task_allocator: A, task_memory: *local.sql_memory_budget, query: state.Record, key: []const u8, claim: state.Claim, attempt_limit: u16, task_context: Context, preparation: TaskPreparation) !void {
         // Retry admission is resolved before acquiring the lease; a successful
         // first attempt never reads the sidecar.
         if (claim.epoch > attempt_limit) return error.TaskRetryBudgetExceeded;
-        var context = task_context;
+        const context = task_context;
         var scoped_service = self;
         scoped_service.context = context;
-        var spec = try scoped_service.loadPlan(a, ticket.query);
+        if (preparation.failure) |err| return err;
+        var spec = preparation.spec orelse try scoped_service.loadPlan(a, ticket.query);
         if (claim.epoch > spec.limits.max_attempts) return error.TaskRetryBudgetExceeded;
         if (task_memory.live > spec.limits.task_memory) return error.SqlJoinBudgetExceeded;
         task_memory.limit = @intCast(spec.limits.task_memory);
@@ -509,19 +547,7 @@ pub const Service = struct {
         const inputs = try scoped_service.loadDependencies(a, spec, ticket.query, task);
         var objects = self.exchange_store;
         objects.context = context;
-        var task_spill: ?local.sql_spill.Manager = if (self.spill) |parent| parent.scoped(task_allocator) else null;
-        defer if (task_spill) |*manager| manager.deinit();
-        if (task_spill) |*manager| {
-            manager.max_bytes = @min(manager.max_bytes, spec.limits.task_spill_bytes);
-            manager.context = &context;
-            manager.checkpoint = struct {
-                fn check(raw: *anyopaque) !void {
-                    const value: *const Context = @ptrCast(@alignCast(raw));
-                    try value.ensureActive();
-                }
-            }.check;
-        }
-        const executor: runner.Runner = .{ .a = task_allocator, .source = self.source, .exchange_store = objects, .context = context, .spill = if (task_spill) |*manager| manager else null };
+        const executor: runner.Runner = .{ .a = task_allocator, .source = self.source, .exchange_store = objects, .context = context, .spill = preparation.spill };
         const output = try executor.run(ticket.query.id, spec, task, inputs);
         defer task_allocator.free(output.key);
         defer if (output.matches) |witness| task_allocator.free(witness.key);

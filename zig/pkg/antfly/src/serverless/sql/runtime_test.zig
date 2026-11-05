@@ -346,7 +346,12 @@ test "distributed SQL signed task RPC uses query listeners and recovery driver w
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const sa = arena.allocator();
-    var memory = storage.MemoryClient.init(a);
+    // Listener workers and recovery lanes genuinely run concurrently. Use the
+    // production backend's conditional-write locking, not the single-threaded
+    // in-memory fake, so the regression exercises real ownership semantics.
+    var temporary = try local.common_test_directory.TestDirectory.init("distributed-sql-listeners");
+    defer temporary.cleanup();
+    var memory = try storage.FilesystemClient.initWithIo(a, temporary.path(), std.testing.io);
     defer memory.deinit();
     var fixture: Fixture = .{};
     const coordinator = fixture.service(a, memory.client(), "coordinator");
@@ -2685,4 +2690,133 @@ test "distributed SQL migrates inline retry authority before claims renewals and
         try std.testing.expectEqual(records.tenant.?, authority.value.tenant);
         try std.testing.expectEqual(@as(u16, 1), authority.value.task_attempt_limit);
     }
+}
+
+test "distributed SQL spill admission bounds concurrent envelopes and releases reservations" {
+    const a = std.testing.allocator;
+    var dummy: u8 = 0;
+    var parent: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .max_bytes = 2048, .max_files = 128 };
+    defer parent.deinit();
+    var first = parent.admit(a, 1024).?;
+    var second = parent.admit(a, 1024).?;
+    try std.testing.expect(parent.admit(a, 1) == null);
+    try std.testing.expectEqual(@as(usize, 0), parent.fileHeadroom());
+    try std.testing.expectEqual(@as(usize, 64), first.fileHeadroom());
+    first.deinit();
+    try std.testing.expect(parent.admit(a, 1025) == null);
+    var third = parent.admit(a, 512).?;
+    try std.testing.expect(parent.admit(a, 1) == null);
+    third.deinit();
+    second.deinit();
+    try std.testing.expectEqual(@as(u64, 0), parent.reserved_bytes);
+    try std.testing.expectEqual(@as(usize, 128), parent.fileHeadroom());
+    var full = parent.admit(a, 4096).?;
+    try std.testing.expectEqual(@as(u64, 2048), full.max_bytes);
+    full.deinit();
+}
+
+test "distributed SQL spill contention preserves attempts and resumes after release" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    const coordinator = fixture.service(a, memory.client(), "coordinator");
+    var temporary = try local.common_test_directory.TestDirectory.init("distributed-sql-admission");
+    defer temporary.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, temporary.path());
+    var dummy: u8 = 0;
+    var parent: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .context = &dummy, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .root = temporary.path() };
+    defer parent.deinit();
+    var held: ?local.sql_spill.Manager = parent.admit(a, parent.max_bytes).?;
+    defer if (held) |*manager| manager.deinit();
+    const BusyDispatch = struct {
+        worker: runtime.Service,
+        busy: usize = 0,
+        maps: usize = 0,
+        fn run(raw: *anyopaque, tickets: []const plan.Ticket, _: Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (tickets) |ticket| {
+                self.worker.execute(ticket) catch |err| {
+                    if (err != error.SqlTaskAdmissionUnavailable) return err;
+                    const key = try self.worker.state_store.key(self.worker.a, ticket.query, ticket.stage, ticket.task);
+                    defer self.worker.a.free(key);
+                    var record = (try self.worker.state_store.load(self.worker.a, key)).?;
+                    defer record.deinit(self.worker.a);
+                    try std.testing.expectEqual(@as(u64, 0), record.value.epoch);
+                    try std.testing.expectEqual(state.Status.pending, record.value.status);
+                    self.busy += 1;
+                    continue;
+                };
+                if (ticket.stage == 0) self.maps += 1;
+            }
+        }
+    };
+    var dispatch: BusyDispatch = .{ .worker = fixture.service(a, memory.client(), "worker") };
+    dispatch.worker.spill = &parent;
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+    var right = input;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    var spec = try plan.choose(input, right, @splat('a'), 1000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .max_attempts = 1, .query_exchange_bytes = 16 * 1024 * 1024 * 1024 }, fixture.now);
+    spec.strategy = .shuffle;
+    const query = try coordinator.submit(spec);
+    const claim = (try coordinator.acquire(query)).?;
+    for (0..64) |_| {
+        try std.testing.expect(!try coordinator.tick(query, claim, .{ .ptr = &dispatch, .dispatch = BusyDispatch.run }));
+        if (dispatch.busy > 16) break;
+    }
+    try std.testing.expect(dispatch.maps > 0);
+    try std.testing.expect(dispatch.busy > 16);
+    held.?.deinit();
+    held = null;
+    var done = false;
+    for (0..128) |_| {
+        done = try coordinator.tick(query, claim, .{ .ptr = &dispatch, .dispatch = BusyDispatch.run });
+        if (done) break;
+    }
+    try std.testing.expect(done);
+    const result = (try coordinator.pollResult(sa, query)).?;
+    try std.testing.expectEqual(@as(u64, 2), result.rows);
+    try std.testing.expectEqual(@as(u64, 0), parent.reserved_bytes);
+    try std.testing.expectEqual(@as(usize, 0), parent.reserved_files);
+}
+
+test "distributed SQL admitted spill isolates real file and byte quotas between siblings" {
+    const a = std.testing.allocator;
+    var temporary = try local.common_test_directory.TestDirectory.init("distributed-sql-spill-isolation");
+    defer temporary.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, temporary.path());
+    var dummy: u8 = 0;
+    var parent: local.sql_spill.Manager = .{ .alloc = a, .io = std.testing.io, .root = temporary.path(), .context = &dummy, .checkpoint = struct {
+        fn check(_: *anyopaque) !void {}
+    }.check, .max_bytes = 2048, .max_files = 128 };
+    defer parent.deinit();
+    var first = parent.admit(a, 1024).?;
+    defer first.deinit();
+    var second = parent.admit(a, 1024).?;
+    defer second.deinit();
+    var files: [64]local.sql_spill.File = undefined;
+    var count: usize = 0;
+    defer for (files[0..count]) |*file| file.close();
+    for (&files) |*file| {
+        file.* = try first.create();
+        count += 1;
+    }
+    try std.testing.expectError(error.SqlProgramLimitExceeded, first.create());
+    // One task reaching its descriptor cap cannot steal its sibling's slots.
+    var sibling = try second.create();
+    defer sibling.close();
+    try files[0].writeRaw(0, &@as([1024]u8, @splat('a')));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, files[0].writeRaw(1024, "x"));
+    try sibling.writeRaw(0, &@as([1024]u8, @splat('b')));
+    try std.testing.expectEqual(@as(u64, 1024), first.live_bytes);
+    try std.testing.expectEqual(@as(u64, 1024), second.live_bytes);
 }
