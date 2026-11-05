@@ -2549,7 +2549,8 @@ pub const ModelManager = struct {
         if (!pressureCanBeRelievedByHostCache(pressure)) return false;
 
         self.lockLoadedModels();
-        defer self.unlockLoadedModels();
+        var loaded_locked = true;
+        defer if (loaded_locked) self.unlockLoadedModels();
         var candidate: ?*LoadedModel = null;
         var oldest_ns: u64 = std.math.maxInt(u64);
         var it = self.loaded.iterator();
@@ -2563,8 +2564,12 @@ pub const ModelManager = struct {
             }
         }
         var model = candidate orelse return false;
-        var released_bytes = session_factory.reclaimOneHostCacheEntryForSession(model.session);
-        if (released_bytes == 0) {
+        var released_bytes = if (model.session.model_lifetime != null)
+            session_factory.reclaimOneHostCacheEntryForSession(model.session)
+        else
+            0;
+        var settlement_pending = session_factory.hostCacheCreditSettlementPendingForSession(model.session);
+        if (released_bytes == 0 and !settlement_pending) {
             // A session may have no unpinned victim at this instant. Do not let
             // one busy model hide reclaimable capacity in another model.
             var fallback_it = self.loaded.iterator();
@@ -2576,14 +2581,17 @@ pub const ModelManager = struct {
                 {
                     continue;
                 }
+                if (fallback.session.model_lifetime == null) continue;
                 released_bytes = session_factory.reclaimOneHostCacheEntryForSession(fallback.session);
-                if (released_bytes != 0) {
+                const pending = session_factory.hostCacheCreditSettlementPendingForSession(fallback.session);
+                if (released_bytes != 0 or pending) {
+                    settlement_pending = pending;
                     model = fallback;
                     break;
                 }
             }
         }
-        if (released_bytes == 0) return false;
+        if (released_bytes == 0 and !settlement_pending) return false;
         std.log.info(
             "reclaimed inference host cache path={s} backend={s} bytes={d} pressure={s}",
             .{
@@ -2593,12 +2601,32 @@ pub const ModelManager = struct {
                 @tagName(pressure),
             },
         );
-        // Cache storage is physically destroyed before its aggregate credit is
-        // observed by the next admission probe. On glibc, also return unused
-        // arena pages so the cgroup working set reflects that destruction
-        // rather than the allocator's historical high-water mark.
+        // LoadedModel/path metadata may retire during a reentrant callback.
+        // Copy only its existing Session and retain the actual Model BEFORE
+        // unlocking. Payload has already died under Native's residency guard;
+        // its exact ledger remains backed until this outside settlement.
+        const reclaimed_session = model.session;
+        const model_pin = reclaimed_session.model_lifetime.?.retain();
+        loaded_locked = false;
+        const settled = self.finishReclaimedHostCacheOutsideLocks(reclaimed_session, model_pin, session_factory.flushHostCacheReleasesOutsideExecutionForSession);
+        return released_bytes != 0 or settled;
+    }
+
+    /// Entry owns loaded-models+eviction locks and one actual Model pin. Exit
+    /// owns eviction only. Payload selection/removal is already complete; the
+    /// synchronous pin protects metadata through a callback that can retire the
+    /// loaded identity. No callbacks may run until BOTH Manager locks are off.
+    fn finishReclaimedHostCacheOutsideLocks(self: *ModelManager, reclaimed_session: backends.Session, model_pin: *backends.Session.ModelLifetime, comptime settle: anytype) bool {
+        self.unlockLoadedModels();
+        self.eviction_lock.unlock();
+        defer spinLock(&self.eviction_lock);
+        const settled = settle(reclaimed_session) catch false;
+        const final_model_drop = model_pin.references.load(.acquire) == 1;
+        // This may be the actual final Model drop after reentrant retirement.
+        // It too occurs outside both Manager locks, before the loop resumes.
+        model_pin.release();
         _ = platform.allocator.reclaimUnusedProcessMemory();
-        return true;
+        return settled or final_model_drop;
     }
 
     fn reclaimOneForAdmission(
@@ -4860,6 +4888,12 @@ pub const ModelManager = struct {
         if (session.model_lifetime) |lifetime| if (lifetime.admission_domain) |pin| {
             if (pin.controller() != domain.admission) return error.ForeignAdmissionDomain;
         };
+        // The tier ledger's final metadata must retain the actual owner before
+        // serving publication. This happens outside Model/lane/cache gates and
+        // before fallible resource-pin creation, so failure closes normally.
+        const cache_domain = domain.admission_owner.pin();
+        defer cache_domain.release();
+        try session_factory.installNativeCacheRetirementDomainForSession(session.*, &cache_domain);
         const holder = try self.allocator.create(RetainedSessionResources);
         errdefer self.allocator.destroy(holder);
         holder.* = .{ .allocator = self.allocator, .domain = domain, .io_owner = io_owner };
@@ -11510,4 +11544,87 @@ test "permanent memory admission failures retain estimates and release reservati
     try std.testing.expectEqual(@as(usize, 0), manager.admissionController().snapshot().hostTotalBytes());
     try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireRequestsWithEviction(&.{.{ .backend_class = .cpu, .limits = limits, .amounts = .{ .host_scratch_bytes = 30 } }}));
     try std.testing.expectEqual(@as(u64, 2), manager.memoryAdmissionDiagnostic().denied_count);
+}
+
+test "Native active cache refund and reentrant final Model release occur outside both Manager locks" {
+    const a = std.testing.allocator;
+    var manager = ModelManager.init(a, backends.SessionManager.init(a));
+    defer manager.deinit();
+    try manager.ensureResourceOwnerReady();
+    const domain = try runtime.tier.admission_domain.Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var cache = runtime.tier.cache.SharedCache.init(.{ .host_limit_bytes = 32 });
+    defer cache.deinitAdmission();
+    try cache.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = 32 }, .{});
+    try cache.installRetirementDomainOutsideExecution(&pin);
+    const Fixture = struct {
+        manager: *ModelManager,
+        cache: *runtime.tier.cache.SharedCache,
+        lifetime: ?*backends.Session.ModelLifetime = null,
+        drop_base: bool = false,
+        violation: bool = false,
+        closed: bool = false,
+        releases: usize = 0,
+        fn inspect(self: *@This()) void {
+            if (self.manager.load_lock.tryLock()) self.manager.load_lock.unlock() else self.violation = true;
+            if (self.manager.eviction_lock.tryLock()) self.manager.eviction_lock.unlock() else self.violation = true;
+        }
+        fn reserve(raw: *anyopaque, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect();
+            return 44;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect();
+            self.releases += 1;
+            if (self.drop_base) {
+                self.drop_base = false;
+                self.lifetime.?.release(); // callback retires original identity
+                if (self.closed) self.violation = true; // helper's exact pin lives
+            }
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect();
+            self.cache.deinitAdmission();
+            self.closed = true;
+        }
+        fn settle(session: backends.Session) !bool {
+            const self: *@This() = @ptrCast(@alignCast(session.ptr));
+            const before = self.cache.admissionAmounts();
+            try self.cache.flushReleasedOutsideExecution();
+            const after = self.cache.admissionAmounts();
+            return after.host_weight_bytes < before.host_weight_bytes;
+        }
+    };
+    var fixture = Fixture{ .manager = &manager, .cache = &cache };
+    var model = backends.Session.ModelLifetime{ .owner = &fixture, .destroy_fn = Fixture.close };
+    fixture.lifetime = &model;
+    try pin.controller().configureResourceBudget(.{ .context = &fixture, .try_reserve = Fixture.reserve, .retain = Fixture.retain, .release = Fixture.release });
+    try cache.reserve(.host, 32);
+    cache.deferPhysicalReleases();
+    manager.lockLoadedModels();
+    spinLock(&manager.eviction_lock);
+    cache.noteRelease(.host, 32); // actual backing already died under residency guard
+    try std.testing.expectEqual(@as(usize, 0), fixture.releases);
+    const selected = backends.Session{ .ptr = &fixture, .vtable = &TeardownTestProbe.vtable, .model_lifetime = &model };
+    const actual_pin = model.retain(); // real selected owner BEFORE lock release
+    fixture.drop_base = true;
+    try std.testing.expect(manager.finishReclaimedHostCacheOutsideLocks(selected, actual_pin, Fixture.settle));
+    // Same outer acquisition lock contract is restored after all callbacks.
+    try std.testing.expect(!manager.eviction_lock.tryLock());
+    manager.eviction_lock.unlock();
+    try std.testing.expect(manager.load_lock.tryLock());
+    manager.load_lock.unlock();
+    try std.testing.expect(fixture.closed and !fixture.violation);
+    try std.testing.expectEqual(@as(usize, 1), fixture.releases);
+    try std.testing.expectEqual(@as(usize, 0), pin.controller().snapshot().host_weight_bytes);
+    try std.testing.expect(cache.admission == null);
 }

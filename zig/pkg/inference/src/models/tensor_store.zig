@@ -200,6 +200,39 @@ pub const TensorStore = struct {
         return store.rawData();
     }
 
+    pub const NativeQuantizedSource = struct {
+        tensor_type: gguf_mod.tensor_types.TensorType,
+        raw_bytes: []const u8,
+        shape: [2]i64,
+        source_name: []const u8,
+        mmap_backed: bool,
+    };
+
+    /// Values-only geometry of the SAME mapped bytes returned by
+    /// loadQuantizedStorageRef. No payload allocation, file reopening, admission,
+    /// or preparation. The actual retained Model keeps this store/source alive;
+    /// the receiving owner must revalidate the full store and entry identities.
+    /// Packed experts/composite/custom stores retain their original path.
+    pub fn nativeQuantizedSource(self: TensorStore, ref: *const LazyTensorRef) !?NativeQuantizedSource {
+        if (self.vtable != &GgufStore.vtable or ref.packed_expert_index != null or ref.packed_expert_count != 0) return null;
+        const store: *const GgufStore = @ptrCast(@alignCast(self.ptr));
+        const source_name = ref.source_name orelse ref.name;
+        const tensor = gguf_mod.tensor_catalog.Catalog.init(&store.parsed).find(source_name) orelse return error.TensorNotFound;
+        if (!tensor.tensor_type.isQuantized() or tensor.dimensions.len != 2) return null;
+        const bytes_u64 = gguf_mod.tensor_types.byteLen(tensor.tensor_type, tensor.dimensions) orelse return error.UnsupportedTensorType;
+        const bytes = std.math.cast(usize, bytes_u64) orelse return error.InvalidTensorShape;
+        const offset = std.math.cast(usize, tensor.data_offset) orelse return error.InvalidTensorShape;
+        const end = std.math.add(usize, offset, bytes) catch return error.InvalidTensorShape;
+        const raw = store.rawData();
+        if (end > raw.len) return error.InvalidTensorShape;
+        var shape: [2]i64 = undefined;
+        for (0..2) |i| {
+            shape[i] = std.math.cast(i64, tensor.dimensions[1 - i]) orelse return error.InvalidTensorShape;
+            if (shape[i] <= 0) return error.InvalidTensorShape;
+        }
+        return .{ .tensor_type = tensor.tensor_type, .raw_bytes = raw[offset..end], .shape = shape, .source_name = source_name, .mmap_backed = store.mmap_region != null };
+    }
+
     pub const GlinerGgufSnapshot = struct {
         encoder: []const u8,
         head: []const u8,
@@ -1893,4 +1926,38 @@ fn expectMappedStorageInventory(store: TensorStore, allocator: std.mem.Allocator
     table.visitStorageSpans = null;
     custom.vtable = &table;
     try std.testing.expect(!try custom.visitStorageSpans(collector.visitor()));
+}
+
+test "Native canonical GGUF cold geometry is exact same immutable quantized source without payload preparation" {
+    const a = std.testing.allocator;
+    const writer = @import("../gguf/writer.zig");
+    var layout = try writer.buildLayout(a, &.{}, &.{.{ .name = "matrix.weight", .dimensions = &.{ 32, 64 }, .tensor_type = .{ .known = .Q8_0 } }});
+    defer layout.deinit(a);
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(a);
+    try bytes.appendSlice(a, layout.header_bytes);
+    const data_offset = std.mem.alignForward(usize, bytes.items.len, @intCast(layout.alignment));
+    try bytes.appendNTimes(a, 0, data_offset - bytes.items.len + 64 * 34);
+    const canonical = try GgufStore.initOwnedBytes(a, "native-cold-geometry", bytes.items);
+    const store = canonical.tensorStore();
+    defer store.deinit();
+    var ref = try store.describeTensor(a, "matrix.weight");
+    defer ref.deinit(a);
+    const geometry = (try store.nativeQuantizedSource(&ref)) orelse return error.TestUnexpectedResult;
+    var actual = (try store.loadQuantizedStorageRef(&ref)) orelse return error.TestUnexpectedResult;
+    defer actual.deinit();
+    try std.testing.expect(geometry.raw_bytes.ptr == actual.raw_bytes.ptr);
+    try std.testing.expectEqual(actual.raw_bytes.len, geometry.raw_bytes.len);
+    try std.testing.expectEqualSlices(i64, actual.shape, &geometry.shape);
+    try std.testing.expectEqualSlices(i64, &.{ 64, 32 }, &geometry.shape);
+    try std.testing.expectEqualStrings(actual.source_name.?, geometry.source_name);
+    try std.testing.expectEqual(@as(usize, 0), actual.prepared.ownedBytes());
+    // Metadata aliases of the public table cannot certify a foreign ctx.
+    var copied = store.vtable.*;
+    var forged = store;
+    forged.vtable = &copied;
+    forged.ptr = @ptrFromInt(16);
+    try std.testing.expect((try forged.nativeQuantizedSource(&ref)) == null);
+    ref.packed_expert_count = 2;
+    try std.testing.expect((try store.nativeQuantizedSource(&ref)) == null);
 }

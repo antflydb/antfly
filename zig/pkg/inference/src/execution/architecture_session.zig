@@ -2902,6 +2902,20 @@ pub fn gemmaWorkspaceLanePolicy(session: Session) ?bool {
     return owner.arch_config == .embedding_gemma2;
 }
 
+/// Canonical selected Native GPT family only. A public callback, model_contract
+/// string, copied table or raw no-Model session never grants this owner loan.
+pub fn nativeWeightPreparationModelData(session: Session) ?*native_mod.WeightStore {
+    if (comptime !build_options.enable_native) return null;
+    if (session.vtable != &arch_vtable) return null;
+    const provider = session.compute_backend_provider orelse return null;
+    const model = session.model_lifetime orelse return null;
+    if (provider.services != &archComputeServices or provider.ptr != session.ptr or model.owner != provider.ptr or model.destroy_fn != archClose or session.execution_gate != &model.execution_gate) return null;
+    const owner: *ArchSession = @ptrCast(@alignCast(provider.ptr));
+    if (&owner.model_lifetime != model or owner.backend_type != .native or owner.arch_config != .gpt) return null;
+    if (!gpt_arch.denseQwen3PrefillEligible(owner.arch_config.gpt)) return null;
+    return &owner.backend_data.native;
+}
+
 pub fn acceptsMetalWorkspaceSession(session: Session) bool {
     const provider = session.compute_backend_provider orelse return false;
     const model = session.model_lifetime orelse return false;
@@ -5761,16 +5775,37 @@ pub fn configureSharedCacheAdmissionForSession(
     };
     const cache = tier_cache orelse return;
     cache.configureHardBudget(hard_budget);
-    try cache.configureAdmission(
-        allocator,
-        controller,
-        backend_class,
-        limits,
-        .{
+    if (self.backend_type == .native) {
+        try cache.configureManagedAdmissionOutsideExecution(controller, backend_class, limits, .{
             .host_limit_bytes = resident.host_weight_bytes,
             .backend_limit_bytes = resident.backend_weight_bytes,
-        },
-    );
+        });
+        // Manually published canonical Sessions may already own their Domain.
+        if (self.model_lifetime.retainAdmissionDomain(controller)) |pin| {
+            defer pin.release();
+            try cache.installRetirementDomainOutsideExecution(&pin);
+        }
+    } else {
+        try cache.configureAdmission(
+            allocator,
+            controller,
+            backend_class,
+            limits,
+            .{
+                .host_limit_bytes = resident.host_weight_bytes,
+                .backend_limit_bytes = resident.backend_weight_bytes,
+            },
+        );
+    }
+}
+
+/// Actual loader cold resource-owner handoff. Full canonical table validation
+/// precedes any cast; the only persistent new value is the real Domain pin.
+pub fn installNativeCacheRetirementDomainForSession(session: Session, pin: *const runtime.tier.admission_domain.Pin) !void {
+    if (session.vtable != &arch_vtable) return;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (self.backend_type != .native) return;
+    if (self.backend_data.native.tier_cache) |*cache| try cache.installRetirementDomainOutsideExecution(pin);
 }
 
 /// Exact admission ownership held by a session's tier cache above the model
@@ -5800,10 +5835,41 @@ pub fn reclaimOneHostCacheEntryForSession(session: Session) usize {
     if (session.vtable != &arch_vtable) return 0;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     return switch (self.backend_type) {
-        .native => native_mod.reclaimOneHostCacheEntry(&self.backend_data.native),
-        .pjrt => native_mod.reclaimOneHostCacheEntry(&self.backend_data.pjrt.native),
+        .native => native_mod.reclaimOneHostCacheEntryDeferringCredit(&self.backend_data.native),
+        .pjrt => native_mod.reclaimOneHostCacheEntryDeferringCredit(&self.backend_data.pjrt.native),
         .metal, .cuda, .wasm => 0,
     };
+}
+
+/// Synchronous settlement AFTER actual cache backing death. Caller retains the
+/// actual Model and releases every enclosing Manager/Model/lane/cache gate;
+/// no Session/Model pointer enters the ledger's pure final retirement node.
+pub fn hostCacheCreditSettlementPendingForSession(session: Session) bool {
+    if (session.vtable != &arch_vtable) return false;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const data: ?*native_mod.WeightStore = switch (self.backend_type) {
+        .native => &self.backend_data.native,
+        .pjrt => &self.backend_data.pjrt.native,
+        else => null,
+    };
+    return if (data) |actual| if (actual.tier_cache) |*cache| cache.releasedCreditPending() else false else false;
+}
+
+pub fn flushHostCacheReleasesOutsideExecutionForSession(session: Session) !bool {
+    if (session.vtable != &arch_vtable) return false;
+    const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const data: ?*native_mod.WeightStore = switch (self.backend_type) {
+        .native => &self.backend_data.native,
+        .pjrt => &self.backend_data.pjrt.native,
+        else => null,
+    };
+    if (data) |actual| if (actual.tier_cache) |*cache| {
+        const before = cache.admissionAmounts();
+        cache.flushReleasedOutsideExecution() catch {};
+        const after = cache.admissionAmounts();
+        return after.host_weight_bytes < before.host_weight_bytes or after.backend_weight_bytes < before.backend_weight_bytes;
+    };
+    return false;
 }
 
 pub fn memoryBudgetExceededDetail(
@@ -6169,7 +6235,9 @@ fn eagerHostRunWithContext(raw: *anyopaque, inputs: []const Tensor, allocator: s
 }
 fn eagerHostRunObserved(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, context: *const @import("invocation_context.zig").Context, receipt: ?*@import("existing_workspace_receipt.zig").Owner, preentry: ?*bool) ![]Tensor {
     const self: *ArchSession = @ptrCast(@alignCast(raw));
-    if (self.backend_type == .metal) {
+    if (self.backend_type == .native) {
+        if (context.native_weights == null or context.cleanup.boundary == null or context.recurrent_state != null or context.workspace_uses != null or receipt != null) return error.ForeignNativeWeightModel;
+    } else if (self.backend_type == .metal) {
         if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
         if (context.cleanup.boundary == null or context.recurrent_state != null) return error.ForeignWorkspaceUse;
         const expected = if (receipt) |owner| try owner.receiverUses() else null;
@@ -6253,7 +6321,9 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
         } else return error.MetalNotEnabled;
     } else if (current_context) |*active| {
         cb.call_context = active;
-        if (comptime build_options.enable_cuda) {
+        if (self.backend_type == .native) {
+            if (active.native_weights == null or active.cleanup.boundary == null or active.recurrent_state != null or active.workspace_uses != null) return error.ForeignNativeWeightModel;
+        } else if (comptime build_options.enable_cuda) {
             const budget = active.recurrent_state orelse return error.UnpreparedRecurrentStateBudget;
             try cuda_compute_mod.CudaCompute.validateTemporaryRecurrentBackend(&cb, budget);
         } else return error.CudaNotEnabled;
@@ -7653,6 +7723,8 @@ fn archCloseWithCleanup(ptr: *anyopaque, current: @import("cleanup_context.zig")
             metal_compute_mod.validateSharedNativeProviderWorkspaceRetirement(gpuBackendData(self), current) catch platform.inference_process_supervisor.restartWorker();
     }
 
+    if (self.backend_type == .native) self.backend_data.native.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+
     self.model_lifetime.discardUnpublishedFinalResources();
     if (self.video_coefficients) |*cache| cache.deinit();
     if (self.video_coefficient_permit) |*permit| permit.deinit();
@@ -7664,7 +7736,7 @@ fn archCloseWithCleanup(ptr: *anyopaque, current: @import("cleanup_context.zig")
         self.laya_trunk_cache = null;
     }
     switch (self.backend_type) {
-        .native => self.backend_data.native.deinitOwned(),
+        .native => self.backend_data.native.deinitOwnedWithCleanup(current) catch platform.inference_process_supervisor.restartWorker(),
         .metal => {
             if (comptime build_options.enable_metal) {
                 const gpu_data = gpuBackendData(self);
@@ -14596,4 +14668,221 @@ test "CUDA Stage optional denial preserves metadata-only warm owner upgrades wit
     try std.testing.expect(funding.optional_disabled and funding.entries[0].upgrade.owner != null);
     try std.testing.expect(!funding.entries[1].miss and funding.entries[1].lease == null);
     try std.testing.expectEqual(@as(usize, 64), pin.controller().snapshot().backend_scratch_bytes);
+}
+
+fn nativeCanonicalSourceColdSelectedCase(peer_embedding: bool) !void {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const Memory = @import("../runtime/tier/memory.zig");
+    const Cache = @import("../runtime/tier/cache.zig");
+    const Quantized = @import("../models/weight_source.zig").QuantizedStorage;
+    const Scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler;
+    const Fixture = struct {
+        fn dense(data: *NativeData, name: []const u8, rows: usize, width: usize, ones: bool) !void {
+            const key = try data.allocator.dupe(u8, name);
+            errdefer data.allocator.free(key);
+            const values = try data.allocator.alloc(f32, rows * width);
+            defer data.allocator.free(values);
+            for (values, 0..) |*value, i| value.* = if (ones) 1 else @as(f32, @floatFromInt(i % 13 + 1)) * 0.01;
+            var tensor = try Tensor.initFloat32(data.allocator, key, &.{ @intCast(rows), @intCast(width) }, values);
+            errdefer tensor.deinit();
+            if (ones) {
+                const shape = try data.allocator.dupe(i64, &.{@intCast(width)});
+                data.allocator.free(tensor.shape);
+                tensor.shape = shape;
+            }
+            try data.resident_weights.put(data.allocator, key, .{ .tensor = tensor });
+        }
+        fn quantized(data: *NativeData, name: []const u8, rows: usize, width: usize) !void {
+            const key = try data.allocator.dupe(u8, name);
+            errdefer data.allocator.free(key);
+            const raw = try data.allocator.alloc(u8, rows * width / 32 * 34);
+            errdefer data.allocator.free(raw);
+            for (0..raw.len / 34) |block| {
+                raw[block * 34] = 0;
+                raw[block * 34 + 1] = 0x28; // exact f16 scale 0.03125
+                for (0..32) |j| raw[block * 34 + 2 + j] = @bitCast(@as(i8, @intCast(@as(i32, @intCast(j % 7)) - 3)));
+            }
+            const shape = try data.allocator.dupe(i64, &.{ @intCast(rows), @intCast(width) });
+            errdefer data.allocator.free(shape);
+            try data.resident_weights.put(data.allocator, key, .{ .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &.{}, .name = key, .allocator = data.allocator, .owns_data = false, .owns_shape = false }, .quantized = true, .quantized_storage = Quantized{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = raw, .shape = shape, .allocator = data.allocator } });
+        }
+        fn build(data: *NativeData) !void {
+            try dense(data, "model.embed_tokens.weight", 8, 32, false);
+            for ([_][]const u8{ "model.norm.weight", "model.layers.0.input_layernorm.weight", "model.layers.0.post_attention_layernorm.weight", "model.layers.0.self_attn.q_norm.weight", "model.layers.0.self_attn.k_norm.weight" }) |name| try dense(data, name, 1, 32, true);
+            for ([_][]const u8{ "model.layers.0.self_attn.q_proj.weight", "model.layers.0.self_attn.k_proj.weight", "model.layers.0.self_attn.v_proj.weight", "model.layers.0.self_attn.o_proj.weight" }) |name| try quantized(data, name, 32, 32);
+            try quantized(data, "model.layers.0.mlp.gate_proj.weight", 64, 32);
+            try quantized(data, "model.layers.0.mlp.up_proj.weight", 64, 32);
+            try quantized(data, "model.layers.0.mlp.down_proj.weight", 32, 64);
+        }
+    };
+    var arch = ArchSession{ .allocator = a, .arch_config = .{ .gpt = .{ .family = .qwen3, .hidden_size = 32, .intermediate_size = 64, .num_hidden_layers = 1, .num_attention_heads = 1, .num_key_value_heads = 1, .attention_head_dim = 32, .vocab_size = 8, .norm_type = .rms_norm, .activation = .silu, .position_encoding = .rope, .max_position_embeddings = 32 } }, .backend_type = .native, .backend_data = .{ .native = .{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = Cache.SharedCache.init(.{ .host_limit_bytes = 1024 * 1024 }) } } };
+    var data_live = true;
+    defer if (data_live) arch.backend_data.native.deinitOwned();
+    try Fixture.build(&arch.backend_data.native);
+    if (peer_embedding) {
+        // Build a real lazy GGUF source BEFORE canonical Model publication.
+        // All remaining original fixture weights and numerical inputs stay exact.
+        const data = &arch.backend_data.native;
+        const name = "model.layers.0.self_attn.q_proj.weight";
+        var removed = data.resident_weights.fetchRemove(name).?;
+        defer {
+            removed.value.deinit();
+            a.free(removed.key);
+        }
+        const raw = removed.value.quantized_storage.?.raw_bytes;
+        var layout = try @import("../gguf/writer.zig").buildLayout(a, &.{}, &.{.{ .name = name, .dimensions = &.{ 32, 32 }, .tensor_type = .{ .known = .Q8_0 } }});
+        defer layout.deinit(a);
+        var bytes: std.ArrayListUnmanaged(u8) = .empty;
+        defer bytes.deinit(a);
+        try bytes.appendSlice(a, layout.header_bytes);
+        const offset = std.mem.alignForward(usize, bytes.items.len, @intCast(layout.alignment));
+        try bytes.appendNTimes(a, 0, offset - bytes.items.len);
+        try bytes.appendSlice(a, raw);
+        const store = try @import("../models/tensor_store.zig").GgufStore.initOwnedBytes(a, "source-peer-embedding", bytes.items);
+        data.tensor_store = store.tensorStore();
+        var reference = try data.tensor_store.?.describeTensor(a, name);
+        var reference_owned = true;
+        errdefer if (reference_owned) reference.deinit(a);
+        const key = try a.dupe(u8, name);
+        errdefer if (reference_owned) a.free(key);
+        try data.lazy_weights.put(a, key, .{ .tensor_ref = reference });
+        reference_owned = false;
+        native_mod.initPrefetchQueue(data, a);
+    }
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    arch.model_lifetime.admission_domain = pin.retain();
+    defer {
+        arch.model_lifetime.admission_domain.?.release();
+        arch.model_lifetime.admission_domain = null;
+        if (arch.model_lifetime.retirement_sink) |*held| held.release();
+        arch.model_lifetime.retirement_sink = null;
+    }
+    var session = archSessionHandle(&arch);
+    session.execution_gate = &arch.model_lifetime.execution_gate;
+    var scheduler = Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    try std.testing.expect(nativeWeightPreparationModelData(session) == &arch.backend_data.native);
+    const Probe = struct {
+        model: *Session.ModelLifetime,
+        quantized: ?*std.atomic.Mutex,
+        calls: usize = 0,
+        violation: bool = false,
+        source: ?*@import("../backends/session.zig").PreparedSource = null,
+        peer_data: ?*NativeData = null,
+        peer_pin: ?*const @import("../runtime/tier/admission_domain.zig").Pin = null,
+        peer_done: bool = false,
+        peer_raw: usize = 0,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const source = self.source orelse return;
+            if (!source.native_weight_paused or self.peer_done) return;
+            const data = self.peer_data orelse return;
+            const name = "model.layers.0.self_attn.q_proj.weight";
+            if (data.lazy_weights.getPtr(name).?.loaded != null) return;
+            self.peer_done = true;
+            self.observe();
+            // A real outside-cold peer wins with an embedding lookup, which
+            // deliberately publishes no matrix layouts. No numerical replay.
+            var peer = native_mod.NativeCompute.init(std.testing.allocator, data, null);
+            defer peer.deinit();
+            const cb = peer.computeBackend();
+            try native_mod.NativeCompute.prepareLazyWeightOutsideExecution(&cb, data, name, false, self.peer_pin);
+            const embedding = try native_mod.NativeCompute.accessPreparedLazyWeight(&cb, data, name, .embedding, false);
+            defer cb.free(embedding);
+            const rows = try cb.embeddingLookup(embedding, &.{0}, 1, 32);
+            defer cb.free(rows);
+            const storage = &data.lazy_weights.getPtr(name).?.loaded.?.quantized_storage.?;
+            try std.testing.expectEqual(@as(usize, 0), storage.prepared.ownedBytes());
+            self.peer_raw = @intFromPtr(storage.raw_bytes.ptr);
+        }
+        fn observe(self: *@This()) void {
+            if (self.model.execution_gate.tryLock()) self.model.execution_gate.unlock() else self.violation = true;
+            if (self.quantized) |lock| {
+                if (lock.tryLock()) lock.unlock() else self.violation = true;
+            }
+        }
+        fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            self.calls += 1;
+            return self.calls;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+    };
+    var probe = Probe{ .model = &arch.model_lifetime, .quantized = &arch.backend_data.native.quantized_prepare_lock };
+    try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    try arch.backend_data.native.tier_cache.?.configureAdmission(a, pin.controller(), .cpu, .{}, .{});
+    session.run_admission = .{ .controller = pin.controller(), .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 2 }, &.{ 1, 2 });
+    defer ids.deinit();
+    const first: []Tensor = if (peer_embedding) run: {
+        var source: @import("../backends/session.zig").PreparedSource = .{};
+        probe.source = &source;
+        probe.peer_data = &arch.backend_data.native;
+        probe.peer_pin = &pin;
+        defer probe.source = null;
+        const control: InferenceExecutionControl = .{ .native_call_policy = .in_process, .ptr = &probe, .check_fn = Probe.check };
+        try source.initBeforeExecutionInto(session, session, session.execution_gate, .{ .host = &.{ids} }, try session.planRun(&.{ids}, null), null, .resident_transient, a, control);
+        defer source.deinit();
+        try source.enter();
+        const result = try source.runHost(&.{ids});
+        errdefer {
+            for (result) |*value| value.deinit();
+            a.free(result);
+        }
+        try std.testing.expect(probe.peer_done and !probe.violation);
+        break :run result;
+    } else try session.runWithControl(&.{ids}, a, .{ .native_call_policy = .in_process });
+    defer {
+        for (first) |*value| value.deinit();
+        a.free(first);
+    }
+    try std.testing.expect(first.len == 1 and first[0].asFloat32().len == 64);
+    for (first[0].asFloat32()) |value| try std.testing.expect(std.math.isFinite(value));
+    const selected = if (peer_embedding) &arch.backend_data.native.lazy_weights.getPtr("model.layers.0.self_attn.q_proj.weight").?.loaded.?.quantized_storage.? else &arch.backend_data.native.resident_weights.getPtr("model.layers.0.self_attn.q_proj.weight").?.quantized_storage.?;
+    if (peer_embedding) try std.testing.expectEqual(probe.peer_raw, @intFromPtr(selected.raw_bytes.ptr));
+    try std.testing.expect(selected.prepared.ownedBytes() != 0);
+    const pointer = selected.preparedBytes(.row_major_blocks).?.ptr;
+    const owned = pin.controller().snapshot().host_weight_bytes;
+    try std.testing.expect(owned != 0 and !probe.violation and scheduler.head == null);
+    const calls = probe.calls;
+    const warm = try session.runWithControl(&.{ids}, a, .{ .native_call_policy = .in_process });
+    defer {
+        for (warm) |*value| value.deinit();
+        a.free(warm);
+    }
+    try std.testing.expectEqualSlices(f32, first[0].asFloat32(), warm[0].asFloat32());
+    try std.testing.expectEqual(pointer, selected.preparedBytes(.row_major_blocks).?.ptr);
+    try std.testing.expectEqual(calls + 1, probe.calls); // original next run floor only
+    var close = try @import("cleanup_owner.zig").Owner.beginResident(session);
+    defer close.finishAfterUnlock();
+    try std.testing.expect(session.execution_gate.?.tryLock());
+    probe.quantized = null; // the actual metadata owner dies in this call
+    try arch.backend_data.native.deinitOwnedWithCleanup(.{ .boundary = close.epoch() });
+    data_live = false;
+    try std.testing.expectEqual(owned, pin.controller().snapshot().host_weight_bytes);
+    session.execution_gate.?.unlock();
+    close.finishAfterUnlock();
+    try std.testing.expectEqual(@as(usize, 0), pin.controller().snapshot().host_weight_bytes);
+    try std.testing.expect(!probe.violation);
+}
+
+test "Native canonical Qwen Source prepares actual selected resident layouts outside Model and quantized owner then preserves warm math" {
+    try nativeCanonicalSourceColdSelectedCase(false);
+}
+
+test "Native actual Source matrix receive prepares same embedding-loaded lazy peer before numerical entry" {
+    try nativeCanonicalSourceColdSelectedCase(true);
 }

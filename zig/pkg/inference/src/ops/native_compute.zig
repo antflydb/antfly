@@ -773,6 +773,7 @@ pub const LazyWeightEntry = struct {
     expert_coord: ?ExpertCoord = null,
     projection_mask: u8 = 0,
     loaded_bytes: usize = 0,
+    prepared_independent_bytes: usize = 0,
     pin_count: usize = 0,
     pending_prefetch: bool = false,
     prefetch_score: u64 = 0,
@@ -839,6 +840,13 @@ pub const WeightStore = struct {
     /// must be drained first. `shared_prefetch` remains borrowed.
     /// Stores with borrowed entries must retain their custom cleanup.
     pub fn deinitOwned(self: *WeightStore) void {
+        self.deinitOwnedWithCleanup(.{ .outside_execution = true }) catch platform.inference_process_supervisor.restartWorker();
+    }
+    pub fn validateCleanup(self: *WeightStore, current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (self.tier_cache) |*cache| try cache.validateCleanup(current);
+    }
+    pub fn deinitOwnedWithCleanup(self: *WeightStore, current: @import("../execution/cleanup_context.zig").Context) !void {
+        try self.validateCleanup(current); // before ANY worker/cache/backing death
         deinitPrefetchQueue(self);
         var resident_it = self.resident_weights.iterator();
         while (resident_it.next()) |entry| {
@@ -855,7 +863,7 @@ pub const WeightStore = struct {
         self.lazy_weights.deinit(self.allocator);
         if (self.residency) |*residency| residency.deinit();
         if (self.tensor_store) |tensor_store| tensor_store.deinit();
-        if (self.tier_cache) |*tier_cache| tier_cache.deinitAdmission();
+        if (self.tier_cache) |*tier_cache| try tier_cache.deinitAdmissionWithCleanup(current);
         self.* = undefined;
     }
 };
@@ -902,6 +910,7 @@ const WeightRetirement = struct {
     data: *WeightStore,
     attached_compute: ?*NativeCompute,
     cache_reader: bool = false,
+    live_temporary_roots: std.atomic.Value(usize) = .init(0),
     references: std.atomic.Value(usize) = .init(1),
     mutex: std.atomic.Mutex = .unlocked,
 
@@ -994,6 +1003,12 @@ const Buf = struct {
     weight_retirement: ?*WeightRetirement = null,
     dense_storage: ?*DenseStorage = null,
     physical_lease: ?*ops.physical_storage.Lease = null,
+    // Private synchronous host Source fallback only. One original owning Buf
+    // holds the payload root; actual Source B owns the preallocated extra root.
+    // Aliases retain their parent, never duplicate this charge or save Epochs.
+    temporary_preparation: ?*@import("../execution/resource_retirement.zig").Charge = null,
+    temporary_scope_record: usize = 0,
+    temporary_scope_nonce: u64 = 0,
     logical_shape: ?[]i64 = null,
     logical_shape_inline: bool = false,
     inline_logical_shape: [8]i64 = undefined,
@@ -4053,6 +4068,15 @@ pub const NativeCompute = struct {
     /// Stack/embedded owners must call this after releasing caller-owned tensors
     /// and before tearing down the borrowed weight store or run budget.
     pub fn deinit(self: *NativeCompute) void {
+        self.deinitWithCleanup(.{}) catch platform.inference_process_supervisor.restartWorker();
+    }
+    pub fn deinitWithCleanup(self: *NativeCompute, current: @import("../execution/cleanup_context.zig").Context) !void {
+        // This cold API is private to synchronous host Source calls: owning
+        // host outputs cannot contain a weight CT/header loan. Enforce actual
+        // child drain BEFORE request metadata or callback context can die.
+        if (self.weight_retirement) |owner| if (owner.live_temporary_roots.load(.acquire) != 0) return error.NativeTemporaryChildrenStillLive;
+        var handles = self.weight_handles.valueIterator();
+        while (handles.next()) |tensor| try validateNativeTemporaryCleanup(tensor.*, current);
         deinitWeightHandles(self);
         if (self.embeddinggemma2_cache_reader) {
             platform.sync.lockYielding(&self.data.embeddinggemma2_f32_cache_lock);
@@ -4143,6 +4167,329 @@ pub const NativeCompute = struct {
     /// context. Stack/embedded owners instead call NativeCompute.deinit.
     pub fn computeBackend(self: *NativeCompute) ComputeBackend {
         return .{ .ptr = self, .vtable = &vtable_impl };
+    }
+
+    pub fn residentWeightCreditsNeedPreparation(cb: *const ComputeBackend, expected_data: *const anyopaque) !bool {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        return if (self.data.tier_cache) |*cache| cache.rawCreditsNeedPreparation() or cache.releasedCreditPending() else false;
+    }
+    pub fn prepareResidentCreditUpgradesOutsideExecution(cb: *const ComputeBackend, expected_data: *const anyopaque, pin: ?*const @import("../runtime/tier/admission_domain.zig").Pin) !void {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        if (self.data.tier_cache) |*cache| {
+            if (!cache.rawCreditsNeedPreparation()) return;
+            const actual = pin orelse return error.MissingCacheRetirementDomain;
+            for (0..8) |_| {
+                var upgrades = cache.prepareCreditUpgradesOutsideExecution(actual) catch |err| {
+                    if (err == error.PreparedCacheGrowthChanged) continue;
+                    return err;
+                };
+                defer upgrades.finishOutsideExecution();
+                upgrades.installLocked(cache) catch |err| {
+                    if (err == error.PreparedCacheGrowthChanged) continue;
+                    return err;
+                };
+                return;
+            }
+            return error.ResourceTemporarilyUnavailable;
+        }
+    }
+
+    /// Metadata-only query under the real lazy owner. A resident-only Model
+    /// does not park for an embedding lookup. Canonical GGUF direct sources
+    /// alone enter this cold path; expert/custom/dequantized routes retain their
+    /// existing contracts until their actual producer is migrated.
+    pub fn lazyWeightNeedsColdPreparation(cb: *const ComputeBackend, expected_data: *const anyopaque, name: []const u8) !bool {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        const data = self.data;
+        if (!data.prefetch_initialized) return false;
+        data.prefetch.lock();
+        defer data.prefetch.unlock();
+        const entry = data.lazy_weights.getPtr(name) orelse return false;
+        if (entry.loaded != null or entry.expert_coord != null or !data.allow_direct_quant) return false;
+        const store = data.tensor_store orelse return false;
+        return (try store.nativeQuantizedSource(&entry.tensor_ref)) != null;
+    }
+
+    pub fn flushWeightReleasesOutsideExecution(cb: *const ComputeBackend, expected_data: *const anyopaque) !void {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        if (self.data.tier_cache) |*cache| try cache.flushReleasedOutsideExecution();
+    }
+
+    /// Same on-demand direct GGUF payload and selected preparation geometry.
+    /// Source has parked its real Model/FIFO/lane; its retained Model pins the
+    /// immutable store. Cache exclusion is used only to snapshot/evict/publish,
+    /// never while acquiring/settling external quota or preparing the payload.
+    /// A private loser/failed candidate is destroyed outside every cache lock.
+    pub fn prepareLazyWeightOutsideExecution(cb: *const ComputeBackend, expected_data: *const anyopaque, name: []const u8, prepare_matrix: bool, pin: ?*const @import("../runtime/tier/admission_domain.zig").Pin) !void {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        const data = self.data;
+        if (!data.prefetch_initialized) return error.NativeWeightPreparationChanged;
+        data.prefetch.lock();
+        const entry = data.lazy_weights.getPtr(name) orelse {
+            data.prefetch.unlock();
+            return error.NativeWeightPreparationChanged;
+        };
+        if (entry.loaded != null) {
+            data.prefetch.unlock();
+            return;
+        }
+        if (entry.expert_coord != null or !data.allow_direct_quant) {
+            data.prefetch.unlock();
+            return error.NativeWeightPreparationChanged;
+        }
+        const store = data.tensor_store orelse {
+            data.prefetch.unlock();
+            return error.NativeWeightPreparationChanged;
+        };
+        const selected = store.nativeQuantizedSource(&entry.tensor_ref) catch |err| {
+            data.prefetch.unlock();
+            return err;
+        };
+        const source = selected orelse {
+            data.prefetch.unlock();
+            return error.NativeWeightPreparationChanged;
+        };
+        data.prefetch.unlock();
+        // This is the original metadata constructor over the same retained
+        // checkpoint mapping. No checkpoint payload copy, eager load or replay.
+        var growth: ?tier_cache_mod.SharedCache.PreparedGrowth = null;
+        defer if (growth) |*candidate| candidate.finishOutsideExecution();
+        // Physical candidate death precedes its unused quota/metadata refund on
+        // EVERY failure/peer-winner path, including post-preparation revalidation.
+        var storage = (try store.loadQuantizedStorageRef(&entry.tensor_ref)) orelse return error.NativeWeightPreparationChanged;
+        var storage_owned = true;
+        defer if (storage_owned) storage.deinit();
+        if (storage.raw_bytes.ptr != source.raw_bytes.ptr or storage.raw_bytes.len != source.raw_bytes.len or !std.meta.eql(storage.tensor_type, source.tensor_type) or !std.mem.eql(i64, storage.shape, &source.shape)) return error.NativeWeightPreparationChanged;
+        const known = switch (storage.tensor_type) {
+            .known => |kind| kind,
+            else => return error.NativeWeightPreparationChanged,
+        };
+        const policy = ResidentWeightPreparation.selectedPolicy(known);
+        const additional = if (prepare_matrix) preparedKBlockAdditionalBytes(&storage) else 0;
+        const expected = if (prepare_matrix) expectedQuantizedStorageLoadBytes(&storage) else quantizedStorageBudgetBytes(&storage);
+        data.prefetch.lock();
+        if (data.lazy_weights.getPtr(name) != entry or entry.loaded != null or data.tensor_store.?.ptr != store.ptr or data.tensor_store.?.vtable != store.vtable or !data.allow_direct_quant) {
+            data.prefetch.unlock();
+            return error.NativeWeightPreparationChanged;
+        }
+        if (data.tier_cache) |*cache| {
+            cache.deferPhysicalReleases();
+            // Preserve the original selected LRU victim order and hard ceiling.
+            evictColdNonExpertWeightsToFitLocked(data, .host, expected, entry);
+        }
+        data.prefetch.unlock();
+        if (data.tier_cache) |*cache| try cache.flushReleasedOutsideExecution();
+        // Same useful-victim retry as reserveHostCacheWithReclaimLocked.
+        // The cold slice additionally bounds peer refill churn by the actual
+        // immutable entry count; no numerical invocation is ever retried.
+        var reclaim_budget = data.lazy_weights.count();
+        while (true) {
+            data.prefetch.lock();
+            if (entry.loaded != null) {
+                data.prefetch.unlock();
+                return;
+            }
+            if (data.tier_cache) |*cache| {
+                growth = cache.snapshotMappedGrowthLocked(expected, additional) catch |err| {
+                    cache.noteDenied(.host, expected);
+                    noteSharedCacheDenial(self.run_budget, cache, .host, expected);
+                    data.prefetch.unlock();
+                    return err;
+                };
+            }
+            data.prefetch.unlock();
+            if (growth) |*candidate| candidate.fundOutsideExecution(pin) catch |err| {
+                if (err != error.MemoryBudgetExceeded and err != error.ResourceTemporarilyUnavailable) return err;
+                if (err == error.ResourceTemporarilyUnavailable) data.discard_file_cache_under_pressure.store(true, .release);
+                candidate.finishOutsideExecution();
+                growth = null;
+                data.prefetch.lock();
+                const released = if (reclaim_budget != 0) reclaimOneHostCacheEntryLocked(data, entry) else 0;
+                if (released == 0) if (data.tier_cache) |*cache| {
+                    cache.noteDenied(.host, expected);
+                    noteSharedCacheDenial(self.run_budget, cache, .host, expected);
+                };
+                data.prefetch.unlock();
+                if (data.tier_cache) |*cache| try cache.flushReleasedOutsideExecution();
+                if (released == 0) return err;
+                reclaim_budget -= 1;
+                continue;
+            };
+            break;
+        }
+        if (!std.meta.eql(policy, ResidentWeightPreparation.selectedPolicy(known))) return error.NativeWeightPreparationChanged;
+        if (prepare_matrix) try prepareNativeQuantizedStorage(&storage);
+        // The actual allocator output must match the same original cold layout
+        // before publication. No corrective supplier or late optional fallback.
+        if (quantizedStorageBudgetBytes(&storage) != expected) return error.NativeWeightPreparationChanged;
+        data.prefetch.lock();
+        defer data.prefetch.unlock();
+        if (data.lazy_weights.getPtr(name) != entry or entry.loaded != null or data.tensor_store.?.ptr != store.ptr or data.tensor_store.?.vtable != store.vtable or !data.allow_direct_quant or !std.meta.eql(policy, ResidentWeightPreparation.selectedPolicy(known))) return error.NativeWeightPreparationChanged;
+        const now = (try store.nativeQuantizedSource(&entry.tensor_ref)) orelse return error.NativeWeightPreparationChanged;
+        if (now.raw_bytes.ptr != source.raw_bytes.ptr or now.raw_bytes.len != source.raw_bytes.len or !std.meta.eql(now.tensor_type, source.tensor_type) or !std.mem.eql(i64, &now.shape, &source.shape)) return error.NativeWeightPreparationChanged;
+        if (growth) |*candidate| try candidate.commit();
+        // Commit is the final fallible step. Publish the SAME LoadedWeight
+        // representation as ensureLazyWeightLoadedForUseLocked.
+        entry.loaded = .{ .tensor = .{ .data = empty_u8[0..], .dtype = .f32, .shape = &.{}, .name = entry.tensor_ref.name, .allocator = data.allocator, .owns_data = false, .owns_shape = false }, .quantized = true, .quantized_storage = storage };
+        storage_owned = false;
+        entry.loaded_bytes = expected;
+        entry.prepared_independent_bytes = additional;
+        entry.active_tier = .host;
+    }
+
+    fn pendingWeightHandleMetadataBytes(self: *NativeCompute) !usize {
+        const Recorder = struct {
+            bytes: usize = 0,
+            alignment: std.mem.Alignment = .of(u8),
+            fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+                const owner: *@This() = @ptrCast(@alignCast(raw));
+                std.debug.assert(owner.bytes == 0);
+                owner.bytes = len;
+                owner.alignment = alignment;
+                return null;
+            }
+            const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = std.mem.Allocator.noResize, .remap = std.mem.Allocator.noRemap, .free = std.mem.Allocator.noFree };
+        };
+        var recorder = Recorder{};
+        // Exact pinned std.HashMap operation. A failed grow allocates before
+        // touching old metadata; a no-grow query changes only this value copy's
+        // pointer-stability fields. Actual request-local compute is exclusive.
+        var query = self.weight_handles;
+        query.ensureUnusedCapacity(.{ .ptr = &recorder, .vtable = &Recorder.vtable }, 1) catch |err| {
+            if (err != error.OutOfMemory) return err;
+        };
+        if (recorder.bytes == 0) return 0;
+        return std.math.add(usize, recorder.bytes, @import("../backends/admitted_allocator.zig").AdmittedAllocator.allocationOverhead(recorder.alignment));
+    }
+
+    /// Additive private temporary layout, outside cache retention policy and
+    /// every Model/lane/Native gate. No opaque primary floor is borrowed. The
+    /// actual synchronous host Source drains these weight children and its CB
+    /// before sealing B; this API grants no foreign/escaping CT reception.
+    pub fn prepareDeniedLazyWeightOutsideExecution(cb: *const ComputeBackend, expected_data: *const anyopaque, name: []const u8, access: @import("../execution/invocation_context.zig").NativeWeights.Access, old_domain: *const @import("../runtime/tier/admission_domain.zig").Pin, current: @import("../execution/cleanup_context.zig").Context) !CT {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        if (current.outside_execution or try epoch.isSealed()) return error.RetirementEpochSealed;
+        const data = self.data;
+        const cache = if (data.tier_cache) |*value| value else return error.MissingCacheRetirementDomain;
+        const binding = cache.admission orelse return error.MissingCacheRetirementDomain;
+        if (binding.controller != old_domain.controller()) return error.ForeignAdmissionDomain;
+        if (access == .get) if (self.weight_handles.get(name)) |cached| {
+            if (toBuf(cached).temporary_preparation == null) return error.UnsupportedNativeTemporaryOwner;
+            try validateNativeTemporaryCleanup(cached, current);
+            return getWeightForPreparedLazy(self, name, false, false);
+        };
+        data.prefetch.lock();
+        const entry = data.lazy_weights.getPtr(name) orelse {
+            data.prefetch.unlock();
+            return error.NativeWeightPreparationChanged;
+        };
+        if (entry.loaded != null or entry.expert_coord != null or !data.allow_direct_quant) {
+            data.prefetch.unlock();
+            return error.NativeWeightPreparationChanged;
+        }
+        const store = data.tensor_store orelse {
+            data.prefetch.unlock();
+            return error.NativeWeightPreparationChanged;
+        };
+        const source = (store.nativeQuantizedSource(&entry.tensor_ref) catch |err| {
+            data.prefetch.unlock();
+            return err;
+        }) orelse {
+            data.prefetch.unlock();
+            return error.NativeWeightPreparationChanged;
+        };
+        data.prefetch.unlock();
+        var shape = source.shape;
+        const geometry = QuantizedStorage{ .tensor_type = source.tensor_type, .raw_bytes = @constCast(source.raw_bytes), .shape = &shape, .allocator = data.allocator, .raw_owned = false };
+        const known = switch (source.tensor_type) {
+            .known => |value| value,
+            else => return error.UnsupportedTensorType,
+        };
+        const policy = ResidentWeightPreparation.selectedPolicy(known);
+        const activation_policy = self.quantized_activation_policy;
+        const prepared_bytes = if (access == .embedding) 0 else preparedKBlockAdditionalBytes(&geometry);
+        const retired = @import("../execution/resource_retirement.zig");
+        const admitted = @import("../backends/admitted_allocator.zig").AdmittedAllocator;
+        // Original loader owns two metadata allocations; raw mapped bytes stay
+        // in the retained Model floor. No rank2 checkpoint copy is charged here.
+        var bytes = try std.math.add(usize, prepared_bytes, 2 * @sizeOf(i64));
+        bytes = try std.math.add(usize, bytes, source.source_name.len);
+        inline for (.{ QuantizedStorage, Buf }) |T| bytes = try std.math.add(usize, bytes, @sizeOf(T) + admitted.allocationOverhead(.of(T)));
+        if (self.weight_retirement == null) bytes = try std.math.add(usize, bytes, @sizeOf(WeightRetirement) + admitted.allocationOverhead(.of(WeightRetirement)));
+        if (access == .get) {
+            bytes = try std.math.add(usize, bytes, @sizeOf(WeightHandle) + name.len + admitted.allocationOverhead(.of(WeightHandle)));
+            bytes = try std.math.add(usize, bytes, try self.pendingWeightHandleMetadataBytes());
+        }
+        bytes = try std.math.add(usize, bytes, try retired.PreparedCharge.requestedMetadataBytes(0));
+        var lease: ?run_memory.AdmissionLease = try old_domain.controller().tryAcquire(binding.backend_class, binding.limits, .{ .host_scratch_bytes = bytes }, true);
+        defer if (lease) |*unused| unused.release();
+        var pin: ?@import("../runtime/tier/admission_domain.zig").Pin = old_domain.retain();
+        defer if (pin) |unused| unused.release();
+        var shell = try retired.PreparedCharge.prepare(0);
+        defer shell.destroyUnused();
+        const charge = try shell.arm(&lease, &pin);
+        var charge_owned = true;
+        defer if (charge_owned) charge.release();
+        // Preowned actual B root precedes ALL fallback payload/CT births.
+        try charge.holdUntilBoundary(try epoch.boundary());
+        if (!std.meta.eql(policy, ResidentWeightPreparation.selectedPolicy(known)) or activation_policy != self.quantized_activation_policy) return error.NativeWeightPreparationChanged;
+        const tensor = try accessPreparedLazyWeight(cb, expected_data, name, access, true);
+        errdefer freeTensorWithCleanup(self, tensor, current);
+        const buf = toBuf(tensor);
+        const actual = buf.owned_quantized_storage orelse return error.InvalidNativeTemporaryBacking;
+        if (!std.meta.eql(policy, ResidentWeightPreparation.selectedPolicy(known)) or activation_policy != self.quantized_activation_policy or actual.raw_bytes.ptr != source.raw_bytes.ptr or actual.raw_bytes.len != source.raw_bytes.len or !std.meta.eql(actual.tensor_type, source.tensor_type) or !std.mem.eql(i64, actual.shape, &source.shape) or actual.prepared.ownedBytes() != prepared_bytes or buf.temporary_preparation != null) return error.NativeWeightPreparationChanged;
+        const owner = buf.weight_retirement orelse return error.InvalidNativeTemporaryBacking;
+        var count = owner.live_temporary_roots.load(.acquire);
+        while (true) count = owner.live_temporary_roots.cmpxchgWeak(count, try std.math.add(usize, count, 1), .acq_rel, .acquire) orelse break;
+        buf.temporary_preparation = charge;
+        buf.temporary_scope_record = @intFromPtr(epoch.record.?);
+        buf.temporary_scope_nonce = epoch.nonce;
+        charge_owned = false;
+        return tensor;
+    }
+
+    pub fn accessPreparedLazyWeight(cb: *const ComputeBackend, expected_data: *const anyopaque, name: []const u8, access: @import("../execution/invocation_context.zig").NativeWeights.Access, denied: bool) !CT {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        return switch (access) {
+            .get => getWeightForPreparedLazy(self, name, denied, denied),
+            .acquire => loadPreparedLazyWeight(self, name, denied, denied),
+            .embedding => loadPreparedLazyWeight(self, name, false, denied),
+        };
+    }
+
+    pub fn accessResidentWeightAfterPreparation(cb: *const ComputeBackend, expected_data: *const anyopaque, name: []const u8, access: @import("../execution/invocation_context.zig").NativeWeights.Access) !CT {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        return switch (access) {
+            .get => getWeightForPreparation(self, name, false),
+            .acquire => loadWeight(self, name, false),
+            .embedding => getEmbeddingWeight(self, name),
+        };
+    }
+
+    /// Only the actual request-local canonical receiver may enter this cold
+    /// slice. Actual Source separately certifies SAME Model/data before cast.
+    pub fn snapshotResidentWeightPreparation(cb: *const ComputeBackend, expected_data: *const anyopaque, name: []const u8) !?ResidentWeightPreparation {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        return ResidentWeightPreparation.snapshot(self, name);
     }
 
     pub fn importHostTensor(self: *NativeCompute, tensor: *const tensor_mod.Tensor) !CT {
@@ -4361,16 +4708,18 @@ fn deinitEmbeddingGemma2F32Cache(data: *WeightStore) void {
     defer data.embeddinggemma2_f32_cache_lock.unlock();
     var canonical = data.embeddinggemma2_canonical_panels.iterator();
     while (canonical.next()) |entry| {
-        if (data.tier_cache) |*cache| cache.noteRelease(.host, entry.value_ptr.panels.data.len * @sizeOf(f32));
+        const dead_bytes = entry.value_ptr.panels.data.len * @sizeOf(f32);
         entry.value_ptr.panels.deinit(data.allocator);
+        if (data.tier_cache) |*cache| cache.noteRelease(.host, dead_bytes);
         data.allocator.free(entry.key_ptr.*);
     }
     data.embeddinggemma2_canonical_panels.deinit(data.allocator);
     data.embeddinggemma2_canonical_panels = .empty;
     var panels = data.embeddinggemma2_panels.valueIterator();
     while (panels.next()) |entry| {
-        if (data.tier_cache) |*cache| cache.noteRelease(.host, entry.panels.data.len * @sizeOf(f32));
+        const dead_bytes = entry.panels.data.len * @sizeOf(f32);
         entry.panels.deinit(data.allocator);
+        if (data.tier_cache) |*cache| cache.noteRelease(.host, dead_bytes);
     }
     data.embeddinggemma2_panels.deinit(data.allocator);
     data.embeddinggemma2_panels = .empty;
@@ -4844,6 +5193,7 @@ const kernel_backend_impl: ops.KernelBackend = .{
 const native_cold_cleanup_services: ops.ColdCleanupServices = .{
     .accepts = acceptsColdCleanupImplementation,
     .free = freeTensorWithCleanup,
+    .deinit_backend = deinitBackendWithCleanup,
 };
 fn acceptsColdCleanupImplementation(table: *const ComputeBackend.VTable) bool {
     return table == &vtable_impl;
@@ -5115,11 +5465,33 @@ fn deinitBackend(ctx: *anyopaque) void {
     self.allocator.destroy(self);
 }
 
+fn deinitBackendWithCleanup(cb: *const ComputeBackend, current: @import("../execution/cleanup_context.zig").Context) void {
+    const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+    self.deinitWithCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+    self.allocator.destroy(self);
+}
+
 fn freeTensor(ctx: *anyopaque, tensor: CT) void {
     freeTensorWithCleanup(ctx, tensor, .{});
 }
 
+fn validateNativeTemporaryCleanup(tensor: CT, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
+    var root = toBuf(tensor);
+    while (true) {
+        if (root.temporary_preparation) |charge| {
+            if (cleanup.outside_execution) return;
+            const epoch = cleanup.boundary orelse return error.MissingCurrentCleanupEpoch;
+            if (try epoch.isSealed()) return error.RetirementEpochSealed;
+            if (@intFromPtr(epoch.record.?) != root.temporary_scope_record or epoch.nonce != root.temporary_scope_nonce) return error.ForeignNativeTemporaryScope;
+            if (charge.references.load(.acquire) < 2) return error.NativeTemporaryScopeEnded;
+            return;
+        }
+        root = toBuf(root.retained_parent orelse return);
+    }
+}
+
 fn freeTensorWithCleanup(ctx: *anyopaque, tensor: CT, cleanup: @import("../execution/cleanup_context.zig").Context) void {
+    validateNativeTemporaryCleanup(tensor, cleanup) catch platform.inference_process_supervisor.restartWorker();
     const b = toBuf(tensor);
     if (b.weight_handle) |handle| {
         const owner = b.weight_retirement.?;
@@ -5184,11 +5556,20 @@ fn releaseTensorStorageWithCleanup(ctx: *anyopaque, tensor: CT, cleanup: @import
     const handle = b.weight_handle;
     const parent = b.retained_parent;
     const physical_lease = b.physical_lease;
+    const temporary_preparation = b.temporary_preparation;
+    if (temporary_preparation != null) {
+        const before = retirement.?.live_temporary_roots.fetchSub(1, .acq_rel);
+        std.debug.assert(before > 0);
+    }
     b.allocator.destroy(b);
     if (physical_lease) |lease| lease.releaseWithCleanup(cleanup);
     if (handle) |value| value.destroy();
     if (retirement) |owner| owner.release();
     if (parent) |value| releaseTensorStorageWithCleanup(ctx, value, cleanup);
+    // Owning payload, QuantizedStorage, Buf, cached handle and parent metadata
+    // are dead first. The separately registered actual B root prevents any
+    // supplier until Source/CB teardown releases the real enclosing gates.
+    if (temporary_preparation) |charge| charge.release();
 }
 
 /// Release a borrower while holding the entry's residency guard (when one is
@@ -5408,7 +5789,12 @@ fn deinitWeightHandles(self: *NativeCompute) void {
 }
 
 fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
-    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    return getWeightForPreparation(@ptrCast(@alignCast(ctx)), name, true);
+}
+fn getWeightForPreparation(self: *NativeCompute, name: []const u8, prepare_matrix: bool) !CT {
+    return getWeightForPreparedLazy(self, name, prepare_matrix, false);
+}
+fn getWeightForPreparedLazy(self: *NativeCompute, name: []const u8, prepare_matrix: bool, denied: bool) !CT {
     if (self.weight_handles.get(name)) |tensor| {
         toBuf(tensor).weight_handle.?.references += 1;
         return tensor;
@@ -5417,7 +5803,7 @@ fn getWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
     const handle = try WeightHandle.create(self.allocator, name);
     errdefer handle.destroy();
     const stable_name = self.data.resident_weights.getKey(name) orelse self.data.lazy_weights.getKey(name) orelse name;
-    const tensor = (try canonicalProjectionWeight(self, stable_name)) orelse try loadWeight(self, stable_name, true);
+    const tensor = (try canonicalProjectionWeight(self, stable_name)) orelse try loadPreparedLazyWeight(self, stable_name, prepare_matrix, denied);
     _ = try self.attachWeightAuthority(tensor);
     toBuf(tensor).weight_handle = handle;
     toBuf(tensor).cached_weight = true;
@@ -5506,7 +5892,13 @@ fn getEmbeddingWeight(ctx: *anyopaque, name: []const u8) anyerror!CT {
 fn loadWeight(self: *NativeCompute, name: []const u8, prepare_matrix: bool) !CT {
     return self.attachWeightAuthority(try loadWeightImpl(self, name, prepare_matrix));
 }
+fn loadPreparedLazyWeight(self: *NativeCompute, name: []const u8, prepare_matrix: bool, denied: bool) !CT {
+    return self.attachWeightAuthority(try loadWeightImplWithPreparedLazy(self, name, prepare_matrix, denied));
+}
 fn loadWeightImpl(self: *NativeCompute, name: []const u8, prepare_matrix: bool) !CT {
+    return loadWeightImplWithPreparedLazy(self, name, prepare_matrix, false);
+}
+fn loadWeightImplWithPreparedLazy(self: *NativeCompute, name: []const u8, prepare_matrix: bool, denied: bool) !CT {
     if (self.data.resident_weights.getPtr(name)) |w| {
         if (w.quantized_storage) |*storage| {
             // Laya's Q8_0 linears (LAYA.md 1d) go through the dequant+SGEMM
@@ -5554,7 +5946,26 @@ fn loadWeightImpl(self: *NativeCompute, name: []const u8, prepare_matrix: bool) 
     self.data.prefetch.lock();
     defer self.data.prefetch.unlock();
     if (self.data.lazy_weights.getPtr(name)) |entry| {
-        ensureLazyWeightLoadedForUseLocked(self.data, self.run_budget, entry, prepare_matrix) catch |err| switch (err) {
+        if (denied) {
+            // The cold refusal belongs to an unloaded source. A peer winner
+            // must pass the Source's actual selected-layout revalidation again.
+            if (entry.loaded != null) return error.NativeWeightPreparationChanged;
+            entry.pin_count = try std.math.add(usize, entry.pin_count, 1);
+            errdefer releaseLazyEntryPinLocked(self.data, entry);
+            // Original immutable fallback payload/CT construction executes
+            // outside prefetch too. The exact source entry pin is transferred
+            // to its Buf, so a concurrent winner cannot invalidate the source
+            // metadata or lose another borrower's pin on the eventual drop.
+            return outside: {
+                self.data.prefetch.unlock();
+                defer self.data.prefetch.lock();
+                if (try loadEphemeralQuantizedLazyWeight(self, entry, name, prepare_matrix)) |ephemeral| break :outside ephemeral;
+                if (canFallbackDenseBudgetPressure(name, entry)) break :outside try self.makeBufWithEntry(empty_f32[0..], false, name, entry, null, null);
+                return error.MemoryBudgetExceeded;
+            };
+        }
+        const ensured = ensureLazyWeightLoadedForUseLocked(self.data, self.run_budget, entry, prepare_matrix);
+        ensured catch |err| switch (err) {
             error.MemoryBudgetExceeded => {
                 if (self.data.tier_cache) |*tier_cache| {
                     logSharedCacheDenial("get_weight_host_load", tier_cache, name);
@@ -5915,6 +6326,14 @@ fn reserveHostCacheWithReclaimLocked(
 /// This is intentionally bounded to one victim so ModelManager can re-probe
 /// the authoritative controller after every physical release.
 pub fn reclaimOneHostCacheEntry(data: *WeightStore) usize {
+    const released = reclaimOneHostCacheEntryDeferringCredit(data);
+    // Legacy/offline endpoint is synchronous outside execution. Maintained
+    // Manager callers use the explicit split below and settle after its gates.
+    if (data.tier_cache) |*cache| cache.flushReleasedOutsideExecution() catch {};
+    return released;
+}
+
+pub fn reclaimOneHostCacheEntryDeferringCredit(data: *WeightStore) usize {
     // This capability is invoked only after authoritative host admission has
     // denied a request. Mark the session before inspecting victims so pinned
     // entries shed clean source pages as soon as their borrowers depart.
@@ -5922,6 +6341,10 @@ pub fn reclaimOneHostCacheEntry(data: *WeightStore) usize {
     if (!data.prefetch_initialized) return 0;
     data.prefetch.lock();
     defer data.prefetch.unlock();
+    // Actual Manager caller owns additional gates. Logical eviction never
+    // invokes suppliers; its retained Model session flushes after BOTH Manager
+    // locks and this prefetch guard are released.
+    if (data.tier_cache) |*cache| cache.deferPhysicalReleases();
     return reclaimOneHostCacheEntryLocked(data, null);
 }
 
@@ -6215,8 +6638,11 @@ fn unloadLazyEntryTierLocked(data: *WeightStore, entry: *LazyWeightEntry, tier: 
             entry.active_tier = entry.placement.spill_tier;
             discardLazyEntryFileCache(data, entry);
             if (data.tier_cache) |*tier_cache| {
-                tier_cache.noteRelease(.host, entry.loaded_bytes);
+                if (entry.prepared_independent_bytes != 0) {
+                    tier_cache.notePreparedRelease(.host, entry.loaded_bytes, entry.prepared_independent_bytes);
+                } else tier_cache.noteRelease(.host, entry.loaded_bytes);
             }
+            entry.prepared_independent_bytes = 0;
         },
         else => {},
     }
@@ -10771,6 +11197,128 @@ fn nativePreparedStorageComplete(storage: *const QuantizedStorage, known: gguf_t
     }
     return true;
 }
+
+/// One actual on-demand resident quantized weight, never a whole-model
+/// preload. Synchronous candidate only: Source retains the Model/receiving CB;
+/// no candidate/Model/name/context pointer is stored in the cache or late Node.
+pub const ResidentWeightPreparation = struct {
+    compute: *NativeCompute,
+    name: []const u8,
+    storage: *QuantizedStorage,
+    lazy_entry: ?*LazyWeightEntry = null,
+    raw_pointer: usize,
+    raw_bytes: usize,
+    shape: [2]i64,
+    kind: gguf_tensor_types.KnownTensorType,
+    signature: u64,
+    policy: [7]bool,
+    additional_bytes: usize,
+    growth: ?tier_cache_mod.SharedCache.PreparedGrowth = null,
+    growth_denied: bool = false,
+    done: bool = false,
+
+    fn selectedPolicy(known: gguf_tensor_types.KnownTensorType) [7]bool {
+        return .{ q3KNoDmnPanelPreparedEnabled(), k16Panel8DirectEnabledFor(known), k16Panel16PreparedEnabledFor(known), q8_0Panel8PrepareEnabled(), q8KPanel8DirectEnabled(), q8KPanel16PreparedEnabled(), q6KPanel16PreparedEnabled() };
+    }
+    fn representationSignature(storage: *const QuantizedStorage) u64 {
+        var hash = std.hash.Wyhash.init(0);
+        for (storage.prepared.entries) |entry| {
+            const pointer: usize = if (entry) |value| @intFromPtr(value.bytes.ptr) else 0;
+            const bytes: usize = if (entry) |value| value.bytes.len else 0;
+            hash.update(std.mem.asBytes(&pointer));
+            hash.update(std.mem.asBytes(&bytes));
+        }
+        const epoch = storage.panel16_epoch.load(.acquire);
+        hash.update(std.mem.asBytes(&epoch));
+        return hash.final();
+    }
+    fn lock(data: *WeightStore) void {
+        if (data.prefetch_initialized) data.prefetch.lock();
+        platform.sync.lockYielding(&data.quantized_prepare_lock);
+    }
+    fn unlock(data: *WeightStore) void {
+        data.quantized_prepare_lock.unlock();
+        if (data.prefetch_initialized) data.prefetch.unlock();
+    }
+    fn snapshot(compute: *NativeCompute, name: []const u8) !?@This() {
+        const data = compute.data;
+        lock(data);
+        defer unlock(data);
+        const lazy_entry = if (data.resident_weights.contains(name)) null else data.lazy_weights.getPtr(name);
+        const weight = data.resident_weights.getPtr(name) orelse if (lazy_entry) |entry| (if (entry.loaded) |*loaded| loaded else return null) else return null;
+        const storage = if (weight.quantized_storage) |*value| value else return null;
+        const known = switch (storage.tensor_type) {
+            .known => |value| value,
+            else => return null,
+        };
+        if (shouldUseLayaDequantSgemm(name) or nativePreparedStorageComplete(storage, known)) return null;
+        if (storage.shape.len != 2 or storage.shape[0] <= 0 or storage.shape[1] <= 0) return null;
+        const additional = preparedKBlockAdditionalBytes(storage); // SAME original geometry
+        if (additional == 0) return null;
+        var result = @This(){ .compute = compute, .name = data.resident_weights.getKey(name) orelse data.lazy_weights.getKey(name).?, .storage = storage, .lazy_entry = lazy_entry, .raw_pointer = @intFromPtr(storage.raw_bytes.ptr), .raw_bytes = storage.raw_bytes.len, .shape = .{ storage.shape[0], storage.shape[1] }, .kind = known, .signature = representationSignature(storage), .policy = selectedPolicy(known), .additional_bytes = additional };
+        if (data.tier_cache) |*cache| result.growth = cache.snapshotIndependentGrowthLocked(.host, additional) catch |err| switch (err) {
+            error.MemoryBudgetExceeded => {
+                cache.noteDenied(.host, additional);
+                noteSharedCacheDenial(compute.run_budget, cache, .host, additional);
+                result.growth_denied = true;
+                return result;
+            },
+            else => return err,
+        };
+        return result;
+    }
+    pub fn fundOutsideExecution(self: *@This(), pin: ?*const @import("../runtime/tier/admission_domain.zig").Pin) !void {
+        if (self.done) return error.InvalidNativeWeightPreparation;
+        if (self.growth_denied) return error.MemoryBudgetExceeded;
+        if (self.growth) |*growth| try growth.fundOutsideExecution(pin);
+    }
+    /// Source has released Model AND its selected/lane ownership. Revalidate
+    /// under SAME actual cache locks, then run ONLY original immutable-layout
+    /// preparation, never a numerical forward or replay.
+    pub fn prepareOutsideExecution(self: *@This()) !void {
+        if (self.done) return error.InvalidNativeWeightPreparation;
+        const data = self.compute.data;
+        lock(data);
+        defer unlock(data);
+        const weight = if (self.lazy_entry) |expected| blk: {
+            if (data.lazy_weights.getPtr(self.name) != expected) return error.NativeWeightPreparationChanged;
+            break :blk if (expected.loaded) |*loaded| loaded else return error.NativeWeightPreparationChanged;
+        } else data.resident_weights.getPtr(self.name) orelse return error.NativeWeightPreparationChanged;
+        const storage = if (weight.quantized_storage) |*value| value else return error.NativeWeightPreparationChanged;
+        if (storage != self.storage or @intFromPtr(storage.raw_bytes.ptr) != self.raw_pointer or storage.raw_bytes.len != self.raw_bytes or storage.shape.len != 2 or !std.mem.eql(i64, storage.shape, &self.shape) or !std.meta.eql(storage.tensor_type, .{ .known = self.kind }) or !std.meta.eql(selectedPolicy(self.kind), self.policy)) return error.NativeWeightPreparationChanged;
+        if (nativePreparedStorageComplete(storage, self.kind)) {
+            self.done = true;
+            return;
+        } // actual peer winner
+        if (representationSignature(storage) != self.signature or preparedKBlockAdditionalBytes(storage) != self.additional_bytes) return error.NativeWeightPreparationChanged;
+        if (self.growth) |*growth| try growth.commit();
+        prepareNativeQuantizedStorage(storage) catch |err| {
+            // Original prepare is failure-atomic for ALL old layouts/epoch.
+            if (self.growth) |*growth| growth.rollbackUnpublishedLocked() catch platform.inference_process_supervisor.restartWorker();
+            return err;
+        };
+        if (self.lazy_entry) |entry| {
+            entry.loaded_bytes += self.additional_bytes;
+            entry.prepared_independent_bytes += self.additional_bytes;
+        }
+        self.done = true;
+    }
+    pub fn noteFundingDeniedOutsideExecution(self: *@This()) void {
+        if (self.growth_denied) return; // already recorded exact hard tier denial
+        const data = self.compute.data;
+        lock(data);
+        defer unlock(data);
+        if (data.tier_cache) |*cache| {
+            cache.noteDenied(.host, self.additional_bytes);
+            noteSharedCacheDenial(self.compute.run_budget, cache, .host, self.additional_bytes);
+        }
+        self.growth_denied = true;
+    }
+    pub fn finishOutsideExecution(self: *@This()) void {
+        if (self.growth) |*growth| growth.finishOutsideExecution();
+        self.growth = null;
+    }
+};
 
 fn ensurePreparedKBlock(
     self: *NativeCompute,
@@ -54745,4 +55293,454 @@ test "Native packed GELU observed all-fault unwind preserves original output own
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+fn nativeResidentColdPreparationOomCase(a: std.mem.Allocator) !void {
+    var data = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 4096 }) };
+    defer data.deinitOwned();
+    var inserted = false;
+    const key = try a.dupe(u8, "model.layers.0.self_attn.q_proj.weight");
+    errdefer if (!inserted) a.free(key);
+    const raw = try a.alloc(u8, 4 * 34);
+    errdefer if (!inserted) a.free(raw);
+    for (0..4) |row| {
+        raw[row * 34] = 0;
+        raw[row * 34 + 1] = 0x28;
+        @memset(raw[row * 34 + 2 ..][0..32], 1);
+    }
+    const shape = try a.dupe(i64, &.{ 4, 32 });
+    errdefer if (!inserted) a.free(shape);
+    try data.resident_weights.put(a, key, .{ .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &.{}, .name = key, .allocator = a, .owns_data = false, .owns_shape = false }, .quantized = true, .quantized_storage = .{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = raw, .shape = shape, .allocator = a } });
+    inserted = true;
+    var compute = NativeCompute.init(a, &data, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var plan = (try NativeCompute.snapshotResidentWeightPreparation(&cb, &data, key)).?;
+    defer plan.finishOutsideExecution();
+    try plan.fundOutsideExecution(null);
+    plan.prepareOutsideExecution() catch |err| {
+        try std.testing.expectEqual(@as(usize, 0), data.tier_cache.?.host_bytes);
+        try std.testing.expectEqual(@as(usize, 0), data.resident_weights.getPtr(key).?.quantized_storage.?.prepared.ownedBytes());
+        return err;
+    };
+    const prepared_bytes = data.resident_weights.getPtr(key).?.quantized_storage.?.prepared.ownedBytes();
+    try std.testing.expectEqual(prepared_bytes, data.tier_cache.?.host_bytes);
+    try std.testing.expect(prepared_bytes != 0);
+    try std.testing.expect((try NativeCompute.snapshotResidentWeightPreparation(&cb, &data, key)) == null);
+}
+
+test "Native selected resident KBlock cold preparation uses original transactional body and unwinds all allocation failures" {
+    try nativeResidentColdPreparationOomCase(std.testing.allocator);
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, nativeResidentColdPreparationOomCase, .{});
+}
+
+test "Native selected resident preparation attests exact receiver before opaque pointer access" {
+    var copied = vtable_impl;
+    const fake: ComputeBackend = .{ .ptr = @ptrFromInt(16), .vtable = &copied };
+    try std.testing.expectError(error.UnsupportedNativeWeightPreparation, NativeCompute.snapshotResidentWeightPreparation(&fake, @ptrFromInt(16), "weight"));
+    try std.testing.expectError(error.UnsupportedNativeWeightPreparation, NativeCompute.residentWeightCreditsNeedPreparation(&fake, @ptrFromInt(16)));
+}
+
+fn nativeColdMappedEmbeddingCase(allocator: std.mem.Allocator) !void {
+    const writer = @import("../gguf/writer.zig");
+    const domain_mod = @import("../runtime/tier/admission_domain.zig");
+    const a = allocator;
+    var layout = try writer.buildLayout(a, &.{}, &.{.{ .name = "embedding.weight", .dimensions = &.{ 32, 64 }, .tensor_type = .{ .known = .Q8_0 } }});
+    defer layout.deinit(a);
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(a);
+    try bytes.appendSlice(a, layout.header_bytes);
+    const data_offset = std.mem.alignForward(usize, bytes.items.len, @intCast(layout.alignment));
+    try bytes.appendNTimes(a, 0, data_offset - bytes.items.len + 64 * 34);
+    for (0..64) |row| {
+        const block = bytes.items[data_offset + row * 34 ..][0..34];
+        std.mem.writeInt(u16, block[0..2], 0x3c00, .little); // exact scale one
+        for (block[2..], 0..) |*q, col| q.* = @bitCast(@as(i8, @intCast(col)) - 16);
+    }
+    const canonical = try tensor_store_mod.GgufStore.initOwnedBytes(a, "native-cold-embedding", bytes.items);
+    var store_owned = true;
+    defer if (store_owned) canonical.tensorStore().deinit();
+    var data = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tensor_store = canonical.tensorStore(), .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 1024 * 1024 }) };
+    store_owned = false;
+    defer data.deinitOwned();
+    const ref = try canonical.tensorStore().describeTensor(a, "embedding.weight");
+    var ref_owned = true;
+    defer if (ref_owned) {
+        var unused = ref;
+        unused.deinit(a);
+    };
+    const key = try a.dupe(u8, ref.name);
+    var key_owned = true;
+    defer if (key_owned) a.free(key);
+    try data.lazy_weights.put(a, key, .{ .tensor_ref = ref });
+    key_owned = false;
+    ref_owned = false;
+    initPrefetchQueue(&data, a);
+    const owner = try domain_mod.Domain.create();
+    defer owner.release();
+    const pin = owner.pin();
+    defer pin.release();
+    try data.tier_cache.?.configureAdmission(a, pin.controller(), .cpu, .{ .host_limit_bytes = 1024 * 1024 }, .{ .host_limit_bytes = bytes.items.len });
+    const Probe = struct {
+        data: *WeightStore,
+        violation: bool = false,
+        reserves: usize = 0,
+        fn inspect(self: *@This()) void {
+            const handle = self.data.prefetch.lockHandle();
+            if (handle.mutex.tryLock()) handle.unlock() else self.violation = true;
+            if (self.data.quantized_prepare_lock.tryLock()) self.data.quantized_prepare_lock.unlock() else self.violation = true;
+        }
+        fn reserve(raw: *anyopaque, _: run_memory.AdmissionAmounts) run_memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect();
+            self.reserves += 1;
+            return self.reserves;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: run_memory.AdmissionAmounts) run_memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect();
+        }
+    };
+    var probe = Probe{ .data = &data };
+    // Install before model-floor acquisition; external budgets cannot be
+    // reconfigured with active admitted resources. All callbacks see actual
+    // cache locks free, including original model-floor birth/death.
+    try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    var baseline = try pin.controller().tryAcquire(.cpu, .{ .host_limit_bytes = 1024 * 1024 }, .{ .host_weight_bytes = bytes.items.len }, false);
+    defer baseline.release();
+    defer data.tier_cache.?.deinitAdmission(); // probe sees live Prefetch on every failure unwind
+    var compute = NativeCompute.init(a, &data, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    try std.testing.expect(try NativeCompute.lazyWeightNeedsColdPreparation(&cb, &data, key));
+    NativeCompute.prepareLazyWeightOutsideExecution(&cb, &data, key, false, &pin) catch |err| {
+        // This fixture has no policy/live-pressure denial; the prepared-array
+        // metadata maps allocator exhaustion to its original retryable class.
+        if (err == error.ResourceTemporarilyUnavailable) return error.OutOfMemory;
+        return err;
+    };
+    const entry = data.lazy_weights.getPtr(key).?;
+    const raw_pointer = entry.loaded.?.quantized_storage.?.raw_bytes.ptr;
+    try std.testing.expect(raw_pointer == (try canonical.tensorStore().nativeQuantizedSource(&entry.tensor_ref)).?.raw_bytes.ptr);
+    try std.testing.expectEqual(@as(usize, 0), entry.loaded.?.quantized_storage.?.prepared.ownedBytes());
+    const embedding = try NativeCompute.accessPreparedLazyWeight(&cb, &data, key, .embedding, false);
+    defer cb.free(embedding);
+    const rows = try cb.embeddingLookup(embedding, &.{ 0, 7 }, 2, 32);
+    defer cb.free(rows);
+    const values = try cb.toFloat32(rows, a);
+    defer a.free(values);
+    for (values, 0..) |value, index| try std.testing.expectEqual(@as(f32, @floatFromInt(@as(i32, @intCast(index % 32)) - 16)), value);
+    // Exact tied-head peer-winner case: a matrix cold loader can encounter a
+    // raw table already published by embedding. Actual Source resnapshots it.
+    try NativeCompute.prepareLazyWeightOutsideExecution(&cb, &data, key, true, &pin);
+    try std.testing.expectEqual(@as(usize, 0), entry.loaded.?.quantized_storage.?.prepared.ownedBytes());
+    var preparation = (try NativeCompute.snapshotResidentWeightPreparation(&cb, &data, key)) orelse return error.TestUnexpectedResult;
+    defer preparation.finishOutsideExecution();
+    preparation.fundOutsideExecution(&pin) catch |err| {
+        if (err == error.ResourceTemporarilyUnavailable) return error.OutOfMemory;
+        return err;
+    };
+    try preparation.prepareOutsideExecution();
+    try std.testing.expect(entry.loaded.?.quantized_storage.?.raw_bytes.ptr == raw_pointer);
+    try std.testing.expectEqual(preparation.additional_bytes, entry.prepared_independent_bytes);
+    try std.testing.expectEqual(preparation.additional_bytes, entry.loaded.?.quantized_storage.?.prepared.ownedBytes());
+    try std.testing.expectEqual(bytes.items.len + preparation.additional_bytes, pin.controller().snapshot().host_weight_bytes);
+    try std.testing.expectEqual(@as(usize, 2), probe.reserves);
+    try std.testing.expect((try NativeCompute.snapshotResidentWeightPreparation(&cb, &data, key)) == null);
+    try std.testing.expect(!probe.violation);
+    // Final direct fixture close is explicitly outside; release actual cache
+    // tokens before data/Prefetch destruction makes the synchronous probe dead.
+    try data.tier_cache.?.deinitAdmissionWithCleanup(.{ .outside_execution = true });
+}
+
+test "Native cold GGUF lazy embedding then matrix prepares same mapping and no supplier under cache locks" {
+    try nativeColdMappedEmbeddingCase(std.testing.allocator);
+}
+
+test "Native cold GGUF lazy payload and metadata failures unwind before publication" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, nativeColdMappedEmbeddingCase, .{});
+}
+
+fn nativeColdDeniedLayoutBoundaryCase(allocator: std.mem.Allocator, domain_cap: ?usize, must_deny: bool, measured: ?*usize) !void {
+    const writer = @import("../gguf/writer.zig");
+    const domain_mod = @import("../runtime/tier/admission_domain.zig");
+    const a = allocator;
+    var layout = try writer.buildLayout(a, &.{}, &.{.{ .name = "embedding.weight", .dimensions = &.{ 32, 64 }, .tensor_type = .{ .known = .Q8_0 } }});
+    defer layout.deinit(a);
+    var bytes: std.ArrayListUnmanaged(u8) = .empty;
+    defer bytes.deinit(a);
+    try bytes.appendSlice(a, layout.header_bytes);
+    const data_offset = std.mem.alignForward(usize, bytes.items.len, @intCast(layout.alignment));
+    try bytes.appendNTimes(a, 0, data_offset - bytes.items.len + 64 * 34);
+    for (0..64) |row| {
+        const block = bytes.items[data_offset + row * 34 ..][0..34];
+        std.mem.writeInt(u16, block[0..2], 0x3c00, .little); // exact scale one
+        for (block[2..], 0..) |*q, col| q.* = @bitCast(@as(i8, @intCast(col)) - 16);
+    }
+    const canonical = try tensor_store_mod.GgufStore.initOwnedBytes(a, "native-cold-embedding", bytes.items);
+    var store_owned = true;
+    defer if (store_owned) canonical.tensorStore().deinit();
+    var data = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tensor_store = canonical.tensorStore(), .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 1 }) };
+    store_owned = false;
+    defer data.deinitOwned();
+    const ref = try canonical.tensorStore().describeTensor(a, "embedding.weight");
+    var ref_owned = true;
+    defer if (ref_owned) {
+        var unused = ref;
+        unused.deinit(a);
+    };
+    const key = try a.dupe(u8, ref.name);
+    var key_owned = true;
+    defer if (key_owned) a.free(key);
+    try data.lazy_weights.put(a, key, .{ .tensor_ref = ref });
+    key_owned = false;
+    ref_owned = false;
+    initPrefetchQueue(&data, a);
+    const owner = try domain_mod.Domain.create();
+    defer owner.release();
+    const pin = owner.pin();
+    defer pin.release();
+    // Hard cache retention denies2176bytes; the independent actual Domain has
+    // ample capacity for exact original temporary prepared layouts+metadata.
+    try data.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = domain_cap orelse 1024 * 1024 }, .{});
+    defer data.tier_cache.?.deinitAdmission();
+    try data.tier_cache.?.installRetirementDomainOutsideExecution(&pin);
+    const Probe = struct {
+        data: *WeightStore,
+        violation: bool = false,
+        fn inspect(self: *@This()) void {
+            const guard = self.data.prefetch.lockHandle();
+            if (guard.mutex.tryLock()) guard.unlock() else self.violation = true;
+            if (self.data.quantized_prepare_lock.tryLock()) self.data.quantized_prepare_lock.unlock() else self.violation = true;
+        }
+        fn reserve(raw: *anyopaque, _: run_memory.AdmissionAmounts) run_memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect();
+            return 1;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: run_memory.AdmissionAmounts) run_memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect();
+        }
+    };
+    var probe = Probe{ .data = &data };
+    try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    for ([_]@import("../execution/invocation_context.zig").NativeWeights.Access{ .get, .acquire, .embedding }) |access| {
+        if (domain_cap != null and access != .get) continue;
+        var reference = NativeCompute.init(a, &data, null);
+        defer reference.deinit();
+        const original_cb = reference.computeBackend();
+        // Explicit unadmitted original callback is the prepared-kernel oracle,
+        // with SAME cache cap/source/policy. No candidate hook or flags used.
+        const original = switch (access) {
+            .get => try original_cb.getWeight(key),
+            .acquire => try original_cb.acquireWeight(key),
+            .embedding => try original_cb.getEmbeddingWeight(key),
+        };
+        defer original_cb.free(original);
+        const original_storage = toBuf(original).quantized_storage.?;
+        var sink = try @import("../execution/retirement_sink.zig").Ref.create();
+        defer sink.release();
+        var boundary = try sink.enter();
+        defer boundary.finish();
+        var epoch = try boundary.retainEpoch();
+        defer epoch.release();
+        const current: @import("../execution/cleanup_context.zig").Context = .{ .boundary = &epoch };
+        var receiving = NativeCompute.init(a, &data, null);
+        var receiving_live = true;
+        defer if (receiving_live) receiving.deinitWithCleanup(current) catch unreachable;
+        const cb = receiving.computeBackend();
+        if (must_deny) {
+            const before = pin.controller().snapshot();
+            const pins = data.lazy_weights.getPtr(key).?.pin_count;
+            try std.testing.expectError(error.ResourceLimitExceeded, NativeCompute.prepareDeniedLazyWeightOutsideExecution(&cb, &data, key, access, &pin, current));
+            try std.testing.expectEqualDeep(before, pin.controller().snapshot());
+            try std.testing.expectEqual(pins, data.lazy_weights.getPtr(key).?.pin_count);
+            try std.testing.expectEqual(@as(u32, 0), receiving.weight_handles.count());
+            try std.testing.expect(receiving.weight_retirement == null);
+            try std.testing.expect(data.lazy_weights.getPtr(key).?.loaded == null);
+            continue; // no candidate payload/receiver mutation or actual math
+        }
+        const actual = try NativeCompute.prepareDeniedLazyWeightOutsideExecution(&cb, &data, key, access, &pin, current);
+        var actual_live = true;
+        defer if (actual_live) cb.freeWithCleanup(actual, current);
+        const selected = toBuf(actual).quantized_storage.?;
+        try std.testing.expect(original_storage.raw_bytes.ptr == selected.raw_bytes.ptr);
+        try std.testing.expectEqualSlices(i64, original_storage.shape, selected.shape);
+        for (original_storage.prepared.entries, selected.prepared.entries) |old, new| {
+            try std.testing.expectEqual(old != null, new != null);
+            if (old) |expected| {
+                try std.testing.expectEqual(expected.panel_cols, new.?.panel_cols);
+                try std.testing.expectEqual(expected.row_blocks, new.?.row_blocks);
+                try std.testing.expectEqualSlices(u8, expected.bytes, new.?.bytes);
+            }
+        }
+        try std.testing.expectEqual(original_storage.panel16_epoch.load(.acquire), selected.panel16_epoch.load(.acquire));
+        if (access != .embedding) try std.testing.expect(selected.prepared.ownedBytes() != 0) else try std.testing.expectEqual(@as(usize, 0), selected.prepared.ownedBytes());
+        var input: [2 * 32]f32 = undefined;
+        for (&input, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 11)) - 5)) * 0.125;
+        const original_input = try original_cb.fromFloat32Shape(&input, &.{ 2, 32 });
+        defer original_cb.free(original_input);
+        const actual_input = try cb.fromFloat32Shape(&input, &.{ 2, 32 });
+        var actual_input_live = true;
+        defer if (actual_input_live) cb.free(actual_input);
+        const expected = try original_cb.linearNoBias(original_input, original, 2, 32, 64);
+        defer original_cb.free(expected);
+        const observed = try cb.linearNoBias(actual_input, actual, 2, 32, 64);
+        var observed_live = true;
+        defer if (observed_live) cb.free(observed);
+        const expected_values = try original_cb.toFloat32(expected, a);
+        defer a.free(expected_values);
+        const observed_values = try cb.toFloat32(observed, a);
+        defer a.free(observed_values);
+        try std.testing.expectEqualSlices(f32, expected_values, observed_values);
+        try std.testing.expect(data.lazy_weights.getPtr(key).?.loaded == null);
+        try std.testing.expectEqual(@as(usize, 0), data.tier_cache.?.host_bytes);
+        const held = pin.controller().snapshot();
+        if (measured) |out| if (access == .get) {
+            out.* = held.host_scratch_bytes;
+        };
+        // Explicit foreign authority fails before shared/cache/ref mutation.
+        var foreign_sink = try @import("../execution/retirement_sink.zig").Ref.create();
+        defer foreign_sink.release();
+        var foreign_guard = try foreign_sink.enter();
+        defer foreign_guard.finish();
+        var foreign_epoch = try foreign_guard.retainEpoch();
+        defer foreign_epoch.release();
+        const refs_before = toBuf(actual).tensor_refs.load(.acquire);
+        try std.testing.expectError(error.ForeignNativeTemporaryScope, validateNativeTemporaryCleanup(actual, .{ .boundary = &foreign_epoch }));
+        try std.testing.expectEqual(refs_before, toBuf(actual).tensor_refs.load(.acquire));
+        try std.testing.expectError(error.NativeTemporaryChildrenStillLive, receiving.deinitWithCleanup(current));
+        try std.testing.expectEqualDeep(held, pin.controller().snapshot());
+        try std.testing.expect(held.host_scratch_bytes >= selected.prepared.ownedBytes());
+        if (access != .embedding) try std.testing.expect(held.host_scratch_bytes != 0);
+        cb.freeWithCleanup(actual, current); // actual CPU backing dies first
+        actual_live = false;
+        try std.testing.expectEqualDeep(held, pin.controller().snapshot()); // NOWB still live
+        cb.free(observed);
+        observed_live = false;
+        cb.free(actual_input);
+        actual_input_live = false;
+        try receiving.deinitWithCleanup(current);
+        receiving_live = false;
+        boundary.finish();
+        try std.testing.expectEqualDeep(run_memory.AdmissionAmounts{}, pin.controller().snapshot());
+        try std.testing.expect(!probe.violation);
+    }
+}
+
+fn nativeColdDeniedLayoutOriginalCase(allocator: std.mem.Allocator) !void {
+    try nativeColdDeniedLayoutBoundaryCase(allocator, null, false, null);
+}
+
+test "Native hard cache denial preserves original get acquire ephemeral prepared layouts with independent Domain until actual B seals" {
+    try nativeColdDeniedLayoutOriginalCase(std.testing.allocator);
+}
+
+test "Native additive denied-layout exact global cap succeeds and one-below refuses before candidate or math" {
+    var exact: usize = 0;
+    try nativeColdDeniedLayoutBoundaryCase(std.testing.allocator, null, false, &exact);
+    try std.testing.expect(exact > 1);
+    try nativeColdDeniedLayoutBoundaryCase(std.testing.allocator, exact, false, null);
+    try nativeColdDeniedLayoutBoundaryCase(std.testing.allocator, exact - 1, true, null);
+}
+
+test "Native additive denied-layout every payload and receiving metadata OOM drains before B quota" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, nativeColdDeniedLayoutOriginalCase, .{});
+}
+
+test "Native populated Gemma GLiNER prefetch teardown keeps historical raw token until actual later B" {
+    const a = std.testing.allocator;
+    const domain_mod = @import("../runtime/tier/admission_domain.zig");
+    const sink_mod = @import("../execution/retirement_sink.zig");
+    for ([_]bool{ false, true }) |with_prefetch| {
+        const domain = try domain_mod.Domain.create();
+        defer domain.release();
+        const pin = domain.pin();
+        defer pin.release();
+        var data = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 64 }) };
+        var data_live = true;
+        defer if (data_live) data.deinitOwned();
+        if (with_prefetch) initPrefetchQueue(&data, a);
+        try data.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = 64 }, .{});
+        try data.tier_cache.?.installRetirementDomainOutsideExecution(&pin);
+        var model: std.atomic.Mutex = .unlocked;
+        const Probe = struct {
+            model: *std.atomic.Mutex,
+            native: ?[2]*std.atomic.Mutex,
+            checking: bool = false,
+            violation: bool = false,
+            releases: usize = 0,
+            fn inspect(self: *@This()) void {
+                if (!self.checking) return; // legitimate legacy cold birth
+                if (self.model.tryLock()) self.model.unlock() else self.violation = true;
+                if (self.native) |locks| for (locks) |mutex| if (mutex.tryLock()) mutex.unlock() else {
+                    self.violation = true;
+                };
+            }
+            fn reserve(raw: *anyopaque, _: run_memory.AdmissionAmounts) run_memory.AdmissionResourceError!usize {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.inspect();
+                return 45;
+            }
+            fn retain(raw: *anyopaque, _: usize, _: run_memory.AdmissionAmounts) run_memory.AdmissionResourceError!void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.inspect();
+            }
+            fn release(raw: *anyopaque, _: usize) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.inspect();
+                self.releases += 1;
+            }
+        };
+        var probe = Probe{ .model = &model, .native = .{ &data.embeddinggemma2_f32_cache_lock, &data.gliner_head_dense_cache_lock } };
+        try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+        try data.tier_cache.?.reserve(.host, 64); // SAME one raw external token
+        const Producer = struct {
+            fn populate(allocator: std.mem.Allocator, cache: *std.StringHashMapUnmanaged(DenseDequantCacheEntry), name: []const u8) !void {
+                const key = try allocator.dupe(u8, name);
+                errdefer allocator.free(key);
+                const values = try allocator.alloc(f32, 8);
+                errdefer allocator.free(values);
+                @memset(values, 1);
+                try cache.put(allocator, key, .{ .data = values, .bytes = values.len * @sizeOf(f32) });
+            }
+        };
+        try Producer.populate(a, &data.embeddinggemma2_f32_cache, "actual.gemma.mirror");
+        try Producer.populate(a, &data.gliner_head_dense_cache, "actual.gliner.mirror");
+        data.embeddinggemma2_f32_cache_bytes = 32;
+        data.gliner_head_dense_cache_bytes = 32;
+        var sink = try sink_mod.Ref.create();
+        defer sink.release();
+        var guard = try sink.enter();
+        defer guard.finish();
+        var epoch = try guard.retainEpoch();
+        defer epoch.release();
+        probe.checking = true;
+        try std.testing.expect(model.tryLock());
+        var model_locked = true;
+        defer if (model_locked) model.unlock();
+        // Real chain: validate -> deinitPrefetchQueue -> both populated cache
+        // destructors/noteRelease -> complete CPU death -> binding final Node.
+        try data.deinitOwnedWithCleanup(.{ .boundary = &epoch });
+        data_live = false;
+        probe.native = null; // embedded Native mutex values have physically died
+        try std.testing.expectEqual(@as(usize, 0), probe.releases);
+        try std.testing.expectEqual(@as(usize, 64), pin.controller().snapshot().host_weight_bytes);
+        try std.testing.expect(!probe.violation);
+        model.unlock();
+        model_locked = false;
+        guard.finish();
+        try std.testing.expectEqual(@as(usize, 1), probe.releases);
+        try std.testing.expectEqual(@as(usize, 0), pin.controller().snapshot().host_weight_bytes);
+        try std.testing.expect(!probe.violation);
+    }
 }

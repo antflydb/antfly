@@ -2050,6 +2050,9 @@ pub const Session = struct {
         if (comptime !@import("build_options").enable_metal) return false;
         return @import("../execution/architecture_session.zig").acceptsMetalWorkspaceSession(self);
     }
+    pub fn nativeWeightPreparationReceiver(self: Session) bool {
+        return @import("../execution/architecture_session.zig").nativeWeightPreparationModelData(self) != null;
+    }
     fn validateEagerHostServices(self: Session) !void {
         if (self.run_admission == null and !self.canonicalMetalWorkspaceReceiver()) return;
         const services = self.vtable.eager_host_services orelse return;
@@ -2073,6 +2076,7 @@ pub const Session = struct {
             };
             if (present) return true;
         }
+        if (self.nativeWeightPreparationReceiver()) return true;
         return self.needsEagerRecurrentFunding();
     }
     /// Top-level cold host entry: all preparation/refunds are outside every
@@ -2081,7 +2085,7 @@ pub const Session = struct {
         for (0..8) |_| {
             if (control) |active| try active.check();
             var source: PreparedSource = .{};
-            source.initBeforeExecutionInto(self, self, self.execution_gate, .{ .host = inputs }, try self.planRun(inputs, null), null, if (self.canonicalMetalWorkspaceReceiver()) .resident_transient else .host, allocator, control) catch |err| {
+            source.initBeforeExecutionInto(self, self, self.execution_gate, .{ .host = inputs }, try self.planRun(inputs, null), null, if (self.canonicalMetalWorkspaceReceiver() or self.nativeWeightPreparationReceiver()) .resident_transient else .host, allocator, control) catch |err| {
                 // A peer may physically retire a snapshotted Root before its
                 // use cell binds. init's error unwind has already closed its
                 // complete Source/B/permit outside lanes; never retry a partly
@@ -3228,6 +3232,7 @@ pub const PreparedSource = struct {
     executed: bool = false,
     preentry_declined: bool = false,
     synchronous_consumers: usize = 0,
+    native_weight_paused: bool = false,
     host_output_producer: ?HostOutputProducer = null,
     numerical_lane: ?*@import("../execution_control.zig").ExecutionLane = null,
     numerical_lane_interactive: bool = false,
@@ -3249,7 +3254,7 @@ pub const PreparedSource = struct {
             self.scheduling_model = model.retain();
         };
         errdefer self.deinit();
-        self.cleanup = if (placement != .host or source.preparesInvocation() or source.canonicalMetalWorkspaceReceiver()) try Owner.beginResident(source) else try Owner.beginAdmitted(source);
+        self.cleanup = if (placement != .host or source.preparesInvocation() or source.canonicalMetalWorkspaceReceiver() or source.nativeWeightPreparationReceiver()) try Owner.beginResident(source) else try Owner.beginAdmitted(source);
         try scheduling.selectReadyCohort(gate, control orelse .{}, &self.waiter);
         const envelope = if (supplied_preprocess) |supplied| original: {
             if (supplied.session.ptr != source.ptr or supplied.session.vtable != source.vtable or supplied.dispatch_cleanup_epoch != null or supplied.invocation_started or supplied.prepared != null or supplied.physical_storage != null) return error.InvalidSourcePreprocessingPermit;
@@ -3319,7 +3324,7 @@ pub const PreparedSource = struct {
             self.scheduling_model = model.retain();
         };
         errdefer self.deinit();
-        self.cleanup = if (placement != .host or source.preparesInvocation() or source.canonicalMetalWorkspaceReceiver()) try Owner.beginResident(source) else try Owner.beginAdmitted(source);
+        self.cleanup = if (placement != .host or source.preparesInvocation() or source.canonicalMetalWorkspaceReceiver() or source.nativeWeightPreparationReceiver()) try Owner.beginResident(source) else try Owner.beginAdmitted(source);
         try scheduling.selectReadyCohort(source.execution_gate orelse fallback_gate, control orelse .{}, &self.waiter);
         // Both managed and ordinary raw sources bind current B only after
         // the true selected encoder output/workspace has been admitted. A
@@ -3592,6 +3597,16 @@ pub const PreparedSource = struct {
         if (self.phase != .executing or self.executed) return error.SourceInvocationAlreadyExecuted;
         self.executed = true;
         self.preentry_declined = false;
+        const selected = self.selectedPermit();
+        const native = self.sourceSession().nativeWeightPreparationReceiver();
+        var native_control = @import("../execution/invocation_context.zig").NativeWeights{ .ptr = self, .access = nativeWeightAccess };
+        if (native) {
+            if (selected.native_weights != null) return error.NativeWeightPreparationReentered;
+            selected.native_weights = &native_control;
+        }
+        defer if (native) {
+            selected.native_weights = null;
+        };
         var outputs = self.selectedPermit().runWithControl(inputs, self.allocator, self.control) catch |err| {
             self.preentry_declined = self.selectedPermit().eager_preentry_declined;
             return err;
@@ -3602,6 +3617,133 @@ pub const PreparedSource = struct {
         outputs = try self.selectedPermit().attachHostOutputs(outputs, self.allocator);
         self.selectedPermit().deinitWithCleanup(.{ .boundary = self.epoch() });
         return outputs;
+    }
+
+    fn sourceSession(self: *PreparedSource) Session {
+        return self.selectedPermit().session;
+    }
+
+    fn restoreNativeWeightSlice(self: *PreparedSource) !void {
+        const scheduling = self.scheduling_session orelse return error.MissingSourceModelLifetime;
+        // Restoring cleanup is mandatory even when the original request was
+        // cancelled. This does not execute/replay numerical work.
+        try scheduling.selectReadyCohort(scheduling.execution_gate, .{}, &self.waiter);
+        try scheduling.acquireSelectedCohort(.{}, &self.waiter);
+        if (self.numerical_lane) |lane| self.numerical_lane_lease = try lane.acquireWithPriority(.{}, self.numerical_lane_interactive);
+        if (self.shape_scope) |*scope| try scope.beginNumerical();
+        self.native_weight_paused = false;
+    }
+    fn nativeWeightAccess(raw: *anyopaque, cb: *const ops.ComputeBackend, name: []const u8, access: @import("../execution/invocation_context.zig").NativeWeights.Access) anyerror!?ops.CT {
+        const self: *PreparedSource = @ptrCast(@alignCast(raw));
+        if (self.phase != .executing or self.native_weight_paused) return error.NativeWeightPreparationReentered;
+        const source = self.sourceSession();
+        const current = self.epoch() orelse return error.MissingCurrentCleanupEpoch;
+        if (try current.isSealed()) return error.RetirementEpochSealed;
+        const native_invocation = cb.call_context orelse return error.ForeignNativeWeightModel;
+        const loan = native_invocation.native_weights orelse return error.ForeignNativeWeightModel;
+        const actual_b = native_invocation.cleanup.boundary orelse return error.MissingCurrentCleanupEpoch;
+        if (loan.ptr != raw or loan.access != nativeWeightAccess or actual_b.record != current.record or actual_b.nonce != current.nonce) return error.ForeignNativeWeightModel;
+        const data = @import("../execution/architecture_session.zig").nativeWeightPreparationModelData(source) orelse return error.ForeignNativeWeightModel;
+        const Native = @import("../ops/native_compute.zig").NativeCompute;
+        var planned = if (access == .embedding) null else try Native.snapshotResidentWeightPreparation(cb, data, name);
+        const lazy_load = try Native.lazyWeightNeedsColdPreparation(cb, data, name);
+        const raw_credits = try Native.residentWeightCreditsNeedPreparation(cb, data);
+        var selected_layout = planned != null;
+        if (!selected_layout and !raw_credits and !lazy_load) return null;
+        const scheduling = self.scheduling_session orelse return error.MissingSourceModelLifetime;
+        const model = self.source_model orelse return error.MissingSourceModelLifetime;
+        var pin: ?@import("../runtime/tier/admission_domain.zig").Pin = if (source.run_admission) |admission| model.retainAdmissionDomain(admission.controller) else null;
+        defer if (pin) |held| held.release();
+        if (self.shape_scope) |*scope| scope.endNumerical();
+        if (self.numerical_lane_lease) |lease| lease.release();
+        self.numerical_lane_lease = null; // keep lane identity for actual resume
+        scheduling.releaseSelectedCohortGate(&self.waiter);
+        scheduling.leaveSelectedCohort(&self.waiter);
+        self.native_weight_paused = true;
+        defer if (self.native_weight_paused) self.restoreNativeWeightSlice() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        // Destructor is before mandatory resume: all unused metadata/refunds
+        // run while Model, selected turn, lane, prefetch and quant locks are off.
+        defer if (planned) |*plan| plan.finishOutsideExecution();
+        if (self.control) |control| try control.check();
+        try Native.prepareResidentCreditUpgradesOutsideExecution(cb, data, if (pin) |*held| held else null);
+        try Native.flushWeightReleasesOutsideExecution(cb, data);
+        if (lazy_load) {
+            var denied = false;
+            var ready = false;
+            for (0..8) |_| {
+                Native.prepareLazyWeightOutsideExecution(cb, data, name, access != .embedding, if (pin) |*held| held else null) catch |err| {
+                    if (err == error.NativeWeightPreparationChanged or err == error.PreparedCacheGrowthChanged) continue;
+                    if (err == error.MemoryBudgetExceeded) {
+                        denied = true;
+                        break;
+                    }
+                    return err;
+                };
+                if (self.control) |control| try control.check();
+                // A peer embedding may have published raw storage while this
+                // matrix lookup was parked. Certify the ACTUAL selected winner
+                // and prepare missing original layouts before receiving it.
+                planned = if (access == .embedding) null else try Native.snapshotResidentWeightPreparation(cb, data, name);
+                if (planned == null) return try Native.accessPreparedLazyWeight(cb, data, name, access, false);
+                selected_layout = true;
+                ready = true;
+                break;
+            }
+            if (denied) {
+                const fallback: ?ops.CT = peer: {
+                    for (0..8) |_| {
+                        const prepared_fallback = if (pin) |*held|
+                            Native.prepareDeniedLazyWeightOutsideExecution(cb, data, name, access, held, .{ .boundary = current })
+                        else
+                            Native.accessPreparedLazyWeight(cb, data, name, access, true); // genuine unadmitted raw storage contract
+                        break :peer prepared_fallback catch |err| {
+                            if (err != error.NativeWeightPreparationChanged) return err;
+                            if (try Native.lazyWeightNeedsColdPreparation(cb, data, name)) continue; // changed cold policy/source, no math
+                            // A winner after the refusal is still cold metadata work,
+                            // never permission to run original prepare under Model.
+                            planned = if (access == .embedding) null else try Native.snapshotResidentWeightPreparation(cb, data, name);
+                            if (planned == null) return try Native.accessResidentWeightAfterPreparation(cb, data, name, access);
+                            selected_layout = true;
+                            ready = true;
+                            break :peer null;
+                        };
+                    }
+                    return error.ResourceTemporarilyUnavailable;
+                };
+                if (fallback) |value| return value;
+            }
+            if (!ready) return error.ResourceTemporarilyUnavailable;
+        }
+        if (!selected_layout) {
+            if (self.control) |control| try control.check();
+            return null; // original unsupported/lazy lookup; no schedule change
+        }
+        // Upgrade changes only the ledger revision. Refresh SAME selected
+        // source/layout under actual cache locks; no numerical work is rerun.
+        if (planned) |*plan| plan.finishOutsideExecution();
+        planned = try Native.snapshotResidentWeightPreparation(cb, data, name);
+        for (0..8) |_| {
+            if (planned) |*plan| {
+                plan.fundOutsideExecution(if (pin) |*held| held else null) catch |err| switch (err) {
+                    error.MemoryBudgetExceeded, error.ResourceTemporarilyUnavailable => {
+                        plan.noteFundingDeniedOutsideExecution();
+                        return try Native.accessResidentWeightAfterPreparation(cb, data, name, access);
+                    },
+                    else => return err,
+                };
+                plan.prepareOutsideExecution() catch |err| {
+                    if (err == error.NativeWeightPreparationChanged or err == error.PreparedCacheGrowthChanged) {
+                        plan.finishOutsideExecution();
+                        planned = try Native.snapshotResidentWeightPreparation(cb, data, name);
+                        continue; // cold metadata retry only, NEVER forward/math
+                    }
+                    return err;
+                };
+            }
+            if (self.control) |control| try control.check();
+            return try Native.accessResidentWeightAfterPreparation(cb, data, name, access);
+        }
+        return error.ResourceTemporarilyUnavailable;
     }
 
     fn releaseNumericalLane(self: *PreparedSource) void {
@@ -3675,6 +3817,17 @@ pub const PreparedSource = struct {
         }
         if (self.shape_scope) |*scope| scope.endNumerical();
         self.phase = .closed;
+        // Last borrowers can make an already-backed lazy cache entry reclaimable.
+        // Settle only after releasing actual Model/FIFO/lane and while the Source
+        // still pins the real Model/ledger. External shrink refusal keeps honest
+        // overpaid custody for the next cold attempt or typed final destruction.
+        // Cancellation may unwind preparation before either permit exists.
+        // Only an actual selected source can have made cache borrowers live.
+        if (self.permit != null or self.shape_scope != null) {
+            if (@import("../execution/architecture_session.zig").nativeWeightPreparationModelData(self.sourceSession())) |native_data| {
+                if (native_data.tier_cache) |*cache| cache.flushReleasedOutsideExecution() catch {};
+            }
+        }
         // All numerical/provider ownership has ended before external callbacks.
         if (consumer.boundary) |current| {
             const finish = self.host_output_finish.?;
@@ -3752,6 +3905,7 @@ pub const RunPermit = struct {
     temporary_recurrent: ?*@import("../execution/recurrent_state_admission.zig").Budget = null,
     existing_workspace: ?*@import("../execution/existing_workspace_receipt.zig").Owner = null,
     existing_workspace_prepared: bool = false,
+    native_weights: ?*const @import("../execution/invocation_context.zig").NativeWeights = null,
     eager_preentry_declined: bool = false,
     // Synchronous dispatch pin, even when the cold Set is empty/warm. Never
     // transferred to a returned output or used for later physical destruction.
@@ -3924,7 +4078,8 @@ pub const RunPermit = struct {
     fn eagerHostRun(self: *RunPermit, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) anyerror!?[]Tensor {
         const budget = self.temporary_recurrent;
         const metal = self.session.canonicalMetalWorkspaceReceiver();
-        if (budget == null and !metal) {
+        const native = self.native_weights != null and self.session.nativeWeightPreparationReceiver();
+        if (budget == null and !metal and !native) {
             if (try self.session.needsEagerRecurrentFunding()) return error.UnpreparedRecurrentStateBudget;
             return null;
         }
@@ -3938,6 +4093,7 @@ pub const RunPermit = struct {
         const context = @import("../execution/invocation_context.zig").Context{
             .cleanup = .{ .boundary = epoch },
             .recurrent_state = budget,
+            .native_weights = self.native_weights,
             .workspace_uses = if (self.existing_workspace) |owner| try owner.receiverUses() else null,
         };
         if (control) |active| try active.check();

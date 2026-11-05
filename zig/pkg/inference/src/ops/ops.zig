@@ -3672,6 +3672,13 @@ pub const ComputeBackend = struct {
     }
 
     pub fn free(self: *const ComputeBackend, tensor: CT) void {
+        // This is the actual caller-owned receiving header, never provider or
+        // Engine ancestry. Borrow its explicit synchronous cleanup only while
+        // the invocation owns this header; durable exports strip call_context.
+        if (self.call_context) |context| {
+            self.freeWithCleanup(tensor, context.cleanup);
+            return;
+        }
         self.vtable.freeTensor(self.ptr, tensor);
     }
 
@@ -3689,7 +3696,9 @@ pub const ComputeBackend = struct {
                 return;
             }
         }
-        self.free(tensor);
+        // A missing/foreign typed service keeps the exact raw compatibility
+        // callback. Calling free here would recursively re-read call_context.
+        self.vtable.freeTensor(self.ptr, tensor);
     }
 
     pub fn detachDenseF32PhysicalPayload(self: *const ComputeBackend, outputs: []const CT, expected_model_data: *const anyopaque, current: @import("../execution/cleanup_context.zig").Context) !?DetachedDenseF32Payload {
@@ -3702,16 +3711,25 @@ pub const ComputeBackend = struct {
 
     pub fn getWeight(self: *const ComputeBackend, name: []const u8) !CT {
         try self.checkExecutionControl();
+        if (self.call_context) |invocation| if (invocation.native_weights) |control| {
+            if (try control.access(control.ptr, self, name, .get)) |value| return value;
+        };
         return self.vtable.getWeight(self.ptr, name);
     }
 
     pub fn acquireWeight(self: *const ComputeBackend, name: []const u8) !CT {
         try self.checkExecutionControl();
+        if (self.call_context) |invocation| if (invocation.native_weights) |control| {
+            if (try control.access(control.ptr, self, name, .acquire)) |value| return value;
+        };
         return self.vtable.acquireWeight(self.ptr, name);
     }
 
     pub fn getEmbeddingWeight(self: *const ComputeBackend, name: []const u8) !CT {
         try self.checkExecutionControl();
+        if (self.call_context) |invocation| if (invocation.native_weights) |control| {
+            if (try control.access(control.ptr, self, name, .embedding)) |value| return value;
+        };
         const acquire = self.vtable.getEmbeddingWeight orelse self.vtable.getWeight;
         return acquire(self.ptr, name);
     }
@@ -7292,4 +7310,72 @@ test "durable backend copy removes only borrowed synchronous invocation context"
     const durable = local.withoutInvocationContext();
     try std.testing.expect(local.call_context == &context and durable.call_context == null);
     try std.testing.expect(local.ptr == durable.ptr and local.vtable == durable.vtable);
+}
+
+test "explicit invocation header free forwards caller cleanup and raw fallback never recurses" {
+    const sink_mod = @import("../execution/retirement_sink.zig");
+    const Cleanup = @import("../execution/cleanup_context.zig").Context;
+    const Fixture = struct {
+        var raw_calls: usize = 0;
+        const Probe = struct { typed: usize = 0, record: ?*anyopaque = null, nonce: u64 = 0 };
+        fn raw(_: *anyopaque, _: CT) void {
+            raw_calls += 1;
+        }
+        fn accepts(table: *const ComputeBackend.VTable) bool {
+            return table == &canonical;
+        }
+        fn typed(ptr: *anyopaque, _: CT, current: Cleanup) void {
+            const probe: *Probe = @ptrCast(@alignCast(ptr));
+            probe.typed += 1;
+            const epoch = current.boundary orelse unreachable;
+            probe.record = epoch.record;
+            probe.nonce = epoch.nonce;
+        }
+        const services = ColdCleanupServices{ .accepts = accepts, .free = typed };
+        const canonical: ComputeBackend.VTable = init();
+        fn init() ComputeBackend.VTable {
+            var table: ComputeBackend.VTable = undefined;
+            table.freeTensor = raw;
+            table.cold_cleanup_services = &services;
+            return table;
+        }
+    };
+    Fixture.raw_calls = 0;
+    var old_sink = try sink_mod.Ref.create();
+    defer old_sink.release();
+    var old_guard = try old_sink.enter();
+    defer old_guard.finish();
+    var old_epoch = try old_guard.retainEpoch();
+    defer old_epoch.release();
+    var current_sink = try sink_mod.Ref.create();
+    defer current_sink.release();
+    var current_guard = try current_sink.enter();
+    defer current_guard.finish();
+    var current_epoch = try current_guard.retainEpoch();
+    defer current_epoch.release();
+    const context = @import("../execution/invocation_context.zig").Context{ .cleanup = .{ .boundary = &old_epoch } };
+    var probe = Fixture.Probe{};
+    var cb = ComputeBackend{ .ptr = &probe, .vtable = &Fixture.canonical, .call_context = &context };
+    const tensor: CT = @ptrFromInt(16);
+    cb.free(tensor);
+    try std.testing.expectEqual(@as(usize, 1), probe.typed);
+    try std.testing.expect(probe.record == @as(?*anyopaque, @ptrCast(old_epoch.record)) and probe.nonce == old_epoch.nonce);
+    cb.freeWithCleanup(tensor, .{ .boundary = &current_epoch });
+    try std.testing.expectEqual(@as(usize, 2), probe.typed);
+    try std.testing.expect(probe.record == @as(?*anyopaque, @ptrCast(current_epoch.record)) and probe.nonce == current_epoch.nonce);
+    cb.call_context = null;
+    cb.free(tensor); // original raw-null-header API remains raw
+    try std.testing.expectEqual(@as(usize, 1), Fixture.raw_calls);
+    var copied = Fixture.canonical;
+    cb.vtable = &copied;
+    cb.call_context = &context;
+    cb.ptr = @ptrFromInt(16); // rejected table never enters typed opaque callback
+    cb.free(tensor);
+    try std.testing.expectEqual(@as(usize, 2), Fixture.raw_calls);
+    copied.cold_cleanup_services = null;
+    cb.free(tensor); // header + no handler takes raw exactly once
+    try std.testing.expectEqual(@as(usize, 3), Fixture.raw_calls);
+    const durable = cb.withoutInvocationContext();
+    try std.testing.expect(durable.call_context == null and durable.ptr == cb.ptr and durable.vtable == cb.vtable);
+    try std.testing.expectEqual(@as(usize, 2), probe.typed);
 }

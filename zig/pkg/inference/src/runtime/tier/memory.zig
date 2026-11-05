@@ -3201,7 +3201,11 @@ pub fn estimateGptGenerationForKvPolicy(
     const scratch_bytes = std.math.add(
         usize,
         base_scratch_bytes,
-        std.math.add(usize, cuda_deferred_activation_scratch, try gptRecurrentBackendStateBytes(backend, config)) catch return error.ResourceLimitExceeded,
+        std.math.add(
+            usize,
+            std.math.add(usize, cuda_deferred_activation_scratch, try gptRecurrentBackendStateBytes(backend, config)) catch return error.ResourceLimitExceeded,
+            if (backend == .native) @import("../../execution/recurrent_state_admission.zig").NativeHostState.requiredBytes(config) catch return error.ResourceLimitExceeded else 0,
+        ) catch return error.ResourceLimitExceeded,
     ) catch return error.ResourceLimitExceeded;
 
     return .{
@@ -5557,4 +5561,35 @@ test "shared external callback can release its already detached caller handle id
     try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
     try controller.configureResourceBudget(null);
     try std.testing.expectEqual(@as(usize, 1), probe.base.references);
+}
+
+test "Native generation independently declares recurrent host state without borrowing KV or original scratch floor" {
+    const cfg = gpt_mod.Config{ .family = .qwen3_5, .hidden_size = 4, .num_hidden_layers = 5, .num_attention_heads = 1, .num_key_value_heads = 1, .intermediate_size = 8, .vocab_size = 16, .qwen35_has_linear_attention = true, .qwen35_full_attention_interval = 4, .qwen35_linear_num_key_heads = 1, .qwen35_linear_num_value_heads = 1, .qwen35_linear_key_head_dim = 2, .qwen35_linear_value_head_dim = 2, .qwen35_linear_conv_kernel_dim = 4 };
+    var ordinary = cfg;
+    ordinary.qwen35_has_linear_attention = false;
+    const base = try estimateGptGeneration(.native, .f32, ordinary, 4, 2, 4);
+    const owned = try estimateGptGeneration(.native, .f32, cfg, 4, 2, 4);
+    const state_bytes = try @import("../../execution/recurrent_state_admission.zig").NativeHostState.requiredBytes(cfg);
+    try std.testing.expectEqual(base.kv_bytes, owned.kv_bytes);
+    try std.testing.expectEqual(base.scratch_bytes + state_bytes, owned.scratch_bytes);
+    var below = RunBudget.init(.{ .scratch_limit_bytes = owned.scratch_bytes - 1 });
+    try std.testing.expectError(error.MemoryBudgetExceeded, below.reserveEstimate(owned));
+    var exact = RunBudget.init(.{ .scratch_limit_bytes = owned.scratch_bytes });
+    try exact.reserveEstimate(owned);
+}
+
+test "Native generation header-only Qwen cache remains an exact independent primary component" {
+    const cfg = gpt_mod.Config{ .family = .qwen3_5, .hidden_size = 4, .num_hidden_layers = 5, .num_attention_heads = 1, .num_key_value_heads = 1, .intermediate_size = 8, .vocab_size = 16, .qwen35_has_linear_attention = true, .qwen35_full_attention_interval = 1, .qwen35_linear_num_key_heads = 1, .qwen35_linear_num_value_heads = 1, .qwen35_linear_key_head_dim = 2, .qwen35_linear_value_head_dim = 2, .qwen35_linear_conv_kernel_dim = 4 };
+    var no_cache = cfg;
+    no_cache.qwen35_has_linear_attention = false;
+    const base = try estimateGptGeneration(.native, .f32, no_cache, 4, 1, 4);
+    const actual = try estimateGptGeneration(.native, .f32, cfg, 4, 1, 4);
+    const required = try @import("../../execution/recurrent_state_admission.zig").NativeHostState.requiredBytes(cfg);
+    try std.testing.expect(required > 0);
+    try std.testing.expectEqual(base.kv_bytes, actual.kv_bytes);
+    try std.testing.expectEqual(base.scratch_bytes + required, actual.scratch_bytes);
+    var below = RunBudget.init(.{ .scratch_limit_bytes = actual.scratch_bytes - 1 });
+    try std.testing.expectError(error.MemoryBudgetExceeded, below.reserveEstimate(actual));
+    var exact = RunBudget.init(.{ .scratch_limit_bytes = actual.scratch_bytes });
+    try exact.reserveEstimate(actual);
 }

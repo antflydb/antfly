@@ -99,6 +99,13 @@ pub const Qwen35LinearLayerState = struct {
 pub const Qwen35LinearCache = struct {
     allocator: std.mem.Allocator,
     layers: []Qwen35LinearLayerState,
+    /// Present only for the actual cold-owned Native request cache. No quota
+    /// or creation boundary is stored in ordinary raw cache instances.
+    host_cleanup: ?HostCleanup = null,
+    pub const HostCleanup = struct {
+        ptr: *anyopaque,
+        validate: *const fn (*anyopaque, @import("../execution/cleanup_context.zig").Context) anyerror!void,
+    };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Qwen35LinearCache {
         const layer_count: usize = @intCast(config.num_hidden_layers);
@@ -109,23 +116,15 @@ pub const Qwen35LinearCache = struct {
             allocator.free(layers);
         }
 
-        const key_heads: usize = @intCast(config.qwen35_linear_num_key_heads);
-        const value_heads: usize = @intCast(config.qwen35_linear_num_value_heads);
-        const key_dim_per_head: usize = @intCast(config.qwen35_linear_key_head_dim);
-        const value_dim_per_head: usize = @intCast(config.qwen35_linear_value_head_dim);
-        const conv_kernel: usize = @intCast(config.qwen35_linear_conv_kernel_dim);
-        const key_dim = key_heads * key_dim_per_head;
-        const value_dim = value_heads * value_dim_per_head;
-        const conv_dim = key_dim * 2 + value_dim;
-        const recurrent_len = value_heads * key_dim_per_head * value_dim_per_head;
+        const geometry = try @import("../models/qwen35_state_layout.zig").Layout.init(config, @sizeOf(Qwen35LinearLayerState), @alignOf(Qwen35LinearLayerState));
 
         for (layers, 0..) |*state, layer| {
             if (!config.layerUsesQwen35LinearAttention(layer)) continue;
             state.device_only = config.qwen35_device_only_state;
             if (state.device_only) continue;
-            state.conv = try allocator.alloc(f32, conv_dim * conv_kernel);
+            state.conv = try allocator.alloc(f32, geometry.conv_elements);
             @memset(state.conv, 0);
-            state.recurrent = try allocator.alloc(f32, recurrent_len);
+            state.recurrent = try allocator.alloc(f32, geometry.recurrent_elements);
             @memset(state.recurrent, 0);
         }
 
@@ -133,6 +132,7 @@ pub const Qwen35LinearCache = struct {
     }
 
     pub fn validateCleanup(self: *const Qwen35LinearCache, current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (self.host_cleanup) |host| try host.validate(host.ptr, current);
         for (self.layers) |*state| try state.validateCleanup(current);
     }
     pub fn deinitWithCleanup(self: *Qwen35LinearCache, current: @import("../execution/cleanup_context.zig").Context) !void {
@@ -143,6 +143,7 @@ pub const Qwen35LinearCache = struct {
     }
 
     pub fn deinit(self: *Qwen35LinearCache) void {
+        if (self.host_cleanup) |host| host.validate(host.ptr, .{ .outside_execution = true }) catch platform.inference_process_supervisor.restartWorker();
         for (self.layers) |*state| state.deinit(self.allocator);
         self.allocator.free(self.layers);
         self.* = undefined;

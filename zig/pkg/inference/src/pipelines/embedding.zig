@@ -841,7 +841,7 @@ pub const EmbeddingPipeline = struct {
         defer source.finishInputLifetime();
         var projection_shell = if (self.text_projection) |projection| try projection.prepareResidentRetirement() else null;
         defer if (projection_shell) |*shell| shell.destroyUnused();
-        if (self.usesGemmaWorkspaceLaneProtocol()) try source.bindExecutionLaneBeforeExecution(self.execution_lane, self.interactive);
+        if (self.usesGemmaWorkspaceLaneProtocol() or self.usesNativeWeightLaneProtocol()) try source.bindExecutionLaneBeforeExecution(self.execution_lane, self.interactive);
         try source.enter();
         const late_lane = if (self.usesQwenWorkspaceLaneProtocol()) try self.enterNumericalExecutionLane() else null;
         var late_lane_live = true;
@@ -897,8 +897,11 @@ pub const EmbeddingPipeline = struct {
     fn usesGemmaWorkspaceLaneProtocol(self: *const EmbeddingPipeline) bool {
         return @import("../execution/architecture_session.zig").gemmaWorkspaceLanePolicy(self.session) orelse false;
     }
+    fn usesNativeWeightLaneProtocol(self: *const EmbeddingPipeline) bool {
+        return self.textEncodingSession().nativeWeightPreparationReceiver();
+    }
     fn usesLateWorkspaceLaneProtocol(self: *const EmbeddingPipeline) bool {
-        return self.usesQwenWorkspaceLaneProtocol() or self.usesGemmaWorkspaceLaneProtocol();
+        return self.usesQwenWorkspaceLaneProtocol() or self.usesGemmaWorkspaceLaneProtocol() or self.usesNativeWeightLaneProtocol();
     }
     fn gemmaStageOptions(self: *const EmbeddingPipeline, options: @import("embedding_gemma2.zig").Options) @import("embedding_gemma2.zig").Options {
         var result = options;
@@ -1669,7 +1672,7 @@ pub const EmbeddingPipeline = struct {
             };
             var projection_shell = if (self.text_projection) |projection| try projection.prepareResidentRetirement() else null;
             defer if (projection_shell) |*shell| shell.destroyUnused();
-            if (self.usesGemmaWorkspaceLaneProtocol()) try source.bindExecutionLaneBeforeExecution(self.execution_lane, self.interactive);
+            if (self.usesGemmaWorkspaceLaneProtocol() or self.usesNativeWeightLaneProtocol()) try source.bindExecutionLaneBeforeExecution(self.execution_lane, self.interactive);
             try source.enter();
             const qwen_lane = if (self.usesQwenWorkspaceLaneProtocol()) try self.enterNumericalExecutionLane() else null;
             var qwen_lane_live = true;
@@ -1779,7 +1782,7 @@ pub const EmbeddingPipeline = struct {
         if (owned) if (consumer_cleanup.boundary) |current| {
             if (try current.isSealed()) return error.RetirementEpochSealed;
         };
-        if (owned and ((self.execution_lane != null and !self.usesQwenWorkspaceLaneProtocol()) or self.execution_lane_held)) return error.OwnedOutputRequiresColdLaneEntry;
+        if (owned and ((self.execution_lane != null and !self.usesQwenWorkspaceLaneProtocol() and !self.usesNativeWeightLaneProtocol()) or self.execution_lane_held)) return error.OwnedOutputRequiresColdLaneEntry;
         const output_width = if (owned) try self.ownedTextOutputWidth() else 0;
         const lane = if (owned or self.usesQwenWorkspaceLaneProtocol()) null else try self.enterExecutionLane();
         defer self.leaveExecutionLane(lane);
@@ -1871,7 +1874,7 @@ pub const EmbeddingPipeline = struct {
             };
             var projection_shell = if (self.text_projection) |projection| try projection.prepareResidentRetirement() else null;
             defer if (projection_shell) |*shell| shell.destroyUnused();
-            if (self.usesGemmaWorkspaceLaneProtocol()) try source.bindExecutionLaneBeforeExecution(self.execution_lane, self.interactive);
+            if (self.usesGemmaWorkspaceLaneProtocol() or self.usesNativeWeightLaneProtocol()) try source.bindExecutionLaneBeforeExecution(self.execution_lane, self.interactive);
             try source.enter();
             const qwen_lane = if (self.usesQwenWorkspaceLaneProtocol()) try self.enterNumericalExecutionLane() else null;
             var qwen_lane_live = true;
@@ -3324,7 +3327,7 @@ pub const EmbeddingPipeline = struct {
 
     fn enterExecutionLane(self: *EmbeddingPipeline) !?@import("../execution_control.zig").ExecutionLane.Lease {
         if (self.execution_lane == null) return null;
-        if (self.usesGemmaWorkspaceLaneProtocol()) return null;
+        if (self.usesGemmaWorkspaceLaneProtocol() or self.usesNativeWeightLaneProtocol()) return null;
         return self.enterNumericalExecutionLane();
     }
     fn enterNumericalExecutionLane(self: *EmbeddingPipeline) !?@import("../execution_control.zig").ExecutionLane.Lease {

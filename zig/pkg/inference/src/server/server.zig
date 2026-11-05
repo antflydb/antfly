@@ -6232,6 +6232,14 @@ pub const Node = struct {
         }});
         defer admission_lease.release();
 
+        const NativeHostState = @import("../execution/recurrent_state_admission.zig").NativeHostState;
+        const native_host_bytes = if (backend_kind == .native) try NativeHostState.requiredBytes(gpt_config) else 0;
+        const native_host_state = if (native_host_bytes != 0)
+            try NativeHostState.prepare(model.session, gpt_config, if (admission_lease.resources) |*primary| primary else null, native_host_bytes, execution_control)
+        else
+            null;
+        defer if (native_host_state) |owned| owned.destroyAfterUnlock() catch platform.inference_process_supervisor.restartWorker();
+
         const execution_mode = batchExecutionMode(backend_kind);
         var scheduler_lease: ?runtime.scheduler.native_generate.Lease = null;
         defer if (scheduler_lease) |lease| model.native_generate_coordinator.?.release(lease);
@@ -6274,7 +6282,9 @@ pub const Node = struct {
             return err;
         };
         defer {
-            if (comptime build_options.enable_cuda) {
+            if (native_host_state) |owned| {
+                cb.deinitWithCleanup(.{ .boundary = owned.cleanupOwner().epoch(), .operation = cb.operationToken() });
+            } else if (comptime build_options.enable_cuda) {
                 if (prepared_ocr) |prepared| prepared.closeBackend(&cb) else cb.deinit();
             } else cb.deinit();
         }
@@ -6343,12 +6353,16 @@ pub const Node = struct {
         } else if (kv_storage) |*storage| {
             decode_state.kv_storage = storage;
         }
-        defer if (comptime build_options.enable_cuda) {
+        defer if (native_host_state) |owned| {
+            decode_state.deinitWithCleanup(.{ .boundary = owned.cleanupOwner().epoch(), .operation = cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
+        } else if (comptime build_options.enable_cuda) {
             if (prepared_ocr) |prepared| decode_state.deinitWithCleanup(.{ .boundary = prepared.cleanupOwner().epoch(), .operation = cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker() else decode_state.deinit();
         } else decode_state.deinit();
 
+        if (native_host_state) |owned| try owned.adopt(&decode_state, gpt_config, .{ .boundary = owned.cleanupOwner().epoch(), .operation = cb.operationToken() });
+
         var pipeline = generation.NativeGenerationPipeline{
-            .execution_cleanup_owner = if (comptime build_options.enable_cuda) if (prepared_ocr) |prepared| prepared.cleanupOwner() else null else null,
+            .execution_cleanup_owner = if (native_host_state) |owned| owned.cleanupOwner() else if (comptime build_options.enable_cuda) if (prepared_ocr) |prepared| prepared.cleanupOwner() else null else null,
             .allocator = allocator,
             .io = io,
             .cb = cb,
@@ -16724,6 +16738,31 @@ pub const Node = struct {
         };
         defer admission_lease.release();
 
+        // Exact Native host histories are an additive part of this SAME
+        // primary. Prepare process-reclaiming state before either Model lane;
+        // defers run after all state children and the real Model unlock, but
+        // before admission_lease.release on every cancellation/error path.
+        const NativeHostState = @import("../execution/recurrent_state_admission.zig").NativeHostState;
+        const target_host_state_bytes = if (backend_kind == .native) try NativeHostState.requiredBytes(gpt_config) else 0;
+        const draft_host_state_bytes = if (draft_backend_kind == .native and draft_gpt_config != null) try NativeHostState.requiredBytes(draft_gpt_config.?) else 0;
+        const native_host_components = try std.math.add(usize, target_host_state_bytes, draft_host_state_bytes);
+        const native_host_state = if (target_host_state_bytes != 0)
+            try NativeHostState.prepare(model.session, gpt_config, if (admission_lease.resources) |*primary| primary else null, native_host_components, execution_control)
+        else
+            null;
+        defer if (native_host_state) |owned| owned.destroyAfterUnlock() catch platform.inference_process_supervisor.restartWorker();
+        const draft_host_state = if (draft_host_state_bytes != 0)
+            try NativeHostState.prepare(draft_model_for_generation.?.session, draft_gpt_config.?, if (admission_lease.resources) |*primary| primary else null, native_host_components, execution_control)
+        else
+            null;
+        defer if (draft_host_state) |owned| owned.destroyAfterUnlock() catch platform.inference_process_supervisor.restartWorker();
+        defer if (draft_host_state) |owned| {
+            if (draft_cb) |*backend| {
+                backend.deinitWithCleanup(.{ .boundary = owned.cleanupOwner().epoch(), .operation = backend.operationToken() });
+                draft_cb = null;
+            }
+        };
+
         const first_locked_model = if (draft_model_for_generation) |draft_model|
             if (@intFromPtr(draft_model) < @intFromPtr(model)) draft_model else model
         else
@@ -16801,7 +16840,9 @@ pub const Node = struct {
         };
         var cb_live = true;
         defer if (cb_live) {
-            if (comptime build_options.enable_cuda) {
+            if (native_host_state) |owned| {
+                cb.deinitWithCleanup(.{ .boundary = owned.cleanupOwner().epoch(), .operation = cb.operationToken() });
+            } else if (comptime build_options.enable_cuda) {
                 if (prepared_generation) |prepared| prepared.closeBackend(0, &cb) else cb.deinit();
             } else cb.deinit();
         };
@@ -16898,16 +16939,22 @@ pub const Node = struct {
         }
         var decode_state_live = true;
         defer if (decode_state_live) {
-            if (comptime build_options.enable_cuda) {
+            if (native_host_state) |owned| {
+                decode_state.deinitWithCleanup(.{ .boundary = owned.cleanupOwner().epoch(), .operation = cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
+            } else if (comptime build_options.enable_cuda) {
                 if (prepared_generation) |prepared| {
                     if (prepared.cleanupOwner(0)) |owner| decode_state.deinitWithCleanup(.{ .boundary = owner.epoch(), .operation = cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker() else decode_state.deinit();
                 } else decode_state.deinit();
             } else decode_state.deinit();
         };
 
+        if (native_host_state) |owned| try owned.adopt(&decode_state, gpt_config, .{ .boundary = owned.cleanupOwner().epoch(), .operation = cb.operationToken() });
+
         var draft_decode_state: ?generation.NativeDecodeState = null;
         defer if (draft_decode_state) |*state| {
-            if (comptime build_options.enable_cuda) {
+            if (draft_host_state) |owned| {
+                state.deinitWithCleanup(.{ .boundary = owned.cleanupOwner().epoch(), .operation = if (draft_cb) |*backend| backend.operationToken() else null }) catch platform.inference_process_supervisor.restartWorker();
+            } else if (comptime build_options.enable_cuda) {
                 if (prepared_generation) |prepared| {
                     if (prepared.cleanupOwner(1)) |owner| state.deinitWithCleanup(.{ .boundary = owner.epoch(), .operation = if (draft_cb) |*backend| backend.operationToken() else null }) catch platform.inference_process_supervisor.restartWorker() else state.deinit();
                 } else state.deinit();
@@ -16926,6 +16973,7 @@ pub const Node = struct {
                 const draft_pool_id = draft_kv_manager.?.addPool(draft_pool_config) catch |err|
                     return ctx.status(500).json(.{ .@"error" = "BACKEND_ERROR", .message = @errorName(err) });
                 draft_decode_state = generation.NativeDecodeState.initPaged(ctx.allocator, &draft_kv_manager.?, draft_pool_id, null);
+                if (draft_host_state) |owned| try owned.adopt(&draft_decode_state.?, draft_cfg, .{ .boundary = owned.cleanupOwner().epoch(), .operation = if (draft_cb) |*backend| backend.operationToken() else null });
             }
         }
 
@@ -16969,8 +17017,8 @@ pub const Node = struct {
         };
 
         var pipeline = generation.NativeGenerationPipeline{
-            .execution_cleanup_owner = if (comptime build_options.enable_cuda) if (prepared_generation) |prepared| prepared.cleanupOwner(0) else null else null,
-            .draft_execution_cleanup_owner = if (comptime build_options.enable_cuda) if (prepared_generation) |prepared| prepared.cleanupOwner(1) else null else null,
+            .execution_cleanup_owner = if (native_host_state) |owned| owned.cleanupOwner() else if (comptime build_options.enable_cuda) if (prepared_generation) |prepared| prepared.cleanupOwner(0) else null else null,
+            .draft_execution_cleanup_owner = if (draft_host_state) |owned| owned.cleanupOwner() else if (comptime build_options.enable_cuda) if (prepared_generation) |prepared| prepared.cleanupOwner(1) else null else null,
             .allocator = execution_allocator,
             .io = ctx.io,
             .cb = cb,
@@ -17977,6 +18025,7 @@ pub const Node = struct {
     const BatchAdmission = struct {
         lease: model_manager_mod.GenerationAdmissionLease,
         estimate: runtime.tier.memory.Estimate,
+        native_host_state: ?*@import("../execution/recurrent_state_admission.zig").NativeHostState = null,
     };
 
     fn mergeSerialBatchEstimate(
@@ -18034,6 +18083,10 @@ pub const Node = struct {
         admission: *?BatchAdmission,
     ) void {
         if (admission.*) |*owned| {
+            if (owned.native_host_state) |state_owner| {
+                state_owner.destroyAfterUnlock() catch platform.inference_process_supervisor.restartWorker();
+                owned.native_host_state = null;
+            }
             owned.lease.release();
             run_budget.releaseEstimate(owned.estimate);
             admission.* = null;
@@ -18863,6 +18916,29 @@ pub const Node = struct {
                 // one reservation covering the largest per-item KV and scratch
                 // working sets is sufficient. Acquire it before the model lock:
                 // admission may evict an idle model and destroy its backend.
+                // Native batches own independent per-item primaries and
+                // backends. All cold state births precede the first worker.
+                if (backend_kind == .native) for (group_indices.items, 0..) |idx, pos| {
+                    if (!pending[idx]) continue;
+                    if (admissions[pos]) |*admission| {
+                        const NativeHostState = @import("../execution/recurrent_state_admission.zig").NativeHostState;
+                        const bytes = try NativeHostState.requiredBytes(gpt_config);
+                        if (bytes != 0) admission.native_host_state = NativeHostState.prepare(model.session, gpt_config, if (admission.lease.resources) |*primary| primary else null, bytes, execution_control) catch |err| {
+                            releaseBatchAdmission(&task_run_budgets[pos], &admissions[pos]);
+                            results[idx].@"error" = batchAdmissionError(err);
+                            pending[idx] = false;
+                            runnable_count -= 1;
+                            if (model.native_generate_coordinator) |coordinator| {
+                                coordinator.release(leases[pos]);
+                                leases[pos].request_id = 0;
+                            }
+                            continue;
+                        };
+                    }
+                };
+
+                if (runnable_count == 0) continue;
+
                 var shared_batch_admission: ?BatchAdmission = null;
                 defer releaseBatchAdmission(&shared_run_budget, &shared_batch_admission);
                 if (execution_mode != .isolated_parallel) {
@@ -19003,16 +19079,22 @@ pub const Node = struct {
                 const task_cbs = try ctx.allocator.alloc(?ops.ComputeBackend, group_indices.items.len);
                 @memset(task_cbs, null);
                 defer {
-                    for (task_cbs) |*maybe_cb| {
-                        if (maybe_cb.*) |*cb| cb.deinit();
+                    for (task_cbs, 0..) |*maybe_cb, pos| {
+                        if (maybe_cb.*) |*cb| {
+                            const native_owner = if (admissions[pos]) |admission| admission.native_host_state else null;
+                            if (native_owner) |owned| cb.deinitWithCleanup(.{ .boundary = owned.cleanupOwner().epoch(), .operation = cb.operationToken() }) else cb.deinit();
+                        }
                     }
                     ctx.allocator.free(task_cbs);
                 }
                 const decode_states = try ctx.allocator.alloc(generation.NativeDecodeState, group_indices.items.len);
                 for (decode_states) |*state| state.* = generation.NativeDecodeState.initContiguous(ctx.allocator);
                 defer {
-                    for (decode_states) |*state| {
-                        if (comptime build_options.enable_cuda) {
+                    for (decode_states, 0..) |*state, pos| {
+                        const native_owner = if (admissions[pos]) |admission| admission.native_host_state else null;
+                        if (native_owner) |owned| {
+                            state.deinitWithCleanup(.{ .boundary = owned.cleanupOwner().epoch(), .operation = if (task_cbs[pos]) |*backend| backend.operationToken() else null }) catch platform.inference_process_supervisor.restartWorker();
+                        } else if (comptime build_options.enable_cuda) {
                             if (prepared_ocr) |prepared| state.deinitWithCleanup(.{ .boundary = prepared.cleanupOwner().epoch(), .operation = if (shared_cb) |*backend| backend.operationToken() else null }) catch platform.inference_process_supervisor.restartWorker() else state.deinit();
                         } else state.deinit();
                     }
@@ -19055,13 +19137,15 @@ pub const Node = struct {
                     decode_states[pos] = generation.NativeDecodeState.initPaged(task_alloc, &kv_manager, pool_id, model.shared_moe_cache);
                     decode_states[pos].kv_lock = &kv_mutex;
                     decode_states[pos].kv_storage = &kv_storage;
+                    const native_owner = if (admissions[pos]) |admission| admission.native_host_state else null;
+                    if (native_owner) |owned| owned.adopt(&decode_states[pos], gpt_config, .{ .boundary = owned.cleanupOwner().epoch(), .operation = task_cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
                     tasks[pos] = .{
                         .allocator = task_alloc,
                         .pipeline = .{
                             .allocator = task_alloc,
                             .io = ctx.io,
                             .cb = task_cb,
-                            .execution_cleanup_owner = if (comptime build_options.enable_cuda) if (prepared_ocr) |prepared| prepared.cleanupOwner() else null else null,
+                            .execution_cleanup_owner = if (native_owner) |owned| owned.cleanupOwner() else if (comptime build_options.enable_cuda) if (prepared_ocr) |prepared| prepared.cleanupOwner() else null else null,
                             .session = model.session,
                             .gpt_config = gpt_config,
                             .kv_dtype = kv_dtype,
@@ -51552,4 +51636,115 @@ test "CUDA actual standalone generation original admission and optional attentio
     defer a.free(raw.logits.?);
     const admitted = try Harness.run(model_path, true, raw.logits.?);
     try std.testing.expect(raw.attention_calls > 0 and admitted.attention_calls > 0 and admitted.logits == null);
+}
+
+test "Native generation cold recurrent state uses same additive primary actual F32 math reset cancel cap and foreign B" {
+    const path = platform.env.getenv("ANTFLY_UNIFIED_QWEN_READER_FIXTURE") orelse return error.SkipZigTest;
+    const Test = struct {
+        const a = std.testing.allocator;
+        const Host = @import("../execution/recurrent_state_admission.zig").NativeHostState;
+        const Gpt = @import("../architectures/gpt.zig");
+        const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+        const Probe = struct {
+            gate: ?*std.atomic.Mutex,
+            calls: usize = 0,
+            next: usize = 1,
+            failure: bool = false,
+            fn check(self: *@This()) void {
+                self.calls += 1;
+                if (self.gate) |gate| {
+                    if (gate.tryLock()) gate.unlock() else self.failure = true;
+                }
+            }
+            fn reserve(raw: *anyopaque, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!usize {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.check();
+                const token = self.next;
+                self.next += 1;
+                return token;
+            }
+            fn retain(raw: *anyopaque, _: usize, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.check();
+            }
+            fn release(raw: *anyopaque, _: usize) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.check();
+            }
+        };
+        fn cancelled(_: ?*anyopaque) anyerror!void {
+            return error.Cancelled;
+        }
+        fn run(model_path: []const u8, comptime managed: bool, reference: ?[]const f32) ![]f32 {
+            var session = try session_factory.createNativeSession(a, model_path);
+            defer session.close();
+            const cfg = session_factory.getGptConfig(session) orelse return error.MissingActualGenerationConfig;
+            try std.testing.expect(session.backend() == .native and cfg.isQwen35() and !cfg.qwen35_device_only_state);
+            try session.installOwnedExecutionGate(a);
+            var probe = Probe{ .gate = session.execution_gate };
+            defer std.testing.expect(!probe.failure) catch @panic("Native recurrent supplier observed actual held Model gate");
+            const domain = try Domain.create();
+            defer domain.release();
+            const control = InferenceExecutionControl{ .native_call_policy = .in_process };
+            const estimate = try runtime.tier.memory.estimateGptGeneration(.native, .f32, cfg, 4, 1, 4);
+            const amounts = runtime.tier.memory.AdmissionAmounts.fromEstimate(estimate);
+            const limits = runtime.tier.memory.Limits{ .host_limit_bytes = 1024 * 1024 * 1024, .scratch_limit_bytes = 1024 * 1024 * 1024 };
+            var primary: ?runtime.tier.memory.AdmissionLease = null;
+            defer if (primary) |*value| value.release();
+            if (managed) {
+                try std.testing.expect(session.model_lifetime.?.admission_domain == null and session.run_admission == null);
+                session.model_lifetime.?.admission_domain = domain.pin();
+                session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = limits, .static_workspace_bytes = 0, .check_live_memory = false };
+                try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+                var below = limits;
+                below.host_limit_bytes = amounts.host_scratch_bytes + amounts.host_kv_bytes - 1;
+                try std.testing.expectError(error.ResourceLimitExceeded, domain.controller.tryAcquire(.cpu, below, amounts, false));
+                try std.testing.expectEqual(@as(usize, 0), probe.calls);
+                primary = try domain.controller.tryAcquire(.cpu, limits, amounts, false);
+                const required = try Host.requiredBytes(cfg);
+                const calls = probe.calls;
+                try std.testing.expectError(error.Cancelled, Host.prepare(session, cfg, &primary.?, required, .{ .check_fn = cancelled }));
+                try std.testing.expectEqual(calls, probe.calls);
+                const foreign = try Domain.create();
+                defer foreign.release();
+                var foreign_primary = try foreign.controller.tryAcquire(.cpu, limits, amounts, false);
+                defer foreign_primary.release();
+                try std.testing.expectError(error.ForeignAdmissionDomain, Host.prepare(session, cfg, &foreign_primary, required, control));
+            }
+            const host: ?*Host = if (managed) (try Host.prepare(session, cfg, &primary.?, try Host.requiredBytes(cfg), control)).? else null;
+            defer if (host) |owned| owned.destroyAfterUnlock() catch platform.inference_process_supervisor.restartWorker();
+            var raw_cleanup = if (!managed) try @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup() else @import("../execution/cleanup_owner.zig").Owner{};
+            defer raw_cleanup.finishAfterUnlock();
+            const current = @import("../execution/cleanup_context.zig").Context{ .boundary = if (host) |owned| owned.cleanupOwner().epoch() else raw_cleanup.epoch() };
+            const gate = session.execution_gate orelse return error.MissingActualModelGate;
+            try control.lock(gate);
+            defer gate.unlock();
+            const calls = probe.calls;
+            var budget = runtime.tier.memory.RunBudget.init(limits);
+            try budget.reserveEstimate(estimate);
+            var cb = try session_factory.getComputeBackendWithBudget(session, a, &budget);
+            defer cb.deinitWithCleanup(current);
+            var state = generation.NativeDecodeState.initContiguous(a);
+            defer state.deinitWithCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+            if (host) |owned| try owned.adopt(&state, cfg, current) else try state.ensureQwen35LinearCache(cfg);
+            const layers = state.qwen35_linear_cache.?.layers.ptr;
+            const recurrent = state.qwen35_linear_cache.?.layers[0].recurrent.ptr;
+            var context = Gpt.DecodeContext{ .total_sequence_len = 4, .query_sequence_len = 4, .kv_sequence_len = 4, .qwen35_linear_cache = &state.qwen35_linear_cache.? };
+            const first = try Gpt.forward(&cb, a, cfg, &.{ 1, 2, 3, 4 }, 1, 4, &context);
+            errdefer a.free(first);
+            if (reference) |expected| try std.testing.expectEqualSlices(f32, expected, first);
+            state.resetQwen35LinearCache();
+            try std.testing.expectEqual(layers, state.qwen35_linear_cache.?.layers.ptr);
+            try std.testing.expectEqual(recurrent, state.qwen35_linear_cache.?.layers[0].recurrent.ptr);
+            const second = try Gpt.forward(&cb, a, cfg, &.{ 1, 2, 3, 4 }, 1, 4, &context);
+            defer a.free(second);
+            try std.testing.expectEqualSlices(f32, first, second);
+            try std.testing.expectEqual(calls, probe.calls);
+            return first;
+        }
+    };
+    const raw = try Test.run(path, false, null);
+    defer std.testing.allocator.free(raw);
+    const managed = try Test.run(path, true, raw);
+    defer std.testing.allocator.free(managed);
 }

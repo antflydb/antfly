@@ -54,6 +54,10 @@ pub const Ref = struct {
     owner: ?*Owner,
     identity: u64,
 
+    /// Requested process payload for one independent cold outer owner.
+    pub fn requestedMetadataBytes() usize {
+        return @sizeOf(Owner);
+    }
     pub fn create() !Ref {
         return createWithAllocator(metadata_allocator);
     }
