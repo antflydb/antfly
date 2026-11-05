@@ -1627,7 +1627,12 @@ def test_privacy_execution_override_retries_without_changing_identity(stateful_a
     api = stateful_api
     table = "privacy_controls_" + uuid4().hex[:8]
     api.create_table(table)
-    api.batch_write(table, inserts={"doc": {"body": "hello"}}, sync_level="full_index")
+    documents = ["doc", "doc-1", "doc-2", "doc-3"]
+    api.batch_write(
+        table,
+        inserts={key: {"body": "hello"} for key in documents},
+        sync_level="full_index",
+    )
     policy = {
         "mode": "monitor",
         "fields": ["body"],
@@ -1676,10 +1681,13 @@ def test_privacy_execution_override_retries_without_changing_identity(stateful_a
     try:
         preview = api.s.post(
             api.url + path + "/preview",
-            json={"policy": policy, "sample": {"keys": ["doc"]}},
+            json={"policy": policy, "sample": {"keys": documents}},
             timeout=90,
         )
-        assert preview.status_code == 422 and calls == [1], preview.text[:1000]
+        assert preview.status_code == 422 and calls == [1] * len(documents), (
+            preview.text[:1000],
+            calls,
+        )
         installed = api.put(path, policy)
         failed = wait_until(
             lambda: finished(installed["scan_id"]), timeout_s=90, interval_s=0.2
