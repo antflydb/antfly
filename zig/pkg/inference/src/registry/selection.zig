@@ -260,7 +260,9 @@ pub const Cache = struct {
         const next = try Inventory.loadStable(self.allocator, io, root);
         if (self.inventory) |*old| old.deinit();
         self.inventory = next;
-        self.rebuilt_at = now;
+        // Cold FUSE validation can take longer than the refresh interval.
+        // Start freshness at publication so the next request can reuse it.
+        self.rebuilt_at = std.Io.Timestamp.now(io, .awake);
         self.rebuilds += 1;
     }
 
