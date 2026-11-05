@@ -915,8 +915,10 @@ in normal builds). `cuda` is a first-class graph/backend contract:
 parsing for `"cuda"`. `cuda` is one of the session backend ordering options,
 CLI choices, and `--backend cuda` is validated explicitly. In a CUDA build, the
 default `auto` order leads with CUDA when a device initializes on this machine,
-probed once per process, and falls back to Metal and the CPU for models CUDA cannot
-load. Without a usable device, `auto` is unchanged. Set
+probed once per execution process, and falls back to Metal and the CPU for models CUDA cannot
+load. Preference construction and proxy-side discovery never initialize a device;
+probing happens at model load, after checking the host's native-call isolation policy.
+Without a usable device, `auto` keeps the ordinary fallback order. Set
 `ANTFLY_INFERENCE_PREFERRED_BACKEND=native` to opt out.
 
 ### Capability probe

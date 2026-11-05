@@ -236,6 +236,7 @@ test "embedded session policy fails before selecting an uninterruptible backend"
 }
 
 const backend_order_capacity = std.meta.fieldNames(BackendType).len;
+pub const BackendOrderBuffer = [backend_order_capacity]BackendType;
 
 const RequiredBackendConfig = struct {
     backend: ?BackendType = null,
@@ -334,10 +335,15 @@ pub const SessionManager = struct {
         var manifest = manifest_mod.loadFromDir(self.allocator, model_path) catch null;
         defer if (manifest) |*m| m.deinit();
         var effective_buf: [backend_order_capacity]BackendType = undefined;
+        // Constructors and discovery run in the database's proxy process too.
+        // Enter a device driver only at the execution boundary, after checking
+        // whether this host can isolate uninterruptible native calls.
+        var device_order_buf: [backend_order_capacity]BackendType = undefined;
+        const preferred = try self.executionBackendOrder(&device_order_buf, self.preferred_backends, null);
         const fallback_backends = effectiveBackendOrder(
             self.allocator,
             &effective_buf,
-            self.preferred_backends,
+            preferred,
             if (manifest) |m| m else null,
         );
         var required_buf: [1]BackendType = undefined;
@@ -577,6 +583,25 @@ pub const SessionManager = struct {
         return isOnnxFilePath(model_path);
     }
 
+    pub fn executionBackendOrder(self: *const SessionManager, scratch: *BackendOrderBuffer, preferred: []const BackendType, control: ?execution_control.InferenceExecutionControl) ![]const BackendType {
+        if (self.required_backend_invalid) return error.InvalidRequiredBackend;
+        if (control) |active| try active.check();
+        // A required or sole backend remains explicit and reports its own load
+        // error. In particular, requiring native must never initialize CUDA.
+        if (self.required_backend != null or preferred.len <= 1 or
+            std.mem.indexOfScalar(BackendType, preferred, .cuda) == null)
+            return preferred;
+        if (!self.uninterruptibleBackendsAllowed()) return backendOrderWithCudaAvailability(scratch, preferred, false);
+        if (comptime !build_options.enable_cuda) return backendOrderWithCudaAvailability(scratch, preferred, false);
+        const known = cuda_probe.load(.acquire);
+        if (known != .unknown) return backendOrderWithCudaAvailability(scratch, preferred, known == .present);
+        var guard: execution_control.UninterruptibleGuard = if (control) |active| try active.enterUninterruptible(.uninterruptible) else .{};
+        defer guard.deinit();
+        const cuda_available = cudaDeviceAvailable();
+        if (control) |active| try active.check();
+        return backendOrderWithCudaAvailability(scratch, preferred, cuda_available);
+    }
+
     pub fn bestAvailable(self: *const SessionManager) ?BackendType {
         if (self.required_backend_invalid) return null;
         if (self.required_backend) |backend| {
@@ -619,15 +644,27 @@ fn configuredPreferredBackends() []const BackendType {
     return automaticBackends();
 }
 
-/// The `auto` order. CUDA leads when this machine has a usable device; a build
-/// with CUDA on a machine without one keeps the ordinary order.
+/// Compiled candidates only: safe for constructors and proxy-side discovery.
+/// Device availability is resolved under execution's native-call policy.
 pub fn automaticBackends() []const BackendType {
-    if (cudaDeviceAvailable()) return &.{ .cuda, .metal, .native };
+    if (build_options.enable_cuda) return &.{ .cuda, .metal, .native };
     return &.{ .metal, .native };
+}
+
+fn backendOrderWithCudaAvailability(scratch: *[backend_order_capacity]BackendType, preferred: []const BackendType, available: bool) []const BackendType {
+    if (available) return preferred;
+    var count: usize = 0;
+    for (preferred) |backend| {
+        if (backend == .cuda) continue;
+        scratch[count] = backend;
+        count += 1;
+    }
+    return scratch[0..count];
 }
 
 const CudaProbe = enum(u8) { unknown, absent, present };
 var cuda_probe = std.atomic.Value(CudaProbe).init(.unknown);
+var cuda_probe_mutex: std.atomic.Mutex = .unlocked;
 
 fn probeCudaDevice() bool {
     const context = @import("../ops/cuda/context.zig");
@@ -639,11 +676,15 @@ fn probeCudaDevice() bool {
 }
 
 /// Initializes a device once per process, not on every backend selection.
-/// Racing first callers may each probe; the answer is the same.
+/// Only execution hosts that allow uninterruptible native calls may invoke this.
 pub fn cudaDeviceAvailable() bool {
     if (comptime !build_options.enable_cuda) return false;
     const known = cuda_probe.load(.acquire);
     if (known != .unknown) return known == .present;
+    while (!cuda_probe_mutex.tryLock()) std.atomic.spinLoopHint();
+    defer cuda_probe_mutex.unlock();
+    const raced = cuda_probe.load(.acquire);
+    if (raced != .unknown) return raced == .present;
     const present = probeCudaDevice();
     cuda_probe.store(if (present) .present else .absent, .release);
     return present;
@@ -784,9 +825,12 @@ test "session manager preferred-backend clone preserves runtime kernel JIT" {
     try std.testing.expectEqualSlices(BackendType, &preferred, cloned.preferred_backends);
 }
 
-test "automatic backend order leads with CUDA only when a device is available" {
+test "automatic backend candidates do not initialize a device" {
+    const before = cuda_probe.load(.acquire);
     const order = automaticBackends();
-    if (cudaDeviceAvailable()) {
+    _ = SessionManager.init(std.testing.allocator);
+    try std.testing.expectEqual(before, cuda_probe.load(.acquire));
+    if (build_options.enable_cuda) {
         try std.testing.expectEqual(BackendType.cuda, order[0]);
         try std.testing.expect(backendOrderSelectsCudaBeforeCpu(order));
     } else {
@@ -796,8 +840,40 @@ test "automatic backend order leads with CUDA only when a device is available" {
     try std.testing.expectEqual(BackendType.native, order[order.len - 1]);
 }
 
-test "auto backend order prefers Metal then native" {
-    if (!build_options.enable_wasm and !cudaDeviceAvailable()) {
+test "automatic execution order removes unavailable CUDA before model fallback policy" {
+    var scratch: [backend_order_capacity]BackendType = undefined;
+    const preferred: []const BackendType = &.{ .cuda, .metal, .native };
+    try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native }, backendOrderWithCudaAvailability(&scratch, preferred, false));
+    try std.testing.expectEqualSlices(BackendType, preferred, backendOrderWithCudaAvailability(&scratch, preferred, true));
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.preferred_backends = preferred;
+    manager.required_backend = null;
+    manager.required_backend_invalid = false;
+    manager.process_termination_available = false;
+    const before = cuda_probe.load(.acquire);
+    try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native }, try manager.executionBackendOrder(&scratch, preferred, null));
+    try std.testing.expectEqual(before, cuda_probe.load(.acquire));
+}
+
+test "automatic execution order checks cancellation before probing a device" {
+    const Cancelled = struct {
+        fn cancelled(_: ?*anyopaque) bool {
+            return true;
+        }
+    };
+    var manager = SessionManager.init(std.testing.allocator);
+    manager.required_backend = null;
+    manager.required_backend_invalid = false;
+    const preferred: []const BackendType = &.{ .cuda, .metal, .native };
+    var scratch: BackendOrderBuffer = undefined;
+    const control: execution_control.InferenceExecutionControl = .{ .cancellation = .{ .is_cancelled_fn = Cancelled.cancelled } };
+    const before = cuda_probe.load(.acquire);
+    try std.testing.expectError(error.Cancelled, manager.executionBackendOrder(&scratch, preferred, control));
+    try std.testing.expectEqual(before, cuda_probe.load(.acquire));
+}
+
+test "auto backend order prefers Metal then native without compiled CUDA" {
+    if (!build_options.enable_wasm and !build_options.enable_cuda) {
         try std.testing.expectEqualSlices(BackendType, &.{ .metal, .native }, configuredPreferredBackends());
     }
 }

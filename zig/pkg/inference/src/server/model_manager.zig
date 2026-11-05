@@ -6585,9 +6585,11 @@ pub const ModelManager = struct {
         control: ?InferenceExecutionControl,
     ) !ManagedSession {
         if (control) |active| try active.update(.loading_model, 0, 1);
+        var device_order_scratch: backends.BackendOrderBuffer = undefined;
+        const available_backends = try source_session_manager.executionBackendOrder(&device_order_scratch, preferred_backends, control);
         var required_backend_scratch: [1]backends.BackendType = undefined;
         const effective_backends = try source_session_manager.requiredBackendCandidates(
-            preferred_backends,
+            available_backends,
             &required_backend_scratch,
         );
         var first_err: ?anyerror = null;
@@ -10851,9 +10853,11 @@ fn loadSessionForPreferredBackends(
     control: ?InferenceExecutionControl,
 ) !LoadedSessionPlan {
     if (control) |active| try active.check();
+    var device_order_scratch: backends.BackendOrderBuffer = undefined;
+    const available_backends = try source_session_manager.executionBackendOrder(&device_order_scratch, preferred_backends, control);
     var required_backend_scratch: [1]backends.BackendType = undefined;
     const policy_backends = try source_session_manager.requiredBackendCandidates(
-        preferred_backends,
+        available_backends,
         &required_backend_scratch,
     );
     const effective_backends = policy_backends;
