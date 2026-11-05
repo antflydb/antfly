@@ -2255,6 +2255,7 @@ pub const Store = struct {
             } else _ = try self.vacuumWithCancel(cancel);
             return;
         }
+        var replay_defers_shrink = false;
         {
             if (self.writer_admission) |admission| try admission.enter(admission.ptr, .allocator_service);
             defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
@@ -2276,8 +2277,21 @@ pub const Store = struct {
                 self.maintenance_policy.status.reason = if (self.maintenance_policy.options.enabled) .none else .disabled;
                 self.maintenance_policy.status.last_error = null;
             }
+            if (cooperative and self.maintenance_policy.options.enabled and !self.defer_background_vacuum) {
+                const debt = try self.file.replayAdmission();
+                if (debt) |value| if (value.records != 0) {
+                    // The allocator lease already checked the current tip.
+                    // Do not enter optional shrink admission just to discover
+                    // known replay debt after another writer has moved it.
+                    _ = self.maintenance_policy.observeShrinkQuiet(native.NativeFile.primaryPublicationIdentity(self.file.header), std.Io.Clock.awake.now(self.file.runtime()).nanoseconds, true);
+                    self.maintenance_policy.status.state = .deferred;
+                    self.maintenance_policy.status.reason = .writer_busy;
+                    self.maintenance_policy.status.last_error = null;
+                    replay_defers_shrink = true;
+                };
+            }
         }
-        if (!self.maintenance_policy.options.enabled or self.defer_background_vacuum) return;
+        if (!self.maintenance_policy.options.enabled or self.defer_background_vacuum or replay_defers_shrink) return;
         var guard: ShrinkGuard = .{ .file = &self.file, .parent = cancel };
         var guard_token: maintenance.CancelToken = .{ .observer = .{ .ptr = &guard, .check = ShrinkGuard.check } };
         const shrink_cancel: ?*const maintenance.CancelToken = if (cooperative) &guard_token else cancel;
@@ -12603,4 +12617,35 @@ test "lite replay cleanup bounded facade avoids materializing large legacy recor
     try std.testing.expect(budget.peak - baseline < 1024 * 1024);
     try std.testing.expect((try physical.file.getDocumentAlloc(a, &key)) == null);
     try std.testing.expect((try physical.file.check()).valid);
+}
+
+test "lite reclamation defers optional shrink before admission while replay is pending" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "pending-replay-shrink.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    try store.file.putDocument(&key, "retained replay");
+    const Admission = struct {
+        allocator: usize = 0,
+        shrink: usize = 0,
+        fn enter(ptr: *anyopaque, scope: PublicationScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (scope == .allocator_service) self.allocator += 1;
+            if (scope == .reclamation) self.shrink += 1;
+        }
+        fn leave(_: *anyopaque) void {}
+    };
+    var admission: Admission = .{};
+    store.writer_admission = .{ .ptr = &admission, .enter = Admission.enter, .leave = Admission.leave };
+    defer store.writer_admission = null;
+    try store.maintainBackgroundOnce(null);
+    try std.testing.expect(admission.allocator > 0);
+    try std.testing.expectEqual(@as(usize, 0), admission.shrink);
+    try std.testing.expectEqual(reclamation.State.deferred, store.maintenance_policy.status.state);
+    try std.testing.expectEqual(@as(u64, 1), (try store.file.replayAdmission()).?.records);
 }

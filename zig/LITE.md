@@ -690,7 +690,9 @@ Antfly Lite should match the familiar embedded database model:
 - Background full-text replay splits oversized journal records into durable
   document-family fragments. Deletions, overwrites and asset keys for a primary
   document stay in the same fragment. The adaptive preparation budget targets
-  25 ms per turn; it is not a latency guarantee for storage publication. Resume
+  25 ms of preparation initially and adapts up to 200 ms to amortize measured
+  publication cost. Retention pressure restores the 25 ms target immediately.
+  These are sizing targets, not latency guarantees for storage publication. Resume
   state is bound to the index generation, configuration and table incarnation,
   and the record's applied sequence advances only after every fragment is durable.
 
@@ -1402,7 +1404,12 @@ Registered manual workers receive the same generation-bound fragment callbacks
 as workerless replay. Their budgets bound complete document families within a
 large journal record. A replacement worker loads the durable continuation;
 neither partial index output nor a failed continuation write advances the
-complete-record watermark or releases that record's retention credits.
+complete-record watermark or releases that record's retention credits. Complete
+small records share one atomic window, bounded by effect count and payload bytes.
+A chunked lookahead remains unhydrated for the next seekable window; unfinished
+record continuations retain their individual fingerprint and offset. A durable
+complete-window receipt recovers progress even if its coarse metadata mirror
+fails, without publishing the window twice.
 Native text-window sizing measures document collection, projection and segment
 preparation directly. Cursor setup, capacity waits, publication and continuation
 sync remain fixed service costs, rather than reasons to shrink cheap preparation
@@ -1418,7 +1425,9 @@ Source baseline pages retain their afterimage hashes and stale-source checks.
 
 Bounded allocator reuse, retirement and orphan service run independently of
 optional whole-generation shrinking. Automatic shrink assessments wait for the
-file-wide replay journal to empty and for a primary quiet interval. That cadence
+file-wide replay journal to empty and for a primary quiet interval. Pending
+replay debt is checked during the required allocator service lease, before
+entering optional shrink admission; required reuse and retirement still run. That cadence
 survives runtime refresh without retaining checkpoint roots. Assessment and copy
 work periodically probe the on-disk primary identity and named inode, yielding
 when a local or peer writer publishes. The probe grants no read/publication
@@ -1470,8 +1479,11 @@ authenticated checkpoint rebase when maintenance captures are replaced.
 Detached replay uses per-index-kind feedback retained by the namespace scheduling
 owner. Cheap full windows can grow up to 2,048 records and 16 MiB. Collection
 also bounds expanded document/artifact keys, allowing one complete oversized
-record; it does not split ownership-completion callbacks. Slow or failed windows shrink, and observed blocked reuse lowers retention limits. The 25 ms
-quantum is a sizing target, not preemption of an individual record/provider call.
+record; it does not split ownership-completion callbacks. Slow or failed windows
+shrink, and observed blocked reuse lowers retention limits. Measured publication
+cost adjusts the preparation target between 25 and 200 ms, under independent
+record and memory ceilings. Retention pressure immediately restores the 25 ms
+target. None of these targets preempts an individual record/provider call.
 Background and foreground retirement work remains capped per publication. Pending
 work diagnostics report producer and consumer replay budgets and the current
 retirement-work limit. Each complete document group remains atomic.
@@ -1618,7 +1630,9 @@ explicit idle drains preserve their existing complete maintenance lifecycle.
 
 The native manual executor uses the same per-kind adaptive replay controller as
 other detached replay paths: one bounded window per worker, with a cooperative
-25 ms processing quantum and bounded record/payload budgets. Writer-gate and
+preparation target initially set to 25 ms and bounded record/payload budgets.
+The target adapts to measured fixed publication cost with a 200 ms ceiling;
+retention pressure immediately restores 25 ms. Writer-gate and
 path-lease queueing plus fixed catalog validation are measured separately:
 shrinking windows because of admission overhead would create more publications
 and starve consumers. Partial applied watermarks are persisted before yielding; a background turn never waits again for the original

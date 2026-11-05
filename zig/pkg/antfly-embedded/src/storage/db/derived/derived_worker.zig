@@ -45,6 +45,7 @@ pub const CatchUpStats = struct {
     scanned_entries: usize = 0,
     collected_items: usize = 0,
     collected_families: usize = 0,
+    collection_budget_exhausted: bool = false,
     applied_entries: usize = 0,
     replay_scan_batches: usize = 0,
     replay_hint_filter_skips: usize = 0,
@@ -334,11 +335,12 @@ pub fn catchUpIndexFromMatchingCursor(
         if (options.max_call_bytes != 0)
             builder.max_chunk_bytes = @min(builder.max_chunk_bytes, options.max_call_bytes -| call_bytes);
         builder.max_items = options.max_items_per_window;
-        if (options.max_collected_items_per_window != 0) {
-            builder.max_items = if (builder.max_items == 0)
-                options.max_collected_items_per_window
-            else
-                @min(builder.max_items, options.max_collected_items_per_window);
+        const item_cap = if (fragments)
+            if (options.max_collected_items_per_window == 0) options.max_fragment_families else @min(options.max_fragment_families, options.max_collected_items_per_window)
+        else
+            options.max_collected_items_per_window;
+        if (item_cap != 0) {
+            builder.max_items = if (builder.max_items == 0) item_cap else @min(builder.max_items, item_cap);
         }
         builder.estimated_dense_vector_bytes = options.estimated_dense_vector_bytes;
         builder.max_work_chunk_bytes = options.max_work_chunk_bytes;
@@ -352,15 +354,26 @@ pub fn catchUpIndexFromMatchingCursor(
         const collect_started_ns = monotonicTimeNs();
         const had_retained_scratch = decode_scratch.retainedCapacityBytes() != 0;
         var retried_fresh = false;
-        var collection_limit = if (fragments) @as(usize, 1) else options.max_records_per_window;
+        const saved_fragment = if (fragments) try options.load_fragment_fn.?(options.fragment_ctx.?, index_ref.name) else null;
+        // An unfinished record must retain its own fingerprint/offset. Whole
+        // small records can share one complete atomic publication. The effect
+        // cap above also bounds their families, so a combined window cannot
+        // accidentally become a resumable prefix of several records.
+        var collection_limit = options.max_records_per_window;
+        if (saved_fragment) |saved| if (saved.next_item != saved.total_items) {
+            collection_limit = 1;
+        };
         var retry_stats = replay_source_mod.MatchingRecordStats{};
-        const seekable_slice = if (fragments) try replay_cursor.readFamilySliceWithBudget(scratch_alloc, index_ref.name, try options.load_fragment_fn.?(options.fragment_ctx.?, index_ref.name), options.max_fragment_families, options.max_chunk_bytes, options.target_sequence) else null;
+        const seekable_slice = if (fragments) try replay_cursor.readFamilySliceWithBudget(scratch_alloc, index_ref.name, saved_fragment, options.max_fragment_families, options.max_chunk_bytes, options.target_sequence) else null;
         defer if (seekable_slice) |slice| scratch_alloc.free(slice.payload);
         const chunk_stats = if (seekable_slice) |slice| bounded: {
             try replayChunkConsumeRecord(&builder, slice.position.sequence, slice.payload);
             break :bounded replay_source_mod.MatchingRecordStats{ .scan_batches = 1, .scanned_entries = 1, .matched_entries = 1, .last_sequence = slice.position.sequence };
         } else collect: while (true) {
-            const collected = replay_cursor.forEachNext(collection_limit, &builder, replayChunkConsumeRecord) catch |err| {
+            const collected = (if (fragments)
+                replay_cursor.forEachWholeRecordWindow(collection_limit, &builder, replayChunkConsumeRecord)
+            else
+                replay_cursor.forEachNext(collection_limit, &builder, replayChunkConsumeRecord)) catch |err| {
                 // An empty window gets one retry after reclaiming cached
                 // scratch and key-block slack. The failed record has not
                 // advanced the cursor; a fresh exact-sized retry is bounded.
@@ -385,6 +398,8 @@ pub fn catchUpIndexFromMatchingCursor(
             break :collect retry_stats;
         };
         stats.window_collect_ns += monotonicTimeNs() - collect_started_ns;
+        stats.collection_budget_exhausted = stats.collection_budget_exhausted or builder.soft_limit_reached or
+            (options.max_records_per_window != 0 and chunk_stats.matched_entries >= options.max_records_per_window);
         if (chunk_stats.last_sequence == 0) {
             break;
         }
@@ -424,6 +439,7 @@ pub fn catchUpIndexFromMatchingCursor(
             fragment_complete = slice.position.next_item == slice.position.total_items;
             stats.collected_items += builder.item_count;
             stats.collected_families += slice.families;
+            stats.collection_budget_exhausted = stats.collection_budget_exhausted or slice.budget_exhausted;
         } else if (fragments) {
             var saved = try options.load_fragment_fn.?(options.fragment_ctx.?, index_ref.name);
             if (saved) |previous| if (previous.sequence < batch.sequence and previous.next_item == previous.total_items) {
@@ -440,11 +456,18 @@ pub fn catchUpIndexFromMatchingCursor(
                 fragment_position = .{ .sequence = batch.sequence, .next_item = fragment_piece.?.next_item, .total_items = total, .fingerprint = fragment_plan.?.fingerprint, .applied = previously_applied };
                 stats.collected_items += fragment_piece.?.next_item - continuation.start;
                 stats.collected_families += fragment_piece.?.families;
+                stats.collection_budget_exhausted = stats.collection_budget_exhausted or fragment_piece.?.families == options.max_fragment_families;
             } else {
                 stats.collected_items += builder.item_count;
-                stats.collected_families += fragment_plan.?.familyCount();
+                var complete_plan = try replay_fragment.Plan.init(scratch_alloc, batch, index_ref.name);
+                defer complete_plan.deinit(scratch_alloc);
+                stats.collected_families += complete_plan.familyCount();
             }
         } else stats.collected_items += builder.item_count;
+        // A partial fingerprint belongs to one source record. Earlier no-op
+        // records are harmless, but output from several records must publish
+        // as a complete window, never as an unresumable combined prefix.
+        if (!fragment_complete and builder.prior_record_had_output) return error.InvalidDerivedApplyState;
         if (options.release_read_snapshot_after_collect) {
             std.debug.assert(options.max_windows_per_call == 1);
             replay_cursor.releaseReadSnapshot();
@@ -628,6 +651,8 @@ const ReplayChunkBuilder = struct {
     tracked_dense_vector_bytes: u64 = 0,
     item_count: usize = 0,
     max_items: usize = 0,
+    soft_limit_reached: bool = false,
+    prior_record_had_output: bool = false,
     estimated_dense_vector_bytes: u64 = 0,
     max_work_chunk_bytes: u64 = 0,
     dense_replay_working_set_factor: u64 = 1,
@@ -885,7 +910,10 @@ const ReplayChunkBuilder = struct {
         if (self.tracked_bytes == 0 and self.item_count == 0) return false;
         if (self.max_chunk_bytes > 0 or self.max_work_chunk_bytes != 0) {
             const incoming_bytes = recordEstimatedBytesForIndex(record, self.index_ref.kind, self.estimatedDenseVectorBytes());
-            if (self.max_chunk_bytes > 0 and self.tracked_bytes +| incoming_bytes > self.max_chunk_bytes) return true;
+            if (self.max_chunk_bytes > 0 and self.tracked_bytes +| incoming_bytes > self.max_chunk_bytes) {
+                self.soft_limit_reached = true;
+                return true;
+            }
             if (self.max_work_chunk_bytes != 0) {
                 const vector_bytes = if (self.index_ref.kind == .dense_vector)
                     @as(u64, @intCast(countEmbeddingArtifactKeys(record.changed_artifact_keys))) *| self.estimatedDenseVectorBytes()
@@ -894,10 +922,16 @@ const ReplayChunkBuilder = struct {
                 const factor = @max(@as(u64, 1), self.dense_replay_working_set_factor);
                 const work_bytes = (self.tracked_bytes -| self.tracked_dense_vector_bytes) +| (self.tracked_dense_vector_bytes / factor);
                 const incoming_work = (incoming_bytes -| vector_bytes) +| (vector_bytes / factor);
-                if (work_bytes +| incoming_work > self.max_work_chunk_bytes) return true;
+                if (work_bytes +| incoming_work > self.max_work_chunk_bytes) {
+                    self.soft_limit_reached = true;
+                    return true;
+                }
             }
         }
-        if (self.max_items > 0 and self.item_count + recordItemCountForIndex(record, self.index_ref.kind) > self.max_items) return true;
+        if (self.max_items > 0 and self.item_count + recordItemCountForIndex(record, self.index_ref.kind) > self.max_items) {
+            self.soft_limit_reached = true;
+            return true;
+        }
         if (self.resource_manager) |manager| {
             // The hard limit also covers shared decode scratch and other replay
             // workers. Size the next record against available admission, rather
@@ -1049,8 +1083,10 @@ fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8)
     if (builder.target_sequence != 0 and sequence > builder.target_sequence) return replay_source_mod.StopReplayChunk.StopReplayChunk;
     // A full window does not need to allocate descriptors for a lookahead
     // record. StopReplayChunk leaves that record at the cursor for the retry.
-    if (builder.max_items != 0 and builder.item_count >= builder.max_items)
+    if (builder.max_items != 0 and builder.item_count >= builder.max_items) {
+        builder.soft_limit_reached = true;
         return replay_source_mod.StopReplayChunk.StopReplayChunk;
+    }
     if (change_journal_mod.looksLikeBinaryRecord(payload)) {
         const denial_generation = if (builder.scratch_budget) |budget| budget.denialGeneration() else 0;
         const record = change_journal_mod.decodeBinaryRecordBorrowedScratchSelected(builder.scratch_alloc, payload, builder.decode_scratch, .{
@@ -1079,7 +1115,9 @@ fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8)
         // aggregate budget is configured. Retained buffers stay charged.
         if (builder.scratch_budget) |budget| _ = budget.releaseUnusedCredit();
         if (builder.wouldOverflowWithRecord(record)) return replay_source_mod.StopReplayChunk.StopReplayChunk;
+        const prior_output = builder.hasOutput();
         try builder.appendRecord(record);
+        builder.prior_record_had_output = prior_output;
         if (!builder.has_accepted_work) builder.has_accepted_work = builder.hasOutput();
         builder.accepted_records += 1;
         return;
@@ -1088,7 +1126,9 @@ fn replayChunkConsumeRecord(ctx: *anyopaque, sequence: u64, payload: []const u8)
     var record = try change_journal_mod.decodeRecord(builder.alloc, payload);
     defer record.deinit();
     if (builder.wouldOverflowWithRecord(record.record)) return replay_source_mod.StopReplayChunk.StopReplayChunk;
+    const prior_output = builder.hasOutput();
     try builder.appendRecord(record.record);
+    builder.prior_record_had_output = prior_output;
     if (!builder.has_accepted_work) builder.has_accepted_work = builder.hasOutput();
     builder.accepted_records += 1;
 }
@@ -2815,4 +2855,31 @@ test "catchUpIndex delivers root-only asset repair metadata to serving consumers
         try std.testing.expectEqual(@as(usize, 1), capture.applied_changed_artifact_keys);
         try std.testing.expectEqualStrings(root, capture.last_batch.?.changed_artifact_keys[0]);
     }
+}
+
+test "catchUpIndex durable fragments count a complete small window without an atomic callback" {
+    const a = std.testing.allocator;
+    var backend = @import("../../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try @import("../../docstore.zig").DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    const payload = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{"small"}, .target_hints = &.{.full_text} });
+    defer a.free(payload);
+    try store.appendReplayOpaque(a, 1, payload);
+    const State = struct {
+        fn load(_: *anyopaque, _: []const u8) !?replay_fragment.Position {
+            return null;
+        }
+        fn save(_: *anyopaque, _: []const u8, _: replay_fragment.Position) !void {
+            return error.UnexpectedPartialCheckpoint;
+        }
+        fn apply(_: *anyopaque, batch: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef) !bool {
+            try std.testing.expectEqual(@as(usize, 1), batch.documents.len);
+            return true;
+        }
+    };
+    var state: u8 = 0;
+    const stats = try catchUpIndexWithOptions(a, replay_source_mod.Source.fromPrimaryStore(&store, null, null), .{ .name = "text", .kind = .full_text }, 0, &state, State.apply, .{ .max_windows_per_call = 1, .max_fragment_families = 8, .fragment_ctx = &state, .load_fragment_fn = State.load, .save_fragment_fn = State.save });
+    try std.testing.expectEqual(@as(usize, 1), stats.collected_families);
+    try std.testing.expectEqual(@as(?u64, 1), stats.appliedSequenceAdvance(0));
 }

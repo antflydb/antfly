@@ -87,7 +87,7 @@ pub const MatchingCursor = struct {
         self.* = undefined;
     }
 
-    pub const FamilySlice = struct { payload: []u8, position: replay_fragment.Position, families: usize };
+    pub const FamilySlice = struct { payload: []u8, position: replay_fragment.Position, families: usize, budget_exhausted: bool };
 
     pub fn readFamilySlice(self: *MatchingCursor, a: Allocator, index_name: []const u8, saved: ?replay_fragment.Position, max_families: usize, target_sequence: u64) !?FamilySlice {
         return self.readFamilySliceWithBudget(a, index_name, saved, max_families, 0, target_sequence);
@@ -136,6 +136,7 @@ pub const MatchingCursor = struct {
         var next = start;
         var families: usize = 0;
         var bytes: u64 = 0;
+        var byte_limited = false;
         while (next < manifest.families and families < max_families) {
             const ordinal: u32 = @intCast(next / replay_chunks.families_per_chunk);
             if (ordinal < manifest.retired_chunks) return error.ReplayHistoryUnavailable;
@@ -145,7 +146,10 @@ pub const MatchingCursor = struct {
             var slice = try replay_chunks.sliceFamilies(a, manifest, ordinal, raw, @intCast(next % replay_chunks.families_per_chunk), limit);
             defer a.free(slice.payload);
             if (max_payload_bytes != 0) {
-                if (families != 0 and slice.payload.len > max_payload_bytes -| bytes) break;
+                if (families != 0 and slice.payload.len > max_payload_bytes -| bytes) {
+                    byte_limited = true;
+                    break;
+                }
                 // A single large physical chunk must still obey a smaller
                 // requested window without splitting one document family.
                 while (families == 0 and slice.payload.len > max_payload_bytes and slice.families > 1) {
@@ -170,7 +174,7 @@ pub const MatchingCursor = struct {
             cursor.next_sequence = sequence;
             cursor.entry = try filterLaneEntry(try cursor.cursor.?.next(), cursor.scan_lane_ordinal);
         }
-        return .{ .payload = payload, .position = .{ .sequence = sequence, .next_item = next, .total_items = manifest.families, .fingerprint = fingerprint, .applied = applied }, .families = families };
+        return .{ .payload = payload, .position = .{ .sequence = sequence, .next_item = next, .total_items = manifest.families, .fingerprint = fingerprint, .applied = applied }, .families = families, .budget_exhausted = families == max_families or byte_limited or (max_payload_bytes != 0 and bytes >= max_payload_bytes) };
     }
 
     pub fn forEachNext(
@@ -178,6 +182,27 @@ pub const MatchingCursor = struct {
         max_matched_entries: usize,
         ctx: *anyopaque,
         consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+    ) !MatchingRecordStats {
+        return self.forEachNextWithMode(max_matched_entries, ctx, consume, false);
+    }
+
+    /// Coalesce complete records, leaving a chunked lookahead untouched for
+    /// the next seekable window rather than reconstructing its whole payload.
+    pub fn forEachWholeRecordWindow(
+        self: *MatchingCursor,
+        max_matched_entries: usize,
+        ctx: *anyopaque,
+        consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+    ) !MatchingRecordStats {
+        return self.forEachNextWithMode(max_matched_entries, ctx, consume, true);
+    }
+
+    fn forEachNextWithMode(
+        self: *MatchingCursor,
+        max_matched_entries: usize,
+        ctx: *anyopaque,
+        consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+        stop_before_chunks: bool,
     ) !MatchingRecordStats {
         self.last_scan_stats = .{};
         return switch (self.state) {
@@ -194,6 +219,7 @@ pub const MatchingCursor = struct {
                 max_matched_entries,
                 ctx,
                 consume,
+                stop_before_chunks,
             ),
         };
     }
@@ -467,6 +493,7 @@ fn primaryStoreMatchingCursorForEachNext(
     max_matched_entries: usize,
     ctx: *anyopaque,
     consume: *const fn (ctx: *anyopaque, sequence: u64, payload: []const u8) anyerror!void,
+    stop_before_chunks: bool,
 ) !MatchingRecordStats {
     if (cursor.hint_exhausted) return .{};
     var stats = MatchingRecordStats{ .scan_batches = 1 };
@@ -481,12 +508,13 @@ fn primaryStoreMatchingCursorForEachNext(
             cursor.entry = null;
             break;
         };
-        if (cursor.fallback_all) {
+        if (cursor.fallback_all or stop_before_chunks) {
             const canonical = try replay_reference.canonicalRaw(&cursor.scan_txn.?, sequence, cursor.scan_lane_ordinal, entry.value);
             if (replay_chunks.isManifest(canonical)) {
                 const manifest = try replay_chunks.Manifest.decode(canonical);
                 if (manifest.sequence != sequence) return error.InvalidReplayChunk;
                 if (manifest.hints & change_journal_mod.singleHintMask(cursor.hint) == 0) {
+                    if (!cursor.fallback_all) return error.InvalidReplayChunk;
                     stats.scanned_entries += 1;
                     stats.hint_filter_skips += 1;
                     stats.last_sequence = sequence;
@@ -495,6 +523,7 @@ fn primaryStoreMatchingCursorForEachNext(
                     if (stats.scanned_entries >= max_scanned_entries) return stats;
                     continue;
                 }
+                if (stop_before_chunks) return stats;
             }
         }
         const resolved = try replay_reference.resolve(cursor.store.alloc, &cursor.scan_txn.?, sequence, cursor.scan_lane_ordinal, entry.value);
@@ -1942,4 +1971,51 @@ test "replay source enrichment trims oversized scratch on filtered callback exit
     defer alloc.free(ordinary);
     try EnrichmentGroupContext.consume(&ctx, 2, ordinary);
     try std.testing.expectEqual(@as(u64, 2), pending.get("doc").?.sequence);
+}
+
+test "replay source whole record windows leave chunked lookahead unhydrated" {
+    const a = std.testing.allocator;
+    var backend = mem_backend_mod.Backend.init(a, .{});
+    defer backend.close();
+    var store = try docstore_mod.DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var keys: [130][]const u8 = undefined;
+    for (&keys, 0..) |*key, i| key.* = try std.fmt.allocPrint(arena.allocator(), "large-{d}", .{i});
+    const small = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{"small"}, .target_hints = &.{.full_text} });
+    defer a.free(small);
+    const record: change_journal_mod.Record = .{ .sequence = 2, .changed_doc_keys = &keys, .target_hints = &.{.full_text} };
+    const large = try change_journal_mod.encodeRecord(a, record);
+    defer a.free(large);
+    var prepared = (try replay_chunks.prepare(a, record)).?;
+    defer prepared.deinit();
+    {
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.setReplayOpaque(1, small);
+        try write.setReplayOpaque(2, large);
+        const canonical = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 2);
+        const hint = internal_keys.replayEntryKey(@intCast(@backingInt(@as(TargetHint, .full_text))), 2);
+        try write.put(&canonical, &prepared.manifest.encode());
+        try write.put(&hint, &replay_reference.encodeReference(2, .full_text));
+        // No chunk rows exist: looking ahead must not attempt their hydration.
+        try write.commit();
+    }
+    var source = Source.fromPrimaryStore(&store, null, null);
+    var cursor = try source.openMatchingCursor(a, 0, .full_text);
+    defer cursor.deinit(a);
+    const Probe = struct {
+        count: usize = 0,
+        fn consume(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            try std.testing.expectEqual(@as(u64, 1), sequence);
+            @as(*@This(), @ptrCast(@alignCast(ptr))).count += 1;
+        }
+    };
+    var probe: Probe = .{};
+    const stats = try cursor.forEachWholeRecordWindow(64, &probe, Probe.consume);
+    try std.testing.expectEqual(@as(usize, 1), probe.count);
+    try std.testing.expectEqual(@as(usize, 1), stats.matched_entries);
+    try std.testing.expectEqual(@as(u64, 1), stats.last_sequence);
+    try std.testing.expectError(error.NotFound, cursor.readFamilySlice(a, "text", null, 64, 0));
 }

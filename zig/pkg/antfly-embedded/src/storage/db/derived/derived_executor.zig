@@ -450,7 +450,7 @@ const ManualRuntime = struct {
             return err;
         };
         completed = true;
-        if (wait.replay_budget) |controller| controller.observe(lane, budget, replayWorkElapsedNs(wait, worker.kind.kind, started, waited_before, preparation_before) +| (if (fragments != null) stats.window_collect_ns else 0), stats.budgetWorkItems(fragments != null), false);
+        if (wait.replay_budget) |controller| controller.observePreparedWindow(lane, budget, replayWorkElapsedNs(wait, worker.kind.kind, started, waited_before, preparation_before) +| (if (fragments != null) stats.window_collect_ns else 0), if (wait.publication_overhead_ns) |counter| counter.load(.monotonic) -| waited_before else 0, stats.collection_budget_exhausted or stats.budgetWorkItems(fragments != null) >= budget.records, false);
         catch_up_open = false;
         return .{ .stats = stats, .token = token };
     }
@@ -1106,4 +1106,84 @@ test "manual replay fragments one oversized record and resumes after replacement
     try std.testing.expectEqual(@as(usize, 8), probe.max_documents);
     try std.testing.expectEqual(@as(u64, 1), probe.scalar);
     try std.testing.expectEqual(@as(u64, 1), probe.retired);
+}
+
+test "manual replay coalesces complete records atomically and recovers before the coarse mirror" {
+    const a = std.testing.allocator;
+    const fragment = @import("replay_fragment.zig");
+    const journal = @import("change_journal.zig");
+    var backend = @import("../../mem_backend.zig").Backend.init(a, .{});
+    defer backend.close();
+    var store = try @import("../../docstore.zig").DocStore.openRuntime(a, try backend.runtimeStore(a, .{}));
+    defer store.close();
+    for (1..5) |sequence| {
+        var buffer: [16]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buffer, "doc-{d}", .{sequence});
+        const payload = try journal.encodeRecord(a, .{ .sequence = sequence, .changed_doc_keys = &.{key}, .deleted_doc_keys = &.{key}, .overwritten_doc_keys = &.{key}, .target_hints = &.{.full_text} });
+        defer a.free(payload);
+        try store.appendReplayOpaque(a, sequence, payload);
+    }
+    const Probe = struct {
+        saved: ?fragment.Position = null,
+        scalar: u64 = 0,
+        seen: [4]usize = @splat(0),
+        publications: usize = 0,
+        fail_coarse: bool = true,
+        fn supports(_: *anyopaque, _: []const u8) !bool {
+            return true;
+        }
+        fn load(ptr: *anyopaque, _: []const u8) !?fragment.Position {
+            return @as(*@This(), @ptrCast(@alignCast(ptr))).saved;
+        }
+        fn save(ptr: *anyopaque, _: []const u8, position: fragment.Position) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualDeep(self.saved.?, position);
+        }
+        fn ordinary(_: *anyopaque, _: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, _: CatchUpSessionToken) !bool {
+            return error.UnexpectedNonAtomicPublication;
+        }
+        fn publish(ptr: *anyopaque, batch: derived_types.DerivedBatch, _: index_manager_mod.ManagedIndexRef, proposed: fragment.Position) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(@as(usize, 2), batch.documents.len);
+            try std.testing.expectEqual(@as(usize, 2), batch.deleted_keys.len);
+            try std.testing.expectEqual(@as(usize, 2), batch.overwritten_doc_keys.len);
+            try std.testing.expectEqual(proposed.total_items, proposed.next_item);
+            for (batch.documents) |doc| self.seen[(try std.fmt.parseInt(usize, doc.key[4..], 10)) - 1] += 1;
+            self.publications += 1;
+            var position = proposed;
+            position.applied = true;
+            self.saved = position;
+            return true;
+        }
+        fn persist(ptr: *anyopaque, _: []const u8, sequence: u64, _: bool) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.fail_coarse) {
+                self.fail_coarse = false;
+                return error.TestCoarseMirrorFailure;
+            }
+            self.scalar = sequence;
+            return true;
+        }
+        fn truncate(_: *anyopaque, _: u64) !void {}
+    };
+    var probe: Probe = .{};
+    var budget: @import("replay_budget.zig").Controller = .{};
+    const wait: VisibilityWait = .{ .replay_budget = &budget, .replay_record_cap = 8, .fragments = .{ .ptr = &probe, .supports = Probe.supports, .apply = Probe.publish, .load = Probe.load, .save = Probe.save } };
+    const source = replay_source_mod.Source.fromPrimaryStore(&store, null, null);
+    {
+        var executor = try initManual(a, source, &probe, Probe.ordinary, Probe.persist, Probe.truncate, null, null, null, null, null);
+        defer executor.deinit(a);
+        try executor.addWorker("text", .{ .name = "text", .kind = .full_text }, 0);
+        try std.testing.expectError(error.TestCoarseMirrorFailure, executor.waitForAllWithVisibilityWait(4, wait));
+        try std.testing.expectEqual(@as(usize, 1), probe.publications);
+        try std.testing.expectEqual(@as(u64, 2), probe.saved.?.sequence);
+        try std.testing.expectEqual(@as(u64, 0), probe.scalar);
+    }
+    var replacement = try initManual(a, source, &probe, Probe.ordinary, Probe.persist, Probe.truncate, null, null, null, null, null);
+    defer replacement.deinit(a);
+    try replacement.addWorker("text", .{ .name = "text", .kind = .full_text }, 0);
+    try replacement.waitForAllWithVisibilityWait(4, wait);
+    try std.testing.expectEqual(@as(u64, 4), probe.scalar);
+    try std.testing.expectEqual(@as(usize, 2), probe.publications);
+    for (probe.seen) |count| try std.testing.expectEqual(@as(usize, 1), count);
 }

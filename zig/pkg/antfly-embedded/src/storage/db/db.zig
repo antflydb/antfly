@@ -56638,10 +56638,10 @@ fn replayPendingDerivedBatches(
             try self.core.saveAppliedSequence(index_ref.name, target_sequence);
         } else try abortReplayCapture(&replay_ctx, index_ref);
         if (options.bounded_replay)
-            replay_state.replay_budget.observe(replay_lane, adaptive_budget, if (fragment_replay)
+            replay_state.replay_budget.observePreparedWindow(replay_lane, adaptive_budget, if (fragment_replay)
                 (self.async_context.full_text_preparation_ns.load(.monotonic) -| preparation_before) +| stats.window_collect_ns
             else
-                (monotonicTimeNs() -| replay_started) -| (replay_state.publication_overhead_ns.load(.monotonic) -| publication_before), stats.budgetWorkItems(fragment_replay), false);
+                (monotonicTimeNs() -| replay_started) -| (replay_state.publication_overhead_ns.load(.monotonic) -| publication_before), replay_state.publication_overhead_ns.load(.monotonic) -| publication_before, stats.collection_budget_exhausted or stats.budgetWorkItems(fragment_replay) >= adaptive_budget.records, false);
         replay_completed = true;
     }
     if (options.truncate_replay) try truncateReplayJournalIfSafe(self);
