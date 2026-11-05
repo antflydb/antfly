@@ -23,6 +23,13 @@ pub const RuntimeError = error{AsyncWorkerFailed};
 /// even when callbacks resume on another worker or share one cooperative thread.
 pub const ApplyFn = *const fn (ctx: *anyopaque, batch: derived_types.DerivedBatch, index_ref: index_manager_mod.ManagedIndexRef, token: CatchUpSessionToken) anyerror!bool;
 pub const PersistFn = *const fn (ctx: *anyopaque, index_name: []const u8, sequence: u64, force: bool) anyerror!bool;
+/// Called from `derived_executor.ManualRuntime.waitForAll`/`waitForIndexes`
+/// once every worker has caught up to its target, with the minimum applied
+/// sequence across them. WS5: this runs on the foreground/ack path, so the
+/// bound function (`db.truncateReplaySequenceAsync`) only raises the
+/// journal-retirement watermark -- it never physically deletes. Physical
+/// retirement happens later, off this path, in the owner-only
+/// `DocStore.serviceRetirement`.
 pub const TruncateFn = *const fn (ctx: *anyopaque, sequence: u64) anyerror!void;
 pub const CatchUpSessionToken = struct {
     value: u64 = 0,
