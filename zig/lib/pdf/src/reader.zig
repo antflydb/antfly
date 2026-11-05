@@ -18824,13 +18824,22 @@ fn semanticTextItemsAlloc(alloc: Allocator, runs: anytype, spans: []SemanticText
                 if (span.exit_run) |exit| {
                     if (same_line) {
                         const last = runs[exit];
-                        // Layout sees the whole scope, while spacing after it uses
-                        // the exact last glyph's endpoint below.
-                        item.advance_width += textRunForwardGap(item, last) + last.advance_width;
+                        // Project the exit endpoint from page space into the
+                        // entry basis. Glyphs may have different axis scales;
+                        // page-space gaps cannot be added to local advances.
+                        // Spacing after the scope still uses the original exit.
+                        const axis = textRunAxisLength(item);
+                        const end_x = last.x + last.a * last.advance_width;
+                        const end_y = last.y + last.b * last.advance_width;
+                        item.advance_width = ((end_x - item.x) * (item.a / axis) +
+                            (end_y - item.y) * (item.b / axis)) / axis;
                     }
                 }
                 item.ordering_fence = !same_line or span.entry_run == null or span.text.len == 0 or std.mem.indexOfScalar(u8, span.text, '\n') != null;
-                try items.append(alloc, item);
+                // An empty scope with no selected glyphs has no layout effect.
+                // Keep its audit metadata, but do not partition ordering or
+                // consume layout capacity. Real glyph deletions retain fences.
+                if (span.text.len != 0 or span.entry_run != null) try items.append(alloc, item);
             }
             run_index = span.run_end;
             span_index += 1;
@@ -34055,6 +34064,127 @@ test "reader semantic scopes preserve punctuation deletion and authored anchors"
             try std.testing.expectEqual(case.glyphs, analysis.runs.len);
             try std.testing.expectEqual(@as(usize, 1), analysis.semantic_spans.len);
             for (analysis.runs) |run| try std.testing.expectEqualStrings(run.raw_text.?, run.text);
+        }
+    }
+}
+
+test "reader semantic extent projects mixed scale endpoints into the entry basis" {
+    const alloc = std.testing.allocator;
+    for ([_]f64{ 0.5, 1, 3 }) |scale| {
+        // The exit glyph has a different scale and a slightly tilted baseline.
+        // Both endpoints are in page space; advances are in each glyph's basis.
+        const runs = [_]TextRun{
+            .{ .text = "first", .x = 10, .y = 100, .a = scale, .d = scale, .font_size = 10 / scale, .advance_width = 10 / scale, .ascent = 8 / scale, .descent = 2 / scale },
+            .{ .text = "last", .x = 30, .y = 100, .a = 2, .b = 0.1, .d = 2, .font_size = 5, .advance_width = 5, .ascent = 4, .descent = 1 },
+        };
+        var spans = [_]SemanticTextSpan{.{ .text = "replacement", .run_start = 0, .run_end = runs.len }};
+        const items = try semanticTextItemsAlloc(alloc, &runs, &spans, .source, .{});
+        defer alloc.free(items);
+        try std.testing.expectEqual(@as(usize, 1), items.len);
+        try std.testing.expect(!items[0].ordering_fence);
+        try std.testing.expectApproxEqAbs(@as(f64, 30 / scale), items[0].advance_width, 0.000001);
+        try std.testing.expectApproxEqAbs(@as(f64, 40), textRunBounds(items[0]).max_x, 0.000001);
+        const exit = textRunExitGeometry(items[0], &runs, &spans);
+        try std.testing.expectEqual(@as(f64, 2), exit.a);
+        try std.testing.expectEqual(@as(f64, 5), exit.advance_width);
+    }
+}
+
+test "reader empty semantic spans with excluded glyphs do not enter layout" {
+    const alloc = std.testing.allocator;
+    const runs = [_]TextRun{.{ .text = "hidden", .x = 10, .y = 100, .font_size = 10, .policy_excluded = true }};
+    const box = PageBox{ .min_x = 10, .min_y = 10, .max_x = 11, .max_y = 11 };
+    // Visible vector paint keeps the scope eligible even though its glyph is
+    // excluded. There is no selected glyph deletion to preserve in layout.
+    var spans = [_]SemanticTextSpan{.{ .text = "", .run_start = 0, .run_end = 1, .paint = .{
+        .has_paint = true,
+        .visible_eligible = true,
+        .visible_bounds = box,
+    } }};
+    const items = try semanticTextItemsAlloc(alloc, &runs, &spans, .visible, .{});
+    defer alloc.free(items);
+    try std.testing.expectEqual(@as(usize, 0), items.len);
+    try std.testing.expect(!spans[0].policy_excluded);
+    try std.testing.expectEqual(box, spans[0].output_bounds.?);
+    try std.testing.expect(spans[0].entry_run == null);
+}
+
+test "reader semantic column ordering is invariant under uniform scaling" {
+    const alloc = std.testing.allocator;
+    const expected = "Left narrative column line one\nLeft narrative column line two\nLeft narrative column line three\n" ++
+        "Right narrative column line one\nRight narrative column line two\nRight narrative column line three\n";
+    for ([_]f64{ 0.5, 1, 3 }) |scale| {
+        for ([_]bool{ false, true }) |replacement| {
+            var content = std.ArrayList(u8).empty;
+            defer content.deinit(alloc);
+            try content.print(alloc, "{d} 0 0 {d} 0 0 cm\n", .{ scale, scale });
+            for ([_][]const u8{ "one", "two", "three" }, 0..) |number, row| {
+                for ([_][]const u8{ "Left", "Right" }, 0..) |side, column| {
+                    try content.print(alloc, "BT /F1 {d} Tf 1 0 0 1 {d} {d} Tm ", .{
+                        10 / scale,                                        (if (column == 0) @as(f64, 10) else 220) / scale,
+                        (240 - @as(f64, @floatFromInt(row)) * 20) / scale,
+                    });
+                    if (replacement and row == 0 and column == 0) {
+                        try content.appendSlice(alloc, "/Span << /ActualText (Left narrative column line one) >> BDC (Left narrative ) Tj (column line ) Tj (one) Tj EMC ");
+                    } else {
+                        try content.print(alloc, "({s} narrative column line {s}) Tj ", .{ side, number });
+                    }
+                    try content.appendSlice(alloc, "ET\n");
+                }
+            }
+            const sample = try buildTextOrderingTestPdfAlloc(alloc, content.items);
+            defer alloc.free(sample);
+            var parsed = try Reader.init(alloc, sample);
+            defer parsed.deinit();
+            inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+                parsed.setTextExtractionPolicy(policy);
+                var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+                defer analysis.deinit(alloc);
+                const plain = try parsed.extractPageTextAlloc(1);
+                defer alloc.free(plain);
+                try std.testing.expectEqualStrings(expected, analysis.text);
+                try std.testing.expectEqualStrings(expected, plain);
+                for (analysis.runs) |run| try std.testing.expectEqualStrings(run.raw_text.?, run.text);
+            }
+        }
+    }
+}
+
+test "reader empty vector semantic spans preserve column ordering and layout capacity" {
+    const alloc = std.testing.allocator;
+    const expected = "Left prose words one\nLeft prose words two\nLeft prose words three\n" ++
+        "Right prose words one\nRight prose words two\nRight prose words three\n";
+    for ([_]usize{ 0, 1, 2050 }) |empty_count| {
+        var content = std.ArrayList(u8).empty;
+        defer content.deinit(alloc);
+        for ([_][]const u8{ "one", "two", "three" }, 0..) |number, row| {
+            for ([_][]const u8{ "Left", "Right" }, 0..) |side, column| {
+                try content.print(alloc, "BT /F1 10 Tf 1 0 0 1 {d} {d} Tm ({s} prose words {s}) Tj ET\n", .{
+                    if (column == 0) @as(usize, 10) else 220, 240 - row * 20, side, number,
+                });
+                if (row == 0 and column == 0) for (0..empty_count) |_| {
+                    try content.appendSlice(alloc, "/Span << /ActualText () >> BDC 10 10 1 1 re f EMC\n");
+                };
+            }
+        }
+        const sample = try buildTextOrderingTestPdfAlloc(alloc, content.items);
+        defer alloc.free(sample);
+        var parsed = try Reader.init(alloc, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(alloc);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer alloc.free(plain);
+            try std.testing.expectEqualStrings(expected, analysis.text);
+            try std.testing.expectEqualStrings(expected, plain);
+            try std.testing.expectEqual(empty_count, analysis.semantic_spans.len);
+            for (analysis.semantic_spans) |span| {
+                try std.testing.expect(span.entry_run == null);
+                try std.testing.expect(span.output_bounds != null);
+                try std.testing.expect(span.output_span == null);
+            }
         }
     }
 }
