@@ -24,6 +24,7 @@ const embedding_gemma2 = @import("embedding_gemma2.zig");
 const ComputeBackend = @import("../ops/ops.zig").ComputeBackend;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 const Session = @import("../backends/session.zig").Session;
+const memory = @import("../runtime/tier/memory.zig");
 
 const sampling: embedding_video.Sampling = .{ .timestamps = .{} };
 
@@ -34,7 +35,7 @@ const portable_frame_bytes: usize = 96 * 1024 * 1024 + 48 * 1024 * 1024;
 /// Reserved through generation admission before any portable video work starts.
 pub const portable_host_bytes: usize = portable_pool_bytes + portable_frame_bytes;
 
-pub fn encode(cb: *const ComputeBackend, session: ?Session, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
+pub fn encode(cb: *const ComputeBackend, session: ?Session, explicit_scratch_limit: usize, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
     if (cb.kind() == .cuda) {
         // NVDEC takes a narrower set of clips than the catalog advertises, and
         // some rejections only surface mid-bitstream. Portable decoding decides
@@ -45,12 +46,45 @@ pub fn encode(cb: *const ComputeBackend, session: ?Session, a: std.mem.Allocator
             if (err != error.NvdecUnavailable and inputError(err) != error.InvalidVideoInput) return err;
             std.log.info("gemma4 video falling back to portable decoding: {s}", .{@errorName(err)});
         }
-        // Admission reserved nothing for this route, since most clips never take it.
-        var permit = if (session) |s| try s.admitHostPreprocess(portable_host_bytes) else null;
+        var permit = if (session) |s| try admitPortableFallback(s, explicit_scratch_limit) else null;
         defer if (permit) |*held| held.deinit();
         return encodePortable(cb, a, projector, bytes);
     }
     return encodePortable(cb, a, projector, bytes);
+}
+
+/// Admission reserved nothing for this route, since most clips never take it, and
+/// the run's own scratch can already fill the automatic cap. Grow that cap to fit,
+/// as model scratch floors do; physical limits and an operator's cap still hold.
+fn admitPortableFallback(session: Session, explicit_scratch_limit: usize) !@import("../backends/session.zig").RunPermit {
+    var fallback = session;
+    if (fallback.run_admission) |*admission| {
+        admission.limits = try memory.withAutomaticScratchFloor(
+            admission.limits,
+            explicit_scratch_limit,
+            admission.controller.snapshot().scratchTotalBytes(),
+            portable_host_bytes,
+        );
+    }
+    return fallback.admitHostPreprocess(portable_host_bytes);
+}
+
+test "gemma4 video portable fallback fits beside a run's scratch unless the operator capped it" {
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    const cap = portable_host_bytes + 1024;
+    const session = Session{
+        .ptr = undefined,
+        .vtable = undefined,
+        .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .scratch_limit_bytes = cap }, .static_workspace_bytes = 0 },
+    };
+    var run = try session.admitHostPreprocess(cap);
+    defer run.deinit();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admitHostPreprocess(portable_host_bytes));
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, admitPortableFallback(session, cap));
+    var permit = try admitPortableFallback(session, 0);
+    defer permit.deinit();
+    try std.testing.expectEqual(cap + portable_host_bytes, controller.snapshot().host_scratch_bytes);
 }
 
 const Observer = struct {
