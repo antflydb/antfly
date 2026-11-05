@@ -41,6 +41,7 @@ const platform_sync = @import("antfly_platform").sync;
 const projection_seal = @import("projection_seal.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
+const wal_trace = @import("write_amplification_trace.zig");
 const Allocator = std.mem.Allocator;
 const backend_adapter = @import("backend_adapter.zig");
 const backend_erased = @import("backend_erased.zig");
@@ -599,6 +600,8 @@ const RetiredSegmentFileDeleter = struct {
             return;
         };
         defer self.allocator.free(path);
+        const wal_trace_scope = wal_trace.scope(.artifact_cleanup);
+        defer wal_trace_scope.end();
         self.storage.deleteFileAbsolute(path) catch |err| switch (err) {
             error.FileNotFound => {},
             else => {
@@ -1357,6 +1360,8 @@ pub const PersistentIndex = struct {
     /// The owner must serialize this with its per-index replay/apply lane.
     pub fn publishProjectionSeal(self: *PersistentIndex, seal: projection_seal.Seal) !void {
         if (self.read_only) return error.ReadOnly;
+        const wal_trace_scope = wal_trace.scope(.status_snapshot);
+        defer wal_trace_scope.end();
         _ = try seal.encode();
         var next = seal;
         self.lockStorage();
@@ -2076,6 +2081,8 @@ pub const PersistentIndex = struct {
     /// The caller keeps mutation admission fenced only for this bounded
     /// manifest/run-reference operation; materialization happens later.
     pub fn pinNativeCheckpoints(self: *PersistentIndex) !NativeCheckpoints {
+        const wal_trace_scope = wal_trace.scope(.artifact_pin);
+        defer wal_trace_scope.end();
         self.lockStorage();
         defer self.unlockStorage();
         const segments = if (self.segment_files != null)
@@ -2156,7 +2163,10 @@ pub const PersistentIndex = struct {
         // recover from metadata alone and orphan pre-commit files are harmless.
         const lsn = if (uses_segment_wal) blk: {
             const wal_append_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            const wal_trace_scope = wal_trace.scope(.lsm_wal);
+            defer wal_trace_scope.end();
             const appended_lsn = try self.wal.append(owned.?);
+            wal_trace.recordCommit();
             if (profile_enabled) wal_append_ns = platform_time.monotonicNs() - wal_append_start_ns;
             break :blk appended_lsn;
         } else self.committed_lsn;
@@ -2173,6 +2183,8 @@ pub const PersistentIndex = struct {
         var segment_data: ?index_mod.SegmentData = null;
         if (self.segment_files != null) {
             const materialize_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            const wal_trace_scope = wal_trace.scope(.artifact_stage);
+            defer wal_trace_scope.end();
             segment_data = try self.materializeSegmentData(seg_id, owned.?);
             segment_data.?.madviseAccessPattern();
             if (profile_enabled) materialize_ns = platform_time.monotonicNs() - materialize_start_ns;
@@ -2197,7 +2209,11 @@ pub const PersistentIndex = struct {
 
         // 4. Persist metadata.
         const persist_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
-        try self.persistSegment(seg_id, owned orelse segment_data.?.bytes(), lsn);
+        {
+            const wal_trace_scope = wal_trace.scope(.artifact_link);
+            defer wal_trace_scope.end();
+            try self.persistSegment(seg_id, owned orelse segment_data.?.bytes(), lsn);
+        }
         if (profile_enabled) persist_ns = platform_time.monotonicNs() - persist_start_ns;
 
         // 5. Every fallible snapshot allocation was staged before catalog
@@ -2211,6 +2227,8 @@ pub const PersistentIndex = struct {
         // 6. Truncate WAL
         if (uses_segment_wal) {
             const wal_truncate_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
+            const wal_trace_scope = wal_trace.scope(.replay_retirement);
+            defer wal_trace_scope.end();
             try self.wal.truncate(lsn);
             if (profile_enabled) wal_truncate_ns = platform_time.monotonicNs() - wal_truncate_start_ns;
         }

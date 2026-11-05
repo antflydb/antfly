@@ -26,6 +26,7 @@ const alloc = std.heap.c_allocator;
 
 const memo_mod = @import("antfly_inference_query_embedding_cache");
 const cache_budget = @import("antfly_cache_budget");
+const wal_trace = @import("../storage/write_amplification_trace.zig");
 const embedding_memo_bytes = 16 * 1024 * 1024;
 const EnrichmentRuntime = std.meta.Child(std.meta.Child(@FieldType(h.db_mod.DB, "enrichment_runtime")));
 const PublicationPort = std.meta.Child(@FieldType(EnrichmentRuntime, "generated_publication"));
@@ -1019,6 +1020,7 @@ pub const Owner = struct {
     /// a different process's publication. Cursor continuation deliberately
     /// uses its pinned generation without reopening the connection.
     pub fn refresh(self: *Owner) !*h.Handle {
+        wal_trace.recordOp(.serving_runtime_refresh);
         var known_maintenance: ?*h.Handle = null;
         if (self.current) |current| {
             if (current.lite_scheduling_owner == null) try self.bindGroupSourceState(current);
@@ -1336,6 +1338,7 @@ pub const Owner = struct {
         if (self.gate.mutex.takeRetained()) |held| {
             var lease = held;
             stats.recordAcquired(.handoff, 0);
+            wal_trace.recordOp(.maintenance_lease_acquired);
             lease.startHold(stats);
             return self.withReadRegistrationBatch(lease);
         }
@@ -1355,6 +1358,7 @@ pub const Owner = struct {
         };
         errdefer held.close();
         stats.recordAcquired(if (held.queue_turn != null) .queued else .uncontended, @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - started)));
+        wal_trace.recordOp(.maintenance_lease_acquired);
         held.startHold(stats);
         if (self.stopping.load(.acquire)) return error.Canceled;
         return self.withReadRegistrationBatch(held);

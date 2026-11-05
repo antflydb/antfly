@@ -27,6 +27,7 @@ const native = @import("native.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 pub const reclamation = @import("reclamation.zig");
 const maintenance = @import("../maintenance.zig");
+const wal_trace = @import("../write_amplification_trace.zig");
 
 const Allocator = std.mem.Allocator;
 const ReadWorkspace = @import("read_workspace.zig").Workspace;
@@ -3363,6 +3364,8 @@ pub const Txn = struct {
                 self.writer_reserved = false;
             }
         }
+        const wal_trace_scope = wal_trace.scope(.primary_commit);
+        defer wal_trace_scope.end();
         try store.submitMutation(&context, Commit.apply);
         self.releaseGenerationReadLock();
         if (self.writer_reserved) {

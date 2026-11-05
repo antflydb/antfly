@@ -28,6 +28,7 @@ const threaded_io_limits = @import("antfly_runtime_fs").threaded_io_limits;
 const resource_manager_mod = @import("../resource_manager.zig");
 const maintenance = @import("../maintenance.zig");
 const writer_queue = @import("writer_queue.zig");
+const wal_trace = @import("../write_amplification_trace.zig");
 pub const allocator_v4 = @import("allocator_v4.zig");
 
 const ScoreSink = @import("../backend_types.zig").ScoreSink;
@@ -11803,6 +11804,7 @@ pub const NativeFile = struct {
         self.header.checkpoints[next_slot] = checkpoint;
         self.header.active_checkpoint = next_slot;
         self.checkpoint_publication_uncertain = false;
+        wal_trace.recordCommit();
         self.last_synced_header = self.header;
         if (self.ledger) |state| {
             self.retirement_activity_bytes +|= state.released_data_pages *| self.header.page_size;

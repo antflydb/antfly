@@ -18,6 +18,7 @@ const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const replay_source_mod = @import("replay_source.zig");
 const derived_types = @import("derived_types.zig");
+const wal_trace = @import("../../write_amplification_trace.zig");
 const backlog_tracker_mod = @import("backlog_tracker.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const runtime_backend = @import("../../runtime_backend.zig");
@@ -360,6 +361,7 @@ const ManualRuntime = struct {
     };
 
     fn catchUpWorker(self: *ManualRuntime, worker: *ManualWorker) !CatchUpResult {
+        wal_trace.recordOp(.derived_worker_turn);
         const token = if (self.begin_catch_up_fn) |begin_catch_up|
             try begin_catch_up(self.ctx, worker.kind)
         else

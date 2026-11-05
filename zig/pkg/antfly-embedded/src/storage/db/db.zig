@@ -106,6 +106,7 @@ const durable_outbox_store = @import("durable_outbox_store.zig");
 const apply_receipts = @import("apply_receipts.zig");
 
 const replication_commit = @import("commit_integration.zig");
+const wal_trace = @import("../write_amplification_trace.zig");
 
 const TestDirectory = @import("../../common/test_directory.zig").TestDirectory;
 const ant_json = @import("antfly-json");
@@ -55863,6 +55864,8 @@ fn replayPendingDerivedBatches(
 
     const PersistReplayProgress = struct {
         fn run(ctx: *anyopaque, index_name: []const u8, sequence: u64) !void {
+            const wal_trace_scope = wal_trace.scope(.progress);
+            defer wal_trace_scope.end();
             const progress: *PersistReplayProgressContext = @ptrCast(@alignCast(ctx));
             try progress.db.core.saveAppliedSequence(index_name, sequence);
             try progress.publish(index_name);
