@@ -1400,6 +1400,13 @@ charging a provider retry. The direct replay fallback without registered workers
 obeys the same dependency cuts and document-fan-out bounds as the registered
 manual executor.
 Explicit idle drains continue to inspect and complete all relevant work.
+Resolver query inference releases writer admission. Candidate, policy and
+embedding-cache callbacks continue to read primary storage, so resolution pins a
+logical-data snapshot under admission before releasing it. The pin survives
+through resumed admission and is released before its runtime can be collected;
+abandoned queries release it too. This closes the gap where a callback could
+register its reader only after a peer had reused the captured primary roots.
+Owned extraction plans retain only their provider lifetime while detached.
 Registered manual workers receive the same generation-bound fragment callbacks
 as workerless replay. Their budgets bound complete document families within a
 large journal record. A replacement worker loads the durable continuation;

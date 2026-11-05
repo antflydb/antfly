@@ -798,6 +798,9 @@ pub const HandleGuard = struct {
     entry_sequence: u64 = 0,
     pinned_store_readonly: ?bool = null,
     suspended_query_root: ?*Handle = null,
+    // Provider-only plans own their inputs. Resolution additionally performs
+    // primary reads off admission, so retain its data epoch before unlocking.
+    suspended_query_primary: ?*@import("../storage/lite/docstore.zig").Txn = null,
     refresh_predecessor: ?*Handle = null,
     /// Busy-wait budget left for this export call. The busy timeout bounds
     /// total admission waiting across every re-entry of one call (for
@@ -840,6 +843,29 @@ pub const HandleGuard = struct {
         self.connection_mutex_held = false;
     }
 
+    pub fn suspendQueryWithPrimarySnapshot(self: *HandleGuard) !void {
+        const connection = self.connection orelse return;
+        std.debug.assert(self.connection_gate_held and self.entry_error == null);
+        std.debug.assert(self.suspended_query_primary == null);
+        // Pin while the exact serving checkpoint is still protected by writer
+        // admission. Acquiring individual callback transactions after unlock
+        // is too late: a peer may already have reused this runtime's roots.
+        // Logical candidate/policy/cache reads need a data epoch, not an
+        // allocator-metadata fence. Immutable index inputs own their leases.
+        const store = connection.current.?.owned_lite_backend.?.native_docstore.?;
+        const pin = try store.allocator.create(@import("../storage/lite/docstore.zig").Txn);
+        errdefer store.allocator.destroy(pin);
+        pin.* = try store.beginRead();
+        self.suspended_query_primary = pin;
+        self.suspendQuery();
+    }
+
+    fn releaseQueryPrimary(pin: *@import("../storage/lite/docstore.zig").Txn) void {
+        const allocator = pin.allocator;
+        pin.abort();
+        allocator.destroy(pin);
+    }
+
     pub fn resumeQuery(self: *HandleGuard, ptr: ?*anyopaque) bool {
         return self.resumeAccess(ptr, .read);
     }
@@ -850,6 +876,10 @@ pub const HandleGuard = struct {
         const next = enterWithAdmissionBudget(entry, ptr, access, if (access == .read) .read_only else .mutation, false, self.admission_budget_ns) orelse return false;
         const connection = self.connection.?;
         if (!next.connection_gate_held) connection.gate.mutex.lockUncancelable(handleLockIo());
+        // Release before collectRetired can destroy the pin's Store. Keep it
+        // through resumed admission so no publication races the handoff.
+        if (self.suspended_query_primary) |pin| releaseQueryPrimary(pin);
+        self.suspended_query_primary = null;
         self.suspended_query_root.?.query_borrows -= 1;
         connection.collectRetired();
         if (!next.connection_gate_held) connection.gate.mutex.unlock(handleLockIo());
@@ -878,6 +908,7 @@ pub const HandleGuard = struct {
         if (self.suspended_query_root) |root| {
             const connection = self.connection.?;
             connection.gate.mutex.lockUncancelable(io);
+            if (self.suspended_query_primary) |pin| releaseQueryPrimary(pin);
             root.query_borrows -= 1;
             connection.collectRetired();
             connection.gate.mutex.unlock(io);
@@ -8248,7 +8279,7 @@ pub fn antfly_db_resolve_query_json(handle_ptr: ?*anyopaque, resolver_name: capi
         const candidates = @import("entity_sink.zig").candidateSource(handle);
         const mention_embedder = handle.database().resolution_embedder;
         const suspend_resolution = guard.connection != null and (cfg.adjudicate_json.len > 0 or cfg.name_embedding.len > 0);
-        if (suspend_resolution) guard.suspendQuery();
+        if (suspend_resolution) guard.suspendQueryWithPrimarySnapshot() catch |err| return capi.mapErrorContext(err, "pinning resolver query primary inputs");
         const computed = @import("../storage/db/resolution_runtime.zig").resolveQueryExtractionWithPolicyAlloc(alloc, configs, cfg, extracted, candidates, mention_embedder, policy_session.loader());
         if (!guard.resumeQuery(handle_ptr)) {
             if (computed) |bytes| alloc.free(bytes) else |_| {}
@@ -12013,4 +12044,77 @@ test "issue1015 issue1431 busy budget is shared across resumed admissions of one
     guard.leave();
     second_thread.join();
     try std.testing.expectEqual(@as(?capi.ErrorCode, .busy), resumed_error);
+}
+
+test "capi native query snapshot protects late candidate reads through foreign page reuse and resume" {
+    try testSuspendedQueryPrimarySnapshot(true);
+}
+
+test "capi native query snapshot releases its data epoch when suspended work is abandoned" {
+    try testSuspendedQueryPrimarySnapshot(false);
+}
+
+fn testSuspendedQueryPrimarySnapshot(resume_query: bool) !void {
+    const a = std.testing.allocator;
+    const native = lite_backend.native;
+    var directory = try TestDirectory.init("query-primary-epoch");
+    defer directory.cleanup();
+    const path = try std.fmt.allocPrintSentinel(a, "{s}.aflite", .{directory.path()}, 0);
+    defer a.free(path);
+    const wrapper = try openLiteHandleAlloc(path, .{ .no_sync = true, .profile = .native }, true);
+    const id = try publishHandle(wrapper);
+    defer antfly_db_close(id);
+    const owner = wrapper.lite_connection.?.owner;
+    owner.stopping.store(true, .release);
+    owner.wake.set(handleLockIo());
+    if (owner.worker) |worker| worker.join();
+    owner.worker = null;
+    owner.stopping.store(false, .release);
+    var out: capi.Buffer = .{};
+    defer antfly_buffer_free(&out);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(id, .fromSlice("{\"inserts\":{\"held\":{\"value\":\"captured\"}},\"sync_level\":\"write\"}"), &out));
+    var guard = enterHandle(id, .read) orelse return error.TestUnexpectedResult;
+    var guard_active = true;
+    defer if (guard_active) guard.leave();
+    try std.testing.expectEqual(@as(?capi.ErrorCode, null), guard.entry_error);
+    const captured = guard.handle;
+    const store = captured.owned_lite_backend.?.native_docstore.?;
+    try guard.suspendQueryWithPrimarySnapshot();
+    try std.testing.expect(guard.suspended_query_primary != null);
+    const sequence = guard.suspended_query_primary.?.checkpoint.commit_sequence;
+    try std.testing.expect(store.reader_frontier.load(.acquire) <= sequence);
+    {
+        // Another writer progresses while this runtime is detached. Repeated
+        // primary-root replacement and allocator reuse precede the first
+        // candidate callback, precisely the gap a late callback pin cannot fix.
+        var lease = try native.lockWriterPathWithIo(a, handleLockIo(), path);
+        defer lease.close();
+        var writer = try native.NativeFile.openWithIo(a, handleLockIo(), path, .{ .externally_locked = true, .no_sync = true, .reader_coordinator = owner.reader_coordinator });
+        defer writer.close();
+        try writer.completeAllocatorVerification();
+        var value: [4096]u8 = @splat('x');
+        for (0..128) |iteration| {
+            std.mem.writeInt(u64, value[0..8], iteration, .little);
+            try writer.beginTransaction();
+            try writer.putDocument("foreign/churn", &value);
+            try writer.commitTransaction();
+            _ = try writer.reclaimPagesForMaintenanceWithCancel(128, null);
+        }
+        try std.testing.expect((try writer.allocatorStats()).?.reused_pages > 0);
+        try std.testing.expect((try writer.check()).valid);
+    }
+    const row = (try @import("entity_sink.zig").candidateSource(captured).get(a, "default", "held")) orelse return error.TestUnexpectedResult;
+    defer a.free(row);
+    try std.testing.expectEqualStrings("{\"value\":\"captured\"}", row);
+    if (resume_query) {
+        try std.testing.expect(guard.resumeQuery(id));
+        try std.testing.expectEqual(@as(?capi.ErrorCode, null), guard.entry_error);
+        try std.testing.expect(guard.suspended_query_primary == null);
+        try std.testing.expect(guard.suspended_query_root == null);
+    } else {
+        guard.leave();
+        guard_active = false;
+        try std.testing.expectEqual(@as(usize, 0), captured.query_borrows);
+        try std.testing.expectEqual(std.math.maxInt(u64), store.reader_frontier.load(.acquire));
+    }
 }
