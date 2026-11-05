@@ -23,6 +23,7 @@ pub const text_encoding = @import("text_encoding.zig");
 pub const reader = @import("reader.zig");
 pub const syntax = @import("syntax.zig");
 pub const render = @import("render.zig");
+pub const text_structure = @import("text_structure.zig");
 /// Native layout producers use the same immutable faces and metrics as the
 /// rasterizer, avoiding platform font dependencies and layout/render drift.
 pub const native_fonts = struct {
@@ -392,6 +393,8 @@ fn renderParsedPagePngEffectiveWithRotationAllocators(
     return renderParsedPagePngNativeWithAllocators(scratch_alloc, output_alloc, parsed, page_number, dpi, max_pixels, rotation, profile) catch |err| switch (err) {
         error.UnsupportedStreamFilter,
         error.UnsupportedNativeDecode,
+        error.UnsupportedPdfInlineImage,
+        error.InvalidPdfInlineImage,
         error.UnsupportedPdfRendering,
         error.InvalidFlateStream,
         error.MissingEndStream,
@@ -562,6 +565,8 @@ fn renderParsedPageRgbaEffectiveWithRotationAllocators(
     return renderParsedPageRgbaNativeWithAllocators(scratch_alloc, output_alloc, parsed, page_number, dpi, max_pixels, rotation, profile) catch |err| switch (err) {
         error.UnsupportedStreamFilter,
         error.UnsupportedNativeDecode,
+        error.UnsupportedPdfInlineImage,
+        error.InvalidPdfInlineImage,
         error.UnsupportedPdfRendering,
         error.InvalidFlateStream,
         error.MissingEndStream,
@@ -4878,6 +4883,7 @@ test {
     _ = reader;
     _ = syntax;
     _ = render;
+    _ = text_structure;
 }
 
 /// Test allocator that records page-sized allocations while serializing an
