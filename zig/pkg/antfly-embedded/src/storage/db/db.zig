@@ -3657,7 +3657,7 @@ pub const DB = struct {
         var privacy_arena = std.heap.ArenaAllocator.init(alloc);
         defer privacy_arena.deinit();
         const policy = try @import("privacy_read.zig").capture(self, privacy_arena.allocator());
-        if (policy != null and policy.?.policy.mode != .monitor) return error.PrivacyRelationalStorageUnsupported;
+        if (policy != null and policy.?.prepared.policy.mode != .monitor) return error.PrivacyRelationalStorageUnsupported;
         // A delayed scan may use only the primary path. READY index state and
         // auto-index plans can change after the original visibility cut.
         if (statement != null and (request.index != null or request.auto_index)) return error.SqlStatementSnapshotRequired;
@@ -10015,7 +10015,7 @@ pub const DB = struct {
         defer privacy_arena.deinit();
         const privacy = @import("privacy_read.zig");
         const policy = try privacy.capture(self, privacy_arena.allocator());
-        const safe = if (policy != null and policy.?.policy.mode != .monitor) blk: {
+        const safe = if (policy != null and policy.?.prepared.policy.mode != .monitor) blk: {
             var read = try self.core.store.beginReadTxn();
             defer read.abort();
             const physical = try artifact_ids.internalKeyForArtifactRefAlloc(privacy_arena.allocator(), artifact.artifact_ref);
@@ -19681,7 +19681,7 @@ pub const DB = struct {
         const privacy = @import("privacy_read.zig");
         const policy = if (opts.privacy_original) null else try privacy.capture(self, privacy_arena.allocator());
         if (!opts.privacy_original) try privacy.requireExpected(privacy_arena.allocator(), opts.privacy_policy_version, policy);
-        const protected = policy != null and policy.?.policy.mode != .monitor;
+        const protected = policy != null and policy.?.prepared.policy.mode != .monitor;
         if (protected) {
             if (opts.include_primary_digest) return error.PrivacyUnsupportedMutation;
             const special = db_query_projection.buildLookupFieldSelectionPlan(opts).special;
@@ -41304,7 +41304,7 @@ pub const DB = struct {
         errdefer session.deinit();
         session.privacy = try @import("privacy_read.zig").capture(self, session.arena.allocator());
         try @import("privacy_read.zig").requireExpected(session.arena.allocator(), opts.privacy_policy_version, session.privacy);
-        if (session.privacy) |policy| if (policy.policy.mode != .monitor and (opts.sql_document_preimage or opts.include_content_hashes)) return error.UnsupportedSqlExecution;
+        if (session.privacy) |policy| if (policy.prepared.policy.mode != .monitor and (opts.sql_document_preimage or opts.include_content_hashes)) return error.UnsupportedSqlExecution;
         session.row_policy_lease = row_policy_lease;
         return session;
     }
@@ -41547,9 +41547,9 @@ pub const DB = struct {
         if (opts.privacy_status) {
             const installed = policy orelse return error.IndexRebuilding;
             const expected = opts.privacy_policy_version orelse return error.InvalidPrivacyReceipt;
-            if (!std.mem.eql(u8, &(try installed.policy.identity(privacy_arena.allocator())), &expected)) return error.IndexRebuilding;
+            if (!std.mem.eql(u8, &(installed.prepared.version), &expected)) return error.IndexRebuilding;
         }
-        const protected = !opts.privacy_status and policy != null and policy.?.policy.mode != .monitor;
+        const protected = !opts.privacy_status and policy != null and policy.?.prepared.policy.mode != .monitor;
         if (protected and opts.isRelational()) return error.PrivacyRelationalStorageUnsupported;
         if (protected and opts.sql_document_preimage) return error.PrivacyUnsupportedMutation;
         if (protected) {
@@ -41815,7 +41815,7 @@ pub const DB = struct {
                 }
                 const privacy_row_arena = &state.privacy_row_arena;
                 defer _ = privacy_row_arena.reset(.retain_capacity);
-                const protected_row = !state.opts.privacy_status and if (state.privacy_policy) |configured| configured.policy.mode != .monitor else false;
+                const protected_row = !state.opts.privacy_status and if (state.privacy_policy) |configured| configured.prepared.policy.mode != .monitor else false;
                 const safe_stored = if (protected_row) privacy.project(privacy_row_arena.allocator(), state.privacy_policy.?, raw_key, stored_value, state.read_txn) catch |err| {
                     if (privacy.pending(err)) return .@"continue";
                     return err;
@@ -41872,7 +41872,7 @@ pub const DB = struct {
                     };
                     defer observed.deinit(privacy_row_arena.allocator());
                     observed.protected_ready = observed.current and state.privacy_status_published;
-                    const json_status = try @import("../../privacy/status.zig").encode(privacy_row_arena.allocator(), try state.privacy_policy.?.policy.identity(privacy_row_arena.allocator()), observed);
+                    const json_status = try @import("../../privacy/status.zig").encode(privacy_row_arena.allocator(), state.privacy_policy.?.prepared.version, observed);
                     try state.visitor.visitEntry(.{ .id = raw_key, .hash = 0, .document_json = json_status });
                     state.count += 1;
                     return if (state.opts.limit > 0 and state.count >= state.opts.limit) .stop else .@"continue";
@@ -42152,7 +42152,7 @@ pub const DB = struct {
             var privacy_arena = std.heap.ArenaAllocator.init(self.window.arena.child_allocator);
             defer privacy_arena.deinit();
             const policy = try @import("privacy_read.zig").capture(self.db, privacy_arena.allocator());
-            if (policy != null and policy.?.policy.mode != .monitor) {
+            if (policy != null and policy.?.prepared.policy.mode != .monitor) {
                 self.values[0] = try self.lookup(documents[0]);
                 self.sources[0] = .{ .bytes = self.values[0].? };
                 return .{ .values = self.sources[0..1], .consumed = 1 };
@@ -42453,7 +42453,7 @@ pub const DB = struct {
         defer privacy_arena.deinit();
         const privacy_policy = try @import("privacy_read.zig").capture(self, privacy_arena.allocator());
         try @import("privacy_read.zig").requireExpected(privacy_arena.allocator(), req.privacy_policy_version, privacy_policy);
-        if (privacy_policy != null and privacy_policy.?.policy.mode != .monitor) {
+        if (privacy_policy != null and privacy_policy.?.prepared.policy.mode != .monitor) {
             try self.lockApplySharedForPortableRuntime();
             defer self.core.unlockApplyShared();
             _ = try @import("privacy_read.zig").requirePublished(self, alloc, req);
@@ -46344,7 +46344,7 @@ pub const DB = struct {
         var privacy_arena = std.heap.ArenaAllocator.init(alloc);
         defer privacy_arena.deinit();
         const privacy_policy = try @import("privacy_read.zig").capture(self, privacy_arena.allocator());
-        if (privacy_policy != null and privacy_policy.?.policy.mode != .monitor) return null;
+        if (privacy_policy != null and privacy_policy.?.prepared.policy.mode != .monitor) return null;
         const manager = self.async_context.resource_manager orelse return null;
         if (!manager.dense_query_snapshot) return null;
         if (!snapshotDenseRequestEligible(req)) {
@@ -48057,7 +48057,7 @@ pub const DB = struct {
         defer privacy_arena.deinit();
         const privacy = @import("privacy_read.zig");
         const policy = try privacy.capture(self, privacy_arena.allocator());
-        if (policy != null and policy.?.policy.mode != .monitor) {
+        if (policy != null and policy.?.prepared.policy.mode != .monitor) {
             if (internal_keys.isInternalUserKey(key)) {
                 const safe = try privacy.projectArtifact(privacy_arena.allocator(), policy.?, store_key, &txn);
                 return try alloc.dupe(u8, safe);
@@ -48674,7 +48674,7 @@ fn loadStoredSearchDocumentsMany(
     const policy = try privacy.capture(self, privacy_arena.allocator());
     for (pending.items, 0..) |item, i| {
         const value = read_values[i] orelse continue;
-        if (policy != null and policy.?.policy.mode != .monitor) {
+        if (policy != null and policy.?.prepared.policy.mode != .monitor) {
             const id = keys[item.original_index];
             if (internal_keys.isInternalUserKey(id)) {
                 const safe = privacy.projectArtifact(privacy_arena.allocator(), policy.?, item.store_key, &txn) catch |err| {
@@ -135583,7 +135583,7 @@ fn openStoredLogicalSourcesCallback(ctx: ?*anyopaque, a: Allocator) anyerror!?db
     const policy = try @import("privacy_read.zig").capture(db, privacy_arena.allocator());
     // Byte-range projection certificates describe original primary bytes.
     // Protected logical values must use the receipt-bound whole-source path.
-    if (policy != null and policy.?.policy.mode != .monitor) return null;
+    if (policy != null and policy.?.prepared.policy.mode != .monitor) return null;
     if (getenv("ANTFLY_BENCH_VALUE_SOURCE_FULL_READ")) |v| if (std.mem.eql(u8, v, "1")) return null;
     // Ordinal rows retain their existing schema-versioned decoding path.
     var view = db.core.acquireSchemaView();
@@ -147874,4 +147874,58 @@ test "privacy primed roots preserve durable retry deadlines and healthy consumer
     try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
     try std.testing.expectEqual(@as(usize, 2), mock.bad_calls);
     try std.testing.expectEqual(@as(usize, 1), mock.healthy_calls);
+}
+
+test "privacy discovery regenerates completed artifacts whose local publication witness was not restored" {
+    const a = std.testing.allocator;
+    const privacy = @import("../../privacy/document.zig");
+    const local = @import("../../privacy/local_publication.zig");
+    const Mock = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        fn check(_: *anyopaque) !void {}
+        fn detect(_: *anyopaque, _: Allocator, _: privacy.contract.Producer, _: []const u8) ![]u8 {
+            return error.UnexpectedInference;
+        }
+        fn produce(ptr: *anyopaque, out: Allocator, request: asset_producer_mod.Request) ![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .monotonic);
+            return privacy.produce(out, request.config_json, request.source_text, .{ .ptr = ptr, .produce = detect, .check = check });
+        }
+        fn interface(self: *@This()) asset_producer_mod.Producer {
+            return .{ .ptr = self, .vtable = &.{ .produce = produce, .invocation_memory_for_requests = GateAssetProducer.invocationMemory } };
+        }
+    };
+    var mock: Mock = .{};
+    var directory = try TestDirectory.init("privacy-restored-publication");
+    defer directory.cleanup();
+    var db = try DB.open(a, directory.path(), .{ .start_index_workers = false, .start_optional_runtime_workers = false, .enrichment = .{ .asset_producer = mock.interface() } });
+    defer db.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const policy = privacy.contract.Policy{ .mode = .monitor, .fields = &.{"absent"} };
+    const resolved = try privacy.resolve(arena.allocator(), policy, true);
+    const producer_json = try std.json.Stringify.valueAlloc(arena.allocator(), .{ .type = "extractor", .config = resolved.config }, .{});
+    try db.addEnrichment(.{ .name = privacy.artifact_name, .kind = .asset, .field = privacy.source_field, .content_type = "application/json", .producer_json = producer_json });
+    try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"ordinal\":1}" }}, .sync_level = .write });
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    try std.testing.expectEqual(@as(usize, 1), mock.calls.load(.acquire));
+    _ = try db.reprocessGeneratedEnrichmentFromStoredDocs(a, null);
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    try std.testing.expectEqual(@as(usize, 1), mock.calls.load(.acquire));
+    const artifact = try internal_keys.artifactNamedPrefixAlloc(a, "doc", "asset", privacy.artifact_name);
+    defer a.free(artifact);
+    const witness = try local.key(a, artifact);
+    defer a.free(witness);
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.delete(witness);
+        try txn.commit();
+    }
+    _ = try db.reprocessGeneratedEnrichmentFromStoredDocs(a, null);
+    try db.runEnrichmentUntil(db.core.nextEnrichmentSequence());
+    try std.testing.expectEqual(@as(usize, 2), mock.calls.load(.acquire));
+    var read = try db.core.store.beginReadTxn();
+    defer read.abort();
+    try local.require(a, &read, artifact, try policy.identity(a), "{\"ordinal\":1}", try read.get(artifact));
 }

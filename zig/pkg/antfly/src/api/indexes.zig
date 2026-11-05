@@ -1292,9 +1292,17 @@ pub fn indexesConfigUsesArtifactSources(alloc: std.mem.Allocator, indexes_json: 
     if (parsed.value != .object) return error.InvalidCreateTableRequest;
     var it = parsed.value.object.iterator();
     while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key_ptr.*, "enrichments") or std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
+            @import("antfly_local_sources").api_index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
         if (try indexConfigValueUsesArtifactSources(entry.value_ptr.*)) return true;
     }
     return false;
+}
+
+test "privacy restore artifact admission skips opaque state and declarations in any order" {
+    const a = std.testing.allocator;
+    try std.testing.expect(!try indexesConfigUsesArtifactSources(a, "{\"enrichments\":[],\"_privacy\":{\"coverage\":{}},\"resolvers\":[],\"full_text_index_v0\":{\"type\":\"full_text\"}}"));
+    try std.testing.expect(try indexesConfigUsesArtifactSources(a, "{\"_privacy\":{},\"enrichments\":[],\"full_text_index_v0\":{\"type\":\"full_text\",\"sources\":[{\"artifact\":\"safe\"}]}}"));
 }
 
 fn appendIndexConfig(

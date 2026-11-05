@@ -122,13 +122,20 @@ pub const Observation = struct {
 pub fn inspect(a: A, policy: contract.Policy, source: []const u8, artifact: []const u8) !Observation {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
+    return inspectPrepared(a, try contract.PreparedPolicy.init(arena.allocator(), policy), source, artifact);
+}
+
+pub fn inspectPrepared(a: A, prepared: contract.PreparedPolicy, source: []const u8, artifact: []const u8) !Observation {
+    const policy = prepared.policy;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
     const scratch = arena.allocator();
     const original = (try std.json.parseFromSlice(std.json.Value, scratch, source, .{ .parse_numbers = false })).value;
     const projected = (try std.json.parseFromSlice(std.json.Value, scratch, artifact, .{ .parse_numbers = false })).value;
     if (original != .object or projected != .object) return error.InvalidPrivacyReceipt;
     const receipt = projected.object.get("_privacy") orelse return error.InvalidPrivacyReceipt;
     if (receipt != .object) return error.InvalidPrivacyReceipt;
-    const version = try policy.identity(scratch);
+    const version = prepared.version;
     const recorded = receipt.object.get("policy_version") orelse return error.InvalidPrivacyReceipt;
     const fingerprint = receipt.object.get("source_fingerprint") orelse return error.InvalidPrivacyReceipt;
     const canonical = try std.json.Stringify.valueAlloc(scratch, original, .{});
@@ -136,7 +143,7 @@ pub fn inspect(a: A, policy: contract.Policy, source: []const u8, artifact: []co
     if (!std.mem.eql(u8, recorded.string, &version) or !std.mem.eql(u8, fingerprint.string, &contract.fingerprint(canonical))) return .{};
     const fields = receipt.object.get("fields") orelse return error.InvalidPrivacyReceipt;
     if (fields != .array or fields.array.items.len != policy.fields.len) return error.InvalidPrivacyReceipt;
-    const labels = try policy.labels(scratch);
+    const labels = prepared.categories;
     var observation: Observation = .{};
     errdefer observation.deinit(a);
     for (policy.fields) |name| {
@@ -151,7 +158,7 @@ pub fn inspect(a: A, policy: contract.Policy, source: []const u8, artifact: []co
             if (value != .string and value != .null) return error.InvalidPrivacyFieldType;
             const text = if (value == .string) value.string else "";
             const proof = try std.json.parseFromValue(contract.Receipt, scratch, field.object.get("receipt") orelse return error.InvalidPrivacyReceipt, .{});
-            if (!proof.value.current(version, text, try policy.revision())) {
+            if (!proof.value.current(version, text, prepared.revision)) {
                 observation.deinit(a);
                 return .{};
             }

@@ -776,11 +776,21 @@ pub const Runtime = struct {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
-        const inspector = try @import("privacy/document.zig").Inspector.init(a, requests[0].config_json);
-        const config = try std.json.Stringify.valueAlloc(a, inspector.producer.config, .{});
+        // Planning needs fields and the physical producer, not a receipt's
+        // canonical policy identity. Hashing/serializing that identity here
+        // wastes the bounded resolution budget on large category descriptions.
+        const privacy = @import("privacy/document.zig");
+        const tree = try std.json.parseFromSliceLeaky(std.json.Value, a, requests[0].config_json, .{});
+        if (tree != .object) return error.InvalidPrivacyProducer;
+        const policy = try std.json.parseFromValueLeaky(privacy.contract.Policy, a, tree.object.get(privacy.config_key) orelse return error.InvalidPrivacyProducer, .{});
+        const resolved_producer = try privacy.resolve(a, policy, false);
+        const config = try std.json.Stringify.valueAlloc(a, resolved_producer.config, .{});
         var largest: [8]asset_producer.Request = undefined;
+        var text_backing = inference_work.ReclaimingInvocationAllocator.init(alloc);
+        const text_alloc = text_backing.allocator();
         var count: usize = 0;
-        const capacity: usize = if (requests.len < 2) 1 else inspector.policy.execution.batch_items;
+        defer for (largest[0..count]) |request| text_alloc.free(request.source_text);
+        const capacity: usize = policy.execution.batch_items;
         var source_bytes: usize = 0;
         var largest_source: usize = 0;
         for (requests) |request| {
@@ -791,25 +801,26 @@ pub const Runtime = struct {
             defer document_arena.deinit();
             const source = try std.json.parseFromSliceLeaky(std.json.Value, document_arena.allocator(), request.source_text, .{ .parse_numbers = false });
             if (source != .object) return error.InvalidPrivacyDocument;
-            for (inspector.policy.fields) |field| {
+            for (policy.fields) |field| {
                 const value = source.object.get(field) orelse .null;
                 // Invalid field types become per-document failures at execution.
                 if (value != .string or value.string.len == 0) continue;
-                const input: asset_producer.Request = .{ .producer_type = if (inspector.producer.type == .extractor) .extractor else .generator, .config_json = config, .source_text = value.string, .content_type = "application/json" };
+                const input: asset_producer.Request = .{ .producer_type = if (resolved_producer.type == .extractor) .extractor else .generator, .config_json = config, .source_text = value.string, .content_type = "application/json" };
                 var index: usize = 0;
                 while (index < count and largest[index].source_text.len >= input.source_text.len) : (index += 1) {}
                 if (index >= capacity) continue;
+                const owned_text = try text_alloc.dupe(u8, input.source_text);
+                if (count == capacity) text_alloc.free(largest[count - 1].source_text);
                 var next = @min(count, capacity - 1);
                 while (next > index) : (next -= 1) largest[next] = largest[next - 1];
                 largest[index] = input;
-                largest[index].source_text = try a.dupe(u8, input.source_text);
+                largest[index].source_text = owned_text;
                 count = @min(count + 1, capacity);
             }
         }
         // Host composition retains only normalized receipts and the bounded
         // logical outputs. At most one physical detector batch is resident.
         var host_runtime = self.*;
-        const privacy = @import("privacy/document.zig");
         const evidence_bytes = self.result_limits.forProducer(requests[0].producer_type);
         host_runtime.result_limits.copy_bytes_per_item = try privacy.projectionLimit(0, evidence_bytes);
         const host = try a.dupe(asset_producer.Request, requests);
@@ -830,7 +841,7 @@ pub const Runtime = struct {
         const growth = try std.math.add(usize, projection_growth, retained);
         plan.fixed_bytes = try std.math.add(usize, plan.fixed_bytes, growth);
         plan.allocator_limit_bytes = try std.math.add(usize, plan.allocator_limit_bytes, growth);
-        const cells = try std.math.mul(usize, requests.len, inspector.policy.fields.len);
+        const cells = try std.math.mul(usize, requests.len, policy.fields.len);
         const control = try std.math.add(usize, try std.math.mul(usize, requests[0].config_json.len, invocation_nonmedia_allocator_multiplier), try std.math.mul(usize, cells, 512));
         plan.fixed_bytes = try std.math.add(usize, plan.fixed_bytes, control);
         plan.allocator_limit_bytes = try std.math.add(usize, plan.allocator_limit_bytes, control);
@@ -1929,25 +1940,11 @@ pub const Runtime = struct {
     fn produceOne(self: *Runtime, alloc: Allocator, request: asset_producer.Request) anyerror![]u8 {
         const privacy = @import("privacy/document.zig");
         if (try privacy.isManaged(alloc, request.config_json)) {
-            const Adapter = struct {
-                fn check(ptr: *anyopaque) !void {
-                    const runtime: *Runtime = @ptrCast(@alignCast(ptr));
-                    try runtime.execution.cancellation.check();
-                    _ = try runtime.execution.remainingTimeoutMs(platform.time.monotonicNs(), max_asset_provider_timeout_ms);
-                }
-                fn produce(ptr: *anyopaque, a: Allocator, detector: privacy.contract.Producer, text: []const u8) anyerror![]u8 {
-                    const runtime: *Runtime = @ptrCast(@alignCast(ptr));
-                    const config = try std.json.Stringify.valueAlloc(a, detector.config, .{});
-                    defer a.free(config);
-                    return runtime.producer().produce(a, .{ .producer_type = if (detector.type == .extractor) .extractor else .generator, .config_json = config, .source_text = text, .content_type = "application/json" });
-                }
-            };
-            return privacy.produce(alloc, request.config_json, request.source_text, .{
-                .ptr = self,
-                .produce = Adapter.produce,
-                .check = Adapter.check,
-                .max_normalized_bytes = try privacy.normalizedLimit(request.source_text.len, self.result_limits.forProducer(request.producer_type)),
-            });
+            var batch = try self.producePrivacyBatchReported(alloc, &.{request});
+            defer batch.deinit(alloc);
+            const outputs = try batch.intoOutputs(alloc);
+            defer alloc.free(outputs);
+            return outputs[0];
         }
         return switch (request.producer_type) {
             .copy => try alloc.dupe(u8, request.source_text),
@@ -1966,7 +1963,7 @@ pub const Runtime = struct {
     /// compatibility path; each field and document keeps its own evidence.
     fn producePrivacyBatchReported(self: *Runtime, alloc: Allocator, requests: []const asset_producer.Request) !asset_producer.ProducedBatch {
         const privacy = @import("privacy/document.zig");
-        if (requests.len < 2 or !requestsShareRoute(requests)) {
+        if (!requestsShareRoute(requests)) {
             const outputs = try self.produceBatchSequential(alloc, requests);
             return asset_producer.producedBatchFromOutputs(alloc, requests, outputs, inference_work.ExecutionReport.serial(requests.len));
         }
@@ -9318,4 +9315,38 @@ test "privacy disclosure follows explicit default linked and generated execution
     }
     const native = privacy.Producer{ .config = try std.json.parseFromSliceLeaky(std.json.Value, a, configs[0], .{}) };
     try std.testing.expect(!(ProducerRouting{ .execution = .{ .default_endpoint = " \t" } }).externalPrivacy(native));
+}
+
+test "privacy large policy single and multi document execution fits its advertised memory without inference" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
+    defer client.deinit();
+    var runtime = Runtime.init(a, &client);
+    defer runtime.deinit();
+    const description = try scratch.alloc(u8, 128 * 1024);
+    @memset(description, 'x');
+    const privacy = @import("privacy/document.zig");
+    const resolved = try privacy.resolve(scratch, .{ .mode = .redact_for_search_and_ai, .fields = &.{"absent"}, .category_groups = &.{}, .categories = &.{.{ .name = "email", .description = description }} }, true);
+    const config = try std.json.Stringify.valueAlloc(scratch, resolved.config, .{});
+    const request: asset_producer.Request = .{ .producer_type = .extractor, .config_json = config, .source_text = "{\"ordinal\":1}", .content_type = "application/json" };
+    for ([_]usize{ 1, 2, 10 }) |count| {
+        const requests = try scratch.alloc(asset_producer.Request, count);
+        @memset(requests, request);
+        const plan = try runtime.producer().invocationMemoryForRequests(a, requests);
+        try plan.validate();
+        var budget = inference_work.BoundedInvocationAllocator.init(a, plan.allocator_limit_bytes);
+        var batch = try runtime.producer().produceBatchReported(budget.allocator(), requests);
+        defer batch.deinit(budget.allocator());
+        try batch.validateForRequests(requests);
+        for (batch.items) |item| try std.testing.expect(item.result == .value);
+        if (count == 1) {
+            const output = try runtime.producer().produce(budget.allocator(), request);
+            budget.allocator().free(output);
+        }
+    }
 }

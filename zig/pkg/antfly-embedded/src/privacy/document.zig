@@ -169,13 +169,12 @@ pub const Inspector = struct {
             var arena = std.heap.ArenaAllocator.init(backing.allocator());
             defer arena.deinit();
             const scratch = arena.allocator();
-            const validation = try std.json.Stringify.valueAlloc(scratch, .{ .privacy = marker }, .{});
             const produced = if (text.len == 0) "{\"findings\":[]}" else try invoke.produce(invoke.ptr, scratch, self.producer, text);
-            const output = materialize.output(scratch, text, validation, produced) catch |err| {
+            const output = materialize.outputPrepared(scratch, text, marker, produced) catch |err| {
                 if (isControl(err) or err == error.OutOfMemory or attempt >= self.policy.execution.max_attempts) return err;
                 continue;
             };
-            return a.dupe(u8, output.?);
+            return a.dupe(u8, output);
         }
     }
 

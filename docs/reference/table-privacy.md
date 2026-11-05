@@ -203,3 +203,14 @@ Capacity exhaustion returns HTTP 422 (`privacy_checkpoint_capacity_exceeded`);
 allow cleanup to finish and use fewer or smaller concurrent range scans before
 retrying. Metadata protocol 81 is required for new privacy mutations. Older
 checkpoint headers remain readable and are reclaimed during upgrade.
+
+
+Table backups retain the policy, its execution controls, managed producers and
+protected index configuration. Restore creates a fresh full-table scan and
+coverage census for the destination. Source-table scan history, cursors and
+coverage counts are not imported; follow the restored resource's new `scan_id`.
+Its policy version and ETag remain unchanged. Protected reads still require
+current source receipts and authoritative publication, independently of census
+progress. Private artifacts without destination publication are regenerated, so
+the configured producer may need to run again. Metadata recovery and hot-standby replication retain their own
+resumable job state; this reset applies to table backup restore.

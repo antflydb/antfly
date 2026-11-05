@@ -28,13 +28,21 @@ pub const Publication = struct {
 };
 
 pub fn project(a: A, policy: contract.Policy, generation: u64, source: []const u8, artifact: ?[]const u8, publication: ?Publication) ![]u8 {
-    try policy.validate();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    return projectPrepared(a, try contract.PreparedPolicy.init(arena.allocator(), policy), generation, source, artifact, publication);
+}
+
+/// The prepared binding must be captured from the same immutable policy cut as
+/// the caller's publication/read fences. Artifact JSON cannot supply it.
+pub fn projectPrepared(a: A, prepared: contract.PreparedPolicy, generation: u64, source: []const u8, artifact: ?[]const u8, publication: ?Publication) ![]u8 {
+    const policy = prepared.policy;
     if (policy.mode == .monitor) return a.dupe(u8, source);
     const bytes = artifact orelse return error.PrivacyPending;
     const witness = publication orelse return error.PrivacyPublicationPending;
     if (witness.state == .failed) return error.PrivacyInspectionFailed;
     if (witness.state != .published) return error.PrivacyPublicationPending;
-    const version = try policy.identity(a);
+    const version = prepared.version;
     if (generation == 0 or witness.generation != generation or !std.mem.eql(u8, &version, &witness.policy_version) or
         !std.mem.eql(u8, &contract.fingerprint(bytes), &witness.projection_fingerprint)) return error.PrivacyStale;
     var arena = std.heap.ArenaAllocator.init(a);
@@ -74,7 +82,7 @@ pub fn project(a: A, policy: contract.Policy, generation: u64, source: []const u
         } else return error.InvalidPrivacyReceipt;
         const receipt_value = matching.object.get("receipt") orelse return error.InvalidPrivacyReceipt;
         const receipt = try std.json.parseFromValue(contract.Receipt, scratch, receipt_value, .{});
-        if (!receipt.value.current(version, original_text, try policy.revision())) return error.PrivacyStale;
+        if (!receipt.value.current(version, original_text, prepared.revision)) return error.PrivacyStale;
         const text = matching.object.get("text") orelse return error.InvalidPrivacyReceipt;
         const actual = sanitized.object.get(field) orelse .null;
         if (original_value == .string and (text != .string or actual != .string or !std.mem.eql(u8, text.string, actual.string))) return error.InvalidPrivacyReceipt;
@@ -113,4 +121,36 @@ test "privacy serving rejects stale generations and requires publication indepen
     try std.testing.expectError(error.PrivacyStale, project(a, policy, 1, "{\"body\":\"edited\"}", bytes, publication));
     publication.state = .failed;
     try std.testing.expectError(error.PrivacyInspectionFailed, project(a, policy, 1, source, bytes, publication));
+}
+
+test "privacy prepared serving and status keep row memory independent of policy descriptions" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const description = try scratch.alloc(u8, 128 * 1024);
+    @memset(description, 'x');
+    const policy = contract.Policy{ .mode = .redact_for_search_and_ai, .fields = &.{"absent"}, .category_groups = &.{}, .categories = &.{.{ .name = "email", .description = description }} };
+    const prepared = try contract.PreparedPolicy.init(scratch, policy);
+    const document = @import("document.zig");
+    const resolved = try document.resolve(scratch, policy, true);
+    const config = try std.json.Stringify.valueAlloc(scratch, resolved.config, .{});
+    const Detector = struct {
+        fn call(_: *anyopaque, _: A, _: contract.Producer, _: []const u8) ![]u8 {
+            return error.UnexpectedInference;
+        }
+        fn check(_: *anyopaque) !void {}
+    };
+    var context: u8 = 0;
+    const source = "{\"ordinal\":1}";
+    const artifact = try document.produce(scratch, config, source, .{ .ptr = &context, .produce = Detector.call, .check = Detector.check });
+    const publication = Publication{ .generation = 1, .policy_version = prepared.version, .source_fingerprint = contract.fingerprint(source), .projection_fingerprint = contract.fingerprint(artifact), .state = .published };
+    var budget = @import("antfly_inference_work").BoundedInvocationAllocator.init(a, 32 * 1024);
+    const visible = try projectPrepared(budget.allocator(), prepared, 1, source, artifact, publication);
+    defer budget.allocator().free(visible);
+    try std.testing.expectEqualStrings(source, visible);
+    var observation = try @import("status.zig").inspectPrepared(budget.allocator(), prepared, source, artifact);
+    defer observation.deinit(budget.allocator());
+    try std.testing.expect(observation.current);
+    try std.testing.expectError(error.PrivacyStale, projectPrepared(budget.allocator(), prepared, 1, "{\"ordinal\":2}", artifact, publication));
 }

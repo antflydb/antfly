@@ -15699,12 +15699,14 @@ fn processAsset(
         const existing = try storeGetOptionalAllocWithRetry(runtime, key);
         if (existing) |value| {
             defer runtime.alloc.free(value);
-            try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
-            try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
-            // The artifact exists and matches its skip state: produced
-            // coverage, so an idempotent replay converges the summary.
-            try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
-            return;
+            if (try reusablePrivateAsset(runtime, artifact_name, key, source_text, raw, producer_cfg.config_json, value)) {
+                try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
+                try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
+                // Private outputs also require their destination-owned witness.
+                // A restored skip state cannot certify imported artifact bytes.
+                try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
+                return;
+            }
         }
     }
 
@@ -32937,6 +32939,34 @@ fn shouldSkipAssetArtifact(runtime: *EnrichmentRuntime, artifact_key: []const u8
         return true;
     }
     return false;
+}
+
+/// Native restore retains artifact bodies and producer skip state, but never
+/// imports standalone publication authority. Missing/stale witnesses require
+/// ordinary producer execution and its atomic output/witness commit.
+fn reusablePrivateAsset(runtime: *EnrichmentRuntime, name: []const u8, artifact: []const u8, source: []const u8, primary: []const u8, config_json: []const u8, output: []const u8) !bool {
+    const privacy = @import("../../../privacy/document.zig");
+    const consumer_version = privacy.consumerPolicyVersion(name);
+    if (!privacy.isArtifactName(name) and consumer_version == null) return true;
+    var arena = std.heap.ArenaAllocator.init(runtime.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const version = consumer_version orelse if (privacy.isProtectedArtifactName(name)) name[privacy.protected_artifact_prefix.len..][0..64].* else resolved: {
+        const tree = try std.json.parseFromSliceLeaky(std.json.Value, a, config_json, .{});
+        if (tree != .object) return error.InvalidPrivacyProducer;
+        const policy = try std.json.parseFromValueLeaky(privacy.contract.Policy, a, tree.object.get(privacy.config_key) orelse return error.InvalidPrivacyProducer, .{});
+        break :resolved try policy.identity(a);
+    };
+    var read = try runtime.store.beginProbe();
+    defer read.abort();
+    if (try @import("../../source_authority.zig").maintenanceMode(&read) != .local or try ordered_publication.authority(&read) != null) return false;
+    const current = read.get(artifact) catch |err| if (err == error.NotFound) return false else return err;
+    if (!std.mem.eql(u8, current, output)) return false;
+    @import("../../../privacy/local_publication.zig").require(a, &read, artifact, version, if (consumer_version != null) primary else source, output) catch |err| switch (err) {
+        error.PrivacyPublicationPending, error.PrivacyStale => return false,
+        else => return err,
+    };
+    return true;
 }
 
 fn shouldSkipAssetProducer(runtime: *EnrichmentRuntime, state_key: []const u8, expected_state: []const u8) !bool {

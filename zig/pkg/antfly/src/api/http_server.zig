@@ -13297,14 +13297,21 @@ pub const ApiHttpServer = struct {
         defer if (previous_definition) |definition| metadata_table_manager.freeTable(self.alloc, definition);
         var definition_publication: RestoreDefinitionPublication = undefined;
         var publication_hook: ?backups_api.RestorePublicationHook = null;
+        var replacement_indexes: ?[]u8 = null;
+        defer if (replacement_indexes) |value| self.alloc.free(value);
         if (replace_existing) {
             previous_definition = (try self.loadOwnedTableRecord(self.alloc, table_name)) orelse return error.TableNotFound;
-            if (!try tableDefinitionMatchesManifest(self.alloc, previous_definition.?, &manifest)) {
+            // Keep authenticated source bytes for storage validation. Only the
+            // destination definition loses source-owned operational checkpoints.
+            replacement_indexes = try @import("antfly_local_sources").privacy_catalog.prepareRestore(self.alloc, manifest.indexes_json);
+            var destination_manifest = manifest;
+            destination_manifest.indexes_json = replacement_indexes.?;
+            if (!try tableDefinitionMatchesManifest(self.alloc, previous_definition.?, &destination_manifest)) {
                 var replacement = previous_definition.?;
                 replacement.description = manifest.description;
                 replacement.schema_json = manifest.schema_json;
                 replacement.read_schema_json = "";
-                replacement.indexes_json = manifest.indexes_json;
+                replacement.indexes_json = replacement_indexes.?;
                 replacement.replication_sources_json = manifest.replication_sources_json;
                 replacement.restore_backup_id = "";
                 replacement.restore_location = "";

@@ -1753,3 +1753,123 @@ def test_privacy_execution_override_retries_without_changing_identity(stateful_a
         server.shutdown()
         thread.join(timeout=5)
         server.server_close()
+
+
+@pytest.mark.parametrize("mode", ["monitor", "redact_for_search_and_ai"])
+@pytest.mark.parametrize("backup_format", ["portable", "native"])
+def test_privacy_restore_rebuilds_destination_checkpoints(
+    backup_api, tmp_path, mode, backup_format
+):
+    api = backup_api
+    table = "privacy_restore_" + uuid4().hex[:8]
+    api.create_table(table, num_shards=1)
+    api.batch_write(table, inserts={"doc": {"ordinal": 1}}, sync_level="full_text")
+    path = f"/tables/{table}/privacy"
+    installed = api.put(
+        path,
+        {
+            "mode": mode,
+            "fields": ["absent"],
+            "execution": {"batch_items": 1, "max_attempts": 5},
+        },
+    )
+    assert wait_until(
+        lambda: (
+            api.get(path + "/scans/" + installed["scan_id"])["phase"] == "succeeded"
+        ),
+        timeout_s=60,
+        interval_s=0.2,
+    ), api.debug_logs()[-6000:]
+    # This bound is externalized into the metadata blob store under the source
+    # table's identity. A destination must never try to dereference that blob.
+    bounded = api.post(path + "/scans", {"from_key": "k" * 5000, "limit": 1})
+    assert wait_until(
+        lambda: api.get(path + "/scans/" + bounded["scan_id"])["phase"] == "succeeded",
+        timeout_s=60,
+        interval_s=0.2,
+    ), api.debug_logs()[-6000:]
+    before = api.get(path)
+    location = tmp_path.as_uri()
+    assert (
+        api.backup_table(
+            table,
+            backup_id="privacy",
+            location=location,
+            backup_format=backup_format,
+        )["backup"]
+        == "successful"
+    )
+    api.delete_table(table)
+    api.restore_table(table, backup_id="privacy", location=location)
+    after = api.get(path)
+    for field in (
+        "policy",
+        "policy_version",
+        "resource_version",
+        "generation",
+        "resolved_producer",
+    ):
+        assert after[field] == before[field], field
+    assert after["scan_id"] not in (installed["scan_id"], bounded["scan_id"])
+    assert wait_until(
+        lambda: api.get(path + "/scans/" + after["scan_id"])["phase"] == "succeeded",
+        timeout_s=60,
+        interval_s=0.2,
+    ), (
+        api.get(path + "/scans/" + after["scan_id"]),
+        api.get(path),
+        api.debug_logs()[-6000:],
+    )
+    assert wait_until(
+        lambda: api.get(path)["coverage"].get("current") == 1,
+        timeout_s=60,
+        interval_s=0.2,
+    ), api.get(path)
+    assert api.get(path)["coverage"]["failed"] == 0
+    if mode == "redact_for_search_and_ai":
+        assert api.get(path)["coverage"]["protected_ready"] == 1
+    rows = api.scan_keys(table, {"limit": 10, "include_documents": True})
+    assert len(rows) == 1
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_privacy_large_policy_empty_fields_preview_and_backfill(stateful_api, count):
+    api = stateful_api
+    table = "privacy_large_policy_" + uuid4().hex[:8]
+    api.create_table(table)
+    keys = [f"doc-{i}" for i in range(count)]
+    api.batch_write(
+        table,
+        inserts={key: {"ordinal": i} for i, key in enumerate(keys)},
+        sync_level="full_index",
+    )
+    policy = {
+        "mode": "redact_for_search_and_ai",
+        "fields": ["absent"],
+        "category_groups": [],
+        "categories": [{"name": "email", "description": "x" * (128 * 1024)}],
+        "execution": {"batch_items": 1, "max_attempts": 3},
+    }
+    path = f"/tables/{table}/privacy"
+    preview = api.post(path + "/preview", {"policy": policy, "sample": {"keys": keys}})
+    assert preview["sampled"] == count
+    assert len(preview["documents"]) == count
+    for document in preview["documents"]:
+        field = document["fields"][0]
+        assert field["field"] == "absent" and field["text"] == ""
+        assert field["findings"] == []
+        assert field["receipt"]["state"] == "inspected"
+        assert field["receipt"]["policy_version"] == preview["policy_version"]
+    installed = api.put(path, policy)
+    assert installed["policy_version"] == preview["policy_version"]
+    assert wait_until(
+        lambda: (
+            api.get(path + "/scans/" + installed["scan_id"])["phase"] == "succeeded"
+        ),
+        timeout_s=60,
+        interval_s=0.2,
+    ), api.debug_logs()[-6000:]
+    coverage = api.get(path)["coverage"]
+    assert coverage["current"] == count and coverage["failed"] == 0, coverage
+    assert coverage["protected_ready"] == count, coverage
+    assert len(api.scan_keys(table, {"limit": 10, "include_documents": True})) == count

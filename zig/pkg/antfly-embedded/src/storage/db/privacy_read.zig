@@ -26,7 +26,7 @@ const A = std.mem.Allocator;
 pub const PolicySnapshot = struct {
     producer_json: []const u8,
     artifact_name: []const u8,
-    policy: contract.Policy,
+    prepared: contract.PreparedPolicy,
     native: bool = false,
 };
 
@@ -55,19 +55,20 @@ pub fn capture(db: anytype, a: A) !?PolicySnapshot {
     const config = parsed.value.object.get("config") orelse return error.InvalidPrivacyProducer;
     const value = config.object.get(document.config_key) orelse return null;
     const policy = try std.json.parseFromValue(contract.Policy, a, value, .{});
-    try policy.value.validate();
-    return .{ .producer_json = raw, .artifact_name = if (guard != null) (if (policy.value.mode == .redact_for_search_and_ai) try document.protectedArtifactName(a, try policy.value.identity(a)) else document.artifact_name) else artifact_name, .policy = policy.value, .native = !try db.maintenanceRequiresOrderedApply() };
+    const prepared = try contract.PreparedPolicy.init(a, policy.value);
+    return .{ .producer_json = raw, .artifact_name = if (guard != null) (if (policy.value.mode == .redact_for_search_and_ai) try document.protectedArtifactName(a, prepared.version) else document.artifact_name) else artifact_name, .prepared = prepared, .native = !try db.maintenanceRequiresOrderedApply() };
 }
 
 pub fn requireExpected(a: A, expected: ?[64]u8, actual: ?PolicySnapshot) !void {
+    _ = a;
     const version = expected orelse return;
     if (std.mem.allEqual(u8, &version, 0)) return;
     const current = actual orelse return error.IndexRebuilding;
-    if (current.policy.mode != .redact_for_search_and_ai or !std.mem.eql(u8, &(try current.policy.identity(a)), &version)) return error.IndexRebuilding;
+    if (current.prepared.policy.mode != .redact_for_search_and_ai or !std.mem.eql(u8, &current.prepared.version, &version)) return error.IndexRebuilding;
 }
 
 pub fn project(a: A, snapshot: PolicySnapshot, key: []const u8, source: []const u8, read: anytype) ![]u8 {
-    if (snapshot.policy.mode == .monitor) return a.dupe(u8, source);
+    if (snapshot.prepared.policy.mode == .monitor) return a.dupe(u8, source);
     const original = try std.json.parseFromSlice(std.json.Value, a, source, .{ .parse_numbers = false });
     const canonical = try std.json.Stringify.valueAlloc(a, original.value, .{});
     const artifact_key = try keys.artifactNamedPrefixAlloc(a, key, "asset", snapshot.artifact_name);
@@ -77,9 +78,9 @@ pub fn project(a: A, snapshot: PolicySnapshot, key: []const u8, source: []const 
     try requireArtifactPublication(a, snapshot, canonical, artifact_key, artifact, input.proofKey(artifact_key), input.proofValue(), read);
     // Generation 1 denotes this immutable policy identity. Index-generation
     // readiness belongs to the ranking adapter, never to artifact metadata.
-    return serving.project(a, snapshot.policy, 1, canonical, artifact, .{
+    return serving.projectPrepared(a, snapshot.prepared, 1, canonical, artifact, .{
         .generation = 1,
-        .policy_version = try snapshot.policy.identity(a),
+        .policy_version = snapshot.prepared.version,
         .source_fingerprint = contract.fingerprint(canonical),
         .projection_fingerprint = contract.fingerprint(artifact),
         .state = .published,
@@ -89,7 +90,7 @@ pub fn project(a: A, snapshot: PolicySnapshot, key: []const u8, source: []const 
 pub fn observation(a: A, snapshot: PolicySnapshot, key: []const u8, source: []const u8, read: anytype) !@import("../../privacy/status.zig").Observation {
     const original = try std.json.parseFromSlice(std.json.Value, a, source, .{ .parse_numbers = false });
     if (original.value != .object) return error.InvalidPrivacyDocument;
-    for (snapshot.policy.fields) |field| {
+    for (snapshot.prepared.policy.fields) |field| {
         const value = original.value.object.get(field) orelse .null;
         if (value != .null and value != .string) return .{ .failed = true, .error_code = try a.dupe(u8, "InvalidPrivacyFieldType") };
     }
@@ -102,7 +103,7 @@ pub fn observation(a: A, snapshot: PolicySnapshot, key: []const u8, source: []co
         if (pending(err)) return failureObservation(a, snapshot, key, source, read);
         return err;
     };
-    var observed = try @import("../../privacy/status.zig").inspect(a, snapshot.policy, source, bytes);
+    var observed = try @import("../../privacy/status.zig").inspectPrepared(a, snapshot.prepared, source, bytes);
     if (observed.current) return observed;
     observed.deinit(a);
     return failureObservation(a, snapshot, key, source, read);
@@ -110,7 +111,7 @@ pub fn observation(a: A, snapshot: PolicySnapshot, key: []const u8, source: []co
 
 fn requireArtifactPublication(a: A, snapshot: PolicySnapshot, source: []const u8, artifact: []const u8, output: []const u8, proof_key: []const u8, proof_value: ?[]const u8, read: anytype) !void {
     if (snapshot.native and try @import("../source_authority.zig").maintenanceMode(read) == .local and try @import("artifact_publication.zig").authority(read) == null) {
-        return @import("../../privacy/local_publication.zig").require(a, read, artifact, try snapshot.policy.identity(a), source, output);
+        return @import("../../privacy/local_publication.zig").require(a, read, artifact, snapshot.prepared.version, source, output);
     }
     var accepted = (try @import("artifact_producer_provenance.zig").readCurrentForArtifact(a, read, proof_key, proof_value)) orelse return error.PrivacyPublicationPending;
     defer accepted.deinit();
@@ -134,7 +135,7 @@ fn failureObservation(a: A, snapshot: PolicySnapshot, key: []const u8, source: [
     defer a.free(canonical);
     const failure = marker.value.privacy_failure;
     if (!try @import("../../privacy/retry.zig").current(a, read, state_key.items, failure.sequence)) return .{};
-    if (!std.mem.eql(u8, failure.policy_version, &(try snapshot.policy.identity(a))) or !std.mem.eql(u8, failure.source_fingerprint, &contract.fingerprint(canonical))) return .{};
+    if (!std.mem.eql(u8, failure.policy_version, &(snapshot.prepared.version)) or !std.mem.eql(u8, failure.source_fingerprint, &contract.fingerprint(canonical))) return .{};
     return .{ .failed = true, .error_code = try a.dupe(u8, failure.error_code) };
 }
 
@@ -155,7 +156,7 @@ pub fn projectArtifact(a: A, snapshot: PolicySnapshot, physical: []const u8, rea
         var ref = (try @import("artifact_ids.zig").decodeArtifactRefAlloc(a, physical)) orelse return error.UnsupportedQueryRequest;
         defer ref.deinit(a);
         const root = std.mem.eql(u8, ref.name, snapshot.artifact_name);
-        const version = try snapshot.policy.identity(a);
+        const version = snapshot.prepared.version;
         if (!root and !std.meta.eql(document.consumerPolicyVersion(ref.name), @as(?[64]u8, version))) return error.UnsupportedQueryRequest;
         const primary = try keys.documentKeyAlloc(a, ref.document_id);
         const source = read.get(primary) catch |err| if (err == error.NotFound) return error.PrivacyStale else return err;
@@ -171,7 +172,7 @@ pub fn projectArtifact(a: A, snapshot: PolicySnapshot, physical: []const u8, rea
     var proof = (try @import("artifact_producer_provenance.zig").readCurrentForArtifact(a, read, input.proofKey(physical), input.proofValue())) orelse return error.PrivacyPublicationPending;
     defer proof.deinit();
     const name = proof.proof.producer_artifact_name;
-    const version = try snapshot.policy.identity(a);
+    const version = snapshot.prepared.version;
     const prefix = try std.fmt.allocPrint(a, "_privacy_{s}_", .{version});
     if (std.mem.eql(u8, name, snapshot.artifact_name)) {
         if (proof.proof.sources.len != 1) return error.InvalidPrivacyReceipt;
@@ -199,7 +200,7 @@ pub fn requirePublished(db: anytype, a: A, req: @import("types.zig").SearchReque
     const captured = try capture(db, scratch);
     try requireExpected(scratch, req.privacy_policy_version, captured);
     const policy = captured orelse return false;
-    if (policy.policy.mode == .monitor) return false;
+    if (policy.prepared.policy.mode == .monitor) return false;
     if (req.cancellation) |control| try control.check();
     if (req.execution_deadline_ns) |deadline| if (@import("antfly_platform").time.monotonicNs() >= deadline) return error.DeadlineExceeded;
     const special = @import("query/projection.zig").buildLookupFieldSelectionPlan(.{ .fields = req.fields, .include_all_fields = req.include_all_fields }).special;

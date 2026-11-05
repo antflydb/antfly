@@ -299,6 +299,55 @@ pub fn replaceResource(a: A, indexes_json: []const u8, resource: Resource) ![]u8
     return std.json.Stringify.valueAlloc(a, root, .{});
 }
 
+/// A backup authenticates the policy and producer graph, but scan cursors name
+/// source table/group owners and external metadata blobs. A restored generation
+/// gets fresh operational state; it never borrows those source dependencies.
+/// Keep the scan sequence monotonic so old scan IDs cannot name the new job.
+pub fn prepareRestore(a: A, indexes_json: []const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var root = try std.json.parseFromSlice(std.json.Value, scratch, indexes_json, .{});
+    defer root.deinit();
+    var saved = (try current(scratch, root.value)) orelse return a.dupe(u8, indexes_json);
+    defer saved.deinit();
+    var restored = saved.value;
+    restored.coverage = .{};
+    restored.scans = &.{};
+    restored.checkpoint_encoding = 0;
+    _ = try startScan(scratch, &restored, "", "", 100);
+    return replaceResource(a, indexes_json, restored);
+}
+
+test "privacy restore retains policy and consumers while replacing all source-owned checkpoints" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_]contract.Mode{ .monitor, .redact_for_search_and_ai }) |mode| {
+        var resource = try next(a, null, .{ .mode = mode, .fields = &.{"body"}, .execution = .{ .batch_items = 1, .max_attempts = 5 } }, null);
+        _ = try startScan(a, &resource, "pk1:source-bound", "upper", 1);
+        resource.checkpoint_encoding = 1;
+        resource.coverage.cursor = "pk1:source-census";
+        resource.coverage.snapshot = .{ .counts = .{ .total = 10, .current = 10 }, .started_at_millis = 1, .completed_at_millis = 2 };
+        const raw = try install(a, "{\"full_text_index_v0\":{\"type\":\"full_text\"}}", resource);
+        const restored_raw = try prepareRestore(a, raw);
+        const tree = try std.json.parseFromSlice(std.json.Value, a, restored_raw, .{});
+        const restored = (try current(a, tree.value)).?.value;
+        try std.testing.expectEqual(resource.policy_version, restored.policy_version);
+        try std.testing.expectEqual(resource.resource_version, restored.resource_version);
+        try std.testing.expectEqual(resource.generation, restored.generation);
+        try std.testing.expectEqual(resource.scan_sequence + 1, restored.scan_sequence);
+        try std.testing.expectEqual(@as(usize, 1), restored.scans.len);
+        try std.testing.expectEqual(.queued, restored.scans[0].phase);
+        try std.testing.expectEqualStrings("", restored.scans[0].from_key);
+        try std.testing.expectEqual(@as(u8, 0), restored.checkpoint_encoding);
+        try std.testing.expect(restored.coverage.cursor == null and restored.coverage.snapshot == null);
+        try std.testing.expect(!std.mem.eql(u8, &resource.scan_id, &restored.scan_id));
+        try std.testing.expect(try progressOnly(a, raw, restored_raw));
+        try std.testing.expectEqual(@as(u8, 5), restored.policy.execution.max_attempts);
+    }
+}
+
 /// A progress CAS may change only these runtime fields. Compare the remaining
 /// JSON, including unknown fields, so future policy/index fields fail closed.
 /// Keeping this allowlist here gives every metadata topology the same boundary.

@@ -38,10 +38,16 @@ pub fn output(a: std.mem.Allocator, source: []const u8, producer_json: []const u
     const raw_marker = config.value.object.get("privacy") orelse return null;
     var marker = try std.json.parseFromValue(Marker, a, raw_marker, .{});
     defer marker.deinit();
+    return try outputPrepared(a, source, marker.value, produced);
+}
+
+/// Managed document execution already owns a validated immutable marker. Avoid
+/// serializing and parsing policy descriptions again for every selected field.
+pub fn outputPrepared(a: std.mem.Allocator, source: []const u8, marker: Marker, produced: []const u8) ![]u8 {
     var tree = try std.json.parseFromSlice(std.json.Value, a, produced, .{});
     defer tree.deinit();
     if (tree.value != .object) return error.InvalidPrivacyOutput;
-    const findings = try inspection.normalize(a, marker.value.field, source, tree.value, marker.value.categories);
+    const findings = try inspection.normalize(a, marker.field, source, tree.value, marker.categories);
     defer a.free(findings);
     var window_count: u32 = 1;
     if (tree.value.object.get("long_document")) |document| {
@@ -49,18 +55,18 @@ pub fn output(a: std.mem.Allocator, source: []const u8, producer_json: []const u
         const count = document.object.get("window_count") orelse return error.InvalidPrivacyWindowReceipt;
         if (count != .integer or count.integer <= 0 or count.integer > 65536) return error.InvalidPrivacyWindowReceipt;
         window_count = @intCast(count.integer);
-    } else if (marker.value.require_window_receipt) return error.InvalidPrivacyWindowReceipt;
-    const text = try contract.redact(a, source, findings, marker.value.replacement);
+    } else if (marker.require_window_receipt) return error.InvalidPrivacyWindowReceipt;
+    const text = try contract.redact(a, source, findings, marker.replacement);
     defer a.free(text);
     const receipt = contract.Receipt{
-        .policy_version = marker.value.policy_version,
+        .policy_version = marker.policy_version,
         .source_fingerprint = contract.fingerprint(source),
-        .producer_revision = marker.value.producer_revision,
+        .producer_revision = marker.producer_revision,
         .required_windows = window_count,
         .inspected_windows = window_count,
         .state = .inspected,
     };
-    return try std.json.Stringify.valueAlloc(a, .{ .field = marker.value.field, .text = text, .findings = findings, .receipt = receipt }, .{});
+    return try std.json.Stringify.valueAlloc(a, .{ .field = marker.field, .text = text, .findings = findings, .receipt = receipt }, .{});
 }
 
 test "privacy materialization drops matched values, rebases no coordinates, and does not certify publication" {

@@ -4,7 +4,7 @@ Implements the table-scoped **Privacy** design in
 [issue #1401](https://github.com/antflydb/antfly/issues/1401). The user-facing
 contract and examples are in [Table privacy](../reference/table-privacy.md).
 The branch starts at `f2b3baaee1cb508005451843c17fa07f2e069d4b`.
-Main is merged through `ab58a77e243983386345e86969f5f8ddee8811e7`; privacy uses metadata protocol version 80.
+Main is merged through `616117cc78ba29dcd6c0212abd78ac076201ee3f`; privacy uses metadata protocol version 81.
 
 ## Policy and user experience
 
@@ -412,6 +412,38 @@ Metadata protocol 81 gates new accounting writes. Legacy headers remain
 readable and drain normally; their serialized bytes omit the new false flag so
 historical CAS hashes continue to replay exactly. New accounting counters and
 partial reclamation progress survive snapshots and restart.
+
+## Restore and prepared execution boundaries
+
+Table backup manifests authenticate configuration and the protected producer
+graph. Their privacy scan and coverage checkpoints are source-owner state:
+large bounds and cursors can refer to blobs in the source table's metadata job
+store. Restore preserves policy/resource identity and execution controls, clears
+scan history and coverage, and starts a new full scan with a monotonically
+advanced scan sequence. Cohort staging, direct table creation and legacy
+replacement restore apply this transformation only to the destination definition;
+source artifact/provenance validation continues to use the authenticated source
+manifest. Metadata snapshots and hot-standby recovery remain resumable.
+Native restore retains logical artifact bodies and matching producer skip state,
+but excludes local publication witnesses. Replay therefore checks the witness
+before reusing any private root or descendant asset. A missing or stale witness
+requires normal producer execution and atomic output/witness publication; it
+cannot be reconstructed by trusting an imported artifact's own receipt.
+
+Index artifact-source admission skips enrichment/resolver declarations and the
+shared allowlist of opaque control metadata. Trusted restored catalogs can carry
+that metadata; public table creation still rejects it. A monitor policy does not
+turn an ordinary full-text index into an artifact consumer.
+
+Protected read snapshots now prepare the validated policy version, resolved
+categories and producer revision once. Projection, publication checks, status
+inspection and status encoding reuse that immutable binding. Every document
+still validates its source fingerprint, receipt, artifact and publication in the
+same read cut. Single-document and multi-document execution share the prepared
+privacy implementation, and internal evidence validation consumes a typed marker
+rather than serializing/reparsing full descriptions for every field. Memory
+planning reserves the largest physical field batch even for one document and
+releases evicted planning candidates instead of retaining the whole input history.
 
 ## Validation
 

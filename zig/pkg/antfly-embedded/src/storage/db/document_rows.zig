@@ -166,7 +166,7 @@ pub const Session = struct {
     /// All output belongs to the bounded caller arena.
     pub fn normalizeRows(self: *Session, alloc: std.mem.Allocator, writes: []const types.BatchWrite) ![]types.BatchWrite {
         if (comptime storage_engine.enabled) return @import("antfly_source_root").antfly_sources.storage_engine.call("documentSessionNormalizeRows", .{ self, alloc, writes });
-        if (self.privacy) |policy| if (policy.policy.mode != .monitor) return error.UnsupportedSqlExecution;
+        if (self.privacy) |policy| if (policy.prepared.policy.mode != .monitor) return error.UnsupportedSqlExecution;
         if (writes.len > 4096) return error.InvalidArgument;
         const result = try alloc.alloc(types.BatchWrite, writes.len);
         // Parse/validator scratch is row-local, not retained for the batch.

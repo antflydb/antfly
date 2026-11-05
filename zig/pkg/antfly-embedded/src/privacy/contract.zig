@@ -210,6 +210,20 @@ pub const Policy = struct {
     }
 };
 
+/// Immutable request/owner-snapshot binding. Validation, canonical identity and
+/// resolved labels belong to this cut, never to each document in a scan.
+/// Strings borrow the policy; the caller owns the preparation allocator.
+pub const PreparedPolicy = struct {
+    policy: Policy,
+    version: [64]u8,
+    categories: []const Category,
+    revision: []const u8,
+
+    pub fn init(a: A, policy: Policy) !PreparedPolicy {
+        return .{ .policy = policy, .version = try policy.identity(a), .categories = try policy.labels(a), .revision = try policy.revision() };
+    }
+};
+
 fn appendCategory(a: A, list: *std.ArrayList(Category), category: Category) !void {
     for (list.items) |*existing| if (std.mem.eql(u8, existing.name, category.name)) {
         existing.* = category;
