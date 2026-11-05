@@ -168,6 +168,9 @@ pub const CudaContext = struct {
         return bytes;
     }
 
+    /// Final ownership boundary for the primary context and driver library.
+    /// Owners with post-GPU host cleanup may call releaseResources first, but
+    /// must finish here rather than closing the driver library directly.
     pub fn deinit(self: *CudaContext) void {
         self.releaseResources();
         if (!allocation_ledger.process.retainDriverLibrary(self.device_allocations.owner_id, self.driver.lib))

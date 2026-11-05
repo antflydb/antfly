@@ -104,6 +104,12 @@ wrapper can release its primary context, it transfers its existing CUDA retain
 to quarantine whenever allocations remain. Owner metadata is reserved before
 allocating device memory, so this transfer cannot fail from host allocation
 pressure. Final wrapper cleanup also transfers its driver-library reference.
+`CudaContext.deinit` is the final ownership boundary for both resources. Loaded
+models defer that same finalizer until all `CudaCompute` host cleanup completes;
+the earlier `releaseResources` call does not authorize closing the driver
+directly. The model-free lifecycle suite exercises the actual compute teardown
+with both successful and failed frees, then verifies that reload releases the
+quarantined allocation, primary reference and driver-library owner together.
 
 A retry requires either the still-active retiring owner or a quarantined owner
 with an uninterrupted primary-context retain. A raw context handle alone is

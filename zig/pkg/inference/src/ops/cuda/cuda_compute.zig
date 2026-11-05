@@ -5297,6 +5297,10 @@ pub const CudaCompute = struct {
     }
 
     pub fn deinit(self: *CudaCompute) void {
+        // The context owns final driver disposal, including transfer to failed-
+        // allocation quarantine. Keep its entry points alive through the host
+        // cleanup below, even after releaseResources retires the GPU wrapper.
+        defer self.ctx.deinit();
         if ((self.capability_profile == .lightonocr3 or self.capability_profile == .florence2) and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
             const stats = self.snapshotStats();
             const physical = self.ctx.device_allocations.snapshot();
@@ -5594,7 +5598,6 @@ pub const CudaCompute = struct {
             self.embedding_gemma2_execution.releaseAfterContextDestroyed(self.allocator);
             self.embedding_gemma2_resize.releaseAfterContextDestroyed(&self.ctx);
         }
-        self.ctx.driver.deinit();
     }
 
     pub const AttentionMatchProfile = struct {
