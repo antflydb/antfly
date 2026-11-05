@@ -58,6 +58,13 @@ class TxnStatus(enum.IntEnum):
     ABORTED = 2
 
 
+class OutcomeReceiptStatus(enum.IntEnum):
+    """The resolved outcome of an ANTFLY_OUTCOME_UNKNOWN write receipt."""
+
+    APPLIED = 1
+    NOT_APPLIED = 2
+
+
 class GraphDirection(enum.IntEnum):
     """Graph edge traversal direction, as used by edges()/neighbors()."""
 
@@ -363,14 +370,50 @@ class Database:
                 ctypes.c_uint64(timestamp),
                 ctypes.c_uint8(0),
             )
-            errors.raise_for_code(code)
+            errors.raise_for_outcome_code(code)
         finally:
             self._release()
 
     def batch_json(self, request: JSONInput, *, raw: bool = False) -> Any:
         """Apply a public Antfly batch request (e.g. {"inserts": {...},
-        "deletes": [...]})."""
-        return self._json_call(self._lib.antfly_db_batch_json, request, raw=raw)
+        "deletes": [...]}).
+
+        An OutcomeUnknownError carries the write's `outcome_receipt`."""
+        handle = self._acquire()
+        try:
+            sl, _keep = _ffi.make_slice(encode_json_input(request))
+            out = _ffi.AntflyBuffer()
+            errors.raise_for_outcome_code(
+                self._lib.antfly_db_batch_json(ctypes.c_void_p(handle), sl, ctypes.byref(out))
+            )
+            data = _ffi.take_buffer(out)
+        finally:
+            self._release()
+        return decode_json_response(data, raw)
+
+    def outcome_receipt_status(self, receipt: str) -> OutcomeReceiptStatus:
+        """Resolve an outcome receipt from an OutcomeUnknownError (or a
+        SQLStateError's `outcome_receipt`) on any handle for the same database.
+
+        Raises StalledError while the uncertain commit is not reconciled yet:
+        retry on a Lite database; for a directory database, close the issuing
+        handle and reopen first.
+        """
+        handle = self._acquire()
+        try:
+            sl, _keep = _ffi.make_slice(encode_text(receipt))
+            status = ctypes.c_uint8(0)
+            errors.raise_for_code(
+                self._lib.antfly_db_outcome_receipt_status(ctypes.c_void_p(handle), sl, ctypes.byref(status))
+            )
+            return OutcomeReceiptStatus(status.value)
+        finally:
+            self._release()
+
+    def forget_outcome_receipt(self, receipt: str) -> None:
+        """Remove a resolved receipt's durable marker; afterwards the receipt
+        can no longer be resolved."""
+        self._with_input(self._lib.antfly_db_outcome_receipt_forget, encode_text(receipt))
 
     def lookup(self, key: str, *, raw: bool = False) -> Any:
         data = self._with_input_output(self._lib.antfly_db_lookup_json, encode_text(key))
