@@ -1421,7 +1421,8 @@ complete-window receipt recovers progress even if its coarse metadata mirror
 fails, without publishing the window twice.
 Native text-window sizing measures document collection, projection and segment
 preparation directly. Its bounded publication-cost feedback includes the entire
-remaining window interval, including staging and sync outside writer leases;
+remaining window interval, including staging and sync outside writer leases,
+capture completion and the coarse progress publication on both wait paths;
 lease timing alone omits those fixed costs. Cursor setup, capacity waits, publication and continuation
 sync remain fixed service costs, rather than reasons to shrink cheap preparation
 windows. The call still obeys its wall-clock yield and cancellation checks, and

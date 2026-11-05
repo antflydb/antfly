@@ -373,6 +373,33 @@ const ManualRuntime = struct {
     const CatchUpResult = struct {
         stats: derived_worker.CatchUpStats,
         token: CatchUpSessionToken,
+        lane: usize,
+        kind: types.IndexKind,
+        budget: @import("replay_budget.zig").Budget,
+        started: u64,
+        waited_before: u64,
+        preparation_before: u64,
+        fragmented: bool,
+
+        fn observe(self: @This(), wait: VisibilityWait, published: bool) void {
+            const controller = wait.replay_budget orelse return;
+            const preparation_ns = replayWorkElapsedNs(wait, self.kind, self.started, self.waited_before, self.preparation_before) +|
+                (if (self.fragmented) self.stats.window_collect_ns else 0);
+            if (!published) {
+                controller.observeFailure(self.lane, self.budget, preparation_ns, null);
+                return;
+            }
+            // Include finishing the capture and publishing the coarse progress
+            // mirror. They are fixed publication costs too, even when the
+            // physical index/fragment receipt already committed atomically.
+            const fixed_ns = if (self.fragmented and wait.full_text_preparation_ns != null)
+                (@import("antfly_platform").time.monotonicNs() -| self.started) -| preparation_ns
+            else if (wait.publication_overhead_ns) |counter|
+                counter.load(.monotonic) -| self.waited_before
+            else
+                0;
+            controller.observePreparedWindow(self.lane, self.budget, preparation_ns, fixed_ns, self.stats.collection_budget_exhausted or self.stats.budgetWorkItems(self.fragmented) >= self.budget.records, false);
+        }
     };
 
     fn catchUpWorker(self: *ManualRuntime, worker: *ManualWorker, wait: VisibilityWait) !CatchUpResult {
@@ -450,20 +477,8 @@ const ManualRuntime = struct {
             return err;
         };
         completed = true;
-        if (wait.replay_budget) |controller| {
-            const preparation_ns = replayWorkElapsedNs(wait, worker.kind.kind, started, waited_before, preparation_before) +| (if (fragments != null) stats.window_collect_ns else 0);
-            // Native text profiles measure preparation directly. Amortize all
-            // remaining window cost, including staging outside writer leases.
-            const fixed_ns = if (fragments != null and wait.full_text_preparation_ns != null)
-                (@import("antfly_platform").time.monotonicNs() -| started) -| preparation_ns
-            else if (wait.publication_overhead_ns) |counter|
-                counter.load(.monotonic) -| waited_before
-            else
-                0;
-            controller.observePreparedWindow(lane, budget, preparation_ns, fixed_ns, stats.collection_budget_exhausted or stats.budgetWorkItems(fragments != null) >= budget.records, false);
-        }
         catch_up_open = false;
-        return .{ .stats = stats, .token = token };
+        return .{ .stats = stats, .token = token, .lane = lane, .kind = worker.kind.kind, .budget = budget, .started = started, .waited_before = waited_before, .preparation_before = preparation_before, .fragmented = fragments != null };
     }
 
     fn waitForAll(self: *ManualRuntime, sequence: u64, wait: VisibilityWait) !void {
@@ -478,6 +493,8 @@ const ManualRuntime = struct {
             while (worker.applied_sequence < target) {
                 const before_applied = worker.applied_sequence;
                 const result = try self.catchUpWorker(worker, wait);
+                var published = false;
+                defer result.observe(wait, published);
                 var session_open = true;
                 defer {
                     if (session_open) if (self.finish_catch_up_fn) |finish_catch_up| {
@@ -509,6 +526,7 @@ const ManualRuntime = struct {
                     worker.applied_sequence = caught_up_sequence;
                     if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);
                 }
+                published = true;
                 if (wait.replay_budget != null or (stats.partial_sequence == 0 and worker.applied_sequence == before_applied)) break;
             }
         }
@@ -534,6 +552,8 @@ const ManualRuntime = struct {
             while (worker.applied_sequence < target) {
                 const before_applied = worker.applied_sequence;
                 const result = try self.catchUpWorker(worker, wait);
+                var published = false;
+                defer result.observe(wait, published);
                 var session_open = true;
                 defer {
                     if (session_open) if (self.finish_catch_up_fn) |finish_catch_up| {
@@ -565,6 +585,7 @@ const ManualRuntime = struct {
                     worker.applied_sequence = caught_up_sequence;
                     if (self.applied_sequence_advanced_fn) |callback| callback(self.ctx, worker.name, caught_up_sequence);
                 }
+                published = true;
                 if (wait.replay_budget != null or (stats.partial_sequence == 0 and worker.applied_sequence == before_applied)) break;
             }
         }
@@ -1300,7 +1321,7 @@ test "manual replay canonical windows publish complete records and recover a los
     for (probe.seen) |seen| try std.testing.expectEqual(@as(u8, 1), seen);
 }
 
-test "manual replay feedback amortizes fixed publication work outside writer leases" {
+test "manual replay feedback includes staging and coarse progress on both wait paths" {
     const a = std.testing.allocator;
     const fragment = @import("replay_fragment.zig");
     var backend = @import("../../mem_backend.zig").Backend.init(a, .{});
@@ -1311,6 +1332,7 @@ test "manual replay feedback amortizes fixed publication work outside writer lea
     defer a.free(payload);
     try store.appendReplayOpaque(a, 1, payload);
     const Probe = struct {
+        coarse_cost: bool,
         preparation: std.atomic.Value(u64) = .init(0),
         lease_time: std.atomic.Value(u64) = .init(0),
         saved: ?fragment.Position = null,
@@ -1329,23 +1351,30 @@ test "manual replay feedback amortizes fixed publication work outside writer lea
             _ = self.preparation.fetchAdd(std.time.ns_per_ms, .monotonic);
             // Artifact staging/sync outside a writer lease still costs one
             // fixed interval per publication. Its lease counter stays zero.
-            try std.testing.io.sleep(.fromMilliseconds(60), .awake);
+            if (!self.coarse_cost) try std.testing.io.sleep(.fromMilliseconds(60), .awake);
             var position = proposed;
             position.applied = true;
             self.saved = position;
             return true;
         }
-        fn persist(_: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+        fn persist(ptr: *anyopaque, _: []const u8, _: u64, _: bool) !bool {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.coarse_cost) try std.testing.io.sleep(.fromMilliseconds(60), .awake);
             return true;
         }
         fn truncate(_: *anyopaque, _: u64) !void {}
     };
-    var probe: Probe = .{};
-    var budget: @import("replay_budget.zig").Controller = .{};
-    var executor = try initManual(a, replay_source_mod.Source.fromPrimaryStore(&store, null, null), &probe, Probe.ordinary, Probe.persist, Probe.truncate, null, null, null, null, null);
-    defer executor.deinit(a);
-    try executor.addWorker("text", .{ .name = "text", .kind = .full_text }, 0);
-    try executor.waitForAllWithVisibilityWait(1, .{ .replay_budget = &budget, .full_text_preparation_ns = &probe.preparation, .publication_overhead_ns = &probe.lease_time, .fragments = .{ .ptr = &probe, .supports = Probe.supports, .apply = Probe.publish, .load = Probe.load, .save = Probe.save } });
-    try std.testing.expectEqual(@as(u64, 0), probe.lease_time.load(.monotonic));
-    try std.testing.expect(budget.snapshot().effective_quantum_ns[0] > @import("replay_budget.zig").Controller.quantum_ns);
+    for ([_]bool{ false, true }) |coarse_cost| {
+        for ([_]bool{ false, true }) |selected| {
+            var probe: Probe = .{ .coarse_cost = coarse_cost };
+            var budget: @import("replay_budget.zig").Controller = .{};
+            var executor = try initManual(a, replay_source_mod.Source.fromPrimaryStore(&store, null, null), &probe, Probe.ordinary, Probe.persist, Probe.truncate, null, null, null, null, null);
+            defer executor.deinit(a);
+            try executor.addWorker("text", .{ .name = "text", .kind = .full_text }, 0);
+            const wait: VisibilityWait = .{ .replay_budget = &budget, .full_text_preparation_ns = &probe.preparation, .publication_overhead_ns = &probe.lease_time, .fragments = .{ .ptr = &probe, .supports = Probe.supports, .apply = Probe.publish, .load = Probe.load, .save = Probe.save } };
+            if (selected) try executor.waitForIndexesWithVisibilityWait(1, &.{"text"}, wait) else try executor.waitForAllWithVisibilityWait(1, wait);
+            try std.testing.expectEqual(@as(u64, 0), probe.lease_time.load(.monotonic));
+            try std.testing.expect(budget.snapshot().effective_quantum_ns[0] > @import("replay_budget.zig").Controller.quantum_ns);
+        }
+    }
 }
