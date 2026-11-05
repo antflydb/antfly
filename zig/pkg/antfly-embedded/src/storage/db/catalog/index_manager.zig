@@ -21449,7 +21449,48 @@ pub const IndexManager = struct {
         if (observed.items.len != 0) try mergeObservedTextFieldAnalyzers(self, store, entry, observed.items);
         var checked_checkpoint = checkpoint;
         checked_checkpoint.identity = .{ .generation = entry.config.coverage_generation, .config_hash = types.indexConfigHash(entry.config), .incarnation = self.artifact_projection_root };
-        const infos = try entry.persistent.publishReplay(segments.items, delete_keys, checked_checkpoint);
+        const native_publication = @import("../../native_publication.zig");
+        const artifact_publication = @import("../artifact_publication.zig");
+        var scope: ?native_publication.Scope = if (checkpoint.position.next_item == checkpoint.position.total_items and checkpoint.position.applied)
+            try store.runtime_store.nativePublicationScope(self.alloc)
+        else
+            null;
+        defer if (scope) |*owned| owned.deinit(self.alloc);
+        const Completion = struct {
+            alloc: Allocator,
+            scope: native_publication.Scope,
+            authority: ?artifact_publication.Authority,
+            update: apply_state.AppliedSequenceUpdate,
+            fn stage(raw: *anyopaque, view: native_publication.View) !void {
+                const completion: *@This() = @ptrCast(@alignCast(raw));
+                var txn: native_publication.MetadataTxn = .{ .alloc = completion.alloc, .view = view, .scope = completion.scope };
+                defer txn.deinit();
+                if (!std.meta.eql(completion.authority, try artifact_publication.authority(&txn))) return error.EnrichmentSourceChanged;
+                try apply_state.advanceProjectionMetadataTxn(&txn, &.{completion.update});
+            }
+        };
+        const authority = if (scope != null) blk: {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            break :blk try artifact_publication.authority(&read);
+        } else null;
+        var completion: Completion = .{
+            .alloc = self.alloc,
+            .scope = scope orelse .{ .inode = 0, .prefix = &.{} },
+            .authority = authority,
+            .update = .{ .index_name = name, .sequence = checkpoint.position.sequence, .generation = entry.config.coverage_generation, .config_hash = types.indexConfigHash(entry.config) },
+        };
+        const joined: ?persistent_mod.PersistentIndex.ReplayPublicationMetadata = if (scope != null) .{
+            .participant = .{ .ptr = &completion, .stage = Completion.stage },
+            .seal = if (authority) |selected| if (self.artifact_projection_root != 0) .{
+                .root = self.artifact_projection_root,
+                .namespace = selected.namespace,
+                .generation = entry.config.coverage_generation,
+                .config_hash = types.indexConfigHash(entry.config),
+                .applied_sequence = checkpoint.position.sequence,
+            } else null else null,
+        } else null;
+        const infos = try entry.persistent.publishReplayWithMetadata(segments.items, delete_keys, checked_checkpoint, joined);
         defer entry.persistent.freeDeleteInfos(infos);
         entry.recordCommittedDeletes(infos);
         try self.finalizeTextBatchMutations(entry, .{ .compact_text = false, .defer_text_compaction = true }, .{ .indexed_any = segments.items.len != 0, .deleted_any = infos.len != 0 });

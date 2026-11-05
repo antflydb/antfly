@@ -5933,17 +5933,24 @@ pub const Backend = struct {
     }
 
     pub fn appendWalForMutable(self: *Backend, state: anytype) !void {
-        try self.appendWalWithPreparation(state, null);
+        try self.appendWalWithPreparation(state, null, null);
     }
 
     pub fn prepareAndAppendWalForMutable(self: *Backend, state: *const ActiveMemTable) !ActiveMemTable {
         var prepared: ActiveMemTable = .{};
         errdefer prepared.deinit(self.allocator);
-        try self.appendWalWithPreparation(state, &prepared);
+        try self.appendWalWithPreparation(state, &prepared, null);
         return prepared;
     }
 
-    fn appendWalWithPreparation(self: *Backend, state: anytype, prepared: ?*ActiveMemTable) !void {
+    pub fn prepareAndAppendWalForPublication(self: *Backend, state: *const ActiveMemTable, participant: @import("native_publication.zig").Participant) !ActiveMemTable {
+        var prepared: ActiveMemTable = .{};
+        errdefer prepared.deinit(self.allocator);
+        try self.appendWalWithPreparation(state, &prepared, participant);
+        return prepared;
+    }
+
+    fn appendWalWithPreparation(self: *Backend, state: anytype, prepared: ?*ActiveMemTable, publication: ?@import("native_publication.zig").Participant) !void {
         if (self.manifest_recovery_required) return error.RecoveryRequired;
         const wal_enabled = self.options.wal_enabled and self.root_dir != null and !self.options.backend.read_only and state.entryCount() != 0;
 
@@ -5962,6 +5969,7 @@ pub const Backend = struct {
                 }
             }
         } else std.debug.assert(prepared == null);
+        if (publication != null and (!wal_enabled or self.storage.?.vtable.append_publication == null)) return error.Unsupported;
         if (!wal_enabled) return;
 
         const start_ns = self.writeStatsNowNs();
@@ -5997,7 +6005,7 @@ pub const Backend = struct {
             self.root_dir.?,
             state,
             self.options.wal_sync_on_commit,
-            .{ .segment_bytes = self.options.wal_segment_bytes, .unrepaired_tail = &self.wal_unrepaired_tail, .proven_unwritten = &proven_unwritten },
+            .{ .segment_bytes = self.options.wal_segment_bytes, .unrepaired_tail = &self.wal_unrepaired_tail, .proven_unwritten = &proven_unwritten, .publication = publication },
             self.writeStatsNowNs(),
         );
         self.noteMutableWalSegment(append_result.segment);
@@ -26773,4 +26781,31 @@ test "lsm cold optimization writer reuses mutable probe metadata across short li
     std.debug.print("lite mixed writer: 100 batches, metadata allocations={d}\n", .{metadata.alloc_calls - calls});
     try std.testing.expectEqual(@as(usize, 0), metadata.alloc_calls - calls);
     metadata.limit = std.math.maxInt(usize);
+}
+
+test "lsm namespace publication refuses storage without atomic participation" {
+    const a = std.testing.allocator;
+    var storage = storage_io.MemoryStorage.init(a);
+    defer storage.deinit();
+    var backend = try Backend.open(a, "/publication-capability", .{ .storage = storage.storage(), .flush_threshold = 32 * 1024 * 1024 });
+    defer backend.close();
+    var namespaces = try backend.runtimeNamespaceStore(a);
+    defer namespaces.deinit();
+    var transaction = try namespaces.beginWrite();
+    defer transaction.abort();
+    try transaction.put(.{ .name = "meta" }, "activation", "must not commit alone");
+    const Stage = struct {
+        called: bool = false,
+        fn apply(raw: *anyopaque, _: @import("native_publication.zig").View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.called = true;
+        }
+    };
+    var stage: Stage = .{};
+    try std.testing.expectError(error.Unsupported, transaction.commitWithPublication(.{ .ptr = &stage, .stage = Stage.apply }));
+    try std.testing.expect(!stage.called);
+    var read = try namespaces.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(.{ .name = "meta" }, "activation"));
+    try std.testing.expectEqual(@as(u64, 0), backend.write_stats.wal_append_records);
 }

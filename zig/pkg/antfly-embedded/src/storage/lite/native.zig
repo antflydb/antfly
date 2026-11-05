@@ -12507,6 +12507,20 @@ pub const NativeFile = struct {
             self.durable_header = null;
         }
         const next_slot: u8 = if (self.header.active_checkpoint == 0) 1 else 0;
+        // Revision-11 readers select the highest authenticated sequence. The
+        // selector is only a tie breaker, so a strictly newer checked slot and
+        // its selector can share the publication barrier. Page data was synced
+        // by the caller before entering this window. Retain the old boundary
+        // for legacy encodings and equal/nonmonotonic publications.
+        const previous_active = self.header.checkpoints[self.header.active_checkpoint];
+        const previous_other = self.header.checkpoints[1 - self.header.active_checkpoint];
+        // A tied older history can still depend on its selector: persisting
+        // the new hint before the new slot could expose the other old state.
+        // Initial duplicate slots are safe because their entire states match.
+        const previous_tip_unambiguous = previous_active.commit_sequence > previous_other.commit_sequence or
+            std.meta.eql(previous_active, previous_other);
+        const ordered_slot = self.header.indexed_reclamation and self.header.indexed_revision >= 11 and
+            previous_tip_unambiguous and checkpoint.commit_sequence > @max(previous_active.commit_sequence, previous_other.commit_sequence);
 
         var encoded_slot: [checkpoint_slot_size]u8 = undefined;
         var identities: [logical_generations_size]u8 = undefined;
@@ -12528,7 +12542,7 @@ pub const NativeFile = struct {
             if (self.header.indexed_reclamation)
                 self.file.writePositionalAll(io, &identities, logicalGenerationsOffset(next_slot)) catch |err| break :blk err;
             self.file.writePositionalAll(io, &encoded_slot, checkpointOffset(next_slot)) catch |err| break :blk err;
-            self.syncIfRequired() catch |err| break :blk err;
+            if (!ordered_slot) self.syncIfRequired() catch |err| break :blk err;
             const active_checkpoint: [1]u8 = .{next_slot};
             self.file.writePositionalAll(io, &active_checkpoint, active_checkpoint_offset) catch |err| break :blk err;
             self.syncIfRequired() catch |err| break :blk err;
@@ -14249,6 +14263,155 @@ test "lite native create writes inspectable aflite file" {
     try std.testing.expectEqual(@as(u8, 0), report.active_checkpoint);
     try std.testing.expectEqual(@as(u64, 0), report.commit_sequence);
     try std.testing.expectEqual(@as(u64, 1), report.page_count);
+}
+
+test "lite native ordered checkpoint ties retain the selector durability boundary" {
+    const Probe = struct {
+        var target: ?std.Io.File.Handle = null;
+        var syncs: usize = 0;
+        fn syncFile(userdata: ?*anyopaque, handle: std.Io.File) std.Io.File.SyncError!void {
+            if (target) |fd| if (handle.handle == fd) {
+                syncs += 1;
+            };
+            try std.testing.io.vtable.fileSync(userdata, handle);
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileSync = Probe.syncFile;
+    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    const path = try testPath(a, tmp, "ordered-tied-history.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true });
+    defer file.close();
+    try file.putDocument("acknowledged", "before");
+    const active = file.header.active_checkpoint;
+    const inactive: u8 = 1 - active;
+    // Model a valid older writer's equal-sequence publication. The active
+    // slot has the acknowledged document; the other still has the empty root.
+    file.header.checkpoints[inactive].commit_sequence = file.activeCheckpoint().commit_sequence;
+    var raw: [header_size]u8 = undefined;
+    encodeHeader(&raw, file.header);
+    raw[active_checkpoint_offset] = inactive;
+    const premature_selector = try decodeHeader(&raw);
+    try std.testing.expectEqual(inactive, premature_selector.active_checkpoint);
+    const lost = try file.getDocumentAtCheckpointAlloc(a, premature_selector.checkpoints[inactive], "acknowledged");
+    defer if (lost) |value| a.free(value);
+    try std.testing.expect(lost == null);
+    // A selector reaching storage before a torn new slot could expose that
+    // older root. Unlike the unique-tip case, keep both header sync boundaries.
+    var next = file.activeCheckpoint();
+    next.commit_sequence += 1;
+    Probe.target = file.file.handle;
+    defer Probe.target = null;
+    Probe.syncs = 0;
+    try file.syncIfRequired();
+    try file.publishCheckpoint(next);
+    try std.testing.expectEqual(@as(usize, 3), Probe.syncs);
+}
+
+test "lite native ordered checkpoint keeps data before a combined publication barrier" {
+    const Probe = struct {
+        var target: ?std.Io.File.Handle = null;
+        var syncs: usize = 0;
+        var first_header_syncs: ?usize = null;
+        var selector_syncs: ?usize = null;
+        fn write(userdata: ?*anyopaque, handle: std.Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) std.Io.File.WritePositionalError!usize {
+            if (target) |fd| if (handle.handle == fd) {
+                if (offset < header_size and first_header_syncs == null) first_header_syncs = syncs;
+                if (offset == active_checkpoint_offset) selector_syncs = syncs;
+            };
+            return std.testing.io.vtable.fileWritePositional(userdata, handle, header, data, splat, offset);
+        }
+        fn syncFile(userdata: ?*anyopaque, handle: std.Io.File) std.Io.File.SyncError!void {
+            if (target) |fd| if (handle.handle == fd) {
+                syncs += 1;
+            };
+            try std.testing.io.vtable.fileSync(userdata, handle);
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileWritePositional = Probe.write;
+    vtable.fileSync = Probe.syncFile;
+    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    for ([_]bool{ false, true }) |indexed| {
+        const path = try testPath(a, tmp, if (indexed) "ordered-indexed.aflite" else "ordered-legacy.aflite");
+        defer a.free(path);
+        {
+            var file = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = indexed });
+            defer file.close();
+            Probe.syncs = 0;
+            Probe.first_header_syncs = null;
+            Probe.selector_syncs = null;
+            Probe.target = file.file.handle;
+            defer Probe.target = null;
+            try file.putDocument("acknowledged", "durable");
+            try std.testing.expectEqual(@as(usize, if (indexed) 2 else 3), Probe.syncs);
+            try std.testing.expectEqual(@as(?usize, 1), Probe.first_header_syncs);
+            try std.testing.expectEqual(@as(?usize, if (indexed) 1 else 2), Probe.selector_syncs);
+        }
+        var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+        defer reopened.close();
+        const raw = (try reopened.getDocumentAlloc(a, "acknowledged")).?;
+        defer a.free(raw);
+        try std.testing.expectEqualStrings("durable", raw);
+        try std.testing.expect((try reopened.check()).valid);
+    }
+}
+
+test "lite native ordered checkpoint separates data refusal from uncertain publication" {
+    const Fault = struct {
+        var target: ?std.Io.File.Handle = null;
+        var calls: usize = 0;
+        var fail_call: usize = 0;
+        fn syncFile(userdata: ?*anyopaque, handle: std.Io.File) std.Io.File.SyncError!void {
+            if (target) |fd| if (handle.handle == fd) {
+                calls += 1;
+                if (calls == fail_call) return error.InputOutput;
+            };
+            try std.testing.io.vtable.fileSync(userdata, handle);
+        }
+    };
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var vtable = std.testing.io.vtable.*;
+    vtable.fileSync = Fault.syncFile;
+    const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
+    for ([_]usize{ 1, 2 }) |fail_call| {
+        const path = try testPath(a, tmp, if (fail_call == 1) "ordered-data-failure.aflite" else "ordered-publish-failure.aflite");
+        defer a.free(path);
+        {
+            var file = try NativeFile.createWithIo(a, io, path, .{ .indexed_reclamation = true });
+            defer file.close();
+            try file.putDocument("acknowledged", "before");
+            Fault.calls = 0;
+            Fault.fail_call = fail_call;
+            Fault.target = file.file.handle;
+            defer Fault.target = null;
+            try std.testing.expectError(if (fail_call == 1) error.InputOutput else error.OutcomeUnknown, file.putDocument("pending", "after"));
+            try std.testing.expectEqual(fail_call == 2, file.checkpoint_publication_uncertain);
+        }
+        var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
+        defer reopened.close();
+        const raw = (try reopened.getDocumentAlloc(a, "acknowledged")).?;
+        defer a.free(raw);
+        try std.testing.expectEqualStrings("before", raw);
+        const pending = try reopened.getDocumentAlloc(a, "pending");
+        defer if (pending) |value| a.free(value);
+        if (fail_call == 1) try std.testing.expect(pending == null);
+        // The raw append primitive may retain an unpublished tail after a
+        // data-sync refusal. Recovery must preserve the complete acknowledged
+        // prefix; a possibly published slot must also pass the full-file check.
+        const prefix = try checkpointPrefixSize(reopened.activeCheckpoint(), reopened.header.page_size);
+        try std.testing.expect((try reopened.checkAtFileSizeWithCancel(prefix, null)).valid);
+        if (fail_call == 2) try std.testing.expect((try reopened.check()).valid);
+    }
 }
 
 test "lite native open options propagate no_sync to file writes" {

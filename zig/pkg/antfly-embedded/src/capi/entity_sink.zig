@@ -605,6 +605,7 @@ pub fn runUntilIdle(handle: *h.Handle) !void {
     try tables.loadAvailable(root);
     for (0..1024) |_| {
         const before = replaySequence(root);
+        if (native_file != null) try drainNativeReplayCohort(root);
         try drainDatabase(root, &root.db);
         var iterator = root.embedded_tables.valueIterator();
         while (iterator.next()) |table| try drainDatabase(root, &table.*.db);
@@ -614,6 +615,41 @@ pub fn runUntilIdle(handle: *h.Handle) !void {
         }
     }
     return error.RunUntilIdleDidNotConverge;
+}
+
+fn drainNativeReplayCohort(root: *h.Handle) !void {
+    const connection = root.lite_connection_context orelse return;
+    const Entry = struct { database: *h.db_mod.DB, state: *h.db_mod.DB.GroupSourceMaintenanceState, producer_after: u64 };
+    var entries = std.ArrayListUnmanaged(Entry).empty;
+    defer entries.deinit(root.alloc);
+    const Add = struct {
+        fn append(a: std.mem.Allocator, list: *std.ArrayListUnmanaged(Entry), owner: @TypeOf(connection.owner), database: *h.db_mod.DB) !void {
+            try list.append(a, .{
+                .database = database,
+                .state = try owner.groupSourceState(database),
+                .producer_after = if (database.enrichment_runtime) |runtime| runtime.stats().applied_sequence else 0,
+            });
+        }
+    };
+    try Add.append(root.alloc, &entries, connection.owner, &root.db);
+    var iterator = root.embedded_tables.valueIterator();
+    while (iterator.next()) |table| try Add.append(root.alloc, &entries, connection.owner, &table.*.db);
+    var arena = std.heap.ArenaAllocator.init(root.alloc);
+    defer arena.deinit();
+    while (true) {
+        var pending = false;
+        var retrying = false;
+        for (entries.items) |entry| {
+            _ = arena.reset(.retain_capacity);
+            // Resolver pulls share the same fair round as producer/index work.
+            const projected = try @import("resolver_authority.zig").pullProjection(root, entry.database, arena.allocator());
+            const replay_pending = try entry.database.runExplicitReplayDrainTurn(entry.state, entry.producer_after);
+            pending = pending or projected or replay_pending;
+            if (entry.database.enrichment_runtime) |runtime| retrying = retrying or runtime.stats().retrying;
+        }
+        if (!pending) return;
+        if (retrying) try h.handleLockIo().sleep(.fromMilliseconds(25), .awake);
+    }
 }
 
 fn drainDatabase(root: *h.Handle, database: *h.db_mod.DB) !void {

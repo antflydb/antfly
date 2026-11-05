@@ -466,9 +466,17 @@ fn writePublicationAttempts(backend: anytype) u64 {
 }
 
 fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable) !void {
+    return publishMutableWithWalPublication(backend, allocator, incoming, null);
+}
+
+fn publishMutableWithWalPublication(backend: anytype, allocator: Allocator, incoming: *ActiveMemTable, publication: ?@import("../native_publication.zig").Participant) !void {
     if (incoming.entryCount() == 0) return;
     if (comptime @TypeOf(backend.mutable) == ActiveMemTable) {
-        var candidate = if (@hasDecl(@TypeOf(backend.*), "prepareAndAppendWalForMutable"))
+        var candidate = if (publication) |participant| blk: {
+            if (comptime @hasDecl(@TypeOf(backend.*), "prepareAndAppendWalForPublication")) {
+                break :blk try backend.prepareAndAppendWalForPublication(incoming, participant);
+            } else return error.Unsupported;
+        } else if (@hasDecl(@TypeOf(backend.*), "prepareAndAppendWalForMutable"))
             try backend.prepareAndAppendWalForMutable(incoming)
         else blk: {
             var prepared = try backend.mutable.preparePublication(allocator, incoming);
@@ -482,6 +490,7 @@ fn publishMutableWithWal(backend: anytype, allocator: Allocator, incoming: *Acti
         incoming.deinit(allocator);
         incoming.* = .{ .ordered_enabled = false };
     } else {
+        if (publication != null) return error.Unsupported;
         try backend.appendWalForMutable(incoming);
         if (@hasDecl(@TypeOf(backend.*), "invalidateMutableReadSnapshot")) backend.invalidateMutableReadSnapshot();
         try state_mod.applyMutableMoveToMutable(&backend.mutable, allocator, incoming);
@@ -4802,8 +4811,12 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
         /// write is already durable or visible; public callers classify such
         /// failures as unknown rather than "not applied".
         pub fn commit(self: *@This()) !void {
+            return self.commitWithPublication(null);
+        }
+
+        pub fn commitWithPublication(self: *@This(), publication: ?@import("../native_publication.zig").Participant) !void {
             var maybe_applied = false;
-            self.commitTracked(&maybe_applied) catch |err| {
+            self.commitTracked(&maybe_applied, publication) catch |err| {
                 if (maybe_applied) {
                     if (backend_types.commit_progress) |progress| progress.maybe_applied = true;
                     noteFailedAppliedCommit(self.backend);
@@ -4812,8 +4825,12 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
             };
         }
 
-        fn commitTracked(self: *@This(), maybe_applied: *bool) !void {
+        fn commitTracked(self: *@This(), maybe_applied: *bool, publication: ?@import("../native_publication.zig").Participant) !void {
             if (self.closed) return error.TransactionClosed;
+            if (publication != null) {
+                if (comptime !@hasDecl(BackendType, "prepareAndAppendWalForPublication")) return error.Unsupported;
+                if (self.batch_options.mode == .bulk_ingest or self.bulk_appends.entryCount() != 0 or self.mutable.entryCount() == 0) return error.Unsupported;
+            }
             defer if (self.closed) {
                 self.bulk_index.deinit(self.allocator);
                 self.prefix_index.deinit(self.allocator);
@@ -4860,7 +4877,7 @@ pub fn BoundWriteTxn(comptime BackendType: type) type {
                     try prepareMutableForWrite(self.backend);
                 }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
-                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable);
+                    try publishMutableWithWalPublication(self.backend, self.allocator, &self.mutable, publication);
                 } else if (@hasDecl(BackendType, "appendWalForState")) {
                     var sorted = try self.mutable.toStateMove(self.allocator);
                     defer sorted.deinit(self.allocator);
@@ -9363,8 +9380,12 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
         /// write is already durable or visible; public callers classify such
         /// failures as unknown rather than "not applied".
         pub fn commit(self: *@This()) !void {
+            return self.commitWithPublication(null);
+        }
+
+        pub fn commitWithPublication(self: *@This(), publication: ?@import("../native_publication.zig").Participant) !void {
             var maybe_applied = false;
-            self.commitTracked(&maybe_applied) catch |err| {
+            self.commitTracked(&maybe_applied, publication) catch |err| {
                 if (maybe_applied) {
                     if (backend_types.commit_progress) |progress| progress.maybe_applied = true;
                     noteFailedAppliedCommit(self.backend);
@@ -9373,8 +9394,12 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
             };
         }
 
-        fn commitTracked(self: *@This(), maybe_applied: *bool) !void {
+        fn commitTracked(self: *@This(), maybe_applied: *bool, publication: ?@import("../native_publication.zig").Participant) !void {
             if (self.closed) return error.TransactionClosed;
+            if (publication != null) {
+                if (comptime !@hasDecl(BackendType, "prepareAndAppendWalForPublication")) return error.Unsupported;
+                if (self.batch_options.mode == .bulk_ingest or self.bulk_appends.entryCount() != 0 or self.mutable.entryCount() == 0) return error.Unsupported;
+            }
             defer if (self.closed) {
                 self.bulk_index.deinit(self.allocator);
                 self.prefix_index.deinit(self.allocator);
@@ -9424,7 +9449,7 @@ pub fn NamespaceWriteTxn(comptime BackendType: type) type {
                     try prepareMutableForWrite(self.backend);
                 }
                 if (@hasDecl(BackendType, "appendWalForMutable")) {
-                    try publishMutableWithWal(self.backend, self.allocator, &self.mutable);
+                    try publishMutableWithWalPublication(self.backend, self.allocator, &self.mutable, publication);
                 } else if (@hasDecl(BackendType, "appendWalForState")) {
                     var sorted = try self.mutable.toStateMove(self.allocator);
                     defer sorted.deinit(self.allocator);

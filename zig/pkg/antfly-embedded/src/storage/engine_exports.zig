@@ -158,6 +158,10 @@ fn runUntilIdleWithGroupSourceState(self: *DB, state: *DB.GroupSourceMaintenance
     return .{ .value = self.runUntilIdleWithGroupSourceState(state) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }
 
+fn runExplicitReplayDrainTurn(self: *DB, state: *DB.GroupSourceMaintenanceState, producer_after: u64) engine.Outcome(bool) {
+    return .{ .value = self.runExplicitReplayDrainTurn(state, producer_after) catch |err| return .{ .failure = .init(@errorName(err)) } };
+}
+
 fn runGroupSourceMaintenanceSlice(self: *DB, state: *DB.GroupSourceMaintenanceState) engine.Outcome(bool) {
     return .{ .value = self.runGroupSourceMaintenanceSlice(state) catch |err| return .{ .failure = .init(@errorName(err)) } };
 }

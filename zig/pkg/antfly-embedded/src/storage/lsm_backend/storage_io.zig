@@ -645,6 +645,7 @@ pub const Storage = struct {
         read_file_trailer_alloc: ?*const fn (*anyopaque, Allocator, []const u8, usize) anyerror!FileTrailer = null,
         write_file_absolute: *const fn (*anyopaque, []const u8, []const u8) anyerror!void,
         append_file_absolute: ?*const fn (*anyopaque, []const u8, []const u8, bool) anyerror!void = null,
+        append_publication: ?*const fn (*anyopaque, []const u8, []const u8, bool, @import("../native_publication.zig").Participant) anyerror!void = null,
         begin_atomic_write: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!AtomicWriteSink = null,
         begin_cold_sequential_read: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!ColdSequentialReader = null,
         begin_cold_random_read: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!ColdSequentialReader = null,
@@ -802,6 +803,12 @@ pub const Storage = struct {
 
     pub fn writeFileAbsolute(self: Storage, path: []const u8, contents: []const u8) !void {
         return BoundaryAbi.call("write_file_absolute", self.boundary_dispatch, self.vtable.write_file_absolute, .{ self.ptr, path, contents });
+    }
+
+    /// No fallback: sequential staging plus append is not an atomic publication.
+    pub fn appendPublication(self: Storage, path: []const u8, contents: []const u8, sync: bool, participant: @import("../native_publication.zig").Participant) !void {
+        const operation = self.vtable.append_publication orelse return error.Unsupported;
+        return BoundaryAbi.call("append_publication", self.boundary_dispatch, operation, .{ self.ptr, path, contents, sync, participant });
     }
 
     pub fn appendFileAbsolute(self: Storage, allocator: Allocator, path: []const u8, contents: []const u8, sync: bool) !void {

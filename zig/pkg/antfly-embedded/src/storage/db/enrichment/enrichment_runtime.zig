@@ -2577,6 +2577,13 @@ fn requireEnrichmentHealthyForQueryCapture(runtime: *EnrichmentRuntime) !void {
         if (runtime.graph_stage_recovery_pending) return RuntimeError.EnrichmentRetryInProgress;
 }
 
+fn requireEnrichmentDrainSuccessfulThrough(runtime: *EnrichmentRuntime, after_sequence: u64, through_sequence: u64) !void {
+    const maybe_io = lockRuntime(runtime);
+    const envelope = terminalFailureEnvelopeSnapshot(runtime);
+    unlockRuntime(runtime, maybe_io);
+    if (terminalFailurePendingInRange(runtime, envelope, after_sequence, through_sequence)) return RuntimeError.EnrichmentWorkerFailed;
+}
+
 fn setActiveFailureFingerprint(runtime: *EnrichmentRuntime, fingerprint: u64) void {
     const maybe_io = lockRuntime(runtime);
     defer unlockRuntime(runtime, maybe_io);
@@ -7277,6 +7284,7 @@ const UnsupportedEnrichmentRuntime = struct {
     }
 
     pub const requireHealthyForQueryCapture = requireEnrichmentHealthyForQueryCapture;
+    pub const requireDrainSuccessfulThrough = requireEnrichmentDrainSuccessfulThrough;
 
     pub fn syncWaitTimeoutMs(self: *const @This()) u64 {
         return @max(self.config.sync_wait_timeout_ms, 1);
@@ -7957,6 +7965,7 @@ const PlatformEnrichmentRuntime = struct {
     }
 
     pub const requireHealthyForQueryCapture = requireEnrichmentHealthyForQueryCapture;
+    pub const requireDrainSuccessfulThrough = requireEnrichmentDrainSuccessfulThrough;
 
     pub fn syncWaitTimeoutMs(self: *const EnrichmentRuntime) u64 {
         return @max(self.config.sync_wait_timeout_ms, 1);
@@ -40846,6 +40855,10 @@ test "enrichment terminal failure envelope is preserved by unbounded drains" {
     try std.testing.expectError(error.EnrichmentWorkerFailed, runtime.waitForApplied(10));
     try std.testing.expectError(error.EnrichmentWorkerFailed, runtime.catchUpUntilForDrain(10));
     try runtime.catchUpUntilForDrain(9);
+    runtime.applied_sequence = 20;
+    runtime.target_sequence = 20;
+    try std.testing.expectError(error.EnrichmentWorkerFailed, runtime.requireDrainSuccessfulThrough(0, 20));
+    try runtime.requireDrainSuccessfulThrough(11, 20);
     runtime.terminal_failure_min_sequence = 0;
     runtime.terminal_failure_max_sequence = 0;
     try runtime.catchUpUntilForDrain(10);

@@ -34573,6 +34573,20 @@ pub const DB = struct {
         return self.runUntilIdleWithGroupSourceState(self.borrowed_group_source_state orelse &self.group_source_owner.state);
     }
 
+    pub fn runExplicitReplayDrainTurn(self: *DB, state: *GroupSourceMaintenanceState, producer_after: u64) !bool {
+        if (comptime storage_engine.enabled) return storage_engine.call("runExplicitReplayDrainTurn", .{ self, state, producer_after });
+        const pending = self.runBackgroundTurnWithState(.none, .replay, state) catch |err| switch (err) {
+            error.TextMergeBackpressureTimeout => blk: {
+                _ = try self.runBackgroundTurnWithState(.none, .pressure_artifacts, state);
+                break :blk true;
+            },
+            else => return err,
+        };
+        if (self.enrichment_runtime) |runtime| try runtime.requireDrainSuccessfulThrough(producer_after, runtime.stats().applied_sequence);
+        const retirement_pending = try self.runBackgroundTurnWithState(.none, .retirement, state);
+        return pending or retirement_pending;
+    }
+
     /// A connection's explicit drain borrows the same cursor/lease identity as
     /// its background turns, rather than competing with an owner it has paused.
     pub fn runUntilIdleWithGroupSourceState(self: *DB, state: *GroupSourceMaintenanceState) !void {
@@ -34580,6 +34594,15 @@ pub const DB = struct {
         const started_ns = platform_time.monotonicNs();
         const before = self.enrichmentThroughputSnapshot();
         defer self.logRunUntilIdleSummary(started_ns, before);
+        if (self.core.store.runtime_store.capabilities().bounded_replay_admission) {
+            const producer_after = if (self.enrichment_runtime) |runtime| runtime.stats().applied_sequence else 0;
+            while (try self.runExplicitReplayDrainTurn(state, producer_after)) {
+                if (self.enrichment_runtime) |runtime| if (runtime.stats().retrying) {
+                    const io = self.backend_runtime.io() orelse return error.MissingBackendRuntimeIo;
+                    try io.sleep(.fromMilliseconds(25), .awake);
+                };
+            }
+        }
         self.runUntilIdleWithReplayDrainOptions(.{
             .wait_for_enrichment_retries = true,
             .unbounded_enrichment_wait = true,
@@ -34683,8 +34706,18 @@ pub const DB = struct {
     pub fn runBackgroundTurnWithCancellation(self: *DB, cancellation: types.CancellationToken, phase: types.BackgroundMaintenancePhase) !bool {
         if (comptime storage_engine.enabled) return storage_engine.call("runBackgroundTurnWithCancellation", .{ self, cancellation, phase });
         try ensureSnapshotActive(cancellation);
-        const state = self.borrowed_group_source_state orelse &self.group_source_owner.state;
+        return self.runBackgroundTurnWithState(cancellation, phase, self.borrowed_group_source_state orelse &self.group_source_owner.state);
+    }
+
+    fn runBackgroundTurnWithState(self: *DB, cancellation: types.CancellationToken, phase: types.BackgroundMaintenancePhase, state: *GroupSourceMaintenanceState) !bool {
         const split_retirement = phase == .replay or phase == .retirement;
+        if (split_retirement) {
+            while (!state.replay_service_mutex.tryLock()) {
+                try ensureSnapshotActive(cancellation);
+                platform_time.yieldNow();
+            }
+        }
+        defer if (split_retirement) state.replay_service_mutex.unlock();
         const old_retirement = self.core.store.deferred_replay_retirement;
         const old_bounded = self.core.store.bounded_replay_retirement;
         defer if (split_retirement) {
@@ -34746,6 +34779,7 @@ pub const DB = struct {
             .bounded_replay = true,
             .source_work_only = phase == .replay,
             .max_windows_per_index = 1,
+            .group_source_state = state,
         };
         if (phase == .replay) try self.runReplayServiceWithOptions(replay_options) else try self.runUntilIdleWithReplayDrainOptions(replay_options);
         // Commit the complete-record watermarks before releasing the captured
@@ -37665,6 +37699,26 @@ pub const DB = struct {
         index_manager: *index_manager_mod.IndexManager,
         updates: []const apply_state.AppliedSequenceUpdate,
     ) !void {
+        var pending_updates = std.ArrayListUnmanaged(apply_state.AppliedSequenceUpdate).empty;
+        defer pending_updates.deinit(alloc);
+        {
+            var read = try store.beginReadTxn();
+            defer read.abort();
+            for (updates) |update| {
+                const cfg = index_manager.get(update.index_name);
+                if (cfg != null and cfg.?.kind == .full_text) if (try apply_state.loadProjectionMetadataTxn(&read, update.index_name)) |current| {
+                    const expected_generation = if (update.generation != 0) update.generation else cfg.?.coverage_generation;
+                    if (current.generation == expected_generation and current.status == update.status and current.applied_sequence >= update.sequence and
+                        (update.generation == 0 or current.generation == update.generation) and
+                        (update.config_hash == 0 or current.config_hash == update.config_hash) and
+                        (update.published_count == null or (current.applied_sequence == update.sequence and std.meta.eql(current.published_count, update.published_count)))) continue;
+                };
+                try pending_updates.append(alloc, update);
+            }
+        }
+        // Status is advisory and maintained by the separately scheduled status
+        // service. An already atomic replay completion needs no durable rewrite.
+        if (pending_updates.items.len == 0) return;
         const Status = struct { key: []u8, value: [index_status_encoded_len]u8 };
         var statuses = std.ArrayListUnmanaged(Status).empty;
         defer {
@@ -37673,7 +37727,7 @@ pub const DB = struct {
         }
         // Capture immutable index state before opening the primary writer;
         // never acquire index snapshot locks underneath its transaction lock.
-        for (updates) |update| {
+        for (pending_updates.items) |update| {
             const status_snapshot = collectLiveIndexStatusSnapshot(index_manager, update.index_name) orelse continue;
             const key = try indexStatusKeyAlloc(alloc, update.index_name);
             errdefer alloc.free(key);
@@ -37683,7 +37737,7 @@ pub const DB = struct {
         }
         var txn = try store.beginWriteTxn();
         errdefer txn.abort();
-        try apply_state.advanceProjectionMetadataTxn(&txn, updates);
+        try apply_state.advanceProjectionMetadataTxn(&txn, pending_updates.items);
         for (statuses.items) |status| try txn.put(status.key, &status.value);
         try txn.commit();
     }
@@ -147496,15 +147550,32 @@ test "native projection progress and status share a failure atomic publication" 
     const raw = try db.core.store.get(a, key);
     defer a.free(raw);
     _ = try DB.decodeIndexStatusSnapshot(raw);
+    const after_publication = file.activeCheckpoint().commit_sequence;
+    file.test_page_write_fail_after = 0;
+    const repeated = DB.saveNativeAppliedSequencesWithStatus(a, db.core.store, db.core.index_manager, &updates);
+    file.test_page_write_fail_after = null;
+    try repeated;
+    try std.testing.expectEqual(after_publication, file.activeCheckpoint().commit_sequence);
     try std.testing.expect((try backend.check()).valid);
 }
 
 test "background enrichment turn explicit native drain services consumers before its progress reserve fills" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const QueuedOutput = struct {
+        database: *DB,
+        file: *@import("../lite/native.zig").NativeFile,
+        calls: usize = 0,
+        previous_after_bytes: u64 = 0,
+        reclaimed_between_outputs: bool = false,
         fn commit(ptr: *anyopaque, batch: enrichment_runtime_mod.GeneratedRecordBatch, promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion, deletes: []const []const u8, guards: []const enrichment_runtime_mod.GeneratedSourceGuard, fence: ?enrichment_runtime_mod.GeneratedWriteFence) anyerror!enrichment_runtime_mod.GeneratedRecordCommit {
-            const database: *DB = @ptrCast(@alignCast(ptr));
-            return database.enqueuePreparedGeneratedBatch(batch, promotions, deletes, guards, fence);
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const before = (try self.file.replayAdmission()).?;
+            if (self.calls != 0 and before.bytes < self.previous_after_bytes) self.reclaimed_between_outputs = true;
+            const result = try self.database.enqueuePreparedGeneratedBatch(batch, promotions, deletes, guards, fence);
+            const after = (try self.file.replayAdmission()).?;
+            self.calls += 1;
+            self.previous_after_bytes = after.bytes;
+            return result;
         }
     };
     const a = std.testing.allocator;
@@ -147532,10 +147603,17 @@ test "background enrichment turn explicit native drain services consumers before
     try backend.configureDbOpenOptions(&options);
     var db = try DB.open(a, path, options);
     defer db.close();
-    try db.addEnrichment(.{ .name = "copy", .kind = .asset, .field = "text", .producer_json = "{\"type\":\"copy\"}" });
+    var producer: GateAssetProducer = .{};
+    producer.allowAll();
+    try db.addEnrichment(.{ .name = "generated_asset_with_a_long_identifier_for_reproducing_bounded_native_replay_credit_starvation_during_explicit_drain", .kind = .asset, .field = "text", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}" });
+    var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
+    try db.initOptionalEnrichmentRuntime(&config);
     try db.addIndex(.{ .name = "raw", .kind = .full_text, .config_json = "{}" });
-    try db.addIndex(.{ .name = "generated", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"copy\"}]}" });
-    db.enrichment_runtime.?.write_ctx = &db;
+    try db.addIndex(.{ .name = "generated", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"generated_asset_with_a_long_identifier_for_reproducing_bounded_native_replay_credit_starvation_during_explicit_drain\"}]}" });
+    try std.testing.expect(!try db.core.indexRequiresEnrichmentReplay("raw"));
+    try std.testing.expect(try db.core.indexRequiresEnrichmentReplay("generated"));
+    var output: QueuedOutput = .{ .database = &db, .file = &backend.native_docstore.?.file };
+    db.enrichment_runtime.?.write_ctx = &output;
     db.enrichment_runtime.?.write_fn = QueuedOutput.commit;
     const padding: [2304]u8 = @splat('a');
     const value = try std.fmt.allocPrint(a, "{{\"text\":\"cooperative canary {s}\"}}", .{padding});
@@ -147545,6 +147623,8 @@ test "background enrichment turn explicit native drain services consumers before
         const name = try std.fmt.bufPrint(&key, "source-{d}", .{i});
         try db.batch(.{ .writes = &.{.{ .key = name, .value = value }}, .sync_level = .write });
     }
+    try std.testing.expectEqual(@as(usize, 0), producer.successful_requests.load(.acquire));
+    try std.testing.expect(db.enrichment_runtime.?.stats().applied_sequence < db.core.nextDerivedSequence());
     const file = &backend.native_docstore.?.file;
     var debt = (try file.replayAdmission()).?;
     try std.testing.expect(debt.bytes != 0);
@@ -147557,6 +147637,9 @@ test "background enrichment turn explicit native drain services consumers before
     file.replay_consumer_admission = true;
     defer file.replay_consumer_admission = false;
     try db.runUntilIdle();
+    try std.testing.expectEqual(@as(usize, 32), producer.successful_requests.load(.acquire));
+    try std.testing.expect(output.calls >= 4);
+    try std.testing.expect(output.reclaimed_between_outputs);
     const target = db.core.nextDerivedSequence();
     try std.testing.expect(db.enrichment_runtime.?.stats().applied_sequence >= target);
     try std.testing.expectEqual(@as(u32, 32), db.core.index_manager.textIndex("raw").?.snapshot().liveDocCount());

@@ -3365,6 +3365,12 @@ const RuntimeStore = struct {
     store: *Store,
     prefix: []const u8 = "",
 
+    pub fn nativePublicationScope(self: *RuntimeStore, alloc: Allocator) !?@import("../native_publication.zig").Scope {
+        if (self.store.read_only) return error.ReadOnly;
+        const inode = (try self.store.file.file.stat(self.store.file.runtime())).inode;
+        return .{ .inode = inode, .file_namespace = self.store.file.header.reader_epoch_namespace, .prefix = try alloc.dupe(u8, self.prefix) };
+    }
+
     pub fn capabilities(self: *RuntimeStore) backend_types.Capabilities {
         return Store.capabilities(self.store);
     }
@@ -6780,7 +6786,7 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
     var vtable = std.Options.debug_io.vtable.*;
     vtable.fileSync = Fault.sync;
     const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
-    for (1..4) |barrier| {
+    for (1..3) |barrier| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(alloc, tmp, "group-sync-failure.aflite");

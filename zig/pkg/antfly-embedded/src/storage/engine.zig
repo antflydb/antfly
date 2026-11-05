@@ -509,6 +509,7 @@ pub const VTable = struct {
     deleteIndex: *const fn (*DB, []const u8) Outcome(bool),
     runUntilIdle: *const fn (*DB) Outcome(void),
     runUntilIdleWithGroupSourceState: *const fn (*DB, *DB.GroupSourceMaintenanceState) Outcome(void),
+    runExplicitReplayDrainTurn: *const fn (*DB, *DB.GroupSourceMaintenanceState, u64) Outcome(bool),
     runUntilIdleWithoutWaitingForEnrichmentRetriesWithCancellation: *const fn (*DB, types.CancellationToken) Outcome(void),
     finishBackgroundGraphReplacement: *const fn (*DB, []const u8, u64) Outcome(bool),
     runGroupSourceMaintenanceSlice: *const fn (*DB, *DB.GroupSourceMaintenanceState) Outcome(bool),

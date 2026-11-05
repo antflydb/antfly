@@ -37,6 +37,9 @@ pub const State = struct {
         .max_records = 128,
         .max_bytes = 4 * 1024 * 1024,
     },
+    /// Serializes replay/retirement scopes borrowing the DocStore's deferred
+    /// retirement pointer. Group command discovery retains its separate lock.
+    replay_service_mutex: std.atomic.Mutex = .unlocked,
     slice_mutex: std.atomic.Mutex = .unlocked,
     allocator: ?std.mem.Allocator = null,
     worker: ?work.Worker = null,

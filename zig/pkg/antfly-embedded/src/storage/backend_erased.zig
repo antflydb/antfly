@@ -82,6 +82,10 @@ fn ParentBox(comptime T: type) type {
         }
 
         fn commit(self: *@This()) !void {
+            return self.commitWithPublication(null);
+        }
+
+        fn commitWithPublication(self: *@This(), publication: ?@import("native_publication.zig").Participant) !void {
             platform.sync.lockYielding(&self.mutex);
             if (self.owner_closed or self.finalizing) {
                 self.mutex.unlock();
@@ -94,7 +98,11 @@ fn ParentBox(comptime T: type) type {
             self.finalizing = true;
             self.mutex.unlock();
 
-            self.handle.commit() catch |err| {
+            const result = if (publication) |participant| blk: {
+                if (comptime @hasDecl(T, "commitWithPublication")) break :blk self.handle.commitWithPublication(participant);
+                break :blk @as(anyerror!void, error.Unsupported);
+            } else self.handle.commit();
+            result catch |err| {
                 platform.sync.lockYielding(&self.mutex);
                 self.finalizing = false;
                 self.mutex.unlock();
@@ -902,6 +910,7 @@ pub const NamespaceWriteTxn = struct {
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         commit: *const fn (Allocator, *anyopaque) anyerror!void,
+        commit_publication: ?*const fn (Allocator, *anyopaque, @import("native_publication.zig").Participant) anyerror!void = null,
         get: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, backend_types.Namespace, []const []const u8, []?[]const u8) anyerror!void = null,
         put: *const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void,
@@ -918,6 +927,12 @@ pub const NamespaceWriteTxn = struct {
 
     pub fn commit(self: *NamespaceWriteTxn) !void {
         try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
+        self.* = undefined;
+    }
+
+    pub fn commitWithPublication(self: *NamespaceWriteTxn, participant: @import("native_publication.zig").Participant) !void {
+        const operation = self.vtable.commit_publication orelse return error.Unsupported;
+        try BoundaryAbi.call("commit_publication", self.boundary_dispatch, operation, .{ self.allocator, self.ptr, participant });
         self.* = undefined;
     }
 
@@ -1187,6 +1202,11 @@ pub const Store = struct {
     write_gate: ?*std.atomic.Mutex = null,
     write_serialization: WriteSerialization = .unsupported,
 
+    pub fn nativePublicationScope(self: *Store, alloc: Allocator) !?@import("native_publication.zig").Scope {
+        const operation = self.vtable.native_publication_scope orelse return null;
+        return BoundaryAbi.call("native_publication_scope", self.boundary_dispatch, operation, .{ self.ptr, alloc });
+    }
+
     pub fn writeSerialization(self: *const Store) WriteSerialization {
         return if (self.write_gate != null) .intrinsic else self.write_serialization;
     }
@@ -1231,6 +1251,7 @@ pub const Store = struct {
     pub const VTable = struct {
         deinit: *const fn (Allocator, *anyopaque) void,
         capabilities: *const fn (*anyopaque) backend_types.Capabilities,
+        native_publication_scope: ?*const fn (*anyopaque, Allocator) anyerror!?@import("native_publication.zig").Scope = null,
         begin_read: *const fn (Allocator, *anyopaque) anyerror!ReadTxn,
         begin_probe: ?*const fn (Allocator, *anyopaque) anyerror!ProbeTxn = null,
         begin_current_scan: ?*const fn (Allocator, *anyopaque) anyerror!CurrentScanTxn = null,
@@ -2006,6 +2027,10 @@ pub fn namespaceWriteTxnFrom(
             try unbox(ptr).commit();
         }
 
+        fn commitPublication(_: Allocator, ptr: *anyopaque, participant: @import("native_publication.zig").Participant) anyerror!void {
+            try unbox(ptr).commitWithPublication(participant);
+        }
+
         fn get(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8) anyerror![]const u8 {
             return try unbox(ptr).handle.get(try mapNamespace(namespace), key);
         }
@@ -2042,6 +2067,7 @@ pub fn namespaceWriteTxnFrom(
         .vtable = &.{
             .abort = vt.abort,
             .commit = vt.commit,
+            .commit_publication = if (@hasDecl(Handle, "commitWithPublication")) vt.commitPublication else null,
             .get = vt.get,
             .get_many_sorted = if (@hasDecl(Handle, "getManySorted")) vt.getManySorted else null,
             .put = vt.put,
@@ -2234,6 +2260,10 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
             const state = unbox(ptr);
             const box_allocator = state.allocator;
             box_allocator.destroy(state);
+        }
+
+        fn nativePublicationScope(ptr: *anyopaque, alloc: Allocator) anyerror!?@import("native_publication.zig").Scope {
+            return try unbox(ptr).handle.nativePublicationScope(alloc);
         }
 
         fn capabilities(ptr: *anyopaque) backend_types.Capabilities {
@@ -2481,6 +2511,7 @@ pub fn storeFrom(allocator: Allocator, handle: anytype) !Store {
         .vtable = &.{
             .deinit = vt.deinit,
             .capabilities = vt.capabilities,
+            .native_publication_scope = if (Handle == Store or @hasDecl(Handle, "nativePublicationScope")) vt.nativePublicationScope else null,
             .begin_read = vt.beginRead,
             .begin_read_with_block_cache_admission = if (Handle == Store or @hasDecl(Handle, "beginReadWithBlockCacheAdmission")) vt.beginReadWithBlockCacheAdmission else null,
             .begin_probe = if (Handle == Store or @hasDecl(Handle, "beginProbe")) vt.beginProbe else null,

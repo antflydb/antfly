@@ -625,12 +625,17 @@ pub const Construction = struct {
         try owner.submitIndexMutation(&request, Request.apply, true);
     }
 
+    /// Caller retains final writer admission while inspecting the lease catalog.
     /// Prepare the immutable reader before linking, then transfer this
     /// construction's durable value lease into that reader. A second lease
     /// publication would protect the very same root and require another commit.
     /// No fallible operation follows link success, so cleanup never removes a
     /// path whose creation failed or whose publication outcome is uncertain.
     pub fn linkSource(self: *Construction, owner: *docs.Store, path: []const u8) !Source {
+        return self.prepareSource(owner, path, true);
+    }
+
+    pub fn prepareSource(self: *Construction, owner: *docs.Store, path: []const u8, link_now: bool) !Source {
         const registry = self.registry orelse return error.InvalidArtifactConstructionState;
         if (!self.sealed) return error.InvalidArtifactConstructionState;
         const captured_owner = registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
@@ -669,7 +674,7 @@ pub const Construction = struct {
         };
         try initializeSourceCache(registry, state, captured_inode);
         errdefer state.cache.?.deinit();
-        try self.link(owner, path);
+        if (link_now) try self.link(owner, path);
         self.registry = null;
         self.release_ticket = null;
         return registry.registerSource(state, owner, captured_inode, true);

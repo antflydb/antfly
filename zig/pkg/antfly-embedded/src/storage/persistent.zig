@@ -1334,6 +1334,16 @@ pub const PersistentIndex = struct {
         delete_keys: []const []const u8,
         checkpoint: ReplayFragment.Checkpoint,
     ) ![]index_mod.IndexWriter.DeleteInfo {
+        return self.publishReplayWithMetadata(segments, delete_keys, checkpoint, null);
+    }
+
+    pub const ReplayPublicationMetadata = struct {
+        participant: @import("native_publication.zig").Participant,
+        seal: ?projection_seal.Seal = null,
+    };
+
+    pub fn publishReplayWithMetadata(self: *PersistentIndex, segments: []PreparedReplaySegment, delete_keys: []const []const u8, checkpoint: ReplayFragment.Checkpoint, metadata: ?ReplayPublicationMetadata) ![]index_mod.IndexWriter.DeleteInfo {
+        if (metadata != null and (!checkpoint.position.applied or checkpoint.position.next_item != checkpoint.position.total_items)) return error.InvalidDerivedApplyState;
         self.lockStorage();
         defer self.unlockStorage();
         if (!self.main_store_owner.externallyPublishedWal()) return error.Unsupported;
@@ -1379,12 +1389,9 @@ pub const PersistentIndex = struct {
         var published = false;
         var uncertain = false;
         defer if (!published) {
-            for (replacements[0..initialized], 0..) |*replacement, i| {
-                replacement.data.deinit(self.alloc);
-                // A possibly committed WAL can refer to these paths. Only a
-                // fresh owner may reconcile it; never remove its immutable data.
-                if (i >= infos.len and !uncertain) self.deleteSegmentFile(replacement.id);
-            }
+            // The native host rolls back uncommitted aliases atomically.
+            // A possibly committed alias remains for fresh-owner reconciliation.
+            for (replacements[0..initialized]) |*replacement| replacement.data.deinit(self.alloc);
         };
         const captured = self.writer.acquireSnapshot();
         defer captured.release();
@@ -1411,7 +1418,7 @@ pub const PersistentIndex = struct {
                 const id = self.reserveSegmentId();
                 const path = try files.pathAlloc(id);
                 defer self.alloc.free(path);
-                const source = segment.artifact.link(path) catch |err| {
+                const source = segment.artifact.prepareLink(path) catch |err| {
                     // No ownership was transferred on failure. In particular,
                     // deleting this ID would delete the colliding artifact.
                     if (err != error.PathAlreadyExists) return err;
@@ -1452,7 +1459,39 @@ pub const PersistentIndex = struct {
         if (publication) |*prepared| try self.savePreparedSegmentAdmissions(&txn, prepared);
         const encoded = ReplayFragment.encode(checkpoint);
         try txn.put(.meta, meta_replay_fragment, &encoded);
-        try self.commitPreparedPublication(&txn, &uncertain);
+        if (metadata) |joined| if (joined.seal) |seal| {
+            var next = seal;
+            const previous = txn.get(.meta, projection_seal.metadata_key) catch |err| if (err == error.NotFound) null else return err;
+            if (previous) |raw| {
+                const old = try projection_seal.Seal.decode(raw);
+                if (!old.sameIdentity(seal)) return error.ProjectionSealIdentityChanged;
+                if (next.baseline == null) next.baseline = old.baseline;
+                next.applied_sequence = @max(next.applied_sequence, old.applied_sequence);
+            }
+            try txn.put(.meta, projection_seal.metadata_key, &try next.encode());
+        };
+        const Participation = struct {
+            segments: []PreparedReplaySegment,
+            metadata: ?ReplayPublicationMetadata,
+            snapshot_publication: ?*index_mod.IndexWriter.PreparedSegmentReplacement,
+            fn stage(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                for (self_.segments) |segment| try segment.artifact.stageLink(view);
+                if (self_.metadata) |joined| {
+                    // Arm only at the actual native boundary, after LSM
+                    // pressure relief and all fallible memtable preparation.
+                    // New progress cannot authorize a newly captured old view.
+                    if (self_.snapshot_publication) |prepared| prepared.guardExternalVisibility();
+                    try joined.participant.apply(view);
+                }
+            }
+        };
+        var participation: Participation = .{
+            .segments = segments,
+            .metadata = metadata,
+            .snapshot_publication = if (publication) |*prepared| prepared else null,
+        };
+        try self.commitPreparedPublicationWithParticipant(&txn, &uncertain, .{ .ptr = &participation, .stage = Participation.stage });
         if (publication) |*prepared| prepared.publish();
         published = true;
         return infos;
@@ -1476,11 +1515,15 @@ pub const PersistentIndex = struct {
     /// A failed durable boundary can still contain this activation. Preserve
     /// its immutable inputs and propagate uncertainty to every serving wrapper.
     fn commitPreparedPublication(self: *PersistentIndex, txn: *MainTxn, uncertain: *bool) !void {
+        return self.commitPreparedPublicationWithParticipant(txn, uncertain, null);
+    }
+
+    fn commitPreparedPublicationWithParticipant(self: *PersistentIndex, txn: *MainTxn, uncertain: *bool, participant: ?@import("native_publication.zig").Participant) !void {
         var progress: backend_types.CommitProgress = .{};
         const parent_progress = backend_types.commit_progress;
         backend_types.commit_progress = &progress;
         defer backend_types.commit_progress = parent_progress;
-        txn.commit() catch |err| {
+        txn.commitWithPublication(participant) catch |err| {
             uncertain.* = progress.maybe_applied;
             if (uncertain.*) {
                 if (parent_progress) |parent| parent.maybe_applied = true;
@@ -1530,8 +1573,12 @@ pub const PersistentIndex = struct {
         }
 
         pub fn commit(self: *MainTxn) !void {
+            return self.commitWithPublication(null);
+        }
+
+        pub fn commitWithPublication(self: *MainTxn, participant: ?@import("native_publication.zig").Participant) !void {
             if (self.write) |*txn| {
-                try txn.commit();
+                if (participant) |value| try txn.commitWithPublication(value) else try txn.commit();
                 self.write = null;
                 return;
             }
@@ -7977,8 +8024,10 @@ test "lite atomic replay activates deletion segments and continuation together a
     try std.testing.expectEqual(@as(?ReplayFragment.Position, null), try index.loadReplayFragment(identity));
     try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
     const before_publication = index.snapshotLsmWriteStats().?.wal_append_records;
+    const before_checkpoint = docs.file.activeCheckpoint().commit_sequence;
     const deletes = try index.publishReplay(&staged, &.{"doc:a"}, checkpoint);
     try std.testing.expectEqual(before_publication + 1, index.snapshotLsmWriteStats().?.wal_append_records);
+    try std.testing.expectEqual(before_checkpoint + 1, docs.file.activeCheckpoint().commit_sequence);
     index.freeDeleteInfos(deletes);
     try std.testing.expect(std.meta.eql(checkpoint.position, (try index.loadReplayFragment(identity)).?));
     try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
@@ -8018,7 +8067,32 @@ test "lite atomic replay activates deletion segments and continuation together a
     try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "κόσμος"));
     checkpoint.position = .{ .sequence = 2, .next_item = 1, .total_items = 1, .fingerprint = @splat(8), .applied = true };
     const before_delete = index.snapshotLsmWriteStats().?.wal_append_records;
-    const delete_only = try index.publishReplay(&.{}, &.{"doc:b"}, checkpoint);
+    var primary = try docs.runtimeStore(a);
+    defer primary.deinit();
+    var scope = (try primary.nativePublicationScope(a)).?;
+    defer scope.deinit(a);
+    const Metadata = struct {
+        writer: *index_mod.IndexWriter,
+        scope: @import("native_publication.zig").Scope,
+        observed_guard: bool = false,
+        fn stage(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.writer.external_visibility_gate.tryLock()) {
+                self.writer.external_visibility_gate.unlock();
+                return error.TestMissingExternalVisibilityGuard;
+            }
+            self.observed_guard = true;
+            try view.putMetadata(self.scope, "\x00\x00replay-progress-test", "complete");
+        }
+    };
+    var metadata: Metadata = .{ .writer = &index.writer, .scope = scope };
+    const before_delete_checkpoint = docs.file.activeCheckpoint().commit_sequence;
+    const delete_only = try index.publishReplayWithMetadata(&.{}, &.{"doc:b"}, checkpoint, .{ .participant = .{ .ptr = &metadata, .stage = Metadata.stage } });
+    try std.testing.expect(metadata.observed_guard);
+    try std.testing.expectEqual(before_delete_checkpoint + 1, docs.file.activeCheckpoint().commit_sequence);
+    const durable_progress = (try docs.file.getDocumentAlloc(a, "\x00\x00replay-progress-test")).?;
+    defer a.free(durable_progress);
+    try std.testing.expectEqualStrings("complete", durable_progress);
     index.freeDeleteInfos(delete_only);
     try std.testing.expectEqual(before_delete + 1, index.snapshotLsmWriteStats().?.wal_append_records);
     try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "κόσμος"));

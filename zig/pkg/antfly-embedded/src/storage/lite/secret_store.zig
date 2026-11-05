@@ -594,9 +594,9 @@ test "lite secrets publication errors distinguish rollback from uncertain outcom
     var vtable = std.Options.debug_io.vtable.*;
     vtable.fileSync = SyncFault.fileSync;
     const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
-    for (1..7) |scenario| {
-        const fail_sync = (scenario - 1) % 3 + 1;
-        const removing = scenario > 3;
+    for (1..5) |scenario| {
+        const fail_sync = (scenario - 1) % 2 + 1;
+        const removing = scenario > 2;
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(alloc, tmp);

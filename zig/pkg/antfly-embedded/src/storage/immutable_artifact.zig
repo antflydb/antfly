@@ -24,11 +24,21 @@ pub const Prepared = struct {
     dispatch: Boundary.Dispatch = Boundary.local_dispatch,
     pub const VTable = struct {
         link: *const fn (*anyopaque, []const u8) anyerror!Source,
+        prepare_link: ?*const fn (*anyopaque, []const u8) anyerror!Source = null,
+        stage_link: ?*const fn (*anyopaque, @import("native_publication.zig").View) anyerror!void = null,
         deinit: *const fn (*anyopaque) void,
     };
     const Boundary = abi.Boundary(VTable);
     pub fn link(self: Prepared, path: []const u8) !Source {
         return Boundary.call("link", self.dispatch, self.vtable.link, .{ self.ptr, path });
+    }
+    pub fn prepareLink(self: Prepared, path: []const u8) !Source {
+        const operation = self.vtable.prepare_link orelse return error.Unsupported;
+        return Boundary.call("prepare_link", self.dispatch, operation, .{ self.ptr, path });
+    }
+    pub fn stageLink(self: Prepared, view: @import("native_publication.zig").View) !void {
+        const operation = self.vtable.stage_link orelse return error.Unsupported;
+        return Boundary.call("stage_link", self.dispatch, operation, .{ self.ptr, view });
     }
     pub fn deinit(self: *Prepared) void {
         self.vtable.deinit(self.ptr);

@@ -16,10 +16,10 @@
 //! Multi-segment index with MVCC snapshots.
 //!
 //! Provides IndexSnapshot (immutable, ref-counted view of segments) and
-//! IndexWriter (serialized writes with lock-free snapshot reads).
+//! IndexWriter (serialized writes with retained snapshot reads).
 //!
 //! Key design choices (improvements over bleve):
-//!   - Lock-free snapshot reads via atomic pointer swap (no RWMutex)
+//!   - Atomic snapshot pointer publication with retained reader captures
 //!   - Ref-counted snapshots for safe concurrent read/write access
 //!   - Global BM25 stats across all segments for consistent scoring
 //!   - Block-Max WAND acceleration when v4 inverted indexes are present
@@ -2718,8 +2718,8 @@ fn compareU32(expected: u32, item: u32) std.math.Order {
 }
 
 /// Coordinates writes and maintains the current snapshot.
-/// Reads are lock-free (atomic snapshot pointer).
-/// Writes are serialized (mutex).
+/// Snapshot pointer publication is atomic; retained captures join external
+/// visibility boundaries. Writes are serialized by the writer mutex.
 pub const IndexWriter = struct {
     alloc: Allocator,
     current: *IndexSnapshot,
@@ -2732,6 +2732,10 @@ pub const IndexWriter = struct {
     // Critical sections are a pointer load + refcount op, so a spinlock is
     // appropriate; the heavy release/deinit stays outside it.
     snapshot_mu: std.atomic.Mutex,
+    /// Native metadata may publish the applied watermark before the prepared
+    /// in-memory pointer is installed. New snapshot captures join this narrow
+    /// external publication boundary; already retained snapshots remain valid.
+    external_visibility_gate: std.atomic.Mutex = .unlocked,
     next_segment_id: u64,
     next_epoch: u64,
     retired_segment_cleanup: ?RetiredSegmentCleanup = null,
@@ -2752,6 +2756,19 @@ pub const IndexWriter = struct {
         carried_count: usize,
         next_segment_id: u64,
         active: bool = true,
+        external_visibility_owned: bool = false,
+
+        pub fn guardExternalVisibility(self: *PreparedSegmentReplacement) void {
+            std.debug.assert(self.active and !self.external_visibility_owned);
+            @import("antfly_platform").sync.lockYielding(&self.writer.external_visibility_gate);
+            self.external_visibility_owned = true;
+        }
+
+        fn releaseExternalVisibility(self: *PreparedSegmentReplacement) void {
+            if (!self.external_visibility_owned) return;
+            self.external_visibility_owned = false;
+            self.writer.external_visibility_gate.unlock();
+        }
 
         pub fn publish(self: *PreparedSegmentReplacement) void {
             std.debug.assert(self.active);
@@ -2773,6 +2790,7 @@ pub const IndexWriter = struct {
             writer.next_segment_id = @max(writer.next_segment_id, self.next_segment_id);
             writer.next_epoch += 1;
             writer.publishSnapshot(self.snapshot);
+            self.releaseExternalVisibility();
             old.release();
             writer.mu.unlock();
             self.active = false;
@@ -2780,6 +2798,7 @@ pub const IndexWriter = struct {
 
         pub fn abort(self: *PreparedSegmentReplacement) void {
             if (!self.active) return;
+            self.releaseExternalVisibility();
             const writer = self.writer;
             for (self.snapshot.segments[self.carried_count..]) |*seg| {
                 SegmentEntry.destroyShared(writer.alloc, seg.shared);
@@ -3123,6 +3142,8 @@ pub const IndexWriter = struct {
     }
 
     fn acquireSnapshotRaw(self: *IndexWriter) *IndexSnapshot {
+        @import("antfly_platform").sync.lockYielding(&self.external_visibility_gate);
+        defer self.external_visibility_gate.unlock();
         self.lockSnapshotMutex();
         defer self.snapshot_mu.unlock();
         return @atomicLoad(*IndexSnapshot, &self.current, .acquire).retain();
@@ -6377,5 +6398,48 @@ test "identity lookup seeks logarithmically as retained corpus grows" {
         const view: View = .{ .length = lookup.header_size + @as(u64, count) * lookup.entry_size, .count = count, .reads = &reads };
         try std.testing.expectEqual(count / 2, try lookup.seek(view, count, count));
         try std.testing.expect(reads <= 22);
+    }
+}
+
+test "external progress publication gates new index snapshots through activation and abort" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Context = struct {
+        writer: *IndexWriter,
+        started: std.Io.Event = .unset,
+        done: std.Io.Event = .unset,
+        count: usize = 0,
+        fn read(self: *@This()) void {
+            self.started.set(std.testing.io);
+            const snapshot = self.writer.acquireSnapshot();
+            defer snapshot.release();
+            self.count = snapshot.segments.len;
+            self.done.set(std.testing.io);
+        }
+    };
+    for ([_]bool{ false, true }) |commit| {
+        var writer = try IndexWriter.init(a);
+        defer writer.deinit();
+        const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "old", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} }});
+        defer a.free(bytes);
+        try writer.addSegment(bytes);
+        const retained = writer.acquireSnapshot();
+        defer retained.release();
+        var prepared = try writer.prepareSegmentsManyData(&.{1}, &.{});
+        defer prepared.abort();
+        prepared.guardExternalVisibility();
+        var context: Context = .{ .writer = &writer };
+        const reader = try std.Thread.spawn(.{}, Context.read, .{&context});
+        // Always release before joining, including an assertion/error path.
+        defer {
+            prepared.abort();
+            reader.join();
+        }
+        try context.started.wait(std.testing.io);
+        try std.testing.expectError(error.Timeout, context.done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromMilliseconds(20), .clock = .awake } }));
+        if (commit) prepared.publish() else prepared.abort();
+        try context.done.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
+        try std.testing.expectEqual(@as(usize, if (commit) 0 else 1), context.count);
+        try std.testing.expectEqual(@as(usize, 1), retained.segments.len);
     }
 }

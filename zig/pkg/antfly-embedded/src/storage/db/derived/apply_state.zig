@@ -160,7 +160,7 @@ fn decodeProjectionMetadata(raw: []const u8) !ProjectionCheckpoint {
     };
 }
 
-fn loadProjectionMetadataTxn(txn: anytype, index_name: []const u8) !?ProjectionCheckpoint {
+pub fn loadProjectionMetadataTxn(txn: anytype, index_name: []const u8) !?ProjectionCheckpoint {
     // Legacy writers update only the scalar key. A mismatched or missing
     // watermark invalidates the richer record's generation/count proof.
     const sequence = (try loadScalarAppliedSequenceTxn(txn, index_name)) orelse return null;
@@ -279,7 +279,7 @@ fn saveProjectionMetadataTxn(txn: anytype, name: []const u8, checkpoint: Project
 
 const MetadataUpdateMode = enum { replace, set, advance };
 
-fn saveProjectionMetadataUpdates(alloc: Allocator, store: anytype, updates: []const AppliedSequenceUpdate, mode: MetadataUpdateMode) !void {
+fn saveProjectionMetadataUpdates(alloc: Allocator, store: anytype, updates: []const AppliedSequenceUpdate, comptime mode: MetadataUpdateMode) !void {
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
     var txn = try runtime.store.beginWrite();
@@ -294,7 +294,7 @@ pub fn advanceProjectionMetadataTxn(txn: anytype, updates: []const AppliedSequen
     try saveProjectionMetadataUpdatesTxn(txn, updates, .advance);
 }
 
-fn saveProjectionMetadataUpdatesTxn(txn: anytype, updates: []const AppliedSequenceUpdate, mode: MetadataUpdateMode) !void {
+fn saveProjectionMetadataUpdatesTxn(txn: anytype, updates: []const AppliedSequenceUpdate, comptime mode: MetadataUpdateMode) !void {
     for (updates) |update| {
         // Replacement is an explicit recovery boundary. Neither malformed
         // metadata record may prevent an authoritative replacement/reset.
