@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     from ..models.chat_message_extra_content import ChatMessageExtraContent
     from ..models.image_url_content_part import ImageURLContentPart
     from ..models.media_content_part import MediaContentPart
+    from ..models.source_content_part import SourceContentPart
     from ..models.text_content_part import TextContentPart
     from ..models.tool_call import ToolCall
 
@@ -28,8 +29,8 @@ class ChatMessage:
         role (ChatMessageRole): Role of the message sender in a generation/chat conversation
         extra_content (ChatMessageExtraContent | Unset): Opaque provider message metadata. Preserve unchanged when
             replaying assistant messages; native Anthropic content retains signed thinking blocks.
-        content (list[ImageURLContentPart | MediaContentPart | TextContentPart] | str | Unset): Message content.
-            Supports two formats:
+        content (list[ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart] | str | Unset):
+            Message content. Supports two formats:
             - Simple string: "Hello, how are you?"
             - Array of content parts: [{"type": "text", "text": "Hello"}]
         tool_calls (list[ToolCall] | Unset): Tool calls made by the assistant (only for role=assistant).
@@ -39,7 +40,7 @@ class ChatMessage:
 
     role: ChatMessageRole
     extra_content: ChatMessageExtraContent | Unset = UNSET
-    content: list[ImageURLContentPart | MediaContentPart | TextContentPart] | str | Unset = UNSET
+    content: list[ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart] | str | Unset = UNSET
     tool_calls: list[ToolCall] | Unset = UNSET
     tool_call_id: str | Unset = UNSET
     name: str | Unset = UNSET
@@ -47,6 +48,7 @@ class ChatMessage:
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.image_url_content_part import ImageURLContentPart
+        from ..models.media_content_part import MediaContentPart
         from ..models.text_content_part import TextContentPart
 
         role = self.role.value
@@ -67,6 +69,10 @@ class ChatMessage:
                         componentsschemas_chat_message_content_type_1_item_data.to_dict()
                     )
                 elif isinstance(componentsschemas_chat_message_content_type_1_item_data, ImageURLContentPart):
+                    componentsschemas_chat_message_content_type_1_item = (
+                        componentsschemas_chat_message_content_type_1_item_data.to_dict()
+                    )
+                elif isinstance(componentsschemas_chat_message_content_type_1_item_data, MediaContentPart):
                     componentsschemas_chat_message_content_type_1_item = (
                         componentsschemas_chat_message_content_type_1_item_data.to_dict()
                     )
@@ -116,6 +122,7 @@ class ChatMessage:
         from ..models.chat_message_extra_content import ChatMessageExtraContent
         from ..models.image_url_content_part import ImageURLContentPart
         from ..models.media_content_part import MediaContentPart
+        from ..models.source_content_part import SourceContentPart
         from ..models.text_content_part import TextContentPart
         from ..models.tool_call import ToolCall
 
@@ -131,7 +138,7 @@ class ChatMessage:
 
         def _parse_content(
             data: object,
-        ) -> list[ImageURLContentPart | MediaContentPart | TextContentPart] | str | Unset:
+        ) -> list[ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart] | str | Unset:
             if isinstance(data, Unset):
                 return data
             try:
@@ -145,7 +152,7 @@ class ChatMessage:
 
                     def _parse_componentsschemas_chat_message_content_type_1_item(
                         data: object,
-                    ) -> ImageURLContentPart | MediaContentPart | TextContentPart:
+                    ) -> ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart:
                         try:
                             if not isinstance(data, dict):
                                 raise TypeError()
@@ -162,11 +169,19 @@ class ChatMessage:
                             return componentsschemas_content_part_type_1
                         except (TypeError, ValueError, AttributeError, KeyError):
                             pass
+                        try:
+                            if not isinstance(data, dict):
+                                raise TypeError()
+                            componentsschemas_content_part_type_2 = MediaContentPart.from_dict(data)
+
+                            return componentsschemas_content_part_type_2
+                        except (TypeError, ValueError, AttributeError, KeyError):
+                            pass
                         if not isinstance(data, dict):
                             raise TypeError()
-                        componentsschemas_content_part_type_2 = MediaContentPart.from_dict(data)
+                        componentsschemas_content_part_type_3 = SourceContentPart.from_dict(data)
 
-                        return componentsschemas_content_part_type_2
+                        return componentsschemas_content_part_type_3
 
                     componentsschemas_chat_message_content_type_1_item = (
                         _parse_componentsschemas_chat_message_content_type_1_item(
@@ -181,7 +196,9 @@ class ChatMessage:
                 return componentsschemas_chat_message_content_type_1
             except (TypeError, ValueError, AttributeError, KeyError):
                 pass
-            return cast(list[ImageURLContentPart | MediaContentPart | TextContentPart] | str | Unset, data)
+            return cast(
+                list[ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart] | str | Unset, data
+            )
 
         content = _parse_content(d.pop("content", UNSET))
 

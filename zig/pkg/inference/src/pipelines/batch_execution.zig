@@ -74,9 +74,9 @@ test "masked sequence buckets bound padding and preserve fixed graph widths" {
             };
         }
     };
-    for (1..513) |width| {
-        const bucket = maskedSequenceBucket(Probe{}, width, 512);
-        try std.testing.expect(bucket >= width and bucket <= 512);
+    for (1..8193) |width| {
+        const bucket = maskedSequenceBucket(Probe{}, width, 8192);
+        try std.testing.expect(bucket >= width and bucket <= 8192);
         try std.testing.expect(bucket * 4 <= width * 5);
     }
     try std.testing.expectEqual(@as(usize, 32), maskedSequenceBucket(Probe{}, 29, 512));

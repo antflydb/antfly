@@ -1198,6 +1198,10 @@ pub fn parseModelCapabilities(
             if (value == .string) try result.batch.applyManifestCapability(value.string);
         }
     };
+    if (info.object.get("model_revision_pinning")) |pinning| {
+        if (pinning != .bool) return error.InvalidInferenceCapabilities;
+        result.model_revision_pinning = pinning.bool;
+    }
     if (info.object.get("model_revision")) |revision| {
         if (revision != .string or revision.string.len != 64) return error.InvalidInferenceCapabilities;
         var digest: [32]u8 = undefined;

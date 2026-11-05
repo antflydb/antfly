@@ -17,6 +17,7 @@ package embedded
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 )
 
@@ -115,10 +116,76 @@ func (code ErrorCode) Description() string {
 type NativeError struct {
 	Code   ErrorCode
 	Detail string
+	// OutcomeReceipt is set when an autocommit SQL write or a batch failed
+	// with OutcomeUnknown and the database issued a receipt for it. Resolve
+	// it later with DB.OutcomeReceiptStatus.
+	OutcomeReceipt string
 }
 
-func (e *NativeError) Error() string { return e.Code.Error() + ": " + e.Detail }
+func (e *NativeError) Error() string {
+	message := e.Code.Error()
+	if e.Detail != "" {
+		message += ": " + e.Detail
+	}
+	if e.OutcomeReceipt != "" {
+		message += " (outcome receipt " + e.OutcomeReceipt + ")"
+	}
+	return message
+}
 func (e *NativeError) Unwrap() error { return e.Code }
+
+// OutcomeReceiptStatus is the resolved outcome of an OutcomeUnknown write.
+type OutcomeReceiptStatus uint8
+
+const (
+	// OutcomeReceiptApplied means the uncertain write applied.
+	OutcomeReceiptApplied OutcomeReceiptStatus = 1
+	// OutcomeReceiptNotApplied means the uncertain write did not apply.
+	OutcomeReceiptNotApplied OutcomeReceiptStatus = 2
+)
+
+func (status OutcomeReceiptStatus) String() string {
+	switch status {
+	case OutcomeReceiptApplied:
+		return "applied"
+	case OutcomeReceiptNotApplied:
+		return "not_applied"
+	default:
+		return fmt.Sprintf("OutcomeReceiptStatus(%d)", uint8(status))
+	}
+}
+
+// OutcomeReceiptOf returns the outcome receipt carried by err, if any. It
+// recognizes *NativeError and *SQLError anywhere in err's chain.
+func OutcomeReceiptOf(err error) (string, bool) {
+	var carrier outcomeReceiptCarrier
+	if errors.As(err, &carrier) {
+		if receipt := carrier.outcomeReceipt(); receipt != "" {
+			return receipt, true
+		}
+	}
+	return "", false
+}
+
+type outcomeReceiptCarrier interface {
+	error
+	outcomeReceipt() string
+}
+
+func (e *NativeError) outcomeReceipt() string { return e.OutcomeReceipt }
+
+// withOutcomeReceipt attaches receipt to err, a failure with code.
+func withOutcomeReceipt(err error, code ErrorCode, receipt string) error {
+	if err == nil || receipt == "" {
+		return err
+	}
+	var native *NativeError
+	if errors.As(err, &native) {
+		native.OutcomeReceipt = receipt
+		return err
+	}
+	return &NativeError{Code: code, OutcomeReceipt: receipt}
+}
 
 // InferenceAPIError is the JSON error body an Antfly inference call returns
 // on failure: {"error": "...", "message": "..."}. Code is a stable string

@@ -59,6 +59,8 @@ pub const Handle = struct {
     parent_handle: ?*Handle = null,
     table_handles: std.ArrayList(*anyopaque) = .empty,
     sql_decision_uncertain: bool = false,
+    /// Outcome-receipt writer for exported writes on this database handle.
+    outcome_writer: @import("outcome_receipts.zig").Writer = .{},
     // New generations inspect durable recovery once. Every job producer dirties
     // these flags before admission, including uncertain publication outcomes.
     sql_commit_recovery_needed: bool = true,
@@ -81,6 +83,9 @@ pub const Handle = struct {
     /// Live coordinator only; detached provider snapshots never drive groups.
     lite_scheduling_owner: ?*@import("lite_connection.zig").Owner = null,
     maintenance_writer_lease: ?lite_backend.native.PathWriterLock = null,
+    /// Scope and start of the current maintenance writer hold (statistics).
+    maintenance_writer_scope: u8 = 0,
+    maintenance_writer_held_from: i96 = 0,
     maintenance_writer_references: usize = 0,
     maintenance_admission_mutex: std.Io.Mutex = .init,
     embedded_path: ?[]u8 = null,
@@ -268,6 +273,8 @@ pub fn closeHandle(handle: *Handle) void {
         }
     }
     invalidateQueryProducer(handle);
+    // Uncertain directory-handle commits settle on the next open.
+    handle.outcome_writer.deinit();
     if (handle.lite_connection) |connection| {
         connection.close();
         handle.alloc.destroy(handle);

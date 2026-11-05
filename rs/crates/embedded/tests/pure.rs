@@ -117,3 +117,30 @@ fn owned_native_diagnostic_keeps_stable_error_category() {
     assert!(error.to_string().contains("sparse must be boolean"));
     assert_eq!(error.clone().detail(), error.detail());
 }
+
+#[test]
+fn outcome_receipt_keeps_outcome_unknown_category() {
+    let receipt = "or1:000102030405060708090a0b0c0d0e0f:3";
+    let error = antfly_embedded::Error::OutcomeUnknownWithReceipt {
+        detail: Some("commit durability unconfirmed".into()),
+        receipt: receipt.into(),
+    };
+    assert_eq!(error, antfly_embedded::Error::OutcomeUnknown);
+    assert_eq!(error.kind(), antfly_embedded::Error::OutcomeUnknown);
+    assert_eq!(error.code(), 7);
+    assert_eq!(error.name(), "ANTFLY_OUTCOME_UNKNOWN");
+    assert_eq!(error.outcome_receipt(), Some(receipt));
+    assert_eq!(error.detail(), Some("commit durability unconfirmed"));
+    assert!(error.to_string().contains(receipt));
+    assert_eq!(
+        antfly_embedded::Error::OutcomeUnknown.outcome_receipt(),
+        None
+    );
+
+    let bare = antfly_embedded::Error::OutcomeUnknownWithReceipt {
+        detail: None,
+        receipt: receipt.into(),
+    };
+    assert_eq!(bare.detail(), None);
+    assert_eq!(bare.outcome_receipt(), Some(receipt));
+}

@@ -118,6 +118,7 @@ const InferenceRuntimeConfig = struct {
     worker_environment: []const worker_runtime.EnvironmentEntry = &.{},
     resources: inference.platform.resource_policy.Resources = .{},
     generation_batching: inference.platform.inference_settings.GenerationBatching = .{},
+    cooperative_execution: inference.platform.inference_settings.CooperativeExecution = .{},
     kernel_jit: inference.graph.kernel_jit.Config = .{},
     prompt_cache: inference.server.PromptCacheConfig = .{},
 };
@@ -236,15 +237,7 @@ const ModelTextsRequest = struct {
     instruction: ?[]const u8 = null,
 };
 
-const ModelPartsRequest = struct {
-    model_identity: ?[]const u8 = null,
-    dimensions: ?u32 = null,
-    model: []const u8,
-    parts: []const template_content.ContentPart,
-    attachment_count: usize = 0,
-    task_type: ?[]const u8 = null,
-    instruction: ?[]const u8 = null,
-};
+const ModelPartsRequest = @import("antfly_inference_embedding_wire").Request(template_content.ContentPart);
 
 fn validateProviderAttachmentRefs(
     payload_len: usize,
@@ -877,6 +870,7 @@ pub fn linkedInferenceCreateLocal(context: *const inference_bridge.CreateContext
     node_config.max_concurrent_requests = policy.admission.max_concurrent_requests;
     node_config.max_work_units = policy.admission.workCapacity();
     node_config.request_limits = policy.request_limits;
+    node_config.cooperative_execution = inference.server.CooperativeExecutionConfig.fromSettings(runtime_config.value.cooperative_execution);
     node_config.generation_batching = inference.server.GenerationBatchingConfig.fromSettings(runtime_config.value.generation_batching);
     const configured_limits = policy.memory.limits(inference.runtime.tier.memory.Limits);
     // CLI/bridge overrides take precedence field by field, while physical caps
@@ -1102,6 +1096,8 @@ pub fn linkedInferenceInvokeProvider(context: *const inference_bridge.ProviderIn
                 alloc,
                 parsed.value.model,
                 parts,
+                parsed.value.grouped,
+                parsed.value.model_revision,
                 state.io,
                 execution_control,
                 if (operation == .embed_dense_parts_with_context) parsed.value.task_type else null,
@@ -2530,6 +2526,8 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
     alloc: std.mem.Allocator,
     model: []const u8,
     parts: []const template_content.ContentPart,
+    grouped: bool,
+    expected_revision: ?[32]u8,
     io: std.Io,
     control: inference.InferenceExecutionControl,
     task_type: ?[]const u8,
@@ -2537,7 +2535,7 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
 ) anyerror![][]f32 {
     const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
     const capabilities = try localModelCapabilities(node, io, model, .embed);
-    var shape = inference_work.InvocationShape{ .item_count = parts.len };
+    var shape = inference_work.InvocationShape{ .item_count = if (grouped) 1 else parts.len };
     for (parts) |part| switch (part) {
         .text => |text| {
             shape.modalities.text = true;
@@ -2586,18 +2584,86 @@ fn localAntflyEmbedDensePartsWithExecutionContext(
             shape.max_media_parts_per_item = @max(shape.max_media_parts_per_item, 1);
         },
     };
+    if (grouped) {
+        shape.max_text_bytes_per_item = shape.text_bytes;
+        var media_count: usize = 0;
+        for (parts) |part| if (part != .text) {
+            media_count += 1;
+        };
+        shape.max_media_parts_per_item = media_count;
+    }
     try capabilities.validateInvocation(.embed, shape);
-    const direct_parts = try localAntflyDirectDenseParts(alloc, parts);
-    defer alloc.free(direct_parts);
-    return try node.embedDensePartsDirectWithExecutionControlAndTask(
+    var direct = try LocalDenseParts.init(alloc, parts, grouped);
+    defer direct.deinit(alloc);
+    return try node.embedDensePartsDirectWithExecutionControlAndTaskRevision(
         alloc,
         io,
         control,
         model,
-        direct_parts,
+        direct.inputs(),
         task_type,
         instruction,
+        expected_revision,
     );
+}
+
+// Own only descriptors; encoded media remains borrowed across the ABI call.
+// A group is one model input, whereas an item batch retains its full row count.
+const LocalDenseParts = struct {
+    parts: []inference.server.Node.DirectDenseEmbedPart,
+    group: [1]inference.server.Node.DirectDenseEmbedPart,
+    grouped: bool,
+
+    fn init(a: std.mem.Allocator, parts: []const template_content.ContentPart, grouped: bool) !LocalDenseParts {
+        const direct = try localAntflyDirectDenseParts(a, parts);
+        return .{ .parts = direct, .group = .{.{ .content = direct }}, .grouped = grouped and direct.len > 1 };
+    }
+    fn inputs(self: *@This()) []const inference.server.Node.DirectDenseEmbedPart {
+        return if (self.grouped) &self.group else self.parts;
+    }
+    fn deinit(self: *@This(), a: std.mem.Allocator) void {
+        a.free(self.parts);
+    }
+};
+
+test "linked embedding groups retain one ordered input and borrowed media" {
+    const a = std.testing.allocator;
+    const parts = [_]template_content.ContentPart{ .{ .text = "astronaut" }, .{ .binary = .{ .mime_type = "image/png", .data = "borrowed image" } } };
+    var group = try LocalDenseParts.init(a, &parts, true);
+    defer group.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), group.inputs().len);
+    const children = group.inputs()[0].content;
+    try std.testing.expectEqualStrings("astronaut", children[0].text);
+    try std.testing.expect(children[1].media.data.ptr == parts[1].binary.data.ptr);
+    var batch = try LocalDenseParts.init(a, &parts, false);
+    defer batch.deinit(a);
+    try std.testing.expectEqual(@as(usize, 2), batch.inputs().len);
+    // A single image retains compatibility with unimodal model executors.
+    var single = try LocalDenseParts.init(a, parts[1..], true);
+    defer single.deinit(a);
+    try std.testing.expect(single.inputs()[0] == .media);
+    var request = try std.json.parseFromSlice(ModelPartsRequest, a, "{\"model\":\"m\",\"parts\":[],\"grouped\":true,\"task_type\":\"RETRIEVAL_QUERY\"}", .{});
+    defer request.deinit();
+    try std.testing.expect(request.value.grouped);
+    try std.testing.expectEqualStrings("RETRIEVAL_QUERY", request.value.task_type.?);
+    // Production consumers and the host decoder share this schema. Preserve
+    // an immutable generation through serialization, including binary refs.
+    const Wire = @import("antfly_inference_embedding_wire");
+    const expected: [32]u8 = @splat(11);
+    const context = request_types.EmbeddingRequestContext{
+        .request = .{ .io = std.testing.io, .deadline_ns = null },
+        .task_type = .retrieval_document,
+        .model_revision = expected,
+    };
+    const options = Wire.Options.fromEmbeddingContext("model", context, true);
+    const metadata = try std.json.Stringify.valueAlloc(a, Wire.Request(template_content.ContentPart).init(options, &.{ .{ .text = "astronaut" }, .{ .binary = .{ .mime_type = "image/png", .data = &.{} } } }, 1), .{});
+    defer a.free(metadata);
+    var recovered = try std.json.parseFromSlice(ModelPartsRequest, a, metadata, .{});
+    defer recovered.deinit();
+    try std.testing.expectEqual(expected, recovered.value.model_revision.?);
+    try std.testing.expectEqual(@as(usize, 2), recovered.value.parts.len);
+    try std.testing.expect(recovered.value.grouped);
+    try std.testing.expectEqual(@as(usize, 1), recovered.value.attachment_count);
 }
 
 pub fn localAntflyDirectDenseParts(
@@ -2629,6 +2695,8 @@ fn localAntflyEmbedDensePartsWithContext(
         alloc,
         model,
         parts,
+        false,
+        context.model_revision,
         context.request.io,
         adapter.control(),
         context.task_type.canonical(),
@@ -2768,6 +2836,7 @@ fn validateLocalGenerateCapabilities(
             .text = preflight.text_bytes > 0,
             .image = preflight.image_count > 0,
             .audio = preflight.has_audio,
+            .video = preflight.video_count > 0,
         },
         .encoded_media_bytes = preflight.encoded_media_bytes,
         .decoded_pixels = decoded_pixels,
@@ -3197,6 +3266,10 @@ fn localModelCapabilitiesInScope(
             try result.accepted_mime_types.add(mime_type);
         }
     }
+    if (task == .generate and inference.server.generatorAcceptsVideo(&manifest)) {
+        result.input_modalities.video = true;
+        for ([_][]const u8{ "video/mp4", "video/quicktime", "video/webm", "video/mp2t" }) |mime_type| try result.accepted_mime_types.add(mime_type);
+    }
     if (task == .embed) {
         result.model_aware_chunking_v1 = true;
         result.dense_output = if (manifest.denseEmbeddingOutput()) |shape| .{ .native_dimensions = shape.native_dimensions, .minimum_dimensions = shape.minimum_dimensions } else null;
@@ -3214,6 +3287,7 @@ fn localModelCapabilitiesInScope(
             result.model_revision = try node.model_manager.modelIdentityForManifest(model_path, manifest);
         }
     }
+    if (task == .embed) result.model_revision_pinning = true;
     try result.validate();
     return result;
 }
@@ -3347,13 +3421,16 @@ fn addLocalGenerateMediaPreflight(
 ) !void {
     const is_image = mimeEssenceStartsWith(descriptor.mime_type, "image/");
     const is_audio = mimeEssenceStartsWith(descriptor.mime_type, "audio/");
-    if (!is_image and (image_only or !is_audio)) return error.UnsupportedGeneratorProvider;
+    const is_video = mimeEssenceStartsWith(descriptor.mime_type, "video/");
+    if (!is_image and (image_only or !(is_audio or is_video))) return error.UnsupportedGeneratorProvider;
 
     try addLocalGenerateBytes(&preflight.encoded_media_bytes, descriptor.encoded_bytes);
     try addLocalGenerateBytes(&preflight.decoded_media_bytes, descriptor.decoded_bytes);
     try addLocalGenerateBytes(&preflight.media_count, 1);
     if (is_image) {
         try addLocalGenerateBytes(&preflight.image_count, 1);
+    } else if (is_video) {
+        try addLocalGenerateBytes(&preflight.video_count, 1);
     } else {
         preflight.has_audio = true;
     }
@@ -3420,6 +3497,8 @@ fn preflightLocalGenerateMessagesInternal(
         }
     }
     if (attachments) |values| if (attachment_index != values.len) return error.InvalidArguments;
+    if (preflight.video_count > 1) return error.VideoLimitExceeded;
+    if (preflight.video_count != 0 and (preflight.image_count != 0 or preflight.has_audio)) return error.UnsupportedMixedVideoInput;
     return preflight;
 }
 
@@ -3509,6 +3588,7 @@ fn convertLocalGenerateParts(
     errdefer text_buf.deinit(alloc);
     var images = std.ArrayListUnmanaged([]const u8).empty;
     errdefer images.deinit(alloc);
+    var video: ?[]const u8 = null;
     var audio = std.ArrayListUnmanaged([]const u8).empty;
     errdefer audio.deinit(alloc);
     var out_parts = std.ArrayListUnmanaged(inference.pipelines.GenerationMessage.ContentPart).empty;
@@ -3551,6 +3631,9 @@ fn convertLocalGenerateParts(
                     } else if (mimeEssenceStartsWith(attachment.content_type, "audio/")) {
                         try audio.append(alloc, attachment.bytes);
                         try out_parts.append(alloc, .{ .audio = audio.items.len - 1 });
+                    } else if (mimeEssenceStartsWith(attachment.content_type, "video/")) {
+                        if (video != null) return error.VideoLimitExceeded;
+                        video = attachment.bytes;
                     } else return error.UnsupportedGeneratorProvider;
                     attachment_index.* += 1;
                     continue;
@@ -3569,6 +3652,11 @@ fn convertLocalGenerateParts(
                     try out_parts.append(alloc, .{ .audio = audio.items.len - 1 });
                     try owner.owned_media.append(alloc, decoded.data);
                     decoded_owned = false;
+                } else if (mimeEssenceStartsWith(decoded.mime_type, "video/")) {
+                    if (video != null) return error.VideoLimitExceeded;
+                    try owner.owned_media.append(alloc, decoded.data);
+                    decoded_owned = false;
+                    video = decoded.data;
                 } else {
                     return error.UnsupportedGeneratorProvider;
                 }
@@ -3597,6 +3685,11 @@ fn convertLocalGenerateParts(
         slice_owned = false;
         break :blk slice;
     } else null;
+    // Video occupies its own message; its text is the plain message content.
+    if (video != null) {
+        if (image_slice != null or audio_slice != null) return error.UnsupportedMixedVideoInput;
+        out_parts.clearAndFree(alloc);
+    }
     const content_parts = if (out_parts.items.len > 0) blk: {
         const slice = try out_parts.toOwnedSlice(alloc);
         var slice_owned = true;
@@ -3611,8 +3704,106 @@ fn convertLocalGenerateParts(
         .content = text,
         .image_bytes = image_slice,
         .audio_bytes = audio_slice,
+        .video_bytes = video,
         .content_parts = content_parts,
     };
+}
+
+test "local generate message conversion gives video its own field and rejects mixed media" {
+    const alloc = std.testing.allocator;
+    const clip = "data:video/mp4;base64,AAAA";
+    const video: inference_types.ContentPart = .{ .media = .{ .mime_type = "video/mp4", .data = clip } };
+    const audio: inference_types.ContentPart = .{ .media = .{ .mime_type = "audio/wav", .data = "data:audio/wav;base64,AAAA" } };
+    const history: inference_types.ChatMessage = .{ .role = .user, .content = .{ .parts = &.{.{ .text = "first" }} } };
+    {
+        const messages = [_]inference_types.ChatMessage{ history, .{ .role = .user, .content = .{ .parts = &.{ .{ .text = "describe" }, video } } } };
+        // The linked entry points run preflight before conversion and compare both.
+        const preflight = try preflightLocalGenerateMessages(&messages);
+        try std.testing.expectEqual(@as(usize, 1), preflight.video_count);
+        try std.testing.expectEqual(@as(usize, 1), preflight.media_count);
+        try std.testing.expect(!preflight.has_audio);
+        var converted = try convertLocalGenerateMessages(alloc, &messages, preflight.decoded_media_bytes);
+        defer converted.deinit(alloc);
+        const message = converted.messages[1];
+        try std.testing.expectEqualStrings("\x00\x00\x00", message.video_bytes.?);
+        try std.testing.expectEqualStrings("describe", message.content);
+        try std.testing.expect(message.content_parts == null);
+        try std.testing.expect(converted.messages[0].content_parts != null);
+        const measured = try inference.server.Node.directGeneratePreflightForMessages(converted.messages);
+        try std.testing.expectEqual(preflight.video_count, measured.video_count);
+        try std.testing.expectEqual(preflight.media_count, measured.media_count);
+        try std.testing.expectEqual(preflight.decoded_media_bytes, measured.decoded_media_bytes);
+    }
+    const one_video: inference_types.ChatMessage = .{ .role = .user, .content = .{ .parts = &.{video} } };
+    try std.testing.expectError(error.VideoLimitExceeded, preflightLocalGenerateMessages(&.{ one_video, one_video }));
+    try std.testing.expectError(error.UnsupportedMixedVideoInput, preflightLocalGenerateMessages(&.{ .{ .role = .user, .content = .{ .parts = &.{audio} } }, one_video }));
+    // Models without video in their capabilities reject it during preflight.
+    const capabilities = inference_work.InferenceCapabilities{
+        .task = .generate,
+        .input_modalities = .{ .text = true, .image = true },
+        .accepted_mime_types = .{ .text_plain = true, .image_jpeg = true },
+        .input_granularity = .page,
+        .batch = .{
+            .mode = .serial_compatibility,
+            .preferred_items = 1,
+            .max_items = 1,
+            .max_encoded_media_bytes = clip.len,
+            .max_decoded_pixels = 5,
+            .max_media_parts_per_item = 1,
+        },
+        .output = .generated_text,
+    };
+    try std.testing.expectError(error.UnsupportedInferenceMimeType, preflightLocalGenerateMessagesInternal(&.{one_video}, null, capabilities));
+}
+
+test "local generate video reaches a Gemma 4 model through the linked provider" {
+    const platform = @import("antfly_platform");
+    const model = platform.env.getenv("ANTFLY_GEMMA4_VIDEO_TEST_MODEL") orelse return error.SkipZigTest;
+    const clip_path = platform.env.getenv("ANTFLY_GEMMA4_VIDEO_TEST_CLIP") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const clip = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, clip_path, a, .limited(16 * 1024 * 1024));
+    defer a.free(clip);
+    const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(clip.len));
+    defer a.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, clip);
+    const uri = try std.fmt.allocPrint(a, "data:video/mp4;base64,{s}", .{encoded});
+    defer a.free(uri);
+
+    var state: LinkedInferenceState = undefined;
+    state.alloc = a;
+    state.io = std.testing.io;
+    state.worker = null;
+    state.node = try inference.server.Node.init(a, .{ .models_dir = std.fs.path.dirname(model).?, .allow_unknown_models = true, .generation_budget_overrides = .{ .host_limit_bytes = 8 * 1024 * 1024 * 1024 }, .process_termination_available = true, .content_security = .{ .allowed_hosts = &.{@constCast("127.0.0.1")}, .block_private_ips = false } });
+    const node = &state.node;
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    node.session_manager.required_backend = if (@import("builtin").os.tag == .macos) .metal else .cuda;
+    node.model_manager.session_manager.required_backend = node.session_manager.required_backend;
+    const name = std.fs.path.basename(model);
+    const prompt = "What colors does this video show, and in what order? Answer briefly.";
+
+    const inline_messages = [_]inference_types.ChatMessage{
+        .{ .role = .user, .content = .{ .parts = &.{.{ .text = "My name is Sam." }} } },
+        .{ .role = .assistant, .content = .{ .text = "Hello Sam." } },
+        .{ .role = .user, .content = .{ .parts = &.{ .{ .text = prompt }, .{ .media = .{ .mime_type = "video/mp4", .data = uri } } } } },
+    };
+    const answer = try localAntflyGenerateMessages(node, std.testing.io, a, name, &inline_messages, .{ .max_tokens = 48 }, .{});
+    defer a.free(answer);
+    const lower = try std.ascii.allocLowerString(a, answer);
+    defer a.free(lower);
+    const red = std.mem.indexOf(u8, lower, "red") orelse return error.TestExpectedRedFrames;
+    const blue = std.mem.indexOf(u8, lower, "blue") orelse return error.TestExpectedBlueFrames;
+    try std.testing.expect(red < blue);
+
+    const attachments = [_]inference_work.Attachment{.{ .content_type = "video/mp4", .bytes = clip }};
+    const attached_messages = [_]inference_types.ChatMessage{
+        .{ .role = .user, .content = .{ .parts = &.{ .{ .text = prompt }, .{ .media = .{ .mime_type = "video/mp4", .data = "" } } } } },
+    };
+    const attached = try localAntflyGenerateMessagesWithAttachments(node, std.testing.io, a, name, &attached_messages, &attachments);
+    defer a.free(attached);
+    const attached_lower = try std.ascii.allocLowerString(a, attached);
+    defer a.free(attached_lower);
+    try std.testing.expect(std.mem.indexOf(u8, attached_lower, "red") != null);
 }
 
 test "local generate message conversion preserves tool history and admission" {
@@ -3895,6 +4086,192 @@ test "native checkpoint route manifest preserves binary upload and export stream
     }
 }
 
+test "linked embedding large image parity across public and grouped inputs" {
+    const image_path = @import("antfly_platform").env.getenv("ANTFLY_MEDIA_PARITY_IMAGE") orelse return error.SkipZigTest;
+    const model = @import("antfly_platform").env.getenv("ANTFLY_EMBEDDINGGEMMA2_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, image_path, a, .limited(32 * 1024 * 1024));
+    defer a.free(bytes);
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    const fingerprint = std.fmt.bytesToHex(digest, .lower);
+    try std.testing.expectEqualStrings("df9ac37cc26e9d72a25017709c1b2b20d9bb0dc54206b6b5df178e9a7de72323", &fingerprint);
+    const info = try inference.pipelines.image.inspectEncodedForInference(bytes, null);
+    try std.testing.expectEqual(@as(u32, 6000), info.width);
+    try std.testing.expectEqual(@as(u32, 4000), info.height);
+    // Exercise the reported encoded size as well as source resolution. JPEG
+    // COM segments do not change decoded pixels or model preprocessing.
+    const padded = try a.alloc(u8, 16 * 1024 * 1024);
+    defer a.free(padded);
+    @memset(padded, 0);
+    @memcpy(padded[0..2], bytes[0..2]);
+    var position: usize = 2;
+    var remaining = padded.len - bytes.len;
+    while (remaining != 0) {
+        var segment = @min(remaining, 65537);
+        if (remaining > segment and remaining - segment < 4) segment -= 4;
+        padded[position] = 0xff;
+        padded[position + 1] = 0xfe;
+        std.mem.writeInt(u16, padded[position + 2 ..][0..2], @intCast(segment - 2), .big);
+        position += segment;
+        remaining -= segment;
+    }
+    @memcpy(padded[position..], bytes[2..]);
+
+    var state: LinkedInferenceState = undefined;
+    state.alloc = a;
+    state.io = std.testing.io;
+    state.worker = null;
+    state.node = try inference.server.Node.init(a, .{ .models_dir = std.fs.path.dirname(model).?, .allow_unknown_models = true, .process_termination_available = true, .content_security = .{ .allowed_hosts = &.{@constCast("127.0.0.1")}, .block_private_ips = false } });
+    const node = &state.node;
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    node.session_manager.required_backend = if (@import("builtin").os.tag == .macos) .metal else .native;
+    node.model_manager.session_manager.required_backend = node.session_manager.required_backend;
+    const name = std.fs.path.basename(model);
+    const Fixture = struct {
+        server: *std.Io.net.Server,
+        bytes: []const u8,
+        failure: ?anyerror = null,
+        fn serve(self: *@This()) void {
+            for (0..2) |_| self.serveOne();
+        }
+        fn serveOne(self: *@This()) void {
+            var stream = self.server.accept(std.testing.io) catch |err| {
+                self.failure = err;
+                return;
+            };
+            defer stream.close(std.testing.io);
+            var read_buffer: [4096]u8 = undefined;
+            var reader = stream.reader(std.testing.io, &read_buffer);
+            while (true) {
+                const line = reader.interface.takeDelimiterInclusive('\n') catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                if (std.mem.eql(u8, line, "\r\n")) break;
+            }
+            var buffer: [4096]u8 = undefined;
+            var writer = stream.writer(std.testing.io, &buffer);
+            writer.interface.print("HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n", .{self.bytes.len}) catch |err| {
+                self.failure = err;
+                return;
+            };
+            writer.interface.writeAll(self.bytes) catch |err| {
+                self.failure = err;
+                return;
+            };
+            writer.interface.flush() catch |err| {
+                self.failure = err;
+            };
+        }
+    };
+    var server = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(std.testing.io, .{});
+    defer server.deinit(std.testing.io);
+    var fixture = Fixture{ .server = &server, .bytes = padded };
+    var serving = try std.testing.io.concurrent(Fixture.serve, .{&fixture});
+    defer serving.cancel(std.testing.io);
+    const url = try std.fmt.allocPrint(a, "http://{f}/large.jpg", .{server.socket.address});
+    defer a.free(url);
+    const body = try std.json.Stringify.valueAlloc(a, .{ .model = name, .task_type = "RETRIEVAL_QUERY", .input = &.{.{ .type = "image_url", .image_url = url }} }, .{});
+    defer a.free(body);
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.createEmbedding(&ctx);
+    defer response.deinit();
+    if (response.status.code != 200) std.debug.print("large image public status={d} body={s}\n", .{ response.status.code, response.body orelse "" });
+    const vectors = localAntflyEmbedDensePartsWithExecutionContext(node, a, name, &.{.{ .binary = .{ .mime_type = "image/jpeg", .data = padded } }}, true, null, std.testing.io, .{ .deadline_ns = platform_time.monotonicNs() + 120 * std.time.ns_per_s }, "RETRIEVAL_QUERY", null) catch |err| {
+        std.debug.print("large image grouped failure={s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer {
+        for (vectors) |vector| a.free(vector);
+        a.free(vectors);
+    }
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer parsed.deinit();
+    const values = parsed.value.object.get("data").?.array.items[0].object.get("embedding").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), vectors.len);
+    try std.testing.expectEqual(values.len, vectors[0].len);
+    for (values, vectors[0]) |value, vector| {
+        const number: f32 = switch (value) {
+            .float => @floatCast(value.float),
+            .integer => @floatFromInt(value.integer),
+            else => return error.InvalidEmbeddingResponse,
+        };
+        try std.testing.expectApproxEqAbs(number, vector, 0.001);
+    }
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    const grouped_body = try std.json.Stringify.valueAlloc(a, .{ .model = name, .task_type = "RETRIEVAL_QUERY", .input = .{.{ .content = .{ .{ .type = "text", .text = "NASA launch pad" }, .{ .type = "image_url", .image_url = url } } }} }, .{});
+    defer a.free(grouped_body);
+    var grouped_request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer grouped_request.deinit();
+    grouped_request.body = grouped_body;
+    var grouped_ctx = httpx.Context.init(a, std.testing.io, &grouped_request);
+    defer grouped_ctx.deinit();
+    var grouped_response = try node.createEmbedding(&grouped_ctx);
+    defer grouped_response.deinit();
+    if (grouped_response.status.code != 200) std.debug.print("large image public group status={d} body={s}\n", .{ grouped_response.status.code, grouped_response.body orelse "" });
+    try std.testing.expectEqual(@as(u16, 200), grouped_response.status.code);
+    var grouped_public = try std.json.parseFromSlice(std.json.Value, a, grouped_response.body.?, .{});
+    defer grouped_public.deinit();
+    const grouped_values = grouped_public.value.object.get("data").?.array.items[0].object.get("embedding").?.array.items;
+
+    // Run the real provider bridge: ordered text+binary, borrowed attachment
+    // bytes, and both matching/stale generations reach the actual loaded model.
+    const revision = (try localModelCapabilities(node, std.testing.io, name, .embed)).model_revision orelse return error.CheckpointRevisionUnavailable;
+    const Wire = @import("antfly_inference_embedding_wire");
+    const wire_parts = [_]template_content.ContentPart{ .{ .text = "NASA launch pad" }, .{ .binary = .{ .mime_type = "image/jpeg", .data = &.{} } } };
+    const payloads = [_]inference_bridge.ProviderBinaryPayload{.{ .bytes = .init(padded), .content_type = .init("image/jpeg") }};
+    const refs = [_]inference_bridge.ProviderAttachmentRef{.{ .attachment_index = 0, .item_index = 1 }};
+    for ([_]bool{ true, false }) |stale| {
+        var expected = revision;
+        if (stale) expected[0] ^= 1;
+        const metadata = try std.json.Stringify.valueAlloc(a, Wire.Request(template_content.ContentPart).init(.{ .model = name, .model_revision = expected, .grouped = true, .task_type = "RETRIEVAL_QUERY" }, &wire_parts, 1), .{});
+        defer a.free(metadata);
+        var response_handle: ?*anyopaque = null;
+        var response_json: inference_bridge.String = undefined;
+        const invoke = inference_bridge.ProviderInvokeContext{
+            .abi_version = inference_bridge.abi_version,
+            .handle = &state,
+            .operation = @backingInt(inference_bridge.ProviderOperation.embed_dense_parts_with_context),
+            .request_json = .init(metadata),
+            .deadline_ns = platform_time.monotonicNs() + 120 * std.time.ns_per_s,
+            .has_deadline = 1,
+            .out_response_handle = &response_handle,
+            .out_response_json = &response_json,
+            .binary_payloads = &payloads,
+            .binary_payloads_len = payloads.len,
+            .attachment_refs = &refs,
+            .attachment_refs_len = refs.len,
+        };
+        if (stale) {
+            try std.testing.expectError(error.InferenceCapabilitiesStale, linkedInferenceInvokeProvider(&invoke));
+            try std.testing.expect(response_handle == null);
+        } else {
+            try linkedInferenceInvokeProvider(&invoke);
+            defer linkedInferenceDestroyProviderResponse(response_handle.?);
+            var result = try std.json.parseFromSlice([][]f32, a, response_json.slice(), .{});
+            defer result.deinit();
+            try std.testing.expectEqual(@as(usize, 1), result.value.len);
+            try std.testing.expectEqual(grouped_values.len, result.value[0].len);
+            for (grouped_values, result.value[0]) |value, actual| {
+                const expected_value: f32 = switch (value) {
+                    .float => @floatCast(value.float),
+                    .integer => @floatFromInt(value.integer),
+                    else => return error.InvalidEmbeddingResponse,
+                };
+                try std.testing.expectApproxEqAbs(expected_value, actual, 0.001);
+            }
+        }
+        try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
+    }
+}
+
 test "standalone chunk minimum content survives the real provider ABI" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -4001,4 +4378,64 @@ test "standalone chunk minimum content survives the real provider ABI" {
             try std.testing.expectEqual(@as(i64, @intCast(abi_chunk.end_char.?)), http_chunk.object.get("end_char").?.integer);
         }
     }
+}
+
+test "linked embedding audio MIME hints match public and native grouped vectors" {
+    const env = @import("antfly_platform").env;
+    const fixture_path = env.getenv("ANTFLY_AUDIO_PARITY_MP3") orelse return error.SkipZigTest;
+    const model = env.getenv("ANTFLY_EMBEDDINGGEMMA2_MODEL") orelse return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const source = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, fixture_path, a, .limited(1024 * 1024));
+    defer a.free(source);
+    const padded = try a.alloc(u8, source.len + 1);
+    defer a.free(padded);
+    padded[0] = 0;
+    @memcpy(padded[1..], source);
+    try std.testing.expect(inference.pipelines.audio.detectFormat(padded) == null);
+    var node = try inference.server.Node.init(a, .{ .models_dir = std.fs.path.dirname(model).?, .allow_unknown_models = true, .process_termination_available = true });
+    defer node.deinit();
+    try node.attachIo(std.testing.io);
+    node.session_manager.required_backend = if (@import("builtin").os.tag == .macos) .metal else .native;
+    node.model_manager.session_manager.required_backend = node.session_manager.required_backend;
+    const name = std.fs.path.basename(model);
+    const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(padded.len));
+    defer a.free(encoded);
+    _ = std.base64.standard.Encoder.encode(encoded, padded);
+    const body = try std.json.Stringify.valueAlloc(a, .{ .model = name, .task_type = "RETRIEVAL_QUERY", .input = .{.{ .content = .{ .{ .type = "text", .text = "Describe this tone" }, .{ .type = "media", .mime_type = "audio/mpeg", .data = encoded } } }} }, .{});
+    defer a.free(body);
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/embed");
+    defer request.deinit();
+    request.body = body;
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try node.createEmbedding(&ctx);
+    defer response.deinit();
+    if (response.status.code != 200) std.debug.print("audio MIME parity status={d} body={s}\n", .{ response.status.code, response.body orelse "" });
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, response.body.?, .{});
+    defer parsed.deinit();
+    const values = parsed.value.object.get("data").?.array.items[0].object.get("embedding").?.array.items;
+    const revision = (try localModelCapabilities(&node, std.testing.io, name, .embed)).model_revision;
+    const vectors = try localAntflyEmbedDensePartsWithExecutionContext(&node, a, name, &.{ .{ .text = "Describe this tone" }, .{ .binary = .{ .mime_type = "audio/mpeg", .data = padded } } }, true, revision, std.testing.io, .{ .deadline_ns = platform_time.monotonicNs() + 120 * std.time.ns_per_s }, "RETRIEVAL_QUERY", null);
+    defer {
+        for (vectors) |vector| a.free(vector);
+        a.free(vectors);
+    }
+    try std.testing.expectEqual(@as(usize, 1), vectors.len);
+    try std.testing.expectEqual(values.len, vectors[0].len);
+    for (values, vectors[0]) |value, actual| {
+        const expected: f32 = switch (value) {
+            .float => @floatCast(value.float),
+            .integer => @floatFromInt(value.integer),
+            else => return error.InvalidEmbeddingResponse,
+        };
+        try std.testing.expectApproxEqAbs(expected, actual, 0.001);
+    }
+    // Decoder policy is request-local on the real grouped backend too.
+    var handle = try node.model_manager.acquireFromDirWithControl(model, .{ .io = std.testing.io });
+    defer handle.release();
+    const loaded = handle.get();
+    const grouped = inference.embedding_gemma2_pipeline;
+    try std.testing.expectError(error.AudioTooLarge, grouped.embed(a, loaded.session, loaded.getTokenizer(), .{ .content = &.{ .{ .text = "Describe this tone" }, .{ .audio = .{ .bytes = padded, .decode_options = .{ .mime_hint = "audio/mpeg" } } } } }, .{ .max_audio_decode_working_bytes = 1 }, loaded.embeddingExecutionLock(), node.bindExecutionControl(std.testing.io, .{})));
+    try std.testing.expectEqual(@as(usize, 0), node.inference_admission.inFlightUnits());
 }

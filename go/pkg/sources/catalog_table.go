@@ -48,16 +48,38 @@ func NewCatalogRecord(binding Binding, provider, revision string, permissions Pe
 	}
 	binding.PublishedRevision = revision
 	binding.AccessID = "" // Cloud proofs are derived from current authenticated policy.
-	return CatalogRecord{Version: CatalogRecordVersion, DocType: "source_catalog", Source: binding, Provider: provider, DocumentVersion: 1, PublishedRevision: revision, Permissions: permissions}
+	version := binding.DocumentVersion
+	if version == 0 {
+		version = 1
+	}
+	return CatalogRecord{Version: CatalogRecordVersion, DocType: "source_catalog", Source: binding, Provider: provider, DocumentVersion: version, PublishedRevision: revision, Permissions: permissions}
 }
 func (r CatalogRecord) Validate() error {
 	switch r.Provider {
-	case ProviderS3, ProviderGCS, ProviderGoogleDrive, ProviderGitHub, ProviderSlack, ProviderDiscord, ProviderGoogleWorkspace:
+	case ProviderS3, ProviderLocal, ProviderGCS, ProviderGoogleDrive, ProviderGitHub, ProviderSlack, ProviderDiscord, ProviderGoogleWorkspace:
 	default:
 		return fmt.Errorf("unsupported catalog provider")
 	}
-	if r.Version != CatalogRecordVersion || r.DocType != "source_catalog" || !canonicalID(r.Source.ID) || r.Source.Table == "" || r.Source.DocumentField != "grep" || r.DocumentVersion != 1 || r.Provider == "" || r.Source.AccessID != "" {
+	if r.Version != CatalogRecordVersion || r.DocType != "source_catalog" || !canonicalID(r.Source.ID) || r.Source.Table == "" || (r.DocumentVersion < 3 && r.Source.DocumentField != "grep") || (r.DocumentVersion != 1 && r.DocumentVersion != 2 && r.DocumentVersion != SourceRecordVersion) || r.Provider == "" || r.Source.AccessID != "" {
 		return fmt.Errorf("invalid source catalog record")
+	}
+	if r.DocumentVersion == SourceRecordVersion {
+		if r.Source.DocumentVersion != SourceRecordVersion || r.Source.Fields == nil || r.Source.Fields.Permissions == "" || r.Source.Fields.URI == "" || r.Source.Fields.Path == "" || r.Source.Fields.Revision == "" || r.Source.Fields.IndexedAt == "" {
+			return fmt.Errorf("source catalog requires explicit identity and permission fields")
+		}
+		if err := r.Source.Fields.Validate(); err != nil {
+			return err
+		}
+		if err := ValidateTextStreams(r.Source.Streams); err != nil {
+			return err
+		}
+	}
+
+	if r.DocumentVersion == 2 && (r.Source.Publication != "media" || r.Source.DocumentVersion != 2) {
+		return fmt.Errorf("media catalog version requires explicit media publication")
+	}
+	if r.DocumentVersion == 1 && r.Source.Publication == "media" {
+		return fmt.Errorf("text catalog cannot advertise media documents")
 	}
 	var actual, expected any
 	if json.Unmarshal(r.Source.Filter, &actual) != nil || json.Unmarshal(SourceFilter(r.Source.ID), &expected) != nil || !reflect.DeepEqual(actual, expected) {

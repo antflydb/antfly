@@ -521,6 +521,9 @@ func (c *CollaborationConnector) workspaceDriveFile(ctx context.Context, id stri
 		}
 	}
 	export := googleWorkspaceTextExport(file.MIME)
+	if c.NativeAttachments && export != "" {
+		export = "application/pdf"
+	}
 	if export == "" && file.Size != "" && size > int64(limit) {
 		return collaborationFile{}, fmt.Errorf("%w: Drive attachment exceeds remaining byte budget", ErrInvalidInput)
 	}

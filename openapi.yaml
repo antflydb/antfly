@@ -13701,6 +13701,13 @@ paths:
       responses:
         '200':
           description: Embeddings generated successfully
+          headers:
+            X-Antfly-Model-Revision:
+              description: The acquired model revision, acknowledging model_revision after successful
+                execution. Present for pinned JSON and numeric responses.
+              schema:
+                type: string
+                pattern: ^[0-9a-f]{64}$
           content:
             application/json:
               schema:
@@ -13735,6 +13742,20 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '409':
+          description: The model identity or immutable revision pin does not match the acquired model.
+          headers:
+            X-Antfly-Capability-Stale:
+              description: Present with value true for a stale model revision. Refresh capabilities and
+                replan before retrying.
+              schema:
+                type: string
+                enum:
+                  - 'true'
           content:
             application/json:
               schema:
@@ -15510,6 +15531,13 @@ paths:
       responses:
         '200':
           description: Embedding response
+          headers:
+            X-Antfly-Model-Revision:
+              description: The acquired model revision, acknowledging model_revision after successful
+                execution. Present for pinned JSON and numeric responses.
+              schema:
+                type: string
+                pattern: ^[0-9a-f]{64}$
           content:
             application/json:
               schema:
@@ -15544,6 +15572,20 @@ paths:
                 $ref: '#/components/schemas/InferenceError'
         '404':
           description: Model not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InferenceError'
+        '409':
+          description: The model identity or immutable revision pin does not match the acquired model.
+          headers:
+            X-Antfly-Capability-Stale:
+              description: Present with value true for a stale model revision. Refresh capabilities and
+                replan before retrying.
+              schema:
+                type: string
+                enum:
+                  - 'true'
           content:
             application/json:
               schema:
@@ -31713,7 +31755,17 @@ components:
       additionalProperties: false
       required:
         - level
-        - id
+      not:
+        anyOf:
+          - required:
+              - id
+              - ids
+          - not:
+              anyOf:
+                - required:
+                    - id
+                - required:
+                    - ids
       properties:
         level:
           type: string
@@ -31722,12 +31774,44 @@ components:
         id:
           type: string
           minLength: 1
+        ids:
+          type: array
+          minItems: 1
+          maxItems: 100
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 1
+          description: Bounded source selection for member traversal; unit traversal requires id.
     HierarchyChildren:
       type: object
       additionalProperties: false
       required:
         - parent
         - level
+      not:
+        anyOf:
+          - required:
+              - artifact
+            properties:
+              level:
+                enum:
+                  - unit
+          - properties:
+              level:
+                enum:
+                  - unit
+              parent:
+                not:
+                  required:
+                    - id
+          - properties:
+              level:
+                enum:
+                  - member
+            not:
+              required:
+                - artifact
       properties:
         parent:
           $ref: '#/components/schemas/HierarchyChildParent'
@@ -31735,10 +31819,27 @@ components:
           type: string
           enum:
             - unit
+            - member
           description: >
             Child level to enumerate. Unit traversal reads the versioned extraction
 
             hierarchy rather than a relevance index, so empty and failed units are included.
+
+            Member traversal requires artifact and seeks that producer's native storage
+
+            prefixes within the selected source or parent.ids batch (up to 100).
+
+            One global cursor orders the selected members; it includes generic assets and chunks.
+
+            Scalar member payloads are returned as {"$": value} in _source so
+
+            every query hit retains an object-shaped projection. Continuation
+
+            requires the remote_snapshot returned with the first page.
+        artifact:
+          type: string
+          minLength: 1
+          description: Producer name; required for member traversal and omitted for unit traversal.
     HierarchyChildrenOrderBy:
       type: array
       minItems: 1
@@ -31799,7 +31900,11 @@ components:
 
         in the selected source revision, including units with no searchable chunk, and uses
 
-        the top-level `_sort`/`search_after` cursor contract.
+        the top-level `_sort`/`search_after` cursor contract. For member traversal,
+
+        `filter_query` applies to source parents before any artifact enumeration;
+
+        it never filters member payloads or changes the member pagination order.
 
 
         Ancestor and nested-match field projections are always explicit to keep response
@@ -32108,7 +32213,7 @@ components:
               - not:
                   required:
                     - fields
-          - description: Hierarchy child traversal requires an explicit top-level field projection.
+          - description: Unit child traversal requires an explicit top-level field projection.
             allOf:
               - required:
                   - hierarchy
@@ -32116,6 +32221,12 @@ components:
                   hierarchy:
                     required:
                       - children
+                    properties:
+                      children:
+                        properties:
+                          level:
+                            enum:
+                              - unit
               - not:
                   required:
                     - fields
@@ -32189,8 +32300,23 @@ components:
                       - search_after
                   - required:
                       - search_before
-          - description: Relevance, filtering, backward/offset pagination, and result transforms do not
-              apply to sequential child traversal.
+          - description: Unit traversal has no public source-filter admission contract.
+            allOf:
+              - required:
+                  - filter_query
+                  - hierarchy
+                properties:
+                  hierarchy:
+                    required:
+                      - children
+                    properties:
+                      children:
+                        properties:
+                          level:
+                            enum:
+                              - unit
+          - description: Relevance, backward/offset pagination, and result transforms do not apply to
+              sequential child traversal.
             allOf:
               - required:
                   - hierarchy
@@ -32205,8 +32331,6 @@ components:
                       - full_text_search
                   - required:
                       - full_text_index
-                  - required:
-                      - filter_query
                   - required:
                       - exclusion_query
                   - required:
@@ -34282,6 +34406,14 @@ components:
           x-go-type-skip-optional-pointer: false
         unit_id:
           type: string
+        revision:
+          type: string
+          description: Opaque fingerprint of this member's native content and captured producer/input
+            state; independent of hierarchy traversal cursors.
+        derivation_revision:
+          type: string
+          description: Opaque fingerprint of the captured producer/input state, when available. Changes
+            to producer configuration or acquired input reopen this identity.
         source:
           $ref: '#/components/schemas/HierarchyArtifactSource'
     HierarchyAncestor:
@@ -39302,6 +39434,85 @@ components:
         last_modified_field:
           type: string
           description: Row field holding the source last-modified timestamp.
+    DocumentExtractionTextQualityConfig:
+      type: object
+      description: Text-quality thresholds. `native_text.quality` assesses native document text and selects
+        fallback independently of whether OCR is configured; `ocr.quality` assesses OCR output. Quality
+        flags are not guarantees of correct reading order or complete document semantics.
+      properties:
+        min_chars:
+          type: integer
+          x-go-type-skip-optional-pointer: false
+          minimum: 0
+          default: 50
+          description: Minimum non-whitespace Unicode characters before text passes the length check.
+        garbled_min_words:
+          type: integer
+          x-go-type-skip-optional-pointer: false
+          minimum: 0
+          default: 20
+          description: Minimum words before the garbled-text check applies.
+        garbled_sample_words:
+          type: integer
+          minimum: 1
+          default: 50
+          description: Words sampled by the garbled-text check.
+        max_single_char_word_ratio:
+          type: number
+          x-go-type-skip-optional-pointer: false
+          format: double
+          minimum: 0
+          maximum: 1
+          default: 0.4
+          description: Maximum ratio of single-character words before text counts as garbled.
+        min_line_chars:
+          type: integer
+          minimum: 1
+          default: 15
+          description: Minimum non-whitespace Unicode characters for a line to count in the corrupted-line
+            check.
+        max_corrupted_line_ratio:
+          type: number
+          x-go-type-skip-optional-pointer: false
+          format: double
+          minimum: 0
+          maximum: 1
+          default: 0.2
+          description: Maximum ratio of corrupted lines.
+        max_font_corruption:
+          type: number
+          x-go-type-skip-optional-pointer: false
+          format: double
+          minimum: 0
+          maximum: 1
+          default: 0.5
+          description: Font corruption score above which a substantial line counts as corrupted.
+        max_replacement_ratio:
+          type: number
+          x-go-type-skip-optional-pointer: false
+          format: double
+          minimum: 0
+          maximum: 1
+          default: 0.05
+          description: Maximum ratio of Unicode replacement characters.
+    DocumentExtractionNativeTextConfig:
+      type: object
+      description: Native document text policy and quality assessment. No OCR model is required. Native
+        quality diagnostics are recorded independently of extraction completion and OCR availability.
+      properties:
+        policy:
+          type: string
+          enum:
+            - source
+            - page
+            - visible
+          default: page
+          description: '`source` retains decoded source text, including off-page runs, for auditing. `page`
+            excludes runs wholly outside the page or a known clipping box while retaining hidden OCR/accessibility
+            text. `visible` additionally excludes nonpainting and fully transparent text. These policies
+            do not claim pixel-perfect occlusion analysis. All policies honor semantic ActualText replacements.'
+        quality:
+          $ref: '#/components/schemas/DocumentExtractionTextQualityConfig'
     DocumentExtractionReaderConfig:
       type: object
       required:
@@ -39413,65 +39624,6 @@ components:
           maximum: 16384
           default: 4096
           description: Maximum width or height of a rendered page.
-    DocumentExtractionOcrQualityConfig:
-      type: object
-      description: Thresholds that decide when a PDF page's native text is too poor to keep, in `auto`
-        mode.
-      properties:
-        min_content_chars:
-          type: integer
-          x-go-type-skip-optional-pointer: false
-          minimum: 0
-          default: 50
-          description: Pages with fewer meaningful characters are read with OCR.
-        garbled_min_words:
-          type: integer
-          x-go-type-skip-optional-pointer: false
-          minimum: 0
-          default: 20
-          description: Minimum words before the garbled-text check applies.
-        garbled_sample_words:
-          type: integer
-          minimum: 1
-          default: 50
-          description: Words sampled by the garbled-text check.
-        max_single_char_word_ratio:
-          type: number
-          x-go-type-skip-optional-pointer: false
-          format: double
-          minimum: 0
-          maximum: 1
-          default: 0.4
-          description: Maximum ratio of single-character words before text counts as garbled.
-        substantial_line_min_chars:
-          type: integer
-          minimum: 1
-          default: 15
-          description: Minimum characters for a line to count in the corrupted-line check.
-        max_corrupted_line_ratio:
-          type: number
-          x-go-type-skip-optional-pointer: false
-          format: double
-          minimum: 0
-          maximum: 1
-          default: 0.2
-          description: Maximum ratio of corrupted lines.
-        font_corruption_score_threshold:
-          type: number
-          x-go-type-skip-optional-pointer: false
-          format: double
-          minimum: 0
-          maximum: 1
-          default: 0.5
-          description: Font corruption score at which text is replaced by OCR.
-        max_replacement_char_ratio:
-          type: number
-          x-go-type-skip-optional-pointer: false
-          format: double
-          minimum: 0
-          maximum: 1
-          default: 0.05
-          description: Maximum ratio of Unicode replacement characters.
     DocumentExtractionOcrConfig:
       type: object
       description: Reads scanned pages and images. Name exactly one of `reader` or `generator`. Readers
@@ -39490,7 +39642,7 @@ components:
             - auto
             - always
           default: auto
-          description: '`auto` reads PDF pages whose native text fails the `quality` checks, and images.
+          description: '`auto` reads PDF pages whose native text fails `native_text.quality`, and images.
             `always` reads every page.'
         prompt:
           type: string
@@ -39499,7 +39651,7 @@ components:
         render:
           $ref: '#/components/schemas/DocumentExtractionRenderConfig'
         quality:
-          $ref: '#/components/schemas/DocumentExtractionOcrQualityConfig'
+          $ref: '#/components/schemas/DocumentExtractionTextQualityConfig'
     CloudflareSTTConfig:
       type: object
       description: Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN.
@@ -39830,6 +39982,8 @@ components:
           x-go-type-skip-optional-pointer: false
           default: true
           description: Strip HTML markup from HTML sources before storing their text.
+        native_text:
+          $ref: '#/components/schemas/DocumentExtractionNativeTextConfig'
         ocr:
           $ref: '#/components/schemas/DocumentExtractionOcrConfig'
         transcription:
@@ -46677,12 +46831,67 @@ components:
           description: MIME type (audio/wav, image/gif, image/png, etc.).
         sampling:
           $ref: '#/components/schemas/VideoSamplingPolicy'
+    SourceContentPart:
+      type: object
+      additionalProperties: false
+      description: Image, audio, or video named by a source record's `content.resource`. Accepted only
+        on the Antfly gateway's generate and chat routes, which fetch the pinned version under `remote_content.security`
+        and replace this part with inline media, so the source URL never reaches a model vendor. Fetching
+        requires a nonempty `allowed_hosts`. The expanded request is limited to 16 MiB. Models that do
+        not support the media type reject the request.
+      required:
+        - type
+        - source
+      properties:
+        type:
+          type: string
+          enum:
+            - source
+        source:
+          type: object
+          additionalProperties: false
+          required:
+            - type
+            - uri
+            - mime_type
+            - version
+            - length
+          properties:
+            type:
+              type: string
+              enum:
+                - source
+            uri:
+              type: string
+              maxLength: 16384
+              description: HTTP(S) URL. Treat source media URLs as private.
+            mime_type:
+              type: string
+              description: image/png, image/jpeg, image/webp, image/gif, or an audio/* or video/* type.
+            version:
+              type: string
+              minLength: 1
+              maxLength: 4096
+              description: Quoted strong ETag. The fetch fails if the source no longer has this version.
+            version_kind:
+              type: string
+              enum:
+                - strong_etag
+              default: strong_etag
+            length:
+              type: integer
+              format: int64
+              minimum: 1
+              maximum: 16777216
+              description: Exact object length.
     ContentPart:
-      description: A content part for multimodal input (text, image URL, or inline media).
+      description: A content part for multimodal input (text, image URL, inline media, or a pinned source
+        reference).
       oneOf:
         - $ref: '#/components/schemas/TextContentPart'
         - $ref: '#/components/schemas/ImageURLContentPart'
         - $ref: '#/components/schemas/MediaContentPart'
+        - $ref: '#/components/schemas/SourceContentPart'
     ChatMessageContent:
       x-go-type: stdjson.RawMessage
       x-go-type-import:
@@ -51658,6 +51867,13 @@ components:
         - model
         - input
       properties:
+        model_revision:
+          type: string
+          pattern: ^[0-9a-f]{64}$
+          description: Optional immutable execution revision from model capabilities. Every acquired model,
+            including recovery attempts, must match before inference. A mismatch returns 409 with X-Antfly-Capability-Stale
+            true. Successful execution acknowledges the pin in X-Antfly-Model-Revision for JSON and numeric
+            responses; callers requiring a pin must reject missing or different acknowledgements.
         model_identity:
           type: string
           pattern: ^[0-9a-f]{64}$
@@ -53137,6 +53353,12 @@ components:
               format: int64
               minimum: 1
               maximum: 4294967295
+        model_revision_pinning:
+          type: boolean
+          default: false
+          description: The embedding endpoint enforces model_revision and acknowledges successful execution
+            in X-Antfly-Model-Revision for both JSON and numeric responses. An observed model_revision
+            alone does not establish this support.
         model_revision:
           type: string
           minLength: 64
@@ -67908,6 +68130,17 @@ components:
           example:
             - /Users/data/
             - my-bucket/uploads/
+        source_media_base_urls:
+          type: array
+          description: Exact source companion base URLs that a chat `source` part may fetch, matched on
+            scheme, host, port and path. This is how a loopback or private companion is allowed; such
+            URLs need no `allowed_hosts` entry. Every other `source` URL needs `allowed_hosts` and always
+            keeps private-IP blocking, whatever `block_private_ips` says. Template fetches ignore this
+            setting.
+          items:
+            type: string
+          example:
+            - http://127.0.0.1:8082/v1/media/
         user_agent:
           type: string
           description: User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some
@@ -68292,11 +68525,40 @@ components:
         s3_credentials:
           $ref: '#/components/schemas/Credentials'
           description: S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
+        cooperative_execution:
+          type: object
+          additionalProperties: false
+          description: Opt-in interleaving of independently owned requests on backends declaring safe
+            step sharing. Independent of row batching; graph, prefix-cache, speculative and multimodal
+            routes remain exclusive. Currently qualified for at most two active E4B CUDA requests with
+            one row per step.
+          properties:
+            mode:
+              type: string
+              enum:
+                - 'off'
+                - 'on'
+              default: 'off'
+            max_active_requests:
+              type: integer
+              minimum: 1
+              maximum: 2
+              default: 2
+            short_context_burst:
+              type: integer
+              minimum: 1
+              maximum: 8
+              default: 8
+            decode_handoff_wait_us:
+              type: integer
+              minimum: 0
+              maximum: 10000
+              default: 5000
         generation_batching:
           type: object
           additionalProperties: false
-          description: Experimental execution batching; mode on explicitly enables qualified CUDA scheduling.
-            Resource and request ceilings still apply.
+          description: Experimental row batching; independent from cooperative_execution. Mode on explicitly
+            enables qualified CUDA row scheduling. Resource and request ceilings still apply.
           properties:
             mode:
               type: string

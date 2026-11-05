@@ -30,6 +30,7 @@ pub const DownloadedContent = struct {
 pub const HttpError = struct {
     status: u16,
     message: []const u8,
+    retry_after_ms: ?u64 = null,
 };
 
 pub const DownloadOutcome = union(enum) {

@@ -132,3 +132,6 @@ test "objectstore module compiles" {
     _ = s3ObjectUriAlloc;
     _ = s3PutObjectShapeAlloc;
 }
+
+/// Shared strict HTTP/provider timestamp parsing.
+pub const retention_time = @import("retention_time.zig");

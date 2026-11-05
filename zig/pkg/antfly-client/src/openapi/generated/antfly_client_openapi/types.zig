@@ -7292,10 +7292,11 @@ pub const ContainsQuery = struct {
     }
 };
 
-/// A content part for multimodal input (text, image URL, or inline media).
+/// A content part for multimodal input (text, image URL, inline media, or a pinned source reference).
 pub const ContentPart = union(enum) {
     media_content_part: *MediaContentPart,
     image_url_content_part: *ImageURLContentPart,
+    source_content_part: *SourceContentPart,
     text_content_part: *TextContentPart,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
@@ -7338,6 +7339,7 @@ pub const ContentPart = union(enum) {
             .value => |disc_str| {
                 if (std.mem.eql(u8, disc_str, "media")) return .{ .media_content_part = try parseStructuralVariantFromSlice(MediaContentPart, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "image_url")) return .{ .image_url_content_part = try parseStructuralVariantFromSlice(ImageURLContentPart, allocator, input, options) };
+                if (std.mem.eql(u8, disc_str, "source")) return .{ .source_content_part = try parseStructuralVariantFromSlice(SourceContentPart, allocator, input, options) };
                 if (std.mem.eql(u8, disc_str, "text")) return .{ .text_content_part = try parseStructuralVariantFromSlice(TextContentPart, allocator, input, options) };
                 return error.UnexpectedToken;
             },
@@ -7369,6 +7371,10 @@ pub const ContentPart = union(enum) {
             const parsed = try parseStructuralVariant(ImageURLContentPart, allocator, source, options) orelse return error.UnexpectedToken;
             return .{ .image_url_content_part = parsed };
         }
+        if (std.mem.eql(u8, disc_str, "source")) {
+            const parsed = try parseStructuralVariant(SourceContentPart, allocator, source, options) orelse return error.UnexpectedToken;
+            return .{ .source_content_part = parsed };
+        }
         if (std.mem.eql(u8, disc_str, "text")) {
             const parsed = try parseStructuralVariant(TextContentPart, allocator, source, options) orelse return error.UnexpectedToken;
             return .{ .text_content_part = parsed };
@@ -7380,6 +7386,7 @@ pub const ContentPart = union(enum) {
         switch (self) {
             .media_content_part => |v| try jw.write(v.*),
             .image_url_content_part => |v| try jw.write(v.*),
+            .source_content_part => |v| try jw.write(v.*),
             .text_content_part => |v| try jw.write(v.*),
         }
     }
@@ -7401,6 +7408,8 @@ pub const ContentSecurityConfig = struct {
     max_image_dimension: ?i64 = null,
     /// Whitelist of allowed path prefixes for file:// and s3:// URLs. File downloads require an explicit nonempty path allowlist; omission and an empty list deny local file access. For S3 the generic scraper treats omission as unrestricted and an empty list as deny-all; Antfly inference requires explicit path allowlists. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
     allowed_paths: ?[]const []const u8 = null,
+    /// Exact source companion base URLs that a chat `source` part may fetch, matched on scheme, host, port and path. This is how a loopback or private companion is allowed; such URLs need no `allowed_hosts` entry. Every other `source` URL needs `allowed_hosts` and always keeps private-IP blocking, whatever `block_private_ips` says. Template fetches ignore this setting.
+    source_media_base_urls: ?[]const []const u8 = null,
     /// User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
     user_agent: ?[]const u8 = null,
 
@@ -7413,6 +7422,7 @@ pub const ContentSecurityConfig = struct {
         .{ "download_timeout_seconds", "download_timeout_seconds", true },
         .{ "max_image_dimension", "max_image_dimension", true },
         .{ "allowed_paths", "allowed_paths", true },
+        .{ "source_media_base_urls", "source_media_base_urls", true },
         .{ "user_agent", "user_agent", true },
     };
 
@@ -7452,6 +7462,10 @@ pub const ContentSecurityConfig = struct {
         }
         if (self.allowed_paths) |value| {
             try jw.objectField("allowed_paths");
+            try jw.write(value);
+        }
+        if (self.source_media_base_urls) |value| {
+            try jw.objectField("source_media_base_urls");
             try jw.write(value);
         }
         if (self.user_agent) |value| {
@@ -12092,6 +12106,7 @@ pub const DocumentExtractionConfig = struct {
     credentials: ?[]const u8 = null,
     /// Strip HTML markup from HTML sources before storing their text.
     html_strip_tags: ?bool = null,
+    native_text: ?DocumentExtractionNativeTextConfig = null,
     ocr: ?DocumentExtractionOcrConfig = null,
     transcription: ?DocumentExtractionTranscriptionConfig = null,
     /// How sources that match no explicit route are handled. `mixed_files` (alias `default`) detects PDFs, HTML, email, Office documents, ZIP archives, images, audio, and text. `explicit_only` (alias `none`) records unmatched sources as unsupported. Detection never requests a producer: detected images and audio without a configured producer report `ocr_not_configured` or `transcription_not_configured`.
@@ -12110,6 +12125,7 @@ pub const DocumentExtractionConfig = struct {
         .{ "last_modified", "last_modified", true },
         .{ "credentials", "credentials", true },
         .{ "html_strip_tags", "html_strip_tags", true },
+        .{ "native_text", "native_text", true },
         .{ "ocr", "ocr", true },
         .{ "transcription", "transcription", true },
         .{ "route_preset", "route_preset", true },
@@ -12162,6 +12178,10 @@ pub const DocumentExtractionConfig = struct {
             try jw.objectField("html_strip_tags");
             try jw.write(value);
         }
+        if (self.native_text) |value| {
+            try jw.objectField("native_text");
+            try jw.write(value);
+        }
         if (self.ocr) |value| {
             try jw.objectField("ocr");
             try jw.write(value);
@@ -12182,16 +12202,50 @@ pub const DocumentExtractionConfig = struct {
     }
 };
 
+/// Native document text policy and quality assessment. No OCR model is required. Native quality diagnostics are recorded independently of extraction completion and OCR availability.
+pub const DocumentExtractionNativeTextConfig = struct {
+    /// `source` retains decoded source text, including off-page runs, for auditing. `page` excludes runs wholly outside the page or a known clipping box while retaining hidden OCR/accessibility text. `visible` additionally excludes nonpainting and fully transparent text. These policies do not claim pixel-perfect occlusion analysis. All policies honor semantic ActualText replacements.
+    policy: ?[]const u8 = null,
+    quality: ?DocumentExtractionTextQualityConfig = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "policy", "policy", true },
+        .{ "quality", "quality", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.policy) |value| {
+            try jw.objectField("policy");
+            try jw.write(value);
+        }
+        if (self.quality) |value| {
+            try jw.objectField("quality");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
 /// Reads scanned pages and images. Name exactly one of `reader` or `generator`. Readers run their own OCR task; generators receive a transcription instruction.
 pub const DocumentExtractionOcrConfig = struct {
     reader: ?DocumentExtractionReaderConfig = null,
     generator: ?GeneratorConfig = null,
-    /// `auto` reads PDF pages whose native text fails the `quality` checks, and images. `always` reads every page.
+    /// `auto` reads PDF pages whose native text fails `native_text.quality`, and images. `always` reads every page.
     mode: ?[]const u8 = null,
     /// Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers reject prompts.
     prompt: ?[]const u8 = null,
     render: ?DocumentExtractionRenderConfig = null,
-    quality: ?DocumentExtractionOcrQualityConfig = null,
+    quality: ?DocumentExtractionTextQualityConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -12235,83 +12289,6 @@ pub const DocumentExtractionOcrConfig = struct {
         }
         if (self.quality) |value| {
             try jw.objectField("quality");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-/// Thresholds that decide when a PDF page's native text is too poor to keep, in `auto` mode.
-pub const DocumentExtractionOcrQualityConfig = struct {
-    /// Pages with fewer meaningful characters are read with OCR.
-    min_content_chars: ?i64 = null,
-    /// Minimum words before the garbled-text check applies.
-    garbled_min_words: ?i64 = null,
-    /// Words sampled by the garbled-text check.
-    garbled_sample_words: ?i64 = null,
-    /// Maximum ratio of single-character words before text counts as garbled.
-    max_single_char_word_ratio: ?f64 = null,
-    /// Minimum characters for a line to count in the corrupted-line check.
-    substantial_line_min_chars: ?i64 = null,
-    /// Maximum ratio of corrupted lines.
-    max_corrupted_line_ratio: ?f64 = null,
-    /// Font corruption score at which text is replaced by OCR.
-    font_corruption_score_threshold: ?f64 = null,
-    /// Maximum ratio of Unicode replacement characters.
-    max_replacement_char_ratio: ?f64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "min_content_chars", "min_content_chars", true },
-        .{ "garbled_min_words", "garbled_min_words", true },
-        .{ "garbled_sample_words", "garbled_sample_words", true },
-        .{ "max_single_char_word_ratio", "max_single_char_word_ratio", true },
-        .{ "substantial_line_min_chars", "substantial_line_min_chars", true },
-        .{ "max_corrupted_line_ratio", "max_corrupted_line_ratio", true },
-        .{ "font_corruption_score_threshold", "font_corruption_score_threshold", true },
-        .{ "max_replacement_char_ratio", "max_replacement_char_ratio", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.min_content_chars) |value| {
-            try jw.objectField("min_content_chars");
-            try jw.write(value);
-        }
-        if (self.garbled_min_words) |value| {
-            try jw.objectField("garbled_min_words");
-            try jw.write(value);
-        }
-        if (self.garbled_sample_words) |value| {
-            try jw.objectField("garbled_sample_words");
-            try jw.write(value);
-        }
-        if (self.max_single_char_word_ratio) |value| {
-            try jw.objectField("max_single_char_word_ratio");
-            try jw.write(value);
-        }
-        if (self.substantial_line_min_chars) |value| {
-            try jw.objectField("substantial_line_min_chars");
-            try jw.write(value);
-        }
-        if (self.max_corrupted_line_ratio) |value| {
-            try jw.objectField("max_corrupted_line_ratio");
-            try jw.write(value);
-        }
-        if (self.font_corruption_score_threshold) |value| {
-            try jw.objectField("font_corruption_score_threshold");
-            try jw.write(value);
-        }
-        if (self.max_replacement_char_ratio) |value| {
-            try jw.objectField("max_replacement_char_ratio");
             try jw.write(value);
         }
         try jw.endObject();
@@ -12654,6 +12631,83 @@ pub const DocumentExtractionSourceConfig = struct {
         }
         if (self.last_modified_field) |value| {
             try jw.objectField("last_modified_field");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Text-quality thresholds. `native_text.quality` assesses native document text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR output. Quality flags are not guarantees of correct reading order or complete document semantics.
+pub const DocumentExtractionTextQualityConfig = struct {
+    /// Minimum non-whitespace Unicode characters before text passes the length check.
+    min_chars: ?i64 = null,
+    /// Minimum words before the garbled-text check applies.
+    garbled_min_words: ?i64 = null,
+    /// Words sampled by the garbled-text check.
+    garbled_sample_words: ?i64 = null,
+    /// Maximum ratio of single-character words before text counts as garbled.
+    max_single_char_word_ratio: ?f64 = null,
+    /// Minimum non-whitespace Unicode characters for a line to count in the corrupted-line check.
+    min_line_chars: ?i64 = null,
+    /// Maximum ratio of corrupted lines.
+    max_corrupted_line_ratio: ?f64 = null,
+    /// Font corruption score above which a substantial line counts as corrupted.
+    max_font_corruption: ?f64 = null,
+    /// Maximum ratio of Unicode replacement characters.
+    max_replacement_ratio: ?f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "min_chars", "min_chars", true },
+        .{ "garbled_min_words", "garbled_min_words", true },
+        .{ "garbled_sample_words", "garbled_sample_words", true },
+        .{ "max_single_char_word_ratio", "max_single_char_word_ratio", true },
+        .{ "min_line_chars", "min_line_chars", true },
+        .{ "max_corrupted_line_ratio", "max_corrupted_line_ratio", true },
+        .{ "max_font_corruption", "max_font_corruption", true },
+        .{ "max_replacement_ratio", "max_replacement_ratio", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.min_chars) |value| {
+            try jw.objectField("min_chars");
+            try jw.write(value);
+        }
+        if (self.garbled_min_words) |value| {
+            try jw.objectField("garbled_min_words");
+            try jw.write(value);
+        }
+        if (self.garbled_sample_words) |value| {
+            try jw.objectField("garbled_sample_words");
+            try jw.write(value);
+        }
+        if (self.max_single_char_word_ratio) |value| {
+            try jw.objectField("max_single_char_word_ratio");
+            try jw.write(value);
+        }
+        if (self.min_line_chars) |value| {
+            try jw.objectField("min_line_chars");
+            try jw.write(value);
+        }
+        if (self.max_corrupted_line_ratio) |value| {
+            try jw.objectField("max_corrupted_line_ratio");
+            try jw.write(value);
+        }
+        if (self.max_font_corruption) |value| {
+            try jw.objectField("max_font_corruption");
+            try jw.write(value);
+        }
+        if (self.max_replacement_ratio) |value| {
+            try jw.objectField("max_replacement_ratio");
             try jw.write(value);
         }
         try jw.endObject();
@@ -26744,6 +26798,10 @@ pub const HierarchyArtifact = struct {
     /// Independent media output sub-window within the parent chunk; omitted for an unsplit vector.
     window_index: ?u32 = null,
     unit_id: ?[]const u8 = null,
+    /// Opaque fingerprint of this member's native content and captured producer/input state; independent of hierarchy traversal cursors.
+    revision: ?[]const u8 = null,
+    /// Opaque fingerprint of the captured producer/input state, when available. Changes to producer configuration or acquired input reopen this identity.
+    derivation_revision: ?[]const u8 = null,
     source: ?HierarchyArtifactSource = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -26753,6 +26811,8 @@ pub const HierarchyArtifact = struct {
         .{ "chunk_id", "chunk_id", true },
         .{ "window_index", "window_index", true },
         .{ "unit_id", "unit_id", true },
+        .{ "revision", "revision", true },
+        .{ "derivation_revision", "derivation_revision", true },
         .{ "source", "source", true },
     };
 
@@ -26780,6 +26840,14 @@ pub const HierarchyArtifact = struct {
         }
         if (self.unit_id) |value| {
             try jw.objectField("unit_id");
+            try jw.write(value);
+        }
+        if (self.revision) |value| {
+            try jw.objectField("revision");
+            try jw.write(value);
+        }
+        if (self.derivation_revision) |value| {
+            try jw.objectField("derivation_revision");
             try jw.write(value);
         }
         if (self.source) |value| {
@@ -26839,13 +26907,75 @@ pub const HierarchyArtifactSource = struct {
 
 pub const HierarchyChildParent = struct {
     level: []const u8,
-    id: []const u8,
+    id: ?[]const u8 = null,
+    /// Bounded source selection for member traversal; unit traversal requires id.
+    ids: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "level", "level", false },
+        .{ "id", "id", true },
+        .{ "ids", "ids", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("level");
+        try jw.write(self.level);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.ids) |value| {
+            try jw.objectField("ids");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HierarchyChildren = struct {
     parent: HierarchyChildParent,
-    /// Child level to enumerate. Unit traversal reads the versioned extraction hierarchy rather than a relevance index, so empty and failed units are included.
+    /// Child level to enumerate. Unit traversal reads the versioned extraction hierarchy rather than a relevance index, so empty and failed units are included. Member traversal requires artifact and seeks that producer's native storage prefixes within the selected source or parent.ids batch (up to 100). One global cursor orders the selected members; it includes generic assets and chunks. Scalar member payloads are returned as {"$": value} in _source so every query hit retains an object-shaped projection. Continuation requires the remote_snapshot returned with the first page.
     level: []const u8,
+    /// Producer name; required for member traversal and omitted for unit traversal.
+    artifact: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "parent", "parent", false },
+        .{ "level", "level", false },
+        .{ "artifact", "artifact", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("parent");
+        try jw.write(self.parent);
+        try jw.objectField("level");
+        try jw.write(self.level);
+        if (self.artifact) |value| {
+            try jw.objectField("artifact");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The required public order for sequential hierarchy traversal. Specify `_hierarchy.position` ascending; Antfly appends `_id` ascending as the deterministic tie-breaker and returns both values in each hit's `_sort`.
@@ -30599,6 +30729,8 @@ pub const InferenceDocumentJobRequest = struct {
 
 /// OpenAI-compatible embedding request with inference multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized vectors.
 pub const InferenceEmbedRequest = struct {
+    /// Optional immutable execution revision from model capabilities. Every acquired model, including recovery attempts, must match before inference. A mismatch returns 409 with X-Antfly-Capability-Stale true. Successful execution acknowledges the pin in X-Antfly-Model-Revision for JSON and numeric responses; callers requiring a pin must reject missing or different acknowledgements.
+    model_revision: ?[]const u8 = null,
     /// Optional exact asset identity pin. A mismatch returns 409 before inference.
     model_identity: ?[]const u8 = null,
     /// Model name to use for embedding generation
@@ -30620,6 +30752,7 @@ pub const InferenceEmbedRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "model_revision", "model_revision", true },
         .{ "model_identity", "model_identity", true },
         .{ "model", "model", false },
         .{ "input", "input", false },
@@ -30641,6 +30774,10 @@ pub const InferenceEmbedRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.model_revision) |value| {
+            try jw.objectField("model_revision");
+            try jw.write(value);
+        }
         if (self.model_identity) |value| {
             try jw.objectField("model_identity");
             try jw.write(value);
@@ -32238,6 +32375,8 @@ pub const InferenceModelInfo = struct {
     inference_capabilities: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Proven native dense output width and inclusive supported truncation range, read from resolved metadata without loading weights. Omitted when unknown or for non-embedding tasks.
     dense_output: ?std.json.Value = null,
+    /// The embedding endpoint enforces model_revision and acknowledges successful execution in X-Antfly-Model-Revision for both JSON and numeric responses. An observed model_revision alone does not establish this support.
+    model_revision_pinning: ?bool = null,
     /// Immutable resolved embedding or generator generation, returned for scoped model/task discovery without loading weights.
     model_revision: ?[]const u8 = null,
     /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
@@ -32259,6 +32398,7 @@ pub const InferenceModelInfo = struct {
         .{ "chunking_limits", "chunking_limits", true },
         .{ "inference_capabilities", "inference_capabilities", true },
         .{ "dense_output", "dense_output", true },
+        .{ "model_revision_pinning", "model_revision_pinning", true },
         .{ "model_revision", "model_revision", true },
         .{ "qualified_limits", "qualified_limits", true },
         .{ "compatibility", "compatibility", true },
@@ -32292,6 +32432,10 @@ pub const InferenceModelInfo = struct {
         }
         if (self.dense_output) |value| {
             try jw.objectField("dense_output");
+            try jw.write(value);
+        }
+        if (self.model_revision_pinning) |value| {
+            try jw.objectField("model_revision_pinning");
             try jw.write(value);
         }
         if (self.model_revision) |value| {
@@ -44643,7 +44787,7 @@ pub const QueryFilterError = struct {
     retryable: bool,
 };
 
-/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit source-grouped result shape.
+/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. For member traversal, `filter_query` applies to source parents before any artifact enumeration; it never filters member payloads or changes the member pagination order. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit source-grouped result shape.
 pub const QueryHierarchy = struct {
     group_by: ?HierarchyGroupBy = null,
     ancestors: ?HierarchyAncestors = null,
@@ -52236,7 +52380,9 @@ pub const RuntimeConfig = struct {
     content_security: ?ContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?Credentials = null,
-    /// Experimental execution batching; mode on explicitly enables qualified CUDA scheduling. Resource and request ceilings still apply.
+    /// Opt-in interleaving of independently owned requests on backends declaring safe step sharing. Independent of row batching; graph, prefix-cache, speculative and multimodal routes remain exclusive. Currently qualified for at most two active E4B CUDA requests with one row per step.
+    cooperative_execution: ?std.json.Value = null,
+    /// Experimental row batching; independent from cooperative_execution. Mode on explicitly enables qualified CUDA row scheduling. Resource and request ceilings still apply.
     generation_batching: ?std.json.Value = null,
     /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to disable idle-time eviction; models can still be evicted under resource pressure or to enforce max_loaded_models.
     keep_alive: ?[]const u8 = null,
@@ -52273,6 +52419,7 @@ pub const RuntimeConfig = struct {
         .{ "ml_dir", "ml_dir", true },
         .{ "content_security", "content_security", true },
         .{ "s3_credentials", "s3_credentials", true },
+        .{ "cooperative_execution", "cooperative_execution", true },
         .{ "generation_batching", "generation_batching", true },
         .{ "keep_alive", "keep_alive", true },
         .{ "max_loaded_models", "max_loaded_models", true },
@@ -52325,6 +52472,10 @@ pub const RuntimeConfig = struct {
         }
         if (self.s3_credentials) |value| {
             try jw.objectField("s3_credentials");
+            try jw.write(value);
+        }
+        if (self.cooperative_execution) |value| {
+            try jw.objectField("cooperative_execution");
             try jw.write(value);
         }
         if (self.generation_batching) |value| {
@@ -54540,6 +54691,12 @@ pub const SortProfile = struct {
         }
         try jw.endObject();
     }
+};
+
+/// Image, audio, or video named by a source record's `content.resource`. Accepted only on the Antfly gateway's generate and chat routes, which fetch the pinned version under `remote_content.security` and replace this part with inline media, so the source URL never reaches a model vendor. Fetching requires a nonempty `allowed_hosts`. The expanded request is limited to 16 MiB. Models that do not support the media type reject the request.
+pub const SourceContentPart = struct {
+    type: []const u8,
+    source: std.json.Value,
 };
 
 pub const SqlSettingDatabaseDefault = struct {

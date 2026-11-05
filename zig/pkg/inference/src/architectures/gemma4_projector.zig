@@ -295,6 +295,100 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
     return .{ .images = .{ .allocator = allocator, .backend = cb, .embeddings = embeddings, .tokens_per_image = counts, .hidden_size = cfg.text_hidden, .batches_executed = state.count, .max_batch_executed = 1 }, .timestamps_us = timestamps, .stats = stats };
 }
 
+/// Frames decoded by the portable or Apple routes. Decoders call `prepare` from
+/// their own delivery path, so preparation stays on the host and retains only
+/// model-sized pixels. `project` runs afterward under the caller's execution lock.
+pub const PortableVideoFrames = struct {
+    allocator: std.mem.Allocator,
+    weights: ProjectorWeights,
+    cfg: Config,
+    prepared: []?PreparedImage,
+
+    pub fn init(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, frames: usize) !PortableVideoFrames {
+        var cfg = try parseConfig(&projector.gguf.parsed);
+        cfg.max_image_tokens = 70;
+        const prepared = try allocator.alloc(?PreparedImage, frames);
+        @memset(prepared, null);
+        return .{ .allocator = allocator, .weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector), .cfg = cfg, .prepared = prepared };
+    }
+    pub fn deinit(self: *PortableVideoFrames) void {
+        for (self.prepared) |item| if (item) |value| value.deinit();
+        self.allocator.free(self.prepared);
+        self.weights.deinit();
+    }
+    /// Model geometry follows the presentation size, so one resample corrects
+    /// non-square pixels without an intermediate stretched raster.
+    pub fn prepare(self: *PortableVideoFrames, slot: usize, frame: image.ImageU8, presentation_width: u32, presentation_height: u32) !void {
+        if (slot >= self.prepared.len or self.prepared[slot] != null) return error.InvalidVideoFrame;
+        self.prepared[slot] = try prepareImageViewAtGeometry(self.allocator, &self.weights, self.cfg, frame, portableFrameGeometry(self.cfg, frame, presentation_width, presentation_height));
+    }
+    /// Consumes `timestamps_us`. A repeated selection is delivered once, so its
+    /// later slots stay empty and leave the prompt rather than repeat a frame.
+    pub fn project(self: *PortableVideoFrames, timestamps_us: []i64) !ProjectedVideo {
+        const a = self.allocator;
+        const cb = self.weights.cb;
+        if (timestamps_us.len != self.prepared.len) return error.InvalidVideoFrame;
+        var frames: std.ArrayList(PreparedImage) = .empty;
+        defer frames.deinit(a);
+        var kept: usize = 0;
+        for (self.prepared, 0..) |item, slot| if (item) |value| {
+            try frames.append(a, value);
+            timestamps_us[kept] = timestamps_us[slot];
+            kept += 1;
+        };
+        if (kept == 0) return error.EmptyVideo;
+        const output = (try cb.allocUninitF32Shape(&.{ @intCast(kept * 70), @intCast(self.cfg.text_hidden) })) orelse return error.UnsupportedVideoBackend;
+        defer cb.free(output);
+        const counts = try a.alloc(usize, kept);
+        errdefer a.free(counts);
+        var rows: usize = 0;
+        var done: usize = 0;
+        while (done < kept) {
+            try cb.checkExecutionControl();
+            const cohort = frames.items[done..@min(done + 8, kept)];
+            var projected = try encodePreparedImagesResidentWithWeights(cb, a, &self.weights, self.cfg, cohort, .{});
+            defer projected.deinit();
+            const added = sumUsize(projected.tokens_per_image);
+            if (!try cb.copyRows2D(a, output, rows, projected.embeddings, 0, added, self.cfg.text_hidden)) return error.UnsupportedVideoBackend;
+            @memcpy(counts[done..][0..cohort.len], projected.tokens_per_image);
+            rows += added;
+            done += cohort.len;
+        }
+        const embeddings = try ownVideoRows(cb, a, output, rows, self.cfg.text_hidden);
+        errdefer cb.free(embeddings);
+        const timestamps = try a.dupe(i64, timestamps_us[0..kept]);
+        return .{ .images = .{ .allocator = a, .backend = cb, .embeddings = embeddings, .tokens_per_image = counts, .hidden_size = self.cfg.text_hidden, .batches_executed = (kept + 7) / 8, .max_batch_executed = @min(kept, 8) }, .timestamps_us = timestamps, .stats = .{ .decoded_frames = kept, .selected_frames = kept } };
+    }
+};
+fn portableFrameGeometry(cfg: Config, frame: image.ImageU8, presentation_width: u32, presentation_height: u32) Geometry {
+    if (presentation_width == 0 or presentation_height == 0) return targetGeometry(cfg, frame.width, frame.height);
+    return targetGeometry(cfg, presentation_width, presentation_height);
+}
+
+test "gemma4 video frame geometry follows presentation size for non-square pixels" {
+    var cfg = embeddingGemma2ImageConfig();
+    cfg.max_image_tokens = 70;
+    const raster: image.ImageU8 = .{ .data = &.{}, .width = 640, .height = 480, .format = .rgb8 };
+    const coded = portableFrameGeometry(cfg, raster, 0, 0);
+    const anamorphic = portableFrameGeometry(cfg, raster, 1280, 480);
+    const square_ratio = @as(f64, @floatFromInt(coded.width)) / @as(f64, @floatFromInt(coded.height));
+    const wide_ratio = @as(f64, @floatFromInt(anamorphic.width)) / @as(f64, @floatFromInt(anamorphic.height));
+    try std.testing.expect(square_ratio < 1.5);
+    try std.testing.expect(wide_ratio > 2.3 and wide_ratio < 3.0);
+    const same = portableFrameGeometry(cfg, raster, 640, 480);
+    try std.testing.expectEqual(coded.width, same.width);
+    try std.testing.expectEqual(coded.height, same.height);
+    // Rotated presentation swaps the axes the model sees.
+    const rotated = portableFrameGeometry(cfg, raster, 480, 640);
+    try std.testing.expect(rotated.height > rotated.width);
+}
+
+fn sumUsize(values: []const usize) usize {
+    var total: usize = 0;
+    for (values) |value| total += value;
+    return total;
+}
+
 /// CUDA row slices borrow their source allocation. Return an owned compact
 /// tensor before the decode accumulator leaves scope; later token lookup can
 /// otherwise reuse that allocation and overwrite the projected frame rows.
@@ -1739,12 +1833,18 @@ pub fn embeddingGemma2EncodedAudioSequenceBoundWithOptions(bytes: []const u8, op
 }
 
 pub fn prepareEmbeddingGemma2AudioForBackend(a: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, backend: @import("../backends/backends.zig").BackendType) !PreparedAudio {
-    if (backend != .cuda) return prepareEmbeddingGemma2AudioWithPacking(a, bytes, options, backend != .native);
+    return prepareEmbeddingGemma2AudioForBackendBounded(a, bytes, options, backend, audio.default_decode_working_bytes);
+}
+pub fn prepareEmbeddingGemma2AudioForBackendBounded(a: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, backend: @import("../backends/backends.zig").BackendType, max_decode_working_bytes: usize) !PreparedAudio {
+    if (backend != .cuda) return prepareEmbeddingGemma2AudioWithPackingBounded(a, bytes, options, backend != .native, max_decode_working_bytes);
     const cfg = embeddingGemma2AudioConfig();
-    return prepareAudioCpuBounded(a, bytes, options, cfg.mel_bins, cfg.reject_audio_truncation, true, cfg.max_audio_samples, 64 * 1024 * 1024, true);
+    return prepareAudioCpuBounded(a, bytes, options, cfg.mel_bins, cfg.reject_audio_truncation, true, cfg.max_audio_samples, max_decode_working_bytes, true);
 }
 pub fn prepareEmbeddingGemma2AudioWithPacking(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, pack_device: bool) !PreparedAudio {
-    return prepareAudioCpu(allocator, bytes, options, 128, true, pack_device);
+    return prepareEmbeddingGemma2AudioWithPackingBounded(allocator, bytes, options, pack_device, audio.default_decode_working_bytes);
+}
+pub fn prepareEmbeddingGemma2AudioWithPackingBounded(allocator: std.mem.Allocator, bytes: []const u8, options: audio.DecodeOptions, pack_device: bool, max_decode_working_bytes: usize) !PreparedAudio {
+    return prepareAudioCpuBounded(allocator, bytes, options, 128, true, pack_device, 480_000, max_decode_working_bytes, false);
 }
 fn prepareAudioCpu(allocator: std.mem.Allocator, audio_bytes: []const u8, decode_options: audio.DecodeOptions, mel_bins: usize, strict: bool, pack_gpu: bool) !PreparedAudio {
     return prepareAudioCpuBounded(allocator, audio_bytes, decode_options, mel_bins, strict, pack_gpu, 480_000, audio.default_decode_working_bytes, false);
@@ -2573,7 +2673,10 @@ pub const PreparedImage = struct {
 };
 
 fn prepareImageView(allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, decoded: image.ImageU8) !PreparedImage {
-    const geometry = targetGeometry(cfg, decoded.width, decoded.height);
+    return prepareImageViewAtGeometry(allocator, store, cfg, decoded, targetGeometry(cfg, decoded.width, decoded.height));
+}
+
+fn prepareImageViewAtGeometry(allocator: std.mem.Allocator, store: *ProjectorWeights, cfg: Config, decoded: image.ImageU8, geometry: Geometry) !PreparedImage {
     try decoded.validate();
     if (store.cb.kind() == .metal and store.gguf == null and cfg.embedding_gemma2_f32_attention) return .{ .allocator = allocator, .pixels = &.{}, .geometry = geometry, .source = decoded, .source_owned = false };
     const pixel_values = try image.preprocessImageViewRectScaledWithResample(

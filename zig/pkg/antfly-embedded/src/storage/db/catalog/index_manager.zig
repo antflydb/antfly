@@ -20166,7 +20166,7 @@ pub const IndexManager = struct {
         var segment_count: usize = 0;
         var start: usize = 0;
         while (start < docs.len) {
-            const split = introducer_mod.splitTextDocumentsForBuildBudget(docs, start, .{
+            const split = try introducer_mod.splitTextDocumentsForBuildBudget(self.alloc, docs, start, .{
                 .target_build_memory_bytes = target_build_memory_bytes,
                 .target_segment_bytes = target_segment_bytes,
             });
@@ -20196,8 +20196,8 @@ pub const IndexManager = struct {
         return segment_count;
     }
 
-    pub fn estimateTextKernelPublication(_: *IndexManager, docs: []const introducer_mod.TextDocument) TextPublicationEstimate {
-        return estimateProjectedTextPublication(docs);
+    pub fn estimateTextKernelPublication(self: *IndexManager, docs: []const introducer_mod.TextDocument) !TextPublicationEstimate {
+        return estimateProjectedTextPublication(self.alloc, docs);
     }
 
     pub fn planTextKernelPublication(
@@ -20216,7 +20216,7 @@ pub const IndexManager = struct {
         var current = TextPublicationEstimate{};
         var start: usize = 0;
         while (start < docs.len) {
-            const split = introducer_mod.splitTextDocumentsForBuildBudget(docs, start, .{
+            const split = try introducer_mod.splitTextDocumentsForBuildBudget(alloc, docs, start, .{
                 .target_build_memory_bytes = target_build_memory_bytes,
                 .target_segment_bytes = target_segment_bytes,
             });
@@ -20527,7 +20527,7 @@ pub const IndexManager = struct {
                 original_ends.items[end - 1],
                 0,
                 projection_batch.docs.len,
-                estimateProjectedTextPublication(projection_batch.docs),
+                try estimateProjectedTextPublication(arena, projection_batch.docs),
                 reservation_limit,
                 arena,
                 &atomic_ranges,
@@ -20714,7 +20714,7 @@ pub const IndexManager = struct {
         }
 
         const mid = start + (end - start) / 2;
-        const left_estimate = estimateProjectedTextPublication(docs[start..mid]);
+        const left_estimate = try estimateProjectedTextPublication(alloc, docs[start..mid]);
         try appendProjectedTextPublicationAtomicRanges(
             docs,
             original_ends,
@@ -20726,7 +20726,7 @@ pub const IndexManager = struct {
             alloc,
             out,
         );
-        const right_estimate = estimateProjectedTextPublication(docs[mid..end]);
+        const right_estimate = try estimateProjectedTextPublication(alloc, docs[mid..end]);
         try appendProjectedTextPublicationAtomicRanges(
             docs,
             original_ends,
@@ -20761,7 +20761,7 @@ pub const IndexManager = struct {
             null,
             null,
         );
-        return estimateProjectedTextPublication(projection_batch.docs);
+        return estimateProjectedTextPublication(projection_arena, projection_batch.docs);
     }
 
     fn appendTextPublicationAtomicRanges(
@@ -25519,17 +25519,7 @@ pub const IndexManager = struct {
                     defer producer.deinit(self.alloc);
                     if (producer.type == .media_output) {
                         const upstream = self.getEnrichment(.chunk, cfg.source_artifact_name) orelse return error.InvalidEnrichmentConfig;
-                        var chunk_config = try @import("../../../chunking/types.zig").parseConfigFromSlice(self.alloc, upstream.chunker_json);
-                        defer chunk_config.deinit(self.alloc);
-                        if (chunk_config.outputs_json.len == 0) return error.InvalidEnrichmentConfig;
-                        var output_config = try std.json.parseFromSlice(@import("inference_chunker").outputs.Config, self.alloc, chunk_config.outputs_json, .{});
-                        defer output_config.deinit();
-                        var consumer = try @import("../enrichment/media_output.zig").parse(self.alloc, producer.config_json);
-                        defer consumer.deinit();
-                        const found = for (output_config.value.targets) |target| {
-                            if (std.mem.eql(u8, target.name, consumer.value.output_name)) break true;
-                        } else false;
-                        if (!found or upstream.source_artifact_name.len != 0) return error.InvalidEnrichmentConfig;
+                        try enrichment_config_validation.validateMediaOutputSource(self.alloc, cfg.producer_json, upstream.chunker_json, upstream.source_artifact_name);
                         return;
                     }
                     if (producer.type == .vector_labels) {
@@ -25543,6 +25533,7 @@ pub const IndexManager = struct {
                     while (current.len > 0) {
                         if (std.mem.eql(u8, current, cfg.name)) return error.InvalidEnrichmentConfig;
                         const upstream = self.getEnrichment(.asset, current) orelse return error.InvalidEnrichmentConfig;
+                        if (try enrichment_config_validation.assetSourceChainEndsHere(self.alloc, upstream.producer_json)) break;
                         current = upstream.source_artifact_name;
                         hops += 1;
                         if (hops > self.enrichments.items.len) return error.InvalidEnrichmentConfig;
@@ -28001,14 +27992,14 @@ pub const IndexManager = struct {
         return @sizeOf(mapper.MapperDoc) +| doc.key.len +| @max(doc.value.len, doc.source_bytes);
     }
 
-    fn estimateProjectedTextPublication(docs: []const introducer_mod.TextDocument) TextPublicationEstimate {
+    fn estimateProjectedTextPublication(alloc: Allocator, docs: []const introducer_mod.TextDocument) !TextPublicationEstimate {
         if (docs.len == 0) return .{};
         const target_segment_bytes = @max(@as(usize, 1), textSegmentBuildTargetBytes());
         const target_build_memory_bytes = @max(@as(usize, 1), textBuildMemoryTargetBytes());
         var estimate = TextPublicationEstimate{};
         var start: usize = 0;
         while (start < docs.len) {
-            const split = introducer_mod.splitTextDocumentsForBuildBudget(docs, start, .{
+            const split = try introducer_mod.splitTextDocumentsForBuildBudget(alloc, docs, start, .{
                 .target_build_memory_bytes = target_build_memory_bytes,
                 .target_segment_bytes = target_segment_bytes,
             });
@@ -28149,7 +28140,7 @@ pub const IndexManager = struct {
                     }
 
                     const projected_doc = builder.text_docs.items[builder.text_docs.items.len - 1];
-                    const doc_build_bytes = introducer_mod.estimateTextDocumentBuildMemoryBytes(projected_doc);
+                    const doc_build_bytes = try introducer_mod.estimateTextDocumentBuildMemoryBytes(projection_alloc, projected_doc);
                     const doc_segment_bytes = introducer_mod.estimateTextDocumentSegmentBytes(projected_doc);
                     const next_build_bytes = projected_build_bytes +| doc_build_bytes;
                     const next_segment_bytes = projected_segment_bytes +| doc_segment_bytes;
@@ -28186,7 +28177,7 @@ pub const IndexManager = struct {
 
                 var start: usize = 0;
                 while (start < projection_batch.docs.len) {
-                    const split = introducer_mod.splitTextDocumentsForBuildBudget(projection_batch.docs, start, .{
+                    const split = try introducer_mod.splitTextDocumentsForBuildBudget(projection_alloc, projection_batch.docs, start, .{
                         .target_build_memory_bytes = target_build_memory_bytes,
                         .target_segment_bytes = target_segment_bytes,
                     });

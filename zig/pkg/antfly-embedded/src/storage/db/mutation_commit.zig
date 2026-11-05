@@ -2373,7 +2373,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     matched_entry = entry;
                     break;
                 };
-                if (!matched and command.action != .retire and command.action != .activate) return error.PreparedGenerationChanged;
+                if (!matched and command.action != .retire and !command.isActivation()) return error.PreparedGenerationChanged;
                 const table = try group_mutations.tableIdentity(&group_overlay, S.ownerField(self, "core").*.identity_namespace.table_id, S.ownerField(self, "root_incarnation").*);
                 if (table != command.definition.table_incarnation) return error.InvalidGroupedSourceCommand;
                 var namespace: [24]u8 = undefined;
@@ -2384,17 +2384,22 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
                 const route = try command.routeAlloc(group_alloc);
                 if (!S.ownerField(self, "core").*.byteRange().contains(route)) return error.KeyOutOfRange;
-                if (command.action == .activate) {
+                if (command.isActivation()) {
                     const entry = opts.ordered_apply_receipt orelse return error.InvalidGroupedSourceCommand;
                     const inventory = @import("artifact_inventory.zig");
                     const publication = @import("artifact_publication.zig");
                     const catalogs = try inventory.catalogs(&group_overlay);
                     const active = try publication.authority(&group_overlay);
                     const status = try inventory.status(group_alloc, &group_overlay, namespace);
-                    const ready = if (active) |value| status.ready and status.ordered != null and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
+                    const planned: ?inventory.Command = if (command.action == .activate_catalog) try inventory.desiredCommand(group_alloc, &group_overlay, namespace, catalogs, status, 16) else null;
+                    const required_protocol: u16 = if (planned) |current| current.binding.effect_protocol else 0;
+                    const ready = if (active) |value| status.ready and status.ordered != null and status.ordered.?.effect_protocol >= required_protocol and value.epoch == status.ordered.?.epoch and std.mem.eql(u8, &value.catalog_digest, &catalogs.digest()) else false;
                     if (!ready) {
                         try @import("artifact_catalog_mutability.zig").requireMutable(group_alloc, &group_overlay, namespace, null);
-                        const ordered = if (status.ready and status.ordered.?.effect_protocol == 16) blk: {
+                        // Legacy controls keep their original deterministic
+                        // replay behavior. The versioned action shares normal
+                        // inventory planning, including monotonic protocol floors.
+                        const ordered = if (planned) |current| current else if (status.ready and status.ordered.?.effect_protocol >= 16) blk: {
                             var installed = (try inventory.load(group_alloc, &group_overlay)).?;
                             defer installed.deinit();
                             var current = installed.value.command;
@@ -2982,6 +2987,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 &write_buffers.owned_store_values,
             );
             try write_buffers.store_writes.appendSlice(S.ownerField(self, "alloc").*, opts.extra_store_writes);
+            if (opts.outcome_marker_write) |marker| try write_buffers.store_writes.append(S.ownerField(self, "alloc").*, marker);
             if (req.merge_page) |page| if (page.integrity.len != 0) {
                 // Private page shape, exact generation/ownership and replay cursor
                 // have been checked under this same apply fence. The physical

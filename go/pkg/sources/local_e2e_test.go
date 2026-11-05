@@ -202,14 +202,14 @@ func TestLocalAntflySourcePipeline(t *testing.T) {
 		keys = append(keys, key)
 		providers = append(providers, providerID)
 	}
-	query, _ := json.Marshal(map[string]any{"query": documentIDsQuery(keys), "fields": append(sourceRowFields(), "grep.content"), "limit": len(keys), "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
+	query, _ := json.Marshal(map[string]any{"query": documentIDsQuery(keys), "fields": append(sourceRowFields(), "content.text"), "limit": len(keys), "order_by": []any{map[string]any{"field": "_id", "desc": false}}})
 	response, err := publisher.Query(ctx, table, query)
 	require.NoError(t, err)
 	hits, err := decodeSyncHits(response)
 	require.NoError(t, err)
 	require.Len(t, hits, 3)
 	for _, hit := range hits {
-		doc := hit.Source.Grep
+		doc := hit.Source.Document
 		doc.IndexedAt += 100
 		docs[hit.ID] = doc
 	}

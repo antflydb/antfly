@@ -32,6 +32,15 @@ use std::fmt;
 pub enum Error {
     /// Owned diagnostic from a native call. Use `code()`/`kind()` to classify.
     Native { code: i32, detail: String },
+    /// An [`Error::OutcomeUnknown`] from a batch or autocommit SQL write that
+    /// issued an outcome receipt. Resolve the receipt later with
+    /// `Database::outcome_receipt_status`. Compares equal to
+    /// `Error::OutcomeUnknown`; read the receipt with
+    /// [`Error::outcome_receipt`].
+    OutcomeUnknownWithReceipt {
+        detail: Option<String>,
+        receipt: String,
+    },
     /// An argument, request, path, or open mode is invalid.
     InvalidArgument,
     /// The requested database object was not found.
@@ -83,8 +92,38 @@ impl Error {
     pub fn detail(&self) -> Option<&str> {
         match self {
             Error::Native { detail, .. } => Some(detail),
+            Error::OutcomeUnknownWithReceipt { detail, .. } => detail.as_deref(),
             _ => None,
         }
+    }
+    /// The outcome receipt of an `OutcomeUnknown` batch or autocommit SQL
+    /// write, when the database issued one.
+    pub fn outcome_receipt(&self) -> Option<&str> {
+        match self {
+            Error::OutcomeUnknownWithReceipt { receipt, .. } => Some(receipt),
+            _ => None,
+        }
+    }
+    /// Attaches `receipt` to an `OutcomeUnknown` error; other errors are
+    /// returned unchanged.
+    pub(crate) fn with_outcome_receipt(self, receipt: Option<String>) -> Error {
+        match receipt {
+            Some(receipt) if self.code() == 7 => Error::OutcomeUnknownWithReceipt {
+                detail: self.detail().map(str::to_owned),
+                receipt,
+            },
+            _ => self,
+        }
+    }
+    /// [`Error::from_native`] for calls that issue outcome receipts: reads
+    /// the receipt first, on this thread, before any other native call.
+    pub(crate) fn from_native_with_receipt(code: i32) -> Error {
+        let receipt = if code == 7 {
+            last_outcome_receipt()
+        } else {
+            None
+        };
+        Error::from_native(code).with_outcome_receipt(receipt)
     }
     pub(crate) fn from_native(code: i32) -> Error {
         #[cfg(feature = "libantfly")]
@@ -124,6 +163,7 @@ impl Error {
     pub fn code(&self) -> i32 {
         match self {
             Error::Native { code, .. } => *code,
+            Error::OutcomeUnknownWithReceipt { .. } => 7,
             Error::InvalidArgument => 1,
             Error::NotFound => 2,
             Error::VersionConflict => 3,
@@ -161,6 +201,7 @@ impl Error {
             Error::Internal => "ANTFLY_INTERNAL",
             Error::Unknown(_) => "ANTFLY_UNKNOWN_ERROR",
             Error::Native { code, .. } => Error::from_code(*code).name(),
+            Error::OutcomeUnknownWithReceipt { .. } => Error::OutcomeUnknown.name(),
         }
     }
 
@@ -201,6 +242,7 @@ impl Error {
             Error::Internal => "an internal error occurred",
             Error::Unknown(_) => "unknown Antfly error code",
             Error::Native { code, .. } => Error::from_code(*code).description(),
+            Error::OutcomeUnknownWithReceipt { .. } => Error::OutcomeUnknown.description(),
         }
     }
 }
@@ -210,6 +252,9 @@ impl fmt::Display for Error {
         write!(f, "{}: {}", self.name(), self.description())?;
         if let Some(detail) = self.detail() {
             write!(f, ": {detail}")?;
+        }
+        if let Some(receipt) = self.outcome_receipt() {
+            write!(f, " (outcome receipt {receipt})")?;
         }
         Ok(())
     }
@@ -242,4 +287,24 @@ pub fn last_error_detail() -> String {
             .to_string_lossy()
             .into_owned()
     }
+}
+
+/// This thread's most recent outcome receipt, or `None` when the failed call
+/// issued none (or the library is not linked).
+fn last_outcome_receipt() -> Option<String> {
+    #[cfg(feature = "libantfly")]
+    {
+        let mut out = antfly_embedded_sys::antfly_buffer::default();
+        let code = unsafe { antfly_embedded_sys::antfly_last_error_outcome_receipt(&mut out) };
+        if code != antfly_embedded_sys::ANTFLY_OK {
+            return None;
+        }
+        let bytes = unsafe { crate::ffi::take_buffer(out) };
+        if bytes.is_empty() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&bytes).into_owned())
+    }
+    #[cfg(not(feature = "libantfly"))]
+    None
 }

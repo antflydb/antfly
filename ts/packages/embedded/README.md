@@ -324,6 +324,25 @@ caller returned `false` from an `Inference.pull()` `onProgress` or
 instead stops the operation the same way, but rejects with the thrown error
 itself, not `CancelledError`), `InternalError` (255).
 
+### Outcome receipts
+
+When an autocommit SQL write (`sqlJson`, `Connection` outside a transaction)
+ends with ANTFLY_OUTCOME_UNKNOWN, the rejection (`SqlError`, or
+`OutcomeUnknownError` without a SQL diagnostic) carries `.outcomeReceipt`
+(`undefined` when none was issued). Resolve it on any handle for the same
+database with `db.outcomeReceiptStatus(receipt)`, which resolves to
+`"applied"` or `"not_applied"`, or rejects with `StalledError` while the
+uncertain commit is not reconciled yet (Lite: retry; directory database:
+close the issuing handle and reopen first). Call
+`db.forgetOutcomeReceipt(receipt)` once resolved; afterwards it can no
+longer be resolved.
+
+`batch`, `batchJson` and `batchJsonRaw` rejections carry `.outcomeReceipt`
+too: they use `antfly_db_batch_with_receipt` and
+`antfly_db_batch_json_with_receipt`, which return the receipt from the same
+native call (the thread-local `antfly_last_error_outcome_receipt` cannot follow
+an async call to a worker thread).
+
 ## API surface
 
 Mirrors `go/pkg/embedded`'s surface idiomatically:
@@ -439,6 +458,11 @@ const sql = new Kysely<{ people: { id: bigint; name: string } }>({
 const people = await sql.selectFrom("people").selectAll().execute();
 await sql.destroy(); // The caller still owns database.
 ```
+
+For typed search relations, migration-table setup, and generated Kysely schema
+interfaces, see the [Kysely reference](../sdk/docs/kysely.md) and
+[`examples/kysely.mjs`](examples/kysely.mjs). The optional shared helpers live in
+`@antfly/sdk/kysely`.
 
 `createTable`, `listTables`, `openTable`, and `dropTable` expose the shared
 document catalog. Table handles reuse existing schema, index, enrichment,

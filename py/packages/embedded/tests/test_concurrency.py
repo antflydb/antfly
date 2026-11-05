@@ -222,7 +222,11 @@ def test_readonly_snapshot_without_sidecar_in_readonly_directory(tmp_path: Path)
                     # the first reader still owns the fallback inode fence.
                     with antfly_embedded.open(snapshot, mode=antfly_embedded.OpenMode.READONLY) as second:
                         assert second.sql("SELECT name FROM items")["rows"] == [["before"]]
-                        assert list(directory.iterdir()) == [snapshot]
+                        # The lock sidecar is the lock authority and must not
+                        # appear. The writer's FIFO admission queue
+                        # (<sidecar>.q) only orders writers and may.
+                        assert not (directory / f"{snapshot.name}.lock").exists()
+                        assert set(directory.iterdir()) <= {snapshot, directory / f"{snapshot.name}.lock.q"}
                         with pytest.raises(antfly_embedded.BusyError):
                             writer.sql("UPDATE items SET name = 'after' WHERE id = 1")
                     assert cursor.fetch(10)["result"]["rows"] == [["before"]]

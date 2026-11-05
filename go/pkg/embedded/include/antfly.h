@@ -420,6 +420,50 @@ antfly_error_code antfly_db_batch_json(
     antfly_slice request_json,
     antfly_buffer *out
 );
+/*
+ * Outcome receipts. When an autocommit SQL write or a batch export returns
+ * ANTFLY_OUTCOME_UNKNOWN, antfly_last_error_outcome_receipt (same thread,
+ * before another call) returns a receipt string; SQL error bodies also carry
+ * it as "outcome_receipt". antfly_db_outcome_receipt_status later resolves it
+ * on any handle for the same database: *out_status is
+ * ANTFLY_OUTCOME_RECEIPT_APPLIED or ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED.
+ * It returns ANTFLY_STALLED until the uncertain commit is reconciled: a Lite
+ * connection reconciles on its next call; a directory database must first be
+ * closed by the handle that issued the receipt and reopened. Forget a receipt
+ * once resolved; afterwards it can no longer be resolved.
+ */
+#define ANTFLY_OUTCOME_RECEIPT_APPLIED 1
+#define ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED 2
+antfly_error_code antfly_last_error_outcome_receipt(antfly_buffer *out);
+/* antfly_db_batch_json that also returns the receipt (only on
+ * ANTFLY_OUTCOME_UNKNOWN) in receipt_out, for bindings whose consecutive calls
+ * may run on different threads. The caller frees receipt_out. */
+antfly_error_code antfly_db_batch_json_with_receipt(
+    antfly_db *db,
+    antfly_slice request_json,
+    antfly_buffer *out,
+    antfly_buffer *receipt_out
+);
+/* antfly_db_batch with the same-call receipt, as above. */
+antfly_error_code antfly_db_batch_with_receipt(
+    antfly_db *db,
+    const antfly_write_intent *writes,
+    size_t write_count,
+    const antfly_version_predicate *predicates,
+    size_t predicate_count,
+    uint64_t timestamp_ns,
+    uint8_t sync_level,
+    antfly_buffer *receipt_out
+);
+antfly_error_code antfly_db_outcome_receipt_status(
+    antfly_db *db,
+    antfly_slice receipt,
+    uint8_t *out_status
+);
+antfly_error_code antfly_db_outcome_receipt_forget(
+    antfly_db *db,
+    antfly_slice receipt
+);
 antfly_error_code antfly_db_begin_transaction_with_id(
     antfly_db *db,
     const uint8_t (*txn_id)[16],

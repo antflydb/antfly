@@ -11,6 +11,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.image_url_content_part import ImageURLContentPart
     from ..models.media_content_part import MediaContentPart
+    from ..models.source_content_part import SourceContentPart
     from ..models.text_content_part import TextContentPart
 
 
@@ -23,8 +24,8 @@ class InferenceRerankRequest:
     Attributes:
         model (str): Name of reranking model from models_dir/rerankers/ Example: BAAI/bge-reranker-v2-m3.
         query (str): Search query for relevance scoring Example: machine learning applications.
-        documents (list[list[ImageURLContentPart | MediaContentPart | TextContentPart] | str] | Unset): Documents to
-            rerank. Each entry is a string or an array of text and image
+        documents (list[list[ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart] | str] |
+            Unset): Documents to rerank. Each entry is a string or an array of text and image
             content parts. Exactly one of `documents` and `prompts` is required.
              Example: ['Introduction to machine learning...', [{'type': 'text', 'text': 'Quarterly invoice'}, {'type':
             'image_url', 'image_url': {'url': 'data:image/png;base64,iVBORw0KGgo...'}}]].
@@ -35,12 +36,15 @@ class InferenceRerankRequest:
 
     model: str
     query: str
-    documents: list[list[ImageURLContentPart | MediaContentPart | TextContentPart] | str] | Unset = UNSET
+    documents: (
+        list[list[ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart] | str] | Unset
+    ) = UNSET
     prompts: list[str] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         from ..models.image_url_content_part import ImageURLContentPart
+        from ..models.media_content_part import MediaContentPart
         from ..models.text_content_part import TextContentPart
 
         model = self.model
@@ -61,6 +65,10 @@ class InferenceRerankRequest:
                                 componentsschemas_chat_message_content_type_1_item_data.to_dict()
                             )
                         elif isinstance(componentsschemas_chat_message_content_type_1_item_data, ImageURLContentPart):
+                            componentsschemas_chat_message_content_type_1_item = (
+                                componentsschemas_chat_message_content_type_1_item_data.to_dict()
+                            )
+                        elif isinstance(componentsschemas_chat_message_content_type_1_item_data, MediaContentPart):
                             componentsschemas_chat_message_content_type_1_item = (
                                 componentsschemas_chat_message_content_type_1_item_data.to_dict()
                             )
@@ -98,6 +106,7 @@ class InferenceRerankRequest:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.image_url_content_part import ImageURLContentPart
         from ..models.media_content_part import MediaContentPart
+        from ..models.source_content_part import SourceContentPart
         from ..models.text_content_part import TextContentPart
 
         d = dict(src_dict)
@@ -106,14 +115,16 @@ class InferenceRerankRequest:
         query = d.pop("query")
 
         _documents = d.pop("documents", UNSET)
-        documents: list[list[ImageURLContentPart | MediaContentPart | TextContentPart] | str] | Unset = UNSET
+        documents: (
+            list[list[ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart] | str] | Unset
+        ) = UNSET
         if _documents is not UNSET:
             documents = []
             for documents_item_data in _documents:
 
                 def _parse_documents_item(
                     data: object,
-                ) -> list[ImageURLContentPart | MediaContentPart | TextContentPart] | str:
+                ) -> list[ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart] | str:
                     try:
                         if not isinstance(data, list):
                             raise TypeError()
@@ -125,7 +136,7 @@ class InferenceRerankRequest:
 
                             def _parse_componentsschemas_chat_message_content_type_1_item(
                                 data: object,
-                            ) -> ImageURLContentPart | MediaContentPart | TextContentPart:
+                            ) -> ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart:
                                 try:
                                     if not isinstance(data, dict):
                                         raise TypeError()
@@ -142,11 +153,19 @@ class InferenceRerankRequest:
                                     return componentsschemas_content_part_type_1
                                 except (TypeError, ValueError, AttributeError, KeyError):
                                     pass
+                                try:
+                                    if not isinstance(data, dict):
+                                        raise TypeError()
+                                    componentsschemas_content_part_type_2 = MediaContentPart.from_dict(data)
+
+                                    return componentsschemas_content_part_type_2
+                                except (TypeError, ValueError, AttributeError, KeyError):
+                                    pass
                                 if not isinstance(data, dict):
                                     raise TypeError()
-                                componentsschemas_content_part_type_2 = MediaContentPart.from_dict(data)
+                                componentsschemas_content_part_type_3 = SourceContentPart.from_dict(data)
 
-                                return componentsschemas_content_part_type_2
+                                return componentsschemas_content_part_type_3
 
                             componentsschemas_chat_message_content_type_1_item = (
                                 _parse_componentsschemas_chat_message_content_type_1_item(
@@ -161,7 +180,9 @@ class InferenceRerankRequest:
                         return componentsschemas_chat_message_content_type_1
                     except (TypeError, ValueError, AttributeError, KeyError):
                         pass
-                    return cast(list[ImageURLContentPart | MediaContentPart | TextContentPart] | str, data)
+                    return cast(
+                        list[ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart] | str, data
+                    )
 
                 documents_item = _parse_documents_item(documents_item_data)
 

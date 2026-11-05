@@ -46,6 +46,7 @@ const gemma3_mm = @import("gemma3_multimodal.zig");
 const gemma4_mm = @import("../architectures/gemma4_multimodal.zig");
 const gemma4_mtp = @import("../architectures/gemma4_mtp.zig");
 const gemma4_projector = @import("../architectures/gemma4_projector.zig");
+const gemma4_video = @import("gemma4_video.zig");
 const qwen3vl_projector = @import("../architectures/qwen3vl_projector.zig");
 const qwen2vl_mm = @import("qwen2vl_multimodal.zig");
 const projector_format_mod = @import("../architectures/projector_format.zig");
@@ -108,8 +109,9 @@ pub const Message = struct {
     /// Raw image bytes for multimodal messages (decoded from data URIs).
     /// Null or empty for text-only messages.
     image_bytes: ?[]const []const u8 = null,
-    /// One H.264 MP4 clip, sampled on CUDA at one frame per second (max 60s).
-    /// Video currently occupies its own message without image/audio parts.
+    /// One video clip, sampled at one frame per second. CUDA takes H.264 MP4 up
+    /// to 60s; CPU and Metal take the portable codecs, capped at 32 uniform frames.
+    /// A request has one video, in its own message, with no image or audio parts.
     video_bytes: ?[]const u8 = null,
     /// Raw encoded audio bytes for multimodal messages.
     /// Null or empty for text/image-only messages.
@@ -245,7 +247,12 @@ pub fn nativeGenerationMediaAdmissionForBackend(
         const max_image_tokens = try qwen2vl_mm.maxImageTokenCount(prep_config);
         return .{ .token_allowance = image_count *| (max_image_tokens +| 1) };
     }
-    return .{ .token_allowance = nativeGenerationMediaTokenAllowance(messages, config) };
+    var admission: NativeGenerationMediaAdmission = .{ .token_allowance = nativeGenerationMediaTokenAllowance(messages, config) };
+    // CUDA decodes on the device. Portable decoding runs in host memory.
+    if (backend != .cuda) for (messages) |message| if (message.video_bytes != null) {
+        admission.host_scratch_bytes = gemma4_video.portable_host_bytes;
+    };
+    return admission;
 }
 
 /// Conservative media-token count used for scheduling and memory admission.
@@ -2796,6 +2803,10 @@ test "CUDA prefill KV reservation respects admitted length and supported geometr
 }
 
 pub const NativeDecodeState = struct {
+    /// Borrowed through claimed-step retirement; each row retains its own
+    /// admission, cancellation lifetime and request budget.
+    execution_backend: ?ops.ComputeBackend = null,
+    execution_control: ?InferenceExecutionControl = null,
     allocator: std.mem.Allocator,
     kv_manager: ?*runtime.kv.manager.KvManager = null,
     kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,
@@ -4154,9 +4165,13 @@ pub const QwenVisionBatchHook = struct {
     encode_fn: *const fn (*anyopaque, std.mem.Allocator, []const []const u8, qwen3vl_projector.Limits) anyerror!qwen3vl_projector.ProjectedImages,
 };
 
+const ExecutionScope = @import("../ops/execution_scope.zig").Scope;
+
 pub const NativeGenerationPipeline = struct {
     /// Token publication is bounded; GPU steps reuse two frame/logit banks.
     pub const max_gpu_token_burst_width: usize = 8;
+    /// Borrowed during a claimed executor step, including yielded readback.
+    claimed_execution_scope: ?*ExecutionScope = null,
     allocator: std.mem.Allocator,
     io: ?std.Io = null,
     cb: ComputeBackend,
@@ -4205,6 +4220,8 @@ pub const NativeGenerationPipeline = struct {
     /// Serializes the shared model backend for one claimed scheduler step.
     /// Request-local tokenization and sampling remain outside this lock.
     execution_lock: ?*std.atomic.Mutex = null,
+    generation_admission: ?*runtime.scheduler.generation_admission.Lane = null,
+    request_started_ns: u64 = 0,
     /// Optional FIFO/event admission for the same atomic backend mutex.
     execution_gate: ?*execution_control_mod.ExecutionLane = null,
     /// Optional bounded polling for a shared epoch gate; zero retains yielding.
@@ -4265,41 +4282,46 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
-    fn lockExecution(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) !void {
-        const waiters = if (self.execution_lock == mutex) self.execution_phase_waiters else null;
+    fn lockExecution(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) !ExecutionScope {
+        const shared = self.execution_lock == mutex;
+        const waiters = if (shared) self.execution_phase_waiters else null;
         if (waiters) |count| _ = count.fetchAdd(1, .acq_rel);
-        defer if (waiters) |count| {
-            self.finishExecutionPhaseWait(count);
-        };
+        defer if (waiters) |count| self.finishExecutionPhaseWait(count);
         var control = self.execution_control orelse InferenceExecutionControl{};
         if (control.io == null) control.io = self.io;
-        const gate = if (self.execution_lock == mutex) self.execution_gate else null;
-        const queued = if (gate) |lane| try lane.acquireWithPriority(control, waiters != null) else null;
-        errdefer if (queued) |lease| lease.release();
-        try control.lockWithPoll(mutex, self.execution_contention_wait_ns);
+        var scope = try ExecutionScope.acquire(control, .{
+            .mutex = mutex,
+            .lane = if (shared) self.execution_gate else null,
+            .interactive = waiters != null,
+            .contention_wait_ns = self.execution_contention_wait_ns,
+        });
+        errdefer scope.deinit();
+        if (shared) try scope.bind(self.cb);
+        return scope;
     }
 
-    fn lockExecutionForCleanup(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) void {
-        const waiters = if (self.execution_lock == mutex) self.execution_phase_waiters else null;
+    fn lockExecutionForCleanup(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) ExecutionScope {
+        return self.lockExecutionNoncancellable(mutex, false);
+    }
+
+    fn lockExecutionForRelease(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) ExecutionScope {
+        return self.lockExecutionNoncancellable(mutex, true);
+    }
+
+    fn lockExecutionNoncancellable(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex, release: bool) ExecutionScope {
+        const shared = self.execution_lock == mutex;
+        const waiters = if (shared) self.execution_phase_waiters else null;
         if (waiters) |count| _ = count.fetchAdd(1, .acq_rel);
-        defer if (waiters) |count| {
-            self.finishExecutionPhaseWait(count);
+        defer if (waiters) |count| self.finishExecutionPhaseWait(count);
+        const options: ExecutionScope.Options = .{
+            .mutex = mutex,
+            .lane = if (shared) self.execution_gate else null,
+            .interactive = waiters != null,
+            .contention_wait_ns = self.execution_contention_wait_ns,
         };
-        // Cleanup ignores request cancellation while retaining an event wait
-        // on the caller's live Io. It must retire borrowed GPU state first.
-        if (self.execution_lock == mutex) if (self.execution_gate) |lane| {
-            _ = lane.acquireForCleanup(self.io, waiters != null);
-        };
-        if (waiters != null) {
-            (InferenceExecutionControl{}).lockWithPoll(mutex, if (self.execution_contention_wait_ns == 0) 100 * std.time.ns_per_us else self.execution_contention_wait_ns) catch unreachable;
-        } else platform.sync.lockYielding(mutex);
-    }
-
-    fn unlockExecution(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) void {
-        mutex.unlock();
-        if (self.execution_lock == mutex) if (self.execution_gate) |lane| {
-            (execution_control_mod.ExecutionLane.Lease{ .lane = lane }).release();
-        };
+        var scope = if (release) ExecutionScope.acquireRelease(self.io, options) else ExecutionScope.acquireCleanup(self.io, options);
+        if (shared) scope.bindCleanup(self.cb);
+        return scope;
     }
 
     pub const AttentionMatchQueryOptions = struct {
@@ -4437,8 +4459,8 @@ pub const NativeGenerationPipeline = struct {
         const control: runtime.kv.attention_match.Control = .{ .context = self, .check_fn = checkAttentionMatchQueryWork };
         const logits = try self.allocator.dupe(f32, saved.logits);
         errdefer self.allocator.free(logits);
-        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-        defer if (self.execution_lock) |mutex| mutex.unlock();
+        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.cb.ptr));
         const storage = destination.kv_storage orelse return error.UnsupportedAttentionMatchRoute;
         if (storage.sequences.items.len != 0 or storage.storage.config.store_cpu_bytes) return error.UnsupportedAttentionMatchRoute;
@@ -4476,8 +4498,8 @@ pub const NativeGenerationPipeline = struct {
         defer self.allocator.free(ids);
         for (ids, tokens) |*id, token| id.* = std.math.cast(u32, token) orelse return error.InvalidCompactionProbe;
         var saved = blk: {
-            if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-            defer if (self.execution_lock) |mutex| mutex.unlock();
+            var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+            defer if (execution_scope) |*scope| scope.deinit();
             if ((try cuda_compute.installedAttentionMatchActivity(compute, source_storage, source_sequence)) == null) return error.UnsupportedAttentionMatchRoute;
             break :blk try self.snapshotAttentionMatchState(ids, logits, source, identity, limits, 2 * 1024 * 1024 * 1024);
         };
@@ -4607,8 +4629,8 @@ pub const NativeGenerationPipeline = struct {
     ) !runtime.kv.attention_match_engine.Stats {
         if (comptime !build_options.enable_cuda) return error.UnsupportedCompactionQueryRoute;
         if (self.cb.kind() != .cuda or self.kv_dtype != .f16) return error.UnsupportedCompactionQueryDType;
-        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-        defer if (self.execution_lock) |mutex| mutex.unlock();
+        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         const checkpoint = runtime.kv.attention_match_checkpoint;
         const engine = runtime.kv.attention_match_engine;
         const storage = @import("../ops/cuda/attention_match_storage.zig");
@@ -4896,8 +4918,8 @@ pub const NativeGenerationPipeline = struct {
             if (self.manager != null or self.storage != null or self.state != null) return error.InvalidCompactionProbe;
             const dtype = pipeline.kv_dtype orelse return error.UnsupportedCompactionQueryDType;
             if (pipeline.cb.kind() != .cuda or dtype != .f16) return error.UnsupportedCompactionQueryRoute;
-            if (pipeline.execution_lock) |mutex| try pipeline.lockExecution(mutex);
-            defer if (pipeline.execution_lock) |mutex| mutex.unlock();
+            var execution_scope = if (pipeline.execution_lock) |mutex| try pipeline.lockExecution(mutex) else null;
+            defer if (execution_scope) |*scope| scope.deinit();
             self.manager = runtime.kv.manager.KvManager.init(pipeline.allocator);
             errdefer self.deinit();
             const config = attentionMatchCheckpointPoolConfig(dtype, pipeline.gpt_config);
@@ -4926,8 +4948,8 @@ pub const NativeGenerationPipeline = struct {
                 donors[donor_count] = .{ .layer = @intCast(layer), .heads = geometry.num_kv_heads, .dim = geometry.head_dim };
                 donor_count += 1;
             }
-            if (pipeline.execution_lock) |mutex| try pipeline.lockExecution(mutex);
-            defer if (pipeline.execution_lock) |mutex| mutex.unlock();
+            var execution_scope = if (pipeline.execution_lock) |mutex| try pipeline.lockExecution(mutex) else null;
+            defer if (execution_scope) |*scope| scope.deinit();
             self.manager = runtime.kv.manager.KvManager.init(pipeline.allocator);
             errdefer self.deinit();
             var config = kvPoolConfig(.cuda, dtype, pipeline.gpt_config, false);
@@ -4969,8 +4991,8 @@ pub const NativeGenerationPipeline = struct {
     /// avoids graph/replay state shared with the original request.
     fn appendAttentionMatchProbeTokens(self: *NativeGenerationPipeline, state: *NativeDecodeState, tokens: []const i64) ![]f32 {
         if (tokens.len == 0) return error.InvalidCompactionProbe;
-        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-        defer if (self.execution_lock) |mutex| mutex.unlock();
+        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         var offset: usize = 0;
         while (offset + 1 < tokens.len) {
             try checkAttentionMatchQueryWork(self);
@@ -5246,8 +5268,8 @@ pub const NativeGenerationPipeline = struct {
         if (options.prefix_mode == .replay and shadow_kv_bytes > options.max_shadow_kv_bytes) return error.CompactionQueryLimit;
         var collector = try queries.Collector.init(self.allocator, consumers[0..count], source_tokens.len, repeat_tokens.len, options.collection);
         errdefer collector.deinit();
-        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-        defer if (self.execution_lock) |mutex| mutex.unlock();
+        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         var manager = runtime.kv.manager.KvManager.init(self.allocator);
         defer manager.deinit();
         var pool_config = kvPoolConfig(.cuda, dtype, self.gpt_config, false);
@@ -5575,9 +5597,9 @@ pub const NativeGenerationPipeline = struct {
             video_bytes = bytes;
         };
         if (video_bytes != null) {
-            if (self.cb.kind() != .cuda or self.gpt_config.family != .gemma or !self.gpt_config.usesGemma4Channels() or self.gguf_projector_path == null) return error.UnsupportedVideoBackend;
+            if (!self.cb.supportsCopyRows2D() or self.gpt_config.family != .gemma or !self.gpt_config.usesGemma4Channels() or self.gguf_projector_path == null) return error.UnsupportedVideoBackend;
             for (messages) |message| {
-                if (message.content_parts != null or message.hasAudio() or (if (message.image_bytes) |imgs| imgs.len > 0 else false)) return error.UnsupportedMixedVideoInput;
+                if ((message.video_bytes != null and message.content_parts != null) or message.hasAudio() or (if (message.image_bytes) |imgs| imgs.len > 0 else false)) return error.UnsupportedMixedVideoInput;
             }
         }
         const has_images = messagesHaveImages(messages);
@@ -5707,14 +5729,14 @@ pub const NativeGenerationPipeline = struct {
 
         var prepared_multimodal_prompt: ?gemma3_mm.PreparedPrompt = null;
         defer if (prepared_multimodal_prompt) |*prepared| {
-            if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex);
-            defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+            var execution_scope = if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex) else null;
+            defer if (execution_scope) |*scope| scope.deinit();
             prepared.deinit(&self.cb);
         };
         var prepared_qwen3vl_prompt: ?qwen3vl_projector.PreparedPrompt = null;
         defer if (prepared_qwen3vl_prompt) |*prepared| {
-            if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex);
-            defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+            var execution_scope = if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex) else null;
+            defer if (execution_scope) |*scope| scope.deinit();
             prepared.deinit(&self.cb);
         };
 
@@ -5820,15 +5842,15 @@ pub const NativeGenerationPipeline = struct {
                     decode_state.qwen3vl_mrope_position_delta = prepared_qwen3vl_prompt.?.plan.mrope_position_delta;
                     decode_state.qwen3vl_text_only = false;
                 } else {
-                    if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-                    defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+                    var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+                    defer if (execution_scope) |*scope| scope.deinit();
                     const request_projector = if (self.projector_store == null)
                         try gemma4_projector.ProjectorStore.open(allocator, projector_path)
                     else
                         null;
                     defer if (request_projector) |store| store.close();
                     const projector = self.projector_store orelse request_projector.?;
-                    var projected_video = if (video_bytes) |bytes| try gemma4_projector.encodeProjectedVideoResident(&self.cb, allocator, projector, bytes) else null;
+                    var projected_video = if (video_bytes) |bytes| try gemma4_video.encode(&self.cb, allocator, projector, bytes) else null;
                     defer if (projected_video) |*video| video.deinit();
                     const resident_images_enabled = images.len <= 8 and self.cb.supportsCopyRows2D() and self.cb.vtable.concatRows2D != null and
                         self.cb.vtable.multiplyScalar != null and !platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GENERATION_IMAGE_HOST", false);
@@ -5910,8 +5932,8 @@ pub const NativeGenerationPipeline = struct {
                     if (config.qwen3vl_parity_json_path == null) if (self.qwen_vision_batch) |hook| {
                         batched = try hook.encode_fn(hook.ptr, allocator, images, vision_limits);
                     };
-                    if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-                    defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+                    var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+                    defer if (execution_scope) |*scope| scope.deinit();
                     var projected = if (batched) |value| take: {
                         batched = null;
                         break :take value;
@@ -6468,8 +6490,8 @@ pub const NativeGenerationPipeline = struct {
                     prefill_greedy_token = null;
                     var continued_decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
                     const kv_mutation_mutex = batchKvMutationMutex(self.execution_lock, decode_state.kv_lock);
-                    if (kv_mutation_mutex) |mutex| try self.lockExecution(mutex);
-                    defer if (kv_mutation_mutex) |mutex| self.unlockExecution(mutex);
+                    var execution_scope = if (kv_mutation_mutex) |mutex| try self.lockExecution(mutex) else null;
+                    defer if (execution_scope) |*scope| scope.deinit();
                     _ = try continued_decode_runtime.appendGeneratedToken();
                 }
             }
@@ -7111,6 +7133,7 @@ pub const NativeGenerationPipeline = struct {
             timestampDurationMillis(started_at, text_decode_started_at),
             timestampDurationMillis(started_at, finished_generate_at),
         }) else null;
+        if (timing_ms) |timing| if (self.generation_admission) |lane| lane.notePipeline(timing.prefill, timing.decode);
         if (self.print_timing and timing_ms != null) {
             const timing = timing_ms.?;
             std.debug.print(
@@ -7485,6 +7508,8 @@ pub const NativeGenerationPipeline = struct {
             platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_RESERVE_PREFILL_KV", true))
         {
             if (cudaE4bPrefillKvCapacity(self.gpt_config, seq_len, config.max_tokens)) |capacity| {
+                var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+                defer if (execution_scope) |*scope| scope.deinit();
                 const limit = std.mem.alignForward(usize, seq_len + @as(usize, @intCast(config.max_tokens)), 16);
                 try decode_state.reserveFreshCudaKvCapacity(capacity, limit);
                 std.log.info("cuda_prefill_kv_reservation prompt_tokens={d} capacity_tokens={d}", .{ seq_len, capacity });
@@ -7773,8 +7798,8 @@ pub const NativeGenerationPipeline = struct {
                     use_metal_prefill_greedy_token,
                     self.execution_lock,
                 );
-                if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
-                defer if (direct_execution_mutex) |mutex| self.unlockExecution(mutex);
+                var execution_scope = if (direct_execution_mutex) |mutex| try self.lockExecution(mutex) else null;
+                defer if (execution_scope) |*scope| scope.deinit();
                 var exact_scope: if (build_options.enable_cuda) ?cuda_compute.CudaCompute.AttentionMatchRepeatScope else ?void = null;
                 if (comptime build_options.enable_cuda) {
                     if (exact_prefill_probe and chunk.len > 1) {
@@ -8055,8 +8080,8 @@ pub const NativeGenerationPipeline = struct {
         // Match text prefill/decode lock order: scheduler turn, then model.
         // Both stay held until the backend forward and result copy complete.
         const direct_execution_mutex = directPrefillExecutionMutex(true, false, false, self.execution_lock);
-        if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
-        defer if (direct_execution_mutex) |mutex| self.unlockExecution(mutex);
+        var execution_scope = if (direct_execution_mutex) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         prepared.input_embeddings = null;
         const input_embeddings = try self.cb.ensureDeviceResidentOwned(host_embeddings);
         var owns_input_embeddings = true;
@@ -8333,8 +8358,8 @@ pub const NativeGenerationPipeline = struct {
         const input_embeddings = prepared.input_embeddings orelse return error.InvalidPreparedPrompt;
         prepared.input_embeddings = null;
         const direct_execution_mutex = directPrefillExecutionMutex(true, false, false, self.execution_lock);
-        if (direct_execution_mutex) |mutex| try self.lockExecution(mutex);
-        defer if (direct_execution_mutex) |mutex| self.unlockExecution(mutex);
+        var execution_scope = if (direct_execution_mutex) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         var decode_context = decode_runtime.makeDecodeContext(seq_len, seq_len);
         decode_context.mrope_positions = prepared.plan.mrope_positions;
         decode_context.qwen3vl_visual_mask = prepared.plan.visual_token_mask;
@@ -8684,7 +8709,10 @@ pub const NativeGenerationPipeline = struct {
                 // scheduler still admits only full-geometry-compatible work,
                 // and incompatible peers do not pay a coalescing delay.
                 const route_decode_through_scheduler = self.execution_lock != null and self.scheduler_lease != null and
-                    (if (self.scheduler) |scheduler| scheduler.shouldCoordinateCurrentRequests() else false);
+                    (self.cb.execution_owner != 0 or (if (self.scheduler) |scheduler| scheduler.shouldCoordinateCurrentRequests() else false));
+                // A cooperative CUDA request uses the same canonical logits
+                // path while alone and shared. Admission/retirement of a peer
+                // must not switch its numerical policy mid-generation.
                 if (route_decode_through_scheduler and self.cb.kind() == .metal and
                     isPureGreedyConfig(config) and token_table == null and json_grammar.* == null and gbnf_grammar == null and
                     !has_cached_prefill_logits)
@@ -8708,8 +8736,8 @@ pub const NativeGenerationPipeline = struct {
                                 }
                             }
                         }
-                        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-                        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+                        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+                        defer if (execution_scope) |*scope| scope.deinit();
                         break :direct_token_blk try self.forwardGreedyDeviceDecodeToken(
                             token_ids,
                             seq_len.*,
@@ -8848,8 +8876,8 @@ pub const NativeGenerationPipeline = struct {
             if (config.kv_cache_mode == .select_v1) try decode_state.compactSelectedGlobalDonors(self.gpt_config, self.execution_control);
             {
                 const kv_mutation_mutex = batchKvMutationMutex(self.execution_lock, decode_state.kv_lock);
-                if (kv_mutation_mutex) |mutex| try self.lockExecution(mutex);
-                defer if (kv_mutation_mutex) |mutex| self.unlockExecution(mutex);
+                var execution_scope = if (kv_mutation_mutex) |mutex| try self.lockExecution(mutex) else null;
+                defer if (execution_scope) |*scope| scope.deinit();
                 _ = try decode_runtime.appendGeneratedToken();
             }
             try penalty_state.noteToken(allocator, @intCast(next_token));
@@ -9644,16 +9672,16 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn makeDeviceTokenTensor(self: *NativeGenerationPipeline, token_id: usize) !?ops.CT {
-        if (self.execution_lock) |mutex| try self.lockExecution(mutex);
-        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+        var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         const data = [_]i32{@intCast(token_id)};
         const shape = [_]i32{1};
         return try self.cb.fromInt32Shape(&data, &shape);
     }
 
     fn freeDeviceTokenTensor(self: *NativeGenerationPipeline, tensor: ops.CT) void {
-        if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex);
-        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+        var execution_scope = if (self.execution_lock) |mutex| self.lockExecutionForRelease(mutex) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         self.cb.free(tensor);
     }
 
@@ -12882,8 +12910,8 @@ pub const NativeGenerationPipeline = struct {
 
     fn retireBatchedProjectedImages(self: *NativeGenerationPipeline, projected: *qwen3vl_projector.ProjectedImages) void {
         const device = projected.device_embeddings != null;
-        if (device) if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex);
-        defer if (device) if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+        var execution_scope: ?ExecutionScope = if (device) (if (self.execution_lock) |mutex| self.lockExecutionForCleanup(mutex) else null) else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         projected.deinit();
     }
 
@@ -12956,7 +12984,17 @@ pub const NativeGenerationPipeline = struct {
         }
     };
 
+    fn cancelledDecodeWork(work: *PendingDecodeBatchWork) bool {
+        if (work.decode_state.execution_control) |control| control.check() catch |err| {
+            work.failure = err;
+            work.ready.store(true, .release);
+            return true;
+        };
+        return false;
+    }
+
     fn publishGreedyToken(work: *PendingDecodeBatchWork, token: u32) void {
+        if (cancelledDecodeWork(work)) return;
         if (work.sequence) |sequence| {
             sequence.acceptToken(token) catch |err| {
                 work.failure = err;
@@ -13473,9 +13511,10 @@ pub const NativeGenerationPipeline = struct {
     /// even for cancellation or a CUDA error before retiring any resource.
     fn waitOutsideLightOnExecution(self: *NativeGenerationPipeline, pending: anytype) !void {
         const mutex = self.execution_lock orelse return error.InvalidBatchDecodeState;
-        self.unlockExecution(mutex);
+        const scope = self.claimed_execution_scope orelse return error.InvalidBatchDecodeState;
+        scope.deinit();
         const waited = pending.wait();
-        self.lockExecutionForCleanup(mutex);
+        scope.* = self.lockExecutionForCleanup(mutex);
         try waited;
     }
 
@@ -14416,15 +14455,55 @@ pub const NativeGenerationPipeline = struct {
         lease: *runtime.scheduler.native_generate.Lease,
         claimed: []const runtime.scheduler.native_generate.StepItem,
     ) void {
-        if (self.execution_lock) |mutex| {
-            if (scheduler.usesStepEvents() or self.execution_gate != null) {
-                self.lockExecution(mutex) catch |err| {
-                    completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = err });
+        // A claimed CUDA cohort drains as one operation. One row's deadline
+        // must not abort a healthy peer or retire its borrowed KV pointers.
+        const shared_batch = self.cb.kind() == .cuda and self.cb.execution_owner != 0 and claimed.len > 1;
+        var batch_budget: @import("../ops/execution_batch.zig").Budget = undefined;
+        if (shared_batch) {
+            var owners: [2]*runtime.tier.memory.RunBudget = undefined;
+            if (claimed.len > owners.len) {
+                completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = error.InvalidBatchDecodeState });
+                return;
+            }
+            for (claimed, 0..) |item, row| {
+                if (item.phase != .decode or item.query_sequence_len != 1) {
+                    completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = error.InvalidBatchDecodeState });
+                    return;
+                }
+                const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                const backend = work.decode_state.execution_backend orelse {
+                    completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = error.InvalidBatchDecodeState });
                     return;
                 };
-            } else platform.sync.lockYielding(mutex);
+                if (backend.ptr != self.cb.ptr or backend.execution_owner == 0 or backend.execution_budget == null) {
+                    completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = error.InvalidBatchDecodeState });
+                    return;
+                }
+                owners[row] = backend.execution_budget.?;
+            }
+            batch_budget = @import("../ops/execution_batch.zig").Budget.init(owners[0..claimed.len]) catch |err| {
+                completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = err });
+                return;
+            };
         }
-        defer if (self.execution_lock) |mutex| self.unlockExecution(mutex);
+        const original_control = self.execution_control;
+        const original_backend_control = self.cb.execution_control;
+        if (shared_batch) {
+            self.execution_control = null;
+            self.cb.execution_control = null;
+        }
+        defer {
+            self.execution_control = original_control;
+            self.cb.execution_control = original_backend_control;
+        }
+        var execution_scope = if (self.execution_lock) |mutex| self.lockExecution(mutex) catch |err| {
+            completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = err });
+            return;
+        } else null;
+        defer if (execution_scope) |*scope| scope.deinit();
+        if (shared_batch) execution_scope.?.bindDecodeBatch(&batch_budget.run, claimed.len);
+        self.claimed_execution_scope = if (execution_scope) |*scope| scope else null;
+        defer self.claimed_execution_scope = null;
 
         // A cohort worker can encode hundreds of steps. Drain Objective-C
         // temporaries at each completed step, while still owning the encoder,
@@ -14464,6 +14543,7 @@ pub const NativeGenerationPipeline = struct {
         };
 
         var result = self.forwardScheduledStep(claimed) catch |err| {
+            if (self.claimed_execution_scope) |scope| scope.drainBatch();
             completeClaimedStepBeforePublish(scheduler, lease, claimed, FailedStepPublisher{ .err = err });
             return;
         };
@@ -14473,6 +14553,7 @@ pub const NativeGenerationPipeline = struct {
         defer if (result.packed_greedy_tokens) |tokens| self.allocator.free(tokens);
         defer if (result.second_greedy_tokens) |tokens| self.allocator.free(tokens);
 
+        if (self.claimed_execution_scope) |scope| scope.drainBatch();
         completeClaimedStepBeforePublish(scheduler, lease, claimed, SuccessfulStepPublisher{
             .vocab_size = self.gpt_config.vocab_size,
             .logits = result.logits,
@@ -14666,6 +14747,7 @@ pub const NativeGenerationPipeline = struct {
             switch (item.phase) {
                 .decode => {
                     const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                    if (cancelledDecodeWork(work)) continue;
                     if (work.sequence) |sequence| {
                         const allocator = work.allocator;
                         const masked = allocator.dupe(f32, slice) catch |err| {
@@ -14744,6 +14826,13 @@ fn runStepLoop(
 
     while (!driver.isReady()) {
         if (events) scheduler.prepareWait(&waiter);
+        if (wait_error == null) {
+            if (@hasDecl(DriverChild, "checkControl")) {
+                driver.checkControl() catch |err| {
+                    wait_error = err;
+                };
+            }
+        }
         if (wait_error) |err| {
             // Cancellation cannot drop a stack-backed work pointer while a
             // peer may own it. Remove idle work immediately; otherwise wait
@@ -14756,9 +14845,18 @@ fn runStepLoop(
             continue;
         }
         if (dedicated) {
-            if (!driver.isReady()) waiter.event.wait(io) catch |err| {
-                wait_error = err;
-            };
+            if (!driver.isReady()) {
+                if (@hasDecl(DriverChild, "checkControl")) {
+                    // Application deadlines do not cancel the I/O event wait.
+                    // Poll them while preserving the claimed-work drain path.
+                    waiter.event.waitTimeout(io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch |err| switch (err) {
+                        error.Timeout => {},
+                        else => wait_error = err,
+                    };
+                } else waiter.event.wait(io) catch |err| {
+                    wait_error = err;
+                };
+            }
             continue;
         }
         if (@hasDecl(DriverChild, "preStep")) driver.preStep();
@@ -14794,6 +14892,10 @@ const DecodeStepDriver = struct {
     work: *NativeGenerationPipeline.PendingDecodeBatchWork,
     decode_state: *NativeDecodeState,
 
+    pub fn checkControl(self: *DecodeStepDriver) !void {
+        if (self.pipeline.execution_control) |control| try control.check();
+    }
+
     fn isReady(self: *const DecodeStepDriver) bool {
         return self.work.ready.load(.acquire);
     }
@@ -14822,6 +14924,10 @@ const PrefillStepDriver = struct {
     scheduler: *runtime.scheduler.native_generate.NativeGenerateCoordinator,
     work: *NativeGenerationPipeline.PendingPrefillBatchWork,
     decode_state: *NativeDecodeState,
+
+    pub fn checkControl(self: *PrefillStepDriver) !void {
+        if (self.pipeline.execution_control) |control| try control.check();
+    }
 
     fn isReady(self: *const PrefillStepDriver) bool {
         return self.work.ready.load(.acquire);
@@ -16238,6 +16344,49 @@ test "runStepLoop drives stub driver to completion and reports per-iteration bud
     try std.testing.expectEqual(@as(usize, 1), driver.prestep_calls);
     try std.testing.expectEqual(@as(usize, 1), driver.budget_calls);
     try std.testing.expectEqual(@as(usize, 0), coordinator.pending_decode.items.len);
+}
+
+test "generation deadline cancels queued steps in inline and dedicated execution" {
+    const Coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator;
+    for ([_]bool{ false, true }) |dedicated| {
+        var threaded = std.Io.Threaded.init(std.testing.allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+        var coordinator = Coordinator.init(std.testing.allocator);
+        defer coordinator.deinit();
+        var wake: std.Io.Event = .unset;
+        if (dedicated) coordinator.registerExecutor(&wake, io);
+        defer if (dedicated) coordinator.unregisterExecutor();
+        var lease = try coordinator.acquire(.{ .requested_units = 1, .prompt_bytes = 1, .max_tokens = 1 });
+        defer coordinator.release(lease);
+        coordinator.beginDecode(&lease, 4);
+        var work: u8 = 0;
+        try coordinator.enqueueDecodeWork(lease, &work, 5, 4, 0, .{});
+        const Driver = struct {
+            checks: usize = 0,
+            allowed_checks: usize,
+            pub fn checkControl(self: *@This()) !void {
+                self.checks += 1;
+                if (self.checks > self.allowed_checks) return error.Timeout;
+            }
+            fn isReady(_: *const @This()) bool {
+                return false;
+            }
+            fn stepBudget(_: *const @This()) runtime.scheduler.native_generate.StepBudget {
+                unreachable;
+            }
+            fn execute(_: *@This(), _: *Coordinator, _: *runtime.scheduler.native_generate.Lease, _: []const runtime.scheduler.native_generate.StepItem) void {
+                unreachable;
+            }
+        };
+        // Dedicated execution first waits for a peer that never claims work.
+        // Its timed event wait must wake and recheck the caller's deadline.
+        var driver: Driver = .{ .allowed_checks = if (dedicated) 1 else 0 };
+        try std.testing.expectError(error.Timeout, runStepLoop(std.testing.failing_allocator, &coordinator, &lease, &work, .decode, io, null, &driver));
+        try std.testing.expectEqual(@as(usize, 0), coordinator.pending_decode.items.len);
+        try std.testing.expect(coordinator.in_turn == null);
+        try std.testing.expect(coordinator.waiters == null);
+    }
 }
 
 test "runStepLoop cancellation removes idle stack work without executing it" {
@@ -20117,6 +20266,7 @@ test "LightOnOCR3 phase priority releases its waiter on cancellation and permits
     var waiters: std.atomic.Value(usize) = .init(0);
     var wake: std.Io.Event = .unset;
     var pipeline: NativeGenerationPipeline = undefined;
+    pipeline.cb = .{ .ptr = &mutex, .vtable = undefined }; // Lock-only fixture: no compute ops.
     pipeline.execution_lock = &mutex;
     pipeline.execution_gate = null;
     pipeline.execution_phase_wake = &wake;
@@ -20138,11 +20288,11 @@ test "LightOnOCR3 phase priority releases its waiter on cancellation and permits
     // A cancelled page still has to retire backend state. This acquisition
     // ignores its cancelled control and clears the priority borrow on success.
     wake.reset();
-    pipeline.lockExecutionForCleanup(&mutex);
+    var cleanup_scope = pipeline.lockExecutionForCleanup(&mutex);
     try std.testing.expect(wake.isSet());
     try std.testing.expectEqual(@as(usize, 0), waiters.load(.acquire));
     try std.testing.expect(!mutex.tryLock());
-    mutex.unlock();
+    cleanup_scope.deinit();
 }
 
 test "LightOnOCR3 event execution gate removes cancelled waiters and drains cleanup" {
@@ -20159,6 +20309,7 @@ test "LightOnOCR3 event execution gate removes cancelled waiters and drains clea
     var waiters: std.atomic.Value(usize) = .init(0);
     var cancel = Cancel{};
     var pipeline: NativeGenerationPipeline = undefined;
+    pipeline.cb = .{ .ptr = &mutex, .vtable = undefined }; // Lock-only fixture: no compute ops.
     pipeline.io = std.testing.io;
     pipeline.execution_lock = &mutex;
     pipeline.execution_gate = &gate;
@@ -20182,9 +20333,9 @@ test "LightOnOCR3 event execution gate removes cancelled waiters and drains clea
     try std.testing.expect(!gate.owned and mutex.tryLock());
     mutex.unlock();
     // Cleanup cannot abandon borrowed GPU state when the page is cancelled.
-    pipeline.lockExecutionForCleanup(&mutex);
+    var cleanup_scope = pipeline.lockExecutionForCleanup(&mutex);
     try std.testing.expect(gate.owned and !mutex.tryLock());
-    pipeline.unlockExecution(&mutex);
+    cleanup_scope.deinit();
     try std.testing.expect(!gate.owned and gate.head == null);
     try std.testing.expect(mutex.tryLock());
     mutex.unlock();
@@ -20705,14 +20856,16 @@ test "LightOnOCR3 CUDA burst readback releases the execution lane and reacquires
         var mutex: std.atomic.Mutex = .unlocked;
         var gate: execution_control_mod.ExecutionLane = .{};
         var pipeline: NativeGenerationPipeline = undefined;
+        pipeline.cb = .{ .ptr = &mutex, .vtable = undefined }; // Lock-only fixture: no compute ops.
         pipeline.execution_lock = &mutex;
         pipeline.execution_gate = if (event_gate) &gate else null;
         pipeline.execution_phase_waiters = null;
         pipeline.execution_control = null;
         pipeline.execution_contention_wait_ns = 100 * std.time.ns_per_us;
         pipeline.io = std.testing.io;
-        try pipeline.lockExecution(&mutex);
-        defer pipeline.unlockExecution(&mutex);
+        var execution_scope = try pipeline.lockExecution(&mutex);
+        defer execution_scope.deinit();
+        pipeline.claimed_execution_scope = &execution_scope;
         pipeline.execution_control = .{ .check_fn = Fake.cancel };
         var pending = Fake{ .mutex = &mutex, .fail = fail };
         if (fail) {
@@ -20750,6 +20903,7 @@ test "LightOnOCR3 device vision cancellation retires independent page features o
         table.freeTensor = Probe.free;
         const cb = ops.ComputeBackend{ .ptr = &probe, .vtable = &table };
         var pipeline: NativeGenerationPipeline = undefined;
+        pipeline.cb = cb;
         pipeline.execution_lock = &mutex;
         pipeline.execution_gate = if (event_gate) &gate else null;
         pipeline.execution_phase_waiters = null;
@@ -20795,4 +20949,37 @@ test "generation audio PCM follows content part order and validates alignment" {
     try std.testing.expectEqual(@intFromPtr(samples[0..].ptr), @intFromPtr(inputs[1].pcm.samples.ptr));
     message.decoded_audio = pcm[0..1];
     try std.testing.expectError(error.InvalidMessageAudioIndex, collectAudioInPromptOrder(a, &.{message}));
+}
+
+test "cooperative decode publication cancels only the expired row after a shared step" {
+    const a = std.testing.allocator;
+    var expired = NativeDecodeState.initContiguous(a);
+    defer expired.deinit();
+    var healthy = NativeDecodeState.initContiguous(a);
+    defer healthy.deinit();
+    const Probe = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.DeadlineExceeded;
+        }
+    };
+    expired.execution_control = .{ .check_fn = Probe.check };
+    var x = NativeGenerationPipeline.PendingDecodeBatchWork{ .allocator = a, .decode_state = &expired, .token_id = 1, .seq_len = 100 };
+    var y = NativeGenerationPipeline.PendingDecodeBatchWork{ .allocator = a, .decode_state = &healthy, .token_id = 2, .seq_len = 9000 };
+    NativeGenerationPipeline.publishGreedyToken(&x, 17);
+    NativeGenerationPipeline.publishGreedyToken(&y, 29);
+    try std.testing.expectEqual(@as(?anyerror, error.DeadlineExceeded), x.failure);
+    try std.testing.expect(x.greedy_token == null and x.ready.load(.acquire));
+    try std.testing.expect(y.failure == null and y.ready.load(.acquire));
+    try std.testing.expectEqual(@as(?u32, 29), y.greedy_token);
+    // Buffered/sampling results obey the same per-row lifetime contract.
+    x.ready.store(false, .release);
+    y.ready.store(false, .release);
+    const items = [_]runtime.scheduler.native_generate.StepItem{
+        .{ .work_ptr = &x, .phase = .decode, .query_sequence_len = 1, .total_sequence_len = 100, .kv_sequence_len = 100, .kv_position_offset = 0 },
+        .{ .work_ptr = &y, .phase = .decode, .query_sequence_len = 1, .total_sequence_len = 9000, .kv_sequence_len = 9000, .kv_position_offset = 0 },
+    };
+    NativeGenerationPipeline.dispatchStepLogitsLayout(3, &items, &.{ 1, 2, 3, 4, 5, 6 }, 1, false);
+    try std.testing.expect(x.logits == null and x.ready.load(.acquire));
+    defer a.free(y.logits.?);
+    try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, y.logits.?);
 }

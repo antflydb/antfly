@@ -157,7 +157,7 @@ pub fn buildIndexed(a: A, out: A, table: local.common_topology_records.TableReco
             // Whole-root reuse remains valid for recipes with no file tree
             // (floating reductions, DISTINCT, or delete-bearing snapshots).
             const previous = for (if (contribution_lookup == null or !contributes) reusable else &.{}) |decl| {
-                if (decl.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(decl.artifact.metadata_version) and std.mem.eql(u8, decl.binding.index_config_hash, identity) and try @import("lake_index_names.zig").matches(ca, decl.name, entry.key_ptr.*, name.string, decl.artifact.metadata_version)) break decl;
+                if (decl.artifact.kind == .algebraic_segment and artifacts.supportsMetadataVersion(decl.artifact.metadata_version) and std.mem.eql(u8, decl.binding.index_config_hash, identity) and try @import("lake_index_names.zig").matches(ca, decl.name, entry.key_ptr.*, name.string)) break decl;
             } else null;
             if (previous) |decl| {
                 // The coordinator proves complete source/schema/credential/store

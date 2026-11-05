@@ -27,6 +27,7 @@ const Wire = struct {
     catalog_digest: publication.Digest,
     producer_name: []const u8,
     producer_generation: u64,
+    execution_identity: ?publication.Digest = null,
     producer_artifact_name: []const u8 = "",
     producer_scope_key: []const u8 = "",
     sources: []const publication.Source,
@@ -45,7 +46,12 @@ comptime {
 }
 pub fn write(command: publication.Command, stream: anytype) @TypeOf(stream.*).Error!void {
     try stream.beginObject();
+    if (command.execution_identity) |identity| {
+        try stream.objectField("execution_identity");
+        try binary.write(identity, stream);
+    }
     inline for (comptime std.meta.fieldNames(publication.Command)) |reflected_name| {
+        if (comptime std.mem.eql(u8, reflected_name, "execution_identity")) continue;
         try stream.objectField(reflected_name);
         if (comptime std.mem.eql(u8, reflected_name, "mutations")) {
             try stream.beginArray();

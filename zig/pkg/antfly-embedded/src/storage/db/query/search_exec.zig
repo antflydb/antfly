@@ -1805,6 +1805,11 @@ fn requestWithoutResolvedStoredFilters(req: types.SearchRequest, filter_query_js
 
 fn requestAfterNativeFilters(req: types.SearchRequest, filter_query_json_resolved: bool, exclusion_query_json_resolved: bool) types.SearchRequest {
     var next = requestWithoutResolvedStoredFilters(req, filter_query_json_resolved, exclusion_query_json_resolved);
+    // Keep candidate provenance separate from consumed constraints. Residual
+    // value predicates may verify these exact keys without permitting a scan.
+    if (req.filter_doc_ids_positive or req.filter_doc_ids.len != 0) {
+        next.value_search_candidate_keys = if (req.filter_doc_ids.len <= types.max_canonical_hierarchy_groups) req.filter_doc_ids else &.{};
+    }
     // Candidate collectors enforce these constraints against their pinned native
     // snapshot. Only residual predicates belong in post-processing: applying an
     // admitted document filter again to a page discards the upstream total and
@@ -13583,7 +13588,11 @@ pub fn searchTextQuery(
     const unresolved_stored_filters =
         (effective_req.filter_query_json.len > 0 and !native_constraints.filter_query_json_resolved) or
         (effective_req.exclusion_query_json.len > 0 and !native_constraints.exclusion_query_json_resolved);
-    try rejectSortedQueryWithUnresolvedStoredFilters(
+    // Artifact-member predicates run against their source parent. They cannot
+    // be translated to the member index's document numbers. The exact bounded
+    // collector below exhausts its admitted candidate population, applies the
+    // parent predicates, and only then sorts/pages; excess work is rejected.
+    if (!(chunk_backed and member_mode_for_filter)) try rejectSortedQueryWithUnresolvedStoredFilters(
         effective_req,
         native_constraints.filter_query_json_resolved,
         native_constraints.exclusion_query_json_resolved,
@@ -38312,4 +38321,15 @@ test "graph legacy ordinal batches bound resolver calls and preserve membership"
     try std.testing.expectEqual(@as(usize, 6), fake.calls);
     try batch.flush(&rows, executor, 42, .{});
     try std.testing.expectEqual(@as(usize, 7), fake.calls);
+}
+
+test "native member verification preserves candidate provenance after native filtering" {
+    const req: types.SearchRequest = .{ .filter_doc_ids = &.{ "a", "b" }, .filter_doc_ids_positive = true };
+    const residual = requestAfterNativeFilters(req, false, false);
+    try std.testing.expect(!residual.filter_doc_ids_positive and residual.filter_doc_ids.len == 0);
+    try std.testing.expectEqual(@as(usize, 2), residual.value_search_candidate_keys.len);
+    try std.testing.expectEqualStrings("a", residual.value_search_candidate_keys[0]);
+    try std.testing.expect(!residual.value_search_execution.allow_scan);
+    const unbounded = requestAfterNativeFilters(.{}, false, false);
+    try std.testing.expectEqual(@as(usize, 0), unbounded.value_search_candidate_keys.len);
 }

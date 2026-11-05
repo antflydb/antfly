@@ -28231,7 +28231,7 @@ fn reconcileDbArtifactEnrichmentsFromIndexesJson(
 ) !void {
     const enrichments = try indexes_api.collectArtifactEnrichmentsFromTableIndexesJsonWithOptions(alloc, indexes_json, embedding_options);
     defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
-    indexes_api.sortArtifactEnrichmentsByDependency(enrichments);
+    try indexes_api.sortArtifactEnrichmentsByDependency(alloc, enrichments);
     for (enrichments) |cfg| {
         _ = try db.upsertEnrichment(cfg);
     }

@@ -275,6 +275,56 @@ class ContentionReportTests(unittest.TestCase):
         )
         self.assertIsNone(bench.handoff_problem({"lease": None}, 4))
 
+    def test_batch_docs_writes_distinct_keys_and_tracks_each(self):
+        class Database:
+            def __init__(self):
+                self.payloads = []
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def batch_json(self, payload):
+                self.payloads.append(payload)
+                time.sleep(0.001)
+
+        database = Database()
+        api = SimpleNamespace(open=lambda *a, **k: database, BusyError=RuntimeError)
+        zero = dict.fromkeys(bench.PROOF_FIELDS, 0)
+        zero.update(
+            mutation_admission_count=0,
+            mutation_admission_ns=0,
+            mutation_admission_max_ns=0,
+            mutation_admission_log2_ns=[0] * 64,
+        )
+        ready, results = queue.Queue(), queue.Queue()
+        config = {
+            "library": "fake",
+            "database": "fresh",
+            "no_sync": True,
+            "timeout_ms": 5,
+            "watchdog": 1,
+            "seconds": 0.03,
+            "workload": "churn",
+            "batch_docs": 4,
+        }
+        with (
+            patch.object(bench, "sdk", return_value=api),
+            patch.object(bench, "measurement_stats", return_value=zero),
+        ):
+            bench.native_worker(
+                config, 1, ready, SimpleNamespace(wait=lambda _: True), results
+            )
+        result = results.get_nowait()
+        self.assertEqual(result["status"], "ok")
+        for payload in database.payloads:
+            self.assertEqual(len(payload["inserts"]), 4)
+        written = {write["key"] for write in result["latest_churn_writes"]}
+        expected = {key for payload in database.payloads for key in payload["inserts"]}
+        self.assertEqual(written, expected)
+
     def test_worker_close_failure_emits_one_error_and_no_success(self):
         class Database:
             def __enter__(self):

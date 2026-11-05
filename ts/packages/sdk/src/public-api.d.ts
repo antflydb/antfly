@@ -12752,16 +12752,26 @@ export interface components {
         HierarchyChildParent: {
             /** @enum {string} */
             level: "source";
-            id: string;
+            id?: string;
+            /** @description Bounded source selection for member traversal; unit traversal requires id. */
+            ids?: string[];
         };
         HierarchyChildren: {
             parent: components["schemas"]["HierarchyChildParent"];
             /**
              * @description Child level to enumerate. Unit traversal reads the versioned extraction
              *     hierarchy rather than a relevance index, so empty and failed units are included.
+             *     Member traversal requires artifact and seeks that producer's native storage
+             *     prefixes within the selected source or parent.ids batch (up to 100).
+             *     One global cursor orders the selected members; it includes generic assets and chunks.
+             *     Scalar member payloads are returned as {"$": value} in _source so
+             *     every query hit retains an object-shaped projection. Continuation
+             *     requires the remote_snapshot returned with the first page.
              * @enum {string}
              */
-            level: "unit";
+            level: "unit" | "member";
+            /** @description Producer name; required for member traversal and omitted for unit traversal. */
+            artifact?: string;
         };
         /**
          * @description The required public order for sequential hierarchy traversal. Specify
@@ -12791,7 +12801,9 @@ export interface components {
          *
          *     `children` is a separate sequential-browsing operation. It enumerates every unit
          *     in the selected source revision, including units with no searchable chunk, and uses
-         *     the top-level `_sort`/`search_after` cursor contract.
+         *     the top-level `_sort`/`search_after` cursor contract. For member traversal,
+         *     `filter_query` applies to source parents before any artifact enumeration;
+         *     it never filters member payloads or changes the member pagination order.
          *
          *     Ancestor and nested-match field projections are always explicit to keep response
          *     size predictable. The presence of this object selects the canonical contract:
@@ -14166,6 +14178,10 @@ export interface components {
              */
             window_index?: number;
             unit_id?: string;
+            /** @description Opaque fingerprint of this member's native content and captured producer/input state; independent of hierarchy traversal cursors. */
+            revision?: string;
+            /** @description Opaque fingerprint of the captured producer/input state, when available. Changes to producer configuration or acquired input reopen this identity. */
+            derivation_revision?: string;
             source?: components["schemas"]["HierarchyArtifactSource"];
         };
         HierarchyAncestor: {
@@ -17097,6 +17113,63 @@ export interface components {
             /** @description Row field holding the source last-modified timestamp. */
             last_modified_field?: string;
         };
+        /** @description Text-quality thresholds. `native_text.quality` assesses native document text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR output. Quality flags are not guarantees of correct reading order or complete document semantics. */
+        DocumentExtractionTextQualityConfig: {
+            /**
+             * @description Minimum non-whitespace Unicode characters before text passes the length check.
+             * @default 50
+             */
+            min_chars?: number;
+            /**
+             * @description Minimum words before the garbled-text check applies.
+             * @default 20
+             */
+            garbled_min_words?: number;
+            /**
+             * @description Words sampled by the garbled-text check.
+             * @default 50
+             */
+            garbled_sample_words?: number;
+            /**
+             * Format: double
+             * @description Maximum ratio of single-character words before text counts as garbled.
+             * @default 0.4
+             */
+            max_single_char_word_ratio?: number;
+            /**
+             * @description Minimum non-whitespace Unicode characters for a line to count in the corrupted-line check.
+             * @default 15
+             */
+            min_line_chars?: number;
+            /**
+             * Format: double
+             * @description Maximum ratio of corrupted lines.
+             * @default 0.2
+             */
+            max_corrupted_line_ratio?: number;
+            /**
+             * Format: double
+             * @description Font corruption score above which a substantial line counts as corrupted.
+             * @default 0.5
+             */
+            max_font_corruption?: number;
+            /**
+             * Format: double
+             * @description Maximum ratio of Unicode replacement characters.
+             * @default 0.05
+             */
+            max_replacement_ratio?: number;
+        };
+        /** @description Native document text policy and quality assessment. No OCR model is required. Native quality diagnostics are recorded independently of extraction completion and OCR availability. */
+        DocumentExtractionNativeTextConfig: {
+            /**
+             * @description `source` retains decoded source text, including off-page runs, for auditing. `page` excludes runs wholly outside the page or a known clipping box while retaining hidden OCR/accessibility text. `visible` additionally excludes nonpainting and fully transparent text. These policies do not claim pixel-perfect occlusion analysis. All policies honor semantic ActualText replacements.
+             * @default page
+             * @enum {string}
+             */
+            policy?: "source" | "page" | "visible";
+            quality?: components["schemas"]["DocumentExtractionTextQualityConfig"];
+        };
         /** @description Reader provider for OCR. Every provider except `apple` requires `model`; Apple uses Vision text recognition and accepts no model, credentials, or prompt. */
         DocumentExtractionReaderConfig: {
             /** @enum {string} */
@@ -17173,59 +17246,12 @@ export interface components {
              */
             max_dimension?: number;
         };
-        /** @description Thresholds that decide when a PDF page's native text is too poor to keep, in `auto` mode. */
-        DocumentExtractionOcrQualityConfig: {
-            /**
-             * @description Pages with fewer meaningful characters are read with OCR.
-             * @default 50
-             */
-            min_content_chars?: number;
-            /**
-             * @description Minimum words before the garbled-text check applies.
-             * @default 20
-             */
-            garbled_min_words?: number;
-            /**
-             * @description Words sampled by the garbled-text check.
-             * @default 50
-             */
-            garbled_sample_words?: number;
-            /**
-             * Format: double
-             * @description Maximum ratio of single-character words before text counts as garbled.
-             * @default 0.4
-             */
-            max_single_char_word_ratio?: number;
-            /**
-             * @description Minimum characters for a line to count in the corrupted-line check.
-             * @default 15
-             */
-            substantial_line_min_chars?: number;
-            /**
-             * Format: double
-             * @description Maximum ratio of corrupted lines.
-             * @default 0.2
-             */
-            max_corrupted_line_ratio?: number;
-            /**
-             * Format: double
-             * @description Font corruption score at which text is replaced by OCR.
-             * @default 0.5
-             */
-            font_corruption_score_threshold?: number;
-            /**
-             * Format: double
-             * @description Maximum ratio of Unicode replacement characters.
-             * @default 0.05
-             */
-            max_replacement_char_ratio?: number;
-        };
         /** @description Reads scanned pages and images. Name exactly one of `reader` or `generator`. Readers run their own OCR task; generators receive a transcription instruction. */
         DocumentExtractionOcrConfig: {
             reader?: components["schemas"]["DocumentExtractionReaderConfig"];
             generator?: components["schemas"]["GeneratorConfig"];
             /**
-             * @description `auto` reads PDF pages whose native text fails the `quality` checks, and images. `always` reads every page.
+             * @description `auto` reads PDF pages whose native text fails `native_text.quality`, and images. `always` reads every page.
              * @default auto
              * @enum {string}
              */
@@ -17233,7 +17259,7 @@ export interface components {
             /** @description Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers reject prompts. */
             prompt?: string;
             render?: components["schemas"]["DocumentExtractionRenderConfig"];
-            quality?: components["schemas"]["DocumentExtractionOcrQualityConfig"];
+            quality?: components["schemas"]["DocumentExtractionTextQualityConfig"];
         };
         /** @description Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN. */
         CloudflareSTTConfig: {
@@ -17452,6 +17478,7 @@ export interface components {
              * @default true
              */
             html_strip_tags?: boolean;
+            native_text?: components["schemas"]["DocumentExtractionNativeTextConfig"];
             ocr?: components["schemas"]["DocumentExtractionOcrConfig"];
             transcription?: components["schemas"]["DocumentExtractionTranscriptionConfig"];
             /**
@@ -21311,8 +21338,33 @@ export interface components {
             mime_type: string;
             sampling?: components["schemas"]["VideoSamplingPolicy"];
         };
-        /** @description A content part for multimodal input (text, image URL, or inline media). */
-        ContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["ImageURLContentPart"] | components["schemas"]["MediaContentPart"];
+        /** @description Image, audio, or video named by a source record's `content.resource`. Accepted only on the Antfly gateway's generate and chat routes, which fetch the pinned version under `remote_content.security` and replace this part with inline media, so the source URL never reaches a model vendor. Fetching requires a nonempty `allowed_hosts`. The expanded request is limited to 16 MiB. Models that do not support the media type reject the request. */
+        SourceContentPart: {
+            /** @enum {string} */
+            type: "source";
+            source: {
+                /** @enum {string} */
+                type: "source";
+                /** @description HTTP(S) URL. Treat source media URLs as private. */
+                uri: string;
+                /** @description image/png, image/jpeg, image/webp, image/gif, or an audio/* or video/* type. */
+                mime_type: string;
+                /** @description Quoted strong ETag. The fetch fails if the source no longer has this version. */
+                version: string;
+                /**
+                 * @default strong_etag
+                 * @enum {string}
+                 */
+                version_kind?: "strong_etag";
+                /**
+                 * Format: int64
+                 * @description Exact object length.
+                 */
+                length: number;
+            };
+        };
+        /** @description A content part for multimodal input (text, image URL, inline media, or a pinned source reference). */
+        ContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["ImageURLContentPart"] | components["schemas"]["MediaContentPart"] | components["schemas"]["SourceContentPart"];
         /**
          * @description Message content. Supports two formats:
          *     - Simple string: "Hello, how are you?"
@@ -23558,6 +23610,8 @@ export interface components {
         };
         /** @description OpenAI-compatible embedding request with inference multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized vectors. */
         InferenceEmbedRequest: {
+            /** @description Optional immutable execution revision from model capabilities. Every acquired model, including recovery attempts, must match before inference. A mismatch returns 409 with X-Antfly-Capability-Stale true. Successful execution acknowledges the pin in X-Antfly-Model-Revision for JSON and numeric responses; callers requiring a pin must reject missing or different acknowledgements. */
+            model_revision?: string;
             /** @description Optional exact asset identity pin. A mismatch returns 409 before inference. */
             model_identity?: string;
             /** @description Model name to use for embedding generation */
@@ -24379,6 +24433,11 @@ export interface components {
                 /** Format: int64 */
                 minimum_dimensions: number;
             };
+            /**
+             * @description The embedding endpoint enforces model_revision and acknowledges successful execution in X-Antfly-Model-Revision for both JSON and numeric responses. An observed model_revision alone does not establish this support.
+             * @default false
+             */
+            model_revision_pinning?: boolean;
             /** @description Immutable resolved embedding or generator generation, returned for scoped model/task discovery without loading weights. */
             model_revision?: string;
             /**
@@ -30654,6 +30713,13 @@ export interface components {
              */
             allowed_paths?: string[];
             /**
+             * @description Exact source companion base URLs that a chat `source` part may fetch, matched on scheme, host, port and path. This is how a loopback or private companion is allowed; such URLs need no `allowed_hosts` entry. Every other `source` URL needs `allowed_hosts` and always keeps private-IP blocking, whatever `block_private_ips` says. Template fetches ignore this setting.
+             * @example [
+             *       "http://127.0.0.1:8082/v1/media/"
+             *     ]
+             */
+            source_media_base_urls?: string[];
+            /**
              * @description User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
              * @example AntflyDB/1.0
              */
@@ -30883,7 +30949,21 @@ export interface components {
             content_security?: components["schemas"]["ContentSecurityConfig"];
             /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
             s3_credentials?: components["schemas"]["Credentials"];
-            /** @description Experimental execution batching; mode on explicitly enables qualified CUDA scheduling. Resource and request ceilings still apply. */
+            /** @description Opt-in interleaving of independently owned requests on backends declaring safe step sharing. Independent of row batching; graph, prefix-cache, speculative and multimodal routes remain exclusive. Currently qualified for at most two active E4B CUDA requests with one row per step. */
+            cooperative_execution?: {
+                /**
+                 * @default off
+                 * @enum {string}
+                 */
+                mode?: "off" | "on";
+                /** @default 2 */
+                max_active_requests?: number;
+                /** @default 8 */
+                short_context_burst?: number;
+                /** @default 5000 */
+                decode_handoff_wait_us?: number;
+            };
+            /** @description Experimental row batching; independent from cooperative_execution. Mode on explicitly enables qualified CUDA row scheduling. Resource and request ceilings still apply. */
             generation_batching?: {
                 /**
                  * @default off
@@ -42056,6 +42136,8 @@ export interface operations {
             /** @description Embeddings generated successfully */
             200: {
                 headers: {
+                    /** @description The acquired model revision, acknowledging model_revision after successful execution. Present for pinned JSON and numeric responses. */
+                    "X-Antfly-Model-Revision"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -42093,6 +42175,17 @@ export interface operations {
             /** @description Model not found */
             404: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The model identity or immutable revision pin does not match the acquired model. */
+            409: {
+                headers: {
+                    /** @description Present with value true for a stale model revision. Refresh capabilities and replan before retrying. */
+                    "X-Antfly-Capability-Stale"?: "true";
                     [name: string]: unknown;
                 };
                 content: {
@@ -43612,6 +43705,8 @@ export interface operations {
             /** @description Embedding response */
             200: {
                 headers: {
+                    /** @description The acquired model revision, acknowledging model_revision after successful execution. Present for pinned JSON and numeric responses. */
+                    "X-Antfly-Model-Revision"?: string;
                     [name: string]: unknown;
                 };
                 content: {
@@ -43649,6 +43744,17 @@ export interface operations {
             /** @description Model not found */
             404: {
                 headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["InferenceError"];
+                };
+            };
+            /** @description The model identity or immutable revision pin does not match the acquired model. */
+            409: {
+                headers: {
+                    /** @description Present with value true for a stale model revision. Refresh capabilities and replan before retrying. */
+                    "X-Antfly-Capability-Stale"?: "true";
                     [name: string]: unknown;
                 };
                 content: {
