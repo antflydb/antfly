@@ -1422,6 +1422,15 @@ charging a provider retry. The direct replay fallback without registered workers
 obeys the same dependency cuts and document-fan-out bounds as the registered
 manual executor.
 Explicit idle drains continue to inspect and complete all relevant work.
+Durable document invocations distinguish computation from artifact upload.
+An output intent is committed under the current attempt fence before any stage
+payload is stored. Cancellation, failure or restart before that intent releases
+the unused output allowance, while ambiguous calls, tokens and pixels remain
+charged. Once upload may have started, its upper bound remains charged through
+lost acknowledgements and takeover. Older reservations without this witness stay
+conservative. This prevents repeated interruptions of a small extraction from
+consuming several whole-response output allowances before any result exists;
+it does not increase limits or forgive ambiguous model work.
 Resolver query inference releases writer admission. Candidate, policy and
 embedding-cache callbacks continue to read primary storage, so resolution pins a
 logical-data snapshot under admission before releasing it. The pin survives
