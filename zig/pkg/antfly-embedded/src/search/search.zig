@@ -722,6 +722,7 @@ fn executeMatch(
     if (preferParallelText(snap) and mq.boost == 1) if (try executeStreamingTextBool(alloc, snap, .{ .should = &.{.{ .match = mq }} }, request, .{})) |result| return result;
     if (requestHasDocNumConstraints(request) or request.tie_rank != null) {
         if (try executeSimpleTextBool(alloc, snap, .{ .should = &.{.{ .match = mq }} }, request)) |result| return result;
+        if (try executeStreamingTextBool(alloc, snap, .{ .should = &.{.{ .match = mq }} }, request, .{})) |result| return result;
     }
     const analyzer = mq.analyzer orelse &analysis_mod.default_analyzer;
     const tokens = try analyzer.analyze(alloc, mq.text);
@@ -2133,6 +2134,14 @@ fn compareU32(expected: u32, item: u32) std.math.Order {
     return std.math.order(expected, item);
 }
 
+// Flattening a match with multiple distinct terms changes its OR membership
+// and the parent's minimum_should_match cardinality. Keep it as a child node.
+fn singleAnalyzedTerm(tokens: []const analysis_mod.Token) bool {
+    if (tokens.len == 0) return false;
+    for (tokens[1..]) |token| if (!std.mem.eql(u8, tokens[0].term, token.term)) return false;
+    return true;
+}
+
 fn appendSimpleTextTerms(alloc: Allocator, out: *std.ArrayListUnmanaged(SimpleTextTerm), query: SearchQuery) !bool {
     switch (query) {
         .term => |tq| {
@@ -2143,7 +2152,7 @@ fn appendSimpleTextTerms(alloc: Allocator, out: *std.ArrayListUnmanaged(SimpleTe
             const analyzer = mq.analyzer orelse &analysis_mod.default_analyzer;
             const tokens = try analyzer.analyze(alloc, mq.text);
             defer analysis_mod.Analyzer.freeTokens(alloc, tokens);
-            if (tokens.len == 0) return false;
+            if (!singleAnalyzedTerm(tokens)) return false;
 
             for (tokens, 0..) |tok, i| {
                 var duplicate = false;
@@ -4052,7 +4061,7 @@ const LoweredText = struct {
                 .term => |t| try out.append(self.a, .{ .field = t.field, .term = t.term, .boost = t.boost }),
                 .match => |m| {
                     const tokens = try self.stats.analyzed(m.text, m.analyzer orelse &analysis_mod.default_analyzer);
-                    if (tokens.len == 0) return false;
+                    if (!singleAnalyzedTerm(tokens)) return false;
                     for (tokens, 0..) |token, i| {
                         var duplicate = false;
                         for (tokens[0..i]) |prior| if (std.mem.eql(u8, prior.term, token.term)) {
@@ -5501,6 +5510,18 @@ fn queryHasIndexedMembership(query: SearchQuery) bool {
     };
 }
 
+// A mixed subtree can still contain required indexed predicates. Descend only
+// through positive must edges: optional OR branches and exclusions cannot bound
+// every result. Wholly indexed subtrees retain their complete Boolean semantics.
+fn appendRequiredIndexedBounds(alloc: Allocator, clauses: *std.ArrayListUnmanaged(query_mod.Filter), query: SearchQuery) anyerror!void {
+    if (query == .match_all) return;
+    if (queryHasIndexedMembership(query)) {
+        try clauses.append(alloc, try searchQueryToFilterArena(alloc, query));
+    } else if (query == .bool_query) {
+        for (query.bool_query.must) |child| try appendRequiredIndexedBounds(alloc, clauses, child);
+    }
+}
+
 // Only required clauses establish a safe candidate bound. Optional/disjunctive
 // producer branches must never be used to discard a different branch's rows.
 fn indexedMustCandidates(alloc: Allocator, snap: *const index_mod.IndexSnapshot, bq: BoolQuery, request: SearchRequest) !?roaring.RoaringBitmap {
@@ -5508,10 +5529,7 @@ fn indexedMustCandidates(alloc: Allocator, snap: *const index_mod.IndexSnapshot,
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     var clauses = std.ArrayListUnmanaged(query_mod.Filter).empty;
-    for (bq.must) |child| {
-        if (child == .match_all or !queryHasIndexedMembership(child)) continue;
-        try clauses.append(arena.allocator(), try searchQueryToFilterArena(arena.allocator(), child));
-    }
+    try appendRequiredIndexedBounds(arena.allocator(), &clauses, .{ .bool_query = bq });
     if (clauses.items.len == 0) return null;
     var required: [2]query_mod.Filter = undefined;
     var stages: [2]query_mod.Filter = undefined;
@@ -10645,8 +10663,8 @@ test "streaming boolean request lowering binds repeated matches without reanalyz
     var stats: StreamingBoolStats = .{ .a = storage.allocator(), .snap = writer.snapshot(), .count = 20 };
     try stats.collect(request.query);
     try stats.load();
-    // Preserve the established streaming arithmetic order bit for bit. The
-    // all-hit tree groups duplicate match clauses differently before summing.
+    // Segment binding must preserve the grouped clause tree and its arithmetic
+    // while sharing the request's cached analysis across repeated matches.
     var legacy_scratch = std.heap.ArenaAllocator.init(a);
     defer legacy_scratch.deinit();
     const legacy_plans = try planStreamingBoolSegments(a, &legacy_scratch, writer.snapshot(), bq, request, &stats, .{});
@@ -10659,7 +10677,12 @@ test "streaming boolean request lowering binds repeated matches without reanalyz
     var lowerer: LoweredText.Lowerer = .{ .a = stats.a, .stats = &stats, .constrained = false };
     stats.lowered = try lowerer.lower(request.query);
     try std.testing.expectEqual(@as(usize, 1), stats.analyses.items.len);
-    try std.testing.expectEqual(@as(usize, 4), stats.lowered.?.should.len);
+    try std.testing.expectEqual(@as(usize, 2), stats.lowered.?.should.len);
+    try std.testing.expectEqual(@as(u32, 2), stats.lowered.?.minimum);
+    for (stats.lowered.?.should) |child| {
+        try std.testing.expectEqual(@as(usize, 2), child.should.len);
+        try std.testing.expectEqual(@as(u32, 1), child.minimum);
+    }
     // If segment preparation accidentally returns to syntax lowering, this
     // analyzer now produces one nonexistent token and changes every result.
     analyzer.tokenizer = .keyword;
@@ -11518,6 +11541,43 @@ test "external lake metadata navigation phrase ceilings union alternatives and p
     std.debug.print("PHRASE_COST documents=10000 rare_upper=20 alternative_upper=50 unknown_upper=10000\n", .{});
 }
 
+test "logical value multiword match remains one boolean child" {
+    const a = std.testing.allocator;
+    const bytes = try buildTestSegmentWithStoredDocs(a, &.{
+        .{ .id = "both", .data = "{}", .terms = &.{ .{ .term = "red", .freq = 1, .norm = 10 }, .{ .term = "blue", .freq = 1, .norm = 10 } } },
+        .{ .id = "red", .data = "{}", .terms = &.{.{ .term = "red", .freq = 1, .norm = 10 }} },
+        .{ .id = "blue", .data = "{}", .terms = &.{.{ .term = "blue", .freq = 1, .norm = 10 }} },
+        .{ .id = "green", .data = "{}", .terms = &.{.{ .term = "green", .freq = 1, .norm = 10 }} },
+    });
+    defer a.free(bytes);
+    var writer = try index_mod.IndexWriter.init(a);
+    defer writer.deinit();
+    try writer.addSegment(bytes);
+    const match: SearchQuery = .{ .match = .{ .field = "title", .text = "red blue red" } };
+    const red: SearchQuery = .{ .term = .{ .field = "title", .term = "red" } };
+    const blue: SearchQuery = .{ .term = .{ .field = "title", .term = "blue" } };
+    const cases = [_]struct { query: SearchQuery, ids: []const u32 }{
+        .{ .query = match, .ids = &.{ 0, 1, 2 } },
+        .{ .query = .{ .bool_query = .{ .must = &.{ match, red } } }, .ids = &.{ 0, 1 } },
+        .{ .query = .{ .bool_query = .{ .must = &.{match}, .must_not = &.{blue} } }, .ids = &.{1} },
+        .{ .query = .{ .bool_query = .{ .should = &.{ match, red }, .min_should = 2 } }, .ids = &.{ 0, 1 } },
+        .{ .query = .{ .bool_query = .{ .must_not = &.{match} } }, .ids = &.{3} },
+    };
+    for (cases) |case| {
+        var result = try execute(a, writer.snapshot(), .{ .query = case.query, .k = 10, .include_stored = false });
+        defer result.deinit();
+        try std.testing.expectEqual(case.ids.len, result.hits.len);
+        try std.testing.expectEqual(@as(u32, @intCast(case.ids.len)), try countMatches(a, writer.snapshot(), case.query));
+        for (case.ids) |id| {
+            var found = false;
+            for (result.hits) |hit| if (hit.doc_id == id) {
+                found = true;
+            };
+            try std.testing.expect(found);
+        }
+    }
+}
+
 test "logical value mixed conjunction bounds deferred verification before scoring" {
     const a = std.testing.allocator;
     const bytes = try buildTestSegmentWithStoredDocs(a, &.{
@@ -11563,30 +11623,34 @@ test "logical value mixed conjunction bounds deferred verification before scorin
     try expected.add(5);
     const reference_leaf: SearchQuery = .{ .doc_num = .{ .ids = &.{}, .bitmap = &expected } };
     const reference: SearchQuery = .{ .bool_query = .{ .should = &.{reference_leaf} } };
-    for ([_]bool{ false, true }) |reverse| {
-        for (0..3) |scope| {
-            state.probed = 0;
-            const clauses = if (reverse) [_]SearchQuery{ indexed, logical } else [_]SearchQuery{ logical, indexed };
-            const oracle = if (reverse) [_]SearchQuery{ indexed, reference } else [_]SearchQuery{ reference, indexed };
-            var req: SearchRequest = .{ .query = .{ .bool_query = .{ .must = &clauses, .should = &.{term}, .min_should = 1, .boost = 1.25 } }, .k = 10, .include_stored = false };
-            if (scope != 0) {
-                req.filter_doc_bitmap = &expected;
-                req.filter_doc_nums_positive = true;
-                req.filter_doc_nums = if (scope == 1) &.{ 2, 5 } else &.{};
-                req.exclude_doc_nums = &.{5};
-            }
-            var result = try execute(a, writer.snapshot(), req);
-            defer result.deinit();
-            var reference_req = req;
-            reference_req.query = .{ .bool_query = .{ .must = &oracle, .should = &.{term}, .min_should = 1, .boost = 1.25 } };
-            var before = try execute(a, writer.snapshot(), reference_req);
-            defer before.deinit();
-            try std.testing.expectEqual(before.total_hits, result.total_hits);
-            try std.testing.expectEqual(before.hits.len, result.hits.len);
-            try std.testing.expectEqual(@as(usize, if (scope == 0) 2 else if (scope == 1) 1 else 0), state.probed);
-            for (before.hits, result.hits) |want, got| {
-                try std.testing.expectEqual(want.doc_id, got.doc_id);
-                try std.testing.expectApproxEqAbs(want.score, got.score, 0.000001);
+    for ([_]bool{ false, true }) |nested| {
+        for ([_]bool{ false, true }) |reverse| {
+            for (0..3) |scope| {
+                state.probed = 0;
+                const bound: SearchQuery = if (nested) .{ .bool_query = .{ .must = &.{ logical, .{ .bool_query = .{ .must = &.{indexed} } } } } } else indexed;
+                const reference_bound: SearchQuery = if (nested) .{ .bool_query = .{ .must = &.{ reference, .{ .bool_query = .{ .must = &.{indexed} } } } } } else indexed;
+                const clauses = if (reverse) [_]SearchQuery{ bound, logical } else [_]SearchQuery{ logical, bound };
+                const oracle = if (reverse) [_]SearchQuery{ reference_bound, reference } else [_]SearchQuery{ reference, reference_bound };
+                var req: SearchRequest = .{ .query = .{ .bool_query = .{ .must = &clauses, .should = &.{term}, .min_should = 1, .boost = 1.25 } }, .k = 10, .include_stored = false };
+                if (scope != 0) {
+                    req.filter_doc_bitmap = &expected;
+                    req.filter_doc_nums_positive = true;
+                    req.filter_doc_nums = if (scope == 1) &.{ 2, 5 } else &.{};
+                    req.exclude_doc_nums = &.{5};
+                }
+                var result = try execute(a, writer.snapshot(), req);
+                defer result.deinit();
+                var reference_req = req;
+                reference_req.query = .{ .bool_query = .{ .must = &oracle, .should = &.{term}, .min_should = 1, .boost = 1.25 } };
+                var before = try execute(a, writer.snapshot(), reference_req);
+                defer before.deinit();
+                try std.testing.expectEqual(before.total_hits, result.total_hits);
+                try std.testing.expectEqual(before.hits.len, result.hits.len);
+                try std.testing.expectEqual(@as(usize, if (scope == 0) 2 else if (scope == 1) 1 else 0) * @as(usize, if (nested) 2 else 1), state.probed);
+                for (before.hits, result.hits) |want, got| {
+                    try std.testing.expectEqual(want.doc_id, got.doc_id);
+                    try std.testing.expectApproxEqAbs(want.score, got.score, 0.000001);
+                }
             }
         }
     }
