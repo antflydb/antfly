@@ -1939,7 +1939,10 @@ second full payload allocation while an object stream remains decoded.
 Selected missing or malformed property dictionaries retain native glyph text and
 report incomplete ActualText, including when selected optional metadata exceeds
 a decode or allocation allowance. Actual allocator failures and cancellation
-propagate; overridden scopes do not report irrelevant metadata errors.
+propagate; overridden scopes do not report irrelevant metadata errors. Cache
+allocations classify quota failures at their own boundary and consume rejection
+state during recovery. Caller allocation failures never use ambient cache flags,
+so a previous optional quota rejection cannot turn a later OOM into page loss.
 UTF-16 text-string BOM detection precedes payload-length validation, so odd or
 truncated replacements use the same explicit fallback as invalid surrogate pairs.
 Optional null ActualText, MCID, Pg, and Stm values behave like omitted entries.

@@ -3179,14 +3179,18 @@ const TextResourceCache = struct {
         self.direct_resources.deinit(a);
     }
 
-    fn failure(self: *@This(), err: anyerror) anyerror {
+    // Call only at a cache-budget allocation boundary, never around work
+    // using the caller allocator. Recovery consumes the rejection state so
+    // later genuine allocator failures cannot inherit an earlier quota error.
+    fn allocationFailure(self: *@This(), err: anyerror) anyerror {
+        defer self.beginResolution();
         return if (err == error.OutOfMemory and (self.budget.limit_exceeded or if (self.live_budget) |budget| budget.limit_exceeded else false)) error.PdfDecodeWorkingSetTooLarge else err;
     }
 
     fn retain(self: *@This(), owned: syntax.Object) !syntax.Object {
         var value = owned;
         errdefer value.deinit(self.allocator());
-        try self.direct_resources.append(self.allocator(), value);
+        self.direct_resources.append(self.allocator(), value) catch |err| return self.allocationFailure(err);
         return value;
     }
 
@@ -3204,7 +3208,7 @@ const TextResourceCache = struct {
         for (object.dict) |entry| if (keepsField(purpose, entry.key)) {
             count += 1;
         };
-        const fields = try self.allocator().alloc(syntax.DictEntry, count);
+        const fields = self.allocator().alloc(syntax.DictEntry, count) catch |err| return self.allocationFailure(err);
         var initialized: usize = 0;
         errdefer {
             for (fields[0..initialized]) |*entry| {
@@ -3216,7 +3220,7 @@ const TextResourceCache = struct {
         for (object.dict, 0..) |entry, i| {
             if (i % 256 == 0) try reader.checkCancellation();
             if (!keepsField(purpose, entry.key)) continue;
-            const key = try self.allocator().dupe(u8, entry.key);
+            const key = self.allocator().dupe(u8, entry.key) catch |err| return self.allocationFailure(err);
             errdefer self.allocator().free(key);
             const value: syntax.Object = switch (purpose) {
                 .resources => if (std.mem.eql(u8, entry.key, "Properties"))
@@ -3226,10 +3230,10 @@ const TextResourceCache = struct {
                         break :blk .{ .boolean = false };
                     }
                 else
-                    try entry.value.clone(self.allocator()),
+                    entry.value.clone(self.allocator()) catch |err| return self.allocationFailure(err),
                 // Keep a small marker for the deferred source. It also gives
                 // property-only resource dictionaries distinct stable storage.
-                .required_resources => if (std.mem.eql(u8, entry.key, "Properties")) .null else try entry.value.clone(self.allocator()),
+                .required_resources => if (std.mem.eql(u8, entry.key, "Properties")) .null else entry.value.clone(self.allocator()) catch |err| return self.allocationFailure(err),
                 .resource_properties => unreachable,
                 .property_table => try self.cloneMetadata(reader, entry.value, .property),
                 .property => switch (entry.value) {
@@ -3268,7 +3272,7 @@ const TextResourceCache = struct {
 
     fn resolve(self: *@This(), reader: *const Reader, raw: *const syntax.Object, purpose: Purpose) !syntax.Object {
         return self.resolveImpl(reader, raw, purpose) catch |original| {
-            const err = self.failure(original);
+            const err = self.allocationFailure(original);
             if (raw.* == .obj_ref and (purpose == .property_table or purpose == .property or purpose == .resource_properties) and
                 (err == error.PdfDecodeWorkingSetTooLarge or err == error.DecodedStreamTooLarge))
             {
@@ -3276,7 +3280,7 @@ const TextResourceCache = struct {
                 // must not be parsed again for every Form using that resource.
                 self.beginResolution();
                 const key = ObjectKey{ .reference = (@as(u64, raw.obj_ref.id) << 16) | raw.obj_ref.gen, .purpose = purpose };
-                self.objects.put(self.allocator(), key, .invalid) catch |cache_err| return self.failure(cache_err);
+                self.objects.put(self.allocator(), key, .invalid) catch |cache_err| return self.allocationFailure(cache_err);
             }
             return err;
         };
@@ -3294,18 +3298,23 @@ const TextResourceCache = struct {
         var scratch = DecodeBudgetAllocator.initWithCumulativeLimit(self.budget.backing, 0, self.budget.max_live_bytes, self.budget.max_live_bytes *| 4);
         const context = StructureResolverContext{ .reader = reader, .budget = &scratch };
         var parsed = StructureResolverContext.resolve(&context, scratch.allocator(), raw) catch |err| switch (err) {
-            error.OutOfMemory => return if (scratch.limit_exceeded) error.PdfDecodeWorkingSetTooLarge else self.failure(err),
+            error.OutOfMemory => {
+                const classified = if (scratch.limit_exceeded) error.PdfDecodeWorkingSetTooLarge else self.allocationFailure(err);
+                self.beginResolution();
+                return classified;
+            },
             error.Canceled, error.PdfDecodeWorkingSetTooLarge, error.DecodedStreamTooLarge => return err,
             else => {
-                try self.objects.put(self.allocator(), key, .invalid);
+                self.objects.put(self.allocator(), key, .invalid) catch |cache_err| return self.allocationFailure(cache_err);
                 return error.InvalidPdfStructure;
             },
         };
         defer parsed.deinit(scratch.allocator());
+        self.beginResolution();
         const metadata = if (purpose == .resource_properties) (if (parsed.get("Properties")) |props| props.* else syntax.Object.null) else parsed;
         var value = try self.cloneMetadata(reader, metadata, if (purpose == .resource_properties) .property_table else purpose);
         errdefer value.deinit(self.allocator());
-        try self.objects.put(self.allocator(), key, .{ .object = value });
+        self.objects.put(self.allocator(), key, .{ .object = value }) catch |err| return self.allocationFailure(err);
         return value;
     }
 
@@ -3319,7 +3328,7 @@ const TextResourceCache = struct {
     fn resources(self: *@This(), reader: *const Reader, raw: *const syntax.Object) !syntax.Object {
         if (raw.* == .obj_ref) {
             const value = try self.resolve(reader, raw, .required_resources);
-            if (value.get("Properties") != null and !self.property_resources.contains(@intFromPtr(value.dict.ptr))) try self.property_resources.put(self.allocator(), @intFromPtr(value.dict.ptr), raw.obj_ref);
+            if (value.get("Properties") != null and !self.property_resources.contains(@intFromPtr(value.dict.ptr))) self.property_resources.put(self.allocator(), @intFromPtr(value.dict.ptr), raw.obj_ref) catch |err| return self.allocationFailure(err);
             return value;
         }
         return self.retain(try self.cloneMetadata(reader, raw.*, .resources));
@@ -3341,7 +3350,9 @@ const TextResourceCache = struct {
         scoped.encrypted_streams = &encrypted_streams;
         scoped.encrypted_stream_generation = 0;
         self.page_resources = (scoped.findInheritedTextResources(page, self) catch |err| {
-            return if (err == error.OutOfMemory and scratch.limit_exceeded) error.PdfDecodeWorkingSetTooLarge else self.failure(err);
+            const classified = if (err == error.OutOfMemory and scratch.limit_exceeded) error.PdfDecodeWorkingSetTooLarge else self.allocationFailure(err);
+            self.beginResolution();
+            return classified;
         }) orelse try self.retain(.null);
         return self.page_resources.?;
     }
@@ -3414,15 +3425,15 @@ const TextResourceCache = struct {
     }
 
     fn deferBindings(self: *@This(), reader: *const Reader, raw: PropertySource, records: []PageTextProperty) !void {
-        const binding = try self.allocator().create(Bindings);
+        const binding = self.allocator().create(Bindings) catch |err| return self.allocationFailure(err);
         errdefer self.allocator().destroy(binding);
         binding.* = .{ .cache = self, .reader = reader, .raw = raw, .records = records };
-        try self.bindings.append(self.allocator(), binding);
+        self.bindings.append(self.allocator(), binding) catch |err| return self.allocationFailure(err);
         for (records) |*record| record.source = .{ .deferred = binding };
     }
 
     fn selectedFailure(self: *@This(), original: anyerror) !PropertyValue {
-        const err = self.failure(original);
+        const err = self.allocationFailure(original);
         switch (err) {
             error.OutOfMemory, error.Canceled => return err,
             else => return .{ .invalid = true },
@@ -3449,7 +3460,7 @@ const TextResourceCache = struct {
         if (value != .dict) return null;
         const id = @intFromPtr(value.dict.ptr);
         if (self.scopes.get(id)) |cached| return cached;
-        const index = try self.allocator().alloc(PropertyEntry, value.dict.len);
+        const index = self.allocator().alloc(PropertyEntry, value.dict.len) catch |err| return self.allocationFailure(err);
         errdefer self.allocator().free(index);
         for (value.dict, index, 0..) |*entry, *slot, i| {
             if (i % 256 == 0) try reader.checkCancellation();
@@ -3460,7 +3471,7 @@ const TextResourceCache = struct {
                 return std.mem.lessThan(u8, left.raw.key, right.raw.key);
             }
         }.less);
-        try self.scopes.put(self.allocator(), id, index);
+        self.scopes.put(self.allocator(), id, index) catch |err| return self.allocationFailure(err);
         return index;
     }
 
@@ -5932,12 +5943,12 @@ pub const Reader = struct {
         var resource_budget = DecodeBudgetAllocator.initWithCumulativeLimit(resource_live_budget.allocator(), 0, self.decode_limits.max_working_set_bytes, self.decode_limits.max_working_set_bytes *| 4);
         var text_resources = TextResourceCache{ .budget = &resource_budget, .live_budget = &resource_live_budget };
         defer text_resources.deinit();
-        const forms = self.collectPageTextFormsForContentAlloc(&page, decoded_content, &text_resources) catch |err| return text_resources.failure(err);
+        const forms = try self.collectPageTextFormsForContentAlloc(&page, decoded_content, &text_resources);
         defer {
             for (forms) |*form| form.deinit(self.alloc);
             self.alloc.free(forms);
         }
-        const text_properties = self.collectPageTextPropertiesForContentAlloc(&page, decoded_content, &text_resources) catch |err| return text_resources.failure(err);
+        const text_properties = try self.collectPageTextPropertiesForContentAlloc(&page, decoded_content, &text_resources);
         defer {
             for (text_properties) |*property| property.deinit(self.alloc);
             self.alloc.free(text_properties);
@@ -36472,4 +36483,72 @@ test "reader property metadata limit failures are memoized across scopes" {
     const retained = budget.cumulative_growth_bytes;
     for (0..512) |_| try std.testing.expectError(error.InvalidPdfStructure, cache.resolve(&reader, &raw, .property_table));
     try std.testing.expectEqual(retained, budget.cumulative_growth_bytes);
+}
+
+fn buildQuotaRecoveryTestPdfAlloc(a: Allocator, count: usize) ![]u8 {
+    var properties = std.ArrayList(u8).empty;
+    defer properties.deinit(a);
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(a);
+    for (0..count) |i| {
+        try properties.print(a, "/Tag{d} << /MCID {d} >> ", .{ i, i });
+        try content.print(a, "/Span /Tag{d} BDC EMC ", .{i});
+    }
+    try content.appendSlice(a, "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET");
+    return buildTaggedTextTestPdfAlloc(a, .{ .content = content.items, .page_properties = properties.items });
+}
+
+test "reader property metadata quota classification is consumed at allocation boundaries" {
+    const a = std.testing.allocator;
+    const sample = try buildQuotaRecoveryTestPdfAlloc(a, 128);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var page = try reader.readPageObject(1);
+    defer page.deinit(a);
+    inline for (.{ false, true }) |limit_live| {
+        var live = DecodeBudgetAllocator.init(a, 0, if (limit_live) 16 * 1024 else 32 * 1024);
+        var retained = DecodeBudgetAllocator.init(live.allocator(), 0, if (limit_live) 32 * 1024 else 16 * 1024);
+        var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+        defer cache.deinit();
+        const resources = try cache.resources(&reader, page.get("Resources").?);
+        try std.testing.expectError(error.PdfDecodeWorkingSetTooLarge, cache.entries(&reader, resources.get("Properties").?));
+        try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
+        // Keep the rejection history observable while injecting a genuine
+        // backing failure; consuming classification must not erase accounting.
+        try std.testing.expect((if (limit_live) live.rejected_growth_charge else retained.rejected_growth_charge) > 0);
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        live.backing = failing.allocator();
+        defer live.backing = a;
+        try std.testing.expectError(error.OutOfMemory, cache.deferBindings(&reader, .{ .table = .null }, &.{}));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
+    }
+}
+
+fn exerciseQuotaRecoveryAllocations(a: Allocator, sample: []const u8, policy: TextExtractionPolicy, analysis_api: bool) !void {
+    var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 64 * 1024, .max_working_set_bytes = 1280 });
+    defer reader.deinit();
+    reader.setTextExtractionPolicy(policy);
+    if (analysis_api) {
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        try std.testing.expectEqualStrings("SOURCE\n", analysis.text);
+        try std.testing.expect(analysis.diagnostics.actual_text_incomplete);
+    } else {
+        // The document API skips non-OOM page failures. The sweep must still
+        // propagate a real OOM rather than silently losing this page's text.
+        const text = try reader.extractPlainTextAlloc();
+        defer a.free(text);
+        try std.testing.expectEqualStrings("SOURCE\n", text);
+    }
+}
+
+test "reader property metadata recovered quotas preserve caller OOM through both APIs" {
+    const a = std.testing.allocator;
+    const sample = try buildQuotaRecoveryTestPdfAlloc(a, 4);
+    defer a.free(sample);
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| inline for (.{ false, true }) |analysis_api| {
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseQuotaRecoveryAllocations, .{ sample, policy, analysis_api });
+    };
 }
