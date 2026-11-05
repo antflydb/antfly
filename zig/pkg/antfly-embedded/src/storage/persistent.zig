@@ -1224,6 +1224,7 @@ pub const PersistentIndex = struct {
         cursor: []const u8,
         segments: std.ArrayListUnmanaged(index_mod.ReplacementSegmentData) = .empty,
         active: bool = false,
+        uncertain: bool = false,
 
         pub fn begin(self: *RebuildPage) !void {
             if (self.index.read_only) return error.ReadOnly;
@@ -1236,7 +1237,7 @@ pub const PersistentIndex = struct {
             if (self.active) self.index.active_rebuild_page = null;
             for (self.segments.items) |*segment| {
                 segment.data.deinit(self.index.alloc);
-                self.index.deleteSegmentFile(segment.id);
+                if (!self.uncertain) self.index.deleteSegmentFile(segment.id);
             }
             self.segments.deinit(self.index.alloc);
             self.* = undefined;
@@ -1265,7 +1266,7 @@ pub const PersistentIndex = struct {
             try saveNextSegmentId(&txn, index.writer.next_segment_id);
             try txn.put(.meta, meta_rebuild_cursor, self.cursor);
             if (publication) |*prepared| try index.savePreparedSegmentAdmissions(&txn, prepared);
-            try txn.commit();
+            try index.commitPreparedPublication(&txn, &self.uncertain);
             if (publication) |*prepared| prepared.publish();
             self.segments.clearRetainingCapacity(); // ownership moved to writer
             index.active_rebuild_page = null;
@@ -1425,21 +1426,27 @@ pub const PersistentIndex = struct {
         if (publication) |*prepared| try self.savePreparedSegmentAdmissions(&txn, prepared);
         const encoded = ReplayFragment.encode(checkpoint);
         try txn.put(.meta, meta_replay_fragment, &encoded);
+        try self.commitPreparedPublication(&txn, &uncertain);
+        if (publication) |*prepared| prepared.publish();
+        published = true;
+        return infos;
+    }
+
+    /// A failed durable boundary can still contain this activation. Preserve
+    /// its immutable inputs and propagate uncertainty to every serving wrapper.
+    fn commitPreparedPublication(self: *PersistentIndex, txn: *MainTxn, uncertain: *bool) !void {
         var progress: backend_types.CommitProgress = .{};
         const parent_progress = backend_types.commit_progress;
         backend_types.commit_progress = &progress;
         defer backend_types.commit_progress = parent_progress;
         txn.commit() catch |err| {
-            uncertain = progress.maybe_applied;
-            if (uncertain) {
+            uncertain.* = progress.maybe_applied;
+            if (uncertain.*) {
                 if (parent_progress) |parent| parent.maybe_applied = true;
-                files.storage.fenceUncertainPublication();
+                if (self.segment_files) |files| files.storage.fenceUncertainPublication();
             }
             return err;
         };
-        if (publication) |*prepared| prepared.publish();
-        published = true;
-        return infos;
     }
 
     pub fn attachResourceManager(self: *PersistentIndex, manager: *resource_manager_mod.ResourceManager) void {
@@ -7885,4 +7892,69 @@ test "lite atomic replay activates deletion segments and continuation together a
     try std.testing.expectEqual(before_delete + 1, index.snapshotLsmWriteStats().?.wal_append_records);
     try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "κόσμος"));
     try std.testing.expect(std.meta.eql(checkpoint.position, (try index.loadReplayFragment(identity)).?));
+}
+
+test "persistent rebuild page preserves possibly committed artifacts across reopen" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    for ([_]bool{ false, true }) |after_wal| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/rebuild-fault.aflite", .{tmp.sub_path});
+        defer a.free(path);
+        var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+        docs.maintenance_start_suppressed = true;
+        docs.file.externally_locked = true;
+        var docs_live = true;
+        defer if (docs_live) docs.close();
+        var storage = lite_indexes.Store.init(a, &docs);
+        const opts: PersistentIndexOptions = .{
+            .path = "/rebuild/index",
+            .io = std.testing.io,
+            .main_backend = .lsm,
+            .main_lsm_storage = storage.storage(),
+            .wal_backend = .lsm,
+            .wal_storage = storage.storage(),
+            .main_lsm_options = .{ .flush_threshold = 32 * 1024 * 1024 },
+            .main_no_sync = true,
+            .wal_no_sync = true,
+        };
+        var index = try PersistentIndex.open(a, opts);
+        var index_live = true;
+        defer if (index_live) index.close();
+        var page: PersistentIndex.RebuildPage = .{ .index = &index, .cursor = "doc:a" };
+        var page_live = true;
+        defer if (page_live) page.deinit();
+        try page.begin();
+        const segment = try buildSimpleSegment(a, "doc:a", "recovered");
+        defer a.free(segment);
+        try index.indexSegment(segment);
+        lsm_backend.Backend.test_commit_fault = .{ .at = if (after_wal) .after_wal_append else .before_wal_append, .err = error.TestRebuildCommitFailure };
+        defer lsm_backend.Backend.test_commit_fault = null;
+        try std.testing.expectError(error.TestRebuildCommitFailure, page.commit());
+        try std.testing.expectEqual(after_wal, page.uncertain);
+        try std.testing.expectEqual(after_wal, docs.file.checkpoint_publication_uncertain);
+        try std.testing.expectEqual(@as(u32, 0), index.snapshot().liveDocCount());
+        page.deinit();
+        page_live = false;
+        index.prepareForCrashRollback();
+        index.abandonAfterCrash();
+        index_live = false;
+        docs.close();
+        docs_live = false;
+        docs = try lite_docs.Store.openWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+        docs_live = true;
+        docs.maintenance_start_suppressed = true;
+        docs.file.externally_locked = true;
+        storage = lite_indexes.Store.init(a, &docs);
+        index = try PersistentIndex.open(a, opts);
+        index_live = true;
+        const cursor = try index.rebuildCursorAlloc(a);
+        defer if (cursor) |value| a.free(value);
+        if (after_wal) try std.testing.expectEqualStrings("doc:a", cursor.?) else try std.testing.expect(cursor == null);
+        try std.testing.expectEqual(@as(usize, if (after_wal) 1 else 0), try persistentSearchHitCount(a, index.snapshot(), "recovered"));
+        try std.testing.expect((try docs.file.check()).valid);
+    }
 }

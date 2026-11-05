@@ -9490,12 +9490,29 @@ test "capi native mixed index turns retain bounded immutable sources after catch
         try std.testing.expect(root.db.detachedTextSourceBlock() != null);
     }
     try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    const Probe = struct {
+        owner: *Owner,
+        closed: bool = false,
+        retained: bool = false,
+        fn beforeStorage(raw: *anyopaque, root: *h.Handle, retained_runtime: bool) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (root.db_live or retained_runtime) return;
+            self.closed = true;
+            self.retained = self.owner.immutable_sources.count > 0 and
+                self.owner.immutable_sources.range_bytes <= artifact_source.WorkingSet.max_range_bytes;
+        }
+    };
+    var probe: Probe = .{ .owner = owner };
+    owner.test_before_storage_service = .{ .ptr = &probe, .notify = Probe.beforeStorage };
+    defer owner.test_before_storage_service = null;
     var complete = false;
     for (0..128) |turn| {
         // Clear prior partial-turn pins: this assertion concerns the turn
         // that completes the target, rather than a cache left by earlier work.
         owner.immutable_sources.clear();
         owner.clearImmutableTextHandoff();
+        probe.closed = false;
+        probe.retained = false;
         _ = try owner.maintenanceTurnForTest();
         var lease = try fixture.connection.acquire();
         defer {
@@ -9506,13 +9523,13 @@ test "capi native mixed index turns retain bounded immutable sources after catch
         const target = root.db.core.nextDerivedSequence();
         const text_applied = try root.db.core.loadAppliedSequence(std.testing.allocator, "text");
         const graph_applied = try root.db.core.loadAppliedSequence(std.testing.allocator, "graph");
-        if (turn == 127) std.debug.print("mixed cache target={d} text={d} graph={d} sources={d} actor_live={} pending_merge={}\n", .{ target, text_applied, graph_applied, owner.immutable_sources.count, if (owner.maintenance_snapshot) |actor| actor.db_live else false, owner.pending_text_merge != null });
+        if (turn == 127) std.debug.print("mixed cache target={d} text={d} graph={d} closed={} retained={} sources={d}\n", .{ target, text_applied, graph_applied, probe.closed, probe.retained, owner.immutable_sources.count });
         if (text_applied < target or graph_applied < target) continue;
-        const actor = owner.maintenance_snapshot orelse continue;
-        if (actor.db_live) continue;
+        // Physical service may already have replaced this actor or inode.
+        // Observe retention at the source teardown boundary, before that work.
+        if (!probe.closed) continue;
         try std.testing.expect(owner.text_source_runtime_cache == null);
-        try std.testing.expect(owner.immutable_sources.count > 0);
-        try std.testing.expect(owner.immutable_sources.range_bytes <= artifact_source.WorkingSet.max_range_bytes);
+        try std.testing.expect(probe.retained);
         complete = true;
         break;
     }
