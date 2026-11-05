@@ -131,6 +131,96 @@ extraction, reprocess the affected documents so existing chunks and vectors are
 replaced. A document whose chunks all fall below the threshold publishes an
 empty inventory and retires its previous full-text entries and chunk vectors.
 
+### Native PDF Text
+
+Native PDF extraction does not use a model or OCR. It decodes the PDF's text
+operators and honors `/ActualText` replacements, including marked content in
+Form XObjects and structure elements linked through `ParentTree` and `MCID`.
+Shared structure replacements emit once and retain the union of their paint
+evidence without removing unrelated interleaved text. Configure native extraction separately from OCR:
+
+```json
+{
+  "native_text": {
+    "policy": "page",
+    "quality": {
+      "min_chars": 50,
+      "max_replacement_ratio": 0.05
+    }
+  }
+}
+```
+
+`policy` selects which source text is eligible:
+
+| Policy | Behavior |
+|---|---|
+| `page` (default) | Excludes runs wholly outside the page or a known clip; retains invisible OCR text layers. |
+| `visible` | Also excludes nonpainting or fully transparent text. This is not pixel-level occlusion detection. |
+| `source` | Retains unfiltered source runs for auditing, including exterior and invisible text. |
+
+All policies honor `/ActualText`; none performs spelling correction or reconstructs
+a missing text layer. A rotated label does not disable geometric ordering for
+unrelated upright text. Ambiguous text, tables, and overlapping transcription
+tracks retain conservative authored ordering.
+
+Every PDF unit records `native_text_quality` and `native_text_diagnostics`, even
+without an `ocr` block. Quality flags describe short text, sampled character/word
+corruption, and replacement characters; they are heuristics, not an accuracy
+score. Diagnostics record the selected policy, ActualText replacement count,
+exterior/invisible glyph runs and semantic spans, unpositioned semantic spans,
+alignment and ordering limitations, and nontext or
+annotation evidence. `extraction_complete` describes decoding, not correctness.
+`actual_text_incomplete` reports malformed or unclosed inline replacements,
+or malformed, unsupported, or resource-limited structure replacement lookup.
+Native glyph text is retained when a replacement cannot be applied;
+cross-page replacements and object-reference (`OBJR`) content are reported as
+partial coverage rather than assigned invented page text or geometry.
+Optional null metadata behaves like an omitted value; an empty `/ActualText`
+string intentionally deletes the covered source text.
+`semantic_coverage` is `partial` when unresolved coverage is known, `unknown`
+when extraction is incomplete, or `text_only` otherwise; it never certifies
+headings, tables, chart interpretation, or complete visual understanding.
+
+`text_regions` include page-local UTF-8 byte spans, page-space bounding boxes,
+effective `font_size`, and optional `bold`/`italic` font evidence. `text_blocks`
+group compatible runs into geometric lines in emitted reading order, with the
+same style evidence and explicit `reading_order`. They are not inferred
+paragraphs or table cells. OCR replacement clears native blocks rather than
+leaving byte offsets pointing into different text; native quality and diagnostics
+remain available as pre-OCR provenance.
+
+`native_text.quality` controls native assessment and automatic OCR routing;
+`ocr.quality` assesses OCR output independently. Both use the same text-quality
+options: `min_chars` and `min_line_chars` count non-whitespace Unicode characters,
+`max_replacement_ratio` limits replacement characters, and `max_font_corruption`
+sets the corrupted-line score threshold. Defaults work without any quality
+configuration. Images go directly to OCR when a reader is configured; they do
+not require a native text layer.
+
+After changing extraction settings, reprocess affected documents so stored text,
+geometry, chunks, and vectors use the new policy.
+
+For a source checkout, build and inspect only the PDF component:
+
+```bash
+cd zig
+ANTFLY_ZIG_MAX_RSS=12884901888 python3 tools/run_bounded_zig_build.py --zig zig -- \
+  build lib-pdf-bench lib-pdf-unit-test -Doptimize=Debug -Dpdf-optimize=Debug -j1
+./zig-out/bin/lib-pdf-bench dump-analysis input.pdf analysis.json page
+./zig-out/bin/lib-pdf-bench dump-text input.pdf text.txt source
+```
+
+These targets do not build the Antfly server. `dump-analysis` includes emitted
+text, diagnostics, blocks, original positioned glyph runs, and `semantic_spans`.
+Each `/ActualText` replacement is stored once with its source run range, output
+span, and policy-selected bounds. Glyph `text` and `raw_text` retain their source
+values; covered glyphs refer to the replacement by `semantic_span_index`.
+Unknown paint bounds are retained conservatively and omitted from geometry
+metadata rather than assigned invented coordinates. Its optional final
+argument selects `source`, `page`, or `visible` (default `page`). The broader
+`lib-pdf-test` target also includes OCR integration and is not PDF-only.
+
 Scanned PDFs with an existing invisible OCR text layer retain that layer's
 positions for word and line reconstruction. Within an overlapping region,
 extraction retains alternate transcriptions and their source spans, including
@@ -161,13 +251,17 @@ Each page becomes a unit under its source document. List them:
 curl -fsS -X POST http://127.0.0.1:8080/db/v1/tables/scans/query \
   -H 'Content-Type: application/json' \
   -d '{
-    "fields": ["unit_type", "extraction_status", "extraction_warning", "text", "provenance.page_number"],
+    "fields": ["unit_type", "extraction_status", "extraction_warning", "text", "native_text_quality", "native_text_diagnostics", "text_blocks", "provenance.page_number"],
     "hierarchy": {"children": {"parent": {"level": "source", "id": "scan-1"}, "level": "unit"}},
     "order_by": [{"field": "_hierarchy.position"}]
   }'
 ```
 
 Each unit's `text` holds the page's native text or the reader's transcription, and `extraction_status` reports where it is: `pending_ocr` while the reader runs, `completed` when the text is ready, `failed_ocr` if the reader failed, and `ocr_not_configured` if the page needed OCR but the enrichment has no `ocr` block. LightOnOCR returns Markdown, so a scanned table comes back as a table and a figure as a short description.
+
+`completed` is a pipeline status, not a text-accuracy guarantee. Inspect
+`native_text_quality` and `native_text_diagnostics` when deciding whether native
+PDF output needs review or OCR.
 
 ### 5. Search the Text
 
@@ -181,10 +275,10 @@ The `ocr` block takes:
 |---|---|
 | `reader` | A reader provider config. Every provider except `apple` names a `model`. |
 | `generator` | Instead of `reader`, a vision-capable generator, which receives a transcription instruction. |
-| `mode` | `auto` (default) reads images and the PDF pages whose native text fails the `quality` checks. `always` reads every page. |
+| `mode` | `auto` (default) reads images and the PDF pages whose native text fails `native_text.quality`. `always` reads every page. |
 | `prompt` | Overrides the prompt. Readers run their own OCR task when it is omitted. |
 | `render` | How PDF pages are rasterized: `dpi` (default 150), `resolution` (`requested_dpi` or `model_input`), `max_pixels`, `max_dimension`. |
-| `quality` | Thresholds that decide when native PDF text is too poor to keep, such as `min_content_chars` (default 50). |
+| `quality` | Thresholds used to assess OCR output, independently of `native_text.quality`. `min_chars` counts non-whitespace Unicode characters (default 50), matching text chunking. |
 
 Without an `ocr` block, `document_extraction` extracts native text only: born-digital PDFs, Office documents, HTML, email, and plain text, with no model. Pages and images that would need OCR keep whatever native text they have and report `extraction_status: "ocr_not_configured"`, so a scan never silently indexes as empty.
 
