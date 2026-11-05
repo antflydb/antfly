@@ -53,9 +53,35 @@ fn boundedControl(request: RequestContext) !RequestContext {
         var receiver = try borrow.receive();
         break :blk @as(u64, @intCast(@max(0, std.Io.Clock.now(.awake, receiver.io()).nanoseconds)));
     } else @import("antfly_platform").time.monotonicNs();
-    result.deadline_ns = @min(request.deadline_ns orelse std.math.maxInt(u64), now_ns +| 5 * std.time.ns_per_s);
+    // The caller owns one end-to-end statement budget. Replacing it with a
+    // fresh five-second phase deadline prematurely expires retained UNIQUE/FK
+    // preparation, especially across a complete COPY or command journal.
+    // Callers without a budget still get the bounded preparation default.
+    result.deadline_ns = request.deadline_ns orelse now_ns +| 5 * std.time.ns_per_s;
     try result.ensureActive();
     return result;
+}
+
+pub const Testing = if (@import("builtin").is_test) struct {
+    pub fn scopedPreparationBudget() !void {
+        const platform_time = @import("antfly_platform").time;
+        const caller_deadline = platform_time.monotonicNs() +| 30 * std.time.ns_per_s;
+        try std.testing.expectEqual(@as(?u64, caller_deadline), (try boundedControl(.{ .deadline_ns = caller_deadline })).deadline_ns);
+        const short_deadline = platform_time.monotonicNs() +| std.time.ns_per_s;
+        try std.testing.expectEqual(@as(?u64, short_deadline), (try boundedControl(.{ .deadline_ns = short_deadline })).deadline_ns);
+        const before = platform_time.monotonicNs();
+        const fallback = try boundedControl(.{});
+        const after = platform_time.monotonicNs();
+        try std.testing.expect(fallback.deadline_ns.? >= before +| 5 * std.time.ns_per_s);
+        try std.testing.expect(fallback.deadline_ns.? <= after +| 5 * std.time.ns_per_s);
+        try std.testing.expectError(error.DeadlineExceeded, boundedControl(.{ .deadline_ns = 0 }));
+        var canceled: std.atomic.Value(bool) = .init(true);
+        try std.testing.expectError(error.Canceled, boundedControl(.{ .deadline_ns = caller_deadline, .cancellation = @import("operation.zig").CancellationToken.fromAtomic(&canceled) }));
+    }
+} else struct {};
+
+test "distributed txn integrity preparation preserves the caller deadline and cancellation" {
+    try Testing.scopedPreparationBudget();
 }
 
 fn authorizedLookupOptions(control: RequestContext, alloc: Allocator, table: []const u8, options: types.LookupOptions) !types.LookupOptions {

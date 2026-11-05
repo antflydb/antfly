@@ -246,16 +246,18 @@ fn rejectTransactionalDdl(statement: ast.Statement) !void {
 
 const ReceiptWaitBudget = @import("antfly_local_sources").sql_read_requirements.WaitBudget;
 
-/// A read already owns its statement snapshot and clock. Only its native
-/// advisory transaction lifetime is lazy: changing active_transaction halfway
-/// through evaluation would incorrectly change snapshot/staging semantics.
-const ImplicitAdvisory = struct {
+/// One completion owner for implicit mutations and lazy advisory reads. A read
+/// keeps its original statement snapshot and clock when its first advisory
+/// effect starts a transaction; it must not switch snapshot/staging semantics.
+const ImplicitTransaction = struct {
     root: *Adapter,
     session: *@import("antfly_local_sources").sql_session.Session,
     coordinator: *@import("sql_session.zig").Coordinator,
     phase: enum { dormant, active, deciding, done } = .dormant,
+    mutation: bool = false,
+    completed_outcome: ?@import("antfly_local_sources").sql_session.CommitOutcome = null,
 
-    pub fn transaction(self: *ImplicitAdvisory) ![16]u8 {
+    pub fn transaction(self: *ImplicitTransaction) ![16]u8 {
         try self.root.context.ensureActive();
         if (self.phase == .dormant) {
             if (self.root.sequence_owner != null) {
@@ -279,7 +281,7 @@ const ImplicitAdvisory = struct {
         return self.session.transaction_id orelse error.SqlTransactionNotActive;
     }
 
-    fn finish(self: *ImplicitAdvisory) !void {
+    fn finish(self: *ImplicitTransaction) !void {
         if (self.phase == .dormant) return;
         std.debug.assert(self.phase == .active);
         try @import("sql_sequence_execution.zig").flush(self.root);
@@ -302,6 +304,7 @@ const ImplicitAdvisory = struct {
             .committed, .committed_pending, .committed_repair_required => {
                 try @import("sql_prepared_coordinator.zig").drainSessionCompletion(self.root.server, commit.reconciliation_id, self.coordinator.context);
                 self.phase = .done;
+                self.completed_outcome = commit.outcome;
             },
             .aborted => {
                 try @import("sql_prepared_coordinator.zig").drainSessionCompletion(self.root.server, commit.reconciliation_id, self.coordinator.context);
@@ -313,7 +316,7 @@ const ImplicitAdvisory = struct {
         }
     }
 
-    fn abort(self: *ImplicitAdvisory) !void {
+    fn abort(self: *ImplicitTransaction) !void {
         if (self.phase != .active) return;
         errdefer self.retireFailedOwner();
         // Request cancellation must not orphan an implicit transaction's
@@ -324,6 +327,9 @@ const ImplicitAdvisory = struct {
         self.coordinator.context.cancellation = .none;
         self.coordinator.context.deadline_io = null;
         self.coordinator.context.deadline_ns = @import("antfly_platform").time.monotonicNs() +| std.time.ns_per_s;
+        const previous_root_context = self.root.context;
+        defer self.root.context = previous_root_context;
+        self.root.context = self.coordinator.context;
         self.root.outcome_transaction_id = std.fmt.bytesToHex(self.session.transaction_id.?, .lower);
         const id = self.session.transaction_id.?;
         // PostgreSQL sequence session state survives statement rollback. Flush
@@ -337,7 +343,7 @@ const ImplicitAdvisory = struct {
         self.root.outcome_transaction_id = null;
     }
 
-    fn failure(self: *ImplicitAdvisory, err: anyerror) anyerror {
+    fn failure(self: *ImplicitTransaction, err: anyerror) anyerror {
         // A proposed decision may never be contradicted by a fresh rollback.
         // Likewise, losing the cleanup reply cannot prove lock release. Its
         // durable receipt and source outbox retain recovery ownership.
@@ -355,9 +361,21 @@ const ImplicitAdvisory = struct {
         self.abort() catch return error.SqlTransactionOutcomeUnknown;
         // Cleanup proves transaction completion, not that a cursor never
         // advanced. Preserve the original admission/iteration distinction.
-        return statementFailure(self.root.context, err);
+        const classified = statementFailure(self.root.context, err);
+        if (!self.mutation) return classified;
+        const operational = @import("table_reads.zig").normalizeDistributedQueryOperationalError(classified);
+        if (classified == error.IntegrityCatalogUnavailable or operational == error.ReadUnavailable or
+            operational == error.DistributedQueryUnavailable or operational == error.SqlStatementReadUnavailable)
+        {
+            self.root.context.ensureActive() catch |expired| return expired;
+            // Cleanup proves no row mutation committed, not that evaluation
+            // never started. Do not advertise the read-admission classifier
+            // that permits automatic preparation/SQL replay.
+            return error.SqlMutationNotAppliedBusy;
+        }
+        return @import("antfly_local_sources").sql_errors.notApplied(classified);
     }
-    fn retireFailedOwner(self: *ImplicitAdvisory) void {
+    fn retireFailedOwner(self: *ImplicitTransaction) void {
         // An implicit transaction must not become a client-owned explicit
         // transaction after cleanup fails. Close through the existing durable
         // source outbox; native decision barriers still precede lock release.
@@ -520,7 +538,7 @@ pub const Adapter = struct {
     active_transaction: ?[16]u8 = null,
     /// Borrowed only while an autocommit read is executing. Bound routines,
     /// operators and casts reach the same provider as direct SQL calls.
-    implicit_advisory: ?*ImplicitAdvisory = null,
+    implicit_advisory: ?*ImplicitTransaction = null,
     data_lock_owner: ?*@import("sql_table_lock_execution.zig").Owner = null,
     lock_provider: @import("antfly_local_sources").sql_locking.Provider = .{
         .ptr = undefined,
@@ -724,7 +742,8 @@ pub const Adapter = struct {
             self.transaction_status = session.status() catch .failed;
             self.result_session_id = if (session.transaction_id) |id| std.fmt.bytesToHex(id, .lower) else null;
         }
-        errdefer if (zig017_return_error) |err| if (err != error.SqlWriteCapacityUnavailable) session.statementFailed() catch {};
+        var statement_failure_handled = false;
+        errdefer if (!statement_failure_handled) if (zig017_return_error) |err| if (err != error.SqlWriteCapacityUnavailable) session.statementFailed() catch {};
         if ((compiled.statement == .select or compiled.statement == .copy_to or compiled.statement == .explain) and self.read_requirements.visibility == .committed and inherited != null and inherited.?.metadata.accepted_lake_reads) return zig017_failure: {
             zig017_return_error = error.ReadSnapshotTooOld;
             break :zig017_failure error.ReadSnapshotTooOld;
@@ -858,228 +877,40 @@ pub const Adapter = struct {
                 return zig017_err;
             });
         }
-        var implicit_decided = false;
-        errdefer if (implicit_guarded and !implicit_decided) {
-            _ = session.execute(.rollback) catch session.deinit();
-        };
         if (session.transaction_id != null) {
-            const transaction = (session.statement(switch (compiled.statement) {
-                .select, .copy_to, .explain, .call, .notification => false,
-                else => true,
-            }) catch |zig017_err| {
-                zig017_return_error = zig017_err;
-                return zig017_err;
-            });
-            const statement_guards = compiled.statement == .effect_block or compiled.statement == .merge or captured_conflict or deferred_conflict;
-            if (statement_guards and !supportsRangeGuards(self.server)) return zig017_failure: {
-                zig017_return_error = error.SqlRangeTrackingRequired;
-                break :zig017_failure error.SqlRangeTrackingRequired;
+            var implicit_scope: ImplicitTransaction = .{
+                .root = self,
+                .session = &session,
+                .coordinator = &coordinator,
+                .phase = if (implicit_guarded) .active else .dormant,
+                .mutation = true,
             };
-            // DDL cannot bypass the native transaction's atomicity boundary.
-            (rejectTransactionalDdl(compiled.statement) catch |zig017_err| {
-                zig017_return_error = zig017_err;
-                return zig017_err;
-            });
-            const id = session.transaction_id.?;
-            var result = statement: {
-                const execution_lease = self.server.txn_sessions.tryAcquireCommitExecution(id) orelse return zig017_failure: {
-                    zig017_return_error = error.SqlWriteCapacityUnavailable;
-                    break :zig017_failure error.SqlWriteCapacityUnavailable;
-                };
-                defer execution_lease.release();
-                var transaction_cut: ?*@import("sql_retained_snapshot.zig").Shared = null;
-                self.pending_transaction_cut = if (transaction.isolation != .read_committed) .{ .id = id, .slot = &transaction_cut } else null;
-                defer {
-                    self.pending_transaction_cut = null;
-                    if (transaction_cut) |cut| cut.release();
+            return self.executeTransaction(alloc, compiled, parameters, limits, guarded_backend, .{
+                .session = &session,
+                .implicit = if (implicit_guarded) &implicit_scope else null,
+                .statement_source = statement_source,
+                .statement_instant = statement_instant,
+                .previous_setting_overlay = previous_setting_overlay,
+                .captured_conflict = captured_conflict,
+                .deferred_conflict = deferred_conflict,
+            }) catch |err| {
+                // Own failure completion once. An unproved cleanup cannot
+                // become a retry-safe statement error or another abort.
+                statement_failure_handled = true;
+                var failure = err;
+                if (implicit_guarded) {
+                    failure = implicit_scope.failure(err);
+                } else if (err != error.SqlWriteCapacityUnavailable) {
+                    failure = transactionStatementFailure(&session, err);
                 }
-                if (transaction.isolation != .read_committed) {
-                    // An earlier statement may already retain a cut. Binding
-                    // must never start statistics maintenance behind that cut.
-                    self.statistics_reads_started = true;
-                } else self.server.txn_sessions.lockSqlCharacteristics(self.server.alloc, id) catch |err| {
-                    zig017_return_error = err;
-                    return err;
-                };
-                // A concurrent HTTP SET/RESET may have committed after the
-                // initial session attachment but before this statement's
-                // execution lease. Refresh the overlay while holding the
-                // same lease that serializes session setting mutations.
-                var leased_settings: ?@import("transactions.zig").SessionRegistry.SqlState = null;
-                defer if (leased_settings) |*state| state.deinit(self.server.alloc);
-                if (self.session_id != null and (compiled.uses_current_setting or self.connection_id != null)) {
-                    self.setting_overlay = (refreshAttachedSettingOverlay(&self.server.txn_sessions, self.server.alloc, id, self.setting_overlay_source, previous_setting_overlay, &leased_settings) catch |zig017_err| {
-                        zig017_return_error = zig017_err;
-                        return zig017_err;
-                    });
-                }
-                if (self.connection_id != null and self.prepared_bindings == null) {
-                    if (leased_settings) |*state| {
-                        self.ddl_search_path = if (state.metadata.search_path_active) |*path| path else null;
-                    }
-                }
-                _ = (session.statement(switch (compiled.statement) {
-                    .select, .copy_to, .explain, .call, .notification => false,
-                    else => true,
-                }) catch |zig017_err| {
-                    zig017_return_error = zig017_err;
-                    return zig017_err;
-                });
-                var staged = (self.server.txn_sessions.cloneSqlStaged(alloc, id) catch |zig017_err| {
-                    zig017_return_error = zig017_err;
-                    return zig017_err;
-                });
-                defer staged.deinit(alloc);
-                var read_guards: @import("transactions.zig").OwnedTransactionCommitRequest = .{};
-                defer read_guards.deinit(self.server.alloc);
-                self.range_reads = if (transaction.isolation != .read_committed or statement_guards) &read_guards else null;
-                self.ranges_staged = false;
-                self.active_transaction = id;
-                self.active_subtransaction = if (leased_settings) |state| state.current_subtransaction else 0;
-                self.active_write_version = transaction.write_version;
-                self.accepted_lake_repeatable = self.lake_visibility == .accepted and (transaction.isolation != .serializable or transaction.mode == .read_only);
-                self.staged = &staged;
-                self.inserting = switch (compiled.statement) {
-                    .insert => |insert| insert.conflict == null,
-                    .merge => |merge| for (merge.arms) |arm| {
-                        if (arm.action == .insert) break true;
-                    } else false,
-                    else => false,
-                };
-                defer {
-                    self.active_transaction = null;
-                    self.active_subtransaction = 0;
-                    self.active_write_version = null;
-                    self.accepted_lake_repeatable = false;
-                    self.staged = null;
-                    self.range_reads = null;
-                    self.ranges_staged = false;
-                    self.inserting = false;
-                    self.dynamic_snapshot = null;
-                    self.dynamic_table = null;
-                }
-                var dynamic: ?@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot = null;
-                defer if (dynamic) |snapshot| snapshot.deinit();
-                var dynamic_scratch = std.heap.ArenaAllocator.init(alloc);
-                defer dynamic_scratch.deinit();
-                if (deferred_conflict and self.pending_transaction_cut == null) {
-                    const table = (resolve(self, dynamic_scratch.allocator(), compiled.statement.insert.table, .read_write) catch |zig017_err| {
-                        zig017_return_error = zig017_err;
-                        return zig017_err;
-                    });
-                    if (table.storage_mode != .relational) return zig017_failure: {
-                        zig017_return_error = error.UnsupportedSqlExecution;
-                        break :zig017_failure error.UnsupportedSqlExecution;
-                    };
-                    const reads = self.server.table_reads orelse return zig017_failure: {
-                        zig017_return_error = error.SqlStatementSnapshotRequired;
-                        break :zig017_failure error.SqlStatementSnapshotRequired;
-                    };
-                    // The immutable cut is captured before INSERT-source and
-                    // conflict-owner reads. Unsupported distributed ownership
-                    // refuses this capability rather than mixing snapshots.
-                    dynamic = (reads.openRelationalStatementSnapshot(alloc, table.physical_name, table.schema_version, .read_index, self.context.cancellation, ((self.context.platformDeadline() catch |zig017_err| {
-                        zig017_return_error = zig017_err;
-                        return zig017_err;
-                    })).deadline_ns) catch |zig017_err| {
-                        const read_err = statementReadAdmissionError(self.context, zig017_err);
-                        zig017_return_error = read_err;
-                        return read_err;
-                    });
-                    if (dynamic.?.vtable.open_guarded == null) return zig017_failure: {
-                        zig017_return_error = error.SqlRangeTrackingRequired;
-                        break :zig017_failure error.SqlRangeTrackingRequired;
-                    };
-                    self.dynamic_snapshot = &dynamic.?;
-                    self.dynamic_table = table.physical_name;
-                }
-                var active_backend = guarded_backend orelse self.backend();
-                // Guarded backends can predate the execution lease. Chain
-                // their bound-authority checks with this statement's cut.
-                var bound_guard: BoundExecutionGuard = .{ .root = self, .prior = active_backend.execution_binding_validator };
-                if (self.pending_transaction_cut != null)
-                    active_backend.execution_binding_validator = .{ .ptr = &bound_guard, .validate = BoundExecutionGuard.validate };
-                active_backend.statement_mutations = if (self.range_reads != null) .{ .ptr = self, .begin = beginCommand } else null;
-                active_backend.write_version = transaction.write_version;
-                active_backend.supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null;
-                // Internal guarded autocommit is still one implicit SQL
-                // transaction. Explicit sessions retain their durable start.
-                active_backend.transaction_start = if (implicit_guarded) statement_instant else transaction.started_at orelse return zig017_failure: {
-                    zig017_return_error = error.InvalidTransactionClock;
-                    break :zig017_failure error.InvalidTransactionClock;
-                };
-                active_backend.statement_clock = .{ .source = statement_source, .statement = statement_instant, .transaction = active_backend.transaction_start.? };
-                self.context.sql_transaction_micros = active_backend.transaction_start.?.micros;
-                active_backend.decision_provider = self.decision_provider;
-                if (compiled.uses_current_setting and active_backend.setting_capture == null) active_backend.setting_capture = self.settingCapture();
-                if (guarded_backend != null) {
-                    active_backend.supports_expression_access_hints = active_backend.supports_expression_access_hints and staged.tables.len == 0;
-                    active_backend.atomic_statement_read_set = self.range_reads != null;
-                    active_backend.coordinated_point_reads = self.range_reads != null;
-                    active_backend.coordinated_index_reads = self.dynamic_snapshot == null and self.pending_transaction_cut == null and self.range_reads != null and staged.tables.len == 0;
-                    active_backend.dynamic_statement_read_set = self.dynamic_snapshot != null or self.pending_transaction_cut != null;
-                }
-                var output = (delivered: {
-                    if (self.read_delivery) |delivery| if (delivery.in_transaction and (compiled.statement == .select or compiled.statement == .copy_to)) {
-                        if (try @import("antfly_local_sources").sql_read_stream.Stream.openOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), active_backend, compiled, parameters, limits)) |stream| {
-                            defer stream.close();
-                            break :delivered try delivery.deliver(delivery.ptr, alloc, stream);
-                        }
-                    };
-                    break :delivered @import("antfly_local_sources").sql_runtime.executeOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), active_backend, compiled, parameters, limits);
-                } catch |zig017_err| {
-                    zig017_return_error = zig017_err;
-                    return zig017_err;
-                });
-                errdefer output.deinit();
-                if (!self.ranges_staged and read_guards.tables.len != 0) {
-                    _ = ((self.server.txn_sessions.stage(self.server.alloc, id, &read_guards) catch |zig017_err| {
-                        zig017_return_error = zig017_err;
-                        return zig017_err;
-                    })) orelse return zig017_failure: {
-                        zig017_return_error = error.SqlTransactionNotActive;
-                        break :zig017_failure error.SqlTransactionNotActive;
-                    };
-                }
-                output.output.mutation_outcome = null;
-                break :statement output;
+                zig017_return_error = failure;
+                return failure;
             };
-            errdefer result.deinit();
-            if (implicit_guarded) {
-                // The statement lease and borrowed read view are gone before
-                // commit admission. A decided/unknown outcome is never retried.
-                try @import("sql_sequence_execution.zig").flush(self);
-                const decision = (session.execute(.commit) catch |zig017_err| {
-                    zig017_return_error = zig017_err;
-                    return zig017_err;
-                });
-                const commit = decision.commit orelse return zig017_failure: {
-                    zig017_return_error = error.InvalidSqlBackendResponse;
-                    break :zig017_failure error.InvalidSqlBackendResponse;
-                };
-                implicit_decided = true;
-                self.outcome_transaction_id = std.fmt.bytesToHex(commit.reconciliation_id, .lower);
-                result.output.mutation_outcome = switch (commit.outcome) {
-                    .committed => .committed,
-                    .committed_pending => .committed_pending,
-                    .committed_repair_required => .committed_repair_required,
-                    .aborted => return zig017_failure: {
-                        const failure = sessions.abortError(commit);
-                        zig017_return_error = failure;
-                        break :zig017_failure failure;
-                    },
-                    .unknown => return zig017_failure: {
-                        zig017_return_error = error.SqlTransactionOutcomeUnknown;
-                        break :zig017_failure error.SqlTransactionOutcomeUnknown;
-                    },
-                };
-            }
-            return result;
         }
         // Allocate no transaction until a transaction-scoped effect actually
         // executes. Parser flags cannot see effects hidden inside bound routines
         // and would start unnecessary transactions for untaken CASE branches.
-        var advisory_scope: ImplicitAdvisory = .{ .root = self, .session = &session, .coordinator = &coordinator };
+        var advisory_scope: ImplicitTransaction = .{ .root = self, .session = &session, .coordinator = &coordinator };
         std.debug.assert(self.implicit_advisory == null);
         self.implicit_advisory = &advisory_scope;
         defer self.implicit_advisory = null;
@@ -1089,13 +920,219 @@ pub const Adapter = struct {
         statement_backend.decision_provider = self.decision_provider;
         if (compiled.uses_current_setting and statement_backend.setting_capture == null) statement_backend.setting_capture = self.settingCapture();
         return self.executeImplicit(alloc, compiled, parameters, limits, statement_backend, &advisory_scope) catch |err| {
+            // This owner has either proved cleanup or retained its exact
+            // uncertain decision. Do not run a second statement-failure effect.
+            statement_failure_handled = true;
             const failure = advisory_scope.failure(err);
             zig017_return_error = failure;
             return failure;
         };
     }
 
-    fn executeImplicit(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, statement_backend: catalog.Backend, advisory_scope: *ImplicitAdvisory) !@import("antfly_local_sources").sql_runtime.Result {
+    fn transactionStatementFailure(session: *@import("antfly_local_sources").sql_session.Session, err: anyerror) anyerror {
+        if (err == error.SqlWriteCapacityUnavailable) return err;
+        session.statementFailed() catch return error.SqlTransactionOutcomeUnknown;
+        return err;
+    }
+
+    const TransactionExecution = struct {
+        session: *@import("antfly_local_sources").sql_session.Session,
+        implicit: ?*ImplicitTransaction,
+        statement_source: catalog.Clock.Source,
+        statement_instant: catalog.Clock.Instant,
+        previous_setting_overlay: []const setting_catalog.OverlayEntry,
+        captured_conflict: bool,
+        deferred_conflict: bool,
+    };
+
+    fn executeTransaction(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, guarded_backend: ?catalog.Backend, run: TransactionExecution) !@import("antfly_local_sources").sql_runtime.Result {
+        const session = run.session;
+        const implicit_guarded = run.implicit != null;
+        const statement_source = run.statement_source;
+        const statement_instant = run.statement_instant;
+        const previous_setting_overlay = run.previous_setting_overlay;
+        const captured_conflict = run.captured_conflict;
+        const deferred_conflict = run.deferred_conflict;
+        const transaction = (session.statement(switch (compiled.statement) {
+            .select, .copy_to, .explain, .call, .notification => false,
+            else => true,
+        }) catch |zig017_err| {
+            return zig017_err;
+        });
+        const statement_guards = compiled.statement == .effect_block or compiled.statement == .merge or captured_conflict or deferred_conflict;
+        if (statement_guards and !supportsRangeGuards(self.server)) return zig017_failure: {
+            break :zig017_failure error.SqlRangeTrackingRequired;
+        };
+        // DDL cannot bypass the native transaction's atomicity boundary.
+        (rejectTransactionalDdl(compiled.statement) catch |zig017_err| {
+            return zig017_err;
+        });
+        const id = session.transaction_id.?;
+        var result = statement: {
+            const execution_lease = self.server.txn_sessions.tryAcquireCommitExecution(id) orelse return zig017_failure: {
+                break :zig017_failure error.SqlWriteCapacityUnavailable;
+            };
+            defer execution_lease.release();
+            var transaction_cut: ?*@import("sql_retained_snapshot.zig").Shared = null;
+            self.pending_transaction_cut = if (transaction.isolation != .read_committed) .{ .id = id, .slot = &transaction_cut } else null;
+            defer {
+                self.pending_transaction_cut = null;
+                if (transaction_cut) |cut| cut.release();
+            }
+            if (transaction.isolation != .read_committed) {
+                // An earlier statement may already retain a cut. Binding
+                // must never start statistics maintenance behind that cut.
+                self.statistics_reads_started = true;
+            } else self.server.txn_sessions.lockSqlCharacteristics(self.server.alloc, id) catch |err| {
+                return err;
+            };
+            // A concurrent HTTP SET/RESET may have committed after the
+            // initial session attachment but before this statement's
+            // execution lease. Refresh the overlay while holding the
+            // same lease that serializes session setting mutations.
+            var leased_settings: ?@import("transactions.zig").SessionRegistry.SqlState = null;
+            defer if (leased_settings) |*state| state.deinit(self.server.alloc);
+            if (self.session_id != null and (compiled.uses_current_setting or self.connection_id != null)) {
+                self.setting_overlay = (refreshAttachedSettingOverlay(&self.server.txn_sessions, self.server.alloc, id, self.setting_overlay_source, previous_setting_overlay, &leased_settings) catch |zig017_err| {
+                    return zig017_err;
+                });
+            }
+            if (self.connection_id != null and self.prepared_bindings == null) {
+                if (leased_settings) |*state| {
+                    self.ddl_search_path = if (state.metadata.search_path_active) |*path| path else null;
+                }
+            }
+            _ = (session.statement(switch (compiled.statement) {
+                .select, .copy_to, .explain, .call, .notification => false,
+                else => true,
+            }) catch |zig017_err| {
+                return zig017_err;
+            });
+            var staged = (self.server.txn_sessions.cloneSqlStaged(alloc, id) catch |zig017_err| {
+                return zig017_err;
+            });
+            defer staged.deinit(alloc);
+            var read_guards: @import("transactions.zig").OwnedTransactionCommitRequest = .{};
+            defer read_guards.deinit(self.server.alloc);
+            self.range_reads = if (transaction.isolation != .read_committed or statement_guards) &read_guards else null;
+            self.ranges_staged = false;
+            self.active_transaction = id;
+            self.active_subtransaction = if (leased_settings) |state| state.current_subtransaction else 0;
+            self.active_write_version = transaction.write_version;
+            self.accepted_lake_repeatable = self.lake_visibility == .accepted and (transaction.isolation != .serializable or transaction.mode == .read_only);
+            self.staged = &staged;
+            self.inserting = switch (compiled.statement) {
+                .insert => |insert| insert.conflict == null,
+                .merge => |merge| for (merge.arms) |arm| {
+                    if (arm.action == .insert) break true;
+                } else false,
+                else => false,
+            };
+            defer {
+                self.active_transaction = null;
+                self.active_subtransaction = 0;
+                self.active_write_version = null;
+                self.accepted_lake_repeatable = false;
+                self.staged = null;
+                self.range_reads = null;
+                self.ranges_staged = false;
+                self.inserting = false;
+                self.dynamic_snapshot = null;
+                self.dynamic_table = null;
+            }
+            var dynamic: ?@import("antfly_local_sources").api_table_read_source.RelationalStatementSnapshot = null;
+            defer if (dynamic) |snapshot| snapshot.deinit();
+            var dynamic_scratch = std.heap.ArenaAllocator.init(alloc);
+            defer dynamic_scratch.deinit();
+            if (deferred_conflict and self.pending_transaction_cut == null) {
+                const table = (resolve(self, dynamic_scratch.allocator(), compiled.statement.insert.table, .read_write) catch |zig017_err| {
+                    return zig017_err;
+                });
+                if (table.storage_mode != .relational) return zig017_failure: {
+                    break :zig017_failure error.UnsupportedSqlExecution;
+                };
+                const reads = self.server.table_reads orelse return zig017_failure: {
+                    break :zig017_failure error.SqlStatementSnapshotRequired;
+                };
+                // The immutable cut is captured before INSERT-source and
+                // conflict-owner reads. Unsupported distributed ownership
+                // refuses this capability rather than mixing snapshots.
+                dynamic = (reads.openRelationalStatementSnapshot(alloc, table.physical_name, table.schema_version, .read_index, self.context.cancellation, ((self.context.platformDeadline() catch |zig017_err| {
+                    return zig017_err;
+                })).deadline_ns) catch |zig017_err| {
+                    const read_err = statementReadAdmissionError(self.context, zig017_err);
+
+                    return read_err;
+                });
+                if (dynamic.?.vtable.open_guarded == null) return zig017_failure: {
+                    break :zig017_failure error.SqlRangeTrackingRequired;
+                };
+                self.dynamic_snapshot = &dynamic.?;
+                self.dynamic_table = table.physical_name;
+            }
+            var active_backend = guarded_backend orelse self.backend();
+            // Guarded backends can predate the execution lease. Chain
+            // their bound-authority checks with this statement's cut.
+            var bound_guard: BoundExecutionGuard = .{ .root = self, .prior = active_backend.execution_binding_validator };
+            if (self.pending_transaction_cut != null)
+                active_backend.execution_binding_validator = .{ .ptr = &bound_guard, .validate = BoundExecutionGuard.validate };
+            active_backend.statement_mutations = if (self.range_reads != null) .{ .ptr = self, .begin = beginCommand } else null;
+            active_backend.write_version = transaction.write_version;
+            active_backend.supports_write_versions = supportsRangeGuards(self.server) and self.server.txn_sessions.durable != null;
+            // Internal guarded autocommit is still one implicit SQL
+            // transaction. Explicit sessions retain their durable start.
+            active_backend.transaction_start = if (implicit_guarded) statement_instant else transaction.started_at orelse return zig017_failure: {
+                break :zig017_failure error.InvalidTransactionClock;
+            };
+            active_backend.statement_clock = .{ .source = statement_source, .statement = statement_instant, .transaction = active_backend.transaction_start.? };
+            self.context.sql_transaction_micros = active_backend.transaction_start.?.micros;
+            active_backend.decision_provider = self.decision_provider;
+            if (compiled.uses_current_setting and active_backend.setting_capture == null) active_backend.setting_capture = self.settingCapture();
+            if (guarded_backend != null) {
+                active_backend.supports_expression_access_hints = active_backend.supports_expression_access_hints and staged.tables.len == 0;
+                active_backend.atomic_statement_read_set = self.range_reads != null;
+                active_backend.coordinated_point_reads = self.range_reads != null;
+                active_backend.coordinated_index_reads = self.dynamic_snapshot == null and self.pending_transaction_cut == null and self.range_reads != null and staged.tables.len == 0;
+                active_backend.dynamic_statement_read_set = self.dynamic_snapshot != null or self.pending_transaction_cut != null;
+            }
+            var output = (delivered: {
+                if (self.read_delivery) |delivery| if (delivery.in_transaction and (compiled.statement == .select or compiled.statement == .copy_to)) {
+                    if (try @import("antfly_local_sources").sql_read_stream.Stream.openOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), active_backend, compiled, parameters, limits)) |stream| {
+                        defer stream.close();
+                        break :delivered try delivery.deliver(delivery.ptr, alloc, stream);
+                    }
+                };
+                break :delivered @import("antfly_local_sources").sql_runtime.executeOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), active_backend, compiled, parameters, limits);
+            } catch |zig017_err| {
+                return zig017_err;
+            });
+            errdefer output.deinit();
+            if (!self.ranges_staged and read_guards.tables.len != 0) {
+                _ = ((self.server.txn_sessions.stage(self.server.alloc, id, &read_guards) catch |zig017_err| {
+                    return zig017_err;
+                })) orelse return zig017_failure: {
+                    break :zig017_failure error.SqlTransactionNotActive;
+                };
+            }
+            output.output.mutation_outcome = null;
+            break :statement output;
+        };
+        errdefer result.deinit();
+        if (run.implicit) |scope| {
+            // Execution leases and retained read views have been released.
+            // Reads and writes share the exact decision/scope/ACK barrier.
+            try scope.finish();
+            result.output.mutation_outcome = switch (scope.completed_outcome orelse return error.InvalidSqlBackendResponse) {
+                .committed => .committed,
+                .committed_pending => .committed_pending,
+                .committed_repair_required => .committed_repair_required,
+                .aborted, .unknown => return error.InvalidSqlBackendResponse,
+            };
+        }
+        return result;
+    }
+
+    fn executeImplicit(self: *Adapter, alloc: std.mem.Allocator, compiled: *const @import("antfly_local_sources").sql_compiler.Compiled, parameters: []const std.json.Value, limits: @import("antfly_local_sources").sql_runtime.Limits, statement_backend: catalog.Backend, advisory_scope: *ImplicitTransaction) !@import("antfly_local_sources").sql_runtime.Result {
         if (self.read_delivery) |delivery| if (self.session_id == null and compiled.statement == .select) {
             if (try @import("antfly_local_sources").sql_read_stream.Stream.openOwned(try @import("sql_memory_owner.zig").create(self.server.alloc, alloc, self.server.shared_resource_manager orelse &self.server.local_resource_manager), statement_backend, compiled, parameters, limits)) |stream| {
                 defer stream.close();
@@ -3388,6 +3425,9 @@ test "SQL implicit lock cleanup preserves uncertain receipts and never contradic
     const sql = @import("antfly_local_sources").sql_session;
     const Fake = struct {
         coordinator: *@import("sql_session.zig").Coordinator,
+        root: *Adapter,
+        failed_requests: usize = 0,
+        failure: ?anyerror = null,
         rollback_failure: bool = false,
         outcome: sql.CommitOutcome = .committed,
         commits: usize = 0,
@@ -3408,13 +3448,16 @@ test "SQL implicit lock cleanup preserves uncertain receipts and never contradic
             self.rollbacks += 1;
             // The canceled statement cannot cancel its bounded cleanup loan.
             try self.coordinator.context.ensureActive();
+            try self.root.context.ensureActive();
             if (self.rollback_failure) return error.InjectedSessionStoreFailure;
         }
         fn named(_: *anyopaque, _: sql.Scope, _: sql.Id, _: []const u8) !void {
             return error.TestUnexpectedAuthorityAccess;
         }
-        fn fail(_: *anyopaque, _: sql.Scope, _: sql.Id) !void {
-            return error.TestUnexpectedAuthorityAccess;
+        fn fail(raw: *anyopaque, _: sql.Scope, _: sql.Id) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.failed_requests += 1;
+            if (self.failure) |err| return err;
         }
         fn abandon(_: *anyopaque, _: sql.Scope, _: sql.Id) void {}
         fn owner(self: *@This()) sql.Owner {
@@ -3428,14 +3471,23 @@ test "SQL implicit lock cleanup preserves uncertain receipts and never contradic
     const context: operation.RequestContext = .{ .deadline_ns = 0, .cancellation = operation.CancellationToken.fromAtomic(&canceled) };
     var root: Adapter = .{ .server = &server, .identity = &identity, .context = context };
     var coordinator: @import("sql_session.zig").Coordinator = .{ .server = &server, .identity = &identity, .context = context };
-    var fake: Fake = .{ .coordinator = &coordinator };
+    var fake: Fake = .{ .coordinator = &coordinator, .root = &root };
     var session: sql.Session = .{ .owner = fake.owner(), .scope = .{ .principal = "alice" } };
-    var scope: ImplicitAdvisory = .{ .root = &root, .session = &session, .coordinator = &coordinator };
+    var scope: ImplicitTransaction = .{ .root = &root, .session = &session, .coordinator = &coordinator };
     try std.testing.expectEqual(error.Canceled, scope.failure(error.ReadIndexTimeout));
     try std.testing.expectEqual(error.Forbidden, scope.failure(error.Forbidden));
     root.context = .{};
     for ([_]anyerror{ error.ReadIndexTimeout, error.GroupLeaderUnavailable, error.SqlStatementReadUnavailable }) |err|
         try std.testing.expectEqual(err, scope.failure(err));
+    scope.mutation = true;
+    try std.testing.expectEqual(error.SqlMutationNotAppliedBusy, scope.failure(error.IntegrityCatalogUnavailable));
+    try std.testing.expectEqual(error.SqlMutationNotAppliedBusy, scope.failure(error.SqlStatementReadUnavailable));
+    try std.testing.expectEqual(error.SqlMutationNotAppliedBusy, scope.failure(error.ReadIndexTimeout));
+    root.context = context;
+    try std.testing.expectEqual(error.Canceled, scope.failure(error.IntegrityCatalogUnavailable));
+    root.context = .{};
+    try std.testing.expectEqual(error.Forbidden, scope.failure(error.Forbidden));
+    scope.mutation = false;
     root.context = context;
     try std.testing.expectEqual(@as(usize, 0), fake.rollbacks);
     const id: sql.Id = @splat(0x42);
@@ -3451,21 +3503,26 @@ test "SQL implicit lock cleanup preserves uncertain receipts and never contradic
         try std.testing.expectEqual(error.SqlTransactionOutcomeUnknown, scope.failure(error.ReadIndexTimeout));
         try std.testing.expectEqualSlices(u8, &receipt, &root.outcome_transaction_id.?);
         try std.testing.expectError(error.Canceled, coordinator.context.ensureActive());
+        try std.testing.expectError(error.Canceled, root.context.ensureActive());
         try std.testing.expectEqual(@as(?sql.Id, if (rollback_failure) id else null), session.transaction_id);
     }
     try std.testing.expectEqual(@as(usize, 2), fake.rollbacks);
     const uncertain = [_]anyerror{ error.SqlMutationOutcomeUnknown, error.SqlTransactionOutcomeUnknown, error.SqlSequenceOutcomeUnknown, error.RaftBatchWriteOutcomeUnknown, error.InvalidPreparedTransactionPhase, error.ExternalTransactionDecisionChanged, error.OutcomeUnknown, error.WriteOutcomeUnknown, error.CommitDecisionUnknown, error.DurabilityOutcomeUnknown, error.SessionLeaseLost, error.MetadataMutationOutcomeUnknown };
-    for (uncertain) |err| {
-        const distinct_receipt = std.fmt.bytesToHex(@as(sql.Id, @splat(0x71)), .lower);
-        for ([_]bool{ false, true }) |has_receipt| {
-            session.transaction_id = id;
-            scope.phase = .active;
-            root.outcome_transaction_id = if (has_receipt) distinct_receipt else null;
-            try std.testing.expectEqual(if (err == error.MetadataMutationOutcomeUnknown) error.SqlTransactionOutcomeUnknown else err, scope.failure(err));
-            try std.testing.expectEqualSlices(u8, if (has_receipt) &distinct_receipt else &receipt, &root.outcome_transaction_id.?);
-            try std.testing.expectEqual(@as(usize, 2), fake.rollbacks);
+    for ([_]bool{ false, true }) |mutation| {
+        scope.mutation = mutation;
+        for (uncertain) |err| {
+            const distinct_receipt = std.fmt.bytesToHex(@as(sql.Id, @splat(0x71)), .lower);
+            for ([_]bool{ false, true }) |has_receipt| {
+                session.transaction_id = id;
+                scope.phase = .active;
+                root.outcome_transaction_id = if (has_receipt) distinct_receipt else null;
+                try std.testing.expectEqual(if (err == error.MetadataMutationOutcomeUnknown) error.SqlTransactionOutcomeUnknown else err, scope.failure(err));
+                try std.testing.expectEqualSlices(u8, if (has_receipt) &distinct_receipt else &receipt, &root.outcome_transaction_id.?);
+                try std.testing.expectEqual(@as(usize, 2), fake.rollbacks);
+            }
         }
     }
+    scope.mutation = false;
     for ([_]sql.CommitOutcome{ .committed, .committed_pending, .committed_repair_required, .aborted, .unknown }) |outcome| {
         fake.outcome = outcome;
         session.transaction_id = id;
@@ -3482,6 +3539,17 @@ test "SQL implicit lock cleanup preserves uncertain receipts and never contradic
         return error.TestUnexpectedResult;
     }
     try std.testing.expectEqual(@as(usize, 5), fake.commits);
+
+    session.transaction_id = id;
+    fake.failure = error.InjectedSessionStoreFailure;
+    try std.testing.expectEqual(error.SqlTransactionOutcomeUnknown, Adapter.transactionStatementFailure(&session, error.IntegrityCatalogUnavailable));
+    try std.testing.expectEqual(@as(?sql.Id, id), session.transaction_id);
+    try std.testing.expectEqual(@as(usize, 1), fake.failed_requests);
+    fake.failure = null;
+    try std.testing.expectEqual(error.Forbidden, Adapter.transactionStatementFailure(&session, error.Forbidden));
+    try std.testing.expectEqual(@as(usize, 2), fake.failed_requests);
+    try std.testing.expectEqual(error.SqlWriteCapacityUnavailable, Adapter.transactionStatementFailure(&session, error.SqlWriteCapacityUnavailable));
+    try std.testing.expectEqual(@as(usize, 2), fake.failed_requests);
 
     // A real sequence owner with dirty state and a missing native transaction
     // would fail its flush. Unknown outcomes must not call it or replace their

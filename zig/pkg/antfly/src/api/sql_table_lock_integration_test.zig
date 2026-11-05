@@ -567,3 +567,7 @@ test "SQL implicit lock cleanup preserves native admission across failure envelo
     try std.testing.expectEqual(@backingInt(callbacks.Code.retryable), callback.code);
     try std.testing.expectEqual(error.RaftApplyWriterUnavailable, callbacks.errorFromStatus(callback));
 }
+
+test "SQL implicit lock cleanup preserves the caller integrity preparation budget" {
+    try local.api_relational_integrity_commit.Testing.scopedPreparationBudget();
+}

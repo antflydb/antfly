@@ -170,9 +170,9 @@ test "SQL default lifecycle retries only definite read admission" {
     try std.testing.expect(!definiteReadAdmission(changed));
 }
 
-// Explicit SQL timeout probes need response/cleanup headroom on every
-// attempt. A fresh server timeout must never outlive the remaining transport
-// budget after a proven pre-admission retry.
+// SQL requests need response/cleanup headroom on every attempt. Forward the
+// finite parent budget, capped by any explicit probe timeout; a server deadline
+// must never outlive the remaining transport budget after pre-admission retry.
 const TimeoutHeaders = struct {
     headers: []http.RequestHeader,
     index: usize,
@@ -188,9 +188,17 @@ const TimeoutHeaders = struct {
             if (index != null) return null;
             index = i;
         }
-        const slot = index orelse return null;
-        const requested = budgets.positive(headers[slot].value, budgets.max_timeout_ms) catch return null;
-        return .{ .headers = try a.dupe(http.RequestHeader, headers), .index = slot, .requested_ms = requested };
+        if (index) |slot| {
+            const requested = budgets.positive(headers[slot].value, budgets.max_timeout_ms) catch return null;
+            return .{ .headers = try a.dupe(http.RequestHeader, headers), .index = slot, .requested_ms = requested };
+        }
+        // The transport already has one finite parent budget. Forward it even
+        // without an explicit SQL override, rather than leaving server phases
+        // to choose independent deadlines which outlive or preempt that budget.
+        const owned = try a.alloc(http.RequestHeader, headers.len + 1);
+        @memcpy(owned[0..headers.len], headers);
+        owned[headers.len] = .{ .name = budgets.timeout_header, .value = "" };
+        return .{ .headers = owned, .index = headers.len, .requested_ms = budgets.max_timeout_ms };
     }
     fn deinit(self: *@This(), a: std.mem.Allocator) void {
         a.free(self.headers);
@@ -228,8 +236,16 @@ test "SQL implicit lock cleanup timeout probes retain parent transport headroom"
         try std.testing.expectEqualStrings(headers[2].value, forwarded[2].value);
         try std.testing.expectEqualStrings("5000", headers[1].value);
     }
-    try std.testing.expect((try TimeoutHeaders.init(a, &.{})) == null);
-    try std.testing.expect((try TimeoutHeaders.init(a, headers[0..1])) == null);
+    var absent = (try TimeoutHeaders.init(a, &.{})).?;
+    defer absent.deinit(a);
+    try std.testing.expectEqualStrings("7500", absent.forRemaining(15000)[0].value);
+    var ordinary = (try TimeoutHeaders.init(a, headers[0..1])).?;
+    defer ordinary.deinit(a);
+    const forwarded = ordinary.forRemaining(8000);
+    try std.testing.expectEqual(@as(usize, 2), forwarded.len);
+    try std.testing.expectEqualStrings(headers[0].value, forwarded[0].value);
+    try std.testing.expectEqualStrings("x-antfly-timeout-ms", forwarded[1].name);
+    try std.testing.expectEqualStrings("4000", forwarded[1].value);
     for ([_][]const u8{ "0", "-1", "invalid", "1800001" }) |invalid| {
         try std.testing.expect((try TimeoutHeaders.init(a, &.{.{ .name = "x-antfly-timeout-ms", .value = invalid }})) == null);
     }

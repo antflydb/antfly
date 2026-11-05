@@ -135,10 +135,11 @@ SKIP LOCKED, retain write admission on cache hits and unwind every allocation
 failure. Invalid SQL, rather than supported FOR UPDATE syntax, exercises failed
 compilation diagnostics and admission cleanup.
 
-Implicit lock-bearing reads share one completion boundary for streamed and
-materialized execution. After an error, bounded cancellation-independent
-rollback must drain the native scope and durable delivery ACK before removing
-the reconciliation ID. Failure to prove that completion returns `40003` and
+Implicit mutations and lock-bearing reads share one completion owner for
+streamed and materialized execution. Internal write transactions no longer use
+a separate best-effort rollback path. After an error, bounded
+cancellation-independent rollback must drain the native scope and durable
+delivery ACK before removing the reconciliation ID. Failure to prove that completion returns `40003` and
 retains recovery ownership. A proposed decision is never followed by a fresh
 rollback; even a known abort must finish its scope/ACK barrier before becoming
 an ordinary statement failure. Cancellation is checked again after cleanup,
@@ -151,6 +152,17 @@ requires ROLLBACK. The process campaign covers both read forms in both lifetimes
 Reconciliation-required errors also bypass error-path sequence flushing: a new
 session-state write must not mask the original uncertain outcome or receipt.
 Known failures continue to preserve PostgreSQL's nontransactional sequence state.
+The same bounded cleanup context covers sequence persistence and native rollback,
+then restores the canceled request context. Each failure path runs exactly once.
+A definite integrity-read availability failure becomes a known-not-applied busy
+mutation only after that cleanup is proved; it never receives the read-admission
+classification that permits automatic SQL replay. Failed explicit-statement
+cleanup instead retains the transaction receipt and returns an unknown outcome.
+Integrity preparation preserves the original caller deadline across UNIQUE/FK
+owners and COPY rather than imposing a fresh five-second phase deadline. Only
+unbudgeted internal callers receive that bounded default. Mounted-owner clients
+forward their existing finite transport budget, including requests without an
+explicit timeout override, and keep response/cleanup headroom within that budget.
 Transport-borrowed sequence state retains its existing publication owner on
 both clean and dirty completion; the SQL adapter must not inspect connection
 publication fences it never captured. The sequence regression gate exercises
@@ -158,6 +170,14 @@ this error path through pgwire as well as direct owner qualification.
 Timeout probes keep one outer transport deadline across proven pre-admission
 retries and cap each forwarded SQL deadline to leave completion headroom. Neither
 budget is extended, and ambiguous operations are never replayed.
+The merged-main Debug qualification passes the 17-test public locking gate,
+eight sequence-effect regressions, four COPY regressions, and all lower-level
+lock/prepared/storage targets (137 successful build steps, 60 executed tests).
+The independent PostgreSQL checks pass 406 assertions. The newly built Debug
+server also passes the actual metadata/data-process locking and restart campaign
+in 73 seconds. These checks preserve original-case dispositions rather than
+awarding new credit for shared fixes.
+
 Native lock transport handles brief owner-publication contention inside the
 existing request budget: bounded admission retries allocate no new effect, and
 readback retries repeat only the exact immutable native query. Unknown proposals
