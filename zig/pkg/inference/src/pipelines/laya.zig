@@ -314,7 +314,7 @@ pub fn executeWithScratchLimit(a: std.mem.Allocator, scratch: std.mem.Allocator,
         const remaining = execution_sequences[finished..end];
         var admitted = try admitChunk(session, remaining, retained, max_workspace_bytes);
         defer admitted.permit.deinit();
-        try executeChunk(a, scratch, &admitted.permit, cfg, execution_tasks[finished..][0..admitted.count], remaining[0..admitted.count], tok.specialTokens().pad_id, decisions[finished..][0..admitted.count], control);
+        try executeChunk(a, scratch, &admitted.permit, &permit, cfg, execution_tasks[finished..][0..admitted.count], remaining[0..admitted.count], tok.specialTokens().pad_id, decisions[finished..][0..admitted.count], control);
         execution_chunks += 1;
         padded_tokens += admitted.count * chunkShape(remaining[0..admitted.count]).sequence;
         finished += admitted.count;
@@ -650,7 +650,16 @@ fn selectChunk(session: Session, sequences: []const Sequence, retained: usize, m
     return count;
 }
 
-fn executeChunk(a: std.mem.Allocator, scratch: std.mem.Allocator, execution: *@import("../backends/session.zig").RunPermit, cfg: model.Config, tasks: []const Task, sequences: []const Sequence, pad: i32, decisions: []Decision, control: ?Control) !void {
+fn runUnpackedChunkSource(execution: *@import("../backends/session.zig").RunPermit, preprocessing: ?*const @import("../backends/session.zig").RunPermit, inputs: []const Tensor, scratch: std.mem.Allocator, control: ?Control) ![]Tensor {
+    var source = @import("../backends/session.zig").PreparedSource{};
+    defer source.deinit();
+    if (!try source.initOwningNativePermitBeforeExecutionInto(execution, preprocessing, inputs, scratch, control))
+        return execution.runWithControl(inputs, scratch, control);
+    try source.enter();
+    return source.runHost(inputs);
+}
+
+fn executeChunk(a: std.mem.Allocator, scratch: std.mem.Allocator, execution: *@import("../backends/session.zig").RunPermit, preprocessing: ?*const @import("../backends/session.zig").RunPermit, cfg: model.Config, tasks: []const Task, sequences: []const Sequence, pad: i32, decisions: []Decision, control: ?Control) !void {
     var arena = std.heap.ArenaAllocator.init(scratch);
     defer arena.deinit();
     const chunk = arena.allocator();
@@ -712,7 +721,7 @@ fn executeChunk(a: std.mem.Allocator, scratch: std.mem.Allocator, execution: *@i
         }
         return;
     }
-    const outputs = try execution.runWithControl(&inputs, scratch, control);
+    const outputs = try runUnpackedChunkSource(execution, preprocessing, &inputs, scratch, control);
     defer {
         for (outputs) |*output| output.deinit();
         scratch.free(outputs);
@@ -850,4 +859,174 @@ test "laya length buckets are stable and require meaningful padding savings" {
     try std.testing.expect(try bucketOrder(a, sequences[0..7]) == null);
     for (&sequences) |*sequence| sequence.ids = ids[0..61];
     try std.testing.expect(try bucketOrder(a, &sequences) == null);
+}
+
+fn freeLayaBankTestResult(a: std.mem.Allocator, result: Result) void {
+    for (result.decisions) |decision| a.free(decision.probabilities);
+    a.free(result.decisions);
+}
+fn expectLayaBankTestResult(expected: Result, actual: Result) !void {
+    try std.testing.expectEqual(expected.prompt_tokens, actual.prompt_tokens);
+    try std.testing.expectEqual(expected.execution_chunks, actual.execution_chunks);
+    try std.testing.expectEqual(expected.padded_tokens, actual.padded_tokens);
+    try std.testing.expectEqual(expected.decisions.len, actual.decisions.len);
+    for (expected.decisions, actual.decisions) |want, got| {
+        try std.testing.expectEqualStrings(want.name, got.name);
+        try std.testing.expectEqualStrings(want.label, got.label);
+        try std.testing.expectEqual(want.kind, got.kind);
+        try std.testing.expectEqualSlices(f32, want.probabilities, got.probabilities);
+        try std.testing.expectEqual(want.confidence, got.confidence);
+        try std.testing.expectEqual(want.expected_value, got.expected_value);
+        try std.testing.expectEqual(want.true_probability, got.true_probability);
+        try std.testing.expectEqual(want.act_probability, got.act_probability);
+    }
+}
+fn layaOriginalPermitBankPipelineCase(a: std.mem.Allocator, path: []const u8, tok: Tokenizer, cfg: model.Config, tasks: []const Task, reference: Result, bank_bytes: usize, extra: usize, accepted: bool) !void {
+    const Memory = @import("../runtime/tier/memory.zig");
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const factory = @import("../architectures/session_factory.zig");
+    var session = try factory.createNativeSession(a, path);
+    var live = true;
+    defer if (live) session.close();
+    try session.installOwnedExecutionGate(a);
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    const domain = try Domain.create();
+    defer domain.release();
+    var pin = domain.pin();
+    defer pin.release();
+    session.model_lifetime.?.admission_domain = pin.retain();
+    const retained = tasks.len * cfg.max_len * 64;
+    const sequences = try a.alloc(Sequence, tasks.len);
+    defer a.free(sequences);
+    var initialized: usize = 0;
+    defer for (sequences[0..initialized]) |sequence| {
+        a.free(sequence.ids);
+        a.free(sequence.markers);
+    };
+    for (tasks, sequences) |task, *sequence| {
+        sequence.* = try prepare(a, tok, cfg, task);
+        initialized += 1;
+    }
+    const request = try chunkPlan(session, sequences, retained);
+    var policy = @import("../backends/session.zig").RunAdmission{ .controller = pin.controller(), .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    const floor = (try policy.planRequest(request, session.outputInfo())).required;
+    const old_peak = try floor.merge(.{ .host_scratch_bytes = retained });
+    policy.limits.host_limit_bytes = try std.math.add(usize, old_peak.host_scratch_bytes, extra);
+    session.run_admission = policy;
+    const Probe = struct {
+        gate: *std.atomic.Mutex,
+        bank_bytes: usize,
+        calls: usize = 0,
+        releases: usize = 0,
+        records: [4]Memory.AdmissionAmounts = undefined,
+        violation: bool = false,
+        cancel_on_bank: bool = false,
+        cancel: bool = false,
+        fn observe(self: *@This()) void {
+            if (self.gate.tryLock()) self.gate.unlock() else self.violation = true;
+        }
+        fn reserve(raw: *anyopaque, amounts: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            if (self.calls >= self.records.len) return error.ResourceLimitExceeded;
+            self.records[self.calls] = amounts;
+            self.calls += 1;
+            if (self.cancel_on_bank and self.calls == 3 and std.meta.eql(amounts, Memory.AdmissionAmounts{ .host_scratch_bytes = self.bank_bytes })) self.cancel = true;
+            return self.calls;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            self.releases += 1;
+        }
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancel) return error.Cancelled;
+        }
+    };
+    var probe = Probe{ .gate = session.execution_gate.?, .bank_bytes = bank_bytes };
+    try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    const control = Control{ .native_call_policy = .in_process, .ptr = &probe, .check_fn = Probe.check };
+    for (0..2) |_| {
+        probe.calls = 0;
+        probe.releases = 0;
+        const actual = try executeWithScratchLimit(a, a, session, tok, cfg, tasks, control, null, null);
+        defer freeLayaBankTestResult(a, actual);
+        try expectLayaBankTestResult(reference, actual);
+        try std.testing.expectEqual(@as(usize, if (accepted) 3 else 2), probe.calls);
+        try std.testing.expectEqualDeep(Memory.AdmissionAmounts{ .host_scratch_bytes = retained }, probe.records[0]);
+        try std.testing.expectEqualDeep(floor, probe.records[1]);
+        if (accepted) try std.testing.expectEqualDeep(Memory.AdmissionAmounts{ .host_scratch_bytes = bank_bytes }, probe.records[2]);
+        try std.testing.expectEqual(probe.calls, probe.releases);
+        try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
+        try std.testing.expect(!probe.violation and scheduler.head == null);
+    }
+    if (accepted) {
+        probe.calls = 0;
+        probe.releases = 0;
+        probe.cancel_on_bank = true;
+        const attempted = executeWithScratchLimit(a, a, session, tok, cfg, tasks, control, null, null);
+        if (attempted) |unexpected| {
+            freeLayaBankTestResult(a, unexpected);
+            try std.testing.expect(false);
+        } else |err| try std.testing.expectEqual(error.Cancelled, err);
+        try std.testing.expectEqual(@as(usize, 3), probe.calls);
+        try std.testing.expectEqual(probe.calls, probe.releases);
+        try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
+        try std.testing.expect(!probe.violation and scheduler.head == null);
+        probe.cancel = false;
+        probe.cancel_on_bank = false;
+        probe.calls = 0;
+        probe.releases = 0;
+        const recovered = try executeWithScratchLimit(a, a, session, tok, cfg, tasks, control, null, null);
+        defer freeLayaBankTestResult(a, recovered);
+        try expectLayaBankTestResult(reference, recovered);
+        try std.testing.expectEqual(@as(usize, 3), probe.calls);
+        try std.testing.expectEqual(probe.calls, probe.releases);
+        try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
+    }
+    session.close();
+    live = false;
+    try std.testing.expect(!probe.violation);
+}
+
+test "actual Laya Q8 task pipeline adopts original chunk once and supplements only exact MAX" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const synthetic = @import("../util/laya_synthetic.zig");
+    const factory = @import("../architectures/session_factory.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    try synthetic.writeModelWith(a, std.testing.io, path, null, ",\"weight_quantization\":\"q8_0\"", 128, 717);
+    var words = synthetic.WordTokenizer{};
+    const tok = words.tokenizer();
+    const question = Question{ .name = "first", .kind = .choice, .instruction = "which tool is needed?", .labels = &.{ "search", "fetch" }, .descriptions = &.{ "look it up", "fetch it" } };
+    var other = question;
+    other.name = "second";
+    const tasks = [_]Task{
+        .{ .text = "find the invoice and check whether payment is late", .question = question },
+        .{ .text = "find the invoice and check whether payment is late", .question = other },
+    };
+    var raw = try factory.createNativeSession(a, path);
+    var raw_live = true;
+    defer if (raw_live) raw.close();
+    const cfg = factory.getLayaConfig(raw).?;
+    const bytes = try @import("../util/c_file.zig").readFileFromDir(a, path, "config.json");
+    defer a.free(bytes);
+    const encoder = try @import("../architectures/modern_bert_config.zig").parseConfig(a, bytes);
+    const bank = (try model.unpackedMatrixScratchGeometry(cfg, encoder, 2, 1)).?;
+    const reference = try executeWithScratchLimit(a, a, raw, tok, cfg, &tasks, .{ .native_call_policy = .in_process }, null, null);
+    defer freeLayaBankTestResult(a, reference);
+    raw.close();
+    raw_live = false;
+    try layaOriginalPermitBankPipelineCase(a, path, tok, cfg, &tasks, reference, bank.bytes, bank.bytes, true);
+    try layaOriginalPermitBankPipelineCase(a, path, tok, cfg, &tasks, reference, bank.bytes, bank.bytes - 1, false);
+    try layaOriginalPermitBankPipelineCase(a, path, tok, cfg, &tasks, reference, bank.bytes, 0, false);
 }

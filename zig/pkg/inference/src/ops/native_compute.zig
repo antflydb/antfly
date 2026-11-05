@@ -666,11 +666,16 @@ fn layaDequantScratchSgemm(
     in_dim: usize,
     out_dim: usize,
     beta: f32,
+    matrix_scratch: ?[]f32,
 ) !bool {
     if (!layaDequantSgemmSupported(storage, in_dim, out_dim)) return false;
     const dequant_start = nativeQuantPhaseStart();
-    const scratch = try self.allocator.alloc(f32, out_dim * in_dim);
-    defer self.allocator.free(scratch);
+    const count = try std.math.mul(usize, out_dim, in_dim);
+    if (matrix_scratch) |span| {
+        if (span.len < count or kernel_geometry.byteRangesOverlap(@intFromPtr(span.ptr), span.len * @sizeOf(f32), @intFromPtr(storage.raw_bytes.ptr), storage.raw_bytes.len) or kernel_geometry.byteRangesOverlap(@intFromPtr(span.ptr), span.len * @sizeOf(f32), @intFromPtr(input.ptr), input.len * @sizeOf(f32)) or kernel_geometry.byteRangesOverlap(@intFromPtr(span.ptr), span.len * @sizeOf(f32), @intFromPtr(output.ptr), output.len * @sizeOf(f32))) return error.InvalidAssignedHostWorkspace;
+    }
+    const scratch = if (matrix_scratch) |span| span[0..count] else try self.allocator.alloc(f32, count);
+    defer if (matrix_scratch == null) self.allocator.free(scratch);
     try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, scratch);
     noteNativeQuantOuterDispatch(.dequant_sgemm, .before_dispatch);
     noteNativeQuantPhase(.dequant_fetch, dequant_start);
@@ -688,8 +693,9 @@ fn tryLayaDequantSgemmNoBias(
     rows: usize,
     in_dim: usize,
     out_dim: usize,
+    matrix_scratch: ?[]f32,
 ) !bool {
-    return layaDequantScratchSgemm(self, storage, input, output, rows, in_dim, out_dim, 0.0);
+    return layaDequantScratchSgemm(self, storage, input, output, rows, in_dim, out_dim, 0.0, matrix_scratch);
 }
 
 fn tryLayaDequantSgemmBias(
@@ -701,13 +707,17 @@ fn tryLayaDequantSgemmBias(
     rows: usize,
     in_dim: usize,
     out_dim: usize,
+    matrix_scratch: ?[]f32,
 ) !bool {
     if (!layaDequantSgemmSupported(storage, in_dim, out_dim)) return false;
+    if (matrix_scratch) |span| {
+        if (kernel_geometry.byteRangesOverlap(@intFromPtr(span.ptr), span.len * @sizeOf(f32), @intFromPtr(bias.ptr), bias.len * @sizeOf(f32))) return error.InvalidAssignedHostWorkspace;
+    }
     const bias_row = bias[0..out_dim];
     for (0..rows) |row| {
         @memcpy(output[row * out_dim ..][0..out_dim], bias_row);
     }
-    return layaDequantScratchSgemm(self, storage, input, output, rows, in_dim, out_dim, 1.0);
+    return layaDequantScratchSgemm(self, storage, input, output, rows, in_dim, out_dim, 1.0, matrix_scratch);
 }
 
 fn shouldUseQuantizedDequantSgemm(name: []const u8, rows: usize, out_dim: usize, storage: *const QuantizedStorage) bool {
@@ -4938,6 +4948,25 @@ pub const NativeCompute = struct {
     /// FINAL metadata-only certification under the actual resumed Model. No
     /// supplier/allocator/codec runs here. A prior successful cold publication
     /// is not proof that a peer left that entry alive through the final yield.
+    pub fn matrixScratchRequest(cb: *const ComputeBackend, expected_data: *const anyopaque, request: *const ops.NativeLinearPreparation, span: []f32) !bool {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        if (!request.matrix_scratch_allowed or self.quantized_activation_policy == .strict_f32 or request.count() != 1 or request.rows == 0 or request.in_dim == 0 or request.out_dim == 0) return false;
+        const weight = request.weights[0] orelse return false;
+        const buf = toBuf(weight);
+        if (!buf.whole_named_weight or weightOrigin(buf) == null or weightData(self, buf) != self.data or buf.owned_quantized_storage != null or !shouldUseLayaDequantSgemm(buf.name)) return false;
+        const storage = buf.quantized_storage orelse return error.NativeWeightPreparationChanged;
+        if (storage.tensor_type != .known or storage.tensor_type.known != .Q8_0 or !layaDequantSgemmSupported(storage, request.in_dim, request.out_dim)) return error.NativeWeightPreparationChanged;
+        if (try std.math.mul(usize, request.in_dim, request.out_dim) > span.len) return error.InvalidAssignedHostWorkspace;
+        ResidentWeightPreparation.lock(self.data);
+        defer ResidentWeightPreparation.unlock(self.data);
+        const current = self.data.resident_weights.getPtr(buf.name) orelse if (self.data.lazy_weights.getPtr(buf.name)) |entry| (if (entry.loaded) |*value| value else return error.NativeWeightPreparationChanged) else return error.NativeWeightPreparationChanged;
+        const actual = if (current.quantized_storage) |*value| value else return error.NativeWeightPreparationChanged;
+        if (actual != storage) return error.NativeWeightPreparationChanged;
+        return true;
+    }
+
     pub fn certifyDenseReceiving(cb: *const ComputeBackend, expected_data: *const anyopaque, request: *const ops.NativeLinearPreparation, selected_mask: u3, ready_mask: u3) !bool {
         if (try selectedDenseProjectionMask(cb, expected_data, request) != selected_mask or (ready_mask & ~selected_mask) != 0) return false;
         const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
@@ -7459,6 +7488,7 @@ const QuantLinearKind = enum {
 
 const QuantLinearRequest = struct {
     dense_prepared: bool = false,
+    matrix_scratch: ?[]f32 = null,
     cleanup: @import("../execution/cleanup_context.zig").Context = .{},
     group_prepared: bool = false,
     compute: *NativeCompute,
@@ -7512,7 +7542,7 @@ fn dispatchQuantizedLinear(request: QuantLinearRequest) !bool {
     switch (request.kind) {
         .single_no_bias => {
             if (shouldUseLayaDequantSgemm(request.name_a)) {
-                if (try tryLayaDequantSgemmNoBias(self, request.storage_a, request.input, request.output_a, request.rows, request.in_dim, request.out_dim)) return true;
+                if (try tryLayaDequantSgemmNoBias(self, request.storage_a, request.input, request.output_a, request.rows, request.in_dim, request.out_dim, request.matrix_scratch)) return true;
             }
             if (shouldUseQuantizedDequantSgemm(request.name_a, request.rows, request.out_dim, request.storage_a)) {
                 if (try tryLinearQuantizedDequantSgemmGroupedFromStores(1, false, self, .{stores[0]}, .{request.storage_a}, .{request.name_a}, .{&.{}}, request.input, .{request.output_a}, request.rows, request.in_dim, request.out_dim, request.dense_prepared)) return true;
@@ -7523,7 +7553,7 @@ fn dispatchQuantizedLinear(request: QuantLinearRequest) !bool {
         .single_bias => {
             const bias = request.bias_a orelse return false;
             if (shouldUseLayaDequantSgemm(request.name_a)) {
-                if (try tryLayaDequantSgemmBias(self, request.storage_a, request.input, bias, request.output_a, request.rows, request.in_dim, request.out_dim)) return true;
+                if (try tryLayaDequantSgemmBias(self, request.storage_a, request.input, bias, request.output_a, request.rows, request.in_dim, request.out_dim, request.matrix_scratch)) return true;
             }
             if (shouldUseQuantizedDequantSgemm(request.name_a, request.rows, request.out_dim, request.storage_a)) {
                 if (try tryLinearQuantizedDequantSgemmGroupedFromStores(1, true, self, .{stores[0]}, .{request.storage_a}, .{request.name_a}, .{bias}, request.input, .{request.output_a}, request.rows, request.in_dim, request.out_dim, request.dense_prepared)) return true;
@@ -7649,10 +7679,10 @@ fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_di
 }
 
 fn linearInto(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize, output: []f32) anyerror!void {
-    return linearIntoPrepared(ctx, input, weight, bias, rows, in_dim, out_dim, output, false);
+    return linearIntoPrepared(ctx, input, weight, bias, rows, in_dim, out_dim, output, false, null);
 }
 
-fn linearIntoPrepared(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize, output: []f32, dense_prepared: bool) anyerror!void {
+fn linearIntoPrepared(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize, output: []f32, dense_prepared: bool, matrix_scratch: ?[]f32) anyerror!void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const weight_buf = toBuf(weight);
@@ -7665,6 +7695,7 @@ fn linearIntoPrepared(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: us
         if (try dispatchQuantizedLinear(.{
             .compute = self,
             .dense_prepared = dense_prepared,
+            .matrix_scratch = matrix_scratch,
             .kind = .single_bias,
             .input = getData(input),
             .rows = rows,
@@ -7980,7 +8011,7 @@ fn linearLoRAPrepared(
     // Reuse the base route so typed and quantized-only weights remain valid
     // when an adapter adds its residual to the same output buffer. The merged
     // base route also preserves the GLiNER strict-F32 activation policy.
-    const result = try allocateLinearOutputPrepared(ctx, input, base_weight, bias, rows, in_dim, out_dim, null, dense_prepared);
+    const result = try allocateLinearOutputPrepared(ctx, input, base_weight, bias, rows, in_dim, out_dim, null, dense_prepared, null);
     errdefer freeTensor(self, result);
     const output = getData(result);
 
@@ -9615,10 +9646,10 @@ fn linearNoBiasOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: u
 }
 
 fn linearNoBiasInto(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, output: []f32) anyerror!void {
-    return linearNoBiasIntoPrepared(ctx, input, weight, rows, in_dim, out_dim, output, false);
+    return linearNoBiasIntoPrepared(ctx, input, weight, rows, in_dim, out_dim, output, false, null);
 }
 
-fn linearNoBiasIntoPrepared(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, output: []f32, dense_prepared: bool) anyerror!void {
+fn linearNoBiasIntoPrepared(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, output: []f32, dense_prepared: bool, matrix_scratch: ?[]f32) anyerror!void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const weight_buf = toBuf(weight);
@@ -9630,6 +9661,7 @@ fn linearNoBiasIntoPrepared(ctx: *anyopaque, input: CT, weight: CT, rows: usize,
         if (try dispatchQuantizedLinear(.{
             .compute = self,
             .dense_prepared = dense_prepared,
+            .matrix_scratch = matrix_scratch,
             .kind = .single_no_bias,
             .input = getData(input),
             .rows = rows,
@@ -9825,9 +9857,9 @@ fn linearNoBiasPairPrepared(
         }
     }
 
-    const first = try allocateLinearOutputPrepared(ctx, input, weight_a, null, rows, in_dim, out_dim, null, dense_prepared);
+    const first = try allocateLinearOutputPrepared(ctx, input, weight_a, null, rows, in_dim, out_dim, null, dense_prepared, null);
     errdefer freeTensor(ctx, first);
-    const second = try allocateLinearOutputPrepared(ctx, input, weight_b, null, rows, in_dim, out_dim, null, dense_prepared);
+    const second = try allocateLinearOutputPrepared(ctx, input, weight_b, null, rows, in_dim, out_dim, null, dense_prepared, null);
     return .{ .first = first, .second = second };
 }
 
@@ -10099,9 +10131,9 @@ fn linearPairPrepared(
         }
     }
 
-    const first = try allocateLinearOutputPrepared(ctx, input, weight_a, bias_a, rows, in_dim, out_dim, null, dense_prepared);
+    const first = try allocateLinearOutputPrepared(ctx, input, weight_a, bias_a, rows, in_dim, out_dim, null, dense_prepared, null);
     errdefer freeTensor(ctx, first);
-    const second = try allocateLinearOutputPrepared(ctx, input, weight_b, bias_b, rows, in_dim, out_dim, null, dense_prepared);
+    const second = try allocateLinearOutputPrepared(ctx, input, weight_b, bias_b, rows, in_dim, out_dim, null, dense_prepared, null);
     return .{ .first = first, .second = second };
 }
 
@@ -10303,6 +10335,15 @@ fn validateNativeDenseReceipt(cb: *const ComputeBackend, request: *const ops.Nat
     if (try epoch.isSealed()) return error.RetirementEpochSealed;
     const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
     if (try NativeCompute.densePolicySignature(cb, self.data) != receipt.policy_signature) return error.NativeDensePreparationPolicyChanged;
+    if (receipt.matrix_scratch) |span| {
+        const context = cb.call_context orelse return error.MissingNativeMatrixScratchLoan;
+        const bound = context.cleanup.boundary orelse return error.MissingCurrentCleanupEpoch;
+        const loan = context.native_weights orelse return error.MissingNativeMatrixScratchLoan;
+        const held = loan.matrix_scratch orelse return error.MissingNativeMatrixScratchLoan;
+        if (held.ptr != span.ptr or held.len != span.len or bound.record != epoch.record or bound.nonce != epoch.nonce) return error.ForeignNativeMatrixScratchLoan;
+        if (!try NativeCompute.matrixScratchRequest(cb, self.data, request, span)) return error.NativeDensePreparationPolicyChanged;
+        return;
+    }
     // Also runs AFTER an optional grouped-panel preparation callback, which
     // can be the last actual Source yield between receipt creation and math.
     if (!try NativeCompute.certifyDenseReceiving(cb, self.data, request, receipt.selected_mask, receipt.ready_mask)) return error.ResourceTemporarilyUnavailable;
@@ -10310,7 +10351,7 @@ fn validateNativeDenseReceipt(cb: *const ComputeBackend, request: *const ops.Nat
 fn linearDenseWithCleanup(cb: *const ComputeBackend, request: *const ops.NativeLinearPreparation, receipt: *const ops.NativeLinearPrepared, current: @import("../execution/cleanup_context.zig").Context) !CT {
     try validateNativeDenseReceipt(cb, request, receipt, current);
     if (request.count() != 1) return error.InvalidQuantizedLinearShape;
-    return allocateLinearOutputPrepared(cb.ptr, request.input, request.weights[0].?, request.biases[0], request.rows, request.in_dim, request.out_dim, null, true);
+    return allocateLinearOutputPrepared(cb.ptr, request.input, request.weights[0].?, request.biases[0], request.rows, request.in_dim, request.out_dim, null, receipt.matrix_scratch == null, receipt.matrix_scratch);
 }
 fn linearLoraDenseWithCleanup(cb: *const ComputeBackend, request: *const ops.NativeLinearPreparation, receipt: *const ops.NativeLinearPrepared, lora_a: CT, lora_b: CT, alpha: f32, rank: usize, current: @import("../execution/cleanup_context.zig").Context) !CT {
     try validateNativeDenseReceipt(cb, request, receipt, current);
@@ -10431,11 +10472,11 @@ fn linearTripleImpl(
         }
     }
 
-    const first = try allocateLinearOutputPrepared(ctx, input, weight_a, bias_a, rows, in_dim, out_dim, null, dense_prepared);
+    const first = try allocateLinearOutputPrepared(ctx, input, weight_a, bias_a, rows, in_dim, out_dim, null, dense_prepared, null);
     errdefer freeTensor(ctx, first);
-    const second = try allocateLinearOutputPrepared(ctx, input, weight_b, bias_b, rows, in_dim, out_dim, null, dense_prepared);
+    const second = try allocateLinearOutputPrepared(ctx, input, weight_b, bias_b, rows, in_dim, out_dim, null, dense_prepared, null);
     errdefer freeTensor(ctx, second);
-    const third = try allocateLinearOutputPrepared(ctx, input, weight_c, bias_c, rows, in_dim, out_dim, null, dense_prepared);
+    const third = try allocateLinearOutputPrepared(ctx, input, weight_c, bias_c, rows, in_dim, out_dim, null, dense_prepared, null);
     return .{ .first = first, .second = second, .third = third };
 }
 
@@ -51148,17 +51189,17 @@ fn allocateLinearOutput(ctx: *anyopaque, input: CT, weight: CT, bias: ?CT, rows:
     return allocateLinearOutputWithPlan(ctx, input, weight, bias, rows, in_dim, out_dim, null);
 }
 fn allocateLinearOutputWithPlan(ctx: *anyopaque, input: CT, weight: CT, bias: ?CT, rows: usize, in_dim: usize, out_dim: usize, plan: ?ops.OperatorPlan) anyerror!CT {
-    return allocateLinearOutputPrepared(ctx, input, weight, bias, rows, in_dim, out_dim, plan, false);
+    return allocateLinearOutputPrepared(ctx, input, weight, bias, rows, in_dim, out_dim, plan, false, null);
 }
 
-fn allocateLinearOutputPrepared(ctx: *anyopaque, input: CT, weight: CT, bias: ?CT, rows: usize, in_dim: usize, out_dim: usize, plan: ?ops.OperatorPlan, dense_prepared: bool) anyerror!CT {
+fn allocateLinearOutputPrepared(ctx: *anyopaque, input: CT, weight: CT, bias: ?CT, rows: usize, in_dim: usize, out_dim: usize, plan: ?ops.OperatorPlan, dense_prepared: bool, matrix_scratch: ?[]f32) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     if (plan) |selected| if (toBuf(weight).quantized_storage) |storage| try validateQuantLinearPlan(selected, storage, rows, in_dim, out_dim);
     var owned: ?[]f32 = try self.allocator.alloc(f32, try std.math.mul(usize, rows, out_dim));
     errdefer if (owned) |data| self.allocator.free(data);
     if (plan != null and toBuf(weight).quantized_storage != null) {
         try plannedQuantLinearInto(self, input, weight, bias, rows, in_dim, out_dim, owned.?, plan.?);
-    } else if (bias) |value| try linearIntoPrepared(ctx, input, weight, value, rows, in_dim, out_dim, owned.?, dense_prepared) else try linearNoBiasIntoPrepared(ctx, input, weight, rows, in_dim, out_dim, owned.?, dense_prepared);
+    } else if (bias) |value| try linearIntoPrepared(ctx, input, weight, value, rows, in_dim, out_dim, owned.?, dense_prepared, matrix_scratch) else try linearNoBiasIntoPrepared(ctx, input, weight, rows, in_dim, out_dim, owned.?, dense_prepared, matrix_scratch);
     const result = try self.makeBuf(owned.?, true);
     owned = null;
     errdefer freeTensor(ctx, result);
@@ -56874,4 +56915,37 @@ test "Native dense cold cache exact payload cap includes key map overlap and raw
 test "Native dense cold cache exact physical Domain cap and one below preserve original payload cap" {
     try nativeDenseCacheColdOomCase(std.testing.allocator, false, .exact);
     try nativeDenseCacheColdOomCase(std.testing.allocator, false, .below);
+}
+
+test "Laya declared matrix span reuses exact original codec SGEMM with no matrix allocation" {
+    const a = std.testing.allocator;
+    var dense: [64]f32 = undefined;
+    for (&dense, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 13)) * 0.125 - 0.75;
+    const raw = try quant_codec.quantizeQ8_0FromF32(a, &dense);
+    defer a.free(raw);
+    const storage = QuantizedStorage{ .allocator = a, .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = raw, .shape = &.{ 2, 32 }, .raw_owned = false };
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    var input: [96]f32 = undefined;
+    for (&input, 0..) |*value, i| value.* = @as(f32, @floatFromInt(i % 7)) * 0.25;
+    var expected: [6]f32 = @splat(0);
+    try std.testing.expect(try layaDequantScratchSgemm(&compute, &storage, &input, &expected, 3, 32, 2, 0, null));
+    var bank: [96]f32 = undefined; // one MAX span may exceed this selected matrix
+    var actual: [6]f32 = @splat(0);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    compute.allocator = failing.allocator();
+    defer compute.allocator = a;
+    for (0..3) |_| {
+        @memset(&actual, 0);
+        try std.testing.expect(try layaDequantScratchSgemm(&compute, &storage, &input, &actual, 3, 32, 2, 0, &bank));
+        try std.testing.expectEqualSlices(f32, &expected, &actual);
+    }
+    try std.testing.expectEqual(@as(usize, 0), failing.alloc_index);
+    try std.testing.expectError(error.InvalidAssignedHostWorkspace, layaDequantScratchSgemm(&compute, &storage, &input, &actual, 3, 32, 2, 0, bank[0..63]));
+    try std.testing.expectError(error.InvalidAssignedHostWorkspace, layaDequantScratchSgemm(&compute, &storage, bank[0..96], &actual, 3, 32, 2, 0, &bank));
+    var aliased_source = storage;
+    aliased_source.raw_bytes = std.mem.sliceAsBytes(bank[0..17]);
+    try std.testing.expectError(error.InvalidAssignedHostWorkspace, layaDequantScratchSgemm(&compute, &aliased_source, &input, &actual, 3, 32, 2, 0, &bank));
+    try std.testing.expectError(error.InvalidAssignedHostWorkspace, tryLayaDequantSgemmBias(&compute, &storage, &input, bank[0..2], &actual, 3, 32, 2, &bank));
 }

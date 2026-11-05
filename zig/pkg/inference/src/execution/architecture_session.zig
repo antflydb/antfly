@@ -2946,6 +2946,87 @@ pub fn nativeWeightPreparationModelData(session: Session) ?*native_mod.WeightSto
     if (&owner.model_lifetime != model) return null;
     return &owner.backend_data.native;
 }
+/// Bounded actual unpacked adapter. The generic backend receives only an
+/// explicit reusable span; model roles remain in the checkpoint inventory.
+pub fn nativeMatrixScratchCandidate(session: Session, inputs: @import("prepared_invocation.zig").Inputs) !?ops.kernel_descriptor.NativeMatrixScratchGeometry {
+    if (nativeWeightPreparationModelData(session) == null or session.run_admission == null) return null;
+    const policy = session.run_admission.?;
+    const model = session.model_lifetime.?; // canonical model proof above
+    const domain = model.retainAdmissionDomain(policy.controller) orelse return null;
+    defer domain.release();
+    const owner: *const ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (owner.arch_config != .modern_bert) return null;
+    const cfg = owner.arch_config.modern_bert;
+    const laya = cfg.laya orelse return null;
+    const host = switch (inputs) {
+        .host => |values| values,
+        else => return null,
+    };
+    if (host.len != 4 or host[0].shape.len != 2 or host[0].shape[0] <= 0 or host[0].shape[1] <= 0) return null;
+    const bi = parseBertRunInputs(host[0..2]) catch return null;
+    const kinds = validateI64Matrix(host[2], .{ bi.batch, 1 }) catch return null;
+    const markers = validateI64Matrix(host[3], null) catch return null;
+    if (markers.shape[0] != bi.batch or markers.shape[1] < 2 or markers.shape[1] > 20) return null;
+    for (bi.input_ids) |id| if (id < 0 or id >= cfg.vocab_size) return null;
+    for (kinds.values) |kind| if (kind < 0 or kind > 2) return null;
+    for (0..bi.batch) |row| {
+        var valid: usize = 0;
+        for (markers.values[row * markers.shape[1] ..][0..markers.shape[1]]) |marker| {
+            if (marker == -1) continue;
+            if (marker < 0 or marker >= bi.seq_len or bi.attention_mask[row * bi.seq_len + @as(usize, @intCast(marker))] != 1) return null;
+            valid += 1;
+        }
+        if (valid < 2) return null;
+    }
+    // Four actual inputs select the original unpacked numerical branch. Packed
+    // trunk/cache selection requires its own positive-work proof and declines.
+    return @import("../models/laya.zig").unpackedMatrixScratchGeometry(laya, cfg, @intCast(host[0].shape[0]), @intCast(host[0].shape[1]));
+}
+
+/// Metadata-only actual layout census. Caller owns the selected real Model
+/// gate; no allocation, supplier, codec or numerical dispatch occurs here.
+pub fn nativeMatrixScratchGeometry(session: Session, inputs: @import("prepared_invocation.zig").Inputs) !?ops.kernel_descriptor.NativeMatrixScratchGeometry {
+    const geometry = (try nativeMatrixScratchCandidate(session, inputs)) orelse return null;
+    return if (try nativeMatrixScratchMatches(session, geometry)) geometry else null;
+}
+pub fn nativeMatrixScratchMatches(session: Session, geometry: ops.kernel_descriptor.NativeMatrixScratchGeometry) !bool {
+    const data = nativeWeightPreparationModelData(session) orelse return false;
+    const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (owner.arch_config != .modern_bert) return false;
+    const cfg = owner.arch_config.modern_bert;
+    const laya = cfg.laya orelse return false;
+    // Matrix demand is row independent; positive execution was established
+    // from actual input shapes before the bank was declared.
+    const current = (try @import("../models/laya.zig").unpackedMatrixScratchGeometry(laya, cfg, 1, 1)) orelse return false;
+    if (!std.meta.eql(current, geometry)) return false;
+    const Census = struct {
+        owner: *ArchSession,
+        data: *native_mod.WeightStore,
+        supported: bool = true,
+        pub fn tensor(self: *@This(), name: []const u8, shape: []const i64) !void {
+            if (!@import("../models/laya.zig").quantizedLinear(name)) return;
+            var name_buf: [256]u8 = undefined;
+            const key = try normalizeWeightKey(.safetensors, self.owner.arch_config, name, &name_buf);
+            const loaded = self.data.resident_weights.getPtr(key) orelse {
+                self.supported = false; // lazy/raw/unknown retained source is not this bank
+                return;
+            };
+            const storage = if (loaded.quantized_storage) |*value| value else {
+                self.supported = false;
+                return;
+            };
+            if (storage.tensor_type != .known or storage.tensor_type.known != .Q8_0 or !std.mem.eql(i64, shape, storage.shape)) self.supported = false;
+        }
+    };
+    if (data.prefetch_initialized) data.prefetch.lock();
+    defer if (data.prefetch_initialized) data.prefetch.unlock();
+    @import("antfly_platform").sync.lockYielding(&data.quantized_prepare_lock);
+    defer data.quantized_prepare_lock.unlock();
+    var census = Census{ .owner = owner, .data = data };
+    try @import("../models/laya.zig").visitTensorInventory(&census, laya, cfg);
+    return census.supported;
+}
+
 pub fn validateNativeWeightPreparationReceiver(session: Session) !void {
     if (session.run_admission != null and nativeWeightPreparationCandidate(session) and nativeWeightPreparationModelData(session) == null) return error.MissingNativeWeightPreparationOwner;
 }
@@ -16920,4 +17001,236 @@ test "native authored maintained replacement staging metadata and payload unwind
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+fn nativeLayaMatrixBankCase(a: std.mem.Allocator, path: []const u8, inputs: []const Tensor, reference: []const Tensor, extra: usize, accepted: bool) !void {
+    const Source = @import("../backends/session.zig").PreparedSource;
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    var session = try createNativeSession(a, path);
+    var session_live = true;
+    defer if (session_live) session.close();
+    try session.installOwnedExecutionGate(a);
+    const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    const domain = try Domain.create();
+    defer domain.release();
+    var pin = domain.pin();
+    defer pin.release();
+    owner.model_lifetime.admission_domain = pin.retain();
+    const Probe = struct {
+        gate: *std.atomic.Mutex,
+        violation: bool = false,
+        calls: usize = 0,
+        fn observe(self: *@This()) void {
+            if (self.gate.tryLock()) self.gate.unlock() else self.violation = true;
+        }
+        fn reserve(raw: *anyopaque, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            self.calls += 1;
+            return self.calls;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: runtime.tier.memory.AdmissionAmounts) runtime.tier.memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+    };
+    var probe = Probe{ .gate = session.execution_gate.? };
+    try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    // Actual old Domain stays independent of the Model and physical slab.
+    const request = try session.planRun(inputs, null);
+    var policy = @import("../backends/session.zig").RunAdmission{ .controller = pin.controller(), .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    const floor = (try policy.planRequest(request, session.outputInfo())).required;
+    policy.limits.host_limit_bytes = try std.math.add(usize, floor.host_scratch_bytes, extra);
+    session.run_admission = policy;
+    const selected = (try nativeMatrixScratchGeometry(session, .{ .host = inputs })).?;
+    var source = Source{};
+    try source.initBeforeExecutionInto(session, session, session.execution_gate, .{ .host = inputs }, request, null, .resident_transient, a, .{ .native_call_policy = .in_process });
+    defer source.deinit();
+    try std.testing.expectEqual(accepted, source.native_matrix_scratch != null);
+    const span = if (source.native_matrix_scratch) |bank| bank.values else null;
+    if (span) |values| try std.testing.expectEqual(selected.bytes, values.len * @sizeOf(f32));
+    // Both physical death and the actual unsealed B must precede final refund.
+    var held = try source.cleanup.guard.?.fork();
+    defer held.finish();
+    try source.enter();
+    const outputs = try source.runHost(inputs);
+    var outputs_live = true;
+    defer if (outputs_live) {
+        for (outputs) |*value| value.deinit();
+        a.free(outputs);
+    };
+    try std.testing.expectEqual(reference.len, outputs.len);
+    for (reference, outputs) |want, got| try std.testing.expectEqualSlices(f32, want.asFloat32(), got.asFloat32());
+    if (span) |values| {
+        try std.testing.expectEqual(values.ptr, source.native_matrix_scratch.?.values.ptr);
+        try std.testing.expectEqual(values.len, source.native_matrix_scratch.?.values.len);
+    }
+    for (outputs) |*value| value.deinit();
+    a.free(outputs);
+    outputs_live = false;
+    source.deinit();
+    // This is the slab's independently held quota, not a full request floor.
+    if (accepted) try std.testing.expect(pin.controller().snapshot().host_scratch_bytes >= selected.bytes);
+    try std.testing.expect(session.execution_gate.?.tryLock());
+    session.execution_gate.?.unlock();
+    try std.testing.expect(scheduler.head == null);
+    held.finish();
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, pin.controller().snapshot());
+    if (accepted) {
+        // Same-original-permit seam used by the public task pipeline: retain
+        // its exact input/workspace token, supplement ONLY the additional bank.
+        const old_cap = session.run_admission.?.limits.host_limit_bytes;
+        session.run_admission.?.limits.host_limit_bytes = try std.math.add(usize, old_cap, 17);
+        var preprocessing = try session.admitHostPreprocess(17);
+        defer preprocessing.deinit();
+        var original = try session.admit(request);
+        defer original.deinit();
+        const original_token = original.lease.?.external_lease;
+        var adopted = Source{};
+        defer adopted.deinit();
+        try std.testing.expect(try adopted.initOwningNativePermitBeforeExecutionInto(&original, &preprocessing, inputs, a, .{ .native_call_policy = .in_process }));
+        try std.testing.expect(original.lease == null and original.dispatch_cleanup_epoch == null);
+        try std.testing.expectEqual(original_token, adopted.permit.?.lease.?.external_lease);
+        try std.testing.expect(adopted.native_matrix_scratch != null and adopted.native_matrix_supplement != null);
+        var final_use = try adopted.cleanup.guard.?.fork();
+        defer final_use.finish();
+        try adopted.enter();
+        const adopted_outputs = try adopted.runHost(inputs);
+        var adopted_outputs_live = true;
+        defer if (adopted_outputs_live) {
+            for (adopted_outputs) |*value| value.deinit();
+            a.free(adopted_outputs);
+        };
+        for (reference, adopted_outputs) |want, got| try std.testing.expectEqualSlices(f32, want.asFloat32(), got.asFloat32());
+        adopted.deinit();
+        try std.testing.expect(pin.controller().snapshot().host_scratch_bytes >= selected.bytes);
+        for (adopted_outputs) |*value| value.deinit();
+        a.free(adopted_outputs);
+        adopted_outputs_live = false;
+        final_use.finish();
+        // The result and explicit preprocess owners remain independent of the
+        // dead MAX span, never a reason to reacquire the original request.
+        session.run_admission.?.limits.host_limit_bytes = old_cap;
+        preprocessing.deinit();
+        try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, pin.controller().snapshot());
+        session.run_admission.?.limits.host_limit_bytes = try std.math.add(usize, old_cap, 17);
+        const Adopt = struct {
+            fn run(case_allocator: std.mem.Allocator, selected_session: Session, values: []const Tensor, requested: @import("../backends/session.zig").RunRequest) !void {
+                var input_permit = try selected_session.admitHostPreprocess(17);
+                defer input_permit.deinit();
+                var original_permit = try selected_session.admit(requested);
+                defer original_permit.deinit();
+                const token = original_permit.lease.?.external_lease;
+                var selected_source = Source{};
+                defer selected_source.deinit();
+                const moved = selected_source.initOwningNativePermitBeforeExecutionInto(&original_permit, &input_permit, values, case_allocator, .{ .native_call_policy = .in_process }) catch |err| {
+                    try std.testing.expect(original_permit.lease != null and original_permit.dispatch_cleanup_epoch == null);
+                    try std.testing.expectEqual(token, original_permit.lease.?.external_lease);
+                    return err;
+                };
+                try std.testing.expect(moved and original_permit.lease == null);
+                try std.testing.expect(selected_source.native_matrix_scratch != null);
+            }
+        };
+        try std.testing.checkAllAllocationFailures(a, Adopt.run, .{ session, inputs, request });
+        session.run_admission.?.limits.host_limit_bytes = old_cap;
+        try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, pin.controller().snapshot());
+        const Init = struct {
+            fn run(case_allocator: std.mem.Allocator, selected_session: Session, values: []const Tensor, requested: @import("../backends/session.zig").RunRequest) !void {
+                var selected_source = Source{};
+                defer selected_source.deinit();
+                try selected_source.initBeforeExecutionInto(selected_session, selected_session, selected_session.execution_gate, .{ .host = values }, requested, null, .resident_transient, case_allocator, .{ .native_call_policy = .in_process });
+                try std.testing.expect(selected_source.native_matrix_scratch != null);
+            }
+        };
+        try std.testing.checkAllAllocationFailures(a, Init.run, .{ session, inputs, request });
+        try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, pin.controller().snapshot());
+        const Cancel = struct {
+            source: *Source,
+            fn check(raw: ?*anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                if (self.source.native_matrix_scratch != null) return error.Cancelled;
+            }
+        };
+        var cancelled = Source{};
+        defer cancelled.deinit();
+        var cancel = Cancel{ .source = &cancelled };
+        const before_cancelled = native_mod.nativeQuantDispatchStatsForTest().dequant_sgemm;
+        const initialized = cancelled.initBeforeExecutionInto(session, session, session.execution_gate, .{ .host = inputs }, request, null, .resident_transient, a, .{ .native_call_policy = .in_process, .ptr = &cancel, .check_fn = Cancel.check });
+        if (initialized) |_| {
+            try std.testing.expectError(error.Cancelled, cancelled.enter());
+        } else |err| try std.testing.expectEqual(error.Cancelled, err);
+        cancelled.deinit();
+        try std.testing.expectEqual(before_cancelled, native_mod.nativeQuantDispatchStatsForTest().dequant_sgemm);
+        try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, pin.controller().snapshot());
+
+        // An actual model-selection change during outside funding cannot run
+        // embeddings or a matrix under the stale declared role census.
+        var stale = Source{};
+        defer stale.deinit();
+        try stale.initBeforeExecutionInto(session, session, session.execution_gate, .{ .host = inputs }, request, null, .resident_transient, a, .{ .native_call_policy = .in_process });
+        const saved = owner.arch_config.modern_bert.laya.?.head_layers;
+        try std.testing.expect(session.execution_gate.?.tryLock());
+        owner.arch_config.modern_bert.laya.?.head_layers = 0;
+        session.execution_gate.?.unlock();
+        defer owner.arch_config.modern_bert.laya.?.head_layers = saved;
+        const before = native_mod.nativeQuantDispatchStatsForTest().dequant_sgemm;
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, stale.enter());
+        try std.testing.expectEqual(before, native_mod.nativeQuantDispatchStatsForTest().dequant_sgemm);
+        owner.arch_config.modern_bert.laya.?.head_layers = saved;
+        stale.deinit();
+        try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, pin.controller().snapshot());
+    }
+    // Genuine total-floor denial is still pre-math; it never becomes an
+    // uncharged legacy request merely because the optional bank was denied.
+    const saved_policy = session.run_admission.?;
+    session.run_admission.?.limits.host_limit_bytes = floor.host_scratch_bytes - 1;
+    defer session.run_admission = saved_policy;
+    var denied_source = Source{};
+    defer denied_source.deinit();
+    const before_denied = native_mod.nativeQuantDispatchStatsForTest().dequant_sgemm;
+    try std.testing.expectError(error.ResourceLimitExceeded, denied_source.initBeforeExecutionInto(session, session, session.execution_gate, .{ .host = inputs }, request, null, .resident_transient, a, .{ .native_call_policy = .in_process }));
+    try std.testing.expectEqual(before_denied, native_mod.nativeQuantDispatchStatsForTest().dequant_sgemm);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, pin.controller().snapshot());
+    session.run_admission = saved_policy;
+    session.close();
+    session_live = false;
+    try std.testing.expect(!probe.violation and probe.calls > 0);
+}
+
+test "actual unpacked Native Laya Q8 declared MAX preserves original outputs exactcap and oldcap fallback" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const synthetic = @import("../util/laya_synthetic.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    try synthetic.writeModelWith(a, std.testing.io, path, null, ",\"weight_quantization\":\"q8_0\"", 128, 717);
+    var reference_session = try createNativeSession(a, path);
+    var reference_live = true;
+    defer if (reference_live) reference_session.close();
+    const ids = Tensor{ .data = @constCast(std.mem.sliceAsBytes(@as([]const i64, &.{ 2, 5, 4, 7, 4, 3 }))), .shape = &.{ 1, 6 }, .dtype = .i64, .name = "input_ids", .allocator = a, .owns_data = false, .owns_shape = false };
+    const mask = Tensor{ .data = @constCast(std.mem.sliceAsBytes(@as([]const i64, &.{ 1, 1, 1, 1, 1, 1 }))), .shape = &.{ 1, 6 }, .dtype = .i64, .name = "attention_mask", .allocator = a, .owns_data = false, .owns_shape = false };
+    const kind = Tensor{ .data = @constCast(std.mem.sliceAsBytes(@as([]const i64, &.{0}))), .shape = &.{ 1, 1 }, .dtype = .i64, .name = "kind", .allocator = a, .owns_data = false, .owns_shape = false };
+    const markers = Tensor{ .data = @constCast(std.mem.sliceAsBytes(@as([]const i64, &.{ 2, 4 }))), .shape = &.{ 1, 2 }, .dtype = .i64, .name = "markers", .allocator = a, .owns_data = false, .owns_shape = false };
+    const inputs = [_]Tensor{ ids, mask, kind, markers };
+    const original: *ArchSession = @ptrCast(@alignCast(reference_session.ptr));
+    const reference = try archRunImpl(original, &inputs, a, .{ .native_call_policy = .in_process });
+    defer {
+        for (reference) |*value| value.deinit();
+        a.free(reference);
+    }
+    const geometry = (try @import("../models/laya.zig").unpackedMatrixScratchGeometry(original.arch_config.modern_bert.laya.?, original.arch_config.modern_bert, 1, 6)).?;
+    reference_session.close();
+    reference_live = false;
+    try nativeLayaMatrixBankCase(a, path, &inputs, reference, geometry.bytes, true);
+    try nativeLayaMatrixBankCase(a, path, &inputs, reference, geometry.bytes - 1, false);
+    try nativeLayaMatrixBankCase(a, path, &inputs, reference, 0, false);
 }

@@ -19,6 +19,13 @@ const std = @import("std");
 const ml = @import("ml");
 const CT = @import("../graph/backend_contracts.zig").CT;
 
+/// Exact MAX span for synchronous matrix work. The caller supplies selected
+/// role cardinality; model interpretation and execution policy remain adapters.
+pub const NativeMatrixScratchGeometry = struct {
+    bytes: usize = 0,
+    matrix_roles: usize = 0,
+};
+
 pub const Unary = enum { negate, sqrt, rsqrt, exp, log, sin, cos, tanh, erf, abs, gelu, gelu_exact, relu, silu };
 pub const Binary = enum { add, subtract, multiply, divide };
 pub const Linear = struct {

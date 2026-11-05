@@ -1863,6 +1863,7 @@ pub const DetachedDenseF32Payload = struct {
 /// It is not a model/family classifier, cache publication or quota capability.
 pub const NativeLinearPreparation = struct {
     pub const Kind = enum { single_no_bias, single_bias, pair_no_bias, pair_bias, triple_bias };
+    matrix_scratch_allowed: bool = true,
     kind: Kind,
     input: CT,
     weights: [3]?CT = @splat(null),
@@ -1878,9 +1879,11 @@ pub const NativeLinearPreparation = struct {
         };
     }
 };
-/// Value-only synchronous selected-layout receipt. This grants no quota and
-/// owns no buffer. Original transient-scratch choices require a declared bank.
+/// Synchronous selected-layout receipt. It owns no quota or buffer. The
+/// optional span borrows the actual caller's separately declared MAX bank.
 pub const NativeLinearPrepared = struct {
+    /// Borrowed SAME Source physical bank, valid for this synchronous call only.
+    matrix_scratch: ?[]f32 = null,
     policy_signature: u64,
     selected_mask: u3 = 0,
     ready_mask: u3 = 0,
@@ -4072,7 +4075,7 @@ pub const ComputeBackend = struct {
         in_dim: usize,
         out_dim: usize,
     ) !CT {
-        const request = NativeLinearPreparation{ .kind = .single_bias, .input = input, .weights = .{ base_weight, null, null }, .biases = .{ bias, null, null }, .rows = rows, .in_dim = in_dim, .out_dim = out_dim };
+        const request = NativeLinearPreparation{ .matrix_scratch_allowed = false, .kind = .single_bias, .input = input, .weights = .{ base_weight, null, null }, .biases = .{ bias, null, null }, .rows = rows, .in_dim = in_dim, .out_dim = out_dim };
         if (try self.prepareNativeLinear(&request)) |receipt| {
             const run = self.vtable.cold_cleanup_services.?.linear_lora_prepared orelse return error.UnsupportedNativeWeightPreparation;
             return run(self, &request, &receipt, lora_a, lora_b, alpha, rank, self.call_context.?.cleanup);

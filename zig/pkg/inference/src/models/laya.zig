@@ -393,21 +393,34 @@ pub fn validateReader(reader: *const @import("safetensors.zig").MMapReader, cfg:
 
 /// Shared inventory checks for native readers and browser-owned tensor metadata.
 pub fn validateTensorInventory(reader: anytype, cfg: Config, encoder: anytype) !void {
-    const Check = struct {
-        fn tensor(r: @TypeOf(reader), name: []const u8, shape: []const i64) !void {
-            const meta = r.header.tensors.get(name) orelse return error.InvalidLayaWeights;
+    const Validator = struct {
+        source: @TypeOf(reader),
+
+        pub fn tensor(self: @This(), name: []const u8, shape: []const i64) !void {
+            const meta = self.source.header.tensors.get(name) orelse return error.InvalidLayaWeights;
             if (!std.mem.eql(i64, meta.shape, shape)) return error.InvalidLayaWeights;
             switch (meta.dtype) {
                 .f32, .f16, .bf16 => {},
                 else => return error.InvalidLayaWeights,
             }
         }
-        fn pair(r: @TypeOf(reader), prefix: []const u8, input: i64, output: i64) !void {
+    };
+    return visitTensorInventory(Validator{ .source = reader }, cfg, encoder);
+}
+
+/// The actual checkpoint roles, shared by validation and cold physical planning.
+/// Visitors borrow names and shapes only for the synchronous callback.
+pub fn visitTensorInventory(visitor: anytype, cfg: Config, encoder: anytype) !void {
+    const Check = struct {
+        fn tensor(r: @TypeOf(visitor), name: []const u8, shape: []const i64) !void {
+            try r.tensor(name, shape);
+        }
+        fn pair(r: @TypeOf(visitor), prefix: []const u8, input: i64, output: i64) !void {
             var buf: [256]u8 = undefined;
             try tensor(r, try std.fmt.bufPrint(&buf, "{s}.weight", .{prefix}), &.{ output, input });
             try tensor(r, try std.fmt.bufPrint(&buf, "{s}.bias", .{prefix}), &.{output});
         }
-        fn norm(r: @TypeOf(reader), prefix: []const u8, dim: i64, bias: bool) !void {
+        fn norm(r: @TypeOf(visitor), prefix: []const u8, dim: i64, bias: bool) !void {
             var buf: [256]u8 = undefined;
             try tensor(r, try std.fmt.bufPrint(&buf, "{s}.weight", .{prefix}), &.{dim});
             if (bias) try tensor(r, try std.fmt.bufPrint(&buf, "{s}.bias", .{prefix}), &.{dim});
@@ -415,44 +428,93 @@ pub fn validateTensorInventory(reader: anytype, cfg: Config, encoder: anytype) !
     };
     const d: i64 = encoder.hidden_size;
     const f: i64 = encoder.intermediate_size;
-    try Check.tensor(reader, "encoder.embeddings.tok_embeddings.weight", &.{ encoder.vocab_size, d });
-    try Check.norm(reader, "encoder.embeddings.norm", d, false);
-    try Check.norm(reader, "encoder.final_norm", d, false);
+    try Check.tensor(visitor, "encoder.embeddings.tok_embeddings.weight", &.{ encoder.vocab_size, d });
+    try Check.norm(visitor, "encoder.embeddings.norm", d, false);
+    try Check.norm(visitor, "encoder.final_norm", d, false);
     var name: [128]u8 = undefined;
     for (0..encoder.num_hidden_layers) |layer| {
-        if (layer > 0) try Check.norm(reader, try std.fmt.bufPrint(&name, "encoder.layers.{d}.attn_norm", .{layer}), d, false);
-        try Check.norm(reader, try std.fmt.bufPrint(&name, "encoder.layers.{d}.mlp_norm", .{layer}), d, false);
-        try Check.tensor(reader, try std.fmt.bufPrint(&name, "encoder.layers.{d}.attn.Wqkv.weight", .{layer}), &.{ d * 3, d });
-        try Check.tensor(reader, try std.fmt.bufPrint(&name, "encoder.layers.{d}.attn.Wo.weight", .{layer}), &.{ d, d });
-        try Check.tensor(reader, try std.fmt.bufPrint(&name, "encoder.layers.{d}.mlp.Wi.weight", .{layer}), &.{ f * 2, d });
-        try Check.tensor(reader, try std.fmt.bufPrint(&name, "encoder.layers.{d}.mlp.Wo.weight", .{layer}), &.{ d, f });
+        if (layer > 0) try Check.norm(visitor, try std.fmt.bufPrint(&name, "encoder.layers.{d}.attn_norm", .{layer}), d, false);
+        try Check.norm(visitor, try std.fmt.bufPrint(&name, "encoder.layers.{d}.mlp_norm", .{layer}), d, false);
+        try Check.tensor(visitor, try std.fmt.bufPrint(&name, "encoder.layers.{d}.attn.Wqkv.weight", .{layer}), &.{ d * 3, d });
+        try Check.tensor(visitor, try std.fmt.bufPrint(&name, "encoder.layers.{d}.attn.Wo.weight", .{layer}), &.{ d, d });
+        try Check.tensor(visitor, try std.fmt.bufPrint(&name, "encoder.layers.{d}.mlp.Wi.weight", .{layer}), &.{ f * 2, d });
+        try Check.tensor(visitor, try std.fmt.bufPrint(&name, "encoder.layers.{d}.mlp.Wo.weight", .{layer}), &.{ d, f });
     }
     if (cfg.format == .opendecider) {
-        try Check.pair(reader, "scorer.0", d, d);
-        try Check.norm(reader, "scorer.2", d, true);
-        try Check.pair(reader, "scorer.3", d, 1);
+        try Check.pair(visitor, "scorer.0", d, d);
+        try Check.norm(visitor, "scorer.2", d, true);
+        try Check.pair(visitor, "scorer.3", d, 1);
         return;
     }
-    try Check.tensor(reader, "type_emb.weight", &.{ 3, d });
-    try Check.norm(reader, "scorer.0", d, true);
-    try Check.pair(reader, "scorer.1", d, d);
-    try Check.pair(reader, "scorer.3", d, 1);
+    try Check.tensor(visitor, "type_emb.weight", &.{ 3, d });
+    try Check.norm(visitor, "scorer.0", d, true);
+    try Check.pair(visitor, "scorer.1", d, d);
+    try Check.pair(visitor, "scorer.3", d, 1);
     if (cfg.decision_head == .pointer) {
-        try Check.norm(reader, "pointer.norm", d, true);
-        try Check.pair(reader, "pointer.q", d, @intCast(cfg.pointer_dim));
-        try Check.pair(reader, "pointer.k", d, @intCast(cfg.pointer_dim));
+        try Check.norm(visitor, "pointer.norm", d, true);
+        try Check.pair(visitor, "pointer.q", d, @intCast(cfg.pointer_dim));
+        try Check.pair(visitor, "pointer.k", d, @intCast(cfg.pointer_dim));
     }
-    try Check.pair(reader, "act_head.0", d + 4, 256);
-    try Check.pair(reader, "act_head.2", 256, @intCast(cfg.n_act));
+    try Check.pair(visitor, "act_head.0", d + 4, 256);
+    try Check.pair(visitor, "act_head.2", 256, @intCast(cfg.n_act));
     for (0..cfg.head_layers) |layer| {
-        try Check.tensor(reader, try std.fmt.bufPrint(&name, "head.layers.{d}.self_attn.in_proj_weight", .{layer}), &.{ d * 3, d });
-        try Check.tensor(reader, try std.fmt.bufPrint(&name, "head.layers.{d}.self_attn.in_proj_bias", .{layer}), &.{d * 3});
-        try Check.pair(reader, try std.fmt.bufPrint(&name, "head.layers.{d}.self_attn.out_proj", .{layer}), d, d);
-        try Check.pair(reader, try std.fmt.bufPrint(&name, "head.layers.{d}.linear1", .{layer}), d, d * 4);
-        try Check.pair(reader, try std.fmt.bufPrint(&name, "head.layers.{d}.linear2", .{layer}), d * 4, d);
-        try Check.norm(reader, try std.fmt.bufPrint(&name, "head.layers.{d}.norm1", .{layer}), d, true);
-        try Check.norm(reader, try std.fmt.bufPrint(&name, "head.layers.{d}.norm2", .{layer}), d, true);
+        try Check.tensor(visitor, try std.fmt.bufPrint(&name, "head.layers.{d}.self_attn.in_proj_weight", .{layer}), &.{ d * 3, d });
+        try Check.tensor(visitor, try std.fmt.bufPrint(&name, "head.layers.{d}.self_attn.in_proj_bias", .{layer}), &.{d * 3});
+        try Check.pair(visitor, try std.fmt.bufPrint(&name, "head.layers.{d}.self_attn.out_proj", .{layer}), d, d);
+        try Check.pair(visitor, try std.fmt.bufPrint(&name, "head.layers.{d}.linear1", .{layer}), d, d * 4);
+        try Check.pair(visitor, try std.fmt.bufPrint(&name, "head.layers.{d}.linear2", .{layer}), d * 4, d);
+        try Check.norm(visitor, try std.fmt.bufPrint(&name, "head.layers.{d}.norm1", .{layer}), d, true);
+        try Check.norm(visitor, try std.fmt.bufPrint(&name, "head.layers.{d}.norm2", .{layer}), d, true);
     }
+}
+
+/// One synchronous dequantization span reused by the unpacked encoder/head.
+/// This is a MAX over the same reachable checkpoint roles, never a layer sum.
+/// Actual receiver/storage attestation remains the caller's responsibility.
+pub const MatrixScratchGeometry = @import("../ops/kernel_descriptor.zig").NativeMatrixScratchGeometry;
+pub fn unpackedMatrixScratchGeometry(cfg: Config, encoder: anytype, batch: usize, sequence: usize) !?MatrixScratchGeometry {
+    if (cfg.packing.enabled() or cfg.weight_quantization != .q8_0 or batch == 0 or sequence == 0 or sequence > cfg.max_len or encoder.lora_rank != 0 or encoder.checkpoint_layout != .huggingface_fused_qkv_no_bias or encoder.hidden_size < 64 or encoder.hidden_size % 64 != 0 or encoder.num_hidden_layers == 0) return null;
+    const Count = struct {
+        value: MatrixScratchGeometry = .{},
+        pub fn tensor(self: *@This(), name: []const u8, shape: []const i64) !void {
+            if (!quantizedLinear(name)) return;
+            if (shape.len != 2 or shape[0] <= 0 or shape[1] <= 0) return error.InvalidLayaWeights;
+            const rows = std.math.cast(usize, shape[0]) orelse return error.ResourceLimitExceeded;
+            const columns = std.math.cast(usize, shape[1]) orelse return error.ResourceLimitExceeded;
+            const elements = std.math.mul(usize, rows, columns) catch return error.ResourceLimitExceeded;
+            const bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return error.ResourceLimitExceeded;
+            self.value.bytes = @max(self.value.bytes, bytes);
+            self.value.matrix_roles = std.math.add(usize, self.value.matrix_roles, 1) catch return error.ResourceLimitExceeded;
+        }
+    };
+    var count = Count{};
+    try visitTensorInventory(&count, cfg, encoder);
+    return if (count.value.bytes == 0) null else count.value;
+}
+
+test "laya unpacked matrix MAX uses actual checkpoint roles and positive work" {
+    const encoder = @import("../architectures/modern_bert_config.zig").Config{
+        .hidden_size = 64,
+        .intermediate_size = 192,
+        .num_hidden_layers = 2,
+        .num_attention_heads = 4,
+        .checkpoint_layout = .huggingface_fused_qkv_no_bias,
+    };
+    var cfg = Config{ .weight_quantization = .q8_0, .head_layers = 2 };
+    const selected = (try unpackedMatrixScratchGeometry(cfg, encoder, 1, 3)).?;
+    try std.testing.expectEqual(@as(usize, 16), selected.matrix_roles);
+    try std.testing.expectEqual(@as(usize, 2 * 192 * 64 * 4), selected.bytes);
+    try std.testing.expectEqualDeep(selected, (try unpackedMatrixScratchGeometry(cfg, encoder, 8, 512)).?);
+    try std.testing.expectEqual(@as(?MatrixScratchGeometry, null), try unpackedMatrixScratchGeometry(cfg, encoder, 0, 3));
+    try std.testing.expectEqual(@as(?MatrixScratchGeometry, null), try unpackedMatrixScratchGeometry(cfg, encoder, 1, 0));
+    cfg.format = .opendecider;
+    cfg.head_layers = 0;
+    try std.testing.expectEqual(@as(usize, 8), (try unpackedMatrixScratchGeometry(cfg, encoder, 1, 3)).?.matrix_roles);
+    cfg.weight_quantization = .none;
+    try std.testing.expectEqual(@as(?MatrixScratchGeometry, null), try unpackedMatrixScratchGeometry(cfg, encoder, 1, 3));
+    cfg.weight_quantization = .q8_0;
+    cfg.packing.mode = .question;
+    try std.testing.expectEqual(@as(?MatrixScratchGeometry, null), try unpackedMatrixScratchGeometry(cfg, encoder, 1, 3));
 }
 
 test "laya weight quantization covers encoder and head linears only" {
