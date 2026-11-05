@@ -1674,7 +1674,7 @@ test "decision functions native generated batches pack decoded pixel limits and 
         \\{"answer":{"type":"choice","instructions":"Compare concepts","criteria":{"same":"Same entity","different":"Distinct entities"}}}
     , .{});
     const raw = try std.json.parseFromSliceLeaky(decisions.Json, scratch,
-        \\[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAEAAAAB"}]}]
+        \\[{"role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAEAAAAB"}]}]
     , .{});
     const parts = raw.array.items[0].object.getPtr("content").?;
     const image = parts.array.items[0];

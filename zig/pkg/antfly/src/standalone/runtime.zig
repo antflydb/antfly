@@ -6017,6 +6017,7 @@ pub fn runFromIterator(
             .inference_api_key = if (loaded_config) |*cfg| if (cfg.inference.api_key) |value| value else null else null,
             .extension_package_store_dir = resolved.extension_package_store_dir,
             .node_config = if (loaded_config) |*cfg| cfg else null,
+            .native_retained_cuts = lite_path == null,
             .native_lake_artifact_base_dir = data_dir,
             .backup_staging_root = data_dir,
             .user_manager = if (user_manager) |*manager| manager else null,
@@ -9826,7 +9827,7 @@ test "standalone runtime local generator accepts media url data uris" {
         .content = .{ .parts = &.{
             .{ .text = "describe" },
             .{ .media = .{
-                .url = "DATA:IMAGE/PNG;BASE64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD",
+                .url = "DATA:IMAGE/PNG;BASE64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD",
                 .mime_type = "image/png",
             } },
         } },
@@ -9842,6 +9843,7 @@ test "standalone runtime local generator accepts media url data uris" {
     try std.testing.expectEqual(@as(usize, 1), message.image_bytes.?.len);
     var expected = @as([24]u8, @splat(0));
     @memcpy(expected[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(expected[12..16], "IHDR");
     std.mem.writeInt(u32, expected[16..20], 2, .big);
     std.mem.writeInt(u32, expected[20..24], 3, .big);
     try std.testing.expectEqualSlices(u8, &expected, message.image_bytes.?[0]);
@@ -10114,14 +10116,14 @@ test "standalone runtime local generator preflights mixed resident media exactly
                 .data = "AQID",
                 .mime_type = "audio/wav",
             } },
-            .{ .image_url = .{ .url = "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD" } },
+            .{ .image_url = .{ .url = "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD" } },
         } },
     }};
 
     const preflight = try inference_host.preflightLocalGenerateMessages(&messages);
     try std.testing.expectEqual(@as(usize, "listen".len), preflight.text_bytes);
     try std.testing.expectEqual(
-        @as(usize, "AQID".len + "data:image/png;base64,iVBORw0KGgoAAAAAAAAAAAAAAAIAAAAD".len),
+        @as(usize, "AQID".len + "data:image/png;base64,iVBORw0KGgoAAAAASUhEUgAAAAIAAAAD".len),
         preflight.encoded_media_bytes,
     );
     try std.testing.expectEqual(@as(usize, 27), preflight.decoded_media_bytes);

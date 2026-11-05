@@ -913,8 +913,17 @@ portable `compute_75` PTX.
 in normal builds). `cuda` is a first-class graph/backend contract:
 `BackendKind.cuda`, `TensorStorageClass.cuda_buffer`, and partition/runtime
 parsing for `"cuda"`. `cuda` is one of the session backend ordering options,
-CLI choices, and `--backend cuda` is validated explicitly. The default `auto`
-order does not include CUDA.
+CLI choices, and `--backend cuda` is validated explicitly. In a CUDA build, the
+default `auto` order leads with CUDA when a device initializes on this machine,
+probed once per execution process, and falls back to Metal and the CPU for models CUDA cannot
+load. Preference construction and proxy-side discovery never initialize a device;
+probing happens at model load, after checking the host's native-call isolation policy.
+Without a usable device, `auto` keeps the ordinary fallback order. Set
+`ANTFLY_INFERENCE_PREFERRED_BACKEND=native` to opt out.
+The native generation CLI checks load budgets for each resolved backend before
+constructing its session, including draft models. `auto` uses CUDA's weight tier
+and residency estimate when CUDA is selected; CPU fallback uses the host tier.
+Budget rejection follows the model loader's fallback and CUDA A4B safety policy.
 
 ### Capability probe
 
@@ -1116,8 +1125,8 @@ CUDA meets its minimal-usefulness bar:
 
 ## Open work
 
-- Promote `-Dcuda=true` to the default `auto` backend order once broader
-  hardware validation lands.
+- Enable `-Dcuda=true` in default source builds once broader hardware validation
+  lands. Release archives already enable it.
 - Promote `polar4` KV to the CUDA default after an explicit quality/parity
   acceptance gate (E2B f32/polar4 output currently diverges).
 - `turbo3` KV remains experimental; needs a faster or higher-quality path

@@ -2578,7 +2578,7 @@ fn dupeOptionalStringField(alloc: Allocator, object: std.json.ObjectMap, field: 
     return try alloc.dupe(u8, value.string);
 }
 
-pub const native_text_extraction_identity = "native-text-v5";
+pub const native_text_extraction_identity = "native-text-v6";
 
 pub fn metadataFingerprintAlloc(
     alloc: Allocator,
