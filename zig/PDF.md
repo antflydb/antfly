@@ -1915,15 +1915,39 @@ Container arrays, ancestor decisions, stream container keys, and decoded owner
 text are reused within each page. MCIDs, number-tree keys, Limits endpoints,
 and root type names use the same bounded, memoized resolver for direct and
 indirect values. Unassigned ParentTree slots treat direct and indirect null
-equally; parent links still require real structure elements. Named property tables are
-sorted once per resource scope and searched in logarithmic time, without
-allocating a separate lookup table or scanning all properties for each BDC.
+equally; parent links still require real structure elements. Named property
+lookups at BDC remain logarithmic. Sparse scopes select names through a shared
+dictionary index; dense scopes reuse its sorted order in one pass.
 Named replacement strings retain their encoded bytes and decode only when
 selected. A bounded page-local cache shares each decoded string, including
-indirect values; overridden malformed properties are never decoded or resolved.
+indirect values; overridden replacement values are never decoded or resolved.
+Indirect resource and property dictionaries are retained once per page. Form
+records borrow their raw strings, and property-name indexes are sorted once per
+dictionary. Repeated Form scopes cannot multiply a shared replacement's storage.
+The resource cache retains recognized resource fields and only MCID/ActualText
+from property dictionaries. Unknown payloads are released with temporary parsing
+storage rather than accumulating in the cache. Temporary per-object parsing and
+retained metadata share one live-byte ceiling, with separate cumulative-allocation
+allowances. Required fields from indirect resources retain only a small source
+reference for Properties; the optional table is projected on first selected use.
+Inherited resource references preserve this behavior. Direct table retention that
+exceeds its allowance becomes an invalid optional value, diagnosed only if used.
+Indirect property tables and dictionaries are resolved only when a selected
+scope needs them; overridden scopes do not read their object streams.
+The syntax scanner transfers owned string/name tokens into objects, avoiding a
+second full payload allocation while an object stream remains decoded.
+Selected missing or malformed property dictionaries retain native glyph text and
+report incomplete ActualText, including when selected optional metadata exceeds
+a decode or allocation allowance. Actual allocator failures and cancellation
+propagate; overridden scopes do not report irrelevant metadata errors. Cache
+allocations classify quota failures at their own boundary and consume rejection
+state during recovery. Caller allocation failures never use ambient cache flags,
+so a previous optional quota rejection cannot turn a later OOM into page loss.
+UTF-16 text-string BOM detection precedes payload-length validation, so odd or
+truncated replacements use the same explicit fallback as invalid surrogate pairs.
 Optional null ActualText, MCID, Pg, and Stm values behave like omitted entries.
 Known current-page references preserve identity without cloning page resources.
-Retained metadata and page-local lookup allocations share
+Retained structure metadata and page-local structure lookup allocations share
 one live-byte allowance. ParentTree bindings are checked against the owner's declared
 content. An outer replacement wins over its descendants; repeated MCIDs owned
 by the same replacement merge paint evidence and emit text once, preserving

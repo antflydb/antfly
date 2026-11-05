@@ -11970,8 +11970,9 @@ const RuntimePdfPageTextSpool = struct {
 
     fn keyAlloc(self: *@This(), alloc: Allocator, page: usize) ![]u8 {
         try self.scheduler.ensureSpool();
-        return std.fmt.allocPrint(alloc, "{s}page-text-v2:{x}:{s}:{d}:{d}:{d}", .{
+        return std.fmt.allocPrint(alloc, "{s}page-text-v3:{s}:{x}:{s}:{d}:{d}:{d}", .{
             self.scheduler.spool_root.?,
+            document_extraction_mod.native_text_extraction_identity,
             self.digest,
             @tagName(self.policy),
             self.limits.max_decoded_stream_bytes,
