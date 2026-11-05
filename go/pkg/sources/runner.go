@@ -780,6 +780,9 @@ func (c *driveMediaConnector) Enumerate(ctx context.Context, request Request) (I
 		item.Metadata["original_mime_type"] = original
 		item.Metadata["export_mime_type"] = "application/pdf"
 		item.Metadata["mime_type"] = "application/pdf"
+		if request.Preview {
+			continue
+		} // Review descriptors without exporting originals.
 		data, err := c.GoogleConnector.Read(ctx, request, *item)
 		if err != nil {
 			return Inventory{}, err

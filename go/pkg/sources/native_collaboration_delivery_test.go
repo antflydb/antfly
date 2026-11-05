@@ -17,6 +17,7 @@ package sources
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -206,4 +207,93 @@ func TestNativeCollaborationDeliveryUsesSelectedAttachment(t *testing.T) {
 		require.Error(t, err)
 		require.Zero(t, downloads)
 	})
+}
+
+func TestNativePreviewReturnsAttachmentDescriptorsWithoutAcquisition(t *testing.T) {
+	calls := 0
+	c := &CollaborationConnector{ProviderName: ProviderSlack, NativeAttachments: true,
+		Extractor: func(context.Context, string, string, []byte) ([]byte, error) {
+			calls++
+			return nil, fmt.Errorf("unexpected extraction")
+		},
+		DownloadTransport: collaborationTransport(func(*http.Request) (*http.Response, error) { calls++; return nil, fmt.Errorf("unexpected download") }),
+	}
+	items, err := c.materialItems(t.Context(), Request{SourceNamespace: "preview/test", Preview: true}, CollaborationConfig{Attachments: true}, collaborationRef{Resource: "slack", Container: "C1", ID: "1"}, collaborationMaterial{Text: []byte("message"), Files: []collaborationFile{{ID: "audio", Name: "interview.wav", MIME: "audio/wav", URL: "https://files.example/audio"}}})
+	require.NoError(t, err)
+	require.Len(t, items, 2)
+	require.Equal(t, "message", string(items[0].Bytes))
+	require.Empty(t, items[1].Bytes)
+	require.Equal(t, "audio", items[1].Metadata["attachment_id"])
+	require.Equal(t, "audio/wav", items[1].Metadata["mime_type"])
+	require.Zero(t, calls)
+}
+
+func TestNativeParentTextReadDoesNotAcquireAttachments(t *testing.T) {
+	f := newWorkspaceRunnerFixture(t)
+	connector, err := f.runner.Factory(t.Context(), f.runner.Profile.Connections["docs"])
+	require.NoError(t, err)
+	c := connector.(*CollaborationConnector)
+	c.NativeAttachments = true
+	base := c.HTTPClient.Transport
+	unavailable, changed, revoked := false, false, false
+	downloads := 0
+	c.HTTPClient = &http.Client{Transport: collaborationTransport(func(r *http.Request) (*http.Response, error) {
+		if strings.Contains(r.URL.Path, "/attachments/") {
+			downloads++
+			if unavailable {
+				return &http.Response{StatusCode: 503, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+			}
+		}
+		if revoked && r.URL.Path == "/gmail/messages/message1" {
+			return &http.Response{StatusCode: 403, Header: http.Header{}, Body: io.NopCloser(strings.NewReader(`{}`)), Request: r}, nil
+		}
+		response, err := base.RoundTrip(r)
+		if err != nil {
+			return nil, err
+		}
+		if r.URL.Path == "/gmail/messages/message1" {
+			data, err := io.ReadAll(response.Body)
+			response.Body.Close()
+			require.NoError(t, err)
+			var message map[string]any
+			require.NoError(t, json.Unmarshal(data, &message))
+			parts := message["payload"].(map[string]any)["parts"].([]any)
+			parts[1].(map[string]any)["mimeType"] = "image/png"
+			parts[1].(map[string]any)["filename"] = "original.png"
+			if changed {
+				parts[0].(map[string]any)["body"] = map[string]any{"data": base64.RawURLEncoding.EncodeToString([]byte("changed"))}
+			}
+			data, err = json.Marshal(message)
+			require.NoError(t, err)
+			response.Body = io.NopCloser(bytes.NewReader(data))
+		}
+		return response, nil
+	})}
+	request := Request{Mode: ImportModeSource, SourceNamespace: "job/" + testSourceID, Config: f.runner.Profile.Sources[0].Config}
+	first, err := c.Enumerate(t.Context(), request)
+	require.NoError(t, err)
+	c.Baseline = &first
+	downloads = 0
+	next, err := c.Enumerate(t.Context(), request)
+	require.NoError(t, err)
+	var parent Item
+	for _, item := range next.Objects {
+		if configString(item.Metadata, "attachment_id") == "" {
+			parent = item
+			break
+		}
+	}
+	unavailable = true
+	data, err := c.Read(t.Context(), request, parent)
+	require.NoError(t, err)
+	require.Contains(t, string(data), "body")
+	require.Zero(t, downloads, "parent-text reads must not depend on sibling byte delivery")
+	changed = true
+	_, err = c.Read(t.Context(), request, parent)
+	var revision *RevisionChangedError
+	require.ErrorAs(t, err, &revision)
+	changed, revoked = false, true
+	_, err = c.Read(t.Context(), request, parent)
+	require.Error(t, err, "revoked parents remain inaccessible")
+	require.Zero(t, downloads)
 }

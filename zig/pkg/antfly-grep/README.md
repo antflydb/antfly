@@ -880,7 +880,15 @@ Do not certify partial or stale term arrays.
 
 The CLI selects at most eight necessary grams per proven case-sensitive literal
 or mandatory regex substring. Up to 64 alternatives are combined with OR, then
-intersected with any user filter. Every alternative must supply a substring of
+intersected with any user filter. Certificate and gram membership use exact
+indexed terms in the text query; source and ACL filters remain independent.
+Certificate size does not consume the original-value JSON traversal budget.
+Required indexed candidates bound content verification before source reads;
+optional OR branches do not exclude their siblings. An unbound native-original
+completeness check can still require metadata verification across the source
+selection. Explicit `--artifact source` selects only inline text; configured
+artifact streams provide their own readiness checks.
+Every alternative must supply a substring of
 at least three bytes; otherwise the entire query falls back to an exact scan.
 All returned content is verified with the shared matcher. Missing certificates
 use the exact-scan fallback. Queries needing nonmatching files, inverted selection,
