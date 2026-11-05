@@ -345,12 +345,17 @@ pub fn managedModelRequestNameAlloc(
 /// The immutable revision comes from the resolved commit, never a moving ref.
 /// All returned memory belongs to allocator (normally a request arena).
 pub fn managedModelSelectorsAlloc(allocator: std.mem.Allocator, io: Io, model_dir: []const u8) ![]const []const u8 {
-    var receipt = (try managed_receipt.loadValidated(allocator, io, model_dir)) orelse return &.{};
+    var receipt = (managed_receipt.loadValidated(allocator, io, model_dir) catch |err| {
+        // Candidate-local publication failures must not hide healthy models.
+        // Allocation and operational I/O failures remain actionable.
+        if (manifest_mod.isListingCandidateRejection(err)) return &.{};
+        return err;
+    }) orelse return &.{};
     defer receipt.deinit();
     if (receipt.parsed.value.version != 2) return &.{};
     const source = receipt.parsed.value.source orelse return &.{};
     if (!hubRepoComponentIsSafe(source.owner) or !hubRepoComponentIsSafe(source.name) or !modelVariantIsSafe(source.variant)) return &.{};
-    const selection = try download.parseVariantRevision(source.variant);
+    const selection = download.parseVariantRevision(source.variant) catch return &.{};
     var names = std.ArrayListUnmanaged([]const u8).empty;
     const base = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source.owner, source.name });
     try names.append(allocator, base);

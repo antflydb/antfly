@@ -50166,6 +50166,11 @@ test "model selection discovery advertises only executable unambiguous selectors
     defer a.free(root);
     var node = try Node.init(a, .{ .models_dir = root });
     defer node.deinit();
+    // An interrupted or malformed unrelated installation is not an alias
+    // authority and must not abort discovery for the healthy installation.
+    try tmp.dir.createDirPath(io, "models/generators/acme/broken");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/generators/acme/broken/model.gguf", .data = "decoder" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/generators/acme/broken/.antfly-download-complete.json", .data = "{}" });
     const body = try node.listModelsJsonAlloc(a, io);
     defer a.free(body);
     var catalog = try std.json.parseFromSlice(std.json.Value, a, body, .{});
