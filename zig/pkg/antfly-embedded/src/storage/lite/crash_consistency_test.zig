@@ -28,21 +28,32 @@
 //! crashed run the harness reopens the database with ordinary IO and asks
 //! the scenario to verify invariants.
 //!
-//! `checkCheckpointsAfterCrash` is the reusable invariant checker other
-//! workstreams can call directly from their own tests: given a list of
-//! `Checkpoint`s (a barrier sequence plus the exact key/value state that
-//! must be visible once that barrier is durable) and the `CrashOutcome` from
-//! a sweep run, it reopens the file and asserts:
-//!   - `check()` (full-file integrity) always passes;
-//!   - a checkpoint whose `durable_after_barrier` is at or before the crash
-//!     point is visible with its exact value (no partial/torn value, ever);
-//!   - a checkpoint whose `durable_after_barrier` is after the crash point
-//!     may be visible or absent (both are valid outcomes of "the call never
-//!     returned"), but never with a value from neither its pre- nor its
-//!     post-state.
+//! Crash-consistency semantics are modeled by *API acknowledgement*, not by
+//! counting syncs (counting would break the moment WS1 collapses a commit's
+//! three fsyncs into one, or WS2 adds group commit): a `Scenario.run`
+//! appends one `Checkpoint` immediately *before* attempting each mutating
+//! API call, recording both the state that must already hold (`before`,
+//! whatever the last acknowledged state was) and the state the call is
+//! trying to reach (`after`). Because the checkpoint for operation N+1 is
+//! only ever appended once operation N's call has returned success, a
+//! crashed run's own checkpoint list structurally encodes exactly which
+//! operations were acknowledged in that run: every checkpoint but the last
+//! belongs to a call that returned; the last is the one that was in flight
+//! when the shim's injected fault fired (or, if `scenario.run` completed
+//! without error, every checkpoint is acknowledged and there is no
+//! in-flight one). The checker then asserts:
+//!   - `check()` (full-file integrity, tolerating the benign `tail_bytes`
+//!     issue an uncommitted append always leaves) always passes;
+//!   - every acknowledged checkpoint's `after` state is visible, exactly;
+//!   - the in-flight checkpoint's every key resolves to *either* its
+//!     `before` or its `after` value, consistently across every key in that
+//!     one checkpoint (atomicity), and never anything else (a torn value).
+//!
+//! `checkCheckpointsViaNative`/`checkCheckpointsViaDb` are the reusable
+//! library pieces other workstreams can call directly from their own tests.
 //!
 //! Run with (Debug only; filtered):
-//!   cd zig && zig build unit-test -Dtest-filter=crash_consistency -- --test-filter crash_consistency
+//!   cd zig && zig build antfly-storage-test -Dtest-filter="crash sweep" -- --test-filter "crash sweep"
 //!
 //! `quick` mode (the default; a bounded sample of barriers, a few seconds per
 //! scenario) is meant for routine runs; `exhaustive` mode (every barrier,
@@ -50,13 +61,13 @@
 //! rewritten commit path and can take several minutes.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
 const sim_io = @import("crash_sim_io.zig");
 const native = @import("native.zig");
 const backend = @import("backend.zig");
 const connection = @import("connection.zig");
+const docstore = @import("docstore.zig");
 const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
 
 pub const When = sim_io.When;
@@ -77,23 +88,23 @@ pub const CrashOutcome = struct {
     run_err: anyerror,
 };
 
-pub const Checkpoint = struct {
-    /// The barrier sequence number recorded immediately after the commit
-    /// that durably applied this checkpoint's expectations (i.e.
-    /// `sim.barrierCount()` right after that commit call returned, minus
-    /// one, naming the last barrier that commit crossed).
-    durable_after_barrier: u64,
-    expectations: []const Expectation,
-};
-
 pub const Expectation = struct {
     key: []const u8,
-    /// `null` means the key must be absent (post-delete).
-    value: ?[]const u8,
-    /// When set, this expectation is checked through full-text search
-    /// instead of (or in addition to) primary lookup: the key must be a hit
-    /// for this exact-phrase query against `search_index`/`search_field`.
-    searchable_text: ?[]const u8 = null,
+    /// The state that must already have been visible before this
+    /// operation was attempted (the last acknowledged state for `key`).
+    /// `null` means `key` did not exist yet.
+    before: ?[]const u8,
+    /// The state this operation is trying to reach. `null` means `key`
+    /// becomes absent (a delete).
+    after: ?[]const u8,
+    /// Checked only on the `after` side (required-acknowledged, or
+    /// in-flight resolved to `after`): `key` must be a full-text hit for
+    /// this phrase against the scenario's `search_index`/`search_field`.
+    searchable_after: ?[]const u8 = null,
+};
+
+pub const Checkpoint = struct {
+    expectations: []const Expectation,
 };
 
 pub const Scenario = struct {
@@ -101,13 +112,18 @@ pub const Scenario = struct {
     search_index: []const u8 = "",
     search_field: []const u8 = "",
     /// Runs the scenario's writes against a fresh database at `path` using
-    /// `io` for all storage. Must append one `Checkpoint` per acknowledged
-    /// commit. Must propagate every error, including the shim's injected
-    /// crash error, to the caller.
+    /// `io` for all storage. Must append one `Checkpoint` *before*
+    /// attempting each mutating call (so the checkpoint for an interrupted
+    /// call is still recorded) and must propagate every error, including
+    /// the shim's injected crash error, to the caller.
     run: *const fn (allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void,
     /// True if `run` opens the database through `db_mod.DB` (full-text /
     /// SQL visible); false if it talks to `native.NativeFile` directly.
     via_db: bool = false,
+    /// True if `run` also exercises a journal retirement turn: after the
+    /// normal document/search checks, additionally verify the replay
+    /// journal itself is still structurally readable.
+    retirement: bool = false,
 };
 
 pub const SweepOptions = struct {
@@ -220,8 +236,9 @@ fn runOneCrash(allocator: Allocator, scenario: Scenario, barrier_seq: u64, when:
 
     if (scenario.run(allocator, path, sim.io(), &checkpoints)) {
         // This particular (barrier, when) combination never actually
-        // crashed the scenario (e.g. a later commit short-circuited before
-        // reaching it). Nothing failed; check the fully-completed state.
+        // crashed the scenario (e.g. it has fewer barriers under this
+        // path than the full discovery run). Nothing in flight; check the
+        // fully-completed state.
         try checkInvariants(allocator, scenario, path, null, checkpoints.items, report);
         return;
     } else |err| {
@@ -247,57 +264,134 @@ fn checkInvariants(
     checkpoints: []const Checkpoint,
     report: *SweepReport,
 ) !void {
-    const placeholder = Barrier{ .sequence = if (outcome) |o| o.barrier.sequence else 0, .kind = .file_sync, .path = "" };
+    // `std.math.maxInt(u64)` and `.rename`/empty-path flag "no crash fired
+    // in this run" in a failure report -- distinct from a real barrier 0 --
+    // so a failure found with no crash at all (the uncrashed discovery
+    // pass, or a (barrier, when) pair that never actually interrupted this
+    // scenario) is never confused with one found exactly at barrier 0.
+    const placeholder = if (outcome) |o| o.barrier else Barrier{ .sequence = std.math.maxInt(u64), .kind = .file_sync, .path = "" };
     const when: When = if (outcome) |o| o.when else .after;
     const power_loss: PowerLoss = if (outcome) |o| o.power_loss else .none;
+    const crash_note = if (outcome == null) " [uncrashed run]" else "";
 
     if (scenario.via_db) {
-        checkCheckpointsViaDb(allocator, path, outcome, checkpoints, scenario.search_index, scenario.search_field) catch |err| {
-            try report.fail(placeholder, when, power_loss, "db invariant check failed: {s}", .{@errorName(err)});
+        checkCheckpointsViaDb(allocator, path, outcome, checkpoints, scenario.search_index, scenario.search_field, scenario.retirement) catch |err| {
+            try report.fail(placeholder, when, power_loss, "db invariant check failed: {s}{s}", .{ @errorName(err), crash_note });
         };
     } else {
         checkCheckpointsViaNative(allocator, path, outcome, checkpoints) catch |err| {
-            try report.fail(placeholder, when, power_loss, "native invariant check failed: {s}", .{@errorName(err)});
+            try report.fail(placeholder, when, power_loss, "native invariant check failed: {s}{s}", .{ @errorName(err), crash_note });
         };
     }
 }
 
-/// True if `checkpoint` must be visible given a crash at `outcome` (or
-/// unconditionally, when there was no crash at all).
-fn mustBeVisible(outcome: ?CrashOutcome, checkpoint: Checkpoint) bool {
-    const o = outcome orelse return true;
-    if (o.when == .after) return checkpoint.durable_after_barrier <= o.barrier.sequence;
-    return checkpoint.durable_after_barrier < o.barrier.sequence;
+/// Splits a run's own checkpoint list into the prefix that is fully
+/// acknowledged (every call up to and including the one that produced it
+/// returned success in this run) and, for a crashed run only, the single
+/// trailing checkpoint whose call was in flight when the fault fired. This
+/// needs no barrier/sync counting: the structure of the list itself proves
+/// it, because `Scenario.run` appends a checkpoint before attempting its
+/// call, so reaching checkpoint N+1 is only possible once call N returned.
+const Split = struct {
+    acknowledged: []const Checkpoint,
+    in_flight: ?Checkpoint,
+};
+
+fn splitCheckpoints(outcome: ?CrashOutcome, checkpoints: []const Checkpoint) Split {
+    if (outcome == null or checkpoints.len == 0) {
+        return .{ .acknowledged = checkpoints, .in_flight = null };
+    }
+    return .{
+        .acknowledged = checkpoints[0 .. checkpoints.len - 1],
+        .in_flight = checkpoints[checkpoints.len - 1],
+    };
 }
 
-/// Collapses a chronological checkpoint list into "the last durable
-/// expectation per key", so a key written several times (update, then
-/// update again, then delete; or the same key across concurrent-writer
-/// rounds) is checked against whichever of those writes actually became
-/// durable before the simulated crash, not against every one that was ever
-/// true at some earlier point in the run.
-fn collapseToLastDurable(allocator: Allocator, outcome: ?CrashOutcome, checkpoints: []const Checkpoint) !std.StringHashMapUnmanaged(Expectation) {
-    var last = std.StringHashMapUnmanaged(Expectation).empty;
-    errdefer last.deinit(allocator);
-    for (checkpoints) |cp| {
-        if (!mustBeVisible(outcome, cp)) continue;
-        for (cp.expectations) |exp| try last.put(allocator, exp.key, exp);
+fn valuesEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null or b == null) return a == null and b == null;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn formatValue(v: ?[]const u8) []const u8 {
+    return v orelse "<absent>";
+}
+
+/// Last `after` per key across `acknowledged`, in chronological order (a
+/// key written more than once keeps only its most recent acknowledged
+/// state).
+fn finalAcknowledgedState(allocator: Allocator, acknowledged: []const Checkpoint) !std.StringHashMapUnmanaged(Expectation) {
+    var state = std.StringHashMapUnmanaged(Expectation).empty;
+    errdefer state.deinit(allocator);
+    for (acknowledged) |cp| {
+        for (cp.expectations) |exp| try state.put(allocator, exp.key, exp);
     }
-    return last;
+    return state;
+}
+
+/// True if `in_flight` (when non-null) has an expectation naming `key` --
+/// i.e. `key` is the subject of the operation that was interrupted, so its
+/// allowed values are `{before, after}` rather than a single required
+/// value.
+fn inFlightCovers(in_flight: ?Checkpoint, key: []const u8) bool {
+    const cp = in_flight orelse return false;
+    for (cp.expectations) |exp| {
+        if (std.mem.eql(u8, exp.key, key)) return true;
+    }
+    return false;
+}
+
+/// Checks the in-flight checkpoint (if any): every key must resolve to
+/// exactly its `before` or exactly its `after` value -- never anything
+/// else -- and every key in the same checkpoint must resolve the *same*
+/// way (atomicity of the batch that was in flight). `lookup` reads the
+/// actual current value for one key; errors from it propagate. Frees each
+/// looked-up value via `freeFn` once it has been compared.
+fn checkInFlightResolution(
+    in_flight: Checkpoint,
+    allocator: Allocator,
+    comptime LookupCtx: type,
+    ctx: LookupCtx,
+    comptime lookupFn: fn (LookupCtx, []const u8) anyerror!?[]const u8,
+) !void {
+    var resolution: ?bool = null; // true => resolved to `after`
+    for (in_flight.expectations) |exp| {
+        const got = try lookupFn(ctx, exp.key);
+        defer if (got) |bytes| allocator.free(@constCast(bytes));
+        const matches_after = valuesEqual(got, exp.after);
+        const matches_before = valuesEqual(got, exp.before);
+        if (!matches_after and !matches_before) {
+            std.debug.print(
+                "crash-consistency: torn value key={s} actual={s} allowed_before={s} allowed_after={s}\n",
+                .{ exp.key, formatValue(got), formatValue(exp.before), formatValue(exp.after) },
+            );
+            return error.CrashConsistencyTornWrite;
+        }
+        if (matches_after and matches_before) continue; // uninformative (before == after)
+        if (resolution) |r| {
+            if (r != matches_after) {
+                std.debug.print(
+                    "crash-consistency: batch not atomic key={s} resolved_after={} (another key in the same in-flight checkpoint resolved {})\n",
+                    .{ exp.key, matches_after, r },
+                );
+                return error.CrashConsistencyBatchNotAtomic;
+            }
+        } else resolution = matches_after;
+    }
 }
 
 /// Library entry point other crash tests can call directly: opens the
 /// `.aflite` file at `path` through `native.NativeFile` and checks every
 /// checkpoint's visibility against `outcome` (`null` for an uncrashed run).
 pub fn checkCheckpointsViaNative(allocator: Allocator, path: []const u8, outcome: ?CrashOutcome, checkpoints: []const Checkpoint) !void {
-    var last_durable = try collapseToLastDurable(allocator, outcome, checkpoints);
-    defer last_durable.deinit(allocator);
+    const split = splitCheckpoints(outcome, checkpoints);
+    var required = try finalAcknowledgedState(allocator, split.acknowledged);
+    defer required.deinit(allocator);
 
     var file = native.NativeFile.openWithIo(allocator, std.testing.io, path, .{ .read_only = true }) catch |err| {
-        // A file that never reached a single durable checkpoint may fail to
-        // open at all. That is only acceptable if nothing was ever supposed
-        // to be durable yet.
-        if (last_durable.count() != 0) return err;
+        // Nothing was ever acknowledged yet, so any state -- including an
+        // unopenable file -- is a valid outcome of "the call never
+        // returned".
+        if (required.count() != 0) return err;
         return;
     };
     defer file.close();
@@ -309,34 +403,50 @@ pub fn checkCheckpointsViaNative(allocator: Allocator, path: []const u8, outcome
     // header") expect `issue == "tail_bytes"` with `tail_bytes > 0` for any
     // file carrying uncommitted/aborted tail writes, which is exactly what a
     // crash before a commit's last durable barrier leaves behind on
-    // purpose -- the recovery path is expected to ignore that tail, not
-    // reject it. Only a *different* issue (real structural corruption) is a
-    // crash-consistency finding here; document visibility/atomicity is
-    // checked separately below regardless.
+    // purpose. Only a *different* issue (real structural corruption) is a
+    // crash-consistency finding here.
     if (!report.valid and !std.mem.eql(u8, report.issue orelse "", "tail_bytes")) {
         std.debug.print("crash-consistency: native check() invalid, issue={s}\n", .{report.issue orelse "<none>"});
         return error.CrashConsistencyIntegrityCheckFailed;
     }
 
-    var it = last_durable.valueIterator();
-    while (it.next()) |exp| {
-        const got = try file.getDocumentAlloc(allocator, exp.key);
-        defer if (got) |bytes| allocator.free(bytes);
-        if (exp.value) |want| {
-            if (got) |bytes| {
-                if (!std.mem.eql(u8, bytes, want)) return error.CrashConsistencyTornWrite;
-            } else {
-                return error.CrashConsistencyAcknowledgedWriteLost;
-            }
-        } else if (got != null) {
-            return error.CrashConsistencyDeleteNotDurable;
+    const Lookup = struct {
+        file: *native.NativeFile,
+        allocator: Allocator,
+        fn get(self: @This(), key: []const u8) anyerror!?[]const u8 {
+            return try self.file.getDocumentAlloc(self.allocator, key);
+        }
+    };
+    const lookup_ctx = Lookup{ .file = &file, .allocator = allocator };
+
+    var it = required.iterator();
+    while (it.next()) |entry| {
+        const exp = entry.value_ptr.*;
+        // A key the in-flight checkpoint also names is *not* independently
+        // required to equal this (older) acknowledged value: the in-flight
+        // checkpoint's own before/after range already covers it (`before`
+        // here is exactly that acknowledged value, so nothing is lost by
+        // deferring to that check instead).
+        if (inFlightCovers(split.in_flight, exp.key)) continue;
+        const got = try lookup_ctx.get(exp.key);
+        defer if (got) |bytes| allocator.free(@constCast(bytes));
+        if (!valuesEqual(got, exp.after)) {
+            std.debug.print(
+                "crash-consistency: acknowledged write not visible key={s} want={s} got={s}\n",
+                .{ exp.key, formatValue(exp.after), formatValue(got) },
+            );
+            return error.CrashConsistencyAcknowledgedWriteLost;
         }
     }
+
+    if (split.in_flight) |cp| try checkInFlightResolution(cp, allocator, Lookup, lookup_ctx, Lookup.get);
 }
 
 /// Library entry point for scenarios that go through `db_mod.DB` (full-text
 /// visible writes). Mirrors `checkCheckpointsViaNative` but also verifies
-/// full-text searchability for checkpoints that name `searchable_text`.
+/// full-text searchability for checkpoints that name `searchable_after`,
+/// and optionally (for `retirement` scenarios) that the replay journal is
+/// still structurally readable afterward.
 pub fn checkCheckpointsViaDb(
     allocator: Allocator,
     path: []const u8,
@@ -344,43 +454,158 @@ pub fn checkCheckpointsViaDb(
     checkpoints: []const Checkpoint,
     search_index: []const u8,
     search_field: []const u8,
+    retirement: bool,
 ) !void {
-    var last_durable = try collapseToLastDurable(allocator, outcome, checkpoints);
-    defer last_durable.deinit(allocator);
+    const split = splitCheckpoints(outcome, checkpoints);
+    var required = try finalAcknowledgedState(allocator, split.acknowledged);
+    defer required.deinit(allocator);
 
     var handle = openDbWithIo(allocator, path, std.testing.io, false) catch |err| {
-        if (last_durable.count() != 0) return err;
+        if (required.count() != 0) return err;
         return;
     };
     defer handle.close();
 
-    var it = last_durable.valueIterator();
-    while (it.next()) |exp| {
-        var looked_up = try handle.db.lookup(allocator, exp.key, .{});
-        defer if (looked_up) |*r| r.deinit(allocator);
-        if (exp.value) |want| {
-            if (looked_up) |result| {
-                if (std.mem.indexOf(u8, result.json, want) == null) return error.CrashConsistencyTornWrite;
-            } else {
-                return error.CrashConsistencyAcknowledgedWriteLost;
-            }
-        } else if (looked_up != null) {
-            return error.CrashConsistencyDeleteNotDurable;
+    const Lookup = struct {
+        handle: *DbHandle,
+        allocator: Allocator,
+        fn get(self: @This(), key: []const u8) anyerror!?[]const u8 {
+            var looked_up = try self.handle.db.lookup(self.allocator, key, .{});
+            defer if (looked_up) |*r| r.deinit(self.allocator);
+            return if (looked_up) |result| try self.allocator.dupe(u8, result.json) else null;
         }
+    };
+    const lookup_ctx = Lookup{ .handle = &handle, .allocator = allocator };
 
-        if (exp.searchable_text) |text| {
-            var result = try handle.db.search(allocator, .{
-                .index_name = search_index,
-                .full_text = .{ .match = .{ .field = search_field, .text = text } },
-                .limit = 10,
-            });
-            defer result.deinit();
-            var found = false;
-            for (result.hits) |hit| {
-                if (std.mem.eql(u8, hit.id, exp.key)) found = true;
-            }
-            if (!found) return error.CrashConsistencyFullTextNotRebuilt;
+    var it = required.iterator();
+    while (it.next()) |entry| {
+        const exp = entry.value_ptr.*;
+        // See the comment at the equivalent point in
+        // `checkCheckpointsViaNative`: a key the in-flight checkpoint also
+        // names is covered by that check instead.
+        if (inFlightCovers(split.in_flight, exp.key)) continue;
+        const got = try lookup_ctx.get(exp.key);
+        defer if (got) |bytes| allocator.free(@constCast(bytes));
+        const matches = if (exp.after) |want|
+            got != null and std.mem.indexOf(u8, got.?, want) != null
+        else
+            got == null;
+        if (!matches) {
+            std.debug.print(
+                "crash-consistency: acknowledged write not visible key={s} want_contains={s} got={s}\n",
+                .{ exp.key, formatValue(exp.after), formatValue(got) },
+            );
+            return error.CrashConsistencyAcknowledgedWriteLost;
         }
+        if (exp.searchable_after) |text| try assertSearchable(&handle, allocator, search_index, search_field, exp.key, text);
+    }
+
+    if (split.in_flight) |cp| {
+        try checkInFlightResolutionDb(cp, &handle, allocator);
+        // If the in-flight write resolved to its `after` state and that
+        // state should be searchable, the index must have come up with it
+        // atomically -- that is the entire point of a synchronous
+        // full-text sync level.
+        for (cp.expectations) |exp| {
+            const text = exp.searchable_after orelse continue;
+            const got = try lookup_ctx.get(exp.key);
+            defer if (got) |bytes| allocator.free(@constCast(bytes));
+            const resolved_after = exp.after != null and got != null and std.mem.indexOf(u8, got.?, exp.after.?) != null;
+            if (resolved_after) try assertSearchable(&handle, allocator, search_index, search_field, exp.key, text);
+        }
+    }
+
+    if (retirement) {
+        const store = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
+        // `ReplayIndexUnavailable` is docstore.zig's documented signal that
+        // `replay_meta_init_key` was never written (lite/docstore.zig around
+        // "Both runtime adapters share traversal and ownership rules. Only
+        // NotFound means exhaustion"), i.e. the journal has never been
+        // durably initialized -- an expected state for a crash early enough
+        // that no write ever got acknowledged, not corruption.
+        const entries = store.iterateReplayFrom(allocator, 0) catch |err| switch (err) {
+            error.ReplayIndexUnavailable => return,
+            else => return err,
+        };
+        defer allocator.free(entries);
+        for (entries) |*entry| entry.deinit(allocator);
+    }
+}
+
+fn checkInFlightResolutionDb(in_flight: Checkpoint, handle: *DbHandle, allocator: Allocator) !void {
+    const Lookup = struct {
+        handle: *DbHandle,
+        allocator: Allocator,
+        fn get(self: @This(), key: []const u8) anyerror!?[]const u8 {
+            var looked_up = try self.handle.db.lookup(self.allocator, key, .{});
+            defer if (looked_up) |*r| r.deinit(self.allocator);
+            return if (looked_up) |result| try self.allocator.dupe(u8, result.json) else null;
+        }
+    };
+    const lookup_ctx = Lookup{ .handle = handle, .allocator = allocator };
+    // db.zig's JSON round-trips (whitespace, field order) so this checker
+    // uses substring containment (`indexOf`) rather than exact equality, to
+    // match a document's `after`/`before` snippet against the stored JSON.
+    var resolution: ?bool = null;
+    for (in_flight.expectations) |exp| {
+        const got = try lookup_ctx.get(exp.key);
+        defer if (got) |bytes| allocator.free(@constCast(bytes));
+        const matches_after = if (exp.after) |want| got != null and std.mem.indexOf(u8, got.?, want) != null else got == null;
+        const matches_before = if (exp.before) |want| got != null and std.mem.indexOf(u8, got.?, want) != null else got == null;
+        if (!matches_after and !matches_before) {
+            std.debug.print(
+                "crash-consistency: torn value key={s} actual={s} allowed_before_contains={s} allowed_after_contains={s}\n",
+                .{ exp.key, formatValue(got), formatValue(exp.before), formatValue(exp.after) },
+            );
+            return error.CrashConsistencyTornWrite;
+        }
+        if (matches_after and matches_before) continue;
+        if (resolution) |r| {
+            if (r != matches_after) {
+                std.debug.print(
+                    "crash-consistency: batch not atomic key={s} resolved_after={} (another key in the same in-flight checkpoint resolved {})\n",
+                    .{ exp.key, matches_after, r },
+                );
+                return error.CrashConsistencyBatchNotAtomic;
+            }
+        } else resolution = matches_after;
+    }
+}
+
+/// "For full-text-visible sync levels, the doc is searchable after recovery
+/// (OR recovery deterministically rebuilds it before serving)" -- db.zig's
+/// own tests document `error.IndexRebuilding` as the expected signal for
+/// the second half of that clause (search is refused, not wrong, while a
+/// background catch-up runs). So this retries through that specific error,
+/// draining background work between attempts, and only treats it as a
+/// finding if the index never finishes catching up within a generous bound.
+fn assertSearchable(handle: *DbHandle, allocator: Allocator, search_index: []const u8, search_field: []const u8, key: []const u8, text: []const u8) !void {
+    var attempt: usize = 0;
+    while (true) : (attempt += 1) {
+        var result = handle.db.search(allocator, .{
+            .index_name = search_index,
+            .full_text = .{ .match = .{ .field = search_field, .text = text } },
+            .limit = 10,
+        }) catch |err| {
+            if (err == error.IndexRebuilding and attempt < 50) {
+                // `runUntilIdle` alone is what a sweep barrier count needs
+                // to stay deterministic (see `openDbWithIo`), but settling
+                // a text index after reopen may need the fuller recipe
+                // `connection.prepareDatabaseCompact` uses.
+                handle.db.runUntilIdle() catch {};
+                handle.db.forceCompactTextIndexes() catch {};
+                handle.db.drainScheduledTextMerges() catch {};
+                continue;
+            }
+            std.debug.print("crash-consistency: search() for key={s} text={s} never recovered from {s} after {d} retries\n", .{ key, text, @errorName(err), attempt });
+            return err;
+        };
+        defer result.deinit();
+        for (result.hits) |hit| {
+            if (std.mem.eql(u8, hit.id, key)) return;
+        }
+        std.debug.print("crash-consistency: acknowledged document not searchable key={s} text={s}\n", .{ key, text });
+        return error.CrashConsistencyFullTextNotRebuilt;
     }
 }
 
@@ -447,65 +672,65 @@ fn openDbWithIo(allocator: Allocator, path: []const u8, io: std.Io, create: bool
     return .{ .backend = lite_backend, .db = db };
 }
 
+/// Runs one retirement turn against main's *current* replay-truncation API
+/// (`docstore.Store.truncateReplayUpTo`). Swap only this function's body for
+/// the owner-queued `DocStore.serviceRetirement(alloc, is_owner, budget)` /
+/// `requestRetirement` API on `perf/lwa-ws5-retirement` once that merges --
+/// every call site below depends only on this function's existence, not on
+/// how it retires the journal.
+fn runRetirementTurn(allocator: Allocator, handle: *DbHandle) !void {
+    const store = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
+    const up_to = store.lastReplaySequence(0);
+    try store.truncateReplayUpTo(allocator, up_to);
+}
+
 // ---------------------------------------------------------------------
 // Scenarios
 // ---------------------------------------------------------------------
-
-/// The current `SimIo`'s underlying pointer, recovered from the `Io` value
-/// scenarios are handed. Lets a scenario ask "what is the last barrier
-/// sequence my most recent commit crossed?" without widening `Scenario.run`.
-fn simFromIo(io: std.Io) *sim_io.SimIo {
-    return @ptrCast(@alignCast(io.userdata.?));
-}
-
-fn lastBarrierSeq(io: std.Io) u64 {
-    const count = simFromIo(io).barrierCount();
-    return if (count == 0) 0 else count - 1;
-}
 
 fn runPrimarySingleDoc(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
     var file = try native.NativeFile.createWithIo(allocator, io, path, .{});
     defer file.close();
 
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "seed", .before = null, .after = "seed-value" }} });
     try file.putDocument("seed", "seed-value");
-    try checkpoints.append(allocator, .{ .durable_after_barrier = lastBarrierSeq(io), .expectations = &.{.{ .key = "seed", .value = "seed-value" }} });
 
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "primary-doc", .before = null, .after = "primary-value" }} });
     try file.putDocument("primary-doc", "primary-value");
-    try checkpoints.append(allocator, .{ .durable_after_barrier = lastBarrierSeq(io), .expectations = &.{.{ .key = "primary-doc", .value = "primary-value" }} });
 }
 
 fn runPrimaryBatch(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
     var file = try native.NativeFile.createWithIo(allocator, io, path, .{});
     defer file.close();
 
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "seed", .before = null, .after = "seed-value" }} });
     try file.putDocument("seed", "seed-value");
-    try checkpoints.append(allocator, .{ .durable_after_barrier = lastBarrierSeq(io), .expectations = &.{.{ .key = "seed", .value = "seed-value" }} });
 
     const mutations = [_]native.DocumentMutation{
         .{ .key = "batch-a", .value = "value-a" },
         .{ .key = "batch-b", .value = "value-b" },
         .{ .key = "batch-c", .value = "value-c" },
     };
-    try file.putDocumentBatch(&mutations);
-    try checkpoints.append(allocator, .{ .durable_after_barrier = lastBarrierSeq(io), .expectations = &.{
-        .{ .key = "batch-a", .value = "value-a" },
-        .{ .key = "batch-b", .value = "value-b" },
-        .{ .key = "batch-c", .value = "value-c" },
+    try checkpoints.append(allocator, .{ .expectations = &.{
+        .{ .key = "batch-a", .before = null, .after = "value-a" },
+        .{ .key = "batch-b", .before = null, .after = "value-b" },
+        .{ .key = "batch-c", .before = null, .after = "value-c" },
     } });
+    try file.putDocumentBatch(&mutations);
 }
 
 fn runPrimaryUpdateDelete(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
     var file = try native.NativeFile.createWithIo(allocator, io, path, .{});
     defer file.close();
 
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "key", .before = null, .after = "v1" }} });
     try file.putDocument("key", "v1");
-    try checkpoints.append(allocator, .{ .durable_after_barrier = lastBarrierSeq(io), .expectations = &.{.{ .key = "key", .value = "v1" }} });
 
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "key", .before = "v1", .after = "v2" }} });
     try file.putDocument("key", "v2");
-    try checkpoints.append(allocator, .{ .durable_after_barrier = lastBarrierSeq(io), .expectations = &.{.{ .key = "key", .value = "v2" }} });
 
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "key", .before = "v2", .after = null }} });
     try file.deleteDocument("key");
-    try checkpoints.append(allocator, .{ .durable_after_barrier = lastBarrierSeq(io), .expectations = &.{.{ .key = "key", .value = null }} });
 }
 
 /// Fixed, fully comptime-known (writer, round) interleaving: 4 logical
@@ -513,7 +738,7 @@ fn runPrimaryUpdateDelete(allocator: Allocator, path: []const u8, io: std.Io, ch
 /// key/value pair is a comptime string so `Checkpoint.expectations` below
 /// can keep pointing at it after this function returns, with no allocation
 /// and nothing to free.
-const ConcurrentStep = struct { key: []const u8, value: []const u8 };
+const ConcurrentStep = struct { key: []const u8, before: ?[]const u8, after: []const u8 };
 const concurrent_writer_count = 4;
 const concurrent_round_count = 3;
 const concurrent_steps: [concurrent_writer_count * concurrent_round_count]ConcurrentStep = blk: {
@@ -523,7 +748,8 @@ const concurrent_steps: [concurrent_writer_count * concurrent_round_count]Concur
         for (0..concurrent_writer_count) |writer| {
             steps[i] = .{
                 .key = std.fmt.comptimePrint("writer-{d}", .{writer}),
-                .value = std.fmt.comptimePrint("round-{d}", .{round}),
+                .before = if (round == 0) null else std.fmt.comptimePrint("round-{d}", .{round - 1}),
+                .after = std.fmt.comptimePrint("round-{d}", .{round}),
             };
             i += 1;
         }
@@ -540,8 +766,8 @@ fn runDeterministicConcurrentWriters(allocator: Allocator, path: []const u8, io:
     defer file.close();
 
     inline for (concurrent_steps) |step| {
-        try file.putDocument(step.key, step.value);
-        try checkpoints.append(allocator, .{ .durable_after_barrier = lastBarrierSeq(io), .expectations = &.{.{ .key = step.key, .value = step.value }} });
+        try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = step.key, .before = step.before, .after = step.after }} });
+        try file.putDocument(step.key, step.after);
     }
 }
 
@@ -549,11 +775,42 @@ fn runFullTextSyncVisible(allocator: Allocator, path: []const u8, io: std.Io, ch
     var handle = try openDbWithIo(allocator, path, io, true);
     defer handle.close();
 
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "seed", .before = null, .after = "seed body" }} });
     try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
-    try checkpoints.append(allocator, .{ .durable_after_barrier = lastBarrierSeq(io), .expectations = &.{.{ .key = "seed", .value = "seed body" }} });
 
+    try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = "ft-doc", .before = null, .after = "needle in a haystack", .searchable_after = "needle" }} });
     try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
-    try checkpoints.append(allocator, .{ .durable_after_barrier = lastBarrierSeq(io), .expectations = &.{.{ .key = "ft-doc", .value = "needle in a haystack", .searchable_text = "needle" }} });
+}
+
+const RetirementDoc = struct { key: []const u8, body: []const u8 };
+const retirement_docs = [_]RetirementDoc{
+    .{ .key = "r-doc-0", .body = "alpha retirement payload" },
+    .{ .key = "r-doc-1", .body = "bravo retirement payload" },
+    .{ .key = "r-doc-2", .body = "charlie retirement payload" },
+};
+
+/// Writes a handful of full-text-indexed documents, then runs one
+/// retirement turn (see `runRetirementTurn`). The crash sweep naturally
+/// crosses barriers both inside the writes and inside the retirement call
+/// itself, exercising "crash during retirement" without a separate
+/// scenario.
+fn runFullTextWithRetirement(allocator: Allocator, path: []const u8, io: std.Io, checkpoints: *std.ArrayListUnmanaged(Checkpoint)) anyerror!void {
+    var handle = try openDbWithIo(allocator, path, io, true);
+    defer handle.close();
+
+    inline for (retirement_docs) |doc| {
+        const json = try std.fmt.allocPrint(allocator, "{{\"body\":\"{s}\"}}", .{doc.body});
+        defer allocator.free(json);
+        try checkpoints.append(allocator, .{ .expectations = &.{.{ .key = doc.key, .before = null, .after = doc.body, .searchable_after = "retirement" }} });
+        try handle.db.batch(.{ .writes = &.{.{ .key = doc.key, .value = json }}, .sync_level = .full_text });
+    }
+
+    // The retirement turn itself touches no document key, so it adds no
+    // checkpoint: nothing it does should ever change what a document reads
+    // back as. `checkCheckpointsViaDb`'s `retirement` flag separately
+    // verifies the journal is still readable no matter where the sweep
+    // crashes inside this call.
+    try runRetirementTurn(allocator, &handle);
 }
 
 test "crash sweep: primary single doc" {
@@ -588,6 +845,55 @@ test "crash sweep: full text synchronous visibility" {
         .search_index = "body_text",
         .search_field = "body",
     }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep: full text with retirement turn" {
+    var report = try runCrashSweep(std.testing.allocator, .{
+        .name = "full-text-with-retirement",
+        .run = runFullTextWithRetirement,
+        .via_db = true,
+        .search_index = "body_text",
+        .search_field = "body",
+        .retirement = true,
+    }, .{});
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep exhaustive: primary single doc" {
+    var report = try runCrashSweep(std.testing.allocator, .{ .name = "primary-single-doc", .run = runPrimarySingleDoc }, .{ .mode = .exhaustive });
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep exhaustive: primary batch" {
+    var report = try runCrashSweep(std.testing.allocator, .{ .name = "primary-batch", .run = runPrimaryBatch }, .{ .mode = .exhaustive });
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep exhaustive: primary update then delete" {
+    var report = try runCrashSweep(std.testing.allocator, .{ .name = "primary-update-delete", .run = runPrimaryUpdateDelete }, .{ .mode = .exhaustive });
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep exhaustive: deterministic concurrent writers" {
+    var report = try runCrashSweep(std.testing.allocator, .{ .name = "deterministic-concurrent-writers", .run = runDeterministicConcurrentWriters }, .{ .mode = .exhaustive });
+    defer report.deinit();
+    try reportFailures(&report);
+}
+
+test "crash sweep exhaustive: full text synchronous visibility" {
+    var report = try runCrashSweep(std.testing.allocator, .{
+        .name = "full-text-sync-visible",
+        .run = runFullTextSyncVisible,
+        .via_db = true,
+        .search_index = "body_text",
+        .search_field = "body",
+    }, .{ .mode = .exhaustive });
     defer report.deinit();
     try reportFailures(&report);
 }
