@@ -182,7 +182,12 @@ Only imports that the generated source uses are included. Run this against a
 stable schema; metadata reads are not an atomic catalog export.
 
 Nullable unions such as `type: ["string", "null"]` retain `null` even when the
-field is required. PostgreSQL array columns use a generated recursive
+field is required. Optional fields also retain SQL NULL when absent, even if
+explicit JSON null is forbidden with `nullable: false`. Columns must be required
+in every document type to be non-nullable. Default introspection excludes only
+`kysely_migration` and `kysely_migration_lock`; other `kysely_` names and custom
+bookkeeping table names remain visible, matching Kysely's standard introspector.
+PostgreSQL array columns use a generated recursive
 `SQLArray<T>` type: `pg` can return one-dimensional or nested arrays for the same
 SQL array type, with nullable elements. Array rank is not fixed by the column's
 type identity. Embedded SQL arrays retain their native envelope and generate as
@@ -210,16 +215,21 @@ First call `prepareKyselyMigrationTables(db)`. Kysely's automatic bookkeeping
 DDL uses `varchar(255)`, which Antfly does not accept. This helper creates only
 the bookkeeping tables with native `TEXT` columns, under the dialect's migration
 lock. It does not rewrite application DDL. If you customize migration table names,
-pass the same `migrationTable` and `migrationLockTable` options to the helper
+pass the same `migrationTableName` and `migrationLockTableName` options to the helper
 and to `Migrator`. The setup helper supports the default namespace.
 
 ```ts
 import { prepareKyselyMigrationTables } from "@antfly/sdk/kysely";
 import { Migrator } from "kysely/migration";
 
-await prepareKyselyMigrationTables(db);
+const migrationTables = {
+  migrationTableName: "app_migrations",
+  migrationLockTableName: "app_migration_lock",
+};
+await prepareKyselyMigrationTables(db, migrationTables);
 const migrator = new Migrator({
   db,
+  ...migrationTables,
   provider: { async getMigrations() { return {
     "001_create_notes": { async up(migrationDb) {
       await migrationDb.schema.createTable("notes")

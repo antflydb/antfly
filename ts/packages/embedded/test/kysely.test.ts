@@ -19,6 +19,7 @@ import { join } from "node:path";
 import {
   antflySearch,
   generateKyselyTypes,
+  type PrepareKyselyMigrationTablesOptions,
   prepareKyselyMigrationTables,
 } from "@antfly/sdk/kysely";
 import { Kysely } from "kysely";
@@ -33,7 +34,12 @@ describeWithLibrary("Kysely search composition", () => {
     const directory = await mkdtemp(join(tmpdir(), "antfly-kysely-nullable-"));
     const database = await createWithOptions(join(directory, "db.aflite"), { noSync: true });
     const db = new Kysely<{
-      nullable_fields: { body: string | null; note: string | null; title: string };
+      nullable_fields: {
+        body: string | null;
+        note: string | null;
+        title: string;
+        optional_nonnull: string | null;
+      };
     }>({ dialect: new AntflyDialect({ database }) });
     try {
       await database.createTable("nullable_fields", {
@@ -48,6 +54,7 @@ describeWithLibrary("Kysely search composition", () => {
                 note: { type: "string", nullable: true },
                 title: { type: "string" },
                 optional: { type: "string" },
+                optional_nonnull: { type: "string", nullable: false },
               },
             },
           },
@@ -63,8 +70,11 @@ describeWithLibrary("Kysely search composition", () => {
         await table.close();
       }
       expect(
-        await db.selectFrom("nullable_fields").select(["body", "note", "title"]).execute()
-      ).toEqual([{ body: null, note: null, title: "present" }]);
+        await db
+          .selectFrom("nullable_fields")
+          .select(["body", "note", "title", "optional_nonnull"])
+          .execute()
+      ).toEqual([{ body: null, note: null, title: "present", optional_nonnull: null }]);
       const tables = await db.introspection.getTables();
       expect(tables[0]?.columns.find((column) => column.name === "body")?.isNullable).toBe(true);
       expect(tables[0]?.columns.find((column) => column.name === "note")?.isNullable).toBe(true);
@@ -76,6 +86,31 @@ describeWithLibrary("Kysely search composition", () => {
       expect(source).toContain('"body": string | null;');
       expect(source).toContain('"note": string | null;');
       expect(source).toContain('"title": string;');
+      expect(source).toContain('"optional_nonnull": string | null;');
+      await database.createTable("multiple_types", {
+        default_type: "first",
+        document_schemas: {
+          first: {
+            schema: {
+              type: "object",
+              required: ["name"],
+              properties: { name: { type: "string", nullable: false } },
+            },
+          },
+          second: {
+            schema: {
+              type: "object",
+              required: ["other"],
+              properties: { other: { type: "string", nullable: false } },
+            },
+          },
+        },
+      });
+      const polymorphic = (await db.introspection.getTables()).find(
+        (table) => table.name === "multiple_types"
+      );
+      expect(polymorphic?.columns.find((column) => column.name === "name")?.isNullable).toBe(true);
+      expect(polymorphic?.columns.find((column) => column.name === "other")?.isNullable).toBe(true);
     } finally {
       await db.destroy();
       await database.close();
@@ -181,7 +216,10 @@ describeWithLibrary("Kysely search composition", () => {
     }
   }, 30_000);
 
-  it("serializes migrators sharing one database and reports default column types", async () => {
+  it.each([
+    {},
+    { migrationTableName: "app_migrations", migrationLockTableName: "app_migration_lock" },
+  ])("serializes migrators sharing one database with table options %j", async (migrationTables: PrepareKyselyMigrationTablesOptions) => {
     const directory = await mkdtemp(join(tmpdir(), "antfly-kysely-migrate-"));
     const database = await createWithOptions(join(directory, "db.aflite"), { noSync: true });
     const makeDb = () => new Kysely({ dialect: new AntflyDialect({ database }) });
@@ -206,17 +244,27 @@ describeWithLibrary("Kysely search composition", () => {
     try {
       const results = await Promise.all(
         [first, second].map(async (db) => {
-          await prepareKyselyMigrationTables(db);
-          return new Migrator({ db, provider }).migrateToLatest();
+          await prepareKyselyMigrationTables(db, migrationTables);
+          return new Migrator({ db, provider, ...migrationTables }).migrateToLatest();
         })
       );
       for (const result of results) expect(result.error).toBeUndefined();
       expect(applied).toBe(1);
+      await first.schema.createTable("kysely_people").addColumn("name", "text").execute();
       const source = generateKyselyTypes(await first.introspection.getTables(), {
         integerMode: "bigint",
       });
       expect(source).toContain('"n": Generated<bigint>;');
+      expect(source).toContain('"kysely_people": {');
       expect(source).not.toContain('"kysely_migration"');
+      expect(source).not.toContain('"kysely_migration_lock"');
+      const allTables = (
+        await first.introspection.getTables({ withInternalKyselyTables: true })
+      ).map((table) => table.name);
+      expect(allTables).toContain(migrationTables.migrationTableName ?? "kysely_migration");
+      expect(allTables).toContain(
+        migrationTables.migrationLockTableName ?? "kysely_migration_lock"
+      );
     } finally {
       await Promise.all([first.destroy(), second.destroy()]);
       await database.close();

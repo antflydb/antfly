@@ -190,17 +190,25 @@ export const invalid: Insertable<Database["items"]> = { id: "1", computed: "x" }
   it("uses Antfly metadata and bounded descriptions, including internal migration tables on request", async () => {
     const client = {
       tables: {
-        list: vi.fn().mockResolvedValue([{ name: 'items"quoted' }, { name: "kysely_migration" }]),
+        list: vi
+          .fn()
+          .mockResolvedValue([
+            { name: 'items"quoted' },
+            { name: "kysely_people" },
+            { name: "kysely_migration" },
+            { name: "kysely_migration_lock" },
+          ]),
         get: vi.fn().mockResolvedValue({
           schema: {
             default_type: "row",
             document_schemas: {
               row: {
                 schema: {
-                  required: ["id", "nullable_union"],
+                  required: ["id", "n", "nullable_union"],
                   properties: {
                     n: { nullable: false },
                     nullable_union: { type: ["string", "null"] },
+                    optional_nonnull: { type: "string", nullable: false },
                   },
                 },
               },
@@ -217,13 +225,14 @@ export const invalid: Insertable<Database["items"]> = { id: "1", computed: "x" }
           { name: "computed", type: "integer" },
           { name: "values", type: "array", element_type: "int32" },
           { name: "nullable_union", type: "string" },
+          { name: "optional_nonnull", type: "string" },
         ],
       }),
     };
     const introspector = createAntflyIntrospector(client as unknown as AntflyClient);
     expect(await introspector.getSchemas()).toEqual([{ name: "public" }]);
     const tables = await introspector.getTables();
-    expect(tables).toHaveLength(1);
+    expect(tables.map((table) => table.name)).toEqual(['items"quoted', "kysely_people"]);
     expect(client.executeSQL).toHaveBeenCalledWith({
       statement: 'SELECT * FROM "items""quoted" LIMIT 0',
     });
@@ -234,12 +243,14 @@ export const invalid: Insertable<Database["items"]> = { id: "1", computed: "x" }
     });
     expect(tables[0]?.columns[2]).toMatchObject({ isGeneratedAlways: true });
     expect(tables[0]?.columns[4]).toMatchObject({ isNullable: true });
-    expect(await introspector.getTables({ withInternalKyselyTables: true })).toHaveLength(2);
+    expect(tables[0]?.columns[5]).toMatchObject({ isNullable: true });
+    expect(await introspector.getTables({ withInternalKyselyTables: true })).toHaveLength(4);
     const source = generateKyselyTypes(tables, { integerMode: "string" });
     expect(source).toContain('"n": Generated<string>;');
     expect(source).toContain('"computed": GeneratedAlways<string | null>;');
     expect(source).toContain('"values": SQLArray<number> | null;');
     expect(source).toContain('"nullable_union": string | null;');
+    expect(source).toContain('"optional_nonnull": string | null;');
     expect(generateKyselyTypes(tables, { integerMode: "bigint" })).toContain(
       '"n": Generated<bigint>;'
     );

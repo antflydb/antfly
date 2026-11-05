@@ -6,14 +6,14 @@ import {
   DEFAULT_MIGRATION_LOCK_TABLE,
   DEFAULT_MIGRATION_TABLE,
   MIGRATION_LOCK_ID,
+  type MigratorProps,
 } from "kysely/migration";
 
-export interface PrepareKyselyMigrationTablesOptions {
-  /** Pass the same name to Migrator. */
-  migrationTable?: string;
-  /** Pass the same name to Migrator. */
-  migrationLockTable?: string;
-}
+/** Share these options directly with Kysely's Migrator. */
+export type PrepareKyselyMigrationTablesOptions = Pick<
+  MigratorProps,
+  "migrationTableName" | "migrationLockTableName"
+>;
 
 /**
  * Create Kysely's bookkeeping tables using native TEXT instead of VARCHAR(255).
@@ -25,8 +25,8 @@ export async function prepareKyselyMigrationTables<DB>(
   db: Kysely<DB>,
   options: PrepareKyselyMigrationTablesOptions = {}
 ): Promise<void> {
-  const migrationTable = options.migrationTable ?? DEFAULT_MIGRATION_TABLE;
-  const lockTable = options.migrationLockTable ?? DEFAULT_MIGRATION_LOCK_TABLE;
+  const migrationTable = options.migrationTableName ?? DEFAULT_MIGRATION_TABLE;
+  const lockTable = options.migrationLockTableName ?? DEFAULT_MIGRATION_LOCK_TABLE;
   if (!migrationTable || !lockTable || migrationTable === lockTable) {
     throw new TypeError("Migration and lock table names must be nonempty and distinct");
   }

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { ColumnMetadata, DatabaseIntrospector, TableMetadata } from "kysely";
+import { DEFAULT_MIGRATION_LOCK_TABLE, DEFAULT_MIGRATION_TABLE } from "kysely/migration";
 import type { AntflyClient } from "./client.js";
 
 export interface AntflyColumnMetadata extends ColumnMetadata {
@@ -25,21 +26,27 @@ export function createAntflyIntrospector(
       const tables = await client.tables.list();
       const result: TableMetadata[] = [];
       for (const entry of tables) {
-        if (!options?.withInternalKyselyTables && entry.name.startsWith("kysely_")) continue;
+        if (
+          !options?.withInternalKyselyTables &&
+          (entry.name === DEFAULT_MIGRATION_TABLE || entry.name === DEFAULT_MIGRATION_LOCK_TABLE)
+        )
+          continue;
         const table = await client.tables.get(entry.name);
         if (!table) throw new Error(`Missing Antfly metadata for ${JSON.stringify(entry.name)}`);
         const schema = table.migration?.read_schema ?? table.schema;
-        const document = schema?.document_schemas?.[schema.default_type ?? "row"]?.schema as
-          | {
-              properties?: Record<string, { type?: string | string[]; nullable?: boolean }>;
-              required?: string[];
-            }
-          | undefined;
+        const documents = Object.values(schema?.document_schemas ?? {}).map(
+          (document) =>
+            document.schema as
+              | {
+                  properties?: Record<string, { type?: string | string[]; nullable?: boolean }>;
+                  required?: string[];
+                }
+              | undefined
+        );
         const described = await client.executeSQL({
           statement: `SELECT * FROM "${entry.name.replace(/"/g, '""')}" LIMIT 0`,
         });
         const columns: AntflyColumnMetadata[] = described.columns.map((column) => {
-          const property = document?.properties?.[column.name];
           return {
             name: column.name,
             dataType:
@@ -48,10 +55,19 @@ export function createAntflyIntrospector(
                 : (column.element_type ?? column.type),
             isNullable:
               column.name !== "_id" &&
-              (property?.nullable === true ||
-                property?.type === "null" ||
-                (Array.isArray(property?.type) && property.type.includes("null")) ||
-                (!document?.required?.includes(column.name) && property?.nullable !== false)),
+              (documents.length === 0 ||
+                documents.some((document) => {
+                  const property = document?.properties?.[column.name];
+                  // Missing fields become SQL NULL, even if explicit JSON null
+                  // is forbidden. A column must be required in every row type.
+                  return (
+                    !property ||
+                    !document?.required?.includes(column.name) ||
+                    property.nullable === true ||
+                    property?.type === "null" ||
+                    (Array.isArray(property?.type) && property.type.includes("null"))
+                  );
+                })),
             isAutoIncrementing: false,
             hasDefaultValue:
               schema?.column_defaults?.some((value) => value.column === column.name) ?? false,

@@ -2,7 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import type { Kysely } from "kysely";
-import { antflySearch } from "../src/kysely.js";
+import { Migrator } from "kysely/migration";
+import {
+  antflySearch,
+  type PrepareKyselyMigrationTablesOptions,
+  prepareKyselyMigrationTables,
+} from "../src/kysely.js";
 
 declare const db: Kysely<{ articles: { id: string; published: boolean } }>;
 const hits = antflySearch<{ published: boolean }>("articles", {
@@ -17,3 +22,22 @@ db.selectFrom(hits).where("hits.published", "=", "yes");
 antflySearch("articles", { table: "other" });
 // @ts-expect-error Query structure is checked against the Antfly SDK request type.
 antflySearch("articles", { full_text_search: { nonexistent_query: true } });
+
+const migrationTables: PrepareKyselyMigrationTablesOptions = {
+  migrationTableName: "app_migrations",
+  migrationLockTableName: "app_migration_lock",
+};
+prepareKyselyMigrationTables(db, migrationTables);
+new Migrator({
+  db,
+  provider: {
+    async getMigrations() {
+      return {};
+    },
+  },
+  ...migrationTables,
+});
+// @ts-expect-error Use the same option names as Kysely's Migrator.
+prepareKyselyMigrationTables(db, { migrationTable: "old_name" });
+// @ts-expect-error Use migrationLockTableName for both setup and Migrator.
+prepareKyselyMigrationTables(db, { migrationLockTable: "old_name" });

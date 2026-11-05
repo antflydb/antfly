@@ -180,6 +180,7 @@ try {
             required: ["body", "matrix"],
             properties: {
               body: { type: ["string", "null"] },
+              optional_nonnull: { type: "string", nullable: false },
               matrix: { type: "sql_array", "x-antfly-sql-type": "int32", nullable: false },
             },
           },
@@ -198,21 +199,26 @@ try {
       ],
     })
     .execute();
-  assert.deepEqual(await db.selectFrom("kysely_shapes").select(["body", "matrix"]).execute(), [
-    {
-      body: null,
-      matrix: [
-        [1, null],
-        [2, 3],
-      ],
-    },
-  ]);
+  assert.deepEqual(
+    await db.selectFrom("kysely_shapes").select(["body", "matrix", "optional_nonnull"]).execute(),
+    [
+      {
+        body: null,
+        optional_nonnull: null,
+        matrix: [
+          [1, null],
+          [2, 3],
+        ],
+      },
+    ]
+  );
   const metadata = await introspector.getTables({ withInternalKyselyTables: true });
   assert.ok(metadata.find((table) => table.name === "kysely_people"));
   assert.match(generateKyselyTypes(metadata, { integerMode: "string" }), /"n": string \| null;/);
   const generated = generateKyselyTypes(metadata, { integerMode: "string" });
   assert.match(generated, /"body": string \| null;/);
   assert.match(generated, /"matrix": SQLArray<number>;/);
+  assert.match(generated, /"optional_nonnull": string \| null;/);
 
   // Server search support is an explicit capability boundary, never an
   // application-side search plus join fallback.
@@ -224,41 +230,65 @@ try {
     (error) => error.code === "0A000"
   );
 
-  const provider = {
-    async getMigrations() {
-      return {
-        "001_create": {
-          async up(tx) {
-            await tx.schema
-              .createTable("kysely_migrated")
-              .addColumn("id", "text", (col) => col.primaryKey())
-              .execute();
-          },
-        },
-        "002_index": {
-          async up(tx) {
-            await tx.schema
-              .createIndex("kysely_migrated_id")
-              .on("kysely_migrated")
-              .column("id")
-              .execute();
-          },
-        },
-      };
+  for (const { migrationTables, table } of [
+    { migrationTables: {}, table: "kysely_migrated" },
+    {
+      migrationTables: {
+        migrationTableName: "app_migrations",
+        migrationLockTableName: "app_migration_lock",
+      },
+      table: "kysely_custom_migrated",
     },
-  };
-  const results = await Promise.all(
-    [db, second].map(async (database) => {
-      await prepareKyselyMigrationTables(database);
-      return new Migrator({ db: database, provider }).migrateToLatest();
-    })
+  ]) {
+    const provider = {
+      async getMigrations() {
+        return {
+          "001_create": {
+            async up(tx) {
+              await tx.schema
+                .createTable(table)
+                .addColumn("id", "text", (col) => col.primaryKey())
+                .execute();
+            },
+          },
+          "002_index": {
+            async up(tx) {
+              await tx.schema.createIndex(`${table}_id`).on(table).column("id").execute();
+            },
+          },
+        };
+      },
+    };
+    const results = await Promise.all(
+      [db, second].map(async (database) => {
+        await prepareKyselyMigrationTables(database, migrationTables);
+        return new Migrator({ db: database, provider, ...migrationTables }).migrateToLatest();
+      })
+    );
+    for (const result of results) assert.ifError(result.error);
+    assert.equal(
+      results.flatMap((r) => r.results ?? []).filter((r) => r.status === "Success").length,
+      2
+    );
+    assert.equal(
+      (
+        await db
+          .selectFrom(migrationTables.migrationTableName ?? "kysely_migration")
+          .selectAll()
+          .execute()
+      ).length,
+      2
+    );
+  }
+  const visible = (await introspector.getTables()).map((table) => table.name);
+  assert.ok(visible.includes("kysely_people"));
+  assert.ok(!visible.includes("kysely_migration"));
+  assert.ok(!visible.includes("kysely_migration_lock"));
+  const allTables = (await introspector.getTables({ withInternalKyselyTables: true })).map(
+    (table) => table.name
   );
-  for (const result of results) assert.ifError(result.error);
-  assert.equal(
-    results.flatMap((r) => r.results ?? []).filter((r) => r.status === "Success").length,
-    2
-  );
-  assert.equal((await db.selectFrom("kysely_migration").selectAll().execute()).length, 2);
+  assert.ok(allTables.includes("kysely_migration"));
+  assert.ok(allTables.includes("kysely_migration_lock"));
   console.log(
     "Kysely pgwire: CRUD, joins, exact integers, transactions, streaming, introspection, migrations: PASS"
   );
