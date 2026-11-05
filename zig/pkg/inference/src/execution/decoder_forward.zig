@@ -136,6 +136,9 @@ pub const Runtime = struct {
     }
 
     context: graph_mod.execution.Context,
+    /// Explicitly owned by the whole-model caller, prepared cold from the
+    /// original forward trace. No Session allocator implies this capability.
+    native_program: ?*@import("native_decoder_program.zig").Program = null,
     graph_cache: ?*graph_mod.cache.GraphCache = null,
     io: ?std.Io = null,
     replay_fallbacks: ?*u64 = null,
@@ -671,6 +674,20 @@ pub const Runtime = struct {
     ) ![]f32 {
         const query_seq_len = decode_context.query_sequence_len;
         try self.rejectUnsupportedDeepSeekV4GraphMode();
+        if (self.graph_cache == null) if (self.native_program) |program| if (program.supportsCall(input_ids, batch, decode_context)) {
+            const NativeCall = @import("native_decoder_program.zig").Call;
+            var selected: ?NativeCall = program.beginCall(input_ids, decode_context, null) catch |err| switch (err) {
+                error.UnsupportedAuthoredNativeCall, error.UnsupportedAuthoredPagedAttention, error.AuthoredPagedWriteRequiresExclusiveBlock => null,
+                else => return err,
+            };
+            if (selected) |*call| {
+                const current = @import("cleanup_context.zig").Context{ .boundary = self.context.cleanupEpoch(), .operation = if (self.context.cb.call_context) |invocation| invocation.cleanup.operation else null };
+                defer call.close(current);
+                try call.prepareInto(self.context.allocator, null, current);
+                try call.run(self.context.cb, self.context.gpt_config.*, decode_context, current);
+                return try call.takeOutput();
+            }
+        };
         if (self.graph_cache) |cache| {
             return self.graphForward(cache, input_ids, batch, seq_len, decode_context);
         }

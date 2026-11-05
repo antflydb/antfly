@@ -267,7 +267,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     var lifecycle_imports = suite.tests.root_module.import_table.iterator();
     while (lifecycle_imports.next()) |entry| lifecycle_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
     lifecycle_root.link_libc = true;
-    const lifecycle_tests = b.addTest(.{ .root_module = lifecycle_root, .filters = &.{ "CUDA quarantine", "CUDA allocation", "CUDA retired", "CUDA physical OOM", "CUDA boundary", "test_0" } });
+    const lifecycle_tests = b.addTest(.{ .root_module = lifecycle_root, .test_runner = .{ .path = ctx.path("src/test_runner_filter.zig"), .mode = .simple }, .filters = &.{ "CUDA quarantine", "CUDA allocation", "CUDA retired", "CUDA physical OOM", "CUDA boundary", "test_0" } });
     const run_lifecycle_tests = ctx.addRunArtifact(lifecycle_tests);
     test_step.dependOn(&run_lifecycle_tests.step);
     ctx.step("test-cuda-allocation-lifecycle", "Verify failed-free quarantine across primary-context lifetimes without a GPU").dependOn(&run_lifecycle_tests.step);

@@ -168,6 +168,7 @@ pub const TracingCompute = struct {
 
     fn makeHandle(self: *TracingCompute, node_id: NodeId) !CT {
         const h = try self.allocator.create(TracingHandle);
+        errdefer self.allocator.destroy(h);
         h.* = .{ .node_id = node_id };
         try self.handles.append(self.allocator, h);
         return @ptrCast(h);
@@ -225,6 +226,7 @@ pub const TracingCompute = struct {
         .takeRows = &takeRowsOp,
         .zeroTensor = &zeroTensorOp,
         .reshape2d = &reshape2dOp,
+        .cloneTensorShape = &cloneTensorShapeOp,
         .sliceLastDim = &sliceLastDimOp,
         .linearNoBiasPair = &linearNoBiasPairOp,
         .mulMatId = &moeLinearNoBiasOp,
@@ -745,6 +747,25 @@ pub const TracingCompute = struct {
     }
 
     // ── Reshape ───────────────────────────────────────────────────────
+
+    // A trace owns immutable symbolic values. Cloning dense storage changes
+    // only shape/ownership; preserve the input dependency instead of emitting
+    // a host readback and a disconnected dummy upload.
+    fn cloneTensorShapeOp(ctx: *anyopaque, input: CT, dims: []const i32) anyerror!?CT {
+        if (dims.len > 8) return error.InvalidShape;
+        const tc = fromCtx(ctx);
+        const source = nodeIdFromCT(input);
+        const shape = tc.graph.node(source).output_shape;
+        var logical: [8]i64 = undefined;
+        for (dims, 0..) |dim, i| {
+            if (dim <= 0) return error.InvalidShape;
+            logical[i] = dim;
+        }
+        const target = Shape.init(shape.dtype, logical[0..dims.len]);
+        if (target.numElements() == null or target.numElements() != shape.numElements()) return error.InvalidShape;
+        var builder = Builder.init(tc.getGraphMut());
+        return tc.makeHandle(try builder.reshape(source, target));
+    }
 
     fn reshape2dOp(ctx: *anyopaque, input: CT, rows: usize, cols: usize) anyerror!CT {
         const tc = fromCtx(ctx);

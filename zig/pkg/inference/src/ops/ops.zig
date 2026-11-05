@@ -1859,8 +1859,20 @@ pub const DetachedDenseF32Payload = struct {
     allocator: std.mem.Allocator,
 };
 
+/// Exact selected biased grouped projection, borrowed for one synchronous call.
+pub const LinearTripleInvocation = struct {
+    input: CT,
+    weights: [3]CT,
+    biases: [3]CT,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    group_prepared: bool = false,
+};
+
 pub const ColdCleanupServices = struct {
     accepts: *const fn (*const ComputeBackend.VTable) bool,
+    linear_triple: ?*const fn (*const ComputeBackend, *const LinearTripleInvocation, @import("../execution/cleanup_context.zig").Context) anyerror!LinearTripleResult = null,
     free: *const fn (*anyopaque, CT, @import("../execution/cleanup_context.zig").Context) void,
     deinit_backend: ?*const fn (*const ComputeBackend, @import("../execution/cleanup_context.zig").Context) void = null,
     detach_dense_f32: ?*const fn (*const ComputeBackend, []const CT, *const anyopaque, @import("../execution/cleanup_context.zig").Context) anyerror!?DetachedDenseF32Payload = null,
@@ -1925,11 +1937,26 @@ pub const ComputeBackend = struct {
         if (self.execution_budget_bind) |bind| bind(self.ptr, null);
     }
 
-    pub fn withoutInvocationContext(self: ComputeBackend) ComputeBackend {
+    /// Retained/output headers preserve only stable endpoint identity and
+    /// target services. Caller cleanup remains explicit at the actual later
+    /// drop; no request, Stage, step budget or cooperative callback may escape.
+    /// Pure value transformation: never invokes a callback or acquires a loan.
+    pub fn withoutSynchronousBorrows(self: ComputeBackend) ComputeBackend {
         var durable = self;
+        durable.execution_control = null;
         durable.call_context = null;
+        durable.embedding_stage = null;
+        durable.execution_budget = null;
+        durable.execution_budget_bind = null;
+        durable.execution_owner = 0;
+        durable.execution_batch_rows = null;
+        durable.execution_batch_drain = null;
+        durable.execution_enter = null;
+        durable.execution_cleanup = null;
+        durable.execution_release = null;
         return durable;
     }
+
     pub fn checkExecutionControl(self: *const ComputeBackend) !void {
         if (self.execution_control) |control| try control.check();
     }
@@ -4202,6 +4229,15 @@ pub const ComputeBackend = struct {
         in_dim: usize,
         out_dim: usize,
     ) !LinearTripleResult {
+        var request = LinearTripleInvocation{ .input = input, .weights = .{ weight_a, weight_b, weight_c }, .biases = .{ bias_a, bias_b, bias_c }, .rows = rows, .in_dim = in_dim, .out_dim = out_dim };
+        if (self.call_context) |context| {
+            if (context.native_weights) |control| if (control.prepare_projection) |prepare| {
+                request.group_prepared = try prepare(control.ptr, self, &request);
+            };
+            if (self.vtable.cold_cleanup_services) |services| if (services.accepts(self.vtable)) {
+                if (services.linear_triple) |run| return run(self, &request, context.cleanup);
+            };
+        }
         if (self.vtable.linearTriple) |linear_triple| {
             return linear_triple(self.ptr, input, weight_a, bias_a, weight_b, bias_b, weight_c, bias_c, rows, in_dim, out_dim);
         }
@@ -7322,16 +7358,6 @@ test "decoder assigned output contracts decline legacy providers before submissi
     try std.testing.expectEqual(@as(usize, 4), submissions);
 }
 
-test "durable backend copy removes only borrowed synchronous invocation context" {
-    const table: ComputeBackend.VTable = undefined; // address identity only
-    var endpoint: u8 = 0;
-    const context = @import("../execution/invocation_context.zig").Context{ .cleanup = .{} };
-    const local = ComputeBackend{ .ptr = &endpoint, .vtable = &table, .call_context = &context };
-    const durable = local.withoutInvocationContext();
-    try std.testing.expect(local.call_context == &context and durable.call_context == null);
-    try std.testing.expect(local.ptr == durable.ptr and local.vtable == durable.vtable);
-}
-
 test "explicit invocation header free forwards caller cleanup and raw fallback never recurses" {
     const sink_mod = @import("../execution/retirement_sink.zig");
     const Cleanup = @import("../execution/cleanup_context.zig").Context;
@@ -7395,7 +7421,51 @@ test "explicit invocation header free forwards caller cleanup and raw fallback n
     copied.cold_cleanup_services = null;
     cb.free(tensor); // header + no handler takes raw exactly once
     try std.testing.expectEqual(@as(usize, 3), Fixture.raw_calls);
-    const durable = cb.withoutInvocationContext();
+    const durable = cb.withoutSynchronousBorrows();
     try std.testing.expect(durable.call_context == null and durable.ptr == cb.ptr and durable.vtable == cb.vtable);
     try std.testing.expectEqual(@as(usize, 2), probe.typed);
+}
+
+test "durable backend header strips all synchronous borrows without invoking hooks or changing endpoint" {
+    const Probe = struct {
+        var calls: usize = 0;
+        fn check(_: ?*anyopaque) !void {
+            calls += 1;
+        }
+        fn pause(_: *anyopaque) !void {
+            calls += 1;
+        }
+        fn cleanup(_: *anyopaque) void {
+            calls += 1;
+        }
+        fn bind(_: *anyopaque, _: ?*runtime.tier.memory.RunBudget) void {
+            calls += 1;
+        }
+        fn rows(_: *anyopaque, _: usize) void {
+            calls += 1;
+        }
+        fn enter(_: *anyopaque, _: u64) !void {
+            calls += 1;
+        }
+        fn leave(_: *anyopaque, _: u64) void {
+            calls += 1;
+        }
+    };
+    Probe.calls = 0;
+    var endpoint: u8 = 0;
+    const table: ComputeBackend.VTable = undefined;
+    var budget = runtime.tier.memory.RunBudget.init(.{});
+    const context = @import("../execution/invocation_context.zig").Context{ .cleanup = .{} };
+    const stage = EmbeddingStageControl{ .ptr = &endpoint, .pause_fn = Probe.pause, .resume_fn = Probe.pause, .cleanup_fn = Probe.cleanup };
+    const local = ComputeBackend{ .ptr = &endpoint, .vtable = &table, .execution_control = .{ .check_fn = Probe.check }, .call_context = &context, .embedding_stage = &stage, .execution_budget = &budget, .execution_budget_bind = Probe.bind, .execution_owner = 17, .execution_batch_rows = Probe.rows, .execution_batch_drain = Probe.pause, .execution_enter = Probe.enter, .execution_cleanup = Probe.leave, .execution_release = Probe.leave };
+    const copy = local.withoutSynchronousBorrows();
+    try std.testing.expect(copy.ptr == local.ptr and copy.vtable == local.vtable);
+    try std.testing.expect(copy.execution_control == null and copy.call_context == null and copy.embedding_stage == null);
+    try std.testing.expect(copy.execution_budget == null and copy.execution_budget_bind == null and copy.execution_owner == 0);
+    try std.testing.expect(copy.execution_batch_rows == null and copy.execution_batch_drain == null and copy.execution_enter == null and copy.execution_cleanup == null and copy.execution_release == null);
+    try std.testing.expect(local.call_context == &context and local.execution_budget == &budget and local.execution_owner == 17);
+    try copy.checkExecutionControl();
+    copy.bindExecutionBudget();
+    copy.clearExecutionBudget();
+    try std.testing.expectEqual(@as(usize, 0), Probe.calls);
 }

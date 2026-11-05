@@ -53,6 +53,12 @@ pub fn createNative(allocator: std.mem.Allocator, weights: *native.WeightStore, 
         if (observers.State.forAllocator(allocator)) |owner| {
             if (register) registry.bind(.compute, owner);
         } else if (observers.State.create(allocator, .from_owner_creation) catch null) |owner| {
+            // A Source's admitted wrapper allocates its actual blocks from
+            // this parent too. Link only the attested live backing, so Registry
+            // excludes the child's overlapping payload from ancestor sums.
+            if (@import("admitted_allocator.zig").AdmittedAllocator.backingAllocator(allocator)) |backing| {
+                if (observers.State.forAllocator(backing)) |parent| owner.parent_owner = parent.retain();
+            }
             owned_observer = owner;
             effective_allocator = owner.allocator();
             if (register) registry.bind(.compute, owner);
@@ -472,4 +478,182 @@ test "Metal Gemma RMS typed host declaration exactcap and onebelow retain origin
             try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
         }
     }
+}
+
+test "Native admitted observer ancestry is actual backing on independent concurrent workers" {
+    const observers = @import("../execution/allocation_observer.zig");
+    const registry = @import("../execution/allocation_registry.zig");
+    const Admitted = @import("admitted_allocator.zig").AdmittedAllocator;
+    const Worker = struct {
+        root: *observers.State,
+        controller: *memory.AdmissionController,
+        result: registry.Summary = .{},
+        failure: ?anyerror = null,
+        fn admit(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = bytes }, false);
+        }
+        fn execute(self: *@This()) void {
+            self.run() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn run(self: *@This()) !void {
+            // No parent/submitting-thread registry is inherited by a worker.
+            try std.testing.expect(!registry.enabled());
+            var local: registry.Registry = undefined;
+            local.begin(std.testing.allocator);
+            var active = true;
+            defer if (active) {
+                _ = local.finish();
+            };
+            var admitted = Admitted{ .backing = self.root.allocator(), .admission_context = self, .admit = admit };
+            defer admitted.deinit();
+            var weights = native.WeightStore{ .allocator = self.root.allocator(), .resident_weights = .empty, .lazy_weights = .empty };
+            native.initPrefetchQueue(&weights, weights.allocator);
+            defer weights.deinitOwned();
+            var cb = try createNative(admitted.allocator(), &weights, null, null, .{});
+            var cb_live = true;
+            defer if (cb_live) cb.deinit();
+            const compute: *native.NativeCompute = @ptrCast(@alignCast(cb.ptr));
+            const child = observers.State.forAllocator(compute.allocator) orelse return error.MissingWorkerObserver;
+            try std.testing.expect(child.parent().? == self.root);
+            const tensor = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+            const values = cb.toFloat32(tensor, std.testing.allocator) catch |err| {
+                cb.free(tensor);
+                return err;
+            };
+            defer std.testing.allocator.free(values);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, values);
+            cb.free(tensor);
+            cb.deinit();
+            cb_live = false;
+            self.result = local.finish();
+            active = false;
+            try std.testing.expectEqual(@as(usize, 2), self.result.owners);
+            try std.testing.expectEqual(@as(usize, 1), self.result.observed_roots);
+            try std.testing.expectEqual(@as(usize, 0), self.result.missing_model_registrations);
+            try std.testing.expectEqual(@as(usize, 0), self.result.missing_compute_registrations);
+            var child_seen = false;
+            for (self.result.reports[0..self.result.reports_count]) |value| if (value.compute) {
+                child_seen = true;
+                try std.testing.expectEqual(@intFromPtr(self.root), value.parent_identity.?);
+                try std.testing.expect(value.covered_by_registered_ancestor);
+            };
+            try std.testing.expect(child_seen);
+        }
+    };
+    const root = try observers.State.create(std.testing.allocator, .from_owner_creation);
+    var root_live = true;
+    defer if (root_live) root.release();
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var parent: registry.Registry = undefined;
+    parent.begin(std.testing.allocator);
+    var parent_live = true;
+    defer if (parent_live) {
+        _ = parent.finish();
+    };
+    registry.bind(.model, root);
+    var workers: [3]Worker = undefined;
+    var threads: [3]std.Thread = undefined;
+    var started: usize = 0;
+    defer for (threads[0..started]) |thread| thread.join();
+    for (&workers, &threads) |*worker, *thread| {
+        worker.* = .{ .root = root, .controller = &controller };
+        thread.* = try std.Thread.spawn(.{}, Worker.execute, .{worker});
+        started += 1;
+    }
+    for (threads[0..started]) |thread| thread.join();
+    started = 0;
+    for (workers) |worker| if (worker.failure) |err| return err;
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+    const identity = @intFromPtr(root);
+    root.release();
+    root_live = false;
+    const summary = parent.finish();
+    parent_live = false;
+    // Main-thread registration was not mutated by worker-local registries.
+    // The actual shared root interval includes its real concurrent activity.
+    try std.testing.expectEqual(@as(usize, 1), summary.owners);
+    try std.testing.expect(summary.allocations.? > 0);
+    try std.testing.expectEqual(summary.allocations.?, summary.frees.?);
+    try std.testing.expectEqual(@as(u64, 0), summary.requested_live_bytes.?);
+    for (workers) |worker| for (worker.result.reports[0..worker.result.reports_count]) |report| if (report.compute) {
+        try std.testing.expectEqual(identity, report.parent_identity.?); // copied after actual owners retired
+    };
+}
+
+test "Native admitted observer ancestry refuses copied allocator tables before opaque pointer access" {
+    const Admitted = @import("admitted_allocator.zig").AdmittedAllocator;
+    var admitted = Admitted{ .backing = std.testing.allocator };
+    const actual = admitted.allocator();
+    try std.testing.expect(Admitted.backingAllocator(actual).?.ptr == std.testing.allocator.ptr);
+    const copied = actual.vtable.*;
+    const unknown = std.mem.Allocator{ .ptr = @ptrFromInt(1), .vtable = &copied };
+    try std.testing.expect(Admitted.backingAllocator(unknown) == null);
+}
+
+test "Native late allocator observation preserves admitted actual parent without claiming creation coverage" {
+    const observers = @import("../execution/allocation_observer.zig");
+    const registry = @import("../execution/allocation_registry.zig");
+    const Admitted = @import("admitted_allocator.zig").AdmittedAllocator;
+    const root = try observers.State.create(std.testing.allocator, .from_owner_creation);
+    defer root.release();
+    const Funding = struct {
+        controller: memory.AdmissionController = .{},
+        fn admit(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = bytes }, false);
+        }
+    };
+    var funding = Funding{};
+    defer funding.controller.deinit();
+    var admitted = Admitted{ .backing = root.allocator(), .admission_context = &funding, .admit = Funding.admit };
+    defer admitted.deinit();
+    var weights = native.WeightStore{ .allocator = root.allocator(), .resident_weights = .empty, .lazy_weights = .empty };
+    native.initPrefetchQueue(&weights, weights.allocator);
+    defer weights.deinitOwned();
+    try std.testing.expect(!registry.enabled());
+    var cb = try createNative(admitted.allocator(), &weights, null, null, .{});
+    defer cb.deinit();
+    const compute: *native.NativeCompute = @ptrCast(@alignCast(cb.ptr));
+    try std.testing.expect(observers.State.forAllocator(compute.allocator) == null);
+    cb.enableRuntimeObservation();
+    const child = observers.State.forAllocator(compute.allocator) orelse return error.MissingLateObserver;
+    try std.testing.expect(child.parent().? == root);
+    try std.testing.expectEqual(observers.Coverage.since_enable, child.coverage);
+    const tensor = try cb.fromFloat32Shape(&.{ 2, 3 }, &.{2});
+    defer cb.free(tensor);
+    try std.testing.expect(child.snapshot().allocations > 0);
+}
+
+test "Native admitted observer parent allocation failure retires child before actual source owner" {
+    const Case = struct {
+        controller: memory.AdmissionController = .{},
+        fn admit(raw: *anyopaque, bytes: usize) !memory.AdmissionLease {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = bytes }, false);
+        }
+        fn run(a: std.mem.Allocator) !void {
+            const observers = @import("../execution/allocation_observer.zig");
+            const parent = try observers.State.createWithMetadata(a, a, .from_owner_creation);
+            defer parent.release();
+            var funding = @This(){};
+            defer funding.controller.deinit();
+            var admitted = @import("admitted_allocator.zig").AdmittedAllocator{ .backing = parent.allocator(), .admission_context = &funding, .admit = admit };
+            defer admitted.deinit();
+            var weights = native.WeightStore{ .allocator = parent.allocator(), .resident_weights = .empty, .lazy_weights = .empty };
+            native.initPrefetchQueue(&weights, weights.allocator);
+            defer weights.deinitOwned();
+            var cb = try createNative(admitted.allocator(), &weights, null, null, .{ .observe_allocations = true });
+            defer cb.deinit();
+            const tensor = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 2, 2 });
+            defer cb.free(tensor);
+            const values = try cb.toFloat32(tensor, a);
+            defer a.free(values);
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, values);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }

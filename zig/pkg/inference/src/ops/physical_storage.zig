@@ -144,7 +144,7 @@ pub const Lease = struct {
             if (actual > value.reservedBytes()) return error.PhysicalStorageExceededReservation;
             if (owned) |binding| binding.owner.measure(binding.construction_epoch, actual) else value.retainBytes(actual);
         }
-        self.* = .{ .admission = reserved.reservation, .retirement_owner = if (owned) |binding| binding.owner else null, .allocator = allocator, .backend = backend, .tensor = tensor, .byte_size = byte_size, .ledger = ledger, .accounting_class = class, .backing_byte_size = backing_bytes };
+        self.* = .{ .admission = reserved.reservation, .retirement_owner = if (owned) |binding| binding.owner else null, .allocator = allocator, .backend = backend.withoutSynchronousBorrows(), .tensor = tensor, .byte_size = byte_size, .ledger = ledger, .accounting_class = class, .backing_byte_size = backing_bytes };
         if (ledger) |owner| owner.allocated(class, byte_size, backing_bytes);
         return self;
     }
@@ -292,8 +292,19 @@ pub const CapturedLeases = struct {
         try self.values.append(allocator, lease);
         lease.retain();
     }
+    pub fn validateCleanup(self: *const CapturedLeases, current: @import("../execution/cleanup_context.zig").Context) !void {
+        for (self.values.items) |lease| if (lease.retirement_owner != null) {
+            if (current.boundary) |epoch| {
+                if (try epoch.isSealed()) return error.RetirementEpochSealed;
+            } else if (lease.references.load(.acquire) == 1) return error.MissingCurrentCleanupEpoch;
+        };
+    }
     pub fn deinit(self: *CapturedLeases, allocator: std.mem.Allocator) void {
-        for (self.values.items) |lease| lease.release();
+        self.deinitWithCleanup(allocator, .{});
+    }
+    pub fn deinitWithCleanup(self: *CapturedLeases, allocator: std.mem.Allocator, current: @import("../execution/cleanup_context.zig").Context) void {
+        self.validateCleanup(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        for (self.values.items) |lease| lease.releaseWithCleanup(current);
         self.values.deinit(allocator);
         self.* = .{};
     }
@@ -314,6 +325,14 @@ pub const View = struct {
 /// Begin/commit only record and instantiate; they never submit GPU work.
 /// Failed recording/instantiation can therefore abort and run ordinary kernels.
 /// The backend context must outlive this owner.
+/// Synchronous borrow installed by the actual Frame, cleared before its cleanup
+/// storage/epoch can die. It neither retains an epoch nor grants later reuse.
+pub const ExecutionScope = struct {
+    backend: ops.ComputeBackend,
+    storages: ?[]const ?*Lease,
+    cleanup: *const @import("../execution/cleanup_context.zig").Context,
+};
+
 pub const Replay = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -324,6 +343,7 @@ pub const Replay = struct {
         launch: *const fn (*anyopaque) anyerror!void,
         retains: *const fn (*anyopaque, *const Lease) bool,
         deinit: *const fn (*anyopaque) void,
+        deinitWithCleanup: ?*const fn (*anyopaque, @import("../execution/cleanup_context.zig").Context) void = null,
     };
     pub fn begin(self: Replay, leases: []const ?*Lease) !bool {
         return self.vtable.begin(self.ptr, leases);
@@ -341,7 +361,10 @@ pub const Replay = struct {
         return self.vtable.retains(self.ptr, lease);
     }
     pub fn deinit(self: Replay) void {
-        self.vtable.deinit(self.ptr);
+        self.deinitWithCleanup(.{});
+    }
+    pub fn deinitWithCleanup(self: Replay, current: @import("../execution/cleanup_context.zig").Context) void {
+        if (self.vtable.deinitWithCleanup) |destroy| destroy(self.ptr, current) else self.vtable.deinit(self.ptr);
     }
 };
 
@@ -1170,4 +1193,117 @@ test "typed physical policy carries initialization and admitted mode through one
     const cb = ops.ComputeBackend{ .ptr = &state, .vtable = &table };
     try std.testing.expectEqual(@as(usize, 80), try reservationBytes(cb, .{ .byte_size = 16, .usage = .host_input, .admitted = true }));
     try std.testing.expect(state.seen);
+}
+
+test "captured prepared final lease retires through fresh caller B after construction A dies" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const memory = @import("../runtime/tier/memory.zig");
+    const sink = @import("../execution/retirement_sink.zig");
+    const prepared = @import("../execution/prepared_storage_admission.zig");
+    const Source = struct {
+        controller: memory.AdmissionController = .{},
+        run: memory.AdmissionLease = undefined,
+        credit: memory.AdmissionAmounts = .{ .host_scratch_bytes = 64 },
+        fn reserve(raw: *anyopaque, allocator: std.mem.Allocator, kind: ops.BackendKind, class: accounting.Class, bytes: usize) !admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return admission.fromRunLease(allocator, &self.run, .{ .controller = &self.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 }, .check_live_memory = false, .credit = &self.credit }, kind, class, bytes);
+        }
+    };
+    var backend = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer backend.deinit(a);
+    const cb = backend.computeBackend();
+    var source = Source{};
+    defer source.controller.deinit();
+    source.run = try source.controller.tryAcquire(.cpu, .{ .host_limit_bytes = 64 }, .{ .host_scratch_bytes = 64 }, false);
+    defer source.run.release();
+    const cap = admission.Capability{ .identity = .{ .controller = &source.controller, .backend_class = .cpu }, .context = &source, .services = &.{ .reserve = Source.reserve } };
+    const plan = (try prepared.Prepared.prepare(cap, &.{.{ .backend = .native, .class = .activation, .bytes = 64 }})).?;
+    var unbound = true;
+    defer if (unbound) plan.abortBeforeExecution() catch unreachable;
+    var origin = try sink.Ref.create();
+    defer origin.release();
+    var first = try origin.enter();
+    defer first.finish();
+    var old = try first.retainEpoch();
+    defer old.release();
+    var current_sink = try sink.Ref.create();
+    defer current_sink.release();
+    var guard = try current_sink.enter();
+    defer guard.finish();
+    var now = try guard.retainEpoch();
+    defer now.release();
+    try plan.bindConstructionEpoch(&old);
+    unbound = false;
+    var preparation_live = true;
+    defer if (preparation_live) plan.releaseAfterExecution(&old);
+    const bank = (try Lease.createAdmitted(a, cb, 64, null, .activation, prepared.Prepared.forDispatch(plan, cap.identity))).?;
+    var table = CapturedLeases{};
+    var live = true;
+    defer if (live) table.deinitWithCleanup(a, .{ .boundary = &now });
+    var bank_live = true;
+    defer if (bank_live) bank.releaseWithBoundary(&old);
+    try table.retain(a, bank);
+    bank.releaseWithBoundary(&old);
+    bank_live = false;
+    plan.releaseAfterExecution(&old);
+    preparation_live = false;
+    first.finish();
+    try std.testing.expectEqual(@as(usize, 1), bank.references.load(.acquire));
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, table.validateCleanup(.{}));
+    try std.testing.expectError(error.RetirementEpochSealed, table.validateCleanup(.{ .boundary = &old }));
+    try std.testing.expectEqual(@as(usize, 1), bank.references.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 64), source.controller.snapshot().host_scratch_bytes);
+    table.deinitWithCleanup(a, .{ .boundary = &now });
+    live = false;
+    try std.testing.expectEqual(@as(usize, 64), source.controller.snapshot().host_scratch_bytes);
+    guard.finish();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, source.controller.snapshot());
+}
+
+test "retained Native physical lease drops request stack header borrows and uses only fresh caller cleanup" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var endpoint = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer endpoint.deinit(a);
+    const canonical = endpoint.computeBackend();
+    const Make = struct {
+        var callbacks: usize = 0;
+        fn check(_: ?*anyopaque) !void {
+            callbacks += 1;
+            return error.ExpiredRequestCallback;
+        }
+        fn bind(_: *anyopaque, _: ?*@import("../runtime/tier/memory.zig").RunBudget) void {
+            callbacks += 1;
+        }
+        fn create(allocator: std.mem.Allocator, backend: ops.ComputeBackend) !*Lease {
+            var budget = @import("../runtime/tier/memory.zig").RunBudget.init(.{});
+            const old = @import("../execution/invocation_context.zig").Context{ .cleanup = .{} };
+            var local = backend;
+            local.call_context = &old;
+            local.execution_budget = &budget;
+            local.execution_budget_bind = bind;
+            local.execution_control = .{ .check_fn = check };
+            const result = (try Lease.create(allocator, local, 16)).?;
+            try std.testing.expect(local.call_context == &old and local.execution_budget == &budget);
+            return result;
+        }
+    };
+    Make.callbacks = 0;
+    const bank = try Make.create(a, canonical);
+    var owner = try @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+    defer owner.finishAfterUnlock();
+    const now = @import("../execution/cleanup_context.zig").Context{ .boundary = owner.epoch() };
+    defer bank.releaseWithCleanup(now);
+    try std.testing.expect(bank.backend.call_context == null and bank.backend.execution_budget == null and bank.backend.execution_control == null and bank.backend.execution_budget_bind == null);
+    try std.testing.expect(bank.backend.ptr == canonical.ptr and bank.backend.vtable == canonical.vtable);
+    try bank.backend.checkExecutionControl();
+    bank.backend.bindExecutionBudget();
+    const view = (try bank.backend.vtable.kernels.?.physicalTensorView.?(bank.backend.ptr, .{ .storage = bank, .shape = &.{4} })).?;
+    defer bank.backend.freeWithCleanup(view, now);
+    try bank.backend.vtable.kernels.?.writePhysicalFloat32.?(bank.backend.ptr, view, &.{ 1, 2, 3, 4 });
+    const actual = try bank.backend.toFloat32(view, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, actual);
+    try std.testing.expectEqual(@as(usize, 0), Make.callbacks);
 }

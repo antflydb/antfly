@@ -5711,6 +5711,7 @@ pub const CudaCompute = struct {
     florence_image_projection_vision_dim: usize = 0,
     florence_image_projection_projection_dim: usize = 0,
     physical_execution_storage: ?[]const ?*ops.physical_storage.Lease = null,
+    physical_execution_cleanup: ?*const CacheCleanup = null,
     capturing_physical_storage: ops.physical_storage.CapturedLeases = .{},
     debug_cuda_graph_capture_active: bool = false,
     debug_cuda_graph_capture_disabled: bool = false,
@@ -7603,8 +7604,7 @@ pub const CudaCompute = struct {
             // Other shapes can grow the cuDNN scratch or populate packed
             // weights. Never replay a graph with stale addresses/topology.
             if (entry.attention_workspace != self.embedding_gemma2_cudnn_attention_scratch.buffer.ptr or entry.weight_generation != self.embedding_gemma2_execution.weight_generation) {
-                if (entry.graph != null) self.ctx.destroyGraphExec(entry.graph);
-                entry.graph = null;
+                try self.ctx.destroyGraphExecChecked(&entry.graph);
                 entry.warm = false;
                 entry.resetTiming();
             }
@@ -7988,6 +7988,9 @@ pub const CudaCompute = struct {
         self.deinitUsing(current, true);
     }
     fn deinitUsing(self: *CudaCompute, current: CacheCleanup, require_owner_empty: bool) void {
+        if (self.physical_execution_storage != null or self.physical_execution_cleanup != null) platform.inference_process_supervisor.restartWorker();
+        self.capturing_physical_storage.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+        for (&self.debug_cuda_graph_slots) |*slot| slot.physical_storage.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
         self.validateCacheCleanup(current) catch platform.inference_process_supervisor.restartWorker();
         // The context owns final driver disposal, including transfer to failed-
         // allocation quarantine. Keep its entry points alive through the host
@@ -8003,12 +8006,13 @@ pub const CudaCompute = struct {
         }
         // Captured executions own addresses in both the prepared plan and
         // backend caches. Retire them before tearing down either owner.
-        if (self.debug_cuda_graph_capture_active) abortDebugCudaGraphCapture(self, self.debug_cuda_graph_active_slot orelse 0);
+        if (self.debug_cuda_graph_capture_active) abortDebugCudaGraphCaptureWithCleanup(self, self.debug_cuda_graph_active_slot orelse 0, current);
         if (self.capturing_physical_storage.values.items.len != 0) {
-            self.ctx.synchronize() catch {};
-            self.capturing_physical_storage.deinit(self.allocator);
+            self.capturing_physical_storage.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+            self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+            self.capturing_physical_storage.deinitWithCleanup(self.allocator, current);
         }
-        for (&self.debug_cuda_graph_slots) |*slot| deinitCudaGraphReplaySlot(self, slot);
+        for (&self.debug_cuda_graph_slots) |*slot| deinitCudaGraphReplaySlot(self, slot, current);
         self.audio_plans.clearWithCleanup(current) catch platform.inference_process_supervisor.restartWorker();
         const retained_cleanup_failed = failed: {
             self.embedding_gemma2_resize.clearWithCleanup(&self.ctx, current) catch break :failed true;
@@ -10177,7 +10181,7 @@ const CudaKvDeviceStorage = struct {
         if (owned) {
             const epoch = cleanup orelse @import("antfly_platform").inference_process_supervisor.restartWorker();
             if (epoch.isSealed() catch true) @import("antfly_platform").inference_process_supervisor.restartWorker();
-            preparePersistentCudaBufferReallocation(self.compute) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            preparePersistentCudaBufferReallocationWithCleanup(self.compute, .{ .boundary = epoch }) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
             if (self.compute.lighton_decode_graph_enabled) self.compute.clearCapturedGraphWithCleanup(.{ .boundary = cleanup }) catch platform.inference_process_supervisor.restartWorker();
             self.compute.ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         }
@@ -10679,7 +10683,7 @@ const CudaKvDeviceStorage = struct {
                 _ = try checkedAdd(@intCast(layer.v.ptr), value_range.source);
             }
         }
-        invalidateDebugFinalHiddenGraph(self.compute);
+        invalidateDebugFinalHiddenGraphWithCleanup(self.compute, request.cleanup);
         const backend = self.compute.computeBackend();
         try invalidateCapturedGraphForMutation(self.compute, &backend, request.cleanup);
         var attempted = false;
@@ -10778,7 +10782,7 @@ const CudaKvDeviceStorage = struct {
         };
         errdefer if (attempted) self.compute.ctx.synchronize() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         claim.attempted = true;
-        try preparePersistentCudaBufferReallocation(self.compute);
+        try preparePersistentCudaBufferReallocationWithCleanup(self.compute, .{ .boundary = cleanup });
         if (self.compute.lighton_decode_graph_enabled) try self.compute.clearCapturedGraphWithCleanup(.{ .boundary = cleanup });
         // Allocate the complete replacement before copying or publishing any
         // plane. Claims already cover all new allocations plus retained olds.
@@ -11830,7 +11834,7 @@ fn beginRequestUsing(ctx: *anyopaque, current: CacheCleanup) anyerror!void {
     try self.clearCapturedGraphWithCleanup(current);
     self.lighton_decode_graph.epoch_id = 0;
     try synchronizeAndDrainDeferredDeviceFrees(self);
-    try resetDebugCudaGraphRequestState(self);
+    try resetDebugCudaGraphRequestStateWithCleanup(self, current);
     if (self.temp_slot_config.autoplan_enabled or
         platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_SERVER_REQUEST_GRAPH_RESET", false))
     {
@@ -11839,7 +11843,7 @@ fn beginRequestUsing(ctx: *anyopaque, current: CacheCleanup) anyerror!void {
         // boundary. The learned planner retains only its shape candidate and
         // proves it again before capture; legacy fixed schedules retain the
         // synchronization required by their process-global allocation ABI.
-        try resetTempPinnedSlotsForRequest(self);
+        try resetTempPinnedSlotsForRequestWithCleanup(self, current);
     }
 }
 
@@ -15969,9 +15973,12 @@ fn releasePinnedTempSlot(self: *CudaCompute, buffer: *buffer_mod.DeviceBuffer) b
 }
 
 fn resetTempPinnedSlotsForRequest(self: *CudaCompute) !void {
+    return resetTempPinnedSlotsForRequestWithCleanup(self, physicalScopeCleanup(self));
+}
+fn resetTempPinnedSlotsForRequestWithCleanup(self: *CudaCompute, current: CacheCleanup) !void {
     // Graph execs retain every captured device address. Destroy them before
     // returning any pinned arena allocation to the general temp cache.
-    invalidateDebugFinalHiddenGraph(self);
+    invalidateDebugFinalHiddenGraphWithCleanup(self, current);
     while (!self.temp_buffer_mutex.tryLock()) std.atomic.spinLoopHint();
     defer self.temp_buffer_mutex.unlock();
 
@@ -17359,7 +17366,7 @@ fn debugCudaGraphCaptureBegin(ctx: *anyopaque, label: []const u8) !bool {
     // Keep every warmed planned address alive for the captured executable.
     // New physical device allocations remain forbidden during capture.
     std.debug.assert(self.capturing_physical_storage.values.items.len == 0);
-    errdefer self.capturing_physical_storage.deinit(self.allocator);
+    errdefer self.capturing_physical_storage.deinitWithCleanup(self.allocator, physicalScopeCleanup(self));
     if (self.physical_execution_storage) |leases| for (leases) |lease| {
         if (lease) |value| if (value.backend.ptr == @as(*anyopaque, @ptrCast(self))) try self.capturing_physical_storage.retain(self.allocator, value);
     };
@@ -17567,14 +17574,16 @@ fn debugCudaTraceTensor(ctx: *anyopaque, label: []const u8, tensor: CT) !void {
 }
 
 fn resetCudaGraphReplaySlotMetadata(self: *CudaCompute, slot: *CudaGraphReplaySlot) void {
-    if (slot.exec) |exec| {
-        self.ctx.destroyGraphExec(exec);
-        slot.exec = null;
-    }
-    // Destruction/eviction is cold. A graph launch is asynchronous, so its
-    // address owners must survive the final submission as well as the exec.
-    if (slot.physical_storage.values.items.len != 0) self.ctx.synchronize() catch {};
-    slot.physical_storage.deinit(self.allocator);
+    resetCudaGraphReplaySlotMetadataWithCleanup(self, slot, physicalScopeCleanup(self));
+}
+fn resetCudaGraphReplaySlotMetadataWithCleanup(self: *CudaCompute, slot: *CudaGraphReplaySlot, current: CacheCleanup) void {
+    slot.physical_storage.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+    // Destruction/eviction is cold. Refuse to retire any retained address or
+    // metadata on failed completion/destruction, including a partial retry.
+    if (slot.exec != null or slot.physical_storage.values.items.len != 0)
+        self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+    self.ctx.destroyGraphExecChecked(&slot.exec) catch platform.inference_process_supervisor.restartWorker();
+    slot.physical_storage.deinitWithCleanup(self.allocator, current);
     resetCudaGraphReplaySlotMetadataKeepExec(self, slot);
     slot.temp_arena_generation = 0;
     slot.captured_temp_allocation_count = 0;
@@ -17601,8 +17610,8 @@ fn resetCudaGraphReplaySlotMetadataKeepExec(self: *CudaCompute, slot: *CudaGraph
     slot.decode_scalars_auto_advance_delta = .{ 1, 1, 1, 1, 0 };
 }
 
-fn deinitCudaGraphReplaySlot(self: *CudaCompute, slot: *CudaGraphReplaySlot) void {
-    resetCudaGraphReplaySlotMetadata(self, slot);
+fn deinitCudaGraphReplaySlot(self: *CudaCompute, slot: *CudaGraphReplaySlot, current: CacheCleanup) void {
+    resetCudaGraphReplaySlotMetadataWithCleanup(self, slot, current);
     slot.input_storage.free(&self.ctx);
     slot.aux_input_storage.free(&self.ctx);
     slot.output_storage.free(&self.ctx);
@@ -17612,8 +17621,12 @@ fn deinitCudaGraphReplaySlot(self: *CudaCompute, slot: *CudaGraphReplaySlot) voi
 }
 
 fn invalidateDebugFinalHiddenGraph(self: *CudaCompute) void {
+    invalidateDebugFinalHiddenGraphWithCleanup(self, physicalScopeCleanup(self));
+}
+fn invalidateDebugFinalHiddenGraphWithCleanup(self: *CudaCompute, current: CacheCleanup) void {
+    for (&self.debug_cuda_graph_slots) |*slot| slot.physical_storage.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
     for (&self.debug_cuda_graph_slots) |*slot| {
-        resetCudaGraphReplaySlotMetadata(self, slot);
+        resetCudaGraphReplaySlotMetadataWithCleanup(self, slot, current);
     }
     self.debug_cuda_graph_active_slot = null;
     self.debug_cuda_graph_prepared_slot = null;
@@ -17637,6 +17650,7 @@ fn disarmSplitkOnlineDecodeReplay(self: *CudaCompute) void {
 
 test "split-K replay rejection cannot leave a prepared graph or stale scalars" {
     var self: CudaCompute = undefined;
+    self.physical_execution_cleanup = null;
     self.ctx.observation.store(null, .release);
     self.ctx.observation_enable_failed.store(false, .release);
 
@@ -17694,15 +17708,22 @@ test "split-K replay rejection cannot leave a prepared graph or stale scalars" {
 }
 
 fn preparePersistentCudaBufferReallocation(self: *CudaCompute) !void {
+    // Capture rejection needs no cleanup borrow. Otherwise only callbacks
+    // inside an active physical scope may use its synchronous fallback.
+    const current: CacheCleanup = if (self.debug_cuda_graph_capture_active) .{} else physicalScopeCleanup(self);
+    return preparePersistentCudaBufferReallocationWithCleanup(self, current);
+}
+fn preparePersistentCudaBufferReallocationWithCleanup(self: *CudaCompute, current: CacheCleanup) !void {
     if (self.debug_cuda_graph_capture_active) {
         self.debug_cuda_graph_capture_disabled = true;
         return error.CudaGraphCaptureUnsafeTempAlloc;
     }
-    invalidateDebugFinalHiddenGraph(self);
+    invalidateDebugFinalHiddenGraphWithCleanup(self, current);
 }
 
 test "CUDA persistent buffer reallocation invalidates graph pointers and rejects capture" {
     var self: CudaCompute = undefined;
+    self.physical_execution_cleanup = null;
     self.ctx.observation.store(null, .release);
     self.ctx.observation_enable_failed.store(false, .release);
 
@@ -17785,6 +17806,7 @@ test "clearing CUDA graph capture state removes stale disabled latch" {
 
 test "CUDA graph request reset clears stale capture and scalar state" {
     var self: CudaCompute = undefined;
+    self.physical_execution_cleanup = null;
     self.ctx.observation.store(null, .release);
     self.ctx.observation_enable_failed.store(false, .release);
 
@@ -17837,6 +17859,7 @@ test "CUDA graph request reset clears stale capture and scalar state" {
 
 test "CUDA request reset clears pinned temp slot ABI mappings" {
     var self: CudaCompute = undefined;
+    self.physical_execution_cleanup = null;
     self.ctx.observation.store(null, .release);
     self.ctx.observation_enable_failed.store(false, .release);
 
@@ -17926,19 +17949,30 @@ fn restoreDebugCudaGraphDecodeScalars(self: *CudaCompute, slot_idx: usize) void 
 }
 
 fn abortDebugCudaGraphCapture(self: *CudaCompute, slot_idx: usize) void {
+    abortDebugCudaGraphCaptureWithCleanup(self, slot_idx, physicalScopeCleanup(self));
+}
+fn abortDebugCudaGraphCaptureWithCleanup(self: *CudaCompute, slot_idx: usize, current: CacheCleanup) void {
+    self.capturing_physical_storage.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+    self.debug_cuda_graph_slots[slot_idx].physical_storage.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
     self.stats.cuda_graph_capture_discards += 1;
     if (self.ctx.debug_graph_capture_active) {
         if (self.ctx.endStreamCapture()) |graph| {
-            self.ctx.destroyGraph(graph);
-        } else |_| {}
+            var pending = graph;
+            self.ctx.destroyGraphChecked(&pending) catch platform.inference_process_supervisor.restartWorker();
+        } else |_| {
+            @import("graph.zig").requireCaptureEnded(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
+        }
     }
-    resetCudaGraphReplaySlotMetadata(self, &self.debug_cuda_graph_slots[slot_idx]);
-    self.capturing_physical_storage.deinit(self.allocator);
+    resetCudaGraphReplaySlotMetadataWithCleanup(self, &self.debug_cuda_graph_slots[slot_idx], current);
+    self.capturing_physical_storage.deinitWithCleanup(self.allocator, current);
     clearDebugCudaGraphCaptureState(self);
     restoreDebugCudaGraphDecodeScalars(self, slot_idx);
 }
 
 fn resetDebugCudaGraphRequestState(self: *CudaCompute) !void {
+    return resetDebugCudaGraphRequestStateWithCleanup(self, physicalScopeCleanup(self));
+}
+fn resetDebugCudaGraphRequestStateWithCleanup(self: *CudaCompute, current: CacheCleanup) !void {
     // Request boundaries must never inherit an invalidated capture latch. Do
     // not attempt recovery while CUDA still considers the stream captured.
     if (self.ctx.debug_graph_capture_active) return error.InvalidCudaState;
@@ -17953,7 +17987,7 @@ fn resetDebugCudaGraphRequestState(self: *CudaCompute) !void {
     self.debug_cuda_graph_capture_temp_seq_begin = 0;
     self.debug_cuda_graph_prepared_attention_topology = .{ 0, 0, 0 };
     self.generated_gqa_score_prework_templates.clearRetainingCapacity();
-    invalidateDebugFinalHiddenGraph(self);
+    invalidateDebugFinalHiddenGraphWithCleanup(self, current);
 }
 
 fn cudaGraphReplayKey(label: []const u8) u64 {
@@ -18696,8 +18730,8 @@ fn debugCudaGraphReplayFinalHiddenDiscard(ctx: *anyopaque, input: CT) !bool {
 }
 
 fn replayCapturedDebugGraphOneShot(self: *CudaCompute, graph: driver_mod.CUgraph) !void {
-    const exec = try self.ctx.instantiateGraph(graph);
-    defer self.ctx.destroyGraphExec(exec);
+    var exec = try self.ctx.instantiateGraph(graph);
+    defer self.ctx.destroyGraphExecChecked(&exec) catch platform.inference_process_supervisor.restartWorker();
     self.stats.cuda_graph_capture_instantiates += 1;
     try self.ctx.launchGraph(exec);
     self.stats.cuda_graph_capture_replays += 1;
@@ -18708,14 +18742,15 @@ fn replayCapturedDebugGraphOneShot(self: *CudaCompute, graph: driver_mod.CUgraph
 
 fn replayCapturedDebugGraphWithUpdate(self: *CudaCompute, slot_idx: usize, graph: driver_mod.CUgraph) !void {
     const slot = &self.debug_cuda_graph_slots[slot_idx];
+    try slot.physical_storage.validateCleanup(physicalScopeCleanup(self));
     update_existing: {
         if (slot.exec) |exec| {
             const outcome = self.ctx.updateGraphExec(exec, graph) catch |err| {
                 if (err == error.CudaSymbolMissing) {
                     self.stats.cuda_graph_capture_update_unavailable += 1;
                     std.log.warn("cuda_graph_capture_probe: update_unavailable fallback=instantiate", .{});
-                    self.ctx.destroyGraphExec(exec);
-                    slot.exec = null;
+                    try self.ctx.synchronize();
+                    try self.ctx.destroyGraphExecChecked(&slot.exec);
                     break :update_existing;
                 }
                 return err;
@@ -18735,8 +18770,8 @@ fn replayCapturedDebugGraphWithUpdate(self: *CudaCompute, slot_idx: usize, graph
                 self.ctx.driver.errorName(outcome.cuda_result),
                 cudaGraphExecUpdateResultName(outcome.update_result),
             });
-            self.ctx.destroyGraphExec(exec);
-            slot.exec = null;
+            try self.ctx.synchronize();
+            try self.ctx.destroyGraphExecChecked(&slot.exec);
         }
     }
 
@@ -18778,8 +18813,9 @@ fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
     var capture_cached = false;
     defer {
         if (self.capturing_physical_storage.values.items.len != 0) {
-            if (replay) self.ctx.synchronize() catch {};
-            self.capturing_physical_storage.deinit(self.allocator);
+            self.capturing_physical_storage.validateCleanup(physicalScopeCleanup(self)) catch platform.inference_process_supervisor.restartWorker();
+            if (replay) self.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
+            self.capturing_physical_storage.deinitWithCleanup(self.allocator, physicalScopeCleanup(self));
         }
         clearDebugCudaGraphCaptureState(self);
         if (!capture_cached) {
@@ -18790,7 +18826,8 @@ fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
         }
     }
 
-    const graph = self.ctx.endStreamCapture() catch |err| {
+    var graph = self.ctx.endStreamCapture() catch |err| {
+        @import("graph.zig").requireCaptureEnded(&self.ctx) catch platform.inference_process_supervisor.restartWorker();
         self.stats.cuda_graph_capture_discards += 1;
         // A caller requesting replay relies on this function to execute the
         // captured work. Never report success after end-capture failed: doing
@@ -18798,7 +18835,7 @@ fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
         if (!replay and capture_was_disabled) return;
         return err;
     };
-    defer self.ctx.destroyGraph(graph);
+    defer self.ctx.destroyGraphChecked(&graph) catch platform.inference_process_supervisor.restartWorker();
     if (replay) {
         if (!capture_was_disabled) {
             const slot = &self.debug_cuda_graph_slots[slot_idx];
@@ -18809,7 +18846,7 @@ fn debugCudaGraphCaptureEnd(ctx: *anyopaque, replay: bool) !void {
                 // Updating an exec may replace all of its addresses. Retire
                 // previous owners only after their last launch has completed.
                 if (slot.physical_storage.values.items.len != 0) try self.ctx.synchronize();
-                slot.physical_storage.deinit(self.allocator);
+                slot.physical_storage.deinitWithCleanup(self.allocator, physicalScopeCleanup(self));
                 slot.physical_storage = self.capturing_physical_storage;
                 self.capturing_physical_storage = .{};
                 capture_cached = true;
@@ -27976,8 +28013,7 @@ fn runEmbeddingGemma2VisionTowerOp(ctx: *anyopaque, input_ct: CT, sequence: usiz
     // an eager fallback. Warm actual plans before entering driver capture.
     if (arena) |entry| {
         if (entry.attention_workspace != self.embedding_gemma2_cudnn_attention_scratch.buffer.ptr or entry.weight_generation != self.embedding_gemma2_execution.weight_generation) {
-            if (entry.graph != null) self.ctx.destroyGraphExec(entry.graph);
-            entry.graph = null;
+            try self.ctx.destroyGraphExecChecked(&entry.graph);
             entry.warm = false;
         }
         if (entry.graph != null) {
@@ -33629,6 +33665,7 @@ const kernel_backend_impl: ops.KernelBackend = .{
     .ownedPayloadServices = &owned_payload_services,
     .physicalReplayReshapeViews = true,
     .physicalExecutionScope = &physicalExecutionScopeOp,
+    .physicalExecutionScopeWithCleanup = &physicalExecutionScopeWithCleanupOp,
     .physical_storage_policy = &physical_storage_policy,
     .implementation_table = &vtable,
     .acceptsImplementation = &acceptsPhysicalImplementation,
@@ -36062,12 +36099,12 @@ const PhysicalReplay = struct {
     leases: ops.physical_storage.CapturedLeases = .{},
     active: bool = false,
     disabled_before: bool = false,
-    const vtable = ops.physical_storage.Replay.VTable{ .begin = begin, .commit = commit, .abort = abort, .launch = launch, .retains = retains, .deinit = deinit };
+    const vtable = ops.physical_storage.Replay.VTable{ .begin = begin, .commit = commit, .abort = abort, .launch = launch, .retains = retains, .deinit = deinit, .deinitWithCleanup = deinitWithCleanup };
     fn begin(raw: *anyopaque, leases: []const ?*ops.physical_storage.Lease) !bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
         const compute = self.compute;
         if (self.graph != null or self.active or compute.execution_scope != null or compute.debug_cuda_graph_capture_active or compute.capturing_physical_storage.values.items.len != 0 or try compute.ctx.streamCaptureActive()) return false;
-        errdefer compute.capturing_physical_storage.deinit(compute.allocator);
+        errdefer compute.capturing_physical_storage.deinitWithCleanup(compute.allocator, physicalScopeCleanup(compute));
         for (leases) |maybe| if (maybe) |lease| {
             if (lease.backend.ptr == @as(*anyopaque, @ptrCast(compute))) try compute.capturing_physical_storage.retain(compute.allocator, lease);
         };
@@ -36088,7 +36125,7 @@ const PhysicalReplay = struct {
             compute.debug_cuda_graph_capture_disabled = self.disabled_before;
             self.active = false;
         }
-        errdefer compute.capturing_physical_storage.deinit(compute.allocator);
+        errdefer compute.capturing_physical_storage.deinitWithCleanup(compute.allocator, physicalScopeCleanup(compute));
         var graph = try @import("graph.zig").endCapture(&compute.ctx);
         errdefer graph.deinit(&compute.ctx);
         if (unsafe_allocation) return error.CudaGraphCaptureUnsafeTempAlloc;
@@ -36100,10 +36137,24 @@ const PhysicalReplay = struct {
     }
     fn abort(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
+        abortWithCleanup(self, physicalScopeCleanup(self.compute));
+    }
+    fn abortWithCleanup(self: *@This(), current: CacheCleanup) void {
         if (!self.active) return;
         const compute = self.compute;
-        if (compute.ctx.endStreamCapture()) |graph| compute.ctx.destroyGraph(graph) else |_| {}
-        compute.capturing_physical_storage.deinit(compute.allocator);
+        compute.capturing_physical_storage.validateCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+        if (compute.ctx.endStreamCapture()) |graph| {
+            // Publish the SDK handle before checked destruction. A failed
+            // destruction must not let the captured address owners unwind.
+            self.graph = .{ .graph = graph };
+            self.graph.?.deinitChecked(&compute.ctx) catch platform.inference_process_supervisor.restartWorker();
+            self.graph = null;
+        } else |_| {
+            // A failed end-capture is safe to discard only when the actual
+            // stream confirms it is no longer capturing.
+            @import("graph.zig").requireCaptureEnded(&compute.ctx) catch platform.inference_process_supervisor.restartWorker();
+        }
+        compute.capturing_physical_storage.deinitWithCleanup(compute.allocator, current);
         compute.debug_cuda_graph_capture_active = false;
         compute.debug_cuda_graph_capture_disabled = self.disabled_before;
         self.active = false;
@@ -36118,15 +36169,27 @@ const PhysicalReplay = struct {
         for (self.leases.values.items) |value| if (value == lease) return true;
         return false;
     }
-    fn deinit(raw: *anyopaque) void {
-        const self: *@This() = @ptrCast(@alignCast(raw));
-        abort(raw);
+    fn deinitChecked(self: *@This()) !void {
+        return self.deinitCheckedWithCleanup(.{});
+    }
+    fn deinitCheckedWithCleanup(self: *@This(), current: CacheCleanup) !void {
+        try self.leases.validateCleanup(current);
+        // Abort uses the existing fail-closed void boundary. Retained storage
+        // cannot be dropped while capture or a last asynchronous launch lives.
+        abortWithCleanup(self, current);
         if (self.graph) |*graph| {
-            self.compute.ctx.synchronize() catch {};
-            graph.deinit(&self.compute.ctx);
+            try self.compute.ctx.synchronize();
+            try graph.deinitChecked(&self.compute.ctx);
         }
-        self.leases.deinit(self.compute.allocator);
+        self.leases.deinitWithCleanup(self.compute.allocator, current);
         self.compute.allocator.destroy(self);
+    }
+    fn deinit(raw: *anyopaque) void {
+        deinitWithCleanup(raw, .{});
+    }
+    fn deinitWithCleanup(raw: *anyopaque, current: CacheCleanup) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.deinitCheckedWithCleanup(current) catch platform.inference_process_supervisor.restartWorker();
     }
 };
 
@@ -36147,6 +36210,7 @@ fn physicalReplayTensorSupportedOp(ctx: *anyopaque, value: CT) bool {
 fn physicalReplayKernelSupportedOp(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
     const compute: *CudaCompute = @ptrCast(@alignCast(ctx));
     return switch (descriptor.operation) {
+        .paged_attention => false,
         .dot => descriptor.input_shapes[0].rank() != 2 or compute.training_blas == null,
         // Strict-F32 cuBLASLt linear dispatch uses the bounded warmed plan
         // cache and an explicit zero-workspace invocation. Bias is the same
@@ -36177,8 +36241,27 @@ fn copyPhysicalInputOp(ctx: *anyopaque, destination: CT, source: CT) anyerror!vo
     if (dst.buffer.ptr != src.buffer.ptr) try copyFromDeviceTracked(compute, dst.buffer, src.buffer, dst.elem_count * @sizeOf(f32));
 }
 
+fn physicalScopeCleanup(self: *const CudaCompute) CacheCleanup {
+    return if (self.physical_execution_cleanup) |current| current.* else .{};
+}
+fn physicalExecutionScopeWithCleanupOp(ctx: *anyopaque, scope: ops.physical_storage.ExecutionScope) !void {
+    // Attest the exact full table and pointer BEFORE opaque owner access.
+    if (scope.backend.ptr != ctx or !acceptsPhysicalImplementation(scope.backend.vtable)) return error.UnsupportedPhysicalExecutionScope;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (scope.storages) |storages| {
+        if (self.physical_execution_storage != null or self.physical_execution_cleanup != null) return error.PhysicalExecutionScopeActive;
+        if (scope.cleanup.boundary) |epoch| if (try epoch.isSealed()) return error.RetirementEpochSealed;
+        self.physical_execution_storage = storages;
+        self.physical_execution_cleanup = scope.cleanup;
+    } else {
+        if (self.physical_execution_cleanup != scope.cleanup) return error.ForeignPhysicalExecutionScope;
+        self.physical_execution_storage = null;
+        self.physical_execution_cleanup = null;
+    }
+}
 fn physicalExecutionScopeOp(ctx: *anyopaque, leases: ?[]const ?*ops.physical_storage.Lease) anyerror!void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    if (self.physical_execution_cleanup != null) return error.PhysicalExecutionCleanupRequired;
     if (leases != null and self.physical_execution_storage != null) return error.PhysicalExecutionScopeActive;
     self.physical_execution_storage = leases;
 }
@@ -36285,6 +36368,7 @@ fn assignedProjectionWeightSupported(weight: *const CudaTensor, bias: bool) bool
 }
 
 fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
+    if (request.descriptor.operation == .paged_attention) return false;
     if (request.descriptor.output_shape.dtype != .f32) return false;
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (request.prepared_route) |selected| {
@@ -36353,6 +36437,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
     for (request.auxiliaries) |auxiliary| try retainPhysicalCaptureTensor(self, auxiliary.tensor);
     const a = tensorFromCt(request.inputs[0]);
     switch (descriptor.operation) {
+        .paged_attention => return false,
         .transpose, .broadcast => |layout| {
             const input_dims = ops.kernel_descriptor.nativeDimensions(u32, descriptor.input_shapes[0]);
             if (descriptor.operation == .transpose) {
@@ -36851,6 +36936,7 @@ test "CUDA physical capture scopes reject nesting and retain operand addresses" 
     compute.ctx.observation_enable_failed.store(false, .release);
     compute.allocator = a;
     compute.physical_execution_storage = null;
+    compute.physical_execution_cleanup = null;
     compute.capturing_physical_storage = .{};
     defer compute.capturing_physical_storage.deinit(a);
     compute.debug_cuda_graph_capture_active = false;
@@ -45386,6 +45472,10 @@ fn destroyIndependentEventChecked(ctx: *context_mod.CudaContext, event: driver_m
 /// Payload retirement closes its private endpoint while supervision is still
 /// armed. Diagnostics may retain only the cell metadata after this point.
 fn closeIndependentEndpointChecked(cell: *CudaStorageRetirement) !void {
+    // This defer precedes the cell-lock defer: final diagnostic metadata
+    // destruction may reenter the owner and must run after its unlock.
+    var observation: ?*@import("../../execution/allocation_observer.zig").State = null;
+    defer if (observation) |state| state.release();
     platform.sync.lockYielding(&cell.mutex);
     defer cell.mutex.unlock();
     if (cell.physical_bytes != 0 or cell.source_context != null) return error.InvalidCudaState;
@@ -45397,6 +45487,7 @@ fn closeIndependentEndpointChecked(cell: *CudaStorageRetirement) !void {
     try ctx.driver.check(ctx.driver.fns.cuDevicePrimaryCtxRelease(ctx.device));
     ctx.ctx = null;
     ctx.driver.deinit();
+    observation = ctx.device_allocations.detachObservation();
     cell.provider = null;
 }
 
@@ -53240,4 +53331,427 @@ test "CUDA allocation Model close refuses ordinary failed resident free until ex
     owner_live = false;
     resident.release();
     try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "CUDA physical replay retains actual planned address owners across checked sync exec and graph death failures" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Mock = struct {
+        var fail: enum { none, sync, exec, graph } = .none;
+        var exec_deaths: usize = 0;
+        var graph_deaths: usize = 0;
+        fn current(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return 0;
+        }
+        fn sync(_: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
+            return if (fail == .sync) 700 else 0;
+        }
+        fn exec(_: driver_mod.CUgraphExec) callconv(.c) driver_mod.CUresult {
+            if (fail == .exec) return 700;
+            exec_deaths += 1;
+            return 0;
+        }
+        fn graph(_: driver_mod.CUgraph) callconv(.c) driver_mod.CUresult {
+            if (fail == .graph) return 700;
+            graph_deaths += 1;
+            return 0;
+        }
+        fn text(_: driver_mod.CUresult, out: *?[*:0]const u8) callconv(.c) driver_mod.CUresult {
+            out.* = "injected physical replay retirement";
+            return 0;
+        }
+    };
+    Mock.fail = .none;
+    Mock.exec_deaths = 0;
+    Mock.graph_deaths = 0;
+    var backend = try @import("../../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer backend.deinit(a);
+    const lease = (try ops.physical_storage.Lease.create(a, backend.computeBackend(), 16)) orelse return error.MissingActualPhysicalStorage;
+    defer lease.release();
+    var compute: CudaCompute = undefined;
+    compute.allocator = a;
+    compute.ctx.ctx = @ptrFromInt(1);
+    compute.ctx.stream = @ptrFromInt(2);
+    compute.ctx.observation.store(null, .release);
+    compute.ctx.observation_enable_failed.store(false, .release);
+    compute.ctx.stats = .{};
+    compute.ctx.driver.fns.cuCtxSetCurrent = Mock.current;
+    compute.ctx.driver.fns.cuStreamSynchronize = Mock.sync;
+    compute.ctx.driver.fns.cuGraphExecDestroy = Mock.exec;
+    compute.ctx.driver.fns.cuGraphDestroy = Mock.graph;
+    compute.ctx.driver.fns.cuGetErrorName = Mock.text;
+    compute.ctx.driver.fns.cuGetErrorString = Mock.text;
+    const owner = try a.create(PhysicalReplay);
+    owner.* = .{ .compute = &compute, .graph = .{ .exec = @ptrFromInt(3), .graph = @ptrFromInt(4) } };
+    var live = true;
+    defer if (live) {
+        Mock.fail = .none;
+        owner.deinitChecked() catch unreachable;
+    };
+    try owner.leases.retain(a, lease);
+    try std.testing.expectEqual(@as(usize, 2), lease.references.load(.acquire));
+    @import("../../test_error_logs.zig").expectErrorLogs(3);
+    Mock.fail = .sync;
+    try std.testing.expectError(error.CudaDriverError, owner.deinitChecked());
+    try std.testing.expect(owner.graph.?.exec != null and owner.graph.?.graph != null);
+    try std.testing.expectEqual(@as(usize, 2), lease.references.load(.acquire));
+    Mock.fail = .exec;
+    try std.testing.expectError(error.CudaDriverError, owner.deinitChecked());
+    try std.testing.expect(owner.graph.?.exec != null and owner.graph.?.graph != null);
+    try std.testing.expectEqual(@as(usize, 2), lease.references.load(.acquire));
+    Mock.fail = .graph;
+    try std.testing.expectError(error.CudaDriverError, owner.deinitChecked());
+    try std.testing.expect(owner.graph.?.exec == null and owner.graph.?.graph != null);
+    try std.testing.expectEqual(@as(usize, 2), lease.references.load(.acquire));
+    Mock.fail = .none;
+    try owner.deinitChecked();
+    live = false;
+    try std.testing.expectEqual(@as(usize, 1), Mock.exec_deaths);
+    try std.testing.expectEqual(@as(usize, 1), Mock.graph_deaths);
+    try std.testing.expectEqual(@as(usize, 1), lease.references.load(.acquire));
+}
+
+test "CUDA physical scope borrows exact live B and clears on end while refusing stale foreign and copied receivers" {
+    const Sink = @import("../../execution/retirement_sink.zig");
+    var root = try Sink.Ref.create();
+    defer root.release();
+    var guard = try root.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    const current = CacheCleanup{ .boundary = &epoch };
+    const foreign = CacheCleanup{ .boundary = &epoch };
+    var compute: CudaCompute = undefined;
+    compute.physical_execution_storage = null;
+    compute.physical_execution_cleanup = null;
+    const backend = ops.ComputeBackend{ .ptr = &compute, .vtable = &vtable };
+    const storages = [_]?*ops.physical_storage.Lease{};
+    var copied = vtable;
+    const invalid = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied };
+    try std.testing.expectError(error.UnsupportedPhysicalExecutionScope, physicalExecutionScopeWithCleanupOp(invalid.ptr, .{ .backend = invalid, .storages = &storages, .cleanup = &current }));
+    try physicalExecutionScopeWithCleanupOp(&compute, .{ .backend = backend, .storages = &storages, .cleanup = &current });
+    try std.testing.expectEqual(&current, compute.physical_execution_cleanup.?);
+    try std.testing.expectError(error.PhysicalExecutionScopeActive, physicalExecutionScopeWithCleanupOp(&compute, .{ .backend = backend, .storages = &storages, .cleanup = &foreign }));
+    try std.testing.expectError(error.ForeignPhysicalExecutionScope, physicalExecutionScopeWithCleanupOp(&compute, .{ .backend = backend, .storages = null, .cleanup = &foreign }));
+    try std.testing.expectError(error.PhysicalExecutionCleanupRequired, physicalExecutionScopeOp(&compute, null));
+    try std.testing.expectEqual(&current, compute.physical_execution_cleanup.?);
+    try physicalExecutionScopeWithCleanupOp(&compute, .{ .backend = backend, .storages = null, .cleanup = &current });
+    try std.testing.expect(compute.physical_execution_cleanup == null and compute.physical_execution_storage == null);
+    guard.finish();
+    try std.testing.expectError(error.RetirementEpochSealed, physicalExecutionScopeWithCleanupOp(&compute, .{ .backend = backend, .storages = &storages, .cleanup = &current }));
+    try std.testing.expect(compute.physical_execution_cleanup == null and compute.physical_execution_storage == null);
+    // Original raw/unmanaged API remains usable independently of the typed scope.
+    try physicalExecutionScopeOp(&compute, &storages);
+    try physicalExecutionScopeOp(&compute, null);
+}
+
+test "CUDA allocation debug graph update failures retain old executable and actual address owner until checked retirement" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Mock = struct {
+        var fail_sync = false;
+        var fail_destroy = false;
+        var deaths: usize = 0;
+        fn current(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return 0;
+        }
+        fn sync(_: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
+            return if (fail_sync) 700 else 0;
+        }
+        fn destroy(_: driver_mod.CUgraphExec) callconv(.c) driver_mod.CUresult {
+            if (fail_destroy) return 700;
+            deaths += 1;
+            return 0;
+        }
+        fn update(_: driver_mod.CUgraphExec, _: driver_mod.CUgraph, info: *driver_mod.CUgraphExecUpdateResultInfo) callconv(.c) driver_mod.CUresult {
+            info.* = .{ .result = 1 };
+            return 0;
+        }
+        fn instantiate(out: *driver_mod.CUgraphExec, _: driver_mod.CUgraph, _: c_ulonglong) callconv(.c) driver_mod.CUresult {
+            out.* = @ptrFromInt(4);
+            return 0;
+        }
+        fn launch(_: driver_mod.CUgraphExec, _: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
+            return 0;
+        }
+        fn text(_: driver_mod.CUresult, out: *?[*:0]const u8) callconv(.c) driver_mod.CUresult {
+            out.* = "injected debug graph update cleanup";
+            return 0;
+        }
+    };
+    var context = try @import("../../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const lease = (try ops.physical_storage.Lease.create(a, context.computeBackend(), 16)).?;
+    defer lease.release();
+    @import("../../test_error_logs.zig").expectErrorLogs(4);
+    for ([_]bool{ false, true }) |missing_symbol| {
+        Mock.fail_sync = false;
+        Mock.fail_destroy = false;
+        Mock.deaths = 0;
+        var compute: CudaCompute = undefined;
+        compute.allocator = a;
+        compute.stats = .{};
+        compute.physical_execution_storage = null;
+        compute.physical_execution_cleanup = null;
+        compute.debug_cuda_graph_slots = @splat(.{});
+        compute.ctx.ctx = @ptrFromInt(1);
+        compute.ctx.stream = @ptrFromInt(2);
+        compute.ctx.stats = .{};
+        compute.ctx.debug_graph_capture_active = false;
+        compute.ctx.observation.store(null, .release);
+        compute.ctx.observation_enable_failed.store(false, .release);
+        compute.ctx.driver.fns.cuCtxSetCurrent = Mock.current;
+        compute.ctx.driver.fns.cuStreamSynchronize = Mock.sync;
+        compute.ctx.driver.fns.cuGraphExecDestroy = Mock.destroy;
+        compute.ctx.driver.fns.cuGraphExecUpdate = if (missing_symbol) null else Mock.update;
+        compute.ctx.driver.fns.cuGraphInstantiateWithParams = null;
+        compute.ctx.driver.fns.cuGraphInstantiate = Mock.instantiate;
+        compute.ctx.driver.fns.cuGraphLaunch = Mock.launch;
+        compute.ctx.driver.fns.cuGetErrorName = Mock.text;
+        compute.ctx.driver.fns.cuGetErrorString = Mock.text;
+        const slot = &compute.debug_cuda_graph_slots[0];
+        slot.exec = @ptrFromInt(3);
+        try slot.physical_storage.retain(a, lease);
+        defer {
+            Mock.fail_sync = false;
+            Mock.fail_destroy = false;
+            resetCudaGraphReplaySlotMetadata(&compute, slot);
+        }
+        Mock.fail_sync = true;
+        try std.testing.expectError(error.CudaDriverError, replayCapturedDebugGraphWithUpdate(&compute, 0, @ptrFromInt(5)));
+        try std.testing.expectEqual(@as(driver_mod.CUgraphExec, @ptrFromInt(3)), slot.exec);
+        try std.testing.expectEqual(@as(usize, 2), lease.references.load(.acquire));
+        Mock.fail_sync = false;
+        Mock.fail_destroy = true;
+        try std.testing.expectError(error.CudaDriverError, replayCapturedDebugGraphWithUpdate(&compute, 0, @ptrFromInt(5)));
+        try std.testing.expectEqual(@as(driver_mod.CUgraphExec, @ptrFromInt(3)), slot.exec);
+        try std.testing.expectEqual(@as(usize, 2), lease.references.load(.acquire));
+        Mock.fail_destroy = false;
+        try replayCapturedDebugGraphWithUpdate(&compute, 0, @ptrFromInt(5));
+        try std.testing.expectEqual(@as(driver_mod.CUgraphExec, @ptrFromInt(4)), slot.exec);
+        try std.testing.expectEqual(@as(usize, 1), Mock.deaths);
+        resetCudaGraphReplaySlotMetadata(&compute, slot);
+        try std.testing.expectEqual(@as(usize, 1), lease.references.load(.acquire));
+        try std.testing.expectEqual(@as(usize, 2), Mock.deaths);
+    }
+}
+
+test "CUDA allocation endpoint observation closes outside owner lock and survives through real Registry pins" {
+    @import("../../test_error_logs.zig").expectErrorLogs(4);
+    const roots = @import("../../execution/device_allocation_registry.zig");
+    const Mock = struct {
+        var fail_current: bool = false;
+        var primary_releases: usize = 0;
+        fn current(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return if (fail_current) 700 else 0;
+        }
+        fn primary(_: driver_mod.CUdevice) callconv(.c) driver_mod.CUresult {
+            primary_releases += 1;
+            return 0;
+        }
+        fn text(_: driver_mod.CUresult, out: *?[*:0]const u8) callconv(.c) driver_mod.CUresult {
+            out.* = "injected endpoint current failure";
+            return 0;
+        }
+    };
+    const Metadata = struct {
+        cell: *CudaStorageRetirement,
+        allocations: usize = 0,
+        frees: usize = 0,
+        freed_under_lock: bool = false,
+        fn alloc(raw: *anyopaque, n: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const result = std.testing.allocator.rawAlloc(n, alignment, ra) orelse return null;
+            self.allocations += 1;
+            return result;
+        }
+        fn resize(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, n: usize, ra: usize) bool {
+            return std.testing.allocator.rawResize(memory, alignment, n, ra);
+        }
+        fn remap(_: *anyopaque, memory: []u8, alignment: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+            return std.testing.allocator.rawRemap(memory, alignment, n, ra);
+        }
+        fn free(raw: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.cell.mutex.tryLock()) {
+                self.cell.mutex.unlock();
+            } else self.freed_under_lock = true;
+            self.frees += 1;
+            std.testing.allocator.rawFree(memory, alignment, ra);
+        }
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+    };
+    // Real OS-library ownership exercises the actual driver close without a
+    // CUDA library/device. Every CUDA entry called by close is an SDK mock.
+    const library = switch (@import("builtin").os.tag) {
+        .macos => "/usr/lib/libSystem.B.dylib",
+        .linux => "libc.so.6",
+        .windows => "kernel32.dll",
+        else => return error.SkipZigTest,
+    };
+    for ([_]bool{ false, true }) |observe| {
+        for ([_]bool{ false, true }) |retain_registry| {
+            var cell = CudaStorageRetirement{ .allocator = std.testing.allocator };
+            var metadata = Metadata{ .cell = &cell };
+            cell.provider = .{ .driver = .{ .lib = try std.DynLib.open(library), .fns = undefined }, .ctx = @ptrFromInt(0x116a), .stream = null, .device = 0, .info = .{} };
+            var provider_live = true;
+            defer if (provider_live) {
+                cell.provider.?.device_allocations.releaseObservation();
+                cell.provider.?.driver.deinit();
+            };
+            cell.provider.?.driver.fns.cuCtxSetCurrent = Mock.current;
+            cell.provider.?.driver.fns.cuDevicePrimaryCtxRelease = Mock.primary;
+            cell.provider.?.driver.fns.cuGetErrorName = Mock.text;
+            cell.provider.?.driver.fns.cuGetErrorString = Mock.text;
+            Mock.fail_current = false;
+            Mock.primary_releases = 0;
+            if (observe) try std.testing.expect(cell.provider.?.device_allocations.enableObservation(metadata.allocator()));
+            const original = cell.provider.?.device_allocations.observation;
+            var registry: roots.Registry = undefined;
+            var registry_live = false;
+            defer if (registry_live) {
+                _ = registry.end();
+            };
+            if (observe and retain_registry) {
+                registry.begin(std.testing.allocator);
+                registry_live = true;
+                cell.registerRootObservation(true);
+                try std.testing.expectEqual(@as(usize, 1), registry.snapshot().roots);
+            }
+            Mock.fail_current = true;
+            try std.testing.expectError(error.CudaDriverError, closeIndependentEndpointChecked(&cell));
+            try std.testing.expect(cell.provider != null);
+            try std.testing.expectEqual(original, cell.provider.?.device_allocations.observation);
+            try std.testing.expectEqual(@as(usize, 0), metadata.frees);
+            try std.testing.expectEqual(@as(usize, 0), Mock.primary_releases);
+            Mock.fail_current = false;
+            try closeIndependentEndpointChecked(&cell);
+            provider_live = false;
+            try std.testing.expect(cell.provider == null);
+            try std.testing.expectEqual(@as(usize, 1), Mock.primary_releases);
+            if (registry_live) {
+                try std.testing.expectEqual(@as(usize, 0), metadata.frees);
+                const report = registry.end();
+                registry_live = false;
+                try std.testing.expectEqual(@as(usize, 1), report.roots);
+                try std.testing.expectEqual(@as(u64, 0), report.reports[0].allocations);
+                try std.testing.expectEqual(@as(u64, 0), report.reports[0].live_bytes);
+            }
+            try std.testing.expectEqual(@as(usize, if (observe) 1 else 0), metadata.allocations);
+            try std.testing.expectEqual(metadata.allocations, metadata.frees);
+            try std.testing.expect(!metadata.freed_under_lock);
+            // Already-closed inert metadata remains idempotent.
+            try closeIndependentEndpointChecked(&cell);
+            try std.testing.expectEqual(@as(usize, 1), Mock.primary_releases);
+        }
+    }
+}
+
+test "CUDA KV explicit cleanup retires actual prepared captured lease outside physical Frame scope through later B" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const memory = @import("../../runtime/tier/memory.zig");
+    const admission = @import("../../execution/storage_admission.zig");
+    const prepared = @import("../../execution/prepared_storage_admission.zig");
+    const sinks = @import("../../execution/retirement_sink.zig");
+    const Source = struct {
+        controller: memory.AdmissionController = .{},
+        run: memory.AdmissionLease = undefined,
+        credit: memory.AdmissionAmounts = .{ .host_scratch_bytes = 64 },
+        fn reserve(raw: *anyopaque, allocator: std.mem.Allocator, kind: ops.BackendKind, class: @import("../../execution/storage_accounting.zig").Class, bytes: usize) !admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return admission.fromRunLease(allocator, &self.run, .{ .controller = &self.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 }, .check_live_memory = false, .credit = &self.credit }, kind, class, bytes);
+        }
+    };
+    const Mock = struct {
+        var syncs: usize = 0;
+        var deaths: usize = 0;
+        fn current(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return 0;
+        }
+        fn sync(_: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
+            syncs += 1;
+            return 0;
+        }
+        fn destroy(_: driver_mod.CUgraphExec) callconv(.c) driver_mod.CUresult {
+            deaths += 1;
+            return 0;
+        }
+    };
+    var endpoint = try @import("../../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer endpoint.deinit(a);
+    var source = Source{};
+    defer source.controller.deinit();
+    source.run = try source.controller.tryAcquire(.cpu, .{ .host_limit_bytes = 64 }, .{ .host_scratch_bytes = 64 }, false);
+    defer source.run.release();
+    const cap = admission.Capability{ .identity = .{ .controller = &source.controller, .backend_class = .cpu }, .context = &source, .services = &.{ .reserve = Source.reserve } };
+    const plan = (try prepared.Prepared.prepare(cap, &.{.{ .backend = .native, .class = .activation, .bytes = 64 }})).?;
+    var unbound = true;
+    defer if (unbound) plan.abortBeforeExecution() catch unreachable;
+    var old_sink = try sinks.Ref.create();
+    defer old_sink.release();
+    var old_guard = try old_sink.enter();
+    defer old_guard.finish();
+    var old = try old_guard.retainEpoch();
+    defer old.release();
+    var new_sink = try sinks.Ref.create();
+    defer new_sink.release();
+    var new_guard = try new_sink.enter();
+    defer new_guard.finish();
+    var now = try new_guard.retainEpoch();
+    defer now.release();
+    try plan.bindConstructionEpoch(&old);
+    unbound = false;
+    var plan_live = true;
+    defer if (plan_live) plan.releaseAfterExecution(&old);
+    const bank = (try ops.physical_storage.Lease.createAdmitted(a, endpoint.computeBackend(), 64, null, .activation, prepared.Prepared.forDispatch(plan, cap.identity))).?;
+    var bank_live = true;
+    defer if (bank_live) bank.releaseWithBoundary(&old);
+    var compute: CudaCompute = undefined;
+    compute.allocator = a;
+    compute.physical_execution_storage = null;
+    compute.physical_execution_cleanup = null; // actual Frame scope has ended
+    compute.debug_cuda_graph_capture_active = false;
+    compute.debug_cuda_graph_slots = @splat(.{});
+    compute.ctx = .{ .driver = undefined, .ctx = @ptrFromInt(1), .stream = @ptrFromInt(2), .device = 0, .info = .{} };
+    compute.ctx.driver.fns.cuCtxSetCurrent = Mock.current;
+    compute.ctx.driver.fns.cuStreamSynchronize = Mock.sync;
+    compute.ctx.driver.fns.cuGraphExecDestroy = Mock.destroy;
+    Mock.syncs = 0;
+    Mock.deaths = 0;
+    const slot = &compute.debug_cuda_graph_slots[0];
+    try slot.physical_storage.retain(a, bank);
+    slot.exec = @ptrFromInt(3);
+    slot.valid = true;
+    var graph_live = true;
+    defer if (graph_live) preparePersistentCudaBufferReallocationWithCleanup(&compute, .{ .boundary = &now }) catch unreachable;
+    bank.releaseWithBoundary(&old);
+    bank_live = false;
+    plan.releaseAfterExecution(&old);
+    plan_live = false;
+    old_guard.finish();
+    try std.testing.expectEqual(@as(usize, 1), bank.references.load(.acquire));
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, slot.physical_storage.validateCleanup(.{}));
+    try std.testing.expectError(error.RetirementEpochSealed, slot.physical_storage.validateCleanup(.{ .boundary = &old }));
+    try std.testing.expectEqual(@as(usize, 0), Mock.syncs);
+    try std.testing.expectEqual(@as(usize, 0), Mock.deaths);
+    var model: std.atomic.Mutex = .unlocked;
+    try std.testing.expect(model.tryLock());
+    var model_locked = true;
+    defer if (model_locked) model.unlock();
+    // Exact helper used by BOTH typed KV grow and final close receives caller
+    // NOW B despite no active Frame scope; no creation epoch is consulted.
+    try preparePersistentCudaBufferReallocationWithCleanup(&compute, .{ .boundary = &now });
+    graph_live = false;
+    try std.testing.expectEqual(@as(usize, 1), Mock.syncs);
+    try std.testing.expectEqual(@as(usize, 1), Mock.deaths);
+    try std.testing.expect(slot.exec == null and slot.physical_storage.values.items.len == 0);
+    try std.testing.expect(compute.physical_execution_cleanup == null);
+    try std.testing.expectEqual(@as(usize, 64), source.controller.snapshot().host_scratch_bytes);
+    model.unlock();
+    model_locked = false;
+    new_guard.finish();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, source.controller.snapshot());
 }

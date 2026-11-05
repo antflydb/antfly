@@ -95,76 +95,100 @@ pub fn fuse(allocator: std.mem.Allocator, graph: *const Graph) !FuseResult {
     // as a div. The pipeline fixed-point loop in `pipeline.zig` re-runs
     // fuse, which lets SDPA match on iteration 2 once the fused_softmax
     // node has been baked into the graph by the previous iteration.
+    var phase1_redirects_live = true;
     var softmax_rewrites = try fuseSoftmaxFromPrimitives(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) softmax_rewrites.redirects.deinit(allocator);
     num_rewrites += softmax_rewrites.num_rewrites;
 
     var silu_rewrites = try fuseSiLUFromPrimitives(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) silu_rewrites.redirects.deinit(allocator);
     num_rewrites += silu_rewrites.num_rewrites;
 
     var gelu_rewrites = try fuseGELUFromPrimitives(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) gelu_rewrites.redirects.deinit(allocator);
     num_rewrites += gelu_rewrites.num_rewrites;
 
     var quick_gelu_rewrites = try fuseQuickGELUFromPrimitives(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) quick_gelu_rewrites.redirects.deinit(allocator);
     num_rewrites += quick_gelu_rewrites.num_rewrites;
 
     var rms_norm_rewrites = try fuseRMSNormFromPrimitives(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) rms_norm_rewrites.redirects.deinit(allocator);
     num_rewrites += rms_norm_rewrites.num_rewrites;
 
     var layer_norm_rewrites = try fuseLayerNormFromPrimitives(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) layer_norm_rewrites.redirects.deinit(allocator);
     num_rewrites += layer_norm_rewrites.num_rewrites;
 
     var linear_bias_rewrites = try fuseLinearBias(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) linear_bias_rewrites.redirects.deinit(allocator);
     num_rewrites += linear_bias_rewrites.num_rewrites;
 
     var matmul_no_bias_rewrites = try fuseMatmulNoBias(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) matmul_no_bias_rewrites.redirects.deinit(allocator);
     num_rewrites += matmul_no_bias_rewrites.num_rewrites;
 
     var rope_rewrites = try fuseRopeFromPrimitives(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) rope_rewrites.redirects.deinit(allocator);
     num_rewrites += rope_rewrites.num_rewrites;
 
     // Algebraic / shape canonicalizations. These run alongside the
     // primitive→fused matchers in Phase 1 because they synthesize new
     // nodes (Phase 2 only does redirects).
     var hoist_rewrites = try fuseHoistUnaryAboveBroadcast(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) hoist_rewrites.redirects.deinit(allocator);
     num_rewrites += hoist_rewrites.num_rewrites;
 
     var chain_reshape_rewrites = try fuseChainReshape(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) chain_reshape_rewrites.redirects.deinit(allocator);
     num_rewrites += chain_reshape_rewrites.num_rewrites;
 
     var chain_broadcast_rewrites = try fuseChainBroadcast(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) chain_broadcast_rewrites.redirects.deinit(allocator);
     num_rewrites += chain_broadcast_rewrites.num_rewrites;
 
     var chain_transpose_rewrites = try fuseChainTranspose(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) chain_transpose_rewrites.redirects.deinit(allocator);
     num_rewrites += chain_transpose_rewrites.num_rewrites;
 
     var transpose_into_dot_rewrites = try fuseTransposeIntoDot(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) transpose_into_dot_rewrites.redirects.deinit(allocator);
     num_rewrites += transpose_into_dot_rewrites.num_rewrites;
 
     var reduce_merge_rewrites = try fuseReduceAxisMerge(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) reduce_merge_rewrites.redirects.deinit(allocator);
     num_rewrites += reduce_merge_rewrites.num_rewrites;
 
     var neg_normalize_rewrites = try fuseNegNormalize(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) neg_normalize_rewrites.redirects.deinit(allocator);
     num_rewrites += neg_normalize_rewrites.num_rewrites;
 
     var slice_chain_rewrites = try fuseSliceChain(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) slice_chain_rewrites.redirects.deinit(allocator);
     num_rewrites += slice_chain_rewrites.num_rewrites;
 
     var slice_concat_rewrites = try fuseSliceOfConcat(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) slice_concat_rewrites.redirects.deinit(allocator);
     num_rewrites += slice_concat_rewrites.num_rewrites;
 
     var canon_commute_rewrites = try fuseCanonicalizeCommutative(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) canon_commute_rewrites.redirects.deinit(allocator);
     num_rewrites += canon_commute_rewrites.num_rewrites;
 
     var self_pair_rewrites = try fuseAlgebraicSelfPairs(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) self_pair_rewrites.redirects.deinit(allocator);
     num_rewrites += self_pair_rewrites.num_rewrites;
 
     var add_mul_scalar_rewrites = try fuseAddMulScalar(allocator, &work, reachable_anchor);
+    errdefer if (phase1_redirects_live) add_mul_scalar_rewrites.redirects.deinit(allocator);
     num_rewrites += add_mul_scalar_rewrites.num_rewrites;
 
     var pair_rewrites = try fuseLinearPairs(allocator, &work);
+    errdefer if (phase1_redirects_live) pair_rewrites.redirects.deinit(allocator);
     num_rewrites += pair_rewrites.num_rewrites;
 
     var sdpa_rewrites = try fuseSDPA(allocator, &work);
+    errdefer if (phase1_redirects_live) sdpa_rewrites.redirects.deinit(allocator);
     num_rewrites += sdpa_rewrites.num_rewrites;
 
     // Phase 2: Simple redirect patterns.
@@ -237,6 +261,7 @@ pub fn fuse(allocator: std.mem.Allocator, graph: *const Graph) !FuseResult {
     self_pair_rewrites.redirects.deinit(allocator);
     pair_rewrites.redirects.deinit(allocator);
     sdpa_rewrites.redirects.deinit(allocator);
+    phase1_redirects_live = false;
 
     // Apply algebraic patterns in topological order (original nodes only;
     // synthetic nodes from phase 1 are correct by construction).

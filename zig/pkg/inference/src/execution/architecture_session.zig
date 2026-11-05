@@ -2911,7 +2911,8 @@ pub fn gemmaWorkspaceLanePolicy(session: Session) ?bool {
     return owner.arch_config == .embedding_gemma2;
 }
 
-/// Canonical selected Native GPT family only. A public callback, model_contract
+/// Canonical selected Native host families only. Model-specific family/shape
+/// interpretation stays in this adapter. A public callback, model_contract
 /// string, copied table or raw no-Model session never grants this owner loan.
 pub fn nativeWeightPreparationModelData(session: Session) ?*native_mod.WeightStore {
     if (comptime !build_options.enable_native) return null;
@@ -2920,8 +2921,15 @@ pub fn nativeWeightPreparationModelData(session: Session) ?*native_mod.WeightSto
     const model = session.model_lifetime orelse return null;
     if (provider.services != &archComputeServices or provider.ptr != session.ptr or model.owner != provider.ptr or model.destroy_fn != archClose or session.execution_gate != &model.execution_gate) return null;
     const owner: *ArchSession = @ptrCast(@alignCast(provider.ptr));
-    if (&owner.model_lifetime != model or owner.backend_type != .native or owner.arch_config != .gpt) return null;
-    if (!gpt_arch.denseQwen3PrefillEligible(owner.arch_config.gpt)) return null;
+    if (&owner.model_lifetime != model or owner.backend_type != .native) return null;
+    const selected = switch (owner.arch_config) {
+        .gpt => |cfg| gpt_arch.denseQwen3PrefillEligible(cfg),
+        // Actual automatic-policy biased QKV consumer. BERT keeps its
+        // original strict-F32 route and is not retagged into this program.
+        .deberta => |cfg| cfg.hidden_size == 512 or cfg.hidden_size == 768,
+        else => false,
+    };
+    if (!selected) return null;
     return &owner.backend_data.native;
 }
 
@@ -5211,6 +5219,17 @@ test "gliner boundary workspace plan separates persistent capacity from request 
     try std.testing.expectError(error.GlinerBoundaryWorkspaceBusy, GlinerBoundaryWorkspacePlan.init(7, .{ .live_bytes = 32, .capacity_bytes = 32, .generation = 1, .epoch = 3, .active = true }, 1, 1, 384, 1536));
 }
 
+/// Cold immutable owner proof for a selected Native authored program. No
+/// metadata callback or ctx cast precedes full canonical table checks.
+pub fn nativeProgramSourceMatches(session: Session, backend: *const ops.ComputeBackend) bool {
+    const native = @import("../ops/native_compute.zig");
+    if (session.vtable != &arch_vtable or backend.vtable != &native.vtable_impl) return false;
+    const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (owner.backend_type != .native or session.model_lifetime != &owner.model_lifetime) return false;
+    const receiving: *native.NativeCompute = @ptrCast(@alignCast(backend.ptr));
+    return receiving.data == &owner.backend_data.native;
+}
+
 pub fn replaceBlasResidentWeight(session: Session, name: []const u8, weight: LoadedWeight) !void {
     if (session.vtable != &arch_vtable) return error.NotArchSession;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
@@ -6407,7 +6426,7 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
             const bert_inputs = try parseBertRunInputs(inputs);
             const batch = bert_inputs.batch;
             const seq_len = bert_inputs.seq_len;
-            const hidden = try bert_arch.forwardWithControl(
+            const hidden = try bert_arch.forwardCtWithControl(
                 &cb,
                 allocator,
                 cfg,
@@ -6418,7 +6437,10 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
                 seq_len,
                 control,
             );
-            defer allocator.free(hidden);
+            defer cb.free(hidden);
+            // Preserve the original post-encoder cancellation boundary before
+            // executing any task head or final host materialization.
+            if (control) |active| try active.check();
 
             if (self.task == .classifier) {
                 const logits = try runBertSequenceClassifier(&cb, allocator, cfg, hidden, batch, seq_len);
@@ -6445,9 +6467,12 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
                 return result;
             }
 
+            // Generic hidden-state outputs retain the explicit public host ABI.
+            const hidden_values = try cb.toFloat32(hidden, allocator);
+            defer allocator.free(hidden_values);
             const H = cfg.hidden_size;
             const shape = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(H) };
-            var output_tensor = try Tensor.initFloat32(allocator, "last_hidden_state", &shape, hidden);
+            var output_tensor = try Tensor.initFloat32(allocator, "last_hidden_state", &shape, hidden_values);
             errdefer output_tensor.deinit();
 
             const result = try allocator.alloc(Tensor, 1);
@@ -6572,13 +6597,11 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
                 }
                 break :blk null;
             };
-            const forward_out = try layoutlmv3_arch.forward(&cb, allocator, cfg, input_ids, attention_mask, token_type_ids, bbox, pixel_values, batch, seq_len);
-            defer allocator.free(forward_out.hidden);
+            const forward_out = try layoutlmv3_arch.forwardTensor(&cb, allocator, cfg, input_ids, attention_mask, token_type_ids, bbox, pixel_values, batch, seq_len);
+            defer cb.free(forward_out.hidden);
             const total_seq_len = forward_out.seq_len;
 
             if (self.task == .classifier) {
-                const cls_embeddings = try extractClsEmbeddings(allocator, forward_out.hidden, batch, total_seq_len, cfg.hidden_size);
-                defer allocator.free(cls_embeddings);
                 const bert_cfg = bert.Config{
                     .model_type = .roberta,
                     .weight_prefix = "",
@@ -6591,7 +6614,7 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
                     .type_vocab_size = cfg.type_vocab_size,
                     .num_labels = cfg.num_labels,
                 };
-                const logits = try runRobertaClassifier(&cb, allocator, bert_cfg, cls_embeddings, batch, cfg.hidden_size);
+                const logits = try runBertSequenceClassifier(&cb, allocator, bert_cfg, forward_out.hidden, batch, total_seq_len);
                 defer allocator.free(logits);
 
                 const logits_shape = [_]i64{ @intCast(batch), @intCast(cfg.num_labels) };
@@ -6617,7 +6640,9 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
 
             const H = cfg.hidden_size;
             const shape = [_]i64{ @intCast(batch), @intCast(total_seq_len), @intCast(H) };
-            var output_tensor = try Tensor.initFloat32(allocator, "last_hidden_state", &shape, forward_out.hidden);
+            const hidden_values = try cb.toFloat32(forward_out.hidden, allocator);
+            defer allocator.free(hidden_values);
+            var output_tensor = try Tensor.initFloat32(allocator, "last_hidden_state", &shape, hidden_values);
             errdefer output_tensor.deinit();
 
             const result = try allocator.alloc(Tensor, 1);
@@ -6658,11 +6683,10 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
                 return result;
             }
 
-            const hidden = try deberta_arch.forward(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
-            defer allocator.free(hidden);
-
             if (self.task == .extractor) {
-                const logits = try runTokenClassifier(&cb, allocator, hidden, batch, seq_len, cfg.hidden_size, cfg.num_labels);
+                const hidden_ct = try deberta_arch.forwardCt(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len, false);
+                defer cb.free(hidden_ct);
+                const logits = try runTokenClassifier(&cb, allocator, hidden_ct, batch, seq_len, cfg.hidden_size, cfg.num_labels);
                 defer allocator.free(logits);
 
                 const logits_shape = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(cfg.num_labels) };
@@ -6674,6 +6698,8 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
                 return result;
             }
 
+            const hidden = try deberta_arch.forward(&cb, allocator, cfg, input_ids, attention_mask, batch, seq_len);
+            defer allocator.free(hidden);
             const H = cfg.hidden_size;
             const shape = [_]i64{ @intCast(batch), @intCast(seq_len), @intCast(H) };
             var output_tensor = try Tensor.initFloat32(allocator, "last_hidden_state", &shape, hidden);
@@ -7180,17 +7206,56 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
     }
 }
 
+// Reproduce the old host-F32 boundary without selecting a lower precision
+// head kernel. Unknown/custom conversion retains its original host fallback.
+const F32HeadInput = struct {
+    tensor: ops.CT,
+    owned: bool = false,
+    fn init(cb: *const ops.ComputeBackend, allocator: std.mem.Allocator, input: ops.CT, rows: usize, width: usize) !F32HeadInput {
+        const dtype: ?@FieldType(Tensor, "dtype") = cb.tensorDType(input) catch |err| switch (err) {
+            error.UnsupportedTensorType => null,
+            else => return err,
+        };
+        if (dtype == .f32) return .{ .tensor = input };
+        const converted = if (dtype != null) cb.tryConvertDType(input, .f32) catch |err| switch (err) {
+            error.UnsupportedTensorType => null,
+            else => return err,
+        } else null;
+        if (converted) |value| {
+            errdefer cb.free(value);
+            const converted_dtype: ?@FieldType(Tensor, "dtype") = cb.tensorDType(value) catch |err| switch (err) {
+                error.UnsupportedTensorType => null,
+                else => return err,
+            };
+            if (converted_dtype == .f32) return .{ .tensor = value, .owned = true };
+            cb.free(value);
+        }
+        const values = try cb.toFloat32(input, allocator);
+        defer allocator.free(values);
+        return .{ .tensor = try cb.fromFloat32Shape(values, &.{ @intCast(rows), @intCast(width) }), .owned = true };
+    }
+    fn deinit(self: *F32HeadInput, cb: *const ops.ComputeBackend) void {
+        if (self.owned) cb.free(self.tensor);
+    }
+};
+
 fn runBertSequenceClassifier(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
     cfg: bert.Config,
-    hidden: []const f32,
+    hidden: anytype,
     batch: usize,
     seq_len: usize,
 ) ![]f32 {
     const H: usize = @intCast(cfg.hidden_size);
-    const cls_embeddings = try extractClsEmbeddings(allocator, hidden, batch, seq_len, H);
-    defer allocator.free(cls_embeddings);
+    const resident = comptime @TypeOf(hidden) == ops.CT;
+    var f32_input = if (resident) try F32HeadInput.init(cb, allocator, hidden, batch * seq_len, H) else {};
+    defer if (resident) f32_input.deinit(cb);
+    const cls_embeddings = if (resident)
+        try extractClsEmbeddingsCt(cb, allocator, f32_input.tensor, batch, seq_len, H)
+    else
+        try extractClsEmbeddings(allocator, hidden, batch, seq_len, H);
+    defer if (resident) cb.free(cls_embeddings) else allocator.free(cls_embeddings);
 
     return switch (cfg.model_type) {
         .distilbert => runDistilBertClassifier(cb, allocator, cfg, cls_embeddings, batch, H),
@@ -7219,12 +7284,16 @@ fn runBertClassifier(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
     cfg: bert.Config,
-    cls_embeddings: []const f32,
+    cls_embeddings: anytype,
     batch: usize,
     hidden_size: usize,
 ) ![]f32 {
-    const pooled = try maybeApplyPooler(cb, allocator, cls_embeddings, batch, hidden_size, "pooler.dense.weight", "pooler.dense.bias");
-    defer allocator.free(pooled);
+    const resident = comptime @TypeOf(cls_embeddings) == ops.CT;
+    const pooled = if (resident)
+        try maybeApplyPoolerCt(cb, allocator, cls_embeddings, batch, hidden_size, "pooler.dense.weight", "pooler.dense.bias")
+    else
+        try maybeApplyPooler(cb, allocator, cls_embeddings, batch, hidden_size, "pooler.dense.weight", "pooler.dense.bias");
+    defer if (resident) cb.free(pooled) else allocator.free(pooled);
     return runLinearHead(allocator, cb, pooled, batch, hidden_size, cfg.num_labels, "classifier.weight", "classifier.bias");
 }
 
@@ -7321,7 +7390,7 @@ fn runLinearHeadCt(
 fn runTokenClassifier(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
-    hidden: []const f32,
+    hidden: anytype,
     batch: usize,
     seq_len: usize,
     hidden_size_u32: u32,
@@ -7336,7 +7405,7 @@ fn runRobertaClassifier(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
     cfg: bert.Config,
-    cls_embeddings: []const f32,
+    cls_embeddings: anytype,
     batch: usize,
     hidden_size: usize,
 ) ![]f32 {
@@ -7365,7 +7434,7 @@ fn runDistilBertClassifier(
     cb: *const ops.ComputeBackend,
     allocator: std.mem.Allocator,
     cfg: bert.Config,
-    cls_embeddings: []const f32,
+    cls_embeddings: anytype,
     batch: usize,
     hidden_size: usize,
 ) ![]f32 {
@@ -7393,7 +7462,7 @@ const HeadActivation = enum {
 fn runTwoLayerHead(
     allocator: std.mem.Allocator,
     cb: *const ops.ComputeBackend,
-    input: []const f32,
+    input: anytype,
     batch: usize,
     input_dim: usize,
     hidden_dim: usize,
@@ -7416,8 +7485,11 @@ fn runTwoLayerHead(
     defer cb.free(first_b);
     const output_dim: usize = @intCast(output_dim_u32);
     const input_shape = [_]i32{ @intCast(batch), @intCast(input_dim) };
-    const input_ct = try cb.fromFloat32Shape(input, &input_shape);
-    defer cb.free(input_ct);
+    const resident = comptime @TypeOf(input) == ops.CT;
+    var f32_input = if (resident) try F32HeadInput.init(cb, allocator, input, batch, input_dim) else {};
+    defer if (resident) f32_input.deinit(cb);
+    const input_ct = if (resident) f32_input.tensor else try cb.fromFloat32Shape(input, &input_shape);
+    defer if (!resident) cb.free(input_ct);
 
     const first_ct = try cb.linear(input_ct, first_w, first_b, batch, input_dim, hidden_dim);
     defer cb.free(first_ct);
@@ -7440,7 +7512,7 @@ fn runTwoLayerHead(
 fn runLinearHead(
     allocator: std.mem.Allocator,
     cb: *const ops.ComputeBackend,
-    input: []const f32,
+    input: anytype,
     batch: usize,
     input_dim: usize,
     output_dim_u32: u32,
@@ -7449,8 +7521,11 @@ fn runLinearHead(
 ) ![]f32 {
     const output_dim: usize = @intCast(output_dim_u32);
     const input_shape = [_]i32{ @intCast(batch), @intCast(input_dim) };
-    const input_ct = try cb.fromFloat32Shape(input, &input_shape);
-    defer cb.free(input_ct);
+    const resident = comptime @TypeOf(input) == ops.CT;
+    var f32_input = if (resident) try F32HeadInput.init(cb, allocator, input, batch, input_dim) else {};
+    defer if (resident) f32_input.deinit(cb);
+    const input_ct = if (resident) f32_input.tensor else try cb.fromFloat32Shape(input, &input_shape);
+    defer if (!resident) cb.free(input_ct);
 
     const weight = try cb.getWeight(weight_name);
     defer cb.free(weight);
@@ -15042,4 +15117,962 @@ test "CUDA allocation architecture close keeps exact Model resources on strict t
     lifetime.admission_domain = null;
     try std.testing.expect(!cudaCloseRequiresOwnerEmpty(&lifetime, .{ .outside_execution = true }));
     try std.testing.expectEqual(@as(usize, 0), Probe.releases);
+}
+
+// The authored route uses the actual canonical Session/Model/FIFO and Native
+// receiver, with complete resident weights; no callback or Model stand-in.
+test "native authored Source exact additive cap current B host ownership and cancellation" {
+    try nativeAuthoredSourceCase(@import("native_decoder_program.zig").Testing.config());
+}
+
+fn nativeAuthoredSourceCase(cfg: gpt_arch.Config) !void {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const authored = @import("native_decoder_program.zig");
+    const a = std.testing.allocator;
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    defer std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot()) catch @panic("authored source quota leak");
+    var weights = if (cfg.fingerprint() == authored.Testing.config().fingerprint()) try authored.Testing.init(a) else try authored.Testing.expanded(a, cfg);
+    var weights_owned = true;
+    defer if (weights_owned) weights.data.deinitOwned();
+    const owner = try a.create(ArchSession);
+    owner.* = .{ .allocator = a, .arch_config = .{ .gpt = cfg }, .backend_type = .native, .backend_data = .{ .native = weights.data } };
+    owner.model_lifetime.prepareFinalResources() catch |err| {
+        a.destroy(owner);
+        return err;
+    };
+    weights_owned = false;
+    var session = archSessionHandle(owner);
+    defer session.close();
+    session.model_lifetime.?.admission_domain = domain.pin();
+    try session.installOwnedExecutionGate(a);
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    var receiving = try getComputeBackendWithControl(session, a, .{ .native_call_policy = .in_process });
+    defer receiving.deinit();
+    const cb = &receiving.backend;
+    var context = @import("../graph/execution.zig").Context{ .allocator = a, .cb = cb, .gpt_config = &cfg, .session = session };
+    const program = (try authored.Program.tryCreate(a, &context)) orelse return error.MissingAuthoredNativeProgram;
+    var program_owned = true;
+    defer if (program_owned) program.destroyWithCleanup(.{ .outside_execution = true });
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = @intCast(cfg.effectiveKVHeads()), .head_dim = @intCast(cfg.headDim()), .num_layers_packed = @intCast(cfg.num_hidden_layers) });
+    var state = @import("../graph/decode_state_runtime.zig").NativeDecodeState.initPaged(a, &manager, pool, null);
+    defer state.deinit();
+    var logical = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state);
+    try logical.appendPrefillChunk(1);
+    var decode = logical.makeDecodeContext(1, 1);
+    var input = try Tensor.initInt64(a, "input_ids", &.{ 1, 1 }, &.{2});
+    defer input.deinit();
+    var call = try program.beginCall(&.{2}, &decode, .{ .controller = &domain.controller, .backend_class = .cpu });
+    defer call.close(.{ .outside_execution = true });
+    var requests = @import("prepared_storage_admission.zig").Builder{ .allocator = a };
+    defer requests.deinit();
+    try call.collectRequirements(&requests, .{ .controller = &domain.controller, .backend_class = .cpu });
+    var exact = (try session.run_admission.?.planRequest(try session.planRun(&.{input}, null), session.outputInfo())).required;
+    for (requests.items()) |request| exact.host_scratch_bytes += request.bytes;
+    var source: @import("../backends/session.zig").PreparedSource = .{};
+    defer source.deinit();
+    const host_peak = exact.host_weight_bytes + exact.host_kv_bytes + exact.host_scratch_bytes;
+    session.run_admission.?.limits.host_limit_bytes = host_peak - 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, call.prepareSourceInto(&source, session, &.{input}, a, .{ .native_call_policy = .in_process }));
+    try std.testing.expectEqual(@as(u64, 0), program.calls);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+    source = .{}; // Failed constructor was fully retired; start a new final-address owner.
+    session.run_admission.?.limits.host_limit_bytes = host_peak;
+    try call.prepareSourceInto(&source, session, &.{input}, a, .{ .native_call_policy = .in_process });
+    var reference = @import("../graph/decode_state_runtime.zig").NativeDecodeState.initPaged(a, &manager, pool, null);
+    defer reference.deinit();
+    var reference_logical = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&reference);
+    try reference_logical.appendPrefillChunk(1);
+    const reference_decode = reference_logical.makeDecodeContext(1, 1);
+    const expected = try gpt_arch.forward(cb, a, cfg, &.{2}, 1, 1, &reference_decode);
+    defer a.free(expected);
+    const actual_b = source.epoch().?;
+    var foreign = try @import("cleanup_owner.zig").Owner.beginOutsideCleanup();
+    defer foreign.finishAfterUnlock();
+    try source.enter();
+    try std.testing.expect(!session.execution_gate.?.tryLock());
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, call.runWithSource(&source, cb, &decode, .{}));
+    try std.testing.expectError(error.NativeProgramCleanupChanged, call.runWithSource(&source, cb, &decode, .{ .boundary = foreign.epoch() }));
+    try std.testing.expectEqual(@as(u64, 0), program.calls);
+    try call.runWithSource(&source, cb, &decode, .{ .boundary = actual_b });
+    const pointer = call.output.?.ptr;
+    const values = try call.takeOutput();
+    var output = Tensor.initFloat32Owned(a, "logits", &.{ 1, @intCast(cfg.vocab_size) }, values) catch |err| {
+        a.free(values);
+        return err;
+    };
+    var output_owned = true;
+    errdefer if (output_owned) output.deinit();
+    call.close(.{ .boundary = source.epoch() });
+    source.finishInputLifetime();
+    source.leaveExecution();
+    const outputs = try a.alloc(Tensor, 1);
+    outputs[0] = output;
+    output_owned = false;
+    var outputs_live = true;
+    defer if (outputs_live) {
+        outputs[0].deinit();
+        a.free(outputs);
+    };
+    const attached = try source.attachSynchronousHost(outputs);
+    source.deinit();
+    try std.testing.expect(attached[0].data.ptr == @as([*]u8, @ptrCast(pointer)));
+    for (attached[0].asFloat32()) |value| try std.testing.expect(std.math.isFinite(value));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), attached[0].data);
+    try std.testing.expect(domain.controller.snapshot().host_scratch_bytes >= values.len * 4);
+    attached[0].deinit();
+    a.free(attached);
+    outputs_live = false;
+    try std.testing.expect(program.assigned_operations > 0);
+    var warm = try program.beginCall(&.{2}, &decode, .{ .controller = &domain.controller, .backend_class = .cpu });
+    defer warm.close(.{ .outside_execution = true });
+    try std.testing.expect(warm.claim != null);
+    var warm_requests = @import("prepared_storage_admission.zig").Builder{ .allocator = a };
+    defer warm_requests.deinit();
+    try warm.collectRequirements(&warm_requests, .{ .controller = &domain.controller, .backend_class = .cpu });
+    try std.testing.expectEqual(@as(usize, 0), warm_requests.items().len);
+    const original = (try session.run_admission.?.planRequest(try session.planRun(&.{input}, null), session.outputInfo())).required;
+    const warm_peak = (try original.merge(try warm.claim.?.ownedDemand(.{ .controller = &domain.controller, .backend_class = .cpu }))).hostTotalBytes();
+    source = .{};
+    session.run_admission.?.limits.host_limit_bytes = warm_peak - 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, warm.prepareSourceInto(&source, session, &.{input}, a, .{ .native_call_policy = .in_process }));
+    session.run_admission.?.limits.host_limit_bytes = warm_peak;
+    try warm.prepareSourceInto(&source, session, &.{input}, a, .{ .native_call_policy = .in_process });
+    try source.enter();
+    try warm.runWithSource(&source, cb, &decode, .{ .boundary = source.epoch() });
+    const warm_values = try warm.takeOutput();
+    warm.close(.{ .boundary = source.epoch() });
+    source.finishInputLifetime();
+    source.leaveExecution();
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(warm_values));
+    a.free(warm_values); // Payload dies outside gates before its Source floor.
+    source.deinit();
+    // Cancellation is observed before selecting Model; a healthy peer can
+    // still enter the same actual FIFO afterwards. No numerical retry occurs.
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    source = .{};
+    var cancelled = try program.beginCall(&.{2}, &decode, .{ .controller = &domain.controller, .backend_class = .cpu });
+    defer cancelled.close(.{ .outside_execution = true });
+    try std.testing.expectError(error.Cancelled, cancelled.prepareSourceInto(&source, session, &.{input}, a, .{ .native_call_policy = .in_process, .check_fn = Cancel.check }));
+    try std.testing.expectEqual(@as(u64, 2), program.calls);
+    cancelled.close(.{ .outside_execution = true });
+    source.deinit();
+    // A prepared bank may outlive its Source metadata, but that sealed Source
+    // epoch cannot authorize a later public Call.run or trigger a stale cap read.
+    source = .{};
+    var stale = try program.beginCall(&.{2}, &decode, .{ .controller = &domain.controller, .backend_class = .cpu });
+    defer stale.close(.{ .outside_execution = true });
+    try stale.prepareSourceInto(&source, session, &.{input}, a, .{ .native_call_policy = .in_process });
+    var sealed_b = try source.epoch().?.retain();
+    defer sealed_b.release();
+    source.deinit();
+    try std.testing.expect(try sealed_b.isSealed());
+    try std.testing.expectError(error.RetirementEpochSealed, stale.run(cb, cfg, &decode, .{ .boundary = &sealed_b }));
+    try std.testing.expect(!stale.ran);
+    try std.testing.expectEqual(@as(u64, 2), program.calls);
+    stale.close(.{ .boundary = foreign.epoch() });
+    // Exercise the real createRuntime -> forwardLastLogits installed caller.
+    // This API retains its existing explicit raw allocator contract; it is not
+    // evidence of a registered Native compiled serving provider.
+    var raw = session;
+    raw.run_admission = null;
+    const live = @import("../graph/live_model_executor.zig");
+    var executor = try live.createModelExecutor(a, raw, cfg, .f32, null);
+    defer executor.deinit();
+    var decoder = try executor.createRuntime(a);
+    defer decoder.deinit();
+    try std.testing.expectEqual(@as(u64, 0), live.authoredProgramStatistics(decoder).?.calls);
+    var first = try decoder.prefill(a, .{ .input_ids = &.{2}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
+    defer first.deinit(a);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(try first.hostLogits(a)));
+    var next = try decoder.decode(a, .{ .token_id = 3, .position = 1 });
+    defer next.deinit(a);
+    const before_reset = live.authoredProgramStatistics(decoder).?;
+    try std.testing.expectEqual(@as(u64, 2), before_reset.calls);
+    try std.testing.expect(before_reset.assigned_operations > 0 and before_reset.physical_frames == 1);
+    try decoder.reset();
+    var reset = try decoder.prefill(a, .{ .input_ids = &.{2}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
+    defer reset.deinit(a);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(try reset.hostLogits(a)));
+    try std.testing.expectEqual(@as(u64, 3), live.authoredProgramStatistics(decoder).?.calls);
+    try decoder.reset();
+    var fallback = try decoder.prefill(a, .{ .input_ids = &.{ 2, 3 }, .seq_len = 2, .query_seq_len = 2, .attention_mode = .paged_prefill });
+    defer fallback.deinit(a);
+    try std.testing.expectEqual(@as(usize, cfg.vocab_size), (try fallback.hostLogits(a)).len);
+    try std.testing.expectEqual(@as(u64, 3), live.authoredProgramStatistics(decoder).?.calls);
+    // Native host BF16 is not implemented by the original KvPool. The public
+    // Runtime must retain that original refusal, without installing143.
+    if (cfg.hidden_size == 8) {
+        var unsupported_executor = try live.createModelExecutor(a, raw, cfg, .bf16, null);
+        defer unsupported_executor.deinit();
+        var unsupported_runtime = try unsupported_executor.createRuntime(a);
+        defer unsupported_runtime.deinit();
+        try std.testing.expectEqual(@as(?@import("native_decoder_program.zig").Program.Statistics, null), live.authoredProgramStatistics(unsupported_runtime));
+        try std.testing.expectError(error.UnsupportedKvDType, unsupported_runtime.prefill(a, .{ .input_ids = &.{2}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill }));
+    }
+    // The maintained replacement API frees the original named payload. A
+    // prepared Call must reject that change before dereferencing cached data.
+    source = .{};
+    var changed = try program.beginCall(&.{2}, &decode, .{ .controller = &domain.controller, .backend_class = .cpu });
+    defer changed.close(.{ .outside_execution = true });
+    try changed.prepareSourceInto(&source, session, &.{input}, a, .{ .native_call_policy = .in_process });
+    const changed_name = "model.layers.0.self_attn.q_proj.weight";
+    const old_tensor = &owner.backend_data.native.resident_weights.getPtr(changed_name).?.tensor;
+    var replacement = try Tensor.initFloat32(a, changed_name, old_tensor.shape, old_tensor.asFloat32());
+    replaceBlasResidentWeight(session, changed_name, .{ .tensor = replacement }) catch |err| {
+        replacement.deinit();
+        return err;
+    };
+    try source.enter();
+    try std.testing.expectError(error.AuthoredResidentWeightChanged, changed.runWithSource(&source, cb, &decode, .{ .boundary = source.epoch() }));
+    try std.testing.expect(!changed.ran);
+    try std.testing.expectEqual(@as(u64, 2), program.calls);
+    changed.close(.{ .boundary = source.epoch() });
+    source.finishInputLifetime();
+    source.leaveExecution();
+    source.deinit();
+    // Old Source A is sealed. Retire genuine managed banks while another
+    // actual Model/current-B scope is held; payload death alone cannot refund.
+    const charged = domain.controller.snapshot().host_scratch_bytes;
+    try std.testing.expect(charged > 0);
+    var retire_waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
+    try session.enterExecutionCohort(session.execution_gate, .{}, &retire_waiter);
+    program_owned = false;
+    program.destroyWithCleanup(.{ .boundary = foreign.epoch() });
+    try std.testing.expectEqual(charged, domain.controller.snapshot().host_scratch_bytes);
+    session.leaveExecutionCohort(session.execution_gate, &retire_waiter);
+    foreign.finishAfterUnlock();
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "native authored larger layered public Runtime and Source retain exact admission and original parity" {
+    for ([_]u32{ 128, 256 }) |hidden| {
+        var cfg = @import("native_decoder_program.zig").Testing.config();
+        cfg.hidden_size = hidden;
+        cfg.intermediate_size = hidden * 2;
+        cfg.vocab_size = 128;
+        cfg.num_hidden_layers = if (hidden == 128) 2 else 4;
+        cfg.num_attention_heads = 8;
+        cfg.num_key_value_heads = 2;
+        cfg.attention_head_dim = 32;
+        try nativeAuthoredSourceCase(cfg);
+    }
+}
+
+fn nativeGroupedEncoderCheckpointCase(comptime kind: @import("../gguf/tensor_types.zig").KnownTensorType, comptime peer_winner: bool, comptime preexisting_raw: bool) !void {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const process = std.heap.c_allocator;
+    const Memory = @import("../runtime/tier/memory.zig");
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const Cache = @import("../runtime/tier/cache.zig").SharedCache;
+    const Quant = @import("../models/weight_source.zig").QuantizedStorage;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    const Builder = struct {
+        fn weight(data: *NativeData, name: []const u8, shape: []const i64, constant: ?f32, quantized: bool) !void {
+            var count: usize = 1;
+            for (shape) |dim| count *= @intCast(dim);
+            const values = try data.allocator.alloc(f32, count);
+            defer data.allocator.free(values);
+            for (values, 0..) |*v, i| v.* = constant orelse @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + name.len) % 29)) - 14)) / 512;
+            const name_copy = try data.allocator.dupe(u8, name);
+            errdefer data.allocator.free(name_copy);
+            if (quantized) {
+                const codec = @import("../gguf/quant_codec.zig");
+                const raw = if (kind == .Q4_K) try codec.quantizeQ4_KFromF32(data.allocator, values) else try codec.quantizeQ5_KFromF32(data.allocator, values);
+                errdefer data.allocator.free(raw);
+                const owned_shape = try data.allocator.dupe(i64, shape);
+                errdefer data.allocator.free(owned_shape);
+                try data.resident_weights.put(data.allocator, name_copy, .{ .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &.{}, .name = name_copy, .allocator = data.allocator, .owns_data = false, .owns_shape = false }, .quantized = true, .quantized_storage = Quant{ .tensor_type = .{ .known = kind }, .raw_bytes = raw, .shape = owned_shape, .allocator = data.allocator } });
+            } else {
+                var tensor = try Tensor.initFloat32(data.allocator, name_copy, shape, values);
+                errdefer tensor.deinit();
+                try data.resident_weights.put(data.allocator, name_copy, .{ .tensor = tensor });
+            }
+        }
+        fn build(data: *NativeData) !void {
+            try weight(data, "embeddings.word_embeddings.weight", &.{ 8, 512 }, null, false);
+            try weight(data, "encoder.rel_embeddings.weight", &.{ 16, 512 }, null, false);
+            for ([_][]const u8{ "embeddings.LayerNorm", "encoder.LayerNorm", "encoder.layer.0.attention.output.LayerNorm", "encoder.layer.0.output.LayerNorm" }) |base| {
+                const w = try std.fmt.allocPrint(data.allocator, "{s}.weight", .{base});
+                defer data.allocator.free(w);
+                const b = try std.fmt.allocPrint(data.allocator, "{s}.bias", .{base});
+                defer data.allocator.free(b);
+                try weight(data, w, &.{512}, 1, false);
+                try weight(data, b, &.{512}, 0, false);
+            }
+            for ([_][]const u8{ "query", "key", "value" }) |projection| {
+                const w = try std.fmt.allocPrint(data.allocator, "encoder.layer.0.attention.self.{s}_proj.weight", .{projection});
+                defer data.allocator.free(w);
+                const b = try std.fmt.allocPrint(data.allocator, "encoder.layer.0.attention.self.{s}_proj.bias", .{projection});
+                defer data.allocator.free(b);
+                try weight(data, w, &.{ 512, 512 }, null, true);
+                try weight(data, b, &.{512}, 0.001, false);
+            }
+            for ([_][]const u8{ "attention.output.dense", "intermediate.dense", "output.dense" }) |projection| {
+                const w = try std.fmt.allocPrint(data.allocator, "encoder.layer.0.{s}.weight", .{projection});
+                defer data.allocator.free(w);
+                const b = try std.fmt.allocPrint(data.allocator, "encoder.layer.0.{s}.bias", .{projection});
+                defer data.allocator.free(b);
+                try weight(data, w, &.{ 512, 512 }, null, false);
+                try weight(data, b, &.{512}, 0.002, false);
+            }
+        }
+    };
+    var arch = ArchSession{ .allocator = process, .task = .generic, .arch_config = .{ .deberta = .{ .hidden_size = 512, .intermediate_size = 512, .num_hidden_layers = 1, .num_attention_heads = 8, .vocab_size = 8, .position_buckets = 8, .max_position_embeddings = 16 } }, .backend_type = .native, .backend_data = .{ .native = .{ .allocator = process, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = Cache.init(.{ .host_limit_bytes = 32 * 1024 * 1024 }) } } };
+    var data_live = true;
+    defer if (data_live) arch.backend_data.native.deinitOwned();
+    try Builder.build(&arch.backend_data.native);
+    var session = archSessionHandle(&arch);
+    session.execution_gate = &arch.model_lifetime.execution_gate;
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 1 }, &.{1});
+    defer ids.deinit();
+    var mask = try Tensor.initInt64(a, "attention_mask", &.{ 1, 1 }, &.{1});
+    defer mask.deinit();
+    var ids2 = try Tensor.initInt64(a, "input_ids", &.{ 1, 2 }, &.{ 1, 2 });
+    defer ids2.deinit();
+    var mask2 = try Tensor.initInt64(a, "attention_mask", &.{ 1, 2 }, &.{ 1, 1 });
+    defer mask2.deinit();
+    const Probe = struct {
+        model: *Session.ModelLifetime,
+        data: ?*NativeData,
+        source: ?*@import("../backends/session.zig").PreparedSource = null,
+        pin: *const @import("../runtime/tier/admission_domain.zig").Pin,
+        calls: usize = 0,
+        violation: bool = false,
+        armed: bool = false,
+        peer_done: bool = false,
+        fn observe(self: *@This()) void {
+            if (!self.armed) return;
+            if (self.model.execution_gate.tryLock()) self.model.execution_gate.unlock() else self.violation = true;
+            if (self.data) |data| {
+                if (data.quantized_prepare_lock.tryLock()) data.quantized_prepare_lock.unlock() else self.violation = true;
+                if (data.prefetch_initialized) {
+                    if (data.prefetch.mutex.tryLock()) data.prefetch.mutex.unlock(data.prefetch.io_impl.io()) else self.violation = true;
+                }
+            }
+        }
+        fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            self.calls += 1;
+            return self.calls;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn check(raw: ?*anyopaque) !void {
+            if (!peer_winner) return;
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const active = self.source orelse return;
+            if (!active.native_weight_paused or self.peer_done) return;
+            const data = self.data orelse return;
+            const names = [_][]const u8{ "encoder.layer.0.attention.self.query_proj.weight", "encoder.layer.0.attention.self.key_proj.weight", "encoder.layer.0.attention.self.value_proj.weight" };
+            for (names) |name| if (data.resident_weights.getPtr(name).?.quantized_storage.?.preparedBytes(.panel16) == null) return;
+            self.peer_done = true;
+            self.observe();
+            var peer = native_mod.NativeCompute.init(std.testing.allocator, data, null);
+            defer peer.deinit();
+            const cb = peer.computeBackend();
+            var weights: [3]ops.CT = undefined;
+            var biases: [3]ops.CT = undefined;
+            var initialized: usize = 0;
+            defer for (0..initialized) |i| {
+                cb.free(weights[i]);
+                cb.free(biases[i]);
+            };
+            for (names, 0..) |name, i| {
+                weights[i] = try cb.getWeight(name);
+                const bias_name = try std.fmt.allocPrint(std.testing.allocator, "{s}bias", .{name[0 .. name.len - "weight".len]});
+                defer std.testing.allocator.free(bias_name);
+                biases[i] = cb.getWeight(bias_name) catch |err| {
+                    cb.free(weights[i]);
+                    return err;
+                };
+                initialized += 1;
+            }
+            const request = ops.LinearTripleInvocation{ .input = weights[0], .weights = weights, .biases = biases, .rows = 1, .in_dim = 512, .out_dim = 512 };
+            try std.testing.expect(try native_mod.NativeCompute.prepareProjectionGroupOutsideExecution(&cb, data, &request, self.pin));
+        }
+    };
+    var probe = Probe{ .model = &arch.model_lifetime, .data = &arch.backend_data.native, .pin = &pin };
+    try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    if (preexisting_raw) try arch.backend_data.native.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = 128 * 1024 * 1024 }, .{});
+    // Original unobserved arch body, same original automatic quantized route.
+    const reference = try archRunImpl(&arch, &.{ ids, mask }, a, .{ .native_call_policy = .in_process });
+    defer {
+        for (reference) |*value| value.deinit();
+        a.free(reference);
+    }
+    const reference2 = try archRunImpl(&arch, &.{ ids2, mask2 }, a, .{ .native_call_policy = .in_process });
+    defer {
+        for (reference2) |*value| value.deinit();
+        a.free(reference2);
+    }
+    const q_name = "encoder.layer.0.attention.self.query_proj.weight";
+    const source = &arch.backend_data.native.resident_weights.getPtr(q_name).?.quantized_storage.?;
+    const raw_group = source.prepared_group_cache orelse return error.MissingPreparedGroupOwner;
+    const raw_pointer = raw_group.packed_bytes.ptr;
+    if (!preexisting_raw) {
+        // A fresh model/provider for the managed first call. This teardown is
+        // explicitly raw/outside and recreates the SAME checkpoint bytes.
+        arch.backend_data.native.deinitOwned();
+        arch.backend_data = .{ .native = .{ .allocator = process, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = Cache.init(.{ .host_limit_bytes = 32 * 1024 * 1024 }) } };
+        try Builder.build(&arch.backend_data.native);
+    }
+    arch.model_lifetime.admission_domain = pin.retain();
+    defer {
+        arch.model_lifetime.admission_domain.?.release();
+        arch.model_lifetime.admission_domain = null;
+        if (arch.model_lifetime.retirement_sink) |*held| held.release();
+        arch.model_lifetime.retirement_sink = null;
+    }
+    if (!preexisting_raw) try arch.backend_data.native.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = 128 * 1024 * 1024 }, .{});
+    if (preexisting_raw) {
+        // Every original raw KBlock/group cache birth already used this SAME
+        // ledger/controller; only retirement metadata/Owner header is upgraded.
+        try std.testing.expect(arch.backend_data.native.tier_cache.?.admissionAmounts().host_weight_bytes > 0);
+        try std.testing.expect(!source.prepared_group_cache.?.hasPhysicalBacking());
+        try std.testing.expectEqual(raw_pointer, source.prepared_group_cache.?.packed_bytes.ptr);
+    }
+    probe.armed = true;
+    try arch.backend_data.native.tier_cache.?.installRetirementDomainOutsideExecution(&pin);
+    session.run_admission = .{ .controller = pin.controller(), .backend_class = .cpu, .limits = .{ .host_limit_bytes = 128 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    var selected_source: @import("../backends/session.zig").PreparedSource = .{};
+    probe.source = &selected_source;
+    const control = InferenceExecutionControl{ .native_call_policy = .in_process, .ptr = &probe, .check_fn = Probe.check };
+    try selected_source.initBeforeExecutionInto(session, session, session.execution_gate, .{ .host = &.{ ids, mask } }, try session.planRun(&.{ ids, mask }, null), null, .resident_transient, a, control);
+    defer selected_source.deinit();
+    try selected_source.enter();
+    const cold = try selected_source.runHost(&.{ ids, mask });
+    defer {
+        for (cold) |*value| value.deinit();
+        a.free(cold);
+    }
+    try std.testing.expectEqualSlices(f32, reference[0].asFloat32(), cold[0].asFloat32());
+    const selected = &arch.backend_data.native.resident_weights.getPtr(q_name).?.quantized_storage.?;
+    try std.testing.expect(selected.prepared_group_cache.?.hasPhysicalBacking());
+    if (preexisting_raw) try std.testing.expectEqual(raw_pointer, selected.prepared_group_cache.?.packed_bytes.ptr);
+    if (peer_winner) try std.testing.expect(probe.peer_done);
+    try std.testing.expect(!probe.violation and scheduler.head == null);
+    const pointer = selected.prepared_group_cache.?.packed_bytes.ptr;
+    probe.source = null;
+    selected_source.deinit(); // no live Source/Model pointer may survive actual store close
+    const warm = try session.runWithControl(&.{ ids2, mask2 }, a, control);
+    defer {
+        for (warm) |*value| value.deinit();
+        a.free(warm);
+    }
+    try std.testing.expectEqualSlices(f32, reference2[0].asFloat32(), warm[0].asFloat32());
+    try std.testing.expectEqual(pointer, selected.prepared_group_cache.?.packed_bytes.ptr);
+    var alias = selected.retainPreparedGroup() orelse return error.MissingPreparedGroupOwner;
+    var alias_live = true;
+    defer if (alias_live) alias.deinitWithCleanup(process, .{ .outside_execution = true }) catch unreachable;
+    var close = try @import("cleanup_owner.zig").Owner.beginResident(session);
+    defer close.finishAfterUnlock();
+    try std.testing.expect(session.execution_gate.?.tryLock());
+    probe.data = null;
+    try arch.backend_data.native.deinitOwnedWithCleanup(.{ .boundary = close.epoch() });
+    data_live = false;
+    session.execution_gate.?.unlock();
+    close.finishAfterUnlock();
+    try std.testing.expect(pin.controller().snapshot().host_weight_bytes != 0);
+    var later = try @import("cleanup_owner.zig").Owner.beginResident(session);
+    defer later.finishAfterUnlock();
+    try std.testing.expect(session.execution_gate.?.tryLock());
+    try alias.deinitWithCleanup(process, .{ .boundary = later.epoch() });
+    alias_live = false;
+    try std.testing.expect(pin.controller().snapshot().host_weight_bytes != 0);
+    session.execution_gate.?.unlock();
+    later.finishAfterUnlock();
+    try std.testing.expectEqual(@as(usize, 0), pin.controller().snapshot().host_weight_bytes);
+    try std.testing.expect(!probe.violation);
+}
+
+test "canonical DeBERTa host Source cold grouped QKV preserves actual Q4K Q5K programs and later alias death" {
+    inline for (.{ @import("../gguf/tensor_types.zig").KnownTensorType.Q4_K, .Q5_K }) |kind| {
+        try nativeGroupedEncoderCheckpointCase(kind, false, false);
+        try nativeGroupedEncoderCheckpointCase(kind, true, false);
+        try nativeGroupedEncoderCheckpointCase(kind, false, true);
+    }
+}
+
+test "Native grouped encoder adapter preserves actual BERT strict F32 exclusion" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    var arch = ArchSession{ .allocator = std.testing.allocator, .arch_config = .{ .bert = .{ .hidden_size = 512, .intermediate_size = 512, .num_hidden_layers = 1, .num_attention_heads = 8, .vocab_size = 8 } }, .backend_type = .native, .backend_data = .{ .native = .{ .allocator = std.testing.allocator, .resident_weights = .empty, .lazy_weights = .empty } } };
+    defer arch.backend_data.native.deinitOwned();
+    var session = archSessionHandle(&arch);
+    session.execution_gate = &arch.model_lifetime.execution_gate;
+    try std.testing.expect(nativeWeightPreparationModelData(session) == null);
+    try std.testing.expect(!session.nativeWeightPreparationReceiver());
+}
+
+test "BERT family resident task heads preserve actual Native math and materialize only final logits" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    var store = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    try populateBertTaskWeights115(&store);
+    var compute = native.NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const original = compute.computeBackend();
+    const Probe = struct {
+        var reads: usize = 0;
+        fn read(raw: *anyopaque, tensor: ops.CT, alloc: std.mem.Allocator) ![]f32 {
+            reads += 1;
+            const real: *native.NativeCompute = @ptrCast(@alignCast(raw));
+            const backend = real.computeBackend();
+            return backend.vtable.toFloat32(raw, tensor, alloc);
+        }
+    };
+    // Only metadata readback counting is interposed. Every operation and payload
+    // still executes on the actual canonical Native implementation/context.
+    var table = original.vtable.*;
+    table.toFloat32 = Probe.read;
+    const cb = ops.ComputeBackend{ .ptr = original.ptr, .vtable = &table };
+    const encoder_cfg = bert.Config{ .weight_prefix = "", .hidden_size = 4, .intermediate_size = 8, .num_hidden_layers = 1, .num_attention_heads = 1, .vocab_size = 16, .max_position_embeddings = 8, .num_labels = 2, .layer_norm_eps = 0.00001 };
+    const hidden = try bert_arch.forwardCtWithControl(&original, a, encoder_cfg, &.{ 1, 2, 3, 4 }, &.{ 1, 1, 1, 1 }, null, 2, 2, null);
+    defer cb.free(hidden);
+    const hidden_values = try original.toFloat32(hidden, a);
+    defer a.free(hidden_values);
+    for ([_]bert.ModelType{ .bert, .roberta, .distilbert }) |family| {
+        const cfg = bert.Config{ .model_type = family, .hidden_size = 4, .num_labels = 2 };
+        const expected = try runBertSequenceClassifier(&original, a, cfg, @as([]const f32, hidden_values), 2, 2);
+        defer a.free(expected);
+        Probe.reads = 0;
+        const actual = try runBertSequenceClassifier(&cb, a, cfg, hidden, 2, 2);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, expected, actual);
+        try std.testing.expectEqual(@as(usize, 1), Probe.reads);
+    }
+    const token_expected = try runTokenClassifier(&original, a, @as([]const f32, hidden_values), 2, 2, 4, 2);
+    defer a.free(token_expected);
+    Probe.reads = 0;
+    const token_actual = try runTokenClassifier(&cb, a, hidden, 2, 2, 4, 2);
+    defer a.free(token_actual);
+    try std.testing.expectEqualSlices(f32, token_expected, token_actual);
+    try std.testing.expectEqual(@as(usize, 1), Probe.reads);
+    // Missing takeRows is an explicit custom capability fallback. It may read
+    // the full hidden state, but never duplicates the numerical head execution.
+    table.takeRows = null;
+    Probe.reads = 0;
+    const fallback = try runBertSequenceClassifier(&cb, a, .{ .hidden_size = 4, .num_labels = 2 }, hidden, 2, 2);
+    defer a.free(fallback);
+    try std.testing.expectEqual(@as(usize, 2), Probe.reads);
+    const control = try runBertSequenceClassifier(&original, a, .{ .hidden_size = 4, .num_labels = 2 }, @as([]const f32, hidden_values), 2, 2);
+    defer a.free(control);
+    try std.testing.expectEqualSlices(f32, control, fallback);
+    var failed = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, runBertSequenceClassifier(&cb, failed.allocator(), .{ .hidden_size = 4, .num_labels = 2 }, hidden, 2, 2));
+    // Input ownership survives metadata denial and can be used again unchanged.
+    const survived = try original.toFloat32(hidden, a);
+    defer a.free(survived);
+    try std.testing.expectEqualSlices(f32, hidden_values, survived);
+}
+
+fn populateBertTaskWeights115(store: *NativeData) !void {
+    const Put = struct {
+        fn weight(s: *NativeData, name: []const u8, shape: []const i64) !void {
+            const alloc = s.allocator;
+            var count: usize = 1;
+            for (shape) |dim| count *= @intCast(dim);
+            const values = try alloc.alloc(f32, count);
+            defer alloc.free(values);
+            for (values, 0..) |*v, i| v.* = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + name.len) % 19)) - 9)) / 32;
+            const key = try alloc.dupe(u8, name);
+            errdefer alloc.free(key);
+            var tensor = try Tensor.initFloat32(alloc, key, shape, values);
+            errdefer tensor.deinit();
+            try s.resident_weights.put(alloc, key, .{ .tensor = tensor });
+        }
+    };
+    for ([_][]const u8{ "pooler.dense", "classifier.dense", "pre_classifier" }) |prefix| {
+        var name: [96]u8 = undefined;
+        try Put.weight(store, try std.fmt.bufPrint(&name, "{s}.weight", .{prefix}), &.{ 4, 4 });
+        try Put.weight(store, try std.fmt.bufPrint(&name, "{s}.bias", .{prefix}), &.{4});
+    }
+    for ([_][]const u8{ "classifier", "classifier.out_proj" }) |prefix| {
+        var name: [96]u8 = undefined;
+        try Put.weight(store, try std.fmt.bufPrint(&name, "{s}.weight", .{prefix}), &.{ 2, 4 });
+        try Put.weight(store, try std.fmt.bufPrint(&name, "{s}.bias", .{prefix}), &.{2});
+    }
+    try Put.weight(store, "embeddings.word_embeddings.weight", &.{ 16, 4 });
+    try Put.weight(store, "embeddings.position_embeddings.weight", &.{ 8, 4 });
+    try Put.weight(store, "embeddings.token_type_embeddings.weight", &.{ 2, 4 });
+    try Put.weight(store, "embeddings.LayerNorm.weight", &.{4});
+    try Put.weight(store, "embeddings.LayerNorm.bias", &.{4});
+    for ([_][]const u8{ "attention.self.query", "attention.self.key", "attention.self.value", "attention.output.dense", "intermediate.dense", "output.dense" }) |suffix| {
+        const shape: [2]i64 = if (std.mem.eql(u8, suffix, "intermediate.dense")) .{ 8, 4 } else if (std.mem.eql(u8, suffix, "output.dense")) .{ 4, 8 } else .{ 4, 4 };
+        var name: [128]u8 = undefined;
+        try Put.weight(store, try std.fmt.bufPrint(&name, "encoder.layer.0.{s}.weight", .{suffix}), &shape);
+        try Put.weight(store, try std.fmt.bufPrint(&name, "encoder.layer.0.{s}.bias", .{suffix}), &.{shape[0]});
+    }
+    for ([_][]const u8{ "attention.output.LayerNorm", "output.LayerNorm" }) |suffix| {
+        var name: [128]u8 = undefined;
+        try Put.weight(store, try std.fmt.bufPrint(&name, "encoder.layer.0.{s}.weight", .{suffix}), &.{4});
+        try Put.weight(store, try std.fmt.bufPrint(&name, "encoder.layer.0.{s}.bias", .{suffix}), &.{4});
+    }
+}
+
+fn bertPublicTaskCase115a(comptime use_metal: bool) !void {
+    if (comptime use_metal) {
+        if (comptime !build_options.enable_metal) return error.SkipZigTest;
+        if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    } else if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const cfg = bert.Config{ .weight_prefix = "", .hidden_size = 4, .intermediate_size = 8, .num_hidden_layers = 1, .num_attention_heads = 1, .vocab_size = 16, .max_position_embeddings = 8, .num_labels = 2, .layer_norm_eps = 0.00001 };
+    var arch = ArchSession{
+        .allocator = a,
+        .arch_config = .{ .bert = cfg },
+        .backend_type = if (use_metal) .metal else .native,
+        .backend_data = if (use_metal) .{ .metal = .{ .allocator = a, .prefix = "", .lazy_weights = .empty } } else .{ .native = .{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty } },
+    };
+    defer if (comptime use_metal) @import("../backends/compute_factory.zig").closeMetalWeights(a, &arch.backend_data.metal) else arch.backend_data.native.deinitOwned();
+    if (comptime use_metal) {
+        var weights = NativeData{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+        defer weights.deinitOwned();
+        try populateBertTaskWeights115(&weights);
+        var iterator = weights.resident_weights.iterator();
+        while (iterator.next()) |entry| {
+            const key = try a.dupe(u8, entry.key_ptr.*);
+            errdefer a.free(key);
+            const reference_name = try a.dupe(u8, entry.key_ptr.*);
+            errdefer a.free(reference_name);
+            var value = try Tensor.initFloat32(a, key, entry.value_ptr.tensor.shape, entry.value_ptr.tensor.asFloat32());
+            errdefer value.deinit();
+            try arch.backend_data.metal.lazy_weights.put(a, key, .{ .tensor_ref = .{ .name = reference_name }, .host_loaded = .{ .tensor = value } });
+        }
+        try @import("../backends/compute_factory.zig").initializeMetalWeightPrefetch(a, &arch.backend_data.metal, false);
+    } else try populateBertTaskWeights115(&arch.backend_data.native);
+    const control = InferenceExecutionControl{ .native_call_policy = .in_process };
+    var ids = try Tensor.initInt64(a, "input_ids", &.{ 2, 2 }, &.{ 1, 2, 3, 4 });
+    defer ids.deinit();
+    var mask = try Tensor.initInt64(a, "attention_mask", &.{ 2, 2 }, &.{ 1, 1, 1, 1 });
+    defer mask.deinit();
+    for ([_]SessionTask{ .classifier, .extractor }) |task| {
+        arch.task = task;
+        // Source-bound control is the ORIGINAL full-F32 encoder materialization
+        // followed by the original host-specialized head on the SAME backend.
+        const expected = expected: {
+            var cb = try makeComputeBackend(&arch, a, null);
+            defer cb.deinit();
+            cb.execution_control = control;
+            const hidden = try bert_arch.forwardWithControl(&cb, a, cfg, &.{ 1, 2, 3, 4 }, &.{ 1, 1, 1, 1 }, null, 2, 2, control);
+            defer a.free(hidden);
+            break :expected if (task == .classifier)
+                try runBertSequenceClassifier(&cb, a, cfg, @as([]const f32, hidden), 2, 2)
+            else
+                try runTokenClassifier(&cb, a, @as([]const f32, hidden), 2, 2, 4, 2);
+        };
+        defer a.free(expected);
+        // Exercise the actual architecture dispatch, not just its head helpers.
+        const outputs = try archRunImpl(&arch, &.{ ids, mask }, a, control);
+        defer {
+            for (outputs) |*output| output.deinit();
+            a.free(outputs);
+        }
+        try std.testing.expectEqual(@as(usize, 1), outputs.len);
+        try std.testing.expectEqualStrings("logits", outputs[0].name);
+        try std.testing.expectEqualSlices(i64, if (task == .classifier) &.{ 2, 2 } else &.{ 2, 2, 2 }, outputs[0].shape);
+        try expectResidentHeadParity118(use_metal, expected, outputs[0].asFloat32());
+        const warm = try archRunImpl(&arch, &.{ ids, mask }, a, control);
+        defer {
+            for (warm) |*output| output.deinit();
+            a.free(warm);
+        }
+        try std.testing.expectEqual(outputs.len, warm.len);
+        try std.testing.expectEqualStrings(outputs[0].name, warm[0].name);
+        try std.testing.expectEqualSlices(i64, outputs[0].shape, warm[0].shape);
+        try std.testing.expectEqualSlices(u8, outputs[0].data, warm[0].data);
+
+        // Also count the actual Metal/Native head readbacks with a borrowed
+        // metadata-only vtable interposer. No mathematical leaf is replaced.
+        var cb = try makeComputeBackend(&arch, a, null);
+        defer cb.deinit();
+        cb.execution_control = control;
+        const hidden = try bert_arch.forwardCtWithControl(&cb, a, cfg, &.{ 1, 2, 3, 4 }, &.{ 1, 1, 1, 1 }, null, 2, 2, control);
+        defer cb.free(hidden);
+        const Probe = struct {
+            var actual: *const ops.ComputeBackend.VTable = undefined;
+            var reads: usize = 0;
+            fn read(raw: *anyopaque, tensor: ops.CT, allocator: std.mem.Allocator) ![]f32 {
+                reads += 1;
+                return actual.toFloat32(raw, tensor, allocator);
+            }
+        };
+        Probe.actual = cb.vtable;
+        Probe.reads = 0;
+        var table = cb.vtable.*;
+        table.toFloat32 = Probe.read;
+        var counted = cb;
+        counted.vtable = &table;
+        const result = if (task == .classifier)
+            try runBertSequenceClassifier(&counted, a, cfg, hidden, 2, 2)
+        else
+            try runTokenClassifier(&counted, a, hidden, 2, 2, 4, 2);
+        defer a.free(result);
+        try expectResidentHeadParity118(use_metal, expected, result);
+        try std.testing.expectEqualSlices(u8, outputs[0].data, std.mem.sliceAsBytes(result));
+        try std.testing.expectEqual(@as(usize, 1), Probe.reads);
+    }
+}
+
+test "BERT actual Native architecture classifier and extractor preserve original host-materialized logits" {
+    try bertPublicTaskCase115a(false);
+}
+
+test "BERT actual Metal architecture classifier and extractor preserve F32 parity exact repeats and final-only readback" {
+    try bertPublicTaskCase115a(true);
+}
+
+fn populateWideQuantizedLayout118(store: *NativeData, width: usize) !void {
+    const Put = struct {
+        fn dense(s: *NativeData, name: []const u8, rows: usize, cols: usize, vector: bool, unit: bool) !void {
+            const a = s.allocator;
+            const key = try a.dupe(u8, name);
+            errdefer a.free(key);
+            const values = try a.alloc(f32, rows * cols);
+            defer a.free(values);
+            for (values, 0..) |*v, i| v.* = if (unit) 1 else @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + name.len) % 19)) - 9)) / 128;
+            const shape: []const i64 = if (vector) &.{@intCast(cols)} else &.{ @intCast(rows), @intCast(cols) };
+            var value = try Tensor.initFloat32(a, key, shape, values);
+            errdefer value.deinit();
+            try s.resident_weights.put(a, key, .{ .tensor = value });
+        }
+        fn quantized(s: *NativeData, name: []const u8, rows: usize, cols: usize) !void {
+            const a = s.allocator;
+            const key = try a.dupe(u8, name);
+            errdefer a.free(key);
+            const raw = try a.alloc(u8, rows * cols / 32 * 34);
+            errdefer a.free(raw);
+            for (0..raw.len / 34) |block| {
+                raw[block * 34] = 0;
+                raw[block * 34 + 1] = 0x20; // exact f16 1/128, all Q8_0 blocks
+                for (0..32) |i| raw[block * 34 + 2 + i] = @bitCast(@as(i8, @intCast(@as(i32, @intCast((i + block + name.len) % 7)) - 3)));
+            }
+            const shape = try a.dupe(i64, &.{ @intCast(rows), @intCast(cols) });
+            errdefer a.free(shape);
+            try s.resident_weights.put(a, key, .{ .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &.{}, .name = key, .allocator = a, .owns_data = false, .owns_shape = false }, .quantized = true, .quantized_storage = .{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = raw, .shape = shape, .allocator = a } });
+        }
+    };
+    try Put.dense(store, "embeddings.word_embeddings.weight", 16, width, false, false);
+    try Put.dense(store, "embeddings.position_embeddings.weight", 8, width, false, false);
+    try Put.dense(store, "embeddings.token_type_embeddings.weight", 2, width, false, false);
+    const coordinate: usize = if (width == 512) 64 else 128;
+    for ([_][]const u8{ "x_position_embeddings", "y_position_embeddings", "h_position_embeddings", "w_position_embeddings" }) |part| {
+        var name: [128]u8 = undefined;
+        const dim: usize = if (part[0] == 'x' or part[0] == 'y') coordinate else 128;
+        try Put.dense(store, try std.fmt.bufPrint(&name, "embeddings.{s}.weight", .{part}), 16, dim, false, false);
+    }
+    for ([_][]const u8{ "embeddings.LayerNorm", "encoder.layer.0.attention.output.LayerNorm", "encoder.layer.0.output.LayerNorm" }) |prefix| {
+        var name: [128]u8 = undefined;
+        try Put.dense(store, try std.fmt.bufPrint(&name, "{s}.weight", .{prefix}), 1, width, true, true);
+        try Put.dense(store, try std.fmt.bufPrint(&name, "{s}.bias", .{prefix}), 1, width, true, false);
+    }
+    for ([_][]const u8{ "attention.self.query", "attention.self.key", "attention.self.value", "attention.output.dense", "intermediate.dense", "output.dense" }) |part| {
+        const rows = if (std.mem.eql(u8, part, "intermediate.dense")) width * 2 else width;
+        const cols = if (std.mem.eql(u8, part, "output.dense")) width * 2 else width;
+        var name: [128]u8 = undefined;
+        try Put.quantized(store, try std.fmt.bufPrint(&name, "encoder.layer.0.{s}.weight", .{part}), rows, cols);
+        try Put.dense(store, try std.fmt.bufPrint(&name, "encoder.layer.0.{s}.bias", .{part}), 1, rows, true, false);
+    }
+    // Additional actual DeBERTa-v3 tensor names for the extractor case.
+    try Put.dense(store, "encoder.rel_embeddings.weight", 16, width, false, false);
+    try Put.dense(store, "encoder.LayerNorm.weight", 1, width, true, true);
+    try Put.dense(store, "encoder.LayerNorm.bias", 1, width, true, false);
+    for ([_][]const u8{ "query_proj", "key_proj", "value_proj" }) |part| {
+        var name: [128]u8 = undefined;
+        try Put.quantized(store, try std.fmt.bufPrint(&name, "encoder.layer.0.attention.self.{s}.weight", .{part}), width, width);
+        try Put.dense(store, try std.fmt.bufPrint(&name, "encoder.layer.0.attention.self.{s}.bias", .{part}), 1, width, true, false);
+    }
+    try Put.quantized(store, "classifier.dense.weight", width, width);
+    try Put.dense(store, "classifier.dense.bias", 1, width, true, false);
+    try Put.quantized(store, "classifier.out_proj.weight", 2, width);
+    try Put.dense(store, "classifier.out_proj.bias", 1, 2, true, false);
+    try Put.quantized(store, "classifier.weight", 2, width);
+    try Put.dense(store, "classifier.bias", 1, 2, true, false);
+}
+
+fn wideQuantizedLayoutTask118(comptime use_metal: bool, width: usize, comptime deberta_extract: bool) !void {
+    if (comptime use_metal) {
+        if (comptime !build_options.enable_metal) return error.SkipZigTest;
+        if (!metal_runtime.metalDeviceAvailable()) return error.SkipZigTest;
+    } else if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const cfg = @import("../models/layoutlmv3.zig").Config{ .weight_prefix = "", .hidden_size = @intCast(width), .intermediate_size = @intCast(width * 2), .num_hidden_layers = 1, .num_attention_heads = @intCast(width / 64), .vocab_size = 16, .max_position_embeddings = 8, .max_2d_position_embeddings = 16, .coordinate_size = if (width == 512) 64 else 128, .shape_size = 128, .num_labels = 2, .has_relative_attention_bias = false, .has_spatial_attention_bias = false };
+    const deberta_cfg = deberta_mod.Config{ .hidden_size = @intCast(width), .intermediate_size = @intCast(width * 2), .num_hidden_layers = 1, .num_attention_heads = @intCast(width / 64), .vocab_size = 16, .max_position_embeddings = 16, .position_buckets = 8, .num_labels = 2, .gliner_quantized_weights = true };
+    var arch = ArchSession{ .allocator = a, .arch_config = if (deberta_extract) .{ .deberta = deberta_cfg } else .{ .layoutlmv3 = cfg }, .backend_type = if (use_metal) .metal else .native, .backend_data = if (use_metal) .{ .metal = .{ .allocator = a, .prefix = "", .lazy_weights = .empty } } else .{ .native = .{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty } } };
+    defer if (comptime use_metal) @import("../backends/compute_factory.zig").closeMetalWeights(a, &arch.backend_data.metal) else arch.backend_data.native.deinitOwned();
+    if (comptime use_metal) {
+        var weights = NativeData{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+        defer weights.deinitOwned();
+        try populateWideQuantizedLayout118(&weights, width);
+        // Move the exact Q8_0 parents into the normal hosted loader. No dense
+        // reinterpretation or test-specific kernel/precision selection.
+        while (weights.resident_weights.count() != 0) {
+            var iterator = weights.resident_weights.iterator();
+            const first = iterator.next().?;
+            const name = try a.dupe(u8, first.key_ptr.*);
+            errdefer a.free(name);
+            const moved = weights.resident_weights.fetchRemove(first.key_ptr.*).?;
+            var loaded = moved.value;
+            errdefer {
+                loaded.deinit();
+                a.free(moved.key);
+            }
+            // The actual hosted loader owns quantized storage on LazyWeightEntry,
+            // independently of its optional dense host-loaded Tensor.
+            var quantized = loaded.quantized_storage;
+            loaded.quantized_storage = null;
+            errdefer if (quantized) |*storage| storage.deinit();
+            // Direct quantized entries own no dense host Tensor; this fixture's
+            // empty non-owning placeholder must not masquerade as a scalar.
+            const host_loaded: ?LoadedWeight = if (quantized == null) loaded else null;
+            try arch.backend_data.metal.lazy_weights.put(a, moved.key, .{ .tensor_ref = .{ .name = name }, .host_loaded = host_loaded, .quantized_storage = quantized });
+        }
+        try @import("../backends/compute_factory.zig").initializeMetalWeightPrefetch(a, &arch.backend_data.metal, false);
+    } else try populateWideQuantizedLayout118(&arch.backend_data.native, width);
+    const control = InferenceExecutionControl{ .native_call_policy = .in_process };
+    const boxes = [_]i64{ 0, 0, 3, 4, 1, 1, 5, 7, 0, 2, 4, 6, 2, 0, 6, 4 };
+    var ids = try Tensor.initInt64(a, "input_ids", &.{ 2, 2 }, &.{ 2, 3, 4, 5 });
+    defer ids.deinit();
+    var mask = try Tensor.initInt64(a, "attention_mask", &.{ 2, 2 }, &.{ 1, 1, 1, 1 });
+    defer mask.deinit();
+    var bbox = try Tensor.initInt64(a, "bbox", &.{ 2, 2, 4 }, &boxes);
+    defer bbox.deinit();
+    const tasks: []const SessionTask = if (deberta_extract) &.{.extractor} else &.{ .classifier, .extractor };
+    for (tasks) |task| {
+        arch.task = task;
+        const expected = expected: {
+            var cb = try makeComputeBackend(&arch, a, null);
+            defer cb.deinit();
+            cb.execution_control = control;
+            // EXACT original host boundary and head dispatch, same model bytes.
+            const hidden: layoutlmv3_arch.ForwardOutput = if (deberta_extract)
+                .{ .hidden = try deberta_arch.forward(&cb, a, deberta_cfg, ids.asInt64(), mask.asInt64(), 2, 2), .seq_len = 2 }
+            else
+                try layoutlmv3_arch.forward(&cb, a, cfg, ids.asInt64(), mask.asInt64(), null, &boxes, null, 2, 2);
+            defer a.free(hidden.hidden);
+            if (task == .extractor) break :expected try runTokenClassifier(&cb, a, @as([]const f32, hidden.hidden), 2, hidden.seq_len, cfg.hidden_size, cfg.num_labels);
+            const cls = try extractClsEmbeddings(a, hidden.hidden, 2, hidden.seq_len, cfg.hidden_size);
+            defer a.free(cls);
+            break :expected try runRobertaClassifier(&cb, a, .{ .hidden_size = cfg.hidden_size, .num_labels = cfg.num_labels }, @as([]const f32, cls), 2, cfg.hidden_size);
+        };
+        defer a.free(expected);
+        const actual = try archRunImpl(&arch, &.{ ids, mask, bbox }, a, control);
+        defer {
+            for (actual) |*value| value.deinit();
+            a.free(actual);
+        }
+        try std.testing.expectEqual(@as(usize, 1), actual.len);
+        try expectResidentHeadParity118(use_metal, expected, actual[0].asFloat32());
+        for (actual[0].asFloat32()) |value| try std.testing.expect(std.math.isFinite(value));
+        // SAME resident route must repeat exactly; CPU-vs-GPU parity is separate.
+        const warm = try archRunImpl(&arch, &.{ ids, mask, bbox }, a, control);
+        defer {
+            for (warm) |*value| value.deinit();
+            a.free(warm);
+        }
+        try expectResidentHeadParity118(use_metal, expected, warm[0].asFloat32());
+        try std.testing.expectEqualSlices(i64, actual[0].shape, warm[0].shape);
+        try std.testing.expectEqualSlices(u8, actual[0].data, warm[0].data);
+    }
+}
+
+test "LayoutLM actual Native Q8 encoder classifier extractor preserve host boundary at H512 and H768" {
+    try wideQuantizedLayoutTask118(false, 512, false);
+    try wideQuantizedLayoutTask118(false, 768, false);
+}
+
+test "LayoutLM actual Metal Q8 encoder classifier extractor preserve F32 parity and exact repeats at H512 and H768" {
+    try wideQuantizedLayoutTask118(true, 512, false);
+    try wideQuantizedLayoutTask118(true, 768, false);
+}
+
+test "resident task head F32 boundary preserves actual Native input and custom unknown dtype fallback" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const native = @import("../ops/native_compute.zig");
+    var weights = NativeData{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.deinitOwned();
+    var compute = native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const values = [_]f32{ 0.25, -0.5, 0.75, 1.0 };
+    const input = try cb.fromFloat32Shape(&values, &.{ 1, 4 });
+    defer cb.free(input);
+    var exact = try F32HeadInput.init(&cb, a, input, 1, 4);
+    defer exact.deinit(&cb);
+    try std.testing.expect(!exact.owned and exact.tensor == input);
+    const Probe = struct {
+        var reads: usize = 0;
+        fn read(raw: *anyopaque, tensor: ops.CT, allocator: std.mem.Allocator) ![]f32 {
+            reads += 1;
+            const actual: *native.NativeCompute = @ptrCast(@alignCast(raw));
+            return actual.computeBackend().toFloat32(tensor, allocator);
+        }
+        fn unexpectedConvert(_: *anyopaque, _: ops.CT, _: ops.GraphDType) !?ops.CT {
+            return error.UnknownDtypeMustUseOriginalHostFallback;
+        }
+    };
+    var table = cb.vtable.*;
+    table.tensorDType = null;
+    table.convertDType = Probe.unexpectedConvert;
+    table.toFloat32 = Probe.read;
+    var custom = cb;
+    custom.vtable = &table;
+    Probe.reads = 0;
+    var fallback = try F32HeadInput.init(&custom, a, input, 1, 4);
+    defer fallback.deinit(&custom);
+    try std.testing.expect(fallback.owned and fallback.tensor != input);
+    try std.testing.expectEqual(@as(usize, 1), Probe.reads);
+    const actual = try cb.toFloat32(fallback.tensor, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, &values, actual);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, F32HeadInput.init(&custom, failing.allocator(), input, 1, 4));
+    const surviving = try cb.toFloat32(input, a);
+    defer a.free(surviving);
+    try std.testing.expectEqualSlices(f32, &values, surviving);
+}
+
+test "DeBERTa actual Native Q8 encoder extractor preserves host boundary at H512 and H768" {
+    try wideQuantizedLayoutTask118(false, 512, true);
+    try wideQuantizedLayoutTask118(false, 768, true);
+}
+
+test "DeBERTa actual Metal Q8 encoder extractor preserves F32 parity and exact repeats at H512 and H768" {
+    try wideQuantizedLayoutTask118(true, 512, true);
+    try wideQuantizedLayoutTask118(true, 768, true);
+}
+
+// The existing assigned F32 Metal linear oracle uses this 3e-5 absolute bound
+// versus its F64 reference. Old host SGEMM and device reduction/unary kernels
+// need not share bits; the SAME Metal route above must still repeat exactly.
+fn expectResidentHeadParity118(comptime use_metal: bool, expected: []const f32, actual: []const f32) !void {
+    if (comptime !use_metal) return std.testing.expectEqualSlices(f32, expected, actual);
+    try std.testing.expectEqual(expected.len, actual.len);
+    for (expected, actual) |want, got| {
+        try std.testing.expect(std.math.isFinite(want) and std.math.isFinite(got));
+        try std.testing.expectApproxEqAbs(want, got, @as(f32, 3e-5));
+    }
 }

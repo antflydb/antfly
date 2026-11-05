@@ -37,6 +37,7 @@ const session_decoder = @import("session_decoder.zig");
 const RuntimeContext = struct {
     allocator: std.mem.Allocator,
     cb: ops.ComputeBackend,
+    native_program: ?*@import("../execution/native_decoder_program.zig").Program = null,
     definition: *session_decoder.Definition,
     kv_manager: runtime.kv.manager.KvManager,
     pool_id: runtime.kv.block.KvPoolId,
@@ -95,6 +96,10 @@ const RuntimeContext = struct {
         ctx.decode_runtime.configureForGptConfig(gpt_config);
         errdefer ctx.decode_runtime.deinit();
         try ctx.decode_runtime.state.ensureQwen35LinearCache(gpt_config);
+        if (cb.kind() == .native and kv_dtype == .f32) {
+            const program_context = @import("execution.zig").Context{ .allocator = allocator, .cb = &ctx.cb, .gpt_config = &ctx.definition.configuration.value, .session = session };
+            ctx.native_program = try @import("../execution/native_decoder_program.zig").Program.tryCreate(allocator, &program_context);
+        }
         return ctx;
     }
 
@@ -122,14 +127,26 @@ const RuntimeContext = struct {
         self.decode_runtime.configureForGptConfig(self.definition.configuration.value);
         self.decode_runtime.state.qwen35_linear_cache = recurrent;
         self.decode_runtime.state.resetQwen35LinearCache();
+        if (self.native_program) |program| try program.afterStateReset(current);
     }
 
     pub fn deinit(self: *RuntimeContext) void {
         self.deinitWithCleanup(.{ .outside_execution = true });
     }
     pub fn deinitWithCleanup(self: *RuntimeContext, current: @import("../execution/cleanup_context.zig").Context) void {
+        // The public raw outside close has no enclosing B. Create its actual
+        // local owner before cleanup guards; seal only after those guards end.
+        if (self.native_program != null and current.boundary == null and current.outside_execution) {
+            var owner = @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            defer owner.finishAfterUnlock();
+            self.deinitWithCleanup(.{ .boundary = owner.epoch() });
+            return;
+        }
         var cleanup = self.definition.beginCleanup();
         defer cleanup.deinit();
+        const program = self.native_program;
+        self.native_program = null;
+        if (program) |owned| owned.destroyWithCleanup(current);
         self.decode_runtime.deinitWithCleanup(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         self.kv_manager.deinit();
         self.cb.deinitWithCleanup(current);
@@ -232,6 +249,15 @@ fn supportsBackend(backend: backends.BackendType) bool {
         .native, .metal => true,
         else => false,
     };
+}
+
+/// Exact maintained runtime metadata; copied/custom tables are declined before
+/// any context cast. The owning caller excludes runtime destruction.
+pub fn authoredProgramStatistics(model: model_runtime.ModelRuntime) ?@import("../execution/native_decoder_program.zig").Program.Statistics {
+    if (model.vtable != &runtime_vtable) return null;
+    const context: *RuntimeContext = @ptrCast(@alignCast(model.ptr));
+    const program = context.native_program orelse return null;
+    return program.statistics();
 }
 
 pub fn supportsSession(session: backends.Session) bool {
@@ -366,7 +392,7 @@ fn forwardLastLogits(
     decode_context: *const gpt_arch.DecodeContext,
 ) ![]f32 {
     std.debug.assert(query_seq_len == decode_context.query_sequence_len);
-    var decoder = decoder_forward.Runtime{ .context = .{
+    var decoder = decoder_forward.Runtime{ .native_program = runtime_ctx.native_program, .context = .{
         .allocator = allocator,
         .cb = &runtime_ctx.cb,
         .gpt_config = &runtime_ctx.definition.configuration.value,

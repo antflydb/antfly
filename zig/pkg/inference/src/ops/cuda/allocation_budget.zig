@@ -105,12 +105,17 @@ pub const Budget = struct {
         defer state.release();
         roots.bind(.{ .state = state, .backing = .cuda_successful_cuMemAlloc_owned_spans });
     }
-    pub fn releaseObservation(self: *Budget) void {
+    /// Transfer the Budget-owned metadata reference without invoking its
+    /// allocator. A containing owner can then release it outside its own lock.
+    pub fn detachObservation(self: *Budget) ?*observer.State {
         while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
         const state = self.observation;
         self.observation = null;
-        self.mutex.unlock();
-        if (state) |value| value.release();
+        return state;
+    }
+    pub fn releaseObservation(self: *Budget) void {
+        if (self.detachObservation()) |state| state.release();
     }
 
     /// Move existing physical ownership without inventing SDK allocation/free

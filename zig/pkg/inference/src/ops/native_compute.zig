@@ -844,19 +844,23 @@ pub const WeightStore = struct {
     }
     pub fn validateCleanup(self: *WeightStore, current: @import("../execution/cleanup_context.zig").Context) !void {
         if (self.tier_cache) |*cache| try cache.validateCleanup(current);
+        var resident = self.resident_weights.valueIterator();
+        while (resident.next()) |weight| try weight.validateCleanup(current);
+        var lazy = self.lazy_weights.valueIterator();
+        while (lazy.next()) |entry| if (entry.loaded) |*weight| try weight.validateCleanup(current);
     }
     pub fn deinitOwnedWithCleanup(self: *WeightStore, current: @import("../execution/cleanup_context.zig").Context) !void {
         try self.validateCleanup(current); // before ANY worker/cache/backing death
         deinitPrefetchQueue(self);
         var resident_it = self.resident_weights.iterator();
         while (resident_it.next()) |entry| {
-            entry.value_ptr.deinit();
+            try entry.value_ptr.deinitWithCleanup(current);
             self.allocator.free(entry.key_ptr.*);
         }
         self.resident_weights.deinit(self.allocator);
         var lazy_it = self.lazy_weights.iterator();
         while (lazy_it.next()) |entry| {
-            if (entry.value_ptr.loaded) |*loaded| loaded.deinit();
+            if (entry.value_ptr.loaded) |*loaded| try loaded.deinitWithCleanup(current);
             entry.value_ptr.tensor_ref.deinit(self.allocator);
             self.allocator.free(entry.key_ptr.*);
         }
@@ -4018,6 +4022,9 @@ pub const NativeCompute = struct {
         const observers = @import("../execution/allocation_observer.zig");
         if (observers.State.forAllocator(self.allocator) != null) return;
         const observer = try observers.State.create(self.allocator, coverage);
+        if (@import("../backends/admitted_allocator.zig").AdmittedAllocator.backingAllocator(self.allocator)) |backing| {
+            if (observers.State.forAllocator(backing)) |parent| observer.parent_owner = parent.retain();
+        }
         self.allocation_observer_owner = observer;
         self.allocator = observer.allocator();
     }
@@ -4047,6 +4054,49 @@ pub const NativeCompute = struct {
         owner.* = .{ .allocator = self.allocator, .data = self.data, .attached_compute = self };
         self.weight_retirement = owner;
         return owner;
+    }
+
+    /// SDK-free immutable-source metadata, before the original tracer asks for
+    /// a lookup header. Packed/lazy sources retain their original route.
+    pub fn authoredResidentF32Shape(backend: *const ops.ComputeBackend, name: []const u8) !@import("ml").graph.Shape {
+        if (backend.vtable != &vtable_impl) return error.UnsupportedAuthoredNativeTarget;
+        const self: *NativeCompute = @ptrCast(@alignCast(backend.ptr));
+        const data = self.data;
+        if (data.prefetch_initialized) data.prefetch.lock();
+        defer if (data.prefetch_initialized) data.prefetch.unlock();
+        const loaded = data.resident_weights.getPtr(name) orelse {
+            if (data.lazy_weights.contains(name)) return error.UnsupportedAuthoredWeight;
+            return error.WeightNotFound;
+        };
+        const tensor = &loaded.tensor;
+        if (loaded.quantized or loaded.quantized_storage != null or tensor.dtype != .f32 or tensor.shape.len == 0 or tensor.shape.len > 2 or @intFromPtr(tensor.data.ptr) % @alignOf(f32) != 0) return error.UnsupportedAuthoredWeight;
+        const shape = @import("ml").graph.Shape.init(.f32, tensor.shape);
+        const elements = shape.numElements() orelse return error.UnsupportedAuthoredWeight;
+        if (elements <= 0 or tensor.data.len != try std.math.mul(usize, @intCast(elements), @sizeOf(f32))) return error.UnsupportedAuthoredWeight;
+        return shape;
+    }
+
+    /// Immutable named-model input. The receiving program keeps the actual
+    /// weight handle and its original model/store owner alive; this grants no
+    /// allocator-owned/workspace credit to a generic borrowed tensor.
+    pub fn authoredResidentF32Plane(backend: *const ops.ComputeBackend, name: []const u8, value: CT) !@import("../execution/storage_ownership.zig").Plane {
+        const shape = try authoredResidentF32Shape(backend, name);
+        const self: *NativeCompute = @ptrCast(@alignCast(backend.ptr));
+        const data = self.data;
+        if (data.prefetch_initialized) data.prefetch.lock();
+        defer if (data.prefetch_initialized) data.prefetch.unlock();
+        const source = data.resident_weights.getPtr(name) orelse return error.UnsupportedAuthoredWeight;
+        const view = toBuf(value);
+        if (!view.cached_weight or view.weight_handle == null or view.weight_handle.?.references == 0 or view.owned or view.retained_parent != null or view.physical_lease != null or view.source_tensor != null or view.quantized_storage != null or view.owned_quantized_storage != null or view.view_strides != null or view.view_base_offset != 0 or !std.mem.eql(u8, view.name, name) or @intFromPtr(view.data.ptr) != @intFromPtr(source.tensor.data.ptr) or std.mem.sliceAsBytes(view.data).len != source.tensor.data.len or view.logical_shape == null or !std.mem.eql(i64, view.logical_shape.?, source.tensor.shape)) return error.AuthoredResidentWeightChanged;
+        var descriptor = backend_contracts.TensorDesc.init(shape, .host_f32);
+        descriptor.current_backend = .native;
+        descriptor.resident_backend = .native;
+        return .{ .descriptor = descriptor, .role = .primary, .backing = .{ .kind = .host, .base = @intFromPtr(source.tensor.data.ptr) }, .byte_offset = 0, .logical_bytes = source.tensor.data.len, .readable_bytes = source.tensor.data.len };
+    }
+
+    pub fn validateAuthoredAttention(backend: *const ops.ComputeBackend, geometry: ops.kernel_descriptor.PagedAttention, attention: *const AttentionContext) !void {
+        if (backend.vtable != &vtable_impl) return error.UnsupportedAuthoredNativeTarget;
+        _ = try validateAssignedPagedAttention(geometry, attention);
     }
 
     pub fn init(allocator: std.mem.Allocator, data: *WeightStore, run_budget: ?*run_memory.RunBudget) NativeCompute {
@@ -4490,6 +4540,182 @@ pub const NativeCompute = struct {
         const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
         if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
         return ResidentWeightPreparation.snapshot(self, name);
+    }
+
+    pub const ProjectionGroupState = enum { ignored, ready, cold, cold_existing };
+
+    /// The receiving Source owns the actual Model. This query only borrows
+    /// copied CT/key/geometry under real Native metadata exclusion.
+    pub fn projectionGroupState(cb: *const ComputeBackend, expected_data: *const anyopaque, request: *const ops.LinearTripleInvocation) !ProjectionGroupState {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        if (self.quantized_activation_policy == .strict_f32) return .ignored;
+        const data = self.data;
+        ResidentWeightPreparation.lock(data);
+        defer ResidentWeightPreparation.unlock(data);
+        const stores = try selectedProjectionGroupStorage(self, request) orelse return .ignored;
+        const tier = if (data.tier_cache) |*value| value else return .ignored;
+        if (tier.admission == null) return .ignored; // original explicit raw store
+        if (preparedQKVPanel16GroupCacheMatches(stores[0], groupSourceEpochs(stores[0], stores[1], stores[2]), toBuf(request.weights[1]).name, toBuf(request.weights[2]).name, preparedKQKVPanel16ByteSize(request.out_dim, request.in_dim / 256), request.in_dim / 256)) {
+            return if (stores[0].prepared_group_cache.?.hasPhysicalBacking()) .ready else .cold_existing;
+        }
+        return .cold;
+    }
+
+    /// Actual Source released Model/FIFO/lane before entering. Cold payload,
+    /// quota and retirement metadata use the same existing cache/controller.
+    /// Return false only for original optional miss denial; raw owner upgrade
+    /// cannot be silently declined into unowned numerical use.
+    pub fn prepareProjectionGroupOutsideExecution(cb: *const ComputeBackend, expected_data: *const anyopaque, request: *const ops.LinearTripleInvocation, old_domain: *const @import("../runtime/tier/admission_domain.zig").Pin) !bool {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        const data = self.data;
+        var growth: ?tier_cache_mod.SharedCache.PreparedGrowth = null;
+        defer if (growth) |*value| value.finishOutsideExecution();
+        var staged: ?QuantizedStorage.PreparedGroupCache = null;
+        // Physical candidate death precedes unused quota/refund on every exit.
+        defer if (staged) |*value| value.deinitWithCleanup(std.heap.c_allocator, .{ .outside_execution = true }) catch platform.inference_process_supervisor.restartWorker();
+        var previous: ?QuantizedStorage.PreparedGroupCache = null;
+        var previous_bytes: usize = 0;
+        var previous_managed = false;
+        var sources: [3]*const QuantizedStorage = undefined;
+        var panels: [3][]const u8 = undefined;
+        var epochs: [3]u64 = undefined;
+        var source_entry: ?*LazyWeightEntry = null;
+        var upgrade_owner: usize = 0;
+        var request_bytes: usize = 0;
+        var policy_bytes: usize = 0;
+        ResidentWeightPreparation.lock(data);
+        const selected = selectedProjectionGroupStorage(self, request) catch |err| {
+            ResidentWeightPreparation.unlock(data);
+            return err;
+        };
+        sources = selected orelse {
+            ResidentWeightPreparation.unlock(data);
+            return error.NativeWeightPreparationChanged;
+        };
+        const cache = if (data.tier_cache) |*value| value else {
+            ResidentWeightPreparation.unlock(data);
+            return error.NativeWeightPreparationChanged;
+        };
+        const binding = cache.admission orelse {
+            ResidentWeightPreparation.unlock(data);
+            return error.MissingCacheRetirementDomain;
+        };
+        if (binding.controller != old_domain.controller()) {
+            ResidentWeightPreparation.unlock(data);
+            return error.ForeignAdmissionDomain;
+        }
+        policy_bytes = preparedKQKVPanel16OwnedByteSize(request.out_dim, request.in_dim / 256, toBuf(request.weights[1]).name, toBuf(request.weights[2]).name) orelse {
+            ResidentWeightPreparation.unlock(data);
+            return error.InvalidQuantizedLinearShape;
+        };
+        request_bytes = std.math.add(usize, policy_bytes, QuantizedStorage.PreparedGroupCache.ownerMetadataBytes()) catch |err| {
+            ResidentWeightPreparation.unlock(data);
+            return err;
+        };
+        epochs = groupSourceEpochs(sources[0], sources[1], sources[2]);
+        const warm = preparedQKVPanel16GroupCacheMatches(sources[0], epochs, toBuf(request.weights[1]).name, toBuf(request.weights[2]).name, preparedKQKVPanel16ByteSize(request.out_dim, request.in_dim / 256), request.in_dim / 256);
+        if (warm and sources[0].prepared_group_cache.?.hasPhysicalBacking()) {
+            ResidentWeightPreparation.unlock(data);
+            return true;
+        }
+        source_entry = weightSourceEntry(toBuf(request.weights[0]));
+        for (sources, &panels) |source, *panel| panel.* = source.preparedBytes(.panel16).?;
+        if (warm) {
+            const group = sources[0].prepared_group_cache.?;
+            const owner = group.retention orelse {
+                ResidentWeightPreparation.unlock(data);
+                return error.NativeWeightPreparationChanged;
+            };
+            // Exact default canonical process allocator can outlive Model.
+            // A custom raw arena owner remains a named unsupported upgrade.
+            if (owner.allocator.vtable != std.heap.c_allocator.vtable or owner.references.load(.acquire) != 1) {
+                ResidentWeightPreparation.unlock(data);
+                return error.NativeWeightPreparationChanged;
+            }
+            upgrade_owner = @intFromPtr(owner);
+            growth = cache.snapshotExistingPhysicalComponentLocked(group.ownedBytes(), QuantizedStorage.PreparedGroupCache.ownerMetadataBytes()) catch |err| {
+                ResidentWeightPreparation.unlock(data);
+                return err;
+            };
+        } else {
+            switch (@constCast(sources[0]).replaceUnusedPreparedGroup(null)) {
+                .busy => {
+                    ResidentWeightPreparation.unlock(data);
+                    return false; // original optional busy-owner decline
+                },
+                .replaced => |old| previous = old,
+            }
+            if (previous) |*old| {
+                previous_managed = old.hasPhysicalBacking();
+                previous_bytes = old.ownedBytes();
+            }
+        }
+        ResidentWeightPreparation.unlock(data);
+        // The existing owner/key/packed destructor executes outside ALL gates.
+        if (previous) |*old| {
+            try old.deinitWithCleanup(data.allocator, .{ .outside_execution = true });
+            previous = null;
+            ResidentWeightPreparation.lock(data);
+            if (previous_managed) cache.noteLogicalPhysicalOwnerRemoval(previous_bytes) else cache.noteRelease(.host, previous_bytes);
+            if (source_entry) |entry| entry.loaded_bytes = quantizedStorageBudgetBytes(sources[0]);
+            ResidentWeightPreparation.unlock(data);
+        }
+        try cache.flushReleasedOutsideExecution();
+        if (upgrade_owner == 0) {
+            ResidentWeightPreparation.lock(data);
+            evictColdNonExpertWeightsToFitLocked(data, .host, policy_bytes, source_entry);
+            ResidentWeightPreparation.unlock(data);
+            try cache.flushReleasedOutsideExecution();
+            while (true) {
+                try cb.checkExecutionControl();
+                ResidentWeightPreparation.lock(data);
+                growth = cache.snapshotPhysicalOwnerGrowthLocked(policy_bytes, request_bytes) catch |err| {
+                    cache.noteDenied(.host, policy_bytes);
+                    noteSharedCacheDenial(self.run_budget, cache, .host, policy_bytes);
+                    ResidentWeightPreparation.unlock(data);
+                    if (err == error.MemoryBudgetExceeded) return false;
+                    return err;
+                };
+                ResidentWeightPreparation.unlock(data);
+                try growth.?.validatePhysicalBacking();
+                growth.?.fundOutsideExecution(old_domain) catch |err| {
+                    if (err != error.MemoryBudgetExceeded and err != error.ResourceTemporarilyUnavailable) return err;
+                    if (err == error.ResourceTemporarilyUnavailable) data.discard_file_cache_under_pressure.store(true, .release);
+                    growth.?.finishOutsideExecution();
+                    growth = null;
+                    ResidentWeightPreparation.lock(data);
+                    const released = reclaimOneHostCacheEntryLocked(data, source_entry);
+                    if (released == 0) {
+                        cache.noteDenied(.host, policy_bytes);
+                        noteSharedCacheDenial(self.run_budget, cache, .host, policy_bytes);
+                    }
+                    ResidentWeightPreparation.unlock(data);
+                    try cache.flushReleasedOutsideExecution();
+                    if (released == 0) return false;
+                    continue; // original useful-victim pressure retry, no math
+                };
+                break;
+            }
+        } else {
+            try growth.?.validatePhysicalBacking();
+            try growth.?.fundOutsideExecution(old_domain); // actual existing owner cannot become an optional miss
+        }
+        if (upgrade_owner == 0) staged = try stageQKVPanel16ProjectionGroup(std.heap.c_allocator, panels[0], panels[1], panels[2], epochs, toBuf(request.weights[1]).name, toBuf(request.weights[2]).name, request.out_dim, request.in_dim / 256);
+        ResidentWeightPreparation.lock(data);
+        defer ResidentWeightPreparation.unlock(data);
+        const receiving = try selectedProjectionGroupStorage(self, request) orelse return error.NativeWeightPreparationChanged;
+        const receiving_epochs = groupSourceEpochs(receiving[0], receiving[1], receiving[2]);
+        if (!std.mem.eql(u64, &epochs, &receiving_epochs)) return error.NativeWeightPreparationChanged;
+        for (receiving, sources, panels) |now, before, panel| {
+            if (now != before or now.preparedBytes(.panel16).?.ptr != panel.ptr or now.preparedBytes(.panel16).?.len != panel.len) return error.NativeWeightPreparationChanged;
+        }
+        if (upgrade_owner != 0) try @constCast(receiving[0]).commitPreparedGroupUpgrade(upgrade_owner, &growth.?) else try @constCast(receiving[0]).commitPreparedGroup(&staged, &growth.?);
+        if (source_entry) |entry| entry.loaded_bytes = quantizedStorageBudgetBytes(receiving[0]);
+        return true;
     }
 
     pub fn importHostTensor(self: *NativeCompute, tensor: *const tensor_mod.Tensor) !CT {
@@ -5194,6 +5420,7 @@ const native_cold_cleanup_services: ops.ColdCleanupServices = .{
     .accepts = acceptsColdCleanupImplementation,
     .free = freeTensorWithCleanup,
     .deinit_backend = deinitBackendWithCleanup,
+    .linear_triple = linearTripleWithCleanup,
 };
 fn acceptsColdCleanupImplementation(table: *const ComputeBackend.VTable) bool {
     return table == &vtable_impl;
@@ -6633,14 +6860,19 @@ fn unloadExpertTierLocked(data: *WeightStore, coord: ExpertCoord, tier: Residenc
 fn unloadLazyEntryTierLocked(data: *WeightStore, entry: *LazyWeightEntry, tier: ResidencyTier) void {
     switch (tier) {
         .host => if (entry.loaded) |*loaded| {
-            loaded.deinit();
+            const group_bytes = if (loaded.quantized_storage) |*storage| storage.retainedGroupLogicalBytes() else 0;
+            // Legacy hot reclaim has no actual cleanup B. Move the managed
+            // creator ref without dropping physical bytes; the SAME Binding's
+            // existing outside settlement performs death before quota release.
+            loaded.deinitDeferringManagedGroup() catch platform.inference_process_supervisor.restartWorker();
             entry.loaded = null;
             entry.active_tier = entry.placement.spill_tier;
             discardLazyEntryFileCache(data, entry);
             if (data.tier_cache) |*tier_cache| {
                 if (entry.prepared_independent_bytes != 0) {
-                    tier_cache.notePreparedRelease(.host, entry.loaded_bytes, entry.prepared_independent_bytes);
-                } else tier_cache.noteRelease(.host, entry.loaded_bytes);
+                    tier_cache.notePreparedRelease(.host, entry.loaded_bytes - group_bytes, entry.prepared_independent_bytes);
+                } else tier_cache.noteRelease(.host, entry.loaded_bytes - group_bytes);
+                if (group_bytes != 0) tier_cache.noteLogicalPhysicalOwnerRemoval(group_bytes);
             }
             entry.prepared_independent_bytes = 0;
         },
@@ -6797,6 +7029,8 @@ const QuantLinearKind = enum {
 };
 
 const QuantLinearRequest = struct {
+    cleanup: @import("../execution/cleanup_context.zig").Context = .{},
+    group_prepared: bool = false,
     compute: *NativeCompute,
     kind: QuantLinearKind,
     input: []const f32,
@@ -6927,11 +7161,11 @@ fn dispatchQuantizedLinear(request: QuantLinearRequest) !bool {
             if (request.weight_buf_a) |weight_buf_a| {
                 if (request.weight_buf_b) |weight_buf_b| {
                     if (request.weight_buf_c) |weight_buf_c| {
-                        try ensureQ4Q5QKVPanel16Cache(self, weight_buf_a, weight_buf_b, weight_buf_c, request.storage_a, storage_b, storage_c, request.in_dim, request.out_dim, request.rows);
+                        if (!request.group_prepared) try ensureQ4Q5QKVPanel16Cache(self, weight_buf_a, weight_buf_b, weight_buf_c, request.storage_a, storage_b, storage_c, request.in_dim, request.out_dim, request.rows);
                     }
                 }
             }
-            if (try linearQuantizedTriple(self.io, request.storage_a, storage_b, storage_c, request.input, bias_a, bias_b, bias_c, request.output_a, output_b, output_c, request.rows, request.in_dim, request.out_dim)) return true;
+            if (try linearQuantizedTripleWithCleanup(self.io, request.storage_a, storage_b, storage_c, request.input, bias_a, bias_b, bias_c, request.output_a, output_b, output_c, request.rows, request.in_dim, request.out_dim, request.cleanup)) return true;
             return false;
         },
     }
@@ -9566,6 +9800,15 @@ fn linearTripleNoBiasOp(ctx: *anyopaque, input: CT, a: CT, b: CT, c: CT, rows: u
     return .{ .first = first, .second = second, .third = third };
 }
 
+fn linearTripleWithCleanup(cb: *const ComputeBackend, request: *const ops.LinearTripleInvocation, current: @import("../execution/cleanup_context.zig").Context) !ops.LinearTripleResult {
+    if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+    if (request.group_prepared) {
+        const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        if (try epoch.isSealed()) return error.RetirementEpochSealed;
+    }
+    return linearTripleImpl(cb.ptr, request.input, request.weights[0], request.biases[0], request.weights[1], request.biases[1], request.weights[2], request.biases[2], request.rows, request.in_dim, request.out_dim, current, request.group_prepared);
+}
+
 fn linearTripleOp(
     ctx: *anyopaque,
     input: CT,
@@ -9579,11 +9822,40 @@ fn linearTripleOp(
     in_dim: usize,
     out_dim: usize,
 ) anyerror!ops.LinearTripleResult {
+    return linearTripleImpl(ctx, input, weight_a, bias_a, weight_b, bias_b, weight_c, bias_c, rows, in_dim, out_dim, .{}, false);
+}
+
+fn linearTripleImpl(
+    ctx: *anyopaque,
+    input: CT,
+    weight_a: CT,
+    bias_a: CT,
+    weight_b: CT,
+    bias_b: CT,
+    weight_c: CT,
+    bias_c: CT,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    current: @import("../execution/cleanup_context.zig").Context,
+    group_prepared: bool,
+) anyerror!ops.LinearTripleResult {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const weight_buf_a = toBuf(weight_a);
     const weight_buf_b = toBuf(weight_b);
     const weight_buf_c = toBuf(weight_c);
 
+    // Before any output/ref mutation, certify the actual selected group.
+    // The Model owner keeps this metadata stable until the numerical snapshot.
+    if (self.quantized_activation_policy != .strict_f32) if (weight_buf_a.quantized_storage) |storage| {
+        if (storage.prepared_group_cache) |*group| {
+            const known: ?gguf_tensor_types.KnownTensorType = switch (storage.tensor_type) {
+                .known => |value| value,
+                else => null,
+            };
+            if (known) |value| if (useQ4Q5PackedQKVPanel16ForShape(rows, out_dim, value)) try group.validateCleanup(current);
+        }
+    };
     if (weight_buf_a.quantized_storage) |storage_a| {
         if (weight_buf_b.quantized_storage) |storage_b| {
             if (weight_buf_c.quantized_storage) |storage_c| {
@@ -9596,6 +9868,8 @@ fn linearTripleOp(
                 const used_quant_triple = try dispatchQuantizedLinear(.{
                     .compute = self,
                     .kind = .triple_bias,
+                    .cleanup = current,
+                    .group_prepared = group_prepared,
                     .input = getData(input),
                     .rows = rows,
                     .in_dim = in_dim,
@@ -10405,6 +10679,26 @@ pub fn linearQuantizedTriple(
     in_dim: usize,
     out_dim: usize,
 ) !bool {
+    return linearQuantizedTripleWithCleanup(io, storage_a, storage_b, storage_c, input, bias_a, bias_b, bias_c, output_a, output_b, output_c, rows, in_dim, out_dim, .{});
+}
+
+fn linearQuantizedTripleWithCleanup(
+    io: ?std.Io,
+    storage_a: *const QuantizedStorage,
+    storage_b: *const QuantizedStorage,
+    storage_c: *const QuantizedStorage,
+    input: []const f32,
+    bias_a: ?[]const f32,
+    bias_b: ?[]const f32,
+    bias_c: ?[]const f32,
+    output_a: []f32,
+    output_b: []f32,
+    output_c: []f32,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    current: @import("../execution/cleanup_context.zig").Context,
+) !bool {
     const projections = NativeProjectionFamily(3){
         .storage = .{ storage_a, storage_b, storage_c },
         .outputs = .{ output_a, output_b, output_c },
@@ -10423,7 +10717,8 @@ pub fn linearQuantizedTriple(
             };
             const use_packed_qkv_panel16 = useQ4Q5PackedQKVPanel16ForShape(rows, out_dim, known);
             var packed_owner = if (use_packed_qkv_panel16) storage_a.retainPreparedGroup() else null;
-            defer if (packed_owner) |*owner| owner.deinit(storage_a.allocator);
+            defer if (packed_owner) |*owner| owner.deinitWithCleanup(storage_a.allocator, current) catch platform.inference_process_supervisor.restartWorker();
+            if (packed_owner) |*owner| try owner.validateCleanup(current);
             const packed_qkv_blocks = if (packed_owner) |cache| selected_bytes: {
                 if (!groupEpochsMatch(cache, groupSourceEpochs(storage_a, storage_b, storage_c)) or cache.format != .panel16_projection_group or cache.projection_count != prepared_k_qkv_panel16_proj or cache.panel_cols != prepared_k_panel16_nr or cache.row_blocks != row_blocks or cache.packed_bytes.len != preparedKQKVPanel16ByteSize(out_dim, row_blocks)) break :selected_bytes null;
                 break :selected_bytes cache.packed_bytes;
@@ -12105,7 +12400,7 @@ fn preparePreparedKPanel16PackedStorage(storage: *QuantizedStorage) !void {
 }
 
 fn clearPreparedGroupCache(storage: *QuantizedStorage) ?usize {
-    return switch (storage.replaceUnusedPreparedGroup(null)) {
+    return switch (storage.replaceUnusedUnchargedPreparedGroup(null)) {
         .busy => null,
         .replaced => |previous| freed: {
             var cache = previous orelse break :freed 0;
@@ -12125,17 +12420,7 @@ fn groupEpochsMatch(cache: QuantizedStorage.PreparedGroupCache, epochs: [3]u64) 
 }
 
 fn preparedQKVPanel16GroupCacheMatches(storage: *const QuantizedStorage, epochs: [3]u64, key_b: []const u8, key_c: []const u8, expected_bytes: usize, row_blocks: usize) bool {
-    var cache = storage.retainPreparedGroup() orelse return false;
-    defer cache.deinit(storage.allocator);
-    if (!groupEpochsMatch(cache, epochs)) return false;
-    if (cache.format != .panel16_projection_group) return false;
-    if (cache.projection_count != prepared_k_qkv_panel16_proj) return false;
-    if (cache.panel_cols != prepared_k_panel16_nr) return false;
-    if (cache.row_blocks != row_blocks) return false;
-    if (cache.packed_bytes.len != expected_bytes) return false;
-    if (cache.partner_count != 2) return false;
-    const keys = cache.partnerKeys();
-    return std.mem.eql(u8, keys[0], key_b) and std.mem.eql(u8, keys[1], key_c);
+    return storage.preparedGroupMatches(.{ .format = .panel16_projection_group, .packed_bytes = expected_bytes, .projection_count = prepared_k_qkv_panel16_proj, .panel_cols = prepared_k_panel16_nr, .row_blocks = row_blocks, .source_epochs = epochs, .keys = .{ key_b, key_c } });
 }
 
 fn preparedQKVPanel16GroupPackedBytes(storage: *const QuantizedStorage, out_dim: usize, row_blocks: usize) ?[]const u8 {
@@ -12149,8 +12434,8 @@ fn preparedQKVPanel16GroupPackedBytes(storage: *const QuantizedStorage, out_dim:
     return cache.packed_bytes;
 }
 
-fn prepareQ4Q5QKVPanel16PackedStorage(
-    storage_a: *QuantizedStorage,
+fn stageQKVPanel16ProjectionGroup(
+    allocator: std.mem.Allocator,
     panel16_a: []const u8,
     panel16_b: []const u8,
     panel16_c: []const u8,
@@ -12159,20 +12444,16 @@ fn prepareQ4Q5QKVPanel16PackedStorage(
     key_c: []const u8,
     out_dim: usize,
     row_blocks: usize,
-) !usize {
+) !QuantizedStorage.PreparedGroupCache {
     const expected_single = preparedKPanel16ByteSize(out_dim, row_blocks);
     if (panel16_a.len != expected_single or panel16_b.len != expected_single or panel16_c.len != expected_single) return error.InvalidQuantizedDataSize;
     const expected_bytes = preparedKQKVPanel16ByteSize(out_dim, row_blocks);
-    if (expected_bytes == 0) return 0;
-    if (preparedQKVPanel16GroupCacheMatches(storage_a, epochs, key_b, key_c, expected_bytes, row_blocks)) return 0;
-    _ = clearPreparedGroupCache(storage_a) orelse return 0;
-
-    const packed_bytes = try storage_a.allocator.alloc(u8, expected_bytes);
-    errdefer storage_a.allocator.free(packed_bytes);
-    const key_b_copy = try storage_a.allocator.dupe(u8, key_b);
-    errdefer storage_a.allocator.free(key_b_copy);
-    const key_c_copy = try storage_a.allocator.dupe(u8, key_c);
-    errdefer storage_a.allocator.free(key_c_copy);
+    const packed_bytes = try allocator.alloc(u8, expected_bytes);
+    errdefer allocator.free(packed_bytes);
+    const key_b_copy = try allocator.dupe(u8, key_b);
+    errdefer allocator.free(key_b_copy);
+    const key_c_copy = try allocator.dupe(u8, key_c);
+    errdefer allocator.free(key_c_copy);
 
     const panel_count = out_dim / prepared_k_panel16_nr;
     for (0..panel_count) |panel_idx| {
@@ -12220,7 +12501,29 @@ fn prepareQ4Q5QKVPanel16PackedStorage(
     };
     // Adoption is the final allocation. Until it succeeds the existing byte
     // errdefers own cleanup; after success publication moves one owner ref.
-    try published.adopt(storage_a.allocator);
+    try published.adopt(allocator);
+    return published;
+}
+
+fn prepareQ4Q5QKVPanel16PackedStorage(
+    storage_a: *QuantizedStorage,
+    panel16_a: []const u8,
+    panel16_b: []const u8,
+    panel16_c: []const u8,
+    epochs: [3]u64,
+    key_b: []const u8,
+    key_c: []const u8,
+    out_dim: usize,
+    row_blocks: usize,
+) !usize {
+    const expected_single = preparedKPanel16ByteSize(out_dim, row_blocks);
+    if (panel16_a.len != expected_single or panel16_b.len != expected_single or panel16_c.len != expected_single) return error.InvalidQuantizedDataSize;
+    const expected_bytes = preparedKQKVPanel16ByteSize(out_dim, row_blocks);
+    if (expected_bytes == 0) return 0;
+    if (preparedQKVPanel16GroupCacheMatches(storage_a, epochs, key_b, key_c, expected_bytes, row_blocks)) return 0;
+    _ = clearPreparedGroupCache(storage_a) orelse return 0;
+
+    var published = try stageQKVPanel16ProjectionGroup(storage_a.allocator, panel16_a, panel16_b, panel16_c, epochs, key_b, key_c, out_dim, row_blocks);
     switch (storage_a.replaceUnusedPreparedGroup(published)) {
         .busy => {
             // Bytes/keys still belong to the surrounding errdefers on error;
@@ -12233,7 +12536,7 @@ fn prepareQ4Q5QKVPanel16PackedStorage(
             retired.deinit(storage_a.allocator);
         },
     }
-    return expected_bytes + key_b_copy.len + key_c_copy.len;
+    return published.ownedBytes();
 }
 
 pub fn prepareQ4Q5QKVPanel16PackedStorageForBench(
@@ -12269,6 +12572,22 @@ pub fn prepareQ4Q5QKVPanel16PackedStorageForBench(
         out_dim,
         in_dim / 256,
     );
+}
+
+/// SAME original policy and geometry, including dense-first selection. The
+/// current bounded positive route is automatic-policy encoder rows1/2; strict
+/// BERT and dense-promotion routes retain their own original programs.
+fn selectedProjectionGroupStorage(self: *NativeCompute, request: *const ops.LinearTripleInvocation) !?[3]*const QuantizedStorage {
+    if (self.quantized_activation_policy == .strict_f32) return null;
+    var stores: [3]*const QuantizedStorage = undefined;
+    for (request.weights, &stores) |weight, *storage| {
+        const buf = toBuf(weight);
+        if (weightData(self, buf) != self.data) return error.ForeignNativeWeightModel;
+        storage.* = buf.quantized_storage orelse return null;
+    }
+    if (!canPrepareQ4Q5QKVPanel16Cache(stores[0], stores[1], stores[2], toBuf(request.weights[1]).name, toBuf(request.weights[2]).name, request.in_dim, request.out_dim, request.rows)) return null;
+    if (shouldUseQuantizedDequantSgemm(toBuf(request.weights[0]).name, request.rows, request.out_dim, stores[0]) and shouldUseQuantizedDequantSgemm(toBuf(request.weights[1]).name, request.rows, request.out_dim, stores[1]) and shouldUseQuantizedDequantSgemm(toBuf(request.weights[2]).name, request.rows, request.out_dim, stores[2])) return null;
+    return stores;
 }
 
 fn canPrepareQ4Q5QKVPanel16Cache(
@@ -34160,15 +34479,38 @@ fn gqaPagedAttentionDirect(
     }
 
     const q_seq_len = attention.query_sequence_len;
+    const H_q = num_heads * head_dim;
+    const sink_scores = try attentionSinkScores(attention.attention_sink, num_heads);
+    const output = try self.allocator.alloc(f32, q_seq_len * H_q);
+    errdefer self.allocator.free(output);
+    try gqaPagedAttentionDirectInto(pool, block_ids, layer_index, Q, bias, attention, num_heads, num_kv_heads, head_dim, sink_scores, output);
+    return self.makeBuf(output, true);
+}
+
+/// Same target-owned paged attention schedule, with caller-authored output.
+/// Owns no allocator, tensor header, cache or SDK root. A complete authored
+/// decoder must supply its actual validated physical bank before using it.
+fn gqaPagedAttentionDirectInto(
+    pool: *runtime.kv.storage.KvStorage,
+    block_ids: []const runtime.kv.block.KvBlockId,
+    layer_index: usize,
+    Q: []const f32,
+    bias: ?[]const f32,
+    attention: AttentionContext,
+    num_heads: usize,
+    num_kv_heads: usize,
+    head_dim: usize,
+    sink_scores: ?[]const f32,
+    output: []f32,
+) !void {
+    const q_seq_len = attention.query_sequence_len;
     const kv_seq_len = attention.kv_sequence_len;
     const query_position_offset = attention.total_sequence_len - q_seq_len;
     const kv_position_offset = attention.kv_position_offset;
     const H_q = num_heads * head_dim;
     const heads_per_group = num_heads / num_kv_heads;
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
-    const sink_scores = try attentionSinkScores(attention.attention_sink, num_heads);
-    const output = try self.allocator.alloc(f32, q_seq_len * H_q);
-    errdefer self.allocator.free(output);
+    if (output.len != q_seq_len * H_q) return error.InvalidAttentionOutputSize;
     @memset(output, 0.0);
 
     for (0..num_heads) |h| {
@@ -34214,8 +34556,6 @@ fn gqaPagedAttentionDirect(
             }
         }
     }
-
-    return self.makeBuf(output, true);
 }
 
 fn gqaPagedAttentionDirectTurboQuant(
@@ -50009,6 +50349,7 @@ fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) any
 fn assignedKernelSupportedOp(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
     if (descriptor.output_shape.dtype != .f32) return descriptor.operation == .slice and (descriptor.output_shape.dtype == .i32 or descriptor.output_shape.dtype == .i64) and descriptor.input_shapes[0].dtype == descriptor.output_shape.dtype;
     return switch (descriptor.operation) {
+        .paged_attention => |geometry| geometry.valid(descriptor),
         // Reduced DOT weights remain on the existing converting compatibility
         // path until their source staging has an exact assigned-workspace route.
         .dot => descriptor.input_shapes[0].dtype == .f32 and descriptor.input_shapes[1].dtype == .f32,
@@ -50043,6 +50384,40 @@ fn assignedDenseF32Input(input: CT, expected: @import("ml").graph.Shape) ?[]cons
     return buf.data;
 }
 
+const AssignedPagedBinding = struct {
+    manager: *runtime.kv.manager.KvManager,
+    pool: *runtime.kv.storage.KvStorage,
+    blocks: []const runtime.kv.block.KvBlockId,
+    context: AttentionContext,
+};
+
+/// Pure current-state checks, including proof that the suffix write performs
+/// no allocation/COW. This is used both before the authored turn and again
+/// immediately before the actual assigned attention operation.
+fn validateAssignedPagedAttention(geometry: ops.kernel_descriptor.PagedAttention, supplied: *const AttentionContext) !AssignedPagedBinding {
+    if ((supplied.mode != .paged_decode and supplied.mode != .paged_prefill) or supplied.query_sequence_len != 1 or supplied.total_sequence_len == 0 or supplied.kv_sequence_len != supplied.total_sequence_len or supplied.kv_position_offset != 0 or supplied.sliding_window != 0 or supplied.attn_or_mask != null or supplied.kv_batch != null or supplied.kv_storage != null or supplied.skip_kv_write or supplied.attention_sink.hasMetadata()) return error.UnsupportedAuthoredPagedAttention;
+    const manager = supplied.kv_manager orelse return error.InvalidPagedKvState;
+    const kv = supplied.kv_cache orelse return error.InvalidPagedKvState;
+    if (kv.kv_storage != null or kv.allow_swa_ring or kv.position_offset != 0) return error.UnsupportedAuthoredPagedAttention;
+    const sequence = try manager.sequenceMut(kv.sequence_id);
+    if (sequence.pool_id != kv.pool_id) return error.InvalidPoolId;
+    const table = &sequence.block_table;
+    const pool = manager.getPoolMut(kv.pool_id) orelse return error.InvalidPoolId;
+    if (pool.config.backend != .native or pool.config.dtype != .f32 or !pool.hasCanonicalHostBlockOwnership() or pool.config.page_size_tokens == 0 or pool.config.num_layers_packed <= geometry.layer_index or pool.config.num_kv_heads != geometry.num_kv_heads or pool.config.head_dim != geometry.head_dim) return error.UnsupportedAuthoredPagedAttention;
+    if (table.tokenCount(pool.config.page_size_tokens) != supplied.total_sequence_len) return error.InvalidPagedKvState;
+    const blocks = table.blocks.items;
+    const needed = try std.math.divCeil(usize, supplied.total_sequence_len, pool.config.page_size_tokens);
+    if (blocks.len < needed or kv.logical_block_count < needed or kv.tail_tokens != table.tail_tokens) return error.InvalidPagedKvState;
+    const tail = pool.blockInfo(blocks[needed - 1]) orelse return error.InvalidBlockId;
+    if (tail.refcount != 1) return error.AuthoredPagedWriteRequiresExclusiveBlock;
+    var current = supplied.*;
+    current.layer_index = geometry.layer_index;
+    // Do not dereference a caller's borrowed/copied block-list address after
+    // its cold window. The exact manager/sequence/pool above owns this table.
+    current.kv_cache.?.logical_blocks = blocks;
+    return .{ .manager = manager, .pool = pool, .blocks = blocks, .context = current };
+}
+
 fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const descriptor = request.descriptor;
@@ -50053,6 +50428,11 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         break :prepared @ptrCast(@alignCast(selected.context));
     } else null;
     if (!assignedKernelSupportedOp(ctx, descriptor)) return false;
+    if (descriptor.operation == .paged_attention and request.prepared_route == null) return false;
+    const paged: ?AssignedPagedBinding = if (descriptor.operation == .paged_attention)
+        try validateAssignedPagedAttention(descriptor.operation.paged_attention, request.attention orelse return false)
+    else
+        null;
     if (request.inputs.len != descriptor.input_count) return error.InvalidTensorShape;
     if (descriptor.output_shape.dtype != .f32) {
         if (source_route != null) return error.InvalidPreparedKernelRoute;
@@ -50103,6 +50483,17 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         if (kernel_geometry.byteRangesOverlap(@intFromPtr(source.ptr), source.len * 4, @intFromPtr(output.ptr), output.len * 4)) return error.InvalidAssignedAlias;
     };
     if (target.physical_lease == null or output.len != descriptor.elements()) return error.InvalidTensorShape;
+    if (descriptor.operation == .paged_attention) {
+        const assigned = request.assigned_output orelse return error.MissingAssignedOutput;
+        const selected = request.prepared_route orelse return error.MissingPreparedKernelRoute;
+        if (!target.physical_lease.?.acceptsWritableRegion(assigned.slot.allocation, assigned.slot.epoch, assigned.slot.writable_bytes, assigned.region) or assigned.slot.writable_bytes != output.len * @sizeOf(f32) or !assigned.slot.logical.eq(descriptor.output_shape)) return error.InvalidAssignedOutputAuthority;
+        for (dense_inputs) |input| if (kernel_geometry.byteRangesOverlap(@intFromPtr(input.ptr), input.len * 4, @intFromPtr(output.ptr), output.len * 4)) return error.InvalidAssignedAlias;
+        var actual_bindings: [3]@import("../execution/kernel_route.zig").Binding = undefined;
+        const implementation = @import("../execution/kernel_route.zig").Implementation{ .context = ctx, .table = &vtable_impl };
+        for (request.inputs, &actual_bindings) |input, *binding| binding.* = .{ .tensor = .{ .value = input, .implementation = implementation } };
+        try @import("../execution/assigned_kernel_route.zig").validateDescriptor(selected, descriptor);
+        try selected.validate(.{ .inputs = &actual_bindings, .output = assigned.slot });
+    }
     if (descriptor.operation == .concat or descriptor.operation == .slice or descriptor.operation == .gather) {
         for (request.inputs, 0..) |input, i| {
             const bytes = if (integerSource(input)) |source| source.data else std.mem.sliceAsBytes(dense_inputs[i]);
@@ -50114,6 +50505,11 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         if (kernel_geometry.byteRangesOverlap(@intFromPtr(source.ptr), source.len * 4, @intFromPtr(output.ptr), output.len * 4)) return error.InvalidAssignedAlias;
     }
     switch (descriptor.operation) {
+        .paged_attention => |geometry| {
+            const actual = paged orelse return error.InvalidPagedKvState;
+            try actual.manager.writeLayerKvSuffix(actual.context.kv_cache.?.sequence_id, geometry.layer_index, actual.context.total_sequence_len, 1, dense_inputs[1], dense_inputs[2]);
+            try gqaPagedAttentionDirectInto(actual.pool, actual.blocks, geometry.layer_index, dense_inputs[0], null, actual.context, geometry.num_heads, geometry.num_kv_heads, geometry.head_dim, null, output);
+        },
         .transpose, .broadcast => unreachable,
         .concat => |geometry| try concatDenseInto(dense_inputs[0], dense_inputs[1], output, geometry),
         .slice => |slice| try sliceDenseInto(dense_inputs[0], output, try slice.plan(descriptor.input_shapes[0], descriptor.output_shape)),
@@ -53004,6 +53400,10 @@ fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../execution/kernel_r
     const target = ops.ComputeBackend{ .ptr = ctx, .vtable = @ptrCast(@alignCast(implementation.table)) };
     if ((target.vtable.kernels orelse return null).runAssignedKernel != &runAssignedKernelOp) return null;
     if (descriptor.operation != .linear) return @import("../execution/assigned_kernel_route.zig").prepareImmutable(target, request, nativeDirectRouteSupported);
+    // Dense resident model planes use the SAME original F32 Into schedule.
+    // Source-tensor conversion and prepared-panel variants retain their route.
+    if (request.inputs.len == descriptor.input_count and request.inputs.len >= 2 and (request.inputs[1] == .resident or request.inputs[1] == .planned))
+        return @import("../execution/assigned_kernel_route.zig").prepareImmutable(target, request, nativeResidentDenseLinearRouteSupported);
     if (request.inputs.len != descriptor.input_count) return null;
     const linear = descriptor.operation.linear;
     if (linear.rows == 0 or linear.in_dim == 0 or linear.out_dim == 0) return null;
@@ -53033,6 +53433,15 @@ fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../execution/kernel_r
     hasher.update(std.mem.asBytes(&linear.in_dim));
     hasher.update(std.mem.asBytes(&linear.out_dim));
     return .{ .context = selected, .implementation = .{ .context = self, .table = implementation.table, .policy_epoch = @intFromBool(use_blas) | (@as(u64, @intFromBool(self.cache_embeddinggemma2_bf16_weights)) << 1) }, .key = hasher.final(), .requirements = .{ .primary_bytes = try std.math.mul(usize, descriptor.elements(), 4), .profile = @backingInt(family), .workspace = .{ .host_byte_size = workspace.byte_size }, .host_alignment = SourceLinearWorkspacePlan.alignment }, .vtable = &NativeSourceRoute.vtable };
+}
+
+fn nativeResidentDenseLinearRouteSupported(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
+    const self: *NativeCompute = @ptrCast(@alignCast(ctx));
+    if (descriptor.operation != .linear or self.cache_embeddinggemma2_bf16_weights) return false;
+    const linear = descriptor.operation.linear;
+    if (linear.rows == 0 or linear.in_dim == 0 or linear.out_dim == 0 or descriptor.input_count != @as(u8, if (linear.bias) 3 else 2)) return false;
+    if (!descriptor.output_shape.eq(@import("ml").graph.Shape.init(.f32, &.{ linear.rows, linear.out_dim })) or !descriptor.input_shapes[0].eq(@import("ml").graph.Shape.init(.f32, &.{ linear.rows, linear.in_dim })) or !descriptor.input_shapes[1].eq(@import("ml").graph.Shape.init(.f32, &.{ linear.out_dim, linear.in_dim }))) return false;
+    return !linear.bias or (descriptor.input_shapes[2].dtype == .f32 and descriptor.input_shapes[2].numElements() == linear.out_dim);
 }
 
 fn nativeDirectRouteSupported(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
@@ -55743,4 +56152,17 @@ test "Native populated Gemma GLiNER prefetch teardown keeps historical raw token
         try std.testing.expectEqual(@as(usize, 0), pin.controller().snapshot().host_weight_bytes);
         try std.testing.expect(!probe.violation);
     }
+}
+
+fn groupedProjectionStageAllOom(allocator: std.mem.Allocator) !void {
+    const panel: [prepared_k_panel16_block_bytes]u8 = @splat(0);
+    var candidate = try stageQKVPanel16ProjectionGroup(allocator, &panel, &panel, &panel, .{ 1, 2, 3 }, "k.weight", "v.weight", prepared_k_panel16_nr, 1);
+    defer candidate.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, prepared_k_qkv_panel16_block_bytes), candidate.packed_bytes.len);
+    try std.testing.expectEqualStrings("k.weight", candidate.partnerKeys()[0]);
+    try std.testing.expectEqualStrings("v.weight", candidate.partnerKeys()[1]);
+}
+
+test "Native grouped projection original construction all OOM leaves no partial owner or keys" {
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, groupedProjectionStageAllOom, .{});
 }

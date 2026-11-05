@@ -101,6 +101,17 @@ pub const FrameClaim = struct {
     nonce: u64,
     route_owner: ?*prepared_routes.PreparedRoutes = null,
 
+    /// Exact already-owned demand, not new reservation/credit authority.
+    /// The same exclusive nonce protects these bank amounts until consume.
+    pub fn ownedDemand(self: *const FrameClaim, identity: admission.Identity) !@import("../runtime/tier/memory.zig").AdmissionAmounts {
+        if (!self.identity.eql(identity)) return error.PhysicalStorageAdmissionMismatch;
+        const frame = self.frame orelse return error.PhysicalFrameClaimConsumed;
+        @import("antfly_platform").sync.lockYielding(&frame.pool.mutex);
+        defer frame.pool.mutex.unlock();
+        if (!frame.claimed or !frame.in_use or frame.claim_nonce != self.nonce) return error.InvalidPhysicalFrameClaim;
+        return self.credit;
+    }
+
     pub fn release(self: *FrameClaim) void {
         self.releaseWithCleanup(.{});
     }
@@ -277,7 +288,7 @@ pub const Pool = struct {
         }
         const owned_backends = try allocator.alloc(ops.ComputeBackend, backends.len);
         errdefer allocator.free(owned_backends);
-        for (backends, owned_backends) |backend, *owned| owned.* = backend.*;
+        for (backends, owned_backends) |backend, *owned| owned.* = backend.withoutSynchronousBorrows();
         const literal_store = try SharedLiteralStore.create(allocator, graph, plan, owned_backends);
         errdefer if (literal_store) |store| store.release();
         if (count == 0 and literal_store == null) {
@@ -933,6 +944,7 @@ pub const Pool = struct {
         const transfers = try self.allocator.dupe(?TransferPlan, self.transfers);
         errdefer self.allocator.free(transfers);
         const backends = try self.allocator.dupe(ops.ComputeBackend, self.backends);
+        for (backends) |*backend| backend.* = backend.withoutSynchronousBorrows();
         errdefer self.allocator.free(backends);
         const workspaces = try self.allocator.dupe(buffers.AllocationId, self.workspace_allocations);
         errdefer self.allocator.free(workspaces);
@@ -1595,6 +1607,11 @@ pub const Pool = struct {
 
 pub const Frame = struct {
     pool: *Pool,
+    /// Private complete Native program metadata, built cold at final address.
+    /// These headers never escape; physical allocation roots remain Leases.
+    native_program_views: []?CT = &.{},
+    native_program_view_pins: []usize = &.{},
+
     owner_pin: ?*prepared_routes.PreparedRoutes = null,
     transient: bool = false,
     assigned: []?route.Assigned = &.{},
@@ -1616,6 +1633,7 @@ pub const Frame = struct {
     retired: bool = false,
     stats: Stats = .{},
     scope_backends: usize = 0,
+    scope_cleanup: @import("cleanup_context.zig").Context = .{},
     replay: ?storage.Replay = null,
     replay_ready: bool = false,
     capture_pins: []bool = &.{},
@@ -1682,6 +1700,16 @@ pub const Frame = struct {
     fn reusableCredit(self: *const Frame, identity: ?admission.Identity, requirement: ?*@import("../runtime/tier/memory.zig").AdmissionAmounts) !?@import("../runtime/tier/memory.zig").AdmissionAmounts {
         if (self.in_use or self.retired) return null;
         for (self.region_claims) |maybe| if (maybe) |claim| if (claim.held) return null;
+        if (self.native_program_views.len != 0) {
+            for (self.native_program_views, 0..) |maybe, node| if (maybe) |value| {
+                const slot = self.pool.plan.slotForNode(@intCast(node)) orelse return null;
+                if (self.pool.plan.allocations[slot.allocation].kind == .constant_binding) continue;
+                const backend = &self.pool.backends[0];
+                const functions = backend.vtable.kernels orelse return null;
+                const exclusive = functions.hostInputViewExclusive orelse return null;
+                if (!functions.accepts(backend.vtable) or !exclusive(backend.ptr, value)) return null;
+            };
+        }
         var credit = @import("../runtime/tier/memory.zig").AdmissionAmounts{};
         if (identity) |expected| if (self.host_workspace_admission) |reserved| {
             if (!reserved.identity.eql(expected)) return null;
@@ -1701,7 +1729,8 @@ pub const Frame = struct {
                     if (!functions.accepts(backend.vtable) or !exclusive(backend.ptr, resource.?.private_view.?)) return null;
                     private_pins += 1;
                 }
-                if (lease.references.load(.acquire) != 1 + capture_pin + private_pins) return null;
+                const program_pins = if (id < self.native_program_view_pins.len) self.native_program_view_pins[id] else 0;
+                if (lease.references.load(.acquire) != 1 + capture_pin + private_pins + program_pins) return null;
             }
             if (identity) |expected| {
                 if (requirement) |refined| {
@@ -1802,6 +1831,7 @@ pub const Frame = struct {
         self.deinitAfterWaitWithCleanup(.{ .boundary = boundary });
     }
     fn deinitAfterWaitWithCleanup(self: *Frame, cleanup: @import("cleanup_context.zig").Context) void {
+        self.clearNativeProgramViews(cleanup);
         if (cleanup.boundary == null) {
             if (self.host_workspace_retirement_owner != null) @import("antfly_platform").inference_process_supervisor.restartWorker();
             for (self.host_input_resources) |maybe| if (maybe) |resource| if (resource.retirement_owner != null) @import("antfly_platform").inference_process_supervisor.restartWorker();
@@ -1825,7 +1855,7 @@ pub const Frame = struct {
         };
         self.pool.allocator.free(self.host_input_resources);
         self.pool.allocator.free(self.host_bound_inputs);
-        if (self.replay) |replay| replay.deinit();
+        if (self.replay) |replay| replay.deinitWithCleanup(cleanup);
         for (self.assigned) |maybe| if (maybe) |resources| resources.deinit(resources.context);
         self.pool.allocator.free(self.assigned);
         self.deinitRegionResources();
@@ -1851,6 +1881,9 @@ pub const Frame = struct {
         self.pool.allocator.destroy(self);
     }
     pub fn begin(self: *Frame) !void {
+        return self.beginWithCleanup(.{});
+    }
+    pub fn beginWithCleanup(self: *Frame, cleanup: @import("cleanup_context.zig").Context) !void {
         if (self.pool.requiresManagedExecution() and !@import("../graph/metal_partition_executor.zig").ownedFramePolicyAvailable()) return error.PreparedMetalFramePolicyChanged;
         for (self.pool.regions, self.region_claims) |installed, maybe| if (installed.owner.requirements.payload_claim_required and maybe == null) return error.PreparedRegionClaimRequired;
         std.debug.assert(self.scope_backends == 0);
@@ -1867,9 +1900,15 @@ pub const Frame = struct {
                 return error.HostInputGenerationExhausted;
             };
         }
+        self.scope_cleanup = cleanup;
         errdefer self.endScope();
         for (self.pool.backends) |backend| {
-            if (backend.vtable.kernels) |functions| if (functions.physicalExecutionScope) |enter| try enter(backend.ptr, self.storages);
+            if (backend.vtable.kernels) |functions| {
+                if (functions.physicalExecutionScopeWithCleanup) |enter| {
+                    if (!functions.accepts(backend.vtable)) return error.UnsupportedPhysicalExecutionScope;
+                    try enter(backend.ptr, .{ .backend = backend, .storages = self.storages, .cleanup = &self.scope_cleanup });
+                } else if (functions.physicalExecutionScope) |enter| try enter(backend.ptr, self.storages);
+            }
             self.scope_backends += 1;
         }
     }
@@ -1877,10 +1916,15 @@ pub const Frame = struct {
         while (self.scope_backends != 0) {
             self.scope_backends -= 1;
             const backend = self.pool.backends[self.scope_backends];
-            if (backend.vtable.kernels) |functions| if (functions.physicalExecutionScope) |leave| leave(backend.ptr, null) catch {
-                self.retired = true;
-            };
+            if (backend.vtable.kernels) |functions| {
+                if (functions.physicalExecutionScopeWithCleanup) |leave| {
+                    leave(backend.ptr, .{ .backend = backend, .storages = null, .cleanup = &self.scope_cleanup }) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+                } else if (functions.physicalExecutionScope) |leave| leave(backend.ptr, null) catch {
+                    self.retired = true;
+                };
+            }
         }
+        self.scope_cleanup = .{};
     }
     pub fn finish(self: *Frame) !Stats {
         return self.finishWithCleanup(.{});
@@ -2465,12 +2509,85 @@ pub const Frame = struct {
         return null;
     }
 
+    pub fn prepareNativeProgramViews(self: *Frame, cb: *const ops.ComputeBackend, graph: *const Graph, values: []?CT, cleanup: @import("cleanup_context.zig").Context) !void {
+        if (self.native_program_views.len != 0) {
+            for (self.native_program_views, values) |maybe, *value| if (maybe) |view| {
+                value.* = view;
+            };
+            return;
+        }
+        if (cb.kind() != .native or self.pool.backends.len != 1 or self.pool.backends[0].ptr != cb.ptr or self.pool.backends[0].vtable != cb.vtable or self.pool.payload_coverage != .complete or values.len != graph.nodeCount()) return error.IncompleteNativeProgram;
+        self.native_program_views = try self.pool.allocator.alloc(?CT, graph.nodeCount());
+        @memset(self.native_program_views, null);
+        errdefer self.clearNativeProgramViews(cleanup);
+        self.native_program_view_pins = try self.pool.allocator.alloc(usize, self.storages.len);
+        @memset(self.native_program_view_pins, 0);
+        for (graph.nodes.items, 0..) |node, index| {
+            if (values[index] != null) continue;
+            const slot = self.pool.plan.slotForNode(@intCast(index)) orelse continue;
+            if (slot.allocation == buffers.invalid_allocation or slot.allocation >= self.storages.len or slot.backend != .native or node.output_shape.dtype != .f32) return error.IncompleteNativeProgram;
+            const view = if (node.op == .constant)
+                (try self.materializeLiteral(cb, @intCast(index))) orelse return error.IncompleteNativeProgram
+            else create: {
+                if (self.pool.kernels[index] == null and (node.op != .reshape or slot.kind != .view)) return error.IncompleteNativeProgram;
+                if (self.pool.kernels[index]) |kernel| {
+                    if (kernel.workspace_bytes != 0) return error.UnsupportedNativeProgramWorkspace;
+                    for (kernel.auxiliaries) |item| if (item != null) return error.UnsupportedNativeProgramWorkspace;
+                }
+                const owner = (try self.storageFor(cb, 0, slot.allocation)) orelse return error.PreparedStorageUnavailable;
+                break :create try self.viewForShape(cb, owner, node.output_shape);
+            };
+            self.native_program_views[index] = view;
+            self.native_program_view_pins[slot.allocation] += 1;
+            values[index] = view;
+        }
+        // Cold assignment only. Inputs are stable physical headers, not values
+        // read by any numerical operation during this preparation.
+        for (self.pool.kernels, 0..) |maybe, index| if (maybe) |*kernel| {
+            if (self.pool.plan.slotForNode(@intCast(index)) == null) continue;
+            const selected = self.pool.preparedKernelRoute(@intCast(index)) orelse return error.MissingPreparedKernelRoute;
+            var inputs: [3]CT = undefined;
+            for (kernel.inputs[0..kernel.descriptor.input_count], 0..) |node, i| inputs[i] = values[node] orelse return error.MissingValue;
+            const output_storage = self.storages[kernel.output_allocation] orelse return error.PreparedStorageUnavailable;
+            var assigned = try self.assignedOutput(@intCast(index), output_storage);
+            var invocation = kernels.Invocation{ .descriptor = &kernel.descriptor, .inputs = inputs[0..kernel.descriptor.input_count], .output = self.native_program_views[index], .prepared_route = selected, .assigned_output = &assigned, .host_workspace = self.host_workspace[0..kernel.host_workspace_bytes] };
+            self.assigned[index] = try selected.prepareAssigned(.{ .allocator = self.pool.allocator, .invocation = &invocation, .output = assigned.slot });
+        };
+    }
+    fn clearNativeProgramViews(self: *Frame, cleanup: @import("cleanup_context.zig").Context) void {
+        const views = self.native_program_views;
+        self.native_program_views = &.{};
+        var remaining = views.len;
+        while (remaining != 0) {
+            remaining -= 1;
+            if (views[remaining]) |view| self.pool.backends[0].freeWithCleanup(view, cleanup);
+        }
+        if (views.len != 0) self.pool.allocator.free(views);
+        if (self.native_program_view_pins.len != 0) self.pool.allocator.free(self.native_program_view_pins);
+        self.native_program_view_pins = &.{};
+    }
+
     pub fn execute(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, id: NodeId, rope_position: ?usize) !?CT {
+        return self.executeWithAttention(cb, values, id, rope_position, null);
+    }
+    pub fn executeWithAttention(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, id: NodeId, rope_position: ?usize, attention: ?*const ops.AttentionContext) !?CT {
+        return self.executeProgram(cb, values, id, rope_position, attention, false);
+    }
+    pub fn executeNativeProgram(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, id: NodeId, rope_position: ?usize, attention: *const ops.AttentionContext) !CT {
+        if (self.native_program_views.len == 0 or cb.kind() != .native) return error.UnpreparedNativeProgramViews;
+        return (try self.executeProgram(cb, values, id, rope_position, attention, true)) orelse error.IncompleteNativeProgram;
+    }
+    fn executeProgram(self: *Frame, cb: *const ops.ComputeBackend, values: []const ?CT, id: NodeId, rope_position: ?usize, attention: ?*const ops.AttentionContext, cached: bool) !?CT {
         if (self.pool.plan.slotForNode(id) == null) return error.InactivePhysicalNode;
-        if (try self.materializeLiteral(cb, id)) |literal| return literal;
-        if (try self.executeMetadataAlias(cb, values, id)) |alias| return alias;
+        if (cached and self.pool.kernels[id] == null) return self.native_program_views[id] orelse error.IncompleteNativeProgram;
+        if (!cached) if (try self.materializeLiteral(cb, id)) |literal| return literal;
+        if (!cached) if (try self.executeMetadataAlias(cb, values, id)) |alias| return alias;
         if (id >= self.pool.kernels.len) return null;
         const kernel = if (self.pool.kernels[id]) |*value| value else return null;
+        if (cached) {
+            if (kernel.workspace_bytes != 0) return error.UnsupportedNativeProgramWorkspace;
+            for (kernel.auxiliaries) |item| if (item != null) return error.UnsupportedNativeProgramWorkspace;
+        }
         var positioned: kernels.Descriptor = undefined;
         const descriptor = if (kernel.descriptor.operation == .rope and rope_position != null) blk: {
             positioned = kernel.descriptor;
@@ -2496,7 +2613,7 @@ pub const Frame = struct {
                 issued_inputs[position] = .{ .node = input_node, .lease_identity = @intFromPtr(owner), .authority = authority, .generation = self.host_input_generation };
             }
         };
-        const request = kernels.Invocation{ .input_generation = self.host_input_generation, .assigned_inputs = if (issue_inputs) &issued_inputs else null, .prepared_route = selected_route, .descriptor = descriptor, .operator_plan = if (kernel.operator_plan) |*plan| plan else null, .inputs = inputs[0..descriptor.input_count] };
+        const request = kernels.Invocation{ .attention = attention, .input_generation = self.host_input_generation, .assigned_inputs = if (issue_inputs) &issued_inputs else null, .prepared_route = selected_route, .descriptor = descriptor, .operator_plan = if (kernel.operator_plan) |*plan| plan else null, .inputs = inputs[0..descriptor.input_count] };
         if (!try run(cb.ptr, request)) {
             if (selected_route != null) return error.PreparedKernelBindingChanged;
             return null;
@@ -2505,8 +2622,8 @@ pub const Frame = struct {
             if (selected_route != null) return error.PreparedStorageUnavailable;
             return null;
         };
-        const output = try self.viewForShape(cb, output_storage, descriptor.output_shape);
-        errdefer cb.free(output);
+        const output = if (cached) self.native_program_views[id] orelse return error.UnpreparedNativeProgramViews else try self.viewForShape(cb, output_storage, descriptor.output_shape);
+        errdefer if (!cached) cb.free(output);
         var bound = request;
         bound.output = output;
         if (kernel.host_workspace_bytes != 0) {
@@ -3241,4 +3358,52 @@ test "quarantined physical frame refuses raw and prepared reuse before opaque ba
         try std.testing.expectError(error.PhysicalStorageAdmissionQuarantined, pool.prepareAcquired(&frame, capability));
         try std.testing.expect(!frame.in_use and frame.owner_pin == null);
     }
+}
+
+test "physical Frame typed scope error unwind clears exact caller cleanup before retry and end" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        borrowed: ?*const @import("cleanup_context.zig").Context = null,
+        fail: bool = false,
+        entries: usize = 0,
+        clears: usize = 0,
+        fn scope(raw: *anyopaque, request: storage.ExecutionScope) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (request.storages != null) {
+                if (self.fail) return error.TestScopeEntryDenied;
+                if (self.borrowed != null) return error.TestScopeAlreadyBound;
+                self.borrowed = request.cleanup;
+                self.entries += 1;
+            } else {
+                if (self.borrowed != request.cleanup) return error.TestForeignScopeCleanup;
+                self.borrowed = null;
+                self.clears += 1;
+            }
+        }
+        const functions: ops.KernelBackend = .{ .implementation_table = &table, .physicalExecutionScopeWithCleanup = scope };
+        const table: ops.ComputeBackend.VTable = blk: {
+            var result = @import("../ops/native_compute.zig").vtable_impl;
+            result.kernels = &functions;
+            break :blk result;
+        };
+    };
+    var first = Probe{};
+    var second = Probe{ .fail = true };
+    var backends = [_]ops.ComputeBackend{ .{ .ptr = &first, .vtable = &Probe.table }, .{ .ptr = &second, .vtable = &Probe.table } };
+    var pool = Pool{ .allocator = a, .plan = .{ .allocator = a, .slots = &.{}, .node_slots = &.{}, .node_positions = &.{}, .allocations = &.{}, .transfers = &.{}, .transfer_index = .empty }, .kernels = &.{}, .transfers = &.{}, .backends = &backends, .workspace_allocations = &.{} };
+    const frame = try Frame.create(&pool);
+    defer frame.deinit();
+    var owner = try @import("cleanup_owner.zig").Owner.beginOutsideCleanup();
+    defer owner.finishAfterUnlock();
+    const current = @import("cleanup_context.zig").Context{ .boundary = owner.epoch() };
+    try std.testing.expectError(error.TestScopeEntryDenied, frame.beginWithCleanup(current));
+    try std.testing.expectEqual(@as(usize, 0), frame.scope_backends);
+    try std.testing.expect(frame.scope_cleanup.boundary == null and first.borrowed == null and second.borrowed == null);
+    try std.testing.expectEqual(@as(usize, 1), first.clears);
+    second.fail = false;
+    try frame.beginWithCleanup(current);
+    try std.testing.expectEqual(&frame.scope_cleanup, first.borrowed.?);
+    try std.testing.expectEqual(&frame.scope_cleanup, second.borrowed.?);
+    frame.endScope();
+    try std.testing.expect(frame.scope_cleanup.boundary == null and first.borrowed == null and second.borrowed == null);
 }

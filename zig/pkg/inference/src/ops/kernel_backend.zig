@@ -58,6 +58,7 @@ pub const VTable = struct {
     /// Borrow the current frame's stable storage table. Entries may be filled
     /// during warmup; capture retains their leases before recording addresses.
     physicalExecutionScope: ?*const fn (ctx: *anyopaque, storages: ?[]const ?*physical_storage.Lease) anyerror!void = null,
+    physicalExecutionScopeWithCleanup: ?*const fn (ctx: *anyopaque, scope: physical_storage.ExecutionScope) anyerror!void = null,
     /// Canonical typed physical allocation policy, accepted as part of this
     /// complete backend table before any context callback is invoked.
     physical_storage_policy: ?*const physical_storage.Policy = null,

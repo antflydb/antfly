@@ -125,7 +125,7 @@ fn prepareImpl(backend: ops.ComputeBackend, request: route.Prepare, support: Sup
         if (index >= request.inputs_witnessed.len or !request.inputs_witnessed[index] or input == .tensor) stable = false;
     }
     const owner = try request.allocator.create(Direct);
-    owner.* = .{ .allocator = request.allocator, .backend = backend, .descriptor = request.descriptor.*, .slot = request.output, .support = support, .workspace = workspace, .auxiliaries = auxiliaries };
+    owner.* = .{ .allocator = request.allocator, .backend = backend.withoutSynchronousBorrows(), .descriptor = request.descriptor.*, .slot = request.output, .support = support, .workspace = workspace, .auxiliaries = auxiliaries };
     return .{ .validation_scope = if (stable) .prepared_program else .invocation, .context = owner, .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .key = @intCast(request.output.node), .requirements = .{ .primary_alignment = request.descriptor.alignment, .primary_bytes = primary_bytes, .profile = @intCast(@backingInt(std.meta.activeTag(request.descriptor.operation))), .workspace = workspace, .auxiliaries = auxiliaries, .capture = if (functions.physicalReplayKernelSupported) |query| (if (query(backend.ptr, request.descriptor)) .supported else .unsupported) else .unsupported }, .vtable = &Direct.vtable };
 }
 
@@ -217,4 +217,12 @@ pub fn belongsToProgram(selected: *const route.Owned, backend: ops.ComputeBacken
     if (!belongsTo(selected, backend)) return false;
     const owner: *const Direct = @ptrCast(@alignCast(selected.context));
     return owner.support == support;
+}
+
+/// Exact authored-operation metadata, after the target selected this private
+/// Direct implementation. No caller-supplied opaque descriptor is trusted.
+pub fn validateDescriptor(selected: *const route.Owned, descriptor: *const ops.kernel_descriptor.Descriptor) !void {
+    if (!isDirect(selected)) return error.InvalidPreparedKernelRoute;
+    const owner: *const Direct = @ptrCast(@alignCast(selected.context));
+    if (!std.meta.eql(owner.descriptor, descriptor.*)) return error.PreparedKernelBindingChanged;
 }

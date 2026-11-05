@@ -123,6 +123,10 @@ pub const ModelRuntime = struct {
     }
 
     fn retainOutputOwner(self: *const ModelRuntime, output: *ModelOutput) void {
+        // Both prefill and decode export owned value headers. Their runtime
+        // owner/affinity remains unchanged; synchronous request borrows do not.
+        if (output.device_logits_backend) |backend| output.device_logits_backend = backend.withoutSynchronousBorrows();
+        if (output.prepared_tail) |*tail| tail.backend = tail.backend.withoutSynchronousBorrows();
         if (output.owner == null and (output.device_logits != null or output.prepared_tail != null)) {
             if (self.vtable.retain_output_owner) |retain| output.owner = retain(self.ptr);
         }
@@ -1381,4 +1385,49 @@ test "model retained output cleanup and materialization forward current epoch af
     if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
     try modelOutputBoundaryCase(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, modelOutputBoundaryCase, .{});
+}
+
+test "Model runtime exported logits sanitize request header before parent stack dies" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var endpoint = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer endpoint.deinit(a);
+    const canonical = endpoint.computeBackend();
+    const Parent = struct {
+        backend: ops.ComputeBackend,
+        var callbacks: usize = 0;
+        fn bind(_: *anyopaque, _: ?*@import("../runtime/tier/memory.zig").RunBudget) void {
+            callbacks += 1;
+        }
+        fn prefill(raw: *anyopaque, _: std.mem.Allocator, _: PrefillRequest) !ModelOutput {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .device_logits = try self.backend.fromFloat32Shape(&.{ 3, 5 }, &.{ 1, 2 }), .device_logits_backend = self.backend };
+        }
+        fn close(_: *anyopaque) void {}
+        fn execute(allocator: std.mem.Allocator, backend: ops.ComputeBackend) !ModelOutput {
+            var budget = @import("../runtime/tier/memory.zig").RunBudget.init(.{});
+            const context = @import("../execution/invocation_context.zig").Context{ .cleanup = .{} };
+            var parent = @This(){ .backend = backend };
+            parent.backend.call_context = &context;
+            parent.backend.execution_budget = &budget;
+            parent.backend.execution_budget_bind = bind;
+            parent.backend.execution_owner = 42;
+            var model = ModelRuntime{ .ptr = &parent, .vtable = &.{ .prefill = prefill, .deinit = close } };
+            return model.prefill(allocator, .{ .input_ids = &.{1}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
+        }
+    };
+    Parent.callbacks = 0;
+    var output = try Parent.execute(a, canonical);
+    var owner = try @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+    defer owner.finishAfterUnlock();
+    const current = CleanupContext{ .boundary = owner.epoch() };
+    defer output.deinitWithCleanup(a, current);
+    const retained = output.device_logits_backend.?;
+    try std.testing.expect(retained.ptr == canonical.ptr and retained.vtable == canonical.vtable);
+    try std.testing.expect(retained.call_context == null and retained.execution_budget == null and retained.execution_budget_bind == null and retained.execution_owner == 0);
+    retained.bindExecutionBudget();
+    retained.clearExecutionBudget();
+    const values = try output.hostLogitsWithCleanup(a, current);
+    try std.testing.expectEqualSlices(f32, &.{ 3, 5 }, values);
+    try std.testing.expectEqual(@as(usize, 0), Parent.callbacks);
 }

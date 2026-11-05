@@ -505,7 +505,7 @@ pub const RunAdmission = struct {
     /// Cold additional mandatory producers belong to the SAME request as
     /// its already-owned run floor. Classify that exact sum before acquiring
     /// a second lease; other executions remain genuine temporary contention.
-    fn validateOwnedRunAmounts(self: RunAdmission, amounts: memory.AdmissionAmounts) !void {
+    pub fn validateOwnedRunAmounts(self: RunAdmission, amounts: memory.AdmissionAmounts) !void {
         const violation = amounts.firstLimitExceeded(self.limits) catch return error.ResourceLimitExceeded;
         const shared = self.controller.sharedLimitsSnapshot();
         const host = amounts.hostTotalBytes();
@@ -3338,6 +3338,20 @@ pub const PreparedSource = struct {
         return self.initShapesBeforeExecutionWithTaskOutputInto(source, fallback_scheduling, fallback_gate, shapes, request, workspace, placement, allocator, control, null);
     }
     pub fn initShapesBeforeExecutionWithTaskOutputInto(self: *PreparedSource, source: Session, fallback_scheduling: Session, fallback_gate: ?*std.atomic.Mutex, shapes: ShapeInputs, request: RunRequest, workspace: ?*@import("admitted_allocator.zig").AdmittedAllocator, placement: Placement, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, task_output: ?RunPermit.HostOutputGeometry) !void {
+        return self.initShapesBeforeExecutionImpl(source, fallback_scheduling, fallback_gate, shapes, request, workspace, placement, allocator, control, task_output, null);
+    }
+    /// An authored whole program declares exact disjoint physical banks before
+    /// numerical entry. Original opaque/IO/output floors stay unchanged in the
+    /// SAME acquisition; no metadata allocator becomes workspace credit.
+    pub fn initDeclaredProgramShapesBeforeExecutionInto(self: *PreparedSource, source: Session, fallback_scheduling: Session, fallback_gate: ?*std.atomic.Mutex, shapes: ShapeInputs, request: RunRequest, requirements: []const @import("../execution/prepared_storage_admission.zig").Requirement, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !void {
+        try source.validateEagerHostServices();
+        if (source.preparesInvocation()) return error.SourceAlreadySelectsPreparedInvocation;
+        try self.initShapesBeforeExecutionImpl(source, fallback_scheduling, fallback_gate, shapes, request, null, .resident_transient, allocator, control, null, requirements);
+        errdefer self.deinit();
+        try self.shape_scope.?.permit.prepareDeclaredPhysicalStorageBeforeExecution(requirements);
+        try self.shape_scope.?.permit.bindPhysicalCleanupEpoch(self.epoch() orelse return error.MissingCurrentCleanupEpoch);
+    }
+    fn initShapesBeforeExecutionImpl(self: *PreparedSource, source: Session, fallback_scheduling: Session, fallback_gate: ?*std.atomic.Mutex, shapes: ShapeInputs, request: RunRequest, workspace: ?*@import("admitted_allocator.zig").AdmittedAllocator, placement: Placement, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, task_output: ?RunPermit.HostOutputGeometry, declared_storage: ?[]const @import("../execution/prepared_storage_admission.zig").Requirement) !void {
         if (self.phase != .empty) return error.SourceInvocationAlreadyInitialized;
         try source.validateEagerHostServices(); // advertised ownership before any metadata callback/cast
         self.allocator = allocator;
@@ -3367,7 +3381,11 @@ pub const PreparedSource = struct {
             self.shape_scope = .{ .permit = .{ .session = source, .lease = null } };
             try owner.admitRunWithTaskHostOutputInto(&self.shape_scope.?, planned, task_output);
         } else {
-            self.shape_scope = .{ .permit = try source.admitShapeRequestBeforeExecutionWithTaskOutput(shapes, planned, allocator, control, task_output) };
+            if (declared_storage) |requirements| {
+                if (task_output != null) return error.InvalidDeclaredProgramOutput;
+                var pressure: ?memory.AdmissionPressure = null;
+                self.shape_scope = .{ .permit = try source.admitDeclaredStorageWithPressure(planned, requirements, &pressure) };
+            } else self.shape_scope = .{ .permit = try source.admitShapeRequestBeforeExecutionWithTaskOutput(shapes, planned, allocator, control, task_output) };
         }
     }
 
@@ -3474,6 +3492,16 @@ pub const PreparedSource = struct {
     pub fn existingWorkspaceReceipt(self: *PreparedSource) !?*@import("../execution/existing_workspace_receipt.zig").Owner {
         if (self.phase != .executing) return error.SourceInvocationNotExecuting;
         return self.selectedPermit().existing_workspace;
+    }
+
+    /// Outside-gates borrowed capability for the exact cold authored program.
+    /// The Set and its construction B remain owned by this Source, never the
+    /// persistent program. A warm empty Set still authorizes no new bank.
+    pub fn preparedProgramStorageBeforeExecution(self: *PreparedSource) !?@import("../execution/storage_admission.zig").Capability {
+        if (self.phase != .ready and self.phase != .preparing) return error.SourceInvocationNotPreparing;
+        const selected = self.selectedPermit();
+        if (!selected.physical_prepared or selected.dispatch_cleanup_epoch == null or selected.invocation_started) return error.UnpreparedPhysicalStorageReservation;
+        return selected.storageCapability();
     }
 
     /// Borrow a single invocation dispatch. The task may select resident or
@@ -3625,7 +3653,7 @@ pub const PreparedSource = struct {
         self.preentry_declined = false;
         const selected = self.selectedPermit();
         const native = self.sourceSession().nativeWeightPreparationReceiver();
-        var native_control = @import("../execution/invocation_context.zig").NativeWeights{ .ptr = self, .access = nativeWeightAccess };
+        var native_control = @import("../execution/invocation_context.zig").NativeWeights{ .ptr = self, .access = nativeWeightAccess, .prepare_projection = nativeProjectionPreparation };
         if (native) {
             if (selected.native_weights != null) return error.NativeWeightPreparationReentered;
             selected.native_weights = &native_control;
@@ -3659,6 +3687,60 @@ pub const PreparedSource = struct {
         if (self.shape_scope) |*scope| try scope.beginNumerical();
         self.native_weight_paused = false;
     }
+    fn suspendNativeWeightSlice(self: *PreparedSource) !void {
+        const scheduling = self.scheduling_session orelse return error.MissingSourceModelLifetime;
+        if (self.shape_scope) |*scope| scope.endNumerical();
+        if (self.numerical_lane_lease) |lease| lease.release();
+        self.numerical_lane_lease = null;
+        scheduling.releaseSelectedCohortGate(&self.waiter);
+        scheduling.leaveSelectedCohort(&self.waiter);
+        self.native_weight_paused = true;
+    }
+    fn nativeProjectionPreparation(raw: *anyopaque, cb: *const ops.ComputeBackend, request: *const ops.LinearTripleInvocation) anyerror!bool {
+        const self: *PreparedSource = @ptrCast(@alignCast(raw));
+        if (self.phase != .executing or self.native_weight_paused) return error.NativeWeightPreparationReentered;
+        const current = self.epoch() orelse return error.MissingCurrentCleanupEpoch;
+        if (try current.isSealed()) return error.RetirementEpochSealed;
+        const context = cb.call_context orelse return error.ForeignNativeWeightModel;
+        const loan = context.native_weights orelse return error.ForeignNativeWeightModel;
+        const actual = context.cleanup.boundary orelse return error.MissingCurrentCleanupEpoch;
+        if (loan.ptr != raw or loan.access != nativeWeightAccess or loan.prepare_projection != nativeProjectionPreparation or actual.record != current.record or actual.nonce != current.nonce) return error.ForeignNativeWeightModel;
+        const source = self.sourceSession();
+        const Native = @import("../ops/native_compute.zig").NativeCompute;
+        const data = @import("../execution/architecture_session.zig").nativeWeightPreparationModelData(source) orelse return error.ForeignNativeWeightModel;
+        switch (try Native.projectionGroupState(cb, data, request)) {
+            .ignored => return false,
+            .ready => return true,
+            .cold, .cold_existing => {},
+        }
+        const model = self.source_model orelse return error.MissingSourceModelLifetime;
+        var pin = if (source.run_admission) |admission| model.retainAdmissionDomain(admission.controller) else null;
+        defer if (pin) |held| held.release();
+        const old_domain = if (pin) |*held| held else return error.MissingCacheRetirementDomain;
+        retry: for (0..8) |_| {
+            const funded = cold: {
+                try self.suspendNativeWeightSlice();
+                defer if (self.native_weight_paused) self.restoreNativeWeightSlice() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+                if (self.control) |control| try control.check();
+                try Native.prepareResidentCreditUpgradesOutsideExecution(cb, data, old_domain);
+                try Native.flushWeightReleasesOutsideExecution(cb, data);
+                break :cold Native.prepareProjectionGroupOutsideExecution(cb, data, request, old_domain) catch |err| {
+                    if (err == error.NativeWeightPreparationChanged or err == error.PreparedCacheGrowthChanged) continue :retry;
+                    return err;
+                };
+            };
+            if (self.control) |control| try control.check();
+            // SAME actual Model/lane is restored; certify before any output
+            // allocation/dispatch. A peer winner never licenses a math replay.
+            switch (try Native.projectionGroupState(cb, data, request)) {
+                .ready => return true,
+                .ignored => return false,
+                .cold_existing => continue :retry, // never decline raw-owner upgrade
+                .cold => if (!funded) return true else continue :retry, // original optional miss fallback
+            }
+        }
+        return error.ResourceTemporarilyUnavailable;
+    }
     fn nativeWeightAccess(raw: *anyopaque, cb: *const ops.ComputeBackend, name: []const u8, access: @import("../execution/invocation_context.zig").NativeWeights.Access) anyerror!?ops.CT {
         const self: *PreparedSource = @ptrCast(@alignCast(raw));
         if (self.phase != .executing or self.native_weight_paused) return error.NativeWeightPreparationReentered;
@@ -3676,16 +3758,10 @@ pub const PreparedSource = struct {
         const raw_credits = try Native.residentWeightCreditsNeedPreparation(cb, data);
         var selected_layout = planned != null;
         if (!selected_layout and !raw_credits and !lazy_load) return null;
-        const scheduling = self.scheduling_session orelse return error.MissingSourceModelLifetime;
         const model = self.source_model orelse return error.MissingSourceModelLifetime;
         var pin: ?@import("../runtime/tier/admission_domain.zig").Pin = if (source.run_admission) |admission| model.retainAdmissionDomain(admission.controller) else null;
         defer if (pin) |held| held.release();
-        if (self.shape_scope) |*scope| scope.endNumerical();
-        if (self.numerical_lane_lease) |lease| lease.release();
-        self.numerical_lane_lease = null; // keep lane identity for actual resume
-        scheduling.releaseSelectedCohortGate(&self.waiter);
-        scheduling.leaveSelectedCohort(&self.waiter);
-        self.native_weight_paused = true;
+        try self.suspendNativeWeightSlice();
         defer if (self.native_weight_paused) self.restoreNativeWeightSlice() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         // Destructor is before mandatory resume: all unused metadata/refunds
         // run while Model, selected turn, lane, prefetch and quant locks are off.
@@ -4002,6 +4078,28 @@ pub const RunPermit = struct {
         self.physical_credit = .{};
     }
 
+    pub fn prepareDeclaredPhysicalStorageBeforeExecution(self: *RunPermit, requirements: []const @import("../execution/prepared_storage_admission.zig").Requirement) !void {
+        const floor = self.declared_storage_floor orelse return error.MissingDeclaredStorageAllowance;
+        const held = self.lease orelse return error.MissingRunAdmission;
+        if (self.invocation_started or self.execution_yielded or self.prepared != null or self.physical_prepared or self.dispatch_cleanup_epoch != null or !std.meta.eql(held.amounts, try floor.merge(self.physical_credit))) return error.DeclaredStorageAllowanceChanged;
+        try self.preparePhysicalRequirements(requirements);
+    }
+    fn preparePhysicalRequirements(self: *RunPermit, requirements: []const @import("../execution/prepared_storage_admission.zig").Requirement) !void {
+        const policy = self.session.run_admission orelse return error.MissingRunAdmission;
+        var total = memory.AdmissionAmounts{};
+        for (requirements) |item| {
+            if (item.backend == .native or item.class == .host_workspace)
+                total.host_scratch_bytes = try addBytes(total.host_scratch_bytes, item.bytes)
+            else
+                total.backend_scratch_bytes = try addBytes(total.backend_scratch_bytes, item.bytes);
+        }
+        if (!std.meta.eql(total, self.physical_credit)) return error.PreparedPhysicalRequirementsChanged;
+        const identity = storage_admission.Identity{ .controller = policy.controller, .backend_class = policy.backend_class };
+        const source = storage_admission.Capability{ .identity = identity, .context = self, .services = &.{ .reserve = reservePhysical } };
+        self.physical_storage = try @import("../execution/prepared_storage_admission.zig").Prepared.prepare(source, requirements);
+        self.physical_prepared = true;
+    }
+
     /// Called with actual input facts before selecting the actual numerical
     /// gate. Every external quota/lifetime/partition callback completes here.
     pub fn preparePhysicalStorage(self: *RunPermit, allocator: std.mem.Allocator) !void {
@@ -4022,19 +4120,7 @@ pub const RunPermit = struct {
         var requirements = @import("../execution/prepared_storage_admission.zig").Builder{ .allocator = allocator };
         defer requirements.deinit();
         try pool.collectAdmissionRequirements(&requirements, if (selected.frame_claim) |*claim| claim else null, identity);
-        var total = memory.AdmissionAmounts{};
-        for (requirements.items()) |item| {
-            if (item.backend == .native or item.class == .host_workspace)
-                total.host_scratch_bytes = try addBytes(total.host_scratch_bytes, item.bytes)
-            else
-                total.backend_scratch_bytes = try addBytes(total.backend_scratch_bytes, item.bytes);
-        }
-        // A mutable/mismatched declaration cannot borrow protected IO quota or
-        // silently fall back after exact physical credit has been granted.
-        if (!std.meta.eql(total, self.physical_credit)) return error.PreparedPhysicalRequirementsChanged;
-        const source = storage_admission.Capability{ .identity = identity, .context = self, .services = &.{ .reserve = reservePhysical } };
-        self.physical_storage = try @import("../execution/prepared_storage_admission.zig").Prepared.prepare(source, requirements.items());
-        self.physical_prepared = true;
+        try self.preparePhysicalRequirements(requirements.items());
     }
 
     /// Source owns its actual resident B and real Model pin before calling.

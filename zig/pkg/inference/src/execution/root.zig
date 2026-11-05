@@ -31,6 +31,7 @@ pub const ModelCandidate = model_candidate.Candidate;
 pub const transfer_audit = @import("transfer_audit.zig");
 
 pub const decoder_forward = @import("decoder_forward.zig");
+pub const native_decoder_program = @import("native_decoder_program.zig");
 pub const decoder_storage = @import("decoder_storage.zig");
 pub const sequence_pool = @import("sequence_pool.zig");
 pub const text_inputs = @import("text_inputs.zig");
@@ -60,6 +61,7 @@ pub const speculative_activation = @import("speculative_activation.zig");
 test {
     _ = @import("../backends/compute_factory.zig");
     _ = @import("decoder_forward.zig");
+    _ = @import("native_decoder_program.zig");
     _ = @import("decoder_storage.zig");
     _ = @import("executable.zig");
     _ = @import("diagnostics.zig");

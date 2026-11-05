@@ -50,8 +50,18 @@ pub const AdmittedAllocator = struct {
         return try std.math.add(usize, try std.math.add(usize, bytes, allocationOverhead(alignment)), @sizeOf(Reservation));
     }
 
+    const allocator_vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
+
     pub fn allocator(self: *@This()) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        return .{ .ptr = self, .vtable = &allocator_vtable };
+    }
+
+    /// The exact transparent allocation source, while this admitted owner is
+    /// live. Unknown/copied allocator tables grant no ancestry proof.
+    pub fn backingAllocator(value: std.mem.Allocator) ?std.mem.Allocator {
+        if (value.vtable != &allocator_vtable) return null;
+        const self: *@This() = @ptrCast(@alignCast(value.ptr));
+        return self.backing;
     }
 
     pub fn allocationOverhead(alignment: std.mem.Alignment) usize {

@@ -350,7 +350,7 @@ pub const Runtime = struct {
                 };
                 if (frame) |active| {
                     active.collect_storage_stats = options.collect_partition_stats;
-                    try active.begin();
+                    try active.beginWithCleanup(physical_cleanup);
                 }
                 var planned_options = options.*;
                 planned_options.backend_operation = backend_operation;
@@ -710,13 +710,7 @@ pub const Runtime = struct {
 };
 
 fn durableBackend(backend: ComputeBackend) ComputeBackend {
-    var retained = backend;
-    retained.execution_control = null;
-    retained.embedding_stage = null;
-    // Scope capabilities remain on their explicit target owner and are never
-    // copied into this durable backend value. currentToken validates activity.
-
-    return retained;
+    return backend.withoutSynchronousBorrows();
 }
 
 const FallbackNativeBackend = struct {
@@ -1459,4 +1453,60 @@ test "backend output layouts materialize partial Native slices before allocation
     var invalid = inferred;
     invalid.shape = graph.node(partial).output_shape;
     try std.testing.expect(PhysicalOutputLayout.resolve(&layout, .native, partial, invalid).isView());
+}
+
+test "graph result retains actual Native output with durable header after executable and request stack retire" {
+    if (comptime !@import("build_options").enable_native or @import("build_options").enable_wasm) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var endpoint = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer endpoint.deinit(a);
+    const canonical = endpoint.computeBackend();
+    const Run = struct {
+        var callbacks: usize = 0;
+        fn bind(_: *anyopaque, _: ?*@import("../runtime/tier/memory.zig").RunBudget) void {
+            callbacks += 1;
+        }
+        fn execute(allocator: std.mem.Allocator, backend: ComputeBackend, strategy: Strategy) !Result {
+            var budget = @import("../runtime/tier/memory.zig").RunBudget.init(.{});
+            const context = @import("../execution/invocation_context.zig").Context{ .cleanup = .{} };
+            var local = backend;
+            local.call_context = &context;
+            local.execution_budget = &budget;
+            local.execution_budget_bind = bind;
+            local.execution_owner = 67;
+            var graph = Graph.init(allocator);
+            defer graph.deinit();
+            var builder = Builder.init(&graph);
+            const x = try builder.parameter("x", Shape.init(.f32, &.{4}));
+            try graph.markOutput(try builder.relu(x));
+            var program = try @import("../execution/program.zig").ModelProgram.init(allocator, &graph, &.{});
+            defer program.deinit();
+            var executable = try @import("../execution/executable.zig").prepare(allocator, &program, &local, strategy);
+            defer executable.deinit();
+            const input = try backend.fromFloat32Shape(&.{ -1, 2, -3, 4 }, &.{4});
+            defer backend.free(input);
+            const inputs = [_]interpreter.RuntimeInput{.{ .node_id = program.id_map[x], .value = input, .source_backend = &local }};
+            return executable.run(allocator, .{ .runtime_inputs = &inputs, .output_placement = .producer });
+        }
+    };
+    for ([_]Strategy{ .interpreter, .compiled_preferred }) |strategy| {
+        var result = try Run.execute(a, canonical, strategy);
+        // Owned headers must suffice: the real executable/program/request have
+        // died, while the actual endpoint and independently owned CT remain.
+        const expired_runtime: Runtime = undefined;
+        var cleanup = try @import("../execution/cleanup_owner.zig").Owner.beginOutsideCleanup();
+        defer cleanup.finishAfterUnlock();
+        const now = @import("../execution/cleanup_context.zig").Context{ .boundary = cleanup.epoch() };
+        defer result.deinitWithCleanup(&expired_runtime, now);
+        const backend = result.owner_backend orelse return error.MissingDurableResultHeader;
+        try std.testing.expect(backend.ptr == canonical.ptr and backend.vtable == canonical.vtable);
+        try std.testing.expect(backend.call_context == null and backend.execution_budget == null and backend.execution_budget_bind == null and backend.execution_owner == 0);
+        const before = Run.callbacks;
+        backend.bindExecutionBudget();
+        backend.clearExecutionBudget();
+        const actual = try backend.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, &.{ 0, 2, 0, 4 }, actual);
+        try std.testing.expectEqual(before, Run.callbacks);
+    }
 }

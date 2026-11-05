@@ -138,7 +138,27 @@ pub const Slice = struct {
     }
 };
 pub const Gather = struct { axis: u8, geometry: kernel_geometry.GatherAxis };
-pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, linear: Linear, norm: Norm, softmax: Softmax, rope: Rope, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather };
+/// Cold, value-only geometry authored only by the complete Native decoder.
+/// Generic lower() deliberately never constructs this operation: ordinary
+/// causal attention must preserve its original target route.
+pub const PagedAttention = struct {
+    num_heads: u32,
+    num_kv_heads: u32,
+    head_dim: u32,
+    layer_index: u32,
+    pub fn valid(self: PagedAttention, descriptor: *const Descriptor) bool {
+        if (self.num_heads == 0 or self.num_kv_heads == 0 or self.head_dim == 0 or self.num_heads % self.num_kv_heads != 0 or descriptor.input_count != 3) return false;
+        const q = std.math.cast(i64, std.math.mul(usize, self.num_heads, self.head_dim) catch return false) orelse return false;
+        const kv = std.math.cast(i64, std.math.mul(usize, self.num_kv_heads, self.head_dim) catch return false) orelse return false;
+        if (descriptor.output_shape.dtype != .f32 or descriptor.output_shape.numElements() != q) return false;
+        for (descriptor.input_shapes, 0..) |shape, index| {
+            if (shape.dtype != .f32 or shape.numElements() != (if (index == 0) q else kv)) return false;
+        }
+        return true;
+    }
+};
+
+pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, linear: Linear, norm: Norm, softmax: Softmax, rope: Rope, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather, paged_attention: PagedAttention };
 
 pub const Descriptor = struct {
     operation: Operation,
@@ -175,6 +195,8 @@ pub const AuxiliaryRequirements = struct {
 };
 pub const AuxiliaryBinding = struct { role: AuxiliaryRole, tensor: CT };
 pub const Invocation = struct {
+    /// Actual synchronous DecodeContext, never saved by a descriptor/route.
+    attention: ?*const @import("../graph/backend_contracts.zig").AttentionContext = null,
     input_generation: u64 = 0,
     assigned_inputs: ?*const [3]?@import("../execution/kernel_route.zig").AssignedInput = null,
     prepared_route: ?*const @import("../execution/kernel_route.zig").Owned = null,
@@ -320,6 +342,7 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
         else => .{ .unary = unary(node.op) orelse return null },
     };
     const inputs: u8 = switch (operation) {
+        .paged_attention => 3,
         .unary => 1,
         .binary, .dot, .concat, .gather => 2,
         .softmax, .rope, .reduction, .transpose, .broadcast, .slice => 1,

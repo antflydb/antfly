@@ -61,6 +61,7 @@ pub const SharedLiteralStore = struct {
         errdefer allocator.free(publications);
         @memset(publications, null);
         const owned_backends = try allocator.dupe(ops.ComputeBackend, backends);
+        for (owned_backends) |*backend| backend.* = backend.withoutSynchronousBorrows();
         errdefer allocator.free(owned_backends);
         const completions = try allocator.alloc(?ops.physical_storage.Completion, backends.len);
         errdefer allocator.free(completions);
