@@ -123,8 +123,7 @@ atomic renames and durable SQLite filesystem semantics. Never mount a published
 copy as the data file of an ordinary writer. A configured runtime account is the only
 writer to this directory. The boundary trusts the local builder's assertion of which
 Drive folder and model produced the text and vectors. Validation checks revision bindings,
-bytes, shape, physical postings counts and model compatibility. Grant checks remain
-with Colony. Its gateway should map `stale_generation` / `stale_cursor` to HTTP 409.
+bytes, shape, physical postings counts and model compatibility. The hosting gateway checks grants and maps `stale_generation` / `stale_cursor` to HTTP 409.
 
 The producer input limit is 64 MiB, each extracted document 4 MiB, each passage 64
 KiB, the artifact 2 GiB and the row limit 100,000. These are engineering limits.
