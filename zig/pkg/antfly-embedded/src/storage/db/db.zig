@@ -55726,11 +55726,17 @@ fn saveAppliedSequencesBatchLockedContext(
                     update.sequence,
                 ) or lifecycle_completed;
             }
-            if (lifecycle_completed) try DB.saveIndexStatusSnapshots(
+            // No generic consumer advanced, so there is no progress v2 record
+            // to write here; a completed dense lifecycle still deserves an
+            // immediate (not interval-gated) status refresh.
+            try publishManagedProgress(
                 ctx.alloc,
                 ctx.store,
                 ctx.index_manager,
-                enriched_updates,
+                &.{},
+                false,
+                if (lifecycle_completed) enriched_updates else &.{},
+                lifecycle_completed,
             );
         }
         return;
@@ -55756,11 +55762,18 @@ fn saveAppliedSequencesBatchLockedContext(
             authoritative_lifecycle_completed = authoritative_lifecycle_completed or
                 (completed_now and ctx.index_manager.densePostingWalAuthoritativeByName(update.index_name));
         }
-        try DB.saveIndexStatusSnapshots(
+        // WS6: one progress commit replaces the separate legacy status
+        // commit(s) that used to follow here, carrying the new v2 progress
+        // record for every generic update plus (interval-gated, or forced by
+        // a completed lifecycle) a piggybacked status refresh.
+        try publishManagedProgress(
             ctx.alloc,
             ctx.store,
             ctx.index_manager,
+            generic_updates.items,
+            true,
             if (authoritative_lifecycle_completed) enriched_updates else generic_updates.items,
+            authoritative_lifecycle_completed,
         );
         return;
     }
@@ -55774,7 +55787,7 @@ fn saveAppliedSequencesBatchLockedContext(
         ctx.applied_sequence_checkpoint_path,
         generic_updates.items,
     );
-    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, generic_updates.items);
+    try publishManagedProgress(ctx.alloc, ctx.store, ctx.index_manager, generic_updates.items, true, generic_updates.items, false);
 }
 
 const appliedSequenceUpdatesWithConfigHashes = local_mutation.appliedSequenceUpdatesWithConfigHashes;
@@ -55819,6 +55832,94 @@ fn checkpointManagedProjectionEffectsForAppliedSequenceUpdates(
             // the source watermark unchanged for replay.
             try index_manager.ensureDensePostingCoverageByName(update.index_name, update.sequence);
         }
+    }
+}
+
+var status_persist_count: std.atomic.Value(u64) = .init(0);
+
+/// Count of durable status-snapshot writes actually committed (piggybacked
+/// into a progress commit or, rarely, standalone), as opposed to updates
+/// where status derivation ran but the interval/force gate skipped the
+/// write. Test-only instrumentation for the "at most once per interval"
+/// requirement.
+pub fn statusPersistCountForTest() u64 {
+    return status_persist_count.load(.monotonic);
+}
+
+pub fn resetStatusPersistCountForTest() void {
+    status_persist_count.store(0, .monotonic);
+}
+
+/// The one authoritative progress commit (WS6) for a batch of applied-
+/// sequence updates on a shared consumer set: every update's v2 progress
+/// record, plus — at most once per `IndexManager.status_persist_interval_ns`,
+/// or always when `force_status` is set (an explicit sync or close drain) —
+/// a piggybacked derived `IndexStatusSnapshot` for `status_targets`, land in
+/// exactly one `apply_state.contributeProgress` commit.
+///
+/// This does not replace the physical per-backend effects
+/// (`checkpointManagedProjectionEffectsForAppliedSequenceUpdates`,
+/// `savePhysicalProjectionMetadataForAppliedSequenceUpdates`) or the legacy
+/// v1 checkpoint (`apply_state.saveAppliedSequencesWithCheckpointWithStorage`,
+/// kept so existing v1 readers — serving-certificate checks, repair, restart
+/// before progress v2 — keep working unchanged). Callers must still run
+/// those first, in that order: progress v2 must never claim a boundary the
+/// physical effects have not reached. `lsm_wal_checkpointed` records only
+/// that `checkpointLsmWalForManagedIndex` was called for `updates` in this
+/// same pass; the WAL checkpoint marker itself lives on the per-index
+/// backend's own pager and is not readable back from this KV record.
+fn publishManagedProgress(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    updates: []const apply_state.AppliedSequenceUpdate,
+    lsm_wal_checkpointed: bool,
+    status_targets: []const apply_state.AppliedSequenceUpdate,
+    force_status: bool,
+) !void {
+    if (updates.len == 0 and status_targets.len == 0) return;
+
+    const progress = try alloc.alloc(apply_state.Progress, updates.len);
+    defer alloc.free(progress);
+    for (updates, 0..) |update, i| {
+        progress[i] = .{
+            .consumer = update.index_name,
+            .sequence = update.sequence,
+            .status = update.status,
+            .generation = update.generation,
+            .config_hash = update.config_hash,
+            .published_count = update.published_count,
+            .lsm_wal_checkpointed_through = if (lsm_wal_checkpointed) update.sequence else 0,
+        };
+    }
+
+    // Owned, heap-stable backing for every candidate status value: pointers
+    // into it are handed to `contributeProgress` as borrowed `StatusWrite`
+    // slices, so it must outlive that call (freed by `defer`, after use).
+    const status_values = try alloc.alloc([DB.index_status_encoded_len]u8, status_targets.len);
+    defer alloc.free(status_values);
+    var status_writes = std.ArrayListUnmanaged(apply_state.StatusWrite).empty;
+    defer {
+        for (status_writes.items) |write| alloc.free(@constCast(write.key));
+        status_writes.deinit(alloc);
+    }
+    const now_ns = platform_time.awakeNs(index_manager.checkpointIo());
+    const due = status_targets.len > 0 and index_manager.statusPersistDue(now_ns, force_status);
+    if (due) {
+        for (status_targets, 0..) |update, i| {
+            const status_snapshot = DB.collectLiveIndexStatusSnapshot(index_manager, update.index_name) orelse continue;
+            const key = try DB.indexStatusKeyAlloc(alloc, update.index_name);
+            errdefer alloc.free(key);
+            DB.encodeIndexStatusSnapshot(status_snapshot, &status_values[i]);
+            try status_writes.append(alloc, .{ .key = key, .value = &status_values[i] });
+        }
+    }
+
+    if (progress.len == 0 and status_writes.items.len == 0) return;
+    try apply_state.contributeProgress(alloc, store, progress, status_writes.items);
+    if (status_writes.items.len > 0) {
+        index_manager.markStatusPersisted(now_ns);
+        _ = status_persist_count.fetchAdd(1, .monotonic);
     }
 }
 
@@ -61518,12 +61619,17 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
     // live cardinality at the lifecycle boundary itself so a later failed
     // open never falls back to the empty creation-time snapshot. The clean
     // projection marker remains correctness authority; status-cache failure
-    // must not roll it back or fail an otherwise complete user write.
-    DB.saveIndexStatusSnapshots(
+    // must not roll it back or fail an otherwise complete user write. A
+    // lifecycle completion is forced through regardless of the ordinary
+    // status-persist interval.
+    publishManagedProgress(
         ctx.alloc,
         ctx.store,
         ctx.index_manager,
+        &.{},
+        false,
         &.{.{ .index_name = index_name, .sequence = applied_sequence }},
+        true,
     ) catch |err| {
         std.log.warn("dense status snapshot persistence deferred index={s} sequence={} err={s}", .{
             index_name,
@@ -61732,11 +61838,22 @@ fn flushFinishedDenseAppliedSequenceLocked(
         }
         const lifecycle_completed_now = try finalizeCoveredDenseProjectionCheckpoint(ctx, pending.owned_name, pending.sequence);
         lifecycle_completed.* = lifecycle_completed_now or lifecycle_completed.*;
-        if (!hbc_authoritative or lifecycle_completed_now) {
-            const status_started = monotonicTimeNs();
-            try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
-            status_snapshot_ns +|= elapsedSince(status_started);
-        }
+        // WS6: one progress commit carries the v2 record for this consumer
+        // (when it took the generic, non-HBC-authoritative path above) and a
+        // piggybacked status refresh (interval-gated, or forced through by a
+        // completed lifecycle), replacing what used to be a separate status
+        // commit here.
+        const status_started = monotonicTimeNs();
+        try publishManagedProgress(
+            ctx.alloc,
+            ctx.store,
+            ctx.index_manager,
+            if (hbc_authoritative) &.{} else enriched_updates,
+            !hbc_authoritative,
+            if (!hbc_authoritative or lifecycle_completed_now) enriched_updates else &.{},
+            lifecycle_completed_now,
+        );
+        status_snapshot_ns +|= elapsedSince(status_started);
         break :blk elapsedSince(save_start_ns);
     };
 
@@ -61826,16 +61943,28 @@ fn flushPendingAppliedSequencesLocked(
             authoritative_lifecycle_completed = authoritative_lifecycle_completed or
                 (completed_now and ctx.index_manager.densePostingWalAuthoritativeByName(update.index_name));
         }
-        if (generic_updates.items.len > 0) {
-            const status_started = monotonicTimeNs();
-            try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, generic_updates.items);
-            status_snapshot_ns +|= elapsedSince(status_started);
-        }
-        if (authoritative_lifecycle_completed) {
-            const status_started = monotonicTimeNs();
-            try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
-            status_snapshot_ns +|= elapsedSince(status_started);
-        }
+        // WS6: one progress commit replaces what used to be up to two
+        // separate status commits here (one for the generic updates, a
+        // second if an HBC-authoritative lifecycle also completed this
+        // pass), plus the v2 progress record for every generic update.
+        //
+        // `force` here means "the caller needs this watermark flushed now
+        // for synchronous visibility" (it fires on an ordinary write under
+        // most sync levels, not only at shutdown) and must not itself force
+        // a status write, or every write would defeat the status-persist
+        // interval. Only a completed lifecycle forces status through early;
+        // otherwise it rides the interval gate inside `publishManagedProgress`.
+        const status_started = monotonicTimeNs();
+        try publishManagedProgress(
+            ctx.alloc,
+            ctx.store,
+            ctx.index_manager,
+            generic_updates.items,
+            generic_updates.items.len > 0,
+            enriched_updates,
+            authoritative_lifecycle_completed,
+        );
+        status_snapshot_ns +|= elapsedSince(status_started);
         break :blk elapsedSince(save_start_ns);
     };
     ctx.applied_sequence_coalescer.clearPending(ctx.alloc);
@@ -100004,6 +100133,86 @@ test "db batch persists per-index applied sequence watermark" {
     try std.testing.expectEqualStrings("primary", owner_stats[0].name);
     try std.testing.expectEqual(DB.LsmOwnerKind.full_text, owner_stats[1].kind);
     try std.testing.expectEqualStrings("ft_v1", owner_stats[1].name);
+}
+
+test "db batch publishes managed progress through the real write path (WS6)" {
+    // A synchronous `.full_index` write drives more than one internal flush
+    // pass (pre-existing coalescing granularity, unrelated to WS6), so this
+    // cannot assert an absolute "exactly one commit per write" count end to
+    // end. What WS6 actually guarantees — that every consumer touched by
+    // one flush pass lands in the same single `contributeProgress` commit,
+    // instead of a separate apply_state checkpoint plus up to two separate
+    // status commits per pass — is proven directly, deterministically, at
+    // the unit level by apply_state's "writes exactly one commit for a
+    // batch of consumers" test. This is the integration half: confirming
+    // the real write path actually reaches `contributeProgress` and that
+    // its v2 record is readable afterward.
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, path_tmp.path(), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+    apply_state.resetProgressCommitCountForTest();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expect(apply_state.progressCommitCount() >= 1);
+    const progress = (try apply_state.loadProgress(alloc, db.core.store, "ft_v1")).?;
+    try std.testing.expectEqual(try db.core.loadAppliedSequence(alloc, "ft_v1"), progress.applied_sequence);
+}
+
+test "db status snapshot persists at most once per interval across a write loop (WS6)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    // 1,000 real, durably-synced writes can themselves take long enough
+    // wall-clock time to cross the default 5s interval many times over —
+    // that is a property of this test's I/O, not of the gate. Pin the
+    // interval to something the loop cannot plausibly cross so the
+    // assertion below is about the gate, not about how fast this machine's
+    // disk happens to be.
+    db.core.index_manager.status_persist_interval_ns = 3600 * std.time.ns_per_s;
+
+    apply_state.resetProgressCommitCountForTest();
+    resetStatusPersistCountForTest();
+
+    var key_buf: [32]u8 = undefined;
+    for (0..1000) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = key, .value = "{\"title\":\"alpha\"}" },
+            },
+            .sync_level = .full_index,
+        });
+    }
+
+    // Every publication still gets its own progress commit (no coalescing
+    // of the authoritative watermark across unrelated writes): at least one
+    // per write.
+    try std.testing.expect(apply_state.progressCommitCount() >= 1000);
+    // ...but the derived status snapshot, which is cheap to recompute and
+    // not needed for recovery, piggybacks on at most one of those commits
+    // per `status_persist_interval_ns`.
+    try std.testing.expectEqual(@as(u64, 1), statusPersistCountForTest());
+    try std.testing.expect(try db.core.loadAppliedSequence(alloc, "ft_v1") >= 1000);
 }
 
 test "db managed projection checkpoints persist status and config identity" {

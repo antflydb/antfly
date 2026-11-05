@@ -1369,6 +1369,7 @@ pub const IndexManager = struct {
     }
 
     pub const dense_native_backup_backend_id = "hbc-native-v1";
+    pub const default_status_persist_interval_ns: u64 = 5 * std.time.ns_per_s;
     const max_retired_lsm_owner_stats: usize = 1024;
     const retired_lsm_owner_overflow_name = "__retired_owner_overflow__";
     /// Stable-address lifetime admission shared by DB searches and background
@@ -1441,6 +1442,15 @@ pub const IndexManager = struct {
     // it. The backend outlives IndexManager in DBCore.
     primary_lsm_backend: ?*lsm_backend_mod.Backend = null,
     applied_sequence_checkpoint_path: ?[]const u8,
+    /// Gate for how often the applied-sequence/progress write path also
+    /// persists a derived `IndexStatusSnapshot`. Status is cheap to recompute
+    /// from live state and is not needed for recovery (progress v2 is), so
+    /// outside a forced flush or close it piggybacks on an existing progress
+    /// commit at most once per `status_persist_interval_ns`. Shared by both
+    /// the sync (`BatchExecutionContext`) and async (`AsyncContext`) applied-
+    /// sequence paths, which both hold a pointer to this same `IndexManager`.
+    last_status_persist_ns: std.atomic.Value(u64) = .init(0),
+    status_persist_interval_ns: u64 = default_status_persist_interval_ns,
     vector_block_generation_mu: std.atomic.Mutex = .unlocked,
     vector_block_build_mu: std.atomic.Mutex = .unlocked,
     // A snapshot builder writes its reserved immutable generation without
@@ -9617,6 +9627,21 @@ pub const IndexManager = struct {
             },
             else => {},
         }
+    }
+
+    /// True when the owner should persist a derived `IndexStatusSnapshot`
+    /// now: always on a forced/close flush, otherwise at most once per
+    /// `status_persist_interval_ns`. Pure decision — does not touch storage
+    /// or update the gate; call `markStatusPersisted` after the write
+    /// actually commits.
+    pub fn statusPersistDue(self: *const IndexManager, now_ns: u64, force: bool) bool {
+        if (force) return true;
+        const last = self.last_status_persist_ns.load(.monotonic);
+        return now_ns -| last >= self.status_persist_interval_ns;
+    }
+
+    pub fn markStatusPersisted(self: *IndexManager, now_ns: u64) void {
+        self.last_status_persist_ns.store(now_ns, .monotonic);
     }
 
     pub const FullTextProjectionGuard = struct {

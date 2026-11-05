@@ -407,6 +407,311 @@ pub fn checkpointPathAlloc(alloc: Allocator, db_path: []const u8) ![]u8 {
     return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ db_path, checkpoint_file_name });
 }
 
+// --- Progress v2: one authoritative record per consumer -------------------
+//
+// `ProjectionCheckpoint`/the sidecar above is replay-progress bookkeeping
+// written per concern (scalar key, enriched key, optional file sidecar) by
+// whichever caller happens to touch an index. Progress v2 is additive: a
+// single new key per consumer that also carries the LSM WAL checkpoint
+// boundary (`checkpointLsmWalForManagedIndex`'s physical WAL-truncation
+// marker lives on the per-backend pager and cannot be fetched back from a KV
+// read; this field records only whether the docstore-side watermark was
+// advanced after that WAL boundary was confirmed). It does not read, write,
+// or migrate the legacy keys above: this project is unreleased, so there is
+// no v1 data to interpret and no compatibility shim to maintain. A reader
+// that only knows v1 keys silently never sees `progress_prefix_v2`; a reader
+// of v2 never looks at v1. Callers that still need v1-key readers to keep
+// working (status endpoints, repair, serving-certificate checks written
+// before WS6) keep calling the existing functions above unchanged, in
+// addition to the one `contributeProgress` call per publication.
+const progress_prefix_v2 = "\x00\x00__metadata__:progress:v2:";
+const progress_magic_v2 = "AFPROG2V";
+const progress_encoded_len_v2 = progress_magic_v2.len + 8 + 1 + 8 + 8 + 1 + 8 + 8 + 4;
+
+/// The merged, authoritative progress identity for one consumer: the applied
+/// sequence, the projection seal/identity fields (status/generation/
+/// config_hash/published_count — the same shape as `ProjectionCheckpoint`,
+/// kept separate so the v1 and v2 wire formats never have to agree), and the
+/// sequence boundary through which the consumer's LSM WAL has been
+/// checkpointed.
+pub const ProgressRecord = struct {
+    applied_sequence: u64 = 0,
+    status: ProjectionStatus = .clean,
+    generation: u64 = 0,
+    config_hash: u64 = 0,
+    published_count: ?u64 = null,
+    lsm_wal_checkpointed_through: u64 = 0,
+};
+
+/// One consumer's contribution to a single progress commit. `consumer` is
+/// typically an index name; callers that batch several consumers into one
+/// publication (one native commit, under WS4) pass several `Progress`
+/// values to one `contributeProgress`/`contributeProgressTxn` call so the
+/// record for each is written inside the same transaction.
+pub const Progress = struct {
+    consumer: []const u8,
+    sequence: u64,
+    status: ProjectionStatus = .clean,
+    generation: u64 = 0,
+    config_hash: u64 = 0,
+    published_count: ?u64 = null,
+    lsm_wal_checkpointed_through: u64 = 0,
+};
+
+/// A raw key/value pair to piggyback into the same progress commit (used by
+/// callers to fold a derived status snapshot write into this transaction
+/// instead of committing it separately). The value must outlive the call.
+pub const StatusWrite = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+var progress_commit_count: std.atomic.Value(u64) = .init(0);
+
+/// Count of completed `contributeProgress` commits. Test-only instrumentation:
+/// production code has no reason to read this, since the whole point of the
+/// counter is to let a test assert "one publication, one progress commit"
+/// without threading a mock transaction through the real write path.
+pub fn progressCommitCount() u64 {
+    return progress_commit_count.load(.monotonic);
+}
+
+pub fn resetProgressCommitCountForTest() void {
+    progress_commit_count.store(0, .monotonic);
+}
+
+fn progressKeyV2(buffer: []u8, consumer: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "{s}{s}", .{ progress_prefix_v2, consumer });
+}
+
+fn encodeProgressRecord(record: ProgressRecord) [progress_encoded_len_v2]u8 {
+    var raw: [progress_encoded_len_v2]u8 = undefined;
+    var pos: usize = 0;
+    @memcpy(raw[0..progress_magic_v2.len], progress_magic_v2);
+    pos += progress_magic_v2.len;
+    writeProgressInt(&raw, &pos, u64, record.applied_sequence);
+    writeProgressInt(&raw, &pos, u8, @backingInt(record.status));
+    writeProgressInt(&raw, &pos, u64, record.generation);
+    writeProgressInt(&raw, &pos, u64, record.config_hash);
+    writeProgressInt(&raw, &pos, u8, @intFromBool(record.published_count != null));
+    writeProgressInt(&raw, &pos, u64, record.published_count orelse 0);
+    writeProgressInt(&raw, &pos, u64, record.lsm_wal_checkpointed_through);
+    writeProgressInt(&raw, &pos, u32, Crc32.hash(raw[0 .. progress_encoded_len_v2 - 4]));
+    return raw;
+}
+
+fn decodeProgressRecord(raw: []const u8) !ProgressRecord {
+    if (raw.len != progress_encoded_len_v2) return error.InvalidDerivedApplyState;
+    if (!std.mem.eql(u8, raw[0..progress_magic_v2.len], progress_magic_v2)) return error.InvalidDerivedApplyState;
+    if (Crc32.hash(raw[0 .. progress_encoded_len_v2 - 4]) != std.mem.readInt(u32, raw[progress_encoded_len_v2 - 4 ..][0..4], .little))
+        return error.InvalidDerivedApplyState;
+    var pos: usize = progress_magic_v2.len;
+    const applied_sequence = readProgressInt(raw, &pos, u64);
+    const status_raw = readProgressInt(raw, &pos, u8);
+    const generation = readProgressInt(raw, &pos, u64);
+    const config_hash = readProgressInt(raw, &pos, u64);
+    const published_count_present = readProgressInt(raw, &pos, u8);
+    if (published_count_present > 1) return error.InvalidDerivedApplyState;
+    const published_count_raw = readProgressInt(raw, &pos, u64);
+    const lsm_wal_checkpointed_through = readProgressInt(raw, &pos, u64);
+    return .{
+        .applied_sequence = applied_sequence,
+        .status = std.enums.fromInt(ProjectionStatus, status_raw) orelse return error.InvalidDerivedApplyState,
+        .generation = generation,
+        .config_hash = config_hash,
+        .published_count = if (published_count_present == 1) published_count_raw else null,
+        .lsm_wal_checkpointed_through = lsm_wal_checkpointed_through,
+    };
+}
+
+fn writeProgressInt(raw: []u8, pos: *usize, comptime T: type, value: T) void {
+    const size = @sizeOf(T);
+    std.mem.writeInt(T, raw[pos.* .. pos.* + size][0..size], value, .little);
+    pos.* += size;
+}
+
+fn readProgressInt(raw: []const u8, pos: *usize, comptime T: type) T {
+    const size = @sizeOf(T);
+    const out = std.mem.readInt(T, raw[pos.* .. pos.* + size][0..size], .little);
+    pos.* += size;
+    return out;
+}
+
+/// Write one consumer's v2 progress entry into an already-open write
+/// transaction/write-batch. The caller owns `commit()`. This is the hook a
+/// future WS4 `CommitPlan` calls directly once it exposes the same
+/// `put`-shaped surface as the rest of this file's `txn: anytype` helpers
+/// (see `commit_participant.View`) — `contributeProgress` below is a thin
+/// convenience wrapper around exactly this for callers that do not yet have
+/// an open plan/batch of their own.
+pub fn contributeProgressTxn(txn: anytype, progress: Progress) !void {
+    var key_buf: [256]u8 = undefined;
+    const key = try progressKeyV2(&key_buf, progress.consumer);
+    const encoded = encodeProgressRecord(.{
+        .applied_sequence = progress.sequence,
+        .status = progress.status,
+        .generation = progress.generation,
+        .config_hash = progress.config_hash,
+        .published_count = progress.published_count,
+        .lsm_wal_checkpointed_through = progress.lsm_wal_checkpointed_through,
+    });
+    var mutable_txn = txn;
+    try mutable_txn.put(key, &encoded);
+}
+
+/// The one authoritative progress commit for a publication: every consumer
+/// it touches, plus any status snapshot the caller chooses to piggyback,
+/// lands in exactly one `txn.commit()`. Call this once per publication,
+/// not once per consumer — batch every `Progress` value touched by that
+/// publication into one call so `progressCommitCount()` advances by exactly
+/// one regardless of how many consumers were updated.
+pub fn contributeProgress(alloc: Allocator, store: anytype, updates: []const Progress, status_writes: []const StatusWrite) !void {
+    if (updates.len == 0 and status_writes.len == 0) return;
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    for (updates) |progress| try contributeProgressTxn(&txn, progress);
+    for (status_writes) |write| try txn.put(write.key, write.value);
+    try txn.commit();
+    _ = progress_commit_count.fetchAdd(1, .monotonic);
+}
+
+pub fn loadProgressTxn(txn: anytype, consumer: []const u8) !?ProgressRecord {
+    var key_buf: [256]u8 = undefined;
+    const key = try progressKeyV2(&key_buf, consumer);
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return try decodeProgressRecord(raw);
+}
+
+/// Read a consumer's v2 progress record, if one has ever been written for
+/// it. Used by restart/recovery to derive where a consumer's effects and
+/// progress actually left off, instead of trusting a persisted status
+/// snapshot that is no longer written on every flush.
+pub fn loadProgress(alloc: Allocator, store: anytype, consumer: []const u8) !?ProgressRecord {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginProbe();
+    defer txn.abort();
+    return try loadProgressTxn(&txn, consumer);
+}
+
+test "contributeProgress writes exactly one commit for a batch of consumers" {
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    resetProgressCommitCountForTest();
+    try contributeProgress(std.testing.allocator, runtime, &.{
+        .{ .consumer = "text", .sequence = 5, .generation = 2, .config_hash = 9, .lsm_wal_checkpointed_through = 5 },
+        .{ .consumer = "dense_idx", .sequence = 7, .status = .rebuilding },
+    }, &.{});
+    try std.testing.expectEqual(@as(u64, 1), progressCommitCount());
+
+    const text = (try loadProgress(std.testing.allocator, runtime, "text")).?;
+    try std.testing.expectEqual(@as(u64, 5), text.applied_sequence);
+    try std.testing.expectEqual(@as(u64, 2), text.generation);
+    try std.testing.expectEqual(@as(u64, 9), text.config_hash);
+    try std.testing.expectEqual(@as(u64, 5), text.lsm_wal_checkpointed_through);
+    try std.testing.expectEqual(ProjectionStatus.clean, text.status);
+
+    const dense = (try loadProgress(std.testing.allocator, runtime, "dense_idx")).?;
+    try std.testing.expectEqual(@as(u64, 7), dense.applied_sequence);
+    try std.testing.expectEqual(ProjectionStatus.rebuilding, dense.status);
+    try std.testing.expectEqual(@as(u64, 0), dense.lsm_wal_checkpointed_through);
+
+    try std.testing.expect((try loadProgress(std.testing.allocator, runtime, "missing")) == null);
+
+    // A second publication is a second commit, not a third write merged with
+    // the first: the counter is per-call, not per-consumer.
+    try contributeProgress(std.testing.allocator, runtime, &.{
+        .{ .consumer = "text", .sequence = 6 },
+    }, &.{});
+    try std.testing.expectEqual(@as(u64, 2), progressCommitCount());
+}
+
+test "contributeProgress piggybacks status writes into the same commit" {
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    resetProgressCommitCountForTest();
+    try contributeProgress(std.testing.allocator, runtime, &.{
+        .{ .consumer = "text", .sequence = 1 },
+    }, &.{
+        .{ .key = "\x00\x00__metadata__:index_status:text", .value = "fake-status-bytes-000001" },
+    });
+    try std.testing.expectEqual(@as(u64, 1), progressCommitCount());
+
+    var txn = try runtime.beginProbe();
+    defer txn.abort();
+    try std.testing.expectEqualStrings("fake-status-bytes-000001", try txn.get("\x00\x00__metadata__:index_status:text"));
+}
+
+test "progress v2 record rejects corruption and ignores legacy v1 keys" {
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    // A v1 writer touching the same consumer leaves no v2 record behind.
+    try saveAppliedSequence(runtime, "text", 41);
+    try std.testing.expect((try loadProgress(std.testing.allocator, runtime, "text")) == null);
+
+    try contributeProgress(std.testing.allocator, runtime, &.{.{ .consumer = "text", .sequence = 9 }}, &.{});
+    // Progress v2 is likewise invisible to a v1-only reader.
+    try std.testing.expectEqual(@as(u64, 41), try loadAppliedSequence(std.testing.allocator, runtime, "text"));
+
+    var encoded = encodeProgressRecord(.{ .applied_sequence = 9 });
+    encoded[progress_magic_v2.len] ^= 1;
+    try std.testing.expectError(error.InvalidDerivedApplyState, decodeProgressRecord(&encoded));
+}
+
+test "contributeProgress never leaves progress ahead of what actually committed" {
+    // Proxy for "crash between effects and progress": fail the progress
+    // commit itself (via allocation-failure injection, the pattern this file
+    // already uses to model partial-write interruption) after a real effects
+    // boundary is durable, and confirm recovery (a fresh read) still reports
+    // only the last value that actually committed — never the attempted,
+    // uncommitted one. The transaction's own atomicity (errdefer txn.abort())
+    // is what the callers in db.zig rely on: `contributeProgress` is always
+    // called strictly after the physical effects and the legacy v1
+    // checkpoint it accompanies, so a crash here can only leave progress
+    // behind those effects, never ahead of them.
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    // The durable boundary "effects" reached: sequence 5.
+    try contributeProgress(std.testing.allocator, runtime, &.{.{ .consumer = "text", .sequence = 5 }}, &.{});
+    try std.testing.expectEqual(@as(u64, 5), (try loadProgress(std.testing.allocator, runtime, "text")).?.applied_sequence);
+
+    // A later attempt to advance to sequence 10 fails partway (simulated
+    // crash/OOM) before its commit lands.
+    var failed_once = false;
+    for (0..256) |fail_index| {
+        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        contributeProgress(failing.allocator(), runtime, &.{.{ .consumer = "text", .sequence = 10 }}, &.{}) catch |err| {
+            if (err != error.OutOfMemory) return err;
+            failed_once = true;
+            // Never ahead of the last real commit, regardless of where the
+            // attempted write failed.
+            try std.testing.expectEqual(@as(u64, 5), (try loadProgress(std.testing.allocator, runtime, "text")).?.applied_sequence);
+            continue;
+        };
+        break;
+    }
+    try std.testing.expect(failed_once);
+    // Once allowed to run to completion, the real advance is visible.
+    try std.testing.expectEqual(@as(u64, 10), (try loadProgress(std.testing.allocator, runtime, "text")).?.applied_sequence);
+}
+
 pub fn loadAppliedSequence(alloc: Allocator, store: anytype, index_name: []const u8) !u64 {
     const key = try std.fmt.allocPrint(alloc, "{s}{s}", .{ metadata_prefix, index_name });
     defer alloc.free(key);
