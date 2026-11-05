@@ -44790,7 +44790,7 @@ pub const DB = struct {
         return try db_query_result_shape.postprocessTextSearchResult(alloc, req, raw, chunk_backed, .{
             .ctx = self,
             .is_visible = isVisibleSearchHitCallback,
-            .filter_visible_many = filterStoredSearchCandidatesManyCallback,
+            .filter_visible_many = if (chunk_backed) filterStoredArtifactCandidatesManyCallback else filterStoredSearchCandidatesManyCallback,
             .resolve_parent_id = resolveChunkParentIdCallback,
             .load_parent_stored = loadParentStoredForSearchCallback,
             .load_stored = loadStoredSearchDocumentCallback,
@@ -51542,7 +51542,9 @@ fn filterPresentSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
     return keep;
 }
 
-fn filterVisibleSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.SearchHit) ![]bool {
+/// `artifact_hits`: a chunk-backed search, whose artifact hits may carry
+/// projected public ids; their parent comes from each hit's artifact_ref.
+fn filterVisibleSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.SearchHit, artifact_hits: bool) ![]bool {
     const keep = try alloc.alloc(bool, hits.len);
     errdefer alloc.free(keep);
     @memset(keep, true);
@@ -51572,6 +51574,14 @@ fn filterVisibleSearchHitsMany(self: *DB, alloc: Allocator, hits: []const types.
             parent_ids[i] = parent;
             continue;
         }
+        // Chunk-backed member searches project artifact hit ids to public ids
+        // before this filter runs. Identity comes from the hit's own artifact
+        // reference, never from the shape of its id: a shared index also holds
+        // ordinary documents, whose keys may look like public artifact ids.
+        if (artifact_hits) if (hit.artifact_ref) |ref| {
+            parent_ids[i] = try alloc.dupe(u8, ref.document_id);
+            continue;
+        };
         if (hit.stored_data != null) {
             parent_ids[i] = parseChunkParentIdFromStoredAlloc(alloc, hit.stored_data.?) catch {
                 fallback_to_hit[i] = true;
@@ -51653,11 +51663,28 @@ fn filterStoredSearchCandidatesManyCallback(
     alloc: Allocator,
     hits: []const types.SearchHit,
 ) anyerror![]bool {
+    return filterStoredSearchCandidatesMany(ctx, alloc, hits, false);
+}
+
+fn filterStoredArtifactCandidatesManyCallback(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    hits: []const types.SearchHit,
+) anyerror![]bool {
+    return filterStoredSearchCandidatesMany(ctx, alloc, hits, true);
+}
+
+fn filterStoredSearchCandidatesMany(
+    ctx: ?*anyopaque,
+    alloc: Allocator,
+    hits: []const types.SearchHit,
+    artifact_hits: bool,
+) anyerror![]bool {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
     const present = try filterPresentSearchHitsMany(self, alloc, hits, null);
     errdefer alloc.free(present);
     if (ttlDurationNs(self) == 0) return present;
-    const visible = try filterVisibleSearchHitsMany(self, alloc, hits);
+    const visible = try filterVisibleSearchHitsMany(self, alloc, hits, artifact_hits);
     defer alloc.free(visible);
     for (present, visible) |*keep, live| keep.* = keep.* and live;
     return present;
@@ -51677,7 +51704,7 @@ fn filterVectorSearchCandidatesManyCallback(
     const present = try filterPresentSearchHitsMany(presence.db, alloc, hits, presence.embedding_presence_name);
     errdefer alloc.free(present);
     if (ttlDurationNs(presence.db) == 0) return present;
-    const visible = try filterVisibleSearchHitsMany(presence.db, alloc, hits);
+    const visible = try filterVisibleSearchHitsMany(presence.db, alloc, hits, false);
     defer alloc.free(visible);
     for (present, visible) |*keep, live| keep.* = keep.* and live;
     return present;
@@ -51689,7 +51716,7 @@ fn filterVisibleSearchHitsManyCallback(
     hits: []const types.SearchHit,
 ) anyerror![]bool {
     const self: *DB = @ptrCast(@alignCast(ctx orelse return error.InvalidArgument));
-    return try filterVisibleSearchHitsMany(self, alloc, hits);
+    return try filterVisibleSearchHitsMany(self, alloc, hits, false);
 }
 
 fn isVisibleNonChunkSearchHitCallback(
@@ -99618,6 +99645,91 @@ test "db full-text chunk consumer filters expired parents under ttl" {
     defer parent_result.deinit();
     try std.testing.expectEqual(@as(u32, 1), parent_result.total_hits);
     try std.testing.expectEqualStrings("doc:fresh", parent_result.hits[0].id);
+}
+
+test "db full-text ttl checks an artifact-shaped document key under its own timestamp" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var db = try DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+    const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
+    try db.setSchema(.{ .version = 1, .default_type = "_default", .ttl_duration_ns = ttl_duration_ns });
+    try db.addIndex(.{ .name = "ft", .kind = .full_text, .config_json = "{}" });
+    // A fresh ordinary document whose key happens to be a well-formed public
+    // artifact id naming an expired document. It must stay visible.
+    const shaped_key = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:old", "body_chunks_v1", 0);
+    defer alloc.free(shaped_key);
+    const now_ns = currentTimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:old", .value = "{\"body\":\"stale words\"}" }},
+        .timestamp_ns = now_ns - 2 * ttl_duration_ns,
+        .sync_level = .full_index,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = shaped_key, .value = "{\"body\":\"fresh words\"}" }},
+        .timestamp_ns = now_ns,
+        .sync_level = .full_index,
+    });
+    try waitForDerivedReplayTarget(&db);
+    var result = try waitForSearchResult(alloc, &db, .{
+        .index_name = "ft",
+        .full_text = .{ .match = .{ .field = "body", .text = "fresh" } },
+    }, 1);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings(shaped_key, result.hits[0].id);
+}
+
+test "db shared chunk-backed index checks an artifact-shaped document key under its own timestamp" {
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+    var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{ .owner_id = "worker-a", .dense_embedder = deterministic.interface() },
+        .start_index_workers = false,
+    });
+    defer db.close();
+    const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
+    try db.setSchema(.{ .version = 1, .default_type = "_default", .ttl_duration_ns = ttl_duration_ns });
+    // The default index holds ordinary documents and, through the chunker's
+    // full_text_index, chunks: it is chunk-backed but not chunk-only.
+    try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+    try db.addIndex(.{
+        .name = "dv_v1",
+        .kind = .dense_vector,
+        .config_json = "{\"field\":\"embedding\",\"dims\":3,\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"artifact_name\":\"body_chunks_v1\",\"chunker\":{\"provider\":\"antfly\",\"store_chunks\":false,\"full_text_index\":{},\"text\":{\"target_tokens\":4,\"overlap_tokens\":1}}}}",
+    });
+    // A fresh ordinary document whose key encodes a chunk of an expired one.
+    const shaped_key = try expectedChunkArtifactPublicIdAlloc(alloc, "doc:old", "body_chunks_v1", 0);
+    defer alloc.free(shaped_key);
+    const now_ns = currentTimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:old", .value = "{\"body\":\"stale words\"}" }},
+        .timestamp_ns = now_ns - 2 * ttl_duration_ns,
+        .sync_level = .full_index,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = shaped_key, .value = "{\"title\":\"zebracorn\"}" }},
+        .timestamp_ns = now_ns,
+        .sync_level = .full_index,
+    });
+    try db.enrichment_runtime.?.waitForApplied(2);
+    try waitForDerivedReplayTarget(&db);
+    try std.testing.expect(try db.core.textIndexIsChunkBacked(alloc, "full_text_index_v0"));
+    var result = try waitForSearchResult(alloc, &db, .{
+        .index_name = "full_text_index_v0",
+        .full_text = .{ .match = .{ .field = "title", .text = "zebracorn" } },
+        .return_mode = .member,
+    }, 1);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(u32, 1), result.total_hits);
+    try std.testing.expectEqualStrings(shaped_key, result.hits[0].id);
 }
 
 test "db full-text ttl filters before pagination and count-only totals" {

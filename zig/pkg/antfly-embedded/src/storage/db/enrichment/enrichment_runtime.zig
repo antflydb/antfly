@@ -36260,7 +36260,11 @@ test "durable enrichment server retry deadline survives restart without early ex
         setRetryAfterHint(&runtime, hint);
         runtime.recordRetryableError(std.testing.io, error.RemoteDocumentFetchFailed, .request);
         const deadline = runtime.next_retry_at_ms;
-        try std.testing.expectEqual(before +| hint, deadline);
+        // Never before the server's minimum; after it, at most the bounded
+        // jitter window (half the capped backoff).
+        const cap = transient_worker_retry_max_sleep_ms;
+        try std.testing.expect(deadline >= before +| hint);
+        try std.testing.expect(deadline <= before +| @max(hint, cap) +| cap / 2);
         try std.testing.expectEqual(@as(u64, 0), runtime.retry_after_hint_ms);
         const persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
         try std.testing.expectEqual(deadline, persisted.next_retry_at_ms);
@@ -36274,7 +36278,10 @@ test "durable enrichment server retry deadline survives restart without early ex
         try std.testing.expectEqual(deadline, runtime.next_retry_at_ms);
         try std.testing.expectEqual(ForegroundCatchUpDecision.retry_in_progress, foregroundCatchUpDecision(runtime.applied_sequence, 7, runtime.target_sequence, runtime.worker_failed, runtime.retrying, clock.clock().nowRealtimeMs() >= runtime.next_retry_at_ms));
         if (hint != std.math.maxInt(u64)) {
-            clock.advanceMs(hint - 30_000);
+            // Still waiting just before the persisted deadline, runnable at it.
+            clock.advanceMs(deadline - 1 - clock.clock().nowRealtimeMs());
+            try std.testing.expectEqual(ForegroundCatchUpDecision.retry_in_progress, foregroundCatchUpDecision(runtime.applied_sequence, 7, runtime.target_sequence, runtime.worker_failed, runtime.retrying, clock.clock().nowRealtimeMs() >= runtime.next_retry_at_ms));
+            clock.advanceMs(1);
             try std.testing.expectEqual(ForegroundCatchUpDecision.run_pass, foregroundCatchUpDecision(runtime.applied_sequence, 7, runtime.target_sequence, runtime.worker_failed, runtime.retrying, clock.clock().nowRealtimeMs() >= runtime.next_retry_at_ms));
         }
     }
@@ -40831,9 +40838,15 @@ test "graph projection routing writer honors root tags without nested suppressio
     }
 }
 
+/// Whether the transcriber can take the already acquired recording. A provider
+/// this build does not recognize (or a config it cannot read) keeps the
+/// URL-based path; the producer itself validates its configuration.
 fn supportsBorrowedTranscriptionAudio(alloc: Allocator, config_json: []const u8) !bool {
     const transcribing = @import("antfly_transcribing");
-    var parsed = try std.json.parseFromSlice(struct { provider: transcribing.Provider }, alloc, config_json, .{ .ignore_unknown_fields = true });
+    var parsed = std.json.parseFromSlice(struct { provider: transcribing.Provider }, alloc, config_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
     defer parsed.deinit();
     return parsed.value.provider.supportsResolvedAudio();
 }
