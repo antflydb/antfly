@@ -2995,7 +2995,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = object_wal_mod,
         // Cache imports reach the archive engine too. Keep this owner focused
         // on shared WAL storage, native admission and captured-cut contracts.
-        .filters = &.{ "serverless indexed", "serverless multiprovider", "external lake shared collector registry", "external lake bounded WAL cuts", "external lake segmented WAL", "external lake WAL collection", "external lake unified WAL" },
+        .filters = selectTestFilters(b, &.{ "serverless indexed", "serverless multiprovider", "external lake shared collector registry", "external lake bounded WAL cuts", "external lake segmented WAL", "external lake WAL collection", "external lake unified WAL", "serverless object WAL whole-log" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-object-wal-test", "Run shared object WAL, lake adaptation and reclamation contracts")
@@ -3176,6 +3176,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     b.step("distributed-sql-test", "Verify distributed lake SQL semantics, RPC, ownership and recovery")
         .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, distributed_sql_tests, distributed_sql_filters).step);
 
+    const lake_vacuum_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_vacuum_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, lake_vacuum_mod, true, true);
+    lake_vacuum_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const lake_vacuum_tests = b.addTest(.{
+        .root_module = lake_vacuum_mod,
+        .filters = selectTestFilters(b, &.{ "external lake vacuum", "external lake expiring", "external lake bounded WAL retained cuts" }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lake-vacuum-test", "Run bounded lake maintenance, fencing and recovery tests").dependOn(&addFilteredTestRunArtifact(b, lake_vacuum_tests).step);
     const text_frontier_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_text_frontier_test_root.zig"),
         .target = target,
@@ -5332,6 +5345,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = lib_standalone_runtime_test_mod,
         .filters = selectTestFilters(b, &.{
             "standalone runtime module compiles",
+            "standalone metadata admission observes cancellation",
             "standalone.runtime.test.system catalog",
             "catalog.domain.",
             "standalone runtime local generator accepts media url data uris",

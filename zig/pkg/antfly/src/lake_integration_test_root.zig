@@ -51,6 +51,7 @@ test {
     _ = @import("api/lake_index_selection.zig");
     _ = @import("api/lake_index_reader_lease.zig");
     _ = @import("api/lake_index_gc.zig");
+    _ = @import("api/lake_index_gc_progress.zig");
     _ = @import("api/lake_index_ordered_rows.zig");
     _ = @import("api/lake_index_native_files.zig");
     _ = @import("api/lake_index_native_text.zig");
@@ -90,7 +91,6 @@ test {
     _ = @import("api/lake_index_sort_stream.zig");
     _ = @import("api/lake_artifact_ranges.zig");
     _ = @import("api/lake_index_text_best_first.zig");
-    _ = @import("api/lake_index_text_compaction.zig");
     _ = @import("api/lake_index_text_statistics.zig");
     _ = @import("api/lake_query_metrics.zig");
     _ = @import("api/lake_index_search_filter.zig");

@@ -1086,8 +1086,7 @@ pub const Operations = struct {
                     context: operation.RequestContext,
                     fn canceled(ptr: *const anyopaque) bool {
                         const deadline_context: *const @This() = @ptrCast(@alignCast(ptr));
-                        deadline_context.context.ensureActive() catch return true;
-                        return false;
+                        return deadline_context.context.isCancellationRequested();
                     }
                 };
                 const deadline: Deadline = .{ .context = request };
