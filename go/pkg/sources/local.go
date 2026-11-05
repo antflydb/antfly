@@ -33,6 +33,9 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
+
+	"github.com/gofrs/flock"
 )
 
 // LocalRootsEnv lists the only directories a local connection may open, using
@@ -291,23 +294,22 @@ func (c *LocalConnector) AcquireMedia(ctx context.Context, r Request, o Item) ([
 		return nil, true, err
 	}
 	key := strings.Join([]string{c.Root, o.Path, o.Revision, configString(o.Metadata, localModifiedKey)}, "\x00")
-	if data, ok := localSnapshots.get(key); ok {
-		return data, true, nil
-	}
-	body, err := c.OpenMedia(ctx, r, o, MediaRange{Length: o.Size})
-	if err != nil {
-		return nil, true, err
-	}
-	data := make([]byte, o.Size)
-	_, err = io.ReadFull(body, data)
-	if closeErr := body.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return nil, true, err
-	}
-	localSnapshots.put(key, data)
-	return data, true, nil
+	data, err := localSnapshots.acquire(ctx, key, o.Size, func() ([]byte, error) {
+		body, err := c.OpenMedia(ctx, r, o, MediaRange{Length: o.Size})
+		if err != nil {
+			return nil, err
+		}
+		data := make([]byte, o.Size)
+		_, err = io.ReadFull(body, data)
+		if closeErr := body.Close(); err == nil {
+			err = closeErr
+		}
+		if err != nil {
+			return nil, err
+		}
+		return data, ctx.Err()
+	})
+	return data, true, err
 }
 
 // AcquiredMediaDigest is the revision AcquireMedia verified, or that its snapshot
@@ -376,33 +378,122 @@ func localObjectIntact(store *os.Root, rel, sum string, size int64) (bool, error
 	return hex.EncodeToString(digest.Sum(nil)) == sum, nil
 }
 
+// replaceDamagedLocalObject serializes writers across processes, so one repair
+// cannot replace another's and invalidate what was published in between.
+func replaceDamagedLocalObject(store *os.Root, lockPath, temp, rel, sum string, size int64) error {
+	lock := flock.New(lockPath)
+	if err := lock.Lock(); err != nil {
+		return err
+	}
+	defer lock.Unlock()
+	intact, err := localObjectIntact(store, rel, sum, size)
+	if err != nil {
+		return err
+	}
+	if intact {
+		return store.Remove(temp)
+	}
+	return store.Rename(temp, rel)
+}
+
 // localSnapshotCache retains verified bytes so repeated ranges of one object do
 // not each read and hash it. Keys include the modification time, and every access
 // still passes open's fence. Entries are read-only and never exceed the budget.
+// Concurrent misses for one key share a read, and reads in flight across all keys
+// also stay within the budget.
 type localSnapshotCache struct {
-	mu      sync.Mutex
-	entries map[string][]byte
-	order   []string
-	bytes   int64
+	mu       sync.Mutex
+	entries  map[string][]byte
+	order    []string
+	bytes    int64
+	calls    map[string]*localSnapshotCall
+	inflight int64
+	released chan struct{}
+}
+
+type localSnapshotCall struct {
+	done chan struct{}
+	data []byte
+	err  error
 }
 
 const localSnapshotBudget = maxLocalMediaBytes
 
 var localSnapshots localSnapshotCache
 
-func (c *localSnapshotCache) get(key string) ([]byte, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	data, ok := c.entries[key]
-	return data, ok
+func (c *localSnapshotCache) acquire(ctx context.Context, key string, size int64, read func() ([]byte, error)) ([]byte, error) {
+	if size > localSnapshotBudget {
+		return nil, fmt.Errorf("%w: local object exceeds the %d byte limit", ErrInvalidInput, int64(localSnapshotBudget))
+	}
+	var call *localSnapshotCall
+	for call == nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		c.mu.Lock()
+		if data, ok := c.entries[key]; ok {
+			c.mu.Unlock()
+			return data, nil
+		}
+		if leader, ok := c.calls[key]; ok {
+			c.mu.Unlock()
+			select {
+			case <-leader.done:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+			// A leader's own cancellation says nothing about this request: retry.
+			if errors.Is(leader.err, context.Canceled) || errors.Is(leader.err, context.DeadlineExceeded) {
+				continue
+			}
+			return leader.data, leader.err
+		}
+		if c.inflight+size <= localSnapshotBudget {
+			if c.calls == nil {
+				c.calls = map[string]*localSnapshotCall{}
+			}
+			call = &localSnapshotCall{done: make(chan struct{})}
+			c.calls[key] = call
+			c.inflight += size
+			c.mu.Unlock()
+			break
+		}
+		if c.released == nil {
+			c.released = make(chan struct{})
+		}
+		released := c.released
+		c.mu.Unlock()
+		select {
+		case <-released:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	finished := false
+	defer func() {
+		if !finished {
+			call.err = fmt.Errorf("local object read failed")
+		}
+		c.mu.Lock()
+		c.inflight -= size
+		delete(c.calls, key)
+		if call.err == nil {
+			c.store(key, call.data)
+		}
+		if c.released != nil {
+			close(c.released)
+			c.released = nil
+		}
+		c.mu.Unlock()
+		close(call.done)
+	}()
+	call.data, call.err = read()
+	finished = true
+	return call.data, call.err
 }
 
-func (c *localSnapshotCache) put(key string, data []byte) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if _, ok := c.entries[key]; ok || int64(len(data)) > localSnapshotBudget {
-		return
-	}
+// store requires c.mu.
+func (c *localSnapshotCache) store(key string, data []byte) {
 	if c.entries == nil {
 		c.entries = map[string][]byte{}
 	}
@@ -466,18 +557,20 @@ func PutLocalObject(root, prefix, ext string, content io.Reader) (LocalObject, e
 	}
 	sum := hex.EncodeToString(digest.Sum(nil))
 	rel := path.Join(dir, sum+ext)
-	// Replacing an intact object would change its modification time and invalidate
-	// records already published for it. A damaged one is repaired by the rename.
-	if intact, err := localObjectIntact(store, rel, sum, size); err != nil {
-		return LocalObject{}, err
-	} else if intact {
+	// A hard link publishes atomically and never replaces an existing object, whose
+	// modification time pins records already published for it.
+	switch err := store.Link(temp, rel); {
+	case err == nil:
 		if err := store.Remove(temp); err != nil {
 			return LocalObject{}, err
 		}
-		committed = true
-		return LocalObject{Path: rel, SHA256: sum, Size: size}, nil
-	}
-	if err := store.Rename(temp, rel); err != nil {
+	case errors.Is(err, fs.ErrExist) || errors.Is(err, errors.ErrUnsupported) || errors.Is(err, syscall.EPERM) || errors.Is(err, syscall.ENOTSUP):
+		// Writers meet here only for an existing object, or a filesystem without
+		// links, so hashing it under the lock does not delay ordinary uploads.
+		if err := replaceDamagedLocalObject(store, filepath.Join(root, filepath.FromSlash(dir), ".put.lock"), temp, rel, sum, size); err != nil {
+			return LocalObject{}, err
+		}
+	default:
 		return LocalObject{}, err
 	}
 	committed = true

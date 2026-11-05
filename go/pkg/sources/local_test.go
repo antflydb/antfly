@@ -27,6 +27,8 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -61,7 +63,9 @@ func TestLocalPutIsContentAddressedAndIdempotent(t *testing.T) {
 	require.Equal(t, before.ModTime(), after.ModTime(), "a retried put must not invalidate published records")
 	entries, err := os.ReadDir(filepath.Join(root, "uploads", "objects", "sha256"))
 	require.NoError(t, err)
-	require.Len(t, entries, 1, "a retried put must leave no temporary files")
+	for _, entry := range entries {
+		require.NotContains(t, entry.Name(), ".tmp", "a retried put must leave no temporary files")
+	}
 	for _, invalid := range []string{"../escape", "/abs", "a/../b", `a\b`} {
 		_, err := PutLocalObject(root, invalid, "", strings.NewReader("x"))
 		require.ErrorIs(t, err, ErrInvalidInput, invalid)
@@ -83,6 +87,157 @@ func TestLocalPutRepairsDamagedObject(t *testing.T) {
 	require.NoError(t, err)
 	_, err = VerifyMediaDigest(context.Background(), &LocalConnector{Root: root}, localRequest(t, ""), inventory.Objects[0])
 	require.NoError(t, err)
+}
+
+func TestLocalPutConcurrentWritersKeepOnePublishedObject(t *testing.T) {
+	root := t.TempDir()
+	const writers = 32
+	stamps := make([]time.Time, writers)
+	objects := make([]LocalObject, writers)
+	errs := make([]error, writers)
+	var ready, done sync.WaitGroup
+	start := make(chan struct{})
+	for i := range writers {
+		ready.Add(1)
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			ready.Done()
+			<-start
+			objects[i], errs[i] = PutLocalObject(root, "", ".bin", strings.NewReader("same bytes"))
+			if errs[i] == nil {
+				info, err := os.Stat(filepath.Join(root, objects[i].Path))
+				errs[i] = err
+				if err == nil {
+					stamps[i] = info.ModTime()
+				}
+			}
+		}()
+	}
+	ready.Wait()
+	close(start)
+	done.Wait()
+	for i := range writers {
+		require.NoError(t, errs[i])
+		require.Equal(t, objects[0], objects[i])
+		require.True(t, stamps[0].Equal(stamps[i]), "a later writer replaced the published object")
+	}
+	entries, err := os.ReadDir(filepath.Dir(filepath.Join(root, objects[0].Path)))
+	require.NoError(t, err)
+	for _, entry := range entries {
+		require.NotContains(t, entry.Name(), ".tmp", "writers must not leave temporary files")
+	}
+}
+
+func TestLocalPutConcurrentRepairsConverge(t *testing.T) {
+	root := t.TempDir()
+	object := localPut(t, root, "", ".bin", "original")
+	path := filepath.Join(root, object.Path)
+	require.NoError(t, os.WriteFile(path, []byte("corrupt!"), 0o600))
+	var done sync.WaitGroup
+	errs := make([]error, 16)
+	for i := range errs {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			_, errs[i] = PutLocalObject(root, "", ".bin", strings.NewReader("original"))
+		}()
+	}
+	done.Wait()
+	for _, err := range errs {
+		require.NoError(t, err)
+	}
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "original", string(data))
+	inventory, err := (&LocalConnector{Root: root}).Enumerate(context.Background(), localRequest(t, ""))
+	require.NoError(t, err, "the lock file must not disturb enumeration")
+	require.Len(t, inventory.Objects, 1)
+}
+
+func TestLocalSnapshotMissesShareOneRead(t *testing.T) {
+	var cache localSnapshotCache
+	var reads atomic.Int32
+	release := make(chan struct{})
+	read := func() ([]byte, error) {
+		reads.Add(1)
+		<-release
+		return []byte("verified"), nil
+	}
+	var done sync.WaitGroup
+	results := make([][]byte, 16)
+	errs := make([]error, 16)
+	for i := range results {
+		done.Add(1)
+		go func() {
+			defer done.Done()
+			results[i], errs[i] = cache.acquire(context.Background(), "key", 8, read)
+		}()
+	}
+	require.Eventually(t, func() bool { return reads.Load() == 1 }, time.Second, time.Millisecond)
+	time.Sleep(20 * time.Millisecond)
+	close(release)
+	done.Wait()
+	require.EqualValues(t, 1, reads.Load())
+	for i := range results {
+		require.NoError(t, errs[i])
+		require.Equal(t, "verified", string(results[i]))
+	}
+}
+
+func TestLocalSnapshotReadsStayWithinBudgetAndHonorCancellation(t *testing.T) {
+	var cache localSnapshotCache
+	release := make(chan struct{})
+	started := make(chan struct{})
+	first := make(chan error, 1)
+	go func() {
+		_, err := cache.acquire(context.Background(), "a", localSnapshotBudget, func() ([]byte, error) {
+			close(started)
+			<-release
+			return nil, errors.New("read failed")
+		})
+		first <- err
+	}()
+	<-started
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := cache.acquire(ctx, "b", 1, func() ([]byte, error) {
+		t.Error("a read must not start beyond the budget")
+		return nil, nil
+	})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	waiting := make(chan []byte, 1)
+	go func() {
+		data, _ := cache.acquire(context.Background(), "c", 1, func() ([]byte, error) { return []byte("c"), nil })
+		waiting <- data
+	}()
+	close(release)
+	require.EqualError(t, <-first, "read failed")
+	require.Equal(t, "c", string(<-waiting), "releasing the budget must wake waiters")
+	_, err = cache.acquire(context.Background(), "big", localSnapshotBudget+1, nil)
+	require.ErrorIs(t, err, ErrInvalidInput)
+}
+
+func TestLocalSnapshotFollowersSurviveLeaderCancellation(t *testing.T) {
+	var cache localSnapshotCache
+	release := make(chan struct{})
+	started := make(chan struct{})
+	go func() {
+		_, _ = cache.acquire(context.Background(), "key", 1, func() ([]byte, error) {
+			close(started)
+			<-release
+			return nil, context.Canceled
+		})
+	}()
+	<-started
+	result := make(chan []byte, 1)
+	go func() {
+		data, _ := cache.acquire(context.Background(), "key", 1, func() ([]byte, error) { return []byte("x"), nil })
+		result <- data
+	}()
+	time.Sleep(10 * time.Millisecond)
+	close(release)
+	require.Equal(t, "x", string(<-result))
 }
 
 func BenchmarkLocalRangeDelivery(b *testing.B) {

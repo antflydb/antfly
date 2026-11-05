@@ -143,6 +143,8 @@ fn setChatImage(a: A, part: *V, url: []const u8) !void {
 fn resolveChatResources(a: A, request: V, found: ChatSources, port: ?Port) !void {
     if (found.resources.items.len == 0) return;
     const fetch = (port orelse return error.InferenceSourceUnsupported).fetch orelse return error.InferenceSourceUnsupported;
+    // The serializer below has a fixed nesting depth, so guard the whole request.
+    try validateDepth(request, 0);
     // Reject before any I/O. Table parts are already expanded in this count.
     var counter: std.Io.Writer.Discarding = .init(&.{});
     try std.json.Stringify.value(request, .{}, &counter.writer);
@@ -702,6 +704,23 @@ const PinnedFixture = struct {
         self.served = true;
     }
 };
+
+test "httpx inference gateway chat source parts reject deep requests before serializing" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var body: std.ArrayList(u8) = .empty;
+    try body.appendSlice(a,
+        \\{"messages":[{"role":"user","content":[{"type":"source","source":{"type":"source","uri":"https://e.org/a","mime_type":"audio/wav","version":"\"v\"","length":1}}]}],"extra":
+    );
+    try body.appendNTimes(a, '[', 300);
+    try body.appendNTimes(a, ']', 300);
+    try body.append(a, '}');
+    const request = try std.json.parseFromSliceLeaky(V, a, body.items, .{ .max_value_len = body.items.len });
+    var fake: ChatFake = .{};
+    try std.testing.expectError(error.InferenceRequestTooLarge, resolve(a, request, fake.port()));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+}
 
 test "httpx inference gateway chat source resources reach private addresses only through a base URL" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
