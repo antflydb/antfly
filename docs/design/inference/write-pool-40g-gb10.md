@@ -1,5 +1,9 @@
 # Write-pool experiment with a 40 GiB device target
 
+For the current automatic batching contract, explicit serving gates and expanded
+qualification, see [write-pool production serving](write-pool-production.md).
+The campaigns below retain their original narrower experimental scope.
+
 This experiment runs BF16 EmbeddingGemma2, Whisper small, the FP32
 GLiNER2.5 boundary extractor and LightOnOCR3 0.8B together on the DGX Spark.
 It follows the [read-pool experiment](read-pool-40g-gb10.md). It qualifies the

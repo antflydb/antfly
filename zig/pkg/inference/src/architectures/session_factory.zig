@@ -8023,6 +8023,7 @@ const arch_vtable = Session.VTable{
     .inputInfo = &archInputInfo,
     .outputInfo = &archOutputInfo,
     .independentBatchRows = &archIndependentBatchRows,
+    .forwardBatchPolicy = &archForwardBatchPolicy,
     .runGeometry = &archRunGeometry,
     .backend = &archBackend,
     .close = &archClose,
@@ -8593,6 +8594,8 @@ fn archExecutionCapabilities(raw: *anyopaque) @import("../backends/session.zig")
     if (comptime !build_options.enable_cuda) return .{};
     const self: *ArchSession = @ptrCast(@alignCast(raw));
     if (self.backend_type != .cuda) return .{};
+    if (self.arch_config == .gliner_boundary and self.backend_data.cuda.compute.capability_profile == .gliner25_boundary)
+        return .{ .boundary_batch_rows = 8, .boundary_batch_tokens = 512, .boundary_batch_padded_tokens = 8 * 512, .boundary_batch_collection_wait_us = 1000 };
     if (self.arch_config == .embedding_gemma2) {
         const eligible = self.arch_config.embedding_gemma2.resident != null and
             self.backend_data.cuda.compute.capability_profile == .embedding_gemma2 and
@@ -11662,6 +11665,32 @@ test "native stage geometry resolves Whisper encoder and decoder output residenc
     const decoder = (try archRunGeometry(&arch, .{ .tensors = &.{ ids, hidden } }, 8)).?;
     try std.testing.expectEqual(@as(usize, 1500), decoder.sequence);
     try std.testing.expectEqual(@as(usize, 8 * 3 * 51865 * 4 + 24), decoder.output_bytes);
+}
+
+fn archForwardBatchPolicy(ptr: *anyopaque, inputs: []const Tensor) @import("../backends/session.zig").ForwardBatchPolicy {
+    const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    // Mel preparation for unequal audio lengths can finish milliseconds apart.
+    // A bounded encoder window gives ready peers time to meet without making
+    // every cached decoder token pay a batch-fill delay. Admission still plans
+    // the actual fused geometry before any forward.
+    if (self.backend_type == .cuda and self.arch_config == .whisper and
+        inputs.len == 1 and inputs[0].dtype == .f32 and
+        inputs[0].shape.len == 3 and std.mem.eql(u8, inputs[0].name, "input_features"))
+        return .{ .max_items = 4, .max_rows = 4, .collection_wait_us = 5000 };
+    return .{};
+}
+
+test "tensor microbatch Whisper collection policy belongs only to the CUDA encoder stage" {
+    var arch = ArchSession{ .allocator = std.testing.allocator, .arch_config = .{ .whisper = .{} }, .backend_type = .cuda, .backend_data = undefined };
+    const encoder = Tensor{ .data = &.{}, .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false, .dtype = .f32, .shape = &.{ 1, 80, 3000 }, .name = "input_features" };
+    const selected = archForwardBatchPolicy(&arch, &.{encoder});
+    try std.testing.expectEqual(@as(usize, 4), selected.max_items);
+    try std.testing.expectEqual(@as(usize, 4), selected.max_rows);
+    try std.testing.expectEqual(@as(u64, 5000), selected.collection_wait_us);
+    const decoder = Tensor{ .data = &.{}, .allocator = std.testing.allocator, .owns_data = false, .owns_shape = false, .dtype = .i64, .shape = &.{ 1, 1 }, .name = "input_ids" };
+    try std.testing.expectEqual(@as(u64, 0), archForwardBatchPolicy(&arch, &.{ decoder, encoder }).collection_wait_us);
+    arch.backend_type = .native;
+    try std.testing.expectEqual(@as(u64, 0), archForwardBatchPolicy(&arch, &.{encoder}).collection_wait_us);
 }
 
 fn archIndependentBatchRows(ptr: *anyopaque, inputs: []const Tensor) bool {

@@ -22,6 +22,9 @@ const processor = @import("pipelines/gliner_boundary_processor.zig");
 test {
     _ = @import("server/executor_microbatch.zig");
     _ = @import("server/read_pool_microbatch.zig");
+    _ = @import("server/write_pool_microbatch.zig");
+    _ = @import("server/tensor_microbatch.zig");
+    _ = @import("architectures/whisper.zig");
     _ = @import("pipelines/text_batch_admission.zig");
     _ = @import("pipelines/batch_execution.zig");
     _ = @import("pipelines/embedding.zig");
