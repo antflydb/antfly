@@ -502,6 +502,54 @@ retry delay for JSON and non-JSON errors without replaying writes.
 
 ## Validation
 
+### Committed acceptance and compact read bindings (2026-11-05)
+
+- Fix `adc07ca4f1` keeps successful policy/scan CAS responses caller-owned before
+  admission, removes the redundant acknowledgment read, and treats structural
+  reconcile scheduling as a best-effort hint. Fault tests exercise unavailable
+  rereads, failed hints, every response allocation failure, and rejected CAS.
+- Main was fetched and checked at
+  `6c0b004e95ad947587cbc4bbb60f4812fb714b28`; it was already incorporated.
+  Metadata protocol 82 requires the compact binding capability.
+- The retained-job regression uses a 14,768,412-byte catalog. One hundred warm
+  binding captures allocate zero bytes, compared with the review probe's
+  49,244,924-byte peak for the former full-resource path. The private HTTP client
+  limits the entire binding reply to 4 KiB. Native tests cover semantic refresh,
+  standalone progress/restore, malformed neighbors, endpoint discovery,
+  unsupported peers, deadline expiry and authority-incarnation mismatches.
+- All 135 native build steps succeed: 70 API/metadata tests, 172 storage/privacy
+  tests, two ABI checks, two data-node transport tests and the standalone binding
+  regression pass. Log: `.privacy-binding-build.log`.
+- The complete TypeScript SDK suite passes 601 tests with one opt-in skip;
+  type checking passes. Error cases cover 409/503, JSON/non-JSON responses,
+  numeric retry delays and unknown mutation outcomes without automatic replay.
+  Zig formatting, license headers and the Apache boundary checks pass.
+- Raft HTTP passes all applicable cases: 40 passed, one opt-in model case
+  skipped and four standalone restore cases excluded in 932.01 s.
+  Log: `.privacy-binding-http-raft.log`.
+- Full standalone HTTP run: 43 passed, one opt-in model case skipped and one
+  curation setup failure in 656.57 s. The failing unprotected-destination case
+  received `ResolverCurationConflict` while creating its initial proposal,
+  before any privacy policy mutation. Both curation variants passed an isolated
+  unchanged-binary rerun (2 passed in 7.98 s). The intermittent proposal conflict
+  remains recorded; this qualification does not claim a clean full-suite run.
+  Logs: `.privacy-binding-http-standalone.log`,
+  `.privacy-binding-http-curation-recheck.log`.
+- The pinned default-model gate passes in 25.32 s with Metal required and
+  selected, covering long-document preview, original offsets, backfill,
+  protected reads, findings and readiness. An initial run passed preview but
+  timed out after 120 s waiting for background protection and logged a cancelled
+  enrichment request. The unchanged-binary rerun passed; the initial timeout is
+  retained rather than treated as a clean first run. Logs:
+  `.privacy-binding-metal.log`, `.privacy-binding-metal-recheck.log`; backend
+  evidence: `.benchmark-results/privacy/binding-fixes/metal-server-first.log`
+  and `metal-server-recheck.log`. Inference/batching code is unchanged; CUDA
+  throughput was not remeasured in this qualification.
+- Required cache cleanup completed, preserving active/recent output and leaving
+  197.6 GiB free (`.privacy-binding-gc.log`).
+- Qualified server SHA-256:
+  `27073455df3d0d1c5b1550393ff17253aab7b8fdfb92107279c6eae550f01325`.
+
 ### Mutation outcome forwarding (2026-11-05)
 
 - Merge `8b041aff4c` incorporates main through
