@@ -60,6 +60,12 @@ its explicit rejection is not positive locking implementation credit. No origina
 locking case remains unresolved. The authoritative dispositions and exact test
 names remain in the parity ledger.
 
+An audit across the entire original corpus, rather than only the locking family,
+finds 106 lock-bearing statements: ten implemented, four rejected and 92
+superseded, with zero unresolved. The other three rejected originals
+(`sql-0577`, `sql-0578`, `sql-0618`) attach SELECT row-lock clauses to UPDATE;
+they are invalid PostgreSQL statements, not missing UPDATE locking support.
+
 The native integration gate covers contention, NOWAIT diagnostics, SKIP LOCKED
 refill, write ownership, savepoint release/rollback, failed-transaction cleanup,
 prepared lock custody after connection close, ordinary read barriers, and cold
