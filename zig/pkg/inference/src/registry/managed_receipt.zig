@@ -544,3 +544,25 @@ test "validated managed receipt cleans up every allocation failure" {
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(allocator, Runner.run, .{model_dir});
 }
+
+/// Cheap publication identity for resident sessions and load flights. Receipt
+/// validation still owns artifact integrity; this token binds its source and
+/// artifact manifest to the generation actually loaded, without hashing weights.
+pub fn publicationGeneration(allocator: std.mem.Allocator, io: std.Io, root: []const u8) !?[32]u8 {
+    const progress = try managedPath(allocator, root, in_progress_filename);
+    defer allocator.free(progress);
+    const plan = try managedPath(allocator, root, plan_filename);
+    defer allocator.free(plan);
+    const complete = try managedPath(allocator, root, complete_filename);
+    defer allocator.free(complete);
+    if (try publicationBlockedPaths(std.Io.Dir.cwd(), io, progress, plan)) return error.IncompleteManagedDownload;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, complete, allocator, .limited(max_receipt_bytes)) catch |err| switch (err) {
+        error.FileNotFound, error.NotDir => return null,
+        else => return err,
+    };
+    defer allocator.free(bytes);
+    if (try publicationBlockedPaths(std.Io.Dir.cwd(), io, progress, plan)) return error.IncompleteManagedDownload;
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return digest;
+}

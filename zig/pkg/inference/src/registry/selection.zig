@@ -234,62 +234,118 @@ pub const Inventory = struct {
 
 pub const Cache = struct {
     allocator: std.mem.Allocator,
+    // Only ownership and publication use this lock; filesystem IO never does.
     mutex: std.Io.Mutex = .init,
-    inventory: ?Inventory = null,
-    rebuilt_at: ?std.Io.Timestamp = null,
+    refresh_mutex: std.Io.Mutex = .init,
+    current: ?*Slot = null,
+    epoch: usize = 0,
     rebuilds: usize = 0,
+
+    const Slot = struct {
+        inventory: Inventory,
+        refs: usize = 1,
+        epoch: usize,
+        rebuilt_at: std.Io.Timestamp,
+    };
+    const Lease = struct {
+        cache: *Cache,
+        slot: *Slot,
+        io: std.Io,
+        fn release(self: Lease) void {
+            self.cache.mutex.lockUncancelable(self.io);
+            self.slot.refs -= 1;
+            const destroy = self.slot.refs == 0;
+            self.cache.mutex.unlock(self.io);
+            if (destroy) {
+                self.slot.inventory.deinit();
+                self.cache.allocator.destroy(self.slot);
+            }
+        }
+    };
 
     pub fn init(allocator: std.mem.Allocator) Cache {
         return .{ .allocator = allocator };
     }
     pub fn deinit(self: *Cache) void {
-        if (self.inventory) |*inventory| inventory.deinit();
+        // The owner joins request workers before destroying the node.
+        if (self.current) |slot| {
+            std.debug.assert(slot.refs == 1);
+            slot.inventory.deinit();
+            self.allocator.destroy(slot);
+        }
     }
+    fn retain(self: *Cache, io: std.Io) !?Lease {
+        try self.mutex.lock(io);
+        defer self.mutex.unlock(io);
+        const slot = self.current orelse return null;
+        if (slot.epoch != self.epoch) return null;
+        slot.refs += 1;
+        return .{ .cache = self, .slot = slot, .io = io };
+    }
+    fn acquire(self: *Cache, io: std.Io, root: []const u8) !Lease {
+        if (try self.retain(io)) |lease| {
+            errdefer lease.release();
+            const unchanged = std.mem.eql(u8, root, lease.slot.inventory.models_dir) and !try lease.slot.inventory.changed(io);
+            if (unchanged) {
+                const age = std.Io.Timestamp.now(io, .awake).nanoseconds - lease.slot.rebuilt_at.nanoseconds;
+                if (age < 5 * std.time.ns_per_s) return lease;
+                // Another caller owns the bounded backstop refresh. Managed
+                // publications are unchanged and execution revalidates its
+                // selected receipt, so readers can retain this generation.
+                if (!self.refresh_mutex.tryLock()) return lease;
+            } else try self.refresh_mutex.lock(io);
+            lease.release();
+        } else try self.refresh_mutex.lock(io);
+        defer self.refresh_mutex.unlock(io);
 
-    fn refresh(self: *Cache, io: std.Io, root: []const u8, force: bool) !void {
-        const now = std.Io.Timestamp.now(io, .awake);
-        if (!force) if (self.inventory) |*inventory| {
-            if (std.mem.eql(u8, root, inventory.models_dir)) {
-                // A bounded full refresh also detects out-of-band edits to
-                // nested artifacts, outside the managed publication protocol.
-                if (self.rebuilt_at) |rebuilt| if (now.nanoseconds - rebuilt.nanoseconds < 5 * std.time.ns_per_s and !try inventory.changed(io)) {
-                    return;
-                };
-            }
-        };
-        const next = try Inventory.loadStable(self.allocator, io, root);
-        if (self.inventory) |*old| old.deinit();
-        self.inventory = next;
-        // Cold FUSE validation can take longer than the refresh interval.
-        // Start freshness at publication so the next request can reuse it.
-        self.rebuilt_at = std.Io.Timestamp.now(io, .awake);
+        // Coalesce queued discovery/lookup refreshes after the first publishes.
+        if (try self.retain(io)) |lease| {
+            errdefer lease.release();
+            const age = std.Io.Timestamp.now(io, .awake).nanoseconds - lease.slot.rebuilt_at.nanoseconds;
+            if (age < 5 * std.time.ns_per_s and std.mem.eql(u8, root, lease.slot.inventory.models_dir) and !try lease.slot.inventory.changed(io)) return lease;
+            lease.release();
+        }
+        self.mutex.lockUncancelable(io);
+        const epoch = self.epoch;
+        self.mutex.unlock(io);
+        var next = try Inventory.loadStable(self.allocator, io, root);
+        errdefer next.deinit();
+        const slot = try self.allocator.create(Slot);
+        errdefer self.allocator.destroy(slot);
+        slot.* = .{ .inventory = next, .epoch = epoch, .rebuilt_at = std.Io.Timestamp.now(io, .awake), .refs = 2 };
+        self.mutex.lockUncancelable(io);
+        if (self.epoch != epoch) {
+            self.mutex.unlock(io);
+            return error.ModelInventoryChanged;
+        }
+        const previous = self.current;
+        self.current = slot;
         self.rebuilds += 1;
+        self.mutex.unlock(io);
+        if (previous) |old| (Lease{ .cache = self, .slot = old, .io = io }).release();
+        return .{ .cache = self, .slot = slot, .io = io };
     }
 
-    /// Explicit publication/refresh notification for in-process installers.
     pub fn invalidate(self: *Cache, io: std.Io) void {
         self.mutex.lockUncancelable(io);
         defer self.mutex.unlock(io);
-        self.rebuilt_at = null;
+        self.epoch +%= 1;
     }
 
     pub fn snapshot(self: *Cache, allocator: std.mem.Allocator, io: std.Io, root: []const u8) !Inventory {
-        try self.mutex.lock(io);
-        defer self.mutex.unlock(io);
-        try self.refresh(io, root, true);
-        return self.inventory.?.clone(allocator);
+        const lease = try self.acquire(io, root);
+        defer lease.release();
+        return lease.slot.inventory.clone(allocator);
     }
 
     pub fn resolve(self: *Cache, allocator: std.mem.Allocator, io: std.Io, root: []const u8, requested: []const u8, task: ?[]const u8) !?[]u8 {
         const path = blk: {
-            try self.mutex.lock(io);
-            defer self.mutex.unlock(io);
-            try self.refresh(io, root, false);
-            const selected = (try self.inventory.?.lookup(requested, task)) orelse return null;
+            const lease = try self.acquire(io, root);
+            defer lease.release();
+            const selected = (try lease.slot.inventory.lookup(requested, task)) orelse return null;
             break :blk try allocator.dupe(u8, selected);
         };
         errdefer allocator.free(path);
-        // Never let a cached pin authorize replaced/incomplete artifacts.
         var temporary = std.heap.ArenaAllocator.init(allocator);
         defer temporary.deinit();
         const names = try registry.managedModelSelectorsAlloc(temporary.allocator(), io, path);

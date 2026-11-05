@@ -2941,6 +2941,9 @@ pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const 
         if (std.mem.startsWith(u8, entry.name, prefix) and
             !isManagedVariantInstallLeaf(requested_name, entry.name))
         {
+            const candidate = try std.fs.path.join(allocator, &.{ search_dir, entry.name });
+            defer allocator.free(candidate);
+            if (!isModelDir(io, candidate)) continue;
             if (best_name != null) return error.AmbiguousModelIdentifier;
             best_name = try allocator.dupe(u8, entry.name);
         }
@@ -3043,6 +3046,7 @@ test "resolveVariant retains legacy suffix resolution" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "models/owner/model-q4_0");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-q4_0/model.gguf", .data = "weights" });
 
     const models_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "models" });
     defer allocator.free(models_dir);
@@ -3287,7 +3291,27 @@ test "resolveVariant rejects multiple legacy suffixes" {
     defer tmp.cleanup();
     try tmp.dir.createDirPath(io, "models/owner/model-q4");
     try tmp.dir.createDirPath(io, "models/owner/model-q8");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-q4/model.gguf", .data = "weights" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-q8/model.gguf", .data = "weights" });
     const root = try tmp.dir.realPathFileAlloc(io, "models", a);
     defer a.free(root);
     try std.testing.expectError(error.AmbiguousModelIdentifier, resolveVariant(a, io, root, "owner/model"));
+}
+
+test "resolveVariant ignores empty and incomplete legacy candidates" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/owner/model-q4");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-q4/model.gguf", .data = "weights" });
+    try tmp.dir.createDirPath(io, "models/owner/model-z");
+    try tmp.dir.createDirPath(io, "models/owner/model-incomplete");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-incomplete/model.gguf", .data = "weights" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/owner/model-incomplete/.antfly-download-in-progress", .data = "pending" });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    const path = (try resolveVariant(a, io, root, "owner/model")).?;
+    defer a.free(path);
+    try std.testing.expect(std.mem.endsWith(u8, path, "model-q4"));
 }

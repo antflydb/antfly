@@ -1093,9 +1093,11 @@ test "concurrent first prompt cache activations share the node budget" {
     defer manager.loaded_aliases.deinit(allocator);
 
     var first: model_manager_mod.LoadedModel = undefined;
+    first.managed_publication = null;
     first.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
     defer first.prompt_prefix_cache.deinit();
     var second: model_manager_mod.LoadedModel = undefined;
+    second.managed_publication = null;
     second.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
     defer second.prompt_prefix_cache.deinit();
     try manager.loaded.put(allocator, "first", &first);
@@ -1131,9 +1133,11 @@ test "deferred foreign prompt cache eviction does not collapse active share" {
     defer manager.loaded_aliases.deinit(allocator);
 
     var idle: model_manager_mod.LoadedModel = undefined;
+    idle.managed_publication = null;
     idle.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
     defer idle.prompt_prefix_cache.deinit();
     var active: model_manager_mod.LoadedModel = undefined;
+    active.managed_publication = null;
     active.prompt_prefix_cache = runtime.kv.prompt_cache.PromptPrefixCache.init(allocator);
     defer active.prompt_prefix_cache.deinit();
     try manager.loaded.put(allocator, "idle", &idle);
@@ -25147,6 +25151,15 @@ pub const Node = struct {
         entry: model_manager_mod.RuntimeSnapshotEntry,
     ) !?[]const u8 {
         _ = self;
+        if (entry.runtime_kind == .primary) {
+            const publication = @import("../registry/managed_receipt.zig").publicationGeneration(allocator, io, entry.model_dir) catch |err| {
+                if (err == error.OutOfMemory) return err;
+                return null;
+            };
+            // A replacement receipt must never relabel a resident/loading
+            // runtime belonging to the preceding installation generation.
+            if (!std.meta.eql(publication, entry.managed_publication)) return null;
+        }
         const identity = (try loadedModelRequestIdentityAlloc(
             allocator,
             io,
@@ -40802,6 +40815,7 @@ test "dense partial result cleanup owns every allocation exactly once" {
 
 test "audio embedding asset guard releases admission on early failure" {
     var model: model_manager_mod.LoadedModel = undefined;
+    model.managed_publication = null;
     model.embedding_session_lock = .unlocked;
     model.audio_session = null;
     model.audio_projection = null;
@@ -45065,6 +45079,7 @@ test "embeddinggemma2 direct video rejects unsupported backends in both error po
             var pipeline: embedding_mod.EmbeddingPipeline = undefined;
             pipeline.config = .{ .resident_embedding_gemma2 = false };
             var model: model_manager_mod.LoadedModel = undefined;
+            model.managed_publication = null;
             var guard: AudioEmbeddingAssetGuard = undefined;
             var lease: model_manager_mod.EmbeddingAssetLease = undefined;
             try std.testing.expectError(error.UnsupportedVideoBackend, embedDenseInputs(a, &pipeline, &inputs, &model, &guard, &lease));
@@ -46583,6 +46598,7 @@ test "LightOnOCR3 decoder peak ownership preserves caps across failed growth and
     var workspace = memory.ReservedGenerationWorkspace{ .floor = limits, .capacity = capacity };
     defer workspace.borrowed.deinit();
     var model: model_manager_mod.LoadedModel = undefined;
+    model.managed_publication = null;
     model.session = .{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
     var ctx: Context = undefined;
     ctx.cb = null;
@@ -46737,6 +46753,7 @@ test "LightOnOCR3 epoch admission owns shared scratch across page retirement and
     var workspace = memory.ReservedGenerationWorkspace{ .floor = limits, .capacity = .{ .backend_scratch_bytes = backend_capacity } };
     defer workspace.borrowed.deinit();
     var model: model_manager_mod.LoadedModel = undefined;
+    model.managed_publication = null;
     model.session = .{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
     var ctx: Context = undefined;
     ctx.cb = null;
@@ -49618,6 +49635,7 @@ test "dynamic CUDA admission counts admitted pages and rolls back failed batch g
     var workspace = memory.ReservedGenerationWorkspace{ .floor = limits, .capacity = capacity };
     defer workspace.borrowed.deinit();
     var model: model_manager_mod.LoadedModel = undefined;
+    model.managed_publication = null;
     model.session = .{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
     var ctx: Context = undefined;
     ctx.cb = null;
@@ -50525,4 +50543,27 @@ test "model selection cached readers survive concurrent inventory replacement" {
         var snapshot = try cache.snapshot(a, io, root);
         snapshot.deinit();
     }
+}
+
+test "model selection catalogs coalesce and warm readers bypass a backstop refresh" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try installModelSelectionFixture(tmp.dir, "models/generators/acme/model", "gguf:Q4_0", "0123456789abcdef0123456789abcdef01234567");
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var cache = selection_mod.Cache.init(a);
+    defer cache.deinit();
+    var first = try cache.snapshot(a, io, root);
+    defer first.deinit();
+    var second = try cache.snapshot(a, io, root);
+    defer second.deinit();
+    try std.testing.expectEqual(@as(usize, 1), cache.rebuilds);
+    cache.current.?.rebuilt_at = .{ .nanoseconds = 0 };
+    try cache.refresh_mutex.lock(io);
+    defer cache.refresh_mutex.unlock(io);
+    const path = (try cache.resolve(a, io, root, "acme/demo:gguf:Q4_0@0123456789abcdef0123456789abcdef01234567", "generators")).?;
+    a.free(path);
+    try std.testing.expectEqual(@as(usize, 1), cache.rebuilds);
 }
