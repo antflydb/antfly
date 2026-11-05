@@ -441,7 +441,7 @@ await sql.destroy(); // The caller still owns database.
 ```
 
 For typed search relations, migration-table setup, and generated Kysely schema
-interfaces, see the [Kysely guide](../../../docs/guides/kysely.mdx) and
+interfaces, see the [Kysely reference](../sdk/docs/kysely.md) and
 [`examples/kysely.mjs`](examples/kysely.mjs). The optional shared helpers live in
 `@antfly/sdk/kysely`.
 

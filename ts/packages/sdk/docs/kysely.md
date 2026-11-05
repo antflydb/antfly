@@ -1,8 +1,4 @@
----
-title: Type-safe SQL with Kysely
-description: Query embedded and server Antfly, compose search with SQL, and generate schema types.
-order: 10
----
+# Type-safe SQL with Kysely
 
 Kysely builds typed SQL; Antfly executes it. Use the embedded dialect for a local
 database, or the PostgreSQL driver for a server. Optional helpers live in
@@ -51,7 +47,7 @@ try {
 }
 ```
 
-See the runnable `ts/packages/embedded/examples/kysely.mjs` example for search
+See the [runnable embedded example](../../embedded/examples/kysely.mjs) for search
 setup, querying, and type generation in one process.
 
 ## Server connection
