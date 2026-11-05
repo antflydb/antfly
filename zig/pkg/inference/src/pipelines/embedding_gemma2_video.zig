@@ -1238,13 +1238,13 @@ fn inspectSelectedPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, co
 
 /// Presentation time of each selected picture, in microseconds from the first
 /// picture. Slots match the slots delivered to a FrameObserver for this sampling.
-pub fn selectedPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: Control, sampling: Sampling) ![]i64 {
+pub fn selectedPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) ![]i64 {
     const adapter = control.imageWorkControl();
-    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-timestamps", .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } };
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-timestamps", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } };
     if (isWebm(bytes)) {
         var reader = try media.webm.Reader.init(a, &source, .{});
         defer reader.deinit();
-        var index = try video.webm_pictures.index(a, &reader, webmDecodeOptions(source.control, null));
+        var index = try video.webm_pictures.index(a, &reader, webmDecodeOptions(source.control, pool));
         defer index.deinit();
         const selected = try selectWebm(a, index, sampling, source.control, null);
         defer a.free(selected);

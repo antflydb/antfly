@@ -31822,6 +31822,15 @@ test "direct generate preflight counts video without treating it as audio" {
     try std.testing.expectEqual(@as(usize, 4), preflight.decoded_media_bytes);
 }
 
+test "generation maps invalid video to a client error and keeps other failures" {
+    for ([_]anyerror{ error.InvalidVideoInput, error.UnsupportedVideoCodec, error.MissingTransportTables }) |err| {
+        try std.testing.expectEqual(@as(u16, 400), generationRequestFailure(err).?.status);
+    }
+    for ([_]anyerror{ error.Cancelled, error.OutOfMemory }) |err| {
+        if (generationRequestFailure(err)) |failure| try std.testing.expect(failure.status != 400);
+    }
+}
+
 test "generate video dependencies declare their tests" {
     _ = @import("../pipelines/gemma4_video.zig");
     _ = model_caps;
@@ -41573,7 +41582,59 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
         error.UnsupportedVideoBackend => .{ .status = 400, .code = "UNSUPPORTED_VIDEO_BACKEND", .message = "video input requires a Gemma 4 generator with its projector", .retryable = false },
         error.UnsupportedMixedVideoInput => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "a request with video cannot also contain image or audio parts", .retryable = false },
         error.VideoLimitExceeded => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "generation request may contain one video", .retryable = false },
-        error.InvalidVideoInput, error.EmptyVideo, error.UnsupportedVideoCodec, error.UnsupportedVideoProfile => .{ .status = 400, .code = "INVALID_VIDEO", .message = "unsupported, empty, or corrupt video", .retryable = false },
+        error.InvalidVideoInput,
+        error.UnsupportedVideoCodec,
+        error.UnsupportedVideoProfile,
+        error.UnsupportedVideoNal,
+        error.UnsupportedVideoDisplay,
+        error.UnsupportedVideoColor,
+        error.MalformedVideoPacket,
+        error.InvalidVideoData,
+        error.WebpDecodeFailed,
+        error.MalformedVideoConfig,
+        error.MissingVideoReference,
+        error.UnsupportedDynamicGeometry,
+        error.IncompleteVideoPicture,
+        error.IncompleteVideoSlice,
+        error.MissingPrimaryVideoSlice,
+        error.MixedVideoPictures,
+        error.OverlappingVideoSlices,
+        error.UnsupportedDynamicVideoConfig,
+        error.EmptyVideo,
+        error.EmptyVideoTrack,
+        error.InvalidSamplingPolicy,
+        error.EmptyVideoWindow,
+        error.InvalidSamplingMetadata,
+        error.SamplingOverflow,
+        error.TimestampOverflow,
+        error.MalformedMedia,
+        error.MissingMovieMetadata,
+        error.NoRandomAccessPoint,
+        error.UnsupportedDataReference,
+        error.UnsupportedDisplayGeometry,
+        error.UnsupportedEncryptedMedia,
+        error.UnsupportedFragmentedMp4,
+        error.UnsupportedHybridMp4,
+        error.UnsupportedInterlacedVideo,
+        error.UnsupportedSampleDescription,
+        error.UnsupportedSampleSize,
+        error.UnsupportedTimeline,
+        error.UnsupportedContainer,
+        error.MalformedTransportStream,
+        error.MalformedTransportPes,
+        error.TransportContinuityError,
+        error.InvalidTransportCrc,
+        error.TruncatedTransportSection,
+        error.TruncatedTransportPes,
+        error.MissingTransportTables,
+        error.MissingTransportTimestamp,
+        error.MissingTransportDuration,
+        error.TransportTimestampRegression,
+        error.UnsupportedTransportProgram,
+        error.AmbiguousTransportPictureTiming,
+        error.MalformedAnnexB,
+        error.MissingVideoParameterSet,
+        => .{ .status = 400, .code = "INVALID_VIDEO", .message = "unsupported, empty, or corrupt video", .retryable = false },
         error.VideoDurationExceeded, error.VideoInputTooLarge => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds this backend's duration or size limit", .retryable = false },
         error.NvdecUnavailable => .{ .status = 503, .code = "VIDEO_BACKEND_UNAVAILABLE", .message = "the CUDA video decoder is unavailable on this server", .retryable = true },
         error.InvalidToolArguments => .{

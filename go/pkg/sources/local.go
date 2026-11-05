@@ -32,6 +32,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // LocalRootsEnv lists the only directories a local connection may open, using
@@ -286,17 +287,26 @@ func (c *LocalConnector) AcquireMedia(ctx context.Context, r Request, o Item) ([
 	if o.Size > maxLocalMediaBytes {
 		return nil, true, fmt.Errorf("%w: local object exceeds the %d byte limit", ErrInvalidInput, maxLocalMediaBytes)
 	}
+	if err := c.CheckAccess(ctx, r, o); err != nil {
+		return nil, true, err
+	}
+	key := strings.Join([]string{c.Root, o.Path, o.Revision, configString(o.Metadata, localModifiedKey)}, "\x00")
+	if data, ok := localSnapshots.get(key); ok {
+		return data, true, nil
+	}
 	body, err := c.OpenMedia(ctx, r, o, MediaRange{Length: o.Size})
 	if err != nil {
 		return nil, true, err
 	}
-	data, err := io.ReadAll(body)
+	data := make([]byte, o.Size)
+	_, err = io.ReadFull(body, data)
 	if closeErr := body.Close(); err == nil {
 		err = closeErr
 	}
 	if err != nil {
 		return nil, true, err
 	}
+	localSnapshots.put(key, data)
 	return data, true, nil
 }
 
@@ -334,6 +344,78 @@ func (b *localMediaBody) Close() error {
 		}
 	}
 	return nil
+}
+
+func localObjectIntact(store *os.Root, rel, sum string, size int64) (bool, error) {
+	info, err := store.Lstat(rel)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() {
+		return false, fmt.Errorf("%w: local object is not a regular file", ErrInvalidInput)
+	}
+	if info.Size() != size {
+		return false, nil
+	}
+	file, err := store.Open(rel)
+	if err != nil {
+		return false, err
+	}
+	defer file.Close()
+	digest := sha256.New()
+	if _, err := io.Copy(digest, file); err != nil {
+		return false, err
+	}
+	return hex.EncodeToString(digest.Sum(nil)) == sum, nil
+}
+
+// localSnapshotCache retains verified bytes so repeated ranges of one object do
+// not each read and hash it. Keys include the modification time, and every access
+// still passes open's fence. Entries are read-only and never exceed the budget.
+type localSnapshotCache struct {
+	mu      sync.Mutex
+	entries map[string][]byte
+	order   []string
+	bytes   int64
+}
+
+const localSnapshotBudget = maxLocalMediaBytes
+
+var localSnapshots localSnapshotCache
+
+func (c *localSnapshotCache) get(key string) ([]byte, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	data, ok := c.entries[key]
+	return data, ok
+}
+
+func (c *localSnapshotCache) put(key string, data []byte) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if _, ok := c.entries[key]; ok || int64(len(data)) > localSnapshotBudget {
+		return
+	}
+	if c.entries == nil {
+		c.entries = map[string][]byte{}
+	}
+	for c.bytes+int64(len(data)) > localSnapshotBudget && len(c.order) > 0 {
+		c.bytes -= int64(len(c.entries[c.order[0]]))
+		delete(c.entries, c.order[0])
+		c.order = c.order[1:]
+	}
+	c.entries[key] = data
+	c.order = append(c.order, key)
+	c.bytes += int64(len(data))
+}
+
+func (c *localSnapshotCache) reset() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries, c.order, c.bytes = nil, nil, 0
 }
 
 // PutLocalObject stores content under its digest. Writing identical bytes is
@@ -380,9 +462,11 @@ func PutLocalObject(root, prefix, ext string, content io.Reader) (LocalObject, e
 	}
 	sum := hex.EncodeToString(digest.Sum(nil))
 	rel := path.Join(dir, sum+ext)
-	// Replacing an identical object would change its modification time and
-	// invalidate records already published for it.
-	if existing, err := store.Lstat(rel); err == nil && existing.Mode().IsRegular() && existing.Size() == size {
+	// Replacing an intact object would change its modification time and invalidate
+	// records already published for it. A damaged one is repaired by the rename.
+	if intact, err := localObjectIntact(store, rel, sum, size); err != nil {
+		return LocalObject{}, err
+	} else if intact {
 		if err := store.Remove(temp); err != nil {
 			return LocalObject{}, err
 		}

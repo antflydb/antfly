@@ -22,6 +22,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -67,6 +68,66 @@ func TestLocalPutIsContentAddressedAndIdempotent(t *testing.T) {
 	}
 	_, err = PutLocalObject(root, "", "../x", strings.NewReader("x"))
 	require.ErrorIs(t, err, ErrInvalidInput)
+}
+
+func TestLocalPutRepairsDamagedObject(t *testing.T) {
+	root := t.TempDir()
+	object := localPut(t, root, "", ".bin", "original")
+	path := filepath.Join(root, object.Path)
+	require.NoError(t, os.WriteFile(path, []byte("corrupt!"), 0o600))
+	require.Equal(t, object, localPut(t, root, "", ".bin", "original"))
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, "original", string(data))
+	inventory, err := (&LocalConnector{Root: root}).Enumerate(context.Background(), localRequest(t, ""))
+	require.NoError(t, err)
+	_, err = VerifyMediaDigest(context.Background(), &LocalConnector{Root: root}, localRequest(t, ""), inventory.Objects[0])
+	require.NoError(t, err)
+}
+
+func BenchmarkLocalRangeDelivery(b *testing.B) {
+	root := b.TempDir()
+	object, err := PutLocalObject(root, "", ".bin", strings.NewReader(strings.Repeat("x", 32<<20)))
+	require.NoError(b, err)
+	c := &LocalConnector{Root: root}
+	raw, _ := json.Marshal(LocalConfig{})
+	request := Request{SourceNamespace: "job/local", Config: raw, Mode: ImportModeSource}
+	inventory, err := c.Enumerate(context.Background(), request)
+	require.NoError(b, err)
+	localSnapshots.reset()
+	b.ReportAllocs()
+	for b.Loop() {
+		data, _, err := c.AcquireMedia(context.Background(), request, inventory.Objects[0])
+		require.NoError(b, err)
+		require.Len(b, data, int(object.Size))
+	}
+}
+
+// One-byte responses through the complete delivery path, after the first read.
+func BenchmarkLocalRangeResponse(b *testing.B) {
+	root := b.TempDir()
+	content := strings.Repeat("x", 32<<20)
+	object, err := PutLocalObject(root, "", ".bin", strings.NewReader(content))
+	require.NoError(b, err)
+	c := &LocalConnector{Root: root}
+	raw, _ := json.Marshal(LocalConfig{})
+	request := Request{SourceNamespace: "job/local", Config: raw, Mode: ImportModeSource}
+	inventory, err := c.Enumerate(context.Background(), request)
+	require.NoError(b, err)
+	localSnapshots.reset()
+	serve := func() {
+		r := httptest.NewRequest("GET", "/media", nil)
+		r.Header.Set("Range", "bytes=5-5")
+		w := httptest.NewRecorder()
+		ServeMedia(w, r, c, request, inventory.Objects[0], object.SHA256)
+		require.Equal(b, 206, w.Code)
+	}
+	serve()
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		serve()
+	}
 }
 
 func TestLocalEnumerateFailsClosedWhenStoreIsMissing(t *testing.T) {
@@ -159,6 +220,11 @@ func TestLocalMediaVerifiesPinnedContent(t *testing.T) {
 	require.NoError(t, c.CheckMedia(ctx, request, item))
 	_, err = c.OpenMedia(ctx, request, item, MediaRange{Offset: 2, Length: 4})
 	require.True(t, errors.As(err, &changed), "%v", err)
+	// A verified snapshot still holds the published bytes; without one, the digest fails.
+	cached, _, err := c.AcquireMedia(ctx, request, item)
+	require.NoError(t, err)
+	require.Equal(t, "0123456789", string(cached))
+	localSnapshots.reset()
 	_, _, err = c.AcquireMedia(ctx, request, item)
 	require.True(t, errors.As(err, &changed), "%v", err)
 
@@ -259,6 +325,10 @@ func TestLocalUploadPublishesThroughASingleSourceRun(t *testing.T) {
 	require.NoError(t, os.WriteFile(path, []byte("\x89PNG CHANGED! bytes"), 0o600))
 	require.NoError(t, os.Chtimes(path, info.ModTime(), info.ModTime()))
 	for _, byteRange := range []string{"bytes=2-5", ""} {
+		// A verified snapshot can keep serving the published bytes, never the new ones.
+		cached := fetchService(s, ref, "GET", byteRange)
+		require.NotContains(t, cached.Body.String(), "CHANGED", byteRange)
+		localSnapshots.reset()
 		changed := fetchService(s, ref, "GET", byteRange)
 		require.Equal(t, 412, changed.Code, byteRange)
 		require.NotContains(t, changed.Body.String(), "CHANGED")

@@ -20,10 +20,18 @@ const media = @import("antfly_media");
 const video = @import("antfly_video");
 const projector_mod = @import("../architectures/gemma4_projector.zig");
 const embedding_video = @import("embedding_gemma2_video.zig");
+const embedding_gemma2 = @import("embedding_gemma2.zig");
 const ComputeBackend = @import("../ops/ops.zig").ComputeBackend;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
 const sampling: embedding_video.Sampling = .{ .timestamps = .{} };
+
+/// Decoder and indexing memory, shared through one pool per request.
+const portable_pool_bytes: u64 = 512 * 1024 * 1024;
+/// Prepared model-sized frames, plus one displayed frame at the source pixel limit.
+const portable_frame_bytes: usize = 96 * 1024 * 1024 + 48 * 1024 * 1024;
+/// Reserved through generation admission before any portable video work starts.
+pub const portable_host_bytes: usize = portable_pool_bytes + portable_frame_bytes;
 
 pub fn encode(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
     if (cb.kind() == .cuda) return projector_mod.encodeProjectedVideoResident(cb, a, projector, bytes);
@@ -47,24 +55,30 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
     // Indexing and decoding run under the model execution lock, so they must honor
     // the request's cancellation and deadline between selected frames too.
     const control = cb.execution_control orelse Control{};
-    const timestamps = try embedding_video.selectedPresentationUs(a, bytes, control, sampling);
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes } };
+    const timestamps = embedding_video.selectedPresentationUs(a, bytes, control, sampling, &pool) catch |err| return inputError(err);
     defer a.free(timestamps);
     var frames = try projector_mod.PortableVideoFrames.init(cb, a, projector, timestamps.len);
     defer frames.deinit();
     var observer: Observer = .{ .a = a, .cb = cb, .frames = &frames };
-    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
-    try embedding_video.observeConfigured(a, bytes, null, control, .{
+    embedding_video.observeConfigured(a, bytes, null, control, .{
         .observer = .{ .context = &observer, .accept = Observer.accept },
         .sampling = sampling,
         .pool = &pool,
-    });
+    }) catch |err| return inputError(err);
     return frames.project(timestamps);
+}
+
+/// Client media failures become one input error. Cancellation, deadlines and
+/// capacity errors keep their identity through the shared embedding normalizer.
+fn inputError(err: anyerror) anyerror {
+    return embedding_gemma2.videoInputError(err);
 }
 
 test "gemma4 video timestamps follow presentation order on every portable container" {
     const a = std.testing.allocator;
     inline for (.{ "mjpeg.mov", "bframes.mp4", "closed.mp4", "vp9.webm", "av1.webm" }) |name| {
-        const times = try embedding_video.selectedPresentationUs(a, @embedFile("../testdata/video/" ++ name), .{}, sampling);
+        const times = try embedding_video.selectedPresentationUs(a, @embedFile("../testdata/video/" ++ name), .{}, sampling, null);
         defer a.free(times);
         try std.testing.expect(times.len > 0 and times.len <= 32);
         try std.testing.expectEqual(@as(i64, 0), times[0]);
@@ -76,7 +90,7 @@ test "gemma4 video timestamps match the frames delivered to the observer" {
     const a = std.testing.allocator;
     inline for (.{ "mjpeg.mov", "bframes.mp4", "vp9.webm" }) |name| {
         const bytes = @embedFile("../testdata/video/" ++ name);
-        const times = try embedding_video.selectedPresentationUs(a, bytes, .{}, sampling);
+        const times = try embedding_video.selectedPresentationUs(a, bytes, .{}, sampling, null);
         defer a.free(times);
         const Count = struct {
             seen: []bool,
@@ -110,7 +124,7 @@ test "gemma4 video timestamps honor request cancellation before indexing and dec
     const control: Control = .{ .cancellation = .{ .is_cancelled_fn = Cancelled.cancelled } };
     inline for (.{ "bframes.mp4", "vp9.webm" }) |name| {
         const bytes = @embedFile("../testdata/video/" ++ name);
-        try std.testing.expectError(error.Cancelled, embedding_video.selectedPresentationUs(a, bytes, control, sampling));
+        try std.testing.expectError(error.Cancelled, embedding_video.selectedPresentationUs(a, bytes, control, sampling, null));
         const Refuse = struct {
             fn accept(_: *anyopaque, _: usize, _: video.preparation.BorrowedFrame, _: video.preparation.Options, _: media.source.Control) anyerror!void {
                 return error.UnexpectedFrame;
@@ -119,4 +133,43 @@ test "gemma4 video timestamps honor request cancellation before indexing and dec
         var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
         try std.testing.expectError(error.Cancelled, embedding_video.observeConfigured(a, bytes, null, control, .{ .observer = .{ .context = &unused, .accept = Refuse.accept }, .sampling = sampling, .pool = &pool }));
     }
+}
+
+test "gemma4 video corrupt input is a client error while cancellation and capacity keep their identity" {
+    const a = std.testing.allocator;
+    const truncated = @embedFile("../testdata/video/bframes.mp4")[0..64];
+    inline for (.{ "not a video at all", truncated }) |bytes| {
+        const failure = if (embedding_video.selectedPresentationUs(a, bytes, .{}, sampling, null)) |times| blk: {
+            a.free(times);
+            break :blk error.TestExpectedError;
+        } else |err| err;
+        try std.testing.expectEqual(error.InvalidVideoInput, inputError(failure));
+    }
+    for ([_]anyerror{ error.Cancelled, error.Timeout, error.SharedAdmissionExceeded, error.OutOfMemory }) |err| {
+        try std.testing.expectEqual(err, inputError(err));
+    }
+}
+
+test "gemma4 video indexing and decoding share one bounded pool" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/av1.webm");
+    var tiny = media.admission.Pool{ .limits = .{ .host_bytes = 1 } };
+    try std.testing.expectError(error.SharedAdmissionExceeded, embedding_video.selectedPresentationUs(a, bytes, .{}, sampling, &tiny));
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes } };
+    const times = try embedding_video.selectedPresentationUs(a, bytes, .{}, sampling, &pool);
+    defer a.free(times);
+    try std.testing.expectEqual(media.admission.Resources{}, pool.snapshot());
+    try std.testing.expect(pool.high_water.host_bytes > 0);
+}
+
+test "gemma4 video reserves portable memory through generation admission" {
+    const generation = @import("generation.zig");
+    const messages = [_]generation.Message{.{ .role = "user", .content = "describe", .video_bytes = "clip" }};
+    const portable = try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &messages, .{ .family = .gemma }, .generic);
+    try std.testing.expectEqual(portable_host_bytes, portable.host_scratch_bytes);
+    try std.testing.expect(portable.token_allowance >= 60 * 80);
+    const cuda = try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &messages, .{ .family = .gemma }, .cuda);
+    try std.testing.expectEqual(@as(usize, 0), cuda.host_scratch_bytes);
+    const text = [_]generation.Message{.{ .role = "user", .content = "describe" }};
+    try std.testing.expectEqual(@as(usize, 0), (try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &text, .{ .family = .gemma }, .generic)).host_scratch_bytes);
 }

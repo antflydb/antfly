@@ -247,7 +247,12 @@ pub fn nativeGenerationMediaAdmissionForBackend(
         const max_image_tokens = try qwen2vl_mm.maxImageTokenCount(prep_config);
         return .{ .token_allowance = image_count *| (max_image_tokens +| 1) };
     }
-    return .{ .token_allowance = nativeGenerationMediaTokenAllowance(messages, config) };
+    var admission: NativeGenerationMediaAdmission = .{ .token_allowance = nativeGenerationMediaTokenAllowance(messages, config) };
+    // CUDA decodes on the device. Portable decoding runs in host memory.
+    if (backend != .cuda) for (messages) |message| if (message.video_bytes != null) {
+        admission.host_scratch_bytes = gemma4_video.portable_host_bytes;
+    };
+    return admission;
 }
 
 /// Conservative media-token count used for scheduling and memory admission.
