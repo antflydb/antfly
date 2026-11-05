@@ -198,7 +198,7 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or bu
                 outline_fallback: bool = false,
                 has_nontext_visual: bool = false,
                 has_unrendered_annotations: bool = false,
-                diagnostics: NativeTextDiagnostics = .{},
+                diagnostics: reader.NativeTextDiagnostics = .{},
 
                 pub fn deinit(self: *PageTextAnalysis, alloc: Allocator) void {
                     alloc.free(self.text);
@@ -2956,6 +2956,9 @@ pub fn resolvesToPdf(config: Config, source_url: []const u8, content_type: []con
 }
 
 fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, quality_config: OcrQualityConfig, decode_limits: pdf.reader.DecodeLimits) !Result {
+    // OCR quality evaluates OCR candidates after recognition; native quality
+    // alone determines whether this embedded-text page is routed to OCR.
+    _ = quality_config;
     var parsed = try pdf.reader.Reader.initWithDecodeLimits(alloc, bytes, decode_limits);
     defer parsed.deinit();
     parsed.setTextExtractionPolicy(native_text.policy);
@@ -2997,15 +3000,14 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         errdefer if (unit_id) |value| alloc.free(value);
         var unit_type: ?[]u8 = try alloc.dupe(u8, "page");
         errdefer if (unit_type) |value| alloc.free(value);
-        const quality = assessOcrQuality(text, quality_config);
-        const scanned_page = force_ocr or quality.needsFallback();
+        const scanned_page = force_ocr or native_quality.needsFallback();
         var method: ?[]u8 = try alloc.dupe(u8, if (scanned_page) "pdf_ocr_pending" else "pdf_text");
         errdefer if (method) |value| alloc.free(value);
         var extraction_status: ?[]u8 = if (scanned_page) try alloc.dupe(u8, "pending_ocr") else null;
         errdefer if (extraction_status) |value| alloc.free(value);
         var page_label: ?[]u8 = try std.fmt.allocPrint(alloc, "{d}", .{page_num});
         errdefer if (page_label) |value| alloc.free(value);
-        var ocr_metadata = if (scanned_page) try PendingOcrMetadata.initAlloc(alloc, quality, force_ocr) else PendingOcrMetadata{};
+        var ocr_metadata = if (scanned_page) try PendingOcrMetadata.initAlloc(alloc, native_quality, force_ocr) else PendingOcrMetadata{};
         defer ocr_metadata.deinit(alloc);
         units[initialized] = .{
             .unit_id = unit_id.?,
@@ -3141,6 +3143,9 @@ fn extractParsedPdfStreaming(alloc: Allocator, parsed: *pdf.reader.Reader, conte
 }
 
 fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink, cache: ?PdfPageTextCache) !void {
+    // OCR quality evaluates OCR candidates after recognition; native quality
+    // alone determines whether this embedded-text page is routed to OCR.
+    _ = quality_config;
     const page_count = try parsed.pageCount();
     try sink.on_begin(sink.ptr, .{ .content_type = content_type, .route_type = "pdf" });
 
@@ -3168,8 +3173,7 @@ fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.
         const char_start = std.math.cast(u32, cursor);
         const char_end = std.math.cast(u32, cursor + page_text_len);
         const native_quality = assessOcrQuality(text, native_text.quality);
-        const quality = assessOcrQuality(text, quality_config);
-        const scanned_page = force_ocr or quality.needsFallback();
+        const scanned_page = force_ocr or native_quality.needsFallback();
         var unit_id: ?[]u8 = try std.fmt.allocPrint(alloc, "page:{d:0>6}", .{page_num});
         errdefer if (unit_id) |value| alloc.free(value);
         var unit_type: ?[]u8 = try alloc.dupe(u8, "page");
@@ -3180,7 +3184,7 @@ fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.
         errdefer if (extraction_status) |value| alloc.free(value);
         var page_label: ?[]u8 = try std.fmt.allocPrint(alloc, "{d}", .{page_num});
         errdefer if (page_label) |value| alloc.free(value);
-        var ocr_metadata = if (scanned_page) try PendingOcrMetadata.initAlloc(alloc, quality, force_ocr) else PendingOcrMetadata{};
+        var ocr_metadata = if (scanned_page) try PendingOcrMetadata.initAlloc(alloc, native_quality, force_ocr) else PendingOcrMetadata{};
         defer ocr_metadata.deinit(alloc);
         var unit = Unit{
             .unit_id = unit_id.?,
@@ -3232,7 +3236,6 @@ fn extractPdfTextRegionsFromRunsAlloc(
     var regions = std.ArrayListUnmanaged(TextRegion).empty;
     defer regions.deinit(alloc);
     for (runs) |run| {
-        if (run.text.len == 0) continue;
         // A null span means reconstruction could not align this positioned run
         // with the canonical page text. Substring matching is unsafe here: a
         // degraded run can match unrelated text and receive the wrong bounds.
@@ -3243,10 +3246,24 @@ fn extractPdfTextRegionsFromRunsAlloc(
         const span_start = std.math.cast(u32, start) orelse continue;
         const span_end = std.math.cast(u32, end) orelse continue;
         const bounds = pdf.render.textRunBounds(run);
+        const font_size = transformedFontSize(run);
+        if (regions.items.len > 0) {
+            const previous = &regions.items[regions.items.len - 1];
+            if (previous.span[0] == span_start and previous.span[1] == span_end) {
+                previous.bbox[0] = @min(previous.bbox[0], bounds.min_x);
+                previous.bbox[1] = @min(previous.bbox[1], bounds.min_y);
+                previous.bbox[2] = @max(previous.bbox[2], bounds.max_x);
+                previous.bbox[3] = @max(previous.bbox[3], bounds.max_y);
+                if (previous.font_size != font_size) previous.font_size = null;
+                if (previous.bold != run.bold) previous.bold = null;
+                if (previous.italic != run.italic) previous.italic = null;
+                continue;
+            }
+        }
         try regions.append(alloc, .{
             .span = .{ span_start, span_end },
             .bbox = .{ bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y },
-            .font_size = transformedFontSize(run),
+            .font_size = font_size,
             .bold = run.bold,
             .italic = run.italic,
         });
@@ -3323,6 +3340,53 @@ test "PDF text regions use reconstructed output spans" {
     try std.testing.expectEqual(@as(?bool, true), regions[0].bold);
     try std.testing.expectEqual(@as(?bool, false), regions[0].italic);
     try std.testing.expect(!std.mem.eql(f64, &regions[0].bbox, &regions[1].bbox));
+
+    // ActualText replacements can map several source fragments to one
+    // semantic output span. Empty continuation text still contributes its
+    // source geometry, but the semantic span must be emitted only once.
+    const replacement_runs = [_]pdf.reader.TextRun{
+        .{
+            .text = "glyph",
+            .x = 10,
+            .y = 20,
+            .font_size = 10,
+            .d = 0.7,
+            .advance_width = 20,
+            .ascent = 8,
+            .descent = 2,
+            .output_span = .{ .start = 0, .end = 8 },
+            .bold = true,
+            .italic = false,
+        },
+        .{
+            .text = "",
+            .x = 30,
+            .y = 20,
+            .font_size = 12,
+            .d = 0.7,
+            .advance_width = 30,
+            .ascent = 8,
+            .descent = 2,
+            .output_span = .{ .start = 0, .end = 8 },
+            .bold = false,
+            .italic = true,
+        },
+    };
+    const replacement_regions = try extractPdfTextRegionsFromRunsAlloc(alloc, &replacement_runs, "Semantic");
+    defer if (replacement_regions.len > 0) alloc.free(replacement_regions);
+    try std.testing.expectEqual(@as(usize, 1), replacement_regions.len);
+    try std.testing.expectEqual([2]u32{ 0, 8 }, replacement_regions[0].span);
+    const replacement_first_bounds = pdf.render.textRunBounds(replacement_runs[0]);
+    const replacement_second_bounds = pdf.render.textRunBounds(replacement_runs[1]);
+    try std.testing.expectEqual([4]f64{
+        @min(replacement_first_bounds.min_x, replacement_second_bounds.min_x),
+        @min(replacement_first_bounds.min_y, replacement_second_bounds.min_y),
+        @max(replacement_first_bounds.max_x, replacement_second_bounds.max_x),
+        @max(replacement_first_bounds.max_y, replacement_second_bounds.max_y),
+    }, replacement_regions[0].bbox);
+    try std.testing.expect(replacement_regions[0].font_size == null);
+    try std.testing.expect(replacement_regions[0].bold == null);
+    try std.testing.expect(replacement_regions[0].italic == null);
 
     const unaligned_runs = [_]pdf.reader.TextRun{.{
         .text = "FR",

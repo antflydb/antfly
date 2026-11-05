@@ -420,8 +420,8 @@ fn putStructJsonValue(alloc: Allocator, object: *std.json.ObjectMap, key: []cons
 
 fn structJsonValueAlloc(alloc: Allocator, value: anytype) !std.json.Value {
     const T = @TypeOf(value);
-    const fields = comptime switch (@typeInfo(T)) {
-        .@"struct" => |info| info.fields,
+    const info = switch (@typeInfo(T)) {
+        .@"struct" => |struct_info| struct_info,
         else => @compileError("expected provenance struct"),
     };
     var object = std.json.ObjectMap.empty;
@@ -433,9 +433,9 @@ fn structJsonValueAlloc(alloc: Allocator, value: anytype) !std.json.Value {
         }
         object.deinit(alloc);
     }
-    inline for (fields) |field| {
-        const item = @field(value, field.name);
-        const encoded: std.json.Value = switch (@typeInfo(field.type)) {
+    inline for (info.field_names, info.field_types) |field_name, Field| {
+        const item = @field(value, field_name);
+        const encoded: std.json.Value = switch (@typeInfo(Field)) {
             .bool => .{ .bool = item },
             .int => .{ .integer = std.math.cast(i64, item) orelse return error.Overflow },
             .float => .{ .float = item },
@@ -446,7 +446,7 @@ fn structJsonValueAlloc(alloc: Allocator, value: anytype) !std.json.Value {
             else => @compileError("unsupported provenance field"),
         };
         errdefer freeJsonValue(alloc, encoded);
-        const key = try alloc.dupe(u8, field.name);
+        const key = try alloc.dupe(u8, field_name);
         errdefer alloc.free(key);
         try object.put(alloc, key, encoded);
     }
