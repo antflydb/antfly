@@ -107,9 +107,9 @@ substituted in the canonical config:
 
 ```sh
 python3 zig/pkg/inference/scripts/qualify_write_pool_production.py \
-  --binary .benchmark-results/write-pool-production/server-final \
+  --binary .benchmark-results/write-pool-production/server-merged \
   --config .benchmark-results/write-pool-40g/local-config.json \
-  --output .benchmark-results/write-pool-production/final \
+  --output .benchmark-results/write-pool-production/merged-final \
   --cgroup /sys/fs/cgroup/user.slice/user-1002.slice/user@1002.service/app.slice/antfly-write-pool-40g.service \
   --speech-corpus ~/.cache/antfly/conformance-fixtures/gemma4-transcription/4e69a06fa5edc90921e5e7e39a7084881f8b3ed9c805c574f4f39c6fde27c603.parquet
 ```
@@ -121,10 +121,10 @@ successful reruns.
 
 ## Final GB10 results
 
-The final campaign passed 1,802 recorded task responses: 1,795 successful
+The merged-source campaign passed 2,138 recorded task responses: 2,131 successful
 responses and seven expected item/context/deadline rejections, plus four
-intentional disconnect probes. Its sustained phase completed 143 turnovers /
-1,144 mixed requests in 300.79 seconds. All four model instance IDs survived;
+intentional disconnect probes. Its sustained phase completed 185 turnovers /
+1,480 mixed requests in 300.12 seconds. All four model instance IDs survived;
 after recovery, active requests and KV reservations were zero. Host scratch
 returned exactly to 67,637,248 bytes and backend scratch to 1,611,251,712 bytes,
 their warmed retained-cache bounds.
@@ -136,10 +136,10 @@ both the non-regression and separate 10% throughput-promotion gates:
 
 | Model | Eight serialized | Eight concurrent | Throughput ratio | Mixed p95 |
 |---|---:|---:|---:|---:|
-| EmbeddingGemma 2 | 0.213 s | 0.141 s | 1.52× | 31.9 ms |
-| GLiNER boundary | 0.347 s | 0.139 s | 2.50× | 131.5 ms |
-| Whisper small | 2.911 s | 2.477 s | 1.18× | 739.9 ms |
-| LightOnOCR3 | 16.583 s | 8.695 s | 1.91× | 4,637.6 ms |
+| EmbeddingGemma 2 | 0.120 s | 0.062 s | 1.92× | 20.6 ms |
+| GLiNER boundary | 0.131 s | 0.057 s | 2.30× | 49.0 ms |
+| Whisper small | 1.360 s | 0.994 s | 1.37× | 445.0 ms |
+| LightOnOCR3 | 7.986 s | 4.199 s | 1.90× | 2,281.8 ms |
 
 Every model showed repeated physical batching. All 40 concurrent OCR pages
 participated in observed two-row decoder steps. Nine extraction schemas passed
@@ -152,10 +152,10 @@ and 156.08 s varied composites scored 12.00% and 12.47%. The separately recorded
 24-repeat stress case still scored 87.5% WER and is explicitly a known accuracy
 failure, not a passed accuracy case.
 
-All 2,073 memory samples were valid across 18 phases, with no sampling errors.
-Peak sampled managed live allocation was 6.05 GiB, cumulative managed highwater
-6.08 GiB, and service-specific NVML 6.56 GiB. These measurements are far below
-38 GiB and do not establish near-exhaustion performance. The production-host
+All 1,704 memory samples were valid, including 1,682 across 18 workload phases,
+with no sampling errors. Peak sampled managed live allocation was 5.76 GiB,
+cumulative managed highwater 5.83 GiB, and service-specific NVML 6.27 GiB.
+These measurements are far below 38 GiB and do not establish near-exhaustion performance. The production-host
 64 MiB guard/recovery test separately passed with 50 valid NVML samples,
 48 MiB retained across failed free/quarantine, confirmed free, and a successful
 64 MiB reload/readback. Observed excluded allocation peaked at 178,765,824 bytes,
@@ -164,28 +164,31 @@ within the explicit 2 GiB allowance.
 The existing 102-request write regression also passed, including eight-page
 OCR, sparse 68-second speech and deadline recovery. The same executable passed
 the 287-request read regression with fresh native-batch controls, retrieval,
-concurrent Gemma generation, cancellation and 156 valid memory samples. Focused
-CPU/CUDA suites passed all 150 tests per configuration (seven lifecycle results
-were cached on CPU), including full-context Whisper positions, encoder-only
-collection, response ownership and admission. The 19 artifact/telemetry tests,
+concurrent Gemma generation, cancellation and 115 valid memory samples. Focused
+CPU/CUDA suites passed all 161 tests per configuration, including full-context
+Whisper positions, encoder-only collection, response ownership and admission. The 19 artifact/telemetry tests,
 five new qualification tests, license headers, Apache boundary and diff checks
 passed. GPU campaigns are local evidence; no A100 performance claim is made.
 
 Provenance for the local receipts under
 `.benchmark-results/write-pool-production/`:
 
+- Qualified serving source: `7067d84b67187698af5ab20a367bbc9201bf4ae8`, including
+  the merged CUDA teardown ownership and unlimited-admission fixes.
 - Serving binary SHA-256:
-  `558b5466193f2770343deccbac130eaacd5c582f7073411d70997dba86944da1`.
+  `a8c738517099f877cdbf75fb70e8c07e3c8d3f6a00d059daced9d05a79a53479`.
 - Full campaign harness SHA-256:
   `9ce43c91db2caf2d796a0d75a5bbd901875f19e1487dcebe9a727c0891ca08f4`.
 - Canonical sorted JSON model-artifact inventory SHA-256 (44 files, verified
   before and after):
   `4012b3912c7f049c8729982f87c9bdb1c331d0165b20b9bde3dc9a7edc232d76`.
 - Production engine/host test binary SHA-256:
-  `7ccbad5e08722e5d79a483935922c5fbee701633b057772b9c0b35d0917544f9`.
+  `056e403d6982b7fc5eea2375f450bddc3273272daba6257e592207beec14f4c7`.
 
-`final/` contains the full campaign and an exact archived harness;
-`physical-recovery-final/`, `legacy-write-regression/` and
-`read-regression-final/` contain the separate recovery and regression receipts.
+`merged-final/` contains the full campaign and an exact archived harness;
+`merged-physical-recovery/`, `merged-legacy-write/` and
+`merged-read-regression/` contain the separate recovery and regression receipts.
+`source-receipt-merged.json` records source hashes and both executable identities.
+The earlier pre-merge campaigns and binaries remain preserved separately.
 The owned write service is restored on port 18841 with the final binary and
 38 GiB guard; the owned read service is stopped.
