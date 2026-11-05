@@ -98,8 +98,10 @@ Generated extractors and generators are supported too. Generators use
 `type: "generator"` and an artifact producer config containing `generator`
 and `output_schema`. Evidence must contain valid source spans; invalid evidence
 fails inspection. Custom producer revisions are mandatory. Credentials must be
-empty, environment references, or supported secret references; literal
-credentials are rejected. Remote producers receive original selected text;
+empty or exact `${secret:key.name}` references. Omitting a credential uses the
+provider’s environment defaults. Literal credentials in nested provider options,
+headers, endpoint userinfo, query parameters, or fragments are rejected before
+preview or installation. Schema and entity-label definitions remain user data. Remote producers receive original selected text;
 the preview and policy response disclose external processing. That disclosure
 uses execution's route selection, including `inference.api_url`, explicit
 producer endpoints, and task-specific linked callback availability. Generated
@@ -181,6 +183,12 @@ field/category ordering and producer object-key ordering keep the executable
 producer unchanged; execution tuning still updates runtime controls separately.
 The policy-bound runtime override survives restart and governs subsequent
 inspection attempts without invalidating accepted receipts.
+
+Policy replacement preserves the live resolver and curation control state,
+including proposals created after protection was enabled. Switching to monitor
+restores the logical consumer declarations while retaining current control
+state. Re-enabling protection does not resurrect deleted resolver metadata or
+interpret curation evidence as index or producer configuration.
 
 Findings enumerate document IDs and inspect one source and manifest at a time.
 Pages stop between documents after an 8 MiB inspection budget, or within a

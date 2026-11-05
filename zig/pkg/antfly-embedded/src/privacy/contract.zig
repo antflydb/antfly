@@ -16,6 +16,7 @@
 //! Privacy's durable contract. Coordinates are half-open UTF-8 byte offsets
 //! into an immutable source. Matched values never belong in durable findings.
 const std = @import("std");
+const credential_safety = @import("../common/credential_safety.zig");
 const A = std.mem.Allocator;
 pub const default_model = "fastino/gliner2-privacy-filter-PII-multi";
 pub const default_revision = "1cb4166094dc58fa8d836429f060d6c95f62b495";
@@ -250,17 +251,38 @@ fn validateSecrets(value: std.json.Value) error{PrivacyLiteralCredential}!void {
             var it = object.iterator();
             while (it.next()) |entry| {
                 const name = entry.key_ptr.*;
-                if (std.mem.eql(u8, name, "api_key") or std.mem.eql(u8, name, "bearer_token") or std.mem.eql(u8, name, "password") or std.mem.eql(u8, name, "access_key") or std.mem.eql(u8, name, "secret_key")) {
-                    const secret = entry.value_ptr.*;
-                    if (secret != .string or (secret.string.len > 0 and !(std.mem.startsWith(u8, secret.string, "${") and std.mem.endsWith(u8, secret.string, "}")))) return error.PrivacyLiteralCredential;
+                // These are user-authored schemas/labels, not provider options.
+                if (std.mem.eql(u8, name, "schema") or std.mem.eql(u8, name, "output_schema") or std.mem.eql(u8, name, "entity_definitions")) continue;
+                const entry_value = entry.value_ptr.*;
+                if (credential_safety.fieldNameIsSensitive(name)) {
+                    if (entry_value != .string or (entry_value.string.len != 0 and !validSecretReference(entry_value.string))) return error.PrivacyLiteralCredential;
+                } else if (entry_value == .string and credential_safety.fieldNameIsEndpoint(name) and credential_safety.urlContainsCredentials(entry_value.string)) {
+                    // Credentials embedded in endpoints cannot be independently
+                    // resolved or safely persisted in the authored policy.
+                    return error.PrivacyLiteralCredential;
                 }
-                if (!std.mem.eql(u8, name, "schema") and !std.mem.eql(u8, name, "output_schema") and !std.mem.eql(u8, name, "entity_definitions")) try validateSecrets(entry.value_ptr.*);
+                try validateSecrets(entry_value);
             }
         },
         .array => |array| for (array.items) |item| try validateSecrets(item),
         else => {},
     }
 }
+// Exact native secret-reference syntax, including the store's key grammar.
+// Environment defaults remain available by omitting the credential option.
+fn validSecretReference(raw: []const u8) bool {
+    if (!std.mem.startsWith(u8, raw, "${secret:") or !std.mem.endsWith(u8, raw, "}")) return false;
+    const key_name = raw[9 .. raw.len - 1];
+    if (key_name.len == 0 or key_name[0] == '.' or key_name[key_name.len - 1] == '.') return false;
+    var dot = false;
+    for (key_name) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '_' and byte != '-' and byte != '.') return false;
+        if (byte == '.' and dot) return false;
+        dot = byte == '.';
+    }
+    return true;
+}
+
 fn canonicalize(a: A, value: *std.json.Value) !void {
     switch (value.*) {
         .object => |*object| {
@@ -434,4 +456,37 @@ test "privacy semantic policy identity normalizes ordering and excludes executio
     );
     second.value.mode = .redact_for_search_and_ai;
     try std.testing.expect(!std.mem.eql(u8, &(try first.value.identity(a)), &(try second.value.identity(a))));
+}
+
+test "privacy rejects literal credentials across nested provider configurations" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "{\"api_key\":\"literal\"}",
+        "{\"generator\":{\"headers\":{\"Authorization\":\"Bearer literal\"}}}",
+        "{\"fallbacks\":[{\"secret_access_key\":\"literal\"}]}",
+        "{\"api_url\":\"http://host/v1?api_key=literal\"}",
+        "{\"base_url\":\"http://user:literal@host/v1\"}",
+        "{\"endpoint\":\"https://host/v1?access%5Fkey%5Fid=literal\"}",
+        "{\"url\":\"https://host/v1#access_token=literal\"}",
+        "{\"api_key\":\"${ENV_VAR}\"}",
+        "{\"api_key\":\"${secret:}\"}",
+        "{\"api_key\":\"${secret:a..b}\"}",
+        "{\"api_key\":\"${secret:a}trailing\"}",
+        "{\"password\":42}",
+    }) |raw| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        try std.testing.expectError(error.PrivacyLiteralCredential, validateSecrets(parsed.value));
+    }
+    for ([_][]const u8{
+        "{\"provider\":\"openai\",\"max_tokens\":100}",
+        "{\"api_key\":\"${secret:providers.openai_api-key}\"}",
+        "{\"api_key\":\"\",\"api_url\":\"https://host/v1?timeout=10\"}",
+        "{\"generator\":{\"headers\":{\"Authorization\":\"${secret:headers.authorization}\"}}}",
+        "{\"schema\":{\"password\":\"string\"},\"output_schema\":{\"api_key\":\"string\"},\"entity_definitions\":{\"secret\":\"API key or password\"}}",
+    }) |raw| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, raw, .{});
+        defer parsed.deinit();
+        try validateSecrets(parsed.value);
+    }
 }

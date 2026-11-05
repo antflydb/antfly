@@ -1936,3 +1936,154 @@ def test_privacy_wide_json_preview_backfill_and_new_writes(stateful_api, shape):
     assert wait_until(updated, timeout_s=90, interval_s=0.2) == source, (
         api.debug_logs()[-6000:]
     )
+
+
+@pytest.mark.parametrize("protect_first", [False, True])
+def test_privacy_transitions_preserve_incoming_resolver_curation(
+    stateful_api, protect_first
+):
+    api = stateful_api
+    tag = uuid4().hex[:8]
+    destination = "privacy_entities_" + tag
+    source = "privacy_graph_" + tag
+    api.create_table(destination)
+    path = f"/tables/{destination}/privacy"
+    policy = {"mode": "redact_for_search_and_ai", "fields": ["absent"]}
+    if protect_first:
+        api.put(path, policy)
+    api.create_table(
+        source,
+        indexes={
+            "knowledge": {
+                "type": "graph",
+                "source": {
+                    "artifact": "kg",
+                    "format": "extraction_graph",
+                    "mention_edge_type": "mentions",
+                },
+                "artifact": {
+                    "name": "kg",
+                    "kind": "asset",
+                    "source": {"type": "field", "value": "kg"},
+                    "content_type": "application/json",
+                },
+                "edge_types": [{"name": "mentions"}],
+                "resolvers": [
+                    {
+                        "name": "concepts",
+                        "table": destination,
+                        "promote": False,
+                        "source_artifact": "kg",
+                        "resolution_artifact": "resolved",
+                        "key_template": "concept/{{uslug _entity.text}}",
+                    }
+                ],
+            }
+        },
+    )
+    proposals = f"/tables/{destination}/curation/proposals"
+    proposal = api.post(proposals, {"action": "suppress", "key": "concept/example"})
+    expected = api.get(proposals)
+    assert proposal["id"] in [p["id"] for p in expected["proposals"]]
+    if not protect_first:
+        api.put(path, policy)
+    # Exercise execution-only tuning, semantic replacement, demotion and
+    # re-enabling. Each mutation uses the current authored-policy CAS token.
+    for changes in (
+        {"execution": {"batch_items": 1}},
+        {"sensitivity": "thorough"},
+        {"mode": "monitor"},
+        {"mode": "redact_for_search_and_ai"},
+    ):
+        before = api.get(path)
+        policy.update(changes)
+        response = api.s.put(
+            api.url + path,
+            json=policy,
+            headers={"If-Match": before["etag"]},
+            timeout=30,
+        )
+        assert response.status_code == 202, response.text
+        assert api.get(proposals) == expected
+    if api.supports_restart:
+        api.restart_server()
+        assert api.get(proposals) == expected
+        assert api.get(path)["policy"]["mode"] == "redact_for_search_and_ai"
+    # The authority still accepts new curation after the full transition cycle.
+    second = api.post(proposals, {"action": "suppress", "key": "concept/another"})
+    assert {proposal["id"], second["id"]} <= {
+        p["id"] for p in api.get(proposals)["proposals"]
+    }
+
+
+@pytest.mark.parametrize(
+    "credentials",
+    [
+        {"api_url": "http://127.0.0.1:1/ai/v1?api_key=literal-review-secret"},
+        {"api_url": "http://user:literal-review-secret@127.0.0.1:1/ai/v1"},
+        {"api_url": "http://127.0.0.1:1/ai/v1?access%5Fkey%5Fid=literal"},
+        {"api_url": "http://127.0.0.1:1/ai/v1#access_token=literal"},
+        {"headers": {"Authorization": "Bearer literal-review-secret"}},
+        {"fallbacks": [{"secret_access_key": "literal-review-secret"}]},
+        {"api_key": "${NOT_A_SECRET_REFERENCE}"},
+    ],
+)
+def test_privacy_rejects_credentials_before_preview_or_installation(
+    stateful_api, credentials
+):
+    api = stateful_api
+    table = "privacy_credentials_" + uuid4().hex[:8]
+    api.create_table(table)
+    path = f"/tables/{table}/privacy"
+    for producer_type in ("extractor", "generator"):
+        policy = {
+            "mode": "monitor",
+            "fields": ["absent"],
+            "producer": {
+                "type": producer_type,
+                "revision": "fixture-v1",
+                "config": {"provider": "antfly", "model": "fixture", **credentials},
+            },
+        }
+        for method, suffix, body in (
+            ("POST", "/preview", {"policy": policy}),
+            ("PUT", "", policy),
+        ):
+            response = api.s.request(
+                method, api.url + path + suffix, json=body, timeout=30
+            )
+            assert response.status_code == 422, response.text
+            assert "PrivacyLiteralCredential" in response.text
+            assert "literal-review-secret" not in response.text
+    current = api.get(path)
+    assert not current["configured"], current
+
+
+def test_privacy_accepts_native_secret_references_without_resolving_on_empty_sample(
+    stateful_api,
+):
+    api = stateful_api
+    table = "privacy_secret_ref_" + uuid4().hex[:8]
+    api.create_table(table)
+    path = f"/tables/{table}/privacy"
+    reference = "${secret:privacy.fixture-api_key}"
+    policy = {
+        "mode": "monitor",
+        "fields": ["absent"],
+        "producer": {
+            "type": "extractor",
+            "revision": "fixture-v1",
+            "config": {
+                "provider": "antfly",
+                "model": "fixture",
+                "api_url": "http://127.0.0.1:1/ai/v1?timeout=10",
+                "api_key": reference,
+                "entity_definitions": {"password": "A password or recovery code"},
+            },
+        },
+    }
+    preview = api.post(path + "/preview", {"policy": policy})
+    assert preview["sampled"] == 0
+    saved = api.put(path, policy)
+    assert saved["policy_version"] == preview["policy_version"]
+    assert api.get(path)["policy"]["producer"]["config"]["api_key"] == reference

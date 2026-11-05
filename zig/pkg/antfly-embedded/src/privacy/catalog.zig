@@ -19,6 +19,7 @@
 const std = @import("std");
 pub const contract = @import("contract.zig");
 const projection = @import("document.zig");
+const index_metadata = @import("../api/index_metadata.zig");
 const A = std.mem.Allocator;
 pub const key = "_privacy";
 pub const Scan = struct {
@@ -456,10 +457,23 @@ pub fn install(a: A, indexes_json: []const u8, resource: Resource) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     const scratch = arena.allocator();
-    const parsed = try std.json.parseFromSlice(std.json.Value, scratch, if (resource.unprotected_indexes_json.len != 0) resource.unprotected_indexes_json else indexes_json, .{});
-    if (parsed.value != .object) return error.InvalidPrivacyCatalog;
-    var root = parsed.value;
-    _ = root.object.swapRemove(key);
+    const live = try std.json.parseFromSlice(std.json.Value, scratch, indexes_json, .{});
+    if (live.value != .object) return error.InvalidPrivacyCatalog;
+    var root: std.json.Value = if (resource.unprotected_indexes_json.len != 0)
+        (try std.json.parseFromSlice(std.json.Value, scratch, resource.unprotected_indexes_json, .{})).value
+    else
+        .{ .object = try live.value.object.clone(scratch) };
+    if (root != .object) return error.InvalidPrivacyCatalog;
+    // Logical consumer declarations are a rollback snapshot. Mutable control
+    // state always comes from the live catalog, including after restoring old
+    // snapshots that persisted opaque entries inside the logical declarations.
+    var logical_index: usize = 0;
+    while (logical_index < root.object.count()) {
+        const name = root.object.keys()[logical_index];
+        if (index_metadata.isOpaqueEntry(name)) {
+            _ = root.object.swapRemove(name);
+        } else logical_index += 1;
+    }
     // Save a clean logical catalog once, so policy replacement never nests
     // another protected catalog and disabling redaction can rebuild originals.
     if (root.object.getPtr("enrichments")) |definitions| {
@@ -476,6 +490,11 @@ pub fn install(a: A, indexes_json: []const u8, resource: Resource) ![]u8 {
     var persisted = resource;
     persisted.unprotected_indexes_json = if (resource.policy.mode == .redact_for_search_and_ai) try std.json.Stringify.valueAlloc(scratch, root, .{}) else "";
     if (resource.policy.mode == .redact_for_search_and_ai) try protect(scratch, &root, resource.policy_version);
+    var controls = live.value.object.iterator();
+    while (controls.next()) |entry| {
+        if (index_metadata.isOpaqueEntry(entry.key_ptr.*) and !std.mem.eql(u8, entry.key_ptr.*, key))
+            try root.object.put(scratch, entry.key_ptr.*, entry.value_ptr.*);
+    }
     const managed_policy = try resource.policy.executable(scratch);
     const producer = try projection.resolve(scratch, managed_policy, true);
     const config = try std.json.Stringify.valueAlloc(scratch, .{ .type = producer.type, .config = producer.config }, .{});
@@ -618,7 +637,7 @@ fn protect(a: A, root: *std.json.Value, version: [64]u8) !void {
     try collectNames(a, root.*, version, &names);
     var it = root.object.iterator();
     while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+        if (std.mem.eql(u8, entry.key_ptr.*, "enrichments") or index_metadata.isOpaqueEntry(entry.key_ptr.*)) continue;
         const value = entry.value_ptr;
         if (value.* != .object) continue;
         var kind = getString(value.*, "type");
@@ -709,7 +728,7 @@ fn collectNames(a: A, root: std.json.Value, version: [64]u8, names: *std.StringH
         }
     }
     var it = root.object.iterator();
-    while (it.next()) |entry| if (entry.value_ptr.* == .object and entry.value_ptr.object.contains("type")) try collectNames(a, entry.value_ptr.*, version, names);
+    while (it.next()) |entry| if (!index_metadata.isOpaqueEntry(entry.key_ptr.*) and entry.value_ptr.* == .object and entry.value_ptr.object.contains("type")) try collectNames(a, entry.value_ptr.*, version, names);
 }
 
 fn rewriteEnrichments(a: A, root: *std.json.Value, names: *std.StringHashMapUnmanaged([]const u8), version: [64]u8, additions: *std.json.Value) !void {
@@ -743,7 +762,7 @@ fn rewriteEnrichments(a: A, root: *std.json.Value, names: *std.StringHashMapUnma
         }
     }
     var it = root.object.iterator();
-    while (it.next()) |entry| if (entry.value_ptr.* == .object and entry.value_ptr.object.contains("type")) try rewriteEnrichments(a, entry.value_ptr, names, version, additions);
+    while (it.next()) |entry| if (!index_metadata.isOpaqueEntry(entry.key_ptr.*) and entry.value_ptr.* == .object and entry.value_ptr.object.contains("type")) try rewriteEnrichments(a, entry.value_ptr, names, version, additions);
 }
 
 test "privacy protected graph versions all named consumers and closes the implicit raw text index" {
@@ -1000,4 +1019,49 @@ test "privacy legacy checkpoint headers retain their CAS bytes after upgrade" {
     const encoded = try std.json.Stringify.valueAlloc(a, parsed.value, .{});
     defer a.free(encoded);
     try std.testing.expectEqualStrings(raw, encoded);
+}
+
+test "privacy policy transitions preserve live opaque controls and never resurrect snapshots" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Evidence deliberately resembles a producer/index declaration. Neither
+    // dependency discovery nor rewriting may interpret anything in this value.
+    const evidence = "{\"type\":\"graph\",\"enrichments\":[{\"name\":\"evidence\",\"kind\":\"group\",\"source_artifact_name\":\"missing\"}]}";
+    const opaque_names = [_][]const u8{ "_resolver_record_store", "_resolver_record_owners", "_resolver_curation", "_resolver_namespaces", "_curation_proposals" };
+    var live = (try std.json.parseFromSlice(std.json.Value, a, "{\"full_text_index_v0\":{}}", .{})).value;
+    for (opaque_names) |name| try live.object.put(a, name, (try std.json.parseFromSlice(std.json.Value, a, evidence, .{})).value);
+    var policy = contract.Policy{ .mode = .redact_for_search_and_ai, .fields = &.{"absent"} };
+    var saved = try install(a, try std.json.Stringify.valueAlloc(a, live, .{}), try next(a, null, policy, null));
+    for ([_]contract.Mode{ .redact_for_search_and_ai, .redact_for_search_and_ai, .monitor, .redact_for_search_and_ai }) |mode| {
+        live = (try std.json.parseFromSlice(std.json.Value, a, saved, .{})).value;
+        var resource = (try current(a, live)).?.value;
+        const logical = (try std.json.parseFromSlice(std.json.Value, a, resource.unprotected_indexes_json, .{})).value;
+        for (opaque_names) |name| try std.testing.expect(!logical.object.contains(name));
+        // Simulate an old persisted snapshot, then delete one control in live
+        // state and change another after protection was originally enabled.
+        var stale = logical;
+        try stale.object.put(a, "_resolver_record_store", (try std.json.parseFromSlice(std.json.Value, a, evidence, .{})).value);
+        resource.unprotected_indexes_json = try std.json.Stringify.valueAlloc(a, stale, .{});
+        _ = live.object.swapRemove("_resolver_record_store");
+        try live.object.put(a, "_curation_proposals", .{ .string = "latest-proposal" });
+        policy.mode = mode;
+        policy.execution.batch_items = 1;
+        if (mode == .redact_for_search_and_ai and resource.policy.execution.batch_items == 1) policy.sensitivity = .thorough;
+        const updated = try next(a, resource, policy, try etag(a, resource));
+        saved = try install(a, try std.json.Stringify.valueAlloc(a, live, .{}), updated);
+        const result = (try std.json.parseFromSlice(std.json.Value, a, saved, .{})).value;
+        try std.testing.expect(!result.object.contains("_resolver_record_store"));
+        try std.testing.expectEqualStrings("latest-proposal", result.object.get("_curation_proposals").?.string);
+        for (opaque_names[1 .. opaque_names.len - 1]) |name| {
+            try std.testing.expectEqualStrings(evidence, try std.json.Stringify.valueAlloc(a, result.object.get(name).?, .{}));
+        }
+        if (mode == .monitor) {
+            // Re-enabling protection starts from current logical declarations.
+            resource = (try current(a, result)).?.value;
+            try std.testing.expectEqualStrings("", resource.unprotected_indexes_json);
+            policy.mode = .redact_for_search_and_ai;
+            saved = try install(a, saved, try next(a, resource, policy, try etag(a, resource)));
+        }
+    }
 }
