@@ -473,6 +473,40 @@ until their metadata has been explicitly admitted as sorted.
 
 ## Validation
 
+### Retryable owner availability (2026-11-05)
+
+- Merge `1a27bdb5da` incorporates main through
+  `fa45514327ae2cf3ce5ea7af461cb07130b3c089`. Fix `c389f256e9` classifies
+  group startup, storage/read-index, leader and transport/topology availability
+  as retryable HTTP 503, sharing table reads' transport classification. These
+  errors include `Retry-After: 1`; forwarded metadata responses retain it.
+- Validation, CAS preconditions, cancellation, deadlines and unknown mutation
+  outcomes retain distinct responses. Native tests force 22 availability errors
+  and verify non-availability cases. The forwarding test proves that a 503 is
+  not replayed and ambiguous scan admission remains an unknown mutation outcome.
+- The cold-start regression creates 15 empty tables and previews each directly,
+  without preliminary writes, deletes or reads. Standalone's first attempts all
+  return 200. In Raft, 11 first attempts return 503 with the typed body/header;
+  every preview subsequently succeeds through bounded client-side polling.
+  No valid preview returns 422, installs a policy or claims a complete scan.
+  The secret-reference empty-sample test also no longer warms its data owner.
+- Build: 106/106 steps, 64 API/metadata tests, 171 native privacy/storage tests
+  and both ABI checks pass. Eighteen HTTP cases pass in each deployment mode
+  (269.68 s standalone, 307.54 s Raft), covering all four lifecycle variants,
+  cold startup, curation transitions, credential rejection, secret references,
+  category limits and unsupported storage. The remaining 27 HTTP cases were
+  outside this targeted run; earlier full-suite qualification is below.
+- The TypeScript SDK additions merged from main pass 593 tests (one opt-in skip)
+  and type checking. Formatting, license headers and the Apache boundary pass.
+  Projected hydration retains the 4,712,210/4,715,173-byte peaks for one/twenty
+  documents. Successful reads gain no RPCs, retries or added error-path work.
+- Qualified server SHA-256:
+  `36109fb1375beafd6a7da83ba5dab12605717ef2efd37e6a42acdc522ec7820b`.
+  Logs: `.privacy-startup-build.log`, `.privacy-startup-http-standalone.log`,
+  `.privacy-startup-http-raft.log`, `.privacy-startup-sdk-tests.log`,
+  `.privacy-startup-sdk-types.log`. Required cache cleanup removed 96.0 GiB,
+  leaving 145.0 GiB free while preserving active builds.
+
 ### Live catalog controls and credential admission (2026-11-05)
 
 - Merge `f0256a88ee` incorporates main through
