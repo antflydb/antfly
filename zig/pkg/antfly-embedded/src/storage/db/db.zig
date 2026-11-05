@@ -11285,11 +11285,15 @@ pub const DB = struct {
         try self.core.store.scanWithContext(lower, if (upper) |buf| buf else "", .{}, &state, ScanState.scanEntry);
 
         if (state.rows < ScanState.batch_limit) {
-            const ready_key = try internal_keys.artifactRepairKindIndexReadyKeyAlloc(alloc);
-            errdefer alloc.free(ready_key);
-            const ready_value = try alloc.dupe(u8, "2");
-            errdefer alloc.free(ready_value);
-            try writes.append(alloc, .{ .key = ready_key, .value = ready_value });
+            {
+                // Scope the errdefers to the append: once `writes` owns the
+                // buffers, its deferred cleanup frees them on a failed commit.
+                const ready_key = try internal_keys.artifactRepairKindIndexReadyKeyAlloc(alloc);
+                errdefer alloc.free(ready_key);
+                const ready_value = try alloc.dupe(u8, "2");
+                errdefer alloc.free(ready_value);
+                try writes.append(alloc, .{ .key = ready_key, .value = ready_value });
+            }
             const deletes = [_][]const u8{ progress_key, legacy_progress_key };
             try self.core.store.putBatchWithReplayWithOptions(null, writes.items, deletes[0..], null, .{ .defer_commit_flush = true });
             return false;
