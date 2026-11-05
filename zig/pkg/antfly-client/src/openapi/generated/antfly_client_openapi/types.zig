@@ -51975,7 +51975,9 @@ pub const RuntimeConfig = struct {
     content_security: ?ContentSecurityConfig = null,
     /// S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
     s3_credentials: ?Credentials = null,
-    /// Experimental execution batching; mode on explicitly enables qualified CUDA scheduling. Resource and request ceilings still apply.
+    /// Opt-in interleaving of independently owned requests on backends declaring safe step sharing. Independent of row batching; graph, prefix-cache, speculative and multimodal routes remain exclusive. Currently qualified for at most two active E4B CUDA requests with one row per step.
+    cooperative_execution: ?std.json.Value = null,
+    /// Experimental row batching; independent from cooperative_execution. Mode on explicitly enables qualified CUDA row scheduling. Resource and request ceilings still apply.
     generation_batching: ?std.json.Value = null,
     /// How long to keep models loaded in memory after last use (Ollama-compatible). Models are automatically unloaded after this duration of inactivity. Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0". Defaults to "5m". Set to "0" to disable idle-time eviction; models can still be evicted under resource pressure or to enforce max_loaded_models.
     keep_alive: ?[]const u8 = null,
@@ -52012,6 +52014,7 @@ pub const RuntimeConfig = struct {
         .{ "ml_dir", "ml_dir", true },
         .{ "content_security", "content_security", true },
         .{ "s3_credentials", "s3_credentials", true },
+        .{ "cooperative_execution", "cooperative_execution", true },
         .{ "generation_batching", "generation_batching", true },
         .{ "keep_alive", "keep_alive", true },
         .{ "max_loaded_models", "max_loaded_models", true },
@@ -52064,6 +52067,10 @@ pub const RuntimeConfig = struct {
         }
         if (self.s3_credentials) |value| {
             try jw.objectField("s3_credentials");
+            try jw.write(value);
+        }
+        if (self.cooperative_execution) |value| {
+            try jw.objectField("cooperative_execution");
             try jw.write(value);
         }
         if (self.generation_batching) |value| {
