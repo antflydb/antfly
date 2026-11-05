@@ -3798,7 +3798,12 @@ pub const PreparedSource = struct {
         // Restoring cleanup is mandatory even when the original request was
         // cancelled. This does not execute/replay numerical work.
         try scheduling.selectReadyCohort(scheduling.execution_gate, .{}, &self.waiter);
+        errdefer scheduling.leaveSelectedCohort(&self.waiter);
         try scheduling.acquireSelectedCohort(.{}, &self.waiter);
+        errdefer {
+            if (self.numerical_lane_lease) |lease| lease.release();
+            self.numerical_lane_lease = null;
+        }
         if (self.numerical_lane) |lane| self.numerical_lane_lease = try lane.acquireWithPriority(.{}, self.numerical_lane_interactive);
         if (self.shape_scope) |*scope| try scope.beginNumerical();
         self.native_weight_paused = false;
@@ -3815,7 +3820,12 @@ pub const PreparedSource = struct {
     /// One existing-cache transaction. Both unused allocations/refunds and old
     /// map destruction settle outside Model/FIFO/lane, including every error.
     fn executeNativeDenseCold(self: *PreparedSource, plan: *@import("../ops/native_compute.zig").NativeCompute.DenseCacheCold, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !void {
-        try self.suspendNativeWeightSlice();
+        self.suspendNativeWeightSlice() catch |err| {
+            // No yield/funding happened: the locked current creator still
+            // pins this metadata, so dropping only this extra ref is pure.
+            plan.abandonUnfundedUnderModel();
+            return err;
+        };
         defer if (self.native_weight_paused) self.restoreNativeWeightSlice() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         var finished = false;
         defer if (!finished) {

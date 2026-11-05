@@ -90,6 +90,8 @@ const AdmissionBinding = struct {
     independent_host_bytes: usize = 0,
     independent_backend_bytes: usize = 0,
     credits: std.ArrayListUnmanaged(AdmissionCredit) = .empty,
+    // Actual per-Binding mutation identity. Saturation prevents raw metadata
+    // ABA after wrap; cold commits reserve one final revision for rollback.
     revision: u64 = 0,
     deferred_releases: bool = false,
     flush_in_flight: bool = false,
@@ -218,7 +220,7 @@ const AdmissionBinding = struct {
             credited.* = desired_credit;
         }
         actual.* = next;
-        self.revision +%= 1;
+        self.revision +|= 1;
     }
 
     fn release(self: *@This(), tier: ResidencyTier, bytes: usize) void {
@@ -237,7 +239,7 @@ const AdmissionBinding = struct {
             credited.* = desired_credit;
         }
         actual.* = next;
-        self.revision +%= 1;
+        self.revision +|= 1;
     }
 
     /// Called only after the actual CPU backing died. The Native cache owner
@@ -254,7 +256,7 @@ const AdmissionBinding = struct {
         actual.* -= bytes;
         derived.* -= independent;
         self.deferred_releases = true;
-        self.revision +%= 1;
+        self.revision +|= 1;
     }
 
     fn deferPhysicalDrop(self: *@This(), node: *retirement.Node) !void {
@@ -345,7 +347,7 @@ const AdmissionBinding = struct {
             self.lock();
             self.creditedPtr(detached.tier).?.* -= reduction;
             if (reduction != owned) self.credits.appendAssumeCapacity(detached);
-            self.revision +%= 1;
+            self.revision +|= 1;
             self.mutex.unlock();
         }
     }
@@ -365,7 +367,7 @@ const AdmissionBinding = struct {
         self.independent_host_bytes = self.physical_component_bytes;
         self.backend_bytes = 0;
         self.independent_backend_bytes = 0;
-        self.revision +%= 1;
+        self.revision +|= 1;
     }
     fn releasePhysicalComponent(self: *@This(), bytes: usize) void {
         self.lock();
@@ -375,7 +377,7 @@ const AdmissionBinding = struct {
         self.physical_component_bytes -= bytes;
         self.host_bytes -= bytes;
         self.independent_host_bytes -= bytes;
-        self.revision +%= 1;
+        self.revision +|= 1;
     }
 
     fn retainPhysicalReference(self: *@This()) void {
@@ -622,7 +624,7 @@ pub const SharedCache = struct {
             if (self.binding) |binding| {
                 binding.lock();
                 defer binding.mutex.unlock();
-                if (binding.flush_in_flight or binding.revision != self.expected_revision) return error.PreparedCacheGrowthChanged;
+                if (binding.flush_in_flight or binding.revision >= std.math.maxInt(u64) - 1 or binding.revision != self.expected_revision) return error.PreparedCacheGrowthChanged;
                 const actual = binding.actualPtr(self.tier).?;
                 const credited = binding.creditedPtr(self.tier).?;
                 const next = try std.math.add(usize, actual.*, self.bytes);
@@ -649,7 +651,7 @@ pub const SharedCache = struct {
                 binding.deferred_releases = true;
                 actual.* = next;
                 binding.independentPtr(self.tier).?.* = next_independent;
-                binding.revision +%= 1;
+                binding.revision +|= 1;
             }
             if (self.logicalBytes() != 0) cache.noteResidentUnchecked(self.tier, self.logicalBytes());
             self.committed = true;
@@ -662,10 +664,18 @@ pub const SharedCache = struct {
         /// Same actual cache exclusion spans validation/commit/attach. This
         /// existing physical owner now pins the SAME token ledger, not a copy.
         pub fn retainCommittedPhysicalBacking(self: *const @This()) PhysicalBacking {
+            const bytes = if (self.physical_component_bytes != 0) self.physical_component_bytes else self.bytes;
+            return self.retainCommittedPhysicalBackingPart(bytes);
+        }
+        /// One exact independently owned part of this same committed growth.
+        /// The serialized caller proves payload/header membership and retains
+        /// each part once. Unretained entries keep their original ledger path.
+        pub fn retainCommittedPhysicalBackingPart(self: *const @This(), bytes: usize) PhysicalBacking {
             std.debug.assert(self.committed);
             self.validatePhysicalBacking() catch @panic("invalid committed cache backing");
+            const total = if (self.physical_component_bytes != 0) self.physical_component_bytes else self.bytes;
+            std.debug.assert(bytes > 0 and bytes <= total);
             const binding = self.binding.?;
-            const bytes = if (self.physical_component_bytes != 0) self.physical_component_bytes else self.bytes;
             binding.lock();
             std.debug.assert(bytes <= binding.independent_host_bytes - binding.physical_component_bytes);
             binding.physical_component_bytes += bytes;
@@ -701,7 +711,7 @@ pub const SharedCache = struct {
                 }
                 actual.* -= self.bytes;
                 binding.independentPtr(self.tier).?.* -= self.independent_bytes;
-                binding.revision +%= 1;
+                binding.revision +|= 1;
             }
             switch (self.tier) {
                 .host => {
@@ -766,7 +776,7 @@ pub const SharedCache = struct {
         const binding = self.admission orelse return result;
         binding.lock();
         defer binding.mutex.unlock();
-        if (binding.flush_in_flight) return error.ResourceTemporarilyUnavailable;
+        if (binding.flush_in_flight or binding.revision >= std.math.maxInt(u64) - 1) return error.ResourceTemporarilyUnavailable;
         const next = std.math.add(usize, binding.actualPtr(tier).?.*, bytes) catch return error.MemoryBudgetExceeded;
         result.expected_revision = binding.revision;
         const next_independent = try std.math.add(usize, binding.independentPtr(tier).?.*, independent_bytes);
@@ -785,7 +795,7 @@ pub const SharedCache = struct {
         const binding = self.admission orelse return error.MissingCacheRetirementDomain;
         binding.lock();
         defer binding.mutex.unlock();
-        if (binding.flush_in_flight or binding.final_queued) return error.ResourceTemporarilyUnavailable;
+        if (binding.flush_in_flight or binding.final_queued or binding.revision >= std.math.maxInt(u64) - 1) return error.ResourceTemporarilyUnavailable;
         const next = try std.math.add(usize, binding.host_bytes, metadata_bytes);
         const next_independent = try std.math.add(usize, binding.independent_host_bytes, physical);
         if (next_independent > next) return error.InvalidPreparedCacheGrowth;
@@ -902,7 +912,7 @@ pub const SharedCache = struct {
             const binding = self.binding orelse return;
             binding.lock();
             defer binding.mutex.unlock();
-            if (binding.flush_in_flight or binding.revision != self.revision) return error.PreparedCacheGrowthChanged;
+            if (binding.flush_in_flight or binding.revision >= std.math.maxInt(u64) - 1 or binding.revision != self.revision) return error.PreparedCacheGrowthChanged;
             // Whole set prevalidation before any metadata transfer.
             for (self.entries) |entry| {
                 if (entry.index >= binding.credits.items.len) return error.PreparedCacheGrowthChanged;
@@ -918,7 +928,7 @@ pub const SharedCache = struct {
             }
             if (self.entries.len != 0) {
                 binding.deferred_releases = true;
-                binding.revision +%= 1;
+                binding.revision +|= 1;
             }
         }
         pub fn finishOutsideExecution(self: *@This()) void {
@@ -946,7 +956,7 @@ pub const SharedCache = struct {
         const binding = self.admission orelse return .{};
         if (old_domain.controller() != binding.controller) return error.ForeignAdmissionDomain;
         binding.lock();
-        if (binding.flush_in_flight) {
+        if (binding.flush_in_flight or binding.revision >= std.math.maxInt(u64) - 1) {
             binding.mutex.unlock();
             return error.PreparedCacheGrowthChanged;
         }
@@ -1047,7 +1057,7 @@ pub const SharedCache = struct {
         binding.backend_credited_bytes = 0;
         binding.independent_host_bytes = 0;
         binding.independent_backend_bytes = 0;
-        binding.revision +%= 1;
+        binding.revision +|= 1;
         binding.mutex.unlock();
         self.admission = null;
         self.host_bytes = 0;
@@ -1660,4 +1670,25 @@ test "Native physical component preserves original payload cap while backing exa
         backing.releaseAfterMetadataDeathOutsideExecution();
         try std.testing.expectEqual(@as(usize, 0), pin.controller().snapshot().host_weight_bytes);
     }
+}
+
+test "Native existing Binding revision exhaustion never certifies a recycled raw map recipe" {
+    const old = try domain.Domain.create();
+    defer old.release();
+    const pin = old.pin();
+    defer pin.release();
+    var cache = SharedCache.init(.{ .host_limit_bytes = 128 });
+    defer cache.deinitAdmission();
+    try cache.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = 128 }, .{});
+    try cache.installRetirementDomainOutsideExecution(&pin);
+    var stale = try cache.snapshotPhysicalOwnerGrowthLocked(0, 16);
+    defer stale.finishOutsideExecution();
+    try stale.fundOutsideExecution(&pin);
+    // Same real raw reserve/release path, with unchanged final counters.
+    cache.admission.?.revision = std.math.maxInt(u64) - 1;
+    try cache.reserve(.host, 1);
+    cache.noteRelease(.host, 1);
+    try std.testing.expectEqual(std.math.maxInt(u64), cache.admission.?.revision);
+    try std.testing.expectError(error.PreparedCacheGrowthChanged, stale.commit());
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, cache.snapshotPhysicalOwnerGrowthLocked(0, 16));
 }

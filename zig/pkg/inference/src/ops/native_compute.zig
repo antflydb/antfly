@@ -88,6 +88,47 @@ const DenseDequantCacheEntry = struct {
     projection_widths: [3]usize = @splat(0),
     in_dim: usize = 0,
 };
+/// Owns only HashMap metadata, never the borrowed entry keys or values. The
+/// exact canonical process allocator and existing Binding can outlive Model.
+/// A cold-prepared node makes later raw replacement allocation-free to retire.
+const DenseCacheMapOwner = struct {
+    const Map = std.StringHashMapUnmanaged(DenseDequantCacheEntry);
+    allocator: std.mem.Allocator,
+    references: std.atomic.Value(usize) = .init(1),
+    map: Map = .empty,
+    backing: ?tier_cache_mod.PhysicalBacking = null,
+    node: @import("../execution/resource_retirement.zig").Node = undefined,
+
+    fn prepare(allocator: std.mem.Allocator) !*@This() {
+        const self = try allocator.create(@This());
+        self.* = .{ .allocator = allocator };
+        return self;
+    }
+    fn finish(raw: *anyopaque) callconv(.c) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.destroyOutsideExecution();
+    }
+    fn retain(self: *@This()) *@This() {
+        const before = self.references.fetchAdd(1, .monotonic);
+        std.debug.assert(before != 0 and before != std.math.maxInt(usize));
+        return self;
+    }
+    fn destroyOutsideExecution(self: *@This()) void {
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        const allocator = self.allocator;
+        const backing = self.backing;
+        self.map.deinit(allocator);
+        allocator.destroy(self);
+        if (backing) |held| held.releaseAfterMetadataDeathOutsideExecution();
+    }
+    fn deferOutsideExecution(self: *@This()) void {
+        const backing = self.backing orelse @panic("unbacked dense map owner");
+        self.node = .{ .context = self, .release_fn = finish };
+        // Actual owner/cache exclusion prevents final Model close from racing
+        // this publication. No callback occurs under the cache/Model lock.
+        backing.deferCreatorDrop(&self.node) catch platform.inference_process_supervisor.restartWorker();
+    }
+};
 const embeddinggemma2_weight_cache = @import("../models/embedding_gemma2_weight_cache.zig");
 
 pub const QuantDequantCacheStats = struct {
@@ -838,6 +879,7 @@ pub const WeightStore = struct {
     gliner_head_dense_cache: std.StringHashMapUnmanaged(DenseDequantCacheEntry) = .{},
     gliner_head_dense_cache_bytes: usize = 0,
     gliner_head_dense_cache_prepared_map_bytes: usize = 0,
+    gliner_head_dense_cache_map_owner: ?*DenseCacheMapOwner = null,
     gliner_head_dense_cache_lock: std.atomic.Mutex = .unlocked,
     quant_dequant_cache_hits: u64 = 0,
     quant_dequant_cache_misses: u64 = 0,
@@ -4619,6 +4661,8 @@ pub const NativeCompute = struct {
         max_bytes: usize = 0,
         map_pointer: usize = 0,
         map_count: u32 = 0,
+        map_owner_pointer: usize = 0,
+        map_owner_loan: ?*DenseCacheMapOwner = null,
         map_capacity: u32 = 0,
         cache_bytes: usize = 0,
         raw_keys: usize = 0,
@@ -4631,6 +4675,9 @@ pub const NativeCompute = struct {
         staged_map: Map = .empty,
         old_map: Map = .empty,
         old_map_bytes: usize = 0,
+        staged_map_owner: ?*DenseCacheMapOwner = null,
+        old_map_owner: ?*DenseCacheMapOwner = null,
+        map_owner_bytes: usize = 0,
 
         fn policies(self: *const NativeCompute) [5]bool {
             return .{ self.quantized_activation_policy == .strict_f32, quantDequantDenseCacheEnabled(), quantDequantSgemmScratchEnabled(), quantizedDequantSgemmEnabled(), clipClapDequantSgemmEnabled() };
@@ -4693,7 +4740,7 @@ pub const NativeCompute = struct {
         }
         fn initial(self: *NativeCompute, kind: Kind) !@This() {
             const data = self.data;
-            return .{ .kind = kind, .compute = self, .policy = policies(self), .max_bytes = quantDequantDenseCacheMaxBytes(), .map_pointer = pointer(&data.gliner_head_dense_cache), .map_count = data.gliner_head_dense_cache.count(), .map_capacity = data.gliner_head_dense_cache.capacity(), .cache_bytes = data.gliner_head_dense_cache_bytes, .raw_keys = try rawKeyBytes(&data.gliner_head_dense_cache), .map_bytes = try currentMapBytes(&data.gliner_head_dense_cache) };
+            return .{ .kind = kind, .compute = self, .policy = policies(self), .max_bytes = quantDequantDenseCacheMaxBytes(), .map_pointer = pointer(&data.gliner_head_dense_cache), .map_count = data.gliner_head_dense_cache.count(), .map_owner_pointer = if (data.gliner_head_dense_cache_map_owner) |owner| @intFromPtr(owner) else 0, .map_capacity = data.gliner_head_dense_cache.capacity(), .cache_bytes = data.gliner_head_dense_cache_bytes, .raw_keys = try rawKeyBytes(&data.gliner_head_dense_cache), .map_bytes = try currentMapBytes(&data.gliner_head_dense_cache) };
         }
         /// Upgrade existing raw keys/map even when an optional future birth is
         /// denied. The SAME old data tokens stay intact; no byte lending.
@@ -4705,6 +4752,9 @@ pub const NativeCompute = struct {
             if (cache.admission == null) return null; // unchanged raw owner
             var result = try initial(self, .metadata);
             if (data.gliner_head_dense_cache_prepared_map_bytes != 0 and data.gliner_head_dense_cache_prepared_map_bytes != result.map_bytes) return error.NativeCacheLayoutChangedOutsidePreparedProtocol;
+            if (data.gliner_head_dense_cache_map_owner) |owner| {
+                if (pointer(&owner.map) != result.map_pointer) return error.NativeCacheLayoutChangedOutsidePreparedProtocol;
+            }
             const keys = result.raw_keys;
             var raw_payload: usize = 0;
             var entries = data.gliner_head_dense_cache.iterator();
@@ -4712,10 +4762,12 @@ pub const NativeCompute = struct {
                 raw_payload = try std.math.add(usize, raw_payload, entry.value_ptr.bytes);
             };
             const map = if (data.gliner_head_dense_cache_prepared_map_bytes == 0) result.map_bytes else 0;
-            const bytes = try std.math.add(usize, keys, map);
+            result.map_owner_bytes = if (map != 0 and data.allocator.vtable == std.heap.c_allocator.vtable) @sizeOf(DenseCacheMapOwner) else 0;
+            const bytes = try std.math.add(usize, try std.math.add(usize, keys, map), result.map_owner_bytes);
             if (bytes == 0) return null;
             result.growth = if (raw_payload != 0) try cache.snapshotExistingPhysicalComponentLocked(raw_payload, bytes) else try cache.snapshotPhysicalOwnerGrowthLocked(0, bytes);
             try result.growth.?.validatePhysicalBacking();
+            result.retainMapOwner(data);
             return result;
         }
         /// Caller has already selected the original dense-first layout and
@@ -4743,16 +4795,41 @@ pub const NativeCompute = struct {
             result.representation = ResidentWeightPreparation.representationSignature(storage);
             result.payload_bytes = try std.math.mul(usize, try std.math.mul(usize, in_dim, out_dim), @sizeOf(f32));
             result.new_map_bytes = try mapAllocation(data.gliner_head_dense_cache, 1);
-            const physical = try std.math.add(usize, try std.math.add(usize, result.payload_bytes, buf.name.len), result.new_map_bytes);
+            result.map_owner_bytes = if (result.new_map_bytes != 0 and data.allocator.vtable == std.heap.c_allocator.vtable) @sizeOf(DenseCacheMapOwner) else 0;
+            const physical = try std.math.add(usize, try std.math.add(usize, try std.math.add(usize, result.payload_bytes, buf.name.len), result.new_map_bytes), result.map_owner_bytes);
             result.growth = try cache.snapshotPhysicalOwnerGrowthLocked(result.payload_bytes, physical);
             try result.growth.?.validatePhysicalBacking();
+            result.retainMapOwner(data);
             return result;
+        }
+        /// Failed suspension before any cold yield/funding. The SAME current
+        /// creator remains published under this cache lock; decrementing the
+        /// extra snapshot ref cannot destroy backing or invoke any callback.
+        pub fn abandonUnfundedUnderModel(self: *@This()) void {
+            const data = self.compute.data;
+            lock(data);
+            defer unlock(data);
+            std.debug.assert(self.growth != null and !self.growth.?.funded and !self.growth.?.committed);
+            std.debug.assert(self.staged_name == null and self.staged_values == null and self.staged_map_owner == null);
+            if (self.map_owner_loan) |owner| {
+                std.debug.assert(data.gliner_head_dense_cache_map_owner == owner);
+                const before = owner.references.fetchSub(1, .acq_rel);
+                std.debug.assert(before > 1);
+            }
+            self.* = .{};
+        }
+        fn retainMapOwner(self: *@This(), data: *WeightStore) void {
+            std.debug.assert(self.map_owner_loan == null);
+            if (data.gliner_head_dense_cache_map_owner) |owner| self.map_owner_loan = owner.retain();
         }
         pub fn fundOutsideExecution(self: *@This(), pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !void {
             if (self.kind == .inactive) return error.InvalidNativeCachePreparation;
             try self.growth.?.fundOutsideExecution(pin);
-            if (self.kind == .metadata) return;
             const allocator = self.compute.data.allocator;
+            if (self.map_owner_bytes != 0) {
+                self.staged_map_owner = try DenseCacheMapOwner.prepare(allocator);
+            }
+            if (self.kind == .metadata) return;
             self.staged_name = try allocator.dupe(u8, self.name);
             self.staged_values = try allocator.alloc(f32, self.payload_bytes / @sizeOf(f32));
             if (self.new_map_bytes != 0) try self.staged_map.ensureTotalCapacity(allocator, try std.math.add(u32, self.map_count, 1));
@@ -4763,7 +4840,7 @@ pub const NativeCompute = struct {
             const data = self.compute.data;
             lock(data);
             defer unlock(data);
-            if (self.kind == .inactive or !std.meta.eql(self.policy, policies(self.compute)) or self.max_bytes != quantDequantDenseCacheMaxBytes() or self.map_pointer != pointer(&data.gliner_head_dense_cache) or self.map_count != data.gliner_head_dense_cache.count() or self.map_capacity != data.gliner_head_dense_cache.capacity() or self.cache_bytes != data.gliner_head_dense_cache_bytes or self.raw_keys != try rawKeyBytes(&data.gliner_head_dense_cache)) return error.NativeWeightPreparationChanged;
+            if (self.kind == .inactive or !std.meta.eql(self.policy, policies(self.compute)) or self.max_bytes != quantDequantDenseCacheMaxBytes() or self.map_pointer != pointer(&data.gliner_head_dense_cache) or self.map_count != data.gliner_head_dense_cache.count() or self.map_owner_pointer != (if (data.gliner_head_dense_cache_map_owner) |owner| @intFromPtr(owner) else @as(usize, 0)) or self.map_capacity != data.gliner_head_dense_cache.capacity() or self.cache_bytes != data.gliner_head_dense_cache_bytes or self.raw_keys != try rawKeyBytes(&data.gliner_head_dense_cache)) return error.NativeWeightPreparationChanged;
             if (self.kind == .metadata) {
                 try self.growth.?.commit();
                 var entries = data.gliner_head_dense_cache.iterator();
@@ -4771,6 +4848,7 @@ pub const NativeCompute = struct {
                     entry.value_ptr.prepared_physical_bytes = entry.value_ptr.bytes + entry.key_ptr.*.len;
                 };
                 data.gliner_head_dense_cache_prepared_map_bytes = self.map_bytes;
+                self.publishMapOwner(data, self.map_bytes);
                 return;
             }
             const current = data.resident_weights.getPtr(self.name) orelse if (data.lazy_weights.getPtr(self.name)) |entry| (if (entry.loaded) |*value| value else return error.NativeWeightPreparationChanged) else return error.NativeWeightPreparationChanged;
@@ -4787,18 +4865,32 @@ pub const NativeCompute = struct {
             }
             try self.growth.?.commit(); // LAST fallible step before publication
             if (self.new_map_bytes != 0) {
-                self.old_map = data.gliner_head_dense_cache;
-                self.old_map_bytes = data.gliner_head_dense_cache_prepared_map_bytes;
-                std.debug.assert(self.old_map_bytes == self.map_bytes);
+                self.old_map_owner = data.gliner_head_dense_cache_map_owner;
+                if (self.old_map_owner == null) {
+                    self.old_map = data.gliner_head_dense_cache;
+                    self.old_map_bytes = data.gliner_head_dense_cache_prepared_map_bytes;
+                }
+                data.gliner_head_dense_cache_map_owner = null;
+                std.debug.assert(data.gliner_head_dense_cache_prepared_map_bytes == self.map_bytes);
                 data.gliner_head_dense_cache = self.staged_map;
                 self.staged_map = .empty;
                 data.gliner_head_dense_cache_prepared_map_bytes = self.new_map_bytes;
+                self.publishMapOwner(data, self.new_map_bytes);
             }
             data.gliner_head_dense_cache.putAssumeCapacityNoClobber(name, .{ .data = values, .bytes = self.payload_bytes, .prepared_physical_bytes = self.payload_bytes + name.len });
             self.staged_name = null;
             self.staged_values = null;
             data.gliner_head_dense_cache_bytes += self.payload_bytes;
             data.quant_dequant_cache_inserts += 1;
+        }
+        fn publishMapOwner(self: *@This(), data: *WeightStore, map_bytes: usize) void {
+            const owner = self.staged_map_owner orelse return;
+            std.debug.assert(data.gliner_head_dense_cache_map_owner == null and map_bytes != 0);
+            owner.map = data.gliner_head_dense_cache;
+            owner.allocator = std.heap.c_allocator; // vtable-certified; no caller ptr survives
+            owner.backing = self.growth.?.retainCommittedPhysicalBackingPart(map_bytes + self.map_owner_bytes);
+            data.gliner_head_dense_cache_map_owner = owner;
+            self.staged_map_owner = null;
         }
         /// Caller ended Model/lane/cache ownership before settling both
         /// unused quota and obsolete map/credit-array metadata.
@@ -4809,6 +4901,9 @@ pub const NativeCompute = struct {
             if (self.staged_name) |name| data.allocator.free(name);
             self.staged_map.deinit(data.allocator);
             self.old_map.deinit(data.allocator);
+            if (self.old_map_owner) |owner| owner.destroyOutsideExecution();
+            if (self.map_owner_loan) |owner| owner.destroyOutsideExecution();
+            if (self.staged_map_owner) |owner| owner.destroyOutsideExecution();
             if (self.old_map_bytes != 0) {
                 ResidentWeightPreparation.lock(data);
                 if (data.tier_cache) |*cache| cache.notePreparedReleaseWithLogical(.host, 0, self.old_map_bytes, self.old_map_bytes);
@@ -4974,6 +5069,9 @@ pub const NativeCompute = struct {
         DenseCacheCold.lock(data);
         defer DenseCacheCold.unlock(data);
         if (data.gliner_head_dense_cache_prepared_map_bytes != try DenseCacheCold.currentMapBytes(&data.gliner_head_dense_cache) or try DenseCacheCold.rawKeyBytes(&data.gliner_head_dense_cache) != 0) return false;
+        if (data.gliner_head_dense_cache_map_owner) |owner| {
+            if (DenseCacheCold.pointer(&owner.map) != DenseCacheCold.pointer(&data.gliner_head_dense_cache)) return false;
+        }
         const expected_bytes = try std.math.mul(usize, try std.math.mul(usize, request.in_dim, request.out_dim), @sizeOf(f32));
         for (0..request.count()) |index| {
             const bit = @as(u3, 1) << @intCast(index);
@@ -5678,7 +5776,15 @@ pub fn deinitGlinerHeadDenseCache(data: *WeightStore) void {
             if (physical != 0) tier_cache.notePreparedReleaseWithLogical(.host, entry.value_ptr.bytes, physical, physical) else tier_cache.noteRelease(.host, entry.value_ptr.bytes);
         }
     }
-    data.gliner_head_dense_cache.deinit(data.allocator);
+    if (data.gliner_head_dense_cache_map_owner) |owner| {
+        // Map has no escaping readers; current Model/cache exclusion ended all
+        // entry access. Metadata/header and quota die at the existing outside
+        // settlement boundary, including final close's actual-B callback.
+        data.gliner_head_dense_cache = .empty;
+        data.gliner_head_dense_cache_map_owner = null;
+        data.gliner_head_dense_cache_prepared_map_bytes = 0;
+        owner.deferOutsideExecution();
+    } else data.gliner_head_dense_cache.deinit(data.allocator);
     if (data.gliner_head_dense_cache_prepared_map_bytes != 0) if (data.tier_cache) |*tier_cache| {
         const bytes = data.gliner_head_dense_cache_prepared_map_bytes;
         tier_cache.notePreparedReleaseWithLogical(.host, 0, bytes, bytes);
@@ -7943,7 +8049,21 @@ fn cachedQuantDequantDenseWeightFromStore(
     errdefer data.allocator.free(dense_weight);
     try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, dense_weight);
 
-    try data.gliner_head_dense_cache.put(data.allocator, owned_name, .{
+    // Preserve the original append/whole-clear map policy. A raw grow cannot
+    // free an already paid allocation invisibly to its exact physical owner.
+    if (data.gliner_head_dense_cache_map_owner != null and try NativeCompute.DenseCacheCold.mapAllocation(data.gliner_head_dense_cache, 1) != 0) {
+        var replacement: DenseCacheMapOwner.Map = .empty;
+        errdefer replacement.deinit(data.allocator);
+        try replacement.ensureTotalCapacity(data.allocator, try std.math.add(u32, data.gliner_head_dense_cache.count(), 1));
+        var entries = data.gliner_head_dense_cache.iterator();
+        while (entries.next()) |entry| replacement.putAssumeCapacityNoClobber(entry.key_ptr.*, entry.value_ptr.*);
+        replacement.putAssumeCapacityNoClobber(owned_name, .{ .data = dense_weight, .bytes = bytes });
+        const previous = data.gliner_head_dense_cache_map_owner.?;
+        data.gliner_head_dense_cache = replacement;
+        data.gliner_head_dense_cache_map_owner = null;
+        data.gliner_head_dense_cache_prepared_map_bytes = 0;
+        previous.deferOutsideExecution();
+    } else try data.gliner_head_dense_cache.put(data.allocator, owned_name, .{
         .data = dense_weight,
         .bytes = bytes,
     });
@@ -56948,4 +57068,191 @@ test "Laya declared matrix span reuses exact original codec SGEMM with no matrix
     aliased_source.raw_bytes = std.mem.sliceAsBytes(bank[0..17]);
     try std.testing.expectError(error.InvalidAssignedHostWorkspace, layaDequantScratchSgemm(&compute, &aliased_source, &input, &actual, 3, 32, 2, 0, &bank));
     try std.testing.expectError(error.InvalidAssignedHostWorkspace, tryLayaDequantSgemmBias(&compute, &storage, &input, bank[0..2], &actual, 3, 32, 2, &bank));
+}
+
+fn nativeRawDenseMapOwnerOom(a: std.mem.Allocator) !void {
+    const owner = try DenseCacheMapOwner.prepare(a);
+    defer owner.destroyOutsideExecution();
+    try owner.map.ensureTotalCapacity(a, 1);
+    owner.map.putAssumeCapacityNoClobber("borrowed key", .{ .data = &.{}, .bytes = 0 });
+}
+
+test "Native raw dense metadata owner header and map allocation errors leave borrowed payload intact" {
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, nativeRawDenseMapOwnerOom, .{});
+}
+
+fn nativeRawDenseMapMutationCase(comptime exact: enum { ample, exact, below }) !void {
+    const a = std.heap.c_allocator;
+    const old = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer old.release();
+    const pin = old.pin();
+    defer pin.release();
+    var data = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 1024 * 1024 }) };
+    var data_live = true;
+    defer if (data_live) data.deinitOwned();
+    const first_key = "raw.0";
+    const payload_bytes = 4 * 32 * @sizeOf(f32);
+    const physical = payload_bytes + first_key.len + try NativeCompute.DenseCacheCold.mapAllocation(.empty, 1) + @sizeOf(DenseCacheMapOwner);
+    const limit = switch (exact) {
+        .ample => 1024 * 1024,
+        .exact => physical,
+        .below => physical - 1,
+    };
+    try data.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = limit }, .{});
+    try data.tier_cache.?.installRetirementDomainOutsideExecution(&pin);
+    var compute = NativeCompute.init(a, &data, null);
+    var compute_live = true;
+    defer if (compute_live) compute.deinit();
+    const cb = compute.computeBackend();
+    var raw: [4 * 34]u8 = @splat(1);
+    for (0..4) |row| {
+        raw[row * 34] = 0;
+        raw[row * 34 + 1] = 0x28;
+    }
+    const storage = QuantizedStorage{ .allocator = a, .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = &raw, .shape = &.{ 4, 32 }, .raw_owned = false };
+    var first = (try cachedQuantDequantDenseWeightFromStore(&compute, &data, first_key, &storage, 32, 4)) orelse return error.TestExpectedDenseCache;
+    try NativeCompute.prepareResidentCreditUpgradesOutsideExecution(&cb, &data, &pin);
+    var initial = (try NativeCompute.snapshotDenseCacheMetadata(&cb, &data)).?;
+    defer initial.finishOutsideExecution();
+    if (exact == .below) {
+        // This API acquires only the exact metadata increment. It fits the
+        // limit by itself; the SAME already-held raw payload makes the total
+        // one byte too large, classified as existing-usage pressure.
+        try std.testing.expectEqual(payload_bytes, pin.controller().snapshot().host_weight_bytes);
+        try std.testing.expectEqual(physical - payload_bytes, initial.growth.?.credit_bytes);
+        try std.testing.expect(initial.growth.?.credit_bytes <= limit);
+        try std.testing.expectEqual(limit + 1, payload_bytes + initial.growth.?.credit_bytes);
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, initial.fundOutsideExecution(&pin));
+        try std.testing.expectEqual(payload_bytes, pin.controller().snapshot().host_weight_bytes);
+        try std.testing.expectEqual(@as(usize, 0), data.gliner_head_dense_cache_prepared_map_bytes);
+        try std.testing.expect(data.gliner_head_dense_cache_map_owner == null);
+        try std.testing.expectEqual(first.ptr, data.gliner_head_dense_cache.get(first_key).?.data.ptr);
+        return;
+    }
+    if (exact == .ample) {
+        // First-raw map has no paid owner yet. Its SAME Binding revision
+        // changes on every real reserve/clear path and never wraps. Rebuild a
+        // map of identical byte size/count/key while the initial recipe waits.
+        try initial.fundOutsideExecution(&pin);
+        const initial_size = initial.map_bytes;
+        deinitGlinerHeadDenseCache(&data);
+        first = (try cachedQuantDequantDenseWeightFromStore(&compute, &data, first_key, &storage, 32, 4)) orelse return error.TestExpectedDenseCache;
+        try std.testing.expectEqual(initial_size, try NativeCompute.DenseCacheCold.currentMapBytes(&data.gliner_head_dense_cache));
+        try std.testing.expect(data.tier_cache.?.admission.?.revision != initial.growth.?.expected_revision);
+        initial.fillAndCommitUnderModel() catch |err| switch (err) {
+            error.NativeWeightPreparationChanged, error.PreparedCacheGrowthChanged => {},
+            else => return err,
+        };
+        try std.testing.expect(!initial.growth.?.committed);
+        initial.finishOutsideExecution();
+        initial = (try NativeCompute.snapshotDenseCacheMetadata(&cb, &data)).?;
+    }
+    try initial.fundOutsideExecution(&pin);
+    try initial.fillAndCommitUnderModel();
+    initial.finishOutsideExecution();
+    try std.testing.expectEqual(physical, pin.controller().snapshot().host_weight_bytes);
+    if (exact == .exact) return;
+    const first_owner = data.gliner_head_dense_cache_map_owner.?;
+    const first_map = NativeCompute.DenseCacheCold.pointer(&first_owner.map);
+    // The ordinary raw producer grows the SAME map while a cold recipe waits.
+    // Its original payload/name allocations and dequantized values are kept.
+    _ = (try cachedQuantDequantDenseWeightFromStore(&compute, &data, "raw.1", &storage, 32, 4)) orelse return error.TestExpectedDenseCache;
+    var stale = (try NativeCompute.snapshotDenseCacheMetadata(&cb, &data)).?;
+    defer stale.finishOutsideExecution();
+    try stale.fundOutsideExecution(&pin);
+    var index: usize = 2;
+    while (data.gliner_head_dense_cache_map_owner != null) : (index += 1) {
+        var text: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&text, "raw.{d}", .{index});
+        _ = (try cachedQuantDequantDenseWeightFromStore(&compute, &data, key, &storage, 32, 4)) orelse return error.TestExpectedDenseCache;
+        try std.testing.expect(index < 32);
+    }
+    try std.testing.expectEqual(first_map, NativeCompute.DenseCacheCold.pointer(&first_owner.map));
+    try std.testing.expect(first_map != NativeCompute.DenseCacheCold.pointer(&data.gliner_head_dense_cache));
+    try std.testing.expectEqual(first.ptr, data.gliner_head_dense_cache.get(first_key).?.data.ptr);
+    try std.testing.expectError(error.NativeWeightPreparationChanged, stale.fillAndCommitUnderModel());
+    stale.finishOutsideExecution(); // unused credit only; never old-map credit
+    try NativeCompute.flushWeightReleasesOutsideExecution(&cb, &data);
+    var replacement = (try NativeCompute.snapshotDenseCacheMetadata(&cb, &data)).?;
+    defer replacement.finishOutsideExecution();
+    try replacement.fundOutsideExecution(&pin);
+    try replacement.fillAndCommitUnderModel();
+    replacement.finishOutsideExecution();
+    try std.testing.expectEqual(first.ptr, data.gliner_head_dense_cache.get(first_key).?.data.ptr);
+    try std.testing.expectEqual(data.gliner_head_dense_cache_prepared_map_bytes, try NativeCompute.DenseCacheCold.currentMapBytes(&data.gliner_head_dense_cache));
+    try std.testing.expect(data.gliner_head_dense_cache_map_owner != null);
+    // A raw insertion with spare capacity creates a mandatory key upgrade.
+    // Snapshot that recipe, then replace the map with a SAME-sized allocation
+    // while the recipe is cold. The actual owner ref prevents address ABA.
+    var extra_text: [32]u8 = undefined;
+    const extra_key = try std.fmt.bufPrint(&extra_text, "raw.{d}", .{index + 1});
+    _ = (try cachedQuantDequantDenseWeightFromStore(&compute, &data, extra_key, &storage, 32, 4)) orelse return error.TestExpectedDenseCache;
+    // Simulate failed initial suspension before any yield. Current creator
+    // proves this atomic unpin cannot be a destructor/callback under Model.
+    var abandoned = (try NativeCompute.snapshotDenseCacheMetadata(&cb, &data)).?;
+    const current_owner = data.gliner_head_dense_cache_map_owner.?;
+    try std.testing.expectEqual(@as(usize, 2), current_owner.references.load(.acquire));
+    abandoned.abandonUnfundedUnderModel();
+    try std.testing.expectEqual(@as(usize, 1), current_owner.references.load(.acquire));
+    abandoned.finishOutsideExecution(); // idempotent empty cleanup
+    var same_size = (try NativeCompute.snapshotDenseCacheMetadata(&cb, &data)).?;
+    defer same_size.finishOutsideExecution();
+    try same_size.fundOutsideExecution(&pin);
+    const held_owner = same_size.map_owner_loan.?;
+    const held_map = NativeCompute.DenseCacheCold.pointer(&held_owner.map);
+    const target_count = data.gliner_head_dense_cache.count();
+    const target_capacity = data.gliner_head_dense_cache.capacity();
+    deinitGlinerHeadDenseCache(&data);
+    try NativeCompute.flushWeightReleasesOutsideExecution(&cb, &data);
+    try std.testing.expectEqual(@as(usize, 1), held_owner.references.load(.acquire));
+    try std.testing.expectEqual(held_map, NativeCompute.DenseCacheCold.pointer(&held_owner.map));
+    for (0..target_count) |n| {
+        var text: [32]u8 = undefined;
+        const key = try std.fmt.bufPrint(&text, "raw.{d}", .{n});
+        _ = (try cachedQuantDequantDenseWeightFromStore(&compute, &data, key, &storage, 32, 4)) orelse return error.TestExpectedDenseCache;
+    }
+    try std.testing.expectEqual(target_capacity, data.gliner_head_dense_cache.capacity());
+    try std.testing.expectEqual(same_size.map_bytes, try NativeCompute.DenseCacheCold.currentMapBytes(&data.gliner_head_dense_cache));
+    try std.testing.expect(held_map != NativeCompute.DenseCacheCold.pointer(&data.gliner_head_dense_cache));
+    try std.testing.expectError(error.NativeWeightPreparationChanged, same_size.fillAndCommitUnderModel());
+    same_size.finishOutsideExecution();
+    var fresh = (try NativeCompute.snapshotDenseCacheMetadata(&cb, &data)).?;
+    defer fresh.finishOutsideExecution();
+    try fresh.fundOutsideExecution(&pin);
+    try fresh.fillAndCommitUnderModel();
+    fresh.finishOutsideExecution();
+    // An actual later cleanup B holds the old Domain after raw whole-clear and
+    // store death. No map/entry pointer survives; quota is released after B.
+    var sink = try @import("../execution/retirement_sink.zig").Ref.create();
+    defer sink.release();
+    var a_guard = try sink.enter();
+    defer a_guard.finish();
+    var a_epoch = try a_guard.retainEpoch();
+    defer a_epoch.release();
+    a_guard.finish();
+    const live_map = data.gliner_head_dense_cache_map_owner.?;
+    const held_bytes = pin.controller().snapshot().host_weight_bytes;
+    try std.testing.expectError(error.RetirementEpochSealed, data.deinitOwnedWithCleanup(.{ .boundary = &a_epoch }));
+    try std.testing.expectEqual(live_map, data.gliner_head_dense_cache_map_owner.?);
+    try std.testing.expectEqual(held_bytes, pin.controller().snapshot().host_weight_bytes);
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    compute.deinit();
+    compute_live = false;
+    try data.deinitOwnedWithCleanup(.{ .boundary = &epoch });
+    data_live = false;
+    try std.testing.expect(pin.controller().snapshot().host_weight_bytes > 0);
+    guard.finish();
+    try std.testing.expectEqual(@as(usize, 0), pin.controller().snapshot().host_weight_bytes);
+}
+
+test "Native raw peer map growth reattests exact new metadata preserves payload and refuses stale cold recipe" {
+    try nativeRawDenseMapMutationCase(.ample);
+}
+
+test "Native raw map upgrade exact physical cap includes owner header and one below preserves raw backing" {
+    try nativeRawDenseMapMutationCase(.exact);
+    try nativeRawDenseMapMutationCase(.below);
 }
