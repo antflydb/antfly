@@ -4,7 +4,7 @@ Implements the table-scoped **Privacy** design in
 [issue #1401](https://github.com/antflydb/antfly/issues/1401). The user-facing
 contract and examples are in [Table privacy](../reference/table-privacy.md).
 The branch starts at `f2b3baaee1cb508005451843c17fa07f2e069d4b`.
-Main is merged through `616117cc78ba29dcd6c0212abd78ac076201ee3f`; privacy uses metadata protocol version 81.
+Main is merged through `81941d33651c582a91341ffcd3bde7e065688352`; privacy uses metadata protocol version 81.
 
 ## Policy and user experience
 
@@ -462,12 +462,61 @@ publication against the pinned transaction. Preview rejects unsupported
 `redact_before_storage` before provider resolution or sample lookup, including
 empty samples, using the same typed error as policy installation.
 
+Wide JSON also requires scalable text-segment navigation. Readers sort their
+owned field directory once during admission, reject adjacent duplicate names,
+and use binary lookup for sections, statistics, capability checks and deferred
+bindings. Mapped and native range readers share this behavior; historical wire
+ordering, payloads and checksum validation are unchanged. This avoids quadratic
+field scans during compaction that could stall writes/publication for documents
+with 10,000 indexed fields. Hand-built readers retain the legacy lookup fallback
+until their metadata has been explicitly admitted as sorted.
+
 ## Validation
+
+### Merged code and wide-field compaction (2026-11-04)
+
+- Privacy fixes are committed in `80ef8959ae`; merge `a61de5b7a7` incorporates
+  main through `81941d33651c582a91341ffcd3bde7e065688352` without conflicts.
+- Full HTTP qualification initially exposed a second wide-object problem:
+  repeated linear segment-directory scans and quadratic duplicate admission
+  delayed ordinary writes and protected publication. The sorted in-memory
+  directory fix (`e167fda62d`) preserves wire ordering, checksums and historical
+  compatibility.
+- Integrated build: 106/106 steps, 62 API/metadata tests, 169 native
+  privacy/storage checks and both ABI checks pass without leaks. All 135
+  segment checks pass, including mapped/native ranges, CRC behavior, merges,
+  and a reversed 2,048-field directory with duplicate rejection.
+- Broader native query target: 66/66 steps, 449 tests passed, two opt-in dense
+  replay/cache benchmarks skipped, and no leaks. The manually driven graph
+  replication fixture now disables autonomous maintenance (`d6b8fe99fb`), so
+  background ownership cannot race its one-shot ordered page applications.
+- All four new HTTP cases pass in both standalone (39.72 s) and Raft (37.67 s).
+  The wide-object preview/backfill/update case takes 9.99/12.36 seconds,
+  respectively, instead of the earlier stalled/timed-out runs.
+- Complete standalone HTTP suite: 33 passed, one optional model case skipped
+  (656.85 s). Complete Raft HTTP suite: 29 passed, one optional model skip,
+  four standalone-only backup fixtures deselected (916.84 s). The pinned-model
+  case passes separately with required Metal on the same binary.
+- All five original HTTP/memory reproducers pass on the merged binary
+  (55.69 s). Sampled RSS depends on background cache warming; the deterministic
+  one/twenty-hit allocator regression remains the working-set bound.
+- Scoped retry, change-journal and enrichment replay checks pass all 11 cases
+  across 58 build steps. The pinned PII model's two-field long-document HTTP
+  gate passes with Metal required (33.88 s). CUDA kernels and model weights
+  are unchanged; CUDA qualification was not repeated.
+- Formatting, license headers and the Apache boundary check pass (2,407 source
+  files). `make gc` completes, preserves active/recent output and removes no
+  eligible build output; 144.3 GiB remains free.
+- Qualified server binary SHA-256:
+  `a46abdbf57fd3b99dc8fba96db5d15d7b8daf68a304252c2f9102d6163bdfb59`.
 
 ### Wide JSON and protected reader lifetimes (2026-11-04)
 
-- Fetched main; the branch already contains
-  `616117cc78ba29dcd6c0212abd78ac076201ee3f` and needs no additional merge.
+- Initial qualification used main at
+  `616117cc78ba29dcd6c0212abd78ac076201ee3f`. Main advanced during testing;
+  merge `a61de5b7a7` incorporates `81941d33651c582a91341ffcd3bde7e065688352`
+  without conflicts. The following measurements use the preserved pre-merge
+  binary; final merged-code qualification is recorded separately.
 - Integrated build: 106/106 steps, 62 API/metadata tests, 168 native
   privacy/storage checks and both ABI checks pass without leaks. New cases
   exercise wide maps/arrays and deep containers in one/16-document cohorts,
