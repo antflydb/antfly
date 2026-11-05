@@ -115,6 +115,8 @@ pub const Owned = struct {
     host: ?@import("lake_source.zig").Host,
     executor: @import("../../common/http/std_http_executor.zig").StdHttpExecutor,
     client: transport.Client,
+    routing: transport.Routing,
+    discovery: ?transport.Discovery,
     service: runtime.Service,
     bridge: @import("bridge.zig").Bridge,
     driver: @import("driver.zig").Driver,
@@ -154,9 +156,13 @@ pub const Owned = struct {
             try std.Io.Dir.cwd().createDirPath(io, path);
         }
         self.host = if (self.artifacts) |*store| .{ .cache = &self.cache, .artifacts = &self.artifact_port, .store_identity = try @import("../../api/native_retained_cut.zig").storeIdentity(scratch, store.locator), .options = .{ .node_config = node, .secret_store = secrets }, .io = io } else null;
-        self.executor.initInPlace(a, .{});
+        self.executor.initInPlace(a, .{ .resolve_before_connect = true, .connect_timeout_ms = 2000 });
         errdefer self.executor.deinit();
-        self.client = .{ .a = a, .executor = self.executor.executor(), .authentication = self.config.authentication, .workers = self.config.workers, .io = io, .discovery = if (self.config.discovery_name) |name| .{ .name = name, .io = io, .port = 12390 } else null };
+        self.routing = .{};
+        self.discovery = if (self.config.discovery_name) |name| .{ .name = name, .io = io, .port = 12390 } else null;
+        if (self.discovery) |*discovery| try discovery.start();
+        errdefer if (self.discovery) |*discovery| discovery.stop();
+        self.client = .{ .a = a, .routing = &self.routing, .executor = self.executor.executor(), .authentication = self.config.authentication, .workers = self.config.workers, .io = io, .discovery = if (self.discovery) |*discovery| discovery else null };
         var nonce: [16]u8 = undefined;
         try io.randomSecure(&nonce);
         const owner = try scratch.dupe(u8, &std.fmt.bytesToHex(nonce, .lower));
@@ -221,6 +227,7 @@ pub const Owned = struct {
         self.driver.stop();
         self.scheduler.stop();
         self.worker_cancellation.stop();
+        if (self.discovery) |*discovery| discovery.stop();
         self.executor.deinit();
         self.spill.deinit();
         self.cache.deinit();

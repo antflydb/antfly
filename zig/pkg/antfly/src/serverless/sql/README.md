@@ -86,6 +86,10 @@ Embeddings can still supply `runtime.Factory`, `lake_source.Host`,
 retained read grant and must enforce the same scope and unsupported-policy
 checks. Ordinary SQL keeps local filter/projection/aggregate/order/limit
 operators above the distributed relation and exports its existing statement cut.
+Transport clients retain a process-owned `transport.Routing` and share its
+pointer across snapshots. Optional `transport.Discovery` owners must be started
+before serving and stopped after callers join; `deployment.Owned` handles both
+lifetimes automatically.
 
 ## Durable protocol
 
@@ -286,8 +290,11 @@ Query cancellation also releases live execution capacity. The owning native
 scheduler drains queued deliveries and signals active RPCs with a per-query
 atomic token; a bounded retirement history rejects racing queue replay. Workers
 reject the durable cancellation flag before claiming a task. Each native worker
-pod shares one background status watch per active query, with at most eight
-concurrent reads, a one-second poll interval, and a two-second read budget.
+pod shares one background status watch per active query, with at most one
+in-flight read per query and 256 queries per pod, a one-second poll interval,
+and a two-second read budget. Reads are scheduled independently: a slow query
+cannot occupy another query's watch lane. Idle and retired watches abort their
+reads and release their entry after the read joins.
 Execution checkpoints only inspect cached atomic signals, including inside
 storage cancellation callbacks; they never perform network I/O. Remote
 cancellation propagates at the next successful watch, with transient storage
@@ -296,3 +303,21 @@ durable record at cooperative checkpoints, at most once per second, and preserve
 host deadline and cancellation hooks. Once observed, cancellation stops task
 completion; the durable query flag also fences result acceptance during races.
 Query expiry still bounds work when the status store is unavailable.
+
+Native task routing retains endpoint health across DNS snapshots and delivery
+replay. Failed workers are quarantined with one- to thirty-second exponential
+cooldowns; at most one recovery probe runs per endpoint. Query/caller cancellation
+and local allocator/executor capacity failures do not penalize worker health. A delivery that exhausts its entire deadline
+still records the unresponsive endpoint, allowing the next replay to use a
+healthy peer. Native connections have a separate two-second setup deadline;
+established tasks retain their full execution budget.
+
+Headless-service discovery uses one process-owned refresh, with sorted,
+deduplicated snapshots of at most 256 endpoints. Snapshots are fresh for one
+second, may serve for five additional seconds during refresh failures, and are
+never extended by failed refreshes. Cold callers coalesce behind the same lookup
+and independently observe cancellation/deadlines at ten-millisecond intervals,
+with a two-second maximum wait. Resolver failures back off for one second.
+Resolver buffers and cleanup belong to the process, so an operating-system DNS
+call that cannot be cancelled never borrows a statement's memory or delays that
+statement's cancellation. Shutdown joins the resolver before freeing its owner.

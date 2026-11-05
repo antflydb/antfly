@@ -387,7 +387,8 @@ test "distributed SQL signed task RPC uses query listeners and recovery driver w
     defer listener_b.deinit();
     var executor = @import("../../raft/transport/mod.zig").StdHttpExecutor.init(a, .{});
     defer executor.deinit();
-    var client: transport.Client = .{ .a = a, .executor = executor.executor(), .authentication = authentication, .workers = &.{ listener_a.base_uri, listener_b.base_uri } };
+    var routing: transport.Routing = .{};
+    var client: transport.Client = .{ .routing = &routing, .a = a, .executor = executor.executor(), .authentication = authentication, .workers = &.{ listener_a.base_uri, listener_b.base_uri } };
     var unsigned = try server_a.handle(.{ .method = .POST, .uri = transport.task_path, .body = "{}" });
     defer unsigned.deinit(a);
     try std.testing.expectEqual(@as(u16, 401), unsigned.status);
@@ -1957,7 +1958,8 @@ test "distributed SQL control failover distinguishes worker failures from termin
         }
     };
     var fake: Fake = .{};
-    var client: transport.Client = .{ .a = a, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{ "http://first", "http://healthy" } };
+    var routing: transport.Routing = .{};
+    var client: transport.Client = .{ .routing = &routing, .a = a, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{ "http://first", "http://healthy" } };
     const query: transport.QueryRequest = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1000000 } };
     const context: Context = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 60 * std.time.ns_per_s };
     for ([_]u16{ 504, 503 }) |status| {
@@ -2018,7 +2020,8 @@ test "distributed SQL control attempt deadlines leave time for healthy peers and
     };
     var fake: Fake = .{};
     defer if (fake.first_uri) |uri| a.free(uri);
-    var client: transport.Client = .{ .a = a, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{ "http://first", "http://healthy" }, .control_attempt_ms = 20 };
+    var routing: transport.Routing = .{};
+    var client: transport.Client = .{ .routing = &routing, .a = a, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{ "http://first", "http://healthy" }, .control_attempt_ms = 20 };
     const query: transport.QueryRequest = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1000000 } };
     const context: Context = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s, .cancellation = .{ .ptr = &fake, .is_cancelled_fn = Fake.check } };
     try std.testing.expect(!try client.turn(query, context));
@@ -2194,7 +2197,8 @@ test "distributed SQL single worker control does not reserve a nonexistent peer 
         }
     };
     var marker: u8 = 0;
-    var client: transport.Client = .{ .a = a, .executor = .{ .ptr = &marker, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{"http://only"} };
+    var routing: transport.Routing = .{};
+    var client: transport.Client = .{ .routing = &routing, .a = a, .executor = .{ .ptr = &marker, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{"http://only"} };
     const request: transport.QueryRequest = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1000000 } };
     const context: Context = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s };
     try std.testing.expect(!try client.turn(request, context));

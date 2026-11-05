@@ -418,10 +418,10 @@ pub const StdHttpExecutor = struct {
 
     fn executeResolved(self: *StdHttpExecutor, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
         const io = self.io_impl.io();
-        // Controlled callers rely on interruptible queueing before the opaque
-        // resolved exchange. Uncontrolled non-persistent transfers use
-        // request-local clients and may overlap safely.
-        const serialize = self.cfg.keep_alive or req.timeout_ms != null or req.cancellation != null;
+        // Only the shared persistent client owns mutable connection state.
+        // Controlled non-persistent calls own separate clients and request
+        // groups, so a slow task must not serialize unrelated control/RPC work.
+        const serialize = self.cfg.keep_alive;
         if (serialize) try self.resolved_client_mutex.lock(io);
         defer if (serialize) self.resolved_client_mutex.unlock(io);
 
@@ -1461,6 +1461,7 @@ test "resolved std http executor bounds queued requests before delivery" {
 
     var executor = StdHttpExecutor.init(std.testing.allocator, .{
         .resolve_before_connect = true,
+        .keep_alive = true,
     });
     defer executor.deinit();
 
@@ -1696,4 +1697,58 @@ test "std http executor cancellation interrupts an active response wait" {
     try std.testing.expect(app.exited.load(.acquire));
     try group.await(task_io.io());
     group_active = false;
+}
+
+test "distributed SQL resolved RPCs overlap with independent deadlines and cancellation" {
+    const App = struct {
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, request: common.HttpRequest) !common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.endsWith(u8, request.uri, "/slow")) {
+                self.entered.set(std.testing.io);
+                try self.release.wait(std.testing.io);
+            }
+            return .{ .status = 200 };
+        }
+    };
+    var app: App = .{};
+    var listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{ .serve_in_connection_threads = true }, .{ .ptr = &app, .vtable = &.{ .execute = App.execute } });
+    defer listener.deinit();
+    try listener.start();
+    const base = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base);
+    const slow_uri = try std.fmt.allocPrint(std.testing.allocator, "{s}/slow", .{std.mem.trimEnd(u8, base, "/")});
+    defer std.testing.allocator.free(slow_uri);
+    var executor = StdHttpExecutor.init(std.testing.allocator, .{ .resolve_before_connect = true, .connect_timeout_ms = 2000 });
+    defer executor.deinit();
+    const Job = struct {
+        executor: common.RequestExecutor,
+        uri: []const u8,
+        cancellation: common.RequestCancellation = .{},
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            var response = self.executor.execute(std.testing.allocator, .{ .method = .GET, .uri = self.uri, .timeout_ms = 2000, .cancellation = &self.cancellation }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            response.deinit(std.testing.allocator);
+        }
+    };
+    var job: Job = .{ .executor = executor.executor(), .uri = slow_uri };
+    var group: std.Io.Group = .init;
+    defer {
+        app.release.set(std.testing.io);
+        group.cancel(std.testing.io);
+    }
+    try group.concurrent(std.testing.io, Job.run, .{&job});
+    try app.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } });
+    var fast = try executor.executor().execute(std.testing.allocator, .{ .method = .GET, .uri = base, .timeout_ms = 500 });
+    defer fast.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 200), fast.status);
+    try std.testing.expect(!app.release.isSet());
+    job.cancellation.cancel();
+    try group.await(std.testing.io);
+    const failure = job.failure orelse return error.ExpectedCancellation;
+    try std.testing.expect(failure == error.Cancelled or failure == error.Canceled);
 }

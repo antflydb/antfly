@@ -44,6 +44,7 @@ pub const Registry = struct {
         polls: u8 = 0,
         next_ns: u64 = 0,
         cancelled: std.atomic.Value(bool) = .init(false),
+        idle: std.atomic.Value(bool) = .init(false),
     };
     a: A,
     io: std.Io,
@@ -83,6 +84,7 @@ pub const Registry = struct {
                     if (!std.meta.eql(entry.tenant, tenant)) return error.SqlExecutionUnauthorized;
                     if (entry.users == 256) return error.SqlWorkerUnavailable;
                     entry.users += 1;
+                    entry.idle.store(false, .release);
                     return entry;
                 }
             } else free = entry;
@@ -97,6 +99,7 @@ pub const Registry = struct {
         defer self.mutex.unlock();
         std.debug.assert(entry.users != 0);
         entry.users -= 1;
+        if (entry.users == 0) entry.idle.store(true, .release);
         if (entry.users == 0 and entry.polls == 0) entry.* = .{};
         self.wake.set(self.io);
     }
@@ -135,12 +138,16 @@ pub const Registry = struct {
     fn poll(self: *Registry, entry: *Entry) void {
         var arena = std.heap.ArenaAllocator.init(self.a);
         defer arena.deinit();
-        const context: Context = .{ .io = self.io, .deadline_ns = @import("antfly_platform").time.monotonicNs() +| @as(u64, self.budget_ms) * std.time.ns_per_ms, .cancellation = .{ .ptr = self, .is_cancelled_fn = struct {
+        const Guard = struct {
+            registry: *Registry,
+            entry: *Entry,
             fn check(raw: *const anyopaque) bool {
-                const registry: *const Registry = @ptrCast(@alignCast(raw));
-                return registry.stopping.load(.acquire);
+                const guard: *const @This() = @ptrCast(@alignCast(raw));
+                return guard.registry.stopping.load(.acquire) or guard.entry.idle.load(.acquire) or guard.entry.cancelled.load(.acquire);
             }
-        }.check } };
+        };
+        const guard: Guard = .{ .registry = self, .entry = entry };
+        const context: Context = .{ .io = self.io, .deadline_ns = @import("antfly_platform").time.monotonicNs() +| @as(u64, self.budget_ms) * std.time.ns_per_ms, .cancellation = .{ .ptr = &guard, .is_cancelled_fn = Guard.check } };
         const ended = cancelled(arena.allocator(), self.store, entry.query.?, entry.tenant, context, self.clock) catch |err| {
             if (invalidAuthority(err)) entry.cancelled.store(true, .release);
             return; // Transient watch failures do not fail otherwise healthy work.
@@ -155,20 +162,40 @@ pub const Registry = struct {
             if (entry.users == 0 and entry.polls == 0) entry.* = .{};
         }
     }
+    fn pollOwned(self: *Registry, entry: *Entry) void {
+        defer {
+            self.releasePolls(&.{entry});
+            self.wake.set(self.io);
+        }
+        if (!self.stopping.load(.acquire)) self.poll(entry);
+    }
     fn run(self: *Registry) void {
         while (!self.stopping.load(.acquire)) {
             self.wake.reset();
-            var entries: [8]*Entry = undefined;
+            // One in-flight read per active query, bounded by the 256 entries.
+            // A slow query never occupies another query's watch lane.
+            var entries: [256]*Entry = undefined;
             var delay_ms: u32 = 0;
             const count = self.take(&entries, &delay_ms);
-            if (count != 0) {
-                defer self.releasePolls(entries[0..count]);
-                var group: std.Io.Group = .init;
-                defer group.cancel(self.io);
-                for (entries[0..count]) |entry| group.concurrent(self.io, poll, .{ self, entry }) catch break;
-                group.await(self.io) catch return;
-                continue;
+            var retry_from: ?usize = null;
+            for (entries[0..count]) |entry| {
+                if (self.stopping.load(.acquire)) {
+                    self.releasePolls(&.{entry});
+                    continue;
+                }
+                // run itself keeps this group alive until every spawn returns;
+                // stop joins both the scheduler and all outstanding reads.
+                self.group.concurrent(self.io, pollOwned, .{ self, entry }) catch {
+                    if (retry_from == null) retry_from = (@intFromPtr(entry) - @intFromPtr(&self.entries[0])) / @sizeOf(Entry);
+                    self.releasePolls(&.{entry});
+                };
             }
+            if (retry_from) |index| {
+                self.lock();
+                self.cursor = index; // Resource pressure must not starve later queries.
+                self.mutex.unlock();
+            }
+            if (count != 0) continue;
             self.wake.waitTimeout(self.io, .{ .duration = .{ .raw = .fromMilliseconds(delay_ms), .clock = .awake } }) catch |err| switch (err) {
                 error.Timeout => continue,
                 error.Canceled => return,
@@ -344,4 +371,68 @@ test "distributed SQL hosted cancellation checkpoints preserve parent hooks" {
     task.next_ns = 0;
     try std.testing.expectError(error.SqlQueryCancelled, context.ensureActive());
     try std.testing.expect(task.isCancelled());
+}
+
+test "distributed SQL independent watches observe healthy cancellation while other reads stall" {
+    const a = std.testing.allocator;
+    const storage = @import("objectstore");
+    var temporary = std.testing.tmpDir(.{});
+    defer temporary.cleanup();
+    const path = try temporary.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(path);
+    var filesystem = try storage.FilesystemClient.initWithIo(a, path, std.testing.io);
+    defer filesystem.deinit();
+    var base = filesystem.client();
+    try base.makeBucket("queries");
+    const records: state.Store = .{ .client = base, .bucket = "queries", .prefix = "sql", .now_ms = 1000, .tenant = @splat('a') };
+    const target: state.Query = .{ .id = @splat('8'), .expires_ms = 1000000 };
+    const fast_key = try records.key(a, target, null, 0);
+    defer a.free(fast_key);
+    for (0..9) |i| {
+        const query: state.Query = .{ .id = @splat(@as(u8, @intCast('0' + i))), .expires_ms = 1000000 };
+        const key = try records.key(a, query, null, 0);
+        defer a.free(key);
+        try records.create(a, key, query.id, query.expires_ms);
+    }
+    try records.requestCancel(a, fast_key);
+    const Gate = struct {
+        var current: *@This() = undefined;
+        base_get: @FieldType(storage.Client.VTable, "get_object"),
+        fast_key: []const u8,
+        fast_seen: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        fn get(raw: *anyopaque, allocator: A, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            const self = current;
+            if (std.mem.eql(u8, key, self.fast_key)) self.fast_seen.set(std.testing.io) else while (!self.release.isSet()) {
+                if (options.cancellation) |token| try token.check();
+                self.release.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromMilliseconds(1), .clock = .awake } }) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    error.Canceled => return err,
+                };
+            }
+            return self.base_get(raw, allocator, bucket, key, options);
+        }
+    };
+    var gate: Gate = .{ .base_get = base.vtable.get_object, .fast_key = fast_key };
+    Gate.current = &gate;
+    var table = base.vtable.*;
+    table.get_object = Gate.get;
+    var watched = records;
+    watched.client.vtable = &table;
+    const Time = struct {
+        fn read(_: ?*anyopaque) u64 {
+            return 1000;
+        }
+    };
+    var registry: Registry = .{ .a = a, .io = std.testing.io, .store = watched, .clock = .{ .read = Time.read } };
+    for (registry.entries[0..9], 0..) |*entry, i| entry.* = .{ .query = .{ .id = @splat(@as(u8, @intCast('0' + i))), .expires_ms = 1000000 }, .tenant = @splat('a'), .users = 1 };
+    const started = @import("antfly_platform").time.monotonicNs();
+    try registry.start();
+    defer {
+        gate.release.set(std.testing.io);
+        registry.stop();
+    }
+    try gate.fast_seen.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } });
+    try std.testing.expect(@import("antfly_platform").time.monotonicNs() - started < std.time.ns_per_s);
+    try std.testing.expect(!gate.release.isSet());
 }

@@ -29,43 +29,16 @@ pub const turn_path = "/internal/v1/sql/queries/turn";
 pub const cancel_path = "/internal/v1/sql/queries/cancel";
 pub const result_path = "/internal/v1/sql/queries/result";
 pub const QueryRequest = struct { tenant: plan.Digest, query: @import("state.zig").Query };
-/// Resolve a bounded snapshot per call; concurrent requests never mutate the
-/// shared client's routing slice. Headless Services expose ready query pods.
-pub const Discovery = struct {
-    name: []const u8,
-    port: u16,
-    io: std.Io,
-    fn resolve(self: Discovery, a: A, context: Context) ![]const []const u8 {
-        try context.ensureActive();
-        var storage: [256]std.Io.net.HostName.LookupResult = undefined;
-        var queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&storage);
-        try (try std.Io.net.HostName.init(self.name)).lookup(self.io, &queue, .{ .port = self.port });
-        var urls: std.ArrayList([]const u8) = .empty;
-        while (queue.getOne(self.io)) |result| {
-            if (result == .address) try urls.append(a, try std.fmt.allocPrint(a, "http://{f}", .{result.address}));
-        } else |err| {
-            switch (err) {
-                error.Closed => {},
-                else => return err,
-            }
-        }
-        try context.ensureActive();
-        if (urls.items.len == 0) return error.SqlWorkerUnavailable;
-        std.mem.sort([]const u8, urls.items, {}, struct {
-            fn less(_: void, left: []const u8, right: []const u8) bool {
-                return std.mem.lessThan(u8, left, right);
-            }
-        }.less);
-        return urls.items;
-    }
-};
+pub const Discovery = @import("discovery.zig").Discovery;
+pub const Routing = @import("routing.zig").Routing;
 pub const Client = struct {
     a: A,
+    routing: *Routing,
     executor: http.RequestExecutor,
     authentication: auth.Config,
     workers: []const []const u8,
     io: ?std.Io = null,
-    discovery: ?Discovery = null,
+    discovery: ?*Discovery = null,
     control_attempt_ms: u32 = 5_000,
     submit_attempt_ms: u32 = 20_000,
     pub fn dispatcher(self: *Client) runtime.Dispatcher {
@@ -224,18 +197,40 @@ pub const Client = struct {
             failure.* = err;
         };
     }
+    fn localFailure(err: anyerror) bool {
+        return switch (err) {
+            error.OutOfMemory, error.ConcurrencyUnavailable, error.SystemResources, error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded, error.LockedMemoryLimitExceeded => true,
+            else => false,
+        };
+    }
     pub fn execute(self: *Client, ticket: plan.Ticket, context: Context) !void {
         try context.ensureActive();
         if (self.workers.len == 0) return error.SqlWorkerUnavailable;
         const first = (std.hash.Wyhash.hash(ticket.stage, &ticket.query.id) +% ticket.task) % self.workers.len;
         var last_error: anyerror = error.SqlWorkerUnavailable;
-        for (0..@min(self.workers.len, 8)) |offset| {
-            self.executeAt((first + offset) % self.workers.len, ticket, context) catch |err| {
+        var attempts: usize = 0;
+        for (0..self.workers.len) |offset| {
+            const index = (first + offset) % self.workers.len;
+            const url = self.workers[index];
+            const admission = self.routing.admit(url, @import("antfly_platform").time.monotonicNs());
+            if (admission.kind == .blocked) continue;
+            self.executeAt(index, ticket, context) catch |err| {
+                // Record an unresponsive endpoint even when it consumed the
+                // delivery quantum. The next durable replay must try a peer.
+                // Explicit query/caller cancellation says nothing about health.
+                const cancelled = if (context.cancellation) |token| token.isCancelled() else false;
+                if (!cancelled and err != error.SqlExecutionUnauthorized and !localFailure(err))
+                    self.routing.failure(url, @import("antfly_platform").time.monotonicNs())
+                else
+                    self.routing.abandon(url, admission);
                 try context.ensureActive();
-                if (err == error.SqlExecutionUnauthorized) return err;
+                if (err == error.SqlExecutionUnauthorized or localFailure(err)) return err;
                 last_error = err;
+                attempts += 1;
+                if (attempts == 8) break;
                 continue;
             };
+            self.routing.success(url);
             return;
         }
         return last_error;
@@ -355,7 +350,7 @@ test "distributed SQL control routing is stable and spreads healthy queries" {
 }
 
 test "distributed SQL control budgets reserve a backup and allow source retention work" {
-    const client: Client = .{ .a = std.testing.allocator, .executor = undefined, .authentication = undefined, .workers = &.{} };
+    const client: Client = .{ .routing = undefined, .a = std.testing.allocator, .executor = undefined, .authentication = undefined, .workers = &.{} };
     const now = @import("antfly_platform").time.monotonicNs();
     const parent: Context = .{ .deadline_ns = now + 60 * std.time.ns_per_s };
     const poll = try client.controlContext(parent, true, false);
@@ -367,4 +362,80 @@ test "distributed SQL control budgets reserve a backup and allow source retentio
     try std.testing.expect(first.deadline_ns.? < short.deadline_ns.?);
     const backup = try client.controlContext(short, false, false);
     try std.testing.expectEqual(short.deadline_ns, backup.deadline_ns);
+}
+
+test "distributed SQL task replay avoids a stalled endpoint across routing snapshots" {
+    const Fake = struct {
+        stalled: usize = 0,
+        healthy: usize = 0,
+        fn execute(raw: *anyopaque, allocator: A, request_: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (std.mem.startsWith(u8, request_.uri, "http://stalled/")) {
+                self.stalled += 1;
+                while (!request_.cancellation.?.isCancelled()) try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+                return error.Canceled;
+            }
+            self.healthy += 1;
+            return .{ .status = 200, .owner_allocator = allocator, .body = try allocator.dupe(u8, "{}") };
+        }
+    };
+    var fake: Fake = .{};
+    var routing: Routing = .{ .cooldown_ms = 5000 };
+    var client: Client = .{ .routing = &routing, .a = std.testing.allocator, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{ "http://stalled", "http://healthy" } };
+    var ticket: plan.Ticket = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1000000 }, .stage = 0, .task = 0 };
+    ticket.task = @intCast(std.hash.Wyhash.hash(ticket.stage, &ticket.query.id) % 2);
+    const expired: Context = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 20 * std.time.ns_per_ms };
+    try std.testing.expectError(error.DeadlineExceeded, client.execute(ticket, expired));
+    var snapshot = client;
+    const live: Context = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + std.time.ns_per_s };
+    try snapshot.execute(ticket, live);
+    try client.execute(ticket, live);
+    try std.testing.expectEqual(@as(usize, 1), fake.stalled);
+    try std.testing.expectEqual(@as(usize, 2), fake.healthy);
+}
+
+test "distributed SQL caller cancellation never quarantines a healthy endpoint" {
+    const Fake = struct {
+        cancelled: bool = false,
+        fn check(raw: *const anyopaque) bool {
+            const self: *const @This() = @ptrCast(@alignCast(raw));
+            return self.cancelled;
+        }
+        fn execute(raw: *anyopaque, _: A, _: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.cancelled = true;
+            return error.Canceled;
+        }
+    };
+    var fake: Fake = .{};
+    var routing: Routing = .{};
+    var client: Client = .{ .a = std.testing.allocator, .routing = &routing, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{"http://healthy"} };
+    const ticket: plan.Ticket = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1000000 }, .stage = 0, .task = 0 };
+    try std.testing.expectError(error.Canceled, client.execute(ticket, .{ .cancellation = .{ .ptr = &fake, .is_cancelled_fn = Fake.check } }));
+    try std.testing.expectEqual(.healthy, routing.admit("http://healthy", @import("antfly_platform").time.monotonicNs()).kind);
+}
+
+test "distributed SQL local allocation and executor capacity failures preserve endpoint health" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var routing: Routing = .{};
+    var client: Client = .{ .a = failing.allocator(), .routing = &routing, .executor = undefined, .authentication = undefined, .workers = &.{"http://healthy"} };
+    const ticket: plan.Ticket = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1000000 }, .stage = 0, .task = 0 };
+    try std.testing.expectError(error.OutOfMemory, client.execute(ticket, .{}));
+    try std.testing.expectEqual(.healthy, routing.admit("http://healthy", @import("antfly_platform").time.monotonicNs()).kind);
+    const Fake = struct {
+        failure: anyerror,
+        fn execute(raw: *anyopaque, _: A, _: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return self.failure;
+        }
+    };
+    var fake: Fake = .{ .failure = error.ConcurrencyUnavailable };
+    client.a = std.testing.allocator;
+    client.authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" };
+    client.executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } };
+    for ([_]anyerror{ error.ConcurrencyUnavailable, error.SystemResources, error.ProcessFdQuotaExceeded }) |failure| {
+        fake.failure = failure;
+        try std.testing.expectError(failure, client.execute(ticket, .{}));
+        try std.testing.expectEqual(.healthy, routing.admit("http://healthy", @import("antfly_platform").time.monotonicNs()).kind);
+    }
 }
