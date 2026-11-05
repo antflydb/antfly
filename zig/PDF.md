@@ -1928,8 +1928,14 @@ The resource cache retains recognized resource fields and only MCID/ActualText
 from property dictionaries. Unknown payloads are released with temporary parsing
 storage rather than accumulating in the cache. Temporary per-object parsing and
 retained metadata share one live-byte ceiling, with separate cumulative-allocation
-allowances. Indirect property tables and dictionaries are resolved only when a
-selected scope needs them; overridden scopes do not read their object streams.
+allowances. Required fields from indirect resources retain only a small source
+reference for Properties; the optional table is projected on first selected use.
+Inherited resource references preserve this behavior. Direct table retention that
+exceeds its allowance becomes an invalid optional value, diagnosed only if used.
+Indirect property tables and dictionaries are resolved only when a selected
+scope needs them; overridden scopes do not read their object streams.
+The syntax scanner transfers owned string/name tokens into objects, avoiding a
+second full payload allocation while an object stream remains decoded.
 Selected missing or malformed property dictionaries retain native glyph text and
 report incomplete ActualText, including when selected optional metadata exceeds
 a decode or allocation allowance. Actual allocator failures and cancellation
