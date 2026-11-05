@@ -261,7 +261,34 @@ export interface NativeLibrary {
       syncLevel: number
     ) => number
   >;
+  /** Struct batch that returns the outcome receipt in the same call. */
+  dbBatchWithReceipt: KoffiFunc<
+    (
+      handle: unknown,
+      writes: object[] | null,
+      writeCount: number,
+      predicates: object[] | null,
+      predicateCount: number,
+      timestampNs: number | bigint,
+      syncLevel: number,
+      receiptOut: object
+    ) => number
+  >;
   dbBatchJson: KoffiFunc<(handle: unknown, request: object, out: object) => number>;
+  /** Batch JSON that returns the outcome receipt in the same call. */
+  dbBatchJsonWithReceipt: KoffiFunc<
+    (handle: unknown, request: object, out: object, receiptOut: object) => number
+  >;
+  /**
+   * Thread-local: valid only on the OS thread that ran the failed call, so
+   * it cannot follow an async (worker-thread) call. SQL error bodies carry
+   * the same receipt as "outcome_receipt".
+   */
+  lastErrorOutcomeReceipt: KoffiFunc<(out: object) => number>;
+  dbOutcomeReceiptStatus: KoffiFunc<
+    (handle: unknown, receipt: object, outStatus: number[]) => number
+  >;
+  dbOutcomeReceiptForget: KoffiFunc<(handle: unknown, receipt: object) => number>;
   dbBeginTransactionWithId: KoffiFunc<
     (
       handle: unknown,
@@ -572,7 +599,33 @@ function buildNative(): NativeLibrary {
       "uint64_t",
       "uint8_t",
     ]),
+    dbBatchWithReceipt: f("antfly_db_batch_with_receipt", "uint32_t", [
+      PAntflyDb,
+      PAntflyWriteIntentArray,
+      "size_t",
+      PAntflyVersionPredicateArray,
+      "size_t",
+      "uint64_t",
+      "uint8_t",
+      PAntflyBufferOut,
+    ]),
     dbBatchJson: f("antfly_db_batch_json", "uint32_t", [PAntflyDb, AntflySlice, PAntflyBufferOut]),
+    dbBatchJsonWithReceipt: f("antfly_db_batch_json_with_receipt", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      PAntflyBufferOut,
+      PAntflyBufferOut,
+    ]),
+    lastErrorOutcomeReceipt: f("antfly_last_error_outcome_receipt", "uint32_t", [PAntflyBufferOut]),
+    dbOutcomeReceiptStatus: f("antfly_db_outcome_receipt_status", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+      PUint8Out,
+    ]),
+    dbOutcomeReceiptForget: f("antfly_db_outcome_receipt_forget", "uint32_t", [
+      PAntflyDb,
+      AntflySlice,
+    ]),
     dbBeginTransactionWithId: f("antfly_db_begin_transaction_with_id", "uint32_t", [
       PAntflyDb,
       "const uint8_t *",

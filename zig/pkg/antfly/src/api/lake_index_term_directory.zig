@@ -21,7 +21,7 @@ const local = @import("antfly_local_sources");
 const stats = @import("lake_index_text_statistics.zig");
 const tree = @import("../serverless/graph_segment/page_tree.zig");
 const A = std.mem.Allocator;
-pub const Roots = struct { version: u8 = 1, branches: ?tree.Ref = null, leaves: ?tree.Ref = null };
+pub const Roots = struct { version: u8 = 2, branches: ?tree.Ref = null, leaves: ?tree.Ref = null };
 pub fn identity(artifact_id: []const u8) [32]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(artifact_id, &digest, .{});
@@ -69,13 +69,6 @@ pub const Branch = struct {
         const count = std.mem.readInt(u64, bytes[64..72], .little);
         if (count == 0 or std.mem.order(u8, &first, &last) == .gt) return error.InvalidNativeLakeTermDirectory;
         return .{ .first = first, .last = last, .count = count, .envelope = try stats.Summary.decode(bytes[72..]) };
-    }
-    pub fn decodeLegacy(bytes: []const u8) !Branch {
-        if (bytes.len < 76) return error.InvalidNativeLakeTermDirectory;
-        const first: [32]u8 = bytes[0..32].*;
-        const last: [32]u8 = bytes[32..64].*;
-        if (first[0] != last[0] or std.mem.order(u8, &first, &last) == .gt) return error.InvalidNativeLakeTermDirectory;
-        return .{ .first = first, .last = last, .count = std.math.maxInt(u64), .envelope = try stats.Summary.decode(bytes[64..]) };
     }
     pub fn merge(self: *Branch, other: Branch) !void {
         if (std.mem.order(u8, &other.first, &self.first) == .lt) self.first = other.first;

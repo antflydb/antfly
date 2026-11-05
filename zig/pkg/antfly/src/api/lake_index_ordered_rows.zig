@@ -31,11 +31,11 @@ pub const metadata_version: u16 = 11;
 const cover_columns = @import("lake_index_cover_columns.zig");
 const sort_stream = @import("lake_index_sort_stream.zig");
 pub const file_dictionary = @import("lake_index_ordered_files.zig");
-// Distinct checkpoint metadata lets older workers safely discard derived runs
-// instead of mistaking a partial forest for a complete serving index.
+// Distinct checkpoint metadata identifies partial merge forests separately
+// from complete serving indexes.
 pub const checkpoint_metadata_version: u16 = 12;
 pub fn supportsBuildMetadata(version: u16) bool {
-    return version == 5 or version == 6 or version == 7 or version == 8 or version == 9 or version == 10 or version == metadata_version or version == checkpoint_metadata_version;
+    return version == metadata_version or version == checkpoint_metadata_version;
 }
 pub const predicate_blocks = @import("lake_index_predicate_blocks.zig");
 pub const max_root_bytes = 4 * 1024 * 1024;
@@ -92,14 +92,12 @@ pub const Root = struct {
         return if (self.file_dictionary) |dictionary| dictionary.count else self.files.len;
     }
     pub fn validate(self: Root) !void {
-        if (!(if (self.building) (self.version == 6 or self.version == 8 or self.version == 10 or self.version == checkpoint_metadata_version) else (self.version == 5 or self.version == 7 or self.version == 9 or self.version == metadata_version)) or self.tuple_encoding != tuples.encoding_version or std.mem.allEqual(u8, &self.domain, 0) or std.mem.allEqual(u8, &self.fingerprint, 0) or self.source.len == 0 or self.snapshot.len == 0) return error.InvalidNativeLakeRowIndex;
+        if (!(if (self.building) self.version == checkpoint_metadata_version else self.version == metadata_version) or self.tuple_encoding != tuples.encoding_version or std.mem.allEqual(u8, &self.domain, 0) or std.mem.allEqual(u8, &self.fingerprint, 0) or self.source.len == 0 or self.snapshot.len == 0) return error.InvalidNativeLakeRowIndex;
         if (self.file_fingerprints.len != 0 and self.file_fingerprints.len != self.files.len) return error.InvalidNativeLakeRowIndex;
-        if (self.files.len > std.math.maxInt(u32) or (self.version <= 6 and self.files.len > 16384)) return error.InvalidNativeLakeRowIndex;
+        if (self.files.len > std.math.maxInt(u32)) return error.InvalidNativeLakeRowIndex;
         if (self.file_dictionary) |dictionary| {
-            if (self.version < 7) return error.InvalidNativeLakeRowIndex;
             try file_dictionary.validate(dictionary);
             if (self.pending_files > dictionary.public_count) return error.InvalidNativeLakeRowIndex;
-            if (dictionary.public_names and self.version < 9) return error.InvalidNativeLakeRowIndex;
             if (self.files.len != 0 and self.files.len != dictionary.count) return error.InvalidNativeLakeRowIndex;
         }
         if (self.build_runs.len > 16 or self.build_level > 16 or (!self.building and (self.build_runs.len != 0 or self.build_level != 0))) return error.InvalidNativeLakeRowIndex;
@@ -477,7 +475,7 @@ pub fn publishIncremental(a: A, result_alloc: A, store: *stores.ArtifactStore, s
             if (cover.len != 0) covering = try applyChanges(a, pages.store(), covering, cover_changes.items);
         }
     } else {
-        // Initial and legacy roots get a streaming reverse tree once.
+        // Initial roots get a streaming reverse tree once.
         const Collect = struct {
             merge: *Merge,
             reverse_sort: ?*local.sql_spill.Sort,
@@ -2811,4 +2809,14 @@ test "external lake bounded window profiles compact cover map avoids wide tuple 
     defer loaded.deinit();
     try loaded.verify(root.domain, covered[0].?.cover.row, covered[0].?.physical, covered[0].?.witness);
     try std.testing.expectEqual(@as(i64, 0), (try loaded.block.cell(covered[0].?.cover.row, 0)).value.integer);
+}
+
+test "external lake ordered row roots reject obsolete metadata versions" {
+    const a = std.testing.allocator;
+    var directory = try local.common_test_directory.TestDirectory.init("obsolete-lake_index_ordered_rows");
+    defer directory.cleanup();
+    var fs = try @import("../serverless/artifacts/fs_store.zig").FsStore.init(a, directory.path());
+    defer fs.deinit();
+    // Missing objects must not be read for unsupported root formats.
+    for (5..metadata_version) |version| try std.testing.expectError(error.InvalidNativeLakeRowIndex, loadRootLazy(a, fs.artifactStore(), .{ .kind = .ordered_row_index, .metadata_version = @intCast(version), .artifact_id = "missing", .byte_len = 1, .checksum = "missing" }, .none, null));
 }

@@ -33,7 +33,6 @@
         "required": [
           "id",
           "table",
-          "document_field",
           "status",
           "filter"
         ],
@@ -53,7 +52,6 @@
           },
           "document_field": {
             "type": "string",
-            "minLength": 1,
             "default": "grep"
           },
           "filter": {
@@ -78,6 +76,132 @@
             "maxLength": 128,
             "pattern": "^[A-Za-z0-9_-]+$",
             "description": "Optional server-specific access-view precondition, never a capability."
+          },
+          "fields": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "uri",
+              "path",
+              "revision",
+              "indexed_at",
+              "permissions",
+              "metadata"
+            ],
+            "properties": {
+              "uri": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^\\u0000\\r\\n]+$"
+              },
+              "path": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^\\u0000\\r\\n]+$"
+              },
+              "revision": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^\\u0000\\r\\n]+$"
+              },
+              "indexed_at": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^\\u0000\\r\\n]+$"
+              },
+              "permissions": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^\\u0000\\r\\n]+$"
+              },
+              "metadata": {
+                "type": "string",
+                "minLength": 1,
+                "pattern": "^[^\\u0000\\r\\n]+$"
+              }
+            }
+          },
+          "streams": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "name",
+                "field",
+                "default"
+              ],
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[^\\u0000\\r\\n]+$"
+                },
+                "artifact": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[^\\u0000\\r\\n]+$"
+                },
+                "index": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[^\\u0000\\r\\n]+$"
+                },
+                "field": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[^\\u0000\\r\\n]+$"
+                },
+                "purpose": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[^\\u0000\\r\\n]+$"
+                },
+                "location_field": {
+                  "type": "string",
+                  "minLength": 1,
+                  "pattern": "^[^\\u0000\\r\\n]+$"
+                },
+                "default": {
+                  "type": "boolean"
+                },
+                "generated": {
+                  "type": "boolean"
+                },
+                "boundary": {
+                  "enum": [
+                    "record",
+                    "unit"
+                  ],
+                  "type": "string"
+                }
+              },
+              "dependentRequired": {
+                "artifact": [
+                  "index"
+                ]
+              }
+            }
+          },
+          "document_version": {
+            "enum": [
+              1,
+              2,
+              3
+            ]
+          },
+          "publication": {
+            "enum": [
+              "text",
+              "media",
+              "native"
+            ]
+          },
+          "published_revision": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$"
           }
         }
       }

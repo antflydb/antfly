@@ -159,7 +159,7 @@ func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) 
 			return MergeResult{}, fmt.Errorf("unexpected source metadata identity")
 		}
 		seen[hit.ID] = true
-		before, after := hit.Source.Grep, doc
+		before, after := hit.Source.Document, doc
 		before.IndexedAt, after.IndexedAt = 0, 0
 		a, err := projectionDigest(before)
 		if err != nil {
@@ -170,7 +170,7 @@ func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) 
 			return MergeResult{}, err
 		}
 		if a == b && sourceRowMatches(hit, w.sourceID) {
-			doc.IndexedAt = hit.Source.Grep.IndexedAt
+			doc.IndexedAt = hit.Source.Document.IndexedAt
 			documents[hit.ID] = doc
 			unchanged[hit.ID] = true
 		}
@@ -185,7 +185,10 @@ func (w *SyncWriter) Upsert(ctx context.Context, documents map[string]Document) 
 		doc := documents[id]
 		changed[id] = doc
 		changedIDs = append(changedIDs, id)
-		rows[id] = map[string]any{"id": id, "source_id": w.sourceID, "doc_type": "source_item", "grep": doc}
+		rows[id], err = SourceRow(id, w.sourceID, doc)
+		if err != nil {
+			return MergeResult{}, err
+		}
 	}
 	result := MergeResult{Status: "success", Skipped: len(unchanged)}
 	if len(changedIDs) > 0 {
@@ -304,7 +307,7 @@ type syncHit struct {
 		ID       string   `json:"id"`
 		SourceID string   `json:"source_id"`
 		DocType  string   `json:"doc_type"`
-		Grep     Document `json:"grep"`
+		Document Document `json:"-"`
 	} `json:"_source"`
 }
 

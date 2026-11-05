@@ -10818,6 +10818,94 @@ fn queryProvisionedAcrossGroups(
     return try queryProvisionedAcrossGroupsAtGenerations(self, alloc, group_ids, req, table_name, consistency, null);
 }
 
+// Parent admission remains a source-row operation. Member owners may have no
+// local copy of that row, so carry only a private proof after this exact lookup.
+fn memberParentAdmissionRequest(alloc: std.mem.Allocator, req: db_mod.types.SearchRequest, parents: []const []const u8) !db_mod.types.SearchRequest {
+    var candidates = parents;
+    if (req.filter_doc_ids_positive or req.filter_doc_ids.len != 0) {
+        const intersection = try alloc.alloc([]const u8, parents.len);
+        var count: usize = 0;
+        for (parents) |parent| {
+            for (req.filter_doc_ids) |allowed| if (std.mem.eql(u8, parent, allowed)) {
+                intersection[count] = parent;
+                count += 1;
+                break;
+            };
+        }
+        candidates = intersection[0..count];
+    }
+    var probe = req;
+    probe.hierarchy_children = null;
+    probe.hierarchy_parent_admitted = false;
+    probe.defer_hierarchy_child_hydration = false;
+    probe.return_mode = .parent;
+    probe.order_by = &.{};
+    probe.search_after = &.{};
+    probe.limit = @intCast(candidates.len);
+    probe.fields = &.{};
+    probe.include_stored = false;
+    probe.include_all_fields = false;
+    // These are primary-key candidates, not a text retrieval relation. Value
+    // verification can inspect this exact set without granting table scans.
+    probe.query = .match_all;
+    probe.filter_doc_ids = candidates;
+    probe.filter_doc_ids_positive = true;
+    probe.document_lookup_groups = &.{};
+    probe.value_search_candidate_keys = &.{};
+    probe.field_projection_json = "";
+    probe.field_projection_plan = null;
+    probe.field_projection_transport = false;
+    probe.document_projection_plan = null;
+    return probe;
+}
+test "native member parent admission uses exact source candidates" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    const predicate = "{\"value\":{\"kind\":\"equals\",\"field\":\"source_id\",\"text\":\"selected\"}}";
+    const req: db_mod.types.SearchRequest = .{
+        .hierarchy_children = .{ .parent_id = "a", .artifact_name = "summary" },
+        .return_mode = .member,
+        .filter_query_json = predicate,
+        .filter_doc_ids_positive = true,
+        .filter_doc_ids = &.{ "a", "c" },
+        .exclude_doc_ids = &.{"c"},
+    };
+    const probe = try memberParentAdmissionRequest(alloc, req, &.{ "a", "b" });
+    try std.testing.expect(probe.hierarchy_children == null);
+    try std.testing.expect(probe.query == .match_all and probe.full_text == null);
+    try std.testing.expect(probe.filter_doc_ids_positive);
+    try std.testing.expectEqual(@as(usize, 1), probe.filter_doc_ids.len);
+    try std.testing.expectEqualStrings("a", probe.filter_doc_ids[0]);
+    try std.testing.expectEqualStrings(predicate, probe.filter_query_json);
+    try std.testing.expectEqualStrings("c", probe.exclude_doc_ids[0]);
+    try std.testing.expect(!probe.value_search_execution.allow_scan);
+    var unrestricted = req;
+    unrestricted.filter_doc_ids = &.{};
+    unrestricted.filter_doc_ids_positive = false;
+    const both = try memberParentAdmissionRequest(alloc, unrestricted, &.{ "a", "b" });
+    try std.testing.expectEqual(@as(usize, 2), both.filter_doc_ids.len);
+    const empty = try memberParentAdmissionRequest(alloc, req, &.{"b"});
+    try std.testing.expect(empty.filter_doc_ids_positive and empty.filter_doc_ids.len == 0);
+}
+
+fn admittedMemberRequest(req: db_mod.types.SearchRequest, parents: []const []const u8) db_mod.types.SearchRequest {
+    var member = req;
+    member.hierarchy_children.?.parent_id = "";
+    member.hierarchy_children.?.parent_ids = parents;
+    member.hierarchy_parent_admitted = true;
+    member.value_search_candidate_keys = &.{};
+    member.filter_query_json = "";
+    member.exclusion_query_json = "";
+    member.authorization_filter_query_json = "";
+    member.filter_doc_ids = &.{};
+    member.filter_doc_ids_positive = false;
+    member.exclude_doc_ids = &.{};
+    member.resolved_doc_filter = null;
+    member.resolved_doc_filter_owned = false;
+    return member;
+}
+
 fn queryProvisionedAcrossGroupsAtGenerations(
     self: *ProvisionedTableReadSource,
     alloc: std.mem.Allocator,
@@ -10835,7 +10923,29 @@ fn queryProvisionedAcrossGroupsAtGenerations(
     const selected_generations = try alloc.alloc(?u64, group_ids.len);
     defer alloc.free(selected_generations);
     @memset(selected_generations, null);
-    var selected = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, req, table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
+    var member_req = req;
+    var admitted_arena = std.heap.ArenaAllocator.init(alloc);
+    defer admitted_arena.deinit();
+    if (req.hierarchy_children) |children| if (children.artifact_name != null) {
+        const single = [_][]const u8{children.parent_id};
+        const parent_ids = if (children.parent_ids.len != 0) children.parent_ids else &single;
+        const admission = try memberParentAdmissionRequest(admitted_arena.allocator(), req, parent_ids);
+        if (admission.filter_doc_ids.len == 0) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+        var parent = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, admission, table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
+        defer parent.deinit();
+        if (parent.hits.len == 0) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+        if (parent.hits.len > admission.filter_doc_ids.len) return error.InvalidQueryRequest;
+        const authorized = try admitted_arena.allocator().alloc([]const u8, parent.hits.len);
+        for (parent.hits, 0..) |hit, i| {
+            const expected = for (admission.filter_doc_ids) |id| {
+                if (std.mem.eql(u8, hit.id, id)) break true;
+            } else false;
+            if (!expected) return error.InvalidQueryRequest;
+            authorized[i] = try admitted_arena.allocator().dupe(u8, hit.id);
+        }
+        member_req = admittedMemberRequest(req, authorized);
+    };
+    var selected = try queryProvisionedAcrossGroupsPhase(self, alloc, group_ids, member_req, table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
     errdefer selected.deinit();
     if (req.hierarchy_children != null) {
         if (req.include_stored) try hydrateProvisionedHierarchyNavigationHits(self, alloc, table_name, req, &selected, consistency);
@@ -10971,7 +11081,29 @@ fn queryHostedAcrossGroupsAtGenerations(
     const selected_generations = try alloc.alloc(?u64, group_ids.len);
     defer alloc.free(selected_generations);
     @memset(selected_generations, null);
-    var selected = try queryHostedAcrossGroupsPhase(active_self, alloc, group_ids, req, table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
+    var member_req = req;
+    var admitted_arena = std.heap.ArenaAllocator.init(alloc);
+    defer admitted_arena.deinit();
+    if (req.hierarchy_children) |children| if (children.artifact_name != null) {
+        const single = [_][]const u8{children.parent_id};
+        const parent_ids = if (children.parent_ids.len != 0) children.parent_ids else &single;
+        const admission = try memberParentAdmissionRequest(admitted_arena.allocator(), req, parent_ids);
+        if (admission.filter_doc_ids.len == 0) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+        var parent = try queryHostedAcrossGroupsPhase(active_self, alloc, group_ids, admission, table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
+        defer parent.deinit();
+        if (parent.hits.len == 0) return .{ .alloc = alloc, .hits = &.{}, .total_hits = 0 };
+        if (parent.hits.len > admission.filter_doc_ids.len) return error.InvalidQueryRequest;
+        const authorized = try admitted_arena.allocator().alloc([]const u8, parent.hits.len);
+        for (parent.hits, 0..) |hit, i| {
+            const expected = for (admission.filter_doc_ids) |id| {
+                if (std.mem.eql(u8, hit.id, id)) break true;
+            } else false;
+            if (!expected) return error.InvalidQueryRequest;
+            authorized[i] = try admitted_arena.allocator().dupe(u8, hit.id);
+        }
+        member_req = admittedMemberRequest(req, authorized);
+    };
+    var selected = try queryHostedAcrossGroupsPhase(active_self, alloc, group_ids, member_req, table_name, consistency, distributed_text_stats, false, required_identity_generations, selected_generations);
     errdefer selected.deinit();
     if (req.hierarchy_children != null) {
         if (req.include_stored) try hydrateHostedHierarchyNavigationHits(active_self, alloc, table_name, req, &selected, consistency);

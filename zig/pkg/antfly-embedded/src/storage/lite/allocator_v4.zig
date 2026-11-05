@@ -153,7 +153,62 @@ pub const State = struct {
             self.dirty_counters.deinit(a);
             self.dirty_pending.deinit(a);
         }
+
+        fn clone(self: *const @This(), a: Allocator) !@This() {
+            var copy: @This() = .{ .chunk_hashes = self.chunk_hashes };
+            errdefer copy.deinit(a);
+            copy.counters = try self.counters.clone(a);
+            copy.pending = try self.pending.clone(a);
+            copy.dirty_counters = try self.dirty_counters.clone(a);
+            copy.dirty_pending = try self.dirty_pending.clone(a);
+            return copy;
+        }
     };
+
+    /// Deep copy of a clean ledger (no unpersisted deltas). Both owners keep
+    /// independent caches. The copy carries no authority: callers rebase and
+    /// authenticate it exactly as they would a transferred cache.
+    pub fn clone(self: *const State, a: Allocator) !State {
+        // Update this copy when State gains a field.
+        comptime std.debug.assert(std.meta.fieldNames(State).len == 29);
+        if (self.changes.count() != 0 or self.added.items.len != 0 or self.completed.items.len != 0)
+            return error.InvalidNativeAllocator;
+        var copy = State.init(a);
+        errdefer copy.deinit();
+        copy.counts = try self.counts.clone(a);
+        for (&copy.bitmap, &self.bitmap) |*target, *source| target.* = try source.clone(a);
+        copy.pending = try self.pending.clone(a);
+        copy.heap = try cloneHeap(a, &self.heap);
+        copy.metadata_heap = try cloneHeap(a, &self.metadata_heap);
+        copy.chains_heap = try cloneHeap(a, &self.chains_heap);
+        copy.metadata = try self.metadata.clone(a);
+        copy.builder_metadata = try self.builder_metadata.clone(a);
+        if (self.digest_cache) |*cache| copy.digest_cache = try cache.clone(a);
+        copy.free_pages = self.free_pages;
+        copy.data_pending = self.data_pending;
+        copy.pending_removals_since_rehash = self.pending_removals_since_rehash;
+        copy.stale_heap_items = self.stale_heap_items;
+        copy.pending_limit = self.pending_limit;
+        copy.first_pending = self.first_pending;
+        copy.last_pending = self.last_pending;
+        copy.incremental = self.incremental;
+        copy.root = self.root;
+        copy.root_page = self.root_page;
+        copy.allocations = self.allocations;
+        copy.collected = self.collected;
+        copy.released_data_pages = self.released_data_pages;
+        copy.retired_inline_bytes = self.retired_inline_bytes;
+        copy.checkpointing = self.checkpointing;
+        copy.force_checkpoint = self.force_checkpoint;
+        return copy;
+    }
+
+    fn cloneHeap(a: Allocator, source: *const Heap) !Heap {
+        var copy = Heap.initContext({});
+        copy.items = try a.dupe(Retirement, source.items);
+        copy.cap = copy.items.len;
+        return copy;
+    }
 
     /// Initialize once for a loaded ledger. Steady commits retain these trees;
     /// clean() only clears persistence deltas, never fingerprint dirtiness.

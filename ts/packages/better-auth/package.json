@@ -73,6 +73,10 @@
     "url": "git+https://github.com/antflydb/antfly.git",
     "directory": "ts/packages/better-auth"
   },
+  "homepage": "https://github.com/antflydb/antfly/tree/main/ts/packages/better-auth#readme",
+  "bugs": {
+    "url": "https://github.com/antflydb/antfly/issues"
+  },
   "keywords": [
     "antfly",
     "better-auth",

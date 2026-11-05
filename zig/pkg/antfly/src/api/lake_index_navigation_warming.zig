@@ -209,8 +209,7 @@ pub fn warmPublicationWithin(a: A, server: *@import("http_server.zig").ApiHttpSe
         fn canceled(raw: *const anyopaque) bool {
             const stop: *const @This() = @ptrCast(@alignCast(raw));
             if (stop.owner.index_installation_closing.load(.acquire)) return true;
-            stop.context.ensureActive() catch return true;
-            return false;
+            return stop.context.isCancellationRequested();
         }
     };
     var stop: Stop = .{ .owner = server, .context = try caller.platformDeadline() };

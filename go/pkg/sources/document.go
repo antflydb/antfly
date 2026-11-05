@@ -31,6 +31,7 @@ type Permissions struct {
 	Readers []string `json:"readers"`
 }
 type Document struct {
+	MIMEType    string          `json:"mime_type,omitempty"`
 	Version     int             `json:"version"`
 	Kind        string          `json:"kind,omitempty"`
 	Media       *MediaReference `json:"media,omitempty"`
@@ -51,7 +52,7 @@ func Normalize(sourceID string, item Item, data []byte, permissions Permissions,
 		return fail("source_revision_missing", "Source revision is required.")
 	}
 	if len(data) > maxImportSourceObjectBytes || !utf8.Valid(data) || bytes.IndexByte(data, 0) >= 0 {
-		return fail("source_text_extraction_required", "Source must have bounded canonical UTF-8 text; binary documents require revision-bound text extraction before publication.")
+		return fail("source_text_extraction_required", "Inline content must be bounded UTF-8; publish binary originals through native media acquisition.")
 	}
 	uri := configString(item.Metadata, "canonical_url")
 	// Pinned inventories may contain a URL emitted before S3 key escaping was
@@ -94,7 +95,7 @@ func Normalize(sourceID string, item Item, data []byte, permissions Permissions,
 	metadata["provider"] = item.SourceKind
 	metadata["source_id"] = sourceID
 	metadata["identity"] = item.ID
-	return Document{Version: 1, URI: parsed.String(), Path: path, Content: string(data), Revision: item.Revision, IndexedAt: now.Unix(), Permissions: permissions, Metadata: metadata}, nil
+	return Document{Version: SourceRecordVersion, Kind: "text", MIMEType: "text/plain", URI: parsed.String(), Path: path, Content: string(data), Revision: item.Revision, IndexedAt: now.Unix(), Permissions: permissions, Metadata: metadata}, nil
 }
 
 // MediaReference is the model-aware chunk source contract. Version is a quoted
@@ -123,7 +124,7 @@ func NormalizeMedia(sourceID string, item Item, ref MediaReference, permissions 
 	if err != nil {
 		return Document{}, err
 	}
-	doc.Version, doc.Kind, doc.Media = 2, "media", &ref
+	doc.Version, doc.Kind, doc.Media = SourceRecordVersion, "media", &ref
 	if !validContentSHA(ref.ContentSHA256) {
 		return Document{}, fmt.Errorf("verified original-byte SHA-256 is required")
 	}
@@ -135,7 +136,7 @@ func NormalizeMedia(sourceID string, item Item, ref MediaReference, permissions 
 }
 
 func validateDocumentContent(doc Document) error {
-	if doc.Version == 1 && doc.Kind == "" && doc.Media == nil {
+	if (doc.Version == 1 && doc.Kind == "" || doc.Version == SourceRecordVersion && doc.Kind == "text") && doc.Media == nil {
 		digest := sha256.Sum256([]byte(doc.Content))
 		if !utf8.ValidString(doc.Content) || strings.ContainsRune(doc.Content, 0) || configString(doc.Metadata, "sha256") != hex.EncodeToString(digest[:]) {
 			return fmt.Errorf("source content digest does not match normalized text")
@@ -143,7 +144,7 @@ func validateDocumentContent(doc Document) error {
 		return nil
 	}
 	hasContentDigest := validContentSHA(configString(doc.Metadata, "sha256"))
-	if doc.Version != 2 || doc.Kind != "media" || doc.Media == nil || doc.Content != "" || !hasContentDigest {
+	if (doc.Version != 2 && doc.Version != SourceRecordVersion) || doc.Kind != "media" || doc.Media == nil || doc.Content != "" || !hasContentDigest {
 		return fmt.Errorf("invalid canonical media document")
 	}
 	ref := doc.Media

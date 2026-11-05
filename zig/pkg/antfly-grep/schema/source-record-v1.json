@@ -34,13 +34,20 @@
     "provider": {
       "enum": [
         "github",
-        "google_drive", "google_workspace", "slack", "discord",
+        "google_drive",
+        "google_workspace",
+        "slack",
+        "discord",
         "gcs",
         "s3"
       ]
     },
     "document_version": {
-      "const": 1
+      "enum": [
+        1,
+        2,
+        3
+      ]
     },
     "published_revision": {
       "type": "string",

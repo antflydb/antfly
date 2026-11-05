@@ -21,18 +21,22 @@ const objectstore = @import("objectstore");
 const catalog = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog;
 const A = std.mem.Allocator;
 pub const max_node_bytes = 256 * 1024;
-const fanout = 256;
+// Small immutable pages share prefixes between snapshot inventories.
+const fanout = 16;
 const Digest = catalog.retirement_index.Digest;
-const max_frontier_bytes = 1024;
+const max_frontier_bytes = 8 * 1024;
 pub const Retired = struct {
     snapshot: []const u8,
-    // Version-one jobs retain their inline inventory and remain replayable.
-    objects: []const []const u8 = &.{},
-    object_plan: ?[]const u8 = null,
+    object_plan: []const u8,
 };
 const Node = struct { objects: []const []const u8 = &.{}, children: []const []const u8 = &.{} };
 pub const Inline = struct { hash: []const u8, node: Node, durable: bool = false };
 const Cached = struct { node: Node, bytes: usize, durable: bool = false };
+const frontier_frames = 32;
+const FrontierRef = struct { hash: Digest, count: u8 };
+const FrontierFrame = struct { hash: []const u8, object: usize = 0, child: usize = 0 };
+const FrontierPage = struct { version: u8 = 1, frames: []const FrontierFrame, parent: ?FrontierRef = null };
+const CachedFrontier = struct { page: FrontierPage, durable: bool = false };
 pub const inline_budget = 2 * 1024 * 1024;
 
 /// Allocations and all supplied object/child slices belong to the job arena.
@@ -46,7 +50,7 @@ pub const Store = struct {
     defer_writes: bool = false,
     uploads_remaining: usize = std.math.maxInt(usize),
     nodes: std.StringHashMapUnmanaged(Cached) = .empty,
-    frontiers: std.AutoHashMapUnmanaged(Digest, Cursor.Frame) = .empty,
+    frontiers: std.AutoHashMapUnmanaged(Digest, CachedFrontier) = .empty,
     budget: usize = 256 * 1024 * 1024,
 
     fn key(self: *Store, hash: []const u8) ![]const u8 {
@@ -72,7 +76,7 @@ pub const Store = struct {
     fn putImmutable(self: *Store, path: []const u8, bytes: []const u8, limit: usize) !void {
         var result: ?objectstore.PutResult = self.client.putObject(self.bucket, path, bytes, .{ .if_none_match = true, .cancellation = catalog.types.contextCancellation(&self.context) }) catch |err| switch (err) {
             error.PreconditionFailed, error.ObjectAlreadyExists => existing: {
-                var previous = try self.client.getObject(self.bucket, path, .{ .max_response_bytes = limit, .cancellation = catalog.types.contextCancellation(&self.context) });
+                var previous = try self.client.getObject(self.bucket, path, .{ .skip_metadata_probe = true, .max_response_bytes = limit, .cancellation = catalog.types.contextCancellation(&self.context) });
                 defer previous.deinit(self.client.allocator);
                 if (!std.mem.eql(u8, previous.body, bytes)) return error.ArtifactIntegrityMismatch;
                 break :existing null;
@@ -84,31 +88,84 @@ pub const Store = struct {
     fn frontierKey(self: *Store, hash: Digest) ![]const u8 {
         return std.fmt.allocPrint(self.a, "{s}/maintenance/vacuum-frontiers/{s}.json", .{ self.prefix, std.fmt.bytesToHex(hash, .lower) });
     }
-    fn saveFrontier(self: *Store, frame: Cursor.Frame) !Digest {
+    fn validateFrontierRef(ref: FrontierRef) !void {
+        if (ref.count == 0 or ref.count > frontier_frames) return error.InvalidLakeVacuumPlan;
+    }
+    fn saveFrontier(self: *Store, frame: Cursor.Frame) !FrontierRef {
         try self.context.ensureActive();
-        const bytes = try std.json.Stringify.valueAlloc(self.a, frame, .{});
+        var parent = frame.parent;
+        var prefix: []const FrontierFrame = &.{};
+        if (parent) |ref| {
+            try validateFrontierRef(ref);
+            if (ref.count < frontier_frames) {
+                const page = try self.readFrontierPage(ref.hash);
+                if (ref.count > page.frames.len) return error.InvalidLakeVacuumPlan;
+                prefix = page.frames[0..ref.count];
+                parent = page.parent;
+            }
+        }
+        const frames = try self.a.alloc(FrontierFrame, prefix.len + 1);
+        @memcpy(frames[0..prefix.len], prefix);
+        frames[prefix.len] = .{ .hash = frame.hash, .object = frame.object, .child = frame.child };
+        const page: FrontierPage = .{ .frames = frames, .parent = parent };
+        const bytes = try std.json.Stringify.valueAlloc(self.a, page, .{});
         defer self.a.free(bytes);
         if (bytes.len > max_frontier_bytes) return error.InvalidLakeVacuumPlan;
         var hash: Digest = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});
-        if (self.frontiers.contains(hash)) return hash;
-        try self.putImmutable(try self.frontierKey(hash), bytes, max_frontier_bytes);
-        try self.frontiers.put(self.a, hash, frame);
-        return hash;
+        if (!self.frontiers.contains(hash)) try self.frontiers.put(self.a, hash, .{ .page = page });
+        // A prefix count pops immutable stack entries without rewriting their
+        // page. Only surviving pages, at most one per 32 new ancestors, upload.
+        return .{ .hash = hash, .count = @intCast(frames.len) };
     }
-    fn loadFrontier(self: *Store, hash: Digest) !Cursor.Frame {
+    fn persistFrontier(self: *Store, root: ?FrontierRef) !void {
+        var pending: std.ArrayList(Digest) = .empty;
+        var current = root;
+        while (current) |ref| {
+            try validateFrontierRef(ref);
+            // Uncached ancestors belong to the prior durable checkpoint.
+            const cached = self.frontiers.get(ref.hash) orelse break;
+            if (ref.count > cached.page.frames.len) return error.InvalidLakeVacuumPlan;
+            if (cached.durable) break;
+            try self.context.ensureActive();
+            try pending.append(self.a, ref.hash);
+            current = cached.page.parent;
+        }
+        var remaining = pending.items.len;
+        while (remaining != 0) {
+            remaining -= 1;
+            const hash = pending.items[remaining];
+            try self.context.ensureActive();
+            const bytes = try std.json.Stringify.valueAlloc(self.a, self.frontiers.get(hash).?.page, .{});
+            defer self.a.free(bytes);
+            try self.putImmutable(try self.frontierKey(hash), bytes, max_frontier_bytes);
+            self.frontiers.getPtr(hash).?.durable = true;
+        }
+    }
+    fn readFrontierPage(self: *Store, hash: Digest) !FrontierPage {
         try self.context.ensureActive();
-        if (self.frontiers.get(hash)) |frame| return frame;
+        if (self.frontiers.get(hash)) |cached| return cached.page;
         if (self.budget == 0) return error.LakeVacuumBudgetExceeded;
-        var result = try self.client.getObject(self.bucket, try self.frontierKey(hash), .{ .max_response_bytes = @min(max_frontier_bytes, self.budget), .cancellation = catalog.types.contextCancellation(&self.context) });
+        var result = try self.client.getObject(self.bucket, try self.frontierKey(hash), .{ .skip_metadata_probe = true, .max_response_bytes = @min(max_frontier_bytes, self.budget), .cancellation = catalog.types.contextCancellation(&self.context) });
         defer result.deinit(self.client.allocator);
+        if (result.body.len > self.budget) return error.LakeVacuumBudgetExceeded;
         self.budget -= result.body.len;
         var actual: Digest = undefined;
         std.crypto.hash.sha2.Sha256.hash(result.body, &actual, .{});
         if (!std.mem.eql(u8, &actual, &hash)) return error.ArtifactIntegrityMismatch;
-        const frame = try std.json.parseFromSliceLeaky(Cursor.Frame, self.a, result.body, .{ .allocate = .alloc_always });
-        try self.frontiers.put(self.a, hash, frame);
-        return frame;
+        const page = try std.json.parseFromSliceLeaky(FrontierPage, self.a, result.body, .{ .allocate = .alloc_always });
+        if (page.version != 1 or page.frames.len == 0 or page.frames.len > frontier_frames) return error.InvalidLakeVacuumPlan;
+        if (page.parent) |parent| try validateFrontierRef(parent);
+        for (page.frames) |frame| if (frame.hash.len != 64) return error.InvalidLakeVacuumPlan;
+        try self.frontiers.put(self.a, hash, .{ .page = page, .durable = true });
+        return page;
+    }
+    fn loadFrontier(self: *Store, ref: FrontierRef) !Cursor.Frame {
+        try validateFrontierRef(ref);
+        const page = try self.readFrontierPage(ref.hash);
+        if (ref.count > page.frames.len) return error.InvalidLakeVacuumPlan;
+        const frame = page.frames[ref.count - 1];
+        return .{ .hash = frame.hash, .object = frame.object, .child = frame.child, .parent = if (ref.count == 1) page.parent else .{ .hash = ref.hash, .count = ref.count - 1 } };
     }
     /// Select inline nodes before writing spills. An external node always owns
     /// a durable descendant closure, so future turns can skip closed subtrees.
@@ -241,7 +298,7 @@ pub const Store = struct {
         if (self.nodes.get(hash)) |cached| return cached.node;
         if (self.budget == 0) return error.LakeVacuumBudgetExceeded;
         const path = try self.key(hash);
-        var result = try self.client.getObject(self.bucket, path, .{ .max_response_bytes = @min(max_node_bytes, self.budget), .cancellation = catalog.types.contextCancellation(&self.context) });
+        var result = try self.client.getObject(self.bucket, path, .{ .skip_metadata_probe = true, .max_response_bytes = @min(max_node_bytes, self.budget), .cancellation = catalog.types.contextCancellation(&self.context) });
         defer result.deinit(self.client.allocator);
         if (result.body.len > self.budget) return error.LakeVacuumBudgetExceeded;
         self.budget -= result.body.len;
@@ -259,30 +316,45 @@ pub const Store = struct {
 /// and selection deduplicates each bounded batch. Shared DAG nodes are read once.
 pub const Cursor = struct {
     snapshot: usize = 0,
-    legacy: usize = 0,
     frame: ?Frame = null,
     visited: ?Digest = null,
     // Parent frames are immutable pages, so checkpoint size and cold-resume
     // work do not grow with the depth of a partially planned inventory.
-    pub const Frame = struct { hash: []const u8, object: usize = 0, child: usize = 0, parent: ?Digest = null };
+    pub const Frame = struct { hash: []const u8, object: usize = 0, child: usize = 0, parent: ?FrontierRef = null };
 };
 pub const Walker = struct {
     store: *Store,
     retired: []const Retired,
     seen: *catalog.retirement_index.Index,
     cursor: Cursor,
+    pending: std.StringHashMapUnmanaged(void) = .empty,
 
     pub fn init(store: *Store, retired: []const Retired, seen: *catalog.retirement_index.Index, cursor: Cursor) !Walker {
         if (cursor.snapshot > retired.len) return error.InvalidLakeVacuumPlan;
+        if (cursor.frame) |frame| if (frame.parent) |parent| try Store.validateFrontierRef(parent);
         return .{ .store = store, .retired = retired, .seen = seen, .cursor = cursor };
     }
-    pub fn checkpoint(self: *const Walker) Cursor {
-        return self.cursor;
+    pub fn checkpoint(self: *Walker) !Cursor {
+        var cursor = self.cursor;
+        if (self.pending.count() != 0) {
+            try self.store.context.ensureActive();
+            var hashes: std.ArrayList([]const u8) = .empty;
+            var keys = self.pending.keyIterator();
+            while (keys.next()) |hash| try hashes.append(self.store.a, hash.*);
+            cursor.visited = try self.seen.insertMany(cursor.visited, hashes.items);
+        }
+        // A returned cursor owns a durable closure, including every parent
+        // page needed after a cold restart. Failed publication leaves the old
+        // visited root and pending set available for a safe retry.
+        try self.store.persistFrontier(if (cursor.frame) |frame| frame.parent else null);
+        self.cursor = cursor;
+        self.pending.clearRetainingCapacity();
+        return cursor;
     }
     fn enter(self: *Walker, hash: []const u8, parent: ?Cursor.Frame) !bool {
-        if (try self.seen.contains(self.cursor.visited, hash)) return false;
+        if (self.pending.contains(hash) or try self.seen.contains(self.cursor.visited, hash)) return false;
         const saved_parent = if (parent) |frame| try self.store.saveFrontier(frame) else null;
-        self.cursor.visited = try self.seen.insert(self.cursor.visited, hash);
+        try self.pending.put(self.store.a, hash, {});
         self.cursor.frame = .{ .hash = hash, .parent = saved_parent };
         return true;
     }
@@ -314,18 +386,8 @@ pub const Walker = struct {
             }
             if (self.cursor.snapshot == self.retired.len) return null;
             const retired = self.retired[self.cursor.snapshot];
-            if (retired.object_plan) |root| {
-                _ = try self.enter(root, null);
-            } else {
-                if (self.cursor.legacy > retired.objects.len) return error.InvalidLakeVacuumPlan;
-                if (self.cursor.legacy < retired.objects.len) {
-                    const uri = retired.objects[self.cursor.legacy];
-                    self.cursor.legacy += 1;
-                    return uri;
-                }
-            }
+            _ = try self.enter(retired.object_plan, null);
             self.cursor.snapshot += 1;
-            self.cursor.legacy = 0;
         }
     }
 };
@@ -369,17 +431,58 @@ pub const Iterator = struct {
             const retired = self.retired[self.index];
             self.index += 1;
             if (self.exclude) |excluded| if (excluded.contains(retired.snapshot)) continue;
-            if (retired.object_plan) |root| {
-                try self.stack.append(a, root);
-            } else {
-                self.pending = retired.objects;
-                self.position = 0;
-            }
+            try self.stack.append(a, retired.object_plan);
         }
     }
 };
 
-test "external lake vacuum plan chunks a large inventory and shares it across restart and legacy jobs" {
+test "external lake vacuum plan shares child prefixes across successive snapshot roots" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var store: Store = .{ .a = a, .client = memory.client(), .bucket = "archive", .prefix = "plans", .context = .{}, .dry_run = false };
+    const leaves = try a.alloc([]const u8, 128);
+    const paths = try a.alloc([]const u8, leaves.len);
+    const shared = try a.alloc(Retired, leaves.len);
+    const shared_prepend = try a.alloc(Retired, leaves.len);
+    for (leaves, paths, 0..) |*leaf, *path, i| {
+        path.* = try std.fmt.allocPrint(a, "gs://archive/data/{d}.parquet", .{i});
+        leaf.* = try store.objects(try a.dupe([]const u8, &.{path.*}));
+        const snapshot = try std.fmt.allocPrint(a, "{d}", .{i});
+        shared[i] = .{ .snapshot = snapshot, .object_plan = try store.children(leaves[0 .. i + 1]) };
+        const newest_first = try a.dupe([]const u8, leaves[0 .. i + 1]);
+        std.mem.reverse([]const u8, newest_first);
+        shared_prepend[i] = .{ .snapshot = snapshot, .object_plan = try store.children(newest_first) };
+    }
+    const Measure = struct {
+        fn run(a_: A, store_: *Store, snapshots: []const Retired, expected: []const []const u8) !usize {
+            var seen = catalog.retirement_index.Index.init(a_, store_.client, store_.bucket, "seen", .{});
+            defer seen.deinit();
+            var walker = try Walker.init(store_, snapshots, &seen, .{});
+            var remaining: usize = 100_000;
+            var count: usize = 0;
+            while (try walker.next(&remaining)) |uri| {
+                try std.testing.expect(count < expected.len);
+                try std.testing.expectEqualStrings(expected[count], uri);
+                count += 1;
+            }
+            try std.testing.expectEqual(expected.len, count);
+            return 100_000 - remaining;
+        }
+    };
+    const unshared_edges = leaves.len * (leaves.len + 1) / 2;
+    const shared_steps = try Measure.run(a, &store, shared, paths);
+    // Sharing must avoid most of the edges in the unshared inventory union.
+    try std.testing.expect(shared_steps * 2 < unshared_edges);
+    // Native manifest lists may put the newest entry first. Stable older
+    // pages must be reusable in that ordering too.
+    try std.testing.expect((try Measure.run(a, &store, shared_prepend, paths)) * 2 < unshared_edges);
+}
+
+test "external lake vacuum plan chunks a large inventory and shares it across restart and shared jobs" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -398,7 +501,6 @@ test "external lake vacuum plan chunks a large inventory and shares it across re
     const retired = [_]Retired{
         .{ .snapshot = "1", .object_plan = root },
         .{ .snapshot = "2", .object_plan = root },
-        .{ .snapshot = "legacy", .objects = &.{ paths[0], "gs://archive/legacy" } },
     };
     const journal = try std.json.Stringify.valueAlloc(a, retired, .{});
     try std.testing.expect(journal.len < 1024);
@@ -406,10 +508,10 @@ test "external lake vacuum plan chunks a large inventory and shares it across re
     var iterator: Iterator = .{ .store = &reopened, .retired = &retired };
     var count: usize = 0;
     while (try iterator.next()) |path| {
-        if (count < paths.len) try std.testing.expectEqualStrings(paths[count], path) else try std.testing.expectEqualStrings("gs://archive/legacy", path);
+        try std.testing.expectEqualStrings(paths[count], path);
         count += 1;
     }
-    try std.testing.expectEqual(paths.len + 1, count);
+    try std.testing.expectEqual(paths.len, count);
     try std.testing.expectEqual(store.nodes.count(), iterator.nodes.count());
     try std.testing.expectEqual(store.nodes.count(), reopened.nodes.count());
     // Each immutable node is read once even when snapshots share ancestors.
@@ -528,6 +630,94 @@ test "external lake vacuum plan checkpoints bounded spills without uploading inl
     try std.testing.expect(try iterator.next() == null);
 }
 
+test "external lake vacuum traversal persists only final visited nodes and surviving frontier pages" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var faults = objectstore.ScriptedFaultClient.init(alloc, memory.client());
+    defer faults.deinit();
+    var writer: Store = .{ .a = a, .client = memory.client(), .bucket = "archive", .prefix = "plans", .context = .{}, .dry_run = false };
+    const children = try a.alloc([]const u8, 16);
+    for (children, 0..) |*child, i| child.* = try writer.objects(try a.dupe([]const u8, &.{try std.fmt.allocPrint(a, "gs://archive/data/{d}", .{i})}));
+    const root = try writer.children(children);
+    var cold: Store = .{ .a = a, .client = faults.client(), .bucket = "archive", .prefix = "plans", .context = .{}, .dry_run = false };
+    try cold.seed(try writer.inlineFor(&.{root}));
+    const Counter = struct {
+        puts: usize = 0,
+        fn matches(raw: *anyopaque, _: []const u8, _: []const u8, _: []const u8) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.puts += 1;
+            return false;
+        }
+    };
+    var counter: Counter = .{};
+    faults.put_filter = .{ .ptr = &counter, .matches = Counter.matches };
+    var seen = catalog.retirement_index.Index.init(a, faults.client(), "archive", "seen", .{});
+    defer seen.deinit();
+    const retired = [_]Retired{ .{ .snapshot = "first", .object_plan = root }, .{ .snapshot = "shared", .object_plan = root } };
+    var walker = try Walker.init(&cold, &retired, &seen, .{});
+    var steps: usize = 64;
+    var emitted: usize = 0;
+    while (try walker.next(&steps)) |_| emitted += 1;
+    try std.testing.expectEqual(@as(usize, 16), emitted);
+    try std.testing.expectEqual(@as(usize, 0), counter.puts);
+    const cursor = try walker.checkpoint();
+    try std.testing.expect(counter.puts > 0 and counter.puts < 32);
+    var reopened = catalog.retirement_index.Index.init(a, memory.client(), "archive", "seen", .{});
+    defer reopened.deinit();
+    try std.testing.expect(try reopened.contains(cursor.visited, root));
+    for (children) |child| try std.testing.expect(try reopened.contains(cursor.visited, child));
+}
+
+test "external lake vacuum checkpoint resolves frontier ACK loss before returning a cold resumable cursor" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var faults = objectstore.ScriptedFaultClient.init(alloc, memory.client());
+    defer faults.deinit();
+    var writer: Store = .{ .a = a, .client = memory.client(), .bucket = "archive", .prefix = "plans", .context = .{}, .dry_run = false };
+    const first = try writer.objects(&.{"first"});
+    const second = try writer.objects(&.{"second"});
+    const root = try writer.children(&.{ first, second });
+    var cold: Store = .{ .a = a, .client = faults.client(), .bucket = "archive", .prefix = "plans", .context = .{}, .dry_run = false };
+    try cold.seed(try writer.inlineFor(&.{root}));
+    var seen = catalog.retirement_index.Index.init(a, faults.client(), "archive", "seen", .{});
+    defer seen.deinit();
+    const retired = [_]Retired{.{ .snapshot = "old", .object_plan = root }};
+    var walker = try Walker.init(&cold, &retired, &seen, .{});
+    var steps: usize = 64;
+    try std.testing.expectEqualStrings("first", (try walker.next(&steps)).?);
+    faults.put_filter = .{ .ptr = &faults, .matches = struct {
+        fn matches(_: *anyopaque, _: []const u8, path: []const u8, _: []const u8) bool {
+            return std.mem.indexOf(u8, path, "/vacuum-frontiers/") != null;
+        }
+    }.matches };
+    faults.commitNextPutThenFail(error.InjectedAckLoss);
+    try std.testing.expectError(error.InjectedAckLoss, walker.checkpoint());
+    try std.testing.expect(walker.cursor.visited == null);
+    const cursor = try walker.checkpoint();
+    var resumed: Store = .{ .a = a, .client = memory.client(), .bucket = "archive", .prefix = "plans", .context = .{}, .dry_run = false };
+    var resumed_seen = catalog.retirement_index.Index.init(a, memory.client(), "archive", "seen", .{});
+    defer resumed_seen.deinit();
+    var replay = try Walker.init(&resumed, &retired, &resumed_seen, try std.json.parseFromSliceLeaky(Cursor, a, try std.json.Stringify.valueAlloc(a, cursor, .{}), .{}));
+    steps = 64;
+    try std.testing.expectEqualStrings("second", (try replay.next(&steps)).?);
+    resumed_seen.context.deadline_ns = 0;
+    const before = memory.operationCount();
+    try std.testing.expectError(error.DeadlineExceeded, replay.checkpoint());
+    try std.testing.expectEqual(before, memory.operationCount());
+    try std.testing.expectEqual(cursor.visited.?, replay.cursor.visited.?);
+    resumed_seen.context.deadline_ns = null;
+    _ = try replay.checkpoint();
+    try std.testing.expect(try replay.next(&steps) == null);
+}
+
 test "external lake vacuum frontier resumes cold chunks with bounded reads and shared roots" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
@@ -544,7 +734,7 @@ test "external lake vacuum frontier resumes cold chunks with bounded reads and s
     var store: Store = .{ .a = a, .client = memory.client(), .bucket = "archive", .prefix = "plans", .context = .{}, .dry_run = false };
     const root = try store.objects(paths);
     const embedded = try store.inlineFor(&.{root});
-    const retired = [_]Retired{ .{ .snapshot = "old", .object_plan = root }, .{ .snapshot = "shared", .object_plan = root }, .{ .snapshot = "legacy", .objects = &.{"legacy"} } };
+    const retired = [_]Retired{ .{ .snapshot = "old", .object_plan = root }, .{ .snapshot = "shared", .object_plan = root } };
     var saved: []const u8 = "{}";
     var position: usize = 0;
     var turns: usize = 0;
@@ -570,21 +760,22 @@ test "external lake vacuum frontier resumes cold chunks with bounded reads and s
                 complete = true;
                 break;
             };
-            try std.testing.expectEqualStrings(if (position < paths.len) paths[position] else "legacy", uri);
+            try std.testing.expectEqualStrings(paths[position], uri);
             position += 1;
         }
         if (turns == 0) {
             // Simulate losing the mutable checkpoint after immutable seen-node
             // writes. Unpublished roots must not suppress the retried prefix.
+            _ = try walker.checkpoint();
             position = 0;
             continue;
         }
         // Serialize/reopen every frontier, as a new process with a cold cache.
-        saved = try std.json.Stringify.valueAlloc(a, walker.checkpoint(), .{});
+        saved = try std.json.Stringify.valueAlloc(a, try walker.checkpoint(), .{});
         try std.testing.expect(saved.len < 16 * 1024);
     }
     try std.testing.expect(complete and turns > 2);
-    try std.testing.expectEqual(paths.len + 1, position);
+    try std.testing.expectEqual(paths.len, position);
     const terminal = try std.json.parseFromSliceLeaky(Cursor, a, saved, .{});
     var seen = catalog.retirement_index.Index.init(a, memory.client(), "archive", "seen", .{});
     defer seen.deinit();
@@ -596,7 +787,7 @@ test "external lake vacuum frontier resumes cold chunks with bounded reads and s
     const before = memory.operationCount();
     try std.testing.expectError(error.LakeVacuumPlanYield, pending.next(&steps));
     try std.testing.expectEqual(before, memory.operationCount());
-    try std.testing.expectEqual(@as(usize, 0), pending.checkpoint().snapshot);
+    try std.testing.expectEqual(@as(usize, 0), (try pending.checkpoint()).snapshot);
     var bad = terminal;
     bad.snapshot = retired.len + 1;
     try std.testing.expectError(error.InvalidLakeVacuumPlan, Walker.init(&store, &retired, &seen, bad));
@@ -638,9 +829,75 @@ test "external lake vacuum frontier checkpoints stay bounded for deep inventory 
             try std.testing.expectEqualStrings(if (emitted == 0) "base" else "shared", uri);
             emitted += 1;
         }
-        saved = try std.json.Stringify.valueAlloc(a, walker.checkpoint(), .{});
+        saved = try std.json.Stringify.valueAlloc(a, try walker.checkpoint(), .{});
         try std.testing.expect(saved.len < 2048);
     }
     try std.testing.expect(complete and turns > 32);
     try std.testing.expectEqual(@as(usize, 2), emitted);
+}
+
+test "external lake vacuum packed frontier checkpoints fit a cold request operation budget" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    var writer: Store = .{ .a = a, .client = memory.client(), .bucket = "archive", .prefix = "packed", .context = .{}, .dry_run = false };
+    var root = try writer.objects(&.{"base"});
+    // Partial planning prepends its prior root on every bounded turn. This is
+    // the normal shape of a large inventory planned a few manifests at a time.
+    for (0..128) |i| root = try writer.children(&.{ root, try writer.objects(&.{try std.fmt.allocPrint(a, "side-{d}", .{i})}) });
+    const Limit = struct {
+        memory: *objectstore.MemoryClient,
+        deadline: u64,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.memory.operationCount() >= self.deadline) return error.DeadlineExceeded;
+        }
+    };
+    const start = memory.operationCount();
+    var limit: Limit = .{ .memory = &memory, .deadline = start + 100 };
+    const context: catalog.types.Context = .{ .checkpoint = .{ .ptr = &limit, .check = Limit.check } };
+    var cold: Store = .{ .a = a, .client = memory.client(), .bucket = "archive", .prefix = "packed", .context = context, .dry_run = false };
+    var seen = catalog.retirement_index.Index.init(a, memory.client(), "archive", "packed-seen", context);
+    defer seen.deinit();
+    var walker = try Walker.init(&cold, &.{.{ .snapshot = "one", .object_plan = root }}, &seen, .{});
+    var steps: usize = 64;
+    try std.testing.expectError(error.LakeVacuumPlanYield, walker.next(&steps));
+    const cursor = try walker.checkpoint();
+    try std.testing.expect(cursor.frame != null and cursor.visited != null);
+    try std.testing.expect(memory.operationCount() - start < 100);
+}
+
+test "external lake vacuum packed frontier pops share a read and reject invalid prefixes" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const out = arena.allocator();
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    var store: Store = .{ .a = out, .client = memory.client(), .bucket = "archive", .prefix = "stack", .context = .{}, .dry_run = false };
+    const hash = try store.objects(&.{"record"});
+    const first = try store.saveFrontier(.{ .hash = hash, .child = 1 });
+    const second = try store.saveFrontier(.{ .hash = hash, .child = 2, .parent = first });
+    try store.persistFrontier(second);
+    var cold: Store = .{ .a = out, .client = memory.client(), .bucket = "archive", .prefix = "stack", .context = .{}, .dry_run = false };
+    const popped = try cold.loadFrontier(second);
+    const reads = memory.operationCount();
+    try std.testing.expectEqual(@as(usize, 2), popped.child);
+    const base = try cold.loadFrontier(popped.parent.?);
+    try std.testing.expectEqual(@as(usize, 1), base.child);
+    try std.testing.expect(base.parent == null);
+    try std.testing.expectEqual(reads, memory.operationCount());
+    var invalid = second;
+    invalid.count += 1;
+    try std.testing.expectError(error.InvalidLakeVacuumPlan, cold.loadFrontier(invalid));
+    invalid.count = 0;
+    try std.testing.expectError(error.InvalidLakeVacuumPlan, Walker.init(&cold, &.{}, undefined, .{ .frame = .{ .hash = hash, .parent = invalid } }));
+    var client = memory.client();
+    var replaced = try client.putObject("archive", try store.frontierKey(second.hash), "tampered", .{});
+    defer replaced.deinit(a);
+    var corrupt: Store = .{ .a = out, .client = memory.client(), .bucket = "archive", .prefix = "stack", .context = .{}, .dry_run = false };
+    try std.testing.expectError(error.ArtifactIntegrityMismatch, corrupt.loadFrontier(second));
 }

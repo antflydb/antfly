@@ -65,7 +65,7 @@ pub const Overlay = struct {
             const clause = try std.json.Stringify.valueAlloc(a, .{ .conjuncts = conjunction.items }, .{});
             try disjunction.append(a, try std.json.parseFromSliceLeaky(V, a, clause, .{}));
             if (change.op == .upsert) {
-                const id = try ingestion.rowId(a, pending.key_fields, change.row, pending.key_identity);
+                const id = try ingestion.rowId(a, pending.key_fields, change.row);
                 try result.rows.put(a, id, change.row);
             }
         }
@@ -420,6 +420,41 @@ pub fn requireNativeAncestry(metadata: V, base_id: []const u8) !void {
         if (!found) break;
     }
     return error.LakeOverlayCoverageUnavailable;
+}
+
+test "external lake vacuum keeps accepted overlay ancestry across snapshot expiry" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var root = try std.json.parseFromSliceLeaky(V, a,
+        \\{"current-snapshot-id":3,"snapshots":[{"snapshot-id":1,"summary":{"antfly.wal.coverage":"1","antfly.batch-id":"one"}},{"snapshot-id":9},{"snapshot-id":2,"parent-snapshot-id":1,"summary":{"antfly.wal.coverage":"2","antfly.batch-id":"two"}},{"snapshot-id":3,"parent-snapshot-id":2,"summary":{"antfly.wal.coverage":"3","antfly.batch-id":"three"}}]}
+    , .{});
+    try std.testing.expectEqual(@as(u64, 1), try snapshotCoverage(root, "1"));
+    try requireNativeAncestry(root, "1");
+    var before = try std.json.parseFromSliceLeaky(V, a, try std.json.Stringify.valueAlloc(a, root, .{}), .{});
+    var base_only = std.json.Array.init(a);
+    for ((try local.serverless_external_source_mod.lake_catalog.metadata.get(before, "snapshots")).array.items) |snapshot| {
+        const id = try local.serverless_external_source_mod.lake_catalog.metadata.int(try local.serverless_external_source_mod.lake_catalog.metadata.get(snapshot, "snapshot-id"));
+        if (id == 1 or id == 3) try base_only.append(snapshot);
+    }
+    try before.object.put(a, "snapshots", .{ .array = base_only });
+    try std.testing.expectEqual(@as(u64, 1), try snapshotCoverage(before, "1"));
+    try std.testing.expectError(error.LakeOverlayCoverageUnavailable, requireNativeAncestry(before, "1"));
+    const protected = try @import("../serverless/lake_vacuum.zig").protectOverlayAncestry(a, root, &.{"1"});
+    var retained = std.json.Array.init(a);
+    // Model expiration of old snapshots, retaining the current main ref and
+    // the maintenance API's protected set. Snapshot 9 is an unrelated branch.
+    for ((try local.serverless_external_source_mod.lake_catalog.metadata.get(root, "snapshots")).array.items) |snapshot| {
+        const id = try local.serverless_external_source_mod.lake_catalog.metadata.int(try local.serverless_external_source_mod.lake_catalog.metadata.get(snapshot, "snapshot-id"));
+        const text = try std.fmt.allocPrint(a, "{d}", .{id});
+        const keep = id == 3 or for (protected) |value| {
+            if (std.mem.eql(u8, value, text)) break true;
+        } else false;
+        if (keep) try retained.append(snapshot);
+    }
+    try root.object.put(a, "snapshots", .{ .array = retained });
+    try requireNativeAncestry(root, "1");
+    try std.testing.expectEqual(@as(usize, 3), retained.items.len);
 }
 
 test "external lake overlays reject unpublished external ancestry and cycles" {

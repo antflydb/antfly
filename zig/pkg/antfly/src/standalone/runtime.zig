@@ -1239,6 +1239,10 @@ const LocalStandaloneMetadata = struct {
         }
     };
     fn lockMutation(self: *LocalStandaloneMetadata) !MutationLock {
+        return self.lockMutationWithRequest(.{});
+    }
+    fn lockMutationWithRequest(self: *LocalStandaloneMetadata, request: LifecycleRequest) !MutationLock {
+        try request.ensureActive();
         // The embedding's role gate is atomic and outlives this catalog.
         // Standbys must reject before contending with replay's catalog lock;
         // the pinned gate below still fences role changes during admission.
@@ -1247,15 +1251,15 @@ const LocalStandaloneMetadata = struct {
         // Copy role pointers under the catalog mutex, then release it BEFORE
         // waiting for the shared seed barrier. Seed capture takes the inverse
         // resources in its documented order: exclusive barrier, then catalog.
-        lockAtomic(&self.mutex);
+        try lockAtomicForRequest(&self.mutex, request);
         const gate = if (self.hot_standby_gate) |value| value.pinned() else null;
         const barrier = if (self.hot_standby_mirror) |mirror| mirror.mutation_barrier else null;
         const binding_generation = self.hot_standby_binding_generation;
         self.mutex.unlock();
-        var lease: ?antfly.db.MutationBarrier.SharedLease = if (barrier) |value| value.acquireShared() else null;
+        var lease: ?antfly.db.MutationBarrier.SharedLease = if (barrier) |value| try value.acquireSharedChecked(request) else null;
         errdefer if (lease) |*value| value.release();
         if (gate) |value| try value.check();
-        lockAtomic(&self.mutex);
+        try lockAtomicForRequest(&self.mutex, request);
         errdefer self.mutex.unlock();
         if (binding_generation != self.hot_standby_binding_generation) return error.NotLeader;
         if (gate) |value| try value.check();
@@ -1296,7 +1300,7 @@ const LocalStandaloneMetadata = struct {
     fn getLakeIndexLifecycle(ptr: *anyopaque, alloc: std.mem.Allocator, table_id: u64, request: LifecycleRequest) ![]u8 {
         try request.ensureActive();
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
-        lockAtomic(&self.mutex);
+        try lockAtomicForRequest(&self.mutex, request);
         defer self.mutex.unlock();
         return (self.lifecycle_store orelse return error.UnsupportedOperation).getLakeIndexLifecycle(alloc, group_ids.main_metadata_group_id, table_id);
     }
@@ -1305,7 +1309,7 @@ const LocalStandaloneMetadata = struct {
         try request.ensureActive();
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         if (!self.coordinated_lifecycle_allowed) return error.CoordinatedStandaloneHAMetadataRequired;
-        var locked = try self.lockMutation();
+        var locked = try self.lockMutationWithRequest(request);
         defer locked.deinit();
         const store = self.lifecycle_store orelse return error.UnsupportedOperation;
         var arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -1325,7 +1329,7 @@ const LocalStandaloneMetadata = struct {
     fn getBackupCohort(ptr: *anyopaque, alloc: std.mem.Allocator, id: u64, request: LifecycleRequest) !?[]u8 {
         try request.ensureActive();
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
-        lockAtomic(&self.mutex);
+        try lockAtomicForRequest(&self.mutex, request);
         defer self.mutex.unlock();
         return (self.lifecycle_store orelse return error.UnsupportedOperation).getBackupCohort(alloc, group_ids.main_metadata_group_id, id);
     }
@@ -1820,15 +1824,18 @@ const LocalStandaloneMetadata = struct {
         // request lifecycle contract on both sides of the potentially large
         // allocation just like the Raft-backed coherent snapshot path does.
         try request.ensureActive();
-        var snapshot = try catalogAdminSnapshot(ptr);
+        var snapshot = try catalogAdminSnapshotWithRequest(ptr, request);
         errdefer catalogFreeAdminSnapshot(ptr, &snapshot);
         try request.ensureActive();
         return snapshot;
     }
 
     fn catalogAdminSnapshot(ptr: *anyopaque) !antfly.metadata_api.AdminSnapshot {
+        return catalogAdminSnapshotWithRequest(ptr, .{});
+    }
+    fn catalogAdminSnapshotWithRequest(ptr: *anyopaque, request: LifecycleRequest) !antfly.metadata_api.AdminSnapshot {
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
-        lockAtomic(&self.mutex);
+        try lockAtomicForRequest(&self.mutex, request);
         defer self.mutex.unlock();
         if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
         if (self.lifecycle_store) |store| if (try store.standaloneRevision() != self.durable_revision) try self.reloadLifecycleProjectionLocked();
@@ -2583,7 +2590,7 @@ const LocalStandaloneMetadata = struct {
         };
         var admitted = context;
         admitted.cancellation = .none;
-        const result = try systemCatalogAdmitted(ptr, alloc, admitted, call);
+        const result = try systemCatalogAdmitted(ptr, alloc, admitted, call, context);
         errdefer alloc.free(result);
         if (!call.isMutation()) try context.ensureActive();
         return result;
@@ -2658,26 +2665,25 @@ const LocalStandaloneMetadata = struct {
         return reply;
     }
 
-    fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call) anyerror![]u8 {
+    fn systemCatalogAdmitted(ptr: *anyopaque, alloc: std.mem.Allocator, context: antfly.public_api.operation.RequestContext, call: @import("../system_catalog/server_call.zig").Call, admission: antfly.public_api.operation.RequestContext) anyerror![]u8 {
         if (call == .native_memory_create) {
             if (!context.setting_admin or context.native_service != .memory) return error.Forbidden;
             var request = call.native_memory_create;
             request.mutation.native_service = .memory;
-            return systemCatalogAdmitted(ptr, alloc, context, .{ .mutate = request });
+            return systemCatalogAdmitted(ptr, alloc, context, .{ .mutate = request }, admission);
         }
         const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
         try context.ensureActive();
-        if (call == .lake_index_lifecycle_read) return getLakeIndexLifecycle(ptr, alloc, call.lake_index_lifecycle_read, context);
+        if (call == .lake_index_lifecycle_read) return getLakeIndexLifecycle(ptr, alloc, call.lake_index_lifecycle_read, admission);
         if (call == .lake_index_lifecycle_work) {
-            try context.ensureActive();
-            lockAtomic(&self.mutex);
+            try lockAtomicForRequest(&self.mutex, admission);
             defer self.mutex.unlock();
             return (self.lifecycle_store orelse return error.UnsupportedOperation).lakeIndexLifecycleWork(alloc, group_ids.main_metadata_group_id, call.lake_index_lifecycle_work);
         }
         if (call == .lake_index_lifecycle_mutate) {
             if (!context.setting_admin) return error.Forbidden;
             const write = call.lake_index_lifecycle_mutate;
-            try mutateLakeIndexLifecycle(ptr, write.table_id, write.expected_revision, write.mutation, context);
+            try mutateLakeIndexLifecycle(ptr, write.table_id, write.expected_revision, write.mutation, admission);
             return alloc.dupe(u8, "{}");
         }
         if (call == .resolver_authority_mutate or call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
@@ -2688,7 +2694,7 @@ const LocalStandaloneMetadata = struct {
         };
         var lease = if (call == .resolver_authority_mutate or call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
-            call == .sql_completion_reference_mutate or call == .fk_initial_create_begin or call == .fk_initial_create_mutate) (if (self.hot_standby_catalog_server) |server| server.hot_standby_mutation_barrier.acquireShared() else null) else null;
+            call == .sql_completion_reference_mutate or call == .fk_initial_create_begin or call == .fk_initial_create_mutate) (if (self.hot_standby_catalog_server) |server| try server.hot_standby_mutation_barrier.acquireSharedChecked(admission) else null) else null;
         defer if (lease) |*value| value.release();
         if (call == .resolver_authority_mutate or call == .mutate or call == .setting_mutate or call == .policy_definition_mutate or
             call == .policy_publication_begin or call == .policy_publication_mutate or
@@ -2696,7 +2702,7 @@ const LocalStandaloneMetadata = struct {
         {
             try server.hot_standby_public_gate_state.checkWrite(server.hot_standby_public_gate_state.currentGeneration());
         };
-        if (!lockAtomicUntil(&self.mutex, (try context.platformDeadline()).deadline_ns)) return error.DeadlineExceeded;
+        try lockAtomicForRequest(&self.mutex, admission);
         var locked = true;
         defer if (locked) self.mutex.unlock();
         if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
@@ -7405,6 +7411,25 @@ const StandaloneWaitClock = struct {
         platform_time.yieldNow();
     }
 };
+
+fn lockAtomicForRequest(mutex: *std.atomic.Mutex, request: anytype) !void {
+    // A cancellation callback may read this same catalog. Invoke it only
+    // before acquisition; the post-grant check uses the deadline alone.
+    var granted = request;
+    granted.cancellation = .none;
+    return lockAtomicForRequestWithClock(mutex, request, granted, StandaloneWaitClock{});
+}
+fn lockAtomicForRequestWithClock(mutex: *std.atomic.Mutex, request: anytype, granted: anytype, clock: anytype) !void {
+    while (true) {
+        try request.ensureActive();
+        if (mutex.tryLock()) {
+            errdefer mutex.unlock();
+            try granted.ensureActive();
+            return;
+        }
+        clock.sleepMs(1);
+    }
+}
 
 fn lockAtomicUntil(mutex: *std.atomic.Mutex, deadline_ns: ?u64) bool {
     return lockAtomicUntilWithClock(mutex, deadline_ns, StandaloneWaitClock{});
@@ -15038,7 +15063,30 @@ test "system catalog cancellation callbacks run outside the authority mutex" {
         alloc.free(result);
     }
     try std.testing.expect(!probe.contended);
-    try std.testing.expectEqual(@as(usize, 7), probe.calls);
+    try std.testing.expect(probe.calls >= 7);
+    const Queued = struct {
+        checks: usize = 0,
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.checks += 1;
+            return self.checks >= 2;
+        }
+    };
+    // Cancellation after the public boundary's initial check must still
+    // interrupt admission, including mutations whose commit context disables
+    // late cancellation. The existing holder must retain its mutex.
+    for ([_]@import("../system_catalog/server_call.zig").Call{
+        .snapshot,
+        .{ .mutate = .{ .mutation = .{ .action = .create, .kind = .database, .name = "never_admitted" } } },
+    }) |call| {
+        var queued: Queued = .{};
+        const waiting: antfly.public_api.operation.RequestContext = .{ .cancellation = .{ .ptr = &queued, .is_cancelled_fn = Queued.canceled } };
+        try std.testing.expect(metadata.mutex.tryLock());
+        defer metadata.mutex.unlock();
+        try std.testing.expectError(error.Canceled, metadata.statusSource().systemCatalog(alloc, waiting, call));
+        try std.testing.expect(!metadata.mutex.tryLock());
+        try std.testing.expectEqual(@as(usize, 2), queued.checks);
+    }
 }
 
 test "standalone catalog journal preserves imported policy publication as fail closed" {
@@ -16263,4 +16311,48 @@ test "standalone cdc review rejects replication sources with scoped HA ownership
     defer a.free(sources);
     std.debug.print("review scoped HA cdc_supported={} publication_supported={}\n", .{ try metadata.statusSource().replicationSourcesSupported(), metadata.standaloneRelationPublicationSupported() });
     try std.testing.expectError(error.HACatalogReplicationSourcesUnsupported, LocalStandaloneMetadata.createTable(&metadata, a, "tickets", .{ .replication_sources_json = sources }));
+}
+
+test "standalone metadata admission observes cancellation while queued and after grant" {
+    const Control = struct {
+        checks: usize = 0,
+        limit: usize,
+        pub fn ensureActive(self: *@This()) error{Canceled}!void {
+            self.checks += 1;
+            if (self.checks >= self.limit) return error.Canceled;
+        }
+    };
+    const Clock = struct {
+        fn sleepMs(_: @This(), _: u64) void {}
+    };
+    var mutex: std.atomic.Mutex = .unlocked;
+    try std.testing.expect(mutex.tryLock());
+    var queued = Control{ .limit = 3 };
+    try std.testing.expectError(error.Canceled, lockAtomicForRequestWithClock(&mutex, &queued, &queued, Clock{}));
+    try std.testing.expect(!mutex.tryLock());
+    mutex.unlock();
+    var raced = Control{ .limit = 2 };
+    try std.testing.expectError(error.Canceled, lockAtomicForRequestWithClock(&mutex, &raced, &raced, Clock{}));
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
+    try std.testing.expectError(error.DeadlineExceeded, lockAtomicForRequest(&mutex, antfly.public_api.operation.RequestContext{ .deadline_ns = 0 }));
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
+    const Probe = struct {
+        mutex: *std.atomic.Mutex,
+        contended: bool = false,
+        fn canceled(raw: *const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            if (!self.mutex.tryLock()) {
+                self.contended = true;
+                return true;
+            }
+            self.mutex.unlock();
+            return false;
+        }
+    };
+    var probe: Probe = .{ .mutex = &mutex };
+    try lockAtomicForRequest(&mutex, antfly.public_api.operation.RequestContext{ .cancellation = .{ .ptr = &probe, .is_cancelled_fn = Probe.canceled } });
+    mutex.unlock();
+    try std.testing.expect(!probe.contended);
 }

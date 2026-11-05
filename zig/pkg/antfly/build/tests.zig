@@ -2987,7 +2987,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = object_wal_mod,
         // Cache imports reach the archive engine too. Keep this owner focused
         // on shared WAL storage, native admission and captured-cut contracts.
-        .filters = &.{ "serverless indexed", "serverless multiprovider", "external lake shared collector registry", "external lake bounded WAL cuts", "external lake segmented WAL", "external lake WAL collection", "external lake unified WAL" },
+        .filters = selectTestFilters(b, &.{ "serverless indexed", "serverless multiprovider", "external lake shared collector registry", "external lake bounded WAL cuts", "external lake segmented WAL", "external lake WAL collection", "external lake unified WAL", "serverless object WAL whole-log" }),
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("antfly-object-wal-test", "Run shared object WAL, lake adaptation and reclamation contracts")
@@ -3159,6 +3159,19 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
+    const lake_vacuum_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_vacuum_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    test_imports.configure(b, lake_vacuum_mod, true, true);
+    lake_vacuum_mod.addImport("antfly_openapi_specs", antfly_imports.embedded_openapi);
+    const lake_vacuum_tests = b.addTest(.{
+        .root_module = lake_vacuum_mod,
+        .filters = selectTestFilters(b, &.{ "external lake vacuum", "external lake expiring", "external lake bounded WAL retained cuts" }),
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("lake-vacuum-test", "Run bounded lake maintenance, fencing and recovery tests").dependOn(&addFilteredTestRunArtifact(b, lake_vacuum_tests).step);
     const text_frontier_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_text_frontier_test_root.zig"),
         .target = target,
@@ -5315,6 +5328,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .root_module = lib_standalone_runtime_test_mod,
         .filters = selectTestFilters(b, &.{
             "standalone runtime module compiles",
+            "standalone metadata admission observes cancellation",
             "standalone.runtime.test.system catalog",
             "catalog.domain.",
             "standalone runtime local generator accepts media url data uris",
@@ -5520,6 +5534,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "standalone data directory does not change the default models directory",
             "standalone linked inference ABI validates the supported function-table prefix",
             "linked rerank documents become server content parts with attachment references",
+            "linked embedding groups retain one ordered input and borrowed media",
+            "linked embedding large image parity across public and grouped inputs",
+            "linked embedding audio MIME hints match public and native grouped vectors",
             "document execution manifests retain raw duplex body mode",
             "native checkpoint route manifest preserves binary upload and export streaming",
             "native checkpoint worker upload honors cancellation counts and cumulative ceiling",
@@ -5527,6 +5544,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 14 else 7) * 1024 * 1024 * 1024,
     });
     const run_inference_host_tests = b.addRunArtifact(inference_host_tests);
+    // Qualification reads external fixture/model paths at execution time.
+    // A prior opt-out must never cache a skip over a later live invocation.
+    run_inference_host_tests.has_side_effects = true;
     lib_standalone_runtime_test_step.dependOn(&run_inference_host_tests.step);
     inference_host_test_step.dependOn(&run_inference_host_tests.step);
     // Keep the complete API worker fixture out of the inference-heavy runtime
@@ -6596,7 +6616,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
 
     const lake_storage_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{"db external lake"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     b.step("lake-storage-test", "Run native owner lake read-only and restart contracts").dependOn(&addFilteredTestRunArtifact(b, lake_storage_tests).step);
-    const grouped_source_production_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{ "grouped sources production", "ordered artifact inventory completion checkpoint resumes", "ordered artifact inventory completion control preserves bounded binary claims" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
+    const grouped_source_production_tests = b.addTest(.{ .root_module = db_test_mod, .filters = &.{ "grouped sources production", "group worker resumes durable activation", "ordered artifact inventory completion checkpoint resumes", "ordered artifact inventory completion control preserves bounded binary claims" }, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const grouped_source_protocol_tests = b.addTest(.{ .root_module = data_implementation_module, .filters = &.{"grouped source protocol dominates"}, .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple } });
     const grouped_source_step = b.step("antfly-group-sources-test", "Verify grouped source publication, graph proofs, protocol negotiation and durable owner lifecycle");
     grouped_source_step.dependOn(&addFilteredTestRunArtifact(b, grouped_source_production_tests).step);

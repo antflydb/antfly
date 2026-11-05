@@ -1145,6 +1145,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
         .optimize = optimize,
     });
     inference_host_mod.addImport("httpx", httpx_mod);
+    inference_host_mod.addImport("antfly_inference_embedding_wire", inference_embedding_wire_mod);
     readers_mod.addImport("apple_reader_options", inference_graph.apple_native_mod.import_table.get("apple_native_options").?);
     readers_mod.addImport("antfly_inference_work", inference_work_mod);
     readers_mod.addImport("antfly_platform", platform_mod);
@@ -1378,6 +1379,9 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // SQL shape fixtures reach native schema and storage contracts, but do not
     // need the inference/API module graph of a full storage owner.
     antfly_imports.configureRuntimeContracts(usermgr_mod);
+    // Shared scheduling's memory admission reaches named native callbacks in
+    // both the SQL contract root and its extracted local-source test owner.
+    sql_test_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
     antfly_imports.storage_boundary.configureSources(sql_test_mod, false, false);
     sql_test_mod.addImport("sql_parser", sql_parser_mod);
     sql_test_mod.addImport("antfly-json", json_mod);

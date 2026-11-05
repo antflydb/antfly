@@ -17,6 +17,7 @@ package sources
 
 import (
 	"context"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"time"
@@ -77,6 +78,24 @@ func ServeMedia(w http.ResponseWriter, r *http.Request, media MediaConnector, re
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", item.Size))
 		serviceError(w, 416, "invalid_range")
 		return
+	}
+	// Export endpoints and collaboration attachments do not support immutable
+	// range reads. Acquire and verify once, then reuse only within this request.
+	if r.Method == http.MethodGet {
+		if acquirer, ok := media.(AcquiredMediaConnector); ok {
+			data, acquired, err := acquirer.AcquireMedia(ctx, request, item)
+			if err != nil {
+				serveMediaError(w, err)
+				return
+			}
+			if acquired {
+				if int64(len(data)) != item.Size || fmt.Sprintf("%x", sha256.Sum256(data)) != digest {
+					serveMediaError(w, &RevisionChangedError{Expected: item.Revision, Actual: "representation changed; synchronize this source again"})
+					return
+				}
+				media = acquiredMedia{data: data}
+			}
+		}
 	}
 	seeker := &mediaSeeker{ctx: ctx, connector: media, request: request, item: item, ranges: spans}
 	defer seeker.Close()

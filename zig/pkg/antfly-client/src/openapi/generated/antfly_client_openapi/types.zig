@@ -26382,6 +26382,10 @@ pub const HierarchyArtifact = struct {
     /// Independent media output sub-window within the parent chunk; omitted for an unsplit vector.
     window_index: ?u32 = null,
     unit_id: ?[]const u8 = null,
+    /// Opaque fingerprint of this member's native content and captured producer/input state; independent of hierarchy traversal cursors.
+    revision: ?[]const u8 = null,
+    /// Opaque fingerprint of the captured producer/input state, when available. Changes to producer configuration or acquired input reopen this identity.
+    derivation_revision: ?[]const u8 = null,
     source: ?HierarchyArtifactSource = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
@@ -26391,6 +26395,8 @@ pub const HierarchyArtifact = struct {
         .{ "chunk_id", "chunk_id", true },
         .{ "window_index", "window_index", true },
         .{ "unit_id", "unit_id", true },
+        .{ "revision", "revision", true },
+        .{ "derivation_revision", "derivation_revision", true },
         .{ "source", "source", true },
     };
 
@@ -26418,6 +26424,14 @@ pub const HierarchyArtifact = struct {
         }
         if (self.unit_id) |value| {
             try jw.objectField("unit_id");
+            try jw.write(value);
+        }
+        if (self.revision) |value| {
+            try jw.objectField("revision");
+            try jw.write(value);
+        }
+        if (self.derivation_revision) |value| {
+            try jw.objectField("derivation_revision");
             try jw.write(value);
         }
         if (self.source) |value| {
@@ -26477,13 +26491,75 @@ pub const HierarchyArtifactSource = struct {
 
 pub const HierarchyChildParent = struct {
     level: []const u8,
-    id: []const u8,
+    id: ?[]const u8 = null,
+    /// Bounded source selection for member traversal; unit traversal requires id.
+    ids: ?[]const []const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "level", "level", false },
+        .{ "id", "id", true },
+        .{ "ids", "ids", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("level");
+        try jw.write(self.level);
+        if (self.id) |value| {
+            try jw.objectField("id");
+            try jw.write(value);
+        }
+        if (self.ids) |value| {
+            try jw.objectField("ids");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 pub const HierarchyChildren = struct {
     parent: HierarchyChildParent,
-    /// Child level to enumerate. Unit traversal reads the versioned extraction hierarchy rather than a relevance index, so empty and failed units are included.
+    /// Child level to enumerate. Unit traversal reads the versioned extraction hierarchy rather than a relevance index, so empty and failed units are included. Member traversal requires artifact and seeks that producer's native storage prefixes within the selected source or parent.ids batch (up to 100). One global cursor orders the selected members; it includes generic assets and chunks. Scalar member payloads are returned as {"$": value} in _source so every query hit retains an object-shaped projection. Continuation requires the remote_snapshot returned with the first page.
     level: []const u8,
+    /// Producer name; required for member traversal and omitted for unit traversal.
+    artifact: ?[]const u8 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "parent", "parent", false },
+        .{ "level", "level", false },
+        .{ "artifact", "artifact", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        try jw.objectField("parent");
+        try jw.write(self.parent);
+        try jw.objectField("level");
+        try jw.write(self.level);
+        if (self.artifact) |value| {
+            try jw.objectField("artifact");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
 };
 
 /// The required public order for sequential hierarchy traversal. Specify `_hierarchy.position` ascending; Antfly appends `_id` ascending as the deterministic tie-breaker and returns both values in each hit's `_sort`.
@@ -30237,6 +30313,8 @@ pub const InferenceDocumentJobRequest = struct {
 
 /// OpenAI-compatible embedding request with inference multimodal content-part extension. EmbeddingGemma 2 text encoding uses official task prefixes, a shared 8192-token limit, mean pooling including prompt tokens, and normalized vectors.
 pub const InferenceEmbedRequest = struct {
+    /// Optional immutable execution revision from model capabilities. Every acquired model, including recovery attempts, must match before inference. A mismatch returns 409 with X-Antfly-Capability-Stale true. Successful execution acknowledges the pin in X-Antfly-Model-Revision for JSON and numeric responses; callers requiring a pin must reject missing or different acknowledgements.
+    model_revision: ?[]const u8 = null,
     /// Optional exact asset identity pin. A mismatch returns 409 before inference.
     model_identity: ?[]const u8 = null,
     /// Model name to use for embedding generation
@@ -30258,6 +30336,7 @@ pub const InferenceEmbedRequest = struct {
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
+        .{ "model_revision", "model_revision", true },
         .{ "model_identity", "model_identity", true },
         .{ "model", "model", false },
         .{ "input", "input", false },
@@ -30279,6 +30358,10 @@ pub const InferenceEmbedRequest = struct {
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         try jw.beginObject();
+        if (self.model_revision) |value| {
+            try jw.objectField("model_revision");
+            try jw.write(value);
+        }
         if (self.model_identity) |value| {
             try jw.objectField("model_identity");
             try jw.write(value);
@@ -31876,6 +31959,8 @@ pub const InferenceModelInfo = struct {
     inference_capabilities: ?std.json.ArrayHashMap(std.json.Value) = null,
     /// Proven native dense output width and inclusive supported truncation range, read from resolved metadata without loading weights. Omitted when unknown or for non-embedding tasks.
     dense_output: ?std.json.Value = null,
+    /// The embedding endpoint enforces model_revision and acknowledges successful execution in X-Antfly-Model-Revision for both JSON and numeric responses. An observed model_revision alone does not establish this support.
+    model_revision_pinning: ?bool = null,
     /// Immutable resolved embedding or generator generation, returned for scoped model/task discovery without loading weights.
     model_revision: ?[]const u8 = null,
     /// Pull-time qualified request profiles for this exact artifact, including backend, supported features and min/max geometry. Runtime admission revalidates artifact identity and resource limits. Omitted for artifacts without a qualification receipt.
@@ -31897,6 +31982,7 @@ pub const InferenceModelInfo = struct {
         .{ "chunking_limits", "chunking_limits", true },
         .{ "inference_capabilities", "inference_capabilities", true },
         .{ "dense_output", "dense_output", true },
+        .{ "model_revision_pinning", "model_revision_pinning", true },
         .{ "model_revision", "model_revision", true },
         .{ "qualified_limits", "qualified_limits", true },
         .{ "compatibility", "compatibility", true },
@@ -31930,6 +32016,10 @@ pub const InferenceModelInfo = struct {
         }
         if (self.dense_output) |value| {
             try jw.objectField("dense_output");
+            try jw.write(value);
+        }
+        if (self.model_revision_pinning) |value| {
+            try jw.objectField("model_revision_pinning");
             try jw.write(value);
         }
         if (self.model_revision) |value| {
@@ -44281,7 +44371,7 @@ pub const QueryFilterError = struct {
     retryable: bool,
 };
 
-/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit source-grouped result shape.
+/// Returns direct index matches with optional projected ancestor context, or groups those matches at a hierarchy level through `group_by`. A group's nested `matches` projection is independently bounded and defaults to three hits while the top-level `limit` continues to control the number of groups. `children` is a separate sequential-browsing operation. It enumerates every unit in the selected source revision, including units with no searchable chunk, and uses the top-level `_sort`/`search_after` cursor contract. For member traversal, `filter_query` applies to source parents before any artifact enumeration; it never filters member payloads or changes the member pagination order. Ancestor and nested-match field projections are always explicit to keep response size predictable. The presence of this object selects the canonical contract: without `group_by` or `children`, including when the object is empty, direct index matches are returned. `ancestors` only controls projected context and never changes result cardinality. Omit `hierarchy` entirely to retain the v0.2-compatible implicit source-grouped result shape.
 pub const QueryHierarchy = struct {
     group_by: ?HierarchyGroupBy = null,
     ancestors: ?HierarchyAncestors = null,

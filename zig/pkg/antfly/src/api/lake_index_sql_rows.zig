@@ -861,7 +861,7 @@ const CoveringWave = struct {
     }
     fn runJobs(self: *CoveringWave, cached: @import("lake_index_aggregate_artifact.zig").CachedRead, comptime run: fn (*Job) anyerror!void) !void {
         const scheduler = local.sql_parallel_scheduler;
-        var ready: std.Io.Event = .unset;
+        var ready: scheduler.Completion = .{};
         var tasks: [4]?scheduler.Task(anyerror!void) = @splat(null);
         defer if (cached.context.io) |io| for (&tasks) |*task| if (task.*) |*held| {
             held.cancel(io) catch {};
