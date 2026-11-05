@@ -83,6 +83,7 @@ pub const Context = struct {
     model_manager: *model_manager_mod.ModelManager,
     execution_control: ?@import("../execution_control.zig").InferenceExecutionControl = null,
     reader_resolver: ?*ReaderResolver = null,
+    selector_cache: ?*@import("../registry/selection.zig").Cache = null,
     reader_request_limits: @import("antfly_platform").resource_policy.InferenceRequestLimits = .{},
     reader_admission: ?struct {
         ptr: *anyopaque,
@@ -798,13 +799,18 @@ fn discoverReaderModelPathFromRegistry(
     return ctx.allocator.dupe(u8, best_path orelse return error.NoReaderModelAvailable);
 }
 
+fn resolveSelector(ctx: Context, requested: []const u8, task: []const u8) !?[]u8 {
+    if (ctx.selector_cache) |cache| return cache.resolve(ctx.allocator, ctx.io, ctx.models_dir, requested, task);
+    return registry_mod.resolveInstalledModelSelector(ctx.allocator, ctx.io, ctx.models_dir, requested, task);
+}
+
 fn resolveNamedModelPath(ctx: Context, requested_name: []const u8, task_type: []const u8) ![]const u8 {
     const resolved_ref = registry_mod.resolveFriendlyRef(requested_name) orelse requested_name;
     const normalized = if (std.mem.startsWith(u8, resolved_ref, "hf:")) resolved_ref[3..] else resolved_ref;
     if (registry_mod.ModelRef.parse(normalized)) |ref| {
         const selection = try registry_mod.download.parseVariantRevision(ref.variant);
         if (selection.revision != null or !std.mem.eql(u8, selection.variant, "auto")) {
-            return (try registry_mod.resolveInstalledModelSelector(ctx.allocator, ctx.io, ctx.models_dir, normalized, task_type)) orelse error.ModelNotFound;
+            return (try resolveSelector(ctx, normalized, task_type)) orelse error.ModelNotFound;
         }
     } else |_| {
         if (std.mem.indexOfAny(u8, normalized, ":@") != null) return error.InvalidModelIdentifier;
@@ -827,7 +833,7 @@ fn resolveNamedModelPath(ctx: Context, requested_name: []const u8, task_type: []
     }
     ctx.allocator.free(task_path);
 
-    if (try registry_mod.resolveInstalledModelSelector(ctx.allocator, ctx.io, ctx.models_dir, normalized, task_type)) |managed_path| return managed_path;
+    if (try resolveSelector(ctx, normalized, task_type)) |managed_path| return managed_path;
 
     const task_dir = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ctx.models_dir, task_type });
     defer ctx.allocator.free(task_dir);

@@ -70,6 +70,7 @@ pub const ModelEntry = struct {
 const DiscoverKindMode = enum {
     manifest,
     path,
+    installations,
 };
 
 test {
@@ -379,31 +380,10 @@ fn immutableHubRevision(revision: []const u8) bool {
 /// Both native HTTP execution and direct extractor APIs use this authority.
 /// Exact legacy paths/defaults are handled by callers before this scan.
 pub fn resolveInstalledModelSelector(allocator: std.mem.Allocator, io: Io, models_dir: []const u8, requested: []const u8, task: ?[]const u8) !?[]u8 {
-    var registry = ModelRegistry.init(allocator, models_dir);
-    const discovered = try registry.discoverShallow(io);
-    defer {
-        for (discovered) |entry| {
-            allocator.free(entry.name);
-            allocator.free(entry.path);
-        }
-        if (discovered.len > 0) allocator.free(discovered);
-    }
-    var arena = std.heap.ArenaAllocator.init(allocator);
-    defer arena.deinit();
-    var match: ?[]const u8 = null;
-    for (discovered) |entry| {
-        if (!modelInTaskScope(models_dir, entry.path, task)) continue;
-        const selectors = try managedModelSelectorsAlloc(arena.allocator(), io, entry.path);
-        var matches = selectors.len == 0 and std.mem.indexOfAny(u8, requested, ":@") == null and std.mem.eql(u8, entry.name, requested);
-        for (selectors) |selector| if (std.mem.eql(u8, selector, requested)) {
-            matches = true;
-            break;
-        };
-        if (!matches) continue;
-        if (match != null and !std.mem.eql(u8, match.?, entry.path)) return error.AmbiguousModelIdentifier;
-        match = entry.path;
-    }
-    return if (match) |path| try allocator.dupe(u8, path) else null;
+    var inventory = try @import("selection.zig").Inventory.loadStable(allocator, io, models_dir);
+    defer inventory.deinit();
+    const selected = (try inventory.lookup(requested, task)) orelse return null;
+    return try allocator.dupe(u8, selected);
 }
 
 pub fn modelInTaskScope(models_dir: []const u8, path: []const u8, task_type: ?[]const u8) bool {
@@ -438,6 +418,12 @@ pub const ModelRegistry = struct {
     /// every manifest twice on listing-style paths.
     pub fn discoverShallow(self: *ModelRegistry, io: Io) ![]ModelEntry {
         return self.discoverWithKindMode(io, .path);
+    }
+
+    /// Enumerate installation paths using literal storage names. Public
+    /// selector ownership is derived separately, without parsing architecture.
+    pub fn discoverInstallations(self: *ModelRegistry, io: Io) ![]ModelEntry {
+        return self.discoverWithKindMode(io, .installations);
     }
 
     fn discoverWithKindMode(self: *ModelRegistry, io: Io, kind_mode: DiscoverKindMode) ![]ModelEntry {
@@ -879,10 +865,10 @@ pub const ModelRegistry = struct {
                 gliner_architecture = manifest.gliner_architecture;
                 break :blk modelKindFromManifestType(manifest.model_type);
             },
-            .path => kind_hint orelse inferModelKindFromPath(model_path),
+            .path, .installations => kind_hint orelse inferModelKindFromPath(model_path),
         };
 
-        const owned_name = managedModelRequestNameAlloc(self.allocator, io, model_path) catch |err| switch (err) {
+        const owned_name = if (kind_mode == .installations) try self.allocator.dupe(u8, display_name) else managedModelRequestNameAlloc(self.allocator, io, model_path) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => null,
         } orelse try self.allocator.dupe(u8, display_name);

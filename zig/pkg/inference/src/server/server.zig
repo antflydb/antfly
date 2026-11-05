@@ -44,6 +44,7 @@ const backends_mod = @import("../backends/backends.zig");
 const session_factory = @import("../architectures/session_factory.zig");
 const qwen35_execution = @import("../architectures/qwen35_execution.zig");
 const registry_mod = @import("../registry/registry.zig");
+const selection_mod = @import("../registry/selection.zig");
 const extractors_mod = @import("../extractors/extractor.zig");
 const cache_mod = @import("../cache/cache.zig");
 pub const model_manager = @import("model_manager.zig");
@@ -2225,6 +2226,7 @@ test "inference download context carries request cancellation" {
 test "dense embed parser contexts reject expired image fetches" {
     const allocator = std.testing.allocator;
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const manifest = manifest_mod.ModelManifest{
         .allocator = allocator,
@@ -4296,6 +4298,7 @@ pub const Node = struct {
     session_manager: backends_mod.SessionManager,
     model_manager: model_manager_mod.ModelManager,
     registry: registry_mod.ModelRegistry,
+    selector_cache: ?*selection_mod.Cache = null,
     extraction_reader_resolver: extractors_mod.ReaderResolver,
     tabular_registry: tabular_mod.registry.Registry,
     embed_cache: cache_mod.ResultCache([]const f32),
@@ -4467,6 +4470,12 @@ pub const Node = struct {
         var runtime_epoch_bytes: [8]u8 = undefined;
         try fillRandomBytes(&runtime_epoch_bytes);
         const runtime_epoch = std.mem.readInt(u64, &runtime_epoch_bytes, .little);
+        const selector_cache = try allocator.create(selection_mod.Cache);
+        selector_cache.* = selection_mod.Cache.init(allocator);
+        errdefer {
+            selector_cache.deinit();
+            allocator.destroy(selector_cache);
+        }
         var node: Node = .{
             .cuda_device_budget_owner = cuda_owner,
             .config = config,
@@ -4474,6 +4483,7 @@ pub const Node = struct {
             .session_manager = session_manager,
             .model_manager = model_manager_mod.ModelManager.initWithRuntimeEpoch(allocator, session_manager, runtime_epoch),
             .registry = registry_mod.ModelRegistry.init(allocator, config.models_dir),
+            .selector_cache = selector_cache,
             .extraction_reader_resolver = extractors_mod.ReaderResolver.init(allocator),
             .tabular_registry = tabular_mod.registry.Registry.init(allocator),
             .embed_cache = cache_mod.ResultCache([]const f32).init(allocator, 120_000),
@@ -4625,6 +4635,10 @@ pub const Node = struct {
         if (self.hard_cancellation_watchdog) |watchdog| {
             watchdog.destroy();
             self.hard_cancellation_watchdog = null;
+        }
+        if (self.selector_cache) |cache| {
+            cache.deinit();
+            self.allocator.destroy(cache);
         }
         self.registry.deinit();
         self.extraction_reader_resolver.deinit();
@@ -12415,6 +12429,7 @@ pub const Node = struct {
             .session_manager = &self.session_manager,
             .model_manager = &self.model_manager,
             .reader_resolver = &self.extraction_reader_resolver,
+            .selector_cache = self.selector_cache,
             .reader_admission = .{ .ptr = &reader_admission, .resolve_limits = ExtractionReaderAdmission.resolveLimits },
             .reader_request_limits = self.config.request_limits,
             .gliner_pipeline_factory = .{ .ptr = self, .create = createGlinerPipeline },
@@ -12860,6 +12875,17 @@ pub const Node = struct {
     }
 
     fn resolveReadingPath(self: *Node, allocator: std.mem.Allocator, io: std.Io, name: ?[]const u8, comptime checked: bool) ![]const u8 {
+        // The selector inventory already joins all read execution scopes.
+        // Constrained selectors need one lookup and one receipt verification.
+        if (name) |raw| {
+            const friendly = registry_mod.resolveFriendlyRef(raw) orelse raw;
+            if (registry_mod.ModelRef.parse(friendly)) |ref| {
+                const selection = try registry_mod.download.parseVariantRevision(ref.variant);
+                if (selection.revision != null or !std.mem.eql(u8, selection.variant, "auto")) {
+                    return if (checked) self.resolveRequestModelPath(allocator, io, raw, "readers") else self.resolveModelPath(io, raw, "readers");
+                }
+            } else |_| {}
+        }
         // A bare identity must not pick a model architecture by search order.
         // Qualified storage identities still resolve through the exact path.
         var selected: ?[]const u8 = null;
@@ -13019,6 +13045,7 @@ pub const Node = struct {
     }
 
     fn resolveDiscoveredRequestName(self: *Node, io: std.Io, request_name: []const u8, task_type: ?[]const u8) !?[]u8 {
+        if (self.selector_cache) |cache| return cache.resolve(self.allocator, io, self.config.models_dir, request_name, task_type);
         return registry_mod.resolveInstalledModelSelector(self.allocator, io, self.config.models_dir, request_name, task_type);
     }
 
@@ -25336,16 +25363,12 @@ pub const Node = struct {
         var openai_data_count: usize = 0;
         const list_created = completionCreatedTimestamp();
 
-        // Discover models from filesystem registry
-        const ra = self.registry.allocator;
-        const discovered = try self.registry.discoverShallow(io);
-        defer {
-            for (discovered) |entry| {
-                ra.free(entry.name);
-                ra.free(entry.path);
-            }
-            if (discovered.len > 0) ra.free(discovered);
-        }
+        var inventory = if (self.selector_cache) |cache|
+            try cache.snapshot(a, io, self.config.models_dir)
+        else
+            try selection_mod.Inventory.loadStable(a, io, self.config.models_dir);
+        defer inventory.deinit();
+        const discovered = inventory.discovered;
 
         var discovered_listings = std.ArrayListUnmanaged(DiscoveredModelListing).empty;
         defer {
@@ -25360,11 +25383,7 @@ pub const Node = struct {
         for (discovered, 0..) |entry, entry_index| {
             // A directory spelling is not proof of a format or immutable pin.
             // Unmanaged installations may advertise only literal legacy names.
-            if (std.mem.indexOfAny(u8, entry.name, ":@") != null) {
-                var selection_arena = std.heap.ArenaAllocator.init(a);
-                defer selection_arena.deinit();
-                if ((try registry_mod.managedModelSelectorsAlloc(selection_arena.allocator(), io, entry.path)).len == 0) continue;
-            }
+            if (inventory.names[entry_index].len == 0) continue;
             var manifest = switch (try manifest_mod.loadListingCandidateResult(a, entry.path)) {
                 .manifest => |loaded| loaded,
                 .rejected => |err| {
@@ -25744,68 +25763,23 @@ pub const Node = struct {
                 try catalog.value.object.getPtr(scope).?.object.put(ca, entry.name, try self.documentCatalogInfo(ca, definition, task));
             }
         }
-        // Build receipt-derived ownership once per inventory, rather than
-        // rescanning every artifact for every public selector. Resolution uses
-        // these same receipt selectors in resolveDiscoveredRequestName.
-        const SelectorOwner = struct { path: ?[]const u8, default_priority: u2 };
-        const selection_names = try ca.alloc([]const []const u8, discovered.len);
-        for (discovered, selection_names) |entry, *names| {
-            const managed = try registry_mod.managedModelSelectorsAlloc(ca, io, entry.path);
-            names.* = if (managed.len > 0) managed else try ca.dupe([]const u8, &.{entry.name});
-        }
+        // Discovery and execution consume the same selector ownership table.
         for (task_names) |task| {
-            var owners = std.StringHashMapUnmanaged(SelectorOwner).empty;
-            // Read execution searches all three physical scopes. Preserve each
-            // scope's legacy defaults, then reject different winners across scopes.
-            const scopes: []const []const u8 = if (std.mem.eql(u8, task, "readers"))
-                &.{ "readers", "transcribers", "generators" }
-            else
-                &.{task};
-            for (scopes) |scope| {
-                var scope_owners = std.StringHashMapUnmanaged(SelectorOwner).empty;
-                for (discovered, selection_names) |entry, names| {
-                    if (!self.discoveredModelInTaskScope(entry.path, scope)) continue;
-                    for (names) |selector| {
-                        // An exact legacy directory is the existing default.
-                        // Artifact constraints always require receipt ownership.
-                        const unqualified = std.mem.indexOfAny(u8, selector, ":@") == null;
-                        const default_path = if (unqualified) try std.fmt.allocPrint(ca, "{s}/{s}", .{ self.config.models_dir, selector }) else "";
-                        const task_path = if (unqualified) try std.fmt.allocPrint(ca, "{s}/{s}/{s}", .{ self.config.models_dir, scope, selector }) else "";
-                        const default_priority: u2 = if (unqualified and std.mem.eql(u8, entry.path, default_path)) 2 else if (unqualified and std.mem.eql(u8, entry.path, task_path)) 1 else 0;
-                        const owner = try scope_owners.getOrPut(ca, selector);
-                        if (!owner.found_existing or default_priority > owner.value_ptr.default_priority) {
-                            owner.value_ptr.* = .{ .path = entry.path, .default_priority = default_priority };
-                        } else if (owner.value_ptr.default_priority == 0 and (owner.value_ptr.path == null or !std.mem.eql(u8, owner.value_ptr.path.?, entry.path))) {
-                            owner.value_ptr.path = null;
-                        }
-                    }
-                }
-                var scope_iterator = scope_owners.iterator();
-                while (scope_iterator.next()) |candidate| {
-                    const owner = try owners.getOrPut(ca, candidate.key_ptr.*);
-                    if (!owner.found_existing) {
-                        owner.value_ptr.* = candidate.value_ptr.*;
-                    } else if (owner.value_ptr.path == null or candidate.value_ptr.path == null or
-                        !std.mem.eql(u8, owner.value_ptr.path.?, candidate.value_ptr.path.?))
-                    {
-                        owner.value_ptr.path = null;
-                    }
-                }
-            }
             const models = catalog.value.object.getPtr(task).?;
-            // Verified revisions keep separate capability descriptors.
-            for (discovered, selection_names) |entry, names| {
+            for (discovered, inventory.names) |entry, names| {
                 const descriptor = models.object.get(entry.name) orelse continue;
                 for (names) |selector| {
-                    const owner = owners.get(selector) orelse continue;
-                    const path = owner.path orelse continue;
-                    if (std.mem.eql(u8, path, entry.path)) try models.object.put(ca, selector, descriptor);
+                    const owner = (inventory.lookup(selector, task) catch continue) orelse continue;
+                    if (std.mem.eql(u8, owner, entry.path)) try models.object.put(ca, selector, descriptor);
                 }
             }
-            var iterator = owners.iterator();
-            while (iterator.next()) |owner| if (owner.value_ptr.path == null) {
-                _ = models.object.swapRemove(owner.key_ptr.*);
-            };
+            for (selection_mod.tasks, inventory.owners) |scope, owners| {
+                if (!std.mem.eql(u8, task, scope)) continue;
+                var iterator = owners.iterator();
+                while (iterator.next()) |owner| if (owner.value_ptr.path == null) {
+                    _ = models.object.swapRemove(owner.key_ptr.*);
+                };
+            }
         }
         filterOpenAiCatalogSelectors(&catalog.value);
         return std.json.Stringify.valueAlloc(a, catalog.value, .{});
@@ -32224,6 +32198,7 @@ test "generate parser consumes generic image and audio media parts strictly" {
     var parsed = try std.json.parseFromSlice(api.GenerateRequest, alloc, request_json, .{ .ignore_unknown_fields = true });
     defer parsed.deinit();
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     var budget = RequestMediaBudget.init(128);
     var messages = try node.parseGenerateMessagesWithBudget(alloc, parsed.value, &budget);
@@ -32313,6 +32288,7 @@ test "generate video dependencies declare their tests" {
 test "generate parser gives video its own field without counting it as audio" {
     const alloc = std.testing.allocator;
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const video_json =
         \\{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"describe"},{"type":"media","mime_type":"video/mp4","data":"AAAA"}]}]}
@@ -32377,6 +32353,7 @@ test "generate parser releases video media on every allocation failure" {
     defer parsed.deinit();
     const attachments = [_]httpx.attachment_envelope.Attachment{.{ .mime_type = "video/webm", .data = "webm" }};
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const Runner = struct {
         fn run(allocator: std.mem.Allocator, target: *Node, body: api.GenerateRequest, media: []const httpx.attachment_envelope.Attachment) !void {
@@ -32414,6 +32391,7 @@ test "generate parser borrows framed media without copying" {
     }};
     try validateGenerateAttachmentReferences(allocator, parsed.value, attachments.len);
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     var budget = RequestMediaBudget.init(128);
     var messages = try node.parseGenerateMessagesWithBudgetAndAttachments(
@@ -32450,6 +32428,7 @@ test "generate parser releases mixed owned and borrowed media on every allocatio
         .data = &png,
     }};
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
 
     const Runner = struct {
@@ -33029,6 +33008,7 @@ test "direct dense embed parser borrows media and propagates allocator exhaustio
         .{ .media = .{ .mime_type = "audio/wav", .data = &raw_audio } },
     };
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const manifest = manifest_mod.ModelManifest{
         .allocator = backing_allocator,
@@ -33101,6 +33081,7 @@ test "direct dense embed precharges borrowed media independent of image url orde
         .{ .image_url = image_url },
     };
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const manifest = manifest_mod.ModelManifest{
         .allocator = allocator,
@@ -34130,6 +34111,7 @@ test "read image preflight maps malformed dimension and aggregate errors before 
 test "extraction image downloads transfer ownership and clean up aggregate failures" {
     const allocator = std.testing.allocator;
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     var request = try httpx.Request.init(allocator, .GET, "/");
     defer request.deinit();
@@ -34667,6 +34649,7 @@ test "direct extraction validates read max tokens" {
 test "direct extraction content shares aggregate budget across downloaded and inline media" {
     const allocator = std.testing.allocator;
     var node: Node = undefined;
+    node.selector_cache = null;
     const first_uri = "data:image/png;base64,YWJj";
     node.config = .{ .content_security = .{ .max_download_size_bytes = first_uri.len + 1 } };
     var out = DirectExtractionInputs{ .allocator = allocator };
@@ -34701,6 +34684,7 @@ test "direct extraction content shares aggregate budget across downloaded and in
 test "direct extraction content releases temporary ownership on every allocation failure" {
     const backing_allocator = std.testing.allocator;
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
 
     const Runner = struct {
@@ -34746,6 +34730,7 @@ test "direct extraction content releases temporary ownership on every allocation
 test "direct extraction borrows indexed media and treats text as its prompt" {
     const allocator = std.testing.allocator;
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const image = [_]u8{ 1, 2, 3, 4 };
     const inputs = [_]extracting_api.Input{.{ .content_json = "\"read this page\"" }};
@@ -34766,6 +34751,7 @@ test "direct extraction borrows indexed media and treats text as its prompt" {
 test "direct extraction rejects conflicting per-image prompts" {
     const allocator = std.testing.allocator;
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const image = [_]u8{ 1, 2, 3, 4 };
     const inputs = [_]extracting_api.Input{
@@ -36627,6 +36613,7 @@ test "HTTP model resolution is canonical and contained while trusted resolution 
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = bge_variant_config, .data = "{}" });
 
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{ .models_dir = models_root };
     node.allocator = alloc;
     var request_arena = std.heap.ArenaAllocator.init(alloc);
@@ -36681,6 +36668,7 @@ test "trusted unqualified model resolution uses an exact legacy path as its defa
     defer allocator.free(model_root);
 
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{ .models_dir = models_root };
     node.allocator = allocator;
 
@@ -36721,6 +36709,7 @@ test "HTTP model resolution accepts the managed identity advertised by discovery
     defer allocator.free(model_root);
 
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{ .models_dir = models_root };
     node.allocator = allocator;
     node.registry = registry_mod.ModelRegistry.init(allocator, models_root);
@@ -36770,6 +36759,7 @@ test "managed model resolution fails closed when explicit variants coexist" {
     defer allocator.free(f16_root);
 
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{ .models_dir = models_root };
     node.allocator = allocator;
 
@@ -36808,6 +36798,7 @@ test "HTTP model resolution caller ownership stays flat across repeated requests
     defer allocator.free(model_root);
 
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{ .models_dir = models_root };
     node.allocator = allocator;
 
@@ -36834,6 +36825,7 @@ test "trusted model resolution caller ownership stays flat across every return s
     defer allocator.free(model_root);
 
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{ .models_dir = models_root };
     node.allocator = allocator;
 
@@ -36923,6 +36915,7 @@ test "request media budget accounting is cumulative and overflow safe" {
 
 test "request media budget clamps an explicit configured maximum to the hard ceiling" {
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{ .content_security = .{ .max_download_size_bytes = std.math.maxInt(u64) } };
     try std.testing.expectEqual(default_max_request_media_bytes, requestMediaMaxBytes(&node));
 }
@@ -36930,6 +36923,7 @@ test "request media budget clamps an explicit configured maximum to the hard cei
 test "configured zero media budget rejects nonempty remote and inline media" {
     const alloc = std.testing.allocator;
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{ .content_security = .{ .max_download_size_bytes = 0 } };
     try std.testing.expectEqual(@as(usize, 0), requestMediaMaxBytes(&node));
 
@@ -36960,6 +36954,7 @@ test "configured zero media budget rejects nonempty remote and inline media" {
 test "bounded remote content helper enforces cumulative data URI bytes" {
     const alloc = std.testing.allocator;
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const first_uri = "data:image/png;base64,YWJj";
     var budget = RequestMediaBudget.init(first_uri.len + 1);
@@ -36989,6 +36984,7 @@ test "inline media budgets charge encoded sources before decoding" {
 
     const uri = "data:image/png;base64,YQ==";
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     var short_budget = RequestMediaBudget.init(uri.len - 1);
     try std.testing.expectError(
@@ -37040,6 +37036,7 @@ test "download helpers fail closed for null and explicit empty policies" {
     };
     for (configs) |config| {
         var node: Node = undefined;
+        node.selector_cache = null;
         node.config = config;
         try std.testing.expectError(error.HostNotAllowed, downloadRemoteContent(&node, alloc, "https://example.com/a.png"));
         try std.testing.expectError(error.HostNotAllowed, downloadReadBatchContent(&node, alloc, "https://example.com/a.png", 1024, 0, .untrusted));
@@ -37052,6 +37049,7 @@ test "download helpers fail closed for null and explicit empty policies" {
 
 test "partial content policy retains deny by default allowlists" {
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{ .content_security = .{ .max_download_size_bytes = 4096 } };
     const effective = effectiveRequestContentSecurity(&node);
     try std.testing.expectEqual(@as(usize, 0), effective.allowed_hosts.?.len);
@@ -37062,6 +37060,7 @@ test "partial content policy retains deny by default allowlists" {
 
 test "explicit private IP override does not implicitly allow hosts or files" {
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{ .content_security = .{ .block_private_ips = false } };
     const effective = effectiveRequestContentSecurity(&node);
     try std.testing.expectEqual(@as(usize, 0), effective.allowed_hosts.?.len);
@@ -37083,6 +37082,7 @@ test "download remote content honors an explicit file allowlist" {
     const allowed_paths = [_][]u8{allowed_root};
 
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{ .content_security = .{ .allowed_paths = &allowed_paths } };
     var downloaded = try downloadRemoteContent(&node, alloc, file_uri);
     defer downloaded.deinit(alloc);
@@ -37937,6 +37937,7 @@ test "EmbeddingGemma2 groups preserve order and rollback failed siblings" {
     , .{});
     defer json.deinit();
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     var manifest_inputs = [_][]const u8{ "text", "image", "audio" };
     const manifest = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .embedder, .embedding_style = .embedding_gemma2, .inputs = &manifest_inputs };
@@ -40711,6 +40712,7 @@ test "Antfly inference per-item dense parser records invalid media and keeps sib
 
     const request = try parseEmbedRequest(parsed_json.value);
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const manifest = manifest_mod.ModelManifest{
         .allocator = alloc,
@@ -40744,6 +40746,7 @@ test "Antfly inference per-item dense parser never masks allocator exhaustion" {
     defer parsed_json.deinit();
     const request = try parseEmbedRequest(parsed_json.value);
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const manifest = manifest_mod.ModelManifest{
         .allocator = backing_allocator,
@@ -41016,6 +41019,7 @@ test "Antfly inference embed request parser accepts multimodal content parts" {
 
     const request = try parseEmbedRequest(parsed.value);
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const manifest = manifest_mod.ModelManifest{
         .allocator = alloc,
@@ -41052,6 +41056,7 @@ test "Antfly inference embed request parser accepts mixed strings and content pa
 
     const request = try parseEmbedRequest(parsed.value);
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const manifest = manifest_mod.ModelManifest{
         .allocator = alloc,
@@ -41089,6 +41094,7 @@ test "Antfly inference embed media-only usage does not require text tokens" {
 
     const request = try parseEmbedRequest(parsed.value);
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const manifest = manifest_mod.ModelManifest{
         .allocator = alloc,
@@ -41140,6 +41146,7 @@ test "Antfly inference embed parser accepts data uri media payloads" {
 
     const request = try parseEmbedRequest(parsed.value);
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const manifest = manifest_mod.ModelManifest{
         .allocator = alloc,
@@ -41170,6 +41177,7 @@ test "Antfly inference embed parser applies one aggregate budget to inline media
     defer parsed.deinit();
     const request = try parseEmbedRequest(parsed.value);
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const manifest = manifest_mod.ModelManifest{
         .allocator = alloc,
@@ -41201,6 +41209,7 @@ test "Antfly inference embed parser rejects mismatched data uri media mime type"
 
     const request = try parseEmbedRequest(parsed.value);
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const manifest = manifest_mod.ModelManifest{
         .allocator = alloc,
@@ -41249,6 +41258,7 @@ test "multimodal rerank parser accepts colqwen-style text and image content part
     defer parsed.deinit();
 
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
 
     var doc = try node.parseChatMessageContentToTextAndImages(alloc, parsed.value.documents.?[0]);
@@ -41349,6 +41359,7 @@ test "multimodal rerank parser borrows framed image attachments" {
     }};
     try validateRerankAttachmentReferences(allocator, parsed.value.documents.?, attachments.len);
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     var budget = RequestMediaBudget.init(128);
     var document = try node.parseChatMessageContentToTextAndImagesWithBudgetAndAttachments(
@@ -41417,6 +41428,7 @@ test "multimodal rerank parser releases both owned slices on every allocation fa
     var parsed = try std.json.parseFromSlice(api.RerankRequest, backing_allocator, body, .{});
     defer parsed.deinit();
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
 
     const Runner = struct {
@@ -41462,6 +41474,7 @@ test "multimodal rerank parser applies one aggregate budget to data URI media" {
     var parsed = try std.json.parseFromSlice(api.RerankRequest, alloc, body, .{});
     defer parsed.deinit();
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const first_uri = "data:image/png;base64,YWJj";
     var budget = RequestMediaBudget.init(first_uri.len + 1);
@@ -41491,6 +41504,7 @@ test "multimodal rerank parser rejects non-image media content parts" {
     defer parsed.deinit();
 
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
 
     try std.testing.expectError(
@@ -41517,6 +41531,7 @@ test "multimodal rerank parser rejects invalid image data uris" {
     defer parsed.deinit();
 
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
 
     try std.testing.expectError(
@@ -44214,6 +44229,7 @@ test "embeddinggemma2 linked reduced dimensions match HTTP and preserve ownershi
             }
             // Already-sized results need no model lookup or new allocation.
             var node: Node = undefined;
+            node.selector_cache = null;
             try node.applyDenseEmbeddingDimensions(a, std.testing.io, "unused", &vectors, 128);
             try std.testing.expectError(error.InvalidEmbeddingDimensions, resizeDenseEmbeddingBatch(a, &vectors, 256, true));
         }
@@ -44243,6 +44259,7 @@ test "LightOnOCR3 active windows preserve the physical reader contract" {
     try std.testing.expectEqual(@as(c_int, 0), Env.setenv(flags[0], "8", 1));
     try std.testing.expectEqual(@as(c_int, 0), Env.setenv(flags[1], "16", 1));
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const limited = node.lightOnOcrPolicy(2);
     try std.testing.expectEqual(@as(usize, 2), limited.max_step_items);
@@ -44311,6 +44328,7 @@ test "LightOnOCR3 logical64 isolates physical rows and bounds multi-image worker
     try std.testing.expectEqual(window, lightOnContinuousWorkerCount(128, window));
     try std.testing.expectEqual(@as(usize, 17), lightOnContinuousWorkerCount(17, window));
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     const policy = node.lightOnOcrPolicy(32);
     try std.testing.expectEqual(@as(usize, if (eligible) 32 else 16), policy.max_step_items);
@@ -44870,6 +44888,7 @@ test "embeddinggemma2 ordered video parser keeps borrowed attachment and caption
     var retained = ParsedDenseEmbedInputs{};
     defer retained.deinit(alloc);
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     var budget = RequestMediaBudget.init(64 * 1024 * 1024);
     const clip = @embedFile("../testdata/video/mjpeg.mov");
@@ -45002,6 +45021,7 @@ test "inference HTTP inline media body limit remains bounded and configurable" {
     try std.testing.expectError(error.InvalidHttpBodyLimit, httpBodyLimitBytesFromMib(std.math.maxInt(usize)));
     try std.testing.expectError(error.InvalidHttpTransportCapacity, Node.init(std.testing.allocator, .{ .http_max_body_bytes = 0 }));
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     try std.testing.expectEqual(@as(usize, 10 * 1024 * 1024), node.httpServerConfig("127.0.0.1", 8090).max_body_size);
     node.config.http_max_body_bytes = try httpBodyLimitBytesFromMib(32);
@@ -45017,6 +45037,7 @@ test "embeddinggemma2 legacy video parser requires ordered groups and rolls back
     , .{});
     defer json.deinit();
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     var modalities = [_][]const u8{ "text", "image", "video" };
     const manifest = manifest_mod.ModelManifest{ .allocator = a, .model_type = .embedder, .embedding_style = .embedding_gemma2, .inputs = &modalities };
@@ -46542,6 +46563,7 @@ test "LightOnOCR3 decoder peak ownership preserves caps across failed growth and
     const memory = runtime.tier.memory;
     const Context = Node.LightOnStreamContext;
     var node: Node = undefined;
+    node.selector_cache = null;
     node.model_manager = model_manager_mod.ModelManager.init(std.testing.allocator, backends_mod.SessionManager.init(std.testing.allocator));
     defer node.model_manager.deinit();
     var bootstrap = try node.model_manager.acquireRunResourceAmounts(.cpu, .{}, .{});
@@ -46684,6 +46706,7 @@ test "LightOnOCR3 epoch admission owns shared scratch across page retirement and
     const memory = runtime.tier.memory;
     const Context = Node.LightOnStreamContext;
     var node: Node = undefined;
+    node.selector_cache = null;
     node.model_manager = model_manager_mod.ModelManager.init(std.testing.allocator, backends_mod.SessionManager.init(std.testing.allocator));
     defer node.model_manager.deinit();
     // Initialize the real resource owner without allocating any model or GPU.
@@ -47058,6 +47081,7 @@ test "LightOnOCR3 packed output admission retains complete projected inputs and 
 
 test "LightOnOCR3 pooled reader rejects invalid cohorts before touching payloads" {
     var node: Node = undefined;
+    node.selector_cache = null;
     try std.testing.expectError(error.InvalidBatchDecodeState, node.runLightOnReadCohortPooled(&.{}));
     var oversized: [65]executor_microbatch.ExecuteItem = undefined;
     try std.testing.expectError(error.InvalidBatchDecodeState, node.runLightOnReadCohortPooled(&oversized));
@@ -49550,6 +49574,7 @@ test "reader batching node honors explicit environment rollback in canonical mod
     for (names, values) |name, value| if (Env.setenv(name, value, 1) != 0) return error.EnvironmentMutationFailed;
     // This policy query must not initialize model managers, routes or drivers.
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{ .generation_batching = .{ .mode = .on, .max_step_items = 4 } };
     try std.testing.expect(!node.lightOnCudaBatchEnabled());
     const policy = node.lightOnOcrPolicy(16);
@@ -49573,6 +49598,7 @@ test "dynamic CUDA admission counts admitted pages and rolls back failed batch g
     const Context = Node.LightOnStreamContext;
     const mib = 1024 * 1024;
     var node: Node = undefined;
+    node.selector_cache = null;
     node.model_manager = model_manager_mod.ModelManager.init(std.testing.allocator, backends_mod.SessionManager.init(std.testing.allocator));
     defer node.model_manager.deinit();
     var bootstrap = try node.model_manager.acquireRunResourceAmounts(.cpu, .{}, .{});
@@ -49724,6 +49750,7 @@ test "fixed chunk request validates minimum content without changing defaults" {
 test "EmbeddingGemma2 ordered audio preserves MIME hints through HTTP native and broker admission" {
     const a = std.testing.allocator;
     var node: Node = undefined;
+    node.selector_cache = null;
     node.config = .{};
     var modalities = [_][]const u8{ "text", "audio" };
     const manifest = manifest_mod.ModelManifest{ .allocator = a, .model_type = .embedder, .embedding_style = .embedding_gemma2, .inputs = &modalities };
@@ -50199,6 +50226,7 @@ test "model selection verifies immutable revisions and rejects variant fallback"
     const expected = try tmp.dir.realPathFileAlloc(io, "models/provisioned/one", a);
     defer a.free(expected);
     var node: Node = undefined;
+    node.selector_cache = null;
     node.allocator = a;
     node.config = .{ .models_dir = root };
     for ([_][]const u8{ "acme/demo", "acme/demo:gguf:Q4_0", "acme/demo@" ++ revision, "acme/demo:gguf:Q4_0@" ++ revision }) |name| {
@@ -50360,5 +50388,141 @@ test "model selection reader aliases follow execution scopes and reject cross-sc
     for (selectors) |selector| {
         try std.testing.expect(!ambiguous.value.object.get("readers").?.object.contains(selector));
         try std.testing.expectError(error.AmbiguousModelIdentifier, node.resolveReadingPath(a, io, selector, true));
+    }
+}
+
+test "model selection cache reuses inventory and detects managed publications" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const revision = "0123456789abcdef0123456789abcdef01234567";
+    try installModelSelectionFixture(tmp.dir, "models/generators/acme/first", "gguf:Q4_0", revision);
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    try tmp.dir.createDirPath(io, "models/generators/empty-owner");
+    try installModelSelectionFixture(tmp.dir, "models/generators/acme/publishing", "gguf:Q8_0", "0123456789abcdef0123456789abcdef01234567");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/generators/acme/publishing/.antfly-download-in-progress", .data = "pending" });
+    var cache = selection_mod.Cache.init(a);
+    defer cache.deinit();
+    for (0..10) |_| {
+        const path = (try cache.resolve(a, io, root, "acme/demo:gguf:Q4_0@" ++ revision, "generators")).?;
+        a.free(path);
+    }
+    try std.testing.expectEqual(@as(usize, 1), cache.rebuilds);
+    try installModelSelectionFixture(tmp.dir, "models/generators/empty-owner/new", "gguf:Q4_0", "ffffffffffffffffffffffffffffffffffffffff");
+    const first_publication = (try cache.resolve(a, io, root, "acme/demo:gguf:Q4_0@ffffffffffffffffffffffffffffffffffffffff", "generators")).?;
+    a.free(first_publication);
+    try tmp.dir.deleteTree(io, "models/generators/empty-owner/new");
+    try tmp.dir.deleteFile(io, "models/generators/acme/publishing/.antfly-download-in-progress");
+    const completed = (try cache.resolve(a, io, root, "acme/demo:gguf:Q8_0@" ++ revision, "generators")).?;
+    a.free(completed);
+    try tmp.dir.deleteTree(io, "models/generators/acme/publishing");
+    try std.testing.expectEqual(@as(usize, 3), cache.rebuilds);
+
+    try installModelSelectionFixture(tmp.dir, "models/generators/acme/second", "gguf:Q8_0", revision);
+    try std.testing.expectError(error.AmbiguousModelIdentifier, cache.resolve(a, io, root, "acme/demo", "generators"));
+    try std.testing.expectEqual(@as(usize, 4), cache.rebuilds);
+    // Replacing a cached receipt cannot authorize its old immutable selector.
+    try installModelSelectionFixture(tmp.dir, "models/generators/acme/first", "gguf:Q4_0", "ffffffffffffffffffffffffffffffffffffffff");
+    try std.testing.expect((try cache.resolve(a, io, root, "acme/demo:gguf:Q4_0@" ++ revision, "generators")) == null);
+    const updated = (try cache.resolve(a, io, root, "acme/demo:gguf:Q4_0@ffffffffffffffffffffffffffffffffffffffff", "generators")).?;
+    a.free(updated);
+    // In-place artifact corruption does not change publication metadata.
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/generators/acme/first/model.gguf", .data = "bad" });
+    try std.testing.expect((try cache.resolve(a, io, root, "acme/demo:gguf:Q4_0@ffffffffffffffffffffffffffffffffffffffff", "generators")) == null);
+}
+
+test "model selection unmanaged constrained directories cannot suppress receipt selectors" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pin = "acme/demo:gguf:Q4_0@0123456789abcdef0123456789abcdef01234567";
+    try installModelSelectionFixture(tmp.dir, "models/generators/acme/healthy", "gguf:Q4_0", "0123456789abcdef0123456789abcdef01234567");
+    try tmp.dir.createDirPath(io, "models/generators/" ++ pin);
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/generators/" ++ pin ++ "/model.gguf", .data = "decoder" });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root });
+    defer node.deinit();
+    const body = try node.listModelsJsonAlloc(a, io);
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    try std.testing.expect(parsed.value.object.get("generators").?.object.contains(pin));
+    const selected = try node.resolveRequestModelPath(a, io, pin, "generators");
+    defer a.free(selected);
+    try std.testing.expect(std.mem.endsWith(u8, selected, "/healthy"));
+}
+
+test "model selection Decide aliases use extractor execution scope" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try installModelSelectionFixture(tmp.dir, "models/extractors/acme/decide", "safetensors", "0123456789abcdef0123456789abcdef01234567");
+    try tmp.dir.deleteFile(io, "models/extractors/acme/decide/model.gguf");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/extractors/acme/decide/model.safetensors", .data = "\x02\x00\x00\x00\x00\x00\x00\x00{}" });
+    // Metadata-only registered span architecture; no weights are executed.
+    const config = "{\"model_type\":\"extractor\",\"architecture\":\"span\",\"config_version\":3,\"architecture_version\":1,\"architectures\":[\"SpanExtractor\"],\"span_head\":{\"span_mode\":\"markerV0\"},\"counting_layer\":\"count_lstm\"}";
+    const metadata = "{\"type\":\"extractor\",\"tasks\":[\"extract\",\"decide\"],\"capabilities\":[\"classification\",\"typed_decisions\"],\"inputs\":[\"text\"],\"gliner_classification_head\":\"label_marker_mlp\"}";
+    const encoder = "{\"model_type\":\"deberta-v2\",\"hidden_size\":1024,\"intermediate_size\":4096,\"num_hidden_layers\":24,\"num_attention_heads\":16,\"vocab_size\":128008,\"max_position_embeddings\":512,\"pad_token_id\":0}";
+    const tokenizer = "{\"added_tokens\":[{\"id\":128007,\"content\":\"[L]\"},{\"id\":128001,\"content\":\"[SEP_STRUCT]\"}]}";
+    try tmp.dir.createDirPath(io, "models/extractors/acme/decide/encoder_config");
+    inline for (.{ .{ "config.json", config }, .{ "model_manifest.json", metadata }, .{ "encoder_config/config.json", encoder }, .{ "tokenizer.json", tokenizer } }) |file| {
+        const path = try std.fs.path.join(a, &.{ "models/extractors/acme/decide", file[0] });
+        defer a.free(path);
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = file[1] });
+    }
+    const receipt = try std.json.Stringify.valueAlloc(a, .{
+        .version = @as(u32, 2),
+        .source = .{ .owner = "acme", .name = "demo", .variant = "safetensors", .resolved_revision = "0123456789abcdef0123456789abcdef01234567" },
+        .artifacts = .{ .{ .path = "model.safetensors", .size = 10 }, .{ .path = "config.json", .size = config.len }, .{ .path = "model_manifest.json", .size = metadata.len }, .{ .path = "encoder_config/config.json", .size = encoder.len }, .{ .path = "tokenizer.json", .size = tokenizer.len } },
+    }, .{});
+    defer a.free(receipt);
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/extractors/acme/decide/.antfly-download-complete.json", .data = receipt });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root });
+    defer node.deinit();
+    const body = try node.listModelsJsonAlloc(a, io);
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    for ([_][]const u8{ "acme/demo", "acme/demo:safetensors", "acme/demo:safetensors@0123456789abcdef0123456789abcdef01234567" }) |selector| {
+        try std.testing.expect(parsed.value.object.get("deciders").?.object.contains(selector));
+        const selected = try node.resolveRequestModelPath(a, io, selector, "extractors");
+        a.free(selected);
+    }
+}
+
+test "model selection cached readers survive concurrent inventory replacement" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const pin = "acme/demo:gguf:Q4_0@0123456789abcdef0123456789abcdef01234567";
+    try installModelSelectionFixture(tmp.dir, "models/generators/acme/one", "gguf:Q4_0", "0123456789abcdef0123456789abcdef01234567");
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var cache = selection_mod.Cache.init(a);
+    defer cache.deinit();
+    const Reader = struct {
+        fn run(shared: *selection_mod.Cache, models: []const u8) !void {
+            for (0..12) |_| {
+                const path = (try shared.resolve(std.testing.allocator, std.testing.io, models, pin, "generators")).?;
+                defer std.testing.allocator.free(path);
+                try std.testing.expect(std.mem.endsWith(u8, path, "/one"));
+            }
+        }
+    };
+    const first = try std.Thread.spawn(.{}, Reader.run, .{ &cache, root });
+    defer first.join();
+    const second = try std.Thread.spawn(.{}, Reader.run, .{ &cache, root });
+    defer second.join();
+    for (0..4) |_| {
+        var snapshot = try cache.snapshot(a, io, root);
+        snapshot.deinit();
     }
 }
