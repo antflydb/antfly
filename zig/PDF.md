@@ -1901,6 +1901,9 @@ eligibility uses transformed bounds without decoding pixels. Page and visible
 eligibility are evaluated per paint before bounds are unioned; unknown paint
 extents remain conservative. Stroke joins and device hairlines do not receive
 an underestimated path-only bound.
+Visibility retains zero-opacity ancestry across nested transparency groups
+separately from each render group's compositing alpha. Nonzero group opacity
+does not become invisible through multiplication or quantization underflow.
 
 Layout consumes each replacement once. Entry and exit glyphs preserve spacing
 at scope boundaries; unpositioned or multiline replacements fence geometric
@@ -1930,6 +1933,10 @@ unsupported rendering. This does not add inline pixels to the native raster IR.
 
 Canonical ActualText tracking retains an active-scope bit across content
 streams, so sibling replacements do not rescan the marked-content stack.
+Overridden scopes retain only lightweight stack frames; their replacement
+strings are not resolved, decoded, or copied. Canonical Form decoding inherits
+that suppression while retaining raw glyph fallback until the outer scope
+closes.
 Cancellation is polled during canonical decoding and resource discovery.
 Empty replacements bridge spacing only along a deleted glyph sequence on the
 same line; unrelated line/column boundaries and empty vector labels retain the

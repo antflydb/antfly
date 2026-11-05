@@ -299,6 +299,8 @@ fn dumpPageAnalysis(alloc: std.mem.Allocator, writer: *std.Io.Writer, page_num: 
             .render_mode = run.render_mode,
             .fill_alpha = run.alpha,
             .stroke_alpha = run.stroke_alpha,
+            .group_alpha = run.group_alpha,
+            .ancestor_groups_visible = run.ancestor_groups_visible,
             .bbox = if (box) |b| @as(?[4]f64, .{ b.min_x, b.min_y, b.max_x, b.max_y }) else null,
             .font_size = @abs(run.font_size) * @sqrt(run.c * run.c + run.d * run.d),
             .source_font_size = run.font_size,
