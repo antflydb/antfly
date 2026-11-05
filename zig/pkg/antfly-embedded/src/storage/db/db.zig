@@ -9234,6 +9234,10 @@ pub const DB = struct {
         lane: background_runtime_mod.DurableJobLane,
         owner_id: u64,
     ) void {
+        if (lane.executesInline()) {
+            manager.repair_cleanup_deferred.store(true, .release);
+            return;
+        }
         @import("cleanup_job_owner.zig").schedule(.{
             .ptr = manager,
             .state = &manager.repair_cleanup_state,
@@ -9243,6 +9247,26 @@ pub const DB = struct {
             .advance = advanceRepairShadowCleanup,
             .name = "repair-generation",
         });
+    }
+
+    fn runDeferredRepairShadowCleanupPage(self: *DB) !bool {
+        const manager = self.core.index_manager;
+        if (!manager.repair_cleanup_deferred.swap(false, .acq_rel)) return false;
+        errdefer manager.repair_cleanup_deferred.store(true, .release);
+        if (manager.repair_cleanup_state.cmpxchgStrong(0, 1, .acq_rel, .acquire) != null) {
+            manager.repair_cleanup_deferred.store(true, .release);
+            return false;
+        }
+        defer manager.repair_cleanup_state.store(0, .release);
+        // Recheck durable rollback protection at service time, after the
+        // original open/notification. Interrupted checks retain the request.
+        if (try self.hasPendingIndexRepairIntents(self.alloc)) {
+            manager.repair_cleanup_deferred.store(true, .release);
+            return false;
+        }
+        const more = try manager.cleanupInactiveRepairShadowRootsPage();
+        if (more) manager.repair_cleanup_deferred.store(true, .release);
+        return more or manager.repair_cleanup_deferred.load(.acquire);
     }
 
     fn advanceRepairShadowCleanup(ptr: *anyopaque) !@import("cleanup_job_owner.zig").Advance {
@@ -34045,6 +34069,13 @@ pub const DB = struct {
             if (self.core.index_manager.write_plan_generation.load(.acquire) != replacement_catalog_generation)
                 try self.drainReplayStagesUntilStableWithOptions(options);
         }
+        if (!options.source_work_only) {
+            while (try self.runDeferredRepairShadowCleanupPage()) {
+                try ensureSnapshotActive(options.cancellation);
+                if (options.bounded_replay) break;
+                if (options.deadline_ns) |deadline| if (monotonicTimeNs() >= deadline) return error.RunUntilIdleDidNotConverge;
+            }
+        }
         _ = try self.evaluateAlgebraicAdaptiveCandidates();
         while (try self.runAlgebraicAdaptiveWork() != 0) {}
         try self.flushAppliedSequencesForIdle();
@@ -34102,11 +34133,13 @@ pub const DB = struct {
             5 => more = try self.runGraphMetricMaintenanceForIdle() != 0,
             6 => more = try self.finalizeDenseProjectionLifecycleForIdle(),
             7 => more = try self.runSourcePinCleanupStep(),
+            8 => more = try self.runDeferredRepairShadowCleanupPage(),
+            else => unreachable,
         }
         // Retry an interrupted service instead of skipping it. An entire
         // clean sweep is required before this lane advertises quiescence.
         state.control_maintenance_changed = state.control_maintenance_changed or more;
-        state.control_maintenance_slot = slot +% 1;
+        state.control_maintenance_slot = (slot + 1) % 9;
         if (state.control_maintenance_slot != 0) return true;
         const changed = state.control_maintenance_changed;
         state.control_maintenance_changed = false;
@@ -77426,15 +77459,15 @@ test "db detached replay leaves optional maintenance to its retained continuatio
     defer database.borrowed_group_source_state = null;
     state.control_maintenance_slot = 3;
     _ = try database.runBackgroundTurnWithCancellation(.none, .replay);
-    try std.testing.expectEqual(@as(u3, 3), state.control_maintenance_slot);
+    try std.testing.expectEqual(@as(u4, 3), state.control_maintenance_slot);
     // Optional work advances exactly one service and cannot report the whole
     // sweep clean simply because that individual service has no work.
     try std.testing.expect(try database.runBackgroundControlMaintenance(.none));
-    try std.testing.expectEqual(@as(u3, 4), state.control_maintenance_slot);
-    state.control_maintenance_slot = 7;
+    try std.testing.expectEqual(@as(u4, 4), state.control_maintenance_slot);
+    state.control_maintenance_slot = 8;
     state.control_maintenance_changed = false;
     _ = try database.runBackgroundControlMaintenance(.none);
-    try std.testing.expectEqual(@as(u3, 0), state.control_maintenance_slot);
+    try std.testing.expectEqual(@as(u4, 0), state.control_maintenance_slot);
 }
 
 test "db batch appends only thin replay stream records" {
@@ -148112,4 +148145,30 @@ test "db scoped retry workset never parks committed earlier chunk requests" {
     defer queue.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), gated.successful_requests.load(.acquire));
     try std.testing.expect(!queue.hasDocument("ZG9jOmE="));
+}
+
+test "db detached replay defers inline repair cleanup until optional service" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("deferred-inline-repair-cleanup");
+    defer directory.cleanup();
+    const base = std.mem.span(directory.path().ptr);
+    const orphan = try std.fs.path.join(a, &.{ base, ".repair-shadow-orphan" });
+    defer a.free(orphan);
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, orphan);
+    var database = try DB.open(a, base, .{ .start_index_workers = false, .executor = .{ .backend = .manual }, .index_base_path = base });
+    defer database.close();
+    try std.testing.expect(database.backend_runtime.durable_jobs.executesInline());
+    try std.testing.expect(database.core.index_manager.repair_cleanup_deferred.load(.acquire));
+    try std.Io.Dir.cwd().access(std.testing.io, orphan, .{});
+    _ = try database.runBackgroundTurnWithCancellation(.none, .replay);
+    try std.Io.Dir.cwd().access(std.testing.io, orphan, .{});
+    const state = &database.group_source_owner.state;
+    state.control_maintenance_slot = 8;
+    _ = try database.runBackgroundControlMaintenance(.none);
+    try std.testing.expect(!database.core.index_manager.repair_cleanup_deferred.load(.acquire));
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, orphan, .{}));
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, orphan);
+    database.scheduleInactiveRepairShadowCleanup();
+    try database.runUntilIdle();
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, orphan, .{}));
 }

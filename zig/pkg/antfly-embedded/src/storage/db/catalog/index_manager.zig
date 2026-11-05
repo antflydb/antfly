@@ -1595,6 +1595,9 @@ pub const IndexManager = struct {
     artifact_projection_root: u128 = 0,
     /// 0 = idle, 1 = queued/running, 2 = rerun requested while active.
     repair_cleanup_state: std.atomic.Value(u8) = .init(0),
+    /// Inline/manual owners service optional generation cleanup separately
+    /// from opening a serving runtime under writer admission.
+    repair_cleanup_deferred: std.atomic.Value(bool) = .init(false),
     /// Durable generated-artifact cleanup uses the same single-flight shape,
     /// but runs in bounded pages so it cannot monopolize structural locks.
     artifact_cleanup_state: std.atomic.Value(u8) = .init(0),

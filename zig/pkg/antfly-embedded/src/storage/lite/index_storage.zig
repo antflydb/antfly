@@ -672,6 +672,8 @@ fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const 
     defer allocator.free(prefix);
     var cursor = try file.indexCatalogCursor(snapshot.checkpoint, prefix);
     defer cursor.deinit();
+    var subtree_end: ?[]u8 = null;
+    defer if (subtree_end) |bound| allocator.free(bound);
     var names = std.ArrayListUnmanaged([]u8).empty;
     errdefer {
         for (names.items) |name| allocator.free(name);
@@ -683,6 +685,15 @@ fn listDirectoryNamesAlloc(ptr: *anyopaque, allocator: Allocator, path: []const 
         const separator = std.mem.indexOfScalar(u8, relative, '/') orelse continue;
         if (separator == 0) continue;
         const name = relative[0..separator];
+        // A directory needs one live descendant, not a visit to every SST or
+        // segment under it. '/' increments to the exact exclusive subtree end.
+        const bound = try allocator.dupe(u8, record.key[0 .. prefix.len + separator + 1]);
+        if (subtree_end) |previous| allocator.free(previous);
+        subtree_end = bound;
+        bound[bound.len - 1] += 1;
+        cursor.restartAfter(bound);
+        // The strict seek may skip a file exactly equal to the boundary, which
+        // has no child separator and cannot itself name a directory here.
         // The catalog cursor is ordered; every child directory is contiguous.
         if (names.items.len != 0 and std.mem.eql(u8, names.items[names.items.len - 1], name)) continue;
         const owned = try allocator.dupe(u8, name);
@@ -3547,5 +3558,46 @@ test "lite WAL checkpoint ages bound repeated cache recovery without tiny flushe
         defer backend.closePreservingWal();
         _ = try backend.runMaintenanceStep();
         try std.testing.expectEqual(@as(u64, 1), backend.snapshotWriteStats().flushes);
+    }
+}
+
+test "lite native directory listing skips descendant artifacts with bounded reads" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 128, 4096 }) |per_directory| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "directory-seek.aflite");
+        defer a.free(path);
+        var docs = try docstore.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+        defer docs.close();
+        docs.maintenance_start_suppressed = true;
+        const mutations = try a.alloc(native.CatalogMutation, per_directory * 2 + 2);
+        defer a.free(mutations);
+        var initialized: usize = 0;
+        defer for (mutations[0..initialized]) |mutation| a.free(mutation.key);
+        for (mutations[0 .. per_directory * 2], 0..) |*mutation, i| {
+            mutation.* = .{ .key = try std.fmt.allocPrint(a, "/scope/{s}/nested/segment-{d:0>8}.sst", .{ if (i < per_directory) "a" else "a0", i }), .value = "immutable artifact payload" };
+            initialized += 1;
+        }
+        for ([_][]const u8{ "/scope/a0", "/scope/root-file" }, mutations[per_directory * 2 ..]) |key, *mutation| {
+            mutation.* = .{ .key = try a.dupe(u8, key), .value = "immediate file" };
+            initialized += 1;
+        }
+        try docs.file.putIndexCatalogBatch(mutations);
+        var snapshot = try docs.beginIndexRead();
+        defer snapshot.abort();
+        const file = try snapshot.readFile();
+        file.page_cache_enabled.store(false, .monotonic);
+        const before = file.test_page_reads.load(.monotonic);
+        var store = Store.initWithNamespace(a, &docs, "/scope");
+        store.read_snapshot = &snapshot;
+        const names = try store.storage().listDirectoryNamesAlloc(a, "/scope");
+        defer StorageIo.freeFileNames(a, names);
+        try std.testing.expectEqual(@as(usize, 2), names.len);
+        try std.testing.expectEqualStrings("a", names[0]);
+        // The exact seek boundary is also an immediate file. Skipping that
+        // file must still discover the adjacent directory of the same name.
+        try std.testing.expectEqualStrings("a0", names[1]);
+        try std.testing.expect(file.test_page_reads.load(.monotonic) - before <= 64);
     }
 }

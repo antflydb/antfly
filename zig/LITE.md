@@ -1847,6 +1847,15 @@ requests retain full-drain behavior. Physical storage service alternates with
 namespace service when both are pending.
 These scheduling hints grant no publication or recovery authority.
 
+Manual runtimes defer repair-generation cleanup instead of executing an inline
+job during serving-runtime open. A separate optional maintenance slot rechecks
+durable repair intents and advances cleanup; explicit idle drains complete it.
+Failed checks preserve the request and rollback protection. Native directory
+discovery seeks past each live child subtree, so discovering generation names
+does not decode every nested SST or segment record. Artifact continuations
+preserve the same bounded immutable-source handoff when they eventually release
+a runtime after its source replay has already caught up.
+
 The `maintenance_priority_turns`, `maintenance_audit_turns` and
 `maintenance_progress_requeues` counters distinguish source service from catalog
 rotation. Compare useful applied prefixes/publications with capture, artifact-open

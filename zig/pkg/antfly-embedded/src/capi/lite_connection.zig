@@ -3513,7 +3513,10 @@ pub const Owner = struct {
             // Provider/query actors and their primary observations still end
             // here. Bounded immutable readers may bridge a later primary batch
             // even when this turn caught up. TTL and byte caps bound retention.
-            if (run_source and maintenance_error == null) {
+            if (maintenance_error == null) {
+                // An artifact continuation may outlive the successful source
+                // turn. Its final teardown must preserve immutable ranges too;
+                // exact pooled identities authorize the next open independently.
                 self.gate.mutex.lockUncancelable(io);
                 self.preserveImmutableTextHandoff(root, database);
                 self.gate.mutex.unlock(io);
@@ -9506,7 +9509,8 @@ test "capi native mixed index turns retain bounded immutable sources after catch
     owner.test_before_storage_service = .{ .ptr = &probe, .notify = Probe.beforeStorage };
     defer owner.test_before_storage_service = null;
     var complete = false;
-    for (0..128) |turn| {
+    for (0..512) |turn| {
+        try h.handleLockIo().sleep(.fromMilliseconds(20), .awake);
         // Clear prior partial-turn pins: this assertion concerns the turn
         // that completes the target, rather than a cache left by earlier work.
         owner.immutable_sources.clear();
@@ -9523,7 +9527,7 @@ test "capi native mixed index turns retain bounded immutable sources after catch
         const target = root.db.core.nextDerivedSequence();
         const text_applied = try root.db.core.loadAppliedSequence(std.testing.allocator, "text");
         const graph_applied = try root.db.core.loadAppliedSequence(std.testing.allocator, "graph");
-        if (turn == 127) std.debug.print("mixed cache target={d} text={d} graph={d} closed={} retained={} sources={d}\n", .{ target, text_applied, graph_applied, probe.closed, probe.retained, owner.immutable_sources.count });
+        if (turn == 511) std.debug.print("mixed cache target={d} text={d} graph={d} closed={} retained={} sources={d}\n", .{ target, text_applied, graph_applied, probe.closed, probe.retained, owner.immutable_sources.count });
         if (text_applied < target or graph_applied < target) continue;
         // Physical service may already have replaced this actor or inode.
         // Observe retention at the source teardown boundary, before that work.

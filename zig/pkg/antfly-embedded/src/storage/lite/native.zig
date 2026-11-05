@@ -2890,6 +2890,15 @@ pub const CatalogCursor = struct {
         self.* = undefined;
     }
 
+    /// Restart on the same checkpoint after a borrowed seek boundary. The
+    /// caller keeps the boundary alive until next() returns. Used to skip a
+    /// complete directory subtree without decoding its descendant records.
+    pub fn restartAfter(self: *CatalogCursor, key: []const u8) void {
+        self.start_after = key;
+        self.started = false;
+        self.done = false;
+    }
+
     pub fn nextRecordAlloc(self: *CatalogCursor, allocator: Allocator) !?OwnedCatalogRecord {
         const file = self.index.file;
         const key = (try self.next()) orelse return null;
