@@ -105,9 +105,14 @@ singleton work and is not evidence of native batching. `canceled_items_total`
 counts broker items removed before execution. These counters are distinct from
 Gemma's generation scheduler metrics.
 
+Native controls and candidate campaigns now include SHA-256 identities for all
+loaded model artifacts, checked again at completion. The controls must be newly
+captured with this harness; legacy receipts without hashes cannot be reused.
+
 ## DGX Spark measurements
 
-The final native-arithmetic executable has SHA-256
+The historical native-arithmetic campaign below predates mandatory model-artifact
+hashes and cannot be re-compared by the updated harness. Its executable has SHA-256
 `24fc2e85d16ff98ee707c89811648401cbe3fee150569f0034ea1bfeb9bb11aa`.
 Its control is the previous serving executable, SHA-256
 `0faa7f347073e372f32161df925afff5e52ab9a73bf2e4a743872f564cf83206`.
@@ -179,3 +184,22 @@ After qualification, the owned read service was restored with the final binary,
 the 38 GiB guard, cooperative execution and ready-only two-row Gemma batching;
 the owned write service was stopped. `make gc` completed, conservatively skipping
 caches reported as active by the repository cleanup script.
+
+## Artifact-aware harness validation
+
+The updated harness was exercised against the existing `24fc2e85...` serving
+executable, with newly captured native controls from `0faa7f34...`. Both receipts
+record matching content identities for all 27 files across the three loaded
+models and revalidate them at completion. The full read campaign passed native
+batch observations, numerical/native controls, retrieval, request limits, mixed
+Gemma traffic, cancellation/disconnect recovery and mandatory memory evidence.
+Receipts are `review-artifacts-control/` and `review-artifacts/` under the same
+local evidence root. This validates the new evidence capture on that existing
+serving binary; the CUDA lifecycle fix is independently exercised through the
+new production engine-host executable documented in
+[cooperative execution](cooperative-execution.md#physical-cap-and-recovery-evidence-on-gb10).
+No new serialized-versus-cooperative or one-row-versus-two-row performance
+promotion is claimed. Eleven artifact-identity tests and eight memory-evidence
+tests pass, including rejection of changed weights at the same path/size/mtime,
+changed manifests/tokenizers, missing hashes, linked-shard cycles, files changing
+during hashing, and model reloads during capture.

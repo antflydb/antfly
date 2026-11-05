@@ -14,7 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Require real allocation rejection, teardown/reload and owned NVML evidence.
+"""Require real allocation rejection, quarantine/reload and owned NVML evidence.
 
 Uses the production engine-host test executable with its 64 MiB cap. This is a
 scaled guard exercise on the local GPU, not 38 GiB exhaustion or A100 testing.
@@ -41,7 +41,7 @@ def main():
         raise q.EvidenceUnavailable(str(error)) from error
     child=subprocess.Popen([str(a.binary.resolve())],env={**os.environ,'ANTFLY_QUALIFY_CUDA_DEVICE_BUDGET':'1'},stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
     lock=threading.Lock(); current={}; events=[]; samples=[]; errors=[]
-    phases={'guard-rejected','failed-free','reloaded'}
+    phases={'guard-rejected','failed-free','quarantined','reloaded'}
     def read():
         with (a.output/'test.log').open('w') as out:
             for line in child.stdout:
@@ -82,7 +82,8 @@ def main():
         assert by_phase['guard-rejected']['managed_live']==48*(1<<20)
         assert by_phase['guard-rejected']['rejected_bytes']==32*(1<<20)
         assert by_phase['failed-free']['managed_live']==48*(1<<20)
-        assert by_phase['confirmed-teardown']['managed_live']==0
+        assert by_phase['quarantined']['managed_live']==48*(1<<20)
+        assert by_phase['confirmed-free']['managed_live']==0
         assert by_phase['reloaded']['managed_live']==64*(1<<20)
         status,error='passed',None
     except BaseException as failure:
@@ -92,7 +93,7 @@ def main():
         if child.poll() is None: child.terminate(); child.wait(timeout=10)
         reader.join(timeout=10)
         (a.output/'memory.jsonl').write_text(''.join(json.dumps(s)+'\n' for s in samples))
-        report={'status':status,'error':error,'scope':'GB10 production engine-host path; scaled 64 MiB physical guard, failed free and confirmed context teardown/reload; no A100 or 38 GiB exhaustion claim','binary_sha256':hashlib.sha256(a.binary.read_bytes()).hexdigest(),'pid':child.pid,'exit_code':child.returncode,'headroom_bytes':2*(1<<30),'events':events,'sample_counts':{phase:sum(s['phase']==phase for s in samples) for phase in sorted(phases)},'sampling_errors':errors,'service_nvml_peak_bytes':max((s['service_nvml_bytes'] for s in samples),default=None),'excluded_bytes_observed_peak':max((s['excluded_bytes_observed'] for s in samples),default=None)}
+        report={'status':status,'error':error,'scope':'GB10 production engine-host path; scaled 64 MiB physical guard, failed free and retained primary lifetime and confirmed free/reload; no A100 or 38 GiB exhaustion claim','binary_sha256':hashlib.sha256(a.binary.read_bytes()).hexdigest(),'pid':child.pid,'exit_code':child.returncode,'headroom_bytes':2*(1<<30),'events':events,'sample_counts':{phase:sum(s['phase']==phase for s in samples) for phase in sorted(phases)},'sampling_errors':errors,'service_nvml_peak_bytes':max((s['service_nvml_bytes'] for s in samples),default=None),'excluded_bytes_observed_peak':max((s['excluded_bytes_observed'] for s in samples),default=None)}
         (a.output/'report.json').write_text(json.dumps(report,indent=2)+'\n')
         print(json.dumps(report,indent=2),flush=True)
 

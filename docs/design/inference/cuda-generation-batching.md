@@ -41,6 +41,14 @@ An unsupported checkpoint or missing quantized output-head kernel retains a
 one-row capability. Requests exceeding that declaration receive
 `UNQUALIFIED_COOPERATIVE_BATCH`.
 
+The numerical performance receipts below predate mandatory model-artifact
+hashes. They are historical measurements, not reproducible controlled evidence
+under the updated harness. Fresh campaigns now record and compare manifest,
+configuration, tokenizer and weight hashes, and reject legacy reports without
+them. This does not establish that the earlier model files differed. The
+ready-only two-row deployment remains an explicit latency/throughput tradeoff;
+its reported 2.2–2.8% throughput gain does **not** pass the 10% promotion gate.
+
 ## Cohort ownership and numerical policy
 
 The execution scope owns the lane, mutex, borrowed aggregate budget, decode

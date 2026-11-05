@@ -272,6 +272,14 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     const run_batch_tests = ctx.addRunArtifact(batch_tests);
     test_step.dependOn(&run_batch_tests.step);
     ctx.step("test-execution-batch", "Verify cohort budgets, scope retirement and decode arithmetic without a GPU").dependOn(&run_batch_tests.step);
+    const lifecycle_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_allocation_lifecycle.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    var lifecycle_imports = suite.tests.root_module.import_table.iterator();
+    while (lifecycle_imports.next()) |entry| lifecycle_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    lifecycle_root.link_libc = true;
+    const lifecycle_tests = b.addTest(.{ .root_module = lifecycle_root, .filters = &.{ "CUDA quarantine", "CUDA allocation", "CUDA retired", "CUDA physical OOM", "CUDA boundary", "test_0" } });
+    const run_lifecycle_tests = ctx.addRunArtifact(lifecycle_tests);
+    test_step.dependOn(&run_lifecycle_tests.step);
+    ctx.step("test-cuda-allocation-lifecycle", "Verify failed-free quarantine across primary-context lifetimes without a GPU").dependOn(&run_lifecycle_tests.step);
     const read_batch_root = b.createModule(.{ .root_source_file = ctx.path("src/test_read_pool_microbatch.zig"), .target = ctx.target, .optimize = ctx.optimize });
     var read_batch_imports = suite.tests.root_module.import_table.iterator();
     while (read_batch_imports.next()) |entry| read_batch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
@@ -283,6 +291,7 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     const inference_unit = ctx.step("test-inference-unit", "Run inference unit tests with optional filters, without independent library suites");
     inference_unit.dependOn(&run_tests.step);
     inference_unit.dependOn(&run_read_batch_tests.step);
+    inference_unit.dependOn(&run_lifecycle_tests.step);
     inference_unit.dependOn(&run_batch_tests.step);
     inference_unit.dependOn(&run_cooperative_tests.step);
     const cancellation_e2e_step = ctx.step("test-cancellation-e2e", "Run HTTP inference cancellation and worker recovery E2E tests");

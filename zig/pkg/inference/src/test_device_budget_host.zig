@@ -69,7 +69,8 @@ test "CUDA production engine physical pressure and failed-free reload qualificat
     var host = try engine.Node.init(std.testing.allocator, .{ .generation_budget_overrides = .{ .backend_limit_bytes = 64 * mib } });
     defer host.deinit();
     var ctx = try gpu.Context.initDefault();
-    defer ctx.deinit();
+    var ctx_owned = true;
+    defer if (ctx_owned) ctx.deinit();
     var allocation = try gpu.Buffer.alloc(&ctx, 48 * mib);
     defer allocation.free(&ctx);
     try allocation.copyFromHost(&ctx, &.{ 1, 2, 3, 4 });
@@ -80,7 +81,6 @@ test "CUDA production engine physical pressure and failed-free reload qualificat
     try std.testing.io.sleep(std.Io.Duration.fromSeconds(1), .awake);
     // A real driver allocation is retained by the process ledger while the
     // injected free fails. No driver symbol or other process is modified.
-    const original_free = ctx.driver.fns.cuMemFree;
     const Fault = struct {
         fn free(_: gpu.driver.CUdeviceptr) callconv(.c) gpu.driver.CUresult {
             return 201;
@@ -91,14 +91,29 @@ test "CUDA production engine physical pressure and failed-free reload qualificat
     try std.testing.expectEqual(before.live + 48 * mib, budget.snapshot().live);
     std.debug.print("CUDA_PRESSURE phase=failed-free managed_limit={d} managed_live={d} managed_peak={d}\n", .{ budget.snapshot().limit, budget.snapshot().live, budget.snapshot().peak });
     try std.testing.io.sleep(std.Io.Duration.fromSeconds(1), .awake);
-    // Drain + confirmed final-primary teardown reconciles the failed charge.
+    // An external user releases between managed owners. Quarantine must retain
+    // our original primary reference rather than relying on raw handle reuse.
+    var external_driver = try gpu.driver.CudaDriver.open();
+    defer external_driver.deinit();
+    const device = ctx.device;
+    var external: gpu.driver.CUcontext = null;
+    try external_driver.check(external_driver.fns.cuDevicePrimaryCtxRetain(&external, device));
     std.debug.print("CUDA_PRESSURE phase=teardown managed_live={d}\n", .{budget.snapshot().live});
-    ctx.releaseResources();
-    try std.testing.expectEqual(before.live, budget.snapshot().live);
-    std.debug.print("CUDA_PRESSURE phase=confirmed-teardown managed_live={d}\n", .{budget.snapshot().live});
-    ctx.driver.fns.cuMemFree = original_free;
+    ctx.deinit();
+    ctx_owned = false;
+    try std.testing.expectEqual(before.live + 48 * mib, budget.snapshot().live);
+    try external_driver.check(external_driver.fns.cuDevicePrimaryCtxRelease(device));
+    var flags: c_uint = 0;
+    var active: c_int = 0;
+    try external_driver.check(external_driver.fns.cuDevicePrimaryCtxGetState.?(device, &flags, &active));
+    try std.testing.expectEqual(@as(c_int, 1), active);
+    std.debug.print("CUDA_PRESSURE phase=quarantined managed_limit={d} managed_live={d} managed_peak={d}\n", .{ budget.snapshot().limit, budget.snapshot().live, budget.snapshot().peak });
+    try std.testing.io.sleep(std.Io.Duration.fromSeconds(1), .awake);
     var reloaded = try gpu.Context.initDefault();
     defer reloaded.deinit();
+    try std.testing.expectEqual(external, reloaded.ctx);
+    try std.testing.expectEqual(before.live, budget.snapshot().live);
+    std.debug.print("CUDA_PRESSURE phase=confirmed-free managed_live={d}\n", .{budget.snapshot().live});
     var replacement = try gpu.Buffer.alloc(&reloaded, 64 * mib);
     defer replacement.free(&reloaded);
     try replacement.copyFromHost(&reloaded, &.{ 5, 6, 7, 8 });

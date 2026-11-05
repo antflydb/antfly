@@ -36,6 +36,7 @@ import urllib.parse
 
 import qualify_read_pool_40g as q
 from qualify_cooperative_execution import serving_identity
+from qualification_identity import require_matching_artifacts, verify_artifacts
 from embeddinggemma2.compare import assert_agreement
 
 
@@ -115,6 +116,7 @@ def capture_native(args):
         responses[case['name']] = response
         result['cases'].append({**case, 'response': response})
     result['retrieval'] = retrieval_agreement(responses, responses)
+    verify_artifacts(result['identity'], args)
     (args.output/'native-references.json').write_text(json.dumps(result, indent=2)+'\n')
     print('Captured native batch and retrieval controls', flush=True)
 
@@ -219,6 +221,7 @@ def run(args):
             if args.native_references is None or not args.native_references.is_file():
                 raise q.EvidenceUnavailable('existing native batch controls are required')
             native = json.loads(args.native_references.read_text())
+            require_matching_artifacts(native['identity'], result['identity'])
             for key in ('gpu', 'runtime_environment', 'configuration'):
                 if native['identity'][key] != result['identity'][key]:
                     raise q.EvidenceUnavailable(f'native control {key} does not match serving campaign')
@@ -323,6 +326,7 @@ def run(args):
         c.instances_after = inventory['data']
         assert status == 200 and {i['id'] for i in c.instances_before} == {i['id'] for i in c.instances_after}
         c.require_memory_evidence()
+        verify_artifacts(result['identity'], args)
         c.status = result['status'] = 'passed'
     except BaseException as error:
         c.status = result['status'] = 'incomplete' if isinstance(error, q.EvidenceUnavailable) else 'failed'

@@ -22,6 +22,7 @@ part of the recorded environment; these results never qualify a different GPU.
 """
 import argparse
 import hashlib
+from qualification_identity import model_artifacts, require_matching_artifacts, sha256_file, verify_artifacts
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -35,9 +36,10 @@ import qualify_read_pool_40g as q
 def serving_identity(args, campaign):
     if not args.cgroup or not args.binary or not args.config:
         raise q.EvidenceUnavailable('controlled qualification requires --cgroup, --binary and --config')
-    digest=hashlib.sha256(args.binary.read_bytes()).hexdigest()
+    digest=sha256_file(args.binary)['sha256']
     expected_port=str(urllib.parse.urlsplit(args.url).port)
     owners=[]
+    working_directory = None
     environment={}
     keys={'ANTFLY_INFERENCE_REQUIRED_BACKEND','ANTFLY_INFERENCE_CUDA_GQA_PREFILL_PROFILE','ANTFLY_INFERENCE_CUDA_DECODE_GRAPH_REPLAY','ANTFLY_SERVER_DECODE_GRAPH_REPLAY','ANTFLY_INFERENCE_CUDA_GREEDY_DEVICE_TOKEN_HANDOFF'}
     for pid in (args.cgroup/'cgroup.procs').read_text().split():
@@ -51,6 +53,10 @@ def serving_identity(args, campaign):
         selected={k:values.get(k) for k in sorted(keys)}
         assert not environment or selected==environment
         environment=selected; owners.append(int(pid))
+        cwd = (proc/'cwd').resolve(strict=True)
+        if working_directory is not None and cwd != working_directory:
+            raise q.EvidenceUnavailable('serving workers have different working directories')
+        working_directory = cwd
     if not owners: raise q.EvidenceUnavailable('expected serving binary is absent from the requested service cgroup')
     configuration=json.loads(args.config.read_text())
     expected='on' if args.mode=='cooperative' else 'off'
@@ -63,7 +69,8 @@ def serving_identity(args, campaign):
         if getattr(gpu.lib,symbol)(gpu.handle,value,q.ctypes.c_uint(len(value)))!=0:
             raise q.EvidenceUnavailable('NVML GPU identity unavailable')
         identity[name]=value.value.decode()
-    return {'binary_sha256':digest,'configuration':configuration,'gpu':identity,'runtime_environment':environment,'owned_pids':owners}
+    return {'binary_sha256':digest,'configuration':configuration,'gpu':identity,'runtime_environment':environment,'owned_pids':owners,
+            'working_directory':str(working_directory),'model_artifacts':model_artifacts(configuration, args.url, working_directory)}
 
 
 def prompt(records, tokens, marker, subject):
@@ -81,6 +88,7 @@ def compare(serialized, cooperative, output):
     assert a['mode'] == 'serialized' and b['mode'] == 'cooperative'
     assert a['workload'] == b['workload'] and a['references'] == b['references'], 'workload or output reference differs'
     assert a['status'] == b['status'] == 'passed'
+    require_matching_artifacts(a['identity'], b['identity'])
     for field in ('binary_sha256','gpu','runtime_environment'):
         assert a['identity'][field]==b['identity'][field], f'controlled identity differs: {field}'
     configs=[json.loads(json.dumps(x['identity']['configuration'])) for x in (a,b)]
@@ -115,6 +123,7 @@ def compare_batching(single, batched, output):
     assert a['status']==b['status']=='passed'
     assert a['mode']==b['mode']=='cooperative' and a['rows']==1 and b['rows']==2
     assert a['workload']==b['workload'] and a['references']==b['references']
+    require_matching_artifacts(a['identity'], b['identity'])
     for field in ('binary_sha256','gpu','runtime_environment'):
         assert a['identity'][field]==b['identity'][field], field
     configs=[json.loads(json.dumps(x['identity']['configuration'])) for x in (a,b)]
@@ -245,6 +254,7 @@ def run(args):
         print('sharing-preflight',args.mode,'owner_transitions',entered,flush=True)
         if args.scenario=='decode-overlap':
             previous=json.loads((args.references.parent/'comparison.json').read_text())
+            require_matching_artifacts(previous['identity'], identity)
             assert previous['status']=='passed' and previous['identity']['binary_sha256']==identity['binary_sha256'] and previous['identity']['gpu']==identity['gpu'], 'references do not belong to a passing campaign on this binary/GPU'
         else:
             c.set_phase('independent-references')
@@ -345,6 +355,7 @@ def run(args):
         c.instances_after = inventory['data']
         assert code == 200 and {i['id'] for i in c.instances_before} == {i['id'] for i in c.instances_after}
         c.require_memory_evidence()
+        verify_artifacts(identity, args)
         c.status = 'passed'
     except BaseException as error:
         c.status = 'incomplete' if isinstance(error,q.EvidenceUnavailable) else 'failed'

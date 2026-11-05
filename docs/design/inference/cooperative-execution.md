@@ -99,13 +99,28 @@ Logical admission remains separate from the final `DeviceBuffer` guard. Physical
 allocation records reserve bytes and durable ownership metadata before the
 CUDA allocation. An allocation failure rolls both back. A failed device free
 keeps its pointer, primary-context identity, owner identity and byte charge in
-the process ledger after the model's descriptor disappears. Drained retired
-owners can retry physical frees. A shared-primary release is not proof of
-cleanup. Charges reconcile after successful frees or a successful driver query
-confirming that the released primary context is inactive. Missing confirmation
-keeps the charge and ownership; a worker restart is the final recovery boundary
-when the driver cannot establish cleanup. Reusing a context address after
-confirmed teardown does not resurrect an old allocation token.
+the process ledger after the model's descriptor disappears. Before a retiring
+wrapper can release its primary context, it transfers its existing CUDA retain
+to quarantine whenever allocations remain. Owner metadata is reserved before
+allocating device memory, so this transfer cannot fail from host allocation
+pressure. Final wrapper cleanup also transfers its driver-library reference.
+
+A retry requires either the still-active retiring owner or a quarantined owner
+with an uninterrupted primary-context retain. A raw context handle alone is
+never sufficient. An external CUDA user's final release cannot reset that pinned
+lifetime. Once every allocation for an owner is physically freed, the ledger
+releases its CUDA retain and library reference. An uncertain retain-release
+result keeps the library until worker exit; the runtime never retries that
+release against a possible successor context lifetime. This follows NVIDIA's
+[primary-context lifecycle contract](https://docs.nvidia.com/cuda/cuda-driver-api/cuda_driver_api/group__CUDA__PRIMARY__CTX.html).
+
+Unsuccessful stream draining is never promoted to safe retry. Such allocations
+remain pinned and charged until the worker restarts. The runtime does not reset
+a primary context shared with other CUDA users. An explicit external device
+reset while managed work exists is outside the supported ownership contract.
+Successful frees release charges; a confirmed inactive primary can reconcile
+only owners without quarantined retains. Reusing a context address after actual
+teardown does not resurrect an old allocation token.
 
 For the nominal 40 GiB pool, the managed cap is 38 GiB, leaving 2 GiB for driver
 and vendor allocations outside `DeviceBuffer`. Admission weight, scratch, KV and
@@ -197,29 +212,42 @@ change makes no A100 performance or near-exhaustion qualification claim.
 
 The production engine function-table integration passes both the model-free
 multiple-node ownership test and the explicitly enabled hardware test. The
-hardware run records ten valid NVML samples during guard rejection, ten during
-failed-free retention, and twenty after reload, with no sampling errors. A real
-48 MiB allocation remains charged under the 64 MiB cap when a further 32 MiB is
-rejected and when `cuMemFree` is forced to fail. Confirmed primary teardown
-reduces managed live bytes to zero. Reload then allocates, writes and reads
-64 MiB successfully. NVML peaks at 245,874,688 bytes; the observed excluded
-allocation allowance peaks at 178,765,824 bytes, below the reserved 2 GiB.
+current GB10 recovery test uses the production host/engine initialization path
+and records ten valid NVML samples during guard rejection, ten during failed-free
+retention, ten after the external CUDA retainer releases, and twenty after reload.
+All fifty samples are valid with no sampling failures.
 
-Mock-driver coverage additionally keeps the charge while another owner retains
-the primary context, covers unsuccessful stream draining, and verifies that a
-stale descriptor cannot free a successor allocation after a context address and
-ledger slot are reused. The sustained admission test completes 64 shared /
-exclusive rounds, 192 successful admissions and 64 queued deadline cleanups.
+A real 48 MiB allocation remains charged under a 64 MiB cap when a further
+32 MiB is rejected and when `cuMemFree` is forced to fail. The managed wrapper
+then fully deinitializes, transferring its primary retain and library reference
+to quarantine. A separate CUDA user releases its reference; the driver still
+reports the primary active and the allocation remains charged at 48 MiB. Reload
+retries the free under the retained lifetime, reduces managed live bytes to zero,
+then allocates, writes and reads 64 MiB successfully. NVML peaks at 245,874,688
+bytes; observed excluded allocations peak at 178,765,824 bytes, below the reserved
+2 GiB. This is a scaled guard/recovery test, not exhaustion near 38 GiB.
 
-Raw hardware evidence is in
-`.benchmark-results/cooperative-execution/physical-pressure-final/`. Its test
-binary SHA-256 is
-`550b4a56f498f483e02542154ece5efc212430f2bbeb36c3520eb5db6913f40e`.
-This is a scaled allocation-guard and recovery result on GB10, rather than a
-claim about physical exhaustion at 38 GiB or any A100 measurement.
+Model-free coverage additionally simulates the external user's would-be final
+release between managed owners, later actual context teardown, and reuse of both
+the context handle and device address. Copied stale descriptors cannot free the
+successor allocation. Unsuccessful draining preserves quarantine; an ambiguous
+retain release is not retried. The seven lifecycle/budget tests pass in CPU and
+CUDA builds. The existing 82 CUDA execution-batch tests also pass. The sustained
+admission test's earlier 64-round result remains separate evidence.
 
+Current hardware receipts are in
+`.benchmark-results/cooperative-execution/review-primary-lifetime-final/` in the
+qualification worktree. Its test executable SHA-256 is
+`ae87475f991cc8c7a2eeb94699a0dde43390e3640f678ce71404444fc2b00a90`.
+The earlier `physical-pressure-final/` teardown report predates quarantine pins
+and is superseded for failed-free recovery safety. No A100 hardware result is
+claimed.
 
 ## Controlled one-row serving results on GB10
+
+These receipts predate mandatory model-artifact hashing. They remain historical
+measurements; the updated harness requires fresh artifact-aware campaigns before
+accepting reproducible performance comparisons. No hashes have been backfilled.
 
 The one-row serving campaign used the ARM64 CUDA HTTP-only production entry point,
 built with `zig build http-server -Dcuda=true -Dmetal=false
@@ -307,3 +335,30 @@ license headers and the Apache product-boundary check pass. Eight telemetry
 unit tests verify that missing measurements and missing phase coverage cannot
 pass. The repository's remote PR CI still requires its normal human approval;
 local results are not presented as a completed GitHub CI run.
+
+## Immutable model identities in controlled evidence
+
+Controlled campaigns hash the manifests, model configuration, tokenizers and
+weight artifacts for every loaded model using SHA-256. The inventory determines
+which model directories participate, including all shards and linked artifacts;
+operational checksum/download caches are excluded and never trusted as hashes.
+The capture checks file metadata around each read and verifies that loaded model
+instances remain unchanged. At campaign completion it hashes the artifacts again
+and rejects changed content or missing evidence.
+
+Both serialized/cooperative and one-row/two-row comparisons require the same
+complete `model_artifacts` identities. Decode-overlap reference reuse and the
+HTTP microbatch campaign's native controls enforce the same boundary. Older
+reports without hashes remain historical observations: they cannot be promoted
+or compared by the updated harness. Hashes cannot be retroactively attached to
+prove which files an earlier campaign loaded; fresh controlled runs are required.
+Model files must remain immutable from loading through campaign completion.
+
+Model-free checks:
+
+```sh
+cd zig/pkg/inference
+zig build test-cuda-allocation-lifecycle -Dcuda=true -Dmetal=false --summary all
+python3 -m unittest discover -s scripts -p test_qualification_identity.py -v
+python3 -m unittest discover -s scripts -p test_qualification_memory.py -v
+```

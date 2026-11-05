@@ -264,12 +264,12 @@ test "CUDA process allocation budget bounds multiple model contexts and restores
     try std.testing.expectEqual(before.live, shared.snapshot().live);
 }
 
-test "CUDA failed free stays owned across shared primary retirement and reconciles on confirmed teardown before reload" {
+test "CUDA quarantine pins primary lifetime across external final release and handle address reuse" {
     const Mock = struct {
-        var active: c_int = 1;
-        var fail_free = true;
-        var fail_drain = false;
+        var references: usize = 0;
+        var resets: usize = 0;
         var frees: usize = 0;
+        var fail_free = true;
         fn current(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
             return 0;
         }
@@ -282,17 +282,17 @@ test "CUDA failed free stays owned across shared primary retirement and reconcil
             return if (fail_free) 201 else 0;
         }
         fn sync(_: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
-            return if (fail_drain) 201 else 0;
-        }
-        fn destroy(_: driver_mod.CUstream) callconv(.c) driver_mod.CUresult {
             return 0;
         }
         fn release(_: driver_mod.CUdevice) callconv(.c) driver_mod.CUresult {
+            std.debug.assert(references > 0);
+            references -= 1;
+            if (references == 0) resets += 1;
             return 0;
         }
-        fn state(_: driver_mod.CUdevice, flags: *c_uint, value: *c_int) callconv(.c) driver_mod.CUresult {
+        fn state(_: driver_mod.CUdevice, flags: *c_uint, active: *c_int) callconv(.c) driver_mod.CUresult {
             flags.* = 0;
-            value.* = active;
+            active.* = @intFromBool(references > 0);
             return 0;
         }
         fn errorName(_: driver_mod.CUresult, value: *?[*:0]const u8) callconv(.c) driver_mod.CUresult {
@@ -300,12 +300,13 @@ test "CUDA failed free stays owned across shared primary retirement and reconcil
             return 0;
         }
         fn context() context_mod.CudaContext {
+            references += 1;
             var ctx: context_mod.CudaContext = .{ .ctx = @ptrFromInt(0xfeed0001), .stream = @ptrFromInt(8), .device = 0, .info = .{}, .driver = undefined };
             ctx.driver.fns.cuCtxSetCurrent = current;
             ctx.driver.fns.cuMemAlloc = alloc;
             ctx.driver.fns.cuMemFree = free;
             ctx.driver.fns.cuStreamSynchronize = sync;
-            ctx.driver.fns.cuStreamDestroy = destroy;
+            ctx.driver.fns.cuStreamDestroy = sync;
             ctx.driver.fns.cuDevicePrimaryCtxRelease = release;
             ctx.driver.fns.cuDevicePrimaryCtxGetState = state;
             ctx.driver.fns.cuGetErrorName = errorName;
@@ -316,50 +317,43 @@ test "CUDA failed free stays owned across shared primary retirement and reconcil
     const before = shared.snapshot();
     try shared.setLimit(before.live + 32);
     defer shared.setLimit(before.limit) catch unreachable;
-    for ([_]bool{ false, true }) |failed_drain| {
-        Mock.active = 1;
-        Mock.fail_free = true;
-        Mock.fail_drain = failed_drain;
-        Mock.frees = 0;
-        var first = Mock.context();
-        var buffer = try DeviceBuffer.alloc(&first, 24);
-        buffer.free(&first);
-        try std.testing.expectEqual(before.live + 24, shared.snapshot().live);
-        first.releaseResources();
-        // A different owner still retains this primary. Retirement must not
-        // forgive the failed allocation, whether or not its stream drained.
-        try std.testing.expectEqual(before.live + 24, shared.snapshot().live);
-        try std.testing.expectEqual(@as(usize, if (failed_drain) 1 else 2), Mock.frees);
-        var peer = Mock.context();
-        try std.testing.expectError(error.CudaMemoryLimitExceeded, DeviceBuffer.alloc(&peer, 16));
-        Mock.active = 0;
-        peer.releaseResources();
-        try std.testing.expectEqual(before.live, shared.snapshot().live);
-        // Same device/context address can be reused by a subsequent load.
-        Mock.active = 1;
-        Mock.fail_free = false;
-        Mock.fail_drain = false;
-        var reloaded = Mock.context();
-        var replacement = try DeviceBuffer.alloc(&reloaded, 32);
-        replacement.free(&reloaded);
-        reloaded.releaseResources();
-        try std.testing.expectEqual(before.live, shared.snapshot().live);
-        var retired = Mock.context();
-        var stale = try DeviceBuffer.alloc(&retired, 8);
-        Mock.fail_free = true;
-        Mock.active = 0;
-        retired.releaseResources();
-        try std.testing.expectEqual(before.live, shared.snapshot().live);
-        var successor = Mock.context();
-        Mock.fail_free = false;
-        Mock.active = 1;
-        var fresh = try DeviceBuffer.alloc(&successor, 32);
-        const frees_before_stale = Mock.frees;
-        stale.free(&successor);
-        try std.testing.expectEqual(frees_before_stale, Mock.frees);
-        try std.testing.expectEqual(before.live + 32, shared.snapshot().live);
-        fresh.free(&successor);
-        successor.releaseResources();
-        try std.testing.expectEqual(before.live, shared.snapshot().live);
-    }
+    Mock.references = 1; // External CUDA retainer, independent of managed owners.
+    Mock.resets = 0;
+    Mock.frees = 0;
+    Mock.fail_free = true;
+    var first = Mock.context();
+    var stale = try DeviceBuffer.alloc(&first, 24);
+    // Keep a copied descriptor to test later ledger slot + address reuse.
+    var copied = stale;
+    stale.free(&first);
+    first.releaseResources();
+    first.releaseResources(); // Idempotent: never relinquish the transferred retain.
+    try std.testing.expectEqual(@as(usize, 2), Mock.references);
+    try std.testing.expectEqual(before.live + 24, shared.snapshot().live);
+    // This WOULD be the final release under the former implementation.
+    _ = Mock.release(0);
+    try std.testing.expectEqual(@as(usize, 1), Mock.references);
+    try std.testing.expectEqual(@as(usize, 0), Mock.resets);
+    var reloaded = Mock.context();
+    try std.testing.expectError(error.CudaMemoryLimitExceeded, DeviceBuffer.alloc(&reloaded, 16));
+    // This is the same post-retain retry used by initDefault. The pin proves
+    // continuity even though no managed wrapper existed between the owners.
+    Mock.fail_free = false;
+    allocation_ledger.process.retryRetired(@intFromPtr(reloaded.ctx), 0, Mock.free, Mock.release);
+    try std.testing.expectEqual(before.live, shared.snapshot().live);
+    try std.testing.expectEqual(@as(usize, 1), Mock.references);
+    reloaded.releaseResources();
+    try std.testing.expectEqual(@as(usize, 1), Mock.resets);
+    // A genuinely new primary lifetime reuses both handle and device address.
+    var successor = Mock.context();
+    var fresh = try DeviceBuffer.alloc(&successor, 32);
+    const frees_before = Mock.frees;
+    copied.free(&successor);
+    allocation_ledger.process.retryRetired(@intFromPtr(successor.ctx), 0, Mock.free, Mock.release);
+    try std.testing.expectEqual(frees_before, Mock.frees);
+    try std.testing.expectEqual(before.live + 32, shared.snapshot().live);
+    fresh.free(&successor);
+    successor.releaseResources();
+    try std.testing.expectEqual(@as(usize, 0), Mock.references);
+    try std.testing.expectEqual(before.live, shared.snapshot().live);
 }
