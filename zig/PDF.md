@@ -1911,9 +1911,11 @@ are cached per Reader; render forks own independent caches.
 Changing either decode limit releases the structure metadata cache; an identical
 limit update preserves it. Subsequent lookups rebuild under the current limits,
 including recovery from a previously exhausted metadata allowance.
-Container arrays, ancestor decisions, stream container keys, and decoded owner text are reused
-within each page. Indirect MCID values in named properties and marked-content
-references use the same bounded, memoized resolver. Named property tables are
+Container arrays, ancestor decisions, stream container keys, and decoded owner
+text are reused within each page. MCIDs, number-tree keys, Limits endpoints,
+and root type names use the same bounded, memoized resolver for direct and
+indirect values. Unassigned ParentTree slots treat direct and indirect null
+equally; parent links still require real structure elements. Named property tables are
 sorted once per resource scope and searched in logarithmic time, without
 allocating a separate lookup table or scanning all properties for each BDC.
 Retained metadata and page-local lookup allocations share

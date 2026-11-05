@@ -161,6 +161,11 @@ pub const Lookup = struct {
         return object;
     }
 
+    fn integerValue(self: *Lookup, raw: *const Object) !i64 {
+        const value = try self.numberObject(raw);
+        return value.asInteger() orelse error.InvalidPdfStructure;
+    }
+
     // Non-root number-tree nodes carry Limits. Binary search avoids walking
     // unrelated page entries; selected paths are depth/work bounded even when
     // a malformed number tree links back to an ancestor.
@@ -180,7 +185,7 @@ pub const Lookup = struct {
                 var index: usize = 0;
                 while (index < nums.array.len) : (index += 2) {
                     if (index % 256 == 0) try self.step(depth);
-                    const number = nums.array[index].asInteger() orelse return error.InvalidPdfStructure;
+                    const number = try self.integerValue(&nums.array[index]);
                     if (number <= previous) return error.InvalidPdfStructure;
                     previous = number;
                 }
@@ -190,7 +195,7 @@ pub const Lookup = struct {
             var high = nums.array.len / 2;
             while (low < high) {
                 const mid = low + (high - low) / 2;
-                const number = nums.array[mid * 2].asInteger() orelse return error.InvalidPdfStructure;
+                const number = try self.integerValue(&nums.array[mid * 2]);
                 if (number < key) low = mid + 1 else if (number > key) high = mid else return nums.array[mid * 2 + 1];
             }
             return null;
@@ -205,21 +210,25 @@ pub const Lookup = struct {
             const child = try self.numberObject(&kids.array[mid]);
             const limits = try self.numberObject(child.get("Limits") orelse return error.InvalidPdfStructure);
             if (limits != .array or limits.array.len != 2) return error.InvalidPdfStructure;
-            const first = limits.array[0].asInteger() orelse return error.InvalidPdfStructure;
-            const last = limits.array[1].asInteger() orelse return error.InvalidPdfStructure;
+            const first = try self.integerValue(&limits.array[0]);
+            const last = try self.integerValue(&limits.array[1]);
             if (first > last) return error.InvalidPdfStructure;
             if (key < first) high = mid else if (key > last) low = mid + 1 else return self.numberValue(&kids.array[mid], key, depth + 1);
         }
         return null;
     }
 
-    fn loadElement(self: *Lookup, ref: syntax.ObjRef) !void {
+    fn loadElement(self: *Lookup, ref: syntax.ObjRef, nullable: bool) !bool {
         const id = refKey(ref);
-        if (self.elements.contains(id)) return;
+        if (self.elements.contains(id)) return true;
         const raw = Object{ .obj_ref = ref };
         const object = try self.numberObject(&raw);
+        // An unassigned ParentTree slot can be direct or indirect null. A
+        // structure element's P chain, however, must reach a real element/root.
+        if (nullable and object == .null) return false;
         if (object != .dict) return error.InvalidPdfStructure;
         try self.elements.put(self.alloc, id, .{ .object = object });
+        return true;
     }
 
     fn pageMatches(self: *Lookup, page: ?syntax.ObjRef) !void {
@@ -236,8 +245,7 @@ pub const Lookup = struct {
         const stream = try self.numberObject(raw);
         if (stream != .stream) return error.InvalidPdfStructure;
         const parent = stream.get("StructParents") orelse return error.UnsupportedPdfStructureText;
-        const resolved = try self.numberObject(parent);
-        const key = resolved.asInteger() orelse return error.InvalidPdfStructure;
+        const key = try self.integerValue(parent);
         if (key < 0) return error.InvalidPdfStructure;
         try self.stream_containers.put(self.alloc, id, key);
         return key;
@@ -264,8 +272,7 @@ pub const Lookup = struct {
         if (value.* != .dict) return error.UnsupportedPdfStructureText;
         const page = if (value.get("Pg")) |pg| try reference(pg) else inherited_page;
         if (value.get("MCID")) |mcid| {
-            const resolved = try self.numberObject(mcid);
-            const index = resolved.asInteger() orelse return error.InvalidPdfStructure;
+            const index = try self.integerValue(mcid);
             if (index < 0) return error.InvalidPdfStructure;
             try self.pageMatches(page);
             const container = if (value.get("Stm")) |stream| try self.streamContainer(stream) else self.page_parent orelse return error.UnsupportedPdfStructureText;
@@ -276,8 +283,8 @@ pub const Lookup = struct {
         try self.validateContent(kids, page, depth + 1, visited, bindings);
     }
 
-    fn owner(self: *Lookup, ref: syntax.ObjRef, depth: usize) anyerror!?u64 {
-        try self.loadElement(ref);
+    fn owner(self: *Lookup, ref: syntax.ObjRef, depth: usize, nullable: bool) anyerror!?u64 {
+        if (!try self.loadElement(ref, nullable)) return null;
         const id = refKey(ref);
         const saved = self.elements.get(id).?;
         switch (saved.state) {
@@ -289,13 +296,16 @@ pub const Lookup = struct {
         self.elements.getPtr(id).?.state = .visiting;
         errdefer self.elements.getPtr(id).?.state = .invalid;
         const object = saved.object; // dictionary storage survives hash-map growth
-        if (object.get("Type")) |kind| if (std.mem.eql(u8, kind.asName() orelse "", "StructTreeRoot")) {
-            self.elements.getPtr(id).?.state = .done;
-            return null;
-        };
+        if (object.get("Type")) |raw| {
+            const kind = try self.numberObject(raw);
+            if (std.mem.eql(u8, kind.asName() orelse "", "StructTreeRoot")) {
+                self.elements.getPtr(id).?.state = .done;
+                return null;
+            }
+        }
         if (object.get("S") == null) return error.InvalidPdfStructure;
         const parent = try reference(object.get("P") orelse return error.InvalidPdfStructure);
-        const ancestor = try self.owner(parent, depth + 1);
+        const ancestor = try self.owner(parent, depth + 1, false);
         const inherited_page = self.elements.get(refKey(parent)).?.page;
         const page = if (object.get("Pg")) |pg| try reference(pg) else inherited_page;
         self.elements.getPtr(id).?.page = page;
@@ -338,7 +348,7 @@ pub const Lookup = struct {
         const index = std.math.cast(usize, mcid) orelse return error.InvalidPdfStructure;
         if (index >= array.len) return error.InvalidPdfStructure;
         if (array[index] == .null) return null;
-        const selected = (try self.owner(try reference(&array[index]), 0)) orelse return null;
+        const selected = (try self.owner(try reference(&array[index]), 0, true)) orelse return null;
         if (!self.elements.get(selected).?.bindings.contains(.{ .container = key, .mcid = mcid })) return error.InvalidPdfStructure;
         return .{ .owner = selected, .text = self.elements.get(selected).?.text.? };
     }
@@ -353,8 +363,7 @@ pub const Lookup = struct {
 
     pub fn getObject(self: *Lookup, container: ?i64, raw: *const Object) !?Replacement {
         try self.resolver.check(self.resolver.context);
-        const resolved = self.numberObject(raw) catch |err| return self.failed(err);
-        const mcid = resolved.asInteger() orelse return self.failed(error.InvalidPdfStructure);
+        const mcid = self.integerValue(raw) catch |err| return self.failed(err);
         return self.get(container, mcid);
     }
 

@@ -34754,6 +34754,7 @@ test "reader inherited ActualText suppression skips unused named property copies
 
 const TaggedTextFixture = struct {
     content: []const u8,
+    root_type: []const u8 = "/StructTreeRoot",
     element: []const u8 = "/P 9 0 R /K 0 /ActualText (Label)",
     document: []const u8 = "",
     document_k: []const u8 = "7 0 R",
@@ -34781,6 +34782,8 @@ fn buildTaggedTextTestPdfAlloc(a: Allocator, fixture: TaggedTextFixture) ![]u8 {
     defer a.free(page);
     const pages = try std.fmt.allocPrint(a, "2 0 obj\n{s}\nendobj\n", .{fixture.pages});
     defer a.free(pages);
+    const root = try std.fmt.allocPrint(a, "6 0 obj\n<< /Type {s} /K [9 0 R] /ParentTree 8 0 R >>\nendobj\n", .{fixture.root_type});
+    defer a.free(root);
     var objects = std.ArrayList([]const u8).empty;
     defer objects.deinit(a);
     try objects.appendSlice(a, &.{
@@ -34789,7 +34792,7 @@ fn buildTaggedTextTestPdfAlloc(a: Allocator, fixture: TaggedTextFixture) ![]u8 {
         page,
         page_stream,
         "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
-        "6 0 obj\n<< /Type /StructTreeRoot /K [9 0 R] /ParentTree 8 0 R >>\nendobj\n",
+        root,
         element,
         parents,
         document,
@@ -34855,6 +34858,92 @@ test "reader indirect MCIDs resolve in named page and Form properties and MCR bi
             const plain = try parsed.extractPageTextAlloc(1);
             defer a.free(plain);
             try std.testing.expectEqualStrings(if (case.incomplete) "SOURCE\n" else "Label\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expectEqual(case.incomplete, analysis.diagnostics.structure_text_incomplete);
+        }
+    }
+}
+
+test "reader structure scalar references resolve number keys limits names and nested containers" {
+    const a = std.testing.allocator;
+    const content = "/Span /Tag BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC";
+    const cases = [_]TaggedTextFixture{
+        .{ .content = content, .parents = "/Nums [11 0 R [7 0 R]]", .extra = &.{"11 0 obj\n0\nendobj\n"} },
+        .{ .content = content, .parents = "/Kids [11 0 R]", .extra = &.{ "11 0 obj\n<< /Limits [12 0 R 12 0 R] /Nums [0 [7 0 R]] >>\nendobj\n", "12 0 obj\n0\nendobj\n" } },
+        .{ .content = content, .root_type = "11 0 R", .extra = &.{"11 0 obj\n/StructTreeRoot\nendobj\n"} },
+        // Both sides of a Kids search, shared scalar references, indirect
+        // arrays, and page/Form MCIDs all select the same replacement owner.
+        .{
+            .content = content ++ " /Fm Do",
+            .root_type = "13 0 R",
+            .page_properties = "/Tag << /MCID 14 0 R >>",
+            .form_content = content,
+            .form_properties = "/Tag << /MCID 14 0 R >>",
+            .form_parent = "/StructParents 15 0 R",
+            .parents = "/Kids 16 0 R",
+            .element = "/P 9 0 R /K [0 << /Type /MCR /Pg 3 0 R /Stm 10 0 R /MCID 14 0 R >>] /ActualText (Label)",
+            .extra = &.{
+                "11 0 obj\n<< /Limits 17 0 R /Nums 19 0 R >>\nendobj\n",
+                "12 0 obj\n<< /Limits 18 0 R /Nums 21 0 R >>\nendobj\n",
+                "13 0 obj\n/StructTreeRoot\nendobj\n",
+                "14 0 obj\n0\nendobj\n",
+                "15 0 obj\n1\nendobj\n",
+                "16 0 obj\n[11 0 R 12 0 R]\nendobj\n",
+                "17 0 obj\n[14 0 R 14 0 R]\nendobj\n",
+                "18 0 obj\n[15 0 R 15 0 R]\nendobj\n",
+                "19 0 obj\n[14 0 R 20 0 R]\nendobj\n",
+                "20 0 obj\n[7 0 R]\nendobj\n",
+                "21 0 obj\n[15 0 R 20 0 R]\nendobj\n",
+            },
+        },
+    };
+    for (cases) |fixture| {
+        const sample = try buildTaggedTextTestPdfAlloc(a, fixture);
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("Label\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(!analysis.diagnostics.structure_text_incomplete);
+            try std.testing.expectEqual(@as(usize, 1), analysis.semantic_spans.len);
+        }
+    }
+}
+
+test "reader structure scalar references retain empty slots and diagnose malformed values" {
+    const a = std.testing.allocator;
+    const content = "/Span /Tag BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC";
+    const cases = [_]struct { fixture: TaggedTextFixture, incomplete: bool = true }{
+        .{ .fixture = .{ .content = content, .parents = "/Nums [0 [null]]" }, .incomplete = false },
+        .{ .fixture = .{ .content = content, .parents = "/Nums [0 [11 0 R]]", .extra = &.{"11 0 obj\nnull\nendobj\n"} }, .incomplete = false },
+        .{ .fixture = .{ .content = content, .element = "/P 11 0 R /K 0 /ActualText (Label)", .extra = &.{"11 0 obj\nnull\nendobj\n"} } },
+        .{ .fixture = .{ .content = content, .parents = "/Nums [11 0 R [7 0 R]]" } },
+        .{ .fixture = .{ .content = content, .parents = "/Nums [11 0 R [7 0 R]]", .extra = &.{"11 0 obj\n(wrong type)\nendobj\n"} } },
+        .{ .fixture = .{ .content = content, .parents = "/Nums [11 0 R [7 0 R]]", .extra = &.{"11 0 obj\n11 0 R\nendobj\n"} } },
+        .{ .fixture = .{ .content = content, .parents = "/Nums [11 0 R [7 0 R] 12 0 R [7 0 R]]", .extra = &.{ "11 0 obj\n1\nendobj\n", "12 0 obj\n0\nendobj\n" } } },
+        .{ .fixture = .{ .content = content, .parents = "/Nums [11 0 R [7 0 R] 11 0 R [7 0 R]]", .extra = &.{"11 0 obj\n0\nendobj\n"} } },
+        .{ .fixture = .{ .content = content, .parents = "/Kids [11 0 R]", .extra = &.{ "11 0 obj\n<< /Limits [12 0 R 12 0 R] /Nums [0 [7 0 R]] >>\nendobj\n", "12 0 obj\nnull\nendobj\n" } } },
+        .{ .fixture = .{ .content = content, .root_type = "11 0 R" } },
+        .{ .fixture = .{ .content = content, .root_type = "11 0 R", .extra = &.{"11 0 obj\n11 0 R\nendobj\n"} } },
+    };
+    for (cases) |case| {
+        const sample = try buildTaggedTextTestPdfAlloc(a, case.fixture);
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("SOURCE\n", analysis.text);
             try std.testing.expectEqualStrings(analysis.text, plain);
             try std.testing.expectEqual(case.incomplete, analysis.diagnostics.structure_text_incomplete);
         }
@@ -35022,8 +35111,10 @@ test "reader structure lookup memoizes shared ancestry and owns allocations on f
     inline for (.{ false, true }) |indirect| {
         const sample = try buildTaggedTextTestPdfAlloc(a, .{
             .content = "/Span << /MCID 0 >> BDC BT (SOURCE) Tj ET EMC",
+            .root_type = if (indirect) "12 0 R" else "/StructTreeRoot",
+            .parents = if (indirect) "/Kids [13 0 R]" else "/Nums [0 [7 0 R]]",
             .element = if (indirect) "/P 9 0 R /K << /Type /MCR /Pg 3 0 R /MCID 11 0 R >> /ActualText (Label)" else "/P 9 0 R /K 0 /ActualText (Label)",
-            .extra = &.{"11 0 obj\n0\nendobj\n"},
+            .extra = &.{ "11 0 obj\n0\nendobj\n", "12 0 obj\n/StructTreeRoot\nendobj\n", "13 0 obj\n<< /Limits [11 0 R 11 0 R] /Nums [11 0 R [7 0 R]] >>\nendobj\n" },
         });
         defer a.free(sample);
         var parsed = try Reader.init(a, sample);
