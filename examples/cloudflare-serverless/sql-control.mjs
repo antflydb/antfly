@@ -68,7 +68,7 @@ export class SQLControl {
  // Serialize only storage metadata, never a turn or external network I/O.
  update(action){const next=this.updates.then(action);this.updates=next.catch(()=>{});return next;}
  async schedule(time){return this.update(async()=>{const previous=await this.ctx.storage.getAlarm();if(previous===null||time<previous)await this.ctx.storage.setAlarm(time);});}
- async retire(){return this.update(async()=>{await this.ctx.storage.deleteAlarm();await this.ctx.storage.deleteAll();});}
+ async retire(){return this.update(async()=>{await this.ctx.storage.deleteAll();await this.ctx.storage.deleteAlarm();});}
  async kick(locator){
   locatorName(locator);
   return this.update(async()=>{
@@ -85,7 +85,7 @@ export class SQLControl {
   this.active=true;
   try{
    locator=await this.ctx.storage.get('query');
-   if(!locator)return{complete:true};
+   if(!locator){await this.retire();return{complete:true};}
    if(locator.query.expires_ms<=this.now()){await this.retire();return{complete:true};}
    // Schedule recovery before entering WASM or delivering any queue message.
    await this.schedule(this.now()+2000);
@@ -97,51 +97,68 @@ export class SQLControl {
   finally{this.active=false;}
  }
  async alarm(){
-  // Consume the fired alarm before rearming, including when a turn is active.
-  await this.update(()=>this.ctx.storage.deleteAlarm());
+  // The runtime consumes the firing alarm. Deleting it here suppresses its
+  // automatic retries. Arm recovery before even the first durable-state read.
+  await this.schedule(this.now()+2000);
   if(await this.ctx.storage.get('discovery'))await this.recover();else await this.advance();
  }
  async recover(){
-  if(this.active){await this.ctx.storage.setAlarm(this.now()+1000);return{recovered:0};}
+  if(this.active){await this.schedule(this.now()+1000);return{recovered:0};}
   this.active=true;
   try{
    // Persist the continuation before I/O: eviction or a failed list/kick must
    // not turn the minute cron into the throughput limit for discovery.
    await this.ctx.storage.put('discovery',true);
-   await this.ctx.storage.setAlarm(this.now()+1000);
+   await this.schedule(this.now()+1000);
    const {config,bindings}=sqlConfig(this.env),bucket=bindings[config.state.bucket],prefix=config.state.prefix+'/sql-query-expiry/';
    const cursor=await this.ctx.storage.get('cursor');
    const page=await bucket.list({prefix,limit:16,...(cursor?{cursor}:{})});
-   let recovered=0;
-   for(const object of page.objects){
-    try{
-     const suffix=object.key.slice(prefix.length),match=/^(\d{20})\/([a-f0-9]{64})\.json$/.exec(suffix);if(!match)continue;
-     const expires_ms=Number(match[1]);if(!Number.isSafeInteger(expires_ms)||expires_ms<=this.now())continue;
-     const base=`${config.state.prefix}/sql-execution-v2/${match[1]}/${match[2]}`;
-     const record=await bucket.get(`${base}/query.json`);
-     if(record){
-      if(record.size>1024*1024)throw Error('InvalidSqlExecutionState');
-      const state=await record.json();
-      if(state.version===2&&digestText(state.plan)===match[2]&&state.expires_ms===expires_ms&&['succeeded','failed','cancelled'].includes(state.status)){await bucket.delete(object.key);continue;}
-     }
-     const raw=await bucket.get(`${base}/plan.json`);if(!raw)continue;
-     if(raw.size>1024*1024)throw Error('InvalidSqlDistributedPlan');
-     const bytes=new Uint8Array(await new Response(raw.body).arrayBuffer());
-     const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),b=>b.toString(16).padStart(2,'0')).join('');
-     if(digest!==match[2])throw Error('InvalidSqlDistributedPlan');
-     const plan=JSON.parse(new TextDecoder().decode(bytes));
-     if(plan.expires_ms!==expires_ms)throw Error('InvalidSqlDistributedPlan');
-     const locator={tenant:plan.tenant,query:{id:Array.from(match[2],c=>c.charCodeAt(0)),expires_ms}};
-     await this.env.SQL_COORDINATORS.getByName(locatorName(locator)).kick(locator);recovered++;
-    }catch(error){console.warn('SQL query recovery deferred',String(error));}
-   }
+   let recovered=0,next=0;
+   // Bound both state reads and locator RPCs. One slow query does not serialize
+   // the entire page, and a continuation never fans out beyond four queries.
+   await Promise.all(Array.from({length:Math.min(4,page.objects.length)},async()=>{
+    while(next<page.objects.length){
+     const count=await this.recoverQuery(page.objects[next++],prefix,config,bucket);
+     recovered+=count;
+    }
+   }));
    if(page.truncated){
     await this.ctx.storage.put('cursor',page.cursor);
     // Drain at the speed of storage, with a new bounded invocation per page.
-    await this.ctx.storage.setAlarm(this.now()+1);
+    await this.schedule(this.now()+1);
    }else{await this.ctx.storage.delete('cursor');await this.ctx.storage.deleteAlarm();}
    return{recovered};
   }finally{this.active=false;}
+ }
+ async recoverQuery(object,prefix,config,bucket){
+  try{
+   const suffix=object.key.slice(prefix.length),match=/^(\d{20})\/([a-f0-9]{64})\.json$/.exec(suffix);if(!match)return 0;
+   const expires_ms=Number(match[1]);if(!Number.isSafeInteger(expires_ms)||expires_ms<=this.now())return 0;
+   const base=`${config.state.prefix}/sql-execution-v2/${match[1]}/${match[2]}`;
+   const query={id:match[2],expires_ms};
+   const record=await bucket.get(`${base}/query.json`);
+   if(record){
+    if(record.size>16384)throw Error('InvalidSqlExecutionState');
+    const state=await record.json();
+    if(state.version!==2||digestText(state.plan)!==query.id||state.expires_ms!==expires_ms||!['pending','running','succeeded','failed','cancelled'].includes(state.status))throw Error('InvalidSqlExecutionState');
+    if(['succeeded','failed','cancelled'].includes(state.status)){await bucket.delete(object.key);return 0;}
+    // Compact records are trusted execution metadata, as on native workers.
+    // Validate the scope before waking its DO; only legacy records need a plan.
+    if(state.tenant!=null){
+     const locator={tenant:digestText(state.tenant),query};
+     await this.env.SQL_COORDINATORS.getByName(locatorName(locator)).kick(locator);return 1;
+    }
+   }
+   const raw=await bucket.get(`${base}/plan.json`);if(!raw)return 0;
+   if(raw.size>1024*1024)throw Error('InvalidSqlDistributedPlan');
+   const bytes=new Uint8Array(await new Response(raw.body).arrayBuffer());
+   const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',bytes)),b=>b.toString(16).padStart(2,'0')).join('');
+   if(digest!==query.id)throw Error('InvalidSqlDistributedPlan');
+   const plan=JSON.parse(new TextDecoder('utf-8',{fatal:true}).decode(bytes));
+   if(plan.expires_ms!==expires_ms)throw Error('InvalidSqlDistributedPlan');
+   const locator={tenant:digestText(plan.tenant),query};
+   await this.env.SQL_COORDINATORS.getByName(locatorName(locator)).kick(locator);return 1;
+  }catch(error){console.warn('SQL query recovery deferred',String(error));return 0;}
  }
 }
 export async function consumeSQL(batch,env,run,{now=()=>Date.now()}={}){

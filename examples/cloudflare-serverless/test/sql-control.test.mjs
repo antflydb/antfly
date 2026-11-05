@@ -21,14 +21,20 @@ import {Bucket} from './object-fixture.mjs';
 const digest=c=>Array(64).fill(c.charCodeAt(0));
 const locator={tenant:digest('a'),query:{id:digest('b'),expires_ms:1000000}};
 class Storage {
- values=new Map();alarm=null;
+ values=new Map();alarm=null;inAlarm=false;retrySuppressed=false;
  async get(key){return this.values.get(key);}
  async put(key,value){this.values.set(key,structuredClone(value));}
  async delete(key){this.values.delete(key);}
  async getAlarm(){return this.alarm;}
  async setAlarm(time){this.alarm=time;}
- async deleteAlarm(){this.alarm=null;}
- async deleteAll(){this.values.clear();}
+ async deleteAlarm(){this.alarm=null;if(this.inAlarm)this.retrySuppressed=true;}
+ async deleteAll(){this.values.clear();this.alarm=null;}
+ async fire(control){
+  const fired=this.alarm;this.alarm=null;this.inAlarm=true;this.retrySuppressed=false;
+  try{return await control.alarm();}
+  catch(error){if(!this.retrySuppressed&&this.alarm===null)this.alarm=(fired??control.now())+2000;throw error;}
+  finally{this.inAlarm=false;}
+ }
 }
 test('SQL service authentication verifies bounded audience-bound native JWT claims',async()=>{
  const env={SQL_SERVICE_SECRET:'x'.repeat(32),SQL_SERVICE_ISSUER:'sql:cluster'},now=100000;
@@ -52,7 +58,7 @@ test('SQL alarms precede queue delivery and a replacement coordinator replays du
  await assert.rejects(first.advance(locator),/queue response lost/);
  assert.equal(storage.alarm,1100);assert.equal(sent.length,1);
  const replacement=new SQLControl(ctx,env,run,{now:()=>200,owner:'new'});
- await replacement.alarm();assert.equal(sent.length,2);assert.equal(turns,2);assert.deepEqual(sent[0].body,sent[1].body);
+ await storage.fire(replacement);assert.equal(sent.length,2);assert.equal(turns,2);assert.deepEqual(sent[0].body,sent[1].body);
  done=true;assert.deepEqual(await replacement.advance(),{complete:true});assert.equal(storage.alarm,null);assert.equal(storage.values.size,0);
 });
 test('SQL queues ACK accepted records and retry leased tasks or lost coordinator wakeups',async()=>{
@@ -114,13 +120,13 @@ test('SQL discovery drains completed backlogs through durable alarms after evict
  const control=()=>new SQLControl({storage},env,()=>{throw Error('unexpected kernel call');},{now:()=>now});
  await control().recover();
  let turns=1;
- while(storage.alarm!==null){now=storage.alarm;await control().alarm();assert.ok(++turns<100);}
+ while(storage.alarm!==null){now=storage.alarm;await storage.fire(control());assert.ok(++turns<100);}
  assert.equal(turns,63);assert.equal(kicks.length,1);assert.ok(now<initial+60000);
  assert.equal(await storage.get('cursor'),undefined);
  // A failed listing retains a durable retry even with no cron invocation.
  const list=bucket.list.bind(bucket);bucket.list=async()=>{throw Error('transient list failure');};
  await assert.rejects(control().recover(),/transient list failure/);assert.ok(storage.alarm);
- bucket.list=list;now=storage.alarm;await control().alarm();assert.equal(await storage.get('cursor'),undefined);
+ bucket.list=list;now=storage.alarm;await storage.fire(control());assert.equal(await storage.get('cursor'),undefined);
  assert.equal((await bucket.list({prefix:'state/sql-query-expiry/'})).objects.length,1);
  assert.equal(kicks.length,2);
 });
@@ -135,7 +141,7 @@ test('SQL notifications retain earliest alarm across sustained traffic and evict
  assert.equal(storage.alarm,1000);
  for(let i=0;i<64;i++){
   now+=500;
-  if(storage.alarm!==null&&storage.alarm<=now)await control.alarm();
+  if(storage.alarm!==null&&storage.alarm<=now)await storage.fire(control);
   control=new SQLControl({storage},env,run,{now:()=>now});
   await control.kick(locator);
  }
@@ -149,7 +155,52 @@ test('SQL alarms rearm during a long turn without starting overlapping turns',as
  const pending=control.advance(locator);
  while(!release)await new Promise(resolve=>setImmediate(resolve));
  now=storage.alarm;
- await control.alarm();
+ await storage.fire(control);
  assert.equal(turns,1);assert.equal(storage.alarm,now+1000);
  release();await pending;
+});
+
+test('SQL alarm failures preserve durable recovery and platform retries before state reads',async()=>{
+ for(const failure of ['getAlarm','setAlarm','get','deleteAll']){
+  const storage=new Storage();let now=100,turns=0;
+  const control=new SQLControl({storage},{SQL_TASKS:{async sendBatch(){}}},async()=>{turns++;return{complete:true,tickets:[]};},{now:()=>now});
+  await control.kick(locator);
+  const original=storage[failure].bind(storage);let fail=true;
+  storage[failure]=async(...args)=>{if(fail){fail=false;throw Error('transient storage failure');}return original(...args);};
+  now=storage.alarm;
+  await assert.rejects(storage.fire(control),/transient storage failure/);
+  assert.equal(storage.retrySuppressed,false);assert.ok(storage.alarm>now);assert.equal(turns,failure==='deleteAll'?1:0);
+  now=storage.alarm;await storage.fire(new SQLControl({storage},control.env,control.run,{now:()=>now}));
+  assert.equal(turns,failure==='deleteAll'?2:1);assert.equal(storage.alarm,null);
+ }
+ const empty=new Storage(),control=new SQLControl({storage:empty},{},()=>{throw Error('unexpected turn');});
+ await empty.fire(control);assert.equal(empty.alarm,null);
+});
+
+test('SQL discovery validates compact records and overlaps bounded reads without loading plans',async()=>{
+ const storage=new Storage(),bucket=new Bucket(),kicks=[];let active=0,maximum=0,planReads=0;
+ const config={state:{bucket:'execution',prefix:'state'},exchange:{bucket:'execution',prefix:'exchange'},artifacts:{bucket:'execution',prefix:'artifacts'},source_buckets:['execution']};
+ const env={SQL_CONFIG:JSON.stringify(config),SQL_BUCKET_BINDINGS:JSON.stringify({execution:'R2'}),R2:bucket,SQL_TASKS:{},SQL_COORDINATORS:{getByName(name){return{async kick(value){kicks.push({name,value});}};}}};
+ const get=bucket.get.bind(bucket);
+ bucket.get=async(...args)=>{
+  if(args[0].endsWith('/plan.json')){planReads++;throw Error('plan unavailable');}
+  active++;maximum=Math.max(maximum,active);
+  try{await new Promise(resolve=>setImmediate(resolve));return await get(...args);}finally{active--;}
+ };
+ for(let i=0;i<16;i++){
+  const expires_ms=1000000+i,id=createHash('sha256').update(String(i)).digest('hex'),stamp=String(expires_ms).padStart(20,'0');
+  await bucket.put(`state/sql-query-expiry/${stamp}/${id}.json`,'{}');
+  const record={version:2,plan:id,expires_ms,status:i<8?'pending':'running',tenant:i%2?locator.tenant:'a'.repeat(64)};
+  // Malformed scoped records must not silently fall back to a different plan.
+  if(i===12)record.plan='b'.repeat(64);
+  if(i===13)record.expires_ms++;
+  if(i===14)record.tenant='bad';
+  if(i===15)record.status='invalid';
+  await bucket.put(`state/sql-execution-v2/${stamp}/${id}/query.json`,JSON.stringify(record));
+ }
+ const control=new SQLControl({storage},env,()=>{throw Error('unexpected kernel');},{now:()=>100});
+ assert.deepEqual(await control.recover(),{recovered:12});
+ assert.deepEqual(await control.recover(),{recovered:12});
+ assert.equal(kicks.length,24);assert.equal(planReads,0);assert.equal(maximum,4);assert.equal(active,0);
+ for(const kick of kicks)assert.equal(kick.name,locatorName(kick.value));
 });

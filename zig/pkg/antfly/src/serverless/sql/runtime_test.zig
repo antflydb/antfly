@@ -388,7 +388,7 @@ test "distributed SQL signed task RPC uses query listeners and recovery driver w
     var executor = @import("../../raft/transport/mod.zig").StdHttpExecutor.init(a, .{});
     defer executor.deinit();
     var routing: transport.Routing = .{};
-    var client: transport.Client = .{ .routing = &routing, .a = a, .executor = executor.executor(), .authentication = authentication, .workers = &.{ listener_a.base_uri, listener_b.base_uri } };
+    var client: transport.Client = .{ .io = std.testing.io, .routing = &routing, .a = a, .executor = executor.executor(), .authentication = authentication, .workers = &.{ listener_a.base_uri, listener_b.base_uri } };
     var unsigned = try server_a.handle(.{ .method = .POST, .uri = transport.task_path, .body = "{}" });
     defer unsigned.deinit(a);
     try std.testing.expectEqual(@as(u16, 401), unsigned.status);
@@ -1963,22 +1963,26 @@ test "distributed SQL control failover distinguishes worker failures from termin
     const query: transport.QueryRequest = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1000000 } };
     const context: Context = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 60 * std.time.ns_per_s };
     for ([_]u16{ 504, 503 }) |status| {
+        routing = .{};
         fake = .{ .status = status };
         try std.testing.expect(!try client.turn(query, context));
         try std.testing.expectEqual(@as(usize, 2), fake.calls);
     }
     for ([_]anyerror{ error.Canceled, error.Cancelled, error.DeadlineExceeded, error.Timeout }) |err| {
+        routing = .{};
         fake = .{ .failure = err };
         try std.testing.expect(!try client.turn(query, context));
         try std.testing.expectEqual(@as(usize, 2), fake.calls);
     }
     const Case = struct { status: u16, failure: anyerror };
     for ([_]Case{ .{ .status = 408, .failure = error.Canceled }, .{ .status = 409, .failure = error.SqlExecutionFailed }, .{ .status = 410, .failure = error.SqlQueryExpired }, .{ .status = 403, .failure = error.SqlExecutionUnauthorized }, .{ .status = 422, .failure = error.SqlJoinBudgetExceeded } }) |case| {
+        routing = .{};
         fake = .{ .status = case.status };
         try std.testing.expectError(case.failure, client.turn(query, context));
         try std.testing.expectEqual(@as(usize, 1), fake.calls);
     }
     for ([_]anyerror{ error.DeadlineExceeded, error.Timeout, error.Canceled }) |err| {
+        routing = .{};
         fake = .{ .failure = err, .always = true };
         try std.testing.expectError(error.SqlWorkerUnavailable, client.turn(query, context));
     }

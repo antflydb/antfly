@@ -163,3 +163,11 @@ Hosted regressions cover 320-fragment ordinary shuffle and broadcast builds
 under the 900-operation cap, plus 9,000 retained WAL changes, including a large
 individual row, applied over a 16,384-row pinned Parquet snapshot with an 8 MiB
 task memory ceiling.
+
+Coordinator alarms arm recovery before durable-state reads. The firing alarm is
+consumed by the runtime; handlers preserve automatic retry registration rather
+than deleting it on entry. Empty and terminal coordinators explicitly retire
+future alarms. Discovery reads at most four queries concurrently from each
+16-query page and validates compact v2 record identity, expiry, status and tenant
+before waking a coordinator. Only legacy unscoped records require downloading
+and authenticating the full immutable plan.

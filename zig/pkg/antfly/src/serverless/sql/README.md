@@ -345,3 +345,11 @@ the sidecar before a claim, renewal or checkpoint removes the inline field.
 Cancellation and terminal writes skip migration, preserving their availability
 when admission storage is unavailable. New extensions
 must use versioned metadata rather than adding fields to mutable v2 records.
+
+Control RPCs share task delivery's process-owned endpoint quarantine and recovery
+probes. A failed first control peer is skipped on subsequent polls; a cooldown
+admits one authenticated metadata probe before restoring the ordinary operation
+budget. A new submission probes its expected query identity, treating absence as
+a healthy response. Application failures, caller cancellation and local resource
+pressure do not quarantine reachable workers. One bounded cooldown round (at
+most one second) preserves response-loss replay when no healthy peer remains.

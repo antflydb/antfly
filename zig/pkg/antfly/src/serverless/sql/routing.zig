@@ -52,6 +52,13 @@ pub const Routing = struct {
         entry.until_ns = now +| @as(u64, self.probe_ms) * std.time.ns_per_ms;
         return .{ .kind = .probe, .generation = entry.generation };
     }
+    pub fn readyIn(self: *Routing, url: []const u8, now: u64) u64 {
+        const key = hash(url);
+        self.lock();
+        defer self.mutex.unlock();
+        const entry = self.find(key) orelse return 0;
+        return if (entry.failures == 0) 0 else entry.until_ns -| now;
+    }
     pub fn success(self: *Routing, url: []const u8) void {
         const key = hash(url);
         self.lock();
