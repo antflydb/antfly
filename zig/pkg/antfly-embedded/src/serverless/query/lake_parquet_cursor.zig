@@ -758,12 +758,12 @@ pub const Cursor = struct {
         return @as(usize, fetched.parsed.header.uncompressed_page_size) *| 2 +|
             @as(usize, fetched.parsed.header.value_count) *| 32 +| 64 * 1024;
     }
-    fn submitDecode(self: *Cursor, io: std.Io, changed: *std.Io.Event, column: *Column, fetched: Fetched) ?Scheduler.Task(anyerror!DecodedStep) {
+    fn submitDecode(self: *Cursor, io: std.Io, changed: *Scheduler.Completion, column: *Column, fetched: Fetched) ?Scheduler.Task(anyerror!DecodedStep) {
         const scheduler = self.scheduler orelse Scheduler.global();
         if (self.speculative) return scheduler.submitNotifiedWithIoReserve(io, decodeWorkspace(fetched), changed, decodeWorker, .{ self.*, column, fetched });
         return scheduler.submitNotified(io, decodeWorkspace(fetched), changed, decodeWorker, .{ self.*, column, fetched });
     }
-    fn queueDecode(self: *Cursor, io: std.Io, changed: *std.Io.Event, slot: *?Pending, column: *Column, fetched: Fetched) !bool {
+    fn queueDecode(self: *Cursor, io: std.Io, changed: *Scheduler.Completion, slot: *?Pending, column: *Column, fetched: Fetched) !bool {
         if (self.submitDecode(io, changed, column, fetched)) |task| {
             slot.* = .{ .decode = .{ .task = task, .input = fetched } };
             return false;
@@ -837,7 +837,7 @@ pub const Cursor = struct {
         }
         var pending: [4]?Pending = @splat(null);
         var columns: [4]?*Column = @splat(null);
-        var changed: std.Io.Event = .unset;
+        var changed: Scheduler.Completion = .{};
         // Cancel and join before releasing any request metadata. A finished
         // but unjoined fetch still owns its input credit and must be drained.
         defer for (&pending) |*slot| if (slot.*) |*task| {
@@ -859,7 +859,8 @@ pub const Cursor = struct {
         };
         var next_column: usize = 0;
         while (true) {
-            changed.reset();
+            if (self.shared_reader) |reader| try reader.context.ensureActive();
+            const observed = changed.observe();
             var active_count: usize = 0;
             var progressed = false;
             for (&pending, &columns) |*slot, *column_slot| {
@@ -989,7 +990,7 @@ pub const Cursor = struct {
                 }
                 break;
             }
-            if (!progressed) try changed.wait(io.?);
+            if (!progressed) try changed.waitChecked(io.?, observed, self.shared_reader.?.context);
         }
         for (self.columns) |*column| if (!required_only or column.required) {
             column.consumed = @intCast(self.position - column.first);

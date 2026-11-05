@@ -138,7 +138,10 @@ pub const ObjectStore = struct {
     }
 
     pub fn initWithClient(alloc: std.mem.Allocator, client: objectstore.Client, bucket: []const u8, prefix: []const u8) !ObjectStore {
+        // Borrow provider state, while retaining results under this store's
+        // owner. The provider's construction allocator remains untouched.
         var owned_client = client;
+        owned_client.allocator = alloc;
         if (!(try owned_client.bucketExists(bucket))) try owned_client.makeBucket(bucket);
         return .{
             .alloc = alloc,
@@ -443,7 +446,12 @@ pub const ObjectStore = struct {
         const key = try logKeyAlloc(alloc, self.prefix, namespace);
         defer alloc.free(key);
 
-        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true }) catch |err| switch (err) {
+        // The facade may borrow a per-operation quota. Provider responses and
+        // decoded records must share that owner without mutating the client
+        // used by concurrent readers and appenders.
+        var client = self.client;
+        client.allocator = alloc;
+        var result = client.getObject(self.bucket, key, .{ .skip_metadata_probe = true }) catch |err| switch (err) {
             error.FileNotFound => return try alloc.alloc(wal_types.Record, 0),
             else => return err,
         };
@@ -526,7 +534,9 @@ pub const ObjectStore = struct {
     };
 
     fn tryReadLog(self: *ObjectStore, alloc: std.mem.Allocator, key: []const u8) !?CurrentLog {
-        var result = self.client.getObject(self.bucket, key, .{ .skip_metadata_probe = true }) catch |err| switch (err) {
+        var client = self.client;
+        client.allocator = alloc;
+        var result = client.getObject(self.bucket, key, .{ .skip_metadata_probe = true }) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
@@ -1023,4 +1033,46 @@ test "serverless multiprovider concurrent layout selection cannot create a shado
     try std.testing.expect(race.activated);
     try std.testing.expectError(error.FileNotFound, backing.getObject("db", "race/docs/wal.log", .{}));
     try std.testing.expectEqual(@as(u64, 0), try indexed.latestLsn("docs"));
+}
+
+test "serverless object WAL whole-log reads honor their result allocator" {
+    const a = std.testing.allocator;
+    var memory = objectstore.MemoryClient.init(a);
+    defer memory.deinit();
+    const Quota = @import("antfly_platform").allocator.reclamation.Quota;
+    var owner = Quota.init(a, 2 * 1024 * 1024);
+    defer owner.deinit();
+    var store = try ObjectStore.initWithClient(owner.allocator(), memory.client(), "archive", "events");
+    defer store.deinit();
+    const payload: [4096]u8 = @splat('x');
+    _ = try store.append("docs", 1, &payload);
+    var quota = Quota.init(a, 64 * 1024);
+    defer quota.deinit();
+    const result_alloc = quota.allocator();
+    var borrowed = store.walStore();
+    borrowed.allocator = result_alloc;
+    {
+        const records = try borrowed.readFromAlloc("docs", 1);
+        defer wal_types.freeRecords(result_alloc, records);
+        try std.testing.expectEqual(@as(usize, 1), records.len);
+        try std.testing.expectEqualStrings(&payload, records[0].payload);
+    }
+    try std.testing.expectEqual(@as(usize, 0), quota.live_bytes);
+    {
+        const log = (try store.tryReadLog(result_alloc, "events/docs/wal.log")).?;
+        defer result_alloc.free(log.body);
+        defer if (log.revision) |revision| freeRevision(result_alloc, revision);
+        try std.testing.expectEqual(@as(u64, 1), try lastLsn(log.body));
+    }
+    try std.testing.expectEqual(@as(usize, 0), quota.live_bytes);
+    try std.testing.expectEqual(owner.allocator().ptr, store.client.allocator.ptr);
+    try std.testing.expectEqual(owner.allocator().vtable, store.client.allocator.vtable);
+    // The provider body itself must be admitted before decoding, rather than
+    // allocating it outside the caller's quota and accounting only the rows.
+    var small = Quota.init(a, 128);
+    defer small.deinit();
+    borrowed.allocator = small.allocator();
+    try std.testing.expectError(error.OutOfMemory, borrowed.readFromAlloc("docs", 1));
+    try std.testing.expectError(error.OutOfMemory, store.tryReadLog(small.allocator(), "events/docs/wal.log"));
+    try std.testing.expectEqual(@as(usize, 0), small.live_bytes);
 }

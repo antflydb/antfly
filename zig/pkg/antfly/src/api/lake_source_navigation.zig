@@ -295,7 +295,7 @@ fn key(bytes: []const u8) [32]u8 {
     return result;
 }
 pub fn load(a: A, store: stores.ArtifactStore, ref: Ref, token: Token, cached: ?artifacts.CachedRead) !Root {
-    if (ref.kind != .doc_values or (ref.metadata_version != 1 and ref.metadata_version != 2 and ref.metadata_version != 3 and ref.metadata_version != 4) or ref.byte_len > 64 * 1024) return error.InvalidNativeLakeFileState;
+    if (ref.kind != .doc_values or (ref.metadata_version != 2 and ref.metadata_version != 3 and ref.metadata_version != 4) or ref.byte_len > 64 * 1024) return error.InvalidNativeLakeFileState;
     const bytes = try artifacts.readArtifact(a, store, .{ .artifact_id = ref.artifact_id, .checksum = ref.checksum, .byte_len = ref.byte_len }, token, cached);
     defer a.free(bytes);
     const root = try std.json.parseFromSliceLeaky(Root, a, bytes, .{ .allocate = .alloc_always });
@@ -306,7 +306,7 @@ pub fn load(a: A, store: stores.ArtifactStore, ref: Ref, token: Token, cached: ?
         try proof.versions.validate();
         if (proof.count == 0 or proof.versions.records != proof.count or root.coverage == null or !std.mem.eql(u8, &proof.data, &root.coverage.?.data)) return error.InvalidNativeLakeFileState;
     }
-    if (root.coverage) |proof| if (root.version < 2 or proof.version != 1) return error.InvalidNativeLakeFileState;
+    if (root.coverage) |proof| if (proof.version != 1) return error.InvalidNativeLakeFileState;
     for ([_]?tree.Ref{ root.files, root.public, root.private }) |r| {
         if ((r == null) != (root.count == 0)) return error.InvalidNativeLakeFileState;
         if (r) |value| {

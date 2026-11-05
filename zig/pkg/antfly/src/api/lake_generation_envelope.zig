@@ -14,7 +14,7 @@
 // limitations under the License.
 
 //! Opaque retained-cut envelopes bind the exact provider version without
-//! changing legacy content identities. Legacy filesystem tokens still decode.
+//! changing content identities. Filesystem tokens omit a provider version.
 const std = @import("std");
 const stores = @import("../serverless/artifacts/store.zig");
 const Token = @import("antfly_cancellation").CancellationToken;
@@ -72,7 +72,7 @@ pub fn read(store: *stores.ArtifactStore, envelope: Envelope, token: Token) ![]u
     }
     return store.getVerifiedAllocWithCancellation(envelope.id, envelope.bytes, try stores.sha256ChecksumFromArtifactId(envelope.id), token);
 }
-test "external lake global frontier retained envelopes preserve exact cloud selectors and legacy identities" {
+test "external lake global frontier retained envelopes preserve exact cloud selectors and filesystem identities" {
     const a = std.testing.allocator;
     const scope: stores.UploadScope = .{ .domain = @splat(1), .attempt = @splat(2) };
     const id = try scope.artifactId(&(@as([64]u8, @splat('a'))));
@@ -84,10 +84,10 @@ test "external lake global frontier retained envelopes preserve exact cloud sele
     try std.testing.expectEqualStrings(&id, envelope.id);
     try std.testing.expectEqualStrings("version/+one", envelope.generation.?);
     try std.testing.expectEqualStrings(&id, try artifactId("lake2:", token));
-    var legacy = metadata;
-    legacy.provider_version = null;
-    const old = try encode(a, "lake2:", legacy);
-    defer a.free(old);
-    try std.testing.expect((try decode(a, "lake2:", old, 42)).generation == null);
+    var filesystem = metadata;
+    filesystem.provider_version = null;
+    const unversioned = try encode(a, "lake2:", filesystem);
+    defer a.free(unversioned);
+    try std.testing.expect((try decode(a, "lake2:", unversioned, 42)).generation == null);
     try std.testing.expectError(error.InvalidQueryRequest, decode(a, "lake2:", token, 41));
 }

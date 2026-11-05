@@ -736,7 +736,7 @@ pub const Client = struct {
         return .{
             .allocator = self.alloc,
             .ptr = self,
-            .vtable = &vtable,
+            .vtable = if (self.owned_httpx != null or self.owned_context_httpx != null) &parallel_vtable else &vtable,
         };
     }
 
@@ -1417,6 +1417,11 @@ pub const Client = struct {
         return self.providerTime(alloc, bucket, token);
     }
 
+    const parallel_vtable: client_mod.Client.VTable = blk: {
+        var result = vtable;
+        result.supports_concurrent_requests = true;
+        break :blk result;
+    };
     const vtable: client_mod.Client.VTable = .{
         .supports_object_versions = supportsObjectVersions,
         .version_retention = erasedVersionRetention,
