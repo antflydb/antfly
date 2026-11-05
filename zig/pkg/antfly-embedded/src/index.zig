@@ -199,9 +199,10 @@ pub const SegmentShared = struct {
     // Compatibility routing is built once for an old immutable segment. It
     // shares the physical reader's accounting/lifetime, never a pathname or
     // reusable page number. Compact persisted tables use the same bounded
-    // immutable owner; larger tables retain their persisted seek path.
+    // immutable owner; larger tables use bounded immutable navigation pages.
     identity_lookup_mutex: std.atomic.Mutex = .unlocked,
     identity_lookup_entries: ?[]@import("document_identity_lookup.zig").Entry = null,
+    identity_lookup_pages: ?*@import("document_identity_lookup.zig").Paged = null,
     identity_lookup_decoded: ?@import("segment_source.zig").Decoded = null,
     identity_lookup_reads: u64 = 0,
     identity_lookup_reservation: ?resource_manager_mod.Reservation = null,
@@ -251,7 +252,8 @@ pub const SegmentShared = struct {
 
     /// Compact persisted routing is immutable navigation, independent of
     /// visibility bitmaps. Share it with the exact artifact owner across DB
-    /// reopenings; large tables and refused cache admissions keep bounded seeks.
+    /// reopenings; larger tables use paged navigation, and refused cache
+    /// admissions keep the bounded persisted seek path.
     fn cachedIdentityLookup(self: *SegmentShared, reader: *const SegmentReader, view: @import("segment_source.zig").View) !?[]const @import("document_identity_lookup.zig").Entry {
         if (self.physical_parent) |parent| return parent.shared.cachedIdentityLookup(&parent.reader, view);
         const source = reader.immutableSource();
@@ -259,6 +261,7 @@ pub const SegmentShared = struct {
         @import("antfly_platform").sync.lockYielding(&self.identity_lookup_mutex);
         defer self.identity_lookup_mutex.unlock();
         if (self.identity_lookup_entries) |entries| return entries;
+        if (self.identity_lookup_pages != null) return null;
         const lookup = @import("document_identity_lookup.zig");
         const Payload = struct { entries: []lookup.Entry };
         const Loader = struct {
@@ -282,6 +285,37 @@ pub const SegmentShared = struct {
         self.identity_lookup_decoded = held;
         self.identity_lookup_entries = payload.entries;
         return payload.entries;
+    }
+
+    fn cachedIdentityPages(self: *SegmentShared, reader: *const SegmentReader, view: @import("segment_source.zig").View) !?*@import("document_identity_lookup.zig").Paged {
+        if (self.physical_parent) |parent| return parent.shared.cachedIdentityPages(&parent.reader, view);
+        const source = reader.immutableSource();
+        if (source != .ranges or source.ranges.acquire_decoded == null) return null;
+        @import("antfly_platform").sync.lockYielding(&self.identity_lookup_mutex);
+        defer self.identity_lookup_mutex.unlock();
+        if (self.identity_lookup_pages) |pages| return pages;
+        const lookup = @import("document_identity_lookup.zig");
+        const Loader = struct {
+            view: @import("segment_source.zig").View,
+            count: u32,
+            fn decode(raw: *anyopaque, a: Allocator) !*const anyopaque {
+                const context: *@This() = @ptrCast(@alignCast(raw));
+                return try lookup.Paged.create(a, context.view, context.count);
+            }
+        };
+        var loader: Loader = .{ .view = view, .count = reader.doc_count };
+        var digest = std.crypto.hash.sha2.Sha256.init(.{});
+        digest.update("antfly paged document identity routing v1");
+        var count: [4]u8 = undefined;
+        std.mem.writeInt(u32, &count, reader.doc_count, .little);
+        digest.update(&count);
+        const held = (try source.acquireDecoded(.{ .offset = view.offset, .length = view.length, .interpretation = digest.finalResult(), .context = &loader, .decode = Loader.decode })) orelse return null;
+        // The representation cache synchronizes its fixed slots internally;
+        // their contents are immutable rows, independent of deletion visibility.
+        const pages: *lookup.Paged = @ptrCast(@alignCast(@constCast(held.value)));
+        self.identity_lookup_decoded = held;
+        self.identity_lookup_pages = pages;
+        return pages;
     }
 
     fn legacyIdentityLookup(self: *SegmentShared, reader: *const SegmentReader) ![]const @import("document_identity_lookup.zig").Entry {
@@ -358,6 +392,7 @@ pub const SegmentShared = struct {
             held.release();
         } else if (self.identity_lookup_entries) |entries| self.allocator.free(entries);
         self.identity_lookup_entries = null;
+        self.identity_lookup_pages = null;
         if (self.identity_lookup_reservation) |*owned| owned.release();
         self.identity_lookup_reservation = null;
     }
@@ -370,6 +405,7 @@ pub const SegmentShared = struct {
         defer self.identity_lookup_mutex.unlock();
         var bytes: u64 = @sizeOf(SegmentShared) + self.typed_doc_values_coverage.len * @sizeOf(TypedDocValuesFieldCoverage);
         if (self.identity_lookup_entries) |entries| bytes +|= entries.len * @sizeOf(@import("document_identity_lookup.zig").Entry);
+        if (self.identity_lookup_pages != null) bytes +|= @sizeOf(@import("document_identity_lookup.zig").Paged);
         if (self.deleted) |*deleted| bytes +|= deleted.retainedBytes();
         for (self.typed_doc_values_coverage) |*field| {
             bytes +|= field.field.len;
@@ -3784,18 +3820,22 @@ pub const IndexWriter = struct {
                 defer identities.deinit();
                 const lookup = @import("document_identity_lookup.zig");
                 var view = try seg.reader.documentIdentityLookup();
+                var pages: ?*lookup.Paged = null;
                 const legacy = if (view) |persisted| rows: {
-                    const cached = try seg.shared.cachedIdentityLookup(&seg.reader, persisted) orelse break :rows &.{};
+                    const cached = try seg.shared.cachedIdentityLookup(&seg.reader, persisted) orelse {
+                        pages = try seg.shared.cachedIdentityPages(&seg.reader, persisted);
+                        break :rows &.{};
+                    };
                     view = null;
                     break :rows cached;
                 } else try seg.shared.legacyIdentityLookup(&seg.reader);
                 var keys = wanted.keyIterator();
                 while (keys.next()) |key| {
                     const hash = lookup.hash(key.*);
-                    var cursor: usize = if (view) |data| try lookup.seek(data, seg.reader.doc_count, hash) else lookup.lowerBound(legacy, hash);
+                    var cursor: usize = if (view) |data| if (pages) |cached| try cached.seek(data, hash) else try lookup.seek(data, seg.reader.doc_count, hash) else lookup.lowerBound(legacy, hash);
                     const count = if (view != null) seg.reader.doc_count else legacy.len;
                     while (cursor < count) : (cursor += 1) {
-                        const entry = if (view) |data| try lookup.readEntry(data, @intCast(cursor), seg.reader.doc_count) else legacy[cursor];
+                        const entry = if (view) |data| if (pages) |cached| try cached.readEntry(data, @intCast(cursor)) else try lookup.readEntry(data, @intCast(cursor), seg.reader.doc_count) else legacy[cursor];
                         if (entry.hash != hash) break;
                         if (seg.shared.deleted) |d| if (d.contains(entry.doc)) continue;
                         // Hash collisions are harmless only when the exact
@@ -3870,18 +3910,22 @@ pub const IndexWriter = struct {
                 defer identities.deinit();
                 const lookup = @import("document_identity_lookup.zig");
                 var view = try seg.reader.documentIdentityLookup();
+                var pages: ?*lookup.Paged = null;
                 const legacy = if (view) |persisted| rows: {
-                    const cached = try seg.shared.cachedIdentityLookup(&seg.reader, persisted) orelse break :rows &.{};
+                    const cached = try seg.shared.cachedIdentityLookup(&seg.reader, persisted) orelse {
+                        pages = try seg.shared.cachedIdentityPages(&seg.reader, persisted);
+                        break :rows &.{};
+                    };
                     view = null;
                     break :rows cached;
                 } else try seg.shared.legacyIdentityLookup(&seg.reader);
                 var keys = wanted.keyIterator();
                 while (keys.next()) |key| {
                     const hash = lookup.hash(key.*);
-                    var cursor: usize = if (view) |data| try lookup.seek(data, seg.reader.doc_count, hash) else lookup.lowerBound(legacy, hash);
+                    var cursor: usize = if (view) |data| if (pages) |cached| try cached.seek(data, hash) else try lookup.seek(data, seg.reader.doc_count, hash) else lookup.lowerBound(legacy, hash);
                     const count = if (view != null) seg.reader.doc_count else legacy.len;
                     while (cursor < count) : (cursor += 1) {
-                        const entry = if (view) |data| try lookup.readEntry(data, @intCast(cursor), seg.reader.doc_count) else legacy[cursor];
+                        const entry = if (view) |data| if (pages) |cached| try cached.readEntry(data, @intCast(cursor)) else try lookup.readEntry(data, @intCast(cursor), seg.reader.doc_count) else legacy[cursor];
                         if (entry.hash != hash) break;
                         if (seg.shared.deleted) |d| if (d.contains(entry.doc)) continue;
                         // Hash collisions are harmless only when the exact
@@ -4152,6 +4196,165 @@ test "identity lookup source ownership reuses persisted routing across independe
         }
         try std.testing.expectEqual(@as(u32, 1), writer.snapshot().liveDocCount());
     }
+}
+
+test "identity lookup large persisted navigation stays bounded and survives runtime replacement" {
+    const source_module = @import("segment_source.zig");
+    const a = std.testing.allocator;
+    var builder = segment_mod.SegmentWriter.init(a);
+    defer builder.deinit();
+    const documents = 32768;
+    for (0..documents) |i| {
+        var buffer: [32]u8 = undefined;
+        try builder.addStoredDoc(try std.fmt.bufPrint(&buffer, "large-{d}", .{i}), "{}");
+    }
+    const bytes = try builder.build();
+    defer a.free(bytes);
+    const State = struct {
+        bytes: []const u8,
+        read_calls: usize = 0,
+        read_bytes: usize = 0,
+        allow_cache: bool = true,
+        cache: *source_module.ImmutableDecodeCache,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.read_calls += 1;
+            self.read_bytes += out.len;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn close(_: *anyopaque) void {}
+        fn release(raw: *anyopaque, item: *anyopaque) void {
+            (source_module.ImmutableDecodeCache.Lease{ .cache = @ptrCast(@alignCast(raw)), .entry = @ptrCast(@alignCast(item)) }).release();
+        }
+        fn acquire(raw: *anyopaque, request: source_module.DecodeRequest) !?source_module.Decoded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.allow_cache) return null;
+            const held = (try self.cache.acquire(request)) orelse return null;
+            return .{ .owner = self.cache, .item = held.entry, .value = held.entry.value.?, .release_fn = release };
+        }
+        fn source(self: *@This()) SegmentSource {
+            return .{ .ranges = .{ .ptr = self, .length = self.bytes.len, .read_into = read, .close = close, .acquire_decoded = acquire } };
+        }
+    };
+    const cache = try source_module.ImmutableDecodeCache.create(a, null, 1024 * 1024);
+    defer cache.deinit();
+    var state: State = .{ .bytes = bytes, .cache = cache };
+    var original: *@import("document_identity_lookup.zig").Paged = undefined;
+    for (0..3) |turn| {
+        state.allow_cache = turn != 2;
+        var writer = try IndexWriter.init(a);
+        defer writer.deinit();
+        try writer.addSegmentWithIdData(1, .fromNative(state.source()));
+        const entry = &writer.snapshot().segments[0];
+        const before_calls = state.read_calls;
+        const before_bytes = state.read_bytes;
+        const changes = try writer.prepareDeleteInfos(a, &.{"absent-large-identity"});
+        defer IndexWriter.freeDeleteInfos(a, changes);
+        try std.testing.expectEqual(@as(usize, 0), changes.len);
+        try std.testing.expect(entry.shared.identity_lookup_entries == null);
+        if (turn == 2) {
+            try std.testing.expect(entry.shared.identity_lookup_pages == null);
+        } else {
+            try std.testing.expect(entry.shared.identity_lookup_pages != null);
+            if (turn == 0) {
+                original = entry.shared.identity_lookup_pages.?;
+                try std.testing.expect(state.read_bytes - before_bytes < 64 * 1024);
+            } else {
+                try std.testing.expectEqual(original, entry.shared.identity_lookup_pages.?);
+                try std.testing.expectEqual(before_calls, state.read_calls);
+            }
+            const warm = state.read_calls;
+            const again = try writer.prepareDeleteInfos(a, &.{"absent-large-identity"});
+            defer IndexWriter.freeDeleteInfos(a, again);
+            try std.testing.expectEqual(@as(usize, 0), again.len);
+            try std.testing.expectEqual(warm, state.read_calls);
+        }
+        // Each independent visibility owner still sees and removes its own row.
+        try std.testing.expectEqual(@as(u32, documents), writer.snapshot().liveDocCount());
+        try std.testing.expect(try writer.deleteById("large-7"));
+        try std.testing.expectEqual(@as(u32, documents - 1), writer.snapshot().liveDocCount());
+    }
+}
+
+test "identity lookup paged navigation validates misses and checks warm read authority" {
+    const a = std.testing.allocator;
+    const lookup = @import("document_identity_lookup.zig");
+    const source_module = @import("segment_source.zig");
+    var bytes: std.ArrayList(u8) = .empty;
+    defer bytes.deinit(a);
+    const Sink = struct {
+        bytes: *std.ArrayList(u8),
+        pub fn appendSlice(self: @This(), data: []const u8) !void {
+            try self.bytes.appendSlice(std.testing.allocator, data);
+        }
+    };
+    const sink: Sink = .{ .bytes = &bytes };
+    const documents = 65536;
+    try lookup.writeHeader(sink, documents);
+    for (0..documents) |i| try lookup.writeEntry(sink, .{ .hash = i * 2, .doc = @intCast(i) });
+    const State = struct {
+        bytes: []const u8,
+        calls: usize = 0,
+        canceled: bool = false,
+        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
+        }
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.canceled) return error.Canceled;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var state: State = .{ .bytes = bytes.items };
+    const view = try source_module.View.init(.{ .ranges = .{ .ptr = &state, .length = bytes.items.len, .read_into = State.read, .close = State.close, .check_read_context = State.check } }, 0, bytes.items.len);
+    const pages = try lookup.Paged.create(a, view, documents);
+    defer a.destroy(pages);
+    const ordinal: u32 = 32123;
+    try std.testing.expectEqual(ordinal + 1, try pages.seek(view, ordinal * 2 + 1));
+    try std.testing.expect(state.calls < 20);
+    const warm = state.calls;
+    for (0..100) |_| try std.testing.expectEqual(ordinal + 1, try pages.seek(view, ordinal * 2 + 1));
+    try std.testing.expectEqual(warm, state.calls);
+    state.canceled = true;
+    try std.testing.expectError(error.Canceled, pages.seek(view, ordinal * 2));
+    try std.testing.expectError(error.Canceled, pages.readEntry(view, ordinal));
+    try std.testing.expectEqual(warm, state.calls);
+    state.canceled = false;
+    // A corrupt uncached page must never become a warm success. A failed
+    // decode leaves the previous slot intact and can be loaded after repair.
+    std.mem.writeInt(u32, bytes.items[lookup.header_size + 8 ..][0..4], documents, .little);
+    try std.testing.expectError(error.InvalidSegment, pages.readEntry(view, 0));
+    try std.testing.expectError(error.InvalidSegment, pages.readEntry(view, 0));
+    std.mem.writeInt(u32, bytes.items[lookup.header_size + 8 ..][0..4], 0, .little);
+    try std.testing.expectEqual(@as(u64, 0), (try pages.readEntry(view, 0)).hash);
+    try std.testing.expectError(error.InvalidSegment, pages.readEntry(view, documents));
+    const Worker = struct {
+        pages: *lookup.Paged,
+        view: source_module.View,
+        first: usize,
+        failed: *std.atomic.Value(bool),
+        fn run(self: @This()) void {
+            for (0..1024) |i| {
+                const ordinal_value: u32 = @intCast((i * 257 + self.first) % documents);
+                const actual = self.pages.seek(self.view, @as(u64, ordinal_value) * 2 + 1) catch {
+                    self.failed.store(true, .release);
+                    return;
+                };
+                if (actual != ordinal_value + 1) self.failed.store(true, .release);
+            }
+        }
+    };
+    var failed = std.atomic.Value(bool).init(false);
+    const first = try std.Thread.spawn(.{}, Worker.run, .{Worker{ .pages = pages, .view = view, .first = 0, .failed = &failed }});
+    const second = std.Thread.spawn(.{}, Worker.run, .{Worker{ .pages = pages, .view = view, .first = 127, .failed = &failed }}) catch |err| {
+        first.join();
+        return err;
+    };
+    first.join();
+    second.join();
+    try std.testing.expect(!failed.load(.acquire));
 }
 
 test "identity lookup compact decoding bounds reads and rejects malformed routing" {
