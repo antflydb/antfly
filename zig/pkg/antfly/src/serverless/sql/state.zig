@@ -33,6 +33,14 @@ pub const Query = struct {
         if (self.expires_ms == 0) return error.InvalidSqlExecutionState;
     }
 };
+pub const max_task_attempts: u16 = 16;
+/// Immutable extension metadata; mutable v2 records retain their frozen schema.
+pub const Admission = struct {
+    version: u8 = 1,
+    tenant: Digest,
+    query: Query,
+    task_attempt_limit: u16,
+};
 pub const Witness = struct {
     key: []const u8,
     hash: Digest,
@@ -68,8 +76,8 @@ pub const Status = enum { pending, running, succeeded, failed, cancelled };
 pub const Record = struct {
     /// Absent only on pre-scope records; services validate their immutable plan.
     tenant: ?Digest = null,
-    /// Query admission authority available even when immutable metadata is unavailable.
-    /// Legacy records retain the global retry cap until their plan is readable.
+    /// Read-only compatibility with the short-lived inline admission format.
+    /// Writers preserve the original v2 wire schema for rolling upgrades.
     task_attempt_limit: ?u16 = null,
     version: u8 = 2,
     plan: Digest,
@@ -92,6 +100,16 @@ pub const Record = struct {
     cancel_requested: bool = false,
     output: ?Output = null,
     failure: ?[]const u8 = null,
+    pub fn jsonStringify(self: Record, jw: anytype) !void {
+        try jw.beginObject();
+        inline for (@typeInfo(Record).@"struct".field_names) |field| {
+            if (comptime !std.mem.eql(u8, field, "task_attempt_limit")) {
+                try jw.objectField(field);
+                try jw.write(@field(self, field));
+            }
+        }
+        try jw.endObject();
+    }
     pub fn terminal(self: Record) bool {
         return self.status == .succeeded or self.status == .failed or self.status == .cancelled;
     }
@@ -117,6 +135,29 @@ pub const Store = struct {
         try query.validate();
         if (stage) |s| return std.fmt.allocPrint(a, "{s}/sql-execution-v2/{d:0>20}/{s}/stage/{d}/task/{d}.json", .{ self.prefix, query.expires_ms, query.id, s, task });
         return std.fmt.allocPrint(a, "{s}/sql-execution-v2/{d:0>20}/{s}/query.json", .{ self.prefix, query.expires_ms, query.id });
+    }
+    pub fn admissionKey(self: Store, a: A, query: Query) ![]const u8 {
+        try query.validate();
+        return std.fmt.allocPrint(a, "{s}/sql-execution-v2/{d:0>20}/{s}/admission-v1.json", .{ self.prefix, query.expires_ms, query.id });
+    }
+    pub fn publishAdmission(self: Store, a: A, query: Query, limit: u16) !void {
+        if (limit == 0 or limit > max_task_attempts) return error.InvalidSqlExecutionState;
+        try self.context.ensureActive();
+        const path = try self.admissionKey(a, query);
+        defer a.free(path);
+        const bytes = try std.json.Stringify.valueAlloc(a, Admission{ .tenant = self.tenant orelse return error.SqlExecutionUnauthorized, .query = query, .task_attempt_limit = limit }, .{});
+        defer a.free(bytes);
+        var client = self.client;
+        client.allocator = a;
+        const cancellation = catalog.types.contextCancellation(&self.context);
+        var accepted = client.putObject(self.bucket, path, bytes, .{ .if_none_match = true, .cancellation = cancellation }) catch |err| {
+            // Resolve both duplicate publication and an accepted PUT's lost ACK.
+            var previous = client.getObject(self.bucket, path, .{ .skip_metadata_probe = true, .max_response_bytes = 1024, .cancellation = cancellation }) catch return err;
+            defer previous.deinit(a);
+            if (!std.mem.eql(u8, previous.body, bytes)) return error.SqlExecutionIdReused;
+            return;
+        };
+        accepted.deinit(a);
     }
     pub fn load(self: Store, a: A, path: []const u8) !?Loaded {
         try self.context.ensureActive();
@@ -262,7 +303,7 @@ pub const Store = struct {
         return true;
     }
     fn validateRecord(self: Store, value: Record) !void {
-        if (value.task_attempt_limit) |limit| if (limit == 0 or limit > 16) return error.InvalidSqlExecutionState;
+        if (value.task_attempt_limit) |limit| if (limit == 0 or limit > max_task_attempts) return error.InvalidSqlExecutionState;
         if (value.pending_after) |after| if (value.pending.len == 0 or after >= value.cursor) return error.InvalidSqlExecutionState;
         if (self.tenant) |scope| if (value.tenant) |admitted| {
             if (!std.meta.eql(scope, admitted)) return error.SqlExecutionUnauthorized;
@@ -271,6 +312,16 @@ pub const Store = struct {
     }
     fn write(self: Store, a: A, path: []const u8, before: ?Loaded, value: Record) !void {
         try self.context.ensureActive();
+        if (value.task_attempt_limit) |limit| {
+            // Live mutations preserve authority before dropping the inline
+            // field. Cancellation/terminal writes need no retry authority and
+            // must remain available during an admission-storage outage.
+            if (!value.cancel_requested and !value.terminal()) {
+                var scoped = self;
+                scoped.tenant = value.tenant orelse self.tenant;
+                try scoped.publishAdmission(a, .{ .id = value.plan, .expires_ms = value.expires_ms }, limit);
+            }
+        }
         const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
         defer a.free(bytes);
         if (bytes.len > 16384) return error.InvalidSqlExecutionState;
@@ -283,11 +334,8 @@ pub const Store = struct {
         _ = try self.ensure(a, path, plan, expires_ms);
     }
     pub fn ensure(self: Store, a: A, path: []const u8, plan: Digest, expires_ms: u64) !bool {
-        return self.ensureQuery(a, path, plan, expires_ms, null);
-    }
-    pub fn ensureQuery(self: Store, a: A, path: []const u8, plan: Digest, expires_ms: u64, limit: ?u16) !bool {
         if (expires_ms <= self.now_ms) return error.SqlQueryExpired;
-        self.write(a, path, null, .{ .plan = plan, .expires_ms = expires_ms, .tenant = self.tenant, .task_attempt_limit = limit }) catch |err| {
+        self.write(a, path, null, .{ .plan = plan, .expires_ms = expires_ms, .tenant = self.tenant }) catch |err| {
             // Existing jobs and lost successful responses are both resolved by
             // identity. Never overwrite state advanced by another participant.
             var existing = (self.load(a, path) catch return err) orelse return err;
@@ -297,13 +345,30 @@ pub const Store = struct {
         };
         return true;
     }
+    pub const RetryAdmission = struct {
+        ptr: *anyopaque,
+        load: *const fn (*anyopaque) anyerror!u16,
+    };
+    pub const TaskClaim = struct { claim: Claim, attempt_limit: u16 };
     pub fn claim(self: Store, a: A, path: []const u8, owner: []const u8, ttl_ms: u64) !?Claim {
+        const value = (try self.claimWithAdmission(a, path, owner, ttl_ms, null)) orelse return null;
+        return value.claim;
+    }
+    pub fn claimTask(self: Store, a: A, path: []const u8, owner: []const u8, ttl_ms: u64, admission: RetryAdmission) !?TaskClaim {
+        return self.claimWithAdmission(a, path, owner, ttl_ms, admission);
+    }
+    fn claimWithAdmission(self: Store, a: A, path: []const u8, owner: []const u8, ttl_ms: u64, admission: ?RetryAdmission) !?TaskClaim {
         if (owner.len == 0 or owner.len > 256 or ttl_ms == 0 or ttl_ms > 60_000) return error.InvalidSqlExecutionClaim;
         var old = (try self.load(a, path)) orelse return error.SqlExecutionNotFound;
         defer old.deinit(a);
         var next = old.value;
         if (next.expires_ms <= self.now_ms) return error.SqlQueryExpired;
         if (next.terminal() or (next.status == .running and next.until_ms +| 30_000 >= self.now_ms)) return null;
+        // Read immutable authority only for an actual retry, before consuming
+        // a new epoch/lease. A sidecar outage must not spend execution attempts.
+        // Exhaustion of the hard cap itself needs no metadata read.
+        const limit = if (admission != null and next.epoch != 0 and next.epoch < max_task_attempts) try admission.?.load(admission.?.ptr) else max_task_attempts;
+        if (limit == 0 or limit > max_task_attempts) return error.InvalidSqlExecutionState;
         next.status = .running;
         next.owner = owner;
         next.epoch = try std.math.add(u64, next.epoch, 1);
@@ -312,7 +377,7 @@ pub const Store = struct {
             error.PreconditionFailed => return null,
             else => return err,
         };
-        return .{ .owner = owner, .epoch = next.epoch };
+        return .{ .claim = .{ .owner = owner, .epoch = next.epoch }, .attempt_limit = limit };
     }
     fn owned(self: Store, a: A, path: []const u8, claim_: Claim) !Loaded {
         var old = (try self.load(a, path)) orelse return error.SqlExecutionNotFound;

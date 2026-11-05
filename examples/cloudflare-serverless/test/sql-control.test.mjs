@@ -93,6 +93,11 @@ test('SQL byte caching is opt-in, physical-binding scoped and excludes mutable q
  const request={op:'get',bucket:'source',key};await first(request);await first(request);assert.equal(reads,1);
  await other(request);assert.equal(reads,2);
  const mutable={...request,key:key.replace('plan.json','query.json')};await first(mutable);await first(mutable);assert.equal(reads,4);
+ const admission={...request,key:key.replace('plan.json','admission-v1.json')};
+ assert.equal(isImmutableObjectKey(admission.key),false);assert.equal(isImmutableObjectKey(admission.key,{includeSQL:true}),true);
+ await first(admission);await first(admission);assert.equal(reads,5);
+ await other(admission);assert.equal(reads,6);
+ assert.equal(isImmutableObjectKey(key.replace('plan.json','admission-v2.json'),{includeSQL:true}),false);
 });
 
 test('SQL discovery drains completed backlogs through durable alarms after eviction',async()=>{

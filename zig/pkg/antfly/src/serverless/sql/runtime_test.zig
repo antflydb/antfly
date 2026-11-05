@@ -2363,62 +2363,81 @@ test "distributed SQL layout failures obey the durable task attempt limit" {
 }
 
 test "distributed SQL plan read failures obey the durable task attempt limit" {
-    const a = std.testing.allocator;
-    var memory = storage.MemoryClient.init(a);
-    defer memory.deinit();
-    var fixture: Fixture = .{};
-    var service = fixture.service(a, memory.client(), "owner");
-    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
-    var right = input;
-    right.table_id = 2;
-    right.snapshot = "old-right";
-    right.wal_cut = 8;
-    var spec = try plan.choose(input, right, service.tenant, 1000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .max_attempts = 1 }, fixture.now);
-    spec.strategy = .shuffle;
-    const query = try service.submit(spec);
-    const coordinator = (try service.acquire(query)).?;
-    var records = service.state_store;
-    records.now_ms = fixture.now;
-    records.tenant = service.tenant;
-    const query_key = try records.key(a, query, null, 0);
-    defer a.free(query_key);
-    const layout = "{\"boundaries\":[0,1],\"skew\":[]}";
-    const hash = local.serverless_external_source_mod.lake_catalog.types.digestHex(layout);
-    const physical_key = try std.fmt.allocPrint(a, "{s}/sql-exchange/{d:0>20}/{s}/{s}.physical.json", .{ service.exchange_store.prefix, query.expires_ms, query.id, hash });
-    defer a.free(physical_key);
-    var client = memory.client();
-    try client.makeBucket(service.exchange_store.bucket);
-    var uploaded = try client.putObject(service.exchange_store.bucket, physical_key, layout, .{});
-    uploaded.deinit(a);
-    try records.checkpointResolved(a, query_key, coordinator, 1, 0, &.{}, null, null, .{ .key = physical_key, .hash = hash, .bytes = layout.len });
-    const Fault = struct {
-        var key: []const u8 = undefined;
-        var original: @FieldType(storage.Client.VTable, "get_object") = undefined;
-        fn get(raw: *anyopaque, allocator: A, bucket: []const u8, path: []const u8, options: storage.GetOptions) !storage.GetResult {
-            if (std.mem.eql(u8, path, key)) return error.NetworkUnreachable;
-            return original(raw, allocator, bucket, path, options);
+    for ([_]enum { admitted, legacy, unavailable }{ .admitted, .legacy, .unavailable }) |mode| {
+        const a = std.testing.allocator;
+        var memory = storage.MemoryClient.init(a);
+        defer memory.deinit();
+        var fixture: Fixture = .{};
+        var service = fixture.service(a, memory.client(), "owner");
+        const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+        var right = input;
+        right.table_id = 2;
+        right.snapshot = "old-right";
+        right.wal_cut = 8;
+        var spec = try plan.choose(input, right, service.tenant, 10000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{ .max_attempts = 1 }, fixture.now);
+        spec.strategy = .shuffle;
+        const query = try service.submit(spec);
+        const coordinator = (try service.acquire(query)).?;
+        var records = service.state_store;
+        records.now_ms = fixture.now;
+        records.tenant = service.tenant;
+        const query_key = try records.key(a, query, null, 0);
+        defer a.free(query_key);
+        const layout = "{\"boundaries\":[0,1],\"skew\":[]}";
+        const hash = local.serverless_external_source_mod.lake_catalog.types.digestHex(layout);
+        const physical_key = try std.fmt.allocPrint(a, "{s}/sql-exchange/{d:0>20}/{s}/{s}.physical.json", .{ service.exchange_store.prefix, query.expires_ms, query.id, hash });
+        defer a.free(physical_key);
+        var client = memory.client();
+        try client.makeBucket(service.exchange_store.bucket);
+        var uploaded = try client.putObject(service.exchange_store.bucket, physical_key, layout, .{});
+        uploaded.deinit(a);
+        try records.checkpointResolved(a, query_key, coordinator, 1, 0, &.{}, null, null, .{ .key = physical_key, .hash = hash, .bytes = layout.len });
+        const Fault = struct {
+            var sidecar_unavailable: bool = false;
+            var key: []const u8 = undefined;
+            var original: @FieldType(storage.Client.VTable, "get_object") = undefined;
+            fn get(raw: *anyopaque, allocator: A, bucket: []const u8, path: []const u8, options: storage.GetOptions) !storage.GetResult {
+                if (std.mem.eql(u8, path, key) or (sidecar_unavailable and std.mem.endsWith(u8, path, "/admission-v1.json"))) return error.NetworkUnreachable;
+                return original(raw, allocator, bucket, path, options);
+            }
+        };
+        const plan_key = try std.fmt.allocPrint(a, "{s}/sql-execution-v2/{d:0>20}/{s}/plan.json", .{ records.prefix, query.expires_ms, query.id });
+        defer a.free(plan_key);
+        Fault.sidecar_unavailable = mode == .unavailable;
+        if (mode == .legacy) {
+            const admission_key = try std.fmt.allocPrint(a, "{s}/sql-execution-v2/{d:0>20}/{s}/admission-v1.json", .{ records.prefix, query.expires_ms, query.id });
+            defer a.free(admission_key);
+            try client.deleteObject(service.state_store.bucket, admission_key, .{});
         }
-    };
-    const plan_key = try std.fmt.allocPrint(a, "{s}/sql-execution-v2/{d:0>20}/{s}/plan.json", .{ records.prefix, query.expires_ms, query.id });
-    defer a.free(plan_key);
-    Fault.key = plan_key;
-    Fault.original = service.state_store.client.vtable.get_object;
-    var table = service.state_store.client.vtable.*;
-    table.get_object = Fault.get;
-    service.state_store.client.vtable = &table;
-    const task_key = try records.key(a, query, 1, 0);
-    defer a.free(task_key);
-    try records.create(a, task_key, query.id, query.expires_ms);
-    const ticket: plan.Ticket = .{ .tenant = service.tenant, .query = query, .stage = 1, .task = 0 };
-    try std.testing.expectError(error.NetworkUnreachable, service.execute(ticket));
-    fixture.now += 91001;
-    try service.execute(ticket);
-    try service.execute(ticket);
-    var current = (try records.load(a, task_key)).?;
-    defer current.deinit(a);
-    try std.testing.expectEqual(state.Status.failed, current.value.status);
-    try std.testing.expectEqual(@as(u64, 2), current.value.epoch);
-    try std.testing.expectEqualStrings("TaskRetryBudgetExceeded", current.value.failure.?);
+        Fault.key = plan_key;
+        Fault.original = service.state_store.client.vtable.get_object;
+        var table = service.state_store.client.vtable.*;
+        table.get_object = Fault.get;
+        service.state_store.client.vtable = &table;
+        const task_key = try records.key(a, query, 1, 0);
+        defer a.free(task_key);
+        try records.create(a, task_key, query.id, query.expires_ms);
+        const ticket: plan.Ticket = .{ .tenant = service.tenant, .query = query, .stage = 1, .task = 0 };
+        const attempts: u64 = if (mode == .legacy) state.max_task_attempts else 1;
+        for (0..attempts) |_| {
+            try std.testing.expectError(error.NetworkUnreachable, service.execute(ticket));
+            fixture.now += 91001;
+        }
+        if (mode == .unavailable) {
+            for (0..3) |_| try std.testing.expectError(error.NetworkUnreachable, service.execute(ticket));
+            var unchanged = (try records.load(a, task_key)).?;
+            defer unchanged.deinit(a);
+            try std.testing.expectEqual(@as(u64, 1), unchanged.value.epoch);
+            Fault.sidecar_unavailable = false;
+        }
+        try service.execute(ticket);
+        try service.execute(ticket);
+        var current = (try records.load(a, task_key)).?;
+        defer current.deinit(a);
+        try std.testing.expectEqual(state.Status.failed, current.value.status);
+        try std.testing.expectEqual(attempts + 1, current.value.epoch);
+        try std.testing.expectEqualStrings("TaskRetryBudgetExceeded", current.value.failure.?);
+    }
 }
 
 test "distributed SQL layout preparation allocation failures terminate within the admitted memory budget" {
@@ -2479,4 +2498,187 @@ test "distributed SQL layout preparation allocation failures terminate within th
     try std.testing.expectEqual(state.Status.failed, current.value.status);
     try std.testing.expectEqual(@as(u64, 1), current.value.epoch);
     try std.testing.expectEqualStrings("SqlJoinBudgetExceeded", current.value.failure.?);
+}
+
+// Frozen wire schema from before inline retry admission. Keep this reader
+// strict: adding a Record field must not silently break rolling deployments.
+const OriginalV2Record = struct {
+    tenant: ?state.Digest = null,
+    version: u8 = 2,
+    plan: state.Digest,
+    expires_ms: u64,
+    status: state.Status = .pending,
+    owner: []const u8 = "",
+    epoch: u64 = 0,
+    until_ms: u64 = 0,
+    stage: u32 = 0,
+    cursor: u32 = 0,
+    pending: []const u32 = &.{},
+    pending_after: ?u32 = null,
+    pending_admission: bool = false,
+    reduce_boundaries: []const u16 = &.{},
+    skew: []const @import("physical.zig").Part = &.{},
+    physical: ?state.Output = null,
+    adaptive: ?state.Output = null,
+    result_progress: ?state.Output = null,
+    cancel_requested: bool = false,
+    output: ?state.Output = null,
+    failure: ?[]const u8 = null,
+};
+
+test "distributed SQL preserves strict v2 readers and avoids admission reads on successful first attempts" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    const Observe = struct {
+        var base_get: @FieldType(storage.Client.VTable, "get_object") = undefined;
+        var base_put: @FieldType(storage.Client.VTable, "put_object") = undefined;
+        var admission_reads: usize = 0;
+        var records: usize = 0;
+        var lost_ack: bool = true;
+        fn get(raw: *anyopaque, allocator: A, bucket: []const u8, key: []const u8, options: storage.GetOptions) !storage.GetResult {
+            if (std.mem.endsWith(u8, key, "/admission-v1.json")) admission_reads += 1;
+            return base_get(raw, allocator, bucket, key, options);
+        }
+        fn put(raw: *anyopaque, allocator: A, bucket: []const u8, key: []const u8, body: []const u8, options: storage.PutOptions) !storage.PutResult {
+            if (std.mem.endsWith(u8, key, "/query.json") or std.mem.indexOf(u8, key, "/task/") != null) {
+                const parsed = try std.json.parseFromSlice(OriginalV2Record, allocator, body, .{ .allocate = .alloc_always });
+                defer parsed.deinit();
+                records += 1;
+            }
+            var accepted = try base_put(raw, allocator, bucket, key, body, options);
+            if (lost_ack and std.mem.endsWith(u8, key, "/admission-v1.json")) {
+                lost_ack = false;
+                accepted.deinit(allocator);
+                return error.NetworkUnreachable;
+            }
+            return accepted;
+        }
+    };
+    Observe.admission_reads = 0;
+    Observe.records = 0;
+    Observe.lost_ack = true;
+    var client = memory.client();
+    Observe.base_get = client.vtable.get_object;
+    Observe.base_put = client.vtable.put_object;
+    var table = client.vtable.*;
+    table.get_object = Observe.get;
+    table.put_object = Observe.put;
+    client.vtable = &table;
+    var fixture: Fixture = .{};
+    const service = fixture.service(a, client, "owner");
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+    var right = input;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    const spec = try plan.choose(input, right, service.tenant, 1000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{}, fixture.now);
+    const query = try service.submit(spec);
+    try std.testing.expectEqual(@as(usize, 1), Observe.admission_reads);
+    Observe.admission_reads = 0;
+    var dispatch: Dispatch = .{ .workers = .{ service, service }, .drop_once = false };
+    var complete = false;
+    for (0..32) |_| {
+        if (try service.turn(query, .{ .ptr = &dispatch, .dispatch = Dispatch.run })) {
+            complete = true;
+            break;
+        }
+    }
+    try std.testing.expect(complete);
+    var result_arena = std.heap.ArenaAllocator.init(a);
+    defer result_arena.deinit();
+    const result = (try service.pollResult(result_arena.allocator(), query)).?;
+    try std.testing.expectEqual(@as(u64, 2), result.rows);
+    try std.testing.expectEqual(@as(usize, 0), Observe.admission_reads);
+    try std.testing.expect(Observe.records >= 6);
+}
+
+test "distributed SQL inline admission is read-only and checkpoints retain the original v2 schema" {
+    const a = std.testing.allocator;
+    const bytes = try std.json.Stringify.valueAlloc(a, .{ .plan = @as(state.Digest, @splat('a')), .expires_ms = @as(u64, 1000), .task_attempt_limit = @as(u16, 1) }, .{});
+    defer a.free(bytes);
+    const old = try std.json.parseFromSlice(state.Record, a, bytes, .{});
+    defer old.deinit();
+    try std.testing.expectEqual(@as(?u16, 1), old.value.task_attempt_limit);
+    const checkpoint = try std.json.Stringify.valueAlloc(a, old.value, .{});
+    defer a.free(checkpoint);
+    const compatible = try std.json.parseFromSlice(OriginalV2Record, a, checkpoint, .{});
+    defer compatible.deinit();
+    try std.testing.expectEqual(old.value.plan, compatible.value.plan);
+}
+
+test "distributed SQL migrates inline retry authority before claims renewals and checkpoints" {
+    const a = std.testing.allocator;
+    for ([_]enum { claim, renew, checkpoint, cancel, terminate }{ .claim, .renew, .checkpoint, .cancel, .terminate }) |operation| {
+        var memory = storage.MemoryClient.init(a);
+        defer memory.deinit();
+        var client = memory.client();
+        try client.makeBucket("queries");
+        const Fault = struct {
+            var base: @FieldType(storage.Client.VTable, "put_object") = undefined;
+            var fail: bool = true;
+            fn put(raw: *anyopaque, allocator: A, bucket: []const u8, key: []const u8, body: []const u8, options: storage.PutOptions) !storage.PutResult {
+                if (fail and std.mem.endsWith(u8, key, "/admission-v1.json")) return error.NetworkUnreachable;
+                return base(raw, allocator, bucket, key, body, options);
+            }
+        };
+        Fault.base = client.vtable.put_object;
+        Fault.fail = true;
+        var table = client.vtable.*;
+        table.put_object = Fault.put;
+        client.vtable = &table;
+        const records: state.Store = .{ .client = client, .bucket = "queries", .prefix = "tenant", .tenant = @splat('a'), .now_ms = 1000 };
+        const query: state.Query = .{ .id = @splat('b'), .expires_ms = 1000000 };
+        const key = try records.key(a, query, null, 0);
+        defer a.free(key);
+        // Emit the exact previous inline format, bypassing the new serializer.
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ .plan = query.id, .expires_ms = query.expires_ms, .tenant = records.tenant, .task_attempt_limit = @as(u16, 1), .status = if (operation == .claim) state.Status.pending else state.Status.running, .owner = if (operation == .claim) "" else "owner", .epoch = @as(u64, if (operation == .claim) 0 else 1), .until_ms = @as(u64, if (operation == .claim) 0 else 60000) }, .{});
+        defer a.free(bytes);
+        var original = try client.putObject(records.bucket, key, bytes, .{});
+        original.deinit(a);
+        const Write = struct {
+            fn run(store: state.Store, allocator: A, path: []const u8, kind: @TypeOf(operation)) !void {
+                const claim: state.Claim = .{ .owner = "owner", .epoch = 1 };
+                switch (kind) {
+                    .claim => _ = try store.claim(allocator, path, "owner", 60000),
+                    .renew => try store.renew(allocator, path, claim, 60000),
+                    .checkpoint => try store.checkpointTasks(allocator, path, claim, 0, 1, &.{0}),
+                    .cancel => try store.requestCancel(allocator, path),
+                    .terminate => try store.terminate(allocator, path, claim, .failed, "TaskFailed"),
+                }
+            }
+        };
+        if (operation == .cancel or operation == .terminate) {
+            try Write.run(records, a, key, operation);
+            var stopped = try client.getObject(records.bucket, key, .{});
+            defer stopped.deinit(a);
+            const compatible = try std.json.parseFromSlice(OriginalV2Record, a, stopped.body, .{});
+            defer compatible.deinit();
+            try std.testing.expect(if (operation == .cancel) compatible.value.cancel_requested else compatible.value.status == .failed);
+            const admission_key = try records.admissionKey(a, query);
+            defer a.free(admission_key);
+            try std.testing.expect((try records.load(a, admission_key)) == null);
+            continue;
+        }
+        try std.testing.expectError(error.NetworkUnreachable, Write.run(records, a, key, operation));
+        var unchanged = (try records.load(a, key)).?;
+        defer unchanged.deinit(a);
+        try std.testing.expectEqual(@as(?u16, 1), unchanged.value.task_attempt_limit);
+        Fault.fail = false;
+        try Write.run(records, a, key, operation);
+        var updated = try client.getObject(records.bucket, key, .{});
+        defer updated.deinit(a);
+        const compatible = try std.json.parseFromSlice(OriginalV2Record, a, updated.body, .{});
+        defer compatible.deinit();
+        try std.testing.expectEqual(query.id, compatible.value.plan);
+        const admission_key = try records.admissionKey(a, query);
+        defer a.free(admission_key);
+        var admission = try client.getObject(records.bucket, admission_key, .{});
+        defer admission.deinit(a);
+        const authority = try std.json.parseFromSlice(state.Admission, a, admission.body, .{});
+        defer authority.deinit();
+        try std.testing.expectEqual(query, authority.value.query);
+        try std.testing.expectEqual(records.tenant.?, authority.value.tenant);
+        try std.testing.expectEqual(@as(u16, 1), authority.value.task_attempt_limit);
+    }
 }

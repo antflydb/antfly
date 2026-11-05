@@ -189,3 +189,37 @@ test('WASM active task observes durable cancellation after a suspended source re
     if(key.includes('/stage/')) assert.notEqual(JSON.parse(new TextDecoder().decode(object.body)).status,'succeeded','cancelled task accepted output');
   }
 });
+
+test('WASM retry admission survives plan failures without spending epochs during sidecar outages',async()=>{
+ const fixture=JSON.parse(await readFile(new URL('../dist/sql-fixture.json',import.meta.url)));
+ const buckets=Object.fromEntries(['source','execution'].map(name=>[name,new Bucket()]));
+ for(const object of fixture.objects)await buckets[object.bucket].put(object.key,new Uint8Array(Buffer.from(object.body_base64,'base64')));
+ const base=createR2Transport(buckets,{maxPutBytes:8*1024*1024});
+ let now=Date.now(),failPlan=false,failAdmission=false,planReads=0,admissionReads=0;
+ const transport=async(request,body)=>{
+  if(request.op==='get'&&request.key.endsWith('/admission-v1.json')){admissionReads++;if(failAdmission)throw Error('injected admission outage');}
+  if(request.op==='get'&&request.key.endsWith('/plan.json')&&failPlan){planReads++;throw Error('injected plan outage');}
+  return base(request,body);
+ };
+ const host=await instantiateHost(module,transport,{clock:()=>now});
+ const request={config:fixture.config,tenant:fixture.tenant,owner:'coordinator'};
+ const spec=JSON.parse(fixture.raw_plan);spec.limits.max_attempts=1;
+ const {query}=await host.request({...request,op:'sql_submit',raw_plan:JSON.stringify(spec)});
+ const turn=await host.request({...request,query,op:'sql_turn'});
+ assert.ok(turn.tickets.length>0);
+ const ticket=turn.tickets[0],task={...request,query,op:'sql_execute',owner:'worker',ticket};
+ failPlan=true;
+ await assert.rejects(host.request(task));
+ assert.equal(planReads,1);assert.equal(admissionReads,0);
+ now+=92001;failAdmission=true;
+ await assert.rejects(host.request(task));
+ const id=typeof query.id==='string'?query.id:String.fromCharCode(...query.id),root=`${fixture.config.state.prefix}/sql-execution-v2/${String(query.expires_ms).padStart(20,'0')}/${id}`;
+ const key=`${root}/stage/${ticket.stage}/task/${ticket.task}.json`;
+ const bucket=buckets[fixture.config.state.bucket];
+ assert.equal((await(await bucket.get(key)).json()).epoch,1);
+ failAdmission=false;
+ assert.equal((await host.request(task)).status,'failed');
+ const failed=await(await bucket.get(key)).json();
+ assert.equal(failed.epoch,2);assert.equal(failed.failure,'TaskRetryBudgetExceeded');
+ assert.equal(failed.task_attempt_limit,undefined);assert.equal(planReads,1);assert.equal(admissionReads,2);
+});

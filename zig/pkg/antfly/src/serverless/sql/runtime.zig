@@ -158,12 +158,32 @@ pub const Service = struct {
         const expiry_key = try std.fmt.allocPrint(self.a, "{s}/sql-query-expiry/{d:0>20}/{s}.json", .{ self.state_store.prefix, specification.expires_ms, query.id });
         defer self.a.free(expiry_key);
         try self.immutable(self.a, expiry_key, "{}", 1024);
+        try self.store().publishAdmission(self.a, query, specification.limits.max_attempts);
         try self.immutable(self.a, key, bytes, 1024 * 1024);
         const query_key = try self.store().key(self.a, query, null, 0);
         defer self.a.free(query_key);
-        _ = try self.store().ensureQuery(self.a, query_key, query.id, specification.expires_ms, specification.limits.max_attempts);
+        try self.store().create(self.a, query_key, query.id, specification.expires_ms);
         self.notify(query);
         return query;
+    }
+    fn retryLimit(self: Service, a: A, query: state.Query, record: state.Record) !u16 {
+        if (record.task_attempt_limit) |limit| return limit;
+        const key = try self.store().admissionKey(a, query);
+        defer a.free(key);
+        var client = self.state_store.client;
+        client.allocator = a;
+        var object = client.getObject(self.state_store.bucket, key, .{ .skip_metadata_probe = true, .max_response_bytes = 1024, .cancellation = local.serverless_external_source_mod.lake_catalog.types.contextCancellation(&self.context) }) catch |err| switch (err) {
+            // Original v2 submissions predate admission sidecars. Their plan
+            // enforces the exact limit when readable; all reads remain bounded
+            // by the global cap even if immutable metadata is unavailable.
+            error.NotFound, error.ObjectNotFound, error.FileNotFound => return state.max_task_attempts,
+            else => return err,
+        };
+        defer object.deinit(a);
+        const value = try std.json.parseFromSliceLeaky(state.Admission, a, object.body, .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+        if (value.version != 1 or !std.meta.eql(value.query, query) or value.task_attempt_limit == 0 or value.task_attempt_limit > state.max_task_attempts) return error.InvalidSqlExecutionState;
+        if (!std.meta.eql(value.tenant, self.tenant)) return error.SqlExecutionUnauthorized;
+        return value.task_attempt_limit;
     }
     pub fn loadPlan(self: Service, a: A, query: state.Query) !plan.Plan {
         const key = try self.planKey(a, query);
@@ -449,8 +469,20 @@ pub const Service = struct {
         context = watch.scoped(context);
         var scoped_service = self;
         scoped_service.context = context;
-        const claim = (try scoped_service.store().claim(a, key, self.owner, 60_000)) orelse return;
-        self.executeClaimed(ticket, a, task_allocator, &task_memory, query.value, key, claim, context) catch |raw_error| {
+        const Retry = struct {
+            service: Service,
+            allocator: A,
+            query: state.Query,
+            record: state.Record,
+            fn load(raw: *anyopaque) !u16 {
+                const value: *const @This() = @ptrCast(@alignCast(raw));
+                return value.service.retryLimit(value.allocator, value.query, value.record);
+            }
+        };
+        var retry: Retry = .{ .service = scoped_service, .allocator = a, .query = ticket.query, .record = query.value };
+        const admitted = (try scoped_service.store().claimTask(a, key, self.owner, 60_000, .{ .ptr = &retry, .load = Retry.load })) orelse return;
+        const claim = admitted.claim;
+        self.executeClaimed(ticket, a, task_allocator, &task_memory, query.value, key, claim, admitted.attempt_limit, context) catch |raw_error| {
             const err = if (raw_error == error.OutOfMemory and task_memory.exhausted) error.SqlJoinBudgetExceeded else raw_error;
             switch (err) {
                 error.SqlJoinBudgetExceeded, error.SqlProgramLimitExceeded, error.InvalidSqlBackendResponse, error.InvalidSqlExchange, error.SqlExecutionUnauthorized, error.InvalidSqlExecutionState, error.InvalidSqlDistributedPlan, error.TaskRetryBudgetExceeded => {
@@ -461,10 +493,10 @@ pub const Service = struct {
             }
         };
     }
-    fn executeClaimed(self: Service, ticket: plan.Ticket, a: A, task_allocator: A, task_memory: *local.sql_memory_budget, query: state.Record, key: []const u8, claim: state.Claim, task_context: Context) !void {
-        // Admission survives immutable-plan read failures; legacy records use the
-        // maximum admitted limit until their immutable plan can be read.
-        if (claim.epoch > (query.task_attempt_limit orelse 16)) return error.TaskRetryBudgetExceeded;
+    fn executeClaimed(self: Service, ticket: plan.Ticket, a: A, task_allocator: A, task_memory: *local.sql_memory_budget, query: state.Record, key: []const u8, claim: state.Claim, attempt_limit: u16, task_context: Context) !void {
+        // Retry admission is resolved before acquiring the lease; a successful
+        // first attempt never reads the sidecar.
+        if (claim.epoch > attempt_limit) return error.TaskRetryBudgetExceeded;
         var context = task_context;
         var scoped_service = self;
         scoped_service.context = context;

@@ -326,3 +326,22 @@ with a two-second maximum wait. Resolver failures back off for one second.
 Resolver buffers and cleanup belong to the process, so an operating-system DNS
 call that cannot be cancelled never borrows a statement's memory or delays that
 statement's cancellation. Shutdown joins the resolver before freeing its owner.
+
+Retry admission is immutable metadata under each expiry-owned query root:
+`sql-execution-v2/<expiry>/<query>/admission-v1.json`. Submission publishes it
+before the plan and mutable query record; lost PUT acknowledgements resolve by
+identity. Its version, tenant and query identity are validated independently.
+Workers read it only when retrying, so successful first attempts add no
+metadata reads. Hosted immutable caching includes this versioned object. Admission
+reads precede acquiring a retry lease, so unavailable metadata never consumes
+another execution attempt. Retry limits are checked before plan/layout reads,
+with an unconditional global cap of 16 attempts. Older queries without a sidecar
+retain this global cap and use their exact plan limit once the plan is readable.
+
+Mutable v2 records keep their original wire schema for strict older readers.
+The inline `task_attempt_limit` field is accepted only on read; serializers omit
+it even when non-null. Live mutations upgrading such an in-flight query publish
+the sidecar before a claim, renewal or checkpoint removes the inline field.
+Cancellation and terminal writes skip migration, preserving their availability
+when admission storage is unavailable. New extensions
+must use versioned metadata rather than adding fields to mutable v2 records.

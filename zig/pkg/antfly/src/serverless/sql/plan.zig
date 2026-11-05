@@ -69,7 +69,7 @@ pub const Limits = struct {
     concurrency: u16 = 8,
     max_attempts: u16 = 3,
     pub fn validate(self: Limits) !void {
-        if (self.task_memory < 1024 * 1024 or self.task_memory > 1024 * 1024 * 1024 or self.task_scan_rows == 0 or self.task_output_bytes < 4096 or self.task_output_bytes > @import("exchange.zig").max_object_bytes or self.max_tasks == 0 or self.max_tasks > 65536 or self.max_partitions == 0 or self.max_partitions > 1024 or self.concurrency == 0 or self.concurrency > 256 or self.max_attempts == 0 or self.max_attempts > 16) return error.InvalidSqlDistributedPlan;
+        if (self.task_memory < 1024 * 1024 or self.task_memory > 1024 * 1024 * 1024 or self.task_scan_rows == 0 or self.task_output_bytes < 4096 or self.task_output_bytes > @import("exchange.zig").max_object_bytes or self.max_tasks == 0 or self.max_tasks > 65536 or self.max_partitions == 0 or self.max_partitions > 1024 or self.concurrency == 0 or self.concurrency > 256 or self.max_attempts == 0 or self.max_attempts > @import("state.zig").max_task_attempts) return error.InvalidSqlDistributedPlan;
         if (self.task_scan_rows > std.math.maxInt(u32) or self.query_scan_bytes == 0 or self.query_exchange_bytes == 0 or self.query_requests == 0) return error.InvalidSqlDistributedPlan;
     }
 };
