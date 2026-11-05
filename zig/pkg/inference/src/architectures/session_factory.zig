@@ -8592,7 +8592,14 @@ fn archExecutionOwnerStats(raw: *anyopaque) @import("../ops/execution_scope.zig"
 fn archExecutionCapabilities(raw: *anyopaque) @import("../backends/session.zig").ExecutionCapabilities {
     if (comptime !build_options.enable_cuda) return .{};
     const self: *ArchSession = @ptrCast(@alignCast(raw));
-    if (self.backend_type != .cuda or self.arch_config != .gpt) return .{};
+    if (self.backend_type != .cuda) return .{};
+    if (self.arch_config == .embedding_gemma2) {
+        const eligible = self.arch_config.embedding_gemma2.resident != null and
+            self.backend_data.cuda.compute.capability_profile == .embedding_gemma2 and
+            self.backend_data.cuda.compute.embedding_gemma2_policy.arithmeticBits() == 0;
+        return .{ .text_batch_rows = if (eligible) 4 else 1, .text_batch_tokens = if (eligible) 64 else 0 };
+    }
+    if (self.arch_config != .gpt) return .{};
     const cfg = self.arch_config.gpt;
     const compute = &self.backend_data.cuda.compute;
     const eager = cfg.family == .gemma and cfg.usesGemma4Channels() and !cfg.usesMoe() and !cfg.gemma4_mtp_assistant and

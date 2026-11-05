@@ -2711,6 +2711,8 @@ pub const LoadedModel = struct {
     /// reserving their full device scratch ceiling, without holding a provider
     /// lock during admission/eviction. Every waiter retains a ModelHandle.
     gliner_boundary_admission_lock: std.atomic.Mutex = .unlocked,
+    /// Fair turns before GLiNER transient workspace admission, including broker cohorts.
+    gliner_execution_lane: execution_control_mod.ExecutionLane = .{},
     vision_session: ?backends.Session = null,
     audio_session: ?backends.Session = null,
     text_projection: ?backends.Session = null,

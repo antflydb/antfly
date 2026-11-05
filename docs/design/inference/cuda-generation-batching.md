@@ -253,21 +253,23 @@ The receipt is `ready-api-checks.json`.
 
 ## GLiNER batching is a separate path
 
-The read pool's FP32 DeBERTa GLiNER 2.5-Decide already supports native CUDA
+The authenticated FP32 and Q8 DeBERTa GLiNER 2.5-Decide artifacts support native CUDA
 classification batches of up to eight compatible inputs through
 `POST /ai/v1/extract` with `schema_version: 2`. The span executor packs those
 inputs into a padded encoder/classifier forward, subject to the checkpoint's
 512-token per-sequence and aggregate resource limits. It is independent of
 Gemma generation batching and needs no generation-batching flag.
 
-That does not mean every concurrent GLiNER HTTP call is automatically merged.
+Eligible concurrent CUDA classification calls now also enter the Node-owned
+executor broker automatically, through both `/extract` and `/decisions`.
 The typed `/decisions` API accepts either one `input` or an `inputs` array;
-a live two-input request returns ordered answers for both inputs. Its qualified
-span executor runs under the model's execution mutex without submitting separate
-HTTP requests to the generic GLiNER microbatch broker. Other GLiNER architectures, artifacts
-and backends have their own batching contracts. In particular, the boundary
-extractor's conservative discovery must not be interpreted as this Decide
-checkpoint's eight-input classification contract.
+results retain caller order and each caller's schema and presentation options.
+The read-pool model directory selects the authenticated Q8 split bundle.
+EmbeddingGemma 2 short CUDA text calls use the same broker with a separate
+four-row capability. See [HTTP batching ownership and qualification](read-pool-http-batching.md)
+for the exact eligibility limits and numerical contract. Other GLiNER
+architectures, artifacts and backends retain their own batching contracts;
+the boundary extractor's discovery does not declare Decide's classification contract.
 
 The live read service also passes an eight-input classification request with
 distinct texts, preserving order and exactly matching singleton results

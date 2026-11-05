@@ -272,8 +272,17 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     const run_batch_tests = ctx.addRunArtifact(batch_tests);
     test_step.dependOn(&run_batch_tests.step);
     ctx.step("test-execution-batch", "Verify cohort budgets, scope retirement and decode arithmetic without a GPU").dependOn(&run_batch_tests.step);
+    const read_batch_root = b.createModule(.{ .root_source_file = ctx.path("src/test_read_pool_microbatch.zig"), .target = ctx.target, .optimize = ctx.optimize });
+    var read_batch_imports = suite.tests.root_module.import_table.iterator();
+    while (read_batch_imports.next()) |entry| read_batch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
+    read_batch_root.link_libc = true;
+    const read_batch_tests = b.addTest(.{ .max_rss = 4 * 1024 * 1024 * 1024, .root_module = read_batch_root, .filters = &.{ "read pool microbatch", "microbatch", "gliner span v2 batch admission", "test_0" } });
+    const run_read_batch_tests = ctx.addRunArtifact(read_batch_tests);
+    test_step.dependOn(&run_read_batch_tests.step);
+    ctx.step("test-read-pool-microbatch", "Verify read-model row ownership, capacity and cancellation").dependOn(&run_read_batch_tests.step);
     const inference_unit = ctx.step("test-inference-unit", "Run inference unit tests with optional filters, without independent library suites");
     inference_unit.dependOn(&run_tests.step);
+    inference_unit.dependOn(&run_read_batch_tests.step);
     inference_unit.dependOn(&run_batch_tests.step);
     inference_unit.dependOn(&run_cooperative_tests.step);
     const cancellation_e2e_step = ctx.step("test-cancellation-e2e", "Run HTTP inference cancellation and worker recovery E2E tests");

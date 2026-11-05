@@ -7126,7 +7126,7 @@ pub const Node = struct {
     }
 
     fn tryEmbedParsedViaBroker(self: *Node, allocator: std.mem.Allocator, io: std.Io, model: *model_manager_mod.LoadedModel, parsed: *const ParsedDenseEmbedInputs, control: InferenceExecutionControl, task_type: EmbeddingTaskType, instruction: ?[]const u8, audio_working_bytes: usize) !?[][]f32 {
-        if (parsed.groups.items.len > 0 or (model.manifest.embedding_style == .embedding_gemma2 and model.session.backend() == .cuda)) return null;
+        if (parsed.groups.items.len > 0) return null;
         if (model.manifest.embedding_style == .embedding_gemma2 and parsed.audio.items.len == parsed.total_count and parsed.total_count > 0 and instruction == null) {
             const grouped = @import("../pipelines/embedding_gemma2.zig");
             const parts = try allocator.alloc(grouped.Part, parsed.total_count);
@@ -7156,7 +7156,8 @@ pub const Node = struct {
         }
         if (model.manifest.embedding_style == .embedding_gemma2 and (parsed.images.items.len != 0 or parsed.audio.items.len != 0 or parsed.videos.items.len != 0)) return null;
         const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
-        if (contract.batch.mode != .native or contract.batch.max_items <= 1 or model.manifest.hasCapability("sparse")) return null;
+        const read_text = readPoolEmbeddingTextBatch(model) and parsed.texts.items.len == parsed.total_count;
+        if ((!read_text and (contract.batch.mode != .native or contract.batch.max_items <= 1)) or model.manifest.hasCapability("sparse")) return null;
         if (parsed.texts.items.len > 0) {
             if (embedding_mod.textSessionBatchPlan(model.session, 2)) |plan| if (plan.batch_size == 1) return null;
         }
@@ -7172,7 +7173,11 @@ pub const Node = struct {
             const texts = try allocator.alloc([]const u8, parsed.texts.items.len);
             defer allocator.free(texts);
             for (texts, parsed.texts.items) |*text, item| text.* = item.text;
-            const rows = (try self.tryEmbedTextsViaBroker(allocator, io, model, texts, control, task_type, instruction)) orelse return error.InvalidInferenceCapabilities;
+            const rows = (try self.tryEmbedTextsViaBroker(allocator, io, model, texts, control, task_type, instruction)) orelse {
+                if (!read_text) return error.InvalidInferenceCapabilities;
+                freeDirectDenseVectors(allocator, vectors);
+                return null;
+            };
             defer allocator.free(rows);
             for (rows, parsed.texts.items) |row, item| vectors[item.index] = row;
         }
@@ -7359,6 +7364,31 @@ pub const Node = struct {
         allocator.free(row);
     }
 
+    fn readPoolEmbeddingTextBatch(model: *const model_manager_mod.LoadedModel) bool {
+        return model.manifest.embedding_style == .embedding_gemma2 and model.session.backend() == .cuda and
+            model.session.executionCapabilities().text_batch_rows > 1;
+    }
+
+    fn strictEmbeddingTextTokens(a: std.mem.Allocator, model: *model_manager_mod.LoadedModel, text: []const u8) !usize {
+        try @import("../pipelines/embedding_gemma2_content.zig").validateTextOnly(text);
+        var encoded = try model.getTokenizer().encodeForModel(a, text, 8193);
+        defer encoded.deinit();
+        var tokens: usize = 0;
+        for (encoded.attention_mask) |active| tokens += @intFromBool(active != 0);
+        if (tokens > 8192) return error.EmbeddingSequenceTooLong;
+        return tokens;
+    }
+
+    fn strictParsedEmbeddingTextTokens(a: std.mem.Allocator, model: *model_manager_mod.LoadedModel, inputs: *const ParsedDenseEmbedInputs, prefix: []const u8) !usize {
+        var tokens: usize = 0;
+        for (inputs.texts.items) |item| {
+            const rendered = try std.fmt.allocPrint(a, "{s}{s}", .{ prefix, item.text });
+            defer a.free(rendered);
+            tokens = try std.math.add(usize, tokens, try strictEmbeddingTextTokens(a, model, rendered));
+        }
+        return tokens;
+    }
+
     fn tryEmbedTextsViaBroker(self: *Node, allocator: std.mem.Allocator, io: std.Io, model: *model_manager_mod.LoadedModel, texts: []const []const u8, control: InferenceExecutionControl, task_type: EmbeddingTaskType, instruction: ?[]const u8) !?[][]f32 {
         return self.tryEmbedTextRowsViaBroker(false, allocator, io, model, texts, control, task_type, instruction);
     }
@@ -7376,7 +7406,9 @@ pub const Node = struct {
 
     fn tryEmbedTextRowsViaBroker(self: *Node, comptime sparse: bool, allocator: std.mem.Allocator, io: std.Io, model: *model_manager_mod.LoadedModel, texts: []const []const u8, control: InferenceExecutionControl, task_type: EmbeddingTaskType, instruction: ?[]const u8) !?[](if (sparse) DirectSparseEmbedding else []f32) {
         const contract = try resolvedInferenceExecutorContract(self, "embed", &model.manifest);
-        if (contract.batch.mode != .native or contract.batch.max_items <= 1 or model.manifest.hasCapability("sparse") != sparse) return null;
+        const read_text = !sparse and readPoolEmbeddingTextBatch(model);
+        if ((!read_text and (contract.batch.mode != .native or contract.batch.max_items <= 1)) or model.manifest.hasCapability("sparse") != sparse) return null;
+        const rows = if (read_text) model.session.executionCapabilities().text_batch_rows else contract.batch.max_items;
         // A serial-only loaded graph must not incur a native batch-fill delay.
         if (embedding_mod.textSessionBatchPlan(model.session, 2)) |plan| if (plan.batch_size == 1) return null;
         const prefix = if (sparse) .{ .prefix = @as([]const u8, ""), .owned = @as(?[]u8, null) } else try denseEmbeddingTextPrefix(allocator, model, task_type, instruction);
@@ -7392,7 +7424,11 @@ pub const Node = struct {
             payload.* = .{ .model = model, .text = text, .task_type = task_type, .instruction = instruction };
             const token_text = if (prefix.prefix.len > 0) try std.fmt.allocPrint(allocator, "{s}{s}", .{ prefix.prefix, text }) else text;
             defer if (prefix.prefix.len > 0) allocator.free(token_text);
-            shape.* = .{ .bytes = token_text.len, .tokens = try countTokenizerTokens(allocator, io, model.getTokenizer(), token_text) };
+            const tokens = if (read_text) try strictEmbeddingTextTokens(allocator, model, token_text) else try countTokenizerTokens(allocator, io, model.getTokenizer(), token_text);
+            // The qualified arithmetic regime covers four <=64-token rows.
+            // Longer items retain the ordinary independently owned path.
+            if (read_text and tokens > model.session.executionCapabilities().text_batch_tokens) return null;
+            shape.* = .{ .bytes = token_text.len, .tokens = tokens, .geometry_key = if (read_text) tokens else 0 };
             try validateTextExecutorInvocation(contract, 1, &.{text}, prefix.prefix.len, shape.tokens, 0, 0);
             identity.* = .{};
         }
@@ -7415,10 +7451,10 @@ pub const Node = struct {
             .resource_class = executorMicrobatchResourceClass(model.session.backend()),
         }, .{
             .mode = .native,
-            .preferred_items = contract.batch.preferred_items,
-            .max_items = contract.batch.max_items,
+            .preferred_items = if (read_text) rows else @min(contract.batch.preferred_items, rows),
+            .max_items = rows,
             .max_bytes = requestMediaMaxBytes(self),
-            .max_tokens = if (contract.batch.max_input_tokens_per_item) |limit| limit *| contract.batch.max_items else std.math.maxInt(usize),
+            .max_tokens = if (contract.batch.max_input_tokens_per_item) |limit| limit *| rows else std.math.maxInt(usize),
             .max_wait_us = self.config.executor_microbatch_max_wait_us,
         }, shapes, identities, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, self, if (sparse) executeSparseTextEmbedMicrobatch else executeTextEmbedMicrobatch);
         return try executor_microbatch.collectOwned(Output, allocator, shared, results, if (sparse) cloneSparseRow else cloneDenseRow, if (sparse) freeSparseRow else freeDenseRow);
@@ -7492,6 +7528,159 @@ pub const Node = struct {
             };
             item.slot.setValue([]f32, vector, @fromBackingInt(@backingInt(observation.execution(items.len))));
         }
+    }
+
+    const read_pool_microbatch = @import("read_pool_microbatch.zig");
+    const DecideOutputOwner = read_pool_microbatch.OutputOwner;
+    const DecideRows = read_pool_microbatch.Rows;
+    const cloneDecideRows = read_pool_microbatch.clone;
+    const freeDecideRows = read_pool_microbatch.destroy;
+
+    const DecideClassifyTicket = struct {
+        model: *model_manager_mod.LoadedModel,
+        config: span_v2_executor.EncoderConfig,
+        sample: @import("../pipelines/gliner_boundary_processor.zig").Sample,
+        counts: []const usize,
+        limits: runtime.tier.memory.Limits,
+    };
+
+    fn tryDecideClassificationMicrobatch(self: *Node, a: std.mem.Allocator, io: std.Io, model: *model_manager_mod.LoadedModel, config: span_v2_executor.EncoderConfig, request: *const extraction_v2.Request, plan: *const span_v2_executor.Plan, options: span_v2_executor.Options) !?[]u8 {
+        if (!span_v2_executor.canBatchClassifications(request, plan)) return null;
+        const control = self.bindExecutionControl(io, options.control orelse .{});
+        const limits = self.config.generation_budget_overrides.apply(self.defaultGenerationLimits(.gpu));
+        // Exact budget identity is part of compatibility. Presentation stays
+        // on each caller, so schema/threshold/output limits never borrow a peer.
+        const key = try std.json.Stringify.valueAlloc(a, .{ .config = config, .limits = limits }, .{});
+        defer a.free(key);
+        const payloads = try a.alloc(DecideClassifyTicket, request.items.len);
+        defer a.free(payloads);
+        const shapes = try a.alloc(executor_microbatch.Shape, request.items.len);
+        defer a.free(shapes);
+        const identities = try a.alloc(executor_microbatch.Identity, request.items.len);
+        defer a.free(identities);
+        var built: usize = 0;
+        defer for (payloads[0..built]) |payload| a.free(payload.counts);
+        for (request.items, plan.items, payloads, shapes, identities) |item, prepared, *payload, *shape, *identity| {
+            const counts = try a.alloc(usize, item.compiled.schema.classifications.len);
+            for (counts, item.compiled.schema.classifications) |*count, task| count.* = task.task.labels.len;
+            const sample = prepared.batches[0].samples[0];
+            payload.* = .{ .model = model, .config = config, .sample = sample, .counts = counts, .limits = limits };
+            built += 1;
+            shape.* = .{ .bytes = sample.input_ids.len * @sizeOf(i64), .tokens = sample.input_ids.len, .geometry_key = try std.math.ceilPowerOfTwo(usize, @max(sample.input_ids.len, 1)) };
+            identity.* = .{};
+        }
+        const Probe = struct {
+            fn canceled(raw: *const anyopaque) bool {
+                const active: *const InferenceExecutionControl = @ptrCast(@alignCast(raw));
+                active.check() catch return true;
+                return false;
+            }
+        };
+        const shared = std.heap.smp_allocator;
+        const results = try self.executorMicrobatchBroker().submitBatchControlled(DecideClassifyTicket, DecideRows, io, shared, .{ .model = model.model_dir, .generation = @intFromPtr(model), .task = .extract, .schema = key, .transform = "read-decide-classification", .resource_class = .gpu }, .{ .mode = .native, .preferred_items = 8, .max_items = 8, .max_tokens = 8 * 512, .max_bytes = 8 * 512 * @sizeOf(i64), .max_wait_us = self.config.executor_microbatch_max_wait_us }, shapes, identities, try directExecutorDeadline(io, control.deadline_ns), .{ .ptr = &control, .is_cancelled_fn = Probe.canceled }, payloads, self, executeDecideClassificationMicrobatch);
+        const rows = try executor_microbatch.collectOwned(DecideRows, a, shared, results, cloneDecideRows, freeDecideRows);
+        defer {
+            for (rows) |row| freeDecideRows(a, row);
+            a.free(rows);
+        }
+        const logits = try a.alloc(span_v2_executor.ItemLogits, rows.len);
+        defer a.free(logits);
+        for (logits, rows, plan.items) |*item, row, prepared| item.* = .{ .rows = row.rows, .prompt_tokens = prepared.prompt_tokens, .sequences = 1 };
+        var presentation = options;
+        presentation.classification_results = logits;
+        return try span_v2_executor.executePlanned(null, a, config, request, plan, presentation);
+    }
+
+    fn executeDecideClassificationMicrobatch(raw: *anyopaque, items: []const executor_microbatch.ExecuteItem) void {
+        const self: *Node = @ptrCast(@alignCast(raw));
+        self.runDecideClassificationMicrobatch(items) catch |err| {
+            for (items) |item| if (!item.slot.completed) item.slot.fail(err);
+        };
+    }
+
+    fn runDecideClassificationMicrobatch(self: *Node, items: []const executor_microbatch.ExecuteItem) anyerror!void {
+        if (items.len == 0) return;
+        const rows = self.forwardDecideClassificationMicrobatch(items) catch |err| {
+            // Capacity subdivision happens before any forward. Never replay a
+            // failed GPU operation or let one oversized cohort reject fit rows.
+            if (err == error.ReadMicrobatchCapacity and items.len > 1) {
+                const half = items.len / 2;
+                try self.runDecideClassificationMicrobatch(items[0..half]);
+                return self.runDecideClassificationMicrobatch(items[half..]);
+            }
+            return if (err == error.ReadMicrobatchCapacity) error.MemoryBudgetExceeded else err;
+        };
+        const a = std.heap.smp_allocator;
+        defer a.free(rows);
+        for (items, rows) |item, row| {
+            item.control.check() catch |err| {
+                freeDecideRows(a, row);
+                item.slot.fail(err);
+                continue;
+            };
+            item.slot.physical_group_key = @intFromPtr(items.ptr);
+            item.slot.setValue(DecideRows, row, if (items.len > 1) .native_batch else .serial);
+        }
+    }
+
+    fn forwardDecideClassificationMicrobatch(self: *Node, items: []const executor_microbatch.ExecuteItem) ![]DecideRows {
+        const a = std.heap.smp_allocator;
+        const first = items[0].payloadAs(DecideClassifyTicket);
+        var group = executor_microbatch.ExecutionControl{ .items = items };
+        const control = self.bindExecutionControl(items[0].control.io, .{ .ptr = &group, .check_fn = executor_microbatch.ExecutionControl.check });
+        var longest: usize = 0;
+        for (items) |item| longest = @max(longest, item.payloadAs(DecideClassifyTicket).sample.input_ids.len);
+        var budget = read_pool_microbatch.classificationBudget(first.limits, first.config, longest, items.len) catch |err| {
+            if (err == error.MemoryBudgetExceeded) return error.ReadMicrobatchCapacity;
+            return err;
+        };
+        const device_bytes = budget.backend_scratch_bytes;
+        const host_bytes = budget.host_scratch_bytes;
+        const turn = try first.model.gliner_execution_lane.acquire(control);
+        defer turn.release();
+        try control.lock(&first.model.gliner_boundary_admission_lock);
+        defer first.model.gliner_boundary_admission_lock.unlock();
+        var lease = self.model_manager.acquireRunResourceAmounts(.gpu, first.limits, .{ .backend_scratch_bytes = device_bytes, .host_scratch_bytes = host_bytes }) catch |err| {
+            if (err == error.MemoryBudgetExceeded) return error.ReadMicrobatchCapacity;
+            return err;
+        };
+        var lease_transferred = false;
+        defer if (!lease_transferred) lease.release();
+        const mutex = first.model.targetInferenceExecutionMutex();
+        if (mutex) |lock| try control.lock(lock);
+        defer if (mutex) |lock| lock.unlock();
+        var managed = try session_factory.getManagedComputeBackend(first.model.session, a, &budget, control);
+        defer managed.deinit();
+        var samples: [8]@import("../pipelines/gliner_boundary_processor.zig").Sample = undefined;
+        var counts: [8][]const usize = undefined;
+        if (items.len > samples.len) return error.InvalidMicrobatchLimits;
+        for (items, 0..) |item, i| {
+            const payload = item.payloadAs(DecideClassifyTicket);
+            samples[i] = payload.sample;
+            counts[i] = payload.counts;
+        }
+        const raw_rows = try span_v2_executor.classificationBatchLogits(&managed.backend, a, first.config, samples[0..items.len], counts[0..items.len], null);
+        defer a.free(raw_rows);
+        errdefer for (raw_rows) |rows| {
+            for (rows) |row| a.free(row);
+            a.free(rows);
+        };
+        const output = try a.alloc(DecideRows, items.len);
+        errdefer a.free(output);
+        const owner = try a.create(DecideOutputOwner);
+        errdefer a.destroy(owner);
+        var retained: usize = @sizeOf(DecideOutputOwner) + output.len * @sizeOf(DecideRows);
+        for (raw_rows) |rows| {
+            retained += rows.len * @sizeOf([]f64);
+            for (rows) |row| retained += row.len * @sizeOf(f64);
+        }
+        // Reduce the physical peak to its independently owned host outputs.
+        // The last broker consumer releases this lease after copying its row.
+        try lease.retain(.{ .host_scratch_bytes = retained });
+        owner.* = .{ .lease = lease, .remaining = .init(items.len) };
+        lease_transferred = true;
+        for (output, raw_rows) |*value, rows| value.* = .{ .rows = rows, .owner = owner };
+        return output;
     }
 
     const AudioEmbedTicket = struct {
@@ -11668,6 +11857,8 @@ pub const Node = struct {
         // capacity and fail before the already-serialized execution can drain.
         // This is distinct from the execution/provider lock: admission may
         // evict other models and must remain outside those locks.
+        const gliner_turn = if (backend == .cuda or backend == .metal) try loaded.gliner_execution_lane.acquire(control orelse .{}) else null;
+        defer if (gliner_turn) |turn| turn.release();
         const admission_mutex = if (backend == .cuda or backend == .metal) &loaded.gliner_boundary_admission_lock else null;
         if (admission_mutex) |mutex| try effective.lock(mutex);
         defer if (admission_mutex) |mutex| mutex.unlock();
@@ -11898,6 +12089,15 @@ pub const Node = struct {
         if (specialty_candidate != null and (longest > 512 or prepared_sequences != request.items.len))
             return error.UnsupportedGlinerDecisionGeometry;
         try validateTextExecutorInvocation(executor_contract, texts.len, texts, 0, longest, max_labels, 0);
+        // The authenticated FP32 and Q8 CUDA Decide artifacts declare independent padded
+        // classification rows. Queue prepared host inputs before GPU admission;
+        // each caller presents its own logits after the shared forward drains.
+        if (backend == .cuda and (qualified_variant == .decide_deberta or qualified_variant == .decide_deberta_q8)) {
+            var owned_microbatch_io: ?std.Io.Threaded = null;
+            defer if (owned_microbatch_io) |*owned| owned.deinit();
+            const microbatch_io = self.inferenceIo(scratch, (control orelse InferenceExecutionControl{}).io, &owned_microbatch_io);
+            if (try self.tryDecideClassificationMicrobatch(scratch, microbatch_io, loaded, config, request, &request_plan, options)) |json| return json;
+        }
         const span_geometry: ?span_v2_executor.SpanExtractionGeometry = if (specialty_candidate == .pii) geometry: {
             var shape = try span_v2_executor.maxSpanExtractionGeometry(request, &request_plan, options.span_extraction_profile.?);
             shape.batch_items = span_v2_executor.extractionBatchItems(request, &request_plan, options);
@@ -11914,6 +12114,8 @@ pub const Node = struct {
         // GPU batches reserve their complete physical workspace only at the
         // front of the model lane. Concurrent waiters retain bounded host state,
         // without each reserving another batch's otherwise serialized workspace.
+        const gliner_turn = if (backend == .cuda or backend == .metal) try loaded.gliner_execution_lane.acquire(control orelse .{}) else null;
+        defer if (gliner_turn) |turn| turn.release();
         const admission_mutex = if (backend == .cuda or backend == .metal) &loaded.gliner_boundary_admission_lock else null;
         if (admission_mutex) |mutex| try (control orelse InferenceExecutionControl{}).lock(mutex);
         defer if (admission_mutex) |mutex| mutex.unlock();
@@ -13601,7 +13803,7 @@ pub const Node = struct {
                         if (try attempt.node.tryEmbedParsedViaBroker(attempt.allocator, io, model, attempt.inputs, attempt.execution_control, attempt.request.task_type orelse .RETRIEVAL_DOCUMENT, attempt.request.instruction, attempt.audio_decode_working_bytes)) |vectors| {
                             errdefer freeDirectDenseVectors(attempt.allocator, vectors);
                             try model.verifyEmbeddingIdentityWithControl(attempt.execution_control);
-                            attempt.prompt_tokens = countParsedDenseEmbedTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.inputs, prefix.prefix);
+                            attempt.prompt_tokens = if (readPoolEmbeddingTextBatch(model)) try strictParsedEmbeddingTextTokens(attempt.allocator, model, attempt.inputs, prefix.prefix) else countParsedDenseEmbedTextTokens(attempt.allocator, attempt.io, model.getTokenizer(), attempt.inputs, prefix.prefix);
                             attempt.result = .{ .fail_fast = vectors };
                             return;
                         }
@@ -25652,6 +25854,13 @@ pub const Node = struct {
         try appendPromMetric(&writer.writer, "antfly_inference_generation_cooperative_capable_models", "gauge", "Loaded backends declaring cooperative step sharing", cooperative_capable);
         try appendPromMetric(&writer.writer, "antfly_inference_generation_cooperative_configured", "gauge", "Explicit cooperative interleaving opt-in", @intFromBool(self.config.cooperative_execution.mode == .on));
         try appendPromMetric(&writer.writer, "antfly_inference_generation_row_batching_configured", "gauge", "Independent experimental row batching opt-in", @intFromBool(self.config.generation_batching.mode == .on));
+        if (self.session_manager.io) |io| {
+            const batch = self.executorMicrobatchBroker().snapshot(io);
+            try appendPromMetric(&writer.writer, "antfly_inference_executor_microbatch_native_batches_total", "counter", "Native execution groups reported by typed executors; may contain bounded sub-batches", batch.native_batches);
+            try appendPromMetric(&writer.writer, "antfly_inference_executor_microbatch_native_items_total", "counter", "Items completed in observed native executor batches", batch.native_items);
+            try appendPromMetric(&writer.writer, "antfly_inference_executor_microbatch_groups_total", "counter", "Executed logical groups; not evidence of native batching", batch.coalesced_groups);
+            try appendPromMetric(&writer.writer, "antfly_inference_executor_microbatch_canceled_items_total", "counter", "Queued executor items canceled before execution", batch.canceled_items);
+        }
         inline for (comptime std.meta.fieldNames(@TypeOf(execution_owners))) |field|
             try appendPromMetric(&writer.writer, "antfly_inference_generation_owner_" ++ field ++ "_total", "counter", "Backend execution owner transitions and same-owner scope reuse", @field(execution_owners, field));
         try appendPromMetric(&writer.writer, "antfly_inference_recurrent_cuda_models", "gauge", "Loaded CUDA models whose recurrent state executes on device", recurrent_cuda);

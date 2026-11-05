@@ -681,6 +681,9 @@ pub const OutputCredits = struct {
 /// This is the core abstraction all backends implement.
 pub const ExecutionCapabilities = struct {
     /// A backend declaration, never inferred by the generic scheduler.
+    /// Backend-qualified short encoder cohorts, independent of generation.
+    text_batch_rows: usize = 1,
+    text_batch_tokens: usize = 0,
     cooperative_steps: bool = false,
     max_active_requests: usize = 1,
     max_batch_rows: usize = 1,
