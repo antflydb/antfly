@@ -264,7 +264,8 @@ pub const Lookup = struct {
         if (value.* != .dict) return error.UnsupportedPdfStructureText;
         const page = if (value.get("Pg")) |pg| try reference(pg) else inherited_page;
         if (value.get("MCID")) |mcid| {
-            const index = mcid.asInteger() orelse return error.InvalidPdfStructure;
+            const resolved = try self.numberObject(mcid);
+            const index = resolved.asInteger() orelse return error.InvalidPdfStructure;
             if (index < 0) return error.InvalidPdfStructure;
             try self.pageMatches(page);
             const container = if (value.get("Stm")) |stream| try self.streamContainer(stream) else self.page_parent orelse return error.UnsupportedPdfStructureText;
@@ -347,7 +348,18 @@ pub const Lookup = struct {
         // Cached owners require no new work or allocation. Keep honoring them
         // after an unrelated lookup exhausts a limit, so later segments of a
         // known replacement cannot leak their original glyphs back into text.
-        return self.getImpl(container, mcid) catch |err| switch (err) {
+        return self.getImpl(container, mcid) catch |err| self.failed(err);
+    }
+
+    pub fn getObject(self: *Lookup, container: ?i64, raw: *const Object) !?Replacement {
+        try self.resolver.check(self.resolver.context);
+        const resolved = self.numberObject(raw) catch |err| return self.failed(err);
+        const mcid = resolved.asInteger() orelse return self.failed(error.InvalidPdfStructure);
+        return self.get(container, mcid);
+    }
+
+    fn failed(self: *Lookup, err: anyerror) !?Replacement {
+        return switch (err) {
             error.Canceled => return err,
             error.OutOfMemory => {
                 if (!self.resolver.exhausted(self.resolver.context)) return err;

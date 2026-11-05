@@ -3075,10 +3075,23 @@ const PagePattern = struct {
     }
 };
 
+const MarkedContentId = union(enum) {
+    index: i64,
+    reference: syntax.ObjRef,
+
+    fn object(self: @This()) syntax.Object {
+        return switch (self) {
+            .index => |value| .{ .integer = value },
+            .reference => |value| .{ .obj_ref = value },
+        };
+    }
+};
+
 const PageTextProperty = struct {
     name: []u8,
     actual_text: ?[]u8 = null,
-    mcid: ?i64 = null,
+    // Resolve references lazily through the bounded structure metadata cache.
+    mcid: ?MarkedContentId = null,
 
     fn deinit(self: *PageTextProperty, alloc: Allocator) void {
         alloc.free(self.name);
@@ -3100,8 +3113,17 @@ const ActualTextScope = struct {
 };
 
 fn findTextProperty(properties: []const PageTextProperty, name: []const u8) ?*const PageTextProperty {
-    for (properties) |*property| {
-        if (std.mem.eql(u8, property.name, name)) return property;
+    // Resource collection sorts once. Binary search keeps immutable borrows
+    // allocation-free and avoids scanning every property for every BDC.
+    var low: usize = 0;
+    var high = properties.len;
+    while (low < high) {
+        const mid = low + (high - low) / 2;
+        switch (std.mem.order(u8, properties[mid].name, name)) {
+            .lt => low = mid + 1,
+            .gt => high = mid,
+            .eq => return &properties[mid],
+        }
     }
     return null;
 }
@@ -3524,20 +3546,28 @@ const SemanticTextContext = struct {
             var owner: ?u64 = null;
             var replacement: ?[]u8 = null;
             if (!self.suppress and self.active == null and std.mem.eql(u8, op, "BDC")) {
-                var mcid: ?i64 = null;
+                var mcid: ?syntax.Object = null;
+                var named_property: ?*const PageTextProperty = null;
                 if (operands.len > 0) {
                     const property = &operands[operands.len - 1];
                     if (property.* == .name) {
-                        if (findTextProperty(properties, property.name)) |named| mcid = named.mcid;
-                    } else if (property.get("MCID")) |value| mcid = value.asInteger() orelse -1;
+                        named_property = findTextProperty(properties, property.name);
+                        if (named_property) |named| if (named.mcid) |id| {
+                            mcid = id.object();
+                        };
+                    } else if (property.get("MCID")) |value| mcid = value.*;
                 }
-                if (mcid) |id| if (self.structure) |lookup| if (try lookup.get(self.structure_parent, id)) |selected| {
+                if (mcid) |*id| if (self.structure) |lookup| if (try lookup.getObject(self.structure_parent, id)) |selected| {
                     owner = selected.owner;
                     // Later sequences contribute paint and glyph membership,
                     // but do not copy or emit the shared replacement again.
                     replacement = try alloc.dupe(u8, if (self.structure_spans.?.contains(selected.owner)) "" else selected.text);
                 };
-                if (replacement == null) replacement = try actualTextFromBdcAlloc(alloc, operands, properties);
+                if (replacement == null) {
+                    if (named_property) |named| {
+                        if (named.actual_text) |text| replacement = try alloc.dupe(u8, text);
+                    } else replacement = try actualTextFromBdcAlloc(alloc, operands, properties);
+                }
             }
             errdefer if (replacement) |text| alloc.free(text);
             const effective = replacement != null;
@@ -8239,7 +8269,14 @@ pub const Reader = struct {
                 else => continue,
             };
             defer property.deinit(self.alloc);
-            const mcid = if (property.get("MCID")) |value| value.asInteger() orelse -1 else null;
+            const mcid: ?MarkedContentId = if (property.get("MCID")) |value|
+                switch (value.*) {
+                    .integer => |index| .{ .index = index },
+                    .obj_ref => |ref| .{ .reference = ref },
+                    else => .{ .index = -1 },
+                }
+            else
+                null;
             var text: ?[]u8 = null;
             errdefer if (text) |owned| self.alloc.free(owned);
             if (property.get("ActualText")) |actual_obj| {
@@ -8252,6 +8289,11 @@ pub const Reader = struct {
             errdefer self.alloc.free(name);
             try out.append(self.alloc, .{ .name = name, .actual_text = text, .mcid = mcid });
         }
+        std.mem.sort(PageTextProperty, out.items, {}, struct {
+            fn lessThan(_: void, left: PageTextProperty, right: PageTextProperty) bool {
+                return std.mem.lessThan(u8, left.name, right.name);
+            }
+        }.lessThan);
         return try out.toOwnedSlice(self.alloc);
     }
 
@@ -34707,6 +34749,8 @@ const TaggedTextFixture = struct {
     parents: []const u8 = "/Nums [0 [7 0 R]]",
     form_content: []const u8 = "",
     form_parent: []const u8 = "/StructParents 1",
+    page_properties: []const u8 = "/Tag << /MCID 0 >>",
+    form_properties: []const u8 = "",
     extra: []const []const u8 = &.{},
     pages: []const u8 = "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
 };
@@ -34720,8 +34764,10 @@ fn buildTaggedTextTestPdfAlloc(a: Allocator, fixture: TaggedTextFixture) ![]u8 {
     defer a.free(parents);
     const document = try std.fmt.allocPrint(a, "9 0 obj\n<< /Type /StructElem /S /Document /P 6 0 R /K {s} {s} >>\nendobj\n", .{ fixture.document_k, fixture.document });
     defer a.free(document);
-    const form = try std.fmt.allocPrint(a, "10 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 400 300] {s} /Resources << /Font << /F1 5 0 R >> >> /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ fixture.form_parent, fixture.form_content.len, fixture.form_content });
+    const form = try std.fmt.allocPrint(a, "10 0 obj\n<< /Type /XObject /Subtype /Form /BBox [0 0 400 300] {s} /Resources << /Font << /F1 5 0 R >> /Properties << {s} >> >> /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ fixture.form_parent, fixture.form_properties, fixture.form_content.len, fixture.form_content });
     defer a.free(form);
+    const page = try std.fmt.allocPrint(a, "3 0 obj\n<< /Type /Page /Parent 2 0 R /StructParents 0 /MediaBox [0 0 400 300] /Resources << /Font << /F1 5 0 R >> /Properties << {s} >> /XObject << /Fm 10 0 R >> >> /Contents 4 0 R >>\nendobj\n", .{fixture.page_properties});
+    defer a.free(page);
     const pages = try std.fmt.allocPrint(a, "2 0 obj\n{s}\nendobj\n", .{fixture.pages});
     defer a.free(pages);
     var objects = std.ArrayList([]const u8).empty;
@@ -34729,7 +34775,7 @@ fn buildTaggedTextTestPdfAlloc(a: Allocator, fixture: TaggedTextFixture) ![]u8 {
     try objects.appendSlice(a, &.{
         "1 0 obj\n<< /Type /Catalog /Pages 2 0 R /MarkInfo << /Marked true >> /StructTreeRoot 6 0 R >>\nendobj\n",
         pages,
-        "3 0 obj\n<< /Type /Page /Parent 2 0 R /StructParents 0 /MediaBox [0 0 400 300] /Resources << /Font << /F1 5 0 R >> /Properties << /Tag << /MCID 0 >> >> /XObject << /Fm 10 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        page,
         page_stream,
         "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
         "6 0 obj\n<< /Type /StructTreeRoot /K [9 0 R] /ParentTree 8 0 R >>\nendobj\n",
@@ -34770,6 +34816,58 @@ test "reader structure ActualText replaces glyph vector and inline image content
                 for (analysis.runs) |run| try std.testing.expectEqualStrings("SOURCE", run.text);
             }
         }
+    }
+}
+
+test "reader indirect MCIDs resolve in named page and Form properties and MCR bindings" {
+    const a = std.testing.allocator;
+    const paint = "BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET";
+    const cases = [_]struct { fixture: TaggedTextFixture, incomplete: bool = false }{
+        .{ .fixture = .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .page_properties = "/Tag << /MCID 11 0 R >>", .extra = &.{"11 0 obj\n0\nendobj\n"} } },
+        .{ .fixture = .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .element = "/P 9 0 R /K << /Type /MCR /Pg 3 0 R /MCID 11 0 R >> /ActualText (Label)", .extra = &.{"11 0 obj\n0\nendobj\n"} } },
+        .{ .fixture = .{ .content = "/Fm Do", .form_content = "/Span /Tag BDC " ++ paint ++ " EMC", .form_properties = "/Tag << /MCID 11 0 R >>", .element = "/P 9 0 R /K << /Type /MCR /Pg 3 0 R /Stm 10 0 R /MCID 11 0 R >> /ActualText (Label)", .parents = "/Nums [0 [] 1 [7 0 R]]", .extra = &.{"11 0 obj\n0\nendobj\n"} } },
+        .{ .fixture = .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .page_properties = "/Tag << /MCID 11 0 R >>" }, .incomplete = true },
+        .{ .fixture = .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .page_properties = "/Tag << /MCID 11 0 R >>", .extra = &.{"11 0 obj\n(wrong type)\nendobj\n"} }, .incomplete = true },
+        .{ .fixture = .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .page_properties = "/Tag << /MCID 11 0 R >>", .extra = &.{"11 0 obj\n11 0 R\nendobj\n"} }, .incomplete = true },
+        .{ .fixture = .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .element = "/P 9 0 R /K << /Type /MCR /Pg 3 0 R /MCID 11 0 R >> /ActualText (Label)", .extra = &.{"11 0 obj\n-1\nendobj\n"} }, .incomplete = true },
+        .{ .fixture = .{ .content = "/Span /Tag BDC " ++ paint ++ " EMC", .page_properties = "/Tag << /MCID 11 0 R >>", .extra = &.{"11 0 obj\n" ++ repeatBytesComptime("[", 256) ++ "0" ++ repeatBytesComptime("]", 256) ++ "\nendobj\n"} }, .incomplete = true },
+    };
+    for (cases) |case| {
+        const sample = try buildTaggedTextTestPdfAlloc(a, case.fixture);
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            parsed.setTextExtractionPolicy(policy);
+            var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try parsed.extractPageTextAlloc(1);
+            defer a.free(plain);
+            try std.testing.expectEqualStrings(if (case.incomplete) "SOURCE\n" else "Label\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expectEqual(case.incomplete, analysis.diagnostics.structure_text_incomplete);
+        }
+    }
+}
+
+test "reader named property index preserves source order and missing name fallback" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{
+        .page_properties = "/Zulu << /ActualText (Z) >> /Alpha << /ActualText (A) >> /Middle << /ActualText (M) >>",
+        .content = "/Span /Zulu BDC BT /F1 10 Tf 10 100 Td (g) Tj ET EMC /Span /Alpha BDC BT /F1 10 Tf 10 100 Td (g) Tj ET EMC /Span /Middle BDC BT /F1 10 Tf 10 100 Td (g) Tj ET EMC /Span /Missing BDC BT /F1 10 Tf 10 100 Td (raw) Tj ET EMC",
+    });
+    defer a.free(sample);
+    var parsed = try Reader.init(a, sample);
+    defer parsed.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        parsed.setTextExtractionPolicy(policy);
+        var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(a);
+        const plain = try parsed.extractPageTextAlloc(1);
+        defer a.free(plain);
+        try std.testing.expectEqualStrings("ZAMraw\n", analysis.text);
+        try std.testing.expectEqualStrings(analysis.text, plain);
+        try std.testing.expectEqual(@as(usize, 3), analysis.semantic_spans.len);
     }
 }
 
@@ -34877,8 +34975,12 @@ test "reader malformed and cross-page structures retain native text with partial
     }
 }
 
-fn exerciseStructureLookupAlloc(a: Allocator, parsed: *Reader, use_document: bool) !void {
-    var budget = DecodeBudgetAllocator.initWithCumulativeLimit(a, 0, 1024 * 1024, 4 * 1024 * 1024);
+fn exerciseStructureLookupAlloc(a: Allocator, parsed: *Reader, use_document: bool, mcid: syntax.Object) !void {
+    // Force grow/shrink paths to allocate/free: platform remaps can change
+    // the allocation count between failure-sweep attempts. The outer failing
+    // allocator still checks every allocation and all ownership cleanup.
+    var no_remap = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+    var budget = DecodeBudgetAllocator.initWithCumulativeLimit(no_remap.allocator(), 0, 1024 * 1024, 4 * 1024 * 1024);
     const context = StructureResolverContext{ .reader = parsed, .budget = &budget };
     var document = structure_text.Document{ .alloc = budget.allocator() };
     defer document.deinit();
@@ -34890,28 +34992,35 @@ fn exerciseStructureLookupAlloc(a: Allocator, parsed: *Reader, use_document: boo
         .resolver = .{ .context = &context, .root = StructureResolverContext.root, .resolve = StructureResolverContext.resolve, .check = StructureResolverContext.check, .exhausted = StructureResolverContext.exhausted },
     };
     defer lookup.deinit();
-    const first = (try lookup.get(0, 0)).?;
+    const first = (try lookup.getObject(0, &mcid)).?;
     try std.testing.expectEqualStrings("Label", first.text);
     const work = lookup.work;
     for (0..4096) |_| {
-        const next = (try lookup.get(0, 0)).?;
+        const next = (try lookup.getObject(0, &mcid)).?;
         try std.testing.expectEqual(first.text.ptr, next.text.ptr);
     }
     try std.testing.expectEqual(work, lookup.work);
     try std.testing.expect(!lookup.incomplete);
     lookup.max_nodes = work;
-    const cached_at_limit = (try lookup.get(0, 0)).?;
+    const cached_at_limit = (try lookup.getObject(0, &mcid)).?;
     try std.testing.expectEqual(first.text.ptr, cached_at_limit.text.ptr);
 }
 
 test "reader structure lookup memoizes shared ancestry and owns allocations on failure" {
     const a = std.testing.allocator;
-    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "/Span << /MCID 0 >> BDC BT (SOURCE) Tj ET EMC" });
-    defer a.free(sample);
-    var parsed = try Reader.init(a, sample);
-    defer parsed.deinit();
-    _ = try parsed.pageCount();
-    inline for (.{ false, true }) |use_document| try std.testing.checkAllAllocationFailures(a, exerciseStructureLookupAlloc, .{ &parsed, use_document });
+    inline for (.{ false, true }) |indirect| {
+        const sample = try buildTaggedTextTestPdfAlloc(a, .{
+            .content = "/Span << /MCID 0 >> BDC BT (SOURCE) Tj ET EMC",
+            .element = if (indirect) "/P 9 0 R /K << /Type /MCR /Pg 3 0 R /MCID 11 0 R >> /ActualText (Label)" else "/P 9 0 R /K 0 /ActualText (Label)",
+            .extra = &.{"11 0 obj\n0\nendobj\n"},
+        });
+        defer a.free(sample);
+        var parsed = try Reader.init(a, sample);
+        defer parsed.deinit();
+        _ = try parsed.pageCount();
+        const mcid = if (indirect) syntax.Object{ .obj_ref = .{ .id = 11, .gen = 0 } } else syntax.Object{ .integer = 0 };
+        inline for (.{ false, true }) |use_document| try std.testing.checkAllAllocationFailures(a, exerciseStructureLookupAlloc, .{ &parsed, use_document, mcid });
+    }
 }
 
 test "reader structure lookup bounds memory work and cancellation without hiding native text" {
@@ -34946,7 +35055,7 @@ test "reader structure lookup bounds memory work and cancellation without hiding
     };
     var probe = Probe{};
     parsed.setCancellationProbe(.{ .context = &probe, .is_cancelled_fn = Probe.canceled });
-    try std.testing.expectError(error.Canceled, exerciseStructureLookupAlloc(a, &parsed, true));
+    try std.testing.expectError(error.Canceled, exerciseStructureLookupAlloc(a, &parsed, true, .{ .integer = 0 }));
     try std.testing.expect(probe.calls >= 10);
 }
 

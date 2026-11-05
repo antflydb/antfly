@@ -1909,7 +1909,11 @@ Structure-backed replacements resolve container-scoped MCIDs through a lazy
 ParentTree number-tree index. Parsed metadata and validated number-tree nodes
 are cached per Reader; render forks own independent caches. Container arrays,
 ancestor decisions, stream container keys, and decoded owner text are reused
-within each page. Retained metadata and page-local lookup allocations share
+within each page. Indirect MCID values in named properties and marked-content
+references use the same bounded, memoized resolver. Named property tables are
+sorted once per resource scope and searched in logarithmic time, without
+allocating a separate lookup table or scanning all properties for each BDC.
+Retained metadata and page-local lookup allocations share
 one live-byte allowance. ParentTree bindings are checked against the owner's declared
 content. An outer replacement wins over its descendants; repeated MCIDs owned
 by the same replacement merge paint evidence and emit text once, preserving
