@@ -1925,17 +1925,22 @@ Indirect resource and property dictionaries are retained once per page. Form
 records borrow their raw strings, and property-name indexes are sorted once per
 dictionary. Repeated Form scopes cannot multiply a shared replacement's storage.
 The resource cache retains recognized resource fields and only MCID/ActualText
-from property dictionaries. Unknown payloads are released with temporary parsing
-storage rather than accumulating in the cache. Temporary per-object parsing and
-retained metadata share one live-byte ceiling, with separate cumulative-allocation
+from property dictionaries. Metadata parsing skips unknown values without allocating
+their strings or object graphs, while preserving token validation and depth limits.
+Temporary per-object parsing and retained metadata share one live-byte ceiling,
+with separate cumulative-allocation
 allowances. Required fields from indirect resources retain only a small source
 reference for Properties; the optional table is projected on first selected use.
 Inherited resource references preserve this behavior. Direct table retention that
 exceeds its allowance becomes an invalid optional value, diagnosed only if used.
 Indirect property tables and dictionaries are resolved only when a selected
 scope needs them; overridden scopes do not read their object streams.
-The syntax scanner transfers owned string/name tokens into objects, avoiding a
-second full payload allocation while an object stream remains decoded.
+Fonts, graphics states, and color spaces share the projected resource root.
+The syntax scanner transfers owned tokens through lookahead and into objects,
+avoiding a second full payload allocation while an object stream remains decoded.
+Cache entries reserve capacity before parsing. Successful projections and
+deterministic failures then commit without allocating; a saturated cache rejects
+a new entry before spending work on metadata it cannot retain.
 Selected missing or malformed property dictionaries retain native glyph text and
 report incomplete ActualText, including when selected optional metadata exceeds
 a decode or allocation allowance. Actual allocator failures and cancellation

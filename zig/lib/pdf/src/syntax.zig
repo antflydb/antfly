@@ -197,6 +197,40 @@ const Token = union(enum) {
 
 pub const Lexeme = Token;
 
+// Metadata readers keep only the fields needed for their selected purpose.
+// Full parsing remains the default for rendering and general object consumers.
+pub const Projection = enum {
+    full,
+    resources,
+    required_resources,
+    resource_container,
+    resource_properties,
+    property_table,
+    property,
+    integer,
+    text,
+
+    const Field = struct { keep: bool, skip: bool = false, child: Projection = .full };
+
+    fn field(self: Projection, key: []const u8) Field {
+        return switch (self) {
+            .full => .{ .keep = true },
+            .resources, .required_resources => blk: {
+                if (std.mem.eql(u8, key, "Properties")) break :blk .{ .keep = true, .skip = self == .required_resources, .child = .property_table };
+                for ([_][]const u8{ "Font", "XObject", "ExtGState", "ColorSpace" }) |name| {
+                    if (std.mem.eql(u8, key, name)) break :blk .{ .keep = true };
+                }
+                break :blk .{ .keep = false };
+            },
+            .resource_container => .{ .keep = true, .child = if (std.mem.eql(u8, key, "Resources")) .resources else .full },
+            .resource_properties => .{ .keep = std.mem.eql(u8, key, "Properties"), .child = .property_table },
+            .property_table => .{ .keep = true, .child = .property },
+            .property => if (std.mem.eql(u8, key, "ActualText")) .{ .keep = true, .child = .text } else if (std.mem.eql(u8, key, "MCID")) .{ .keep = true, .child = .integer } else .{ .keep = false },
+            .integer, .text => .{ .keep = false },
+        };
+    }
+};
+
 pub const Scanner = struct {
     alloc: Allocator,
     bytes: []const u8,
@@ -225,6 +259,27 @@ pub const Scanner = struct {
     }
 
     pub fn readObject(self: *Scanner) anyerror!Object {
+        return self.readObjectProjected(.full);
+    }
+
+    pub fn readObjectProjected(self: *Scanner, projection: Projection) anyerror!Object {
+        if (projection != .full and self.unread.items.len == 0) {
+            self.skipSpaceAndComments();
+            if (self.peekByte()) |first| {
+                const compound = first == '[' or (first == '<' and self.pos + 1 < self.bytes.len and self.bytes[self.pos + 1] == '<');
+                const string = first == '(' or (first == '<' and !compound);
+                const reject = switch (projection) {
+                    .full => false,
+                    .integer => compound or string or first == '/',
+                    .text => compound or first == '/',
+                    else => first == '[' or string or first == '/',
+                };
+                if (reject) {
+                    try self.skipObject(self.object_depth);
+                    return .{ .boolean = false };
+                }
+            }
+        }
         if (self.object_depth >= self.max_object_depth) return error.PdfObjectNestingTooDeep;
         self.object_depth += 1;
         defer self.object_depth -= 1;
@@ -254,7 +309,7 @@ pub const Scanner = struct {
                                 if (boxed_initialized) boxed.deinit(self.alloc);
                                 self.alloc.destroy(boxed);
                             }
-                            boxed.* = try self.readObject();
+                            boxed.* = try self.readObjectProjected(projection);
                             boxed_initialized = true;
 
                             var end_tok = try self.readToken();
@@ -271,9 +326,9 @@ pub const Scanner = struct {
                                 .value = boxed,
                             } };
                         }
-                        try self.unreadToken(try cloneToken(self.alloc, tok3));
+                        try self.unreadOwnedToken(&tok3);
                     }
-                    try self.unreadToken(try cloneToken(self.alloc, tok2));
+                    try self.unreadOwnedToken(&tok2);
                 }
                 return .{ .integer = value };
             },
@@ -289,7 +344,7 @@ pub const Scanner = struct {
             .keyword => |kw| {
                 if (std.mem.eql(u8, kw, "null")) return .null;
                 if (std.mem.eql(u8, kw, "[")) return try self.readArray();
-                if (std.mem.eql(u8, kw, "<<")) return try self.readDictOrStream();
+                if (std.mem.eql(u8, kw, "<<")) return try self.readDictOrStream(projection);
                 return error.UnexpectedKeyword;
             },
         }
@@ -319,7 +374,7 @@ pub const Scanner = struct {
             defer tok.deinit(self.alloc);
             if (tok == .eof) return error.UnexpectedEof;
             if (tok == .keyword and std.mem.eql(u8, tok.keyword, "]")) break;
-            try self.unreadToken(try cloneToken(self.alloc, tok));
+            try self.unreadOwnedToken(&tok);
             var item = try self.readObject();
             errdefer item.deinit(self.alloc);
             try items.append(self.alloc, item);
@@ -331,7 +386,7 @@ pub const Scanner = struct {
         return .{ .array = owned };
     }
 
-    fn readDictOrStream(self: *Scanner) anyerror!Object {
+    fn readDictOrStream(self: *Scanner, projection: Projection) anyerror!Object {
         var entries = std.ArrayList(DictEntry).empty;
         defer {
             for (entries.items) |*entry| entry.deinit(self.alloc);
@@ -345,10 +400,18 @@ pub const Scanner = struct {
             if (tok == .keyword and std.mem.eql(u8, tok.keyword, ">>")) break;
             if (tok != .name) return error.UnexpectedDictKey;
 
+            const selected = projection.field(tok.name);
+            if (!selected.keep) {
+                try self.skipObject(self.object_depth);
+                continue;
+            }
             const key = try self.alloc.dupe(u8, tok.name);
             errdefer self.alloc.free(key);
 
-            const value = try self.readObject();
+            const value: Object = if (selected.skip) blk: {
+                try self.skipObject(self.object_depth);
+                break :blk .null;
+            } else try self.readObjectProjected(selected.child);
             errdefer {
                 var mutable = value;
                 mutable.deinit(self.alloc);
@@ -367,7 +430,7 @@ pub const Scanner = struct {
         var tok = try self.readToken();
         defer tok.deinit(self.alloc);
         if (tok != .keyword or !std.mem.eql(u8, tok.keyword, "stream")) {
-            try self.unreadToken(try cloneToken(self.alloc, tok));
+            try self.unreadOwnedToken(&tok);
             return .{ .dict = owned };
         }
 
@@ -457,6 +520,132 @@ pub const Scanner = struct {
         var owned = tok;
         errdefer owned.deinit(self.alloc);
         try self.unread.append(self.alloc, owned);
+    }
+
+    fn unreadOwnedToken(self: *Scanner, tok: *Token) anyerror!void {
+        // unreadToken takes ownership even if growing the stack fails. Clear
+        // the caller's deferred cleanup before transferring the payload.
+        const owned = tok.*;
+        tok.* = .eof;
+        try self.unreadToken(owned);
+    }
+
+    fn skipObject(self: *Scanner, depth: usize) anyerror!void {
+        if (depth >= self.max_object_depth) return error.PdfObjectNestingTooDeep;
+        if (self.unread.items.len != 0) {
+            // Normally a dictionary key consumes the final lookahead token.
+            // Preserve generic parser behavior for unusual buffered input.
+            var object = try self.readObject();
+            object.deinit(self.alloc);
+            return;
+        }
+        self.skipSpaceAndComments();
+        const first = self.readByte() orelse return error.UnexpectedEof;
+        switch (first) {
+            '(' => {
+                var nesting: usize = 1;
+                while (nesting != 0) {
+                    const offset = std.mem.indexOfAny(u8, self.bytes[self.pos..], "()\\") orelse {
+                        self.pos = self.bytes.len;
+                        return;
+                    };
+                    self.pos += offset;
+                    switch (self.readByte().?) {
+                        '(' => nesting += 1,
+                        ')' => nesting -= 1,
+                        '\\' => {
+                            const escaped = self.readByte() orelse return error.UnexpectedEof;
+                            if (escaped >= '0' and escaped <= '7') {
+                                var value: u16 = escaped - '0';
+                                var count: usize = 0;
+                                while (count < 2) : (count += 1) {
+                                    const next = self.peekByte() orelse break;
+                                    if (next < '0' or next > '7') break;
+                                    self.pos += 1;
+                                    value = value * 8 + next - '0';
+                                }
+                                if (value > 255) return error.InvalidOctalEscape;
+                            }
+                        },
+                        else => unreachable,
+                    }
+                }
+            },
+            '[' => while (true) {
+                self.skipSpaceAndComments();
+                if (self.peekByte() == ']') {
+                    self.pos += 1;
+                    break;
+                }
+                try self.skipObject(depth + 1);
+            },
+            '<' => {
+                if (self.peekByte() == '<') {
+                    self.pos += 1;
+                    while (true) {
+                        self.skipSpaceAndComments();
+                        if (self.pos + 1 < self.bytes.len and std.mem.eql(u8, self.bytes[self.pos..][0..2], ">>")) {
+                            self.pos += 2;
+                            break;
+                        }
+                        if (self.peekByte() != '/') return error.UnexpectedDictKey;
+                        try self.skipObject(depth + 1);
+                        try self.skipObject(depth + 1);
+                    }
+                } else {
+                    if (!self.nextStartsHexString()) return error.UnexpectedKeyword;
+                    while (true) {
+                        const hi = self.readSkippingSpace() orelse break;
+                        if (hi == '>' or unhex(hi) == null) break;
+                        const lo = self.readSkippingSpace() orelse break;
+                        if (lo == '>' or unhex(lo) == null) break;
+                    }
+                }
+            },
+            '/' => {
+                while (self.pos < self.bytes.len) {
+                    const byte = self.readByte().?;
+                    if (isSpace(byte) or isDelim(byte)) {
+                        self.pos -= 1;
+                        break;
+                    }
+                    if (byte == '#') {
+                        _ = self.readByte() orelse break;
+                        _ = self.readByte() orelse break;
+                    }
+                }
+            },
+            else => {
+                self.pos -= 1;
+                const word = try self.skipWord();
+                if (std.mem.eql(u8, word, "null") or std.mem.eql(u8, word, "true") or std.mem.eql(u8, word, "false")) return;
+                const number = (try numberToken(word)) orelse return error.UnexpectedKeyword;
+                if (number != .integer or number.integer < 0 or number.integer > std.math.maxInt(u32)) return;
+                const end = self.pos;
+                const generation = self.skipWord() catch {
+                    self.pos = end;
+                    return;
+                };
+                const gen = try numberToken(generation);
+                if (gen == null or gen.? != .integer or gen.?.integer < 0 or gen.?.integer > std.math.maxInt(u16)) {
+                    self.pos = end;
+                    return;
+                }
+                const suffix = self.skipWord() catch {
+                    self.pos = end;
+                    return;
+                };
+                if (!std.mem.eql(u8, suffix, "R")) self.pos = end;
+            },
+        }
+    }
+
+    fn skipWord(self: *Scanner) ![]const u8 {
+        self.skipSpaceAndComments();
+        const start = self.pos;
+        while (self.pos < self.bytes.len and !isSpace(self.bytes[self.pos]) and !isDelim(self.bytes[self.pos])) self.pos += 1;
+        if (self.pos == start) return error.UnexpectedEof;
+        return self.bytes[start..self.pos];
     }
 
     fn skipSpaceAndComments(self: *Scanner) void {
@@ -612,50 +801,13 @@ pub const Scanner = struct {
     }
 
     fn readKeywordToken(self: *Scanner) anyerror!Token {
-        var out = std.ArrayList(u8).empty;
-        defer out.deinit(self.alloc);
-
-        while (self.pos < self.bytes.len) {
-            const c = self.readByte().?;
-            if (isDelim(c) or isSpace(c)) {
-                self.unreadByte();
-                break;
-            }
-            try out.append(self.alloc, c);
-        }
-
-        const text = try out.toOwnedSlice(self.alloc);
-        errdefer self.alloc.free(text);
-
-        if (std.mem.eql(u8, text, "true")) {
-            self.alloc.free(text);
-            return .{ .boolean = true };
-        }
-        if (std.mem.eql(u8, text, "false")) {
-            self.alloc.free(text);
-            return .{ .boolean = false };
-        }
-        if (isInteger(text)) {
-            const value = std.fmt.parseInt(i64, text, 10) catch |err| switch (err) {
-                error.Overflow => {
-                    // Some producers serialize large real-valued bounds without
-                    // a decimal point. Preserve them in the real-number range.
-                    const real = try std.fmt.parseFloat(f64, text);
-                    if (!std.math.isFinite(real)) return error.Overflow;
-                    self.alloc.free(text);
-                    return .{ .real = real };
-                },
-                else => return err,
-            };
-            self.alloc.free(text);
-            return .{ .integer = value };
-        }
-        if (isReal(text)) {
-            const value = try std.fmt.parseFloat(f64, text);
-            self.alloc.free(text);
-            return .{ .real = value };
-        }
-        return .{ .keyword = text };
+        const start = self.pos;
+        while (self.pos < self.bytes.len and !isSpace(self.bytes[self.pos]) and !isDelim(self.bytes[self.pos])) self.pos += 1;
+        const text = self.bytes[start..self.pos];
+        if (std.mem.eql(u8, text, "true")) return .{ .boolean = true };
+        if (std.mem.eql(u8, text, "false")) return .{ .boolean = false };
+        if (try numberToken(text)) |number| return number;
+        return .{ .keyword = try self.alloc.dupe(u8, text) };
     }
 
     fn readSkippingSpace(self: *Scanner) ?u8 {
@@ -683,16 +835,22 @@ pub const Scanner = struct {
     }
 };
 
-fn cloneToken(alloc: Allocator, tok: Token) !Token {
-    return switch (tok) {
-        .eof => .eof,
-        .boolean => |value| .{ .boolean = value },
-        .integer => |value| .{ .integer = value },
-        .real => |value| .{ .real = value },
-        .string => |value| .{ .string = try alloc.dupe(u8, value) },
-        .name => |value| .{ .name = try alloc.dupe(u8, value) },
-        .keyword => |value| .{ .keyword = try alloc.dupe(u8, value) },
-    };
+// Scalar tokens borrow no storage. Shared numeric validation keeps skipped
+// metadata lexically consistent with ordinary object parsing.
+fn numberToken(text: []const u8) !?Token {
+    if (isInteger(text)) {
+        const value = std.fmt.parseInt(i64, text, 10) catch |err| switch (err) {
+            error.Overflow => {
+                const real = try std.fmt.parseFloat(f64, text);
+                if (!std.math.isFinite(real)) return error.Overflow;
+                return .{ .real = real };
+            },
+            else => return err,
+        };
+        return .{ .integer = value };
+    }
+    if (isReal(text)) return .{ .real = try std.fmt.parseFloat(f64, text) };
+    return null;
 }
 
 fn streamLength(entries: []const DictEntry) ?usize {
@@ -1117,4 +1275,137 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "scanner lookahead keeps a single large payload allocation" {
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 55 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'X');
+    for ([_][]const u8{ "[ (", "[ 0 (", "[ 0 1 (", "[ << >> (" }) |prefix| {
+        const input = try std.fmt.allocPrint(a, "{s}{s}) ]", .{ prefix, payload });
+        defer a.free(input);
+        var storage: [64 * 1024]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&storage);
+        var scanner = Scanner.init(bounded.allocator(), input);
+        defer scanner.deinit();
+        var object = try scanner.readObject();
+        defer object.deinit(bounded.allocator());
+        try std.testing.expect(object == .array);
+        try std.testing.expectEqualStrings(payload, object.array[object.array.len - 1].string);
+        try std.testing.expectEqual(@as(usize, 0), scanner.unread.items.len);
+    }
+}
+
+test "scanner lookahead transfers release partial allocations on every failure" {
+    const backing = std.testing.allocator;
+    const Check = struct {
+        fn run(a: Allocator, input: []const u8, expected: ?anyerror) !void {
+            var moving = std.testing.FailingAllocator.init(a, .{ .resize_fail_index = 0 });
+            const alloc = moving.allocator();
+            var scanner = Scanner.init(alloc, input);
+            defer scanner.deinit();
+            var object = scanner.readObject() catch |err| {
+                if (err == error.OutOfMemory or expected == null) return err;
+                try std.testing.expectEqual(expected.?, err);
+                return;
+            };
+            defer object.deinit(alloc);
+            if (expected != null) return error.ExpectedParseFailure;
+        }
+    };
+    for ([_]struct { input: []const u8, expected: ?anyerror = null }{
+        .{ .input = "[(payload)]" },
+        .{ .input = "[0 (payload)]" },
+        .{ .input = "[0 1 (payload)]" },
+        .{ .input = "[<< >> (payload)]" },
+        .{ .input = "[1 0 R 1.5 null true /Name]" },
+        .{ .input = "[0 1 (payload)", .expected = error.UnexpectedEof },
+        .{ .input = "[<< >> keyword]", .expected = error.UnexpectedKeyword },
+    }) |case| {
+        try std.testing.checkAllAllocationFailures(backing, Check.run, .{ case.input, case.expected });
+    }
+}
+
+test "scanner metadata projections skip unknown payloads within a small heap" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 55 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const input = try std.fmt.allocPrint(a, "11 0 obj << /Font << /F1 2 0 R >> /Unknown -0 +0 R /Properties << /Tag << /MCID 0 /ActualText (Label) /Private [ /Name#20WithSpace <CAFE> [<< /Nested (\\n{s}) >>] ] >> >> >> endobj", .{padding});
+    defer a.free(input);
+    for ([_]Projection{ .resources, .required_resources, .resource_properties }) |projection| {
+        var storage: [8 * 1024]u8 = undefined;
+        var bounded = std.heap.FixedBufferAllocator.init(&storage);
+        var scanner = Scanner.init(bounded.allocator(), input);
+        scanner.max_object_depth = 128;
+        defer scanner.deinit();
+        var object = try scanner.readObjectProjected(projection);
+        defer object.deinit(bounded.allocator());
+        const value = object.obj_def.value;
+        try std.testing.expect(value.get("Unknown") == null);
+        if (projection != .resource_properties) try std.testing.expectEqual(@as(u32, 2), value.get("Font").?.get("F1").?.obj_ref.id);
+        const properties = value.get("Properties").?;
+        if (projection == .required_resources) {
+            try std.testing.expect(properties.* == .null);
+        } else {
+            const tag = properties.get("Tag").?;
+            try std.testing.expectEqual(@as(i64, 0), tag.get("MCID").?.integer);
+            try std.testing.expectEqualStrings("Label", tag.get("ActualText").?.string);
+            try std.testing.expect(tag.get("Private") == null);
+        }
+    }
+}
+
+test "scanner projected values preserve references and reject compound scalars without retaining them" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{
+        "<< /MCID [1 2 3] /ActualText << /Nested [null true] >> /Private 99 0 R >>",
+        "<< /MCID (not an integer) /ActualText /NotText /Private [0 1 (unread) << >>] >>",
+    }) |input| {
+        var scanner = Scanner.init(a, input);
+        defer scanner.deinit();
+        var object = try scanner.readObjectProjected(.property);
+        defer object.deinit(a);
+        try std.testing.expect(object.get("MCID").?.* == .boolean);
+        try std.testing.expect(object.get("ActualText").?.* == .boolean);
+        try std.testing.expect(object.get("Private") == null);
+    }
+    var scanner = Scanner.init(a, "<< /MCID 12 0 R /ActualText 13 0 R /Private -0 -0 R >>");
+    defer scanner.deinit();
+    var object = try scanner.readObjectProjected(.property);
+    defer object.deinit(a);
+    try std.testing.expectEqual(@as(u32, 12), object.get("MCID").?.obj_ref.id);
+    try std.testing.expectEqual(@as(u32, 13), object.get("ActualText").?.obj_ref.id);
+}
+
+test "scanner skipped metadata preserves malformed token boundaries" {
+    const cases = [_]struct { input: []const u8, expected: anyerror }{
+        .{ .input = "<< /Private /Bad# /ActualText (forged) >>", .expected = error.UnexpectedDictKey },
+        .{ .input = "<< /Private <q /ActualText (forged) >>", .expected = error.UnexpectedKeyword },
+        .{ .input = "<< /Private (\\777) /ActualText (forged) >>", .expected = error.InvalidOctalEscape },
+        .{ .input = "<< /Private (unterminated", .expected = error.UnexpectedEof },
+    };
+    for (cases) |case| for ([_]Projection{ .full, .property }) |projection| {
+        var scanner = Scanner.init(std.testing.allocator, case.input);
+        defer scanner.deinit();
+        try std.testing.expectError(case.expected, scanner.readObjectProjected(projection));
+    };
+}
+
+test "scanner projected object ownership is safe under allocation failure" {
+    const Check = struct {
+        fn run(backing: Allocator, projection: Projection) !void {
+            var moving = std.testing.FailingAllocator.init(backing, .{ .resize_fail_index = 0 });
+            const alloc = moving.allocator();
+            var scanner = Scanner.init(alloc, "11 0 obj << /Font << /F1 2 0 R >> /Ignored [0 1 (skip) << /Name /Value >>] /Properties << /Tag << /MCID 0 /ActualText (Label) /Private [<CAFE> null true] >> >> >> endobj");
+            defer scanner.deinit();
+            var object = try scanner.readObjectProjected(projection);
+            defer object.deinit(alloc);
+            try std.testing.expect(object.obj_def.value.get("Ignored") == null);
+        }
+    };
+    for ([_]Projection{ .resources, .required_resources, .resource_properties }) |projection| {
+        try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{projection});
+    }
 }
