@@ -1341,6 +1341,12 @@ pub const PersistentIndex = struct {
         {
             var previous_txn = try self.beginReadMainTxn();
             defer previous_txn.abort();
+            const next = previous_txn.get(.meta, meta_next_seg_id) catch |err|
+                if (err == error.NotFound) null else return err;
+            if (next) |bytes| {
+                if (bytes.len < @sizeOf(u64)) return error.InvalidDerivedApplyState;
+                if (self.writer.next_segment_id < std.mem.readInt(u64, bytes[0..8], .little)) return error.EnrichmentWaitCanceled;
+            }
             const raw = previous_txn.get(.meta, meta_replay_fragment) catch |err|
                 if (err == error.NotFound) null else return err;
             if (raw) |bytes| {
@@ -1382,6 +1388,12 @@ pub const PersistentIndex = struct {
         };
         const captured = self.writer.acquireSnapshot();
         defer captured.release();
+        // An unpublished alias can outlive its allocating runtime.
+        // Reusing its numerical ID must neither overwrite nor unlink it.
+        // Bound collision work and durably advance the allocation frontier
+        // before yielding, so reopening cannot retry the same occupied prefix.
+        var collided_ids: [64]u64 = undefined;
+        var collided_count: usize = 0;
         for (infos, 0..) |info, i| {
             deleted[i] = try roaring.RoaringBitmap.fromBytes(self.alloc, info.bitmap_bytes);
             deleted_count += 1;
@@ -1395,16 +1407,29 @@ pub const PersistentIndex = struct {
             initialized += 1;
         }
         for (segments) |*segment| {
-            const id = self.reserveSegmentId();
-            const path = try files.pathAlloc(id);
-            defer self.alloc.free(path);
-            // Choosing the alias only under admission prevents a peer from
-            // assigning this id between staging and activation.
-            const source = segment.artifact.link(path) catch |err| {
-                self.deleteSegmentFile(id);
-                return err;
+            replacements[initialized] = while (true) {
+                const id = self.reserveSegmentId();
+                const path = try files.pathAlloc(id);
+                defer self.alloc.free(path);
+                const source = segment.artifact.link(path) catch |err| {
+                    // No ownership was transferred on failure. In particular,
+                    // deleting this ID would delete the colliding artifact.
+                    if (err != error.PathAlreadyExists) return err;
+                    for (captured.segments) |active| if (active.id == id) return error.EnrichmentWaitCanceled;
+                    collided_ids[collided_count] = id;
+                    collided_count += 1;
+                    if (collided_count == collided_ids.len) {
+                        var reservation = try self.beginWriteMainTxn();
+                        errdefer reservation.abort();
+                        try self.checkReplayAliasCollisions(&reservation, collided_ids[0..collided_count]);
+                        try saveNextSegmentId(&reservation, self.writer.next_segment_id);
+                        try self.commitPreparedPublication(&reservation, &uncertain);
+                        return error.EnrichmentWaitCanceled;
+                    }
+                    continue;
+                };
+                break .{ .id = id, .data = .fromNative(source) };
             };
-            replacements[initialized] = .{ .id = id, .data = .fromNative(source) };
             initialized += 1;
         }
         var publication: ?index_mod.IndexWriter.PreparedSegmentReplacement = if (count != 0)
@@ -1414,6 +1439,7 @@ pub const PersistentIndex = struct {
         defer if (publication) |*prepared| prepared.abort();
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
+        try self.checkReplayAliasCollisions(&txn, collided_ids[0..collided_count]);
         for (infos) |info| {
             const key = std.mem.toBytes(std.mem.nativeToBig(u64, info.seg_id));
             try txn.put(.deletions, &key, info.bitmap_bytes);
@@ -1430,6 +1456,21 @@ pub const PersistentIndex = struct {
         if (publication) |*prepared| prepared.publish();
         published = true;
         return infos;
+    }
+
+    fn checkReplayAliasCollisions(_: *PersistentIndex, txn: *MainTxn, ids: []const u64) !void {
+        for (ids) |id| {
+            // A current active marker contradicts the captured writer. Refuse
+            // that stale runtime. An inactive alias can still belong to an
+            // in-flight construction, so allocation never reclaims it.
+            const active_key = activeSegmentMetaKey(id);
+            if (txn.get(.meta, &active_key)) |_| {
+                return error.EnrichmentWaitCanceled;
+            } else |err| switch (err) {
+                error.NotFound => {},
+                else => return err,
+            }
+        }
     }
 
     /// A failed durable boundary can still contain this activation. Preserve
@@ -7794,6 +7835,96 @@ test "lite persistent cache lifecycle preserves replayed WAL without publication
             try std.testing.expectEqual(before.index_catalog_root_page, docs.file.activeCheckpoint().index_catalog_root_page);
         }
     }
+}
+
+test "lite atomic replay preserves colliding aliases and advances bounded allocation across reopen" {
+    if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/replay-collisions.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io });
+    docs.maintenance_start_suppressed = true;
+    docs.file.externally_locked = true;
+    defer docs.close();
+    var storage = lite_indexes.Store.init(a, &docs);
+    const opts: PersistentIndexOptions = .{
+        .path = "/collision/index",
+        .io = std.testing.io,
+        .main_backend = .lsm,
+        .main_lsm_storage = storage.storage(),
+        .wal_backend = .lsm,
+        .wal_storage = storage.storage(),
+        .main_lsm_options = .{ .flush_threshold = 32 * 1024 * 1024 },
+        .main_no_sync = true,
+        .wal_no_sync = true,
+    };
+    var index = try PersistentIndex.open(a, opts);
+    var index_live = true;
+    defer if (index_live) index.close();
+    const alpha = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(alpha);
+    try index.indexSegment(alpha);
+    var stager = (try index.acquireReplayStager(a)).?;
+    defer stager.deinit();
+    const beta = try buildSimpleSegment(a, "doc:b", "beta");
+    defer a.free(beta);
+    var staged = [_]PreparedReplaySegment{try prepareReplaySegment(a, stager, beta)};
+    defer staged[0].deinit();
+    const identity: ReplayFragment.Identity = .{ .generation = 4, .config_hash = 5, .incarnation = 6 };
+    const checkpoint: ReplayFragment.Checkpoint = .{ .identity = identity, .position = .{ .sequence = 1, .next_item = 1, .total_items = 1, .fingerprint = @splat(7), .applied = true } };
+    const first = index.writer.next_segment_id;
+    const active_id = index.snapshot().segments[0].id;
+    index.writer.next_segment_id = active_id;
+    try std.testing.expectError(error.EnrichmentWaitCanceled, index.publishReplay(&staged, &.{}, checkpoint));
+    index.writer.next_segment_id = first;
+    const active_path = try index.segment_files.?.pathAlloc(active_id);
+    defer a.free(active_path);
+    {
+        const raw = (try docs.file.getIndexCatalogRecordAlloc(a, active_path)).?;
+        defer a.free(raw);
+        try std.testing.expectEqualSlices(u8, alpha, raw);
+    }
+    // Simulate aliases left after physical staging but before metadata commit.
+    // Their contents must survive allocation, even when no active marker is
+    // present: another construction can still own the unpublished bytes.
+    for (0..70) |offset| {
+        const orphan_path = try index.segment_files.?.pathAlloc(first + offset);
+        defer a.free(orphan_path);
+        try docs.file.putIndexCatalogRecord(orphan_path, alpha);
+    }
+    try std.testing.expectError(error.EnrichmentWaitCanceled, index.publishReplay(&staged, &.{}, checkpoint));
+    try std.testing.expectEqual(first + 64, index.writer.next_segment_id);
+    try std.testing.expectEqual(@as(?ReplayFragment.Position, null), try index.loadReplayFragment(identity));
+    {
+        const orphan_path = try index.segment_files.?.pathAlloc(first);
+        defer a.free(orphan_path);
+        const raw = (try docs.file.getIndexCatalogRecordAlloc(a, orphan_path)).?;
+        defer a.free(raw);
+        try std.testing.expectEqualSlices(u8, alpha, raw);
+    }
+    index.close();
+    index_live = false;
+    index = try PersistentIndex.open(a, opts);
+    index_live = true;
+    try std.testing.expectEqual(first + 64, index.writer.next_segment_id);
+    const infos = try index.publishReplay(&staged, &.{}, checkpoint);
+    index.freeDeleteInfos(infos);
+    try std.testing.expectEqual(first + 71, index.writer.next_segment_id);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    try std.testing.expect(std.meta.eql(checkpoint.position, (try index.loadReplayFragment(identity)).?));
+    for (0..70) |offset| {
+        const occupied_path = try index.segment_files.?.pathAlloc(first + offset);
+        defer a.free(occupied_path);
+        const raw = (try docs.file.getIndexCatalogRecordAlloc(a, occupied_path)).?;
+        defer a.free(raw);
+        try std.testing.expectEqualSlices(u8, alpha, raw);
+    }
+    try std.testing.expect((try docs.file.check()).valid);
 }
 
 test "lite atomic replay activates deletion segments and continuation together across uncertain commit" {

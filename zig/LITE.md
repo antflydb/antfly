@@ -1419,6 +1419,12 @@ unfinished record completes under its own fingerprint and offset before another
 record can join, preserving scan-only no-op recovery witnesses too. A durable
 complete-window receipt recovers progress even if its coarse metadata mirror
 fails, without publishing the window twice.
+Logical alias allocation preserves occupied destinations, including inactive
+aliases that another construction may still own. A turn skips at most 64
+collisions and checkpoints its allocation frontier before yielding, so reopen
+cannot repeat the same occupied prefix. This checkpoint activates no segments
+and advances no replay receipt. Cleanup after failed source acquisition applies
+only to an alias whose exclusive creation succeeded in that attempt.
 Native text-window sizing measures document collection, projection and segment
 preparation directly. Its bounded publication-cost feedback includes the entire
 remaining window interval, including staging and sync outside writer leases,
