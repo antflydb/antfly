@@ -233,8 +233,8 @@ pub const Shadow = struct {
         if (self.manager != null or self.storage != null or self.state != null) return error.InvalidCompactionProbe;
         const dtype = runner.context.kv_dtype orelse return error.UnsupportedCompactionQueryDType;
         if (runner.context.backend.kind() != .cuda or dtype != .f16) return error.UnsupportedCompactionQueryRoute;
-        try runner.context.execution.acquire();
-        defer runner.context.execution.release();
+        var execution_scope = try runner.context.execution.acquireScope();
+        defer if (execution_scope) |*scope| scope.deinit();
         self.manager = runtime.kv.manager.KvManager.init(runner.context.allocator);
         errdefer self.deinit();
         const config = decoder_storage.checkpointPool(dtype, runner.context.model.*);
@@ -263,8 +263,8 @@ pub const Shadow = struct {
             donors[donor_count] = .{ .layer = @intCast(layer), .heads = geometry.num_kv_heads, .dim = geometry.head_dim };
             donor_count += 1;
         }
-        try runner.context.execution.acquire();
-        defer runner.context.execution.release();
+        var execution_scope = try runner.context.execution.acquireScope();
+        defer if (execution_scope) |*scope| scope.deinit();
         self.manager = runtime.kv.manager.KvManager.init(runner.context.allocator);
         errdefer self.deinit();
         const config = decoder_storage.checkpointPool(dtype, runner.context.model.*);
@@ -395,8 +395,8 @@ pub const Runtime = struct {
         const control = self.context.work_control;
         const logits = try self.context.allocator.dupe(f32, saved.logits);
         errdefer self.context.allocator.free(logits);
-        try self.context.execution.acquire();
-        defer self.context.execution.release();
+        var execution_scope = try self.context.execution.acquireScope();
+        defer if (execution_scope) |*scope| scope.deinit();
         const compute: *cuda_compute.CudaCompute = @ptrCast(@alignCast(self.context.backend.ptr));
         const storage = destination.kv_storage orelse return error.UnsupportedAttentionMatchRoute;
         if (storage.sequences.items.len != 0 or storage.storage.config.store_cpu_bytes) return error.UnsupportedAttentionMatchRoute;
@@ -434,8 +434,8 @@ pub const Runtime = struct {
         defer self.context.allocator.free(ids);
         for (ids, tokens) |*id, token| id.* = std.math.cast(u32, token) orelse return error.InvalidCompactionProbe;
         var saved = blk: {
-            try self.context.execution.acquire();
-            defer self.context.execution.release();
+            var execution_scope = try self.context.execution.acquireScope();
+            defer if (execution_scope) |*scope| scope.deinit();
             if ((try cuda_compute.installedAttentionMatchActivity(compute, source_storage, source_sequence)) == null) return error.UnsupportedAttentionMatchRoute;
             break :blk try self.snapshotAttentionMatchState(ids, logits, source, identity, limits, 2 * 1024 * 1024 * 1024);
         };
@@ -527,8 +527,8 @@ pub const Runtime = struct {
     ) !runtime.kv.attention_match_engine.Stats {
         if (comptime !build_options.enable_cuda) return error.UnsupportedCompactionQueryRoute;
         if (self.context.backend.kind() != .cuda or self.context.kv_dtype != .f16) return error.UnsupportedCompactionQueryDType;
-        try self.context.execution.acquire();
-        defer self.context.execution.release();
+        var execution_scope = try self.context.execution.acquireScope();
+        defer if (execution_scope) |*scope| scope.deinit();
         const checkpoint = runtime.kv.attention_match_checkpoint;
         const engine = runtime.kv.attention_match_engine;
         const storage = @import("../ops/cuda/attention_match_storage.zig");
@@ -796,8 +796,8 @@ pub const Runtime = struct {
     /// avoids graph/replay state shared with the original request.
     fn appendAttentionMatchProbeTokens(self: *Runtime, state: *NativeDecodeState, tokens: []const i64) ![]f32 {
         if (tokens.len == 0) return error.InvalidCompactionProbe;
-        try self.context.execution.acquire();
-        defer self.context.execution.release();
+        var execution_scope = try self.context.execution.acquireScope();
+        defer if (execution_scope) |*scope| scope.deinit();
         var offset: usize = 0;
         while (offset + 1 < tokens.len) {
             try checkAttentionMatchQueryWork(self);
@@ -1065,8 +1065,8 @@ pub const Runtime = struct {
         if (options.prefix_mode == .replay and shadow_kv_bytes > options.max_shadow_kv_bytes) return error.CompactionQueryLimit;
         var collector = try queries.Collector.init(self.context.allocator, consumers[0..count], source_tokens.len, repeat_tokens.len, options.collection);
         errdefer collector.deinit();
-        try self.context.execution.acquire();
-        defer self.context.execution.release();
+        var execution_scope = try self.context.execution.acquireScope();
+        defer if (execution_scope) |*scope| scope.deinit();
         var manager = runtime.kv.manager.KvManager.init(self.context.allocator);
         defer manager.deinit();
         const pool_config = decoder_storage.checkpointPool(dtype, self.context.model.*);

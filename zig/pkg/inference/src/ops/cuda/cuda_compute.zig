@@ -20,6 +20,7 @@ const kernel_geometry = ops.kernel_descriptor.kernel_geometry;
 const tensor_mod = @import("../../backends/tensor.zig");
 const buffer_mod = @import("buffer.zig");
 const context_mod = @import("context.zig");
+const allocation_ledger = @import("allocation_ledger.zig");
 const CacheQuota = @import("cache_quota.zig").Quota;
 const CacheCleanup = @import("../../execution/cleanup_context.zig").Context;
 const driver_mod = @import("driver.zig");
@@ -5681,6 +5682,9 @@ pub const CudaCompute = struct {
     decoder_runtime_next_dynamic_slot: usize = 1,
     decoder_runtime_family_state: CudaDecoderRuntimeFamilyState = .{},
     run_budget: ?*run_memory.RunBudget = null,
+    /// Execution scope distinguishes decode cohorts from prefill matrices.
+    cooperative_decode_rows: usize = 0,
+    cooperative_owner: @import("../execution_scope.zig").OwnerState = .{},
     dense_stream_entries: std.ArrayListUnmanaged(DenseStreamEntry) = .empty,
     dense_stream_epoch: u64 = 1,
     dense_host_prefetch_entries: std.StringHashMapUnmanaged(*DenseHostPrefetchEntry) = .{},
@@ -5982,9 +5986,9 @@ pub const CudaCompute = struct {
             releaseDeviceBuffer(self, &owned);
         }
         try self.kernels.launchF32ToBf16(&self.ctx, mirror, tensor.buffer, tensor.elem_count);
+        if (tensor.storage_retirement) |owner| try owner.adoptBuffers(&self.ctx, &.{mirror});
         tensor.bf16_mirror = mirror;
         tensor.owns_bf16_mirror = true;
-        if (tensor.storage_retirement) |owner| owner.addPhysical(mirror.allocation_bytes);
         if (lookup != tensor) {
             lookup.bf16_mirror = mirror;
             lookup.owns_bf16_mirror = false;
@@ -7976,10 +7980,19 @@ pub const CudaCompute = struct {
         self.deinitWithCleanup(.{ .boundary = boundary });
     }
     pub fn deinit(self: *CudaCompute) void {
-        self.deinitWithCleanup(.{ .outside_execution = true });
+        // Legacy raw wrappers own no separate Model resident/domain charge.
+        // Their process-ledger quarantine remains the incoming main contract.
+        self.deinitUsing(.{ .outside_execution = true }, false);
     }
     pub fn deinitWithCleanup(self: *CudaCompute, current: CacheCleanup) void {
+        self.deinitUsing(current, true);
+    }
+    fn deinitUsing(self: *CudaCompute, current: CacheCleanup, require_owner_empty: bool) void {
         self.validateCacheCleanup(current) catch platform.inference_process_supervisor.restartWorker();
+        // The context owns final driver disposal, including transfer to failed-
+        // allocation quarantine. Keep its entry points alive through the host
+        // cleanup below, even after releaseResources retires the GPU wrapper.
+        defer self.ctx.deinit();
         if ((self.capability_profile == .lightonocr3 or self.capability_profile == .florence2) and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) {
             const stats = self.snapshotStats();
             const physical = self.ctx.device_allocations.snapshot();
@@ -8003,7 +8016,10 @@ pub const CudaCompute = struct {
             self.clearEmbeddingGemma2ConstantsWithCleanup(false, current) catch break :failed true;
             break :failed false;
         };
-        if (retained_cleanup_failed and !current.outside_execution) platform.inference_process_supervisor.restartWorker();
+        // releaseResources may transfer a live primary to the allocation ledger.
+        // Wrapper close is therefore NOT proof of failed cache payload death,
+        // even for the legacy outside path. Preserve its owner/quota failclosed.
+        if (retained_cleanup_failed) platform.inference_process_supervisor.restartWorker();
         @import("video.zig").closeCachedDecoderWithCleanup(&self.ctx, current) catch platform.inference_process_supervisor.restartWorker();
         var auxiliary_quotas = self.detachAuxiliaryCacheData(current) catch platform.inference_process_supervisor.restartWorker();
         self.scalar_clamp_kernel.deinit(&self.ctx);
@@ -8251,23 +8267,25 @@ pub const CudaCompute = struct {
         }
         self.kernels.unload(&self.ctx);
         closeStorageRetirement(self);
+        // Context quarantine owns a process-backstop token, not this Model's
+        // separate resident/domain charge. Any failed ordinary SDK free must
+        // stop final Model teardown before that old charge can be released.
+        if (require_owner_empty) self.validateLedgerForModelClose() catch platform.inference_process_supervisor.restartWorker();
         self.ctx.releaseResources();
         self.ocr_retained_cache_quota.releaseAfterSdkDeath(current) catch platform.inference_process_supervisor.restartWorker();
         for (&auxiliary_quotas) |*quota| quota.releaseAfterSdkDeath(current) catch platform.inference_process_supervisor.restartWorker();
         // Keep the extra workspace charged through physical/context teardown,
         // including an exceptional failed device free.
 
-        if (retained_cleanup_failed) {
-            self.clearEmbeddingGemma2Constants(true) catch {};
-            self.embedding_gemma2_execution.releaseAfterContextDestroyed(self.allocator);
-            self.embedding_gemma2_resize.releaseAfterContextDestroyed(&self.ctx);
-        }
         self.lockConstantMetadata();
         var constant_map = self.embedding_gemma2_constants;
         self.embedding_gemma2_constants = .empty;
         self.unlockConstantMetadata();
         constant_map.deinit(self.allocator);
-        self.ctx.driver.deinit();
+    }
+
+    fn validateLedgerForModelClose(self: *const CudaCompute) !void {
+        try allocation_ledger.process.validateOwnerEmpty(self.ctx.device_allocations.owner_id);
     }
 
     pub const AttentionMatchProfile = struct {
@@ -8347,6 +8365,70 @@ pub const CudaCompute = struct {
     ) ops.ComputeBackend {
         self.configureRunBudget(run_budget);
         return .{ .ptr = self, .vtable = &scoped_run_budget_vtable };
+    }
+
+    /// The caller owns the model mutex for setup and every compute/cleanup
+    /// step. Unlike a whole-request scoped handle, deinit does not mutate the
+    /// shared binding while a different request may be executing.
+    /// Numerical qualification belongs to the resident backend inventory.
+    /// Geometry alone cannot qualify a dense/BF16 or differently quantized head.
+    pub fn cooperativeDecodeBatchRows(self: *const CudaCompute, tied: bool) usize {
+        const embedding = self.resident_weights.getPtr("model.embed_tokens.weight") orelse
+            self.resident_weights.getPtr("model.language_model.embed_tokens.weight") orelse
+            self.resident_weights.getPtr("token_embd.weight");
+        const output = if (tied) embedding else self.resident_weights.getPtr("lm_head.weight") orelse
+            self.resident_weights.getPtr("model.lm_head.weight") orelse
+            self.resident_weights.getPtr("output.weight") orelse embedding;
+        const head = output orelse return 1;
+        if (!isKnownQuant(head, .Q6_K) or !self.tuned_route_gates.q6_k_lm_head_q8_1) return 1;
+        var q4_backbone = false;
+        var weights = self.resident_weights.valueIterator();
+        while (weights.next()) |weight| if (isKnownQuant(weight, .Q4_0)) {
+            q4_backbone = true;
+            break;
+        };
+        if (!q4_backbone or self.kernels.linear_q6_k_q8_1_f32_tile8_e4b == null) return 1;
+        return 2;
+    }
+
+    pub fn computeBackendWithStepRunBudget(self: *CudaCompute, budget: *run_memory.RunBudget, owner: u64) ops.ComputeBackend {
+        return .{ .ptr = self, .vtable = &vtable, .execution_budget = budget, .execution_budget_bind = &bindStepRunBudget, .execution_owner = owner, .execution_batch_rows = &setCooperativeDecodeRows, .execution_batch_drain = &drainCooperativeDecode, .execution_enter = &enterExecutionOwner, .execution_cleanup = &cleanupExecutionOwner, .execution_release = &releaseExecutionOwner };
+    }
+
+    fn setCooperativeDecodeRows(raw: *anyopaque, rows: usize) void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        std.debug.assert(rows == 0 or rows == 2);
+        // A cohort touched both requests' backend metadata. The next single
+        // owner must enter through the normal transition contract, even when
+        // it was the leader of this cohort. Ordinary singleton reuses remain
+        // unchanged. Called after the scope's confirmed stream drain.
+        if (rows == 0 and self.cooperative_decode_rows != 0) self.cooperative_owner.cleanup();
+        self.cooperative_decode_rows = rows;
+    }
+
+    fn drainCooperativeDecode(raw: *anyopaque) !void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        try self.ctx.synchronize();
+    }
+
+    fn enterExecutionOwner(raw: *anyopaque, owner: u64) !void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        try self.cooperative_owner.enter(owner, raw, &beginRequest);
+    }
+
+    fn releaseExecutionOwner(raw: *anyopaque, owner: u64) void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        self.cooperative_owner.release(owner);
+    }
+
+    fn cleanupExecutionOwner(raw: *anyopaque, _: u64) void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        self.cooperative_owner.cleanup();
+    }
+
+    fn bindStepRunBudget(raw: *anyopaque, budget: ?*run_memory.RunBudget) void {
+        const self: *CudaCompute = @ptrCast(@alignCast(raw));
+        self.configureRunBudget(budget);
     }
 
     pub fn deviceMemoryInfo(self: *CudaCompute) !context_mod.DeviceMemoryInfo {
@@ -11738,6 +11820,7 @@ fn beginRequest(ctx: *anyopaque) anyerror!void {
 fn beginRequestUsing(ctx: *anyopaque, current: CacheCleanup) anyerror!void {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (self.cacheRetirementPending()) return error.QueueFull;
+    self.cooperative_owner.reset();
     // A graph launch may still reference its captured temporary addresses.
     // Establish stream completion before destroying execs or recycling any
     // pinned slot at a request boundary. This is normally already satisfied
@@ -14128,7 +14211,16 @@ fn tryDebertaMaterializedAttentionF16(
 // BF16 mirror, return the mirror when the matmul is prefill-shaped
 // (rows > 1) so cuBLASLt handles it; decode (rows == 1) stays on the
 // native Q4/F32 kernels.
+/// A multi-row matrix is still decoding only while its execution scope says
+/// so. Keep output-head eligibility identical for sampled and greedy paths.
+fn cudaQuantizedDecodeRowsEligible(rows: usize, cohort_rows: usize) bool {
+    return rows == 1 or (cohort_rows > 1 and rows == cohort_rows);
+}
+
 fn weightBf16MirrorForRows(self: *const CudaCompute, weight: *const CudaTensor, rows: usize) ?buffer_mod.DeviceBuffer {
+    // A decode cohort retains singleton quantized math. Two rows alone do
+    // not authorize prefill mirrors or their different arithmetic.
+    if (self.cooperative_decode_rows != 0) return null;
     if (!self.bf16_mirror_row_selector.accepts(rows)) return null;
     if (weight.bf16_mirror.ptr == 0) return null;
     if (weight.bf16_mirror.len < weight.elem_count * @sizeOf(u16)) return null;
@@ -23065,7 +23157,7 @@ fn linearNoBiasInto(self: *CudaCompute, device: buffer_mod.DeviceBuffer, input_t
     var prefill_profile_scope = beginPrefillProfile(self, prefillProfileCategoryForLinearNoBias(weight_tensor, rows, in_dim, out_dim), rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
     const bf16_mirror = weightBf16MirrorForRows(self, weight_tensor, rows);
-    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, rows, bf16_mirror != null) and
+    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill and self.cooperative_decode_rows == 0, rows, bf16_mirror != null) and
         try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device, input_tensor, weight_tensor, rows, in_dim, out_dim))
     {
         // W4A16 tensor-core prefill route (default on SM89). It DEFERS to the
@@ -23090,7 +23182,7 @@ fn linearNoBiasInto(self: *CudaCompute, device: buffer_mod.DeviceBuffer, input_t
             self.stats.f16_scalar_linear_calls += 1;
             self.dispatch_stats.note(self.allocator, .linear_no_bias, .f16, .dense_cuda, .none, .none, rows, in_dim, out_dim, 0);
         }
-    } else if (rows == 1 and weight_tensor.quant_type == null and weight_tensor.dtype == .f32 and
+    } else if (cudaQuantizedDecodeRowsEligible(rows, self.cooperative_decode_rows) and weight_tensor.quant_type == null and weight_tensor.dtype == .f32 and
         weight_tensor.bf16_mirror.ptr != 0 and
         weight_tensor.bf16_mirror.len >= weight_tensor.elem_count * @sizeOf(u16))
     {
@@ -23290,8 +23382,9 @@ fn linearNoBiasInto(self: *CudaCompute, device: buffer_mod.DeviceBuffer, input_t
                     // Full-logits lm-head fast path: Q8_1 activations + DP4A,
                     // same math as the greedy argmax kernels. Feeds sampled
                     // decoding, which needs the whole distribution.
-                    if (rows == 1 and in_dim == 2560 and out_dim >= 32768 and out_dim % 8 == 0 and cudaQ6KLmHeadQ8_1Enabled(self)) q6_q8_blk: {
-                        var q8_input = allocDeviceBuffer(self, (in_dim / 32) * 36) catch |err| switch (err) {
+                    if (cudaQuantizedDecodeRowsEligible(rows, self.cooperative_decode_rows) and in_dim == 2560 and out_dim >= 32768 and out_dim % 8 == 0 and cudaQ6KLmHeadQ8_1Enabled(self)) q6_q8_blk: {
+                        const row_bytes = (in_dim / 32) * 36;
+                        var q8_input = allocDeviceBuffer(self, try checkedMul(rows, row_bytes)) catch |err| switch (err) {
                             error.CudaGraphCaptureUnsafeTempAlloc => break :q6_q8_blk,
                             else => return err,
                         };
@@ -23300,10 +23393,17 @@ fn linearNoBiasInto(self: *CudaCompute, device: buffer_mod.DeviceBuffer, input_t
                             error.CudaKernelUnavailable, error.InvalidCudaState => break :q6_q8_blk,
                             else => return err,
                         };
-                        self.kernels.launchLinearQ6KQ8_1F32Tile8E4B(&self.ctx, device, q8_input, weight_tensor.buffer, in_dim, out_dim) catch |err| switch (err) {
-                            error.CudaKernelUnavailable, error.InvalidCudaState => break :q6_q8_blk,
-                            else => return err,
-                        };
+                        // The sampled path needs every logit. Reuse the exact
+                        // singleton Q8_1 head for each row; only the projection
+                        // tail is split, while the decoder backbone stays fused.
+                        for (0..rows) |row| {
+                            const output_row = buffer_mod.DeviceBuffer{ .ptr = device.ptr + row * out_dim * @sizeOf(f32), .len = out_dim * @sizeOf(f32) };
+                            const input_row = buffer_mod.DeviceBuffer{ .ptr = q8_input.ptr + row * row_bytes, .len = row_bytes };
+                            self.kernels.launchLinearQ6KQ8_1F32Tile8E4B(&self.ctx, output_row, input_row, weight_tensor.buffer, in_dim, out_dim) catch |err| switch (err) {
+                                error.CudaKernelUnavailable, error.InvalidCudaState => break :q6_q8_blk,
+                                else => return err,
+                            };
+                        }
                         self.dispatch_stats.note(self.allocator, .linear_no_bias, .q6_k, .q6_simt, .none, tcUnavailableReason(), rows, in_dim, out_dim, 0);
                         self.stats.launch_linear += 1;
                         return;
@@ -24567,7 +24667,7 @@ fn linearNoBiasQkv(ctx: *anyopaque, input: CT, q_weight: CT, k_weight: CT, v_wei
     // attached, defer to the individual linearNoBias path (which routes Q4_0
     // prefill through tc_hmma). When a mirror IS present, keep the fused
     // BF16-mirror triple (cuBLASLt is faster + equal quality).
-    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, rows, use_hybrid_bf16) and
+    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill and self.cooperative_decode_rows == 0, rows, use_hybrid_bf16) and
         tcQuantBuffer(q_weight_tensor, .q4_0_hmma) != null and
         tcQuantBuffer(k_weight_tensor, .q4_0_hmma) != null and
         tcQuantBuffer(v_weight_tensor, .q4_0_hmma) != null) return null;
@@ -25139,7 +25239,7 @@ fn linearNoBiasPair(ctx: *anyopaque, input: CT, weight_a: CT, weight_b: CT, rows
     var prefill_profile_scope = beginPrefillProfile(self, if (use_bf16) .bf16_pair else if (use_q4_0) .q4_pair else null, rows);
     defer if (prefill_profile_scope) |*scope| scope.end();
 
-    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill, rows, use_hybrid_bf16) and
+    if (shouldTryQ4_0TcHmmaPrefill(self.tuned_route_gates.q4_0_tc_hmma_prefill and self.cooperative_decode_rows == 0, rows, use_hybrid_bf16) and
         tcQuantBuffer(weight_a_tensor, .q4_0_hmma) != null and
         tcQuantBuffer(weight_b_tensor, .q4_0_hmma) != null and
         try launchQ4_0TcHmmaNoBias(self, .tc_hmma, device_a, input_tensor, weight_a_tensor, rows, in_dim, out_dim) and
@@ -25424,7 +25524,7 @@ fn linearNoBiasPairActivationQ4_0(
     try ensureF32(input_tensor);
     try ensureF32Bf16OrQuantized(weight_gate_tensor);
     try ensureF32Bf16OrQuantized(weight_up_tensor);
-    if (rows != 1) return null;
+    if (!cudaQuantizedDecodeRowsEligible(rows, self.cooperative_decode_rows)) return null;
     if (!isKnownQuant(weight_gate_tensor, .Q4_0) or !isKnownQuant(weight_up_tensor, .Q4_0)) return null;
     const input_expected = try checkedMul(rows, in_dim);
     if (input_tensor.elem_count != input_expected) return error.InvalidShape;
@@ -33839,6 +33939,29 @@ const scoped_run_budget_vtable = blk: {
     copied.deinitBackend = &deinitBackendClearRunBudget;
     break :blk copied;
 };
+
+test "generation cooperative CUDA handles bind budgets per step and retire without clearing a peer" {
+    var compute: CudaCompute = undefined;
+    compute.owned_by_backend = false;
+    compute.run_budget = null;
+    compute.lazy_device_budget_bytes = 0;
+    var first = run_memory.RunBudget.init(.{ .backend_limit_bytes = 1000 });
+    var second = run_memory.RunBudget.init(.{ .backend_limit_bytes = 2000 });
+    var a = compute.computeBackendWithStepRunBudget(&first, 1);
+    var b = compute.computeBackendWithStepRunBudget(&second, 2);
+    try std.testing.expect(compute.run_budget == null);
+    a.bindExecutionBudget();
+    try std.testing.expect(compute.run_budget == &first);
+    try std.testing.expectEqual(@as(usize, 1000), compute.lazy_device_budget_bytes);
+    a.clearExecutionBudget();
+    b.bindExecutionBudget();
+    a.deinit();
+    try std.testing.expect(compute.run_budget == &second);
+    try std.testing.expectEqual(@as(usize, 2000), compute.lazy_device_budget_bytes);
+    b.clearExecutionBudget();
+    b.deinit();
+    try std.testing.expect(compute.run_budget == null);
+}
 
 test "cuda compute vtable is type checked" {
     const backend_kind_fn: *const fn (*anyopaque) ops.BackendKind = &backendKind;
@@ -43380,12 +43503,13 @@ fn pinCachedStorageRoot(self: *CudaCompute, source: *CudaTensor) !?*CudaTensor {
     const bytes = try CudaStorageRetirement.physicalBytes(source);
     const retirement = try storageRetirement(self, bytes);
     const root = try self.allocator.create(CudaTensor);
+    errdefer self.allocator.destroy(root);
+    try retirement.adoptTensor(&self.ctx, source);
     root.* = source.*;
     root.owned_by_tensor = true;
     root.resident_owner = null;
     root.storage_retirement = retirement;
     retirement.retain();
-    retirement.addPhysical(bytes);
     // Model/cache storage retires directly, never into a request temp pool.
     root.physical_storage_base = true;
     root.resident_references = .init(1); // Lookup-store ownership.
@@ -43822,13 +43946,46 @@ const CudaStorageRetirement = struct {
         if (retained != source.ctx) return error.InvalidCudaState;
         // Cleanup uses synchronous cuMemFree. It needs neither a stream nor
         // kernels, and carries no video/scoped request admission callbacks.
-        self.provider = .{ .driver = driver, .device = source.device, .ctx = retained, .stream = null, .info = source.info };
+        var provider = context_mod.CudaContext{ .driver = driver, .device = source.device, .ctx = retained, .stream = null, .info = source.info };
+        try allocation_ledger.process.prepareOwner(@intFromPtr(retained), &provider.device_allocations.owner_id);
+        self.provider = provider;
         self.source_context = source;
     }
-    fn addPhysical(self: *CudaStorageRetirement, bytes: usize) void {
+    fn adoptBuffers(self: *CudaStorageRetirement, source: *context_mod.CudaContext, buffers: []const buffer_mod.DeviceBuffer) !void {
         platform.sync.lockYielding(&self.mutex);
         defer self.mutex.unlock();
-        self.physical_bytes = std.math.add(usize, self.physical_bytes, bytes) catch unreachable;
+        if (self.source_context != source or self.provider == null or self.provider.?.ctx != source.ctx) return error.CudaStorageOwnerClosed;
+        var tokens: [3]allocation_ledger.Token = undefined;
+        var count: usize = 0;
+        var bytes: usize = 0;
+        for (buffers) |buffer| {
+            if (buffer.borrowed) return error.InvalidCudaAllocationOwner;
+            bytes = try std.math.add(usize, bytes, buffer.allocation_bytes);
+            if (buffer.allocation_token) |token| {
+                tokens[count] = token;
+                count += 1;
+            }
+        }
+        const total = try std.math.add(usize, self.physical_bytes, bytes);
+        if (count != 0) try allocation_ledger.process.handoff(tokens[0..count], source.device_allocations.owner_id, self.provider.?.device_allocations.owner_id, @intFromPtr(source.ctx));
+        self.physical_bytes = total;
+    }
+    fn adoptTensor(self: *CudaStorageRetirement, source: *context_mod.CudaContext, tensor: *const CudaTensor) !void {
+        var buffers: [3]buffer_mod.DeviceBuffer = undefined;
+        var count: usize = 0;
+        if (tensor.owns_buffer) {
+            buffers[count] = tensor.buffer;
+            count += 1;
+        }
+        if (tensor.owns_bf16_mirror) {
+            buffers[count] = tensor.bf16_mirror;
+            count += 1;
+        }
+        if (tensor.owns_tc_quant) if (tensor.tc_quant) |quant| {
+            buffers[count] = quant.buffer;
+            count += 1;
+        };
+        try self.adoptBuffers(source, buffers[0..count]);
     }
     fn detachSource(self: *CudaStorageRetirement) void {
         // Independent cleanup root is registered before custody moves, while
@@ -45236,6 +45393,7 @@ fn closeIndependentEndpointChecked(cell: *CudaStorageRetirement) !void {
     if (ctx.stream != null or ctx.video_decoder_cache != null or ctx.observation.load(.acquire) != null) return error.InvalidCudaState;
     try ctx.makeCurrent();
     try ctx.driver.check(ctx.driver.fns.cuCtxSetCurrent(null));
+    try allocation_ledger.process.forgetEmptyOwner(ctx.device_allocations.owner_id);
     try ctx.driver.check(ctx.driver.fns.cuDevicePrimaryCtxRelease(ctx.device));
     ctx.ctx = null;
     ctx.driver.deinit();
@@ -45495,8 +45653,6 @@ fn prepareAsyncForeignTensorCopyPolicy(comptime failure_policy: ColdCopyFailureP
     }
     if (try source.ctx.streamCaptureActive()) return error.CudaGraphCaptureUnsafeHostCopy;
     if (original == null) {
-        funded.commitSource();
-        funded.commitDestination();
         const cell = new_cell.?;
         try cell.ensureProviderChecked(&source.ctx);
         cell.detachSource();
@@ -45507,6 +45663,9 @@ fn prepareAsyncForeignTensorCopyPolicy(comptime failure_policy: ColdCopyFailureP
             source.ctx.synchronize() catch platform.inference_process_supervisor.restartWorker();
             return err;
         };
+        try tensor.buffer.handoffLedgerOwner(&source.ctx, &cell.provider.?);
+        funded.commitSource();
+        funded.commitDestination();
         const owner = new_original.?;
         owner.* = .{ .cell = cell, .original = tensor.buffer, .charge = funded.takeSource(), .ready_event = ready_event, .ticket = source_ticket.?, .deadline_ns = capability.root_cleanup_deadline_ns };
         source.ctx.device_allocations.handoffTo(&cell.provider.?.device_allocations, tensor.buffer.allocation_bytes) catch platform.inference_process_supervisor.restartWorker();
@@ -46298,6 +46457,7 @@ pub const ColdKvBank = struct {
         if (ledger.live != 0 or ledger.physical_live != 0 or ctx.stream != null) platform.inference_process_supervisor.restartWorker();
         ctx.makeCurrent() catch platform.inference_process_supervisor.restartWorker();
         ctx.driver.check(ctx.driver.fns.cuCtxSetCurrent(null)) catch platform.inference_process_supervisor.restartWorker();
+        allocation_ledger.process.forgetEmptyOwner(ctx.device_allocations.owner_id) catch platform.inference_process_supervisor.restartWorker();
         ctx.driver.check(ctx.driver.fns.cuDevicePrimaryCtxRelease(ctx.device)) catch platform.inference_process_supervisor.restartWorker();
         ctx.ctx = null;
         ctx.driver.deinit();
@@ -46402,6 +46562,7 @@ pub const ColdKvBank = struct {
         // Nothing below saves its Io, cancellation hook or absolute deadline.
         var guard = try control.enterUninterruptible(.uninterruptible);
         defer guard.deinit();
+        if (comptime Allocation == Physical) try allocation_ledger.process.prepareOwner(@intFromPtr(source.ctx.ctx), &source.ctx.device_allocations.owner_id);
         var endpoint = try openEndpoint(cuda);
         defer closeEndpoint(&endpoint);
         errdefer freePlanes(storage, parents, &endpoint, cleanup);
@@ -46413,6 +46574,7 @@ pub const ColdKvBank = struct {
             const plane_count: usize = if (mode == .shared_physical_pages) 3 else 2;
             for (planes[0..plane_count], 0..) |plane, which| {
                 plane.* = try Allocation.alloc(&endpoint, requested[which]);
+                if (comptime Allocation == Physical) try plane.handoffLedgerOwner(&endpoint, &source.ctx);
                 value.capacity_owners[which] = claim.takeOwner(index, which);
                 value.capacity_owners[which].?.measure(cleanup, plane.allocation_bytes);
             }
@@ -52957,4 +53119,125 @@ test "CUDA audio depthwise cold inventory validates actual floating source layou
     var packed_builder = Cache.Builder{ .storage = &requests };
     try compute.appendAudioCacheWorkload(recipe, &packed_builder);
     try std.testing.expectEqual(@as(usize, 53), packed_builder.len); // 38+3frontend+12QKV
+}
+
+test "cooperative decode batches preserve quantized routing without changing prefill mirrors" {
+    var compute: CudaCompute = undefined;
+    compute.cooperative_decode_rows = 0;
+    compute.cooperative_owner = .{};
+    compute.cooperative_owner.last_owner = 7;
+    compute.bf16_mirror_row_selector = .production;
+    var weight: CudaTensor = undefined;
+    weight.elem_count = 16;
+    weight.bf16_mirror = .{ .ptr = 128, .len = 32 };
+    try std.testing.expect(weightBf16MirrorForRows(&compute, &weight, 1) == null);
+    try std.testing.expect(weightBf16MirrorForRows(&compute, &weight, 2) != null);
+    CudaCompute.setCooperativeDecodeRows(&compute, 2);
+    try std.testing.expect(weightBf16MirrorForRows(&compute, &weight, 2) == null);
+    CudaCompute.setCooperativeDecodeRows(&compute, 0);
+    try std.testing.expectEqual(@as(u64, 0), compute.cooperative_owner.last_owner);
+    try std.testing.expectEqual(@as(u64, 1), compute.cooperative_owner.snapshot().cleanups);
+    try std.testing.expect(weightBf16MirrorForRows(&compute, &weight, 512) != null);
+}
+
+test "cooperative decode batches require the qualified quantized head and honor weight tying" {
+    const a = std.testing.allocator;
+    var shape = [_]i64{ 1, 32 };
+    var compute: CudaCompute = undefined;
+    compute.resident_weights = .{};
+    defer compute.resident_weights.deinit(a);
+    try std.testing.expectEqual(@as(usize, 1), compute.cooperativeDecodeBatchRows(true));
+    compute.tuned_route_gates = .{};
+    compute.tuned_route_gates.q6_k_lm_head_q8_1 = true;
+    compute.kernels.linear_q6_k_q8_1_f32_tile8_e4b = @ptrFromInt(1);
+    try compute.resident_weights.put(a, "model.embed_tokens.weight", .{ .buffer = .{}, .dtype = .u8, .shape = &shape, .elem_count = 32, .quant_type = .{ .known = .Q6_K } });
+    try compute.resident_weights.put(a, "gate.weight", .{ .buffer = .{}, .dtype = .u8, .shape = &shape, .elem_count = 32, .quant_type = .{ .known = .Q4_0 } });
+    try std.testing.expectEqual(@as(usize, 2), compute.cooperativeDecodeBatchRows(true));
+    try compute.resident_weights.put(a, "lm_head.weight", .{ .buffer = .{}, .dtype = .f32, .shape = &shape, .elem_count = 32 });
+    try std.testing.expectEqual(@as(usize, 1), compute.cooperativeDecodeBatchRows(false));
+    try std.testing.expectEqual(@as(usize, 2), compute.cooperativeDecodeBatchRows(true));
+    compute.tuned_route_gates.q6_k_lm_head_q8_1 = false;
+    try std.testing.expectEqual(@as(usize, 1), compute.cooperativeDecodeBatchRows(true));
+}
+
+test "cooperative decode batches keep sampled and greedy Q6 heads on the same quantized row contract" {
+    try std.testing.expect(cudaQuantizedDecodeRowsEligible(1, 0));
+    try std.testing.expect(!cudaQuantizedDecodeRowsEligible(2, 0));
+    try std.testing.expect(cudaQuantizedDecodeRowsEligible(2, 2));
+    try std.testing.expect(!cudaQuantizedDecodeRowsEligible(3, 2));
+    try std.testing.expect(!cudaQuantizedDecodeRowsEligible(0, 0));
+}
+
+test "CUDA allocation Model close refuses ordinary failed resident free until exact SDK retry while old quota stays held" {
+    const Memory = @import("../../runtime/tier/memory.zig");
+    const Mock = struct {
+        var fail: bool = true;
+        var physical_deaths: usize = 0;
+        var primary_releases: usize = 0;
+        fn current(_: driver_mod.CUcontext) callconv(.c) driver_mod.CUresult {
+            return 0;
+        }
+        fn alloc(out: *driver_mod.CUdeviceptr, _: usize) callconv(.c) driver_mod.CUresult {
+            out.* = 0x889900;
+            return 0;
+        }
+        fn free(_: usize) callconv(.c) c_int {
+            if (fail) return 700;
+            physical_deaths += 1;
+            return 0;
+        }
+        fn primary(_: c_int) callconv(.c) c_int {
+            primary_releases += 1;
+            return 0;
+        }
+        fn text(_: driver_mod.CUresult, out: *?[*:0]const u8) callconv(.c) driver_mod.CUresult {
+            out.* = "injected ordinary resident free failure";
+            return 0;
+        }
+    };
+    var controller = Memory.AdmissionController{};
+    defer controller.deinit();
+    var resident = try controller.tryAcquire(.gpu, .{ .backend_limit_bytes = 16 }, .{ .backend_weight_bytes = 16 }, false);
+    defer resident.release();
+    Mock.fail = true;
+    Mock.physical_deaths = 0;
+    Mock.primary_releases = 0;
+    var compute: CudaCompute = undefined;
+    compute.ctx = .{ .driver = undefined, .ctx = @ptrFromInt(0x8899), .stream = null, .device = 0, .info = .{} };
+    compute.ctx.driver.fns.cuCtxSetCurrent = Mock.current;
+    compute.ctx.driver.fns.cuMemAlloc = Mock.alloc;
+    compute.ctx.driver.fns.cuMemFree = Mock.free;
+    compute.ctx.driver.fns.cuGetErrorName = Mock.text;
+    const process_before = @import("allocation_budget.zig").process_device_allocations.snapshot();
+    var buffer = try buffer_mod.DeviceBuffer.allocWithPurpose(&compute.ctx, 16, .model_cache);
+    const token = buffer.allocation_token.?;
+    var owner_live = true;
+    defer if (owner_live) {
+        Mock.fail = false;
+        allocation_ledger.process.retire(compute.ctx.device_allocations.owner_id, true);
+        allocation_ledger.process.retryRetired(@intFromPtr(compute.ctx.ctx), compute.ctx.device_allocations.owner_id, Mock.free, Mock.primary);
+        allocation_ledger.process.forgetEmptyOwner(compute.ctx.device_allocations.owner_id) catch unreachable;
+    };
+    // The actual ordinary-weight destructor is the legacy free path: its lost
+    // descriptor is backed by the durable process record, not an old Domain pin.
+    buffer.free(&compute.ctx);
+    try std.testing.expectError(error.CudaAllocationOwnerStillLive, compute.validateLedgerForModelClose());
+    try std.testing.expect(compute.ctx.ctx != null and allocation_ledger.process.isLive(token));
+    try std.testing.expectEqual(@as(usize, 0), Mock.primary_releases);
+    try std.testing.expectEqual(@as(usize, 16), controller.snapshot().backend_weight_bytes);
+    try std.testing.expectEqual(process_before.live + 16, @import("allocation_budget.zig").process_device_allocations.snapshot().live);
+    // A retiring caller retaining its actual primary may retry the SAME SDK
+    // address. Only that successful physical death makes Model close admissible.
+    allocation_ledger.process.retire(compute.ctx.device_allocations.owner_id, true);
+    Mock.fail = false;
+    allocation_ledger.process.retryRetired(@intFromPtr(compute.ctx.ctx), compute.ctx.device_allocations.owner_id, Mock.free, Mock.primary);
+    try compute.validateLedgerForModelClose();
+    try std.testing.expectEqual(@as(usize, 1), Mock.physical_deaths);
+    try std.testing.expectEqual(@as(usize, 0), Mock.primary_releases);
+    try std.testing.expectEqual(@as(usize, 16), controller.snapshot().backend_weight_bytes);
+    try std.testing.expectEqual(process_before.live, @import("allocation_budget.zig").process_device_allocations.snapshot().live);
+    try allocation_ledger.process.forgetEmptyOwner(compute.ctx.device_allocations.owner_id);
+    owner_live = false;
+    resident.release();
+    try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, controller.snapshot());
 }

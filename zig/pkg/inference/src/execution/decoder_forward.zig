@@ -169,15 +169,15 @@ pub const Runtime = struct {
     /// A supplied access is the caller's exact model-lane capability. Cleanup
     /// uses its noncancellable path even when the request was cancelled.
     pub fn createDeviceToken(self: *Runtime, token: usize, access: ?@import("../execution_control.zig").ExecutionAccess) !?ops.CT {
-        if (access) |lane| try lane.acquire();
-        defer if (access) |lane| lane.release();
+        var execution_scope = if (access) |lane| try lane.acquireScope() else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         const data = [_]i32{@intCast(token)};
         return self.context.cb.fromInt32Shape(&data, &.{1});
     }
 
     pub fn destroyDeviceToken(self: *Runtime, tensor: ops.CT, access: ?@import("../execution_control.zig").ExecutionAccess) void {
-        if (access) |lane| lane.acquireForCleanup();
-        defer if (access) |lane| lane.release();
+        var execution_scope = if (access) |lane| lane.acquireReleaseScope() else null;
+        defer if (execution_scope) |*scope| scope.deinit();
         self.context.cb.free(tensor);
     }
 

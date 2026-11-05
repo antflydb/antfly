@@ -49,6 +49,11 @@ class ContentSecurityConfig:
                 generic scraper treats omission as unrestricted and an empty list as deny-all; Antfly inference requires
                 explicit path allowlists. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix
                 (e.g., my-bucket/uploads/). Example: ['/Users/data/', 'my-bucket/uploads/'].
+            source_media_base_urls (list[str] | Unset): Exact source companion base URLs that a chat `source` part may
+                fetch, matched on scheme, host, port and path. This is how a loopback or private companion is allowed; such URLs
+                need no `allowed_hosts` entry. Every other `source` URL needs `allowed_hosts` and always keeps private-IP
+                blocking, whatever `block_private_ips` says. Template fetches ignore this setting. Example:
+                ['http://127.0.0.1:8082/v1/media/'].
             user_agent (str | Unset): User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some
                 servers (e.g., Wikipedia) reject requests without a User-Agent. Example: AntflyDB/1.0.
     """
@@ -60,6 +65,7 @@ class ContentSecurityConfig:
     download_timeout_seconds: int | Unset = 30
     max_image_dimension: int | Unset = UNSET
     allowed_paths: list[str] | Unset = UNSET
+    source_media_base_urls: list[str] | Unset = UNSET
     user_agent: str | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
@@ -84,6 +90,10 @@ class ContentSecurityConfig:
         if not isinstance(self.allowed_paths, Unset):
             allowed_paths = self.allowed_paths
 
+        source_media_base_urls: list[str] | Unset = UNSET
+        if not isinstance(self.source_media_base_urls, Unset):
+            source_media_base_urls = self.source_media_base_urls
+
         user_agent = self.user_agent
 
         field_dict: dict[str, Any] = {}
@@ -103,6 +113,8 @@ class ContentSecurityConfig:
             field_dict["max_image_dimension"] = max_image_dimension
         if allowed_paths is not UNSET:
             field_dict["allowed_paths"] = allowed_paths
+        if source_media_base_urls is not UNSET:
+            field_dict["source_media_base_urls"] = source_media_base_urls
         if user_agent is not UNSET:
             field_dict["user_agent"] = user_agent
 
@@ -125,6 +137,8 @@ class ContentSecurityConfig:
 
         allowed_paths = cast(list[str], d.pop("allowed_paths", UNSET))
 
+        source_media_base_urls = cast(list[str], d.pop("source_media_base_urls", UNSET))
+
         user_agent = d.pop("user_agent", UNSET)
 
         content_security_config = cls(
@@ -135,6 +149,7 @@ class ContentSecurityConfig:
             download_timeout_seconds=download_timeout_seconds,
             max_image_dimension=max_image_dimension,
             allowed_paths=allowed_paths,
+            source_media_base_urls=source_media_base_urls,
             user_agent=user_agent,
         )
 

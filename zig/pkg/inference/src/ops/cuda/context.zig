@@ -16,6 +16,14 @@
 const std = @import("std");
 const driver_mod = @import("driver.zig");
 const artifact = @import("artifact.zig");
+const allocation_ledger = @import("allocation_ledger.zig");
+// Orders internal retains and allocation publication against the final
+// release/state-query/reconciliation boundary. External retainers may keep
+// the primary alive; they can never authorize forgiving managed allocations.
+var primary_lifecycle_mutex: std.atomic.Mutex = .unlocked;
+fn lockPrimaryLifecycle() void {
+    while (!primary_lifecycle_mutex.tryLock()) std.atomic.spinLoopHint();
+}
 
 const CudaDriver = driver_mod.CudaDriver;
 const CUcontext = driver_mod.CUcontext;
@@ -176,9 +184,12 @@ pub const CudaContext = struct {
         };
 
         var ctx: CUcontext = null;
+        lockPrimaryLifecycle();
+        defer primary_lifecycle_mutex.unlock();
         checkStep(&driver, "cuDevicePrimaryCtxRetain", driver.fns.cuDevicePrimaryCtxRetain(&ctx, device)) catch |err| return err;
         errdefer _ = driver.fns.cuDevicePrimaryCtxRelease(device);
         checkStep(&driver, "cuCtxSetCurrent", driver.fns.cuCtxSetCurrent(ctx)) catch |err| return err;
+        allocation_ledger.process.retryRetired(@intFromPtr(ctx), 0, driver.fns.cuMemFree, driver.fns.cuDevicePrimaryCtxRelease);
 
         var stream: CUstream = null;
         checkStep(&driver, "cuStreamCreate", driver.fns.cuStreamCreate(&stream, 0)) catch |err| return err;
@@ -216,9 +227,13 @@ pub const CudaContext = struct {
         return bytes;
     }
 
+    /// Final ownership boundary for the primary context and driver library.
+    /// Owners with post-GPU host cleanup may call releaseResources first, but
+    /// must finish here rather than closing the driver library directly.
     pub fn deinit(self: *CudaContext) void {
         self.releaseResources();
-        self.driver.deinit();
+        if (!allocation_ledger.process.retainDriverLibrary(self.device_allocations.owner_id, self.driver.lib))
+            self.driver.deinit();
     }
 
     /// Leave driver entry points loaded for host-only cleanup after a lost
@@ -226,8 +241,15 @@ pub const CudaContext = struct {
     pub fn releaseResources(self: *CudaContext) void {
         defer self.device_allocations.releaseObservation();
         if (self.observation.swap(null, .acq_rel)) |state| state.deinit();
+        lockPrimaryLifecycle();
+        defer primary_lifecycle_mutex.unlock();
+        const primary = @intFromPtr(self.ctx);
+        var drained = false;
         if (self.ctx != null) {
-            _ = self.driver.fns.cuCtxSetCurrent(self.ctx);
+            if (self.driver.fns.cuCtxSetCurrent(self.ctx) == driver_mod.CUDA_SUCCESS)
+                drained = self.stream == null or self.driver.fns.cuStreamSynchronize(self.stream) == driver_mod.CUDA_SUCCESS;
+            allocation_ledger.process.retire(self.device_allocations.owner_id, drained);
+            if (drained) allocation_ledger.process.retryRetired(primary, self.device_allocations.owner_id, self.driver.fns.cuMemFree, self.driver.fns.cuDevicePrimaryCtxRelease);
         }
         if (self.video_decoder_cache) |decoder| {
             self.video_decoder_release.?(decoder);
@@ -239,7 +261,17 @@ pub const CudaContext = struct {
         }
         if (self.ctx != null) {
             _ = self.driver.fns.cuCtxSetCurrent(null);
-            _ = self.driver.fns.cuDevicePrimaryCtxRelease(self.device);
+            // Failed allocations keep this exact primary lifetime alive even
+            // after every external CUDA user releases its own reference.
+            if (!allocation_ledger.process.retainPrimaryReference(self.device_allocations.owner_id, self.device)) {
+                const released = self.driver.fns.cuDevicePrimaryCtxRelease(self.device);
+                if (released == driver_mod.CUDA_SUCCESS) if (self.driver.fns.cuDevicePrimaryCtxGetState) |state| {
+                    var flags: c_uint = 0;
+                    var active: c_int = 1;
+                    if (state(self.device, &flags, &active) == driver_mod.CUDA_SUCCESS and active == 0)
+                        allocation_ledger.process.confirmedPrimaryTeardown(primary);
+                };
+            }
             self.ctx = null;
         }
     }

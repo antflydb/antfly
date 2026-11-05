@@ -223,7 +223,7 @@ pub fn loadPreferred(
                 continue;
             };
         } else null;
-        const resident_amounts = if (reservation) |reserved| reserved.resident else runtime.tier.memory.AdmissionAmounts{};
+        var resident_amounts = if (reservation) |reserved| reserved.resident else runtime.tier.memory.AdmissionAmounts{};
         resource_lease = if (reservation) |reserved| reserved.lease else null;
         var close_protection = host.protect_close_fn(host.context, backend_runtime) catch |err| {
             if (err == error.ProcessIsolationRequired) {
@@ -242,6 +242,13 @@ pub fn loadPreferred(
             defer loaded.deinit();
             if (control) |active| try active.check();
             if (reservation) |reserved| {
+                if (loaded.session.executionCapabilities().measured_resident_weights) |weight_bytes| {
+                    const construction_bytes = resident_amounts.backend_weight_bytes;
+                    resident_amounts.backend_weight_bytes = try session_factory.retainedCudaMirrorWeightBytes(construction_bytes, weight_bytes);
+                    std.log.info("cuda_eager_weight_residency construction_bytes={d} measured_weight_bytes={d} retained_weight_bytes={d}", .{
+                        construction_bytes, weight_bytes, resident_amounts.backend_weight_bytes,
+                    });
+                }
                 if (reserved.serving_floor) |floor| session_factory.configureReservedGenerationWorkspace(
                     &loaded.session,
                     floor,

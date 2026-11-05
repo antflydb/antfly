@@ -763,6 +763,15 @@ fn createCudaSessionWithRequiredProfile(
     try impl.model_lifetime.prepareFinalResources();
     try impl.backend_data.cuda.compute.publishLightOnNormCatalog();
     try impl.backend_data.cuda.compute.configureOptionalPrefillOutsideExecution();
+    if (impl.arch_config == .gpt and impl.arch_config.gpt.family == .gemma) {
+        const declared = archExecutionCapabilities(impl);
+        const compute = impl.backend_data.cuda.compute;
+        std.log.info("cuda_execution_capabilities cooperative={any} max_active={d} max_rows={d} measured_weight_bytes={d} lazy={any} training={any} bert_bf16_mirrors={d} profile={s}", .{
+            declared.cooperative_steps,                  declared.max_active_requests,                                            declared.max_batch_rows,
+            declared.measured_resident_weights orelse 0, compute.lazy_host_store != null,                                         compute.resident_training_cache,
+            compute.stats.bf16_mirror_weight_count,      if (compute.capability_profile) |profile| @tagName(profile) else "none",
+        });
+    }
     return archSessionHandle(impl);
 }
 
@@ -3273,6 +3282,8 @@ fn gpuBackendData(self: *ArchSession) *GpuHostedData {
 }
 
 const arch_vtable = Session.VTable{
+    .executionOwnerStats = &archExecutionOwnerStats,
+    .executionCapabilities = &archExecutionCapabilities,
     .hasLayaDecisions = archHasLayaDecisions,
     .runLayaDecisions = archRunLayaDecisions,
     .run = &archRun,
@@ -3979,6 +3990,54 @@ pub fn getCudaRuntimeStats(session: Session) ?CudaRuntimeStats {
         .cuda => self.backend_data.cuda.compute.snapshotStats(),
         else => null,
     };
+}
+
+/// Dense Gemma 4 mirrors are created during eager upload, before the native
+/// source session is destroyed. This inventory excludes scratch/KV caches.
+/// Leave all lazy, expert, training and non-mirrored policies conservative.
+fn archExecutionOwnerStats(raw: *anyopaque) @import("../ops/execution_scope.zig").OwnerSnapshot {
+    if (comptime !build_options.enable_cuda) return .{};
+    const self: *ArchSession = @ptrCast(@alignCast(raw));
+    if (self.backend_type != .cuda) return .{};
+    return self.backend_data.cuda.compute.cooperative_owner.snapshot();
+}
+
+fn archExecutionCapabilities(raw: *anyopaque) @import("../backends/session.zig").ExecutionCapabilities {
+    if (comptime !build_options.enable_cuda) return .{};
+    const self: *ArchSession = @ptrCast(@alignCast(raw));
+    if (self.backend_type != .cuda) return .{};
+    if (self.arch_config == .embedding_gemma2) {
+        const eligible = self.arch_config.embedding_gemma2.resident != null and
+            self.backend_data.cuda.compute.capability_profile == .embedding_gemma2 and
+            self.backend_data.cuda.compute.embedding_gemma2_policy.arithmeticBits() == 0;
+        return .{ .text_batch_rows = if (eligible) 4 else 1, .text_batch_tokens = if (eligible) 8192 else 0, .text_batch_padded_tokens = if (eligible) 8192 else 0 };
+    }
+    if (self.arch_config != .gpt) return .{};
+    const cfg = self.arch_config.gpt;
+    const compute = self.backend_data.cuda.compute;
+    const eager = cfg.family == .gemma and cfg.usesGemma4Channels() and !cfg.usesMoe() and !cfg.gemma4_mtp_assistant and
+        compute.capability_profile == .gemma4 and compute.lazy_host_store == null and
+        compute.a4b_inference == null and !compute.resident_training_cache and compute.stats.resident_weight_bytes > 0;
+    // Qualification fence belongs to the backend, alongside the state contract.
+    // Widening this declaration requires independent output/fairness evidence.
+    const cooperative = eager and cfg.hidden_size == 2560 and cfg.num_attention_heads == 8 and
+        cfg.effectiveKVHeads() == 2 and cfg.headDim() == 256 and cfg.global_head_dim == 512;
+    return .{
+        .cooperative_steps = cooperative,
+        .max_active_requests = if (cooperative) 2 else 1,
+        .max_batch_rows = if (cooperative) compute.cooperativeDecodeBatchRows(cfg.weight_tying) else 1,
+        .decode_only_batching = true,
+        .measured_resident_weights = if (eager) compute.stats.resident_weight_bytes else null,
+    };
+}
+
+/// Compatibility accessor; scheduling and residency consume the same backend contract.
+pub fn getEagerCudaMirrorWeightBytes(session: Session) ?usize {
+    return session.executionCapabilities().measured_resident_weights;
+}
+
+pub fn retainedCudaMirrorWeightBytes(construction_bytes: usize, weight_bytes: usize) !usize {
+    return @import("../ops/cuda/load_plan.zig").retainedEagerMirrorBytes(construction_bytes, weight_bytes);
 }
 
 pub const CudaAllocationStats = struct {
@@ -5241,6 +5300,17 @@ pub fn getComputeBackendWithBudgetAndCleanup(
     current: @import("cleanup_context.zig").Context,
 ) !ops.ComputeBackend {
     return acquireComputeBackendForRequest(session, allocator, .{ .run_budget = run_budget, .cleanup = current });
+}
+
+pub fn getCoordinatedCudaComputeBackend(session: Session, budget: *runtime.tier.memory.RunBudget, owner: u64) !ops.ComputeBackend {
+    if (comptime build_options.enable_cuda) {
+        if (session.vtable != &arch_vtable) return error.NotArchSession;
+        const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
+        if (self.backend_type != .cuda) return error.CudaNotEnabled;
+        var cb = self.backend_data.cuda.compute.computeBackendWithStepRunBudget(budget, owner);
+        try @import("../backends/compute_factory.zig").beginRequest(session, &cb);
+        return cb;
+    } else return error.CudaNotEnabled;
 }
 
 pub fn getGenericEncoderArchConfig(session: Session) !GenericEncoderArchConfig {
@@ -7716,6 +7786,12 @@ fn archClose(ptr: *anyopaque) void {
 fn archCloseWithBoundary(ptr: *anyopaque, boundary: ?*const @import("retirement_sink.zig").Epoch) void {
     archCloseWithCleanup(ptr, .{ .boundary = boundary });
 }
+fn cudaCloseRequiresOwnerEmpty(lifetime: *const Session.ModelLifetime, current: @import("cleanup_context.zig").Context) bool {
+    // These exact fields still exist during ModelLifetime's physical destroy;
+    // releaseFinal drops/moves their resources only AFTER this callback returns.
+    return !current.outside_execution or lifetime.model_lease != null or lifetime.resource_pin != null or lifetime.admission_domain != null;
+}
+
 fn archCloseWithCleanup(ptr: *anyopaque, current: @import("cleanup_context.zig").Context) void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     if (self.backend_type == .metal) {
@@ -7754,10 +7830,10 @@ fn archCloseWithCleanup(ptr: *anyopaque, current: @import("cleanup_context.zig")
         },
         .cuda => {
             if (comptime build_options.enable_cuda) {
-                if (current.outside_execution)
-                    @import("../backends/compute_factory.zig").closeCuda(self.allocator, self.backend_data.cuda.compute)
+                if (cudaCloseRequiresOwnerEmpty(&self.model_lifetime, current))
+                    @import("../backends/compute_factory.zig").closeCudaWithCleanup(self.allocator, self.backend_data.cuda.compute, current)
                 else
-                    @import("../backends/compute_factory.zig").closeCudaWithBoundary(self.allocator, self.backend_data.cuda.compute, current.boundary);
+                    @import("../backends/compute_factory.zig").closeCuda(self.allocator, self.backend_data.cuda.compute);
             }
         },
         .wasm => {},
@@ -14885,4 +14961,85 @@ test "Native canonical Qwen Source prepares actual selected resident layouts out
 
 test "Native actual Source matrix receive prepares same embedding-loaded lazy peer before numerical entry" {
     try nativeCanonicalSourceColdSelectedCase(true);
+}
+
+test "cooperative backend declaration uses eager weight inventory independently of BERT mirror counters" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var compute: cuda_compute_mod.CudaCompute = undefined;
+    compute.capability_profile = .gemma4;
+    compute.resident_weights = .{};
+    compute.lazy_host_store = null;
+    compute.a4b_inference = null;
+    compute.resident_training_cache = false;
+    compute.stats = .{};
+    compute.stats.resident_weight_bytes = 4096;
+    var arch = ArchSession{
+        .allocator = std.testing.allocator,
+        .arch_config = .{ .gpt = .{
+            .family = .gemma,
+            .gemma4_channel_protocol = true,
+            .hidden_size = 2560,
+            .num_attention_heads = 8,
+            .num_key_value_heads = 2,
+            .attention_head_dim = 256,
+            .global_head_dim = 512,
+        } },
+        .backend_type = .cuda,
+        .backend_data = .{ .cuda = .{ .compute = &compute } },
+    };
+    const session = Session{ .ptr = &arch, .vtable = &arch_vtable };
+    var caps = session.executionCapabilities();
+    try std.testing.expect(caps.cooperative_steps);
+    try std.testing.expectEqual(@as(?usize, 4096), caps.measured_resident_weights);
+    try std.testing.expectEqual(@as(usize, 2), caps.max_active_requests);
+    try std.testing.expectEqual(@as(usize, 1), caps.max_batch_rows);
+    // BERT-specific projection mirrors do not describe E4B eager residency.
+    try std.testing.expectEqual(@as(usize, 0), arch.backend_data.cuda.compute.stats.bf16_mirror_weight_count);
+    arch.backend_data.cuda.compute.resident_training_cache = true;
+    caps = session.executionCapabilities();
+    try std.testing.expect(!caps.cooperative_steps and caps.measured_resident_weights == null);
+    arch.backend_data.cuda.compute.resident_training_cache = false;
+    arch.backend_data.cuda.compute.lazy_host_store = @ptrFromInt(16);
+    caps = session.executionCapabilities();
+    try std.testing.expect(!caps.cooperative_steps and caps.measured_resident_weights == null);
+    arch.backend_data.cuda.compute.lazy_host_store = null;
+    arch.arch_config.gpt.num_key_value_heads = 1;
+    try std.testing.expect(!session.executionCapabilities().cooperative_steps);
+    try std.testing.expectEqual(@as(?usize, 4096), session.executionCapabilities().measured_resident_weights);
+}
+
+test "CUDA allocation architecture close keeps exact Model resources on strict typed path even outside execution" {
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const memory = @import("../runtime/tier/memory.zig");
+    const Probe = struct {
+        var releases: usize = 0;
+        fn close(_: *anyopaque) void {
+            releases += 1;
+        }
+    };
+    Probe.releases = 0;
+    var marker: u8 = 0;
+    var lifetime = Session.ModelLifetime{ .owner = &marker, .destroy_fn = Probe.close };
+    try std.testing.expect(!cudaCloseRequiresOwnerEmpty(&lifetime, .{ .outside_execution = true }));
+    try std.testing.expect(cudaCloseRequiresOwnerEmpty(&lifetime, .{}));
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var lease = try controller.tryAcquire(.gpu, .{}, .{ .backend_weight_bytes = 16 }, false);
+    defer lease.release();
+    lifetime.model_lease = lease;
+    try std.testing.expect(cudaCloseRequiresOwnerEmpty(&lifetime, .{ .outside_execution = true }));
+    try std.testing.expectEqual(@as(usize, 16), controller.snapshot().backend_weight_bytes);
+    lifetime.model_lease = null;
+    lifetime.resource_pin = .{ .ptr = &marker, .release_fn = Probe.close };
+    try std.testing.expect(cudaCloseRequiresOwnerEmpty(&lifetime, .{ .outside_execution = true }));
+    lifetime.resource_pin = null;
+    const domain = try Domain.create();
+    defer domain.release();
+    var pin = domain.pin();
+    defer pin.release();
+    lifetime.admission_domain = pin;
+    try std.testing.expect(cudaCloseRequiresOwnerEmpty(&lifetime, .{ .outside_execution = true }));
+    lifetime.admission_domain = null;
+    try std.testing.expect(!cudaCloseRequiresOwnerEmpty(&lifetime, .{ .outside_execution = true }));
+    try std.testing.expectEqual(@as(usize, 0), Probe.releases);
 }

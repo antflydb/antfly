@@ -748,6 +748,8 @@ pub const Runtime = struct {
     shared_prefetch: ?*runtime.tier.shared.SharedPrefetchState = null,
     prompt_prefix_cache: runtime.kv.prompt_cache.PromptPrefixCache,
     native_generate_coordinator: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
+    generation_admission: runtime.scheduler.generation_admission.Lane = .{},
+    native_generation_step_lane: execution_control_mod.ExecutionLane = .{},
     native_generation_graph_cache: graph_mod.cache.GraphCache,
     // ponytail: model-wide safety lock; replace with per-request backend state only when continuous batching is proven safe.
     native_generate_lock: std.atomic.Mutex = .unlocked,
@@ -769,6 +771,8 @@ pub const Runtime = struct {
     /// reserving their full device scratch ceiling, without holding a provider
     /// lock during admission/eviction. Every waiter retains a loaded-model handle.
     gliner_boundary_admission_lock: std.atomic.Mutex = .unlocked,
+    /// Fair turns before GLiNER transient workspace admission, including broker cohorts.
+    gliner_execution_lane: execution_control_mod.ExecutionLane = .{},
     vision_session: ?backends.Session = null,
     audio_session: ?backends.Session = null,
     text_projection: ?backends.Session = null,

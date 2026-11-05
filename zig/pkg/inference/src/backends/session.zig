@@ -1613,6 +1613,22 @@ pub const ResidentPreparation = struct {
     prepare: *const fn (*anyopaque, Session, ?InferenceExecutionControl) anyerror!void,
 };
 
+/// Backend-declared execution limits and immutable eager-weight residency.
+pub const ExecutionCapabilities = struct {
+    /// Backend-qualified encoder cohorts, independent of generation.
+    text_batch_rows: usize = 1,
+    text_batch_tokens: usize = 0,
+    /// Maximum sum of bucket-padded token rows in one encoder cohort.
+    text_batch_padded_tokens: usize = 0,
+    cooperative_steps: bool = false,
+    max_active_requests: usize = 1,
+    max_batch_rows: usize = 1,
+    /// Mixed prefill/decode padding is excluded unless explicitly qualified.
+    decode_only_batching: bool = true,
+    /// Eager, immutable weight inventory; excludes KV and retained scratch.
+    measured_resident_weights: ?usize = null,
+};
+
 /// Loaded model execution handle. Copies preserve the resolved model contract.
 pub const Session = struct {
     pub const ModelLifetime = struct {
@@ -1999,6 +2015,8 @@ pub const Session = struct {
     };
 
     pub const VTable = struct {
+        executionOwnerStats: ?*const fn (*anyopaque) @import("../ops/execution_scope.zig").OwnerSnapshot = null,
+        executionCapabilities: ?*const fn (*anyopaque) ExecutionCapabilities = null,
         quiesce: ?*const fn (*anyopaque) void = null,
         configureExecutionDiagnostics: ?*const fn (ptr: *anyopaque, enabled: bool) void = null,
         executionDiagnostics: ?*const fn (ptr: *anyopaque) ?@import("../execution/diagnostics.zig").Snapshot = null,
@@ -2079,6 +2097,14 @@ pub const Session = struct {
         if (self.nativeWeightPreparationReceiver()) return true;
         return self.needsEagerRecurrentFunding();
     }
+    pub fn executionOwnerStats(self: Session) @import("../ops/execution_scope.zig").OwnerSnapshot {
+        return if (self.vtable.executionOwnerStats) |query| query(self.ptr) else .{};
+    }
+
+    pub fn executionCapabilities(self: Session) ExecutionCapabilities {
+        return if (self.vtable.executionCapabilities) |query| query(self.ptr) else .{};
+    }
+
     /// Top-level cold host entry: all preparation/refunds are outside every
     /// enclosing lane. Only an explicit PRE-MATH stale receipt may retry.
     fn runColdEager(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) anyerror![]Tensor {

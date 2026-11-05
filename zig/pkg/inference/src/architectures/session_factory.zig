@@ -149,3 +149,7 @@ pub const createNativeSessionWithOptions = implementation.createNativeSessionWit
 pub const CudaAllocationStats = implementation.CudaAllocationStats;
 pub const getCudaAllocationStats = implementation.getCudaAllocationStats;
 pub const getGlinerSpecialtyIdentity = implementation.getGlinerSpecialtyIdentity;
+
+pub const getEagerCudaMirrorWeightBytes = implementation.getEagerCudaMirrorWeightBytes;
+pub const retainedCudaMirrorWeightBytes = implementation.retainedCudaMirrorWeightBytes;
+pub const getCoordinatedCudaComputeBackend = implementation.getCoordinatedCudaComputeBackend;

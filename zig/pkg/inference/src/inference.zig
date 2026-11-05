@@ -42,6 +42,33 @@ pub const decide_benchmark = @import("server/gliner_decide_1b_service_test.zig")
 pub const server = if (build_options.skip_openapi) struct {
     pub const model_manager = @import("server/model_manager.zig");
 } else @import("server/server.zig");
+
+/// Process allocation ownership is common to every executable and engine host.
+pub const cuda_memory = if (build_options.enable_cuda) struct {
+    pub const budget = @import("ops/cuda/allocation_budget.zig");
+    pub const Context = @import("ops/cuda/context.zig").CudaContext;
+    pub const Buffer = @import("ops/cuda/buffer.zig").DeviceBuffer;
+    pub const driver = @import("ops/cuda/driver.zig");
+} else struct {};
+
+test "CUDA process allocation budget declarations compile" {
+    _ = @import("ops/cuda/buffer.zig");
+    _ = @import("ops/cuda/allocation_budget.zig");
+    _ = @import("ops/cuda/device_budget_owner.zig");
+    _ = @import("ops/cuda/allocation_ledger.zig");
+}
+
+test "generation deadline declarations compile" {
+    _ = @import("pipelines/generation.zig");
+    _ = server;
+}
+
+test "generation cooperative declarations compile" {
+    _ = server;
+    _ = @import("runtime/scheduler/generation_admission.zig");
+    if (build_options.enable_cuda) _ = @import("ops/cuda/cuda_compute.zig");
+}
+
 pub const executor_microbatch = @import("server/executor_microbatch.zig");
 pub const tensor_microbatch = @import("server/tensor_microbatch.zig");
 pub const cache = @import("cache/cache.zig");

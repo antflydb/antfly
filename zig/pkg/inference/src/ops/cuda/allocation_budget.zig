@@ -23,6 +23,11 @@ const roots = @import("../../execution/device_allocation_registry.zig");
 pub const OwnedPurpose = @import("../../execution/storage_accounting.zig").OwnedPurpose;
 const purpose_count = @import("../../execution/storage_accounting.zig").owned_purpose_count;
 
+/// Physical DeviceBuffer bytes across all CUDA model contexts in this worker.
+/// The serving process may narrow this independently of per-owner quotas.
+/// Module storage, NVDEC and vendor-library-private allocations are excluded.
+pub var process_device_allocations: Budget = .{};
+
 pub const Budget = struct {
     mutex: std.atomic.Mutex = .unlocked,
     limit: usize = std.math.maxInt(usize),
@@ -37,6 +42,9 @@ pub const Budget = struct {
     observation: ?*observer.State = null,
     handoffs_in: u64 = 0,
     handoffs_out: u64 = 0,
+    /// Stable identity used by the process allocation ledger across moves of
+    /// a model's CudaContext value. Assigned lazily under the ledger lock.
+    owner_id: u64 = 0,
 
     fn observedSnapshot(self: *Budget) observer.Snapshot {
         return .{ .purpose_live_bytes = self.purpose_live, .purpose_lifetime_peak_bytes = self.purpose_peak, .requested_live_bytes = self.physical_live, .requested_lifetime_peak_bytes = self.physical_peak, .allocations = self.allocations, .frees = self.frees, .custody_transfers_in = self.handoffs_in, .custody_transfers_out = self.handoffs_out };

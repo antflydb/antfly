@@ -2055,7 +2055,7 @@ fn logCudaVideoAdmission(session: Session, request: @import("../backends/session
     });
 }
 
-fn videoInputError(err: anyerror) anyerror {
+pub fn videoInputError(err: anyerror) anyerror {
     return switch (err) {
         error.UnexpectedEndOfSource, error.EmptyVideo, error.EmptyVideoTrack, error.MalformedMedia, error.MissingMovieMetadata, error.UnsupportedContainer, error.UnsupportedDataReference, error.UnsupportedDisplayGeometry, error.UnsupportedEncryptedMedia, error.UnsupportedFragmentedMp4, error.UnsupportedHybridMp4, error.UnsupportedInterlacedVideo, error.UnsupportedSampleDescription, error.UnsupportedSampleSize, error.UnsupportedTimeline, error.UnsupportedVideoCodec, error.InvalidTimebase, error.TimestampOverflow, error.NoRandomAccessPoint, error.InvalidVideoTimestamp, error.NonMonotonicVideoPresentation, error.UnsupportedVideoFormat, error.UnsupportedVideoContainerColor, error.InvalidVideoGeometry, error.InvalidVideoConfiguration, error.InvalidVideoPacket, error.VideoDecodeFailed => error.InvalidVideoInput,
         else => err,

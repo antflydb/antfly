@@ -256,7 +256,11 @@ pub fn closeCuda(allocator: std.mem.Allocator, compute: *if (build_options.enabl
 
 pub fn closeCudaWithBoundary(allocator: std.mem.Allocator, compute: *if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig").CudaCompute else void, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
     if (comptime !build_options.enable_cuda) return;
-    compute.deinitWithBoundary(boundary);
+    closeCudaWithCleanup(allocator, compute, .{ .boundary = boundary });
+}
+pub fn closeCudaWithCleanup(allocator: std.mem.Allocator, compute: *if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig").CudaCompute else void, current: @import("../execution/cleanup_context.zig").Context) void {
+    if (comptime !build_options.enable_cuda) return;
+    compute.deinitWithCleanup(current);
     allocator.destroy(compute);
 }
 

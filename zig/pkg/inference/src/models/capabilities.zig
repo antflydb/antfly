@@ -65,8 +65,16 @@ pub fn modelSupportsCapability(
         std.mem.eql(u8, capability, "extraction");
 }
 
+/// Gemma 4 generators project sampled video frames through their image tower.
+/// Older manifests omit video from `inputs`, so the checkpoint architecture and
+/// its projector decide. Other multimodal generators reject video.
+pub fn generatorAcceptsVideo(manifest: *const manifest_mod.ModelManifest) bool {
+    return manifest.model_type == .generator and manifest.gguf_projector_path != null and
+        std.mem.eql(u8, manifest.config_model_arch, "gemma4");
+}
+
 pub fn modelAcceptsInput(manifest: *const manifest_mod.ModelManifest, input: []const u8) bool {
-    if (std.mem.eql(u8, input, "video")) return manifest.embedding_style == .embedding_gemma2 and modelAcceptsInput(manifest, "image");
+    if (std.mem.eql(u8, input, "video")) return generatorAcceptsVideo(manifest) or manifest.embedding_style == .embedding_gemma2 and modelAcceptsInput(manifest, "image");
     return modelKindAcceptsInput(
         @tagName(manifest.model_type),
         manifest.gliner_model_type,
@@ -240,4 +248,19 @@ test "rewriters are blocked because the onnx seq2seq import panics" {
     var rewriter = manifest_mod.ModelManifest{ .allocator = std.testing.allocator };
     rewriter.model_type = .rewriter;
     try std.testing.expectEqual(CompatibilityLevel.incompatible, modelClassCompatibility(&rewriter));
+}
+
+test "only Gemma 4 generators with a projector accept video generation" {
+    const allocator = std.testing.allocator;
+    var manifest = manifest_mod.ModelManifest{ .allocator = allocator, .model_type = .generator, .config_model_arch = "gemma4", .gguf_projector_path = "mmproj.gguf" };
+    try std.testing.expect(generatorAcceptsVideo(&manifest));
+    try std.testing.expect(modelAcceptsInput(&manifest, "video"));
+    manifest.gguf_projector_path = null;
+    try std.testing.expect(!generatorAcceptsVideo(&manifest));
+    manifest.gguf_projector_path = "mmproj.gguf";
+    manifest.config_model_arch = "qwen3vl";
+    try std.testing.expect(!generatorAcceptsVideo(&manifest));
+    manifest.config_model_arch = "gemma4";
+    manifest.model_type = .embedder;
+    try std.testing.expect(!generatorAcceptsVideo(&manifest));
 }

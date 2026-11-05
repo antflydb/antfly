@@ -40,6 +40,7 @@ type Connection struct {
 	SessionTokenEnv string            `json:"session_token_env,omitempty"`
 	S3Endpoint      string            `json:"s3_endpoint,omitempty"`
 	S3Insecure      bool              `json:"s3_insecure,omitempty"`
+	LocalRoot       string            `json:"local_root,omitempty"`
 }
 type Factory func(context.Context, Connection) (Connector, error)
 
@@ -81,6 +82,15 @@ func CredentialFactory(resolve func(context.Context, string) (string, error)) Fa
 			return value, nil
 		}
 		switch connection.Provider {
+		case ProviderLocal:
+			if connection.TokenEnv != "" || connection.CredentialsEnv != "" || connection.AccessKeyEnv != "" || connection.SecretKeyEnv != "" || connection.SessionTokenEnv != "" || len(connection.SecretRefs) != 0 {
+				return nil, fmt.Errorf("%w: local connections take no credentials", ErrInvalidInput)
+			}
+			root, err := localRootAllowed(connection.LocalRoot, os.Getenv(LocalRootsEnv))
+			if err != nil {
+				return nil, err
+			}
+			return &LocalConnector{Root: root}, nil
 		case ProviderGoogleWorkspace, ProviderGCS:
 			raw, err := secret("credentials", connection.CredentialsEnv)
 			if err != nil {

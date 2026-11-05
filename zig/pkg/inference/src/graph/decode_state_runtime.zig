@@ -74,6 +74,9 @@ const SelectionQueryEntry = struct {
 };
 
 pub const NativeDecodeState = struct {
+    /// Borrowed through claimed-step drain and publication.
+    execution_backend: ?@import("../ops/ops.zig").ComputeBackend = null,
+    execution_control: ?InferenceExecutionControl = null,
     allocator: std.mem.Allocator,
     kv_manager: ?*runtime.kv.manager.KvManager = null,
     kv_storage: ?*runtime.kv.storage_runtime.KvStorageRuntime = null,

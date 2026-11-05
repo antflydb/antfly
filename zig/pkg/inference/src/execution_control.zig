@@ -709,6 +709,8 @@ pub const ExecutionPause = struct {
 /// Borrowed admission for a physical backend lane. Callers retain all fields
 /// through the final drain and release; cleanup always ignores cancellation.
 pub const ExecutionAccess = struct {
+    /// Borrowed actual receiver; binding lasts exactly as long as the acquired scope.
+    backend: ?@import("ops/ops.zig").ComputeBackend = null,
     mutex: ?*std.atomic.Mutex = null,
     gate: ?*ExecutionLane = null,
     io: ?std.Io = null,
@@ -764,6 +766,32 @@ pub const ExecutionAccess = struct {
     }
     pub fn acquireForCleanup(self: ExecutionAccess) void {
         self.acquirePolicy(false) catch unreachable;
+    }
+
+    /// Preserve pause/FIFO acquisition and add the backend budget/state owner.
+    pub fn acquireScope(self: ExecutionAccess) !?@import("ops/execution_scope.zig").Scope {
+        if (self.mutex == null) return null;
+        try self.acquire();
+        var scope = self.adoptScope(.step);
+        errdefer scope.deinit();
+        if (self.backend) |backend| try scope.bind(backend);
+        return scope;
+    }
+    pub fn acquireCleanupScope(self: ExecutionAccess) ?@import("ops/execution_scope.zig").Scope {
+        return self.acquireNoncancellableScope(.cleanup);
+    }
+    pub fn acquireReleaseScope(self: ExecutionAccess) ?@import("ops/execution_scope.zig").Scope {
+        return self.acquireNoncancellableScope(.release);
+    }
+    fn acquireNoncancellableScope(self: ExecutionAccess, phase: @import("ops/execution_scope.zig").Phase) ?@import("ops/execution_scope.zig").Scope {
+        if (self.mutex == null) return null;
+        self.acquireForCleanup();
+        var scope = self.adoptScope(phase);
+        if (self.backend) |backend| scope.bindCleanup(backend);
+        return scope;
+    }
+    fn adoptScope(self: ExecutionAccess, phase: @import("ops/execution_scope.zig").Phase) @import("ops/execution_scope.zig").Scope {
+        return .{ .mutex = self.mutex.?, .lane = if (self.gate) |gate| .{ .lane = gate } else null, .phase = phase };
     }
 
     pub fn release(self: ExecutionAccess) void {
@@ -891,5 +919,70 @@ test "paused execution access cleanup survives cancellation of its owning Io tas
     cancel_task.?.await(std.testing.io);
     cancel_task = null;
     try std.testing.expect(done.load(.acquire));
+    try std.testing.expect(!lane.owned and lane.head == null and lane.tail == null);
+}
+
+test "scoped execution access retains pause policy and binds backend only while exclusion is owned" {
+    const Probe = struct {
+        mutex: std.atomic.Mutex = .unlocked,
+        enters: usize = 0,
+        cleanups: usize = 0,
+        releases: usize = 0,
+        binds: usize = 0,
+        fn held(self: *@This()) void {
+            std.debug.assert(!self.mutex.tryLock());
+        }
+        fn enter(raw: *anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.held();
+            self.enters += 1;
+        }
+        fn cleanup(raw: *anyopaque, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.held();
+            self.cleanups += 1;
+        }
+        fn release(raw: *anyopaque, _: u64) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.held();
+            self.releases += 1;
+        }
+        fn bind(raw: *anyopaque, _: ?*@import("runtime/tier/memory.zig").RunBudget) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.held();
+            self.binds += 1;
+        }
+        fn cancelled(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var probe = Probe{};
+    var lane = ExecutionLane{};
+    var pause = ExecutionPause{};
+    var access = ExecutionAccess{
+        .mutex = &probe.mutex,
+        .gate = &lane,
+        .pause = &pause,
+        .backend = .{ .ptr = &probe, .vtable = undefined, .execution_enter = Probe.enter, .execution_cleanup = Probe.cleanup, .execution_release = Probe.release, .execution_budget_bind = Probe.bind },
+    };
+    var scope = (try access.acquireScope()).?;
+    try std.testing.expectEqual(@as(usize, 1), probe.enters);
+    scope.deinit();
+    scope = access.acquireCleanupScope().?;
+    scope.deinit();
+    scope = access.acquireReleaseScope().?;
+    scope.deinit();
+    try std.testing.expectEqual(@as(usize, 1), probe.cleanups);
+    try std.testing.expectEqual(@as(usize, 1), probe.releases);
+    try std.testing.expectEqual(@as(usize, 6), probe.binds);
+    try std.testing.expect(probe.mutex.tryLock());
+    try pause.pauseWithStepLocked();
+    probe.mutex.unlock();
+    access.control = .{ .check_fn = Probe.cancelled };
+    try std.testing.expectError(error.Cancelled, access.acquireScope());
+    try std.testing.expectEqual(@as(usize, 6), probe.binds);
+    try std.testing.expect(probe.mutex.tryLock());
+    pause.resumeWithStepLocked();
+    probe.mutex.unlock();
     try std.testing.expect(!lane.owned and lane.head == null and lane.tail == null);
 }

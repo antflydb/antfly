@@ -264,8 +264,8 @@ pub fn firstTokenCoalesceLimit() usize {
 }
 
 pub const Runtime = struct {
-    inline fn acquireForObservation(self: *Runtime) !void {
-        self.execution.acquire() catch |err| {
+    inline fn acquireForObservation(self: *Runtime) !?@import("../ops/execution_scope.zig").Scope {
+        return self.execution.acquireScope() catch |err| {
             @import("invocation_observation.zig").recordContextAcquisitionFailure(&self.forward.context, .prefill, err);
             return err;
         };
@@ -274,6 +274,7 @@ pub const Runtime = struct {
     forward: decoder_forward.Runtime,
     state: *graph_mod.decode_state_runtime.NativeDecodeState,
     execution: control.ExecutionAccess = .{},
+    setup_execution: control.ExecutionAccess = .{},
     work_control: runtime.kv.attention_match.Control = .{},
 
     /// Resolve from the actual loaded backend/model/cache, not task-selected
@@ -334,8 +335,8 @@ pub const Runtime = struct {
     }
 
     pub fn runChunk(self: *Runtime, request: ChunkRequest) !ChunkOutcome {
-        try self.acquireForObservation();
-        defer self.execution.release();
+        var execution_scope = try self.acquireForObservation();
+        defer if (execution_scope) |*scope| scope.deinit();
         return @import("invocation_observation.zig").callContextOperationClassified(&self.forward.context, .prefill, classifyChunkOutcome, @This().runChunkUnobserved, .{ self, request });
     }
 
@@ -564,8 +565,8 @@ pub const Runtime = struct {
             @import("invocation_observation.zig").recordContextAcquisitionFailure(&self.forward.context, .prefill, error.MissingCompiledModelRuntime);
             return error.MissingCompiledModelRuntime;
         };
-        try self.acquireForObservation();
-        defer self.execution.release();
+        var execution_scope = try self.acquireForObservation();
+        defer if (execution_scope) |*scope| scope.deinit();
         return @import("invocation_observation.zig").callContextOperation(&self.forward.context, .prefill, @This().runCompiledChunkWithOwnedLane, .{ self, request, cache, forward_fn });
     }
 
@@ -620,6 +621,8 @@ pub const Runtime = struct {
             platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_RESERVE_PREFILL_KV", true))
         {
             if (decoder_routes.cudaE4bPrefillKvCapacity(config, request.prompt_tokens, request.generated_tokens)) |capacity| {
+                var execution_scope = try self.setup_execution.acquireScope();
+                defer if (execution_scope) |*scope| scope.deinit();
                 const limit = std.mem.alignForward(usize, request.prompt_tokens + @as(usize, @intCast(request.generated_tokens)), 16);
                 try self.state.reserveFreshCudaKvCapacity(capacity, limit);
                 std.log.info("cuda_prefill_kv_reservation prompt_tokens={d} capacity_tokens={d}", .{ request.prompt_tokens, capacity });
@@ -659,8 +662,8 @@ pub const Runtime = struct {
     /// The caller owns its admitted scheduler turn. Physical state was prepared
     /// before acquiring the model lane, preserving prepared-prefix lock order.
     pub fn runEmbeddingsOwned(self: *Runtime, request: EmbeddingRequest) !Output {
-        try self.acquireForObservation();
-        defer self.execution.release();
+        var execution_scope = try self.acquireForObservation();
+        defer if (execution_scope) |*scope| scope.deinit();
         return @import("invocation_observation.zig").callContextOperation(&self.forward.context, .prefill, @This().runEmbeddingsOwnedUnobserved, .{ self, request });
     }
 

@@ -130,19 +130,21 @@ pub const GreedyFrame = struct {
     encoded: bool = false,
     reserved_position: bool = false,
     execution_owned: bool = false,
+    execution_scope: ?@import("../ops/execution_scope.zig").Scope = null,
 
     pub fn init(context: Context) !GreedyFrame {
-        context.execution.acquire() catch |err| {
+        const execution_scope = context.execution.acquireScope() catch |err| {
             @import("pending_observation.zig").acquisitionFailure(context.observation, err);
             return err;
         };
-        return .{ .context = context, .execution_owned = true, .observation = @import("pending_observation.zig").Span.begin(context.observation) };
+        return .{ .context = context, .execution_owned = true, .execution_scope = execution_scope, .observation = @import("pending_observation.zig").Span.begin(context.observation) };
     }
 
     pub fn deinit(self: *GreedyFrame) void {
         if (!self.execution_owned) return;
         self.execution_owned = false;
-        self.context.execution.release();
+        if (self.execution_scope) |*scope| scope.deinit();
+        self.execution_scope = null;
         self.observation.deinit();
     }
 

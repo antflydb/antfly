@@ -89,7 +89,9 @@ func ServeMedia(w http.ResponseWriter, r *http.Request, media MediaConnector, re
 				return
 			}
 			if acquired {
-				if int64(len(data)) != item.Size || fmt.Sprintf("%x", sha256.Sum256(data)) != digest {
+				verifier, verifies := acquirer.(VerifiedAcquisitionConnector)
+				verified := verifies && verifier.AcquiredMediaDigest(item) == digest
+				if int64(len(data)) != item.Size || (!verified && fmt.Sprintf("%x", sha256.Sum256(data)) != digest) {
 					serveMediaError(w, &RevisionChangedError{Expected: item.Revision, Actual: "representation changed; synchronize this source again"})
 					return
 				}

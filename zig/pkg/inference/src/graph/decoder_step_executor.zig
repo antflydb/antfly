@@ -161,6 +161,9 @@ fn endDecodeEpochUsing(cb: *const ComputeBackend, execution_id: u64, attempts: u
 }
 
 pub const Executor = struct {
+    claimed_execution_scope: ?*@import("../ops/execution_scope.zig").Scope = null,
+    claimed_batch_budget: ?*runtime.tier.memory.RunBudget = null,
+    claimed_batch_rows: usize = 0,
     /// Borrowed model sink, independent of context so pre-acquisition errors
     /// never dereference the backend, work or borrowed numerical context.
     batch_diagnostics: ?@import("../execution/invocation_observation.zig").Binding = null,
@@ -196,16 +199,73 @@ pub const Executor = struct {
     };
 
     pub fn execute(self: *Executor, claimed: []const runtime.scheduler.native_generate.StepItem, step_events: bool, publication: Publication) void {
-        if (self.access.mutex) |mutex| {
-            if (step_events or self.access.gate != null or self.access.pause != null) {
-                self.access.acquire() catch |err| {
-                    @import("../execution/shared_batch_observation.zig").acquisitionFailure(self.batchBinding(), .scheduled_step, claimed, describeParticipant, err);
-                    publication.publish(claimed, err);
+        _ = step_events; // The scoped adapter retains pause/FIFO/event acquisition.
+        // A shared CUDA cohort drains before any row publishes/retires its borrow.
+        var cohort_backend = self.access.backend;
+        const shared_batch = if (cohort_backend) |backend| backend.kind() == .cuda and backend.execution_owner != 0 and claimed.len > 1 else false;
+        var batch_budget: @import("../ops/execution_batch.zig").Budget = undefined;
+        if (shared_batch) {
+            var owners: [2]*runtime.tier.memory.RunBudget = undefined;
+            if (claimed.len > owners.len or self.access.mutex == null) {
+                publication.publish(claimed, error.InvalidBatchDecodeState);
+                return;
+            }
+            for (claimed, 0..) |item, row| {
+                if (item.phase != .decode or item.query_sequence_len != 1) {
+                    publication.publish(claimed, error.InvalidBatchDecodeState);
+                    return;
+                }
+                const work: *PendingDecodeBatchWork = @ptrCast(@alignCast(item.work_ptr));
+                const backend = work.decode_state.execution_backend orelse {
+                    publication.publish(claimed, error.InvalidBatchDecodeState);
                     return;
                 };
-            } else platform.sync.lockYielding(mutex);
+                if (backend.ptr != cohort_backend.?.ptr or backend.vtable != cohort_backend.?.vtable or backend.execution_owner == 0 or backend.execution_budget == null) {
+                    publication.publish(claimed, error.InvalidBatchDecodeState);
+                    return;
+                }
+                owners[row] = backend.execution_budget.?;
+            }
+            batch_budget = @import("../ops/execution_batch.zig").Budget.init(owners[0..claimed.len]) catch |err| {
+                publication.publish(claimed, err);
+                return;
+            };
         }
-        defer self.access.release();
+        const original_access = self.access;
+        if (shared_batch) {
+            cohort_backend.?.execution_control = null;
+            self.access.backend = cohort_backend;
+            self.access.control = null;
+        }
+        defer self.access = original_access;
+        var execution_scope = self.access.acquireScope() catch |err| {
+            @import("../execution/shared_batch_observation.zig").acquisitionFailure(self.batchBinding(), .scheduled_step, claimed, describeParticipant, err);
+            publication.publish(claimed, err);
+            return;
+        };
+        defer if (execution_scope) |*scope| scope.deinit();
+        const original_backend = self.context.cb;
+        if (shared_batch) self.context.cb = &cohort_backend.?;
+        defer self.context.cb = original_backend;
+        // Direct Reader adapters supply the same concrete receiving header.
+        if (execution_scope) |*scope| if (scope.backend == null) {
+            scope.bind(self.context.cb.*) catch |err| {
+                publication.publish(claimed, err);
+                return;
+            };
+        };
+        if (self.access.mutex != null) self.access.backend = self.context.cb.*;
+        if (shared_batch) {
+            execution_scope.?.bindDecodeBatch(&batch_budget.run, claimed.len);
+            self.claimed_batch_budget = &batch_budget.run;
+            self.claimed_batch_rows = claimed.len;
+        }
+        self.claimed_execution_scope = if (execution_scope) |*scope| scope else null;
+        defer {
+            self.claimed_execution_scope = null;
+            self.claimed_batch_budget = null;
+            self.claimed_batch_rows = 0;
+        }
         if (comptime build_options.enable_metal) {
             if (self.context.cb.kind() == .metal and self.context.gpt_config.hasQwen35VisionArchitectureContract() and
                 !platform.env.getenvBool("TERMITE_METAL_DISABLE_QWEN35_STEP_POOL"))
@@ -229,10 +289,12 @@ pub const Executor = struct {
 
     fn executePooled(self: *Executor, claimed: []const runtime.scheduler.native_generate.StepItem, publication: Publication) void {
         var result = @import("../execution/shared_batch_observation.zig").call(self.batchBinding(), self.context.cb.*, .scheduled_step, claimed, describeParticipant, @This().forwardOwnedCohort, .{ self, claimed }) catch |err| {
+            if (self.claimed_execution_scope) |scope| scope.drainBatch();
             publication.publish(claimed, err);
             return;
         };
         defer result.deinitWithCleanup(self.context.allocator, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
+        if (self.claimed_execution_scope) |scope| scope.drainBatch();
         publication.publish(claimed, result);
     }
 
@@ -621,9 +683,11 @@ pub const Executor = struct {
     /// even for cancellation or a CUDA error before retiring any resource.
     pub fn waitOutsideLightOnExecution(self: *Executor, pending: anytype) !void {
         if (self.access.mutex == null) return error.InvalidBatchDecodeState;
-        self.access.release();
+        const scope = self.claimed_execution_scope orelse return error.InvalidBatchDecodeState;
+        scope.deinit();
         const waited = pending.wait();
-        self.access.acquireForCleanup();
+        scope.* = self.access.acquireCleanupScope().?;
+        if (self.claimed_batch_budget) |budget| scope.bindDecodeBatch(budget, self.claimed_batch_rows);
         try waited;
     }
 

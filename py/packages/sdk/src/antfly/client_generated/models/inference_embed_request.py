@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     from ..models.inference_embedding_content_input import InferenceEmbeddingContentInput
     from ..models.inference_embedding_group import InferenceEmbeddingGroup
     from ..models.media_content_part import MediaContentPart
+    from ..models.source_content_part import SourceContentPart
     from ..models.text_content_part import TextContentPart
 
 
@@ -31,8 +32,9 @@ class InferenceEmbedRequest:
 
         Attributes:
             model (str): Model name to use for embedding generation
-            input_ (InferenceEmbeddingContentInput | list[ImageURLContentPart | MediaContentPart | TextContentPart] |
-                list[InferenceEmbeddingContentInput] | list[InferenceEmbeddingGroup] | list[str] | str): Input content to embed.
+            input_ (InferenceEmbeddingContentInput | list[ImageURLContentPart | MediaContentPart | SourceContentPart |
+                TextContentPart] | list[InferenceEmbeddingContentInput] | list[InferenceEmbeddingGroup] | list[str] | str):
+                Input content to embed.
                 Supports:
                 - a single string
                 - an array of strings
@@ -76,7 +78,7 @@ class InferenceEmbedRequest:
     model: str
     input_: (
         InferenceEmbeddingContentInput
-        | list[ImageURLContentPart | MediaContentPart | TextContentPart]
+        | list[ImageURLContentPart | MediaContentPart | SourceContentPart | TextContentPart]
         | list[InferenceEmbeddingContentInput]
         | list[InferenceEmbeddingGroup]
         | list[str]
