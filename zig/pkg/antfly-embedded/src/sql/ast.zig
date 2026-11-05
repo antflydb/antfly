@@ -504,6 +504,14 @@ pub const DomainDefinition = union(enum) {
     drop_check: struct { name: []const u8, if_exists: bool = false, cascade: bool = false },
 };
 
+pub const NativeIndex = struct {
+    pub const OperatorClass = @import("../system_catalog/native_indexes.zig").GinOperatorClass;
+    field: []const u8,
+    analyzer: []const u8 = "standard",
+    method: enum { full_text, gin } = .full_text,
+    operator_class: ?OperatorClass = null,
+};
+
 pub const CatalogDdl = struct {
     kind: enum { database, namespace, tablespace, table, index, view, role, sequence, function, procedure, operator, aggregate, cast, named_type },
     action: enum { create, drop, rename, set_tablespace, alter_schema, truncate, setting_default, comment, alter_sequence, populate, maintenance },
@@ -518,7 +526,7 @@ pub const CatalogDdl = struct {
     cascade: bool = false,
     /// Index names are namespace relations, not names of their owning table.
     index_table: ?Name = null,
-    native_index: ?struct { field: []const u8, analyzer: []const u8 = "standard" } = null,
+    native_index: ?NativeIndex = null,
     index_targets: []const Name = &.{},
     concurrently: bool = false,
     view_definition: ?ViewDefinition = null,

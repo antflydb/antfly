@@ -1297,11 +1297,11 @@ fn removeResourceRow(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, grou
 
 /// Constant-depth checks through the same immutable parent policy used by
 /// admission and capture. No global catalog scan or query mutex is involved.
-pub fn requireScopeResourceWritable(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, resource: domain.Resource, meta: Meta) !void {
+pub fn requireScopeResourceWritable(alloc: std.mem.Allocator, txn: anytype, group: u64, resource: domain.Resource, meta: Meta) !void {
     _ = meta;
     return requireScopeResourceWritableWithParents(alloc, txn, group, resource, &.{});
 }
-fn requireScopeResourceWritableWithParents(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, resource: domain.Resource, planned: []const domain.Resource) !void {
+fn requireScopeResourceWritableWithParents(alloc: std.mem.Allocator, txn: anytype, group: u64, resource: domain.Resource, planned: []const domain.Resource) !void {
     const retirement = @import("../metadata/scope_retirement_ledger.zig");
     if (try retirement.member(txn, group, resource.kind, resource.id) != null) return error.TableTransitionActive;
     switch (domain.parentScope(resource.kind)) {

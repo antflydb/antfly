@@ -3327,6 +3327,17 @@ const Parser = struct {
         return .{ .kind = .index, .action = .create, .name = .{ .table = index_name }, .index_table = table_name, .conditional = conditional, .concurrently = concurrently, .native_index = .{ .field = column_name, .analyzer = analyzer } };
     }
 
+    fn ginIndexTail(self: *Parser, index_name: []const u8, table_name: ast.Name, conditional: bool, concurrently: bool, unique: bool) Error!ast.CatalogDdl {
+        if (unique) return self.fail(error.UnsupportedSqlShape, "GIN does not support unique indexes");
+        try self.expect(.lparen);
+        const column_name = try self.identifier();
+        const class_name = try self.identifier();
+        const operator_class = std.meta.stringToEnum(ast.NativeIndex.OperatorClass, class_name) orelse return self.fail(error.UnsupportedSqlShape, "unsupported GIN operator class");
+        try self.expect(.rparen);
+        if (self.keyword(.include)) return self.fail(error.UnsupportedSqlShape, "GIN does not support included columns");
+        return .{ .kind = .index, .action = .create, .name = .{ .table = index_name }, .index_table = table_name, .conditional = conditional, .concurrently = concurrently, .native_index = .{ .field = column_name, .method = .gin, .operator_class = operator_class } };
+    }
+
     fn indexDdl(self: *Parser, create: bool, unique: bool) Error!ast.CatalogDdl {
         const concurrently = self.ddlWord("concurrently");
         const conditional = self.keyword(.@"if");
@@ -3357,6 +3368,7 @@ const Parser = struct {
         const table_name = try self.tableReferenceName();
         if (self.ddlWord("USING")) {
             const method = try self.identifier();
+            if (std.ascii.eqlIgnoreCase(method, "gin")) return self.ginIndexTail(index_name, table_name, conditional, concurrently, unique);
             if (std.ascii.eqlIgnoreCase(method, "antfly_full_text")) {
                 if (unique) return self.fail(error.UnsupportedSqlShape, "full-text indexes cannot enforce uniqueness");
                 return self.nativeIndexTail(index_name, table_name, conditional, concurrently);
@@ -6763,6 +6775,24 @@ test "compiler SQL COMMENT index and constraint bind original identities qualifi
     defer indexed.deinit();
     try std.testing.expectEqualStrings("idx Ω", indexed.statement.catalog_ddl.comment_object.?.name);
     try std.testing.expectEqualStrings("quoted ' Ω", indexed.statement.catalog_ddl.comment_value.?);
+}
+
+test "SQL GIN original declarations retain operator classes and reject PostgreSQL INCLUDE" {
+    const a = std.testing.allocator;
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(a);
+    defer corpus.deinit();
+    for ([_][]const u8{ "sql-0719", "sql-0721" }) |id| {
+        var compiled = try compile(a, (try corpus.get(id)).sql, .{});
+        defer compiled.deinit();
+        const ddl = compiled.statement.catalog_ddl;
+        try std.testing.expectEqual(.gin, ddl.native_index.?.method);
+        try std.testing.expectEqualStrings("usage_records", ddl.index_table.?.table);
+        try std.testing.expect(ddl.schema_change == null);
+        try std.testing.expectEqual(if (std.mem.eql(u8, id, "sql-0719")) ast.NativeIndex.OperatorClass.jsonb_path_ops else .array_ops, ddl.native_index.?.operator_class.?);
+    }
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(a, (try corpus.get("sql-0720")).sql, .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(a, "CREATE UNIQUE INDEX x ON usage_records USING gin(tags array_ops)", .{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(a, "CREATE INDEX x ON usage_records USING gin(tags nonexistent_ops)", .{}));
 }
 
 test "SQL native index original full-text declarations retain typed intent and reject unsupported options" {

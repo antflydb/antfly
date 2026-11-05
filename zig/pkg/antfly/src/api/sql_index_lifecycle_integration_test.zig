@@ -55,7 +55,7 @@ fn execute(ctx: *fixture.Context, namespace: []const u8, statement: []const u8, 
 }
 
 fn command(ctx: *fixture.Context, namespace: []const u8, statement: []const u8) !void {
-    var response = try execute(ctx, namespace, statement, false);
+    var response = try @import("sql_owner_test_client.zig").executeIn(ctx, namespace, statement, .write_admission);
     defer response.deinit(ctx.alloc);
     if (response.status != 200 and response.status != 202) {
         std.debug.print("SQL index campaign command status={d} statement={s} body={s}\n", .{ response.status, statement, response.body });
@@ -595,7 +595,7 @@ const NativeFullTextCampaign = struct {
         try command(ctx, "public", "UPDATE usage_records SET status='Pending Changes' WHERE id='00000000-0000-0000-0000-000000000001'");
         try checkNativeFullText(ctx, "usage_records_status_fts", "changes");
         try checkNativeFullText(ctx, "usage_records_status_fts_method", "changes");
-        try nativeIndexLostAck(ctx);
+        try nativeIndexLostAck(ctx, false);
         try prepareNativeDocumentAlias(ctx);
         var duplicate_name = try execute(ctx, "public", "CREATE TABLE usage_records_status_fts (id INTEGER)", false);
         defer duplicate_name.deinit(ctx.alloc);
@@ -701,6 +701,175 @@ fn waitNativeFullTextForTable(ctx: *fixture.Context, table: []const u8, name: []
 test "mounted SQL original native full-text indexes share API lifecycle across cold restart" {
     // sql-0696 and sql-0697 execute unchanged before querying their own backfill.
     try fixture.run(NativeFullTextCampaign);
+}
+
+const GinCampaign = struct {
+    pub const cold_catalog = true;
+    pub fn beforeRestart(_: *@This(), ctx: *fixture.Context) !void {
+        try std.testing.expect((try relationOwner(ctx, "public")) == null);
+        try command(ctx, "public", "CREATE TABLE usage_records(id UUID PRIMARY KEY,tenant_id TEXT,metadata JSONB,tags TEXT[])");
+        const serving = try fixture.waitServingSchema(ctx, "usage_records", 0);
+        try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, serving.table_id);
+        try waitEnforced(ctx, "public");
+        try command(ctx, "public", "INSERT INTO usage_records VALUES('00000000-0000-0000-0000-000000000001','a','{\"plan\":\"pro\"}'::jsonb,ARRAY['red','blue']),('00000000-0000-0000-0000-000000000002','b','{\"plan\":\"free\"}'::jsonb,ARRAY['green'])");
+        var corpus = try sources.sql_parity_fixtures.Corpus.init(ctx.alloc);
+        defer corpus.deinit();
+        for ([_][]const u8{ "sql-0719", "sql-0721" }) |id| try command(ctx, "public", (try corpus.get(id)).sql);
+        try check(ctx, "00000000-0000-0000-0000-000000000001");
+        var include_response = try execute(ctx, "public", (try corpus.get("sql-0720")).sql, false);
+        defer include_response.deinit(ctx.alloc);
+        var error_body = try std.json.parseFromSlice(struct { code: []const u8 }, ctx.alloc, include_response.body, .{ .ignore_unknown_fields = true });
+        defer error_body.deinit();
+        try std.testing.expect(include_response.status >= 400);
+        try std.testing.expectEqualStrings("0A000", error_body.value.code);
+        // Typed operator-class admission must precede metadata installation.
+        var wrong = try execute(ctx, "public", "CREATE INDEX wrong_class ON usage_records USING gin(tenant_id array_ops)", false);
+        defer wrong.deinit(ctx.alloc);
+        try std.testing.expect(wrong.status >= 400);
+        var wrong_body = try std.json.parseFromSlice(struct { code: []const u8 }, ctx.alloc, wrong.body, .{ .ignore_unknown_fields = true });
+        defer wrong_body.deinit();
+        try std.testing.expectEqualStrings("42804", wrong_body.value.code);
+        try command(ctx, "public", "CREATE TABLE wrong_class(id INTEGER)");
+        try command(ctx, "public", "UPDATE usage_records SET metadata='{\"plan\":\"free\"}'::jsonb,tags=ARRAY['green'] WHERE tenant_id='a'");
+        try command(ctx, "public", "UPDATE usage_records SET metadata='{\"plan\":\"pro\"}'::jsonb,tags=ARRAY['red'] WHERE tenant_id='b'");
+        try check(ctx, "00000000-0000-0000-0000-000000000002");
+        try command(ctx, "public", "ALTER TABLE usage_records ADD COLUMN unrelated BIGINT");
+        _ = try fixture.waitServingSchema(ctx, "usage_records", serving.version + 1);
+        try check(ctx, "00000000-0000-0000-0000-000000000002");
+        try nativeIndexLostAck(ctx, true);
+    }
+    pub fn afterRestart(_: *@This(), ctx: *fixture.Context) !void {
+        const serving = try fixture.waitServingSchema(ctx, "usage_records", 0);
+        try fixture.waitForDonorRoute(ctx.alloc, ctx.io, ctx.metadata, ctx.data, serving.table_id);
+        try check(ctx, "00000000-0000-0000-0000-000000000002");
+        try command(ctx, "public", "DROP INDEX usage_records_metadata_gin");
+        try command(ctx, "public", "DROP INDEX usage_records_tags_gin");
+        try command(ctx, "public", "CREATE TABLE usage_records_metadata_gin(id INTEGER)");
+        try command(ctx, "public", "CREATE TABLE usage_records_tags_gin(id INTEGER)");
+    }
+    fn check(ctx: *fixture.Context, expected: []const u8) !void {
+        for ([_][]const u8{
+            "SELECT id FROM usage_records WHERE metadata @> '{\"plan\":\"pro\"}'::jsonb ORDER BY id",
+            "SELECT id FROM usage_records WHERE tags @> ARRAY['red'] ORDER BY id",
+        }) |sql| {
+            var response = try execute(ctx, "public", sql, true);
+            defer response.deinit(ctx.alloc);
+            if (response.status != 200) std.debug.print("GIN read sql={s} body={s}\n", .{ sql, response.body });
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            var value = try std.json.parseFromSlice(struct { rows: []const []const std.json.Value }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+            defer value.deinit();
+            try std.testing.expectEqual(@as(usize, 1), value.value.rows.len);
+            try std.testing.expectEqual(@as(usize, 1), value.value.rows[0].len);
+            try std.testing.expectEqualStrings(expected, value.value.rows[0][0].string);
+        }
+        // Physical captures cover the whole configured index cohort.
+        for ([_][]const u8{ "usage_records_metadata_gin", "usage_records_tags_gin" }) |name| try waitNativeFullText(ctx, name);
+        const initial = std.mem.endsWith(u8, expected, "1");
+        const Binding = struct { name: []const u8, path: []const u8, before: []const u8, after: []const u8 };
+        for ([_]Binding{
+            .{ .name = "usage_records_metadata_gin", .path = "/metadata/plan", .before = "pro", .after = "free" },
+            // SQL arrays retain their dimensions/values/SQL-null envelope;
+            // flattened physical values are distinct from JSON-array cells.
+            .{ .name = "usage_records_tags_gin", .path = "/tags/values/0", .before = "red", .after = "green" },
+        }) |binding| {
+            const name = binding.name;
+            try waitNativeFullText(ctx, name);
+            const path = try std.fmt.allocPrint(ctx.alloc, "/db/v1/tables/usage_records/indexes/{s}", .{name});
+            defer ctx.alloc.free(path);
+            var response = try fixture.request(ctx.alloc, ctx.transport, ctx.headers, ctx.base, path, .GET, null);
+            defer response.deinit(ctx.alloc);
+            try std.testing.expectEqual(@as(u16, 200), response.status);
+            errdefer std.debug.print("GIN index status name={s} body={s}\n", .{ name, response.body[0..@min(response.body.len, 2048)] });
+            var value = try std.json.parseFromSlice(struct { config: struct { type: []const u8 }, status: struct { healthy: bool, parse_error_count: u64, target_revision: u64, published_revision: u64 } }, ctx.alloc, response.body, .{ .ignore_unknown_fields = true });
+            defer value.deinit();
+            try std.testing.expectEqualStrings("algebraic", value.value.config.type);
+            try std.testing.expect(value.value.status.healthy);
+            try std.testing.expectEqual(@as(u64, 0), value.value.status.parse_error_count);
+            try std.testing.expect(value.value.status.target_revision > 0);
+            try std.testing.expect(value.value.status.published_revision >= value.value.status.target_revision);
+            try checkGinFacts(ctx, name, binding.path, if (initial) binding.before else binding.after);
+        }
+    }
+};
+
+// Inspect each exact named sidecar through the production native partials
+// reader. SQL postimages alone could pass through a primary-row fallback, and
+// algebraic stats do not currently populate the legacy doc_count field.
+fn checkGinFacts(ctx: *fixture.Context, name: []const u8, path: []const u8, expected: []const u8) !void {
+    const ir = sources.storage_db_algebraic_ir;
+    const token = sources.storage_db_algebraic_token;
+    const first_id = try token.canonicalTupleAlloc(ctx.alloc, &.{ "string", "00000000-0000-0000-0000-000000000001" });
+    defer ctx.alloc.free(first_id);
+    const metadata = try sources.storage_db_algebraic_index.pathFactBucketFoldMetadataAlloc(ctx.alloc, .{ .kind = .terms, .op = .count, .bucket_path = path, .bucket_kind = .string, .constraints = &.{.{ .field = "/id", .value = first_id }} });
+    defer ctx.alloc.free(metadata);
+    const paths = [_]ir.PhysicalAccessPath{ir.pathFactAccessPath(name)};
+    const steps = [_]ir.TensorProgramStep{
+        .{ .expr = .{ .fragment = .slice, .output_dims = &.{ .doc, .path, .kind, .scalar }, .owner = name, .layout = .pathfact_rows } },
+        .{ .expr = .{ .fragment = .reduce, .input_dims = &.{ .doc, .path, .kind, .scalar }, .output_dims = &.{ .bucket, .scalar }, .semantic_id = "gin_source_witness", .law_id = .count, .metadata = metadata }, .inputs = &.{.{ .step = 0 }} },
+    };
+    const body = try @import("table_reads.zig").encodeAlgebraicPartialsRequestWithProgramAtGeneration(ctx.alloc, name, null, &paths, &.{}, .{ .steps = &steps, .output = .{ .step = 1 } });
+    defer ctx.alloc.free(body);
+    const axis = try token.canonicalTupleAlloc(ctx.alloc, &.{ "string", expected });
+    defer ctx.alloc.free(axis);
+    const table_id = try owner(ctx, "public");
+    var snapshot = try ctx.metadata.server.svc.adminSnapshot();
+    defer ctx.metadata.server.svc.freeAdminSnapshot(&snapshot);
+    const group_id = for (snapshot.ranges) |range| {
+        if (range.table_id == table_id) break range.group_id;
+    } else return error.TableNotFound;
+    const table = for (snapshot.tables) |entry| {
+        if (entry.table_id == table_id) break entry.name;
+    } else return error.TableNotFound;
+    const reader = if (ctx.data.http_server) |*api| api.table_reads orelse return error.MissingOwnerReadSource else return error.MissingOwnerReadSource;
+    // A bare local read may reuse an older read owner. Capture the current
+    // physical generation, as production coordinated index queries do, after
+    // the public SQL read barrier and exact-index completion checks.
+    var nonce: [32]u8 = undefined;
+    try ctx.io.randomSecure(&nonce);
+    const id = std.fmt.bytesToHex(nonce, .lower);
+    const cut: sources.storage_db_native_query_cut_contract.Request = .{ .id = &id, .table_id = table_id, .expires_ms = platform.time.realtimeNs() / std.time.ns_per_ms + 60_000, .create = true, .timeout_ms = 15_000 };
+    const encoded_cut = try std.json.Stringify.valueAlloc(ctx.alloc, cut, .{});
+    defer ctx.alloc.free(encoded_cut);
+    const captured_body = try std.fmt.allocPrint(ctx.alloc, "{{\"_native_cut\":{s},{s}", .{ encoded_cut, body[1..] });
+    defer ctx.alloc.free(captured_body);
+    try ctx.checkDrivers();
+    const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
+    var response = capture: while (true) {
+        const result = reader.algebraicPartialsGroupLocal(ctx.alloc, group_id, table, captured_body) catch |err| switch (err) {
+            // A capture cannot publish while another configured projection
+            // still retires its repair boundary. Observe that definite pending
+            // state; never replace a successfully captured immutable cut.
+            error.IndexRebuilding => {
+                if (platform.time.monotonicNs() >= deadline) return err;
+                try ctx.checkDrivers();
+                try ctx.io.sleep(.fromMilliseconds(20), .awake);
+                continue;
+            },
+            else => return err,
+        };
+        break :capture result orelse return error.GinNativePartialsUnavailable;
+    };
+    defer response.deinit(ctx.alloc);
+    errdefer std.debug.print("GIN persisted fact mismatch index={s} path={s} expected={s} response={s}\n", .{ name, path, expected, response.json[0..@min(response.json.len, 2048)] });
+    const Partial = struct { canonical_axis: []const u8, law: []const u8, value: ?[]const u8 = null, value_base64: ?[]const u8 = null };
+    var parsed = try std.json.parseFromSlice(struct { partials: []const Partial }, ctx.alloc, response.json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.partials.len);
+    const partial = parsed.value.partials[0];
+    try std.testing.expectEqualStrings(axis, partial.canonical_axis);
+    try std.testing.expectEqualStrings("count", partial.law);
+    if (partial.value) |count| try std.testing.expectEqualStrings("1", count) else {
+        const encoded = partial.value_base64 orelse return error.InvalidQueryRequest;
+        var decoded: [1]u8 = undefined;
+        try std.testing.expectEqual(@as(usize, 1), try std.base64.standard.Decoder.calcSizeForSlice(encoded));
+        try std.base64.standard.Decoder.decode(&decoded, encoded);
+        try std.testing.expectEqualStrings("1", &decoded);
+    }
+}
+
+test "mounted SQL original GIN indexes publish typed sidecars maintain mutations and recover cold owners" {
+    // sql-0719 and sql-0721 execute unchanged; sql-0720 matches PostgreSQL rejection.
+    try fixture.run(GinCampaign);
 }
 
 fn prepareNativeDocumentAlias(ctx: *fixture.Context) !void {
@@ -813,7 +982,7 @@ fn waitNativeNamesReleased(ctx: *fixture.Context) !void {
     return error.SqlIndexCampaignPublicationTimeout;
 }
 
-fn nativeIndexLostAck(ctx: *fixture.Context) !void {
+fn nativeIndexLostAck(ctx: *fixture.Context, gin: bool) !void {
     const Call = @import("../system_catalog/server_call.zig").Call;
     const Probe = struct {
         source: server.StatusSource,
@@ -838,7 +1007,9 @@ fn nativeIndexLostAck(ctx: *fixture.Context) !void {
     var probe: Probe = .{ .source = original.source };
     var gateway = server.ApiHttpServer.init(ctx.alloc, .{ .backend_runtime = original.cfg.backend_runtime, .imported_runtime_io = original.cfg.imported_runtime_io }, .{ .ptr = &probe, .vtable = &.{ .supports_query_definitions = true, .status = Probe.status, .system_catalog = Probe.catalog } }, null, null);
     defer gateway.deinit();
-    var parsed = try sources.sql_compiler.compile(ctx.alloc, "CREATE INDEX lost_ack_fts ON usage_records USING antfly_full_text(status)", .{});
+    const create_sql = if (gin) "CREATE INDEX lost_ack_gin ON usage_records USING gin(tags array_ops)" else "CREATE INDEX lost_ack_fts ON usage_records USING antfly_full_text(status)";
+    const drop_sql = if (gin) "DROP INDEX lost_ack_gin" else "DROP INDEX lost_ack_fts";
+    var parsed = try sources.sql_compiler.compile(ctx.alloc, create_sql, .{});
     defer parsed.deinit();
     const outcome = try @import("sql_catalog.zig").execute(&gateway, null, .{}, "default", "public", ctx.alloc, .{ .catalog_ddl = parsed.statement.catalog_ddl });
     const receipt = outcome.catalog_receipt orelse return error.MissingNativeIndexReceipt;
@@ -847,8 +1018,8 @@ fn nativeIndexLostAck(ctx: *fixture.Context) !void {
     try std.testing.expectEqual(.index, receipt.kind);
     try std.testing.expect(receipt.recovery_token.len < 2048);
     try std.testing.expectEqual(@as(usize, 1), probe.mutations);
-    try command(ctx, "public", "DROP INDEX lost_ack_fts");
-    try command(ctx, "public", "CREATE INDEX lost_ack_fts ON usage_records USING antfly_full_text(status)");
+    try command(ctx, "public", drop_sql);
+    try command(ctx, "public", create_sql);
     probe.hidden = false;
     const recovered = try @import("sql_catalog_recovery.zig").recover(&gateway, null, .{}, ctx.alloc, receipt.recovery_token);
     defer recovered.deinit(ctx.alloc);

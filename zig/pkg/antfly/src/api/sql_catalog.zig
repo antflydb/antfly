@@ -952,9 +952,13 @@ fn executeNativeIndex(server: *server_mod.ApiHttpServer, identity: ?server_mod.A
     const io = server.sharedApiIo() orelse return error.UnsupportedSqlExecution;
     var config_json: ?[]const u8 = null;
     if (ddl.native_index) |intent| {
-        var analyzers: std.json.ObjectMap = .empty;
-        try analyzers.put(a, intent.field, .{ .string = intent.analyzer });
-        const bytes = try std.json.Stringify.valueAlloc(a, .{ .type = "full_text", .field = intent.field, .analysis_config = .{ .field_analyzers = std.json.Value{ .object = analyzers } } }, .{});
+        const bytes = if (intent.method == .gin)
+            try std.json.Stringify.valueAlloc(a, .{ .type = "algebraic", .derive_from_schema = true, .field = intent.field, .operator_class = @tagName(intent.operator_class orelse return error.InvalidSqlSyntax) }, .{})
+        else full_text: {
+            var analyzers: std.json.ObjectMap = .empty;
+            try analyzers.put(a, intent.field, .{ .string = intent.analyzer });
+            break :full_text try std.json.Stringify.valueAlloc(a, .{ .type = "full_text", .field = intent.field, .analysis_config = .{ .field_analyzers = std.json.Value{ .object = analyzers } } }, .{});
+        };
         const value = try std.json.parseFromSliceLeaky(std.json.Value, a, bytes, .{});
         config_json = try @import("antfly_local_sources").api_coverage_policy.withFreshIncarnationAllocWithIo(a, io, value);
     }

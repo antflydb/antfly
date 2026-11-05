@@ -4823,6 +4823,69 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-qualified-gin-contract-debug": {
+      "command": [
+        "zig",
+        "build",
+        "sql-test",
+        "-Dtest-filter=SQL GIN",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-gin-metadata-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-metadata-logic-test",
+        "-Dtest-filter=SQL GIN",
+        "-Dtest-filter=system catalog resource comments use three atomic writes retain receipts and recover cold snapshots",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-gin-replay-debug": {
+      "command": [
+        "zig",
+        "build",
+        "replay-document-integration-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-gin-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-native-index-test",
+        "-Dtest-filter=mounted SQL original GIN indexes",
+        "-Dtest-filter=mounted SQL original native full-text indexes",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-gin-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/check_sql_gin_postgres.py"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -18031,18 +18094,89 @@
     },
     {
       "id": "sql-0719",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original explicit single-column GIN declaration binds its operator class to the immutable typed layout and publishes through the existing native algebraic index lifecycle. Authenticated public SQL plus named production partials reads prove actual per-row sidecar facts before and after typed mutations, unrelated schema evolution, lost acknowledgement recovery and cold owner restart. Shared replay and captured-generation regressions qualify typed primary resolution and immutable namespace custody for both document and relational rows. PostgreSQL independently verifies operator classes, postimages, invalid class diagnostics and retired-name reuse. This proves DDL and maintained native sidecars; it does not claim new SQL GIN candidate selection, default classes or multicolumn GIN.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original GIN indexes publish typed sidecars maintain mutations and recover cold owners",
+          "gate": "sql-qualified-gin-contract-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original GIN indexes publish typed sidecars maintain mutations and recover cold owners",
+          "gate": "sql-qualified-gin-metadata-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original GIN indexes publish typed sidecars maintain mutations and recover cold owners",
+          "gate": "sql-qualified-gin-replay-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original GIN indexes publish typed sidecars maintain mutations and recover cold owners",
+          "gate": "sql-qualified-gin-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original GIN indexes publish typed sidecars maintain mutations and recover cold owners",
+          "gate": "sql-qualified-gin-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0720",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "superseded",
+      "reason": "The original expects a covering GIN index, but PostgreSQL does not support INCLUDE for GIN (SQLSTATE 0A000). The unchanged original is rejected by both the independent PostgreSQL oracle and authenticated native SQL. This corrects an invalid historical source expectation and does not claim positive index implementation coverage.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original GIN indexes publish typed sidecars maintain mutations and recover cold owners",
+          "gate": "sql-qualified-gin-contract-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original GIN indexes publish typed sidecars maintain mutations and recover cold owners",
+          "gate": "sql-qualified-gin-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original GIN indexes publish typed sidecars maintain mutations and recover cold owners",
+          "gate": "sql-qualified-gin-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0721",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged original explicit single-column GIN declaration binds its operator class to the immutable typed layout and publishes through the existing native algebraic index lifecycle. Authenticated public SQL plus named production partials reads prove actual per-row sidecar facts before and after typed mutations, unrelated schema evolution, lost acknowledgement recovery and cold owner restart. Shared replay and captured-generation regressions qualify typed primary resolution and immutable namespace custody for both document and relational rows. PostgreSQL independently verifies operator classes, postimages, invalid class diagnostics and retired-name reuse. This proves DDL and maintained native sidecars; it does not claim new SQL GIN candidate selection, default classes or multicolumn GIN.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original GIN indexes publish typed sidecars maintain mutations and recover cold owners",
+          "gate": "sql-qualified-gin-contract-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original GIN indexes publish typed sidecars maintain mutations and recover cold owners",
+          "gate": "sql-qualified-gin-metadata-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original GIN indexes publish typed sidecars maintain mutations and recover cold owners",
+          "gate": "sql-qualified-gin-replay-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original GIN indexes publish typed sidecars maintain mutations and recover cold owners",
+          "gate": "sql-qualified-gin-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_index_lifecycle_integration_test.zig",
+          "test": "mounted SQL original GIN indexes publish typed sidecars maintain mutations and recover cold owners",
+          "gate": "sql-qualified-gin-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0722",

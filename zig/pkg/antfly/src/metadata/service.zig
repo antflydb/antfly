@@ -3583,15 +3583,43 @@ test "relation mutation admission projects naming capability without materializi
 }
 
 pub fn transitionRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const native_index = nativeIndexRequiredCoordinatedDecoderVersion(command);
     const envelope: ?[]const u8 = switch (command) {
         .apply_system_catalog, .apply_fk_initial_create, .apply_fk_generation_publication, .apply_restore_staging, .begin_relational_index_publication => |bytes| bytes,
         .create_restore_job_with_staging => |request| request.plan_json,
         else => null,
     };
     if (envelope) |bytes| if (@import("schema_reader_wire.zig").requiresStrongestDecoder(bytes)) return metadata_topology_protocol.current_version;
-    if (envelope) |bytes| if (@import("schema_reader_wire.zig").requiresInitialCreationCopy(bytes)) return metadata_topology_protocol.initial_fk_creation_copy_version;
-    if (envelope) |bytes| if (@import("schema_reader_wire.zig").requiresInitialCounterEffects(bytes)) return metadata_topology_protocol.initial_fk_column_sequences_version;
-    return @max(resolverRequiredCoordinatedDecoderVersion(command), baseRequiredCoordinatedDecoderVersion(command), clockReadersRequiredDecoderVersion(command), nativeServiceRequiredDecoderVersion(command), objectRenameRequiredDecoderVersion(command));
+    if (envelope) |bytes| if (@import("schema_reader_wire.zig").requiresInitialCreationCopy(bytes)) return @max(native_index, metadata_topology_protocol.initial_fk_creation_copy_version);
+    if (envelope) |bytes| if (@import("schema_reader_wire.zig").requiresInitialCounterEffects(bytes)) return @max(native_index, metadata_topology_protocol.initial_fk_column_sequences_version);
+    return @max(native_index, resolverRequiredCoordinatedDecoderVersion(command), baseRequiredCoordinatedDecoderVersion(command), clockReadersRequiredDecoderVersion(command), nativeServiceRequiredDecoderVersion(command), objectRenameRequiredDecoderVersion(command));
+}
+
+// The opaque native configuration can contain newer SQL operator classes.
+// Every SQL-owned namespace mutation requires that decoder before proposal;
+// an older command fence or catalog journal must never weaken this floor.
+fn nativeIndexRequiredCoordinatedDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
+    const required = switch (command) {
+        .upsert_table => |table| table.sql_native_indexes_json.len != 0,
+        .compare_and_replace_table => |value| value.expected.sql_native_indexes_json.len != 0 or value.replacement.sql_native_indexes_json.len != 0,
+        .apply_table_topology => |mutation| switch (mutation) {
+            .create => |value| value.table.sql_native_indexes_json.len != 0,
+            .drop => false,
+        },
+        .apply_system_catalog, .apply_restore_staging, .apply_fk_generation_publication, .apply_fk_initial_create, .apply_schema_validation, .begin_relational_index_publication => |bytes| @import("schema_reader_wire.zig").requiresSqlNativeIndex(bytes),
+        .create_restore_job_with_staging => |value| @import("schema_reader_wire.zig").requiresSqlNativeIndex(value.plan_json),
+        else => false,
+    };
+    return if (required) metadata_topology_protocol.sql_gin_index_version else 0;
+}
+
+test "SQL GIN decoder floor dominates command fences catalog journals restore and native namespaces" {
+    const required = metadata_topology_protocol.sql_gin_index_version;
+    const encoded = "{\"sql_native_index\":{},\"sql_catalog_admission\":{},\"command_fence\":{}}";
+    try std.testing.expectEqual(required, transitionRequiredCoordinatedDecoderVersion(.{ .apply_system_catalog = encoded }));
+    try std.testing.expectEqual(required, transitionRequiredCoordinatedDecoderVersion(.{ .apply_restore_staging = "{\"sql_native_indexes_json\":\"owned\",\"command_fence\":{}}" }));
+    try std.testing.expectEqual(required, transitionRequiredCoordinatedDecoderVersion(.{ .upsert_table = .{ .table_id = 77, .name = "items", .sql_native_indexes_json = "owned" } }));
+    try std.testing.expectEqual(required, transitionRequiredCoordinatedDecoderVersion(.{ .begin_relational_index_publication = "{\"plan\":{\"table\":{\"sql_native_indexes_json\":\"owned\"}}}" }));
 }
 
 fn objectRenameRequiredDecoderVersion(command: metadata_storage.TransitionCommand) u16 {
@@ -4328,7 +4356,7 @@ pub fn ensureSqlCastCapabilityWithContext(service: anytype, context: api_operati
 }
 
 pub fn ensureSqlNativeIndexNamespaceCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {
-    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_native_index_namespace_version);
+    try ensureDurableDecoderActivation(service, context, metadata_topology_protocol.sql_gin_index_version);
 }
 
 pub fn ensureSqlTriggerFunctionCapabilityWithContext(service: anytype, context: api_operation.RequestContext) !void {

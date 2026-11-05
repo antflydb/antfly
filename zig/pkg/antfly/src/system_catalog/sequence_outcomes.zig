@@ -226,6 +226,7 @@ pub const Rejection = enum {
     UnknownColumn,
     SqlTypeMismatch,
     SqlAssignmentTypeMismatch,
+    SqlIndexOperatorClassTypeMismatch,
     CatalogRevisionExhausted,
 };
 /// Compact reference to the existing all-owner schema job. The catalog

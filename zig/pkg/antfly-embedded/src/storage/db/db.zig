@@ -112931,6 +112931,7 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
     {
         var db = try DB.open(alloc, std.mem.span(path), .{
             .open_mode = .writer_no_replay,
+            .identity_namespace = .{ .table_id = 7, .shard_id = 11, .range_id = 11 },
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -112981,6 +112982,7 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
 
     var reopened = try DB.open(alloc, std.mem.span(path), .{
         .open_mode = .writer_no_replay,
+        .identity_namespace = .{ .table_id = 7, .shard_id = 11, .range_id = 11 },
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
@@ -112998,6 +113000,18 @@ test "db managed algebraic admission builds and reopens an isolated generation" 
         .ordinals => |ordinals| try std.testing.expectEqual(@as(usize, 1), ordinals.len),
         else => return error.ExpectedOrdinalDocSet,
     }
+    // Managed algebraic rows are in the primary checkpoint under the active
+    // generation namespace. A captured reader must not silently reopen an
+    // empty canonical namespace after directory normalization.
+    const cut_id: [64]u8 = @splat('b');
+    var captured = try reopened.openQueryCut(.{ .id = &cut_id, .table_id = 7, .expires_ms = @import("native_query_cut.zig").nowMs() + 60_000, .create = true }, .none);
+    defer captured.close();
+    const selected = captured.core.index_manager.algebraicIndex(cfg.name) orelse return error.IndexNotFound;
+    try std.testing.expectEqualStrings(active_namespace, selected.index.storageNamespace());
+    const captured_ids = (try selected.index.docIdsForFilterJsonAlloc(captured.core.store, "{\"term\":{\"category\":\"tools\"}}")) orelse return error.UnsupportedQueryRequest;
+    defer selected.index.freeDocIds(captured_ids);
+    try std.testing.expectEqual(@as(usize, 1), captured_ids.len);
+    try std.testing.expectEqualStrings("doc:old", captured_ids[0]);
 }
 
 test "db algebraic generation build yields and resumes from its durable source cursor" {
@@ -149928,4 +149942,58 @@ test "db scoped retry workset never parks committed earlier chunk requests" {
     defer queue.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), gated.successful_requests.load(.acquire));
     try std.testing.expect(!queue.hasDocument("ZG9jOmE="));
+}
+
+test "db algebraic relational replay materializes typed rows and preserves document replay across cold owners" {
+    const a = std.testing.allocator;
+    const schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"metadata":{"type":"json","x-antfly-sql-type":"jsonb"},"tags":{"type":"sql_array","x-antfly-sql-type":"text"}},"additionalProperties":false}}}}
+    ;
+    const pro =
+        \\{"id":"r1","metadata":{"plan":"pro"},"tags":{"dimensions":[{"length":1,"lower_bound":1}],"values":["red"],"sql_nulls":[false]}}
+    ;
+    const free =
+        \\{"id":"r2","metadata":{"plan":"free"},"tags":{"dimensions":[{"length":1,"lower_bound":1}],"values":["green"],"sql_nulls":[false]}}
+    ;
+    const Check = struct {
+        fn run(db: *DB, name: []const u8, expected: ?[]const u8) !void {
+            const entry = db.core.index_manager.algebraicIndex(name) orelse return error.IndexNotFound;
+            for ([_][]const u8{ "{\"term\":{\"/metadata/plan\":\"pro\"}}", "{\"term\":{\"/tags/values/0\":\"red\"}}" }) |filter| {
+                const ids = (try entry.index.docIdsForFilterJsonAlloc(db.core.store, filter)) orelse return error.UnsupportedQueryRequest;
+                defer entry.index.freeDocIds(ids);
+                try std.testing.expectEqual(@as(usize, if (expected == null) 0 else 1), ids.len);
+                if (expected) |key| try std.testing.expectEqualStrings(key, ids[0]);
+            }
+        }
+    };
+    for ([_]bool{ false, true }) |relational| {
+        var directory = try TestDirectory.init("algebraic-replay");
+        defer directory.cleanup();
+        const options: OpenOptions = .{ .primary_backend = .{ .lsm = .{ .flush_threshold = 2 } }, .start_index_workers = false };
+        {
+            var db = try DB.open(a, directory.path(), options);
+            defer db.close();
+            if (relational) try db.setSchemaJson(a, schema);
+            for ([_][]const u8{ "left", "right" }) |name| try db.addIndex(.{ .name = name, .kind = .algebraic, .config_json = "{\"version\":1,\"table\":\"items\",\"materializations\":[]}" });
+            try db.batch(.{ .writes = &.{ .{ .key = "r1", .value = pro }, .{ .key = "r2", .value = free } }, .sync_level = .write });
+            try db.runUntilIdle();
+            for ([_][]const u8{ "left", "right" }) |name| try Check.run(&db, name, "r1");
+            try db.batch(.{ .writes = &.{ .{ .key = "r1", .value = free }, .{ .key = "r2", .value = pro } }, .sync_level = .write });
+            try db.runUntilIdle();
+            for ([_][]const u8{ "left", "right" }) |name| try Check.run(&db, name, "r2");
+        }
+        {
+            var db = try DB.open(a, directory.path(), options);
+            defer db.close();
+            for ([_][]const u8{ "left", "right" }) |name| try Check.run(&db, name, "r2");
+            try db.batch(.{ .deletes = &.{"r2"}, .sync_level = .write });
+            try db.runUntilIdle();
+            for ([_][]const u8{ "left", "right" }) |name| try Check.run(&db, name, null);
+        }
+        {
+            var db = try DB.open(a, directory.path(), options);
+            defer db.close();
+            for ([_][]const u8{ "left", "right" }) |name| try Check.run(&db, name, null);
+        }
+    }
 }

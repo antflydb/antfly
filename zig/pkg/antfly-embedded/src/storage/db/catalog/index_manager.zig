@@ -9310,6 +9310,25 @@ pub const IndexManager = struct {
                 .checkpoint = .{ .lsm = checkpoints.reverse },
             });
         }
+        // Algebraic facts live in primary KV, but a managed generation's
+        // namespace is selected by its active-root pointer. Filesystem index
+        // checkpoints are flattened below; these primary namespaces cannot be
+        // renamed during capture. Retain the selected namespace as small owned
+        // metadata, without an off-fence read of the mutable live pointer.
+        for (self.algebraic_indexes.items) |*entry| {
+            var parts = std.mem.splitScalar(u8, entry.index.storageNamespace(), '/');
+            const generation = parts.next() orelse return error.InvalidIndexRootPointer;
+            const name = parts.next() orelse return error.InvalidIndexRootPointer;
+            if (parts.next() != null or !std.mem.eql(u8, name, entry.config.name)) return error.InvalidIndexRootPointer;
+            if (std.mem.eql(u8, generation, canonical_algebraic_generation)) continue;
+            const active = try self.retainNativeBackupAllocation(&native_owned, try std.fmt.allocPrint(self.alloc, "{s}/indexes/{s}", .{ generation, name }));
+            if (!validRelativeRepairIndexRoot(name, active)) return error.InvalidIndexRootPointer;
+            const relative = try self.retainNativeBackupAllocation(&native_owned, try std.fmt.allocPrint(self.alloc, "indexes/{s}/{s}", .{ name, active_index_root_pointer_file }));
+            // The immutable primary checkpoint owns the facts. V1 here is a
+            // namespace locator, not a promise of another physical backend.
+            const payload = try self.retainNativeBackupAllocation(&native_owned, try std.fmt.allocPrint(self.alloc, "{s}{s}\n", .{ active_index_root_pointer_magic_v1, active }));
+            try native_specs.append(self.alloc, .{ .relative_path = relative, .source = .{ .bytes = payload } });
+        }
         // Retain manifested files independently of the live index owners.
         // Snapshot refs protect compaction, but a catalog replacement can close
         // an owner and retire its root before off-fence sealing starts. Capture

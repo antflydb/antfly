@@ -213,7 +213,7 @@ pub fn mutateSqlNativeIndex(svc: anytype, alloc: std.mem.Allocator, context: ope
     if (!context.setting_admin) return error.Forbidden;
     try context.ensureActive();
     try request.validate();
-    const required = protocol.sql_native_index_namespace_version;
+    const required = protocol.sql_gin_index_version;
     try @import("../metadata/service.zig").ensureSqlNativeIndexNamespaceCapabilityWithContext(svc, context);
     const readiness = try svc.ensureTableTopologyProtocolReadyWithContext(context, required);
     try svc.ensureLinearizableReadWithContext(context);

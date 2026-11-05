@@ -99,6 +99,83 @@ python3 scripts/check_sql_advisory_wait_postgres.py
 This closes the original locking cohort; it does not imply that every remaining
 SQL feature or every PostgreSQL lock-bearing query shape is implemented.
 
+## Native GIN index custody
+
+Single-column SQL GIN declarations with explicit `jsonb_path_ops` or `array_ops`
+use the existing native algebraic sidecar lifecycle. SQL binds the operator
+class against the immutable relational column layout before committing the
+index. An incompatible column returns PostgreSQL SQLSTATE `42804` and acquires
+no SQL name. PostgreSQL GIN does not support `INCLUDE`; the original covering-GIN
+source contract is superseded against that behavior, not counted as a
+supported covering index.
+
+The SQL namespace record owns each GIN field/operator-class definition alongside
+its index name. Version 2 of that record is gated by metadata decoder capability
+165. The physical algebraic configuration retains its existing strict format;
+SQL annotations are never injected into runtime worker configuration. Namespace
+updates, native configuration and replayable catalog outcomes commit together.
+Source digests bind the definition as well as its incarnation, so substituting
+an operator class or field cannot preserve the prior source identity.
+
+Schema regeneration preserves index incarnations and validates retained GIN
+bindings. Generic schema writers refuse missing or incompatible sources before
+publication; committed invalid mutations have deterministic refusal semantics
+without poisoning subsequent Raft entries. Generic index deletion prunes the
+SQL name and typed definition together. Lost acknowledgement recovery observes
+the original durable outcome even after that name is dropped and recreated.
+
+Algebraic replay resolves journal keys through the shared sorted document
+collector. Relational rows use their native primary namespace and pinned schema
+layout to produce owned logical values; a missing required live row blocks
+checkpoint advancement. This shares document and typed-row replay machinery
+rather than treating packed rows as JSON or silently skipping their keys.
+
+Managed algebraic generations store facts in primary KV under a generation
+namespace. Native backup and retained-query capture pin the matching active-root
+locator as owned metadata while the catalog is fenced. Captured readers then
+select the same immutable primary namespace. The data remains in the common
+primary checkpoint; no separate GIN restore stream or corpus-sized copy is
+introduced under the apply lock.
+
+Catalog completion and physical sidecar readiness remain distinct. Public
+`/indexes` status reports the existing worker backfill and mutation watermarks.
+Typed SQL predicates retain their primary-row/residual execution path: this
+work does not claim a new GIN candidate-selection plan or query speedup. Default
+operator-class inference, expression indexes and multicolumn GIN are separate
+coverage, not implied by these explicit single-column declarations.
+
+The focused Debug gates are:
+
+```sh
+cd zig
+zig build sql-test '-Dtest-filter=SQL GIN' -Doptimize=Debug -j1
+zig build antfly-metadata-logic-test '-Dtest-filter=SQL GIN' -Doptimize=Debug -j1
+zig build replay-document-integration-test -Doptimize=Debug -j1
+zig build antfly-api-sql-native-index-test \
+  '-Dtest-filter=mounted SQL original GIN indexes' \
+  '-Dtest-filter=mounted SQL original native full-text indexes' \
+  -Doptimize=Debug -j1
+cd ..
+python3 scripts/check_sql_gin_postgres.py
+```
+
+The native campaign executes the unchanged originals, waits for real backfill,
+reads exact per-row canonical facts from each named sidecar through the native
+partials reader, checks typed postimages after updates and unrelated schema
+evolution, qualifies lost acknowledgements, cold-reopens the native owners and
+reuses retired names. SQL arrays retain their lossless dimensions/values/nulls
+envelope; the physical witness follows its flat values while SQL predicates
+retain the declared array semantics. This gate does not use the legacy
+algebraic `total_indexed` field as a cardinality proof: the current stats path
+does not populate that field.
+The PostgreSQL oracle independently checks the declarations, operator classes,
+invalid `INCLUDE`, incompatible column diagnostics and matching postimages.
+
+The two valid original GIN cases (`sql-0719`, `sql-0721`) are implemented.
+`sql-0720` is superseded because its covering-GIN expectation disagrees with
+PostgreSQL. All three have executable native and PostgreSQL evidence in the
+parity ledger; no original GIN case remains unresolved.
+
 ## Ancestor retirement
 
 Schema/database DROP activation is in progress in

@@ -7266,6 +7266,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db managed full text admission replays transitive artifact producers",
         "db full text repair page replay is idempotent without compaction",
         "db algebraic bulk ingest survives reopen with durable lsm primary backend",
+        "db algebraic relational replay materializes typed rows and preserves document replay across cold owners",
         "db managed algebraic admission builds and reopens an isolated generation",
         "db algebraic generation build yields and resumes from its durable source cursor",
         "db graph index reloads on reopen for neighbor queries with durable lsm primary backend",

@@ -34119,6 +34119,14 @@ pub const RaftApplyStore = struct {
             std.mem.writeInt(u64, header[8..16], binding.incarnation, .big);
             hash.update(&header);
             hash.update(binding.name);
+            if (binding.gin) |gin| {
+                hash.update("antfly.sql-gin-binding.v1");
+                var definition: [9]u8 = undefined;
+                std.mem.writeInt(u64, definition[0..8], gin.field.len, .big);
+                definition[8] = @backingInt(gin.operator_class);
+                hash.update(&definition);
+                hash.update(gin.field);
+            }
         }
         var result: [32]u8 = undefined;
         hash.final(&result);
@@ -40532,6 +40540,10 @@ pub const RaftApplyStore = struct {
         var resolver_arena = std.heap.ArenaAllocator.init(self.alloc);
         defer resolver_arena.deinit();
         const record = (try self.admittedResolverProjectionTxn(resolver_arena.allocator(), txn, group_id, input_record)) orelse return null;
+        sql_native_indexes.validateStoredGinBindings(resolver_arena.allocator(), record.schema_json, record.indexes_json, record.sql_native_indexes_json) catch |err| switch (err) {
+            error.InvalidSchemaUpdateRequest => return null,
+            else => return err,
+        };
         const type_guards = sql_type_layouts.guardsForDefinitionsAlloc(self.alloc, record.schema_json, record.read_schema_json) catch |err| switch (err) {
             error.InvalidSchemaUpdateRequest => return null,
             else => return err,
@@ -40546,7 +40558,7 @@ pub const RaftApplyStore = struct {
             error.NotFound => null,
             else => return err,
         };
-        if (record.sql_native_indexes_json.len != 0) _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.sql_native_index_namespace_version);
+        if (record.sql_native_indexes_json.len != 0) _ = try self.standbyRelationActivationTxn(txn, group_id, topology_protocol.sql_gin_index_version);
         const source_tracked = try relation_reconciliation.readSourceRevision(txn, group_id) != 0;
         var defaults_changed = true;
         var foreign_keys_changed = true;
@@ -42415,7 +42427,7 @@ pub const RaftApplyStore = struct {
             try @import("antfly_local_sources").api_coverage_policy.validateStoredIndexConfig(config);
             if (config != .object) return error.InvalidCatalogMutation;
             const kind = config.object.get("type") orelse return error.InvalidCatalogMutation;
-            if (kind != .string or !std.mem.eql(u8, kind.string, "full_text")) return error.InvalidCatalogMutation;
+            if (kind != .string) return error.InvalidCatalogMutation;
             const field = config.object.get("field") orelse return error.InvalidCatalogMutation;
             if (field != .string or field.string.len == 0) return error.InvalidCatalogMutation;
             var parsed_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(a, current.schema_json);
@@ -42424,13 +42436,32 @@ pub const RaftApplyStore = struct {
             // The admission digest binds the logical request and its schema
             // guard. Store the native physical selector resolved under that
             // same cut, rather than treating an SQL alias as a document path.
-            const physical_field = try sql_native_indexes.bindSqlField(a, parsed_schema, schema, field.string);
+            const is_gin = std.mem.eql(u8, kind.string, "algebraic");
+            if (is_gin) _ = try self.standbyRelationActivationTxn(txn, group, topology_protocol.sql_gin_index_version);
+            var gin_binding: ?sql_native_indexes.names.GinBinding = null;
+            const physical_field = if (is_gin) gin: {
+                const value = config.object.get("operator_class") orelse return error.InvalidCatalogMutation;
+                if (value != .string) return error.InvalidCatalogMutation;
+                const operator_class = std.meta.stringToEnum(@import("antfly_local_sources").sql_ast.NativeIndex.OperatorClass, value.string) orelse return error.InvalidCatalogMutation;
+                const bound = try sql_native_indexes.bindGinField(a, schema, field.string, operator_class);
+                gin_binding = .{ .name = request.name, .field = bound, .operator_class = operator_class };
+                break :gin bound;
+            } else try sql_native_indexes.bindSqlField(a, parsed_schema, schema, field.string);
             config.object.getPtr("field").?.* = .{ .string = physical_field };
-            const analyzers = config.object.getPtr("analysis_config").?.object.getPtr("field_analyzers").?;
-            analyzers.object.clearRetainingCapacity();
-            try analyzers.object.put(a, physical_field, .{ .string = "standard" });
+            if (!is_gin) {
+                const analyzers = config.object.getPtr("analysis_config").?.object.getPtr("field_analyzers").?;
+                analyzers.object.clearRetainingCapacity();
+                try analyzers.object.put(a, physical_field, .{ .string = "standard" });
+            } else {
+                _ = config.object.swapRemove("field");
+                _ = config.object.swapRemove("operator_class");
+                config = try @import("antfly_local_sources").api_local_tables.schemaDerivedAlgebraicIndexValueAlloc(a, current.name, current.schema_json, config);
+            }
             try configs.value.object.put(a, request.name, config);
-            replacement.sql_native_indexes_json = try sql_native_indexes.names.add(a, current.sql_native_indexes_json, request.name);
+            replacement.sql_native_indexes_json = if (gin_binding) |gin|
+                try sql_native_indexes.names.addGin(a, current.sql_native_indexes_json, gin)
+            else
+                try sql_native_indexes.names.add(a, current.sql_native_indexes_json, request.name);
         } else {
             if (!configs.value.object.swapRemove(request.name)) return error.SqlIndexNotFound;
         }
@@ -63262,6 +63293,9 @@ test "system catalog resource comments use three atomic writes retain receipts a
             fail_at: usize,
             after: bool,
             writes: usize = 0,
+            pub fn get(self: *@This(), key: []const u8) ![]const u8 {
+                return self.txn.get(key);
+            }
             pub fn put(self: *@This(), key: []const u8, value: []const u8) !void {
                 self.writes += 1;
                 if (self.writes == self.fail_at and !self.after) return error.TestCommentWriteFailed;
@@ -70480,5 +70514,61 @@ test "SQL scope retirement capture pins native scoped membership overloads range
 comptime {
     if (builtin.is_test and !@import("storage_source_options").control_only) {
         _ = @import("../scope_retirement_test.zig");
+    }
+}
+
+test "SQL GIN namespace source digests fence definition substitution at identical incarnations" {
+    const a = std.testing.allocator;
+    const first = try relation_names.native_indexes.addGin(a, "", .{ .name = "gin", .field = "metadata", .operator_class = .jsonb_path_ops });
+    defer a.free(first);
+    const replaced = try relation_names.native_indexes.addGin(a, "", .{ .name = "gin", .field = "tags", .operator_class = .array_ops });
+    defer a.free(replaced);
+    const configs = "{\"gin\":{\"type\":\"algebraic\",\"_index_incarnation\":17}}";
+    const left = try RaftApplyStore.relationNativeTableSourceDigest(a, 17, "items", "{}", first, configs);
+    const right = try RaftApplyStore.relationNativeTableSourceDigest(a, 17, "items", "{}", replaced, configs);
+    try std.testing.expect(!std.mem.eql(u8, &left, &right));
+}
+
+test "SQL GIN invalid incoming schema is a deterministic refusal without blocking committed entries or cold recovery" {
+    const a = std.testing.allocator;
+    var region: std.heap.ArenaAllocator = .init(a);
+    defer region.deinit();
+    const scratch = region.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/gin-writer-guard", .{tmp.sub_path});
+    const gin_local = @import("antfly_local_sources");
+    var create = try gin_local.sql_compiler.compile(a, "CREATE TABLE items(id BIGINT PRIMARY KEY,metadata JSONB)", .{});
+    defer create.deinit();
+    const schema = try gin_local.sql_ddl_runtime.createSchemaAlloc(scratch, create.statement.create_table);
+    var bad_create = try gin_local.sql_compiler.compile(a, "CREATE TABLE items(id BIGINT PRIMARY KEY,metadata TEXT)", .{});
+    defer bad_create.deinit();
+    const bad_schema = try gin_local.sql_ddl_runtime.createSchemaAlloc(scratch, bad_create.statement.create_table);
+    const selected = try relation_names.native_indexes.addGin(scratch, "", .{ .name = "gin", .field = "metadata", .operator_class = .jsonb_path_ops });
+    var before: metadata.TableRecord = undefined;
+    for (0..2) |pass| {
+        var store = try RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        if (pass == 0) {
+            const group: u64 = 21;
+            const incarnation: [32]u8 = @splat('1');
+            try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = incarnation });
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(scratch, topology_protocol.Activation{ .version = topology_protocol.current_version, .incarnation = incarnation, .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+            try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 101, .name = "items", .schema_json = schema, .indexes_json = "{\"gin\":{\"type\":\"algebraic\",\"_index_incarnation\":17}}", .sql_native_indexes_json = selected } });
+            before = (try store.getTable(scratch, group, 101)).?;
+            var bad = before;
+            bad.schema_json = bad_schema;
+            try store.applyStandaloneCommand(group, .{ .upsert_table = bad });
+            try std.testing.expectEqualDeep(before, (try store.getTable(scratch, group, 101)).?);
+            const commands = [_]TransitionCommand{
+                .{ .upsert_table = bad },
+                .{ .upsert_table = .{ .table_id = 999, .name = "disjoint" } },
+            };
+            var entries: [commands.len]@import("raft_engine").core.Entry = undefined;
+            for (commands, &entries, 0..) |command, *entry, i| entry.* = .{ .term = 1, .index = 1 + i, .entry_type = .normal, .data = try encodeTransitionCommand(scratch, command) };
+            try store.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = commands.len, .entries_bytes = try @import("../../raft/state_machine/mod.zig").encodeCommittedEntries(scratch, &entries) });
+        }
+        try std.testing.expectEqualDeep(before, (try store.getTable(scratch, 21, 101)).?);
+        try std.testing.expectEqualStrings("disjoint", (try store.getTable(scratch, 21, 999)).?.name);
     }
 }

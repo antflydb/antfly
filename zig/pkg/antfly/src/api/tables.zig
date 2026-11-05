@@ -1439,10 +1439,12 @@ fn regenerateAlgebraicIndexValueAlloc(
     if (derived != .object) return error.InvalidSchemaUpdateRequest;
     try derived.object.put(alloc, try alloc.dupe(u8, "type"), .{ .string = try alloc.dupe(u8, "algebraic") });
 
-    // Schema-derived fields stay authoritative; only carry forward user knobs.
+    // Preserve runtime knobs and catalog identity; schema-derived fields stay authoritative.
     var it = source.object.iterator();
     while (it.next()) |entry| {
-        if (!isAlgebraicUserTunableField(entry.key_ptr.*)) continue;
+        // Incarnation belongs to catalog custody, independently of schema-derived
+        // runtime config. Rebuilding capabilities does not recreate the SQL name.
+        if (!std.mem.eql(u8, entry.key_ptr.*, "_index_incarnation") and !isAlgebraicUserTunableField(entry.key_ptr.*)) continue;
         try derived.object.put(
             alloc,
             try alloc.dupe(u8, entry.key_ptr.*),
@@ -1870,6 +1872,7 @@ fn applySchemaRecord(alloc: std.mem.Allocator, table: *const metadata_table_mana
 }
 
 fn applySchemaRecordWithEpoch(alloc: std.mem.Allocator, table: *const metadata_table_manager.TableRecord, schema_json: []const u8, rewrite: bool, fk_publication: bool, pinned_incarnation: ?u64, force_epoch: bool) !metadata_table_manager.TableRecord {
+    try @import("../system_catalog/native_indexes.zig").validateStoredGinBindings(alloc, schema_json, table.indexes_json, table.sql_native_indexes_json);
     try @import("antfly_local_sources").schema_relational_index_namespace.validate(alloc, schema_json, table.indexes_json);
     const current_version = try schemaVersion(table.schema_json);
     const comparison = try compareSchemaDefinitions(alloc, table.schema_json, schema_json);
