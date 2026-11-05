@@ -1164,3 +1164,7 @@ resumable initial seed and supervised Lite producer, see [DEPLOYMENT.md](DEPLOYM
 The production target reuses Colony’s `antfly-showcases` hosting foundation; the
 standalone renderer is a qualification tool. Managed RC.5 and archive-scale
 acceptance remain deployment gates.
+
+For continuous writable Iceberg changes, publication visibility, catalog-history
+growth and concurrent vacuum, see [Continuous writable-lake qualification](CONTINUOUS_LAKE.md).
+This is a separate bounded workload from the static archive search timings.

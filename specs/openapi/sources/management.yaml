@@ -453,9 +453,11 @@
           "publication": {
             "type": "string",
             "enum": [
+              "native",
               "text",
               "media"
-            ]
+            ],
+            "description": "Native acquisition is the default: text stays inline and binary originals are revision-pinned for native artifact producers."
           },
           "state": {
             "type": "string",
@@ -472,6 +474,15 @@
             "type": "integer",
             "minimum": 60,
             "maximum": 86400
+          },
+          "streams": {
+            "type": "array",
+            "maxItems": 64,
+            "items": {
+              "$ref": "#/components/schemas/TextStream"
+            },
+            "x-go-type-skip-optional-pointer": true,
+            "description": "Searchable source-text and native artifact bindings; credentials and producer execution remain separate."
           }
         },
         "additionalProperties": false
@@ -638,6 +649,74 @@
             ],
             "default": "sync"
           }
+        }
+      },
+      "TextStream": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "field",
+          "default"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "artifact": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "index": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "field": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "purpose": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "location_field": {
+            "type": "string",
+            "minLength": 1,
+            "pattern": "^[^\\u0000\\r\\n]+$",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "default": {
+            "type": "boolean",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "generated": {
+            "type": "boolean",
+            "x-go-type-skip-optional-pointer": true
+          },
+          "boundary": {
+            "enum": [
+              "record",
+              "unit"
+            ],
+            "x-go-type-skip-optional-pointer": true,
+            "type": "string"
+          }
+        },
+        "dependentRequired": {
+          "artifact": [
+            "index"
+          ]
         }
       }
     }

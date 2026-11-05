@@ -46,7 +46,8 @@ type Profile struct {
 	Sources           []Source              `json:"sources"`
 }
 type Source struct {
-	// Publication defaults to text. Media rows require a revision-enforcing
+	Streams []TextStream `json:"streams,omitempty"`
+	// Publication defaults to native acquisition. Binary rows require a revision-enforcing
 	// fetch resolver, supplied by the source service or an embedding application.
 	Publication          string          `json:"publication,omitempty"`
 	ID                   string          `json:"id"`
@@ -172,11 +173,15 @@ func (r *Runner) syncLocked(ctx context.Context) error {
 		if alias == "" {
 			alias = source.ID
 		}
-		binding := Binding{ID: source.ID, Alias: alias, Table: source.Table, DocumentField: "grep", Filter: SourceFilter(source.ID), Status: "pending"}
-		if source.Publication == "media" {
-			binding.Publication, binding.DocumentVersion = "media", 2
+		binding := Binding{ID: source.ID, Alias: alias, Table: source.Table, DocumentVersion: SourceRecordVersion, Fields: CanonicalDocumentFields(), Streams: source.Streams, Filter: SourceFilter(source.ID), Status: "pending"}
+		if len(binding.Streams) == 0 && source.Publication != "media" {
+			binding.Streams = DefaultTextStreams()
 		}
-		if prior, ok := old[source.ID]; ok && prior.Table == source.Table {
+		binding.Publication = source.Publication
+		if binding.Publication == "" {
+			binding.Publication = "native"
+		}
+		if prior, ok := old[source.ID]; ok && prior.Table == source.Table && binding.SameRecordLayout(prior) {
 			binding.Status = prior.Status
 			binding.ValidUntil = prior.ValidUntil
 			binding.PublishedRevision = prior.PublishedRevision
@@ -261,8 +266,11 @@ func (r *Runner) validate() error {
 		if !canonicalID(s.ID) || seen[s.ID] || s.Table == "" || strings.ContainsAny(s.Table, "\x00\r\n") || s.Table == "." || s.Table == ".." || s.Permissions == nil {
 			return fmt.Errorf("source needs a unique UUID, destination and explicit permissions")
 		}
-		if s.Publication != "" && s.Publication != "text" && s.Publication != "media" {
-			return fmt.Errorf("publication must be text or media")
+		if err := ValidateTextStreams(s.Streams); err != nil {
+			return err
+		}
+		if s.Publication != "" && s.Publication != "text" && s.Publication != "media" && s.Publication != "native" {
+			return fmt.Errorf("publication must be native, text or media")
 		}
 		if s.Publication == "media" && r.MediaReference == nil && (r.SourceID == "" || r.SourceID == s.ID) {
 			return fmt.Errorf("media publication requires a revision-enforcing fetch resolver; use antfly-source serve")
@@ -301,6 +309,7 @@ func canonicalID(id string) bool {
 // with the full Workspace service list; an exact match permits safe adoption.
 func sourceConfigurationHash(source Source, connection Connection) (string, error) {
 	source.Alias = ""
+	source.Streams = nil // Search/producer bindings do not change acquired bytes.
 	source.PermissionTTLSeconds = 0
 	identity, err := json.Marshal(struct {
 		Source     Source
@@ -394,7 +403,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 			ProviderName: c.ProviderName, HTTPClient: c.HTTPClient, AccessToken: c.AccessToken,
 			Services: c.Services, APIBase: c.APIBase, GmailBase: c.GmailBase, CalendarBase: c.CalendarBase,
 			DriveBase: c.DriveBase, Extractor: c.Extractor, DownloadTransport: c.DownloadTransport,
-			ExtractorVersion: c.ExtractorVersion, accessAuditWindow: c.accessAuditWindow, accessWait: c.accessWait,
+			NativeAttachments: c.NativeAttachments, ExtractorVersion: c.ExtractorVersion, accessAuditWindow: c.accessAuditWindow, accessWait: c.accessWait,
 		}
 		c, connector = &run, &run
 		c.Baseline = state.Published
@@ -458,7 +467,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if err := writeJSON(statePath, state, 256<<20); err != nil {
 		return 0, "", err
 	}
-	if r.MediaInventory != nil && s.Publication == "media" {
+	if r.MediaInventory != nil && s.Publication != "text" {
 		if err := r.MediaInventory(ctx, s, state.Pending, state.Published); err != nil {
 			return 0, "", err
 		}
@@ -495,7 +504,10 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 		item.Metadata = cloneSourceMetadata(item.Metadata)
 		item.Metadata["connection_id"] = s.Connection
 		var doc Document
-		if s.Publication == "media" {
+		if UsesNativeResource(s, item) {
+			if r.MediaReference == nil {
+				return 0, "", fmt.Errorf("native binary publication requires a source media service")
+			}
 			phase = "verify_media"
 			if !r.mediaReferenceAuthorizes {
 				if err := connector.CheckAccess(ctx, request, item); err != nil {
@@ -610,7 +622,7 @@ func (r *Runner) syncSource(ctx context.Context, s Source, connection Connection
 	if err := writeJSON(statePath, state, 256<<20); err != nil {
 		return 0, "", err
 	}
-	if r.MediaInventory != nil && s.Publication == "media" {
+	if r.MediaInventory != nil && s.Publication != "text" {
 		if err := r.MediaInventory(ctx, s, nil, state.Published); err != nil {
 			return 0, "", err
 		}
@@ -698,23 +710,37 @@ func writeJSON(path string, value any, limit int64) error {
 // Drive media uses the same inventory, access checks and revision-checked binary
 // reads as GoogleConnector, bypassing collaboration's text/OCR extraction.
 func publicationConnector(connector Connector, source Source) (Connector, error) {
-	if source.Publication != "media" {
+	if source.Publication == "text" {
 		return connector, nil
+	}
+	if c, ok := connector.(*GoogleConnector); ok && c.ProviderName == ProviderGoogleDrive {
+		return &driveMediaConnector{GoogleConnector: c, sourceKind: c.ProviderName}, nil
 	}
 	if c, ok := connector.(*CollaborationConnector); ok {
 		config, err := decodeSourceConfig[CollaborationConfig](source.Config)
-		if err != nil || c.ProviderName != ProviderGoogleWorkspace || config.Resource != "drive" {
-			return nil, fmt.Errorf("media publication supports S3, GCS and Drive sources")
+		if err != nil {
+			return nil, err
+		}
+		if c.ProviderName != ProviderGoogleWorkspace || config.Resource != "drive" {
+			if source.Publication == "media" {
+				return nil, fmt.Errorf("mixed collaboration sources require native publication")
+			}
+			copy := *c
+			copy.NativeAttachments = true
+			return &copy, nil
 		}
 		if err := c.Validate(context.Background(), Request{Mode: ImportModeSource, Config: source.Config}); err != nil {
 			return nil, err
 		}
-		return &driveMediaConnector{GoogleConnector: c.drive()}, nil
+		return &driveMediaConnector{GoogleConnector: c.drive(), sourceKind: ProviderGoogleWorkspace}, nil
 	}
 	return connector, nil
 }
 
-type driveMediaConnector struct{ *GoogleConnector }
+type driveMediaConnector struct {
+	*GoogleConnector
+	sourceKind string
+}
 
 // A materialized text snapshot remains usable after Drive changes. A media
 // reference does not: both acquisition and publication audits must prove that
@@ -733,10 +759,56 @@ func (c *driveMediaConnector) ValidateInventory(ctx context.Context, request Req
 
 func (c *driveMediaConnector) Enumerate(ctx context.Context, request Request) (Inventory, error) {
 	inventory, err := c.GoogleConnector.Enumerate(ctx, request)
-	for i := range inventory.Objects {
-		inventory.Objects[i].SourceKind = ProviderGoogleWorkspace
+	if err != nil {
+		return inventory, err
 	}
-	return inventory, err
+	for i := range inventory.Objects {
+		item := &inventory.Objects[i]
+		if c.sourceKind != "" {
+			item.SourceKind = c.sourceKind
+		}
+		if configString(item.Metadata, "export_mime_type") == "" {
+			continue
+		}
+		original := configString(item.Metadata, "mime_type")
+		switch original {
+		case "application/vnd.google-apps.document", "application/vnd.google-apps.presentation":
+		default:
+			return Inventory{}, fmt.Errorf("unsupported native Drive export %s", original)
+		}
+		item.Metadata = cloneSourceMetadata(item.Metadata)
+		item.Metadata["original_mime_type"] = original
+		item.Metadata["export_mime_type"] = "application/pdf"
+		item.Metadata["mime_type"] = "application/pdf"
+		if request.Preview {
+			continue
+		} // Review descriptors without exporting originals.
+		data, err := c.GoogleConnector.Read(ctx, request, *item)
+		if err != nil {
+			return Inventory{}, err
+		}
+		item.Size = int64(len(data))
+		item.Metadata["size_is_upper_bound"] = false
+		item.Metadata["representation_sha256"] = fmt.Sprintf("%x", sha256.Sum256(data))
+	}
+	return inventory, nil
+}
+
+func UsesNativeResource(source Source, item Item) bool {
+	if source.Publication == "media" {
+		return true
+	}
+	if source.Publication == "text" {
+		return false
+	}
+	if item.SourceKind != ProviderS3 && item.SourceKind != ProviderGCS && item.SourceKind != ProviderGoogleDrive && item.SourceKind != ProviderGoogleWorkspace && configString(item.Metadata, "attachment_id") == "" {
+		return false
+	}
+	if configString(item.Metadata, "acquisition") != "" && configString(item.Metadata, "attachment_id") == "" {
+		return false
+	}
+	typ := strings.ToLower(strings.Split(MediaMIME(item), ";")[0])
+	return !strings.HasPrefix(typ, "text/") && typ != "application/json" && typ != "application/xml"
 }
 
 // PublicationConnector selects original-binary acquisition for media sources.

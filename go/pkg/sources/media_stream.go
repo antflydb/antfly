@@ -16,6 +16,7 @@
 package sources
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"crypto/sha256"
@@ -78,7 +79,7 @@ func (c *GoogleConnector) StableMediaRanges() bool { return c.ProviderName == Pr
 // while promoting the native CheckMedia method.
 func checkMediaAccess(ctx context.Context, connector Connector, media MediaConnector, request Request, item Item) error {
 	switch connector.(type) {
-	case *S3Connector, *GoogleConnector, *driveMediaConnector:
+	case *S3Connector, *GoogleConnector, *driveMediaConnector, *CollaborationConnector:
 	default:
 		if err := connector.CheckAccess(ctx, request, item); err != nil {
 			return err
@@ -204,6 +205,16 @@ func (c *GoogleConnector) CheckMedia(ctx context.Context, r Request, item Item) 
 }
 
 func (c *GoogleConnector) OpenMedia(ctx context.Context, r Request, item Item, span MediaRange) (io.ReadCloser, error) {
+	if configString(item.Metadata, "export_mime_type") != "" {
+		if err := span.validate(item.Size); err != nil {
+			return nil, err
+		}
+		data, err := c.exportMediaBytes(ctx, r, item)
+		if err != nil {
+			return nil, err
+		}
+		return io.NopCloser(bytes.NewReader(data[span.Offset : span.Offset+span.Length])), nil
+	}
 	if err := span.validate(item.Size); err != nil {
 		return nil, err
 	}
@@ -345,7 +356,7 @@ func VerifyMediaDigest(ctx context.Context, media MediaConnector, request Reques
 	if media == nil || item.Size < 1 {
 		return "", fmt.Errorf("%w: invalid media representation", ErrInvalidInput)
 	}
-	if upper, _ := item.Metadata["size_is_upper_bound"].(bool); upper || configString(item.Metadata, "export_mime_type") != "" {
+	if upper, _ := item.Metadata["size_is_upper_bound"].(bool); upper || (configString(item.Metadata, "export_mime_type") != "" && !validContentSHA(configString(item.Metadata, "representation_sha256"))) {
 		return "", fmt.Errorf("%w: original binary representation required", ErrInvalidInput)
 	}
 	if err := media.CheckMedia(ctx, request, item); err != nil {

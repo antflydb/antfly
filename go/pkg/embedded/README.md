@@ -127,6 +127,16 @@ Database failures retain an owned native diagnostic in `NativeError`. Use
 classify failures. The copied detail remains valid after later native calls;
 Go keeps each native call and diagnostic read on the same OS thread.
 
+When `Batch`, `BatchJSON`, or an autocommit SQL write fails with
+`OutcomeUnknown`, the error may carry an outcome receipt
+(`NativeError.OutcomeReceipt` or `SQLError.OutcomeReceipt`; read either with
+`lite.OutcomeReceiptOf(err)`). Resolve it later on any handle for the same
+database with `db.OutcomeReceiptStatus(receipt)`, which returns
+`OutcomeReceiptApplied` or `OutcomeReceiptNotApplied`, or `Stalled` while the
+uncertain commit is not reconciled yet (Lite: retry; directory database: close
+the issuing handle and reopen first). Call `db.ForgetOutcomeReceipt(receipt)`
+once resolved; afterwards the receipt can no longer be resolved.
+
 `OpenInference` opens a standalone `*Inference` handle that runs models with
 no `DB` attached -- models load on first use and stay cached until `Close`.
 Each method sends and receives the JSON of the matching `/ai/v1` route of the

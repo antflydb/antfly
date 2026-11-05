@@ -496,12 +496,12 @@ chunk API's source-reference contract:
 The canonical source URI, provider revision, permissions, and connection identity
 remain in the canonical document. Enrichment `field` selectors read top-level
 fields; use a nested-value template for this canonical envelope. For document
-extraction use `template: "{{grep.media.uri}}"` with the
+extraction use `template: "{{content.resource.uri}}"` with the
 `document_extraction` asset producer; the gateway supplies MIME type and a strong
 versioned URL. For URL-based media embeddings use
-`template: "{{remoteMedia url=grep.media.uri}}"`. Model-aware chunking consumes the
-`grep.media` source-reference object through a JSON-producing source template.
-Do not configure the literal field name `grep.media.uri` as a field selector.
+`template: "{{remoteMedia url=content.resource.uri}}"`. Model-aware chunking consumes the
+`content.resource` source-reference object through a JSON-producing source template.
+Do not configure the literal field name `content.resource.uri` as a field selector.
 Text-only consumers such as `antfly-grep` should continue selecting text sources.
 Publication readiness proves the canonical row is query-visible; downstream
 embedding/extraction completion is observed through Antfly's normal index status.
@@ -512,7 +512,7 @@ A PDF extraction producer for the canonical media envelope uses:
 {
   "name": "document_units_v1",
   "kind": "asset",
-  "template": "{{grep.media.uri}}",
+  "template": "{{content.resource.uri}}",
   "content_type": "application/json",
   "producer_json": "{\"type\":\"document_extraction\",\"config\":{}}"
 }
@@ -709,3 +709,104 @@ stale historical representations fail rather than silently returning newer bytes
 endpoint independently of credentials and source policy. Hosting runtimes can
 cache verified byte digests under that namespace, immutable object version and
 length; a digest receipt never replaces live access checks or grants delivery.
+
+## Native source records and searchable artifacts
+
+Source runs now publish the consumer-independent [v3 envelope](../../../zig/pkg/antfly-grep/schema/document-v3.json):
+
+```json
+{
+  "schema_version": 3,
+  "source": {"id":"catalog-source-id","provider":"gcs","item_id":"bucket/report.pdf","uri":"gs://bucket/report.pdf","path":"report.pdf","revision":"generation","indexed_at":1793740000},
+  "content": {"mime_type":"application/pdf","resource":{"type":"source","uri":"https://sources.example/v1/media/PIN/SIGNATURE","mime_type":"application/pdf","version":"\"SHA256\"","version_kind":"strong_etag","length":1234}},
+  "permissions": {"public":false,"readers":["group:researchers"]},
+  "metadata": {}
+}
+```
+
+The illustrative `SHA256` must be the actual lowercase 64-digit content digest.
+Text/code/community bodies use `content.text` instead of `content.resource`.
+`source.id` identifies the logical catalog source; the Antfly document key and
+`source.item_id` identify its individual item. No persisted `grep` wrapper is
+required. Catalog/document formats have separate version numbers.
+
+Publication defaults to `native`: S3/GCS binaries are streamed, collaboration
+attachments use their original bytes, and Docs/Slides are exported as PDF
+with before/after provider revision checks and an acquired representation hash.
+Drive identity remains the original document, not the export URL. The proxy
+exports on demand and acquires each representation once per HTTP request. It
+checks current access, provider revision, size, and the pinned representation
+hash before exposing bytes, then serves request-local ranges without a durable
+copy or staging bucket. Changed export bytes require resynchronization even when
+the provider revision is unchanged. Collaboration delivery checks the current
+parent object, attachment membership and pinned parent revision using metadata;
+HEAD, permission audits and matching conditional responses acquire no attachment
+bodies. Gmail checks the message history revision through its metadata API and
+fetches remote attachments by their pinned attachment ID. Inline MIME parts use
+a bounded full-message acquisition only when their bytes are requested. A GET
+fetches only the selected attachment and checks its pinned byte digest. Deleted
+or edited parents fail closed, and an unavailable sibling cannot block delivery.
+Canonical parent-text reads likewise reload only text and provider metadata,
+validate the pinned parent identity and revision, and acquire no attachment bodies.
+Native parent revisions cover canonical text, provider metadata and attachment
+descriptors. Attachment-derived Calendar invitation relationships remain in the
+published metadata without changing that revision. Prior native acquisition
+baselines are rediscovered once to establish this canonical revision.
+Exports and collaboration attachments retain
+bounded acquisition limits; large S3/GCS originals use streaming. Unsupported
+whole-workbook export is rejected. Explicit `publication: text` retains the optional text-extractor path;
+it is not required by native indexing. Standalone binary publication requires
+`antfly-source serve` (or an embedded revision-enforcing media resolver).
+
+References carry no provider credentials. Media signatures have no clock expiry;
+the source service rechecks current selection, credentials, access and revision
+before delivery. Keep the service URL and signing key durable, or use an embedded
+resolver with equivalent guarantees. Do not replace it with a short-lived signed
+provider URL.
+
+Configure native enrichments with `template: "{{content.resource.uri}}"` and
+ordinary artifact-backed indexes. A source's `streams` binding declares searchable
+content; producer names and index names are application configuration:
+
+```json
+"streams": [
+  {"name":"source","field":"content.text","purpose":"source","default":true,"boundary":"record"},
+  {"name":"extracted","artifact":"units","index":"unit_text","field":"text","purpose":"extraction","default":true,"boundary":"unit","location_field":"provenance"},
+  {"name":"summary","artifact":"summary","index":"summary_text","field":"text","purpose":"summary","generated":true,"default":false,"boundary":"record"}
+]
+```
+
+Transcripts/captions use the same binding contract and native `asset` producers.
+Acquisition visibility is distinct from artifact convergence. Grep checks native
+index/source readiness; pending or failed producer work is an explicit incomplete
+result. Updating stream/producer configuration does not change acquisition identity
+or revoke the original byte reference. Scoped LinearMerge still reconciles only
+the owning source. Current exposed API authorization must cover both originals
+and derived members; catalog filters and local principals grant no access.
+
+### Transition and local smoke
+
+New synchronizations write version 3 records. Re-run a complete source sync to
+replace old `grep` rows in its owned key range; keep the same source UUID and
+catalog table. Finish or discard an interrupted old acquisition before changing
+its publication mode. Existing manual grep tables can keep an explicit
+`document_field` adapter. Native bindings use `fields` and `streams` instead.
+Colony marks older catalog publications stale until the source is synchronized.
+No automatic deletion of old Grepstein projection tables or buckets occurs.
+
+Build the local server and grep in the worktree, then run:
+
+```sh
+(cd zig && zig build antfly grep -Doptimize=Debug -Dmetal=false -Dcuda=false -j2)
+bash scripts/smoke_native_sources.sh
+```
+
+The smoke starts an isolated loopback database, acquires actual source/media
+records, waits for native producers and indexes, and searches the native members
+with the real grep executable. It covers text synchronization/deletion, PDF pages,
+timed audio, image captions, a video audio route, summaries, incomplete extraction,
+transient transcription failure, bounded cursor pagination, a 1,000-document
+member batch, source-versus-artifact trigram isolation, path/type exclusions and
+retained snapshot completion. Model HTTP replies
+are deterministic fixtures; this validates the integration, not GPU/model quality.
+Private-IP fetching is enabled only in the isolated smoke configuration.

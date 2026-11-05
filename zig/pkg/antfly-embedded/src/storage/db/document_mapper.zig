@@ -1501,7 +1501,7 @@ pub fn consumeTextProjectionChunks(batch_: TextProjectionBatch, options: BuildTe
     const build_options = buildTextOptionsFromSegmentOptions(options);
     var start: usize = 0;
     while (start < batch_.docs.len) {
-        const split = introducer_mod.splitTextDocumentsForBuildBudget(batch_.docs, start, .{
+        const split = try introducer_mod.splitTextDocumentsForBuildBudget(options.scratch_allocator orelse introducer_mod.textBuildScratchAllocator(), batch_.docs, start, .{
             .target_build_memory_bytes = options.target_build_memory_bytes orelse build_options.build_memory_target_bytes,
             .target_segment_bytes = @max(@as(usize, 1), options.target_segment_bytes),
         });
@@ -7432,5 +7432,5 @@ test "external lake bounded window profiles native source column inputs keep typ
     try std.testing.expectEqualStrings(payload, doc.stored_source.?.object.get("payload").?.string);
     try std.testing.expect(doc.stored_source_bytes > payload.len and bytes >= payload.len);
     try std.testing.expect(introducer_mod.estimateTextDocumentSegmentBytes(doc) >= payload.len);
-    try std.testing.expect(introducer_mod.estimateTextDocumentBuildMemoryBytes(doc) >= payload.len);
+    try std.testing.expect((try introducer_mod.estimateTextDocumentBuildMemoryBytes(a, doc)) >= payload.len);
 }

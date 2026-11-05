@@ -1168,6 +1168,8 @@ pub const Result = struct {
     ocr_selected_count: usize = 0,
     ocr_retained_embedded_count: usize = 0,
     ocr_failed_count: usize = 0,
+    incomplete_unit_count: usize = 0,
+    retryable_incomplete_unit_count: usize = 0,
     /// Complete aggregate; diagnostics below may be bounded to a sample.
     ocr_retryable_failed_count: usize = 0,
     ocr_failed_page_numbers: []const u32 = &.{},

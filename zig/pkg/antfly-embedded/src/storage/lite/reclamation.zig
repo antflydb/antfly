@@ -61,6 +61,8 @@ pub const AllocatorWork = struct {
     journal_rebases: u64 = 0,
     journal_rebase_ns: u64 = 0,
     cache_transfers: u64 = 0,
+    /// Warm ledgers copied (not moved) from an idle owner of the same file.
+    cache_copies: u64 = 0,
     artifact_source_opens: u64 = 0,
     artifact_source_reuses: u64 = 0,
     digest_rebuilds: u64 = 0,
