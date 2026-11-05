@@ -22,7 +22,13 @@ const ObjectWal = @import("wal/object_store.zig").ObjectStore;
 const IndexedWal = @import("wal/indexed_object_store.zig").IndexedObjectStore;
 const A = std.mem.Allocator;
 const namespace = "lake-transactions";
+/// Admission bounds writes ahead of catalog commit, not replay from an older
+/// searchable publication. Committed history can legitimately exceed this gap.
 pub const max_pending = 64;
+const replay_bytes = 32 * 1024 * 1024;
+// The shared reader charges encoded bytes, payloads and Record descriptors.
+// Derive the record guard from that budget rather than the ingestion window.
+const replay_records = replay_bytes / @sizeOf(@import("wal/types.zig").Record);
 pub const Record = struct { lsn: u64, payload: []const u8, operation_id: []const u8, previous: ?[]const u8 = null };
 pub const Head = struct { lsn: u64, key: []const u8, captured: IndexedWal.CapturedHead };
 pub const Range = struct { lsn: u64, records: []const Record };
@@ -141,7 +147,6 @@ pub const Store = struct {
         const snapshot = captured.snapshot;
         if (cut < snapshot.first_lsn - 1) return error.LakeOverlayCoverageUnavailable;
         if (snapshot.latest_lsn < cut) return error.LakeWalCoverageGap;
-        if (snapshot.latest_lsn - cut > max_pending) return error.LakeOverlayCoverageUnavailable;
         if (snapshot.latest_lsn == 0) return null;
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update(&captured.scope);
@@ -154,11 +159,12 @@ pub const Store = struct {
     }
     pub fn rangePinned(self: Store, a: A, cut: u64, head: ?Head) !Range {
         const pinned = head orelse return .{ .lsn = cut, .records = &.{} };
-        if (pinned.lsn < cut or pinned.lsn - cut > max_pending) return error.LakeOverlayCoverageUnavailable;
+        if (pinned.lsn < cut) return error.LakeOverlayCoverageUnavailable;
+        if (pinned.lsn - cut > replay_records) return error.LakeOverlayTooLarge;
         if (cut == pinned.lsn) return .{ .lsn = cut, .records = &.{} };
         var wal = try self.open(a, false);
         defer wal.deinit();
-        const rows = wal.indexed.?.readCapturedRangeAlloc(a, namespace, pinned.captured, .{ .start_lsn = cut + 1, .end_lsn = pinned.lsn, .max_records = max_pending, .max_bytes = 32 * 1024 * 1024, .cancellation = catalog.types.contextCancellation(&self.context) }) catch |err| switch (err) {
+        const rows = wal.indexed.?.readCapturedRangeAlloc(a, namespace, pinned.captured, .{ .start_lsn = cut + 1, .end_lsn = pinned.lsn, .max_records = replay_records, .max_bytes = replay_bytes, .cancellation = catalog.types.contextCancellation(&self.context) }) catch |err| switch (err) {
             error.WalSnapshotExpired => return error.LakeOverlayCoverageUnavailable,
             error.WalReadBudgetExceeded => return error.LakeOverlayTooLarge,
             else => return err,
@@ -235,7 +241,6 @@ pub const Store = struct {
         const snapshot = captured.snapshot;
         if (cut < snapshot.first_lsn - 1) return error.LakeOverlayCoverageUnavailable;
         if (snapshot.latest_lsn < cut) return error.LakeWalCoverageGap;
-        if (snapshot.latest_lsn - cut > max_pending) return error.LakeOverlayCoverageUnavailable;
         const cursor = try opened.indexed.?.capturedReader(a, namespace, captured, .{ .start_lsn = cut + 1, .end_lsn = snapshot.latest_lsn, .max_record_bytes = 32 * 1024 * 1024, .cancellation = catalog.types.contextCancellation(&self.context) });
         return .{ .wal = opened, .cursor = cursor, .position = cut, .context = self.context };
     }
@@ -250,6 +255,37 @@ pub const Store = struct {
         return records[0];
     }
 };
+
+test "external lake segmented WAL replays committed history beyond admission backlog" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var memory = objectstore.MemoryClient.init(alloc);
+    defer memory.deinit();
+    const store: Store = .{ .client = memory.client(), .bucket = "archive", .prefix = "committed-replay" };
+    // Catalog commit keeps pace with every append. The search publication is
+    // older, which must not turn the catalog's admission window into a read cap.
+    const count = max_pending + 8;
+    for (0..count) |index| {
+        const id = try std.fmt.allocPrint(a, "batch-{d}", .{index});
+        try std.testing.expectEqual(index + 1, try store.append(a, id, "payload", index, index));
+    }
+    const range = try store.range(a, 0);
+    try std.testing.expectEqual(@as(u64, count), range.lsn);
+    try std.testing.expectEqual(@as(usize, count), range.records.len);
+    for (range.records, 1..) |record, lsn| {
+        try std.testing.expectEqual(lsn, record.lsn);
+        try std.testing.expectEqualStrings("payload", record.payload);
+    }
+    var reader = try store.reader(a, 0);
+    defer reader.deinit();
+    for (1..count + 1) |lsn| {
+        const record = (try reader.next(a)).?;
+        try std.testing.expectEqual(lsn, record.lsn);
+    }
+    try std.testing.expect(try reader.next(a) == null);
+}
 
 test "external lake segmented WAL resolves lost tail response and fences concurrent admission" {
     const alloc = std.testing.allocator;

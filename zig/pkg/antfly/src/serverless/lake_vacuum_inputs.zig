@@ -46,7 +46,6 @@ pub const Store = struct {
     prefix: []const u8,
     state_key: []const u8,
     planning_key: []const u8,
-    legacy_prefix: []const u8,
     context: Context,
     clock: Clock = .{},
 
@@ -58,7 +57,6 @@ pub const Store = struct {
             .prefix = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-inputs/v2/{s}/", .{ base, hash }),
             .state_key = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-input-state/{s}.json", .{ base, hash }),
             .planning_key = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-planning/{s}.json", .{ base, hash }),
-            .legacy_prefix = try std.fmt.allocPrint(a, "{s}/maintenance/vacuum-inputs/", .{base}),
             .context = context,
         };
     }
@@ -205,25 +203,7 @@ pub const Store = struct {
             };
             if (!state.collected) return false;
         }
-        return self.finishLegacy(a);
-    }
-    fn finishLegacy(self: Store, a: A) !bool {
-        // Pre-scoped caches are disposable optimizations. New planners never
-        // read these two directories; never sweep v2 scopes or catalog proofs.
-        var client = self.client;
-        client.allocator = a;
-        var empty = true;
-        inline for (.{ "inventories/", "chunks/" }) |kind| {
-            const prefix = try std.fmt.allocPrint(a, "{s}{s}", .{ self.legacy_prefix, kind });
-            var listed = try client.listObjects(self.bucket, .{ .prefix = prefix, .max_keys = max_deletes / 2, .cancellation = catalog.types.contextCancellation(&self.context) });
-            defer listed.deinit(a);
-            if (listed.entries.len != 0) empty = false;
-            for (listed.entries) |entry| {
-                if (!std.mem.startsWith(u8, entry.key, prefix)) return error.InvalidLakeVacuumPlan;
-                try self.remove(a, entry.key);
-            }
-        }
-        return empty;
+        return true;
     }
 };
 
@@ -301,7 +281,7 @@ test "external lake vacuum inputs recover abandoned writer leases after deadline
     try std.testing.expectError(error.LakeVacuumPlanClosed, store.acquire(a));
 }
 
-test "external lake vacuum inputs cleanup is bounded resumes lost outcomes and reaps legacy caches" {
+test "external lake vacuum inputs cleanup is bounded resumes lost outcomes and isolates catalog proofs" {
     const alloc = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -315,8 +295,6 @@ test "external lake vacuum inputs cleanup is bounded resumes lost outcomes and r
     var writer = try store.acquire(a);
     try writer.release(a);
     for (0..40) |n| try put(alloc, memory.client(), "journal", try std.fmt.allocPrint(a, "{s}chunks/{d:0>3}.bin", .{ store.prefix, n }), "inventory");
-    try put(alloc, memory.client(), "journal", "table/maintenance/vacuum-inputs/chunks/legacy.bin", "legacy pack");
-    try put(alloc, memory.client(), "journal", "table/maintenance/vacuum-inputs/inventories/legacy.json", "legacy receipt");
     try put(alloc, memory.client(), "journal", "table/metadata/antfly-catalog/reachability/chunks/proof.bin", "authoritative proof");
     try store.close(a);
     faults.next_delete = .{ .commit_then_fail = error.ConnectionResetByPeer };
