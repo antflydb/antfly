@@ -1016,3 +1016,36 @@ Final-source ReleaseFast filesystem/GCS, full-archive and Cloud qualification
 remain outstanding. No cloud jobs, exports, provisioning or additional cloud
 spend were initiated for this review. Full CI still requires a maintainer's
 exact-revision approval under the repository's CI policy.
+
+
+## Follow-up: logical churn coverage and exact scalar verification
+
+PR #1493 was admin-merged as `7e988c3a417d7200ca02e852bb5d16e384893d35`.
+A subsequent fresh review of its `c5daaa765d` head reproduced two qualification
+false passes: the actual report gates admitted `qualified: true` with
+`--max-updates 1` and no logical delete, and SQL rows `[[7.9, 3.9]]` compared equal
+to the expected integer map `{7: 3}` after truncation.
+
+The follow-up counts net acknowledged search updates/deletes and requires an
+accepted query, started after the relevant ACK, to verify at least one of each.
+It records per-transaction mutation witnesses and aggregate coverage separately
+from storage reclamation. Seed inserts, missing-key deletes, atomic intermediate
+deletes, reads started before the ACK and reinsertion after an unobserved delete
+do not satisfy delete verification. The producer adds at most two successful
+labeled accepted-read probes to verify the first update/delete before replacement;
+query distributions include these probes. Failure evidence remains retained and
+cannot qualify. Other manifest, retention, vacuum and query checks still apply.
+
+SQL and search scalar verification rejects lossy coercion and malformed types,
+including booleans masquerading as integers. SQL requires two exact integer
+columns; search rows must satisfy their fixture's declared field types. WAL ACKs
+also require a positive integer LSN.
+
+All 101 focused Python qualification, recovery and metrics tests and 11 subtests
+pass, including ACK/read races, atomic batch classification, missed deletes,
+probe failures, bounded probe counts and the two original false-pass cases.
+Ruff, formatting and documentation links are checked separately. No engine or
+storage implementation changes are included, and native/GCS suites were not
+rerun for this harness-only follow-up. Historical qualification is not upgraded
+by these tests; current-source provider/archive/Cloud qualification is still
+outstanding.

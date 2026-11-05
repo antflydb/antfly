@@ -38,6 +38,19 @@ def run(tmp_path):
     value.events.close()
 
 
+def search_row(key, version):
+    return {
+        name: key
+        if name == "hn_id"
+        else version
+        if name == "qual_version"
+        else 0
+        if kind == "integer"
+        else "database"
+        for name, kind in lake.KINDS.items()
+    }
+
+
 def test_retry_preserves_pending_intent_until_durable_ack(run, monkeypatch):
     calls = []
     row = {"hn_id": 42, "qual_version": 1, "body": "database"}
@@ -201,7 +214,9 @@ def test_existing_gcs_namespace_prevents_process_start(run, monkeypatch):
 
 def test_unknown_query_image_is_a_correctness_failure(run, monkeypatch):
     run.anchor_id = 42
-    run.known[(42, 1)] = {"body": "database expected"}
+    expected = search_row(42, 1)
+    expected["body"] = "database expected"
+    run.known[(42, 1)] = expected
     monkeypatch.setattr(
         run,
         "call",
@@ -211,11 +226,7 @@ def test_unknown_query_image_is_a_correctness_failure(run, monkeypatch):
                     "hits": {
                         "hits": [
                             {
-                                "_source": {
-                                    "hn_id": 42,
-                                    "qual_version": 1,
-                                    "body": "database CORRUPT",
-                                },
+                                "_source": dict(expected, body="database CORRUPT"),
                                 "highlight": {"body": ["database"]},
                             }
                         ]
@@ -670,3 +681,278 @@ def test_live_accepted_search_allows_a_write_in_flight_at_invocation(run, monkey
         },
     )
     assert run.query("accepted")["row_versions"] == {"1": 1, "2": 1}
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [
+        [[7.9, 3.9]],
+        [[7.0, 3]],
+        [[7, "3"]],
+        [[True, 3]],
+        [[7, False]],
+        [[7, None]],
+        [[7]],
+        [[7, 3, 4]],
+        ["73"],
+        [{0: 7, 1: 3}],
+        {7: 3},
+    ],
+)
+def test_sql_oracle_rejects_lossy_values_and_invalid_row_shapes(rows):
+    with pytest.raises(AssertionError):
+        lake.accepted_sql_versions(rows)
+    assert lake.accepted_sql_versions([[2**63 - 1, 3], [-7, 0]]) == {
+        2**63 - 1: 3,
+        -7: 0,
+    }
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("hn_id", 7.9),
+        ("hn_id", True),
+        ("qual_version", 3.9),
+        ("qual_version", "3"),
+        ("points", False),
+        ("created_at", 0.0),
+        ("title", 7),
+    ],
+)
+def test_search_oracle_rejects_numeric_coercion_and_wrong_field_types(field, value):
+    row = search_row(7, 3)
+    assert lake.search_versions([{"_source": row}]) == {7: 3}
+    row[field] = value
+    with pytest.raises(AssertionError, match="invalid typed row"):
+        lake.search_versions([{"_source": row}])
+
+
+@pytest.fixture
+def search_engine(run, monkeypatch):
+    rows, queries = {}, []
+
+    def call(method, route, body):
+        if route.endswith("/changes"):
+            for change in body["changes"]:
+                row = change["row"]
+                if change["op"] == "delete":
+                    rows.pop(row["hn_id"], None)
+                else:
+                    rows[row["hn_id"]] = dict(row)
+            return {
+                "state": "accepted",
+                "wal_lsn": len(run.transactions[lake.TABLES[1]]) + 1,
+            }
+        assert method == "POST" and route.endswith("/query")
+        queries.append(copy.deepcopy(body))
+        return {
+            "responses": [
+                {
+                    "hits": {
+                        "hits": [
+                            {
+                                "_source": dict(row),
+                                "_highlights": {"body": ["database"]},
+                            }
+                            for row in rows.values()
+                        ]
+                    }
+                }
+            ]
+        }
+
+    monkeypatch.setattr(run, "call", call)
+    run.anchor_id = 1
+    run.transaction(
+        lake.TABLES[1], [{"op": "upsert", "row": search_row(key, 0)} for key in (1, 2)]
+    )
+    return rows, queries
+
+
+def change(run, operation, key=2, version=1):
+    return run.transaction(
+        lake.TABLES[1], [{"op": operation, "row": search_row(key, version)}]
+    )
+
+
+def test_qualification_requires_actual_verified_churn_even_when_vacuum_succeeds(
+    run, search_engine
+):
+    args = SimpleNamespace(
+        history_commits=100, burst_transactions=2, duration_seconds=660, max_updates=1
+    )
+    old_checks = {
+        name: True
+        for name in (
+            "final_rows",
+            "queries_succeeded",
+            "retention_window_exercised",
+            "manifest_merge_observed",
+            "group_commit_observed",
+            "vacuum_progress_during_continuous",
+            "vacuum_deleted_objects",
+            "independent_deletion_observed",
+        )
+    }
+    receipt = change(run, "upsert")
+    run.verify_search_churn(receipt)
+    coverage = run.search_churn_coverage()
+    assert coverage == {
+        "acknowledged": {"update": 1, "delete": 0},
+        "accepted_verified": {"update": 1, "delete": 0},
+    }
+    result = lake.qualification_result(args, old_checks, coverage)
+    assert result["full_profile"] and not result["qualified"]
+    assert not result["checks"]["search_delete_acknowledged"]
+    receipt = change(run, "delete")
+    assert not lake.qualification_result(args, old_checks, run.search_churn_coverage())[
+        "qualified"
+    ]
+    run.verify_search_churn(receipt)
+    assert lake.qualification_result(args, old_checks, run.search_churn_coverage())[
+        "qualified"
+    ]
+    assert all(old_checks.values())  # Reporting never mutates the other checks.
+
+
+def test_seed_missing_delete_and_atomic_replacement_do_not_fabricate_delete_coverage(
+    run, search_engine
+):
+    assert run.search_churn_coverage()["acknowledged"] == {"update": 0, "delete": 0}
+    change(run, "delete", key=9)
+    run.transaction(
+        lake.TABLES[1],
+        [
+            {"op": "delete", "row": {"hn_id": 2}},
+            {"op": "upsert", "row": search_row(2, 1)},
+        ],
+    )
+    run.query("accepted")
+    assert run.search_churn_coverage() == {
+        "acknowledged": {"update": 1, "delete": 0},
+        "accepted_verified": {"update": 1, "delete": 0},
+    }
+
+
+def test_published_and_pre_ack_reads_do_not_verify_a_later_delete(
+    run, search_engine, monkeypatch
+):
+    original = run.call
+
+    def racing_call(method, route, body):
+        result = original(method, route, body)
+        if route.endswith("/query"):
+            change(run, "delete")
+        return result
+
+    monkeypatch.setattr(run, "call", racing_call)
+    run.query(
+        "accepted"
+    )  # Valid earlier snapshot; the delete ACK arrives during this read.
+    assert run.search_churn_coverage()["accepted_verified"]["delete"] == 0
+    monkeypatch.setattr(run, "call", original)
+    run.query("published")
+    assert run.search_churn_coverage()["accepted_verified"]["delete"] == 0
+    run.query("accepted")
+    assert run.search_churn_coverage()["accepted_verified"]["delete"] == 1
+
+
+def test_reinsert_does_not_retroactively_verify_a_missed_delete(run, search_engine):
+    change(run, "delete")
+    change(run, "upsert", version=2)
+    run.query("accepted")
+    assert run.search_churn_coverage()["acknowledged"]["delete"] == 1
+    assert run.search_churn_coverage()["accepted_verified"]["delete"] == 0
+
+
+def test_first_update_and_delete_witnesses_add_only_two_reads(run, search_engine):
+    _, queries = search_engine
+    for version in range(1, 5):
+        run.verify_search_churn(change(run, "upsert", version=version))
+    run.verify_search_churn(change(run, "delete"))
+    run.verify_search_churn(change(run, "upsert", version=6))
+    run.verify_search_churn(change(run, "delete"))
+    assert len(queries) == 2
+    assert all(
+        sample["purpose"] == "search_churn_verification" for sample in run.samples
+    )
+    assert run.search_churn_coverage()["accepted_verified"] == {
+        "update": 1,
+        "delete": 1,
+    }
+
+
+def test_failed_witness_read_retains_failure_and_cannot_qualify(
+    run, search_engine, monkeypatch
+):
+    receipt = change(run, "delete")
+
+    def fail(*_):
+        raise lake.RequestFailure.transport("POST", "/query", TimeoutError(), 1)
+
+    monkeypatch.setattr(run, "call", fail)
+    with pytest.raises(lake.RequestFailure):
+        run.verify_search_churn(receipt)
+    assert run.search_churn_coverage()["accepted_verified"]["delete"] == 0
+    assert run.samples[-1]["purpose"] == "search_churn_verification"
+    assert run.samples[-1]["failure"]["code"] == "transport_error"
+
+
+def test_invalid_highlights_do_not_credit_churn_verification(
+    run, search_engine, monkeypatch
+):
+    change(run, "upsert")
+    original = run.call
+
+    def incomplete(*args):
+        result = original(*args)
+        for hit in result["responses"][0]["hits"]["hits"]:
+            hit.pop("_highlights")
+        return result
+
+    monkeypatch.setattr(run, "call", incomplete)
+    with pytest.raises(AssertionError, match="omitted requested highlights"):
+        run.query("accepted")
+    assert run.search_churn_coverage()["accepted_verified"]["update"] == 0
+
+
+@pytest.mark.parametrize("lsn", [True, False, 0, -1, 1.0, "1"])
+def test_non_integer_or_non_positive_wal_receipts_do_not_count_churn(
+    run, monkeypatch, lsn
+):
+    run.expected = {2: search_row(2, 0)}
+    monkeypatch.setattr(run, "call", lambda *_: {"state": "accepted", "wal_lsn": lsn})
+    with pytest.raises(AssertionError, match="durable receipt"):
+        change(run, "delete")
+    assert run.search_churn_coverage()["acknowledged"]["delete"] == 0
+
+
+@pytest.mark.parametrize(
+    "history,burst,duration", [(99, 2, 660), (100, 1, 660), (100, 2, 659)]
+)
+def test_verified_churn_cannot_upgrade_a_short_profile(history, burst, duration):
+    coverage = {
+        phase: {"update": 1, "delete": 1}
+        for phase in ("acknowledged", "accepted_verified")
+    }
+    args = SimpleNamespace(
+        history_commits=history, burst_transactions=burst, duration_seconds=duration
+    )
+    result = lake.qualification_result(args, {"final_rows": True}, coverage)
+    assert not result["full_profile"] and not result["qualified"]
+
+
+@pytest.mark.parametrize("failed_check", [False, None])
+def test_verified_churn_cannot_mask_other_qualification_failures(failed_check):
+    coverage = {
+        phase: {"update": 1, "delete": 1}
+        for phase in ("acknowledged", "accepted_verified")
+    }
+    args = SimpleNamespace(
+        history_commits=100, burst_transactions=2, duration_seconds=660
+    )
+    result = lake.qualification_result(
+        args, {"queries_succeeded": failed_check}, coverage
+    )
+    assert result["full_profile"] and not result["qualified"]
