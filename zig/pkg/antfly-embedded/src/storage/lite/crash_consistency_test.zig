@@ -293,7 +293,7 @@ pub fn checkCheckpointsViaNative(allocator: Allocator, path: []const u8, outcome
     var last_durable = try collapseToLastDurable(allocator, outcome, checkpoints);
     defer last_durable.deinit(allocator);
 
-    var file = native.NativeFile.openWithIo(allocator, std.testing.io, path, .{ .externally_locked = true, .read_only = true }) catch |err| {
+    var file = native.NativeFile.openWithIo(allocator, std.testing.io, path, .{ .read_only = true }) catch |err| {
         // A file that never reached a single durable checkpoint may fail to
         // open at all. That is only acceptable if nothing was ever supposed
         // to be durable yet.
@@ -303,7 +303,20 @@ pub fn checkCheckpointsViaNative(allocator: Allocator, path: []const u8, outcome
     defer file.close();
 
     const report = try file.check();
-    if (!report.valid) return error.CrashConsistencyIntegrityCheckFailed;
+    // `check()` is a byte-exact cleanliness verifier (what a backup/vacuum
+    // wants), not a recoverability probe: native.zig's own tests
+    // (e.g. "lite native file publishes checkpoint without rewriting static
+    // header") expect `issue == "tail_bytes"` with `tail_bytes > 0` for any
+    // file carrying uncommitted/aborted tail writes, which is exactly what a
+    // crash before a commit's last durable barrier leaves behind on
+    // purpose -- the recovery path is expected to ignore that tail, not
+    // reject it. Only a *different* issue (real structural corruption) is a
+    // crash-consistency finding here; document visibility/atomicity is
+    // checked separately below regardless.
+    if (!report.valid and !std.mem.eql(u8, report.issue orelse "", "tail_bytes")) {
+        std.debug.print("crash-consistency: native check() invalid, issue={s}\n", .{report.issue orelse "<none>"});
+        return error.CrashConsistencyIntegrityCheckFailed;
+    }
 
     var it = last_durable.valueIterator();
     while (it.next()) |exp| {
@@ -425,6 +438,12 @@ fn openDbWithIo(allocator: Allocator, path: []const u8, io: std.Io, create: bool
     var db = try db_mod.DB.open(allocator, path, db_opts);
     errdefer db.close();
     if (create) try db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+    // Open (and addIndex) can leave background maintenance queued, running
+    // concurrently via io.concurrent(...). Drain it here so the barriers the
+    // scenario's own explicit batch() calls cross are not interleaved with
+    // nondeterministic background commits, which would break the
+    // enumerate-once/replay-many sweep below.
+    try db.runUntilIdle();
     return .{ .backend = lite_backend, .db = db };
 }
 

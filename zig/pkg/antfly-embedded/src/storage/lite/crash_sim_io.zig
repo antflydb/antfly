@@ -93,6 +93,23 @@ const HandleEntry = struct {
     path: []u8,
 };
 
+/// `std.atomic.Mutex` (this Zig version's primitive) only exposes
+/// `tryLock`/`unlock`, not a blocking `lock`; this is the same spin-wrapper
+/// `storage/sim_runtime.zig`'s `SpinMutex` uses, duplicated here so this file
+/// keeps zero dependencies beyond `std` and stays testable with a plain
+/// `zig test` outside the full build graph.
+const SpinMutex = struct {
+    inner: std.atomic.Mutex = .unlocked,
+
+    fn lock(self: *SpinMutex) void {
+        while (!self.inner.tryLock()) std.atomic.spinLoopHint();
+    }
+
+    fn unlock(self: *SpinMutex) void {
+        self.inner.unlock();
+    }
+};
+
 /// Generic fault-injecting `std.Io` wrapper. Heap-allocate with `init` (the
 /// returned pointer must stay stable for the lifetime of any `Io` value
 /// handed out by `io()`) and free with `deinit`.
@@ -114,12 +131,28 @@ pub const SimIo = struct {
     /// created/opened and updated on every successful `fileSync`/rename.
     durable: std.StringHashMapUnmanaged(?[]u8) = .empty,
 
+    /// Paths known to be directories, discovered the first time a `fileSync`
+    /// on them hits `error.IsDir` while this shim tries to snapshot their
+    /// bytes (POSIX directory durability is commonly implemented by opening
+    /// the directory itself as a read-only file purely to `fsync` its fd --
+    /// `fs_paths.syncDirPortable` does exactly this). A directory has no byte
+    /// content to roll back, so it is excluded from `durable`/power-loss
+    /// restoration entirely; the barrier is still recorded.
+    directories: std.StringHashMapUnmanaged(void) = .empty,
+
     barriers: std.ArrayListUnmanaged(Barrier) = .empty,
     next_sequence: u64 = 0,
 
     crash_plan: ?CrashPlan = null,
     crashed: bool = false,
     crash_barrier: ?Barrier = null,
+
+    /// Guards every field above. A scenario that opens a `db_mod.DB` can
+    /// spawn a background maintenance task via `io.concurrent(...)`, which
+    /// calls back into this shim's overridden vtable entries from a second
+    /// thread; without this, two threads racing on `barriers`/`handle_paths`
+    /// would corrupt them.
+    mutex: SpinMutex = .{},
 
     pub fn init(allocator: Allocator, real: Io) !*SimIo {
         const self = try allocator.create(SimIo);
@@ -135,10 +168,12 @@ pub const SimIo = struct {
         self.vtable.fileSync = vtFileSync;
         self.vtable.dirRename = vtDirRename;
         self.vtable.dirRenamePreserve = vtDirRenamePreserve;
+        try registerSelf(real.userdata, self);
         return self;
     }
 
     pub fn deinit(self: *SimIo) void {
+        unregisterSelf(self.real.userdata);
         const a = self.allocator;
         var handle_it = self.handle_paths.valueIterator();
         while (handle_it.next()) |entry| a.free(entry.path);
@@ -151,6 +186,10 @@ pub const SimIo = struct {
         }
         self.durable.deinit(a);
 
+        var dir_it = self.directories.keyIterator();
+        while (dir_it.next()) |key| a.free(key.*);
+        self.directories.deinit(a);
+
         for (self.barriers.items) |barrier| {
             a.free(barrier.path);
             if (barrier.old_path) |old| a.free(old);
@@ -160,8 +199,14 @@ pub const SimIo = struct {
         a.destroy(self);
     }
 
+    /// The returned `Io` keeps the *real* underlying `userdata` untouched --
+    /// every vtable entry this shim does not override must still receive
+    /// exactly the pointer the real implementation expects (its own runtime
+    /// state, e.g. a thread pool), not this `SimIo`. Overridden entries
+    /// recover their `*SimIo` from a side table keyed by that same real
+    /// `userdata` instead of smuggling it through `Io.userdata`.
     pub fn io(self: *SimIo) Io {
-        return .{ .userdata = self, .vtable = &self.vtable };
+        return .{ .userdata = self.real.userdata, .vtable = &self.vtable };
     }
 
     pub fn setCrashPlan(self: *SimIo, plan: ?CrashPlan) void {
@@ -255,12 +300,24 @@ pub const SimIo = struct {
     }
 
     fn captureDurableSnapshot(self: *SimIo, file: File, path: []const u8) !void {
+        if (self.directories.contains(path)) return;
         const len = try self.real.vtable.fileLength(self.real.userdata, file);
         const bytes = try self.allocator.alloc(u8, len);
         errdefer self.allocator.free(bytes);
         var filled: usize = 0;
         while (filled < bytes.len) {
-            const got = try self.real.vtable.fileReadPositional(self.real.userdata, file, &.{bytes[filled..]}, filled);
+            const got = self.real.vtable.fileReadPositional(self.real.userdata, file, &.{bytes[filled..]}, filled) catch |err| switch (err) {
+                // A directory fsync'd by opening it as a read-only file hits
+                // this on the first read attempt; it is not a real fault.
+                // There is nothing byte-level to snapshot, so forget this
+                // path ever looked like a regular, syncable file.
+                error.IsDir => {
+                    self.allocator.free(bytes);
+                    try self.markDirectory(path);
+                    return;
+                },
+                else => return err,
+            };
             if (got == 0) break;
             filled += got;
         }
@@ -268,10 +325,17 @@ pub const SimIo = struct {
         if (!gop.found_existing) gop.key_ptr.* = try self.allocator.dupe(u8, path);
         if (gop.value_ptr.*) |old| self.allocator.free(old);
         gop.value_ptr.* = bytes[0..filled];
-        if (filled != bytes.len) {
-            // Shrink the allocation record to what was actually read; freeing
-            // the unused tail is not worth a realloc here since len is small
-            // relative to a scenario's total I/O.
+    }
+
+    fn markDirectory(self: *SimIo, path: []const u8) !void {
+        if (!self.directories.contains(path)) {
+            const owned = try self.allocator.dupe(u8, path);
+            errdefer self.allocator.free(owned);
+            try self.directories.put(self.allocator, owned, {});
+        }
+        if (self.durable.fetchRemove(path)) |removed| {
+            self.allocator.free(removed.key);
+            if (removed.value) |bytes| self.allocator.free(bytes);
         }
     }
 
@@ -303,13 +367,38 @@ pub const SimIo = struct {
     }
 };
 
+/// Side table from a real `Io`'s `userdata` to the `SimIo` wrapping it.
+/// `std.testing.io` (and most real `Io` implementations) share one
+/// process-wide `userdata` pointer, so this only needs to support one active
+/// `SimIo` per distinct real `userdata` at a time -- true for every scenario
+/// in this package, which runs its enumerate/replay passes sequentially.
+var registry_mutex: SpinMutex = .{};
+var registry: std.AutoHashMapUnmanaged(?*anyopaque, *SimIo) = .empty;
+var registry_allocator: Allocator = std.heap.page_allocator;
+
+fn registerSelf(real_userdata: ?*anyopaque, self: *SimIo) !void {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    try registry.put(registry_allocator, real_userdata, self);
+}
+
+fn unregisterSelf(real_userdata: ?*anyopaque) void {
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    _ = registry.remove(real_userdata);
+}
+
 fn selfFrom(userdata: ?*anyopaque) *SimIo {
-    return @ptrCast(@alignCast(userdata.?));
+    registry_mutex.lock();
+    defer registry_mutex.unlock();
+    return registry.get(userdata).?;
 }
 
 fn vtDirCreateFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, opts: Dir.CreateFileOptions) File.OpenError!File {
     const self = selfFrom(userdata);
     const file = try self.real.vtable.dirCreateFile(self.real.userdata, dir, sub_path, opts);
+    self.mutex.lock();
+    defer self.mutex.unlock();
     trackOpenedFile(self, file, sub_path) catch {};
     return file;
 }
@@ -317,20 +406,29 @@ fn vtDirCreateFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, opts: 
 fn vtDirOpenFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, opts: Dir.OpenFileOptions) File.OpenError!File {
     const self = selfFrom(userdata);
     const file = try self.real.vtable.dirOpenFile(self.real.userdata, dir, sub_path, opts);
+    self.mutex.lock();
+    defer self.mutex.unlock();
     trackOpenedFile(self, file, sub_path) catch {};
     return file;
 }
 
 fn vtFileClose(userdata: ?*anyopaque, files: []const File) void {
     const self = selfFrom(userdata);
-    for (files) |file| {
-        if (self.handle_paths.fetchRemove(file.handle)) |entry| self.allocator.free(entry.value.path);
+    {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        for (files) |file| {
+            if (self.handle_paths.fetchRemove(file.handle)) |entry| self.allocator.free(entry.value.path);
+        }
     }
     self.real.vtable.fileClose(self.real.userdata, files);
 }
 
 fn vtFileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
     const self = selfFrom(userdata);
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
     const path = self.allocator.dupe(u8, self.pathOf(file.handle)) catch return error.InputOutput;
     defer self.allocator.free(path);
 
@@ -345,6 +443,9 @@ fn vtFileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
 
 fn vtDirRename(userdata: ?*anyopaque, old_dir: Dir, old_sub_path: []const u8, new_dir: Dir, new_sub_path: []const u8) Dir.RenameError!void {
     const self = selfFrom(userdata);
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
     const crash_before = self.recordBarrier(.rename, new_sub_path, old_sub_path) catch return error.AccessDenied;
     if (crash_before) return error.AccessDenied;
 
@@ -356,6 +457,9 @@ fn vtDirRename(userdata: ?*anyopaque, old_dir: Dir, old_sub_path: []const u8, ne
 
 fn vtDirRenamePreserve(userdata: ?*anyopaque, old_dir: Dir, old_sub_path: []const u8, new_dir: Dir, new_sub_path: []const u8) Dir.RenamePreserveError!void {
     const self = selfFrom(userdata);
+    self.mutex.lock();
+    defer self.mutex.unlock();
+
     const crash_before = self.recordBarrier(.rename, new_sub_path, old_sub_path) catch return error.AccessDenied;
     if (crash_before) return error.AccessDenied;
 
