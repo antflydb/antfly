@@ -570,12 +570,8 @@ pub const EmbeddingPipeline = struct {
 
         if (self.boundedQwenBatchingEnabled()) return self.embedBoundedQwen(texts);
 
-        return embedTextBatchAdaptive(
-            self.allocator,
-            self,
-            texts,
-            runDirectTextBatch,
-        );
+        if (self.cudaDocumentBatchingEnabled()) return @import("text_batch_admission.zig").run(self.allocator, self, texts, runDirectTextBatch, false);
+        return embedTextBatchAdaptive(self.allocator, self, texts, runDirectTextBatch);
     }
 
     /// One result per ordered content group; text parts concatenate without
@@ -988,10 +984,10 @@ pub const EmbeddingPipeline = struct {
         const batch = execution_batch;
         const max_preprocess_tokens = std.math.mul(usize, batch, max_len) catch
             return error.ResourceLimitExceeded;
-        var preprocess_permit = try text_session.admitHostPreprocess(
+        var preprocess_permit = text_session.admitHostPreprocess(
             std.math.mul(usize, max_preprocess_tokens, 32) catch
                 return error.ResourceLimitExceeded,
-        );
+        ) catch |err| return self.textAdmissionError(err, batch);
         defer preprocess_permit.deinit();
 
         const encoded = try alloc.alloc(EncodeResult, texts.len);
@@ -1187,6 +1183,20 @@ pub const EmbeddingPipeline = struct {
         return self.last_resident_backend_timing;
     }
 
+    fn cudaDocumentBatchingEnabled(self: *const EmbeddingPipeline) bool {
+        return self.config.resident_embedding_gemma2 and self.session.backend() == .cuda and
+            self.session.executionCapabilities().text_batch_padded_tokens > 0;
+    }
+
+    /// Only a refusal before dispatch may be retried with fewer rows. Never
+    /// classify a backend/kernel failure as evidence that a smaller run fits.
+    fn textAdmissionError(self: *const EmbeddingPipeline, err: anyerror, batch: usize) anyerror {
+        if (batch > 1 and self.cudaDocumentBatchingEnabled() and
+            (err == error.ResourceLimitExceeded or err == error.ResourceTemporarilyUnavailable or err == error.MemoryBudgetExceeded))
+            return error.EmbeddingBatchAdmissionDenied;
+        return err;
+    }
+
     fn admitTextRun(self: *EmbeddingPipeline, session: session_mod.Session, request: session_mod.RunRequest) !@import("../backends/admitted_allocator.zig").AdmittedAllocator.RunScope {
         if (session.backend() == .native) if (self.gemma_workspace) |workspace| {
             // Resolve the full encoder output before lending its workspace.
@@ -1199,7 +1209,7 @@ pub const EmbeddingPipeline = struct {
             planned.workspace_bytes = @max(request.workspace_bytes, try @import("embedding_gemma2.zig").textEncoderWorkspace(rows));
             return workspace.admitRun(planned);
         };
-        return .{ .permit = try session.admit(request) };
+        return .{ .permit = session.admit(request) catch |err| return self.textAdmissionError(err, request.batch) };
     }
 
     fn embedPreparedTextInputs(
@@ -3859,39 +3869,7 @@ fn embedTextBatchAdaptive(
     texts: []const []const u8,
     run_batch: TextBatchRunner,
 ) anyerror![][]f32 {
-    return run_batch(ctx, texts) catch |err| {
-        if (err != error.ResourceLimitExceeded or texts.len <= 1) return err;
-
-        const midpoint = (texts.len + 1) / 2;
-        const left = try embedTextBatchAdaptive(
-            allocator,
-            ctx,
-            texts[0..midpoint],
-            run_batch,
-        );
-        var left_owned = true;
-        defer if (left_owned) freeEmbeddingSlices(allocator, left);
-        if (left.len != midpoint) return error.UnexpectedOutputShape;
-
-        const right = try embedTextBatchAdaptive(
-            allocator,
-            ctx,
-            texts[midpoint..],
-            run_batch,
-        );
-        var right_owned = true;
-        defer if (right_owned) freeEmbeddingSlices(allocator, right);
-        if (right.len != texts.len - midpoint) return error.UnexpectedOutputShape;
-
-        const combined = try allocator.alloc([]f32, texts.len);
-        @memcpy(combined[0..left.len], left);
-        @memcpy(combined[left.len..], right);
-        allocator.free(left);
-        left_owned = false;
-        allocator.free(right);
-        right_owned = false;
-        return combined;
-    };
+    return @import("text_batch_admission.zig").run(allocator, ctx, texts, run_batch, true);
 }
 
 test "embedding text batch adaptively splits resource-limited requests" {
@@ -5133,4 +5111,54 @@ test "embeddinggemma2 CUDA flat audio and mixed batch dispatch fit production ad
         for (expected, actual) |x, y| try std.testing.expectApproxEqAbs(x, y, 1e-5);
     }
     try std.testing.expect(pipeline.last_input_tokens > expected_audio.input_tokens);
+}
+
+test "read pool microbatch CUDA admission marks only pre-dispatch cohort refusals" {
+    const memory = @import("../runtime/tier/memory.zig");
+    const Probe = struct {
+        fn run(_: *anyopaque, _: []const Tensor, _: std.mem.Allocator) anyerror![]Tensor {
+            return error.TestUnexpectedForward;
+        }
+        fn inputs(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+            return &.{
+                .{ .name = "input_ids", .dtype = .i64, .shape = &.{ -1, -1 } },
+                .{ .name = "attention_mask", .dtype = .i64, .shape = &.{ -1, -1 } },
+            };
+        }
+        fn outputs(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+            return &.{.{ .name = "sentence_embedding", .dtype = .f32, .shape = &.{ -1, 768 } }};
+        }
+        fn backend(_: *anyopaque) backends.BackendType {
+            return .cuda;
+        }
+        fn capabilities(_: *anyopaque) session_mod.ExecutionCapabilities {
+            return .{ .text_batch_rows = 4, .text_batch_tokens = 8192, .text_batch_padded_tokens = 8192 };
+        }
+        fn close(_: *anyopaque) void {}
+        fn admit(pipeline: *EmbeddingPipeline, batch: usize) !void {
+            // Exercise the CUDA branch directly. The generic native branch
+            // references the full architecture dispatch table and is unrelated
+            // to this pre-dispatch refusal contract.
+            var permit = pipeline.session.admit(.{ .batch = batch, .sequence = 2, .input_bytes = batch * 48 }) catch |err|
+                return pipeline.textAdmissionError(err, batch);
+            defer permit.deinit();
+        }
+    };
+    var state: u8 = 0;
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var pipeline = EmbeddingPipeline{
+        .allocator = std.testing.allocator,
+        .session = .{
+            .ptr = &state,
+            .vtable = &.{ .run = Probe.run, .inputInfo = Probe.inputs, .outputInfo = Probe.outputs, .backend = Probe.backend, .close = Probe.close, .executionCapabilities = Probe.capabilities },
+            .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .scratch_limit_bytes = 1 }, .static_workspace_bytes = 0, .check_live_memory = false },
+        },
+        .tok = undefined, // Admission-only test; tokenization and forward are unreachable.
+        .config = .{ .resident_embedding_gemma2 = true },
+    };
+    try std.testing.expectError(error.EmbeddingBatchAdmissionDenied, Probe.admit(&pipeline, 2));
+    try std.testing.expectError(error.ResourceLimitExceeded, Probe.admit(&pipeline, 1));
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
 }

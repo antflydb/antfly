@@ -146,6 +146,14 @@ pub const Config = struct {
         return parsed.value;
     }
 
+    fn parseCooperativeExecution(alloc: std.mem.Allocator, raw: ?std.json.Value) !platform.inference_settings.CooperativeExecution {
+        const object = raw orelse return .{};
+        const value = object.object.get("cooperative_execution") orelse return .{};
+        const parsed = try std.json.parseFromValue(platform.inference_settings.CooperativeExecution, alloc, value, .{ .ignore_unknown_fields = false });
+        defer parsed.deinit();
+        return parsed.value;
+    }
+
     pub const MetadataConfig = struct {
         pub const NodeUrl = struct {
             node_id: u64,
@@ -435,6 +443,7 @@ pub const Config = struct {
         // openapi path.
         prompt_cache_configured: bool = false,
         generation_batching: platform.inference_settings.GenerationBatching = .{},
+        cooperative_execution: platform.inference_settings.CooperativeExecution = .{},
         max_loaded_models: ?i64 = null,
         http_max_body_mb: usize = 10,
         pool_size: usize = 2,
@@ -983,6 +992,7 @@ pub const Config = struct {
                 .prompt_cache = prompt_cache,
                 .keep_alive = if (inference.keep_alive) |value| try alloc.dupe(u8, value) else null,
                 .generation_batching = try parseGenerationBatching(alloc, raw_root.get("inference")),
+                .cooperative_execution = try parseCooperativeExecution(alloc, raw_root.get("inference")),
                 .max_loaded_models = inference.max_loaded_models,
                 .http_max_body_mb = if (inference.http_max_body_mb) |value| std.math.cast(usize, value) orelse return error.InvalidConfig else 10,
                 .pool_size = if (inference.pool_size) |value| std.math.cast(usize, value) orelse return error.InvalidConfig else 2,
@@ -2511,6 +2521,7 @@ fn contentSecurityFromOpenApi(
     else
         null;
     out.allowed_paths = if (value.allowed_paths) |paths| try dupOwnedStringSlice(alloc, paths) else null;
+    out.source_media_base_urls = if (value.source_media_base_urls) |urls| try dupOwnedStringSlice(alloc, urls) else null;
     out.user_agent = if (value.user_agent) |user_agent| try alloc.dupe(u8, user_agent) else null;
     scraping.validateNat64Prefixes(out) catch return error.InvalidConfig;
     return out;

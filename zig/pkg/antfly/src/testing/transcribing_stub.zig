@@ -26,11 +26,9 @@ pub const Provider = enum {
     vertex,
     apple,
 
+    /// Mirrors `antfly_transcribing.Provider.supportsResolvedAudio`.
     pub fn supportsResolvedAudio(self: @This()) bool {
-        return switch (self) {
-            .openai, .google, .cloudflare, .vertex, .apple => true,
-            .antfly => false,
-        };
+        return self != .antfly;
     }
 };
 
