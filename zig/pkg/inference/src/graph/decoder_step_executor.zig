@@ -113,8 +113,12 @@ fn forwardAllUnobserved(
 ) ![]f32 {
     if (NativeDecodeState.requiresDeepSeekV4CompressedCache(context.gpt_config.*) and
         (graph_cache != null or context.compiled_partition_backend != null)) return error.DeepSeekV4CompressedGraphModeNotSupported;
-    if (graph_cache) |cache| return execution.graphForwardAll(context, cache, input_ids, batch_size, seq_len, decode_context);
+    if (graph_cache) |cache| {
+        observeNativeStateOwnership(context, decode_context);
+        return execution.graphForwardAll(context, cache, input_ids, batch_size, seq_len, decode_context);
+    }
     if (context.compiled_partition_backend != null) return error.MissingGraphCacheForCompiledPartitionBackend;
+    observeNativeStateOwnership(context, decode_context);
     if (context.cb.kind() == .cuda and batch_size == 1 and
         decode_context.query_sequence_len == 1 and cudaReplayLastLogitsEnabled())
     {
@@ -126,6 +130,16 @@ fn forwardAllUnobserved(
         }
     }
     return gpt_arch.forward(context.cb, context.allocator, context.gpt_config.*, input_ids, batch_size, seq_len, decode_context);
+}
+
+/// Actual independent Native callers begin their own invocation on the worker.
+/// One entry-time registration copies immutable ownership facts. Disabled code
+/// never dereferences the provider/cache or allocates observation metadata.
+fn observeNativeStateOwnership(context: *const execution.Context, decode: *const gpt_arch.DecodeContext) void {
+    if (!@import("../execution/allocation_registry.zig").enabled()) return;
+    if (context.cb.kind() != .native) return;
+    if (decode.qwen35_linear_cache) |cache| cache.registerOwnershipObservation();
+    if (decode.qwen35_linear_batch) |caches| for (caches) |maybe| if (maybe) |cache| cache.registerOwnershipObservation();
 }
 
 pub fn endDecodeEpoch(cb: *const ComputeBackend, execution_id: u64, attempts: u64, declines: [8]u64) void {

@@ -586,3 +586,27 @@ test "retirement origin seal witness observes concurrent seal and refuses nonce 
     try std.testing.expect(!observer.failed.load(.acquire));
     try std.testing.expect(observer.observed.load(.acquire));
 }
+
+test "copied owned baseline identity survives actual sink destruction and address reuse" {
+    var bytes: [@sizeOf(Owner)]u8 align(@alignOf(Owner)) = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&bytes);
+    var registry: @import("allocation_registry.zig").Registry = undefined;
+    registry.begin(std.testing.allocator);
+    defer {
+        if (registry.attached) _ = registry.finish();
+    }
+    var first = try Ref.createWithAllocator(fixed.allocator());
+    const old_address = first.owner;
+    const old_identity = first.identity;
+    @import("allocation_registry.zig").bindPreexistingOwnedPayload(.{ .identity = old_identity, .host_scratch_payload_bytes = 17 });
+    first.release();
+    var second = try Ref.createWithAllocator(fixed.allocator());
+    try std.testing.expectEqual(old_address, second.owner);
+    try std.testing.expect(old_identity != second.identity and second.identity != 0);
+    @import("allocation_registry.zig").bindPreexistingOwnedPayload(.{ .identity = second.identity, .host_scratch_payload_bytes = 19 });
+    second.release();
+    const result = registry.finish();
+    try std.testing.expectEqual(@as(u8, 2), result.preexisting_owned_payloads.count);
+    try std.testing.expectEqual(old_identity, result.preexisting_owned_payloads.records[0].identity);
+    try std.testing.expectEqual(@as(u64, 17), result.preexisting_owned_payloads.records[0].host_scratch_payload_bytes);
+}

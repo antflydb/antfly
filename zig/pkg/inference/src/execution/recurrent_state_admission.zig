@@ -266,7 +266,7 @@ pub const NativeHostState = struct {
         errdefer cleanup.finishAfterUnlock();
         self.* = .{ .metadata = a, .backing = bytes, .fixed = .init(bytes), .geometry = layout, .cleanup = cleanup };
         self.cache = try Gpt.Qwen35LinearCache.init(self.childAllocator(), config);
-        self.cache.?.host_cleanup = .{ .ptr = self, .validate = validateHostCleanup };
+        self.cache.?.host_cleanup = .{ .ptr = self, .access = accessHostStorage };
         std.debug.assert(self.fixed.end_index == layout.backing_bytes);
         return self;
     }
@@ -286,6 +286,31 @@ pub const NativeHostState = struct {
         state.qwen35_linear_cache = value;
         self.cache = null;
         self.borrowed = true;
+    }
+
+    fn accessHostStorage(raw: *anyopaque, action: Gpt.Qwen35LinearCache.HostCleanup.Access) !void {
+        switch (action) {
+            .cleanup => |current| try validateHostCleanup(raw, current),
+            .observe_preexisting_payload => {
+                const self: *NativeHostState = @ptrCast(@alignCast(raw));
+                const registry = @import("allocation_registry.zig");
+                if (!self.borrowed) {
+                    registry.missing(.compute);
+                    return;
+                }
+                const source = self.cleanup.retained_sink orelse {
+                    registry.missing(.compute);
+                    return;
+                };
+                // The private Sink uses the existing non-recycling scalar
+                // namespace, independent of allocator address reuse. Its own
+                // metadata can outlive this parent and is deliberately omitted.
+                registry.bindPreexistingOwnedPayload(.{
+                    .identity = source.identity,
+                    .host_scratch_payload_bytes = self.backing.len + @sizeOf(NativeHostState),
+                });
+            },
+        }
     }
 
     fn validateHostCleanup(raw: *anyopaque, current: Cleanup) !void {
@@ -443,4 +468,131 @@ test "Native numerical recurrent owner never grants outside raw cleanup authorit
     try std.testing.expectError(error.MissingOutsideCleanupOwner, owner.cleanupOwner().synchronousOutsideContext(&pending));
     try std.testing.expect(pending.boundary_context == null);
     try std.testing.expect(!try owner.cleanupOwner().epoch().?.isSealed());
+}
+
+test "independent Native recurrent workers publish copied baselines only from their actual enabled invocation" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Config = NativeHostState.Config;
+    const State = NativeHostState.State;
+    const Gpt = NativeHostState.Gpt;
+    const native = @import("../ops/native_compute.zig");
+    const Tensor = @import("../backends/tensor.zig").Tensor;
+    const cfg = Config{ .family = .qwen3_5, .hidden_size = 4, .intermediate_size = 8, .vocab_size = 16, .num_hidden_layers = 1, .num_attention_heads = 1, .num_key_value_heads = 1, .attention_head_dim = 4, .weight_tying = true, .norm_type = .rms_norm, .position_encoding = .rope, .activation = .silu, .norm_eps = 0.000001, .max_position_embeddings = 32, .qwen35_has_linear_attention = true, .qwen35_full_attention_interval = 4, .qwen35_linear_conv_kernel_dim = 4, .qwen35_linear_key_head_dim = 2, .qwen35_linear_value_head_dim = 2, .qwen35_linear_num_key_heads = 1, .qwen35_linear_num_value_heads = 1 };
+    const Spec = struct { name: []const u8, shape: []const i64, constant: ?f32 = null };
+    const specs = [_]Spec{
+        .{ .name = "model.embed_tokens.weight", .shape = &.{ 16, 4 } },
+        .{ .name = "model.norm.weight", .shape = &.{4}, .constant = 0.125 },
+        .{ .name = "model.layers.0.input_layernorm.weight", .shape = &.{4}, .constant = 0.125 },
+        .{ .name = "model.layers.0.post_attention_layernorm.weight", .shape = &.{4}, .constant = 0.125 },
+        .{ .name = "model.layers.0.mlp.gate_proj.weight", .shape = &.{ 8, 4 } },
+        .{ .name = "model.layers.0.mlp.up_proj.weight", .shape = &.{ 8, 4 } },
+        .{ .name = "model.layers.0.mlp.down_proj.weight", .shape = &.{ 4, 8 } },
+        .{ .name = "model.layers.0.linear_attn.in_proj_qkv.weight", .shape = &.{ 6, 4 } },
+        .{ .name = "model.layers.0.linear_attn.in_proj_z.weight", .shape = &.{ 2, 4 } },
+        .{ .name = "model.layers.0.linear_attn.in_proj_a.weight", .shape = &.{ 1, 4 } },
+        .{ .name = "model.layers.0.linear_attn.in_proj_b.weight", .shape = &.{ 1, 4 } },
+        .{ .name = "model.layers.0.linear_attn.out_proj.weight", .shape = &.{ 4, 2 } },
+        .{ .name = "model.layers.0.linear_attn.conv1d.weight", .shape = &.{ 6, 1, 4 }, .constant = 0.25 },
+        .{ .name = "model.layers.0.linear_attn.A_log", .shape = &.{1}, .constant = -1 },
+        .{ .name = "model.layers.0.linear_attn.dt_bias", .shape = &.{1}, .constant = 0.1 },
+        .{ .name = "model.layers.0.linear_attn.norm.weight", .shape = &.{2}, .constant = 1 },
+    };
+
+    const Worker = struct {
+        store: native.WeightStore,
+        host: *NativeHostState,
+        state: State,
+        diagnostics: @import("diagnostics.zig").Diagnostics = .{},
+        config: Config,
+        state_live: bool = true,
+        host_live: bool = true,
+        store_live: bool = true,
+        result: ?[]f32 = null,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) void {
+            self.execute() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn execute(self: *@This()) !void {
+            var compute = native.NativeCompute.init(std.testing.allocator, &self.store, null);
+            defer compute.deinitWithCleanup(.{ .boundary = self.host.cleanupOwner().epoch() }) catch unreachable;
+            const cb = compute.computeBackend();
+            const context = @import("../graph/execution.zig").Context{ .allocator = std.testing.allocator, .cb = &cb, .gpt_config = &self.config, .cleanup_owner = self.host.cleanupOwner(), .diagnostics_binding = .{ .diagnostics = &self.diagnostics } };
+            const decode = Gpt.DecodeContext{ .total_sequence_len = 4, .query_sequence_len = 4, .kv_sequence_len = 4, .qwen35_linear_cache = &self.state.qwen35_linear_cache.? };
+            var fallbacks: u64 = 0;
+            self.result = try @import("../graph/decoder_step_executor.zig").forwardAll(&context, null, &.{ 1, 2, 3, 4 }, 1, 4, &decode, &fallbacks);
+        }
+    };
+    var workers: [2]Worker = undefined;
+    var initialized: usize = 0;
+    defer for (workers[0..initialized]) |*worker| {
+        if (worker.result) |values| a.free(values);
+        if (worker.state_live) worker.state.deinitWithCleanup(.{ .boundary = worker.host.cleanupOwner().epoch() }) catch unreachable;
+        if (worker.host_live) worker.host.destroyAfterUnlock() catch unreachable;
+        if (worker.store_live) worker.store.deinitOwned();
+    };
+    for (&workers, 0..) |*worker, index| {
+        const host = try NativeHostState.prepareWithAllocator(a, cfg);
+        worker.* = .{ .host = host, .state = State.initContiguous(a), .config = cfg, .store = .{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty } };
+        initialized += 1;
+        try host.adopt(&worker.state, cfg, .{ .boundary = host.cleanupOwner().epoch() });
+        worker.diagnostics.configure(index == 0);
+        for (specs) |specification| {
+            var count: usize = 1;
+            for (specification.shape) |dim| count *= @intCast(dim);
+            const values = try a.alloc(f32, count);
+            defer a.free(values);
+            for (values, 0..) |*value, i| value.* = specification.constant orelse @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + specification.name.len) % 23)) - 11)) / 32;
+            const key = try a.dupe(u8, specification.name);
+            errdefer a.free(key);
+            var tensor = try Tensor.initFloat32(a, key, specification.shape, values);
+            errdefer tensor.deinit();
+            try worker.store.resident_weights.put(a, key, .{ .tensor = tensor });
+        }
+    }
+    const expected_bytes = workers[0].host.backing.len + @sizeOf(NativeHostState);
+    const identity = workers[0].host.cleanup.retained_sink.?.identity;
+    var parent: @import("allocation_registry.zig").Registry = undefined;
+    parent.begin(a);
+    defer {
+        if (parent.attached) _ = parent.finish();
+    }
+    var first = try std.Thread.spawn(.{}, Worker.run, .{&workers[0]});
+    // On second spawn failure the first worker must join before any parent/state teardown.
+    var second = std.Thread.spawn(.{}, Worker.run, .{&workers[1]}) catch |err| {
+        first.join();
+        _ = parent.finish();
+        return err;
+    };
+    first.join();
+    second.join();
+    const parent_result = parent.finish();
+    for (&workers) |*worker| if (worker.failure) |err| return err;
+    try std.testing.expectEqualSlices(f32, workers[0].result.?, workers[1].result.?);
+    try std.testing.expectEqual(@as(u8, 0), parent_result.preexisting_owned_payloads.count);
+    try std.testing.expect(workers[1].diagnostics.snapshot() == null);
+    const report = workers[0].diagnostics.snapshot().?.report.?;
+    const copied = report.preexisting_owned_payloads.?;
+    try std.testing.expectEqual(@as(u8, 1), copied.count);
+    try std.testing.expectEqual(identity, copied.records[0].identity);
+    try std.testing.expectEqual(expected_bytes, copied.records[0].host_scratch_payload_bytes);
+    try std.testing.expect(report.allocator_coverage_incomplete and report.observed_host_requested_live_bytes == null and report.host_allocations == null);
+    // Retire both real parents before inspecting the still-owned publication.
+    for (&workers) |*worker| {
+        a.free(worker.result.?);
+        worker.result = null;
+        try worker.state.deinitWithCleanup(.{ .boundary = worker.host.cleanupOwner().epoch() });
+        worker.state_live = false;
+        try worker.host.destroyAfterUnlock();
+        worker.host_live = false;
+        worker.store.deinitOwned();
+        worker.store_live = false;
+    }
+    initialized = 0;
+    try std.testing.expectEqual(identity, copied.records[0].identity);
+    const json = try std.json.Stringify.valueAlloc(a, report, .{});
+    defer a.free(json);
+    try std.testing.expect(std.mem.indexOf(u8, json, "preexisting_payload_at_first_registration") != null);
 }

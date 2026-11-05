@@ -47,6 +47,9 @@ pub const Report = struct {
     host_peak_scope: enum { registered_single_root_owner_interval_including_concurrent_activity } = .registered_single_root_owner_interval_including_concurrent_activity,
     observed_allocator_roots: ?usize = null,
     observed_allocator_root_identity: ?usize = null,
+    /// Authored existing payloads at registration; not final-live, allocation
+    /// events, exclusive invocation peaks or an aggregate with opaque heaps.
+    preexisting_owned_payloads: ?@import("allocation_registry.zig").OwnedPayloadBaselines = null,
     host_allocation_counter_scope: enum { registered_single_root_invocation_interval } = .registered_single_root_invocation_interval,
     host_allocations: ?u64 = null,
     host_frees: ?u64 = null,
@@ -110,12 +113,13 @@ pub const Report = struct {
             report.observed_host_owner_interval_peak_bytes = owners.requested_owner_interval_peak_bytes;
             report.observed_allocator_roots = owners.observed_roots;
             report.observed_allocator_root_identity = owners.aggregate_owner_identity;
+            if (owners.preexisting_owned_payloads.present()) report.preexisting_owned_payloads = owners.preexisting_owned_payloads;
             report.host_allocations = owners.allocations;
             report.host_frees = owners.frees;
             report.host_resizes = owners.resizes;
             report.host_remaps = owners.remaps;
             report.maximum_individual_host_owner_lifetime_peak_bytes = owners.maximum_individual_lifetime_peak_bytes;
-            report.allocator_coverage_incomplete = owners.owners == 0 or owners.observed_roots != 1 or owners.missing_model_registrations != 0 or owners.missing_compute_registrations != 0 or owners.metadata_failures != 0 or owners.reports_truncated or owners.since_enable_owners != 0;
+            report.allocator_coverage_incomplete = owners.preexisting_owned_payloads.present() or owners.owners == 0 or owners.observed_roots != 1 or owners.missing_model_registrations != 0 or owners.missing_compute_registrations != 0 or owners.metadata_failures != 0 or owners.reports_truncated or owners.since_enable_owners != 0;
         }
         if (value.runtime.device_owners) |owners| report.retained_device_owner_count = owners.owners;
         if (value.execution) |program| {

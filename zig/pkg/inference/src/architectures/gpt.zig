@@ -104,7 +104,11 @@ pub const Qwen35LinearCache = struct {
     host_cleanup: ?HostCleanup = null,
     pub const HostCleanup = struct {
         ptr: *anyopaque,
-        validate: *const fn (*anyopaque, @import("../execution/cleanup_context.zig").Context) anyerror!void,
+        access: *const fn (*anyopaque, Access) anyerror!void,
+        pub const Access = union(enum) {
+            cleanup: @import("../execution/cleanup_context.zig").Context,
+            observe_preexisting_payload,
+        };
     };
 
     pub fn init(allocator: std.mem.Allocator, config: Config) !Qwen35LinearCache {
@@ -131,8 +135,22 @@ pub const Qwen35LinearCache = struct {
         return .{ .allocator = allocator, .layers = layers };
     }
 
+    /// Called at the numerical decoder entry, never in an inner kernel. The
+    /// current worker copies owned facts; it retains no cache/parent pointer.
+    pub fn registerOwnershipObservation(self: *const Qwen35LinearCache) void {
+        const registry = @import("../execution/allocation_registry.zig");
+        if (!registry.enabled()) return;
+        if (self.host_cleanup) |host| {
+            host.access(host.ptr, .observe_preexisting_payload) catch {
+                registry.missing(.compute);
+            };
+        } else if (@import("../execution/allocation_observer.zig").State.forAllocator(self.allocator)) |owner| {
+            registry.bind(.compute, owner);
+        } else registry.missing(.compute);
+    }
+
     pub fn validateCleanup(self: *const Qwen35LinearCache, current: @import("../execution/cleanup_context.zig").Context) !void {
-        if (self.host_cleanup) |host| try host.validate(host.ptr, current);
+        if (self.host_cleanup) |host| try host.access(host.ptr, .{ .cleanup = current });
         for (self.layers) |*state| try state.validateCleanup(current);
     }
     pub fn deinitWithCleanup(self: *Qwen35LinearCache, current: @import("../execution/cleanup_context.zig").Context) !void {
@@ -143,7 +161,7 @@ pub const Qwen35LinearCache = struct {
     }
 
     pub fn deinit(self: *Qwen35LinearCache) void {
-        if (self.host_cleanup) |host| host.validate(host.ptr, .{ .outside_execution = true }) catch platform.inference_process_supervisor.restartWorker();
+        if (self.host_cleanup) |host| host.access(host.ptr, .{ .cleanup = .{ .outside_execution = true } }) catch platform.inference_process_supervisor.restartWorker();
         for (self.layers) |*state| state.deinit(self.allocator);
         self.allocator.free(self.layers);
         self.* = undefined;

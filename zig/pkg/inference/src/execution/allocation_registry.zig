@@ -21,6 +21,29 @@ pub const OwnerReport = struct {
     requested_owner_interval_peak_bytes: ?u64 = null,
 };
 
+/// Copied facts about an authored backing which already exists at registration.
+/// This carries no live owner pointer, allocator ancestry, allocation timestamp,
+/// final-live gauge, counter interval or peak. It is never reusable quota credit.
+pub const OwnedPayloadBaseline = struct {
+    identity: u64 = 0,
+    source: enum { native_recurrent_host_state } = .native_recurrent_host_state,
+    scope: enum { preexisting_payload_at_first_registration } = .preexisting_payload_at_first_registration,
+    parentage: enum { unobserved } = .unobserved,
+    payload_scope: enum { actual_owner_header_and_process_slab_excluding_cleanup_sink } = .actual_owner_header_and_process_slab_excluding_cleanup_sink,
+    host_scratch_payload_bytes: u64 = 0,
+    registration_calls: u64 = 1,
+    changed_after_first_registration: bool = false,
+};
+pub const OwnedPayloadBaselines = struct {
+    records: [8]OwnedPayloadBaseline = @splat(.{}),
+    count: u8 = 0,
+    dropped_registration_calls: u64 = 0,
+    invalid_registration_calls: u64 = 0,
+    pub fn present(self: *const @This()) bool {
+        return self.count != 0 or self.dropped_registration_calls != 0 or self.invalid_registration_calls != 0;
+    }
+};
+
 pub const Summary = struct {
     /// This is never a census of uninstrumented libraries or all process heaps.
     scope: enum { registered_allocator_owners } = .registered_allocator_owners,
@@ -31,6 +54,8 @@ pub const Summary = struct {
     reports: [8]OwnerReport = @splat(.{}),
     reports_count: u8 = 0,
     reports_truncated: bool = false,
+    /// Separate point observations; never folded into allocator interval totals.
+    preexisting_owned_payloads: OwnedPayloadBaselines = .{},
     /// Aggregates are available only for one proven observer root. Distinct
     /// opaque backing allocators do not prove independent payload ownership.
     aggregate_owner_identity: ?usize = null,
@@ -66,6 +91,13 @@ pub inline fn enabled() bool {
 pub fn bind(role: Role, owner: *observer.State) void {
     var current = active;
     while (current) |registry| : (current = registry.previous) registry.add(role, owner);
+}
+
+/// Registration is synchronous on the actual worker. Copy values through the
+/// existing nested registries; never borrow another thread's TLS or parent.
+pub fn bindPreexistingOwnedPayload(value: OwnedPayloadBaseline) void {
+    var current = active;
+    while (current) |registry| : (current = registry.previous) registry.addBaseline(value);
 }
 
 pub fn missing(role: Role) void {
@@ -153,6 +185,26 @@ pub const Registry = struct {
         }
         inserted.before = inserted.interval.?.before;
     }
+    fn addBaseline(self: *Registry, value: OwnedPayloadBaseline) void {
+        const output = &self.summary.preexisting_owned_payloads;
+        if (value.identity == 0 or value.host_scratch_payload_bytes == 0) {
+            output.invalid_registration_calls +|= 1;
+            return;
+        }
+        for (output.records[0..output.count]) |*record| if (record.identity == value.identity and record.source == value.source) {
+            record.registration_calls +|= 1;
+            record.changed_after_first_registration = record.changed_after_first_registration or record.host_scratch_payload_bytes != value.host_scratch_payload_bytes;
+            return;
+        };
+        if (output.count == output.records.len) {
+            output.dropped_registration_calls +|= 1;
+            return;
+        }
+        output.records[output.count] = value;
+        output.records[output.count].registration_calls = 1;
+        output.count += 1;
+    }
+
     fn contains(self: *const Registry, owner: *observer.State) bool {
         for (self.inline_entries[0..self.inline_count]) |entry| if (entry.owner == owner) return true;
         for (self.overflow.items) |entry| if (entry.owner == owner) return true;
@@ -208,6 +260,15 @@ pub const Registry = struct {
         for (self.inline_entries[0..self.inline_count]) |entry| entry.owner.release();
         for (self.overflow.items) |entry| entry.owner.release();
         self.overflow.deinit(self.metadata);
+        if (self.summary.preexisting_owned_payloads.present()) {
+            // A separate baseline has no allocator-parent proof or interval.
+            // Even one observed allocator root cannot describe this union.
+            self.summary.aggregate_owner_identity = null;
+            self.summary.requested_live_bytes = null;
+            self.summary.requested_owner_interval_peak_bytes = null;
+            self.summary.maximum_individual_lifetime_peak_bytes = null;
+            inline for (.{ "allocations", "frees", "resizes", "remaps", "unobserved_frees", "unobserved_resizes", "unobserved_remaps" }) |name| @field(self.summary, name) = null;
+        }
         return self.summary;
     }
 };
@@ -468,4 +529,49 @@ test "registry overflow interval OOM preserves missing peak coverage and release
     try std.testing.expectEqual(@as(u64, 2), usage.frees);
     try std.testing.expectEqual(@as(u64, 0), usage.requested_live_bytes);
     try std.testing.expectEqual(@as(u64, 11), usage.requested_lifetime_peak_bytes);
+}
+
+test "copied owned baselines are bounded first observations without aggregate or peak claims" {
+    const a = std.testing.allocator;
+    var failed = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    bindPreexistingOwnedPayload(.{ .identity = 1, .host_scratch_payload_bytes = 11 });
+    var outer: Registry = undefined;
+    outer.begin(failed.allocator());
+    defer {
+        if (outer.attached) _ = outer.finish();
+    }
+    var inner: Registry = undefined;
+    inner.begin(failed.allocator());
+    bindPreexistingOwnedPayload(.{ .identity = 1, .host_scratch_payload_bytes = 11 });
+    bindPreexistingOwnedPayload(.{ .identity = 1, .host_scratch_payload_bytes = 12 });
+    const nested = inner.finish();
+    for (2..10) |id| bindPreexistingOwnedPayload(.{ .identity = id, .host_scratch_payload_bytes = id });
+    bindPreexistingOwnedPayload(.{});
+    const result = outer.finish();
+    try std.testing.expectEqual(@as(usize, 0), failed.alloc_index);
+    try std.testing.expectEqual(@as(u8, 1), nested.preexisting_owned_payloads.count);
+    try std.testing.expectEqual(@as(u64, 11), nested.preexisting_owned_payloads.records[0].host_scratch_payload_bytes);
+    try std.testing.expectEqual(@as(u64, 2), nested.preexisting_owned_payloads.records[0].registration_calls);
+    try std.testing.expect(nested.preexisting_owned_payloads.records[0].changed_after_first_registration);
+    try std.testing.expectEqual(@as(u8, 8), result.preexisting_owned_payloads.count);
+    try std.testing.expectEqual(@as(u64, 1), result.preexisting_owned_payloads.dropped_registration_calls);
+    try std.testing.expectEqual(@as(u64, 1), result.preexisting_owned_payloads.invalid_registration_calls);
+    try std.testing.expect(result.requested_live_bytes == null and result.allocations == null and result.requested_owner_interval_peak_bytes == null);
+}
+
+test "owned baseline leaves observed allocator records intact without inventing a common ancestry" {
+    const a = std.testing.allocator;
+    const owner = try observer.State.createWithMetadata(a, a, .from_owner_creation);
+    defer owner.release();
+    var registry: Registry = undefined;
+    registry.begin(a);
+    bind(.compute, owner);
+    const bytes = try owner.allocator().alloc(u8, 7);
+    owner.allocator().free(bytes);
+    bindPreexistingOwnedPayload(.{ .identity = 9, .host_scratch_payload_bytes = 31 });
+    const result = registry.finish();
+    try std.testing.expectEqual(@as(u8, 1), result.reports_count);
+    try std.testing.expectEqual(@as(u64, 1), result.reports[0].usage.allocations);
+    try std.testing.expectEqual(@as(u64, 31), result.preexisting_owned_payloads.records[0].host_scratch_payload_bytes);
+    try std.testing.expect(result.aggregate_owner_identity == null and result.maximum_individual_lifetime_peak_bytes == null and result.allocations == null);
 }
