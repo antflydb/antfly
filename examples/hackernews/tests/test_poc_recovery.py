@@ -107,6 +107,38 @@ class ConstructionRecoveryTests(unittest.TestCase):
             self.assertEqual(unknown.record["code"], "http_error")
             self.assertNotIn("private", json.dumps(unknown.record) + str(unknown))
 
+    def test_public_unavailable_reasons_survive_redaction(self):
+        for reason in (
+            "decision_provider_unavailable",
+            "doc_identity_unavailable",
+            "read_requires_primary",
+            "standby_read_unavailable",
+            "distributed_query_unavailable",
+            "storage_read_temporarily_unavailable",
+            "index_rebuilding",
+            "metric_not_ready",
+            "metric_stale",
+            "query_embedding_temporarily_unavailable",
+            "reranker_temporarily_unavailable",
+        ):
+            with self.subTest(reason=reason):
+                failure = poc.RequestFailure.http(
+                    "POST",
+                    "/query?token=private-token",
+                    503,
+                    json.dumps(
+                        {
+                            "code": reason,
+                            "retryable": True,
+                            "message": "private-token gs://private-bucket/object",
+                        }
+                    ),
+                    5000,
+                )
+                self.assertEqual(failure.record["code"], reason)
+                self.assertTrue(failure.record["retryable"])
+                self.assertNotIn("private", json.dumps(failure.record) + str(failure))
+
     def test_transport_evidence_preserves_errno_without_exception_text(self):
         failure = poc.RequestFailure.transport(
             "POST",

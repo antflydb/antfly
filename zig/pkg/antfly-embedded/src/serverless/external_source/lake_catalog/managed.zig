@@ -268,8 +268,7 @@ pub const Managed = struct {
             defer current.deinit(work.allocator());
             if (current.version == null or !std.mem.eql(u8, current.version.?, request.expected_version)) return error.LakeCommitConflict;
         }
-        var root = table.retirement_root;
-        for (request.objects) |uri| root = try index.insert(root, uri);
+        const root = try index.insertMany(table.retirement_root, request.objects);
         // Keep the metadata bytes unchanged. The catalog version nevertheless
         // advances and the immutable history retains receipt recovery proof.
         const head_key = try self.catalogKey(scratch, "head.json");
