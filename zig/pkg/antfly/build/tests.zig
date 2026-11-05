@@ -5299,6 +5299,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"privacy standalone compact bindings refresh on policy publication and survive progress"},
     });
     b.step("antfly-standalone-privacy-binding-test", "Verify compact privacy bindings across standalone publication and progress").dependOn(&addFilteredTestRunArtifact(b, standalone_privacy_binding_tests).step);
+    const standalone_cors_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"standalone CORS"},
+    });
+    b.step("antfly-standalone-cors-test", "Verify public CORS defaults and explicit operator overrides").dependOn(&addFilteredTestRunArtifact(b, standalone_cors_tests).step);
     const standalone_cdc_tests = b.addTest(.{
         .root_module = system_catalog_standalone_test_mod,
         .filters = &.{"standalone cdc"},

@@ -69,10 +69,12 @@ const LocalSchemaProgressProvider = struct {
 };
 const default_public_port: u16 = 8080;
 const cors_default_methods = [_][]const u8{ "GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH" };
-const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin" };
+const cors_default_headers = [_][]const u8{ "Content-Type", "Authorization", "X-Requested-With", "Accept", "Origin", "If-Match" };
 const cors_default_exposed_headers = [_][]const u8{
     "X-Request-ID",
     "Retry-After",
+    "ETag",
+    "X-Antfly-Raft-Mutation-Outcome",
     "Deprecation",
     "X-RateLimit-Limit",
     "X-RateLimit-Remaining",
@@ -10514,7 +10516,7 @@ test "standalone CORS middleware enforces dynamic configuration for system catal
         try std.testing.expectEqual(@as(u16, 209), response.status.code);
         try std.testing.expectEqualStrings("*", response.headers.get("Access-Control-Allow-Origin").?);
         try std.testing.expectEqualStrings(
-            "X-Request-ID, Retry-After, Deprecation, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-Antfly-Next-Cursor",
+            "X-Request-ID, Retry-After, ETag, X-Antfly-Raft-Mutation-Outcome, Deprecation, X-RateLimit-Limit, X-RateLimit-Remaining, X-RateLimit-Reset, X-Antfly-Next-Cursor",
             response.headers.get("Access-Control-Expose-Headers").?,
         );
     }
@@ -10529,7 +10531,7 @@ test "standalone CORS middleware enforces dynamic configuration for system catal
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 204), response.status.code);
         try std.testing.expectEqualStrings("GET, POST, PUT, DELETE, OPTIONS, PATCH", response.headers.get("Access-Control-Allow-Methods").?);
-        try std.testing.expectEqualStrings("Content-Type, Authorization, X-Requested-With, Accept, Origin", response.headers.get("Access-Control-Allow-Headers").?);
+        try std.testing.expectEqualStrings("Content-Type, Authorization, X-Requested-With, Accept, Origin, If-Match", response.headers.get("Access-Control-Allow-Headers").?);
         try std.testing.expectEqualStrings("3600", response.headers.get("Access-Control-Max-Age").?);
     }
     {
@@ -10542,6 +10544,13 @@ test "standalone CORS middleware enforces dynamic configuration for system catal
         var response = try Harness.execute(&defaults, .OPTIONS, null, "POST", null);
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, 209), response.status.code);
+    }
+
+    // A privacy replacement needs If-Match even with otherwise default CORS.
+    {
+        var response = try Harness.execute(&defaults, .OPTIONS, "https://any.example", "PUT", "content-type, if-match");
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 204), response.status.code);
     }
 
     var exact_origin = "https://allowed.example".*;
@@ -10561,6 +10570,19 @@ test "standalone CORS middleware enforces dynamic configuration for system catal
         .max_age = 7,
     };
     try validateCorsConfig(&exact);
+    {
+        var conditional = exact;
+        conditional.allowed_methods = null;
+        var content_type = "Content-Type".*;
+        var conditional_headers = [_][]u8{content_type[0..]};
+        conditional.allowed_headers = &conditional_headers;
+        var ordinary = try Harness.execute(&conditional, .OPTIONS, exact_origin[0..], "PUT", "content-type");
+        defer ordinary.deinit();
+        try std.testing.expectEqual(@as(u16, 204), ordinary.status.code);
+        var response = try Harness.execute(&conditional, .OPTIONS, exact_origin[0..], "PUT", "content-type, if-match");
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 403), response.status.code);
+    }
     {
         var response = try Harness.execute(&exact, .POST, exact_origin[0..], null, null);
         defer response.deinit();

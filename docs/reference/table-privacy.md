@@ -232,6 +232,12 @@ The TypeScript SDK exposes these headers on `AntflyHTTPError` as
 nonnegative numeric delay when supplied). The delay alone never authorizes
 replaying a mutation; the SDK does not retry policy or scan writes.
 
+For browser clients on an allowed cross-origin site, default CORS permits
+`If-Match` and exposes `ETag`, `Retry-After` and
+`X-Antfly-Raft-Mutation-Outcome`. Explicit `cors.allowed_headers` and
+`cors.exposed_headers` lists replace those defaults; include these headers when
+customizing the lists so conditional saves and outcome inspection remain usable.
+
 
 Private range checkpoints have per-table budgets of 256 MiB for staged uploads
 and 8 GiB for retained payloads, including retired generations awaiting cleanup.

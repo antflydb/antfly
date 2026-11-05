@@ -500,6 +500,15 @@ convergence. Transport ambiguity continues to require observation before replay.
 The TypeScript HTTP error exposes the server's typed mutation outcome and numeric
 retry delay for JSON and non-JSON errors without replaying writes.
 
+Metadata classifies projection reads, rejection receipts and semantic comparisons
+inside one post-apply observation boundary. Definite rejection remains a conflict;
+all failed or inconclusive observations return the unknown-outcome contract.
+This adds no reads, retries or response copies to the successful path.
+Allowed cross-origin browser clients can send `If-Match` with the default CORS
+policy and inspect `ETag`, `Retry-After` and the mutation-outcome header. Explicit
+operator header lists remain replacements for those defaults.
+
+
 ## Validation
 
 ### Committed acceptance and compact read bindings (2026-11-05)

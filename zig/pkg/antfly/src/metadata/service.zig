@@ -659,43 +659,44 @@ fn replaceTableDefinitionGuardedWithContextReceipt(
         return error.MetadataMutationOutcomeUnknown;
     };
 
-    // Exact receipt application makes the local projection authoritative for
-    // this command. Inspect it once; polling leadership after admission would
-    // incorrectly turn a committed mutation into a retryable NotLeader error.
-    const current = store.getTable(
-        service.alloc,
-        service.metadata_group_id,
-        expected.table_id,
-    ) catch |err| {
+    // One post-admission boundary covers every fallible observation, including
+    // receipt reads and semantic comparisons. A failed observation cannot
+    // establish rejection or authorize replay of this already-admitted write.
+    const outcome = observeTableDefinitionApply(store, service.alloc, service.metadata_group_id, expected, replacement, receipt) catch |err| {
         std.log.warn(
-            "table definition mutation applied but projection observation failed table={s} table_id={} term={} index={} err={s}",
+            "table definition mutation applied but outcome observation failed table={s} table_id={} term={} index={} err={s}",
             .{ expected.name, expected.table_id, receipt.term, receipt.index, @errorName(err) },
         );
         return error.MetadataMutationOutcomeUnknown;
-    } orelse {
-        std.log.warn(
-            "table definition mutation applied but table is absent from projection table={s} table_id={} term={} index={}",
-            .{ expected.name, expected.table_id, receipt.term, receipt.index },
-        );
-        return error.MetadataMutationOutcomeUnknown;
     };
-    defer metadata_table_manager.freeTable(service.alloc, current);
-    if (try store.tableDefinitionReplacementRejected(service.alloc, service.metadata_group_id, receipt.term, receipt.index, expected, replacement)) return error.TableGenerationChanged;
-    if (try store.resolverNamespaceReplacementMatches(service.alloc, service.metadata_group_id, current, replacement) or
-        try metadata_table_manager.privacyPolicyInstallationMatches(service.alloc, expected, replacement, current)) return .{
-        .metadata_group_id = service.metadata_group_id,
-        .metadata_incarnation = metadata_incarnation,
-        .term = receipt.term,
-        .index = receipt.index,
-    };
-    // A later command may already have superseded or even reverted this exact
-    // definition. Without a durable per-command apply result, any non-exact
-    // projection is ambiguous; never turn it back into a replayable conflict.
-    std.log.warn(
-        "table definition mutation applied but exact replacement is no longer projected table={s} table_id={} term={} index={}",
-        .{ expected.name, expected.table_id, receipt.term, receipt.index },
-    );
-    return error.MetadataMutationOutcomeUnknown;
+    switch (outcome) {
+        .rejected => return error.TableGenerationChanged,
+        .accepted => return .{
+            .metadata_group_id = service.metadata_group_id,
+            .metadata_incarnation = metadata_incarnation,
+            .term = receipt.term,
+            .index = receipt.index,
+        },
+        .unknown => {
+            // A later command may have superseded or reverted this definition.
+            std.log.warn(
+                "table definition mutation applied but exact replacement is no longer projected table={s} table_id={} term={} index={}",
+                .{ expected.name, expected.table_id, receipt.term, receipt.index },
+            );
+            return error.MetadataMutationOutcomeUnknown;
+        },
+    }
+}
+
+const TableDefinitionApplyOutcome = enum { accepted, rejected, unknown };
+
+fn observeTableDefinitionApply(store: anytype, alloc: std.mem.Allocator, group_id: u64, expected: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord, receipt: MetadataProposalReceipt) !TableDefinitionApplyOutcome {
+    const current = (try store.getTable(alloc, group_id, expected.table_id)) orelse return .unknown;
+    defer metadata_table_manager.freeTable(alloc, current);
+    if (try store.tableDefinitionReplacementRejected(alloc, group_id, receipt.term, receipt.index, expected, replacement)) return .rejected;
+    if (try store.resolverNamespaceReplacementMatches(alloc, group_id, current, replacement) or
+        try metadata_table_manager.privacyPolicyInstallationMatches(alloc, expected, replacement, current)) return .accepted;
+    return .unknown;
 }
 
 test "relation mutation admission uses exact point ownership without source revision serialization" {
@@ -765,15 +766,19 @@ test "relation mutation admission uses exact point ownership without source revi
     try std.testing.expectError(error.CatalogGenerationChanged, requireRelationMutationOwner(&service, expected, guard));
 }
 
-test "table definition stamp distinguishes rejection from post-admission ambiguity" {
+test "privacy table definition stamp distinguishes rejection from all post-admission failures" {
     const FakeStore = struct {
         current: metadata_table_manager.TableRecord,
         reads: usize = 0,
         rejected_index: ?u64 = null,
+        observation_error: ?anyerror = null,
+        failure_stage: enum { projection, rejection, comparison } = .projection,
         pub fn tableDefinitionReplacementRejected(self: *@This(), _: std.mem.Allocator, _: u64, term: u64, index: u64, _: metadata_table_manager.TableRecord, _: metadata_table_manager.TableRecord) !bool {
+            if (self.failure_stage == .rejection) if (self.observation_error) |err| return err;
             return term == 7 and self.rejected_index == index;
         }
-        pub fn resolverNamespaceReplacementMatches(_: *@This(), _: std.mem.Allocator, _: u64, current: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !bool {
+        pub fn resolverNamespaceReplacementMatches(self: *@This(), _: std.mem.Allocator, _: u64, current: metadata_table_manager.TableRecord, replacement: metadata_table_manager.TableRecord) !bool {
+            if (self.failure_stage == .comparison) if (self.observation_error) |err| return err;
             return metadata_table_manager.tableDefinitionsEqual(current, replacement);
         }
 
@@ -792,6 +797,7 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
             _: u64,
         ) !?metadata_table_manager.TableRecord {
             self.reads += 1;
+            if (self.failure_stage == .projection) if (self.observation_error) |err| return err;
             return try metadata_table_manager.cloneTable(alloc, self.current);
         }
     };
@@ -885,6 +891,24 @@ test "table definition stamp distinguishes rejection from post-admission ambigui
     try std.testing.expectEqual(@as(u64, 19), stamp.index);
     try std.testing.expectEqual(@as(usize, 1), committed.wait_calls);
     try std.testing.expectEqual(@as(usize, 1), committed.store.reads);
+
+    // Storage, allocation and control failures at every post-apply stage
+    // remain ambiguous even when the installed replacement is already visible.
+    for ([_]anyerror{ error.StorageBusy, error.NotLeader, error.DeadlineExceeded, error.OutOfMemory }) |err| {
+        inline for (.{ .projection, .rejection, .comparison }) |stage| {
+            var observed: FakeService = .{ .alloc = std.testing.allocator, .store = .{ .current = replacement, .observation_error = err, .failure_stage = stage } };
+            try std.testing.expectError(error.MetadataMutationOutcomeUnknown, replaceTableDefinitionStampedWithReceipt(&observed, expected, replacement));
+            try std.testing.expectEqual(@as(usize, 1), observed.wait_calls);
+            try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(observed.store.current, replacement));
+        }
+    }
+    // The privacy-specific semantic comparison shares the same boundary.
+    var malformed = replacement;
+    malformed.indexes_json = "{";
+    var semantic: FakeService = .{ .alloc = std.testing.allocator, .store = .{ .current = replacement } };
+    semantic.store.current.indexes_json = "{}";
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, replaceTableDefinitionStampedWithReceipt(&semantic, expected, malformed));
+    try std.testing.expectEqual(@as(usize, 1), semantic.wait_calls);
 
     var superseded: FakeService = .{
         .alloc = std.testing.allocator,
