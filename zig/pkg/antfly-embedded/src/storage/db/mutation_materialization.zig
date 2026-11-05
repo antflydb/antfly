@@ -4626,6 +4626,36 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .extraction_method = unit.method,
                 .extraction_status = unit.extraction_status,
                 .confidence = documentUnitConfidence(unit),
+                .native_text_quality = if (unit.native_text_quality) |quality| .{
+                    .too_short = quality.too_short,
+                    .garbled = quality.garbled,
+                    .font_corrupted = quality.font_corrupted,
+                    .replacement_corrupted = quality.replacement_corrupted,
+                    .single_char_word_ratio = quality.single_char_word_ratio,
+                    .corrupted_line_ratio = quality.corrupted_line_ratio,
+                    .replacement_char_ratio = quality.replacement_char_ratio,
+                    .trimmed_len = quality.trimmed_len,
+                    .non_whitespace_chars = quality.non_whitespace_chars,
+                } else null,
+                .native_text_diagnostics = if (unit.native_text_diagnostics) |diagnostics| .{
+                    .policy = @tagName(diagnostics.policy),
+                    .extraction_complete = diagnostics.extraction_complete,
+                    .semantic_coverage = @tagName(diagnostics.semantic_coverage),
+                    .actual_text_replacements = diagnostics.actual_text_replacements,
+                    .outside_page_runs = diagnostics.outside_page_runs,
+                    .invisible_runs = diagnostics.invisible_runs,
+                    .unaligned_runs = diagnostics.unaligned_runs,
+                    .unsupported_ordering_runs = diagnostics.unsupported_ordering_runs,
+                    .source_run_count = diagnostics.source_run_count,
+                    .emitted_run_count = diagnostics.emitted_run_count,
+                    .outside_page_spans = diagnostics.outside_page_spans,
+                    .invisible_spans = diagnostics.invisible_spans,
+                    .unpositioned_spans = diagnostics.unpositioned_spans,
+                    .actual_text_incomplete = diagnostics.actual_text_incomplete,
+                    .outline_fallback = diagnostics.outline_fallback,
+                    .has_nontext_visual = diagnostics.has_nontext_visual,
+                    .has_unrendered_annotations = diagnostics.has_unrendered_annotations,
+                } else null,
                 .ocr_used = unit.ocr_used,
                 .ocr_attempted = unit.ocr_attempted,
                 .ocr_render_dpi = unit.ocr_render_dpi,
@@ -8081,6 +8111,12 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer parsed.deinit();
             if (parsed.value != .object) return error.InvalidDocumentExtractionState;
             const object = parsed.value.object;
+            if (object.get("_artifact_unit_fingerprint")) |value| {
+                if (value != .string or !document_unit_fingerprint.isCurrent(value.string)) {
+                    return error.InvalidDocumentExtractionState;
+                }
+                return try alloc.dupe(u8, value.string);
+            }
             const provenance_value = object.get("provenance") orelse return error.InvalidDocumentExtractionState;
             if (provenance_value != .object) return error.InvalidDocumentExtractionState;
             const provenance = provenance_value.object;
@@ -8123,7 +8159,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // A payload without the marker predates the canonical fingerprint
             // encoding. Its state descriptor therefore contains the legacy digest;
             // reconstruct that exact value for rolling-upgrade validation. Current
-            // payloads always validate through their persisted `duf2:` marker.
+            // payloads always validate through their persisted versioned marker.
             return try document_unit_fingerprint.legacyFingerprintAlloc(alloc, unit);
         }
 
@@ -8273,6 +8309,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .source_sha256 = unit.source_sha256,
                 .byte_length = unit.byte_length,
                 .confidence = documentUnitConfidence(unit),
+                .native_text_quality = unit.native_text_quality,
+                .native_text_diagnostics = unit.native_text_diagnostics,
                 .ocr_attempted = unit.ocr_attempted,
                 .ocr_render_dpi = unit.ocr_render_dpi,
                 .ocr_effective_render_dpi = unit.ocr_effective_render_dpi,
@@ -8288,6 +8326,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 .ocr_bbox = unit.ocr_bbox,
                 .transcript_confidence = unit.transcript_confidence,
                 .extraction_warning = unit.extraction_warning,
+                .text_blocks = unit.text_blocks,
                 .provenance = .{
                     .source_url = source_url,
                     .source_path = unit.source_path,
@@ -8296,6 +8335,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .source_sha256 = unit.source_sha256,
                     .byte_length = unit.byte_length,
                     .confidence = documentUnitConfidence(unit),
+                    .native_text_quality = unit.native_text_quality,
+                    .native_text_diagnostics = unit.native_text_diagnostics,
                     .ocr_used = unit.ocr_used,
                     .ocr_attempted = unit.ocr_attempted,
                     .ocr_render_dpi = unit.ocr_render_dpi,
@@ -8319,6 +8360,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .page_bbox = unit.page_bbox,
                     .page_rotation = unit.page_rotation,
                     .text_regions = unit.text_regions,
+                    .text_blocks = unit.text_blocks,
                     .char_start = unit.char_start,
                     .char_end = unit.char_end,
                     .source_content_type = content_type,
@@ -8332,6 +8374,8 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .source_sha256 = unit.source_sha256,
                         .byte_length = unit.byte_length,
                         .confidence = documentUnitConfidence(unit),
+                        .native_text_quality = unit.native_text_quality,
+                        .native_text_diagnostics = unit.native_text_diagnostics,
                         .ocr_used = unit.ocr_used,
                         .ocr_attempted = unit.ocr_attempted,
                         .ocr_render_dpi = unit.ocr_render_dpi,
@@ -8354,6 +8398,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .page_bbox = unit.page_bbox,
                         .page_rotation = unit.page_rotation,
                         .text_regions = unit.text_regions,
+                        .text_blocks = unit.text_blocks,
                     },
                 },
             }, .{});
