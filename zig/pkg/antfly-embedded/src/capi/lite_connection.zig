@@ -3717,7 +3717,7 @@ pub const Owner = struct {
         self.gate.mutex.unlock(io);
         gate_locked = false;
         const service_started = @import("antfly_platform").time.monotonicNs();
-        if (comptime h.builtin.is_test) if (self.test_before_storage_service) |hook| hook.notify(hook.ptr, root, false);
+        if (comptime h.builtin.is_test) if (self.test_before_storage_service) |hook| hook.notify(hook.ptr, root, self.text_source_runtime_cache != null);
         store.defer_background_vacuum = self.pending_text_merge != null;
         defer store.defer_background_vacuum = false;
         const result = store.maintainBackgroundOnce(&self.verification_cancel);
@@ -3729,7 +3729,16 @@ pub const Owner = struct {
         root.maintenance_references -= 1;
         inheritReclamationTelemetry(self.current.?.owned_lite_backend.?.native_docstore.?, store);
         try self.adoptIdleMaintenanceCheckpoint(foreground, entry_header, maintenance_entry_header, store);
-        try result;
+        result catch |err| {
+            // Physical service does not certify or discard a retained source
+            // witness. Reuse still validates its original logical identities,
+            // including when admission adopted a foreign checkpoint then yielded.
+            if (self.text_source_runtime_cache != null and switch (err) {
+                error.EnrichmentWaitCanceled, error.FileBusy, error.WouldBlock => true,
+                else => false,
+            }) self.publication_stats.text_runtime_cache.retained_storage_yield +|= 1;
+            return err;
+        };
         return true;
     }
 
