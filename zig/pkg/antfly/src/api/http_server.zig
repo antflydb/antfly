@@ -15838,7 +15838,6 @@ pub const ApiHttpServer = struct {
         query_req.req.cancellation = cancellation;
         if (query_req.req.graph_queries.len > 0) query_req.req.graph_query_diagnostic_sink = graph_query_diagnostic.sink();
         query_req.req.response_table_name = response_label;
-        var live_read = false;
         // Hierarchy traversal owns its source-revision cursor. Capturing a
         // whole-table native cut here both bypasses its stale-revision check
         // and rejects Lite, whose storage cannot publish a directory snapshot.
@@ -15850,7 +15849,7 @@ pub const ApiHttpServer = struct {
             if (try self.queryTableDefinition(resolver.arena, resolver, table_name, context)) |table| {
                 const external = try @import("antfly_local_sources").serverless_external_source_schema_binding.externalBindingFromSchemaJsonAlloc(resolver.arena, table.schema_json);
                 if (external == null and table.storage.engine != .object and !self.cfg.native_retained_cuts) {
-                    live_read = true;
+                    query_req.req.response_live_read = true;
                 } else if (external == null and table.storage.engine != .object) {
                     var store = try @import("lake_index_store.zig").Store.openNative(resolver.arena, self.cfg.node_config, self.cfg.secret_store, false, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
                     defer store.deinit();
@@ -15894,9 +15893,9 @@ pub const ApiHttpServer = struct {
         // Source-program preparation is a physical delivery choice, not a
         // change to every ordinary public query. Wire consumers keep the native
         // reader's owned-response shortcut; lake delivery was handled above.
-        const native_delivery = if (live_read) null else if (delivery) |sink| (if (sink.typed_result != null) sink else null) else null;
+        const native_delivery = if (delivery) |sink| (if (sink.typed_result != null) sink else null) else null;
         if (native_delivery != null) try query_req.prepareEncodedDelivery(alloc);
-        var response = (queryWithTransientReadRetryAndDelivery(
+        return (queryWithTransientReadRetryAndDelivery(
             alloc,
             self.sharedApiIo(),
             source,
@@ -15913,8 +15912,6 @@ pub const ApiHttpServer = struct {
             error.InvalidArgument => return error.InvalidQueryRequest,
             else => return err,
         }) orelse return error.TableNotFound;
-        if (live_read) try markLiveReadResponse(alloc, &response);
-        return response;
     }
 
     const CatalogGraphReadContext = struct {
@@ -30138,29 +30135,6 @@ fn normalizePublicQueryParseError(err: anyerror) anyerror {
         return err;
     }
     return normalizeQueryEmbeddingOperationalError(err) orelse error.InvalidQueryRequest;
-}
-
-/// Says the page came from live state, with nothing to echo for paging. An
-/// unrecognized shape stays unmarked, which source gates reject.
-fn markLiveReadResponse(alloc: std.mem.Allocator, response: *query_api.QueryResponse) !void {
-    const opening = "{\"responses\":[{";
-    if (!std.mem.startsWith(u8, response.json, opening)) return;
-    const marked = try std.mem.concat(alloc, u8, &.{ opening, "\"live_read\":true,", response.json[opening.len..] });
-    alloc.free(response.json);
-    response.json = marked;
-}
-
-test "live read marker leaves unrecognized responses unmarked" {
-    const alloc = std.testing.allocator;
-    var response: query_api.QueryResponse = .{ .json = try alloc.dupe(u8, "{\"responses\":[{\"status\":200}]}") };
-    defer alloc.free(response.json);
-    try markLiveReadResponse(alloc, &response);
-    try std.testing.expectEqualStrings("{\"responses\":[{\"live_read\":true,\"status\":200}]}", response.json);
-
-    alloc.free(response.json);
-    response.json = try alloc.dupe(u8, "{\"error\":\"x\"}");
-    try markLiveReadResponse(alloc, &response);
-    try std.testing.expectEqualStrings("{\"error\":\"x\"}", response.json);
 }
 
 fn unsupportedPublicTableQueryDispatchError(alloc: std.mem.Allocator, body: []const u8) error{ UnsupportedQueryRequest, UnsupportedExactSort } {

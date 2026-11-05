@@ -102,12 +102,23 @@ def test_ordered_first_page_on_every_engine(storage_engine):
             )
             assert cursor.status_code == 409, cursor.text
 
+            # The read annotation is selected by the coordinator, never by a
+            # caller attempting to turn an ordinary response into a proof.
+            spoofed = post(
+                "/tables/docs/query",
+                {"order_by": ORDER, "_response_live_read": True},
+            )
+            assert spoofed.status_code == 400, spoofed.text
+
             # A committed insert can still be absent from Lite's live index.
             # Source cleanup must reconcile primary rows and wait for indexing,
             # rather than treating an empty live query as proof of absence.
             pending = post(
                 "/tables/docs/batch",
-                {"inserts": {"doc/pending": {"title": "pending"}}, "sync_level": "write"},
+                {
+                    "inserts": {"doc/pending": {"title": "pending"}},
+                    "sync_level": "write",
+                },
             )
             assert pending.ok, pending.text
             cleanup = session.post(

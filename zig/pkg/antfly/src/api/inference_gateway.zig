@@ -1212,13 +1212,21 @@ fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, requ
     if (links.len == 0 or links.len > 8) return error.InvalidInferenceRequest;
     const configs = try a.alloc(generating.GeneratorConfig, links.len);
     const original = try std.json.Stringify.valueAlloc(a, request, .{});
+    // Retry storage must refund the same admission layers as the invocation,
+    // rather than accumulating failed providers' base64 and JSON in its arena.
+    const scratch = sources.sql_memory_budget.reclaimingAllocator(a);
     // Qualify every link through the same request adapter used for execution.
     // Each receives its own JSON tree because body adaptation mutates objects.
     for (links, configs) |link, *cfg| {
+        var preflight = std.heap.ArenaAllocator.init(scratch);
+        defer preflight.deinit();
+        const p = preflight.allocator();
         const qualified: gateway.Target = .{ .configured = .{ .task = .generate, .name = link.generator_name orelse name, .chain = link.generator_name == null } };
-        const candidate = try std.json.parseFromSliceLeaky(Json, a, original, .{});
-        const prepared = try prepareGeneration(a, link.generator_config orelse try named.providers.getGeneratorConfig(link.generator_name.?), candidate, options.operation orelse "generate");
-        cfg.* = prepared.config;
+        const candidate = try std.json.parseFromSliceLeaky(Json, p, original, .{});
+        // Store only registry-owned configuration. Request-derived options are
+        // recreated by each attempt and cannot outlive preflight's arena.
+        cfg.* = link.generator_config orelse try named.providers.getGeneratorConfig(link.generator_name.?);
+        const prepared = try prepareGeneration(p, cfg.*, candidate, options.operation orelse "generate");
         try named.capabilities(qualified).require(prepared.requirements);
         if (cfg.provider != .cloudflare and cfg.provider != .openai and cfg.provider != .openrouter and cfg.provider != .ollama and cfg.provider != .antfly and cfg.provider != .gemini and cfg.provider != .vertex and cfg.provider != .bedrock and cfg.provider != .anthropic) return error.UnsupportedInferenceFeature;
     }
@@ -1253,9 +1261,12 @@ fn executeChain(server: anytype, ctx: *httpx.Context, a: std.mem.Allocator, requ
                 if (link.retry) |retry| backoff_ms = @intFromFloat(@min(@as(f32, @floatFromInt(retry.max_backoff_ms)), @as(f32, @floatFromInt(backoff_ms)) * retry.backoff_multiplier));
             }
             try attempts.begin(@import("antfly_platform").time.monotonicNs());
-            const candidate = try std.json.parseFromSliceLeaky(Json, a, original, .{});
+            var attempt_arena = std.heap.ArenaAllocator.init(scratch);
+            defer attempt_arena.deinit();
+            const attempt_allocator = attempt_arena.allocator();
+            const candidate = try std.json.parseFromSliceLeaky(Json, attempt_allocator, original, .{});
             const target: gateway.Target = .{ .configured = .{ .task = .generate, .name = link.generator_name orelse name, .chain = link.generator_name == null } };
-            return executeResolved(server, ctx, .generate, a, candidate, named, target, cfg, true, budget - attempts.remaining, options) catch |err| {
+            return executeResolved(server, ctx, .generate, attempt_allocator, candidate, named, target, cfg, true, budget - attempts.remaining, options) catch |err| {
                 if (err == error.InferenceResponseCommitted) return err;
                 failure = err;
                 // Invalid requests, credentials, refusals and malformed output
