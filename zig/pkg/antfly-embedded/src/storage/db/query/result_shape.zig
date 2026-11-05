@@ -1900,7 +1900,18 @@ fn verifyArtifactIdentity(alloc: Allocator, existing: types.ArtifactRef, resolve
     defer alloc.free(a);
     const b = try artifact_ids.internalKeyForArtifactRefAlloc(alloc, resolved);
     defer alloc.free(b);
-    if (!std.mem.eql(u8, a, b)) return error.InvalidChunkArtifact;
+    if (std.mem.eql(u8, a, b)) return;
+    // Dense/sparse collectors project an embedding member's id to its source
+    // chunk for hydration and grouping, retaining the embedding reference as
+    // provenance. Validate the complete backing identity before allowing that
+    // alias; a different parent, producer, unit or window remains invalid.
+    if (existing.kind == .embedding) {
+        if (try chunkStorageKeyForArtifactRefAlloc(alloc, existing)) |source| {
+            defer alloc.free(source);
+            if (std.mem.eql(u8, source, b)) return;
+        }
+    }
+    return error.InvalidChunkArtifact;
 }
 
 fn externalizeSearchHitIdentity(alloc: Allocator, hit: *types.SearchHit) !void {
@@ -3707,4 +3718,55 @@ test "native member ancestry ignores payload source and unit identities" {
     defer scalar.deinit(a);
     try std.testing.expectEqualStrings("allowed", scalar.parent_doc_key);
     try std.testing.expect(scalar.unit_key == null);
+}
+
+test "externalizeSearchResultArtifactIds validates embedding source aliases and preserves provenance" {
+    const Harness = struct {
+        fn run(a: Allocator) !void {
+            const chunk = types.ArtifactRef{
+                .document_id = @constCast("doc:你好"),
+                .name = @constCast("chunks_v1"),
+                .kind = .chunk,
+                .chunk_id = 3,
+                .unit_id = @constCast("page:000001"),
+                .window_index = 2,
+            };
+            const embedding = types.ArtifactRef{
+                .document_id = chunk.document_id,
+                .name = @constCast("embeddings_v1"),
+                .kind = .embedding,
+                .source = .{ .name = chunk.name, .kind = .chunk, .chunk_id = chunk.chunk_id, .unit_id = chunk.unit_id, .window_index = chunk.window_index },
+            };
+            var hit: types.SearchHit = .{ .id = try artifact_ids.internalKeyForArtifactRefAlloc(a, chunk), .doc_ordinal = 17 };
+            defer hit.deinit(a);
+            hit.artifact_ref = try embedding.clone(a);
+            try externalizeSearchHitIdentity(a, &hit);
+            const expected = try artifact_ids.artifactPublicIdAlloc(a, chunk);
+            defer a.free(expected);
+            try std.testing.expectEqualStrings(expected, hit.id);
+            try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 17), hit.doc_ordinal);
+            try std.testing.expectEqual(types.ArtifactKind.embedding, hit.artifact_ref.?.kind);
+            try std.testing.expectEqualStrings(embedding.name, hit.artifact_ref.?.name);
+            try std.testing.expectEqualStrings(chunk.name, hit.artifact_ref.?.source.?.name);
+            // Every component of the alias binding is authoritative.
+            for (0..5) |variant| {
+                var wrong = embedding;
+                switch (variant) {
+                    0 => wrong.document_id = @constCast("another-document"),
+                    1 => wrong.source.?.name = @constCast("another-producer"),
+                    2 => wrong.source.?.chunk_id = 4,
+                    3 => wrong.source.?.unit_id = @constCast("page:000002"),
+                    4 => wrong.source.?.window_index = 3,
+                    else => unreachable,
+                }
+                verifyArtifactIdentity(a, wrong, chunk) catch |err| {
+                    if (err == error.OutOfMemory) return err;
+                    try std.testing.expectEqual(error.InvalidChunkArtifact, err);
+                    continue;
+                };
+                return error.TestExpectedError;
+            }
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
 }
