@@ -34159,6 +34159,10 @@ pub const DB = struct {
     /// of each forcing another native capture. Reported work yields immediately;
     /// this never drains a service. The primary source epoch has already ended.
     fn runBackgroundControlMaintenance(self: *DB, cancellation: types.CancellationToken) !bool {
+        return self.runBackgroundControlMaintenanceWithBudget(cancellation, @import("derived/replay_budget.zig").Controller.quantum_ns);
+    }
+
+    fn runBackgroundControlMaintenanceWithBudget(self: *DB, cancellation: types.CancellationToken, budget_ns: u64) !bool {
         try ensureSnapshotActive(cancellation);
         const state = self.borrowed_group_source_state orelse &self.group_source_owner.state;
         const Control = struct {
@@ -34187,7 +34191,7 @@ pub const DB = struct {
             }
         };
         var context: Control = .{ .database = self, .cancellation = cancellation };
-        return @import("maintenance/control_sweep.zig").run(state, &context, Control.step, Control.now, state.replay_budget.target_quantum_ns);
+        return @import("maintenance/control_sweep.zig").run(state, &context, Control.step, Control.now, budget_ns);
     }
 
     pub fn runGraphMetricMaintenanceForIdle(self: *DB) !usize {
@@ -77570,8 +77574,7 @@ test "db detached replay leaves optional maintenance to its retained continuatio
     // A clean continuation checks its remaining services in one capture.
     // Isolate this dispatch assertion from host scheduling delays; deterministic
     // control_sweep tests separately exercise the normal quantum and errors.
-    state.replay_budget.target_quantum_ns = std.time.ns_per_hour;
-    try std.testing.expect(!try database.runBackgroundControlMaintenance(.none));
+    try std.testing.expect(!try database.runBackgroundControlMaintenanceWithBudget(.none, std.time.ns_per_hour));
     try std.testing.expectEqual(@as(u4, 0), state.control_maintenance_slot);
     try std.testing.expect(!state.control_maintenance_pending);
     state.control_maintenance_slot = 8;
