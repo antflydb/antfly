@@ -473,6 +473,46 @@ until their metadata has been explicitly admitted as sorted.
 
 ## Validation
 
+### Live catalog controls and credential admission (2026-11-05)
+
+- Merge `f0256a88ee` incorporates main through
+  `a60aa92028ee5a9a336ba5c4ac95f506b9f83e7e`. The combined Go SDK was
+  regenerated, including checked SQL hooks. The merged extractor retains
+  native/Metal/CUDA long-window batching and adapts to main's optional backend
+  used by classification microbatches.
+- Fixes `e881502272` and `d22e81ac58` separate rollback consumer declarations
+  from live opaque resolver/curation state. Policy replacement merges only
+  current control entries, removes legacy control snapshots, and never treats
+  evidence as index or producer declarations. Deleted controls cannot reappear.
+- Credential admission shares public provider inspection's field/URL classifier.
+  It rejects nested/header literals, userinfo, encoded credential query keys,
+  fragments, and malformed references before preview or installation. Exact
+  native secret references, omitted credentials/environment defaults, safe
+  endpoints, and user-authored schema/label definitions remain supported.
+- The extended HTTP regression exposed mutable privacy progress inside resolver
+  fingerprints. Resolver admission and query proofs now exclude exactly the
+  runtime fields already exempted by privacy's progress-only CAS path. Authored
+  policy, resource versions, generations and consumer declarations remain
+  fences. Fresh proposals work after tuning, semantic replacement, monitor,
+  protection re-enablement and restart in both deployment modes.
+- Final server SHA-256:
+  `224668cabdd3787d57cfe4c8adcac955b22705250d6daac55d39862f79546cdb`.
+  Build: 106/106 steps; 63 API/metadata tests, 171 native privacy/storage tests
+  and both ABI checks pass without leaks. Go SDK tests, formatting, license
+  headers and the Apache product boundary pass.
+- Focused HTTP qualification: 10/10 standalone (37.41 s), 10/10 Raft (29.19 s).
+  The required Metal long-document gate also passes on the final binary
+  (27.05 s), with two selected fields, UTF-8 offsets and a long document.
+- Full standalone HTTP qualification: 43 passed, one opt-in native model
+  skip (666.77 s). Full Raft HTTP qualification: 39 passed, one model skip,
+  four standalone-only restore cases deselected (889.84 s). Those four restore
+  cases pass in the standalone run; the model gate runs separately with
+  required Metal.
+- Native projected hydration retains the earlier allocation bound: one
+  128 KiB document peaks at 4,712,210 bytes and twenty at 4,715,173 bytes.
+  Catalog installation parses live state once and excludes opaque control
+  payloads from the rollback snapshot; credential checks run at admission.
+
 ### Merged code and wide-field compaction (2026-11-04)
 
 - Privacy fixes are committed in `80ef8959ae`; merge `a61de5b7a7` incorporates
