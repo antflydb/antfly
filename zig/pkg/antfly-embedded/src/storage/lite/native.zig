@@ -4741,6 +4741,18 @@ pub const NativeFile = struct {
     change_capture: ?*ChangeCapture = null,
     read_only: bool = false,
     no_sync: bool = false,
+    /// When set, durability barriers (`syncIfRequired`) call
+    /// `antfly_platform.filesystem.syncData` directly on the raw handle
+    /// instead of `self.file.sync(io)`: `fdatasync` on Linux instead of
+    /// `fsync`, skipping metadata the data does not need to be retrievable.
+    /// Null (the default) keeps going through the `std.Io` vtable, which
+    /// every backend (including an evented/fiber scheduler) already knows
+    /// how to run without blocking its reactor. Set this only when the
+    /// runtime backing this file's `Io` is known to run blocking ops
+    /// synchronously on the calling thread (e.g. the default `Threaded`
+    /// backend embedded Lite normally opens with), since this bypasses the
+    /// vtable (and its cancellation support) entirely.
+    durability_policy: ?antfly_platform.filesystem.DurabilityPolicy = null,
     // An error after slot publication may leave disk ahead of header. Do not
     // elide a subsequent write based on the old in-memory checkpoint then.
     checkpoint_publication_uncertain: bool = false,
@@ -11824,9 +11836,19 @@ pub const NativeFile = struct {
         if (self.publication_observer) |observer| observer.notify(observer.context, self.activeCheckpoint(), self.checkpoint_publication_uncertain);
     }
 
+    /// Opts this handle's durability barriers into the raw `syncData`
+    /// primitive. See the `durability_policy` field doc for when that is
+    /// safe to call.
+    pub fn setDurabilityPolicy(self: *NativeFile, policy: ?antfly_platform.filesystem.DurabilityPolicy) void {
+        self.durability_policy = policy;
+    }
+
     fn syncIfRequired(self: *NativeFile) !void {
         if (!self.no_sync and self.transaction_header == null) {
-            try self.file.sync(self.runtimeIo());
+            if (self.durability_policy) |policy|
+                try antfly_platform.filesystem.syncData(self.file.handle, policy)
+            else
+                try self.file.sync(self.runtimeIo());
             if (builtin.is_test) _ = self.test_sync_calls.fetchAdd(1, .monotonic);
         }
     }
@@ -13802,6 +13824,31 @@ test "lite native durable commit costs two syncs after dropping the active_check
     // (publishCheckpoint). The active_checkpoint hint byte is no longer
     // written or synced, so this is 2, not the historical 3.
     try std.testing.expectEqual(@as(u64, 2), file.test_sync_calls.load(.monotonic) - before);
+}
+
+test "lite native durability_policy durable commit survives reopen" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    for ([_]antfly_platform.filesystem.DurabilityPolicy{ .default, .full_fsync }) |policy| {
+        const path = try testPath(allocator, tmp, if (policy == .default) "native-sync-data-default.aflite" else "native-sync-data-full.aflite");
+        defer allocator.free(path);
+        {
+            var file = try NativeFile.createWithIo(allocator, std.testing.io, path, .{ .indexed_reclamation = true, .exclusive = true });
+            defer file.close();
+            file.setDurabilityPolicy(policy);
+            const before = file.test_sync_calls.load(.monotonic);
+            try file.putDocument("doc", "durable via syncData");
+            try std.testing.expectEqual(@as(u64, 2), file.test_sync_calls.load(.monotonic) - before);
+            try std.testing.expect((try file.check()).valid);
+        }
+        var reopened = try NativeFile.open(allocator, path, true);
+        defer reopened.close();
+        const value = (try reopened.getDocumentAlloc(allocator, "doc")).?;
+        defer allocator.free(value);
+        try std.testing.expectEqualStrings("durable via syncData", value);
+    }
 }
 
 test "lite native file recovers older complete checkpoint when newest prefix is truncated" {
