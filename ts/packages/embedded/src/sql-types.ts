@@ -38,6 +38,7 @@ export class SqlError extends Error {
 export interface SqlColumn {
   name: string;
   type: string;
+  element_type?: string;
 }
 export interface SqlResult<Row = Record<string, unknown>> {
   columns: readonly SqlColumn[];

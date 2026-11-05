@@ -28,6 +28,7 @@ import {
   type QueryResult,
   type TransactionSettings,
 } from "kysely";
+import { DEFAULT_MIGRATION_LOCK_TABLE, DEFAULT_MIGRATION_TABLE } from "kysely/migration";
 import type { Database } from "./database.js";
 import { Connection } from "./sql.js";
 import type { WireResult } from "./sql-types.js";
@@ -161,7 +162,9 @@ export class AntflyDialect implements Dialect {
       async getTables(options?: DatabaseMetadataOptions) {
         const names = (await database.listTables()).filter(
           (name) =>
-            name !== "default" && (options?.withInternalKyselyTables || !name.startsWith("kysely_"))
+            name !== "default" &&
+            (options?.withInternalKyselyTables ||
+              (name !== DEFAULT_MIGRATION_TABLE && name !== DEFAULT_MIGRATION_LOCK_TABLE))
         );
         return Promise.all(
           names.map(async (name) => {
@@ -173,11 +176,12 @@ export class AntflyDialect implements Dialect {
             let schema: {
               default_type?: string;
               column_defaults?: { column: string }[];
+              generated_columns?: { column: string }[];
               document_schemas?: Record<
                 string,
                 {
                   schema?: {
-                    properties?: Record<string, { nullable?: boolean }>;
+                    properties?: Record<string, { type?: string | string[]; nullable?: boolean }>;
                     required?: string[];
                   };
                 }
@@ -188,23 +192,45 @@ export class AntflyDialect implements Dialect {
             } finally {
               await handle.close();
             }
-            const document = schema.document_schemas?.[schema.default_type ?? "row"]?.schema;
+            const documents = Object.values(schema.document_schemas ?? {}).map(
+              (document) => document.schema
+            );
             return {
               name,
               schema: "public",
               isView: false,
               isForeign: false,
-              columns: described.columns.map((column) => ({
-                name: column.name,
-                dataType: column.type,
-                isNullable:
-                  column.name !== "_id" &&
-                  !document?.required?.includes(column.name) &&
-                  document?.properties?.[column.name]?.nullable !== false,
-                isAutoIncrementing: false,
-                hasDefaultValue:
-                  schema.column_defaults?.some((entry) => entry.column === column.name) ?? false,
-              })),
+              columns: described.columns.map((column) => {
+                return {
+                  name: column.name,
+                  // The embedded decoder returns every integer width as bigint.
+                  // Exact NUMERIC uses decimal text; other structured values
+                  // retain conservative metadata for schema generation.
+                  dataType:
+                    column.element_type === "numeric" && column.type !== "array"
+                      ? "numeric"
+                      : column.type,
+                  isNullable:
+                    column.name !== "_id" &&
+                    (documents.length === 0 ||
+                      documents.some((document) => {
+                        const property = document?.properties?.[column.name];
+                        return (
+                          !property ||
+                          !document?.required?.includes(column.name) ||
+                          property.nullable === true ||
+                          property.type === "null" ||
+                          (Array.isArray(property.type) && property.type.includes("null"))
+                        );
+                      })),
+                  isAutoIncrementing: false,
+                  hasDefaultValue:
+                    schema.column_defaults?.some((entry) => entry.column === column.name) ?? false,
+                  isGeneratedAlways:
+                    schema.generated_columns?.some((entry) => entry.column === column.name) ??
+                    false,
+                };
+              }),
             };
           })
         );
