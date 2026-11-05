@@ -21482,8 +21482,33 @@ export interface components {
             mime_type: string;
             sampling?: components["schemas"]["VideoSamplingPolicy"];
         };
-        /** @description A content part for multimodal input (text, image URL, or inline media). */
-        ContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["ImageURLContentPart"] | components["schemas"]["MediaContentPart"];
+        /** @description Image, audio, or video named by a source record's `content.resource`. Accepted only on the Antfly gateway's generate and chat routes, which fetch the pinned version under `remote_content.security` and replace this part with inline media, so the source URL never reaches a model vendor. Fetching requires a nonempty `allowed_hosts`. The expanded request is limited to 16 MiB. Models that do not support the media type reject the request. */
+        SourceContentPart: {
+            /** @enum {string} */
+            type: "source";
+            source: {
+                /** @enum {string} */
+                type: "source";
+                /** @description HTTP(S) URL. Treat source media URLs as private. */
+                uri: string;
+                /** @description image/png, image/jpeg, image/webp, image/gif, or an audio/* or video/* type. */
+                mime_type: string;
+                /** @description Quoted strong ETag. The fetch fails if the source no longer has this version. */
+                version: string;
+                /**
+                 * @default strong_etag
+                 * @enum {string}
+                 */
+                version_kind?: "strong_etag";
+                /**
+                 * Format: int64
+                 * @description Exact object length.
+                 */
+                length: number;
+            };
+        };
+        /** @description A content part for multimodal input (text, image URL, inline media, or a pinned source reference). */
+        ContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["ImageURLContentPart"] | components["schemas"]["MediaContentPart"] | components["schemas"]["SourceContentPart"];
         /**
          * @description Message content. Supports two formats:
          *     - Simple string: "Hello, how are you?"
@@ -30826,6 +30851,13 @@ export interface components {
              */
             allowed_paths?: string[];
             /**
+             * @description Exact source companion base URLs that a chat `source` part may fetch, matched on scheme, host, port and path. This is how a loopback or private companion is allowed; such URLs need no `allowed_hosts` entry. Every other `source` URL needs `allowed_hosts` and always keeps private-IP blocking, whatever `block_private_ips` says. Template fetches ignore this setting.
+             * @example [
+             *       "http://127.0.0.1:8082/v1/media/"
+             *     ]
+             */
+            source_media_base_urls?: string[];
+            /**
              * @description User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
              * @example AntflyDB/1.0
              */
@@ -31055,7 +31087,21 @@ export interface components {
             content_security?: components["schemas"]["ContentSecurityConfig"];
             /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
             s3_credentials?: components["schemas"]["Credentials"];
-            /** @description Experimental execution batching; mode on explicitly enables qualified CUDA scheduling. Resource and request ceilings still apply. */
+            /** @description Opt-in interleaving of independently owned requests on backends declaring safe step sharing. Independent of row batching; graph, prefix-cache, speculative and multimodal routes remain exclusive. Currently qualified for at most two active E4B CUDA requests with one row per step. */
+            cooperative_execution?: {
+                /**
+                 * @default off
+                 * @enum {string}
+                 */
+                mode?: "off" | "on";
+                /** @default 2 */
+                max_active_requests?: number;
+                /** @default 8 */
+                short_context_burst?: number;
+                /** @default 5000 */
+                decode_handoff_wait_us?: number;
+            };
+            /** @description Experimental row batching; independent from cooperative_execution. Mode on explicitly enables qualified CUDA row scheduling. Resource and request ceilings still apply. */
             generation_batching?: {
                 /**
                  * @default off

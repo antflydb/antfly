@@ -30,6 +30,10 @@ components:
           type: string
           enum: [unknown, unsupported, supported]
           default: unknown
+        video:
+          type: string
+          enum: [unknown, unsupported, supported]
+          default: unknown
     RuntimeTaskBinding:
       type: object
       additionalProperties: false

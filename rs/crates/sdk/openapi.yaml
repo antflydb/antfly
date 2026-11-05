@@ -47554,12 +47554,67 @@ components:
           description: MIME type (audio/wav, image/gif, image/png, etc.).
         sampling:
           $ref: '#/components/schemas/VideoSamplingPolicy'
+    SourceContentPart:
+      type: object
+      additionalProperties: false
+      description: Image, audio, or video named by a source record's `content.resource`. Accepted only
+        on the Antfly gateway's generate and chat routes, which fetch the pinned version under `remote_content.security`
+        and replace this part with inline media, so the source URL never reaches a model vendor. Fetching
+        requires a nonempty `allowed_hosts`. The expanded request is limited to 16 MiB. Models that do
+        not support the media type reject the request.
+      required:
+        - type
+        - source
+      properties:
+        type:
+          type: string
+          enum:
+            - source
+        source:
+          type: object
+          additionalProperties: false
+          required:
+            - type
+            - uri
+            - mime_type
+            - version
+            - length
+          properties:
+            type:
+              type: string
+              enum:
+                - source
+            uri:
+              type: string
+              maxLength: 16384
+              description: HTTP(S) URL. Treat source media URLs as private.
+            mime_type:
+              type: string
+              description: image/png, image/jpeg, image/webp, image/gif, or an audio/* or video/* type.
+            version:
+              type: string
+              minLength: 1
+              maxLength: 4096
+              description: Quoted strong ETag. The fetch fails if the source no longer has this version.
+            version_kind:
+              type: string
+              enum:
+                - strong_etag
+              default: strong_etag
+            length:
+              type: integer
+              format: int64
+              minimum: 1
+              maximum: 16777216
+              description: Exact object length.
     ContentPart:
-      description: A content part for multimodal input (text, image URL, or inline media).
+      description: A content part for multimodal input (text, image URL, inline media, or a pinned source
+        reference).
       oneOf:
         - $ref: '#/components/schemas/TextContentPart'
         - $ref: '#/components/schemas/ImageURLContentPart'
         - $ref: '#/components/schemas/MediaContentPart'
+        - $ref: '#/components/schemas/SourceContentPart'
     ChatMessageContent:
       x-go-type: stdjson.RawMessage
       x-go-type-import:
@@ -68788,6 +68843,17 @@ components:
           example:
             - /Users/data/
             - my-bucket/uploads/
+        source_media_base_urls:
+          type: array
+          description: Exact source companion base URLs that a chat `source` part may fetch, matched on
+            scheme, host, port and path. This is how a loopback or private companion is allowed; such
+            URLs need no `allowed_hosts` entry. Every other `source` URL needs `allowed_hosts` and always
+            keeps private-IP blocking, whatever `block_private_ips` says. Template fetches ignore this
+            setting.
+          items:
+            type: string
+          example:
+            - http://127.0.0.1:8082/v1/media/
         user_agent:
           type: string
           description: User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some
@@ -69172,11 +69238,40 @@ components:
         s3_credentials:
           $ref: '#/components/schemas/Credentials'
           description: S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail.
+        cooperative_execution:
+          type: object
+          additionalProperties: false
+          description: Opt-in interleaving of independently owned requests on backends declaring safe
+            step sharing. Independent of row batching; graph, prefix-cache, speculative and multimodal
+            routes remain exclusive. Currently qualified for at most two active E4B CUDA requests with
+            one row per step.
+          properties:
+            mode:
+              type: string
+              enum:
+                - 'off'
+                - 'on'
+              default: 'off'
+            max_active_requests:
+              type: integer
+              minimum: 1
+              maximum: 2
+              default: 2
+            short_context_burst:
+              type: integer
+              minimum: 1
+              maximum: 8
+              default: 8
+            decode_handoff_wait_us:
+              type: integer
+              minimum: 0
+              maximum: 10000
+              default: 5000
         generation_batching:
           type: object
           additionalProperties: false
-          description: Experimental execution batching; mode on explicitly enables qualified CUDA scheduling.
-            Resource and request ceilings still apply.
+          description: Experimental row batching; independent from cooperative_execution. Mode on explicitly
+            enables qualified CUDA row scheduling. Resource and request ceilings still apply.
           properties:
             mode:
               type: string

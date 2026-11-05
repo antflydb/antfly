@@ -32,6 +32,7 @@ const (
 	ProviderGoogleDrive        = "google_drive"
 	ProviderGCS                = "gcs"
 	ProviderS3                 = "s3"
+	ProviderLocal              = "local"
 	ProviderSlack              = "slack"
 	ProviderDiscord            = "discord"
 	ProviderGoogleWorkspace    = "google_workspace"
