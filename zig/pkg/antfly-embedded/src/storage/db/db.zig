@@ -34155,35 +34155,39 @@ pub const DB = struct {
     }
 
     /// Optional control work has its own continuation, retained by the file
-    /// owner across runtime reopen. Each visit executes one service, never an
-    /// idle drain. It runs after the source epoch has been released.
+    /// owner across runtime reopen. Empty checks share a budgeted turn instead
+    /// of each forcing another native capture. Reported work yields immediately;
+    /// this never drains a service. The primary source epoch has already ended.
     fn runBackgroundControlMaintenance(self: *DB, cancellation: types.CancellationToken) !bool {
         try ensureSnapshotActive(cancellation);
         const state = self.borrowed_group_source_state orelse &self.group_source_owner.state;
-        const slot = state.control_maintenance_slot;
-        state.control_maintenance_pending = true;
-        var more = false;
-        switch (slot) {
-            0 => more = try self.evaluateAlgebraicAdaptiveCandidates() != 0,
-            1 => more = try self.runAlgebraicAdaptiveWork() != 0,
-            2 => more = try self.runArtifactRepairMetadataMaintenancePass(),
-            3 => more = try self.runRelationalIndexMaintenancePass(),
-            4 => more = try self.runDensePostingMaintenanceForIdle() != 0,
-            5 => more = try self.runGraphMetricMaintenanceForIdle() != 0,
-            6 => more = try self.finalizeDenseProjectionLifecycleForIdle(),
-            7 => more = try self.runSourcePinCleanupStep(),
-            8 => more = try self.runDeferredRepairShadowCleanupPage(),
-            else => unreachable,
-        }
-        // Retry an interrupted service instead of skipping it. An entire
-        // clean sweep is required before this lane advertises quiescence.
-        state.control_maintenance_changed = state.control_maintenance_changed or more;
-        state.control_maintenance_slot = (slot + 1) % 9;
-        if (state.control_maintenance_slot != 0) return true;
-        const changed = state.control_maintenance_changed;
-        state.control_maintenance_changed = false;
-        state.control_maintenance_pending = changed;
-        return changed;
+        const Control = struct {
+            database: *DB,
+            cancellation: types.CancellationToken,
+
+            fn step(context: *@This(), slot: u4) !bool {
+                try ensureSnapshotActive(context.cancellation);
+                const database = context.database;
+                return switch (slot) {
+                    0 => try database.evaluateAlgebraicAdaptiveCandidates() != 0,
+                    1 => try database.runAlgebraicAdaptiveWork() != 0,
+                    2 => try database.runArtifactRepairMetadataMaintenancePass(),
+                    3 => try database.runRelationalIndexMaintenancePass(),
+                    4 => try database.runDensePostingMaintenanceForIdle() != 0,
+                    5 => try database.runGraphMetricMaintenanceForIdle() != 0,
+                    6 => try database.finalizeDenseProjectionLifecycleForIdle(),
+                    7 => try database.runSourcePinCleanupStep(),
+                    8 => try database.runDeferredRepairShadowCleanupPage(),
+                    else => unreachable,
+                };
+            }
+
+            fn now(_: *@This()) u64 {
+                return @import("antfly_platform").time.monotonicNs();
+            }
+        };
+        var context: Control = .{ .database = self, .cancellation = cancellation };
+        return @import("maintenance/control_sweep.zig").run(state, &context, Control.step, Control.now, state.replay_budget.target_quantum_ns);
     }
 
     pub fn runGraphMetricMaintenanceForIdle(self: *DB) !usize {
@@ -77563,11 +77567,13 @@ test "db detached replay leaves optional maintenance to its retained continuatio
     state.control_maintenance_slot = 3;
     _ = try database.runBackgroundTurnWithCancellation(.none, .replay);
     try std.testing.expectEqual(@as(u4, 3), state.control_maintenance_slot);
-    // Optional work advances exactly one service and cannot report the whole
-    // sweep clean simply because that individual service has no work.
-    try std.testing.expect(try database.runBackgroundControlMaintenance(.none));
-    try std.testing.expectEqual(@as(u4, 4), state.control_maintenance_slot);
-    try std.testing.expect(state.control_maintenance_pending);
+    // A clean continuation checks its remaining services in one capture.
+    // Isolate this dispatch assertion from host scheduling delays; deterministic
+    // control_sweep tests separately exercise the normal quantum and errors.
+    state.replay_budget.target_quantum_ns = std.time.ns_per_hour;
+    try std.testing.expect(!try database.runBackgroundControlMaintenance(.none));
+    try std.testing.expectEqual(@as(u4, 0), state.control_maintenance_slot);
+    try std.testing.expect(!state.control_maintenance_pending);
     state.control_maintenance_slot = 8;
     state.control_maintenance_changed = false;
     _ = try database.runBackgroundControlMaintenance(.none);

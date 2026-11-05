@@ -1333,6 +1333,12 @@ Artifact continuations have a separate pending flag and deadline. Running an LSM
 slice or retiring journal rows does not restart providers, replay or source
 status publication. Artifact-only turns retain the catalog publication fence,
 but acquire no primary source epoch; future LSM work respects its wake deadline.
+Optional control cleanup coalesces empty checks in the same turn. It checks at
+most nine services, yielding at the first reported work/continuation or after a
+check consumes the replay time quantum (25 ms by default). Interrupted checks
+leave the cursor at that service; quiescence still requires an entire unchanged
+sweep. Empty services therefore do not manufacture nine separate runtime captures
+and writer-admission rounds for every otherwise idle namespace.
 Source replay can retain eligible immutable text inputs after catching its
 target and across namespace rotation. Residency is bounded to the root and eight
 named namespaces; selecting a ninth evicts the least recently selected runtime.
