@@ -4648,6 +4648,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .outside_page_spans = diagnostics.outside_page_spans,
                     .invisible_spans = diagnostics.invisible_spans,
                     .unpositioned_spans = diagnostics.unpositioned_spans,
+                    .structure_text_incomplete = diagnostics.structure_text_incomplete,
                     .outline_fallback = diagnostics.outline_fallback,
                     .has_nontext_visual = diagnostics.has_nontext_visual,
                     .has_unrendered_annotations = diagnostics.has_unrendered_annotations,
@@ -8123,7 +8124,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             // A payload without the marker predates the canonical fingerprint
             // encoding. Its state descriptor therefore contains the legacy digest;
             // reconstruct that exact value for rolling-upgrade validation. Current
-            // payloads always validate through their persisted `duf3:` marker.
+            // payloads always validate through their persisted versioned marker.
             return try document_unit_fingerprint.legacyFingerprintAlloc(alloc, unit);
         }
 

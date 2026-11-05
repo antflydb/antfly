@@ -22,9 +22,9 @@ const Sha256 = std.crypto.hash.sha2.Sha256;
 /// Persisted prefix for the canonical, injective unit-fingerprint encoding.
 /// Keeping the version in the value makes payload markers self-describing and
 /// lets readers distinguish them from the unversioned legacy digest.
-pub const current_prefix = "duf4:";
-pub const current_state_version: u8 = 4;
-const current_domain = "antfly-document-unit-fingerprint-v4";
+pub const current_prefix = "duf5:";
+pub const current_state_version: u8 = 5;
+const current_domain = "antfly-document-unit-fingerprint-v5";
 
 // Adding extraction metadata is a persisted-format change: update the encoder,
 // assign a new stable tag, and bump the fingerprint version deliberately.
@@ -115,7 +115,7 @@ pub fn fingerprintAlloc(alloc: Allocator, unit: document_extraction.Unit) ![]u8 
     hashTaggedTextRegions(&hasher, unit.text_regions);
     hashTaggedTextBlocks(&hasher, unit.text_blocks);
     // Transcript timing retains its established tag and remains omitted when
-    // absent, while the v3 domain separates this complete encoding from v2.
+    // absent, while the versioned domain separates this encoding from older units.
     if (unit.transcript_spans.len > 0) hashTaggedTranscriptSpans(&hasher, unit.transcript_spans);
     hashTaggedOptionalU32(&hasher, .char_start, unit.char_start);
     hashTaggedOptionalU32(&hasher, .char_end, unit.char_end);
@@ -518,6 +518,7 @@ fn hashTaggedNativeTextDiagnostics(hasher: *Sha256, diagnostics: ?document_extra
         hashU64(hasher, @intCast(value.invisible_spans));
         hashU64(hasher, @intCast(value.unpositioned_spans));
         hasher.update(&.{
+            @intFromBool(value.structure_text_incomplete),
             @intFromBool(value.outline_fallback),
             @intFromBool(value.has_nontext_visual),
             @intFromBool(value.has_unrendered_annotations),
@@ -698,6 +699,12 @@ test "document unit fingerprint includes native quality diagnostics region style
         defer alloc.free(fingerprint);
         try std.testing.expect(!std.mem.eql(u8, metadata, fingerprint));
     }
+
+    var partial_structure = enriched;
+    partial_structure.native_text_diagnostics.?.structure_text_incomplete = true;
+    const partial_fingerprint = try fingerprintAlloc(alloc, partial_structure);
+    defer alloc.free(partial_fingerprint);
+    try std.testing.expect(!std.mem.eql(u8, metadata, partial_fingerprint));
 
     var regions = [_]document_extraction.TextRegion{.{ .span = .{ 0, 7 }, .bbox = .{ 1, 2, 3, 4 }, .font_size = 12, .bold = true }};
     var blocks = [_]document_extraction.TextBlock{.{ .span = .{ 0, 7 }, .bbox = .{ 1, 2, 3, 4 }, .reading_order = 0, .font_size = 12, .bold = true }};

@@ -1894,8 +1894,8 @@ removing this lease.
 ### Native semantic replacements
 
 Native extraction retains decoded glyph runs unchanged. Each effective
-`/ActualText` scope owns one semantic span, its source run range (including
-zero-glyph scopes), and a constant-space summary of glyph, vector, and image
+`/ActualText` scope owns one semantic span, its enclosing source run interval
+(including zero-glyph scopes), explicit glyph membership, and a constant-space summary of glyph, vector, and image
 paint evidence. Nested Forms inherit active scopes and graphics state. Image
 eligibility uses transformed bounds without decoding pixels. Page and visible
 eligibility are evaluated per paint before bounds are unioned; unknown paint
@@ -1904,6 +1904,25 @@ an underestimated path-only bound.
 Visibility retains zero-opacity ancestry across nested transparency groups
 separately from each render group's compositing alpha. Nonzero group opacity
 does not become invisible through multiplication or quantization underflow.
+
+Structure-backed replacements resolve container-scoped MCIDs through a lazy
+ParentTree number-tree index. Parsed metadata and validated number-tree nodes
+are cached per Reader; render forks own independent caches. Container arrays,
+ancestor decisions, stream container keys, and decoded owner text are reused
+within each page. Retained metadata and page-local lookup allocations share
+one live-byte allowance. ParentTree bindings are checked against the owner's declared
+content. An outer replacement wins over its descendants; repeated MCIDs owned
+by the same replacement merge paint evidence and emit text once, preserving
+unrelated interleaved runs. Glyph selection and span propagation remain linear
+even when enclosing source intervals overlap.
+
+Structure lookup has explicit byte, cumulative-allocation, work, and recursion
+limits and polls cancellation. Metadata object parsing is depth-limited before
+recursive syntax expansion. Missing/cyclic links, mismatched content, dangling
+marked-content scopes, cross-page replacements, and unsupported OBJR content
+preserve native fallback and set `structure_text_incomplete`; document semantic
+coverage becomes partial. Page references retained in the shared immutable
+page index distinguish pages even when they reuse the same content stream.
 
 Layout consumes each replacement once. Entry and exit glyphs preserve spacing
 at scope boundaries; unpositioned or multiline replacements fence geometric

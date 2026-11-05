@@ -135,7 +135,9 @@ empty inventory and retires its previous full-text entries and chunk vectors.
 
 Native PDF extraction does not use a model or OCR. It decodes the PDF's text
 operators and honors `/ActualText` replacements, including marked content in
-Form XObjects. Configure native extraction separately from OCR:
+Form XObjects and structure elements linked through `ParentTree` and `MCID`.
+Shared structure replacements emit once and retain the union of their paint
+evidence without removing unrelated interleaved text. Configure native extraction separately from OCR:
 
 ```json
 {
@@ -169,6 +171,10 @@ score. Diagnostics record the selected policy, ActualText replacement count,
 exterior/invisible glyph runs and semantic spans, unpositioned semantic spans,
 alignment and ordering limitations, and nontext or
 annotation evidence. `extraction_complete` describes decoding, not correctness.
+`structure_text_incomplete` reports malformed, unsupported, or resource-limited
+structure replacement lookup. Native glyph text is retained in those cases;
+cross-page replacements and object-reference (`OBJR`) content are reported as
+partial coverage rather than assigned invented page text or geometry.
 `semantic_coverage` is `partial` when unresolved coverage is known, `unknown`
 when extraction is incomplete, or `text_only` otherwise; it never certifies
 headings, tables, chart interpretation, or complete visual understanding.

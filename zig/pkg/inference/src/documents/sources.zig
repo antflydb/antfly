@@ -306,6 +306,7 @@ pub const Source = struct {
                 page.regions = try nativePdfRegionsAlloc(a, analysis, limit, control);
                 if (analysis.diagnostics.unaligned_runs > 0 or analysis.diagnostics.unpositioned_spans > 0)
                     try @import("representation.zig").finding(a, &page, "native_text_alignment_unavailable", true);
+                if (analysis.diagnostics.structure_text_incomplete) try @import("representation.zig").finding(a, &page, "native_structure_text_unavailable", true);
                 if (analysis.has_unrendered_annotations) try @import("representation.zig").finding(a, &page, "pdf_annotation_rendering_unavailable", true);
                 if (analysis.outline_fallback) try @import("representation.zig").finding(a, &page, "native_font_fallback", true);
                 if (analysis.has_nontext_visual) try @import("representation.zig").finding(a, &page, "visual_content_requires_inspection", true);

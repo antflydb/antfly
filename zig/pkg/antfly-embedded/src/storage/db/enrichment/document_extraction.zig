@@ -88,6 +88,7 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or bu
                 outside_page_spans: usize = 0,
                 invisible_spans: usize = 0,
                 unpositioned_spans: usize = 0,
+                structure_text_incomplete: bool = false,
             };
 
             pub const DecodeLimits = struct {
@@ -871,6 +872,7 @@ pub const NativeTextDiagnostics = struct {
     outside_page_spans: usize = 0,
     invisible_spans: usize = 0,
     unpositioned_spans: usize = 0,
+    structure_text_incomplete: bool = false,
     outline_fallback: bool = false,
     has_nontext_visual: bool = false,
     has_unrendered_annotations: bool = false,
@@ -2576,7 +2578,7 @@ fn dupeOptionalStringField(alloc: Allocator, object: std.json.ObjectMap, field: 
     return try alloc.dupe(u8, value.string);
 }
 
-pub const native_text_extraction_identity = "native-text-v4";
+pub const native_text_extraction_identity = "native-text-v5";
 
 pub fn metadataFingerprintAlloc(
     alloc: Allocator,
@@ -2977,6 +2979,7 @@ fn nativeTextDiagnostics(
         else if (diagnostics.unaligned_runs > 0 or
             diagnostics.unsupported_ordering_runs > 0 or
             diagnostics.unpositioned_spans > 0 or
+            diagnostics.structure_text_incomplete or
             analysis.outline_fallback or
             analysis.has_nontext_visual or
             analysis.has_unrendered_annotations)
@@ -2993,6 +2996,7 @@ fn nativeTextDiagnostics(
         .outside_page_spans = diagnostics.outside_page_spans,
         .invisible_spans = diagnostics.invisible_spans,
         .unpositioned_spans = diagnostics.unpositioned_spans,
+        .structure_text_incomplete = diagnostics.structure_text_incomplete,
         .outline_fallback = analysis.outline_fallback,
         .has_nontext_visual = analysis.has_nontext_visual,
         .has_unrendered_annotations = analysis.has_unrendered_annotations,
@@ -3550,6 +3554,13 @@ test "native text diagnostics distinguish extraction completion and semantic cov
         .runs = @constCast(&[_]pdf.reader.TextRun{}),
     }, true);
     try std.testing.expectEqual(NativeTextSemanticCoverage.text_only, text_only.semantic_coverage);
+    const unresolved_structure = nativeTextDiagnostics(.page, .{
+        .text = @constCast("SOURCE"),
+        .runs = &.{},
+        .diagnostics = .{ .structure_text_incomplete = true },
+    }, true);
+    try std.testing.expectEqual(NativeTextSemanticCoverage.partial, unresolved_structure.semantic_coverage);
+    try std.testing.expect(unresolved_structure.structure_text_incomplete);
     const unpositioned = nativeTextDiagnostics(.page, .{
         .text = @constCast("semantic label"),
         .runs = &.{},

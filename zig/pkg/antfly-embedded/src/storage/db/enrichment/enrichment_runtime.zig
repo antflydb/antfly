@@ -63,6 +63,11 @@ const document_extraction_client = if (!builtin.is_test and build_options.linked
     @import("document_extraction_client.zig")
 else
     struct {};
+// Runtime tests use direct compute stubs, but the curated clone-ownership test
+// must still be declared and audited in this compilation root.
+test {
+    _ = @import("document_extraction_client.zig");
+}
 const document_unit_fingerprint = @import("document_unit_fingerprint.zig");
 const artifact_ids = @import("../artifact_ids.zig");
 const chunker_mod = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or builtin.is_test or build_options.bench_minimal_deps)
@@ -25956,6 +25961,7 @@ fn buildDocumentUnitChunkPayloadAlloc(
             .outside_page_spans = diagnostics.outside_page_spans,
             .invisible_spans = diagnostics.invisible_spans,
             .unpositioned_spans = diagnostics.unpositioned_spans,
+            .structure_text_incomplete = diagnostics.structure_text_incomplete,
             .outline_fallback = diagnostics.outline_fallback,
             .has_nontext_visual = diagnostics.has_nontext_visual,
             .has_unrendered_annotations = diagnostics.has_unrendered_annotations,
