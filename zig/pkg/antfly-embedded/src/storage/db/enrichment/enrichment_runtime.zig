@@ -13266,14 +13266,14 @@ fn verifySharedPdfWindowConsumers(alloc: Allocator, batch: document_extraction_m
         var first_sink = Sink{ .alloc = alloc };
         var first_text = RuntimePdfPageTextSpool{ .scheduler = &scheduler, .digest = digest, .limits = .{}, .policy = .page };
         defer first_text.deinit();
-        try document_extraction_mod.extractPreparedPdfStreamingWithTextCache(alloc, session, "application/pdf", .{}, .auto, .{}, first_sink.sink(), first_text.cache());
+        try document_extraction_mod.extractPreparedPdfStreamingWithTextCache(alloc, session, "application/pdf", .{}, .auto, first_sink.sink(), first_text.cache());
         try first_text.finish();
         try std.testing.expectEqual(@as(usize, 2), first_text.stores);
         try std.testing.expectEqual(@as(usize, 0), first_text.hits);
         var second_sink = Sink{ .alloc = alloc };
         var second_text = RuntimePdfPageTextSpool{ .scheduler = &scheduler, .digest = digest, .limits = .{}, .policy = .page };
         defer second_text.deinit();
-        try document_extraction_mod.extractPreparedPdfStreamingWithTextCache(alloc, session, "application/pdf", .{}, .always, .{}, second_sink.sink(), second_text.cache());
+        try document_extraction_mod.extractPreparedPdfStreamingWithTextCache(alloc, session, "application/pdf", .{}, .always, second_sink.sink(), second_text.cache());
         try second_text.finish();
         try std.testing.expectEqual(@as(usize, 0), second_text.stores);
         try std.testing.expectEqual(@as(usize, 2), second_text.hits);
@@ -17509,7 +17509,6 @@ fn processDocumentExtractionAsset(
             if (extraction_config.content_type.len > 0) extraction_config.content_type else downloaded.content_type,
             extraction_config.native_text,
             extraction_config.ocr_mode,
-            extraction_config.ocr_quality,
             prepared_marking.sink(),
             if (page_text_spool) |*spool| spool.cache() else null,
         )
@@ -22360,7 +22359,7 @@ fn flushRuntimeGeneratedTextBatch(
     units: []document_extraction_mod.Unit,
     method: []const u8,
     kind: RuntimeGeneratedUnitTextKind,
-    quality_config: document_extraction_mod.OcrQualityConfig,
+    quality_config: document_extraction_mod.TextQualityConfig,
     ocr_prompt: []const u8,
     source_fingerprint: []const u8,
     retry_fingerprint: u64,
@@ -22439,7 +22438,7 @@ fn recoverRuntimeGeneratedTextBatch(
     units: []document_extraction_mod.Unit,
     method: []const u8,
     kind: RuntimeGeneratedUnitTextKind,
-    quality_config: document_extraction_mod.OcrQualityConfig,
+    quality_config: document_extraction_mod.TextQualityConfig,
     ocr_prompt: []const u8,
     source_fingerprint: []const u8,
     err: anyerror,
@@ -22464,7 +22463,7 @@ fn applyRuntimeGeneratedTextBatch(
     method: []const u8,
     kind: RuntimeGeneratedUnitTextKind,
     output_mode: RuntimeGeneratedUnitTextOutputMode,
-    quality_config: document_extraction_mod.OcrQualityConfig,
+    quality_config: document_extraction_mod.TextQualityConfig,
     ocr_prompt: []const u8,
     produced_batch: *asset_producer_mod.ProducedBatch,
     retry_fingerprint: u64,
@@ -22515,7 +22514,7 @@ fn flushRuntimeGeneratedTextBatchSequential(
     units: []document_extraction_mod.Unit,
     method: []const u8,
     kind: RuntimeGeneratedUnitTextKind,
-    quality_config: document_extraction_mod.OcrQualityConfig,
+    quality_config: document_extraction_mod.TextQualityConfig,
     ocr_prompt: []const u8,
     source_fingerprint: []const u8,
     fallback_reason: []const u8,
@@ -22699,7 +22698,7 @@ fn applyRuntimeGeneratedUnitText(
     status: []const u8,
     kind: RuntimeGeneratedUnitTextKind,
     output_mode: RuntimeGeneratedUnitTextOutputMode,
-    quality_config: document_extraction_mod.OcrQualityConfig,
+    quality_config: document_extraction_mod.TextQualityConfig,
     ocr_prompt: []const u8,
 ) !void {
     var staged = cloneDocumentExtractionUnit(alloc, unit.*) catch |err| {
@@ -22732,7 +22731,7 @@ fn applyRuntimeGeneratedUnitTextInPlace(
     status: []const u8,
     kind: RuntimeGeneratedUnitTextKind,
     output_mode: RuntimeGeneratedUnitTextOutputMode,
-    quality_config: document_extraction_mod.OcrQualityConfig,
+    quality_config: document_extraction_mod.TextQualityConfig,
     ocr_prompt: []const u8,
 ) !void {
     if (produced.len == 0 and kind != .ocr) {
@@ -22755,10 +22754,18 @@ fn applyRuntimeGeneratedUnitTextInPlace(
         unit.ocr_failure_stage = null;
         unit.ocr_failure_retryable = null;
     }
+    if (kind == .ocr and std.mem.eql(u8, unit.unit_type, "image")) {
+        // Images have no native candidate, but the same OCR output policy and
+        // diagnostics apply regardless of the input format.
+        const output_quality = document_extraction_mod.assessTextQuality(parsed.text, quality_config);
+        const owned_quality = try document_extraction_mod.ocrQualityJsonAlloc(alloc, output_quality);
+        if (unit.ocr_output_quality) |value| alloc.free(value);
+        unit.ocr_output_quality = owned_quality;
+    }
     if (kind == .ocr and !std.mem.eql(u8, unit.unit_type, "image")) {
         unit.ocr_attempted = true;
-        const embedded_quality = document_extraction_mod.assessOcrQuality(unit.text, quality_config);
-        const output_quality = document_extraction_mod.assessOcrQuality(parsed.text, quality_config);
+        const embedded_quality = unit.native_text_quality orelse document_extraction_mod.assessTextQuality(unit.text, .{});
+        const output_quality = document_extraction_mod.assessTextQuality(parsed.text, quality_config);
         const text_choice = try document_extraction_mod.chooseOcrTextForContentAlloc(alloc, unit.text, parsed.text, embedded_quality, output_quality);
         {
             const owned_embedded_quality = try document_extraction_mod.ocrQualityJsonAlloc(alloc, embedded_quality);
@@ -32782,11 +32789,11 @@ fn documentExtractionFingerprintAlloc(
 test "document extraction runtime fingerprints independent native quality and policy without OCR" {
     const alloc = std.testing.allocator;
     var native_only = try document_extraction_mod.parseConfig(alloc,
-        \\{"native_text":{"policy":"page","quality":{"min_content_chars":1}}}
+        \\{"native_text":{"policy":"page","quality":{"min_chars":1}}}
     );
     defer native_only.deinit(alloc);
     try std.testing.expect(!native_only.ocr_enabled);
-    try std.testing.expect(!document_extraction_mod.assessOcrQuality("native text", native_only.native_text.quality).too_short);
+    try std.testing.expect(!document_extraction_mod.assessTextQuality("native text", native_only.native_text.quality).too_short);
     const source = "%PDF-test-content";
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(source, &digest, .{});
@@ -32807,7 +32814,7 @@ test "document extraction runtime fingerprints independent native quality and po
     defer alloc.free(visible);
     try std.testing.expect(!std.mem.eql(u8, prepared, visible));
     var tuned_native = document_extraction_mod.NativeTextConfig{};
-    tuned_native.quality.min_content_chars += 1;
+    tuned_native.quality.min_chars += 1;
     const tuned = try documentExtractionFingerprintFromDigestAlloc(alloc, &identity, "{}", tuned_native, "application/pdf", "file.pdf", "application/pdf", &digest);
     defer alloc.free(tuned);
     try std.testing.expect(!std.mem.eql(u8, prepared, tuned));
@@ -32846,14 +32853,14 @@ fn documentExtractionFingerprintFromDigestAlloc(
         hasher.update(field);
     }
     for ([_]u64{
-        @intCast(native_text.quality.min_content_chars),
+        @intCast(native_text.quality.min_chars),
         @intCast(native_text.quality.garbled_min_words),
         @intCast(native_text.quality.garbled_sample_words),
         @bitCast(native_text.quality.max_single_char_word_ratio),
-        @intCast(native_text.quality.substantial_line_min_chars),
+        @intCast(native_text.quality.min_line_chars),
         @bitCast(native_text.quality.max_corrupted_line_ratio),
-        @bitCast(native_text.quality.font_corruption_score_threshold),
-        @bitCast(native_text.quality.max_replacement_char_ratio),
+        @bitCast(native_text.quality.max_font_corruption),
+        @bitCast(native_text.quality.max_replacement_ratio),
     }) |value| {
         var encoded: [8]u8 = undefined;
         std.mem.writeInt(u64, &encoded, value, .little);
@@ -37246,7 +37253,7 @@ test "document extraction generated OCR applies unit updates transactionally" {
                 .extraction_status = @constCast("pending_ocr"),
                 .ocr_failure_stage = @constCast("render"),
                 .page_number = 1,
-                .native_text_quality = document_extraction_mod.assessOcrQuality("prior text", .{ .min_content_chars = 1 }),
+                .native_text_quality = document_extraction_mod.assessTextQuality("prior text", .{ .min_chars = 1 }),
                 .native_text_diagnostics = .{
                     .policy = .page,
                     .semantic_coverage = .partial,
@@ -37423,9 +37430,9 @@ test "OCR text selection retains only exactly mapped region spans" {
     const ocr_text = "Quarterly revenue and margins improved throughout the year. This transcription contains fluent explanatory prose but omits the individual table cells.";
     // Make OCR an actual quality improvement so this fixture exercises the
     // numeric-row hybrid and its grounding, rather than source retention.
-    const quality_config: document_extraction_mod.OcrQualityConfig = .{ .min_content_chars = 100 };
-    try std.testing.expect(document_extraction_mod.assessOcrQuality(embedded_text, quality_config).needsFallback());
-    try std.testing.expect(!document_extraction_mod.assessOcrQuality(ocr_text, quality_config).needsFallback());
+    const quality_config: document_extraction_mod.TextQualityConfig = .{ .min_chars = 100 };
+    try std.testing.expect(document_extraction_mod.assessTextQuality(embedded_text, quality_config).needsFallback());
+    try std.testing.expect(!document_extraction_mod.assessTextQuality(ocr_text, quality_config).needsFallback());
     const regions_json =
         "[{\"text\":\"Quarterly revenue and margins improved throughout the year. This transcription contains fluent explanatory prose but omits the individual table cells.\",\"bbox\":[5,5,95,35],\"coordinate_space\":\"image_pixels_top_left\"}," ++
         "{\"text\":\"Q1 101 81 20\",\"bbox\":[5,40,50,50],\"coordinate_space\":\"image_pixels_top_left\"}]";
@@ -37438,6 +37445,7 @@ test "OCR text selection retains only exactly mapped region spans" {
         .unit_id = @constCast("page:000001"),
         .unit_type = @constCast("page"),
         .text = @constCast(embedded_text),
+        .native_text_quality = document_extraction_mod.assessTextQuality(embedded_text, quality_config),
         .method = @constCast("pdf_text"),
         .extraction_status = @constCast("pending_ocr"),
         .page_number = 1,
@@ -44023,4 +44031,41 @@ test "durable enrichment scoped retry captures prior context failures before ren
     }
     // Content equality cannot revive a failure of an older incarnation.
     try std.testing.expectError(error.EnrichmentSourceChanged, replay.requireCurrentCapturedRequest(&runtime, .{ .request = request }));
+}
+
+test "document extraction OCR selection keeps independent native quality" {
+    const alloc = std.testing.allocator;
+    const native_text = "A readable native heading";
+    var unit = try cloneDocumentExtractionUnit(alloc, .{
+        .unit_id = @constCast("page:000001"),
+        .unit_type = @constCast("page"),
+        .text = @constCast(native_text),
+        .method = @constCast("pdf_ocr_pending"),
+        .native_text_quality = document_extraction_mod.assessTextQuality(native_text, .{ .min_chars = 1 }),
+    });
+    defer unit.deinit(alloc);
+    const output = try alloc.dupe(u8, "A different OCR heading");
+    try applyRuntimeGeneratedUnitText(alloc, alloc, &unit, output, "reader", "completed", .ocr, .plain_or_generator_object, .{ .min_chars = 100 }, "<OCR>");
+    try std.testing.expectEqualStrings(native_text, unit.text);
+    try std.testing.expect(!unit.native_text_quality.?.too_short);
+    var native = try std.json.parseFromSlice(std.json.Value, alloc, unit.ocr_embedded_quality.?, .{});
+    defer native.deinit();
+    var ocr = try std.json.parseFromSlice(std.json.Value, alloc, unit.ocr_output_quality.?, .{});
+    defer ocr.deinit();
+    try std.testing.expect(!native.value.object.get("too_short").?.bool);
+    try std.testing.expect(ocr.value.object.get("too_short").?.bool);
+
+    var image = try cloneDocumentExtractionUnit(alloc, .{
+        .unit_id = @constCast("image:000001"),
+        .unit_type = @constCast("image"),
+        .text = @constCast(""),
+        .method = @constCast("ocr_pending"),
+    });
+    defer image.deinit(alloc);
+    try applyRuntimeGeneratedUnitText(alloc, alloc, &image, try alloc.dupe(u8, "Short image label"), "reader", "completed", .ocr, .plain_or_generator_object, .{ .min_chars = 100 }, "<OCR>");
+    try std.testing.expect(image.ocr_used);
+    try std.testing.expect(image.native_text_quality == null);
+    var image_quality = try std.json.parseFromSlice(std.json.Value, alloc, image.ocr_output_quality.?, .{});
+    defer image_quality.deinit();
+    try std.testing.expect(image_quality.value.object.get("too_short").?.bool);
 }

@@ -16927,13 +16927,13 @@ export interface components {
             /** @description Row field holding the source last-modified timestamp. */
             last_modified_field?: string;
         };
-        /** @description Text-quality thresholds. `native_text.quality` assesses native PDF text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR output. Quality flags are not guarantees of correct reading order or complete document semantics. */
-        DocumentExtractionOcrQualityConfig: {
+        /** @description Text-quality thresholds. `native_text.quality` assesses native document text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR output. Quality flags are not guarantees of correct reading order or complete document semantics. */
+        DocumentExtractionTextQualityConfig: {
             /**
-             * @description Minimum trimmed UTF-8 byte length before text counts as too short.
+             * @description Minimum non-whitespace Unicode characters before text passes the length check.
              * @default 50
              */
-            min_content_chars?: number;
+            min_chars?: number;
             /**
              * @description Minimum words before the garbled-text check applies.
              * @default 20
@@ -16951,10 +16951,10 @@ export interface components {
              */
             max_single_char_word_ratio?: number;
             /**
-             * @description Minimum trimmed UTF-8 byte length for a line to count in the corrupted-line check.
+             * @description Minimum non-whitespace Unicode characters for a line to count in the corrupted-line check.
              * @default 15
              */
-            substantial_line_min_chars?: number;
+            min_line_chars?: number;
             /**
              * Format: double
              * @description Maximum ratio of corrupted lines.
@@ -16966,15 +16966,15 @@ export interface components {
              * @description Font corruption score above which a substantial line counts as corrupted.
              * @default 0.5
              */
-            font_corruption_score_threshold?: number;
+            max_font_corruption?: number;
             /**
              * Format: double
              * @description Maximum ratio of Unicode replacement characters.
              * @default 0.05
              */
-            max_replacement_char_ratio?: number;
+            max_replacement_ratio?: number;
         };
-        /** @description Native PDF text policy and quality assessment. No OCR model is required. Native quality diagnostics are recorded independently of extraction completion and OCR availability. */
+        /** @description Native document text policy and quality assessment. No OCR model is required. Native quality diagnostics are recorded independently of extraction completion and OCR availability. */
         DocumentExtractionNativeTextConfig: {
             /**
              * @description `source` retains decoded source text, including off-page runs, for auditing. `page` excludes runs wholly outside the page or a known clipping box while retaining hidden OCR/accessibility text. `visible` additionally excludes nonpainting and fully transparent text. These policies do not claim pixel-perfect occlusion analysis. All policies honor semantic ActualText replacements.
@@ -16982,7 +16982,7 @@ export interface components {
              * @enum {string}
              */
             policy?: "source" | "page" | "visible";
-            quality?: components["schemas"]["DocumentExtractionOcrQualityConfig"];
+            quality?: components["schemas"]["DocumentExtractionTextQualityConfig"];
         };
         /** @description Reader provider for OCR. Every provider except `apple` requires `model`; Apple uses Vision text recognition and accepts no model, credentials, or prompt. */
         DocumentExtractionReaderConfig: {
@@ -17073,7 +17073,7 @@ export interface components {
             /** @description Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers reject prompts. */
             prompt?: string;
             render?: components["schemas"]["DocumentExtractionRenderConfig"];
-            quality?: components["schemas"]["DocumentExtractionOcrQualityConfig"];
+            quality?: components["schemas"]["DocumentExtractionTextQualityConfig"];
         };
         /** @description Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN. */
         CloudflareSTTConfig: {

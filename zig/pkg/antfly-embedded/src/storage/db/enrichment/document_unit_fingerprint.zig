@@ -480,7 +480,7 @@ fn hashTaggedTextRegions(hasher: *Sha256, regions: []const document_extraction.T
     }
 }
 
-fn hashTaggedNativeTextQuality(hasher: *Sha256, quality: ?document_extraction.OcrQuality) void {
+fn hashTaggedNativeTextQuality(hasher: *Sha256, quality: ?document_extraction.TextQuality) void {
     hashField(hasher, .native_text_quality);
     hashPresence(hasher, quality != null);
     if (quality) |value| {

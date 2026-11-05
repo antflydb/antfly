@@ -12188,11 +12188,11 @@ pub const DocumentExtractionConfig = struct {
     }
 };
 
-/// Native PDF text policy and quality assessment. No OCR model is required. Native quality diagnostics are recorded independently of extraction completion and OCR availability.
+/// Native document text policy and quality assessment. No OCR model is required. Native quality diagnostics are recorded independently of extraction completion and OCR availability.
 pub const DocumentExtractionNativeTextConfig = struct {
     /// `source` retains decoded source text, including off-page runs, for auditing. `page` excludes runs wholly outside the page or a known clipping box while retaining hidden OCR/accessibility text. `visible` additionally excludes nonpainting and fully transparent text. These policies do not claim pixel-perfect occlusion analysis. All policies honor semantic ActualText replacements.
     policy: ?[]const u8 = null,
-    quality: ?DocumentExtractionOcrQualityConfig = null,
+    quality: ?DocumentExtractionTextQualityConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -12231,7 +12231,7 @@ pub const DocumentExtractionOcrConfig = struct {
     /// Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers reject prompts.
     prompt: ?[]const u8 = null,
     render: ?DocumentExtractionRenderConfig = null,
-    quality: ?DocumentExtractionOcrQualityConfig = null,
+    quality: ?DocumentExtractionTextQualityConfig = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -12275,83 +12275,6 @@ pub const DocumentExtractionOcrConfig = struct {
         }
         if (self.quality) |value| {
             try jw.objectField("quality");
-            try jw.write(value);
-        }
-        try jw.endObject();
-    }
-};
-
-/// Text-quality thresholds. `native_text.quality` assesses native PDF text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR output. Quality flags are not guarantees of correct reading order or complete document semantics.
-pub const DocumentExtractionOcrQualityConfig = struct {
-    /// Minimum trimmed UTF-8 byte length before text counts as too short.
-    min_content_chars: ?i64 = null,
-    /// Minimum words before the garbled-text check applies.
-    garbled_min_words: ?i64 = null,
-    /// Words sampled by the garbled-text check.
-    garbled_sample_words: ?i64 = null,
-    /// Maximum ratio of single-character words before text counts as garbled.
-    max_single_char_word_ratio: ?f64 = null,
-    /// Minimum trimmed UTF-8 byte length for a line to count in the corrupted-line check.
-    substantial_line_min_chars: ?i64 = null,
-    /// Maximum ratio of corrupted lines.
-    max_corrupted_line_ratio: ?f64 = null,
-    /// Font corruption score above which a substantial line counts as corrupted.
-    font_corruption_score_threshold: ?f64 = null,
-    /// Maximum ratio of Unicode replacement characters.
-    max_replacement_char_ratio: ?f64 = null,
-
-    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
-    pub const openApiFieldMetadata = .{
-        .{ "min_content_chars", "min_content_chars", true },
-        .{ "garbled_min_words", "garbled_min_words", true },
-        .{ "garbled_sample_words", "garbled_sample_words", true },
-        .{ "max_single_char_word_ratio", "max_single_char_word_ratio", true },
-        .{ "substantial_line_min_chars", "substantial_line_min_chars", true },
-        .{ "max_corrupted_line_ratio", "max_corrupted_line_ratio", true },
-        .{ "font_corruption_score_threshold", "font_corruption_score_threshold", true },
-        .{ "max_replacement_char_ratio", "max_replacement_char_ratio", true },
-    };
-
-    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
-    }
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        try jw.beginObject();
-        if (self.min_content_chars) |value| {
-            try jw.objectField("min_content_chars");
-            try jw.write(value);
-        }
-        if (self.garbled_min_words) |value| {
-            try jw.objectField("garbled_min_words");
-            try jw.write(value);
-        }
-        if (self.garbled_sample_words) |value| {
-            try jw.objectField("garbled_sample_words");
-            try jw.write(value);
-        }
-        if (self.max_single_char_word_ratio) |value| {
-            try jw.objectField("max_single_char_word_ratio");
-            try jw.write(value);
-        }
-        if (self.substantial_line_min_chars) |value| {
-            try jw.objectField("substantial_line_min_chars");
-            try jw.write(value);
-        }
-        if (self.max_corrupted_line_ratio) |value| {
-            try jw.objectField("max_corrupted_line_ratio");
-            try jw.write(value);
-        }
-        if (self.font_corruption_score_threshold) |value| {
-            try jw.objectField("font_corruption_score_threshold");
-            try jw.write(value);
-        }
-        if (self.max_replacement_char_ratio) |value| {
-            try jw.objectField("max_replacement_char_ratio");
             try jw.write(value);
         }
         try jw.endObject();
@@ -12694,6 +12617,83 @@ pub const DocumentExtractionSourceConfig = struct {
         }
         if (self.last_modified_field) |value| {
             try jw.objectField("last_modified_field");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Text-quality thresholds. `native_text.quality` assesses native document text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR output. Quality flags are not guarantees of correct reading order or complete document semantics.
+pub const DocumentExtractionTextQualityConfig = struct {
+    /// Minimum non-whitespace Unicode characters before text passes the length check.
+    min_chars: ?i64 = null,
+    /// Minimum words before the garbled-text check applies.
+    garbled_min_words: ?i64 = null,
+    /// Words sampled by the garbled-text check.
+    garbled_sample_words: ?i64 = null,
+    /// Maximum ratio of single-character words before text counts as garbled.
+    max_single_char_word_ratio: ?f64 = null,
+    /// Minimum non-whitespace Unicode characters for a line to count in the corrupted-line check.
+    min_line_chars: ?i64 = null,
+    /// Maximum ratio of corrupted lines.
+    max_corrupted_line_ratio: ?f64 = null,
+    /// Font corruption score above which a substantial line counts as corrupted.
+    max_font_corruption: ?f64 = null,
+    /// Maximum ratio of Unicode replacement characters.
+    max_replacement_ratio: ?f64 = null,
+
+    /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
+    pub const openApiFieldMetadata = .{
+        .{ "min_chars", "min_chars", true },
+        .{ "garbled_min_words", "garbled_min_words", true },
+        .{ "garbled_sample_words", "garbled_sample_words", true },
+        .{ "max_single_char_word_ratio", "max_single_char_word_ratio", true },
+        .{ "min_line_chars", "min_line_chars", true },
+        .{ "max_corrupted_line_ratio", "max_corrupted_line_ratio", true },
+        .{ "max_font_corruption", "max_font_corruption", true },
+        .{ "max_replacement_ratio", "max_replacement_ratio", true },
+    };
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObject(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        return try openApiParseObjectFromValue(@This(), openApiFieldMetadata, allocator, source, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.min_chars) |value| {
+            try jw.objectField("min_chars");
+            try jw.write(value);
+        }
+        if (self.garbled_min_words) |value| {
+            try jw.objectField("garbled_min_words");
+            try jw.write(value);
+        }
+        if (self.garbled_sample_words) |value| {
+            try jw.objectField("garbled_sample_words");
+            try jw.write(value);
+        }
+        if (self.max_single_char_word_ratio) |value| {
+            try jw.objectField("max_single_char_word_ratio");
+            try jw.write(value);
+        }
+        if (self.min_line_chars) |value| {
+            try jw.objectField("min_line_chars");
+            try jw.write(value);
+        }
+        if (self.max_corrupted_line_ratio) |value| {
+            try jw.objectField("max_corrupted_line_ratio");
+            try jw.write(value);
+        }
+        if (self.max_font_corruption) |value| {
+            try jw.objectField("max_font_corruption");
+            try jw.write(value);
+        }
+        if (self.max_replacement_ratio) |value| {
+            try jw.objectField("max_replacement_ratio");
             try jw.write(value);
         }
         try jw.endObject();

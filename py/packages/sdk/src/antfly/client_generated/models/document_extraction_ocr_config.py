@@ -10,9 +10,9 @@ from ..models.document_extraction_ocr_config_mode import DocumentExtractionOcrCo
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.document_extraction_ocr_quality_config import DocumentExtractionOcrQualityConfig
     from ..models.document_extraction_reader_config import DocumentExtractionReaderConfig
     from ..models.document_extraction_render_config import DocumentExtractionRenderConfig
+    from ..models.document_extraction_text_quality_config import DocumentExtractionTextQualityConfig
     from ..models.generator_config import GeneratorConfig
 
 
@@ -34,8 +34,8 @@ class DocumentExtractionOcrConfig:
             prompt (str | Unset): Overrides the OCR prompt. Omit it to let the reader run its own OCR task. Apple readers
                 reject prompts.
             render (DocumentExtractionRenderConfig | Unset): How PDF pages are rasterized for OCR.
-            quality (DocumentExtractionOcrQualityConfig | Unset): Text-quality thresholds. `native_text.quality` assesses
-                native PDF text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR
+            quality (DocumentExtractionTextQualityConfig | Unset): Text-quality thresholds. `native_text.quality` assesses
+                native document text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR
                 output. Quality flags are not guarantees of correct reading order or complete document semantics.
     """
 
@@ -44,7 +44,7 @@ class DocumentExtractionOcrConfig:
     mode: DocumentExtractionOcrConfigMode | Unset = DocumentExtractionOcrConfigMode.AUTO
     prompt: str | Unset = UNSET
     render: DocumentExtractionRenderConfig | Unset = UNSET
-    quality: DocumentExtractionOcrQualityConfig | Unset = UNSET
+    quality: DocumentExtractionTextQualityConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -90,9 +90,9 @@ class DocumentExtractionOcrConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.document_extraction_ocr_quality_config import DocumentExtractionOcrQualityConfig
         from ..models.document_extraction_reader_config import DocumentExtractionReaderConfig
         from ..models.document_extraction_render_config import DocumentExtractionRenderConfig
+        from ..models.document_extraction_text_quality_config import DocumentExtractionTextQualityConfig
         from ..models.generator_config import GeneratorConfig
 
         d = dict(src_dict)
@@ -127,11 +127,11 @@ class DocumentExtractionOcrConfig:
             render = DocumentExtractionRenderConfig.from_dict(_render)
 
         _quality = d.pop("quality", UNSET)
-        quality: DocumentExtractionOcrQualityConfig | Unset
+        quality: DocumentExtractionTextQualityConfig | Unset
         if isinstance(_quality, Unset):
             quality = UNSET
         else:
-            quality = DocumentExtractionOcrQualityConfig.from_dict(_quality)
+            quality = DocumentExtractionTextQualityConfig.from_dict(_quality)
 
         document_extraction_ocr_config = cls(
             reader=reader,

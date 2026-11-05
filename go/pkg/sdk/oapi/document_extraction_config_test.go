@@ -26,9 +26,11 @@ import (
 func TestDocumentExtractionConfigPreservesOptionPresence(t *testing.T) {
 	for _, tc := range []struct{ name, payload string }{
 		{"unset", `{}`},
+		{"native text without OCR", `{"native_text":{"policy":"visible","quality":{"min_chars":0,"max_replacement_ratio":0}}}`},
+		{"independent text quality", `{"native_text":{"quality":{"min_chars":1}},"ocr":{"reader":{"provider":"antfly","model":"test-reader"},"quality":{"min_chars":100}}}`},
 		{"html tags retained", `{"html_strip_tags":false}`},
 		{"unset quality thresholds", `{"ocr":{"reader":{"provider":"antfly","model":"test-reader"}}}`},
-		{"zero quality thresholds", `{"ocr":{"reader":{"provider":"antfly","model":"test-reader"},"quality":{"min_content_chars":0,"garbled_min_words":0,"max_single_char_word_ratio":0,"max_corrupted_line_ratio":0,"font_corruption_score_threshold":0,"max_replacement_char_ratio":0}}}`},
+		{"zero quality thresholds", `{"ocr":{"reader":{"provider":"antfly","model":"test-reader"},"quality":{"min_chars":0,"garbled_min_words":0,"max_single_char_word_ratio":0,"max_corrupted_line_ratio":0,"max_font_corruption":0,"max_replacement_ratio":0}}}`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			var config DocumentExtractionConfig

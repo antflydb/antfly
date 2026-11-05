@@ -51,8 +51,8 @@ class DocumentExtractionConfig:
             last_modified (str | Unset): Static last-modified timestamp recorded as source version metadata.
             credentials (str | Unset): Credential reference used to download the source URL.
             html_strip_tags (bool | Unset): Strip HTML markup from HTML sources before storing their text. Default: True.
-            native_text (DocumentExtractionNativeTextConfig | Unset): Native PDF text policy and quality assessment. No OCR
-                model is required. Native quality diagnostics are recorded independently of extraction completion and OCR
+            native_text (DocumentExtractionNativeTextConfig | Unset): Native document text policy and quality assessment. No
+                OCR model is required. Native quality diagnostics are recorded independently of extraction completion and OCR
                 availability.
             ocr (DocumentExtractionOcrConfig | Unset): Reads scanned pages and images. Name exactly one of `reader` or
                 `generator`. Readers run their own OCR task; generators receive a transcription instruction.

@@ -1430,6 +1430,7 @@ pub const TextRun = struct {
     /// Policy filtering leaves source text and geometry intact for auditing.
     /// Reconstruction skips these runs and leaves `output_span` null.
     policy_excluded: bool = false,
+    semantic_only: bool = false,
     /// ActualText is emitted once, while every covered source run shares its
     /// final output span so downstream geometry can retain the whole scope.
     actual_text_leader: ?usize = null,
@@ -1452,13 +1453,7 @@ pub const TextRun = struct {
     /// and font ascent/descent. Vertical writing needs per-glyph vertical
     /// origins; leave that geometry unknown rather than inventing a rectangle.
     pub fn bounds(self: TextRun) ?PageBox {
-        if (self.vertical) return null;
-        inline for (.{ self.x, self.y, self.a, self.b, self.c, self.d, self.advance_width, self.ascent, self.descent }) |value| if (!std.math.isFinite(value)) return null;
-        if (self.ascent < 0 or self.descent < 0) return null;
-        const box = textRunBounds(self);
-        inline for (.{ box.min_x, box.min_y, box.max_x, box.max_y }) |value| if (!std.math.isFinite(value)) return null;
-        if (box.min_x >= box.max_x or box.min_y >= box.max_y) return null;
-        return .{ .min_x = box.min_x, .min_y = box.min_y, .max_x = box.max_x, .max_y = box.max_y };
+        return extractionTextRunBounds(self);
     }
 
     pub fn deinit(self: *TextRun, alloc: Allocator) void {
@@ -1470,6 +1465,16 @@ pub const TextRun = struct {
         self.* = undefined;
     }
 };
+/// Unknown geometry is retained conservatively by extraction policies.
+fn extractionTextRunBounds(run: anytype) ?PageBox {
+    if (run.vertical) return null;
+    inline for (.{ run.x, run.y, run.a, run.b, run.c, run.d, run.advance_width, run.ascent, run.descent }) |value| if (!std.math.isFinite(value)) return null;
+    if (run.ascent < 0 or run.descent < 0) return null;
+    const box = textRunBounds(run);
+    inline for (.{ box.min_x, box.min_y, box.max_x, box.max_y }) |value| if (!std.math.isFinite(value)) return null;
+    if (box.min_x >= box.max_x or box.min_y >= box.max_y) return null;
+    return .{ .min_x = box.min_x, .min_y = box.min_y, .max_x = box.max_x, .max_y = box.max_y };
+}
 const LayoutTextRun = struct {
     text: []const u8,
     x: f64,
@@ -1487,10 +1492,20 @@ const LayoutTextRun = struct {
     text_object_id: ?usize = null,
     render_mode: i64 = 0,
     policy_excluded: bool = false,
+    semantic_only: bool = false,
     text_show_tracking_gap: ?f64 = null,
     output_span: ?TextOutputSpan = null,
     actual_text_leader: ?usize = null,
     actual_text_end: usize = 0,
+    alpha: u8 = 0xff,
+    stroke_alpha: u8 = 0xff,
+    group_alpha: u8 = 0xff,
+    vertical: bool = false,
+    clip_box: ?PageBox = null,
+
+    pub fn bounds(self: LayoutTextRun) ?PageBox {
+        return extractionTextRunBounds(self);
+    }
 
     pub fn deinit(self: *LayoutTextRun, alloc: Allocator) void {
         alloc.free(self.text);
@@ -2977,6 +2992,9 @@ const PageShading = struct {
 
 const PageExtGState = struct {
     name: []u8,
+    fill_alpha_specified: bool = true,
+    stroke_alpha_specified: bool = true,
+    blend_mode_specified: bool = true,
     fill_alpha: u8 = 0xff,
     stroke_alpha: u8 = 0xff,
     blend_mode: BlendMode = .normal,
@@ -3383,7 +3401,13 @@ fn replacePositionedActualTextAlloc(
 ) !void {
     switch (output) {
         .layout => |out| {
-            if (start >= out.items.len) return;
+            if (start >= out.items.len) {
+                if (replacement.len == 0) return;
+                const text = try alloc.dupe(u8, replacement);
+                errdefer alloc.free(text);
+                try out.append(alloc, .{ .text = text, .x = 0, .y = 0, .font_size = 0, .horizontal_scale = 1, .semantic_only = true, .actual_text_leader = start, .actual_text_end = start + 1 });
+                return;
+            }
             const end = out.items.len;
             for (out.items[start..], 0..) |*run, index| {
                 if (index % 256 == 0) try cancellation.check();
@@ -3395,7 +3419,14 @@ fn replacePositionedActualTextAlloc(
             }
         },
         .analysis => |analysis| {
-            if (start >= analysis.runs.items.len) return;
+            if (start >= analysis.runs.items.len) {
+                if (replacement.len == 0) return;
+                if (analysis.runs.items.len >= analysis.max_runs) return error.TextRunLimitExceeded;
+                const text = try alloc.dupe(u8, replacement);
+                errdefer alloc.free(text);
+                try analysis.runs.append(alloc, .{ .text = text, .x = 0, .y = 0, .font_size = 0, .semantic_only = true, .actual_text_leader = start, .actual_text_end = start + 1 });
+                return;
+            }
             const end = analysis.runs.items.len;
             for (analysis.runs.items[start..], 0..) |*run, index| {
                 if (index % 256 == 0) try cancellation.check();
@@ -3410,6 +3441,35 @@ fn replacePositionedActualTextAlloc(
     }
 }
 
+/// Text extraction only needs a conservative bound for rectangular clips.
+/// Keep this constant-space and leave arbitrary paths unknown instead of
+/// retaining/vectorizing paint paths on the text-only hot path.
+const TextClipPath = struct {
+    box: ?PageBox = null,
+    unknown: bool = false,
+
+    fn consume(self: *@This(), state: *TextRunState, op: []const u8, operands: []const syntax.Object) void {
+        if (std.mem.eql(u8, op, "re") and operands.len >= 4) {
+            const x = numericObjectValue(&operands[operands.len - 4]) orelse return;
+            const y = numericObjectValue(&operands[operands.len - 3]) orelse return;
+            const w = numericObjectValue(&operands[operands.len - 2]) orelse return;
+            const h = numericObjectValue(&operands[operands.len - 1]) orelse return;
+            const rect = transformPageBox(.{ .min_x = @min(x, x + w), .min_y = @min(y, y + h), .max_x = @max(x, x + w), .max_y = @max(y, y + h) }, state.matrix);
+            if (self.box) |box| {
+                self.box = .{ .min_x = @min(box.min_x, rect.min_x), .min_y = @min(box.min_y, rect.min_y), .max_x = @max(box.max_x, rect.max_x), .max_y = @max(box.max_y, rect.max_y) };
+            } else self.box = rect;
+        } else if (std.mem.eql(u8, op, "W") or std.mem.eql(u8, op, "W*")) {
+            if (!self.unknown) if (self.box) |box| {
+                state.clip_box = if (state.clip_box) |clip| intersectPageBoxes(clip, box) else box;
+            };
+        } else if (std.mem.eql(u8, op, "n") or isShapePaintOperator(op)) {
+            self.* = .{};
+        } else if (std.mem.eql(u8, op, "m") or std.mem.eql(u8, op, "l") or std.mem.eql(u8, op, "c") or std.mem.eql(u8, op, "v") or std.mem.eql(u8, op, "y")) {
+            self.unknown = true;
+        }
+    }
+};
+
 const PositionedTextParser = struct {
     alloc: Allocator,
     output: PositionedTextOutput,
@@ -3419,6 +3479,7 @@ const PositionedTextParser = struct {
     state: TextRunState = .{},
     stack: std.ArrayList(TextRunStackEntry) = .empty,
     marked_content: std.ArrayList(ActualTextScope) = .empty,
+    text_clip_path: TextClipPath = .{},
     current_path: std.ArrayList([2]f64) = .empty,
     current_path_closed: bool = false,
     current_clip_points: std.ArrayList([2]f64) = .empty,
@@ -3492,6 +3553,7 @@ const PositionedTextParser = struct {
                     &self.state,
                     &self.retained_pattern_names,
                     &self.stack,
+                    &self.text_clip_path,
                     &self.current_path,
                     &self.current_path_closed,
                     &self.current_clip_points,
@@ -5108,7 +5170,7 @@ pub const Reader = struct {
         return self.extractPageTextAnalysisCoreAlloc(page_num, max_runs, true);
     }
 
-    fn extractPageTextAnalysisCoreAlloc(self: *Reader, page_num: usize, max_runs: usize, include_page_metadata: bool) !PageTextAnalysis {
+    fn extractPageTextAnalysisCoreAlloc(self: *Reader, page_num: usize, max_runs: usize, comptime include_page_metadata: bool) !PageTextAnalysis {
         try self.beginImageCacheScope();
         defer self.endImageCacheScope();
         var page = try self.readPageObject(page_num);
@@ -5154,7 +5216,7 @@ pub const Reader = struct {
             self.alloc.free(color_spaces);
         }
 
-        var analysis = try self.extractDecodedTextAnalysisAlloc(decoded_content, stream_ranges.?, fonts, gstates, forms, text_properties, color_spaces, page_box, max_runs);
+        var analysis = try self.extractDecodedTextAnalysisAlloc(decoded_content, stream_ranges.?, fonts, gstates, forms, text_properties, color_spaces, page_box, max_runs, include_page_metadata);
         errdefer analysis.deinit(self.alloc);
         analysis.has_unrendered_annotations = annotations;
         analysis.outline_fallback = pageFontsUsedOutlineFallback(fonts);
@@ -6531,18 +6593,27 @@ pub const Reader = struct {
         color_spaces: []const PageColorSpace,
         page_box: PageBox,
         max_runs: usize,
+        comptime positioned: bool,
     ) !PageTextAnalysis {
+        // Plain extraction returns one string. All parser/run storage is
+        // page-local scratch: coalesce its small allocations and release it in
+        // one operation instead of retaining allocator size classes per run.
+        var scratch = std.heap.ArenaAllocator.init(self.alloc);
+        defer scratch.deinit();
+        const alloc = if (positioned) self.alloc else scratch.allocator();
         var text = std.ArrayList(u8).empty;
-        errdefer text.deinit(self.alloc);
-        var runs = std.ArrayList(TextRun).empty;
-        errdefer {
-            for (runs.items) |*run| run.deinit(self.alloc);
-            runs.deinit(self.alloc);
-        }
-        var run_parser = try PositionedTextParser.init(self.alloc, .{ .analysis = .{ .runs = &runs, .max_runs = max_runs } }, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
+        errdefer text.deinit(alloc);
+        const Run = if (positioned) TextRun else LayoutTextRun;
+        var runs = std.ArrayList(Run).empty;
+        errdefer if (positioned) {
+            for (runs.items) |*run| run.deinit(alloc);
+            runs.deinit(alloc);
+        };
+        const output: PositionedTextOutput = if (positioned) .{ .analysis = .{ .runs = &runs, .max_runs = max_runs } } else .{ .layout = &runs };
+        var run_parser = try PositionedTextParser.init(alloc, output, initialTextRunStateForColorSpaces(color_spaces), &.{}, .nonzero);
         defer run_parser.deinit();
         run_parser.cancellation = self.cancellation;
-        var text_parser = TextContentParser.init(self.alloc, &text);
+        var text_parser = TextContentParser.init(alloc, &text);
         defer text_parser.deinit();
 
         for (ranges) |range| {
@@ -6559,24 +6630,30 @@ pub const Reader = struct {
         var diagnostics = NativeTextDiagnostics{
             .actual_text_replacements = run_parser.actual_text_replacements,
         };
-        applyTextExtractionPolicy(runs.items, page_box, self.text_extraction_policy, &diagnostics);
-        try rehomeActualTextForPolicyAlloc(self.alloc, runs.items, self.cancellation);
-        var owned_text = try text.toOwnedSlice(self.alloc);
-        errdefer self.alloc.free(owned_text);
+        if (positioned or self.text_extraction_policy != .source) {
+            applyTextExtractionPolicy(runs.items, page_box, self.text_extraction_policy, &diagnostics);
+            try rehomeActualTextForPolicy(runs.items, self.cancellation);
+        }
+        var owned_text = try text.toOwnedSlice(alloc);
+        errdefer alloc.free(owned_text);
         const canonical_matches = sameNonWhitespaceBytesAsTextRuns(owned_text, runs.items);
         if (runs.items.len > 0 and
             (canonical_matches or self.text_extraction_policy != .source))
         {
-            const reconstructed = try reconstructTextFromRunsCancelableAlloc(self.alloc, runs.items, self.cancellation);
-            self.alloc.free(owned_text);
+            const reconstructed = try reconstructTextFromRunsCancelableAlloc(alloc, runs.items, self.cancellation);
+            alloc.free(owned_text);
             owned_text = reconstructed;
         } else {
             clearTextRunOutputSpans(runs.items);
         }
-        propagateActualTextOutputSpans(runs.items);
-        finalizeNativeTextDiagnostics(runs.items, &diagnostics);
-        const owned_runs = try runs.toOwnedSlice(self.alloc);
-        return .{ .text = owned_text, .runs = owned_runs, .diagnostics = diagnostics };
+        if (positioned) {
+            propagateActualTextOutputSpans(runs.items);
+            finalizeNativeTextDiagnostics(runs.items, &diagnostics);
+            const owned_runs = try runs.toOwnedSlice(alloc);
+            return .{ .text = owned_text, .runs = owned_runs, .diagnostics = diagnostics };
+        } else {
+            return .{ .text = try self.alloc.dupe(u8, owned_text), .runs = &.{} };
+        }
     }
 
     fn extractSingleContentImageRunsAppend(self: *const Reader, out: *std.ArrayList(ImageRun), obj: *const syntax.Object, images: []const PageImage, gstates: []const PageExtGState, forms: []const PageForm) !void {
@@ -7828,10 +7905,10 @@ pub const Reader = struct {
     }
 
     fn collectTextPropertiesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) ![]PageTextProperty {
+        const properties_obj = resources.get("Properties") orelse return try self.alloc.alloc(PageTextProperty, 0);
         var references = try collectReferencedResourceNamesAlloc(self.alloc, content, &.{"BDC"});
         defer references.deinit(self.alloc);
         if (references.names.count() == 0) return try self.alloc.alloc(PageTextProperty, 0);
-        const properties_obj = resources.get("Properties") orelse return try self.alloc.alloc(PageTextProperty, 0);
         var properties = try self.resolveValue(properties_obj);
         defer properties.deinit(self.alloc);
         if (properties != .dict) return try self.alloc.alloc(PageTextProperty, 0);
@@ -8281,8 +8358,10 @@ pub const Reader = struct {
             var gs = try self.resolveValue(&entry.value);
             defer gs.deinit(self.alloc);
             if (gs != .dict) continue;
-            const fill_alpha = if (gs.get("ca")) |obj| alphaByteFromNumber(numericObjectValue(obj) orelse 1.0) else @as(u8, 0xff);
-            const stroke_alpha = if (gs.get("CA")) |obj| alphaByteFromNumber(numericObjectValue(obj) orelse 1.0) else @as(u8, 0xff);
+            const fill_alpha_value = if (gs.get("ca")) |obj| numericObjectValue(obj) orelse 1.0 else 1.0;
+            const stroke_alpha_value = if (gs.get("CA")) |obj| numericObjectValue(obj) orelse 1.0 else 1.0;
+            const fill_alpha = alphaByteFromNumber(fill_alpha_value);
+            const stroke_alpha = alphaByteFromNumber(stroke_alpha_value);
             const blend_mode = if (gs.get("BM")) |obj| parseBlendModeObject(obj) else BlendMode.normal;
             var soft_mask = if (decode_soft_masks) try self.buildImageExtGStateSoftMaskAlloc(&gs) else null;
             errdefer if (soft_mask) |*mask| mask.deinit(self.alloc);
@@ -8290,8 +8369,11 @@ pub const Reader = struct {
             errdefer if (name) |owned| self.alloc.free(owned);
             try out.append(self.alloc, .{
                 .name = name.?,
-                .fill_alpha = fill_alpha,
-                .stroke_alpha = stroke_alpha,
+                .fill_alpha = if (!decode_soft_masks and fill_alpha_value > 0) @max(1, fill_alpha) else fill_alpha,
+                .stroke_alpha = if (!decode_soft_masks and stroke_alpha_value > 0) @max(1, stroke_alpha) else stroke_alpha,
+                .fill_alpha_specified = gs.get("ca") != null,
+                .stroke_alpha_specified = gs.get("CA") != null,
+                .blend_mode_specified = gs.get("BM") != null,
                 .blend_mode = blend_mode,
                 .soft_mask = soft_mask,
                 .soft_mask_specified = gs.get("SMask") != null,
@@ -15878,6 +15960,7 @@ fn applyTextRunOperator(
     state: *TextRunState,
     retained_pattern_names: *ContentNameInterner,
     stack: *std.ArrayList(TextRunStackEntry),
+    text_clip_path: *TextClipPath,
     current_path: *std.ArrayList([2]f64),
     current_path_closed: *bool,
     current_clip_points: *std.ArrayList([2]f64),
@@ -16019,9 +16102,9 @@ fn applyTextRunOperator(
     }
     if (std.mem.eql(u8, op, "gs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
         if (findExtGState(gstates, operands[operands.len - 1].name)) |gstate| {
-            state.alpha = gstate.fill_alpha;
-            state.stroke_alpha = gstate.stroke_alpha;
-            state.blend_mode = gstate.blend_mode;
+            if (gstate.fill_alpha_specified) state.alpha = gstate.fill_alpha;
+            if (gstate.stroke_alpha_specified) state.stroke_alpha = gstate.stroke_alpha;
+            if (gstate.blend_mode_specified) state.blend_mode = gstate.blend_mode;
         }
         return;
     }
@@ -16039,7 +16122,10 @@ fn applyTextRunOperator(
         }
         return;
     }
-    if (out.isTextOnly() and isLayoutIgnoredTextOperator(op)) return;
+    if (out.isTextOnly() and isLayoutIgnoredTextOperator(op)) {
+        text_clip_path.consume(state, op, operands);
+        return;
+    }
     if (std.mem.eql(u8, op, "m") and operands.len >= 2) {
         current_path.clearRetainingCapacity();
         current_path_closed.* = false;
@@ -16559,9 +16645,9 @@ fn applyImageOperator(
     }
     if (std.mem.eql(u8, op, "gs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
         if (findExtGState(gstates, operands[operands.len - 1].name)) |gstate| {
-            state.fill_alpha = gstate.fill_alpha;
-            state.stroke_alpha = gstate.stroke_alpha;
-            state.blend_mode = gstate.blend_mode;
+            if (gstate.fill_alpha_specified) state.fill_alpha = gstate.fill_alpha;
+            if (gstate.stroke_alpha_specified) state.stroke_alpha = gstate.stroke_alpha;
+            if (gstate.blend_mode_specified) state.blend_mode = gstate.blend_mode;
             if (gstate.soft_mask_specified) {
                 state.soft_mask = if (gstate.soft_mask) |mask| blk: {
                     var placed = mask;
@@ -16859,9 +16945,9 @@ fn applyShapeOperator(
     }
     if (std.mem.eql(u8, op, "gs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
         if (findExtGState(gstates, operands[operands.len - 1].name)) |gstate| {
-            state.fill_alpha = gstate.fill_alpha;
-            state.stroke_alpha = gstate.stroke_alpha;
-            state.blend_mode = gstate.blend_mode;
+            if (gstate.fill_alpha_specified) state.fill_alpha = gstate.fill_alpha;
+            if (gstate.stroke_alpha_specified) state.stroke_alpha = gstate.stroke_alpha;
+            if (gstate.blend_mode_specified) state.blend_mode = gstate.blend_mode;
         }
         return;
     }
@@ -17264,9 +17350,9 @@ fn applyShadingOperator(
     }
     if (std.mem.eql(u8, op, "gs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
         if (findExtGState(gstates, operands[operands.len - 1].name)) |gstate| {
-            state.fill_alpha = gstate.fill_alpha;
-            state.stroke_alpha = gstate.stroke_alpha;
-            state.blend_mode = gstate.blend_mode;
+            if (gstate.fill_alpha_specified) state.fill_alpha = gstate.fill_alpha;
+            if (gstate.stroke_alpha_specified) state.stroke_alpha = gstate.stroke_alpha;
+            if (gstate.blend_mode_specified) state.blend_mode = gstate.blend_mode;
         }
         return;
     }
@@ -17476,9 +17562,9 @@ fn applyPatternOperator(
     }
     if (std.mem.eql(u8, op, "gs") and operands.len >= 1 and operands[operands.len - 1] == .name) {
         if (findExtGState(gstates, operands[operands.len - 1].name)) |gstate| {
-            state.fill_alpha = gstate.fill_alpha;
-            state.stroke_alpha = gstate.stroke_alpha;
-            state.blend_mode = gstate.blend_mode;
+            if (gstate.fill_alpha_specified) state.fill_alpha = gstate.fill_alpha;
+            if (gstate.stroke_alpha_specified) state.stroke_alpha = gstate.stroke_alpha;
+            if (gstate.blend_mode_specified) state.blend_mode = gstate.blend_mode;
         }
         return;
     }
@@ -17950,6 +18036,11 @@ fn appendTextRunDecodedString(
                 .paint_order = paint_order,
                 .text_object_id = state.text_object_id,
                 .render_mode = render_mode,
+                .alpha = state.alpha,
+                .stroke_alpha = state.stroke_alpha,
+                .group_alpha = state.group_alpha,
+                .vertical = vertical,
+                .clip_box = state.clip_box,
             });
         },
         .analysis, .render => {
@@ -18428,22 +18519,25 @@ fn textRunAxesCompatible(left: anytype, right: anytype) bool {
     return axis_alignment >= 0.995 and vertical_alignment >= 0.995;
 }
 fn pageBoxesOverlap(left: PageBox, right: PageBox) bool {
+    // Intersecting disjoint clips produces an empty (possibly inverted) box.
+    // A large text bound spanning both endpoints must not make it nonempty.
+    if (right.min_x >= right.max_x or right.min_y >= right.max_y) return false;
     return left.max_x > right.min_x and left.min_x < right.max_x and
         left.max_y > right.min_y and left.min_y < right.max_y;
 }
 
-fn textRunOutsidePageOrClip(run: TextRun, page_box: PageBox) bool {
+fn textRunOutsidePageOrClip(run: anytype, page_box: PageBox) bool {
     const bounds = run.bounds() orelse return false;
     if (!pageBoxesOverlap(bounds, page_box)) return true;
     if (run.clip_box) |clip_box| if (!pageBoxesOverlap(bounds, clip_box)) return true;
     return false;
 }
 
-fn textRunInvisible(run: TextRun) bool {
+fn textRunInvisible(run: anytype) bool {
     const mode = @mod(run.render_mode, 8);
     if (mode == 3 or mode == 7 or run.group_alpha == 0) return true;
-    const fill_visible = run.alpha != 0 and run.fill_color[3] != 0;
-    const stroke_visible = run.stroke_alpha != 0 and run.stroke_color[3] != 0;
+    const fill_visible = run.alpha != 0;
+    const stroke_visible = run.stroke_alpha != 0;
     return switch (mode) {
         0, 4 => !fill_visible,
         1, 5 => !stroke_visible,
@@ -18453,7 +18547,7 @@ fn textRunInvisible(run: TextRun) bool {
 }
 
 fn applyTextExtractionPolicy(
-    runs: []TextRun,
+    runs: anytype,
     page_box: PageBox,
     policy: TextExtractionPolicy,
     diagnostics: *NativeTextDiagnostics,
@@ -18474,9 +18568,8 @@ fn applyTextExtractionPolicy(
     }
 }
 
-fn rehomeActualTextForPolicyAlloc(
-    alloc: Allocator,
-    runs: []TextRun,
+fn rehomeActualTextForPolicy(
+    runs: anytype,
     cancellation: CancellationProbe,
 ) !void {
     for (runs, 0..) |*leader_run, leader| {
@@ -18495,14 +18588,9 @@ fn rehomeActualTextForPolicyAlloc(
             }
         }
         const target_index = replacement_index orelse continue;
-        const target_text = try alloc.dupe(u8, leader_run.text);
-        errdefer alloc.free(target_text);
-        const empty_text = try alloc.dupe(u8, "");
-        errdefer alloc.free(empty_text);
-        alloc.free(runs[target_index].text);
-        runs[target_index].text = target_text;
-        alloc.free(leader_run.text);
-        leader_run.text = empty_text;
+        // Both strings are already owned by the runs. Moving the replacement
+        // requires no allocation or error cleanup after ownership changes.
+        std.mem.swap([]const u8, &leader_run.text, &runs[target_index].text);
         for (leader..end) |index| {
             if ((index - leader) % 256 == 0) try cancellation.check();
             runs[index].actual_text_leader = target_index;
@@ -33482,4 +33570,131 @@ test "reader ambiguous overlap keeps interleaved text objects coherent" {
         }
     };
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "reader policies preserve vector ActualText with unknown geometry in both APIs" {
+    const alloc = std.testing.allocator;
+    const sample = try buildTextOrderingTestPdfAlloc(
+        alloc,
+        "/Span << /ActualText (Vector label) >> BDC 10 100 30 30 re f EMC " ++
+            "BT /F1 12 Tf 10 50 Td (Visible) Tj ET " ++
+            "/Span << /ActualText () >> BDC 10 10 5 5 re f EMC",
+    );
+    defer alloc.free(sample);
+    var parsed = try Reader.init(alloc, sample);
+    defer parsed.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        parsed.setTextExtractionPolicy(policy);
+        var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(alloc);
+        const text = try parsed.extractPageTextAlloc(1);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings(analysis.text, text);
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Vector label"));
+        try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, text, "Visible"));
+        try std.testing.expect(analysis.runs[0].semantic_only);
+        try std.testing.expect(analysis.runs[0].bounds() == null);
+        try std.testing.expect(analysis.runs[0].output_span != null);
+    }
+    try std.testing.expectError(error.TextRunLimitExceeded, parsed.extractPageTextAnalysisWithRunLimitAlloc(1, 0));
+}
+
+test "reader rectangular clip policy is constant space and respects transforms and restore" {
+    const alloc = std.testing.allocator;
+    const sample = try buildTextOrderingTestPdfAlloc(
+        alloc,
+        "q 1 0 0 1 20 20 cm 0 0 30 30 re W n " ++
+            "BT /F1 10 Tf 100 100 Td (Clipped) Tj ET " ++
+            "BT /F1 10 Tf 5 5 Td (Inside) Tj ET Q " ++
+            "BT /F1 10 Tf 100 100 Td (Restored) Tj ET",
+    );
+    defer alloc.free(sample);
+    var parsed = try Reader.init(alloc, sample);
+    defer parsed.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        parsed.setTextExtractionPolicy(policy);
+        var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(alloc);
+        const text = try parsed.extractPageTextAlloc(1);
+        defer alloc.free(text);
+        try std.testing.expectEqualStrings(analysis.text, text);
+        try std.testing.expectEqual(policy == .source, std.mem.indexOf(u8, text, "Clipped") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Inside") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, "Restored") != null);
+        try std.testing.expectEqual(@as(usize, 1), analysis.diagnostics.outside_page_runs);
+    }
+    var path = TextClipPath{};
+    var state = TextRunState{};
+    const rect = [_]syntax.Object{ .{ .integer = 0 }, .{ .integer = 0 }, .{ .integer = 20 }, .{ .integer = 20 } };
+    path.consume(&state, "re", &rect);
+    path.consume(&state, "m", &.{});
+    path.consume(&state, "W", &.{});
+    try std.testing.expect(state.clip_box == null); // Unknown path stays conservative.
+    const empty_clip = intersectPageBoxes(
+        .{ .min_x = 0, .min_y = 0, .max_x = 20, .max_y = 20 },
+        .{ .min_x = 100, .min_y = 100, .max_x = 120, .max_y = 120 },
+    );
+    try std.testing.expect(!pageBoxesOverlap(.{ .min_x = 0, .min_y = 0, .max_x = 200, .max_y = 200 }, empty_clip));
+}
+
+test "reader ActualText policy relocation preserves ownership through cancellation" {
+    const alloc = std.testing.allocator;
+    var runs = [_]TextRun{
+        .{ .text = try alloc.dupe(u8, "replacement"), .x = 300, .y = 10, .font_size = 10, .policy_excluded = true, .actual_text_leader = 0, .actual_text_end = 2 },
+        .{ .text = try alloc.dupe(u8, ""), .x = 10, .y = 10, .font_size = 10, .actual_text_leader = 0, .actual_text_end = 2 },
+    };
+    defer for (&runs) |*run| run.deinit(alloc);
+    const Probe = struct {
+        calls: usize = 0,
+        fn canceled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.calls >= 2;
+        }
+    };
+    var probe = Probe{};
+    try std.testing.expectError(error.Canceled, rehomeActualTextForPolicy(&runs, .{ .context = &probe, .is_cancelled_fn = Probe.canceled }));
+    try std.testing.expectEqualStrings("replacement", runs[1].text);
+    try std.testing.expectEqualStrings("", runs[0].text);
+}
+
+test "reader visibility preserves partial alpha state and nonzero alpha" {
+    const alloc = std.testing.allocator;
+    const content = "/Zero gs BT /F1 10 Tf 10 100 Td (Hidden) Tj ET " ++
+        "/Stroke gs BT /F1 10 Tf 10 80 Td (StillHidden) Tj ET " ++
+        "/Faint gs BT /F1 10 Tf 10 60 Td (Faint) Tj ET";
+    const stream = try std.fmt.allocPrint(alloc, "4 0 obj\n<< /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ content.len, content });
+    defer alloc.free(stream);
+    const sample = try buildImageDecodeTestPdfAlloc(alloc, &.{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 200 200] /Resources << /Font << /F1 5 0 R >> /ExtGState << /Zero << /ca 0 >> /Stroke << /CA 1 >> /Faint << /ca 0.001 >> >> >> /Contents 4 0 R >>\nendobj\n",
+        stream,
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+    });
+    defer alloc.free(sample);
+    var parsed = try Reader.init(alloc, sample);
+    defer parsed.deinit();
+    parsed.setTextExtractionPolicy(.visible);
+    var analysis = try parsed.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(alloc);
+    const text = try parsed.extractPageTextAlloc(1);
+    defer alloc.free(text);
+    try std.testing.expectEqualStrings("Faint\n", text);
+    try std.testing.expectEqualStrings(analysis.text, text);
+    try std.testing.expectEqual(@as(usize, 2), analysis.diagnostics.invisible_runs);
+}
+
+test "reader plain text scratch releases all allocations and returns owned output" {
+    const Check = struct {
+        fn run(alloc: Allocator) !void {
+            var parsed = try Reader.init(alloc, @embedFile("../testdata/two_page_text_fixture.pdf"));
+            defer parsed.deinit();
+            parsed.setTextExtractionPolicy(.page);
+            const text = try parsed.extractPageTextAlloc(1);
+            defer alloc.free(text);
+            try std.testing.expectEqualStrings("FIRST PAGE", std.mem.trim(u8, text, &std.ascii.whitespace));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Check.run, .{});
 }

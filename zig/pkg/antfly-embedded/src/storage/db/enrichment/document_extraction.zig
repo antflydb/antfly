@@ -186,6 +186,7 @@ const pdf = if (builtin.os.tag == .freestanding or builtin.os.tag == .wasi or bu
                 ascent: f64 = 0,
                 descent: f64 = 0,
                 output_span: ?TextOutputSpan = null,
+                semantic_only: bool = false,
                 bold: ?bool = null,
                 italic: ?bool = null,
 
@@ -1132,7 +1133,7 @@ pub const Unit = struct {
     extraction_status: ?[]u8 = null,
     source_sha256: ?[]u8 = null,
     byte_length: ?u64 = null,
-    native_text_quality: ?OcrQuality = null,
+    native_text_quality: ?TextQuality = null,
     native_text_diagnostics: ?NativeTextDiagnostics = null,
     ocr_used: bool = false,
     ocr_attempted: bool = false,
@@ -1299,7 +1300,7 @@ pub const UnitSink = struct {
 
 pub const NativeTextConfig = struct {
     policy: NativeTextPolicy = .page,
-    quality: OcrQualityConfig = .{},
+    quality: TextQualityConfig = .{},
 };
 
 pub const Config = struct {
@@ -1332,7 +1333,7 @@ pub const Config = struct {
     ocr_max_rendered_dimension: u32 = 4096,
     ocr_prompt: []const u8 = "",
     ocr_model: []const u8 = "",
-    ocr_quality: OcrQualityConfig = .{},
+    ocr_quality: TextQualityConfig = .{},
     transcription_enabled: bool = false,
     transcription_config_json: []const u8 = "",
     route_preset: RoutePreset = .mixed_files,
@@ -1383,28 +1384,28 @@ test "document extraction parses independent native text policy and quality" {
     var defaults = try parseConfig(alloc, "{}");
     defer defaults.deinit(alloc);
     try std.testing.expectEqual(NativeTextPolicy.page, defaults.native_text.policy);
-    try std.testing.expectEqual(@as(usize, 50), defaults.native_text.quality.min_content_chars);
+    try std.testing.expectEqual(@as(usize, 50), defaults.native_text.quality.min_chars);
     try std.testing.expect(!defaults.ocr_enabled);
-    const native_pass = assessOcrQuality("This native PDF page contains enough readable words to pass its independent quality policy without enabling optical character recognition.", defaults.native_text.quality);
-    const native_fail = assessOcrQuality("", defaults.native_text.quality);
+    const native_pass = assessTextQuality("This native PDF page contains enough readable words to pass its independent quality policy without enabling optical character recognition.", defaults.native_text.quality);
+    const native_fail = assessTextQuality("", defaults.native_text.quality);
     try std.testing.expect(!native_pass.needsFallback());
     try std.testing.expect(native_fail.needsFallback());
 
     var tuned = try parseConfig(alloc,
-        \\{"native_text":{"policy":"visible","quality":{"min_content_chars":7,"max_replacement_char_ratio":0.2}},"ocr":{"reader":{"provider":"antfly","model":"reader"},"quality":{"min_content_chars":91}}}
+        \\{"native_text":{"policy":"visible","quality":{"min_chars":7,"max_replacement_ratio":0.2}},"ocr":{"reader":{"provider":"antfly","model":"reader"},"quality":{"min_chars":91}}}
     );
     defer tuned.deinit(alloc);
     try std.testing.expectEqual(NativeTextPolicy.visible, tuned.native_text.policy);
-    try std.testing.expectEqual(@as(usize, 7), tuned.native_text.quality.min_content_chars);
-    try std.testing.expectEqual(@as(f64, 0.2), tuned.native_text.quality.max_replacement_char_ratio);
-    try std.testing.expectEqual(@as(usize, 91), tuned.ocr_quality.min_content_chars);
+    try std.testing.expectEqual(@as(usize, 7), tuned.native_text.quality.min_chars);
+    try std.testing.expectEqual(@as(f64, 0.2), tuned.native_text.quality.max_replacement_ratio);
+    try std.testing.expectEqual(@as(usize, 91), tuned.ocr_quality.min_chars);
 
     inline for (.{
         "{\"native_text\":true}",
         "{\"native_text\":{\"policy\":\"automatic\"}}",
         "{\"native_text\":{\"policy\":1}}",
         "{\"native_text\":{\"quality\":false}}",
-        "{\"native_text\":{\"quality\":{\"min_content_chars\":-1}}}",
+        "{\"native_text\":{\"quality\":{\"min_chars\":-1}}}",
         "{\"native_text\":{\"quality\":{\"unknown\":1}}}",
         "{\"native_text\":{\"quality\":{\"max_corrupted_line_ratio\":1.1}}}",
         "{\"native_text\":{\"unknown\":1}}",
@@ -1460,18 +1461,18 @@ fn normalizedPromptTextEqual(a_raw: []const u8, b_raw: []const u8) bool {
     }
 }
 
-pub const OcrQualityConfig = struct {
-    min_content_chars: usize = 50,
+pub const TextQualityConfig = struct {
+    min_chars: usize = 50,
     garbled_min_words: usize = 20,
     garbled_sample_words: usize = 50,
     max_single_char_word_ratio: f64 = 0.40,
-    substantial_line_min_chars: usize = 15,
+    min_line_chars: usize = 15,
     max_corrupted_line_ratio: f64 = 0.20,
-    font_corruption_score_threshold: f64 = 0.50,
-    max_replacement_char_ratio: f64 = 0.05,
+    max_font_corruption: f64 = 0.50,
+    max_replacement_ratio: f64 = 0.05,
 };
 
-pub const OcrQuality = struct {
+pub const TextQuality = struct {
     too_short: bool = false,
     garbled: bool = false,
     font_corrupted: bool = false,
@@ -1480,14 +1481,14 @@ pub const OcrQuality = struct {
     corrupted_line_ratio: f64 = 0,
     replacement_char_ratio: f64 = 0,
     trimmed_len: usize = 0,
-    /// Valid UTF-8 codepoints, excluding ASCII whitespace.
+    /// Valid UTF-8 codepoints, excluding Unicode White_Space.
     non_whitespace_chars: usize = 0,
 
-    pub fn needsFallback(self: OcrQuality) bool {
+    pub fn needsFallback(self: TextQuality) bool {
         return self.too_short or self.garbled or self.font_corrupted or self.replacement_corrupted;
     }
 
-    pub fn failureCount(self: OcrQuality) u8 {
+    pub fn failureCount(self: TextQuality) u8 {
         return @as(u8, @intFromBool(self.too_short)) +
             @as(u8, @intFromBool(self.garbled)) +
             @as(u8, @intFromBool(self.font_corrupted)) +
@@ -1495,9 +1496,28 @@ pub const OcrQuality = struct {
     }
 };
 
-pub fn assessOcrQuality(text: []const u8, config: OcrQualityConfig) OcrQuality {
+fn isContentCharacter(cp: u21) bool {
+    // Unicode White_Space, matching the fixed text chunker's min_chars rule.
+    return switch (cp) {
+        0x09...0x0d, 0x20, 0x85, 0xa0, 0x1680, 0x2000...0x200a, 0x2028, 0x2029, 0x202f, 0x205f, 0x3000 => false,
+        else => true,
+    };
+}
+
+/// Match text chunking's length unit: non-whitespace Unicode scalar values.
+fn countContentChars(text: []const u8) usize {
+    const view = std.unicode.Utf8View.init(text) catch return 0;
+    var iter = view.iterator();
+    var count: usize = 0;
+    while (iter.nextCodepoint()) |cp| {
+        if (isContentCharacter(cp)) count += 1;
+    }
+    return count;
+}
+
+pub fn assessTextQuality(text: []const u8, config: TextQualityConfig) TextQuality {
     const trimmed = std.mem.trim(u8, text, &std.ascii.whitespace);
-    var out = OcrQuality{ .trimmed_len = trimmed.len, .too_short = trimmed.len < config.min_content_chars };
+    var out = TextQuality{ .trimmed_len = trimmed.len };
 
     var word_count: usize = 0;
     var sampled_words: usize = 0;
@@ -1534,9 +1554,9 @@ pub fn assessOcrQuality(text: []const u8, config: OcrQualityConfig) OcrQuality {
     var lines = std.mem.splitScalar(u8, trimmed, '\n');
     while (lines.next()) |line_raw| {
         const line = std.mem.trim(u8, line_raw, &std.ascii.whitespace);
-        if (line.len < config.substantial_line_min_chars) continue;
+        if (countContentChars(line) < config.min_line_chars) continue;
         substantial_lines += 1;
-        if (fontCorruptionScore(line) > config.font_corruption_score_threshold) corrupted_lines += 1;
+        if (fontCorruptionScore(line) > config.max_font_corruption) corrupted_lines += 1;
     }
     if (substantial_lines > 0) out.corrupted_line_ratio = @as(f64, @floatFromInt(corrupted_lines)) / @as(f64, @floatFromInt(substantial_lines));
     out.font_corrupted = out.corrupted_line_ratio > config.max_corrupted_line_ratio;
@@ -1548,7 +1568,7 @@ pub fn assessOcrQuality(text: []const u8, config: OcrQualityConfig) OcrQuality {
         var iter = valid_view.iterator();
         while (iter.nextCodepoint()) |cp| {
             codepoints += 1;
-            if (cp >= 0x80 or !std.ascii.isWhitespace(@intCast(cp))) out.non_whitespace_chars += 1;
+            if (isContentCharacter(cp)) out.non_whitespace_chars += 1;
             if (cp == 0xfffd) replacements += 1;
         }
     } else {
@@ -1560,7 +1580,8 @@ pub fn assessOcrQuality(text: []const u8, config: OcrQualityConfig) OcrQuality {
         }
     }
     if (codepoints > 0) out.replacement_char_ratio = @as(f64, @floatFromInt(replacements)) / @as(f64, @floatFromInt(codepoints));
-    out.replacement_corrupted = out.replacement_char_ratio > config.max_replacement_char_ratio;
+    out.replacement_corrupted = out.replacement_char_ratio > config.max_replacement_ratio;
+    out.too_short = out.non_whitespace_chars < config.min_chars;
     return out;
 }
 
@@ -1641,7 +1662,7 @@ fn fontCorruptionScore(text_raw: []const u8) f64 {
     return @min(1.0, score);
 }
 
-pub fn preferOcrText(embedded: OcrQuality, ocr: OcrQuality) bool {
+pub fn preferOcrText(embedded: TextQuality, ocr: TextQuality) bool {
     // Absence is not a clean candidate. Empty text has zero corruption ratios
     // and must not win those tie-breakers against a short transcription.
     if (ocr.trimmed_len == 0) return false;
@@ -1650,7 +1671,8 @@ pub fn preferOcrText(embedded: OcrQuality, ocr: OcrQuality) bool {
     // candidate. This can otherwise happen when both candidates have one
     // quality failure (for example embedded `.garbled` versus OCR
     // `.too_short`) and the ratio tie-breakers favor the one-character OCR.
-    if (ocr.too_short and !embedded.too_short) return false;
+    if (ocr.too_short and !embedded.too_short and
+        !embedded.font_corrupted and !embedded.replacement_corrupted) return false;
     // Fragmentation does not make decoded content expendable. A cleaner
     // partial transcription must not erase most of a page. Count characters
     // without whitespace so faithful reconstruction can still join fragments.
@@ -1672,7 +1694,7 @@ pub fn preferOcrText(embedded: OcrQuality, ocr: OcrQuality) bool {
 /// prose quality while silently dropping values; when embedded PDF text
 /// contains substantial numeric content, require the OCR candidate to retain
 /// most of its numeric-token occurrences before replacing it.
-pub fn preferOcrTextForContentAlloc(alloc: Allocator, embedded_text: []const u8, ocr_text: []const u8, embedded: OcrQuality, ocr: OcrQuality) !bool {
+pub fn preferOcrTextForContentAlloc(alloc: Allocator, embedded_text: []const u8, ocr_text: []const u8, embedded: TextQuality, ocr: TextQuality) !bool {
     return (try chooseOcrTextForContentAlloc(alloc, embedded_text, ocr_text, embedded, ocr)) != .embedded;
 }
 
@@ -1681,7 +1703,7 @@ pub const OcrTextChoice = enum { embedded, ocr, ocr_with_embedded_numeric_rows }
 const max_numeric_recall_unique_tokens: usize = 65_536;
 const max_numeric_recall_token_occurrences: usize = 1_000_000;
 
-pub fn chooseOcrTextForContentAlloc(alloc: Allocator, embedded_text: []const u8, ocr_text: []const u8, embedded: OcrQuality, ocr: OcrQuality) !OcrTextChoice {
+pub fn chooseOcrTextForContentAlloc(alloc: Allocator, embedded_text: []const u8, ocr_text: []const u8, embedded: TextQuality, ocr: TextQuality) !OcrTextChoice {
     // Apply content eligibility before comparing two available candidates.
     // Prompt-echo validation remains the executor's responsibility.
     if (!hasMeaningfulOcrContent(ocr_text)) return .embedded;
@@ -1733,8 +1755,8 @@ fn isBareNumericGlyph(raw: []const u8, normalized: []const u8) bool {
 }
 
 fn assessEmbeddedNumericRow(line: []const u8) EmbeddedNumericRow {
-    const config = OcrQualityConfig{ .min_content_chars = 0 };
-    const quality = assessOcrQuality(line, config);
+    const config = TextQualityConfig{ .min_chars = 0 };
+    const quality = assessTextQuality(line, config);
     if (quality.font_corrupted or quality.replacement_corrupted) return .{ .corrupted = true };
     // Rows are usually shorter than the page-level garbled-word minimum.
     // Count alphabetic tokens independently so numeric cells neither signal
@@ -1978,11 +2000,11 @@ fn normalizedNumericToken(raw: []const u8) ?[]const u8 {
     return null;
 }
 
-pub fn ocrQualityJsonAlloc(alloc: Allocator, quality: OcrQuality) ![]u8 {
+pub fn ocrQualityJsonAlloc(alloc: Allocator, quality: TextQuality) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, quality, .{});
 }
 
-fn ocrTriggerReasonsAlloc(alloc: Allocator, quality: OcrQuality, forced: bool) ![]u8 {
+fn ocrTriggerReasonsAlloc(alloc: Allocator, quality: TextQuality, forced: bool) ![]u8 {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(alloc);
     if (forced) try out.appendSlice(alloc, "always");
@@ -2009,7 +2031,7 @@ const PendingOcrMetadata = struct {
     trigger_reasons: ?[]u8 = null,
     embedded_quality: ?[]u8 = null,
 
-    fn initAlloc(alloc: Allocator, quality: OcrQuality, forced: bool) !PendingOcrMetadata {
+    fn initAlloc(alloc: Allocator, quality: TextQuality, forced: bool) !PendingOcrMetadata {
         var metadata = PendingOcrMetadata{};
         errdefer metadata.deinit(alloc);
         metadata.trigger_reasons = try ocrTriggerReasonsAlloc(alloc, quality, forced);
@@ -2229,11 +2251,11 @@ fn parseOcrOptions(alloc: Allocator, object: std.json.ObjectMap, config: *Config
     }
 }
 
-fn parseQualityOptions(quality: std.json.ObjectMap, config: *OcrQualityConfig) !void {
-    try rejectUnknownFields(quality, &.{ "min_content_chars", "garbled_min_words", "garbled_sample_words", "max_single_char_word_ratio", "substantial_line_min_chars", "max_corrupted_line_ratio", "font_corruption_score_threshold", "max_replacement_char_ratio" });
-    if (try intField(quality, "min_content_chars")) |v| {
+fn parseQualityOptions(quality: std.json.ObjectMap, config: *TextQualityConfig) !void {
+    try rejectUnknownFields(quality, &.{ "min_chars", "garbled_min_words", "garbled_sample_words", "max_single_char_word_ratio", "min_line_chars", "max_corrupted_line_ratio", "max_font_corruption", "max_replacement_ratio" });
+    if (try intField(quality, "min_chars")) |v| {
         if (v < 0) return error.InvalidDocumentExtractionConfig;
-        config.min_content_chars = @intCast(v);
+        config.min_chars = @intCast(v);
     }
     if (try intField(quality, "garbled_min_words")) |v| {
         if (v < 0) return error.InvalidDocumentExtractionConfig;
@@ -2244,13 +2266,13 @@ fn parseQualityOptions(quality: std.json.ObjectMap, config: *OcrQualityConfig) !
         config.garbled_sample_words = @intCast(v);
     }
     if (try floatField(quality, "max_single_char_word_ratio")) |v| config.max_single_char_word_ratio = try ratio(v);
-    if (try intField(quality, "substantial_line_min_chars")) |v| {
+    if (try intField(quality, "min_line_chars")) |v| {
         if (v < 1) return error.InvalidDocumentExtractionConfig;
-        config.substantial_line_min_chars = @intCast(v);
+        config.min_line_chars = @intCast(v);
     }
     if (try floatField(quality, "max_corrupted_line_ratio")) |v| config.max_corrupted_line_ratio = try ratio(v);
-    if (try floatField(quality, "font_corruption_score_threshold")) |v| config.font_corruption_score_threshold = try ratio(v);
-    if (try floatField(quality, "max_replacement_char_ratio")) |v| config.max_replacement_char_ratio = try ratio(v);
+    if (try floatField(quality, "max_font_corruption")) |v| config.max_font_corruption = try ratio(v);
+    if (try floatField(quality, "max_replacement_ratio")) |v| config.max_replacement_ratio = try ratio(v);
 }
 
 fn parseOcrRenderOptions(render: std.json.ObjectMap, config: *Config) !void {
@@ -2526,7 +2548,7 @@ fn dupeOptionalStringField(alloc: Allocator, object: std.json.ObjectMap, field: 
     return try alloc.dupe(u8, value.string);
 }
 
-pub const native_text_extraction_identity = "native-text-v1";
+pub const native_text_extraction_identity = "native-text-v2";
 
 pub fn metadataFingerprintAlloc(
     alloc: Allocator,
@@ -2558,14 +2580,14 @@ pub fn metadataFingerprintAlloc(
 fn hashNativeTextConfig(hasher: *std.crypto.hash.sha2.Sha256, native_text: NativeTextConfig) void {
     hashField(hasher, "native_text_extraction_identity", native_text_extraction_identity);
     hashField(hasher, "native_text_policy", @tagName(native_text.policy));
-    hashU64Field(hasher, "native_text_min_content_chars", @intCast(native_text.quality.min_content_chars));
+    hashU64Field(hasher, "native_text_min_chars", @intCast(native_text.quality.min_chars));
     hashU64Field(hasher, "native_text_garbled_min_words", @intCast(native_text.quality.garbled_min_words));
     hashU64Field(hasher, "native_text_garbled_sample_words", @intCast(native_text.quality.garbled_sample_words));
     hashU64Field(hasher, "native_text_max_single_char_word_ratio", @bitCast(native_text.quality.max_single_char_word_ratio));
-    hashU64Field(hasher, "native_text_substantial_line_min_chars", @intCast(native_text.quality.substantial_line_min_chars));
+    hashU64Field(hasher, "native_text_min_line_chars", @intCast(native_text.quality.min_line_chars));
     hashU64Field(hasher, "native_text_max_corrupted_line_ratio", @bitCast(native_text.quality.max_corrupted_line_ratio));
-    hashU64Field(hasher, "native_text_font_corruption_score_threshold", @bitCast(native_text.quality.font_corruption_score_threshold));
-    hashU64Field(hasher, "native_text_max_replacement_char_ratio", @bitCast(native_text.quality.max_replacement_char_ratio));
+    hashU64Field(hasher, "native_text_max_font_corruption", @bitCast(native_text.quality.max_font_corruption));
+    hashU64Field(hasher, "native_text_max_replacement_ratio", @bitCast(native_text.quality.max_replacement_ratio));
 }
 
 fn hashU64Field(hasher: *std.crypto.hash.sha2.Sha256, name: []const u8, value: u64) void {
@@ -2614,13 +2636,13 @@ fn extractDownloadedUnmarkedAlloc(
     const content_type = if (config.content_type.len > 0) config.content_type else downloaded.content_type;
     for (config.routes) |route| {
         if (!routeMatches(route.match, content_type, config.filename, source_url, downloaded.data)) continue;
-        return try extractWithRouteAlloc(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.native_text, config.ocr_mode, config.ocr_quality, config.pdf_decode_limits);
+        return try extractWithRouteAlloc(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.native_text, config.ocr_mode, config.pdf_decode_limits);
     }
     if (config.route_preset == .explicit_only) {
         return try unsupportedResultAlloc(alloc, content_type, "no_configured_route_matched");
     }
     if (isPdfContent(content_type, config.filename, source_url, downloaded.data)) {
-        return try extractPdfAlloc(alloc, downloaded.data, content_type, config.native_text, config.ocr_mode, config.ocr_quality, config.pdf_decode_limits);
+        return try extractPdfAlloc(alloc, downloaded.data, content_type, config.native_text, config.ocr_mode, config.pdf_decode_limits);
     }
     if (isHtmlContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitAlloc(alloc, downloaded.data, content_type, "article:000001", "article", "html_text", config.html_strip_tags);
@@ -2673,14 +2695,14 @@ fn extractDownloadedStreamingUnmarked(
     const content_type = if (config.content_type.len > 0) config.content_type else downloaded.content_type;
     for (config.routes) |route| {
         if (!routeMatches(route.match, content_type, config.filename, source_url, downloaded.data)) continue;
-        return try extractWithRouteStreaming(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.native_text, config.ocr_mode, config.ocr_quality, config.pdf_decode_limits, sink);
+        return try extractWithRouteStreaming(alloc, downloaded.data, content_type, route, config.html_strip_tags, config.native_text, config.ocr_mode, config.pdf_decode_limits, sink);
     }
     if (config.route_preset == .explicit_only) {
         try streamUnsupportedResult(sink, content_type, "no_configured_route_matched");
         return;
     }
     if (isPdfContent(content_type, config.filename, source_url, downloaded.data)) {
-        return try extractPdfStreaming(alloc, downloaded.data, content_type, config.native_text, config.ocr_mode, config.ocr_quality, config.pdf_decode_limits, sink);
+        return try extractPdfStreaming(alloc, downloaded.data, content_type, config.native_text, config.ocr_mode, config.pdf_decode_limits, sink);
     }
     if (isHtmlContent(content_type, config.filename, source_url, downloaded.data)) {
         return try extractSingleTextUnitStreaming(alloc, downloaded.data, content_type, "article:000001", "article", "html_text", config.html_strip_tags, sink);
@@ -2720,12 +2742,11 @@ fn extractWithRouteStreaming(
     html_strip_tags: bool,
     native_text: NativeTextConfig,
     ocr_mode: OcrMode,
-    ocr_quality: OcrQualityConfig,
     pdf_decode_limits: pdf.reader.DecodeLimits,
     sink: UnitSink,
 ) !void {
     switch (route.extractor_type) {
-        .pdf => return try extractPdfStreaming(alloc, bytes, content_type, native_text, ocr_mode, ocr_quality, pdf_decode_limits, sink),
+        .pdf => return try extractPdfStreaming(alloc, bytes, content_type, native_text, ocr_mode, pdf_decode_limits, sink),
         .html => return try extractSingleConfiguredUnitStreaming(alloc, bytes, content_type, route.unit, "article", "html_text", html_strip_tags, sink),
         .text => return try extractSingleConfiguredUnitStreaming(alloc, bytes, content_type, route.unit, "document", "text", false, sink),
         .email => return try streamBufferedExtraction(alloc, try extractEmailAlloc(alloc, bytes, content_type, if (route.unit.len > 0) route.unit else "email"), sink),
@@ -2825,11 +2846,10 @@ fn extractWithRouteAlloc(
     html_strip_tags: bool,
     native_text: NativeTextConfig,
     ocr_mode: OcrMode,
-    ocr_quality: OcrQualityConfig,
     pdf_decode_limits: pdf.reader.DecodeLimits,
 ) !Result {
     return switch (route.extractor_type) {
-        .pdf => try extractPdfAlloc(alloc, bytes, content_type, native_text, ocr_mode, ocr_quality, pdf_decode_limits),
+        .pdf => try extractPdfAlloc(alloc, bytes, content_type, native_text, ocr_mode, pdf_decode_limits),
         .html => try extractSingleConfiguredUnitAlloc(alloc, bytes, content_type, route.unit, "article", "html_text", html_strip_tags),
         .text => try extractSingleConfiguredUnitAlloc(alloc, bytes, content_type, route.unit, "document", "text", false),
         .email => try extractEmailAlloc(alloc, bytes, content_type, if (route.unit.len > 0) route.unit else "email"),
@@ -2955,10 +2975,17 @@ pub fn resolvesToPdf(config: Config, source_url: []const u8, content_type: []con
     return isPdfContent(content_type, config.filename, source_url, bytes);
 }
 
-fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, quality_config: OcrQualityConfig, decode_limits: pdf.reader.DecodeLimits) !Result {
-    // OCR quality evaluates OCR candidates after recognition; native quality
-    // alone determines whether this embedded-text page is routed to OCR.
-    _ = quality_config;
+const NativeTextAssessment = struct {
+    quality: TextQuality,
+    needs_ocr: bool,
+
+    fn init(text: []const u8, config: NativeTextConfig, mode: OcrMode) NativeTextAssessment {
+        const quality = assessTextQuality(text, config.quality);
+        return .{ .quality = quality, .needs_ocr = mode == .always or quality.needsFallback() };
+    }
+};
+
+fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, decode_limits: pdf.reader.DecodeLimits) !Result {
     var parsed = try pdf.reader.Reader.initWithDecodeLimits(alloc, bytes, decode_limits);
     defer parsed.deinit();
     parsed.setTextExtractionPolicy(native_text.policy);
@@ -2989,7 +3016,8 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         const text_blocks = try pdf.text_structure.blocksFromRunsAlloc(alloc, text, analysis.runs);
         errdefer if (text_blocks.len > 0) alloc.free(text_blocks);
         const native_diagnostics = nativeTextDiagnostics(native_text.policy, analysis, candidate.extraction_complete);
-        const native_quality = assessOcrQuality(text, native_text.quality);
+        const assessment = NativeTextAssessment.init(text, native_text, ocr_mode);
+        const native_quality = assessment.quality;
         const extraction_warning: ?[]u8 = candidate.warning;
         errdefer if (extraction_warning) |value| alloc.free(value);
         const page_box = parsed.extractPageBox(page_num) catch null;
@@ -3000,14 +3028,15 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
         errdefer if (unit_id) |value| alloc.free(value);
         var unit_type: ?[]u8 = try alloc.dupe(u8, "page");
         errdefer if (unit_type) |value| alloc.free(value);
-        const scanned_page = force_ocr or native_quality.needsFallback();
+        const quality = native_quality;
+        const scanned_page = assessment.needs_ocr;
         var method: ?[]u8 = try alloc.dupe(u8, if (scanned_page) "pdf_ocr_pending" else "pdf_text");
         errdefer if (method) |value| alloc.free(value);
         var extraction_status: ?[]u8 = if (scanned_page) try alloc.dupe(u8, "pending_ocr") else null;
         errdefer if (extraction_status) |value| alloc.free(value);
         var page_label: ?[]u8 = try std.fmt.allocPrint(alloc, "{d}", .{page_num});
         errdefer if (page_label) |value| alloc.free(value);
-        var ocr_metadata = if (scanned_page) try PendingOcrMetadata.initAlloc(alloc, native_quality, force_ocr) else PendingOcrMetadata{};
+        var ocr_metadata = if (scanned_page) try PendingOcrMetadata.initAlloc(alloc, quality, force_ocr) else PendingOcrMetadata{};
         defer ocr_metadata.deinit(alloc);
         units[initialized] = .{
             .unit_id = unit_id.?,
@@ -3047,21 +3076,21 @@ fn extractPdfAlloc(alloc: Allocator, bytes: []const u8, content_type: []const u8
     };
 }
 
-fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, quality_config: OcrQualityConfig, decode_limits: pdf.reader.DecodeLimits, sink: UnitSink) !void {
+fn extractPdfStreaming(alloc: Allocator, bytes: []const u8, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, decode_limits: pdf.reader.DecodeLimits, sink: UnitSink) !void {
     var parsed = try pdf.reader.Reader.initWithDecodeLimits(alloc, bytes, decode_limits);
     defer parsed.deinit();
     parsed.setTextExtractionPolicy(native_text.policy);
 
-    return extractParsedPdfStreaming(alloc, &parsed, content_type, native_text, ocr_mode, quality_config, sink);
+    return extractParsedPdfStreaming(alloc, &parsed, content_type, native_text, ocr_mode, sink);
 }
 
 /// Stream text through a task-local read fork. The prepared session may be
 /// shared by render work and is never mutated with a consumer's text policy.
-pub fn extractPreparedPdfStreaming(alloc: Allocator, session: *PdfRenderSession, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink) !void {
+pub fn extractPreparedPdfStreaming(alloc: Allocator, session: *PdfRenderSession, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, sink: UnitSink) !void {
     var text_session = try PdfRenderSession.initFromPrepared(alloc, session, session.parsed.cancellationProbe());
     defer text_session.deinit();
     text_session.parsed.setTextExtractionPolicy(native_text.policy);
-    return extractParsedPdfStreaming(alloc, &text_session.parsed, content_type, native_text, ocr_mode, quality_config, sink);
+    return extractParsedPdfStreaming(alloc, &text_session.parsed, content_type, native_text, ocr_mode, sink);
 }
 
 /// Task-neutral text inspection. OCR selection, offsets, prompts and output
@@ -3108,11 +3137,11 @@ pub const PdfPageTextCache = struct {
     store_fn: *const fn (*anyopaque, usize, PdfPageText) anyerror!void,
 };
 
-pub fn extractPreparedPdfStreamingWithTextCache(alloc: Allocator, session: *PdfRenderSession, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink, cache: ?PdfPageTextCache) !void {
+pub fn extractPreparedPdfStreamingWithTextCache(alloc: Allocator, session: *PdfRenderSession, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, sink: UnitSink, cache: ?PdfPageTextCache) !void {
     var text_session = try PdfRenderSession.initFromPrepared(alloc, session, session.parsed.cancellationProbe());
     defer text_session.deinit();
     text_session.parsed.setTextExtractionPolicy(native_text.policy);
-    return extractParsedPdfStreamingWithTextCache(alloc, &text_session.parsed, content_type, native_text, ocr_mode, quality_config, sink, cache);
+    return extractParsedPdfStreamingWithTextCache(alloc, &text_session.parsed, content_type, native_text, ocr_mode, sink, cache);
 }
 
 fn inspectPdfPageText(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: usize, policy: NativeTextPolicy, cache: ?PdfPageTextCache) !PdfPageText {
@@ -3138,14 +3167,11 @@ fn inspectPdfPageText(alloc: Allocator, parsed: *pdf.reader.Reader, page_num: us
     return result;
 }
 
-fn extractParsedPdfStreaming(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink) !void {
-    return extractParsedPdfStreamingWithTextCache(alloc, parsed, content_type, native_text, ocr_mode, quality_config, sink, null);
+fn extractParsedPdfStreaming(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, sink: UnitSink) !void {
+    return extractParsedPdfStreamingWithTextCache(alloc, parsed, content_type, native_text, ocr_mode, sink, null);
 }
 
-fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, quality_config: OcrQualityConfig, sink: UnitSink, cache: ?PdfPageTextCache) !void {
-    // OCR quality evaluates OCR candidates after recognition; native quality
-    // alone determines whether this embedded-text page is routed to OCR.
-    _ = quality_config;
+fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.Reader, content_type: []const u8, native_text: NativeTextConfig, ocr_mode: OcrMode, sink: UnitSink, cache: ?PdfPageTextCache) !void {
     const page_count = try parsed.pageCount();
     try sink.on_begin(sink.ptr, .{ .content_type = content_type, .route_type = "pdf" });
 
@@ -3172,8 +3198,10 @@ fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.
         const page_text_len = text.len;
         const char_start = std.math.cast(u32, cursor);
         const char_end = std.math.cast(u32, cursor + page_text_len);
-        const native_quality = assessOcrQuality(text, native_text.quality);
-        const scanned_page = force_ocr or native_quality.needsFallback();
+        const assessment = NativeTextAssessment.init(text, native_text, ocr_mode);
+        const native_quality = assessment.quality;
+        const quality = native_quality;
+        const scanned_page = assessment.needs_ocr;
         var unit_id: ?[]u8 = try std.fmt.allocPrint(alloc, "page:{d:0>6}", .{page_num});
         errdefer if (unit_id) |value| alloc.free(value);
         var unit_type: ?[]u8 = try alloc.dupe(u8, "page");
@@ -3184,7 +3212,7 @@ fn extractParsedPdfStreamingWithTextCache(alloc: Allocator, parsed: *pdf.reader.
         errdefer if (extraction_status) |value| alloc.free(value);
         var page_label: ?[]u8 = try std.fmt.allocPrint(alloc, "{d}", .{page_num});
         errdefer if (page_label) |value| alloc.free(value);
-        var ocr_metadata = if (scanned_page) try PendingOcrMetadata.initAlloc(alloc, native_quality, force_ocr) else PendingOcrMetadata{};
+        var ocr_metadata = if (scanned_page) try PendingOcrMetadata.initAlloc(alloc, quality, force_ocr) else PendingOcrMetadata{};
         defer ocr_metadata.deinit(alloc);
         var unit = Unit{
             .unit_id = unit_id.?,
@@ -3236,6 +3264,7 @@ fn extractPdfTextRegionsFromRunsAlloc(
     var regions = std.ArrayListUnmanaged(TextRegion).empty;
     defer regions.deinit(alloc);
     for (runs) |run| {
+        if (run.semantic_only) continue;
         // A null span means reconstruction could not align this positioned run
         // with the canonical page text. Substring matching is unsafe here: a
         // degraded run can match unrelated text and receive the wrong bounds.
@@ -5477,7 +5506,7 @@ test "document extraction metadata fingerprint requires version metadata" {
     defer alloc.free(visible);
     try std.testing.expect(!std.mem.eql(u8, second, visible));
 
-    config.native_text.quality.min_content_chars += 1;
+    config.native_text.quality.min_chars += 1;
     const tuned = (try metadataFingerprintAlloc(alloc, "data:application/pdf;base64,AA==", "{}", config)).?;
     defer alloc.free(tuned);
     try std.testing.expect(!std.mem.eql(u8, visible, tuned));
@@ -5602,18 +5631,18 @@ test "document extraction classifies unsupported content without units" {
 }
 
 test "OCR quality fallback covers born digital scanned garbled and encoding failures" {
-    const config = OcrQualityConfig{};
-    const born_digital = assessOcrQuality("This is a normal born-digital document page with enough readable English text to be indexed without optical character recognition.", config);
+    const config = TextQualityConfig{};
+    const born_digital = assessTextQuality("This is a normal born-digital document page with enough readable English text to be indexed without optical character recognition.", config);
     try std.testing.expect(!born_digital.needsFallback());
-    try std.testing.expect(assessOcrQuality("", config).too_short);
+    try std.testing.expect(assessTextQuality("", config).too_short);
 
-    const garbled = assessOcrQuality("a b c d e f g h i j k l m n o p q r s t u v w y z a b c d e f", config);
+    const garbled = assessTextQuality("a b c d e f g h i j k l m n o p q r s t u v w y z a b c d e f", config);
     try std.testing.expect(garbled.garbled);
 
-    const replacement = assessOcrQuality("Readable source text that is long enough but contains replacement markers \u{fffd} \u{fffd} \u{fffd} \u{fffd} \u{fffd} \u{fffd}.", config);
+    const replacement = assessTextQuality("Readable source text that is long enough but contains replacement markers \u{fffd} \u{fffd} \u{fffd} \u{fffd} \u{fffd} \u{fffd}.", config);
     try std.testing.expect(replacement.replacement_corrupted);
 
-    const financial_table = assessOcrQuality(
+    const financial_table = assessTextQuality(
         "JPMORGAN CHASE & CO. CONSOLIDATED FINANCIAL HIGHLIGHTS\n" ++
             "NET REVENUE $33,119 $30,161 10% TOTAL ASSETS $3,689,336 $3,386,071",
         config,
@@ -5621,14 +5650,14 @@ test "OCR quality fallback covers born digital scanned garbled and encoding fail
     try std.testing.expect(!financial_table.font_corrupted);
     try std.testing.expect(!financial_table.needsFallback());
 
-    const font_garbled = assessOcrQuality(
+    const font_garbled = assessTextQuality(
         "Qzxvbnm Plkghjkl Mnbvcxz Trwqplkj Bcdfghjk\n" ++
             "Zxcvbnml Qwrtplkj Hgfdsqwr Mnbvcxzl Plkjhgfd",
         config,
     );
     try std.testing.expect(font_garbled.font_corrupted);
 
-    try std.testing.expectEqual(@as(u8, 4), (OcrQuality{
+    try std.testing.expectEqual(@as(u8, 4), (TextQuality{
         .too_short = true,
         .garbled = true,
         .font_corrupted = true,
@@ -5644,21 +5673,21 @@ test "OCR quality distinguishes a spaced heading from corruption throughout the 
             return out;
         }
     };
-    const config = OcrQualityConfig{};
+    const config = TextQualityConfig{};
     const sentence = "The report documents completed deliveries and verified records for every district. ";
     const readable_body = Text.repeat(sentence, 24);
     const decorated_page = Text.repeat("D E C O R A T I V E ", 4) ++ "\n" ++ readable_body;
-    const decorated = assessOcrQuality(decorated_page, config);
+    const decorated = assessTextQuality(decorated_page, config);
     try std.testing.expect(!decorated.needsFallback());
 
     // Fixed-stride sampling must not repeatedly select only "I".
     const repeated_prose = Text.repeat("The report says I am prepared today ", 50);
-    try std.testing.expect(!assessOcrQuality(&repeated_prose, config).needsFallback());
+    try std.testing.expect(!assessTextQuality(&repeated_prose, config).needsFallback());
 
     // The first fifty words are ordinary prose; most subsequent words are
     // broken glyphs, so prefix-only sampling would miss the damaged body.
     const damaged_page = Text.repeat(sentence, 5) ++ "\n" ++ Text.repeat("b c d e f g h j k l m n ", 40);
-    try std.testing.expect(assessOcrQuality(damaged_page, config).garbled);
+    try std.testing.expect(assessTextQuality(damaged_page, config).garbled);
 }
 
 test "OCR pending metadata construction is allocation-failure safe" {
@@ -5680,12 +5709,12 @@ test "OCR pending metadata construction is allocation-failure safe" {
 }
 
 test "OCR text selection retains embedded text on ties and chooses a better transcription" {
-    const config = OcrQualityConfig{};
-    const embedded = assessOcrQuality("a b c d e f g h i j k l m n o p q r s t u v w y z a b c d e f", config);
-    const ocr = assessOcrQuality("A faithfully transcribed table page with readable headings and enough ordinary English content to pass all quality checks.", config);
+    const config = TextQualityConfig{ .min_chars = 20 };
+    const embedded = assessTextQuality("a b c d e f g h i j k l m n o p q r s t u v w y z a b c d e f", config);
+    const ocr = assessTextQuality("A faithfully transcribed table page with readable headings and enough ordinary English content to pass all quality checks.", config);
     try std.testing.expect(preferOcrText(embedded, ocr));
     try std.testing.expect(!preferOcrText(ocr, ocr));
-    const trivial_ocr = assessOcrQuality("-", config);
+    const trivial_ocr = assessTextQuality("-", config);
     try std.testing.expect(trivial_ocr.too_short);
     try std.testing.expect(!embedded.too_short);
     try std.testing.expect(!preferOcrText(embedded, trivial_ocr));
@@ -5700,11 +5729,11 @@ test "OCR text selection retains clean embedded content despite sampled ratios a
     // the certification, while scoring better on single-character words.
     const candidates = [_][]const u8{ z17RepeatString(prefix, 8), z17RepeatString(prefix, 16) };
     for ([_]usize{ 0, 25, 50, 100 }) |sample_words| {
-        const config = OcrQualityConfig{ .garbled_sample_words = sample_words };
-        const embedded_quality = assessOcrQuality(embedded, config);
+        const config = TextQualityConfig{ .garbled_sample_words = sample_words };
+        const embedded_quality = assessTextQuality(embedded, config);
         try std.testing.expect(!embedded_quality.needsFallback());
         for (candidates) |ocr| {
-            const ocr_quality = assessOcrQuality(ocr, config);
+            const ocr_quality = assessTextQuality(ocr, config);
             try std.testing.expect(!ocr_quality.needsFallback());
             if (sample_words == 50)
                 try std.testing.expect(embedded_quality.single_char_word_ratio > ocr_quality.single_char_word_ratio);
@@ -5720,55 +5749,55 @@ test "OCR text selection retains clean embedded content despite sampled ratios a
 
     const table = "Quarter Revenue Cost Margin\nQ1 101 81 20\nQ2 115 90 25\nQ3 124 94 30\nQ4 140 100 40";
     const missing_cells = "The report summarizes quarterly performance in complete readable prose without reproducing the individual numeric table cells.";
-    const table_quality = assessOcrQuality(table, .{});
+    const table_quality = assessTextQuality(table, .{});
     try std.testing.expect(!table_quality.needsFallback());
     try std.testing.expectEqual(OcrTextChoice.embedded, try chooseOcrTextForContentAlloc(
         alloc,
         table,
         missing_cells,
         table_quality,
-        assessOcrQuality(missing_cells, .{}),
+        assessTextQuality(missing_cells, .{}),
     ));
 }
 
 test "OCR text selection checks availability before quality ratios" {
     const alloc = std.testing.allocator;
-    const config = OcrQualityConfig{};
+    const config = TextQualityConfig{};
     // Reproduce the scan's shape: both candidates are too short, but OCR has
     // single-letter words, whereas absent embedded text has a zero ratio.
     const short_text = "A short note with I and a reference";
-    const short_quality = assessOcrQuality(short_text, config);
+    const short_quality = assessTextQuality(short_text, config);
     try std.testing.expect(short_quality.too_short);
     try std.testing.expect(short_quality.single_char_word_ratio > 0);
     for ([_][]const u8{ "", " \t\n" }) |absent| {
-        const absent_quality = assessOcrQuality(absent, config);
+        const absent_quality = assessTextQuality(absent, config);
         try std.testing.expectEqual(OcrTextChoice.ocr, try chooseOcrTextForContentAlloc(alloc, absent, short_text, absent_quality, short_quality));
         try std.testing.expectEqual(OcrTextChoice.embedded, try chooseOcrTextForContentAlloc(alloc, short_text, absent, short_quality, absent_quality));
         try std.testing.expectEqual(OcrTextChoice.embedded, try chooseOcrTextForContentAlloc(alloc, absent, absent, absent_quality, absent_quality));
     }
-    const empty = assessOcrQuality("", config);
+    const empty = assessTextQuality("", config);
     try std.testing.expect(preferOcrText(empty, short_quality));
     try std.testing.expect(!preferOcrText(short_quality, empty));
     try std.testing.expect(!preferOcrText(empty, empty));
     const punctuation = "--- ...";
-    try std.testing.expectEqual(OcrTextChoice.embedded, try chooseOcrTextForContentAlloc(alloc, "", punctuation, empty, assessOcrQuality(punctuation, config)));
+    try std.testing.expectEqual(OcrTextChoice.embedded, try chooseOcrTextForContentAlloc(alloc, "", punctuation, empty, assessTextQuality(punctuation, config)));
     const substantial = "This is substantial readable embedded content that must not be replaced by a short OCR response.";
-    const substantial_quality = assessOcrQuality(substantial, config);
+    const substantial_quality = assessTextQuality(substantial, config);
     try std.testing.expectEqual(OcrTextChoice.embedded, try chooseOcrTextForContentAlloc(alloc, substantial, short_text, substantial_quality, short_quality));
 }
 
 test "OCR text selection preserves dense embedded numeric tables" {
     const alloc = std.testing.allocator;
-    const config = OcrQualityConfig{};
+    const config = TextQualityConfig{};
     // The prose needs OCR, while the decoded table values remain reliable.
     const embedded_text = "T h e s e r v i c e n e t t e d 1 2 0 t i c k e t s a t $ 5 0 e a c h\n" ++
         "Quarter Revenue Cost Margin\nQ1 101 81 20\nQ2 115 90 25\nQ3 124 94 30\nQ4 140 100 40";
     const missing_cells = "Quarterly revenue and margins improved throughout the year. This transcription contains fluent explanatory prose but omits the individual table cells.";
     const preserved_cells = "Quarter Revenue Cost Margin Q1 101 81 20 Q2 115 90 25 Q3 124 94 30 Q4 140 100 40 with complete table values and readable prose.";
-    const embedded = assessOcrQuality(embedded_text, config);
+    const embedded = assessTextQuality(embedded_text, config);
     try std.testing.expect(embedded.needsFallback());
-    const missing = assessOcrQuality(missing_cells, config);
-    const preserved = assessOcrQuality(preserved_cells, config);
+    const missing = assessTextQuality(missing_cells, config);
+    const preserved = assessTextQuality(preserved_cells, config);
     try std.testing.expectEqual(OcrTextChoice.ocr_with_embedded_numeric_rows, try chooseOcrTextForContentAlloc(alloc, embedded_text, missing_cells, embedded, missing));
     try std.testing.expect(try preferOcrTextForContentAlloc(alloc, embedded_text, preserved_cells, embedded, preserved));
 
@@ -5784,13 +5813,13 @@ test "numeric recovery rejects broken prose but preserves readable rows and sing
     const alloc = std.testing.allocator;
     const broken = "T h e s e r v i c e n e t t e d 1 2 0 t i c k e t s a t $ 5 0 e a c h";
     const ocr = "The service netted 120 tickets at $50 each. The transcription preserves the complete sentence.";
-    const config = OcrQualityConfig{};
+    const config = TextQualityConfig{};
     try std.testing.expectEqual(OcrTextChoice.ocr, try chooseOcrTextForContentAlloc(
         alloc,
         broken,
         ocr,
-        assessOcrQuality(broken, config),
-        assessOcrQuality(ocr, config),
+        assessTextQuality(broken, config),
+        assessTextQuality(ocr, config),
     ));
     const without_broken = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, broken, ocr);
     defer alloc.free(without_broken);
@@ -5824,8 +5853,8 @@ test "numeric recovery rejects short fragmented labels without counting numeric 
             alloc,
             embedded,
             ocr,
-            assessOcrQuality(embedded, .{}),
-            assessOcrQuality(ocr, .{}),
+            assessTextQuality(embedded, .{}),
+            assessTextQuality(ocr, .{}),
         ));
         const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded, ocr);
         defer alloc.free(merged);
@@ -5850,18 +5879,18 @@ test "numeric recovery retains single letter class labels and their balances" {
         alloc,
         embedded,
         ocr,
-        assessOcrQuality(embedded, .{}),
-        assessOcrQuality(ocr, .{}),
+        assessTextQuality(embedded, .{}),
+        assessTextQuality(ocr, .{}),
     ));
     const damaged = "T h e s e r v i c e n e t t e d 1 2 0 t i c k e t s a t $ 5 0 e a c h\n" ++ embedded;
-    const damaged_quality = assessOcrQuality(damaged, .{});
+    const damaged_quality = assessTextQuality(damaged, .{});
     try std.testing.expect(damaged_quality.needsFallback());
     try std.testing.expectEqual(OcrTextChoice.ocr_with_embedded_numeric_rows, try chooseOcrTextForContentAlloc(
         alloc,
         damaged,
         ocr,
         damaged_quality,
-        assessOcrQuality(ocr, .{}),
+        assessTextQuality(ocr, .{}),
     ));
     const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded, ocr);
     defer alloc.free(merged);
@@ -5880,7 +5909,7 @@ test "numeric recovery preserves intact coefficients beside lowercase variable l
     const alloc = std.testing.allocator;
     const embedded = "Coefficients a b c d 101 201 301 401\nCoefficients a b c d 102 202 302 402\nCoefficients a b c d 103 203 303 403";
     const ocr = "The table lists measured coefficients for several experiments, with each row describing four independent input parameters and their recorded observations.";
-    const embedded_quality = assessOcrQuality(embedded, .{});
+    const embedded_quality = assessTextQuality(embedded, .{});
     try std.testing.expect(embedded_quality.needsFallback());
     const recall = try numericTokenRecallAlloc(alloc, embedded, ocr);
     try std.testing.expectEqual(@as(usize, 12), recall.reference_count);
@@ -5889,7 +5918,7 @@ test "numeric recovery preserves intact coefficients beside lowercase variable l
         embedded,
         ocr,
         embedded_quality,
-        assessOcrQuality(ocr, .{}),
+        assessTextQuality(ocr, .{}),
     ));
     const merged = try mergeOcrWithEmbeddedNumericRowsAlloc(alloc, embedded, ocr);
     defer alloc.free(merged);
@@ -5983,7 +6012,7 @@ test "OCR meaningful content rejects punctuation while retaining text and table 
 test "OCR options parse configurable thresholds resolution model and explicit prompt" {
     const alloc = std.testing.allocator;
     var config = try parseConfig(alloc,
-        \\{"ocr":{"mode":"always","prompt":"Preserve tables","render":{"dpi":200,"max_pixels":123456,"max_dimension":3072},"quality":{"min_content_chars":75,"max_replacement_char_ratio":0.1},"reader":{"provider":"antfly","model":"lightonai/LightOnOCR-3-0.8B"}}}
+        \\{"ocr":{"mode":"always","prompt":"Preserve tables","render":{"dpi":200,"max_pixels":123456,"max_dimension":3072},"quality":{"min_chars":75,"max_replacement_ratio":0.1},"reader":{"provider":"antfly","model":"lightonai/LightOnOCR-3-0.8B"}}}
     );
     defer config.deinit(alloc);
     try std.testing.expect(config.ocr_enabled);
@@ -5991,7 +6020,7 @@ test "OCR options parse configurable thresholds resolution model and explicit pr
     try std.testing.expectEqual(@as(u16, 200), config.ocr_render_dpi);
     try std.testing.expectEqual(@as(u64, 123456), config.ocr_max_rendered_pixels);
     try std.testing.expectEqual(@as(u32, 3072), config.ocr_max_rendered_dimension);
-    try std.testing.expectEqual(@as(usize, 75), config.ocr_quality.min_content_chars);
+    try std.testing.expectEqual(@as(usize, 75), config.ocr_quality.min_chars);
     try std.testing.expectEqualStrings("lightonai/LightOnOCR-3-0.8B", config.ocr_model);
     try std.testing.expectEqualStrings("Preserve tables", config.ocr_prompt);
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
@@ -6073,7 +6102,7 @@ test "generated text provider config is validated while parsing extraction confi
         \\{"ocr":{"reader":{"provider":"antfly","model":"r"},"render":{"dpi":"150"}}}
     ));
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
-        \\{"ocr":{"reader":{"provider":"antfly","model":"r"},"quality":{"min_content_chars":"50"}}}
+        \\{"ocr":{"reader":{"provider":"antfly","model":"r"},"quality":{"min_chars":"50"}}}
     ));
     try std.testing.expectError(error.InvalidDocumentExtractionConfig, parseConfig(alloc,
         \\{"ocr":{"reader":{"provider":"antfly","model":"r"},"render":{"dp":150}}}
@@ -6124,7 +6153,7 @@ test "OCR prompt echo detection covers Florence task and canonical prompts" {
 
 test "OCR numeric hybrid preserves fragmented single-value lines" {
     const alloc = std.testing.allocator;
-    const config = OcrQualityConfig{};
+    const config = TextQualityConfig{};
     const embedded_text =
         \\T h e s e r v i c e n e t t e d 1 2 0 t i c k e t s a t $ 5 0 e a c h
         \\Classified references
@@ -6146,9 +6175,9 @@ test "OCR numeric hybrid preserves fragmented single-value lines" {
         \\808
     ;
     const ocr_text = "The OCR transcription makes every classified listing readable and preserves the descriptive prose, but the small reference values are absent from the clearer transcription.";
-    const embedded_quality = assessOcrQuality(embedded_text, config);
+    const embedded_quality = assessTextQuality(embedded_text, config);
     try std.testing.expect(embedded_quality.needsFallback());
-    const ocr_quality = assessOcrQuality(ocr_text, config);
+    const ocr_quality = assessTextQuality(ocr_text, config);
     try std.testing.expectEqual(
         OcrTextChoice.ocr_with_embedded_numeric_rows,
         try chooseOcrTextForContentAlloc(alloc, embedded_text, ocr_text, embedded_quality, ocr_quality),
@@ -6206,7 +6235,7 @@ test "numeric hybrid bounds candidate accounting and preserves OCR provenance on
 
 test "OCR selection rejects partial transcription without rejecting whitespace reconstruction" {
     const alloc = std.testing.allocator;
-    const config = OcrQualityConfig{};
+    const config = TextQualityConfig{};
     const partial = "Project Alpha retains the original delivery records.";
     const complete = partial ++
         " The supplier delivered all requested materials to the receiving warehouse." ++
@@ -6218,22 +6247,22 @@ test "OCR selection rejects partial transcription without rejecting whitespace r
         try fragmented.append(alloc, byte);
         try fragmented.append(alloc, '\n');
     }
-    const embedded_quality = assessOcrQuality(fragmented.items, config);
-    const partial_quality = assessOcrQuality(partial, config);
+    const embedded_quality = assessTextQuality(fragmented.items, config);
+    const partial_quality = assessTextQuality(partial, config);
     try std.testing.expectEqual(
         OcrTextChoice.embedded,
         try chooseOcrTextForContentAlloc(alloc, fragmented.items, partial, embedded_quality, partial_quality),
     );
     try std.testing.expectEqual(
         OcrTextChoice.ocr,
-        try chooseOcrTextForContentAlloc(alloc, fragmented.items, complete, embedded_quality, assessOcrQuality(complete, config)),
+        try chooseOcrTextForContentAlloc(alloc, fragmented.items, complete, embedded_quality, assessTextQuality(complete, config)),
     );
     // A shorter usable transcription can still replace genuinely undecodable
     // source text; the content-retention guard is not a blanket length rule.
     const undecodable = z17RepeatString("\u{fffd}", 200);
     try std.testing.expectEqual(
         OcrTextChoice.ocr,
-        try chooseOcrTextForContentAlloc(alloc, undecodable, partial, assessOcrQuality(undecodable, config), partial_quality),
+        try chooseOcrTextForContentAlloc(alloc, undecodable, partial, assessTextQuality(undecodable, config), partial_quality),
     );
 }
 
@@ -6578,4 +6607,25 @@ fn z17RepeatString(comptime bytes: []const u8, comptime repetitions: usize) *con
         break :blk repeated;
     };
     return &result;
+}
+
+test "native text routes independently of OCR output thresholds and counts Unicode characters" {
+    const alloc = std.testing.allocator;
+    var config = try parseConfig(alloc,
+        \\{"native_text":{"quality":{"min_chars":3}},"ocr":{"reader":{"provider":"antfly","model":"reader"},"quality":{"min_chars":50}}}
+    );
+    defer config.deinit(alloc);
+    const native = NativeTextAssessment.init("世 界!", config.native_text, .auto);
+    try std.testing.expect(!native.needs_ocr);
+    try std.testing.expectEqual(@as(usize, 3), native.quality.non_whitespace_chars);
+    try std.testing.expect(assessTextQuality("世 界!", config.ocr_quality).too_short);
+    try std.testing.expect(NativeTextAssessment.init("世界", config.native_text, .auto).needs_ocr);
+    try std.testing.expect(NativeTextAssessment.init("世 界!", config.native_text, .always).needs_ocr);
+    config.native_text.quality.min_chars = 50;
+    config.ocr_quality.min_chars = 1;
+    try std.testing.expect(NativeTextAssessment.init("Readable text", config.native_text, .auto).needs_ocr);
+    try std.testing.expect(!assessTextQuality("Readable text", config.ocr_quality).too_short);
+    try std.testing.expect(assessTextQuality("     ", .{ .min_chars = 1 }).too_short);
+    try std.testing.expect(assessTextQuality("\u{a0}\u{2003}\u{3000}", .{ .min_chars = 1 }).too_short);
+    try std.testing.expectEqual(@as(usize, 2), assessTextQuality("世\u{3000}界", .{}).non_whitespace_chars);
 }

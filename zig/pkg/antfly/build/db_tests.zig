@@ -279,6 +279,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "retained document collection allocations compose with the hard working-set cap",
         "document replay payloads are admitted before persistent allocation",
         "document extraction accepts validated reader no-text results without hiding invalid output",
+        "native text routes independently of OCR output thresholds and counts Unicode characters",
+        "document extraction OCR selection keeps independent native quality",
         "document extraction generated OCR rejects empty punctuation and prompt echoes on empty pages",
         "document extraction generated OCR preserves short scan text and quality warnings transactionally",
         "document extraction generated OCR bypasses unsupported native batch",

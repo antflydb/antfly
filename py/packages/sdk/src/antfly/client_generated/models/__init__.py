@@ -355,7 +355,6 @@ from .document_extraction_native_text_config import DocumentExtractionNativeText
 from .document_extraction_native_text_config_policy import DocumentExtractionNativeTextConfigPolicy
 from .document_extraction_ocr_config import DocumentExtractionOcrConfig
 from .document_extraction_ocr_config_mode import DocumentExtractionOcrConfigMode
-from .document_extraction_ocr_quality_config import DocumentExtractionOcrQualityConfig
 from .document_extraction_reader_config import DocumentExtractionReaderConfig
 from .document_extraction_reader_config_provider import DocumentExtractionReaderConfigProvider
 from .document_extraction_reader_config_recognition_level import DocumentExtractionReaderConfigRecognitionLevel
@@ -366,6 +365,7 @@ from .document_extraction_route_extractor import DocumentExtractionRouteExtracto
 from .document_extraction_route_extractor_type import DocumentExtractionRouteExtractorType
 from .document_extraction_route_match import DocumentExtractionRouteMatch
 from .document_extraction_source_config import DocumentExtractionSourceConfig
+from .document_extraction_text_quality_config import DocumentExtractionTextQualityConfig
 from .document_extraction_transcription_config import DocumentExtractionTranscriptionConfig
 from .document_field_mapping import DocumentFieldMapping
 from .document_field_mapping_fields import DocumentFieldMappingFields
@@ -2892,7 +2892,6 @@ __all__ = (
     "DocumentExtractionNativeTextConfigPolicy",
     "DocumentExtractionOcrConfig",
     "DocumentExtractionOcrConfigMode",
-    "DocumentExtractionOcrQualityConfig",
     "DocumentExtractionReaderConfig",
     "DocumentExtractionReaderConfigProvider",
     "DocumentExtractionReaderConfigRecognitionLevel",
@@ -2903,6 +2902,7 @@ __all__ = (
     "DocumentExtractionRouteExtractorType",
     "DocumentExtractionRouteMatch",
     "DocumentExtractionSourceConfig",
+    "DocumentExtractionTextQualityConfig",
     "DocumentExtractionTranscriptionConfig",
     "DocumentFieldMapping",
     "DocumentFieldMappingFields",

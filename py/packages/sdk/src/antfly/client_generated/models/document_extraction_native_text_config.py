@@ -10,7 +10,7 @@ from ..models.document_extraction_native_text_config_policy import DocumentExtra
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
-    from ..models.document_extraction_ocr_quality_config import DocumentExtractionOcrQualityConfig
+    from ..models.document_extraction_text_quality_config import DocumentExtractionTextQualityConfig
 
 
 T = TypeVar("T", bound="DocumentExtractionNativeTextConfig")
@@ -18,8 +18,8 @@ T = TypeVar("T", bound="DocumentExtractionNativeTextConfig")
 
 @_attrs_define
 class DocumentExtractionNativeTextConfig:
-    """Native PDF text policy and quality assessment. No OCR model is required. Native quality diagnostics are recorded
-    independently of extraction completion and OCR availability.
+    """Native document text policy and quality assessment. No OCR model is required. Native quality diagnostics are
+    recorded independently of extraction completion and OCR availability.
 
         Attributes:
             policy (DocumentExtractionNativeTextConfigPolicy | Unset): `source` retains decoded source text, including off-
@@ -27,13 +27,13 @@ class DocumentExtractionNativeTextConfig:
                 hidden OCR/accessibility text. `visible` additionally excludes nonpainting and fully transparent text. These
                 policies do not claim pixel-perfect occlusion analysis. All policies honor semantic ActualText replacements.
                 Default: DocumentExtractionNativeTextConfigPolicy.PAGE.
-            quality (DocumentExtractionOcrQualityConfig | Unset): Text-quality thresholds. `native_text.quality` assesses
-                native PDF text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR
+            quality (DocumentExtractionTextQualityConfig | Unset): Text-quality thresholds. `native_text.quality` assesses
+                native document text and selects fallback independently of whether OCR is configured; `ocr.quality` assesses OCR
                 output. Quality flags are not guarantees of correct reading order or complete document semantics.
     """
 
     policy: DocumentExtractionNativeTextConfigPolicy | Unset = DocumentExtractionNativeTextConfigPolicy.PAGE
-    quality: DocumentExtractionOcrQualityConfig | Unset = UNSET
+    quality: DocumentExtractionTextQualityConfig | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -57,7 +57,7 @@ class DocumentExtractionNativeTextConfig:
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
-        from ..models.document_extraction_ocr_quality_config import DocumentExtractionOcrQualityConfig
+        from ..models.document_extraction_text_quality_config import DocumentExtractionTextQualityConfig
 
         d = dict(src_dict)
         _policy = d.pop("policy", UNSET)
@@ -68,11 +68,11 @@ class DocumentExtractionNativeTextConfig:
             policy = DocumentExtractionNativeTextConfigPolicy(_policy)
 
         _quality = d.pop("quality", UNSET)
-        quality: DocumentExtractionOcrQualityConfig | Unset
+        quality: DocumentExtractionTextQualityConfig | Unset
         if isinstance(_quality, Unset):
             quality = UNSET
         else:
-            quality = DocumentExtractionOcrQualityConfig.from_dict(_quality)
+            quality = DocumentExtractionTextQualityConfig.from_dict(_quality)
 
         document_extraction_native_text_config = cls(
             policy=policy,

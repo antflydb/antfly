@@ -84195,7 +84195,7 @@ test "db document extraction completes audio transcription with transcriber prod
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"transcriber\":{\"provider\":\"mock-transcriber\",\"model\":\"test-transcriber\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"transcriber\":{\"provider\":\"antfly\",\"model\":\"test-transcriber\"}}}}",
     });
 
     try db.batch(.{
@@ -84251,7 +84251,7 @@ test "db document extraction transcript segments time chunk artifacts" {
         .kind = .asset,
         .field = "url",
         .content_type = "application/json",
-        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"transcriber\":{\"provider\":\"mock-transcriber\",\"model\":\"test-transcriber\"}}}}",
+        .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"transcriber\":{\"provider\":\"antfly\",\"model\":\"test-transcriber\"}}}}",
     });
     try db.addEnrichment(.{
         .name = "document_chunks_v1",
@@ -84340,7 +84340,7 @@ test "db document extraction keeps diarized speakers through reopen" {
             .kind = .asset,
             .field = "url",
             .content_type = "application/json",
-            .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"transcriber\":{\"provider\":\"mock-transcriber\",\"model\":\"test-transcriber\",\"diarization\":true}}}}",
+            .producer_json = "{\"type\":\"document_extraction\",\"config\":{\"source\":{\"filename_field\":\"filename\",\"content_type_field\":\"mime_type\"},\"transcription\":{\"transcriber\":{\"provider\":\"antfly\",\"model\":\"test-transcriber\",\"diarization\":true}}}}",
         });
         try db.addEnrichment(.{
             .name = "document_chunks_v1",
@@ -89345,11 +89345,11 @@ test "db document extraction chunks units through source artifact enrichment" {
     try std.testing.expect(std.mem.indexOf(u8, state, "\"chunk_keys\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, state, "\"unit_descriptors\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, state, "\"fingerprint\"") != null);
-    try ant_json.testing.expectSubsetJsonText(
-        alloc,
-        "{\"chunk_unit_fingerprint_version\":2}",
-        state,
-    );
+    const expected_fingerprint_version = try std.json.Stringify.valueAlloc(alloc, .{
+        .chunk_unit_fingerprint_version = document_unit_fingerprint.current_state_version,
+    }, .{});
+    defer alloc.free(expected_fingerprint_version);
+    try ant_json.testing.expectSubsetJsonText(alloc, expected_fingerprint_version, state);
 
     const manifest = try db.core.store.get(alloc, manifest_key);
     defer alloc.free(manifest);

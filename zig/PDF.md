@@ -1207,7 +1207,7 @@ The implementation must preserve the following invariants:
 ### 1. Inspect the document and select OCR candidates
 
 Embedded text extraction produces stable page units. OCR candidates are page
-metadata (`unit_index`, `page_number`, embedded `OcrQuality`, `force_ocr`)
+metadata (`unit_index`, `page_number`, embedded `TextQuality`, `force_ocr`)
 chosen by `ocr_mode` and quality, not rendered bytes. Sparse candidate lists
 (for example pages 1, 5, and 19) keep their original unit positions.
 

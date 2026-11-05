@@ -142,8 +142,8 @@ Form XObjects. Configure native extraction separately from OCR:
   "native_text": {
     "policy": "page",
     "quality": {
-      "min_content_chars": 50,
-      "max_replacement_char_ratio": 0.05
+      "min_chars": 50,
+      "max_replacement_ratio": 0.05
     }
   }
 }
@@ -181,10 +181,15 @@ leaving byte offsets pointing into different text; native quality and diagnostic
 remain available as pre-OCR provenance.
 
 `native_text.quality` controls native assessment and automatic OCR routing;
-`ocr.quality` assesses OCR output independently. Move any custom native-routing
-thresholds previously placed in `ocr.quality` into `native_text.quality`.
-Reprocess existing documents after upgrading so stored text, geometry, chunks,
-and vectors use the new extraction policy.
+`ocr.quality` assesses OCR output independently. Both use the same text-quality
+options: `min_chars` and `min_line_chars` count non-whitespace Unicode characters,
+`max_replacement_ratio` limits replacement characters, and `max_font_corruption`
+sets the corrupted-line score threshold. Defaults work without any quality
+configuration. Images go directly to OCR when a reader is configured; they do
+not require a native text layer.
+
+After changing extraction settings, reprocess affected documents so stored text,
+geometry, chunks, and vectors use the new policy.
 
 For a source checkout, build and inspect only the PDF component:
 
@@ -259,7 +264,7 @@ The `ocr` block takes:
 | `mode` | `auto` (default) reads images and the PDF pages whose native text fails `native_text.quality`. `always` reads every page. |
 | `prompt` | Overrides the prompt. Readers run their own OCR task when it is omitted. |
 | `render` | How PDF pages are rasterized: `dpi` (default 150), `resolution` (`requested_dpi` or `model_input`), `max_pixels`, `max_dimension`. |
-| `quality` | Thresholds used to assess OCR output, independently of `native_text.quality`. `min_content_chars` counts trimmed UTF-8 bytes (default 50), not Unicode characters. |
+| `quality` | Thresholds used to assess OCR output, independently of `native_text.quality`. `min_chars` counts non-whitespace Unicode characters (default 50), matching text chunking. |
 
 Without an `ocr` block, `document_extraction` extracts native text only: born-digital PDFs, Office documents, HTML, email, and plain text, with no model. Pages and images that would need OCR keep whatever native text they have and report `extraction_status: "ocr_not_configured"`, so a scan never silently indexes as empty.
 

@@ -38954,18 +38954,18 @@ components:
         last_modified_field:
           type: string
           description: Row field holding the source last-modified timestamp.
-    DocumentExtractionOcrQualityConfig:
+    DocumentExtractionTextQualityConfig:
       type: object
-      description: Text-quality thresholds. `native_text.quality` assesses native PDF text and selects
+      description: Text-quality thresholds. `native_text.quality` assesses native document text and selects
         fallback independently of whether OCR is configured; `ocr.quality` assesses OCR output. Quality
         flags are not guarantees of correct reading order or complete document semantics.
       properties:
-        min_content_chars:
+        min_chars:
           type: integer
           x-go-type-skip-optional-pointer: false
           minimum: 0
           default: 50
-          description: Minimum trimmed UTF-8 byte length before text counts as too short.
+          description: Minimum non-whitespace Unicode characters before text passes the length check.
         garbled_min_words:
           type: integer
           x-go-type-skip-optional-pointer: false
@@ -38985,11 +38985,12 @@ components:
           maximum: 1
           default: 0.4
           description: Maximum ratio of single-character words before text counts as garbled.
-        substantial_line_min_chars:
+        min_line_chars:
           type: integer
           minimum: 1
           default: 15
-          description: Minimum trimmed UTF-8 byte length for a line to count in the corrupted-line check.
+          description: Minimum non-whitespace Unicode characters for a line to count in the corrupted-line
+            check.
         max_corrupted_line_ratio:
           type: number
           x-go-type-skip-optional-pointer: false
@@ -38998,7 +38999,7 @@ components:
           maximum: 1
           default: 0.2
           description: Maximum ratio of corrupted lines.
-        font_corruption_score_threshold:
+        max_font_corruption:
           type: number
           x-go-type-skip-optional-pointer: false
           format: double
@@ -39006,7 +39007,7 @@ components:
           maximum: 1
           default: 0.5
           description: Font corruption score above which a substantial line counts as corrupted.
-        max_replacement_char_ratio:
+        max_replacement_ratio:
           type: number
           x-go-type-skip-optional-pointer: false
           format: double
@@ -39016,8 +39017,8 @@ components:
           description: Maximum ratio of Unicode replacement characters.
     DocumentExtractionNativeTextConfig:
       type: object
-      description: Native PDF text policy and quality assessment. No OCR model is required. Native quality
-        diagnostics are recorded independently of extraction completion and OCR availability.
+      description: Native document text policy and quality assessment. No OCR model is required. Native
+        quality diagnostics are recorded independently of extraction completion and OCR availability.
       properties:
         policy:
           type: string
@@ -39031,7 +39032,7 @@ components:
             text. `visible` additionally excludes nonpainting and fully transparent text. These policies
             do not claim pixel-perfect occlusion analysis. All policies honor semantic ActualText replacements.'
         quality:
-          $ref: '#/components/schemas/DocumentExtractionOcrQualityConfig'
+          $ref: '#/components/schemas/DocumentExtractionTextQualityConfig'
     DocumentExtractionReaderConfig:
       type: object
       required:
@@ -39170,7 +39171,7 @@ components:
         render:
           $ref: '#/components/schemas/DocumentExtractionRenderConfig'
         quality:
-          $ref: '#/components/schemas/DocumentExtractionOcrQualityConfig'
+          $ref: '#/components/schemas/DocumentExtractionTextQualityConfig'
     CloudflareSTTConfig:
       type: object
       description: Cloudflare Workers AI native speech adapter. Credentials use CLOUDFLARE_API_TOKEN.
