@@ -171,10 +171,13 @@ score. Diagnostics record the selected policy, ActualText replacement count,
 exterior/invisible glyph runs and semantic spans, unpositioned semantic spans,
 alignment and ordering limitations, and nontext or
 annotation evidence. `extraction_complete` describes decoding, not correctness.
-`structure_text_incomplete` reports malformed, unsupported, or resource-limited
-structure replacement lookup. Native glyph text is retained in those cases;
+`actual_text_incomplete` reports malformed or unclosed inline replacements,
+or malformed, unsupported, or resource-limited structure replacement lookup.
+Native glyph text is retained when a replacement cannot be applied;
 cross-page replacements and object-reference (`OBJR`) content are reported as
 partial coverage rather than assigned invented page text or geometry.
+Optional null metadata behaves like an omitted value; an empty `/ActualText`
+string intentionally deletes the covered source text.
 `semantic_coverage` is `partial` when unresolved coverage is known, `unknown`
 when extraction is incomplete, or `text_only` otherwise; it never certifies
 headings, tables, chart interpretation, or complete visual understanding.

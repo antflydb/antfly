@@ -518,7 +518,7 @@ fn hashTaggedNativeTextDiagnostics(hasher: *Sha256, diagnostics: ?document_extra
         hashU64(hasher, @intCast(value.invisible_spans));
         hashU64(hasher, @intCast(value.unpositioned_spans));
         hasher.update(&.{
-            @intFromBool(value.structure_text_incomplete),
+            @intFromBool(value.actual_text_incomplete),
             @intFromBool(value.outline_fallback),
             @intFromBool(value.has_nontext_visual),
             @intFromBool(value.has_unrendered_annotations),
@@ -701,7 +701,7 @@ test "document unit fingerprint includes native quality diagnostics region style
     }
 
     var partial_structure = enriched;
-    partial_structure.native_text_diagnostics.?.structure_text_incomplete = true;
+    partial_structure.native_text_diagnostics.?.actual_text_incomplete = true;
     const partial_fingerprint = try fingerprintAlloc(alloc, partial_structure);
     defer alloc.free(partial_fingerprint);
     try std.testing.expect(!std.mem.eql(u8, metadata, partial_fingerprint));

@@ -140,7 +140,7 @@ pub const NativeTextDiagnosticsProvenance = struct {
     outside_page_spans: usize = 0,
     invisible_spans: usize = 0,
     unpositioned_spans: usize = 0,
-    structure_text_incomplete: bool = false,
+    actual_text_incomplete: bool = false,
     outline_fallback: bool,
     has_nontext_visual: bool,
     has_unrendered_annotations: bool,

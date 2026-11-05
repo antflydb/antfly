@@ -1918,6 +1918,11 @@ indirect values. Unassigned ParentTree slots treat direct and indirect null
 equally; parent links still require real structure elements. Named property tables are
 sorted once per resource scope and searched in logarithmic time, without
 allocating a separate lookup table or scanning all properties for each BDC.
+Named replacement strings retain their encoded bytes and decode only when
+selected. A bounded page-local cache shares each decoded string, including
+indirect values; overridden malformed properties are never decoded or resolved.
+Optional null ActualText, MCID, Pg, and Stm values behave like omitted entries.
+Known current-page references preserve identity without cloning page resources.
 Retained metadata and page-local lookup allocations share
 one live-byte allowance. ParentTree bindings are checked against the owner's declared
 content. An outer replacement wins over its descendants; repeated MCIDs owned
@@ -1928,8 +1933,8 @@ even when enclosing source intervals overlap.
 Structure lookup has explicit byte, cumulative-allocation, work, and recursion
 limits and polls cancellation. Metadata object parsing is depth-limited before
 recursive syntax expansion. Missing/cyclic links, mismatched content, dangling
-marked-content scopes, cross-page replacements, and unsupported OBJR content
-preserve native fallback and set `structure_text_incomplete`; document semantic
+marked-content scopes, malformed inline replacements, cross-page replacements, and unsupported OBJR content
+preserve native fallback and set `actual_text_incomplete`; document semantic
 coverage becomes partial. Page references retained in the shared immutable
 page index distinguish pages even when they reuse the same content stream.
 

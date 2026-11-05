@@ -4648,7 +4648,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     .outside_page_spans = diagnostics.outside_page_spans,
                     .invisible_spans = diagnostics.invisible_spans,
                     .unpositioned_spans = diagnostics.unpositioned_spans,
-                    .structure_text_incomplete = diagnostics.structure_text_incomplete,
+                    .actual_text_incomplete = diagnostics.actual_text_incomplete,
                     .outline_fallback = diagnostics.outline_fallback,
                     .has_nontext_visual = diagnostics.has_nontext_visual,
                     .has_unrendered_annotations = diagnostics.has_unrendered_annotations,
