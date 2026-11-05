@@ -1924,9 +1924,16 @@ indirect values; overridden replacement values are never decoded or resolved.
 Indirect resource and property dictionaries are retained once per page. Form
 records borrow their raw strings, and property-name indexes are sorted once per
 dictionary. Repeated Form scopes cannot multiply a shared replacement's storage.
-Resource metadata has a page-local byte and cumulative-allocation allowance.
+The resource cache retains recognized resource fields and only MCID/ActualText
+from property dictionaries. Unknown payloads are released with temporary parsing
+storage rather than accumulating in the cache. Temporary per-object parsing and
+retained metadata share one live-byte ceiling, with separate cumulative-allocation
+allowances. Indirect property tables and dictionaries are resolved only when a
+selected scope needs them; overridden scopes do not read their object streams.
 Selected missing or malformed property dictionaries retain native glyph text and
-report incomplete ActualText; overridden scopes do not report irrelevant errors.
+report incomplete ActualText, including when selected optional metadata exceeds
+a decode or allocation allowance. Actual allocator failures and cancellation
+propagate; overridden scopes do not report irrelevant metadata errors.
 UTF-16 text-string BOM detection precedes payload-length validation, so odd or
 truncated replacements use the same explicit fallback as invalid surrogate pairs.
 Optional null ActualText, MCID, Pg, and Stm values behave like omitted entries.
