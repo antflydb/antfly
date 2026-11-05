@@ -2272,6 +2272,8 @@ from .route_type import RouteType
 from .row_filter_entry import RowFilterEntry
 from .row_filter_entry_filter import RowFilterEntryFilter
 from .runtime_config import RuntimeConfig
+from .runtime_config_cooperative_execution import RuntimeConfigCooperativeExecution
+from .runtime_config_cooperative_execution_mode import RuntimeConfigCooperativeExecutionMode
 from .runtime_config_generation_batching import RuntimeConfigGenerationBatching
 from .runtime_config_generation_batching_mode import RuntimeConfigGenerationBatchingMode
 from .runtime_config_model_strategies import RuntimeConfigModelStrategies
@@ -2310,6 +2312,11 @@ from .sort_field import SortField
 from .sort_profile import SortProfile
 from .sort_profile_candidate_source import SortProfileCandidateSource
 from .sort_profile_sort_lifecycle_state import SortProfileSortLifecycleState
+from .source_content_part import SourceContentPart
+from .source_content_part_source import SourceContentPartSource
+from .source_content_part_source_type import SourceContentPartSourceType
+from .source_content_part_source_version_kind import SourceContentPartSourceVersionKind
+from .source_content_part_type import SourceContentPartType
 from .sql_array_column_schema import SQLArrayColumnSchema
 from .sql_array_column_schema_type import SQLArrayColumnSchemaType
 from .sql_array_dimension import SQLArrayDimension
@@ -4587,6 +4594,8 @@ __all__ = (
     "RowFilterEntry",
     "RowFilterEntryFilter",
     "RuntimeConfig",
+    "RuntimeConfigCooperativeExecution",
+    "RuntimeConfigCooperativeExecutionMode",
     "RuntimeConfigGenerationBatching",
     "RuntimeConfigGenerationBatchingMode",
     "RuntimeConfigModelStrategies",
@@ -4625,6 +4634,11 @@ __all__ = (
     "SortProfile",
     "SortProfileCandidateSource",
     "SortProfileSortLifecycleState",
+    "SourceContentPart",
+    "SourceContentPartSource",
+    "SourceContentPartSourceType",
+    "SourceContentPartSourceVersionKind",
+    "SourceContentPartType",
     "SQLArrayColumnSchema",
     "SQLArrayColumnSchemaType",
     "SQLArrayDimension",

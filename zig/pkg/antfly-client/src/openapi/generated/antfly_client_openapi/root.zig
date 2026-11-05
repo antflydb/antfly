@@ -1091,6 +1091,7 @@ pub const SignificanceAlgorithm = types.SignificanceAlgorithm;
 pub const SortDirection = types.SortDirection;
 pub const SortField = types.SortField;
 pub const SortProfile = types.SortProfile;
+pub const SourceContentPart = types.SourceContentPart;
 pub const SqlSettingDatabaseDefault = types.SqlSettingDatabaseDefault;
 pub const SqlSettingMutationDrop = types.SqlSettingMutationDrop;
 pub const SqlSettingMutationPut = types.SqlSettingMutationPut;

@@ -13,8 +13,8 @@ T = TypeVar("T", bound="RuntimeConfigGenerationBatching")
 
 @_attrs_define
 class RuntimeConfigGenerationBatching:
-    """Experimental execution batching; mode on explicitly enables qualified CUDA scheduling. Resource and request ceilings
-    still apply.
+    """Experimental row batching; independent from cooperative_execution. Mode on explicitly enables qualified CUDA row
+    scheduling. Resource and request ceilings still apply.
 
         Attributes:
             mode (RuntimeConfigGenerationBatchingMode | Unset):  Default: RuntimeConfigGenerationBatchingMode.OFF.

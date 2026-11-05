@@ -1684,6 +1684,7 @@ pub const InferenceTaskCapabilities = struct {
     structured_output: ?[]const u8 = null,
     images: ?[]const u8 = null,
     audio: ?[]const u8 = null,
+    video: ?[]const u8 = null,
 
     /// OpenAPI wire names and nullability consumed by compatible typed JSON parsers.
     pub const openApiFieldMetadata = .{
@@ -1692,6 +1693,7 @@ pub const InferenceTaskCapabilities = struct {
         .{ "structured_output", "structured_output", true },
         .{ "images", "images", true },
         .{ "audio", "audio", true },
+        .{ "video", "video", true },
     };
 
     pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
@@ -1722,6 +1724,10 @@ pub const InferenceTaskCapabilities = struct {
         }
         if (self.audio) |value| {
             try jw.objectField("audio");
+            try jw.write(value);
+        }
+        if (self.video) |value| {
+            try jw.objectField("video");
             try jw.write(value);
         }
         try jw.endObject();

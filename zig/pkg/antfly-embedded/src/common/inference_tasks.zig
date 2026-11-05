@@ -779,7 +779,7 @@ pub fn chatRequirements(request: Json) !gateway.Requirements {
                 if (std.mem.eql(u8, kind.string, "media")) {
                     const mime = part.object.get("mime_type") orelse return error.InvalidInferenceRequest;
                     if (mime != .string) return error.InvalidInferenceRequest;
-                    if (std.mem.startsWith(u8, mime.string, "image/")) requirements.images = true else if (std.mem.startsWith(u8, mime.string, "audio/")) requirements.audio = true else return error.UnsupportedInferenceFeature;
+                    if (std.mem.startsWith(u8, mime.string, "image/")) requirements.images = true else if (std.mem.startsWith(u8, mime.string, "audio/")) requirements.audio = true else if (std.mem.startsWith(u8, mime.string, "video/")) requirements.video = true else return error.UnsupportedInferenceFeature;
                 } else if (std.mem.eql(u8, kind.string, "image_url")) requirements.images = true else if (std.mem.eql(u8, kind.string, "input_audio")) requirements.audio = true else if (!std.mem.eql(u8, kind.string, "text")) return error.UnsupportedInferenceFeature;
             }
         };

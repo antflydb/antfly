@@ -1151,7 +1151,7 @@ fn prepareGeneration(a: std.mem.Allocator, cfg: generating.GeneratorConfig, requ
     // native-only options select it instead of chat-completions forwarding.
     if (requirements.images and !generationAdapterSupportsImages(cfg.provider)) return error.UnsupportedInferenceFeature;
     if (requirements.streaming and !cfg.supportsStreamingChat()) return error.UnsupportedInferenceFeature;
-    if (!rich_adapter and requirements.audio) return error.UnsupportedInferenceFeature;
+    if (!rich_adapter and (requirements.audio or requirements.video)) return error.UnsupportedInferenceFeature;
     if (!rich_adapter and requirements.structured_output and cfg.provider != .bedrock and cfg.provider != .anthropic) return error.UnsupportedInferenceFeature;
     const messages = try tasks.chatMessages(a, request);
     const options = try generationOptions(a, request);
