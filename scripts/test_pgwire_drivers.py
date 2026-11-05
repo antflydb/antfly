@@ -15,6 +15,8 @@
 
 """Real driver conformance; supply --binary to start an isolated authenticated node.
 
+Build @antfly/sdk first for the Kysely client (pnpm --dir ts --filter @antfly/sdk build).
+
 uv run --no-project --with requests --with pytest --with 'psycopg[binary]==3.3.6' \
   --with asyncpg==0.31.0 python scripts/test_pgwire_drivers.py --binary zig/zig-out/bin/antfly
 """
@@ -80,13 +82,25 @@ def exercise_cached_setting_plans(server, password):
     print("SQL and driver cached settings survive catalog changes: PASS", flush=True)
 
 
-def run_clients(url, drivers):
+def run_clients(url, drivers, http_url=None):
     env = {**os.environ, "ANTFLY_PGWIRE_URL": url}
+    if http_url:
+        env["ANTFLY_HTTP_URL"] = http_url
+    if any(driver in ("node", "kysely") for driver in drivers):
+        subprocess.run(
+            ["npm", "ci", "--ignore-scripts"],
+            cwd=CLIENTS,
+            env=env,
+            check=True,
+            timeout=300,
+        )
     commands = {
         "python": [(CLIENTS, [sys.executable, "python.py"])],
         "node": [
-            (CLIENTS, ["npm", "ci", "--ignore-scripts"]),
             (CLIENTS, ["node", "node.mjs"]),
+        ],
+        "kysely": [
+            (CLIENTS, ["node", "kysely.mjs"]),
         ],
         "go": [(CLIENTS / "go", ["go", "run", "."])],
         "rust": [(CLIENTS / "rust", ["cargo", "run", "--locked"])],
@@ -105,14 +119,19 @@ def main():
         help="PostgreSQL connection URL for an existing authenticated Antfly node",
     )
     parser.add_argument(
+        "--http-url", help="Matching Antfly HTTP URL (required for Kysely with --url)"
+    )
+    parser.add_argument(
         "--drivers",
         nargs="+",
-        choices=["python", "node", "go", "rust"],
-        default=["python", "node", "go", "rust"],
+        choices=["python", "node", "go", "rust", "kysely"],
+        default=["python", "node", "go", "rust", "kysely"],
     )
     args = parser.parse_args()
     if args.url:
-        run_clients(args.url, args.drivers)
+        if "kysely" in args.drivers and not args.http_url:
+            parser.error("--http-url is required for the Kysely driver with --url")
+        run_clients(args.url, args.drivers, args.http_url)
         return
     sys.path.insert(0, str(ROOT / "zig" / "e2e" / "antfly"))
     from conftest import AUTH_BOOTSTRAP_PASSWORD, StandaloneAntflyServer
@@ -142,6 +161,7 @@ def main():
         run_clients(
             f"postgres://admin:{AUTH_BOOTSTRAP_PASSWORD}@127.0.0.1:{server.pgwire_port}/default",
             args.drivers,
+            server.url,
         )
     except BaseException:
         failed = True
