@@ -2911,26 +2911,43 @@ pub fn gemmaWorkspaceLanePolicy(session: Session) ?bool {
     return owner.arch_config == .embedding_gemma2;
 }
 
-/// Canonical selected Native host families only. Model-specific family/shape
-/// interpretation stays in this adapter. A public callback, model_contract
-/// string, copied table or raw no-Model session never grants this owner loan.
+/// Source's synchronous weight-operation protocol is independent of encoder
+/// names. The exclusions are actual different producer/worker ownership:
+/// expert workers, an explicitly installed graph runtime and Gemma's distinct
+/// canonical BF16 packed-media caches. Layout selection remains in Native's
+/// original per-operation geometry/policy queries.
+pub fn nativeWeightPreparationCandidate(session: Session) bool {
+    if (comptime !build_options.enable_native) return false;
+    if (session.vtable != &arch_vtable) return false;
+    const owner: *const ArchSession = @ptrCast(@alignCast(session.ptr));
+    if (owner.backend_type != .native or owner.graph_runtime_strategy != null) return false;
+    // Do not touch the storage union through a raw/incomplete owner header.
+    // The actual published Model/gate identity certifies this additional
+    // expert-worker exclusion; missing admitted ownership is rejected below.
+    if (session.compute_backend_provider) |provider| if (session.model_lifetime) |model| {
+        if (provider.services == &archComputeServices and provider.ptr == session.ptr and model.owner == provider.ptr and model.destroy_fn == archClose and &owner.model_lifetime == model and session.execution_gate == &model.execution_gate) {
+            if (owner.backend_data.native.moe_num_experts != 0) return false;
+        }
+    };
+    return switch (owner.arch_config) {
+        .embedding_gemma2 => false,
+        .gpt => |cfg| cfg.num_local_experts == 0 and cfg.family != .deepseek_v4,
+        else => true,
+    };
+}
+/// Exact published owner/gate certification before the Native ctx is exposed.
+/// Neither copied callback tables nor public model strings prove this identity.
 pub fn nativeWeightPreparationModelData(session: Session) ?*native_mod.WeightStore {
-    if (comptime !build_options.enable_native) return null;
-    if (session.vtable != &arch_vtable) return null;
+    if (!nativeWeightPreparationCandidate(session)) return null;
     const provider = session.compute_backend_provider orelse return null;
     const model = session.model_lifetime orelse return null;
     if (provider.services != &archComputeServices or provider.ptr != session.ptr or model.owner != provider.ptr or model.destroy_fn != archClose or session.execution_gate != &model.execution_gate) return null;
     const owner: *ArchSession = @ptrCast(@alignCast(provider.ptr));
-    if (&owner.model_lifetime != model or owner.backend_type != .native) return null;
-    const selected = switch (owner.arch_config) {
-        .gpt => |cfg| gpt_arch.denseQwen3PrefillEligible(cfg),
-        // Actual automatic-policy biased QKV consumer. BERT keeps its
-        // original strict-F32 route and is not retagged into this program.
-        .deberta => |cfg| cfg.hidden_size == 512 or cfg.hidden_size == 768,
-        else => false,
-    };
-    if (!selected) return null;
+    if (&owner.model_lifetime != model) return null;
     return &owner.backend_data.native;
+}
+pub fn validateNativeWeightPreparationReceiver(session: Session) !void {
+    if (session.run_admission != null and nativeWeightPreparationCandidate(session) and nativeWeightPreparationModelData(session) == null) return error.MissingNativeWeightPreparationOwner;
 }
 
 pub fn acceptsMetalWorkspaceSession(session: Session) bool {
@@ -15615,14 +15632,566 @@ test "canonical DeBERTa host Source cold grouped QKV preserves actual Q4K Q5K pr
     }
 }
 
-test "Native grouped encoder adapter preserves actual BERT strict F32 exclusion" {
+test "Native generic source adapter includes BERT while preserving strict grouped policy" {
     if (comptime !build_options.enable_native) return error.SkipZigTest;
     var arch = ArchSession{ .allocator = std.testing.allocator, .arch_config = .{ .bert = .{ .hidden_size = 512, .intermediate_size = 512, .num_hidden_layers = 1, .num_attention_heads = 8, .vocab_size = 8 } }, .backend_type = .native, .backend_data = .{ .native = .{ .allocator = std.testing.allocator, .resident_weights = .empty, .lazy_weights = .empty } } };
     defer arch.backend_data.native.deinitOwned();
     var session = archSessionHandle(&arch);
     session.execution_gate = &arch.model_lifetime.execution_gate;
-    try std.testing.expect(nativeWeightPreparationModelData(session) == null);
-    try std.testing.expect(!session.nativeWeightPreparationReceiver());
+    try std.testing.expect(nativeWeightPreparationModelData(session) == &arch.backend_data.native);
+    try std.testing.expect(session.nativeWeightPreparationReceiver());
+}
+
+fn nativeDenseEncoderCheckpointCase(comptime is_bert: bool, comptime cache_limit: usize, comptime peer_dense: bool, comptime cancel_after_first: bool, comptime peer_clear: bool) !void {
+    const kind = @import("../gguf/tensor_types.zig").KnownTensorType.Q4_K;
+    const preexisting_raw = false;
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const process = std.heap.c_allocator;
+    const Memory = @import("../runtime/tier/memory.zig");
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const Cache = @import("../runtime/tier/cache.zig").SharedCache;
+    const Quant = @import("../models/weight_source.zig").QuantizedStorage;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    const Builder = struct {
+        fn weight(data: *NativeData, name: []const u8, shape: []const i64, constant: ?f32, quantized: bool) !void {
+            var count: usize = 1;
+            for (shape) |dim| count *= @intCast(dim);
+            const values = try data.allocator.alloc(f32, count);
+            defer data.allocator.free(values);
+            for (values, 0..) |*v, i| v.* = constant orelse @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + name.len) % 29)) - 14)) / 512;
+            const name_copy = try data.allocator.dupe(u8, name);
+            errdefer data.allocator.free(name_copy);
+            if (quantized) {
+                const codec = @import("../gguf/quant_codec.zig");
+                const raw = if (kind == .Q4_K) try codec.quantizeQ4_KFromF32(data.allocator, values) else try codec.quantizeQ5_KFromF32(data.allocator, values);
+                errdefer data.allocator.free(raw);
+                const owned_shape = try data.allocator.dupe(i64, shape);
+                errdefer data.allocator.free(owned_shape);
+                try data.resident_weights.put(data.allocator, name_copy, .{ .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &.{}, .name = name_copy, .allocator = data.allocator, .owns_data = false, .owns_shape = false }, .quantized = true, .quantized_storage = Quant{ .tensor_type = .{ .known = kind }, .raw_bytes = raw, .shape = owned_shape, .allocator = data.allocator } });
+            } else {
+                var tensor = try Tensor.initFloat32(data.allocator, name_copy, shape, values);
+                errdefer tensor.deinit();
+                try data.resident_weights.put(data.allocator, name_copy, .{ .tensor = tensor });
+            }
+        }
+        fn build(data: *NativeData) !void {
+            try weight(data, "embeddings.word_embeddings.weight", &.{ 8, 512 }, null, false);
+            if (is_bert) {
+                try weight(data, "embeddings.position_embeddings.weight", &.{ 16, 512 }, null, false);
+                try weight(data, "embeddings.token_type_embeddings.weight", &.{ 2, 512 }, null, false);
+            } else try weight(data, "encoder.rel_embeddings.weight", &.{ 16, 512 }, null, false);
+            for ([_][]const u8{ "embeddings.LayerNorm", "encoder.LayerNorm", "encoder.layer.0.attention.output.LayerNorm", "encoder.layer.0.output.LayerNorm" }) |base| {
+                const w = try std.fmt.allocPrint(data.allocator, "{s}.weight", .{base});
+                defer data.allocator.free(w);
+                const b = try std.fmt.allocPrint(data.allocator, "{s}.bias", .{base});
+                defer data.allocator.free(b);
+                try weight(data, w, &.{512}, 1, false);
+                try weight(data, b, &.{512}, 0, false);
+            }
+            for ([_][]const u8{ "query", "key", "value" }) |projection| {
+                const w = try std.fmt.allocPrint(data.allocator, "encoder.layer.0.attention.self.{s}{s}.weight", .{ projection, if (is_bert) "" else "_proj" });
+                defer data.allocator.free(w);
+                const b = try std.fmt.allocPrint(data.allocator, "encoder.layer.0.attention.self.{s}{s}.bias", .{ projection, if (is_bert) "" else "_proj" });
+                defer data.allocator.free(b);
+                try weight(data, w, &.{ 512, 512 }, null, true);
+                try weight(data, b, &.{512}, 0.001, false);
+            }
+            for ([_][]const u8{ "attention.output.dense", "intermediate.dense", "output.dense" }) |projection| {
+                const w = try std.fmt.allocPrint(data.allocator, "encoder.layer.0.{s}.weight", .{projection});
+                defer data.allocator.free(w);
+                const b = try std.fmt.allocPrint(data.allocator, "encoder.layer.0.{s}.bias", .{projection});
+                defer data.allocator.free(b);
+                // BERT's real query/key/value workload remains .direct. Its
+                // actual output/FFN names select the encoder dense policy.
+                try weight(data, w, &.{ 512, 512 }, null, is_bert);
+                try weight(data, b, &.{512}, 0.002, false);
+            }
+        }
+    };
+    var arch = ArchSession{ .allocator = process, .task = .generic, .arch_config = if (is_bert) .{ .bert = .{ .weight_prefix = "", .hidden_size = 512, .intermediate_size = 512, .num_hidden_layers = 1, .num_attention_heads = 8, .vocab_size = 8, .max_position_embeddings = 16 } } else .{ .deberta = .{ .hidden_size = 512, .intermediate_size = 512, .num_hidden_layers = 1, .num_attention_heads = 8, .vocab_size = 8, .position_buckets = 8, .max_position_embeddings = 16 } }, .backend_type = .native, .backend_data = .{ .native = .{ .allocator = process, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = Cache.init(.{ .host_limit_bytes = cache_limit }) } } };
+    var data_live = true;
+    defer if (data_live) arch.backend_data.native.deinitOwned();
+    try Builder.build(&arch.backend_data.native);
+    var session = archSessionHandle(&arch);
+    session.execution_gate = &arch.model_lifetime.execution_gate;
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 16 }, &@as([16]i64, @splat(1)));
+    defer ids.deinit();
+    var mask = try Tensor.initInt64(a, "attention_mask", &.{ 1, 16 }, &@as([16]i64, @splat(1)));
+    defer mask.deinit();
+    var ids2 = try Tensor.initInt64(a, "input_ids", &.{ 1, 16 }, &@as([16]i64, @splat(2)));
+    defer ids2.deinit();
+    var mask2 = try Tensor.initInt64(a, "attention_mask", &.{ 1, 16 }, &@as([16]i64, @splat(1)));
+    defer mask2.deinit();
+    const Probe = struct {
+        model: *Session.ModelLifetime,
+        data: ?*NativeData,
+        source: ?*@import("../backends/session.zig").PreparedSource = null,
+        pin: *const @import("../runtime/tier/admission_domain.zig").Pin,
+        calls: usize = 0,
+        violation: bool = false,
+        armed: bool = false,
+        peer_done: bool = false,
+        cancel_armed: bool = cancel_after_first,
+        did_cancel: bool = false,
+        clear_armed: bool = peer_clear,
+        did_clear: bool = false,
+        fn observe(self: *@This()) void {
+            if (!self.armed) return;
+            if (self.model.execution_gate.tryLock()) self.model.execution_gate.unlock() else self.violation = true;
+            if (self.data) |data| {
+                if (data.quantized_prepare_lock.tryLock()) data.quantized_prepare_lock.unlock() else self.violation = true;
+                if (data.gliner_head_dense_cache_lock.tryLock()) data.gliner_head_dense_cache_lock.unlock() else self.violation = true;
+                if (data.prefetch_initialized) {
+                    if (data.prefetch.mutex.tryLock()) data.prefetch.mutex.unlock(data.prefetch.io_impl.io()) else self.violation = true;
+                }
+            }
+        }
+        fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            self.calls += 1;
+            return self.calls;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const active = self.source orelse return;
+            if (!active.native_weight_paused) return;
+            const data = self.data orelse return;
+            if (self.clear_armed and !self.did_clear) {
+                @import("antfly_platform").sync.lockYielding(&data.gliner_head_dense_cache_lock);
+                const has_entry = data.gliner_head_dense_cache.count() != 0;
+                data.gliner_head_dense_cache_lock.unlock();
+                if (has_entry) {
+                    self.did_clear = true;
+                    try std.testing.expect(self.model.execution_gate.tryLock());
+                    // Actual destructive peer under the SAME real Model gate,
+                    // during the producer's later-projection cold window.
+                    native_mod.deinitGlinerHeadDenseCache(data);
+                    self.model.execution_gate.unlock();
+                }
+            }
+            if (self.cancel_armed) {
+                @import("antfly_platform").sync.lockYielding(&data.gliner_head_dense_cache_lock);
+                const has_entry = data.gliner_head_dense_cache.count() != 0;
+                data.gliner_head_dense_cache_lock.unlock();
+                if (has_entry) {
+                    self.did_cancel = true;
+                    return error.Cancelled;
+                }
+            }
+            if (!peer_dense or self.peer_done) return;
+            self.peer_done = true;
+            self.observe();
+            var peer = native_mod.NativeCompute.init(std.testing.allocator, data, null);
+            defer peer.deinit();
+            const cb = peer.computeBackend();
+            const name = if (is_bert) "encoder.layer.0.attention.output.dense.weight" else "encoder.layer.0.attention.self.query_proj.weight";
+            const weight = try cb.getEmbeddingWeight(name);
+            defer cb.free(weight);
+            const request = ops.NativeLinearPreparation{ .kind = .single_bias, .input = weight, .weights = .{ weight, null, null }, .rows = 16, .in_dim = 512, .out_dim = 512 };
+            try std.testing.expectEqual(@as(u3, 1), try native_mod.NativeCompute.selectedDenseProjectionMask(&cb, data, &request));
+            var plan = (try native_mod.NativeCompute.snapshotDenseCacheEntry(&cb, data, weight, 512, 512)).?;
+            defer plan.finishOutsideExecution();
+            try plan.fundOutsideExecution(self.pin);
+            try std.testing.expect(self.model.execution_gate.tryLock());
+            plan.fillAndCommitUnderModel() catch |err| {
+                self.model.execution_gate.unlock();
+                return err;
+            };
+            self.model.execution_gate.unlock();
+        }
+    };
+    var probe = Probe{ .model = &arch.model_lifetime, .data = &arch.backend_data.native, .pin = &pin };
+    try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    if (preexisting_raw) try arch.backend_data.native.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = 128 * 1024 * 1024 }, .{});
+    // Original unobserved arch body, same original automatic quantized route.
+    const reference = try archRunImpl(&arch, &.{ ids, mask }, a, .{ .native_call_policy = .in_process });
+    defer {
+        for (reference) |*value| value.deinit();
+        a.free(reference);
+    }
+    const reference2 = try archRunImpl(&arch, &.{ ids2, mask2 }, a, .{ .native_call_policy = .in_process });
+    defer {
+        for (reference2) |*value| value.deinit();
+        a.free(reference2);
+    }
+    const q_name = if (is_bert) "encoder.layer.0.attention.self.query.weight" else "encoder.layer.0.attention.self.query_proj.weight";
+    if (!preexisting_raw) {
+        // A fresh model/provider for the managed first call. This teardown is
+        // explicitly raw/outside and recreates the SAME checkpoint bytes.
+        arch.backend_data.native.deinitOwned();
+        arch.backend_data = .{ .native = .{ .allocator = process, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = Cache.init(.{ .host_limit_bytes = cache_limit }) } };
+        try Builder.build(&arch.backend_data.native);
+    }
+    arch.model_lifetime.admission_domain = pin.retain();
+    defer {
+        arch.model_lifetime.admission_domain.?.release();
+        arch.model_lifetime.admission_domain = null;
+        if (arch.model_lifetime.retirement_sink) |*held| held.release();
+        arch.model_lifetime.retirement_sink = null;
+    }
+    if (!preexisting_raw) try arch.backend_data.native.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = 128 * 1024 * 1024 }, .{});
+    probe.armed = true;
+    try arch.backend_data.native.tier_cache.?.installRetirementDomainOutsideExecution(&pin);
+    session.run_admission = .{ .controller = pin.controller(), .backend_class = .cpu, .limits = .{ .host_limit_bytes = 128 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    var selected_source: @import("../backends/session.zig").PreparedSource = .{};
+    probe.source = &selected_source;
+    const control = InferenceExecutionControl{ .native_call_policy = .in_process, .ptr = &probe, .check_fn = Probe.check };
+    try selected_source.initBeforeExecutionInto(session, session, session.execution_gate, .{ .host = &.{ ids, mask } }, try session.planRun(&.{ ids, mask }, null), null, .resident_transient, a, control);
+    defer selected_source.deinit();
+    try selected_source.enter();
+    if (peer_clear) native_mod.resetNativeQuantDispatchStatsForTest();
+    const cold = if (peer_clear) recovered: {
+        const attempted = selected_source.runHost(&.{ ids, mask });
+        if (attempted) |unexpected| {
+            for (unexpected) |*value| value.deinit();
+            a.free(unexpected);
+            try std.testing.expect(false); // stale ready Q must never switch kernels
+        } else |err| try std.testing.expectEqual(error.ResourceTemporarilyUnavailable, err);
+        try std.testing.expect(probe.did_clear);
+        try std.testing.expect(!selected_source.canRetryBeforeExecution());
+        try std.testing.expectEqual(@as(u64, 0), native_mod.nativeQuantDispatchStatsForTest().dequant_sgemm_triple);
+        selected_source.deinit();
+        probe.clear_armed = false;
+        probe.source = null;
+        // A separate explicit request can prepare the actual winner and run;
+        // the failed invocation never retries/replays any numerical operation.
+        break :recovered try session.runWithControl(&.{ ids, mask }, a, control);
+    } else if (cancel_after_first) recovered: {
+        const attempted = selected_source.runHost(&.{ ids, mask });
+        if (attempted) |unexpected| {
+            // An assertion failure must not retain owning outputs/admission
+            // and replace the useful failure with a Domain teardown panic.
+            for (unexpected) |*value| value.deinit();
+            a.free(unexpected);
+            try std.testing.expect(false); // expected cancellation, no replay
+        } else |err| try std.testing.expectEqual(error.Cancelled, err);
+        try std.testing.expect(probe.did_cancel);
+        selected_source.deinit(); // complete error unwind BEFORE a new user invocation
+        probe.cancel_armed = false;
+        probe.source = null;
+        break :recovered try session.runWithControl(&.{ ids, mask }, a, control);
+    } else try selected_source.runHost(&.{ ids, mask });
+    defer {
+        for (cold) |*value| value.deinit();
+        a.free(cold);
+    }
+    try std.testing.expectEqualSlices(f32, reference[0].asFloat32(), cold[0].asFloat32());
+    if (peer_dense) try std.testing.expect(probe.peer_done);
+    const data = &arch.backend_data.native;
+    const selected = &data.resident_weights.getPtr(q_name).?.quantized_storage.?;
+    if (is_bert) {
+        try std.testing.expect(selected.prepared_group_cache == null); // strict policy stays strict
+        try std.testing.expect(!data.gliner_head_dense_cache.contains(q_name)); // actual QKV workload stays direct
+    }
+    if (cache_limit > 1) {
+        try std.testing.expect(data.gliner_head_dense_cache.count() > 0);
+        try std.testing.expect(data.gliner_head_dense_cache_prepared_map_bytes > 0);
+        var entries = data.gliner_head_dense_cache.iterator();
+        while (entries.next()) |entry| try std.testing.expectEqual(entry.value_ptr.bytes + entry.key_ptr.*.len, entry.value_ptr.prepared_physical_bytes);
+    } else try std.testing.expectEqual(@as(u32, 0), data.gliner_head_dense_cache.count());
+    try std.testing.expect(!probe.violation and scheduler.head == null);
+    const count = data.gliner_head_dense_cache.count();
+    probe.source = null;
+    selected_source.deinit(); // no live Source/Model pointer may survive actual store close
+    const warm = try session.runWithControl(&.{ ids2, mask2 }, a, control);
+    defer {
+        for (warm) |*value| value.deinit();
+        a.free(warm);
+    }
+    try std.testing.expectEqualSlices(f32, reference2[0].asFloat32(), warm[0].asFloat32());
+    try std.testing.expectEqual(count, data.gliner_head_dense_cache.count());
+    var close = try @import("cleanup_owner.zig").Owner.beginResident(session);
+    defer close.finishAfterUnlock();
+    try std.testing.expect(session.execution_gate.?.tryLock());
+    probe.data = null;
+    try arch.backend_data.native.deinitOwnedWithCleanup(.{ .boundary = close.epoch() });
+    data_live = false;
+    if (cache_limit > 1) try std.testing.expect(pin.controller().snapshot().host_weight_bytes != 0); // actual B still held after physical death
+    session.execution_gate.?.unlock();
+    close.finishAfterUnlock();
+    try std.testing.expectEqual(@as(usize, 0), pin.controller().snapshot().host_weight_bytes);
+    try std.testing.expect(!probe.violation);
+}
+
+test "canonical Native BERT and DeBERTa Source default dense cache cold warm denial preserves original programs" {
+    inline for (.{ false, true }) |is_bert| {
+        try nativeDenseEncoderCheckpointCase(is_bert, 32 * 1024 * 1024, false, false, false);
+        try nativeDenseEncoderCheckpointCase(is_bert, 32 * 1024 * 1024, true, false, false);
+        try nativeDenseEncoderCheckpointCase(is_bert, 1, false, false, false);
+    }
+}
+
+fn nativeClipEncoderCheckpointCase() !void {
+    const cache_limit = 32 * 1024 * 1024;
+    const kind = @import("../gguf/tensor_types.zig").KnownTensorType.Q4_K;
+    const peer_winner = false;
+    const preexisting_raw = false;
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const process = std.heap.c_allocator;
+    const Memory = @import("../runtime/tier/memory.zig");
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const Cache = @import("../runtime/tier/cache.zig").SharedCache;
+    const Quant = @import("../models/weight_source.zig").QuantizedStorage;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    const Builder = struct {
+        fn weight(data: *NativeData, name: []const u8, shape: []const i64, constant: ?f32, quantized: bool) !void {
+            var count: usize = 1;
+            for (shape) |dim| count *= @intCast(dim);
+            const values = try data.allocator.alloc(f32, count);
+            defer data.allocator.free(values);
+            for (values, 0..) |*v, i| v.* = constant orelse @as(f32, @floatFromInt(@as(i32, @intCast((i * 7 + name.len) % 29)) - 14)) / 512;
+            const name_copy = try data.allocator.dupe(u8, name);
+            errdefer data.allocator.free(name_copy);
+            if (quantized) {
+                const codec = @import("../gguf/quant_codec.zig");
+                const raw = if (kind == .Q4_K) try codec.quantizeQ4_KFromF32(data.allocator, values) else try codec.quantizeQ5_KFromF32(data.allocator, values);
+                errdefer data.allocator.free(raw);
+                const owned_shape = try data.allocator.dupe(i64, shape);
+                errdefer data.allocator.free(owned_shape);
+                try data.resident_weights.put(data.allocator, name_copy, .{ .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &.{}, .name = name_copy, .allocator = data.allocator, .owns_data = false, .owns_shape = false }, .quantized = true, .quantized_storage = Quant{ .tensor_type = .{ .known = kind }, .raw_bytes = raw, .shape = owned_shape, .allocator = data.allocator } });
+            } else {
+                var tensor = try Tensor.initFloat32(data.allocator, name_copy, shape, values);
+                errdefer tensor.deinit();
+                try data.resident_weights.put(data.allocator, name_copy, .{ .tensor = tensor });
+            }
+        }
+        fn build(data: *NativeData) !void {
+            try weight(data, "text_model.embeddings.token_embedding.weight", &.{ 8, 512 }, null, false);
+            try weight(data, "text_model.embeddings.position_embedding.weight", &.{ 16, 512 }, null, false);
+            for ([_][]const u8{ "text_model.final_layer_norm", "text_model.encoder.layers.0.layer_norm1", "text_model.encoder.layers.0.layer_norm2" }) |base| {
+                const w = try std.fmt.allocPrint(data.allocator, "{s}.weight", .{base});
+                defer data.allocator.free(w);
+                const b = try std.fmt.allocPrint(data.allocator, "{s}.bias", .{base});
+                defer data.allocator.free(b);
+                try weight(data, w, &.{512}, 1, false);
+                try weight(data, b, &.{512}, 0, false);
+            }
+            for ([_][]const u8{ "self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj", "self_attn.out_proj", "mlp.fc1", "mlp.fc2" }, 0..) |projection, index| {
+                const w = try std.fmt.allocPrint(data.allocator, "text_model.encoder.layers.0.{s}.weight", .{projection});
+                defer data.allocator.free(w);
+                const b = try std.fmt.allocPrint(data.allocator, "text_model.encoder.layers.0.{s}.bias", .{projection});
+                defer data.allocator.free(b);
+                try weight(data, w, &.{ 512, 512 }, null, index < 3);
+                try weight(data, b, &.{512}, 0.001, false);
+            }
+            try weight(data, "text_projection.weight", &.{ 512, 512 }, null, false);
+        }
+    };
+    var arch = ArchSession{ .allocator = process, .task = .generic, .arch_config = .{ .clip = .{ .text_hidden_size = 512, .text_num_layers = 1, .text_num_heads = 8, .text_intermediate_size = 512, .text_max_position_embeddings = 16, .vocab_size = 8, .projection_dim = 512 } }, .backend_type = .native, .backend_data = .{ .native = .{ .allocator = process, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = Cache.init(.{ .host_limit_bytes = cache_limit }) } } };
+    var data_live = true;
+    defer if (data_live) arch.backend_data.native.deinitOwned();
+    try Builder.build(&arch.backend_data.native);
+    var session = archSessionHandle(&arch);
+    session.execution_gate = &arch.model_lifetime.execution_gate;
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    var ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 2 }, &.{ 1, 1 });
+    defer ids.deinit();
+    var mask = try Tensor.initInt64(a, "attention_mask", &.{ 1, 2 }, &.{ 1, 1 });
+    defer mask.deinit();
+    var ids2 = try Tensor.initInt64(a, "input_ids", &.{ 1, 2 }, &.{ 2, 2 });
+    defer ids2.deinit();
+    var mask2 = try Tensor.initInt64(a, "attention_mask", &.{ 1, 2 }, &.{ 1, 1 });
+    defer mask2.deinit();
+    const Probe = struct {
+        model: *Session.ModelLifetime,
+        data: ?*NativeData,
+        source: ?*@import("../backends/session.zig").PreparedSource = null,
+        pin: *const @import("../runtime/tier/admission_domain.zig").Pin,
+        calls: usize = 0,
+        violation: bool = false,
+        armed: bool = false,
+        peer_done: bool = false,
+        fn observe(self: *@This()) void {
+            if (!self.armed) return;
+            if (self.model.execution_gate.tryLock()) self.model.execution_gate.unlock() else self.violation = true;
+            if (self.data) |data| {
+                if (data.quantized_prepare_lock.tryLock()) data.quantized_prepare_lock.unlock() else self.violation = true;
+                if (data.gliner_head_dense_cache_lock.tryLock()) data.gliner_head_dense_cache_lock.unlock() else self.violation = true;
+                if (data.prefetch_initialized) {
+                    if (data.prefetch.mutex.tryLock()) data.prefetch.mutex.unlock(data.prefetch.io_impl.io()) else self.violation = true;
+                }
+            }
+        }
+        fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            self.calls += 1;
+            return self.calls;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn check(raw: ?*anyopaque) !void {
+            if (!peer_winner) return;
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            const active = self.source orelse return;
+            if (!active.native_weight_paused or self.peer_done) return;
+            const data = self.data orelse return;
+            const names = [_][]const u8{ "encoder.layer.0.attention.self.query_proj.weight", "encoder.layer.0.attention.self.key_proj.weight", "encoder.layer.0.attention.self.value_proj.weight" };
+            for (names) |name| if (data.resident_weights.getPtr(name).?.quantized_storage.?.preparedBytes(.panel16) == null) return;
+            self.peer_done = true;
+            self.observe();
+            var peer = native_mod.NativeCompute.init(std.testing.allocator, data, null);
+            defer peer.deinit();
+            const cb = peer.computeBackend();
+            var weights: [3]ops.CT = undefined;
+            var biases: [3]ops.CT = undefined;
+            var initialized: usize = 0;
+            defer for (0..initialized) |i| {
+                cb.free(weights[i]);
+                cb.free(biases[i]);
+            };
+            for (names, 0..) |name, i| {
+                weights[i] = try cb.getWeight(name);
+                const bias_name = try std.fmt.allocPrint(std.testing.allocator, "{s}bias", .{name[0 .. name.len - "weight".len]});
+                defer std.testing.allocator.free(bias_name);
+                biases[i] = cb.getWeight(bias_name) catch |err| {
+                    cb.free(weights[i]);
+                    return err;
+                };
+                initialized += 1;
+            }
+            const request = ops.LinearTripleInvocation{ .input = weights[0], .weights = weights, .biases = biases, .rows = 1, .in_dim = 512, .out_dim = 512 };
+            try std.testing.expect(try native_mod.NativeCompute.prepareProjectionGroupOutsideExecution(&cb, data, &request, self.pin));
+        }
+    };
+    var probe = Probe{ .model = &arch.model_lifetime, .data = &arch.backend_data.native, .pin = &pin };
+    try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    if (preexisting_raw) try arch.backend_data.native.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = 128 * 1024 * 1024 }, .{});
+    // Original unobserved arch body, same original automatic quantized route.
+    const reference = try archRunImpl(&arch, &.{ ids, mask }, a, .{ .native_call_policy = .in_process });
+    defer {
+        for (reference) |*value| value.deinit();
+        a.free(reference);
+    }
+    const reference2 = try archRunImpl(&arch, &.{ ids2, mask2 }, a, .{ .native_call_policy = .in_process });
+    defer {
+        for (reference2) |*value| value.deinit();
+        a.free(reference2);
+    }
+    const q_name = "text_model.encoder.layers.0.self_attn.q_proj.weight";
+    if (!preexisting_raw) {
+        // A fresh model/provider for the managed first call. This teardown is
+        // explicitly raw/outside and recreates the SAME checkpoint bytes.
+        arch.backend_data.native.deinitOwned();
+        arch.backend_data = .{ .native = .{ .allocator = process, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = Cache.init(.{ .host_limit_bytes = cache_limit }) } };
+        try Builder.build(&arch.backend_data.native);
+    }
+    arch.model_lifetime.admission_domain = pin.retain();
+    defer {
+        arch.model_lifetime.admission_domain.?.release();
+        arch.model_lifetime.admission_domain = null;
+        if (arch.model_lifetime.retirement_sink) |*held| held.release();
+        arch.model_lifetime.retirement_sink = null;
+    }
+    if (!preexisting_raw) try arch.backend_data.native.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = 128 * 1024 * 1024 }, .{});
+    probe.armed = true;
+    try arch.backend_data.native.tier_cache.?.installRetirementDomainOutsideExecution(&pin);
+    session.run_admission = .{ .controller = pin.controller(), .backend_class = .cpu, .limits = .{ .host_limit_bytes = 128 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    var selected_source: @import("../backends/session.zig").PreparedSource = .{};
+    probe.source = &selected_source;
+    const control = InferenceExecutionControl{ .native_call_policy = .in_process, .ptr = &probe, .check_fn = Probe.check };
+    try selected_source.initBeforeExecutionInto(session, session, session.execution_gate, .{ .host = &.{ ids, mask } }, try session.planRun(&.{ ids, mask }, null), null, .resident_transient, a, control);
+    defer selected_source.deinit();
+    try selected_source.enter();
+    const cold = try selected_source.runHost(&.{ ids, mask });
+    defer {
+        for (cold) |*value| value.deinit();
+        a.free(cold);
+    }
+    try std.testing.expectEqualSlices(f32, reference[0].asFloat32(), cold[0].asFloat32());
+    const data = &arch.backend_data.native;
+    const selected = &data.resident_weights.getPtr(q_name).?.quantized_storage.?;
+    try std.testing.expectEqual(@as(u32, 0), data.gliner_head_dense_cache.count()); // default CLIP optional dense policy unchanged
+    try std.testing.expect(selected.prepared_group_cache.?.hasPhysicalBacking());
+    const packed_pointer = selected.prepared_group_cache.?.packed_bytes.ptr;
+    try std.testing.expect(!probe.violation and scheduler.head == null);
+    const count = data.gliner_head_dense_cache.count();
+    probe.source = null;
+    selected_source.deinit(); // no live Source/Model pointer may survive actual store close
+    const warm = try session.runWithControl(&.{ ids2, mask2 }, a, control);
+    defer {
+        for (warm) |*value| value.deinit();
+        a.free(warm);
+    }
+    try std.testing.expectEqualSlices(f32, reference2[0].asFloat32(), warm[0].asFloat32());
+    try std.testing.expectEqual(count, data.gliner_head_dense_cache.count());
+    try std.testing.expectEqual(packed_pointer, selected.prepared_group_cache.?.packed_bytes.ptr);
+    var close = try @import("cleanup_owner.zig").Owner.beginResident(session);
+    defer close.finishAfterUnlock();
+    try std.testing.expect(session.execution_gate.?.tryLock());
+    probe.data = null;
+    try arch.backend_data.native.deinitOwnedWithCleanup(.{ .boundary = close.epoch() });
+    data_live = false;
+    if (cache_limit > 1) try std.testing.expect(pin.controller().snapshot().host_weight_bytes != 0); // actual B still held after physical death
+    session.execution_gate.?.unlock();
+    close.finishAfterUnlock();
+    try std.testing.expectEqual(@as(usize, 0), pin.controller().snapshot().host_weight_bytes);
+    try std.testing.expect(!probe.violation);
+}
+
+test "canonical Native CLIP Source uses actual default grouped QKV without dense policy override" {
+    try nativeClipEncoderCheckpointCase();
+}
+
+test "canonical Native dense Source cancellation after first cache publication unwinds before explicit recovery" {
+    try nativeDenseEncoderCheckpointCase(true, 32 * 1024 * 1024, false, true, false);
+}
+
+test "Native operation source adapter rejects missing admitted owners and leaves raw expert graph contracts unchanged" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    var arch = ArchSession{ .allocator = std.testing.allocator, .arch_config = .{ .bert = .{ .hidden_size = 512, .intermediate_size = 512, .num_hidden_layers = 1, .num_attention_heads = 8, .vocab_size = 8 } }, .backend_type = .native, .backend_data = .{ .native = .{ .allocator = std.testing.allocator, .resident_weights = .empty, .lazy_weights = .empty } } };
+    defer arch.backend_data.native.deinitOwned();
+    var session = archSessionHandle(&arch);
+    session.execution_gate = null;
+    try std.testing.expect(nativeWeightPreparationCandidate(session));
+    try validateNativeWeightPreparationReceiver(session); // original explicit raw/no-gate contract
+    var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+    session.run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0 };
+    try std.testing.expectError(error.MissingNativeWeightPreparationOwner, validateNativeWeightPreparationReceiver(session));
+    var source: @import("../backends/session.zig").PreparedSource = .{};
+    try std.testing.expectError(error.MissingNativeWeightPreparationOwner, source.initBeforeExecutionInto(session, session, null, .{ .host = &.{} }, .{}, null, .host, std.testing.allocator, null));
+    try std.testing.expect(source.phase == .empty);
+    try std.testing.expectEqualDeep(@import("../runtime/tier/memory.zig").AdmissionAmounts{}, controller.snapshot());
+    session.execution_gate = &arch.model_lifetime.execution_gate;
+    try validateNativeWeightPreparationReceiver(session);
+    try std.testing.expect(nativeWeightPreparationModelData(session) == &arch.backend_data.native);
+    arch.backend_data.native.moe_num_experts = 2;
+    try std.testing.expect(!nativeWeightPreparationCandidate(session));
+    arch.backend_data.native.moe_num_experts = 0;
+    arch.arch_config = .{ .gpt = .{ .family = .qwen3, .num_local_experts = 2 } };
+    try std.testing.expect(!nativeWeightPreparationCandidate(session));
+    arch.arch_config = .{ .gpt = .{ .family = .deepseek_v4 } };
+    try std.testing.expect(!nativeWeightPreparationCandidate(session));
+    var copied = arch_vtable;
+    session.vtable = &copied;
+    session.ptr = @ptrFromInt(16);
+    try std.testing.expect(!nativeWeightPreparationCandidate(session)); // no opaque ctx cast through copied table
 }
 
 test "BERT family resident task heads preserve actual Native math and materialize only final logits" {
@@ -16075,4 +16644,8 @@ fn expectResidentHeadParity118(comptime use_metal: bool, expected: []const f32, 
         try std.testing.expect(std.math.isFinite(want) and std.math.isFinite(got));
         try std.testing.expectApproxEqAbs(want, got, @as(f32, 3e-5));
     }
+}
+
+test "canonical Native dense Source refuses peer-cleared grouped selection before math then explicit recovery" {
+    try nativeDenseEncoderCheckpointCase(false, 32 * 1024 * 1024, false, false, true);
 }

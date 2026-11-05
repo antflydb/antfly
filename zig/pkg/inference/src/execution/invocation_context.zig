@@ -15,6 +15,7 @@ pub const Context = struct {
 /// creation Epoch and is stripped with the containing borrowed Context.
 pub const NativeWeights = struct {
     pub const Access = enum { get, acquire, embedding };
+    prepare_dense: ?*const fn (*anyopaque, *const @import("../ops/ops.zig").ComputeBackend, *const @import("../ops/ops.zig").NativeLinearPreparation) anyerror!?@import("../ops/ops.zig").NativeLinearPrepared = null,
     /// Synchronous copied operation geometry; no tensors/loan escape callback.
     prepare_projection: ?*const fn (*anyopaque, *const @import("../ops/ops.zig").ComputeBackend, *const @import("../ops/ops.zig").LinearTripleInvocation) anyerror!bool = null,
     ptr: *anyopaque,

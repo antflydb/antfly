@@ -1859,6 +1859,34 @@ pub const DetachedDenseF32Payload = struct {
     allocator: std.mem.Allocator,
 };
 
+/// Actual synchronous layout request for the selected Native projection.
+/// It is not a model/family classifier, cache publication or quota capability.
+pub const NativeLinearPreparation = struct {
+    pub const Kind = enum { single_no_bias, single_bias, pair_no_bias, pair_bias, triple_bias };
+    kind: Kind,
+    input: CT,
+    weights: [3]?CT = @splat(null),
+    biases: [3]?CT = @splat(null),
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    pub fn count(self: *const @This()) usize {
+        return switch (self.kind) {
+            .single_no_bias, .single_bias => 1,
+            .pair_no_bias, .pair_bias => 2,
+            .triple_bias => 3,
+        };
+    }
+};
+/// Value-only synchronous selected-layout receipt. This grants no quota and
+/// owns no buffer. Original transient-scratch choices require a declared bank.
+pub const NativeLinearPrepared = struct {
+    policy_signature: u64,
+    selected_mask: u3 = 0,
+    ready_mask: u3 = 0,
+    fallback_direct: bool = false,
+};
+
 /// Exact selected biased grouped projection, borrowed for one synchronous call.
 pub const LinearTripleInvocation = struct {
     input: CT,
@@ -1868,11 +1896,19 @@ pub const LinearTripleInvocation = struct {
     in_dim: usize,
     out_dim: usize,
     group_prepared: bool = false,
+    dense_prepared: bool = false,
+    dense_fallback: bool = false,
+    dense_policy_signature: u64 = 0,
+    dense_selected_mask: u3 = 0,
+    dense_ready_mask: u3 = 0,
 };
 
 pub const ColdCleanupServices = struct {
+    linear_lora_prepared: ?*const fn (*const ComputeBackend, *const NativeLinearPreparation, *const NativeLinearPrepared, CT, CT, f32, usize, @import("../execution/cleanup_context.zig").Context) anyerror!CT = null,
     accepts: *const fn (*const ComputeBackend.VTable) bool,
     linear_triple: ?*const fn (*const ComputeBackend, *const LinearTripleInvocation, @import("../execution/cleanup_context.zig").Context) anyerror!LinearTripleResult = null,
+    linear_prepared: ?*const fn (*const ComputeBackend, *const NativeLinearPreparation, *const NativeLinearPrepared, @import("../execution/cleanup_context.zig").Context) anyerror!CT = null,
+    linear_pair_prepared: ?*const fn (*const ComputeBackend, *const NativeLinearPreparation, *const NativeLinearPrepared, @import("../execution/cleanup_context.zig").Context) anyerror!LinearPairResult = null,
     free: *const fn (*anyopaque, CT, @import("../execution/cleanup_context.zig").Context) void,
     deinit_backend: ?*const fn (*const ComputeBackend, @import("../execution/cleanup_context.zig").Context) void = null,
     detach_dense_f32: ?*const fn (*const ComputeBackend, []const CT, *const anyopaque, @import("../execution/cleanup_context.zig").Context) anyerror!?DetachedDenseF32Payload = null,
@@ -3921,7 +3957,21 @@ pub const ComputeBackend = struct {
         return result;
     }
 
+    fn prepareNativeLinear(self: *const ComputeBackend, request: *const NativeLinearPreparation) !?NativeLinearPrepared {
+        const services = self.vtable.cold_cleanup_services orelse return null;
+        if (!services.accepts(self.vtable)) return null; // before any opaque loan callback
+        const context = self.call_context orelse return null;
+        const loan = context.native_weights orelse return null;
+        const prepare = loan.prepare_dense orelse return null;
+        return prepare(loan.ptr, self, request);
+    }
+
     pub fn linear(self: *const ComputeBackend, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) !CT {
+        const request = NativeLinearPreparation{ .kind = .single_bias, .input = input, .weights = .{ weight, null, null }, .biases = .{ bias, null, null }, .rows = rows, .in_dim = in_dim, .out_dim = out_dim };
+        if (try self.prepareNativeLinear(&request)) |receipt| {
+            const run = self.vtable.cold_cleanup_services.?.linear_prepared orelse return error.UnsupportedNativeWeightPreparation;
+            return self.observeBackendEntry(.linear, run, .{ self, &request, &receipt, self.call_context.?.cleanup });
+        }
         return self.observeBackendEntry(.linear, self.vtable.linear, .{ self.ptr, input, weight, bias, rows, in_dim, out_dim });
     }
 
@@ -3952,6 +4002,11 @@ pub const ComputeBackend = struct {
     }
 
     pub fn linearNoBias(self: *const ComputeBackend, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize) !CT {
+        const request = NativeLinearPreparation{ .kind = .single_no_bias, .input = input, .weights = .{ weight, null, null }, .rows = rows, .in_dim = in_dim, .out_dim = out_dim };
+        if (try self.prepareNativeLinear(&request)) |receipt| {
+            const run = self.vtable.cold_cleanup_services.?.linear_prepared orelse return error.UnsupportedNativeWeightPreparation;
+            return self.observeBackendEntry(.linear_no_bias, run, .{ self, &request, &receipt, self.call_context.?.cleanup });
+        }
         return self.observeBackendEntry(.linear_no_bias, self.vtable.linearNoBias, .{ self.ptr, input, weight, rows, in_dim, out_dim });
     }
 
@@ -4017,6 +4072,12 @@ pub const ComputeBackend = struct {
         in_dim: usize,
         out_dim: usize,
     ) !CT {
+        const request = NativeLinearPreparation{ .kind = .single_bias, .input = input, .weights = .{ base_weight, null, null }, .biases = .{ bias, null, null }, .rows = rows, .in_dim = in_dim, .out_dim = out_dim };
+        if (try self.prepareNativeLinear(&request)) |receipt| {
+            const run = self.vtable.cold_cleanup_services.?.linear_lora_prepared orelse return error.UnsupportedNativeWeightPreparation;
+            return run(self, &request, &receipt, lora_a, lora_b, alpha, rank, self.call_context.?.cleanup);
+        }
+
         if (self.vtable.linearLoRA) |op| {
             return op(self.ptr, input, base_weight, bias, lora_a, lora_b, alpha, rank, rows, in_dim, out_dim);
         }
@@ -4054,6 +4115,13 @@ pub const ComputeBackend = struct {
         in_dim: usize,
         out_dim: usize,
     ) !LinearNoBiasPairResult {
+        const request = NativeLinearPreparation{ .kind = .pair_no_bias, .input = input, .weights = .{ weight_a, weight_b, null }, .rows = rows, .in_dim = in_dim, .out_dim = out_dim };
+        if (try self.prepareNativeLinear(&request)) |receipt| {
+            const run = self.vtable.cold_cleanup_services.?.linear_pair_prepared orelse return error.UnsupportedNativeWeightPreparation;
+            const pair = try run(self, &request, &receipt, self.call_context.?.cleanup);
+            return .{ .first = pair.first, .second = pair.second };
+        }
+
         if (self.vtable.linearNoBiasPair) |linear_no_bias_pair| {
             return linear_no_bias_pair(self.ptr, input, weight_a, weight_b, rows, in_dim, out_dim);
         }
@@ -4098,6 +4166,12 @@ pub const ComputeBackend = struct {
         in_dim: usize,
         out_dim: usize,
     ) !LinearPairResult {
+        const request = NativeLinearPreparation{ .kind = .pair_bias, .input = input, .weights = .{ weight_a, weight_b, null }, .biases = .{ bias_a, bias_b, null }, .rows = rows, .in_dim = in_dim, .out_dim = out_dim };
+        if (try self.prepareNativeLinear(&request)) |receipt| {
+            const run = self.vtable.cold_cleanup_services.?.linear_pair_prepared orelse return error.UnsupportedNativeWeightPreparation;
+            return run(self, &request, &receipt, self.call_context.?.cleanup);
+        }
+
         if (self.vtable.linearPair) |linear_pair| {
             return linear_pair(self.ptr, input, weight_a, bias_a, weight_b, bias_b, rows, in_dim, out_dim);
         }
@@ -4230,6 +4304,14 @@ pub const ComputeBackend = struct {
         out_dim: usize,
     ) !LinearTripleResult {
         var request = LinearTripleInvocation{ .input = input, .weights = .{ weight_a, weight_b, weight_c }, .biases = .{ bias_a, bias_b, bias_c }, .rows = rows, .in_dim = in_dim, .out_dim = out_dim };
+        const dense_request = NativeLinearPreparation{ .kind = .triple_bias, .input = input, .weights = .{ weight_a, weight_b, weight_c }, .biases = .{ bias_a, bias_b, bias_c }, .rows = rows, .in_dim = in_dim, .out_dim = out_dim };
+        if (try self.prepareNativeLinear(&dense_request)) |receipt| {
+            request.dense_prepared = true;
+            request.dense_fallback = receipt.fallback_direct;
+            request.dense_policy_signature = receipt.policy_signature;
+            request.dense_selected_mask = receipt.selected_mask;
+            request.dense_ready_mask = receipt.ready_mask;
+        }
         if (self.call_context) |context| {
             if (context.native_weights) |control| if (control.prepare_projection) |prepare| {
                 request.group_prepared = try prepare(control.ptr, self, &request);

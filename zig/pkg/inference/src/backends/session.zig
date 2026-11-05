@@ -2083,6 +2083,7 @@ pub const Session = struct {
         return try services.recurrent_layout(self.ptr) != null;
     }
     fn needsColdEagerHost(self: Session) !bool {
+        try @import("../execution/architecture_session.zig").validateNativeWeightPreparationReceiver(self);
         try self.validateEagerHostServices();
         // Only the actual complete host service may replace its callback.
         // Forwarded/custom callbacks without this descriptor retain their ABI;
@@ -3268,6 +3269,7 @@ pub const PreparedSource = struct {
 
     pub fn initBeforeExecutionInto(self: *PreparedSource, source: Session, fallback_scheduling: Session, fallback_gate: ?*std.atomic.Mutex, inputs: invocation.Inputs, declared: RunRequest, supplied_preprocess: ?*RunPermit, placement: Placement, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !void {
         if (self.phase != .empty) return error.SourceInvocationAlreadyInitialized;
+        try @import("../execution/architecture_session.zig").validateNativeWeightPreparationReceiver(source);
         try source.validateEagerHostServices(); // advertised ownership before any metadata callback/cast
         self.allocator = allocator;
         self.control = control;
@@ -3353,6 +3355,7 @@ pub const PreparedSource = struct {
     }
     fn initShapesBeforeExecutionImpl(self: *PreparedSource, source: Session, fallback_scheduling: Session, fallback_gate: ?*std.atomic.Mutex, shapes: ShapeInputs, request: RunRequest, workspace: ?*@import("admitted_allocator.zig").AdmittedAllocator, placement: Placement, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, task_output: ?RunPermit.HostOutputGeometry, declared_storage: ?[]const @import("../execution/prepared_storage_admission.zig").Requirement) !void {
         if (self.phase != .empty) return error.SourceInvocationAlreadyInitialized;
+        try @import("../execution/architecture_session.zig").validateNativeWeightPreparationReceiver(source);
         try source.validateEagerHostServices(); // advertised ownership before any metadata callback/cast
         self.allocator = allocator;
         self.control = control;
@@ -3653,7 +3656,7 @@ pub const PreparedSource = struct {
         self.preentry_declined = false;
         const selected = self.selectedPermit();
         const native = self.sourceSession().nativeWeightPreparationReceiver();
-        var native_control = @import("../execution/invocation_context.zig").NativeWeights{ .ptr = self, .access = nativeWeightAccess, .prepare_projection = nativeProjectionPreparation };
+        var native_control = @import("../execution/invocation_context.zig").NativeWeights{ .ptr = self, .access = nativeWeightAccess, .prepare_projection = nativeProjectionPreparation, .prepare_dense = nativeDensePreparation };
         if (native) {
             if (selected.native_weights != null) return error.NativeWeightPreparationReentered;
             selected.native_weights = &native_control;
@@ -3695,6 +3698,119 @@ pub const PreparedSource = struct {
         scheduling.releaseSelectedCohortGate(&self.waiter);
         scheduling.leaveSelectedCohort(&self.waiter);
         self.native_weight_paused = true;
+    }
+    /// One existing-cache transaction. Both unused allocations/refunds and old
+    /// map destruction settle outside Model/FIFO/lane, including every error.
+    fn executeNativeDenseCold(self: *PreparedSource, plan: *@import("../ops/native_compute.zig").NativeCompute.DenseCacheCold, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !void {
+        try self.suspendNativeWeightSlice();
+        defer if (self.native_weight_paused) self.restoreNativeWeightSlice() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        var finished = false;
+        defer if (!finished) {
+            if (!self.native_weight_paused) self.suspendNativeWeightSlice() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            plan.finishOutsideExecution();
+        };
+        if (self.control) |control| try control.check();
+        try plan.fundOutsideExecution(pin);
+        try self.restoreNativeWeightSlice();
+        if (self.control) |control| try control.check();
+        try plan.fillAndCommitUnderModel();
+        try self.suspendNativeWeightSlice();
+        plan.finishOutsideExecution();
+        finished = true;
+    }
+    fn nativeDensePreparation(raw: *anyopaque, cb: *const ops.ComputeBackend, request: *const ops.NativeLinearPreparation) anyerror!?ops.NativeLinearPrepared {
+        const self: *PreparedSource = @ptrCast(@alignCast(raw));
+        if (self.phase != .executing or self.native_weight_paused) return error.NativeWeightPreparationReentered;
+        const current = self.epoch() orelse return error.MissingCurrentCleanupEpoch;
+        if (try current.isSealed()) return error.RetirementEpochSealed;
+        const context = cb.call_context orelse return error.ForeignNativeWeightModel;
+        const loan = context.native_weights orelse return error.ForeignNativeWeightModel;
+        const actual = context.cleanup.boundary orelse return error.MissingCurrentCleanupEpoch;
+        if (loan.ptr != raw or loan.access != nativeWeightAccess or loan.prepare_dense != nativeDensePreparation or actual.record != current.record or actual.nonce != current.nonce) return error.ForeignNativeWeightModel;
+        const source = self.sourceSession();
+        const Native = @import("../ops/native_compute.zig").NativeCompute;
+        const data = @import("../execution/architecture_session.zig").nativeWeightPreparationModelData(source) orelse return error.ForeignNativeWeightModel;
+        const signature = try Native.densePolicySignature(cb, data);
+        const mask = try Native.selectedDenseProjectionMask(cb, data, request);
+        if (mask == 0) return null; // unchanged raw, scratch or non-dense route
+        const model = self.source_model orelse return error.MissingSourceModelLifetime;
+        var pin = if (source.run_admission) |admission| model.retainAdmissionDomain(admission.controller) else null;
+        defer if (pin) |held| held.release();
+        const old_domain = if (pin) |*held| held else return error.MissingCacheRetirementDomain;
+        {
+            try self.suspendNativeWeightSlice();
+            defer if (self.native_weight_paused) self.restoreNativeWeightSlice() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            if (self.control) |control| try control.check();
+            try Native.prepareResidentCreditUpgradesOutsideExecution(cb, data, old_domain);
+            try Native.flushWeightReleasesOutsideExecution(cb, data);
+        }
+        // Mandatory raw metadata upgrade precedes optional new entry funding.
+        // It cannot be lost when a later optional cache birth is denied.
+        var metadata_ready = false;
+        for (0..8) |_| {
+            var plan = (Native.snapshotDenseCacheMetadata(cb, data) catch |err| {
+                // A raw API peer can replace stdlib map storage without this
+                // protocol. No new receipt/metadata credit is invented for it;
+                // preserve that original compatibility route before math.
+                if (err == error.NativeCacheLayoutChangedOutsidePreparedProtocol) return null;
+                return err;
+            }) orelse {
+                metadata_ready = true;
+                break;
+            };
+            self.executeNativeDenseCold(&plan, old_domain) catch |err| {
+                if (err == error.NativeWeightPreparationChanged or err == error.PreparedCacheGrowthChanged) continue;
+                return err;
+            };
+            metadata_ready = true;
+            break;
+        }
+        if (!metadata_ready) return error.ResourceTemporarilyUnavailable;
+        const independent = try Native.denseUsesIndependentProjections(cb, data, request);
+        var fallback = false;
+        var ready_mask: u3 = 0;
+        for (0..request.count()) |index| {
+            if ((mask & (@as(u3, 1) << @intCast(index))) == 0) continue;
+            const weight = request.weights[index].?;
+            var ready = false;
+            const state = try Native.inspectDenseCache(cb, data, weight, request.in_dim, request.out_dim);
+            if (state == .ready) {
+                ready_mask |= @as(u3, 1) << @intCast(index);
+                continue;
+            }
+            if (state == .cold) {
+                for (0..8) |_| {
+                    var plan = (Native.snapshotDenseCacheEntry(cb, data, weight, request.in_dim, request.out_dim) catch |err| {
+                        if (err == error.MemoryBudgetExceeded or err == error.ResourceTemporarilyUnavailable) {
+                            try Native.noteDenseTierDenied(cb, data, weight, try std.math.mul(usize, try std.math.mul(usize, request.in_dim, request.out_dim), @sizeOf(f32)));
+                            break;
+                        }
+                        return err;
+                    }) orelse {
+                        ready = true; // peer published the SAME actual named key
+                        break;
+                    };
+                    self.executeNativeDenseCold(&plan, old_domain) catch |err| {
+                        if (err == error.NativeWeightPreparationChanged or err == error.PreparedCacheGrowthChanged) continue;
+                        if (err == error.MemoryBudgetExceeded or err == error.ResourceTemporarilyUnavailable) {
+                            try Native.noteDenseTierDenied(cb, data, weight, try std.math.mul(usize, try std.math.mul(usize, request.in_dim, request.out_dim), @sizeOf(f32)));
+                            break;
+                        }
+                        return err;
+                    };
+                    ready = true;
+                    break;
+                } else return error.ResourceTemporarilyUnavailable;
+            }
+            if (ready) ready_mask |= @as(u3, 1) << @intCast(index);
+            if (!ready) {
+                fallback = true;
+                if (!independent) break; // original grouped acquisition stops here
+            }
+        }
+        if (try Native.densePolicySignature(cb, data) != signature) return error.NativeWeightPreparationChanged;
+        if (!try Native.certifyDenseReceiving(cb, data, request, mask, ready_mask)) return error.ResourceTemporarilyUnavailable;
+        return .{ .policy_signature = signature, .selected_mask = mask, .ready_mask = ready_mask, .fallback_direct = fallback };
     }
     fn nativeProjectionPreparation(raw: *anyopaque, cb: *const ops.ComputeBackend, request: *const ops.LinearTripleInvocation) anyerror!bool {
         const self: *PreparedSource = @ptrCast(@alignCast(raw));

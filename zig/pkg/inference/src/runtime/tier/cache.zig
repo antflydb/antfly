@@ -823,16 +823,21 @@ pub const SharedCache = struct {
     }
 
     pub fn notePreparedRelease(self: *SharedCache, tier: ResidencyTier, bytes: usize, independent: usize) void {
-        std.debug.assert(tier != .disk);
-        if (self.admission) |binding| binding.releasePrepared(tier, bytes, independent);
+        self.notePreparedReleaseWithLogical(tier, bytes, bytes, independent);
+    }
+    /// Exact physical data/key/map death may exceed the unchanged cache-policy
+    /// payload. It grants no credit; reductions settle only outside all gates.
+    pub fn notePreparedReleaseWithLogical(self: *SharedCache, tier: ResidencyTier, logical: usize, physical: usize, independent: usize) void {
+        std.debug.assert(tier != .disk and logical <= physical);
+        if (self.admission) |binding| binding.releasePrepared(tier, physical, independent);
         switch (tier) {
             .host => {
-                self.host_bytes -= bytes;
-                self.host_evictions +|= 1;
+                self.host_bytes -= logical;
+                if (logical != 0) self.host_evictions +|= 1;
             },
             .backend => {
-                self.backend_bytes -= bytes;
-                self.backend_evictions +|= 1;
+                self.backend_bytes -= logical;
+                if (logical != 0) self.backend_evictions +|= 1;
             },
             .disk => unreachable,
         }

@@ -81,6 +81,9 @@ const run_memory = runtime.tier.memory;
 const DenseDequantCacheEntry = struct {
     data: []f32,
     bytes: usize,
+    // Exact additional physical data+key storage, independent of the
+    // original payload-only cache retention policy. Zero preserves raw owners.
+    prepared_physical_bytes: usize = 0,
     prepared_shape: ?[]i64 = null,
     projection_widths: [3]usize = @splat(0),
     in_dim: usize = 0,
@@ -824,6 +827,7 @@ pub const WeightStore = struct {
     allow_direct_quant: bool = true,
     gliner_head_dense_cache: std.StringHashMapUnmanaged(DenseDequantCacheEntry) = .{},
     gliner_head_dense_cache_bytes: usize = 0,
+    gliner_head_dense_cache_prepared_map_bytes: usize = 0,
     gliner_head_dense_cache_lock: std.atomic.Mutex = .unlocked,
     quant_dequant_cache_hits: u64 = 0,
     quant_dequant_cache_misses: u64 = 0,
@@ -4542,6 +4546,377 @@ pub const NativeCompute = struct {
         return ResidentWeightPreparation.snapshot(self, name);
     }
 
+    /// One synchronous existing-cache transaction. Allocation and quota happen
+    /// outside Source's gates; source bytes are read only after Model resumes.
+    /// No pointer in this stack-owned state enters a cache or a late Node.
+    pub const DenseCacheCold = struct {
+        const Map = @FieldType(WeightStore, "gliner_head_dense_cache");
+        const Kind = enum { inactive, metadata, entry };
+        kind: Kind = .inactive,
+        compute: *NativeCompute = undefined,
+        storage: ?*const QuantizedStorage = null,
+        name: []const u8 = &.{},
+        raw_pointer: usize = 0,
+        raw_bytes: usize = 0,
+        raw_kind: gguf_tensor_types.TensorType = undefined,
+        selected_workload: @FieldType(QuantizedStorage, "dense_workload") = null,
+        shape: [2]i64 = .{ 0, 0 },
+        representation: u64 = 0,
+        policy: [5]bool = @splat(false),
+        max_bytes: usize = 0,
+        map_pointer: usize = 0,
+        map_count: u32 = 0,
+        map_capacity: u32 = 0,
+        cache_bytes: usize = 0,
+        raw_keys: usize = 0,
+        map_bytes: usize = 0,
+        new_map_bytes: usize = 0,
+        payload_bytes: usize = 0,
+        growth: ?tier_cache_mod.SharedCache.PreparedGrowth = null,
+        staged_name: ?[]u8 = null,
+        staged_values: ?[]f32 = null,
+        staged_map: Map = .empty,
+        old_map: Map = .empty,
+        old_map_bytes: usize = 0,
+
+        fn policies(self: *const NativeCompute) [5]bool {
+            return .{ self.quantized_activation_policy == .strict_f32, quantDequantDenseCacheEnabled(), quantDequantSgemmScratchEnabled(), quantizedDequantSgemmEnabled(), clipClapDequantSgemmEnabled() };
+        }
+        fn lock(data: *WeightStore) void {
+            ResidentWeightPreparation.lock(data);
+            platform.sync.lockYielding(&data.gliner_head_dense_cache_lock);
+        }
+        fn unlock(data: *WeightStore) void {
+            data.gliner_head_dense_cache_lock.unlock();
+            ResidentWeightPreparation.unlock(data);
+        }
+        fn pointer(map: *const Map) usize {
+            return if (map.metadata) |value| @intFromPtr(value) else 0;
+        }
+        /// Execute the SAME stdlib allocation policy against a value copy and
+        /// a failing recorder. No source byte, SDK or external allocator access.
+        fn mapAllocation(map: Map, additional: u32) !usize {
+            const Recorder = struct {
+                bytes: usize = 0,
+                fn alloc(raw: *anyopaque, bytes: usize, _: std.mem.Alignment, _: usize) ?[*]u8 {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    std.debug.assert(self.bytes == 0);
+                    self.bytes = bytes;
+                    return null;
+                }
+                fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+                    return false;
+                }
+                fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+                    return null;
+                }
+                fn free(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize) void {
+                    unreachable;
+                }
+            };
+            var recorder = Recorder{};
+            const allocator = std.mem.Allocator{ .ptr = &recorder, .vtable = &.{ .alloc = Recorder.alloc, .resize = Recorder.resize, .remap = Recorder.remap, .free = Recorder.free } };
+            var copy = map;
+            copy.ensureUnusedCapacity(allocator, additional) catch {
+                if (recorder.bytes == 0) return error.InvalidNativeCacheMetadataLayout;
+                return recorder.bytes;
+            };
+            return 0;
+        }
+        fn currentMapBytes(map: *const Map) !usize {
+            if (map.metadata == null) return 0;
+            // This cache only appends and clears as a whole; available+count
+            // is the exact current max-load entry count, not bucket guessing.
+            const entries = try std.math.add(u32, map.count(), map.available);
+            return mapAllocation(.empty, entries);
+        }
+        fn rawKeyBytes(map: *const Map) !usize {
+            var total: usize = 0;
+            var entries = map.iterator();
+            while (entries.next()) |entry| if (entry.value_ptr.prepared_physical_bytes == 0) {
+                total = try std.math.add(usize, total, entry.key_ptr.*.len);
+            };
+            return total;
+        }
+        fn initial(self: *NativeCompute, kind: Kind) !@This() {
+            const data = self.data;
+            return .{ .kind = kind, .compute = self, .policy = policies(self), .max_bytes = quantDequantDenseCacheMaxBytes(), .map_pointer = pointer(&data.gliner_head_dense_cache), .map_count = data.gliner_head_dense_cache.count(), .map_capacity = data.gliner_head_dense_cache.capacity(), .cache_bytes = data.gliner_head_dense_cache_bytes, .raw_keys = try rawKeyBytes(&data.gliner_head_dense_cache), .map_bytes = try currentMapBytes(&data.gliner_head_dense_cache) };
+        }
+        /// Upgrade existing raw keys/map even when an optional future birth is
+        /// denied. The SAME old data tokens stay intact; no byte lending.
+        pub fn snapshotExistingMetadata(self: *NativeCompute) !?@This() {
+            const data = self.data;
+            lock(data);
+            defer unlock(data);
+            const cache = if (data.tier_cache) |*value| value else return null;
+            if (cache.admission == null) return null; // unchanged raw owner
+            var result = try initial(self, .metadata);
+            if (data.gliner_head_dense_cache_prepared_map_bytes != 0 and data.gliner_head_dense_cache_prepared_map_bytes != result.map_bytes) return error.NativeCacheLayoutChangedOutsidePreparedProtocol;
+            const keys = result.raw_keys;
+            var raw_payload: usize = 0;
+            var entries = data.gliner_head_dense_cache.iterator();
+            while (entries.next()) |entry| if (entry.value_ptr.prepared_physical_bytes == 0) {
+                raw_payload = try std.math.add(usize, raw_payload, entry.value_ptr.bytes);
+            };
+            const map = if (data.gliner_head_dense_cache_prepared_map_bytes == 0) result.map_bytes else 0;
+            const bytes = try std.math.add(usize, keys, map);
+            if (bytes == 0) return null;
+            result.growth = if (raw_payload != 0) try cache.snapshotExistingPhysicalComponentLocked(raw_payload, bytes) else try cache.snapshotPhysicalOwnerGrowthLocked(0, bytes);
+            try result.growth.?.validatePhysicalBacking();
+            return result;
+        }
+        /// Caller has already selected the original dense-first layout and
+        /// holds the actual Model. No declaration is made for an unused route.
+        pub fn snapshotEntry(self: *NativeCompute, weight: CT, in_dim: usize, out_dim: usize) !?@This() {
+            const data = self.data;
+            lock(data);
+            defer unlock(data);
+            const buf = toBuf(weight);
+            if (!buf.whole_named_weight or weightData(self, buf) != data) return error.ForeignNativeWeightModel;
+            const current = data.resident_weights.getPtr(buf.name) orelse if (data.lazy_weights.getPtr(buf.name)) |entry| (if (entry.loaded) |*value| value else return error.NativeWeightPreparationChanged) else return error.NativeWeightPreparationChanged;
+            const storage = if (current.quantized_storage) |*value| value else return error.NativeWeightPreparationChanged;
+            if (storage != buf.quantized_storage or storage.shape.len != 2 or storage.shape[0] != out_dim or storage.shape[1] != in_dim) return error.NativeWeightPreparationChanged;
+            const cache = if (data.tier_cache) |*value| value else return null;
+            if (cache.admission == null) return null;
+            if (data.gliner_head_dense_cache.get(buf.name) != null) return null;
+            var result = try initial(self, .entry);
+            result.name = buf.name;
+            result.storage = storage;
+            result.raw_pointer = @intFromPtr(storage.raw_bytes.ptr);
+            result.raw_bytes = storage.raw_bytes.len;
+            result.raw_kind = storage.tensor_type;
+            result.selected_workload = storage.dense_workload;
+            result.shape = .{ storage.shape[0], storage.shape[1] };
+            result.representation = ResidentWeightPreparation.representationSignature(storage);
+            result.payload_bytes = try std.math.mul(usize, try std.math.mul(usize, in_dim, out_dim), @sizeOf(f32));
+            result.new_map_bytes = try mapAllocation(data.gliner_head_dense_cache, 1);
+            const physical = try std.math.add(usize, try std.math.add(usize, result.payload_bytes, buf.name.len), result.new_map_bytes);
+            result.growth = try cache.snapshotPhysicalOwnerGrowthLocked(result.payload_bytes, physical);
+            try result.growth.?.validatePhysicalBacking();
+            return result;
+        }
+        pub fn fundOutsideExecution(self: *@This(), pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !void {
+            if (self.kind == .inactive) return error.InvalidNativeCachePreparation;
+            try self.growth.?.fundOutsideExecution(pin);
+            if (self.kind == .metadata) return;
+            const allocator = self.compute.data.allocator;
+            self.staged_name = try allocator.dupe(u8, self.name);
+            self.staged_values = try allocator.alloc(f32, self.payload_bytes / @sizeOf(f32));
+            if (self.new_map_bytes != 0) try self.staged_map.ensureTotalCapacity(allocator, try std.math.add(u32, self.map_count, 1));
+        }
+        /// Only actual Model-owned metadata and existing arithmetic below.
+        /// Every allocation/supplier already finished in the cold window.
+        pub fn fillAndCommitUnderModel(self: *@This()) !void {
+            const data = self.compute.data;
+            lock(data);
+            defer unlock(data);
+            if (self.kind == .inactive or !std.meta.eql(self.policy, policies(self.compute)) or self.max_bytes != quantDequantDenseCacheMaxBytes() or self.map_pointer != pointer(&data.gliner_head_dense_cache) or self.map_count != data.gliner_head_dense_cache.count() or self.map_capacity != data.gliner_head_dense_cache.capacity() or self.cache_bytes != data.gliner_head_dense_cache_bytes or self.raw_keys != try rawKeyBytes(&data.gliner_head_dense_cache)) return error.NativeWeightPreparationChanged;
+            if (self.kind == .metadata) {
+                try self.growth.?.commit();
+                var entries = data.gliner_head_dense_cache.iterator();
+                while (entries.next()) |entry| if (entry.value_ptr.prepared_physical_bytes == 0) {
+                    entry.value_ptr.prepared_physical_bytes = entry.value_ptr.bytes + entry.key_ptr.*.len;
+                };
+                data.gliner_head_dense_cache_prepared_map_bytes = self.map_bytes;
+                return;
+            }
+            const current = data.resident_weights.getPtr(self.name) orelse if (data.lazy_weights.getPtr(self.name)) |entry| (if (entry.loaded) |*value| value else return error.NativeWeightPreparationChanged) else return error.NativeWeightPreparationChanged;
+            const storage = if (current.quantized_storage) |*value| value else return error.NativeWeightPreparationChanged;
+            if (storage != self.storage or !std.meta.eql(storage.dense_workload, self.selected_workload) or @intFromPtr(storage.raw_bytes.ptr) != self.raw_pointer or storage.raw_bytes.len != self.raw_bytes or !std.meta.eql(storage.tensor_type, self.raw_kind) or storage.shape.len != 2 or !std.mem.eql(i64, storage.shape, &self.shape) or ResidentWeightPreparation.representationSignature(storage) != self.representation) return error.NativeWeightPreparationChanged;
+            const name = self.staged_name orelse return error.UnfundedNativeCachePreparation;
+            const values = self.staged_values orelse return error.UnfundedNativeCachePreparation;
+            // Original codec, original source and destination shape. No MatMul
+            // or inference node is executed/replayed by cache preparation.
+            try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, values);
+            if (self.new_map_bytes != 0) {
+                var entries = data.gliner_head_dense_cache.iterator();
+                while (entries.next()) |entry| self.staged_map.putAssumeCapacityNoClobber(entry.key_ptr.*, entry.value_ptr.*);
+            }
+            try self.growth.?.commit(); // LAST fallible step before publication
+            if (self.new_map_bytes != 0) {
+                self.old_map = data.gliner_head_dense_cache;
+                self.old_map_bytes = data.gliner_head_dense_cache_prepared_map_bytes;
+                std.debug.assert(self.old_map_bytes == self.map_bytes);
+                data.gliner_head_dense_cache = self.staged_map;
+                self.staged_map = .empty;
+                data.gliner_head_dense_cache_prepared_map_bytes = self.new_map_bytes;
+            }
+            data.gliner_head_dense_cache.putAssumeCapacityNoClobber(name, .{ .data = values, .bytes = self.payload_bytes, .prepared_physical_bytes = self.payload_bytes + name.len });
+            self.staged_name = null;
+            self.staged_values = null;
+            data.gliner_head_dense_cache_bytes += self.payload_bytes;
+            data.quant_dequant_cache_inserts += 1;
+        }
+        /// Caller ended Model/lane/cache ownership before settling both
+        /// unused quota and obsolete map/credit-array metadata.
+        pub fn finishOutsideExecution(self: *@This()) void {
+            if (self.kind == .inactive) return;
+            const data = self.compute.data;
+            if (self.staged_values) |values| data.allocator.free(values);
+            if (self.staged_name) |name| data.allocator.free(name);
+            self.staged_map.deinit(data.allocator);
+            self.old_map.deinit(data.allocator);
+            if (self.old_map_bytes != 0) {
+                ResidentWeightPreparation.lock(data);
+                if (data.tier_cache) |*cache| cache.notePreparedReleaseWithLogical(.host, 0, self.old_map_bytes, self.old_map_bytes);
+                ResidentWeightPreparation.unlock(data);
+            }
+            if (self.growth) |*growth| growth.finishOutsideExecution();
+            if (data.tier_cache) |*cache| cache.flushReleasedOutsideExecution() catch {};
+            self.* = .{};
+        }
+    };
+
+    pub fn snapshotDenseCacheMetadata(cb: *const ComputeBackend, expected_data: *const anyopaque) !?DenseCacheCold {
+        _ = try densePolicySignature(cb, expected_data);
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        return DenseCacheCold.snapshotExistingMetadata(self);
+    }
+    pub fn snapshotDenseCacheEntry(cb: *const ComputeBackend, expected_data: *const anyopaque, weight: CT, in_dim: usize, out_dim: usize) !?DenseCacheCold {
+        _ = try densePolicySignature(cb, expected_data);
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        return DenseCacheCold.snapshotEntry(self, weight, in_dim, out_dim);
+    }
+    pub const DenseCacheState = enum { ready, cold, unavailable };
+    pub fn densePolicySignature(cb: *const ComputeBackend, expected_data: *const anyopaque) !u64 {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        var hash = std.hash.Wyhash.init(0);
+        const flags = DenseCacheCold.policies(self);
+        const limit = quantDequantDenseCacheMaxBytes();
+        hash.update(std.mem.asBytes(&flags));
+        hash.update(std.mem.asBytes(&limit));
+        return hash.final();
+    }
+    /// Exact original producer selection. No family/config names, source byte
+    /// access, allocator, cache mutation or numerical operation occurs here.
+    pub fn selectedDenseProjectionMask(cb: *const ComputeBackend, expected_data: *const anyopaque, request: *const ops.NativeLinearPreparation) !u3 {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        if (self.cache_embeddinggemma2_bf16_weights or quantDequantSgemmScratchEnabled()) return 0; // original scratch/packed contract, no new receipt
+        if (request.rows == 0 or request.in_dim == 0 or request.out_dim == 0) return error.InvalidQuantizedLinearShape;
+        if (self.data.tier_cache == null or self.data.tier_cache.?.admission == null) return 0; // unchanged raw contract
+        const strict = self.quantized_activation_policy == .strict_f32;
+        var result: u3 = 0;
+        var all_quantized = true;
+        var pair_direct = true;
+        var first_type: ?gguf_tensor_types.TensorType = null;
+        for (0..request.count()) |index| {
+            const weight = request.weights[index] orelse return error.InvalidQuantizedLinearShape;
+            const buf = toBuf(weight);
+            const storage = buf.quantized_storage orelse {
+                all_quantized = false;
+                pair_direct = false;
+                continue;
+            };
+            if (!buf.whole_named_weight or buf.owned_quantized_storage != null or weightData(self, buf) != self.data) return 0; // original non-cache-backed/foreign parameter contract
+            if (storage.shape.len != 2 or storage.shape[0] != request.out_dim or storage.shape[1] != request.in_dim) return error.InvalidQuantizedLinearShape;
+            if (first_type) |first| {
+                if (!first.eql(storage.tensor_type)) pair_direct = false;
+            } else first_type = storage.tensor_type;
+            const known: ?gguf_tensor_types.KnownTensorType = switch (storage.tensor_type) {
+                .known => |kind| kind,
+                else => null,
+            };
+            if (known == null or !dequantSgemmSupportedQuant(known.?) or storage.packed_expert != null or request.in_dim % (gguf_tensor_types.valuesPerBlock(storage.tensor_type) orelse return error.InvalidQuantizedLinearShape) != 0) pair_direct = false;
+            if (!strict and shouldUseLayaDequantSgemm(buf.name) and layaDequantSgemmSupported(storage, request.in_dim, request.out_dim)) return 0; // original mandatory scratch route remains unchanged
+            if (shouldUseQuantizedDequantSgemm(buf.name, request.rows, request.out_dim, storage)) result |= @as(u3, 1) << @intCast(index);
+        }
+        if (!strict and request.kind == .pair_no_bias and all_quantized and pair_direct) return 0;
+        if (!strict and all_quantized and pair_direct and (request.kind == .pair_bias or request.kind == .triple_bias) and result != @as(u3, @intCast((@as(u4, 1) << @intCast(request.count())) - 1))) return 0;
+        return result;
+    }
+    /// Same counters and chronological warm/miss/cap decisions as the original
+    /// producer. A received preparation suppresses a second hot reservation.
+    pub fn inspectDenseCache(cb: *const ComputeBackend, expected_data: *const anyopaque, weight: CT, in_dim: usize, out_dim: usize) !DenseCacheState {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        const buf = toBuf(weight);
+        if (!buf.whole_named_weight or weightData(self, buf) != self.data) return error.ForeignNativeWeightModel;
+        const data = self.data;
+        platform.sync.lockYielding(&data.gliner_head_dense_cache_lock);
+        defer data.gliner_head_dense_cache_lock.unlock();
+        const bytes = try std.math.mul(usize, try std.math.mul(usize, in_dim, out_dim), @sizeOf(f32));
+        const max_bytes = quantDequantDenseCacheMaxBytes();
+        if (!quantDequantDenseCacheEnabled()) {
+            data.quant_dequant_cache_disabled += 1;
+            return .unavailable;
+        }
+        if (bytes == 0 or bytes > max_bytes) {
+            data.quant_dequant_cache_too_large += 1;
+            return .unavailable;
+        }
+        if (data.gliner_head_dense_cache.contains(buf.name)) {
+            data.quant_dequant_cache_hits += 1;
+            return .ready;
+        }
+        data.quant_dequant_cache_misses += 1;
+        if (data.gliner_head_dense_cache_bytes > max_bytes or bytes > max_bytes - data.gliner_head_dense_cache_bytes) {
+            data.quant_dequant_cache_capacity_denied += 1;
+            return .unavailable;
+        }
+        return .cold;
+    }
+    pub fn noteDenseTierDenied(cb: *const ComputeBackend, expected_data: *const anyopaque, weight: CT, bytes: usize) !void {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        DenseCacheCold.lock(self.data);
+        defer DenseCacheCold.unlock(self.data);
+        self.data.quant_dequant_cache_tier_denied += 1;
+        if (self.data.tier_cache) |*cache| {
+            cache.noteDenied(.host, bytes);
+            noteSharedCacheDenial(self.run_budget, cache, .host, bytes);
+            logSharedCacheDenial("quant_dequant_dense_cache", cache, toBuf(weight).name);
+        }
+    }
+    pub fn denseUsesIndependentProjections(cb: *const ComputeBackend, expected_data: *const anyopaque, request: *const ops.NativeLinearPreparation) !bool {
+        if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        if (self.quantized_activation_policy == .strict_f32 or request.count() == 1) return true;
+        var first_type: ?gguf_tensor_types.TensorType = null;
+        var same_type = true;
+        var all_dense = true;
+        for (0..request.count()) |index| {
+            const buf = toBuf(request.weights[index].?);
+            const storage = buf.quantized_storage orelse return true;
+            if (first_type) |first| {
+                if (!first.eql(storage.tensor_type)) same_type = false;
+            } else first_type = storage.tensor_type;
+            all_dense = all_dense and shouldUseQuantizedDequantSgemm(buf.name, request.rows, request.out_dim, storage);
+        }
+        return !same_type and (!all_dense or request.kind == .pair_no_bias);
+    }
+
+    /// FINAL metadata-only certification under the actual resumed Model. No
+    /// supplier/allocator/codec runs here. A prior successful cold publication
+    /// is not proof that a peer left that entry alive through the final yield.
+    pub fn certifyDenseReceiving(cb: *const ComputeBackend, expected_data: *const anyopaque, request: *const ops.NativeLinearPreparation, selected_mask: u3, ready_mask: u3) !bool {
+        if (try selectedDenseProjectionMask(cb, expected_data, request) != selected_mask or (ready_mask & ~selected_mask) != 0) return false;
+        const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+        const data = self.data;
+        DenseCacheCold.lock(data);
+        defer DenseCacheCold.unlock(data);
+        if (data.gliner_head_dense_cache_prepared_map_bytes != try DenseCacheCold.currentMapBytes(&data.gliner_head_dense_cache) or try DenseCacheCold.rawKeyBytes(&data.gliner_head_dense_cache) != 0) return false;
+        const expected_bytes = try std.math.mul(usize, try std.math.mul(usize, request.in_dim, request.out_dim), @sizeOf(f32));
+        for (0..request.count()) |index| {
+            const bit = @as(u3, 1) << @intCast(index);
+            if ((selected_mask & bit) == 0) continue;
+            const buf = toBuf(request.weights[index].?);
+            const current = data.resident_weights.getPtr(buf.name) orelse if (data.lazy_weights.getPtr(buf.name)) |entry| (if (entry.loaded) |*value| value else return false) else return false;
+            const source = if (current.quantized_storage) |*value| value else return false;
+            if (source != buf.quantized_storage) return false;
+            if (data.gliner_head_dense_cache.get(buf.name)) |entry| {
+                if (entry.bytes != expected_bytes or entry.data.len != expected_bytes / @sizeOf(f32) or entry.prepared_physical_bytes != try std.math.add(usize, expected_bytes, buf.name.len)) return false;
+            } else if ((ready_mask & bit) != 0) return false;
+        }
+        return true;
+    }
+
     pub const ProjectionGroupState = enum { ignored, ready, cold, cold_existing };
 
     /// The receiving Source owns the actual Model. This query only borrows
@@ -5226,9 +5601,17 @@ pub fn deinitGlinerHeadDenseCache(data: *WeightStore) void {
     while (it.next()) |entry| {
         data.allocator.free(entry.key_ptr.*);
         data.allocator.free(entry.value_ptr.data);
-        if (data.tier_cache) |*tier_cache| tier_cache.noteRelease(.host, entry.value_ptr.bytes);
+        if (data.tier_cache) |*tier_cache| {
+            const physical = entry.value_ptr.prepared_physical_bytes;
+            if (physical != 0) tier_cache.notePreparedReleaseWithLogical(.host, entry.value_ptr.bytes, physical, physical) else tier_cache.noteRelease(.host, entry.value_ptr.bytes);
+        }
     }
     data.gliner_head_dense_cache.deinit(data.allocator);
+    if (data.gliner_head_dense_cache_prepared_map_bytes != 0) if (data.tier_cache) |*tier_cache| {
+        const bytes = data.gliner_head_dense_cache_prepared_map_bytes;
+        tier_cache.notePreparedReleaseWithLogical(.host, 0, bytes, bytes);
+    };
+    data.gliner_head_dense_cache_prepared_map_bytes = 0;
     data.gliner_head_dense_cache = .{};
     data.gliner_head_dense_cache_bytes = 0;
 }
@@ -5421,6 +5804,9 @@ const native_cold_cleanup_services: ops.ColdCleanupServices = .{
     .free = freeTensorWithCleanup,
     .deinit_backend = deinitBackendWithCleanup,
     .linear_triple = linearTripleWithCleanup,
+    .linear_prepared = linearDenseWithCleanup,
+    .linear_lora_prepared = linearLoraDenseWithCleanup,
+    .linear_pair_prepared = linearPairDenseWithCleanup,
 };
 fn acceptsColdCleanupImplementation(table: *const ComputeBackend.VTable) bool {
     return table == &vtable_impl;
@@ -7029,6 +7415,7 @@ const QuantLinearKind = enum {
 };
 
 const QuantLinearRequest = struct {
+    dense_prepared: bool = false,
     cleanup: @import("../execution/cleanup_context.zig").Context = .{},
     group_prepared: bool = false,
     compute: *NativeCompute,
@@ -7085,7 +7472,7 @@ fn dispatchQuantizedLinear(request: QuantLinearRequest) !bool {
                 if (try tryLayaDequantSgemmNoBias(self, request.storage_a, request.input, request.output_a, request.rows, request.in_dim, request.out_dim)) return true;
             }
             if (shouldUseQuantizedDequantSgemm(request.name_a, request.rows, request.out_dim, request.storage_a)) {
-                if (try tryLinearQuantizedDequantSgemmGroupedFromStores(1, false, self, .{stores[0]}, .{request.storage_a}, .{request.name_a}, .{&.{}}, request.input, .{request.output_a}, request.rows, request.in_dim, request.out_dim)) return true;
+                if (try tryLinearQuantizedDequantSgemmGroupedFromStores(1, false, self, .{stores[0]}, .{request.storage_a}, .{request.name_a}, .{&.{}}, request.input, .{request.output_a}, request.rows, request.in_dim, request.out_dim, request.dense_prepared)) return true;
             }
             if (try linearNoBiasQuantized(self.io, request.storage_a, request.input, request.output_a, request.rows, request.in_dim, request.out_dim)) return true;
             return false;
@@ -7096,7 +7483,7 @@ fn dispatchQuantizedLinear(request: QuantLinearRequest) !bool {
                 if (try tryLayaDequantSgemmBias(self, request.storage_a, request.input, bias, request.output_a, request.rows, request.in_dim, request.out_dim)) return true;
             }
             if (shouldUseQuantizedDequantSgemm(request.name_a, request.rows, request.out_dim, request.storage_a)) {
-                if (try tryLinearQuantizedDequantSgemmGroupedFromStores(1, true, self, .{stores[0]}, .{request.storage_a}, .{request.name_a}, .{bias}, request.input, .{request.output_a}, request.rows, request.in_dim, request.out_dim)) return true;
+                if (try tryLinearQuantizedDequantSgemmGroupedFromStores(1, true, self, .{stores[0]}, .{request.storage_a}, .{request.name_a}, .{bias}, request.input, .{request.output_a}, request.rows, request.in_dim, request.out_dim, request.dense_prepared)) return true;
             }
             if (q4q5FusedSingleBiasEnabled()) {
                 if (try linearQ4Q5KPreparedQ8KActivationWithBias(self.io, request.storage_a, request.input, bias, request.output_a, request.rows, request.in_dim, request.out_dim)) return true;
@@ -7121,7 +7508,7 @@ fn dispatchQuantizedLinear(request: QuantLinearRequest) !bool {
             if (shouldUseQuantizedDequantSgemm(request.name_a, request.rows, request.out_dim, request.storage_a) and
                 shouldUseQuantizedDequantSgemm(request.name_b, request.rows, request.out_dim, storage_b))
             {
-                if (try tryLinearQuantizedDequantSgemmGroupedFromStores(2, true, self, .{ stores[0], stores[1] }, .{ request.storage_a, storage_b }, .{ request.name_a, request.name_b }, .{ bias_a, bias_b }, request.input, .{ request.output_a, output_b }, request.rows, request.in_dim, request.out_dim)) return true;
+                if (try tryLinearQuantizedDequantSgemmGroupedFromStores(2, true, self, .{ stores[0], stores[1] }, .{ request.storage_a, storage_b }, .{ request.name_a, request.name_b }, .{ bias_a, bias_b }, request.input, .{ request.output_a, output_b }, request.rows, request.in_dim, request.out_dim, request.dense_prepared)) return true;
             }
             if (request.storage_a.tensor_type.eql(.{ .known = .Q8_0 }) and
                 storage_b.tensor_type.eql(.{ .known = .Q8_0 }) and
@@ -7156,7 +7543,7 @@ fn dispatchQuantizedLinear(request: QuantLinearRequest) !bool {
                 shouldUseQuantizedDequantSgemm(request.name_b, request.rows, request.out_dim, storage_b) and
                 shouldUseQuantizedDequantSgemm(request.name_c, request.rows, request.out_dim, storage_c))
             {
-                if (try tryLinearQuantizedDequantSgemmGroupedFromStores(3, true, self, stores, .{ request.storage_a, storage_b, storage_c }, .{ request.name_a, request.name_b, request.name_c }, .{ bias_a, bias_b, bias_c }, request.input, .{ request.output_a, output_b, output_c }, request.rows, request.in_dim, request.out_dim)) return true;
+                if (try tryLinearQuantizedDequantSgemmGroupedFromStores(3, true, self, stores, .{ request.storage_a, storage_b, storage_c }, .{ request.name_a, request.name_b, request.name_c }, .{ bias_a, bias_b, bias_c }, request.input, .{ request.output_a, output_b, output_c }, request.rows, request.in_dim, request.out_dim, request.dense_prepared)) return true;
             }
             if (request.weight_buf_a) |weight_buf_a| {
                 if (request.weight_buf_b) |weight_buf_b| {
@@ -7207,7 +7594,7 @@ fn dispatchQuantizedLinearStrictF32(request: QuantLinearRequest) !bool {
         // This existing path uses F32 SGEMM and the bounded shared dense
         // cache/scratch policy. It never creates a quantized activation.
         const dense = shouldUseQuantizedDequantSgemm(names[index], request.rows, request.out_dim, storage) and
-            try tryLinearQuantizedDequantSgemmGroupedFromStores(1, false, self, .{stores[index]}, .{storage}, .{names[index]}, .{&.{}}, request.input, .{output}, request.rows, request.in_dim, request.out_dim);
+            try tryLinearQuantizedDequantSgemmGroupedFromStores(1, false, self, .{stores[index]}, .{storage}, .{names[index]}, .{&.{}}, request.input, .{output}, request.rows, request.in_dim, request.out_dim, request.dense_prepared);
         if (!dense and !try linearNoBiasQuantizedWithPolicy(.strict_f32, self.io, storage, request.input, output, request.rows, request.in_dim, request.out_dim)) return false;
         if (has_bias) addLinearBiasRows(output, biases[index].?, request.rows, request.out_dim);
     }
@@ -7219,6 +7606,10 @@ fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_di
 }
 
 fn linearInto(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize, output: []f32) anyerror!void {
+    return linearIntoPrepared(ctx, input, weight, bias, rows, in_dim, out_dim, output, false);
+}
+
+fn linearIntoPrepared(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize, output: []f32, dense_prepared: bool) anyerror!void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const weight_buf = toBuf(weight);
@@ -7230,6 +7621,7 @@ fn linearInto(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_
     if (weight_buf.quantized_storage) |storage| {
         if (try dispatchQuantizedLinear(.{
             .compute = self,
+            .dense_prepared = dense_prepared,
             .kind = .single_bias,
             .input = getData(input),
             .rows = rows,
@@ -7302,24 +7694,33 @@ const DenseDequantForSgemm = struct {
     }
 };
 
-fn denseDequantForSgemmFromStore(
+fn denseDequantForSgemmFromStorePrepared(
     self: *NativeCompute,
     data: ?*WeightStore,
     storage: *const QuantizedStorage,
     name: []const u8,
     in_dim: usize,
     out_dim: usize,
+    dense_prepared: bool,
 ) !?DenseDequantForSgemm {
     const statistics = data orelse self.data;
     if (storage.shape.len != 2 or storage.shape[0] != out_dim or storage.shape[1] != in_dim) return error.InvalidQuantizedLinearShape;
     if (data) |owner| {
-        if (try cachedQuantDequantDenseWeightFromStore(self, owner, name, storage, in_dim, out_dim)) |cached| return .{ .data = cached };
+        if (dense_prepared) {
+            platform.sync.lockYielding(&owner.gliner_head_dense_cache_lock);
+            defer owner.gliner_head_dense_cache_lock.unlock();
+            const bytes = try std.math.mul(usize, try std.math.mul(usize, in_dim, out_dim), @sizeOf(f32));
+            if (quantDequantDenseCacheEnabled() and bytes != 0 and bytes <= quantDequantDenseCacheMaxBytes()) {
+                if (owner.gliner_head_dense_cache.get(name)) |cached| return .{ .data = cached.data };
+            }
+        } else if (try cachedQuantDequantDenseWeightFromStore(self, owner, name, storage, in_dim, out_dim)) |cached| return .{ .data = cached };
     }
     if (!quantDequantSgemmScratchEnabled()) {
         statistics.quant_dequant_cache_scratch_denied += 1;
         return null;
     }
 
+    if (dense_prepared) return error.NativeDensePreparationPolicyChanged; // no undeclared scratch birth
     const scratch = try self.allocator.alloc(f32, out_dim * in_dim);
     errdefer self.allocator.free(scratch);
     try quant_codec.dequantizeToFloat32(storage.tensor_type, storage.raw_bytes, scratch);
@@ -7340,7 +7741,7 @@ fn tryLinearQuantizedDequantSgemmGrouped(
     in_dim: usize,
     out_dim: usize,
 ) !bool {
-    return tryLinearQuantizedDequantSgemmGroupedFromStores(count, with_bias, self, @splat(self.data), storages, names, biases, input, outputs, rows, in_dim, out_dim);
+    return tryLinearQuantizedDequantSgemmGroupedFromStores(count, with_bias, self, @splat(self.data), storages, names, biases, input, outputs, rows, in_dim, out_dim, false);
 }
 
 fn tryLinearQuantizedDequantSgemmGroupedFromStores(
@@ -7356,6 +7757,7 @@ fn tryLinearQuantizedDequantSgemmGroupedFromStores(
     rows: usize,
     in_dim: usize,
     out_dim: usize,
+    dense_prepared: bool,
 ) !bool {
     const dequant_start = nativeQuantPhaseStart();
     var dense: [count]DenseDequantForSgemm = undefined;
@@ -7365,7 +7767,7 @@ fn tryLinearQuantizedDequantSgemmGroupedFromStores(
         dense[acquired].deinit(self.allocator);
     };
     inline for (0..count) |i| {
-        dense[i] = (try denseDequantForSgemmFromStore(self, data[i], storages[i], names[i], in_dim, out_dim)) orelse return false;
+        dense[i] = (try denseDequantForSgemmFromStorePrepared(self, data[i], storages[i], names[i], in_dim, out_dim, dense_prepared)) orelse return false;
         acquired += 1;
     }
     noteNativeQuantOuterDispatch(switch (count) {
@@ -7504,6 +7906,23 @@ fn linearLoRAOp(
     in_dim: usize,
     out_dim: usize,
 ) anyerror!CT {
+    return linearLoRAPrepared(ctx, input, base_weight, bias, lora_a, lora_b, alpha, rank, rows, in_dim, out_dim, false);
+}
+
+fn linearLoRAPrepared(
+    ctx: *anyopaque,
+    input: CT,
+    base_weight: CT,
+    bias: CT,
+    lora_a: CT,
+    lora_b: CT,
+    alpha: f32,
+    rank: usize,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    dense_prepared: bool,
+) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, lora_a);
     defer maybeDiscardMappedWeightAfterUse(self, lora_b);
@@ -7518,7 +7937,7 @@ fn linearLoRAOp(
     // Reuse the base route so typed and quantized-only weights remain valid
     // when an adapter adds its residual to the same output buffer. The merged
     // base route also preserves the GLiNER strict-F32 activation policy.
-    const result = try linearOp(ctx, input, base_weight, bias, rows, in_dim, out_dim);
+    const result = try allocateLinearOutputPrepared(ctx, input, base_weight, bias, rows, in_dim, out_dim, null, dense_prepared);
     errdefer freeTensor(self, result);
     const output = getData(result);
 
@@ -9153,6 +9572,10 @@ fn linearNoBiasOp(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: u
 }
 
 fn linearNoBiasInto(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, output: []f32) anyerror!void {
+    return linearNoBiasIntoPrepared(ctx, input, weight, rows, in_dim, out_dim, output, false);
+}
+
+fn linearNoBiasIntoPrepared(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim: usize, out_dim: usize, output: []f32, dense_prepared: bool) anyerror!void {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     defer maybeDiscardMappedWeightAfterUse(self, weight);
     const weight_buf = toBuf(weight);
@@ -9163,6 +9586,7 @@ fn linearNoBiasInto(ctx: *anyopaque, input: CT, weight: CT, rows: usize, in_dim:
         @memset(output, 0.0);
         if (try dispatchQuantizedLinear(.{
             .compute = self,
+            .dense_prepared = dense_prepared,
             .kind = .single_no_bias,
             .input = getData(input),
             .rows = rows,
@@ -9313,6 +9737,19 @@ fn linearNoBiasPairOp(
     in_dim: usize,
     out_dim: usize,
 ) anyerror!ops.LinearNoBiasPairResult {
+    return linearNoBiasPairPrepared(ctx, input, weight_a, weight_b, rows, in_dim, out_dim, false);
+}
+
+fn linearNoBiasPairPrepared(
+    ctx: *anyopaque,
+    input: CT,
+    weight_a: CT,
+    weight_b: CT,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    dense_prepared: bool,
+) anyerror!ops.LinearNoBiasPairResult {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const weight_buf_a = toBuf(weight_a);
     const weight_buf_b = toBuf(weight_b);
@@ -9324,6 +9761,7 @@ fn linearNoBiasPairOp(
             defer outputs.deinit(self);
             if (try dispatchQuantizedLinear(.{
                 .compute = self,
+                .dense_prepared = dense_prepared,
                 .kind = .pair_no_bias,
                 .input = getData(input),
                 .rows = rows,
@@ -9344,9 +9782,9 @@ fn linearNoBiasPairOp(
         }
     }
 
-    const first = try linearNoBiasOp(ctx, input, weight_a, rows, in_dim, out_dim);
+    const first = try allocateLinearOutputPrepared(ctx, input, weight_a, null, rows, in_dim, out_dim, null, dense_prepared);
     errdefer freeTensor(ctx, first);
-    const second = try linearNoBiasOp(ctx, input, weight_b, rows, in_dim, out_dim);
+    const second = try allocateLinearOutputPrepared(ctx, input, weight_b, null, rows, in_dim, out_dim, null, dense_prepared);
     return .{ .first = first, .second = second };
 }
 
@@ -9565,6 +10003,21 @@ fn linearPairOp(
     in_dim: usize,
     out_dim: usize,
 ) anyerror!ops.LinearPairResult {
+    return linearPairPrepared(ctx, input, weight_a, bias_a, weight_b, bias_b, rows, in_dim, out_dim, false);
+}
+
+fn linearPairPrepared(
+    ctx: *anyopaque,
+    input: CT,
+    weight_a: CT,
+    bias_a: CT,
+    weight_b: CT,
+    bias_b: CT,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    dense_prepared: bool,
+) anyerror!ops.LinearPairResult {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const weight_buf_a = toBuf(weight_a);
     const weight_buf_b = toBuf(weight_b);
@@ -9578,6 +10031,7 @@ fn linearPairOp(
 
             const used_quant_pair = try dispatchQuantizedLinear(.{
                 .compute = self,
+                .dense_prepared = dense_prepared,
                 .kind = .pair_bias,
                 .input = getData(input),
                 .rows = rows,
@@ -9602,9 +10056,9 @@ fn linearPairOp(
         }
     }
 
-    const first = try linearOp(ctx, input, weight_a, bias_a, rows, in_dim, out_dim);
+    const first = try allocateLinearOutputPrepared(ctx, input, weight_a, bias_a, rows, in_dim, out_dim, null, dense_prepared);
     errdefer freeTensor(ctx, first);
-    const second = try linearOp(ctx, input, weight_b, bias_b, rows, in_dim, out_dim);
+    const second = try allocateLinearOutputPrepared(ctx, input, weight_b, bias_b, rows, in_dim, out_dim, null, dense_prepared);
     return .{ .first = first, .second = second };
 }
 
@@ -9800,13 +10254,46 @@ fn linearTripleNoBiasOp(ctx: *anyopaque, input: CT, a: CT, b: CT, c: CT, rows: u
     return .{ .first = first, .second = second, .third = third };
 }
 
+fn validateNativeDenseReceipt(cb: *const ComputeBackend, request: *const ops.NativeLinearPreparation, receipt: *const ops.NativeLinearPrepared, current: @import("../execution/cleanup_context.zig").Context) !void {
+    if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+    const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+    if (try epoch.isSealed()) return error.RetirementEpochSealed;
+    const self: *NativeCompute = @ptrCast(@alignCast(cb.ptr));
+    if (try NativeCompute.densePolicySignature(cb, self.data) != receipt.policy_signature) return error.NativeDensePreparationPolicyChanged;
+    // Also runs AFTER an optional grouped-panel preparation callback, which
+    // can be the last actual Source yield between receipt creation and math.
+    if (!try NativeCompute.certifyDenseReceiving(cb, self.data, request, receipt.selected_mask, receipt.ready_mask)) return error.ResourceTemporarilyUnavailable;
+}
+fn linearDenseWithCleanup(cb: *const ComputeBackend, request: *const ops.NativeLinearPreparation, receipt: *const ops.NativeLinearPrepared, current: @import("../execution/cleanup_context.zig").Context) !CT {
+    try validateNativeDenseReceipt(cb, request, receipt, current);
+    if (request.count() != 1) return error.InvalidQuantizedLinearShape;
+    return allocateLinearOutputPrepared(cb.ptr, request.input, request.weights[0].?, request.biases[0], request.rows, request.in_dim, request.out_dim, null, true);
+}
+fn linearLoraDenseWithCleanup(cb: *const ComputeBackend, request: *const ops.NativeLinearPreparation, receipt: *const ops.NativeLinearPrepared, lora_a: CT, lora_b: CT, alpha: f32, rank: usize, current: @import("../execution/cleanup_context.zig").Context) !CT {
+    try validateNativeDenseReceipt(cb, request, receipt, current);
+    if (request.kind != .single_bias) return error.InvalidQuantizedLinearShape;
+    return linearLoRAPrepared(cb.ptr, request.input, request.weights[0].?, request.biases[0].?, lora_a, lora_b, alpha, rank, request.rows, request.in_dim, request.out_dim, true);
+}
+
+fn linearPairDenseWithCleanup(cb: *const ComputeBackend, request: *const ops.NativeLinearPreparation, receipt: *const ops.NativeLinearPrepared, current: @import("../execution/cleanup_context.zig").Context) !ops.LinearPairResult {
+    try validateNativeDenseReceipt(cb, request, receipt, current);
+    if (request.kind == .pair_bias) return linearPairPrepared(cb.ptr, request.input, request.weights[0].?, request.biases[0].?, request.weights[1].?, request.biases[1].?, request.rows, request.in_dim, request.out_dim, true);
+    if (request.kind != .pair_no_bias) return error.InvalidQuantizedLinearShape;
+    const pair = try linearNoBiasPairPrepared(cb.ptr, request.input, request.weights[0].?, request.weights[1].?, request.rows, request.in_dim, request.out_dim, true);
+    return .{ .first = pair.first, .second = pair.second };
+}
+
 fn linearTripleWithCleanup(cb: *const ComputeBackend, request: *const ops.LinearTripleInvocation, current: @import("../execution/cleanup_context.zig").Context) !ops.LinearTripleResult {
     if (cb.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+    if (request.dense_prepared) {
+        const selected = ops.NativeLinearPreparation{ .kind = .triple_bias, .input = request.input, .weights = .{ request.weights[0], request.weights[1], request.weights[2] }, .biases = .{ request.biases[0], request.biases[1], request.biases[2] }, .rows = request.rows, .in_dim = request.in_dim, .out_dim = request.out_dim };
+        try validateNativeDenseReceipt(cb, &selected, &.{ .policy_signature = request.dense_policy_signature, .selected_mask = request.dense_selected_mask, .ready_mask = request.dense_ready_mask, .fallback_direct = request.dense_fallback }, current);
+    }
     if (request.group_prepared) {
         const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
         if (try epoch.isSealed()) return error.RetirementEpochSealed;
     }
-    return linearTripleImpl(cb.ptr, request.input, request.weights[0], request.biases[0], request.weights[1], request.biases[1], request.weights[2], request.biases[2], request.rows, request.in_dim, request.out_dim, current, request.group_prepared);
+    return linearTripleImpl(cb.ptr, request.input, request.weights[0], request.biases[0], request.weights[1], request.biases[1], request.weights[2], request.biases[2], request.rows, request.in_dim, request.out_dim, current, request.group_prepared, request.dense_prepared);
 }
 
 fn linearTripleOp(
@@ -9822,7 +10309,7 @@ fn linearTripleOp(
     in_dim: usize,
     out_dim: usize,
 ) anyerror!ops.LinearTripleResult {
-    return linearTripleImpl(ctx, input, weight_a, bias_a, weight_b, bias_b, weight_c, bias_c, rows, in_dim, out_dim, .{}, false);
+    return linearTripleImpl(ctx, input, weight_a, bias_a, weight_b, bias_b, weight_c, bias_c, rows, in_dim, out_dim, .{}, false, false);
 }
 
 fn linearTripleImpl(
@@ -9839,6 +10326,7 @@ fn linearTripleImpl(
     out_dim: usize,
     current: @import("../execution/cleanup_context.zig").Context,
     group_prepared: bool,
+    dense_prepared: bool,
 ) anyerror!ops.LinearTripleResult {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     const weight_buf_a = toBuf(weight_a);
@@ -9870,6 +10358,7 @@ fn linearTripleImpl(
                     .kind = .triple_bias,
                     .cleanup = current,
                     .group_prepared = group_prepared,
+                    .dense_prepared = dense_prepared,
                     .input = getData(input),
                     .rows = rows,
                     .in_dim = in_dim,
@@ -9899,11 +10388,11 @@ fn linearTripleImpl(
         }
     }
 
-    const first = try linearOp(ctx, input, weight_a, bias_a, rows, in_dim, out_dim);
+    const first = try allocateLinearOutputPrepared(ctx, input, weight_a, bias_a, rows, in_dim, out_dim, null, dense_prepared);
     errdefer freeTensor(ctx, first);
-    const second = try linearOp(ctx, input, weight_b, bias_b, rows, in_dim, out_dim);
+    const second = try allocateLinearOutputPrepared(ctx, input, weight_b, bias_b, rows, in_dim, out_dim, null, dense_prepared);
     errdefer freeTensor(ctx, second);
-    const third = try linearOp(ctx, input, weight_c, bias_c, rows, in_dim, out_dim);
+    const third = try allocateLinearOutputPrepared(ctx, input, weight_c, bias_c, rows, in_dim, out_dim, null, dense_prepared);
     return .{ .first = first, .second = second, .third = third };
 }
 
@@ -12586,7 +13075,7 @@ fn selectedProjectionGroupStorage(self: *NativeCompute, request: *const ops.Line
         storage.* = buf.quantized_storage orelse return null;
     }
     if (!canPrepareQ4Q5QKVPanel16Cache(stores[0], stores[1], stores[2], toBuf(request.weights[1]).name, toBuf(request.weights[2]).name, request.in_dim, request.out_dim, request.rows)) return null;
-    if (shouldUseQuantizedDequantSgemm(toBuf(request.weights[0]).name, request.rows, request.out_dim, stores[0]) and shouldUseQuantizedDequantSgemm(toBuf(request.weights[1]).name, request.rows, request.out_dim, stores[1]) and shouldUseQuantizedDequantSgemm(toBuf(request.weights[2]).name, request.rows, request.out_dim, stores[2])) return null;
+    if (!request.dense_fallback and shouldUseQuantizedDequantSgemm(toBuf(request.weights[0]).name, request.rows, request.out_dim, stores[0]) and shouldUseQuantizedDequantSgemm(toBuf(request.weights[1]).name, request.rows, request.out_dim, stores[1]) and shouldUseQuantizedDequantSgemm(toBuf(request.weights[2]).name, request.rows, request.out_dim, stores[2])) return null;
     return stores;
 }
 
@@ -43934,6 +44423,35 @@ test "laya q8_0 encoder linear uses dequant sgemm and skips native panel prepara
         }
     }
     try std.testing.expectEqualSlices(f32, &expected, getData(result));
+    // Receipt eligibility is a decline, never a new visible unsupported error
+    // or a substituted quantized kernel for the original scratch contract.
+    var controller = run_memory.AdmissionController{};
+    store.tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 4096 });
+    try store.tier_cache.?.configureManagedAdmissionOutsideExecution(&controller, .cpu, .{ .host_limit_bytes = 4096 }, .{});
+    defer store.tier_cache.?.deinitAdmission();
+    const Invocation = @import("../execution/invocation_context.zig");
+    const Hooks = struct {
+        fn access(_: *anyopaque, _: *const ComputeBackend, _: []const u8, _: Invocation.NativeWeights.Access) !?CT {
+            return null;
+        }
+        fn prepare(raw_compute: *anyopaque, cb: *const ComputeBackend, request: *const ops.NativeLinearPreparation) !?ops.NativeLinearPrepared {
+            const real: *NativeCompute = @ptrCast(@alignCast(raw_compute));
+            try std.testing.expectEqual(@as(u3, 0), try NativeCompute.selectedDenseProjectionMask(cb, real.data, request));
+            return null;
+        }
+    };
+    const hooks = Invocation.NativeWeights{ .ptr = &compute, .access = Hooks.access, .prepare_dense = Hooks.prepare };
+    const context = Invocation.Context{ .cleanup = .{}, .native_weights = &hooks };
+    var receiving = compute.computeBackend();
+    receiving.call_context = &context;
+    defer receiving.call_context = null;
+    defer setQuantizedDequantSgemmScratchOverrideForBench(null);
+    inline for (.{ false, true }) |scratch| {
+        setQuantizedDequantSgemmScratchOverrideForBench(scratch);
+        const received = try receiving.linear(input, weight, bias, 3, 32, 2);
+        defer receiving.free(received);
+        try std.testing.expectEqualSlices(f32, getData(result), getData(received));
+    }
 }
 
 test "linear q8_k kernel computes direct matmul" {
@@ -50587,13 +51105,17 @@ fn allocateLinearOutput(ctx: *anyopaque, input: CT, weight: CT, bias: ?CT, rows:
     return allocateLinearOutputWithPlan(ctx, input, weight, bias, rows, in_dim, out_dim, null);
 }
 fn allocateLinearOutputWithPlan(ctx: *anyopaque, input: CT, weight: CT, bias: ?CT, rows: usize, in_dim: usize, out_dim: usize, plan: ?ops.OperatorPlan) anyerror!CT {
+    return allocateLinearOutputPrepared(ctx, input, weight, bias, rows, in_dim, out_dim, plan, false);
+}
+
+fn allocateLinearOutputPrepared(ctx: *anyopaque, input: CT, weight: CT, bias: ?CT, rows: usize, in_dim: usize, out_dim: usize, plan: ?ops.OperatorPlan, dense_prepared: bool) anyerror!CT {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
     if (plan) |selected| if (toBuf(weight).quantized_storage) |storage| try validateQuantLinearPlan(selected, storage, rows, in_dim, out_dim);
     var owned: ?[]f32 = try self.allocator.alloc(f32, try std.math.mul(usize, rows, out_dim));
     errdefer if (owned) |data| self.allocator.free(data);
     if (plan != null and toBuf(weight).quantized_storage != null) {
         try plannedQuantLinearInto(self, input, weight, bias, rows, in_dim, out_dim, owned.?, plan.?);
-    } else if (bias) |value| try linearInto(ctx, input, weight, value, rows, in_dim, out_dim, owned.?) else try linearNoBiasInto(ctx, input, weight, rows, in_dim, out_dim, owned.?);
+    } else if (bias) |value| try linearIntoPrepared(ctx, input, weight, value, rows, in_dim, out_dim, owned.?, dense_prepared) else try linearNoBiasIntoPrepared(ctx, input, weight, rows, in_dim, out_dim, owned.?, dense_prepared);
     const result = try self.makeBuf(owned.?, true);
     owned = null;
     errdefer freeTensor(ctx, result);
@@ -55748,6 +56270,8 @@ test "Native selected resident preparation attests exact receiver before opaque 
     const fake: ComputeBackend = .{ .ptr = @ptrFromInt(16), .vtable = &copied };
     try std.testing.expectError(error.UnsupportedNativeWeightPreparation, NativeCompute.snapshotResidentWeightPreparation(&fake, @ptrFromInt(16), "weight"));
     try std.testing.expectError(error.UnsupportedNativeWeightPreparation, NativeCompute.residentWeightCreditsNeedPreparation(&fake, @ptrFromInt(16)));
+    const request = ops.NativeLinearPreparation{ .kind = .single_no_bias, .input = @ptrFromInt(16), .weights = .{ @ptrFromInt(16), null, null }, .rows = 1, .in_dim = 32, .out_dim = 4 };
+    try std.testing.expectError(error.UnsupportedNativeWeightPreparation, NativeCompute.certifyDenseReceiving(&fake, @ptrFromInt(16), &request, 1, 1));
 }
 
 fn nativeColdMappedEmbeddingCase(allocator: std.mem.Allocator) !void {
@@ -56165,4 +56689,146 @@ fn groupedProjectionStageAllOom(allocator: std.mem.Allocator) !void {
 
 test "Native grouped projection original construction all OOM leaves no partial owner or keys" {
     try platform.allocator.checkAllAllocationFailures(std.testing.allocator, groupedProjectionStageAllOom, .{});
+}
+
+fn nativeDenseCacheColdOomCase(a: std.mem.Allocator, comptime raw_first: bool, comptime cap_mode: enum { all, exact, below }) !void {
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var gate: std.atomic.Mutex = .unlocked;
+    var data = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 8 * 4 * 32 * 4 }) };
+    const Probe = struct {
+        gate: *std.atomic.Mutex,
+        data: *WeightStore,
+        armed: bool = false,
+        violation: bool = false,
+        fn inspect(self: *@This()) void {
+            if (!self.armed) return;
+            if (self.gate.tryLock()) self.gate.unlock() else self.violation = true;
+            if (self.data.quantized_prepare_lock.tryLock()) self.data.quantized_prepare_lock.unlock() else self.violation = true;
+            if (self.data.gliner_head_dense_cache_lock.tryLock()) self.data.gliner_head_dense_cache_lock.unlock() else self.violation = true;
+        }
+        fn reserve(raw: *anyopaque, _: run_memory.AdmissionAmounts) run_memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect();
+            return 1;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: run_memory.AdmissionAmounts) run_memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.inspect();
+        }
+    };
+    var probe = Probe{ .gate = &gate, .data = &data };
+    try pin.controller().configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    defer {
+        data.deinitOwned();
+        std.debug.assert(!probe.violation);
+        std.debug.assert(pin.controller().snapshot().host_weight_bytes == 0);
+    }
+    for (0..8) |index| {
+        const key = try std.fmt.allocPrint(a, "encoder.layer.0.test.{d}.weight", .{index});
+        var moved = false;
+        errdefer if (!moved) a.free(key);
+        const raw = try a.alloc(u8, 4 * 34);
+        errdefer if (!moved) a.free(raw);
+        for (0..4) |row| {
+            raw[row * 34] = 0;
+            raw[row * 34 + 1] = 0x28;
+            @memset(raw[row * 34 + 2 ..][0..32], @intCast(index + 1));
+        }
+        const shape = try a.dupe(i64, &.{ 4, 32 });
+        errdefer if (!moved) a.free(shape);
+        try data.resident_weights.put(a, key, .{ .tensor = .{ .data = &.{}, .dtype = .f32, .shape = &.{}, .name = key, .allocator = a, .owns_data = false, .owns_shape = false }, .quantized = true, .quantized_storage = .{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = raw, .shape = shape, .allocator = a } });
+        moved = true;
+    }
+    const first_physical = 4 * 32 * @sizeOf(f32) + "encoder.layer.0.test.0.weight".len + try NativeCompute.DenseCacheCold.mapAllocation(.empty, 1);
+    const domain_limit = switch (cap_mode) {
+        .all => 1024 * 1024,
+        .exact => first_physical,
+        .below => first_physical - 1,
+    };
+    try data.tier_cache.?.configureManagedAdmissionOutsideExecution(pin.controller(), .cpu, .{ .host_limit_bytes = domain_limit }, .{});
+    var compute = NativeCompute.init(a, &data, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var raw_pointer: ?[*]const f32 = null;
+    if (raw_first) {
+        const key = "encoder.layer.0.test.0.weight";
+        const storage = &data.resident_weights.getPtr(key).?.quantized_storage.?;
+        raw_pointer = (try cachedQuantDequantDenseWeightFromStore(&compute, &data, key, storage, 32, 4)).?.ptr;
+    }
+    probe.armed = true;
+    try data.tier_cache.?.installRetirementDomainOutsideExecution(&pin);
+    try NativeCompute.prepareResidentCreditUpgradesOutsideExecution(&cb, &data, &pin);
+    if (try NativeCompute.snapshotDenseCacheMetadata(&cb, &data)) |value| {
+        var metadata = value;
+        defer metadata.finishOutsideExecution();
+        try metadata.fundOutsideExecution(&pin);
+        try std.testing.expect(gate.tryLock());
+        metadata.fillAndCommitUnderModel() catch |err| {
+            gate.unlock();
+            return err;
+        };
+        gate.unlock();
+    }
+    if (raw_first) try std.testing.expectEqual(raw_pointer.?, data.gliner_head_dense_cache.get("encoder.layer.0.test.0.weight").?.data.ptr);
+    for (0..8) |index| {
+        var key_buffer: [96]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buffer, "encoder.layer.0.test.{d}.weight", .{index});
+        const weight = try cb.getEmbeddingWeight(key); // real named Buf, no matrix prewarming
+        defer cb.free(weight);
+        if (try NativeCompute.snapshotDenseCacheEntry(&cb, &data, weight, 32, 4)) |value| {
+            var plan = value;
+            defer plan.finishOutsideExecution();
+            if (cap_mode == .below) {
+                try std.testing.expectError(error.MemoryBudgetExceeded, plan.fundOutsideExecution(&pin));
+                try std.testing.expectEqual(@as(u32, 0), data.gliner_head_dense_cache.count());
+                try std.testing.expectEqual(@as(usize, 0), pin.controller().snapshot().host_weight_bytes);
+                return;
+            }
+            try plan.fundOutsideExecution(&pin);
+            try std.testing.expect(gate.tryLock());
+            plan.fillAndCommitUnderModel() catch |err| {
+                gate.unlock();
+                return err;
+            };
+            gate.unlock();
+        }
+        const entry = data.gliner_head_dense_cache.get(key).?;
+        try std.testing.expectEqual(entry.bytes + key.len, entry.prepared_physical_bytes);
+        try std.testing.expectEqual(@as(f32, @floatFromInt(index + 1)) / 32, entry.data[0]);
+        if (cap_mode == .exact) {
+            try std.testing.expectEqual(first_physical, pin.controller().snapshot().host_weight_bytes);
+            return;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 8 * 4 * 32 * 4), data.tier_cache.?.host_bytes);
+    try std.testing.expectEqual(data.gliner_head_dense_cache_prepared_map_bytes, try NativeCompute.DenseCacheCold.currentMapBytes(&data.gliner_head_dense_cache));
+    // Metadata adds real physical credit while the original payload cache cap
+    // is exactly full. Replacing the map cannot borrow its old live allocation.
+    try std.testing.expect(pin.controller().snapshot().host_weight_bytes > data.tier_cache.?.host_bytes);
+    try std.testing.expect(!probe.violation);
+}
+
+test "Native dense cold cache exact payload cap includes key map overlap and raw upgrade all OOM" {
+    const Cases = struct {
+        fn cold(a: std.mem.Allocator) !void {
+            return nativeDenseCacheColdOomCase(a, false, .all);
+        }
+        fn raw(a: std.mem.Allocator) !void {
+            return nativeDenseCacheColdOomCase(a, true, .all);
+        }
+    };
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Cases.cold, .{});
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, Cases.raw, .{});
+}
+
+test "Native dense cold cache exact physical Domain cap and one below preserve original payload cap" {
+    try nativeDenseCacheColdOomCase(std.testing.allocator, false, .exact);
+    try nativeDenseCacheColdOomCase(std.testing.allocator, false, .below);
 }
