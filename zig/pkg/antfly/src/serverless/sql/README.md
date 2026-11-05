@@ -147,18 +147,25 @@ workers validate the capability, schema incarnation, and snapshot on reopen.
   full-object read. Larger objects retain range reads, so small reducers do not
   download unrelated partitions. Hosted execution retains its existing bounded
   immutable byte cache.
-- Clean retained base scans, map partitioning, hash/Grace admission, and hash
-  probe seeding use borrowed typed batches. WAL reconciliation and residual
-  expressions retain scalar fallbacks. Output accumulates in typed columns;
+- Clean retained base scans (including dynamic-filter selections), map
+  partitioning, hash/Grace admission, and hash probe seeding use borrowed typed batches. WAL reconciliation and residual
+  expressions retain scalar fallbacks. Join matches append in bounded cohorts
+  of up to 256 coordinates, sharing JSON sizing/insertion leases. Tight
+  budgets admit smaller prefixes before sizing the remaining cohort against
+  updated dictionaries. Aggregate cohorts read only grouping/input columns
+  and retire row scratch immediately. Output accumulates in typed columns;
   the exchange writer retires encoding scratch after every 256-row block.
 - Broadcast probes and skew tile pairs reuse prepared in-memory builds on the
   same worker. Cache identity includes tenant, execution, accepted dependency
-  descriptors, exchange location, partition range and join keys. A lease is
-  exclusive: busy entries fall back rather than serializing tasks. Skew match
-  witnesses remain task-local. Dynamic filters are rebuilt from cached keys.
-  Native build residency is capped at 32 MiB across four entries; each hosted
-  kernel caps it at 4 MiB. These are additional worker-level residency budgets,
-  separate from task allocation ceilings. Hosted physical binding changes clear
+  descriptors, exchange location, partition range and join keys. Leases are
+  reference-counted: completed immutable indexes support concurrent probes;
+  unfinished builds may fall back without waiting. Probe cursors and skew match
+  witnesses remain task-local. Sealed dynamic filters own their column names
+  and are reused with the build. Native build residency is capped at 32 MiB
+  across four entries; each hosted kernel caps it at 4 MiB. Entries share the
+  aggregate byte budget and may consume spare capacity rather than fixed
+  quarters; allocation pressure evicts only unpinned entries. These are
+  additional worker-level residency budgets, separate from task allocation ceilings. Hosted physical binding changes clear
   residency. Oversized cache builds retry under the ordinary task budget and
   enter a bounded negative cache to avoid repeatedly paying the failed build.
 - Adaptive coalescing groups adjacent small partitions from accepted map

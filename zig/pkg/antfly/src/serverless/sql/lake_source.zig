@@ -235,6 +235,32 @@ pub const Host = struct {
         return .{ .ptr = owner, .next_fn = Owner.next, .next_batch_fn = Owner.nextBatch, .close_fn = Owner.close };
     }
 };
+/// Filter keys only. Payload vectors and their logical selection remain
+/// borrowed; neither excluded nor surviving payload cells need materialization.
+fn filterTypedBatch(a: A, batch: *const local.sql_execution_batch.Batch, columns: []const plan.Column, filter: ?*const local.sql_dynamic_filter.Filter) !local.sql_execution_batch.Batch {
+    const value = filter orelse return batch.*;
+    if (value.columns.len > 32) return error.InvalidSqlDistributedPlan;
+    var ordinals: [32]usize = undefined;
+    for (value.columns, 0..) |column, i| {
+        ordinals[i] = for (columns, 0..) |candidate, position| {
+            if (std.mem.eql(u8, candidate.name, column.name)) break position;
+        } else return error.InvalidSqlDistributedPlan;
+    }
+    const selection = try a.alloc(usize, batch.len());
+    var count: usize = 0;
+    var scratch = std.heap.ArenaAllocator.init(a);
+    defer scratch.deinit();
+    for (0..batch.len()) |row| {
+        _ = scratch.reset(.free_all);
+        var keys: [32]Datum = undefined;
+        for (ordinals[0..value.columns.len], keys[0..value.columns.len]) |ordinal, *cell| cell.* = try batch.cell(scratch.allocator(), row, ordinal);
+        if (try value.contains(keys[0..value.columns.len])) {
+            selection[count] = row;
+            count += 1;
+        }
+    }
+    return batch.select(a, selection[0..count]);
+}
 const Owner = struct {
     a: A,
     arena: std.heap.ArenaAllocator,
@@ -253,28 +279,39 @@ const Owner = struct {
     base_suppressed: []bool = &.{},
     base_at: usize = 0,
     base_prepared: bool = false,
+    batch_arena: ?std.heap.ArenaAllocator = null,
     fn recentEnd(self: *const Owner) usize {
         return if (self.paged) |paged| paged.end else self.cut.pending.changes.len;
     }
     fn nextBatch(raw: *anyopaque, a: A, maximum: usize) !?local.sql_execution_batch.Batch {
         const self: *Owner = @ptrCast(@alignCast(raw));
-        // WAL reconciliation and bucket/filter evaluation retain their scalar
-        // fallback. Clean retained base scans borrow the physical column page.
-        if (self.paged != null or self.cut.changed.count() != 0 or self.cut.pending.changes.len != 0 or self.input.bucket_group != null or self.filter != null)
+        // WAL reconciliation and bucket ownership retain their scalar fallback.
+        // Filtered clean scans borrow one page until the next producer pull.
+        if (self.paged != null or self.cut.changed.count() != 0 or self.cut.pending.changes.len != 0 or self.input.bucket_group != null)
             return .{ .rows = (try next(raw, a, maximum)) orelse return null };
         if (maximum == 0) return error.InvalidSqlBackendResponse;
+        if (self.batch_arena == null) self.batch_arena = .init(self.a);
+        const region = &self.batch_arena.?;
+        _ = region.reset(.free_all);
         while (!self.base_done) {
             try self.context.ensureActive();
-            const page = try self.cursor.next_columns.?(self.cursor.ptr, a, @intCast(maximum));
+            // Entirely rejected pages retire here, even if thousands precede
+            // the next surviving row. Their bytes never accumulate in a caller.
+            _ = region.reset(.free_all);
+            const page_alloc = region.allocator();
+            const page = try self.cursor.next_columns.?(self.cursor.ptr, page_alloc, @intCast(maximum));
             try page.validate();
             if (page.selection.len > maximum) return error.InvalidSqlBackendResponse;
             self.base_done = page.after == null;
             if (page.selection.len == 0) continue;
-            const definitions = try a.alloc(local.sql_scalar.Column, self.input.columns.len);
+            const definitions = try page_alloc.alloc(local.sql_scalar.Column, self.input.columns.len);
             for (self.input.columns, definitions) |column, *definition| {
                 definition.* = .{ .name = (try self.table.column(column.name)).path, .type = column.type, .element_type = column.element_type };
             }
-            return .{ .columns = .{ .page = page, .definitions = definitions } };
+            const batch = try page_alloc.create(local.sql_execution_batch.Batch);
+            batch.* = .{ .columns = .{ .page = page, .definitions = definitions } };
+            const selected = try filterTypedBatch(page_alloc, batch, self.input.columns, self.filter);
+            if (selected.len() != 0) return selected;
         }
         return null;
     }
@@ -453,8 +490,13 @@ const Owner = struct {
         }
         return if (result.items.len == 0) null else result.items;
     }
+    fn retireBatchPage(self: *Owner) void {
+        if (self.batch_arena) |*region| region.deinit();
+        self.batch_arena = null;
+    }
     fn close(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
+        self.retireBatchPage();
         self.a.free(self.base_suppressed);
         if (self.paged) |*paged| paged.deinit();
         if (!self.cursor_closed) self.cursor.close(self.cursor.ptr);
@@ -680,4 +722,73 @@ test "distributed SQL clustered WAL keys read each exact page once" {
     @memset(suppressed, false);
     try legacy_reader.suppressBatch(lookups, suppressed);
     for (suppressed, 0..) |value, index| try std.testing.expectEqual(index < 1500 or index == 1600, value);
+}
+
+test "distributed SQL filtered typed pages inspect only keys and preserve borrowed payload selections" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const filter = try local.sql_dynamic_filter.Filter.create(a, &.{.{ .name = "id", .type = .integer }}, 256);
+    defer filter.close();
+    try filter.add(&.{Datum.json(.{ .integer = 7 })});
+    filter.sealed = true;
+    const Reader = struct {
+        fn read(_: *anyopaque, _: A, row: usize, column: usize) anyerror!Datum {
+            if (column != 0) return error.UnexpectedPayloadMaterialization;
+            return if (row == 2) .{} else Datum.json(.{ .integer = if (row == 3) @as(i64, 7) else @as(i64, @intCast(row)) });
+        }
+        fn json(_: *anyopaque, row: usize, column: usize) anyerror!?[]const u8 {
+            if (column == 1 and row == 3) return "{\"borrowed\":true}";
+            return null;
+        }
+    };
+    var marker: u8 = 0;
+    const batch: local.sql_execution_batch.Batch = .{ .reader = .{ .ptr = &marker, .read = Reader.read, .read_json = Reader.json, .count = 4, .width = 2 } };
+    const result = try filterTypedBatch(region.allocator(), &batch, &.{ .{ .name = "id", .type = .integer }, .{ .name = "payload", .type = .json } }, filter);
+    try std.testing.expectEqual(@as(usize, 1), result.len());
+    try std.testing.expectEqualStrings("{\"borrowed\":true}", (try result.encodedJson(0, 1)).?);
+    try std.testing.expectEqual(@as(i64, 7), (try result.cell(region.allocator(), 0, 0)).value.integer);
+}
+
+test "distributed SQL filtered typed scans retire rejected pages before the next surviving row" {
+    const a = std.testing.allocator;
+    var budget: local.sql_memory_budget = .{ .backing = a, .limit = 512 * 1024 };
+    defer std.debug.assert(budget.live == 0);
+    const filter = try local.sql_dynamic_filter.Filter.create(a, &.{.{ .name = "id", .type = .integer }}, 256);
+    defer filter.close();
+    try filter.add(&.{Datum.json(.{ .integer = 7 })});
+    filter.sealed = true;
+    const Pages = struct {
+        count: usize = 0,
+        fn columns(raw: *anyopaque, alloc: A, _: u32) !catalog.ColumnPage {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.count += 1;
+            const payload = try alloc.alloc(u8, 64 * 1024);
+            @memset(payload, 'x');
+            const cells = try alloc.dupe(Datum, &.{ Datum.json(.{ .integer = if (self.count == 1000) 7 else 0 }), Datum.json(.{ .string = payload }) });
+            const rows = try alloc.alloc([]const Datum, 1);
+            rows[0] = cells;
+            const values = try alloc.create(local.sql_execution_batch.Batch);
+            values.* = .{ .rows = rows };
+            return .{ .native = .{ .values = values, .names = &.{ "id", "payload" } }, .selection = &.{0}, .after = if (self.count == 1000) null else "next" };
+        }
+        fn next(_: *anyopaque, _: A, _: u32) !catalog.Page {
+            return error.UnexpectedScalarPath;
+        }
+        fn close(_: *anyopaque) void {}
+    };
+    var pages: Pages = .{};
+    const input: plan.Input = .{ .table_id = 7, .schema = @splat('a'), .snapshot = "42", .wal_cut = 1, .cut = "cut", .columns = &.{ .{ .name = "id", .type = .integer }, .{ .name = "payload", .type = .string } }, .estimated_bytes = 1, .estimated_rows = 1000, .splits = 1 };
+    const table: catalog.Table = .{ .id = 7, .physical_name = "t", .schema_version = 1, .columns = &.{ .{ .name = "id", .path = "id", .type = .integer }, .{ .name = "payload", .path = "payload", .type = .string } } };
+    const cut: overlay.Cut = .{ .pending = .{ .lsn = 1, .key_fields = &.{"id"}, .changes = &.{} } };
+    var owner: Owner = .{ .a = budget.allocator(), .arena = .init(budget.allocator()), .input = input, .table = table, .cut = &cut, .filter = filter, .context = .{}, .cursor = .{ .ptr = &pages, .next = Pages.next, .next_columns = Pages.columns, .close = Pages.close } };
+    defer owner.arena.deinit();
+    defer owner.retireBatchPage();
+    const batch = (try Owner.nextBatch(&owner, budget.allocator(), 256)).?;
+    try std.testing.expectEqual(@as(usize, 1000), pages.count);
+    try std.testing.expectEqual(@as(usize, 1), batch.len());
+    try std.testing.expectEqual(@as(i64, 7), (try batch.cell(budget.allocator(), 0, 0)).value.integer);
+    try std.testing.expectEqual(@as(usize, 64 * 1024), (try batch.cell(budget.allocator(), 0, 1)).value.string.len);
+    try std.testing.expect(try Owner.nextBatch(&owner, budget.allocator(), 256) == null);
+    try std.testing.expect(budget.peak <= budget.limit);
 }
