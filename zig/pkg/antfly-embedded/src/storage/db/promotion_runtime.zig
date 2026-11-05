@@ -613,14 +613,14 @@ fn catchUpWindowMaybeSink(
         for (configs) |*cfg| cfg.deinit(gpa);
         gpa.free(configs);
     };
-    _ = replay_source.forEachMatchingRecord(gpa, from_sequence, .promotion, max_records, &ctx, Ctx.consume) catch |err| switch (err) {
+    const scan = replay_source.forEachMatchingRecord(gpa, from_sequence, .promotion, max_records, &ctx, Ctx.consume) catch |err| switch (err) {
         error.PromotionSinkUnavailable => return .{
             .max_seen = ctx.max_seen,
             .blocked_missing_sink = true,
         },
         else => return err,
     };
-    return .{ .max_seen = ctx.max_seen };
+    return .{ .max_seen = @max(ctx.max_seen, scan.last_sequence) };
 }
 
 /// Managed worker that catches the promoter up on changed resolution artifacts.
@@ -1946,4 +1946,43 @@ test "inline resolver replacement promotion bounded turns commit one record and 
     try testing.expectEqual(@as(usize, 2), capture.keys.items.len);
     try runtime.catchUp();
     try testing.expectEqual(@as(u64, 2), runtime.applied_sequence.load(.acquire));
+}
+
+test "catchUpWindow preserves a bounded fallback prefix before a late match" {
+    const a = testing.allocator;
+    var memory = @import("../mem_backend.zig").Backend.init(a, .{});
+    defer memory.close();
+    var journal = try @import("../docstore.zig").DocStore.openRuntime(a, try memory.runtimeStore(a, .{}));
+    defer journal.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var artifacts = MapStore{ .alloc = a };
+    defer artifacts.deinit();
+    const key = try internal_keys.resolutionArtifactKeyAlloc(scratch, "late", "resolution_v1");
+    try artifacts.put(key, sample_resolution);
+    var sink = CaptureSink{ .alloc = a };
+    defer sink.deinit();
+    // Model a legacy canonical journal whose hint side index is absent.
+    // Two complete unrelated pages precede the one record with useful work.
+    var batch = try journal.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(internal_keys.replay_meta_init_key[0..], "");
+    for (1..515) |sequence| {
+        const payload = try change_journal_mod.encodeRecord(scratch, .{
+            .sequence = @intCast(sequence),
+            .changed_artifact_keys = if (sequence == 514) &.{key} else &.{},
+            .target_hints = if (sequence == 514) &.{.promotion} else &.{.full_text},
+        });
+        const record_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, @intCast(sequence));
+        try batch.put(&record_key, payload);
+    }
+    try batch.commit();
+    const source = replay_source_mod.Source.fromPrimaryStore(&journal, null, null);
+    var applied: u64 = 0;
+    for ([_]u64{ 256, 512, 514 }) |expected| {
+        applied = try catchUpWindow(a, source, artifacts.store(), sink.sink(), applied, 1);
+        try testing.expectEqual(expected, applied);
+    }
+    try testing.expectEqual(@as(usize, 2), sink.keys.items.len);
 }

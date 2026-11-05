@@ -28,6 +28,8 @@ pub const State = struct {
     source_replay_stage: std.atomic.Value(u32) = .init(0),
     control_maintenance_slot: u4 = 0,
     control_maintenance_changed: bool = false,
+    /// Runnable control continuation must not inherit an unrelated LSM timer.
+    control_maintenance_pending: bool = false,
     replay_retirement: @import("../docstore.zig").ReplayRetirement = .{},
     replay_budget: @import("derived/replay_budget.zig").Controller = .{},
     producer_replay_budget: @import("derived/replay_budget.zig").Controller = .{

@@ -1983,14 +1983,10 @@ pub const Owner = struct {
         // Foreground native views need not own these runtimes, so inspect the
         // two durable watermarks instead of constructing providers on idle polls.
         if (database.core.index_manager.resolvers.items.len != 0) {
-            if (database.resolution_runtime) |runtime| {
-                const stats = runtime.stats();
-                if (stats.applied_sequence < @max(target, stats.target_sequence)) return true;
-            } else if (try state.loadAppliedSequence(alloc, database.core.store, "resolution") < target) return true;
-            if (database.promotion_runtime) |runtime| {
-                const stats = runtime.stats();
-                if (stats.applied_sequence < @max(target, stats.target_sequence)) return true;
-            } else if (try state.loadAppliedSequence(alloc, database.core.store, "promotion") < target) return true;
+            const resolution_target = if (database.resolution_runtime) |runtime| @max(target, runtime.stats().target_sequence) else target;
+            if (try state.loadAppliedSequence(alloc, database.core.store, "resolution") < resolution_target) return true;
+            const promotion_target = if (database.promotion_runtime) |runtime| @max(target, runtime.stats().target_sequence) else target;
+            if (try state.loadAppliedSequence(alloc, database.core.store, "promotion") < promotion_target) return true;
             // Catalog backfills also advance durable cursors without adding
             // replay records. Inspect both keys in one committed view only
             // after the cheap watermark checks have ruled out other debt.
@@ -3473,7 +3469,7 @@ pub const Owner = struct {
                     if (std.mem.eql(u8, active.name, publication_name)) artifact_more = true;
                 }
             }
-            if (!retirement_more) {
+            if (!retirement_more and !group_state.control_maintenance_pending) {
                 if (database.core.index_manager.nextLsmMaintenanceWakeDelayNsBestEffort()) |delay| {
                     artifact_delay_ns = delay;
                 }
@@ -3740,6 +3736,13 @@ pub const Owner = struct {
             return err;
         };
         return true;
+    }
+
+    /// Model a cold owner including its path-owned allocator authority.
+    /// Test callers must own the gate and drain background operations first.
+    pub fn resetAllocatorAuthorityForTest(self: *Owner) void {
+        std.debug.assert(h.builtin.is_test);
+        forgetAllocatorAuthorityForTest(self);
     }
 
     pub fn maintenanceTurnForTest(self: *Owner) !bool {

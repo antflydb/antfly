@@ -32106,7 +32106,22 @@ pub const DB = struct {
 
     fn resolutionStageStats(self: *DB) types.ReplayStageStats {
         if (!self.hasConfiguredResolvers()) return .{};
-        if (self.resolution_runtime) |runtime| return runtime.stats();
+        if (self.resolution_runtime) |runtime| {
+            const cached = runtime.stats();
+            if (!self.executor.isManual() or runtime.worker_started.load(.acquire)) return cached;
+            // Detached owners can advance control records without replacing a
+            // serving runtime. A dormant driver's counters are not a witness
+            // for the admitted native checkpoint.
+            var current = self.persistedResolutionStageStats() catch return .{
+                .enabled = true,
+                .catch_up_required = true,
+                .blocked = true,
+                .blocked_reason = "resolver_recovery_state_unavailable",
+            };
+            current.target_sequence = @max(current.target_sequence, cached.target_sequence);
+            current.catch_up_required = current.catch_up_required or current.applied_sequence < current.target_sequence;
+            return current;
+        }
         return self.persistedResolutionStageStats() catch .{
             .enabled = true,
             .catch_up_required = true,
@@ -32127,8 +32142,31 @@ pub const DB = struct {
 
     fn promotionStageStats(self: *DB) types.ReplayStageStats {
         if (!self.hasConfiguredResolvers()) return .{};
-        if (self.promotion_runtime) |runtime| return runtime.stats();
-        return self.persistedReplayStageStats(promotion_runtime_mod.scope_name, false) catch .{};
+        if (self.promotion_runtime) |runtime| {
+            var current = runtime.stats();
+            if (!self.executor.isManual() or runtime.worker_started.load(.acquire)) return current;
+            const persisted = self.persistedReplayStageStats(promotion_runtime_mod.scope_name, false) catch return .{
+                .enabled = true,
+                .catch_up_required = true,
+                .blocked = true,
+                .blocked_reason = "promotion_recovery_state_unavailable",
+            };
+            current.applied_sequence = persisted.applied_sequence;
+            current.target_sequence = @max(current.target_sequence, persisted.target_sequence);
+            current.enabled = current.enabled or persisted.enabled;
+            current.catch_up_required = current.applied_sequence < current.target_sequence;
+            if (!current.catch_up_required) {
+                current.blocked = false;
+                current.blocked_reason = "";
+            }
+            return current;
+        }
+        return self.persistedReplayStageStats(promotion_runtime_mod.scope_name, false) catch .{
+            .enabled = true,
+            .catch_up_required = true,
+            .blocked = true,
+            .blocked_reason = "promotion_recovery_state_unavailable",
+        };
     }
 
     fn resolverReplayDiagnosticsLocked(self: *DB, alloc: Allocator) !types.ResolverReplayDiagnostics {
@@ -34123,6 +34161,7 @@ pub const DB = struct {
         try ensureSnapshotActive(cancellation);
         const state = self.borrowed_group_source_state orelse &self.group_source_owner.state;
         const slot = state.control_maintenance_slot;
+        state.control_maintenance_pending = true;
         var more = false;
         switch (slot) {
             0 => more = try self.evaluateAlgebraicAdaptiveCandidates() != 0,
@@ -34143,6 +34182,7 @@ pub const DB = struct {
         if (state.control_maintenance_slot != 0) return true;
         const changed = state.control_maintenance_changed;
         state.control_maintenance_changed = false;
+        state.control_maintenance_pending = changed;
         return changed;
     }
 
@@ -77527,10 +77567,12 @@ test "db detached replay leaves optional maintenance to its retained continuatio
     // sweep clean simply because that individual service has no work.
     try std.testing.expect(try database.runBackgroundControlMaintenance(.none));
     try std.testing.expectEqual(@as(u4, 4), state.control_maintenance_slot);
+    try std.testing.expect(state.control_maintenance_pending);
     state.control_maintenance_slot = 8;
     state.control_maintenance_changed = false;
     _ = try database.runBackgroundControlMaintenance(.none);
     try std.testing.expectEqual(@as(u4, 0), state.control_maintenance_slot);
+    try std.testing.expect(!state.control_maintenance_pending);
 }
 
 test "db batch appends only thin replay stream records" {
@@ -147553,14 +147595,27 @@ test "inline resolver replacement background replay yields within a large record
         }
         sequence = try appendDerivedBatchRecord(&db, .{ .changed_artifact_keys = &source_keys });
         db.resolution_runtime.?.notifySequence(sequence);
+        const Clock = struct {
+            var calls: usize = 0;
+            var late: u64 = 0;
+            fn read() u64 {
+                calls += 1;
+                return if (calls == 1) 0 else late;
+            }
+        };
+        Clock.calls = 0;
+        Clock.late = monotonicTimeNs() + std.time.ns_per_min;
+        resolution_runtime_mod.test_replay_now_ns = Clock.read;
+        defer resolution_runtime_mod.test_replay_now_ns = null;
         try std.testing.expect(try db.runBackgroundTurnWithCancellation(.none, .replay));
+        resolution_runtime_mod.test_replay_now_ns = null;
         const runtime = db.resolution_runtime.?;
         // A source turn may durably process only a prefix of this record.
         // Unbounded catchUp() consumed all 40 before returning to the owner.
         try std.testing.expect(runtime.applied_sequence.load(.acquire) < sequence);
         try std.testing.expect(runtime.replay_progress != null);
         try std.testing.expect(runtime.replay_progress.?.next_key > 0);
-        try std.testing.expect(runtime.replay_progress.?.next_key <= 32);
+        try std.testing.expectEqual(@as(usize, 1), runtime.replay_progress.?.next_key);
     }
     {
         var db = try DB.open(a, directory.path(), options);
@@ -148319,4 +148374,31 @@ test "db detached replay defers inline repair cleanup until optional service" {
     database.scheduleInactiveRepairShadowCleanup();
     try database.runUntilIdle();
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(std.testing.io, orphan, .{}));
+}
+
+test "db manual resolver observations follow durable peer control progress" {
+    const a = std.testing.allocator;
+    var directory = try TestDirectory.init("manual-durable-resolver-progress");
+    defer directory.cleanup();
+    var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer host.deinit();
+    var db = try DB.open(a, directory.path(), .{ .backend_runtime = host.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtime_workers = false, .start_independent_maintenance = false });
+    defer db.close();
+    _ = try db.upsertResolverWithResultOptions(.{ .name = "r", .table = "default", .source_artifact = "kg", .resolution_artifact = "resolved", .key_template = "entity/{{_key}}", .promote = false }, .{ .drain_backfill = false });
+    try db.runUntilIdle();
+    try db.batch(.{ .writes = &.{.{ .key = "observed", .value = "{}" }}, .sync_level = .write });
+    const sequence = db.core.nextDerivedSequence();
+    db.resolution_runtime.?.notifySequence(sequence);
+    db.promotion_runtime.?.notifySequence(sequence);
+    try std.testing.expect(db.resolution_runtime.?.stats().catch_up_required);
+    // A different maintenance runtime completed this control-only record.
+    try enrichment_state.saveAppliedSequence(db.core.store, "resolution", sequence);
+    try enrichment_state.saveAppliedSequence(db.core.store, "promotion", sequence);
+    const observed = db.pendingWorkStats();
+    try std.testing.expectEqual(sequence, observed.resolution.applied_sequence);
+    try std.testing.expectEqual(sequence, observed.promotion.applied_sequence);
+    try std.testing.expect(!observed.resolution.catch_up_required);
+    try std.testing.expect(!observed.promotion.catch_up_required);
+    // The proof came from storage; no dormant driver was run or replaced.
+    try std.testing.expect(db.resolution_runtime.?.stats().applied_sequence < sequence);
 }

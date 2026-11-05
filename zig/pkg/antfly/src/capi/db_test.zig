@@ -754,13 +754,35 @@ fn MaintenancePhaseDriver(comptime Owner: type) type {
     };
 }
 
+fn dumpMaintenanceProgress(owner: anytype) !void {
+    const db = &owner.current.?.db;
+    const state = shared.db_mod.enrichment_state;
+    const stats = db.pendingWorkStats();
+    std.debug.print("\nresolution={f} promotion={f} target={d} durable_generated={d} durable_resolution={d} durable_promotion={d} turns={d} error={?s}\n", .{ std.json.fmt(stats.resolution, .{}), std.json.fmt(stats.promotion, .{}), db.core.nextDerivedSequence(), try state.loadAppliedSequence(std.testing.allocator, db.core.store, "generated"), try state.loadAppliedSequence(std.testing.allocator, db.core.store, "resolution"), try state.loadAppliedSequence(std.testing.allocator, db.core.store, "promotion"), owner.publication_stats.maintenance_source_turns, owner.publication_stats.last_maintenance_error });
+    var probe = try db.core.store.beginProbeTxn();
+    defer probe.abort();
+    const progress = probe.get("\x00\x00__metadata__:resolution_replay_progress") catch |err| switch (err) {
+        error.NotFound => "none",
+        else => return err,
+    };
+    std.debug.print("resolver cursor={s}\n", .{progress});
+    var schedules = owner.maintenance_schedules.iterator();
+    while (schedules.next()) |entry| {
+        const group = entry.value_ptr.group_sources;
+        std.debug.print("schedule table={d} database={any} artifact={any} serviced={d} startup={any} control_slot={d} control_pending={any}\n", .{ entry.key_ptr.table_id, entry.value_ptr.database_pending, entry.value_ptr.artifact_pending, entry.value_ptr.serviced_sequence, entry.value_ptr.startup_replay_pending, if (group) |g| g.control_maintenance_slot else @as(u4, 0), if (group) |g| g.control_maintenance_pending else false });
+    }
+}
+
 fn drainOwnerMaintenance(owner: anytype) !void {
     const io = shared.handleLockIo();
     const deadline = std.Io.Clock.awake.now(io).nanoseconds + 10 * std.time.ns_per_s;
     while (true) {
         const immediate = try owner.maintenanceTurnForTest();
         if (!immediate and !owner.maintenanceContinuationPendingForTest()) return;
-        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) return error.TestMaintenanceDidNotSettle;
+        if (std.Io.Clock.awake.now(io).nanoseconds >= deadline) {
+            try dumpMaintenanceProgress(owner);
+            return error.TestMaintenanceDidNotSettle;
+        }
         // A false turn can still own a timed LSM retry or private merge. Drive
         // that continuation before asserting that idle polling opens nothing.
         if (!immediate) try io.sleep(.fromMilliseconds(5), .awake);
@@ -5149,7 +5171,7 @@ test "capi SQL background embedding releases the file gate and fences stale resu
             const result = (try guard.handle.db.lookup(alloc, if (source_changed) "doc" else "new", .{})).?;
             defer alloc.free(result.json);
             try std.testing.expect(std.mem.indexOf(u8, result.json, "foreground") != null);
-            try std.testing.expectEqual(@as(usize, 0), connection.retired.items.len);
+            // This guard may pin its refresh predecessor until leave.
             const artifact_key = try @import("antfly_local_sources").storage_internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc", "body_dense");
             defer alloc.free(artifact_key);
             const completed = try guard.handle.db.core.getStoreValue(alloc, artifact_key);
@@ -5159,6 +5181,12 @@ test "capi SQL background embedding releases the file gate and fences stale resu
             try std.testing.expect((completed == null) == source_changed);
             try guard.handle.db.reconfigureEnrichmentRuntimePaused(.{ .dense_embedder = gate.interface() });
             connection.maintenance_pending = true;
+        }
+        {
+            connection.gate.mutex.lockUncancelable(shared.handleLockIo());
+            defer connection.gate.mutex.unlock(shared.handleLockIo());
+            connection.collectRetired();
+            try std.testing.expectEqual(@as(usize, 0), connection.retired.items.len);
         }
         try std.testing.expectEqual(@as(usize, 1), gate.calls.load(.monotonic));
         var idle = false;
@@ -5286,7 +5314,8 @@ test "capi native idle maintenance verifies allocator outside connection and wri
             const owner = blk: {
                 const guard = public.enterHandle(handle, .exclusive).?;
                 defer guard.leave();
-                guard.handle.owned_lite_backend.?.native_docstore.?.file.free_pages_verified = false;
+                guard.connection.?.owner.resetAllocatorAuthorityForTest();
+                guard.connection.?.owner.maintenance_pending = true;
                 break :blk guard.connection.?.owner;
             };
             const Owner = @TypeOf(owner.*);
@@ -5660,7 +5689,7 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
                 store.maintenance_policy.next_assessment_size = 0;
                 if (phase != .verification) store.test_maintenance_hook = .{ .ptr = &gate, .notify = Gate.notify };
                 if (phase == .verification) {
-                    store.file.free_pages_verified = false;
+                    guard.connection.?.owner.resetAllocatorAuthorityForTest();
                     guard.connection.?.owner.maintenance_pending = true;
                     // Verification now runs at the owner capture boundary.
                     guard.connection.?.owner.test_after_allocator_capture = .{ .ptr = &gate, .notify = Gate.allocatorCaptured };
@@ -5668,7 +5697,7 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
                 break :blk guard.connection.?.owner;
             };
             defer connection.test_after_allocator_capture = null;
-            var driver: MaintenancePhaseDriver(@TypeOf(connection)) = .{ .owner = connection, .started = &gate.started, .retry_idle = phase != .verification };
+            var driver: MaintenancePhaseDriver(@TypeOf(connection)) = .{ .owner = connection, .started = &gate.started, .retry_idle = true };
             const background = try std.Thread.spawn(.{}, @TypeOf(driver).run, .{&driver});
             var joined = false;
             defer if (!joined) {
@@ -5720,12 +5749,18 @@ test "capi SQL reclamation assessment and copy release the foreground gate" {
             if (gate.failure) |err| return err;
             try std.testing.expect(completed);
             try std.testing.expectEqual(capi.ErrorCode.ok, foreground.status);
-            const guard = public.enterHandle(handle, .exclusive).?;
-            defer guard.leave();
-            const result = (try guard.handle.db.lookup(alloc, "new", .{})).?;
-            defer alloc.free(result.json);
-            try std.testing.expect(std.mem.indexOf(u8, result.json, "foreground") != null);
-            try std.testing.expectEqual(@as(usize, 0), connection.retired.items.len);
+            {
+                const guard = public.enterHandle(handle, .exclusive).?;
+                defer guard.leave();
+                const result = (try guard.handle.db.lookup(alloc, "new", .{})).?;
+                defer alloc.free(result.json);
+                try std.testing.expect(std.mem.indexOf(u8, result.json, "foreground") != null);
+            }
+            connection.gate.mutex.lockUncancelable(shared.handleLockIo());
+            connection.collectRetired();
+            const retired = connection.retired.items.len;
+            connection.gate.mutex.unlock(shared.handleLockIo());
+            try std.testing.expectEqual(@as(usize, 0), retired);
         }
     }
 }
@@ -6812,10 +6847,28 @@ test "capi native resolver maintenance retries transient inference and survives 
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open_with_options(path, &options, &handle));
     owner = try Fixture.pause(handle);
     owner.test_after_capture = .{ .ptr = &fixture, .notify = Fixture.notify };
-    for (0..160) |_| {
-        if (!try owner.maintenanceTurnForTest()) break;
+    // Each resumed turn owns a bounded page, with Debug setup and durable
+    // publication between pages. This is a correctness watchdog, not a
+    // production latency allowance; every acknowledged output is checked.
+    const settle_deadline = std.Io.Clock.awake.now(shared.handleLockIo()).nanoseconds + 60 * std.time.ns_per_s;
+    var settled = false;
+    while (std.Io.Clock.awake.now(shared.handleLockIo()).nanoseconds < settle_deadline) {
+        _ = try owner.maintenanceTurnForTest();
+        {
+            const current = public.enterHandle(handle, .read).?;
+            defer current.leave();
+            const progress = current.handle.db.pendingWorkStats();
+            if (progress.enrichment.applied_sequence >= progress.enrichment.target_sequence and
+                !progress.resolution.catch_up_required and !progress.promotion.catch_up_required)
+            {
+                settled = true;
+                break;
+            }
+        }
         try shared.handleLockIo().sleep(.fromMilliseconds(25), .awake);
     }
+    if (!settled) try dumpMaintenanceProgress(owner);
+    try std.testing.expect(settled);
     try std.testing.expectEqual(@as(usize, 2), fixture.failures);
     try std.testing.expect(fixture.successful >= 30);
     const guard = public.enterHandle(handle, .read).?;
@@ -6875,7 +6928,7 @@ test "capi native bounded admission coalesces allocator proof outside publicatio
         limit = (try file.file.stat(file.runtime())).size;
         store.maintenance_policy.options.max_storage_bytes = limit;
         file.max_file_bytes = limit;
-        file.free_pages_verified = false;
+        owner.resetAllocatorAuthorityForTest();
         owner.maintenance_storage_pending = true;
     }
     const Probe = struct {
@@ -7245,8 +7298,8 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
         try guard.handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = document }}, .sync_level = .write });
         owner.maintenance_pending = true;
     }
-    // Finish any initial reclamation. Later idle polls must reuse the physical
-    // store and must neither open a DB runtime nor refresh the foreground DB.
+    // Finish initial reclamation. Later idle polls may retain an existing
+    // immutable runtime, but must not open one or retain primary readers.
     var settled = false;
     for (0..64) |_| if (!try owner.maintenanceTurnForTest()) {
         settled = true;
@@ -7283,7 +7336,9 @@ test "capi SQL idle native maintenance avoids runtime construction and resumes w
             try std.testing.expectEqual(current, owner.current.?);
             try std.testing.expectEqual(snapshot, owner.maintenance_snapshot.?);
         }
-        try std.testing.expect(!owner.maintenance_snapshot.?.db_live);
+        const retained = owner.maintenance_snapshot.?;
+        try std.testing.expectEqual(@as(usize, 0), retained.maintenance_references);
+        try std.testing.expectEqual(std.math.maxInt(u64), retained.owned_lite_backend.?.native_docstore.?.reader_frontier.load(.acquire));
     }
     try std.testing.expect(!owner.wake.isSet());
     try std.testing.expectEqual(settled_replay_sequence, owner.current.?.db.core.nextDerivedSequence());

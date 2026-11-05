@@ -2592,8 +2592,10 @@ fn catchUpWindowWithOrdered(
     var seen_sequences = std.AutoHashMapUnmanaged(u64, void).empty;
     defer seen_sequences.deinit(gpa);
     ctx.seen_sequences = &seen_sequences;
-    _ = try replay_source.forEachMatchingRecord(gpa, from_sequence, .resolution, max_records, &ctx, Ctx.consume);
-    return ctx.max_seen;
+    const scan = try replay_source.forEachMatchingRecord(gpa, from_sequence, .resolution, max_records, &ctx, Ctx.consume);
+    // A bounded fallback page can certify only unrelated records. Preserve
+    // that checked prefix so the driver cannot mistake it for an empty tail.
+    return @max(ctx.max_seen, scan.last_sequence);
 }
 
 /// Erased shard store + ownership, shared with the promotion runtime so both
@@ -2916,6 +2918,7 @@ pub const ResolutionRuntime = struct {
         // acknowledged by an earlier empty scan.
         const target = self.target_sequence.load(.acquire);
         const applied = self.applied_sequence.load(.acquire);
+        var checked_prefix = applied;
         if (self.pending_replay_record == null) {
             const Capture = struct {
                 fn consume(ptr: *anyopaque, sequence: u64, payload: []const u8) anyerror!void {
@@ -2927,12 +2930,16 @@ pub const ResolutionRuntime = struct {
                     runtime.pending_replay_record = .{ .sequence = sequence, .raw = raw, .decoded = decoded };
                 }
             };
-            _ = try self.replay_source.forEachMatchingRecord(self.alloc, applied, .resolution, 1, self, Capture.consume);
+            const scan = try self.replay_source.forEachMatchingRecord(self.alloc, applied, .resolution, 1, self, Capture.consume);
+            checked_prefix = scan.last_sequence;
         }
         const record = if (self.pending_replay_record) |*value| value else {
             if (self.replay_progress != null) return error.InvalidResolutionReplayCursor;
-            try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, target);
-            self.applied_sequence.store(target, .release);
+            // No callback does not prove exhaustion: a fallback scan may have
+            // consumed one bounded page of unrelated canonical records.
+            const complete = if (checked_prefix > applied) @min(target, checked_prefix) else target;
+            try enrichment_state.saveAppliedSequence(self.store_handle.store, scope_name, complete);
+            self.applied_sequence.store(complete, .release);
             return;
         };
         const keys = record.decoded.record.changed_artifact_keys;
@@ -2957,7 +2964,11 @@ pub const ResolutionRuntime = struct {
             if (next < end) try self.processReplayKeys(resolvers, store, keys[next..end]);
             next = end;
         } else while (next < end) {
-            if (replayNowNs() >= deadline_ns.?) break;
+            // Entry checked the deadline before loading the record. Permit one
+            // atomic source even when decoding/catalog setup used the quantum;
+            // otherwise a reopened owner can repeat setup forever without
+            // advancing its durable continuation.
+            if (next > initial and replayNowNs() >= deadline_ns.?) break;
             // A source is the atomic unit, including label routing and sibling
             // dependencies. Ordered publication keeps its read-set validation.
             try self.processReplayKeys(resolvers, store, keys[next .. next + 1]);
@@ -5847,4 +5858,48 @@ test "inline resolver replacement repair discovers sparse sources without scanni
     try testing.expectEqual(@as(usize, 2), adapter.scans);
     try testing.expectEqual(@as(usize, 1), output.items.len);
     try testing.expectEqualStrings(key, output.items[0]);
+}
+
+test "catchUpWindow preserves a bounded fallback prefix before a late match" {
+    const a = testing.allocator;
+    var memory = @import("../mem_backend.zig").Backend.init(a, .{});
+    defer memory.close();
+    var journal = try @import("../docstore.zig").DocStore.openRuntime(a, try memory.runtimeStore(a, .{}));
+    defer journal.close();
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    var artifacts = FakeStore{ .alloc = a };
+    defer artifacts.deinit();
+    var das = DbArtifactStore(FakeStore){ .store = &artifacts };
+    const artifact_store = das.artifactStore();
+    const key = try internal_keys.artifactNamedPrefixAlloc(scratch, "late", "asset", "relations_v1");
+    try artifact_store.put(key, test_extraction);
+    const resolvers = [_]ResolverConfig{.{ .name = "kg", .table = "entities", .source_artifact = "relations_v1", .resolution_artifact = "resolution_v1", .key_template = "{{ slug _entity.text }}", .config_generation = 1 }};
+    var writer = CaptureWriter{ .alloc = a, .store = artifact_store };
+    defer writer.deinit();
+    // Model a legacy canonical journal whose hint side index is absent.
+    // Two complete unrelated pages precede the one record with useful work.
+    var batch = try journal.beginWriteBatch();
+    errdefer batch.abort();
+    try batch.put(internal_keys.replay_meta_init_key[0..], "");
+    for (1..515) |sequence| {
+        const payload = try change_journal_mod.encodeRecord(scratch, .{
+            .sequence = @intCast(sequence),
+            .changed_artifact_keys = if (sequence == 514) &.{key} else &.{},
+            .target_hints = if (sequence == 514) &.{.resolution} else &.{.full_text},
+        });
+        const record_key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, @intCast(sequence));
+        try batch.put(&record_key, payload);
+    }
+    try batch.commit();
+    const source = replay_source_mod.Source.fromPrimaryStore(&journal, null, null);
+    var applied: u64 = 0;
+    for ([_]u64{ 256, 512, 514 }) |expected| {
+        applied = try catchUpWindow(a, source, &resolvers, artifact_store, null, applied, 1, &writer, CaptureWriter.writeFn, null, null);
+        try testing.expectEqual(expected, applied);
+    }
+    const output_key = try internal_keys.resolutionArtifactKeyAlloc(scratch, "late", "resolution_v1");
+    try testing.expect(artifacts.map.contains(output_key));
+    try testing.expectEqual(@as(u64, 1), writer.calls);
 }
