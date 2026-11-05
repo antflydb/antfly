@@ -50,6 +50,19 @@ test('workerd coordinates retained lake SQL through alarms, Queues and R2 across
   assert.ok(result,'durable alarms and queue processing did not converge');assert.equal(result.rows,2);assert.equal(result.pages.length,1);
   await mf.dispose();mf=new Miniflare(convertV4MiniflareOptions(options));
   assert.deepEqual(await call('queries/result',locator),result);
+  const bucket=await mf.getR2Bucket('SQL_EXECUTION');
+  const originalId=typeof query.id==='string'?query.id:String.fromCharCode(...query.id);
+  const baseRecord=await(await bucket.get(`${fixture.config.state.prefix}/sql-execution-v2/${String(query.expires_ms).padStart(20,'0')}/${originalId}/query.json`)).json();
+  for(const [digit,expires_ms,stage,exists]of [['c',query.expires_ms,1,true],['d',1,0,true],['e',query.expires_ms,0,false]]){
+   const id=Array(64).fill(digit.charCodeAt(0)),retired={id,expires_ms};
+   if(exists){
+    const record={...baseRecord,plan:id,expires_ms,stage,status:'pending',owner:'',epoch:0,until_ms:0,cursor:0,pending:[],output:null};
+    await bucket.put(`${fixture.config.state.prefix}/sql-execution-v2/${String(expires_ms).padStart(20,'0')}/${digit.repeat(64)}/query.json`,JSON.stringify(record));
+   }
+   const response=await mf.dispatchFetch('https://sql/internal/v1/sql/tasks/execute',{method:'POST',headers:headers(),body:JSON.stringify({tenant:fixture.tenant,query:retired,stage:0,task:0})});
+   assert.equal(response.status,204,'a fenced, expired or collected task was reported as a worker failure');
+   assert.equal(await response.text(),'');
+  }
   const cancelledPlan=JSON.parse(fixture.raw_plan);cancelledPlan.expires_ms-=1;
   const cancelled=await call('queries/submit',JSON.stringify(cancelledPlan)),abandoned={tenant:fixture.tenant,query:cancelled.query};
   await call('queries/cancel',abandoned);

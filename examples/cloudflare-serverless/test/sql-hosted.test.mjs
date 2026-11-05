@@ -17,6 +17,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {readFile} from 'node:fs/promises';
 import {Bucket} from './object-fixture.mjs';
+import {SQLControl} from '../sql-control.mjs';
 import {instantiateHost} from '../../../zig/lib/objectstore/wasm/asyncify.mjs';
 import {createR2Transport} from '../../../zig/lib/objectstore/wasm/r2.mjs';
 
@@ -253,4 +254,59 @@ test('WASM collection independently drains thousand-object expiry lanes and pres
   const idle=await host.request({config:fixture.config,tenant:fixture.tenant,owner:'gc',op:'sql_collect'});
   assert.equal(idle.deleted,0);assert.equal(idle.more,false);
  }
+});
+
+
+function collectionStorage(){
+ const values=new Map();let alarm=null;
+ return{values,async get(key){return values.get(key);},async put(key,value){values.set(key,structuredClone(value));},async delete(key){values.delete(key);},async getAlarm(){return alarm;},async setAlarm(time){alarm=time;},async deleteAlarm(){alarm=null;}};
+}
+for(const slow of ['list','delete'])test(`WASM GC ${slow} quantum yields without starving exchange or inducing failure backoff`,async()=>{
+ const fixture=JSON.parse(await readFile(new URL('../dist/sql-fixture.json',import.meta.url)));
+ let now=Date.now();
+ const prefix=fixture.config.state.prefix+'/sql-execution-v2/';
+ class SlowState extends Bucket{
+  async list(options){if(slow==='list'&&options.prefix===prefix)now+=16000;return super.list(options);}
+  async delete(key){if(slow==='delete'&&typeof key==='string'&&key.startsWith(prefix))now+=1000;return super.delete(key);}
+ }
+ const buckets={source:new Bucket(),execution:new SlowState()};
+ for(let i=0;i<1000;i++)await buckets.execution.put(prefix+'00000000000000000001/'+i.toString(16).padStart(64,'0')+'/query.json','{}');
+ const output=fixture.config.exchange.prefix+'/sql-exchange/00000000000000000001/'+'b'.repeat(64)+'/output.bin';
+ await buckets.execution.put(output,'expired');
+ const host=await instantiateHost(module,createR2Transport(buckets),{clock:()=>now});
+ const run=async(_env,input)=>host.request({...input,config:fixture.config},{deadlineMs:now+55000,maxOperations:900});
+ const storage=collectionStorage(),control=new SQLControl({storage},{},run,{now:()=>now});
+ const result=await control.collect();
+ assert.equal(result.more,true);assert.equal(result.lanes.state.more,true);
+ assert.equal(result.lanes.exchange.deleted,1);assert.equal(buckets.execution.objects.has(output),false);
+ assert.equal(await storage.get('gc_failures'),undefined,'yielding a quantum was misclassified as an outage');
+ assert.equal(await storage.get('gc_not_before'),undefined);
+ assert.ok((await storage.getAlarm())<=now+1,'the yielded pass lost its prompt continuation');
+ assert.equal(await storage.get('gc_lane'),1);
+ if(slow==='list')assert.equal(result.lanes.state.deleted,0);
+ else assert.ok(result.lanes.state.deleted>0&&result.lanes.state.deleted<64);
+});
+
+test('WASM GC durable lane rotation serves healthy storage even after an unabortable call exhausts a pass',async()=>{
+ const fixture=JSON.parse(await readFile(new URL('../dist/sql-fixture.json',import.meta.url)));
+ let now=Date.now();const prefix=fixture.config.state.prefix+'/sql-execution-v2/';
+ class SlowState extends Bucket{
+  async delete(key){if(typeof key==='string'&&key.startsWith(prefix))now+=60000;return super.delete(key);}
+ }
+ const buckets={source:new Bucket(),execution:new SlowState()};
+ for(let i=0;i<100;i++)await buckets.execution.put(prefix+'00000000000000000001/'+i.toString(16).padStart(64,'0')+'/query.json','{}');
+ const output=fixture.config.exchange.prefix+'/sql-exchange/00000000000000000001/'+'b'.repeat(64)+'/output.bin';
+ await buckets.execution.put(output,'expired');
+ const host=await instantiateHost(module,createR2Transport(buckets),{clock:()=>now});
+ const run=async(_env,input)=>host.request({...input,config:fixture.config},{deadlineMs:now+55000,maxOperations:900});
+ const storage=collectionStorage();
+ let control=new SQLControl({storage},{},run,{now:()=>now});
+ await assert.rejects(control.collect(),/Canceled|DeadlineExceeded/);
+ assert.equal(await storage.get('gc_lane'),1);
+ assert.equal(buckets.execution.objects.has(output),true);
+ now=await storage.getAlarm();
+ control=new SQLControl({storage},{},run,{now:()=>now});
+ await assert.rejects(control.collect(),/Canceled|DeadlineExceeded/);
+ assert.equal(await storage.get('gc_lane'),2);
+ assert.equal(buckets.execution.objects.has(output),false,'the slow first lane pinned healthy exchange collection after eviction');
 });

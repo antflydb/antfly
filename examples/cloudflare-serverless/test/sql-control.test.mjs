@@ -324,3 +324,25 @@ test('SQL collector recovery alarms do not keep a slow empty collector alive',as
  release();assert.equal((await pass).more,false);
  assert.equal(storage.alarm,null,'an overlapping recovery alarm caused an idle busy loop');
 });
+
+
+test('SQL collector rotates its first lane durably before successful or failed external work',async()=>{
+ const storage=new Storage();let now=100000,fail=true;const lanes=[];
+ const run=async(_env,input)=>{
+  lanes.push(input.collection_lane);
+  assert.equal(await storage.get('gc_lane'),(input.collection_lane+1)%3);
+  if(fail){fail=false;throw Error('interrupted pass');}
+  return{deleted:1,more:lanes.length<4};
+ };
+ let control=new SQLControl({storage},{},run,{now:()=>now});
+ await assert.rejects(control.collect(),/interrupted/);
+ assert.equal(await storage.get('gc_lane'),1);
+ assert.equal((await new SQLControl({storage},{},run,{now:()=>now}).collect()).deferred,true);
+ assert.deepEqual(lanes,[0]);
+ while(storage.alarm!==null){
+  now=storage.alarm;control=new SQLControl({storage},{},run,{now:()=>now});
+  await storage.fire(control);assert.ok(lanes.length<=4);
+ }
+ assert.deepEqual(lanes,[0,1,2,0]);
+ assert.equal(await storage.get('gc_failures'),undefined);
+});

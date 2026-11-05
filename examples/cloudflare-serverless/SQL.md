@@ -183,11 +183,27 @@ expired page schedules another collector alarm even when the other lanes are
 empty. Fully drained or live-only pages stop the continuation. Live execution
 objects and source retention namespaces are never deleted by this collector.
 
+Each cleanup lane receives a share of the remaining invocation deadline, with
+one share reserved for checkpointing and publication. A lane that exhausts its
+work quantum returns partial counts with `more: true`; this is successful bounded
+work, not a provider outage. The first lane rotates durably before R2 I/O, so even
+an unabortable operation exhausting a whole pass cannot pin healthy lanes behind
+it after retries or eviction.
+
 The named `collector` object persists its mode and arms recovery before R2 I/O.
 Its alarm survives eviction; successful backlog pages continue promptly without
 waiting for another minute cron. Provider failures retain durable exponential
 backoff from one through 30 seconds, which subsequent nudges and eviction cannot
 bypass. Healthy cleanup lanes are still attempted when a sibling lane fails.
 The cron remains a repair backstop for late uploads and initially unavailable
-metadata storage. Older kernels that return only a deletion count continue
-conservatively until an empty pass, preserving rolling bundle compatibility.
+metadata storage. Count-only adapter results still continue conservatively until an empty pass.
+The worker and WASM kernel deploy together as one Wrangler bundle; the optional
+kernel `collection_lane` request field defaults to zero for existing callers.
+
+
+Task delivery can outlive its query phase, execution lease, or retained namespace.
+Authenticated fenced, expired, or already-collected deliveries return HTTP 204;
+Queue consumers acknowledge the same retired outcomes. This ends only delivery,
+not task execution: accepted task records remain authoritative for query progress.
+Task admission pressure returns HTTP 429. Neither retirement nor task pressure
+quarantines a responsive endpoint.

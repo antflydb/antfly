@@ -354,7 +354,7 @@ pub const Server = struct {
         // Coordinator control traffic must not occupy a worker slot while
         // waiting for that same pod's task RPC. HTTP connection admission
         // separately bounds control requests.
-        var lease = if (std.mem.eql(u8, path, task_path)) self.admission.tryAcquireLease() orelse return response(a, 503, "{}") else null;
+        var lease = if (std.mem.eql(u8, path, task_path)) self.admission.tryAcquireLease() orelse return response(a, 429, "{}") else null;
         defer if (lease) |*held| held.release();
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
@@ -379,7 +379,10 @@ pub const Server = struct {
         if (std.mem.eql(u8, path, task_path)) {
             const input = std.json.parseFromSliceLeaky(plan.Ticket, scratch, body, .{}) catch return response(a, 400, "{}");
             const service = try self.factory.open(self.factory.ptr, scratch, input.tenant, context);
-            try service.execute(input);
+            service.execute(input) catch |err| {
+                if (runtime.retiredTaskDelivery(err)) return response(a, 204, "");
+                return err;
+            };
             return response(a, 200, "{}");
         }
         if (std.mem.eql(u8, path, submit_path)) {

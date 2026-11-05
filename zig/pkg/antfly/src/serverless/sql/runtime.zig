@@ -26,6 +26,12 @@ const runner = @import("runner.zig");
 const A = std.mem.Allocator;
 const Context = local.serverless_query_lake_read_context.Context;
 const digest = local.serverless_external_source_mod.lake_catalog.types.digestHex;
+/// A task delivery can outlive its query phase, lease, or retained namespace.
+/// Acknowledging retirement only ends delivery; durable task state still decides
+/// query progress. These authority outcomes say nothing about endpoint health.
+pub fn retiredTaskDelivery(err: anyerror) bool {
+    return err == error.SqlExecutionFenced or err == error.SqlQueryExpired or err == error.SqlExecutionNotFound or err == error.SqlExecutionFailed;
+}
 pub const Clock = struct {
     ptr: ?*anyopaque = null,
     read: *const fn (?*anyopaque) u64 = realtime,
@@ -468,6 +474,7 @@ pub const Service = struct {
         var query = (try self.store().load(a, query_key)) orelse return error.SqlExecutionNotFound;
         defer query.deinit(a);
         try self.authorize(a, ticket.query, query.value);
+        if (query.value.expires_ms <= self.clock.now()) return error.SqlQueryExpired;
         if (query.value.terminal() or query.value.cancel_requested) return;
         try watch.enter();
         if (watch.isCancelled()) return;

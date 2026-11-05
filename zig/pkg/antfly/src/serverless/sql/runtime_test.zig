@@ -2864,3 +2864,87 @@ test "distributed SQL admitted spill isolates real file and byte quotas between 
     try std.testing.expectEqual(@as(u64, 1024), first.live_bytes);
     try std.testing.expectEqual(@as(u64, 1024), second.live_bytes);
 }
+
+test "distributed SQL stale expired and collected task deliveries acknowledge without quarantining healthy workers" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    var service = fixture.service(a, memory.client(), "worker");
+    var records = service.state_store;
+    records.tenant = service.tenant;
+    const query: state.Query = .{ .id = @splat('b'), .expires_ms = 200000 };
+    const key = try records.key(a, query, null, 0);
+    defer a.free(key);
+    try records.create(a, key, query.id, query.expires_ms);
+    const claim = (try records.claim(a, key, "coordinator", 60000)).?;
+    try records.checkpointTasks(a, key, claim, 1, 0, &.{});
+    const expired: state.Query = .{ .id = @splat('d'), .expires_ms = 500 };
+    const expired_key = try records.key(a, expired, null, 0);
+    defer a.free(expired_key);
+    records.now_ms = 0;
+    try records.create(a, expired_key, expired.id, expired.expires_ms);
+    const cases = [_]struct { query: state.Query, failure: anyerror }{
+        .{ .query = query, .failure = error.SqlExecutionFenced },
+        .{ .query = expired, .failure = error.SqlQueryExpired },
+        .{ .query = .{ .id = @splat('c'), .expires_ms = 200000 }, .failure = error.SqlExecutionNotFound },
+    };
+    const transport = @import("transport.zig");
+    const auth = @import("../../api/internal_service_auth.zig");
+    const Scope = struct {
+        fn open(raw: *anyopaque, _: A, tenant: state.Digest, context: Context) !runtime.Service {
+            var scoped = @as(*runtime.Service, @ptrCast(@alignCast(raw))).*;
+            if (!std.meta.eql(tenant, scoped.tenant)) return error.SqlExecutionUnauthorized;
+            scoped.context = context;
+            return scoped;
+        }
+    };
+    const config: auth.Config = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" };
+    var admission = local.common_request_admission.RequestAdmission.init(2);
+    const Fake = struct {
+        server: transport.Server,
+        calls: usize = 0,
+        expected_status: u16 = 204,
+        fn execute(raw: *anyopaque, allocator: A, request_: local.common_http_http_common.HttpRequest) !local.common_http_http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            var credential: ?[]const u8 = null;
+            for (request_.headers) |header| if (std.ascii.eqlIgnoreCase(header.name, auth.header_name)) {
+                credential = header.value;
+            };
+            const response = try self.server.handle(allocator, transport.task_path, credential, request_.body, .{});
+            try std.testing.expectEqual(self.expected_status, response.status);
+            return response;
+        }
+    };
+    var fake: Fake = .{ .server = .{ .factory = .{ .ptr = &service, .open = Scope.open, .dispatcher = undefined }, .authentication = config, .admission = &admission } };
+    var routing: transport.Routing = .{ .cooldown_ms = 30000 };
+    var client: transport.Client = .{ .a = a, .routing = &routing, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = config, .workers = &.{ "http://a", "http://b" } };
+    for (cases, 0..) |case, i| {
+        const ticket: plan.Ticket = .{ .tenant = service.tenant, .query = case.query, .stage = 0, .task = 0 };
+        try std.testing.expectError(case.failure, service.execute(ticket));
+        try client.execute(ticket, .{});
+        try std.testing.expectEqual(i + 1, fake.calls);
+        const now = @import("antfly_platform").time.monotonicNs();
+        try std.testing.expectEqual(.healthy, routing.admit("http://a", now).kind);
+        try std.testing.expectEqual(.healthy, routing.admit("http://b", now).kind);
+    }
+    try std.testing.expectEqual(@as(usize, 0), fixture.opens);
+    try std.testing.expectEqual(@as(usize, 0), admission.stats().in_flight);
+    {
+        var first = admission.tryAcquireLease().?;
+        defer first.release();
+        var second = admission.tryAcquireLease().?;
+        defer second.release();
+        fake.expected_status = 429;
+        try std.testing.expectError(error.SqlWorkerUnavailable, client.execute(.{ .tenant = service.tenant, .query = query, .stage = 0, .task = 0 }, .{}));
+        const now = @import("antfly_platform").time.monotonicNs();
+        try std.testing.expectEqual(.healthy, routing.admit("http://a", now).kind);
+        try std.testing.expectEqual(.healthy, routing.admit("http://b", now).kind);
+    }
+    try std.testing.expectEqual(@as(usize, 0), admission.stats().in_flight);
+    var unchanged = (try records.load(a, key)).?;
+    defer unchanged.deinit(a);
+    try std.testing.expectEqual(@as(u32, 1), unchanged.value.stage);
+    try std.testing.expectEqual(state.Status.running, unchanged.value.status);
+}

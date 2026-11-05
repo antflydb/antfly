@@ -3039,6 +3039,7 @@ pub const AntflyApiHandler = struct {
     fn internalSqlError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
         return textResponse(ctx, switch (err) {
             error.SqlExecutionUnauthorized => 403,
+            error.SqlTaskAdmissionUnavailable => 429,
             error.SqlWorkerUnavailable, error.SqlQueryRoleRequired, error.SqlExecutionFenced, error.PreconditionFailed => 503,
             error.SqlExecutionNotFound => 404,
             error.SqlQueryExpired => 410,
@@ -3054,9 +3055,12 @@ pub const AntflyApiHandler = struct {
         var input = std.json.parseFromSlice(@import("../serverless/sql/plan.zig").Ticket, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid SQL task ticket");
         defer input.deinit();
         const service = self.internalSqlService(ctx, input.value.tenant) catch |err| return internalSqlError(ctx, err);
-        var admission = self.api_server.acquireSqlExecution(false) catch return textResponse(ctx, 503, "query capacity exhausted");
+        var admission = self.api_server.acquireSqlExecution(false) catch return textResponse(ctx, 429, "query capacity exhausted");
         defer admission.release();
-        service.execute(input.value) catch |err| return internalSqlError(ctx, err);
+        service.execute(input.value) catch |err| {
+            if (@import("../serverless/sql/runtime.zig").retiredTaskDelivery(err)) return textResponse(ctx, 204, "");
+            return internalSqlError(ctx, err);
+        };
         return ctx.json(.{ .accepted = true });
     }
     fn internalSqlSubmit(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {

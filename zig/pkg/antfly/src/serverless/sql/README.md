@@ -58,6 +58,8 @@ round-robin discovery. Embeddings wire `Driver.notification()` into their
 pools collect expired execution records, discovery hints, and exchange objects
 with an independent 64-object page per namespace. Each pass returns per-lane
 continuation information; healthy lanes are attempted even when a sibling fails.
+Time-bounded lane quanta yield partial progress without failure backoff, and the
+first lane rotates before external I/O so an interrupted pass cannot pin it.
 API gateways never execute worker tasks.
 
 Native coordinator turns enqueue task tickets without waiting for task RPCs.
@@ -359,3 +361,11 @@ budget. A new submission probes its expected query identity, treating absence as
 a healthy response. Application failures, caller cancellation and local resource
 pressure do not quarantine reachable workers. One bounded cooldown round (at
 most one second) preserves response-loss replay when no healthy peer remains.
+
+
+Task RPCs acknowledge authenticated retired deliveries (fenced stage/lease,
+expired query, or collected query namespace) with HTTP 204. Delivery ACKs never
+replace the durable task record when deciding query completion. Task slot and
+spill pressure return HTTP 429 for bounded peer failover without endpoint
+quarantine. Authority races and backpressure are distinct from worker transport
+failures on all task listener paths.

@@ -18,6 +18,8 @@
 const std = @import("std");
 const state = @import("state.zig");
 const A = std.mem.Allocator;
+const exchange = @import("exchange.zig");
+const Context = @import("antfly_local_sources").serverless_query_lake_read_context.Context;
 /// Only expiry-owned namespaces are deleted. Their content-addressed query ID
 /// includes the expiry, and every claimant rejects an expired plan. No live
 /// generation can reuse these names, so conditional DELETE is unnecessary.
@@ -28,34 +30,46 @@ pub fn collect(a: A, store: state.Store, max_steps: usize) !usize {
     var steps: usize = 0;
     for ([_][]const u8{ "sql-execution-v2", "sql-query-expiry" }) |lane| {
         if (steps == max_steps) break;
-        steps += (try collectLane(a, store, lane, max_steps - steps)).deleted;
+        steps += (try collectLane(a, store, lane, max_steps - steps, store.context)).deleted;
     }
     return steps;
 }
-fn collectLane(a: A, store: state.Store, lane: []const u8, max_keys: usize) !@import("exchange.zig").Collection {
+fn collectLane(a: A, store: state.Store, lane: []const u8, max_keys: usize, parent: Context) !@import("exchange.zig").Collection {
     var client = store.client;
     client.allocator = a;
     const token = @import("antfly_local_sources").serverless_external_source_mod.lake_catalog.types.contextCancellation(&store.context);
     const prefix = try std.fmt.allocPrint(a, "{s}/{s}/", .{ store.prefix, lane });
     defer a.free(prefix);
-    var listed = try client.listObjects(store.bucket, .{ .prefix = prefix, .max_keys = @intCast(max_keys), .cancellation = token });
+    var listed = client.listObjects(store.bucket, .{ .prefix = prefix, .max_keys = @intCast(max_keys), .cancellation = token }) catch |err| {
+        if (try exchange.collectionYield(parent, store.context, err)) return .{ .more = true };
+        return err;
+    };
     defer listed.deinit(a);
     var deleted: usize = 0;
     for (listed.entries) |entry| {
-        try store.context.ensureActive();
+        store.context.ensureActive() catch |err| {
+            if (try exchange.collectionYield(parent, store.context, err)) return .{ .deleted = deleted, .more = true };
+            return err;
+        };
         if (!std.mem.startsWith(u8, entry.key, prefix) or entry.key.len < prefix.len + 21 + 64 or entry.key[prefix.len + 20] != '/') return error.InvalidSqlExecutionState;
         const expires = try std.fmt.parseInt(u64, entry.key[prefix.len..][0..20], 10);
         try state.validateDigest(entry.key[prefix.len + 21 ..][0..64].*);
         if (expires +| 30_000 >= store.now_ms) break;
-        try client.deleteObject(store.bucket, entry.key, .{ .cancellation = token });
+        client.deleteObject(store.bucket, entry.key, .{ .cancellation = token }) catch |err| switch (err) {
+            error.FileNotFound, error.NotFound, error.ObjectNotFound => {},
+            else => {
+                if (try exchange.collectionYield(parent, store.context, err)) return .{ .deleted = deleted, .more = true };
+                return err;
+            },
+        };
         deleted += 1;
     }
     return .{ .deleted = deleted, .more = deleted != 0 and deleted == listed.entries.len and listed.next_continuation_token != null };
 }
 pub const Progress = struct {
-    state: @import("exchange.zig").Collection,
-    discovery: @import("exchange.zig").Collection,
-    exchange: @import("exchange.zig").Collection,
+    state: exchange.Collection = .{},
+    discovery: exchange.Collection = .{},
+    exchange: @import("exchange.zig").Collection = .{},
     pub fn deleted(self: Progress) usize {
         return self.state.deleted + self.discovery.deleted + self.exchange.deleted;
     }
@@ -75,26 +89,49 @@ pub const Collector = struct {
     /// fails. One turn uses at most three LISTs and 192 DELETEs. Errors retain
     /// retry semantics without starving healthy cleanup lanes.
     pub fn runProgress(self: Collector, a: A, context: @import("antfly_local_sources").serverless_query_lake_read_context.Context) !Progress {
-        var state_store = self.state_store;
-        state_store.context = context;
-        state_store.now_ms = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+        return self.runProgressFrom(a, context, 0);
+    }
+    pub fn runProgressFrom(self: Collector, a: A, context: Context, first_lane: u8) !Progress {
+        if (first_lane >= 3) return error.InvalidSqlExecutionState;
+        var parent = context;
+        const now = @import("antfly_platform").time.monotonicNs();
+        if (parent.deadline_ns == null) parent.deadline_ns = now +| 55 * std.time.ns_per_s;
+        try parent.ensureActive();
+        const wall_ms: u64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+        var progress: Progress = .{};
         var failure: ?anyerror = null;
-        const execution = collectLane(a, state_store, "sql-execution-v2", 64) catch |err| failed: {
-            failure = err;
-            break :failed @import("exchange.zig").Collection{};
-        };
-        const discovery = collectLane(a, state_store, "sql-query-expiry", 64) catch |err| failed: {
-            if (failure == null) failure = err;
-            break :failed @import("exchange.zig").Collection{};
-        };
-        var exchange_store = self.exchange_store;
-        exchange_store.context = context;
-        const exchange = exchange_store.collectPage(a, state_store.now_ms, 64) catch |err| failed: {
-            if (failure == null) failure = err;
-            break :failed @import("exchange.zig").Collection{};
-        };
+        for (0..3) |offset| {
+            const lane = (@as(usize, first_lane) + offset) % 3;
+            const start = @import("antfly_platform").time.monotonicNs();
+            var child = parent;
+            // Give every unvisited lane a share of the remaining budget and
+            // reserve one share for publication. Quantum expiry returns partial
+            // progress; it is not a provider failure and must not induce backoff.
+            child.deadline_ns = start +| (parent.deadline_ns.? -| start) / (4 - offset);
+            const value = if (lane == 2) collect_exchange: {
+                var objects = self.exchange_store;
+                objects.context = child;
+                break :collect_exchange objects.collectPageWithin(a, wall_ms, 64, parent);
+            } else collect_state: {
+                var records = self.state_store;
+                records.context = child;
+                records.now_ms = wall_ms;
+                break :collect_state collectLane(a, records, if (lane == 0) "sql-execution-v2" else "sql-query-expiry", 64, parent);
+            };
+            const done = value catch |err| failed: {
+                if (failure == null) failure = err;
+                break :failed exchange.Collection{};
+            };
+            switch (lane) {
+                0 => progress.state = done,
+                1 => progress.discovery = done,
+                2 => progress.exchange = done,
+                else => unreachable,
+            }
+        }
+        try parent.ensureActive();
         if (failure) |err| return err;
-        return .{ .state = execution, .discovery = discovery, .exchange = exchange };
+        return progress;
     }
 };
 
@@ -126,6 +163,7 @@ test "distributed SQL expiry roots rediscover writes arriving after discovery cl
 pub const Schedule = struct {
     next_ms: u64 = 0,
     delay_ms: u32 = 100,
+    next_lane: u8 = 0,
     pub fn waitMs(self: Schedule, now_ms: u64) u64 {
         return @max(@as(u64, 1), self.next_ms -| now_ms);
     }
@@ -138,8 +176,12 @@ pub const Schedule = struct {
         try context.ensureActive();
         if (now_ms < self.next_ms) return 0;
         errdefer self.deferPass(collector, now_ms);
-        const steps = try collector.run(a, context);
-        if (steps == 0) self.deferPass(collector, now_ms) else {
+        const first = self.next_lane;
+        // Advance before I/O so an interrupted pass cannot pin the first lane.
+        self.next_lane = (first + 1) % 3;
+        const progress = try collector.runProgressFrom(a, context, first);
+        const steps = progress.deleted();
+        if (steps == 0 and !progress.more()) self.deferPass(collector, now_ms) else {
             self.delay_ms = 100;
             self.next_ms = now_ms +| 1;
         }
@@ -224,4 +266,17 @@ test "distributed SQL collection attempts healthy lanes after an independent lan
     defer remaining.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), remaining.entries.len);
     try std.testing.expect(std.mem.indexOf(u8, remaining.entries[0].key, "/sql-execution-v2/") != null);
+}
+
+test "distributed SQL collection quantum yields preserve real cancellation and provider failures" {
+    const now = @import("antfly_platform").time.monotonicNs();
+    const parent: Context = .{ .deadline_ns = now + std.time.ns_per_s };
+    const child: Context = .{ .deadline_ns = 0 };
+    try std.testing.expect(try exchange.collectionYield(parent, child, error.Canceled));
+    try std.testing.expect(!try exchange.collectionYield(parent, parent, error.Canceled));
+    try std.testing.expect(!try exchange.collectionYield(parent, child, error.AccessDenied));
+    var cancelled = std.atomic.Value(bool).init(true);
+    const canceled_parent: Context = .{ .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromAtomic(&cancelled) };
+    try std.testing.expectError(error.Canceled, exchange.collectionYield(canceled_parent, child, error.Canceled));
+    try std.testing.expectError(error.DeadlineExceeded, exchange.collectionYield(child, child, error.Canceled));
 }

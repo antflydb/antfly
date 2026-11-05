@@ -97,6 +97,7 @@ pub const Request = struct {
     query: ?@import("state.zig").Query = null,
     ticket: ?plan.Ticket = null,
     working_set_bytes: usize = 20 * 1024 * 1024,
+    collection_lane: u8 = 0,
 };
 const Tickets = struct {
     a: A,
@@ -152,7 +153,7 @@ fn executeIn(a: A, client: storage.Client, io: std.Io, context: Context, raw: []
         },
         .sql_collect => blk: {
             const collector: @import("collector.zig").Collector = .{ .state_store = service.state_store, .exchange_store = service.exchange_store };
-            const progress = try collector.runProgress(a, context);
+            const progress = try collector.runProgressFrom(a, context, request.collection_lane);
             break :blk std.json.Stringify.valueAlloc(a, .{ .deleted = progress.deleted(), .more = progress.more(), .lanes = progress }, .{});
         },
     };

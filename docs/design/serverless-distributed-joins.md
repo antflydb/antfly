@@ -125,8 +125,10 @@ Object owns coordinator turns and arms recovery before execution or Queue
 submission. Queue consumers acknowledge accepted terminal task records and wake
 orchestration. Separate named discovery and collector objects persist bounded
 alarm continuations; cron starts them independently as a repair backstop. The
-collector drains each expiry lane independently, preserves failure backoff across
-eviction, and stops once only live objects remain. These continuations repair
+collector gives each expiry lane a bounded time share, checkpoints partial
+progress on quantum expiry, and rotates its first lane durably before I/O. It
+preserves genuine failure backoff across eviction and stops once only live
+objects remain. These continuations repair
 missed delivery and process eviction without making cron the cleanup throughput
 limit. The checked-in Wrangler profile
 binds the coordinator class, task Queue, source/execution R2 buckets, and cron.

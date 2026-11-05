@@ -14,7 +14,7 @@
 // limitations under the License.
 
 import {DurableObject} from 'cloudflare:workers';
-import {SQLControl,authenticateSQL,boundedSQLBody,consumeSQL,locatorName,scheduleSQLMaintenance} from './sql-control.mjs';
+import {SQLControl,authenticateSQL,boundedSQLBody,consumeSQL,locatorName,scheduleSQLMaintenance,retiredSQLDelivery} from './sql-control.mjs';
 import {runSQL} from './sql-kernel.mjs';
 import {IngressBudget} from './ingress-budget.mjs';
 const ingress=new IngressBudget(2*1024*1024);
@@ -41,7 +41,7 @@ export default {
   if(!action)return new Response('not found',{status:404});
   if(request.method!=='POST')return new Response('method not allowed',{status:405});
   if(!await authenticateSQL(request,env))return new Response('unauthorized',{status:401});
-  if(active>=16)return new Response('SQL runtime busy',{status:503,headers:{'Retry-After':'1'}});
+  if(active>=16)return new Response('SQL runtime busy',{status:action==='execute'?429:503,headers:{'Retry-After':'1'}});
   active++;const reservation=ingress.open();
   try{
    const raw=await boundedSQLBody(request,reservation),body=JSON.parse(raw);
@@ -56,7 +56,8 @@ export default {
    if(action==='turn')return Response.json(await env.SQL_COORDINATORS.getByName(locatorName(locator)).advance(locator));
    if(action==='cancel'){await runSQL(env,{op:'sql_cancel',...locator,owner:crypto.randomUUID()});await env.SQL_COORDINATORS.getByName(locatorName(locator)).kick(locator);return Response.json({});}
    if(action==='result')return Response.json(await runSQL(env,{op:'sql_result',...locator,owner:crypto.randomUUID()}));
-   await runSQL(env,{op:'sql_execute',...locator,ticket:body,owner:crypto.randomUUID()});
+   try{await runSQL(env,{op:'sql_execute',...locator,ticket:body,owner:crypto.randomUUID()});}
+   catch(error){if(retiredSQLDelivery(error))return new Response(null,{status:204});throw error;}
    return Response.json({});
   }catch(error){return Response.json({error:String(error)},{status:status(error)});}finally{reservation.release();active--;}
  },

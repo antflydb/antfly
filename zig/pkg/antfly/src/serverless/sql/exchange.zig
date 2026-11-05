@@ -73,6 +73,13 @@ fn hash(bytes: []const u8) [32]u8 {
 /// One expiry lane's bounded cleanup result. A truncated, fully expired page
 /// needs another pass even when every other lane is empty.
 pub const Collection = struct { deleted: usize = 0, more: bool = false };
+/// Only a child work quantum may yield. Caller cancellation/deadline and
+/// provider failures remain errors; a yielded lane is retried without backoff.
+pub fn collectionYield(parent: catalog.types.Context, child: catalog.types.Context, err: anyerror) !bool {
+    try parent.ensureActive();
+    if (err != error.DeadlineExceeded and err != error.Canceled and err != error.Cancelled) return false;
+    return if (child.deadline_ns) |deadline| @import("antfly_platform").time.monotonicNs() >= deadline else false;
+}
 pub const Store = struct {
     client: storage.Client,
     bucket: []const u8,
@@ -232,21 +239,39 @@ pub const Store = struct {
         return (try self.collectPage(a, now_ms, max_keys)).deleted;
     }
     pub fn collectPage(self: Store, a: A, now_ms: u64, max_keys: u32) !Collection {
+        return self.collectPageWithin(a, now_ms, max_keys, self.context);
+    }
+    pub fn collectPageWithin(self: Store, a: A, now_ms: u64, max_keys: u32, parent: catalog.types.Context) !Collection {
         if (max_keys == 0 or max_keys > 256) return error.InvalidSqlExchange;
         const prefix = try std.fmt.allocPrint(a, "{s}/sql-exchange/", .{self.prefix});
         defer a.free(prefix);
         var client = self.client;
         client.allocator = a;
-        var listed = try client.listObjects(self.bucket, .{ .prefix = prefix, .max_keys = max_keys, .cancellation = catalog.types.contextCancellation(&self.context) });
+        var listed = client.listObjects(self.bucket, .{ .prefix = prefix, .max_keys = max_keys, .cancellation = catalog.types.contextCancellation(&self.context) }) catch |err| {
+            if (try collectionYield(parent, self.context, err)) return .{ .more = true };
+            return err;
+        };
         defer listed.deinit(a);
         var deleted: usize = 0;
         for (listed.entries) |entry| {
+            self.context.ensureActive() catch |err| {
+                if (try collectionYield(parent, self.context, err)) return .{ .deleted = deleted, .more = true };
+                return err;
+            };
             if (!std.mem.startsWith(u8, entry.key, prefix) or entry.key.len < prefix.len + 21) return error.InvalidSqlExchange;
             const expiry = std.fmt.parseInt(u64, entry.key[prefix.len..][0..20], 10) catch return error.InvalidSqlExchange;
             if (expiry +| 30_000 >= now_ms) break;
             // Expired content-addressed exchange names can never be a live
             // generation again. A late upload is found by the next expiry walk.
-            try client.deleteObject(self.bucket, entry.key, .{ .cancellation = catalog.types.contextCancellation(&self.context) });
+            client.deleteObject(self.bucket, entry.key, .{ .cancellation = catalog.types.contextCancellation(&self.context) }) catch |err| switch (err) {
+                // Concurrent collectors and accepted DELETE response loss are
+                // replayable: an already absent expired object is reclaimed.
+                error.FileNotFound, error.NotFound, error.ObjectNotFound => {},
+                else => {
+                    if (try collectionYield(parent, self.context, err)) return .{ .deleted = deleted, .more = true };
+                    return err;
+                },
+            };
             deleted += 1;
         }
         return .{ .deleted = deleted, .more = deleted != 0 and deleted == listed.entries.len and listed.next_continuation_token != null };

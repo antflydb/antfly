@@ -62,7 +62,7 @@ export async function boundedSQLBody(request,reservation){
  const bytes=new Uint8Array(size);let at=0;for(const chunk of chunks){bytes.set(chunk,at);at+=chunk.length;}
  return new TextDecoder('utf-8',{fatal:true}).decode(bytes);
 }
-const retired=error=>/SqlQueryExpired|SqlExecutionFenced|SqlExecutionNotFound|SqlExecutionFailed/.test(String(error));
+export const retiredSQLDelivery=error=>/SqlQueryExpired|SqlExecutionFenced|SqlExecutionNotFound|SqlExecutionFailed/.test(String(error));
 export class SQLControl {
  constructor(ctx,env,run,{now=()=>Date.now(),owner=crypto.randomUUID()}={}){this.ctx=ctx;this.env=env;this.run=run;this.now=now;this.owner=owner;this.active=false;this.collectAgain=false;this.updates=Promise.resolve();}
  // Serialize only storage metadata, never a turn or external network I/O.
@@ -93,7 +93,7 @@ export class SQLControl {
    for(let i=0;i<result.tickets.length;i+=100)await this.env.SQL_TASKS.sendBatch(result.tickets.slice(i,i+100).map(body=>({body,contentType:'json'})));
    if(result.complete)await this.retire();
    return{complete:result.complete};
-  }catch(error){if(retired(error)){await this.retire();return{complete:true};}throw error;}
+  }catch(error){if(retiredSQLDelivery(error)){await this.retire();return{complete:true};}throw error;}
   finally{this.active=false;}
  }
  async alarm(){
@@ -119,7 +119,12 @@ export class SQLControl {
     await this.update(()=>this.ctx.storage.setAlarm(notBefore));
     return{deleted:0,more:true,deferred:true};
    }
-   const result=await this.run(this.env,{op:'sql_collect',tenant:Array(64).fill(97),owner:this.owner});
+   const lane=await this.ctx.storage.get('gc_lane')??0;
+   if(!Number.isInteger(lane)||lane<0||lane>=3)throw Error('InvalidSqlCollectionLane');
+   // Advance durably before external I/O, even if an unabortable operation
+   // consumes the whole invocation. Eviction/failure cannot pin a slow lane.
+   await this.ctx.storage.put('gc_lane',(lane+1)%3);
+   const result=await this.run(this.env,{op:'sql_collect',tenant:Array(64).fill(97),owner:this.owner,collection_lane:lane});
    if(!Number.isSafeInteger(result?.deleted)||result.deleted<0||result.more!==undefined&&typeof result.more!=='boolean')throw Error('InvalidSqlCollectionResult');
    // Compatibility with a pre-progress kernel is conservative: a nonempty
    // pass may have filled only one of its independently bounded lanes.
@@ -216,7 +221,7 @@ export async function consumeSQL(batch,env,run,{now=()=>Date.now()}={}){
     // ACK only the durable accepted/terminal record, then wake orchestration.
     await env.SQL_COORDINATORS.getByName(locatorName(locator)).kick(locator);message.ack();
    }else message.retry({delaySeconds:Math.min(120,Math.max(1,Math.ceil((result.until_ms+30000-now())/1000)))});
-  }catch(error){if(retired(error))message.ack();else message.retry({delaySeconds:2});}
+  }catch(error){if(retiredSQLDelivery(error))message.ack();else message.retry({delaySeconds:2});}
  }
 }
 
