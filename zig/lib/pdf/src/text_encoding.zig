@@ -21,11 +21,12 @@ const Allocator = std.mem.Allocator;
 pub const no_rune = std.unicode.replacement_character;
 
 pub fn isUtf16Be(bytes: []const u8) bool {
-    return bytes.len >= 2 and bytes[0] == 0xfe and bytes[1] == 0xff and bytes.len % 2 == 0;
+    return bytes.len >= 2 and bytes[0] == 0xfe and bytes[1] == 0xff;
 }
 
 pub fn utf16BeDecodeAlloc(alloc: Allocator, bytes: []const u8) ![]u8 {
     if (!isUtf16Be(bytes)) return try alloc.dupe(u8, bytes);
+    if (bytes.len % 2 != 0) return error.InvalidUtf16;
 
     const payload = bytes[2..];
     const units_len = payload.len / 2;
@@ -188,7 +189,10 @@ pub const mac_expert_glyph_names: [256][]const u8 = .{
 };
 
 pub fn decodeNamedAlloc(alloc: Allocator, enc: NamedEncoding, bytes: []const u8) ![]u8 {
-    if (isUtf16Be(bytes)) return try utf16BeDecodeAlloc(alloc, bytes);
+    // Font character codes are byte strings, not PDF text strings. Preserve
+    // the historical well-formed UTF-16 shortcut without interpreting an odd
+    // byte sequence beginning FE FF as a malformed replacement string.
+    if (isUtf16Be(bytes) and bytes.len % 2 == 0) return try utf16BeDecodeAlloc(alloc, bytes);
     const table: *const [256]u21 = switch (enc) {
         .pdf_doc => &pdf_doc_encoding,
         .win_ansi => &win_ansi_encoding,
@@ -498,4 +502,21 @@ test "Adobe glyph names decode complete and algorithmic Unicode mappings" {
 
     try std.testing.expect((try glyphNameToUtf8Alloc(alloc, "uniD800")) == null);
     try std.testing.expectEqual(@as(?u21, 0x00c1), glyphNameToRune("Aacute.alt"));
+}
+
+test "PDF text strings reject odd UTF16 payloads without changing font byte decoding" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ &.{ 0xfe, 0xff, 0 }, &.{ 0xfe, 0xff, 0, 0x41, 0 } }) |bytes| {
+        try std.testing.expect(isUtf16Be(bytes));
+        try std.testing.expectError(error.InvalidUtf16, utf16BeDecodeAlloc(a, bytes));
+        try std.testing.expectError(error.InvalidUtf16, pdfDocDecodeAlloc(a, bytes));
+        const font_bytes = try decodeNamedAlloc(a, .win_ansi, bytes);
+        defer a.free(font_bytes);
+        const expected = try decodeTableAlloc(a, &win_ansi_encoding, bytes);
+        defer a.free(expected);
+        try std.testing.expectEqualStrings(expected, font_bytes);
+    }
+    const empty = try pdfDocDecodeAlloc(a, &.{ 0xfe, 0xff });
+    defer a.free(empty);
+    try std.testing.expectEqualStrings("", empty);
 }
