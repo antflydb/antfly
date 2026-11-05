@@ -18084,9 +18084,13 @@ pub const ApiHttpServer = struct {
     ) public_table_http.TableApi.ExecutePutArtifactEnrichmentError!void {
         const self: *ApiHttpServer = @ptrCast(@alignCast(ptr));
         try ensureTableOperationActive(request);
-        const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| return metadataAccessFailure(err)) orelse return error.NotFound;
+        const table_before = (self.loadOwnedTableRecord(alloc, table_name) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=load_table table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            return metadataAccessFailure(err);
+        }) orelse return error.NotFound;
         defer metadata_table_manager.freeTable(alloc, table_before);
-        const enrichment_json = table_contract.parseArtifactEnrichmentRequest(alloc, artifact_name, body) catch {
+        const enrichment_json = table_contract.parseArtifactEnrichmentRequest(alloc, artifact_name, body) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=request table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
             return error.InvalidEnrichmentRequest;
         };
         defer alloc.free(enrichment_json);
@@ -18101,17 +18105,23 @@ pub const ApiHttpServer = struct {
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
             },
-        ) catch |err| switch (err) {
-            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
-            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
-            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
-            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
-            else => return error.InternalFailure,
+        ) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=producer table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            switch (err) {
+                error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+                error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+                error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+                error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+                else => return error.InternalFailure,
+            }
         };
 
-        const assembled_indexes_json = indexes_api.addEnrichmentToTableIndexesJson(alloc, table_before.indexes_json, artifact_name, enrichment_json) catch |err| switch (err) {
-            error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return error.InvalidEnrichmentRequest,
-            else => return error.InternalFailure,
+        const assembled_indexes_json = indexes_api.addEnrichmentToTableIndexesJson(alloc, table_before.indexes_json, artifact_name, enrichment_json) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=assemble_table table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            switch (err) {
+                error.InvalidTableIndexMetadata, error.InvalidExtensionEnrichment => return error.InvalidEnrichmentRequest,
+                else => return error.InternalFailure,
+            }
         };
         defer alloc.free(assembled_indexes_json);
         const expected_indexes_json = table_index_config.normalizeAdmittedManagedEmbeddingIndexDimensionsJsonWithOptions(
@@ -18125,18 +18135,22 @@ pub const ApiHttpServer = struct {
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
             },
-        ) catch |err| switch (err) {
-            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
-            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
-            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
-            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
-            error.ModelNotFound => return error.ModelNotFound,
-            error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
-            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
-            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
-            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
-            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
-            else => return error.InvalidEnrichmentRequest,
+        ) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=normalize_table_embeddings table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            switch (err) {
+                error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+                error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
+                error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+                error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
+                error.ModelNotFound => return error.ModelNotFound,
+                error.AmbiguousModelIdentifier => return error.AmbiguousModelIdentifier,
+                error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
+                error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+                error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+                error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+                error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+                else => return error.InvalidEnrichmentRequest,
+            }
         };
         defer alloc.free(expected_indexes_json);
         table_index_config.validateManagedEmbeddingRuntimeConfigJsonWithOptions(
@@ -18150,23 +18164,30 @@ pub const ApiHttpServer = struct {
                 .inference_api_url = self.configuredInferenceAPIURL(),
                 .inference_api_key = self.cfg.inference_api_key,
             },
-        ) catch |err| switch (err) {
-            error.InvalidCreateTableRequest, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
-            error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
-            error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
-            error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
-            error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
-            error.ModelNotFound => return error.ModelNotFound,
-            error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
-            error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
-            error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
-            error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
-            error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
-            else => return error.InternalFailure,
+        ) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=validate_table_runtime table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            switch (err) {
+                error.InvalidCreateTableRequest, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
+                error.ResourceLimitExceeded => return error.ResourceLimitExceeded,
+                error.MemoryBudgetExceeded => return error.MemoryBudgetExceeded,
+                error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
+                error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
+                error.ModelNotFound => return error.ModelNotFound,
+                error.AmbiguousModelIdentifier => return error.AmbiguousModelIdentifier,
+                error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
+                error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
+                error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
+                error.EmbeddingArtifactDimensionRequired => return error.EmbeddingArtifactDimensionRequired,
+                error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
+                else => return error.InternalFailure,
+            }
         };
-        indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| switch (err) {
-            error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
-            else => return error.InternalFailure,
+        indexes_api.validateArtifactEnrichmentsForTableIndexesJson(alloc, expected_indexes_json) catch |err| {
+            std.log.warn("artifact enrichment validation failed stage=validate_table_artifacts table={s} artifact={s} err={s} request_id={s}", .{ table_name, artifact_name, @errorName(err), request.request_id });
+            switch (err) {
+                error.InvalidEnrichmentConfig, error.ConflictingEnrichmentConfig, error.InvalidDocumentExtractionConfig, error.DocumentExtractionModelRequired => return error.InvalidEnrichmentRequest,
+                else => return error.InternalFailure,
+            }
         };
 
         try ensureTableOperationActive(request);
@@ -18184,6 +18205,7 @@ pub const ApiHttpServer = struct {
             error.EmbeddingProbeUnavailable => return error.ProbeUnavailable,
             error.InferenceEndpointAccessDenied => return error.InferenceEndpointAccessDenied,
             error.ModelNotFound => return error.ModelNotFound,
+            error.AmbiguousModelIdentifier => return error.AmbiguousModelIdentifier,
             error.MissingEmbeddingArtifactEnrichment => return error.MissingEmbeddingArtifactEnrichment,
             error.MissingEmbeddingArtifactProducer => return error.MissingEmbeddingArtifactProducer,
             error.InvalidEmbeddingArtifactProducer => return error.InvalidEmbeddingArtifactProducer,
@@ -18191,19 +18213,19 @@ pub const ApiHttpServer = struct {
             error.ConflictingEmbeddingArtifactDimensions => return error.ConflictingEmbeddingArtifactDimensions,
             else => {
                 if (metadata_authority.isRetryableError(err)) return error.NotLeader;
-                std.log.err("public artifact enrichment metadata update failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                std.log.err("public artifact enrichment metadata update failed table={s} artifact={s} err={} request_id={s}", .{ table_name, artifact_name, err, request.request_id });
                 return error.InternalFailure;
             },
         };
         self.waitForMetadataProjection(table_name, null, expected_indexes_json) catch |err| {
             if (metadata_authority.isRetryableError(err)) return error.NotLeader;
-            std.log.err("public artifact enrichment metadata projection wait failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+            std.log.err("public artifact enrichment metadata projection wait failed table={s} artifact={s} err={} request_id={s}", .{ table_name, artifact_name, err, request.request_id });
             return error.InternalFailure;
         };
         if (self.table_writes) |table_writes_source| {
             _ = table_writes_source.putArtifactEnrichment(alloc, table_name, artifact_name, enrichment_json) catch |err| switch (err) {
                 else => {
-                    std.log.err("public artifact enrichment local apply failed table={s} artifact={s} err={}", .{ table_name, artifact_name, err });
+                    std.log.err("public artifact enrichment local apply failed table={s} artifact={s} err={} request_id={s}", .{ table_name, artifact_name, err, request.request_id });
                     _ = table_writes_source.requestTableStructuralReconcile(alloc, table_name) catch |reconcile_err| {
                         std.log.warn("public artifact enrichment structural reconcile enqueue failed table={s} artifact={s} err={}", .{ table_name, artifact_name, reconcile_err });
                     };

@@ -799,7 +799,17 @@ fn discoverReaderModelPathFromRegistry(
 }
 
 fn resolveNamedModelPath(ctx: Context, requested_name: []const u8, task_type: []const u8) ![]const u8 {
-    const name_without_variant = canonicalModelName(requested_name);
+    const resolved_ref = registry_mod.resolveFriendlyRef(requested_name) orelse requested_name;
+    const normalized = if (std.mem.startsWith(u8, resolved_ref, "hf:")) resolved_ref[3..] else resolved_ref;
+    if (registry_mod.ModelRef.parse(normalized)) |ref| {
+        const selection = try registry_mod.download.parseVariantRevision(ref.variant);
+        if (selection.revision != null or !std.mem.eql(u8, selection.variant, "auto")) {
+            return (try registry_mod.resolveInstalledModelSelector(ctx.allocator, ctx.io, ctx.models_dir, normalized, task_type)) orelse error.ModelNotFound;
+        }
+    } else |_| {
+        if (std.mem.indexOfAny(u8, normalized, ":@") != null) return error.InvalidModelIdentifier;
+    }
+    const name_without_variant = normalized;
 
     if (std.mem.startsWith(u8, name_without_variant, "/")) {
         return try ctx.allocator.dupe(u8, name_without_variant);
@@ -816,6 +826,8 @@ fn resolveNamedModelPath(ctx: Context, requested_name: []const u8, task_type: []
         return task_path;
     }
     ctx.allocator.free(task_path);
+
+    if (try registry_mod.resolveInstalledModelSelector(ctx.allocator, ctx.io, ctx.models_dir, normalized, task_type)) |managed_path| return managed_path;
 
     const task_dir = try std.fmt.allocPrint(ctx.allocator, "{s}/{s}", .{ ctx.models_dir, task_type });
     defer ctx.allocator.free(task_dir);
@@ -1750,4 +1762,29 @@ test "reader extractor does not accept text input" {
         .session_manager = undefined,
         .model_manager = undefined,
     }, &.{}, .{}, &.{}));
+}
+
+test "model selection direct extraction verifies receipt pins" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/provisioned/demo");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/provisioned/demo/model.gguf", .data = "decoder" });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "models/provisioned/demo/.antfly-download-complete.json",
+        .data =
+        \\{"version":2,"source":{"owner":"acme","name":"demo","variant":"gguf:Q4_0@main","resolved_revision":"0123456789abcdef0123456789abcdef01234567"},"artifacts":[{"path":"model.gguf","size":7}]}
+        ,
+    });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    const expected = try tmp.dir.realPathFileAlloc(io, "models/provisioned/demo", a);
+    defer a.free(expected);
+    const ctx: Context = .{ .allocator = a, .io = io, .models_dir = root, .session_manager = undefined, .model_manager = undefined };
+    const selected = try resolveNamedModelPath(ctx, "acme/demo:gguf:Q4_0@0123456789abcdef0123456789abcdef01234567", "extractors");
+    defer a.free(selected);
+    try std.testing.expectEqualStrings(expected, selected);
+    try std.testing.expectError(error.ModelNotFound, resolveNamedModelPath(ctx, "acme/demo:gguf:Q8_0", "extractors"));
+    try std.testing.expectError(error.ModelNotFound, resolveNamedModelPath(ctx, "acme/demo:gguf:Q4_0@ffffffffffffffffffffffffffffffffffffffff", "extractors"));
 }

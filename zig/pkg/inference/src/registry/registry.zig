@@ -303,10 +303,9 @@ pub fn modelInstallDirAlloc(
 }
 
 /// Return the stable Hub request name recorded by a validated managed-model
-/// receipt. Install-directory leaves include a variant hash and are an internal
-/// cache detail; callers should publish `owner/name` for automatic selection or
-/// `owner/name:variant` for an explicit variant so every advertised value is
-/// stable, unique, and accepted by model-resolution endpoints.
+/// receipt. Install-directory leaves are an internal cache detail. A known
+/// resolved revision makes the canonical key immutable; variant-less and
+/// unpinned selectors are published separately only when unambiguous.
 pub fn managedModelRequestNameAlloc(
     allocator: std.mem.Allocator,
     io: Io,
@@ -325,15 +324,92 @@ pub fn managedModelRequestNameAlloc(
     {
         return null;
     }
-    if (std.mem.eql(u8, source.variant, "auto")) {
-        return try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source.owner, source.name });
-    }
-    return try std.fmt.allocPrint(
-        allocator,
-        "{s}/{s}:{s}",
-        .{ source.owner, source.name, source.variant },
-    );
+    const selection = try download.parseVariantRevision(source.variant);
+    const base = if (std.mem.eql(u8, selection.variant, "auto"))
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source.owner, source.name })
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}:{s}", .{ source.owner, source.name, selection.variant });
+    errdefer allocator.free(base);
+    // Separate revisions must not share one descriptor merely because their
+    // public unpinned selector has the same spelling.
+    if (source.resolved_revision) |revision| if (immutableHubRevision(revision)) {
+        const pinned = try std.fmt.allocPrint(allocator, "{s}@{s}", .{ base, revision });
+        allocator.free(base);
+        return pinned;
+    };
+    return base;
 }
+
+/// Candidate public selectors from a validated installation receipt. Callers
+/// must reject names shared by different installations before advertising them.
+/// The immutable revision comes from the resolved commit, never a moving ref.
+/// All returned memory belongs to allocator (normally a request arena).
+pub fn managedModelSelectorsAlloc(allocator: std.mem.Allocator, io: Io, model_dir: []const u8) ![]const []const u8 {
+    var receipt = (try managed_receipt.loadValidated(allocator, io, model_dir)) orelse return &.{};
+    defer receipt.deinit();
+    if (receipt.parsed.value.version != 2) return &.{};
+    const source = receipt.parsed.value.source orelse return &.{};
+    if (!hubRepoComponentIsSafe(source.owner) or !hubRepoComponentIsSafe(source.name) or !modelVariantIsSafe(source.variant)) return &.{};
+    const selection = try download.parseVariantRevision(source.variant);
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    const base = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ source.owner, source.name });
+    try names.append(allocator, base);
+    const qualified = if (std.mem.eql(u8, selection.variant, "auto")) base else try std.fmt.allocPrint(allocator, "{s}:{s}", .{ base, selection.variant });
+    if (qualified.ptr != base.ptr) try names.append(allocator, qualified);
+    if (source.resolved_revision) |revision| {
+        if (immutableHubRevision(revision)) {
+            try names.append(allocator, try std.fmt.allocPrint(allocator, "{s}@{s}", .{ qualified, revision }));
+            if (!std.mem.eql(u8, base, qualified)) try names.append(allocator, try std.fmt.allocPrint(allocator, "{s}@{s}", .{ base, revision }));
+        }
+    }
+    return names.toOwnedSlice(allocator);
+}
+fn immutableHubRevision(revision: []const u8) bool {
+    if (revision.len != 40) return false;
+    for (revision) |c| if (!std.ascii.isHex(c)) return false;
+    return true;
+}
+
+/// Resolve a receipt-backed selector within the requested installation scope.
+/// Both native HTTP execution and direct extractor APIs use this authority.
+/// Exact legacy paths/defaults are handled by callers before this scan.
+pub fn resolveInstalledModelSelector(allocator: std.mem.Allocator, io: Io, models_dir: []const u8, requested: []const u8, task: ?[]const u8) !?[]u8 {
+    var registry = ModelRegistry.init(allocator, models_dir);
+    const discovered = try registry.discoverShallow(io);
+    defer {
+        for (discovered) |entry| {
+            allocator.free(entry.name);
+            allocator.free(entry.path);
+        }
+        if (discovered.len > 0) allocator.free(discovered);
+    }
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    var match: ?[]const u8 = null;
+    for (discovered) |entry| {
+        if (!modelInTaskScope(models_dir, entry.path, task)) continue;
+        const selectors = try managedModelSelectorsAlloc(arena.allocator(), io, entry.path);
+        var matches = selectors.len == 0 and std.mem.indexOfAny(u8, requested, ":@") == null and std.mem.eql(u8, entry.name, requested);
+        for (selectors) |selector| if (std.mem.eql(u8, selector, requested)) {
+            matches = true;
+            break;
+        };
+        if (!matches) continue;
+        if (match != null and !std.mem.eql(u8, match.?, entry.path)) return error.AmbiguousModelIdentifier;
+        match = entry.path;
+    }
+    return if (match) |path| try allocator.dupe(u8, path) else null;
+}
+
+pub fn modelInTaskScope(models_dir: []const u8, path: []const u8, task_type: ?[]const u8) bool {
+    const task = task_type orelse return true;
+    const root = std.mem.trimEnd(u8, models_dir, "/");
+    if (!std.mem.startsWith(u8, path, root) or (path.len > root.len and path[root.len] != '/')) return false;
+    const relative = std.mem.trimStart(u8, path[root.len..], "/");
+    const first = relative[0 .. std.mem.indexOfScalar(u8, relative, '/') orelse relative.len];
+    return !isLegacyTaskDir(first) or std.mem.eql(u8, first, task);
+}
+
 pub const ModelRegistry = struct {
     allocator: std.mem.Allocator,
     models_dir: []const u8,
@@ -2837,11 +2913,10 @@ fn isManagedVariantInstallLeaf(requested_name: []const u8, candidate: []const u8
 
 /// Resolve a legacy model name by variant suffix.
 /// If `requested` isn't found in the directory, looks for sibling entries
-/// prefixed with "requested-" and returns the shortest deterministic match.
+/// prefixed with "requested-" and accepts only a single matching directory.
 /// Managed variant directories are deliberately excluded: their suffix is an
 /// opaque cache hash, and validated receipt identities must resolve them.
 /// `requested` may include an owner directory (for example `owner/model`).
-/// Matches Go inference's resolveVariant.
 /// Returns null only for a missing directory or missing match; allocation and
 /// directory iteration failures remain actionable to callers.
 pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const u8, requested: []const u8) !?[]const u8 {
@@ -2875,13 +2950,8 @@ pub fn resolveVariant(allocator: std.mem.Allocator, io: Io, models_dir: []const 
         if (std.mem.startsWith(u8, entry.name, prefix) and
             !isManagedVariantInstallLeaf(requested_name, entry.name))
         {
-            if (best_name == null or entry.name.len < best_name.?.len or
-                (entry.name.len == best_name.?.len and std.mem.lessThan(u8, entry.name, best_name.?)))
-            {
-                const new_best = try allocator.dupe(u8, entry.name);
-                if (best_name) |old| allocator.free(old);
-                best_name = new_best;
-            }
+            if (best_name != null) return error.AmbiguousModelIdentifier;
+            best_name = try allocator.dupe(u8, entry.name);
         }
     }
 
@@ -3217,4 +3287,16 @@ test "specialty managed pull requalifies existing task manifests before publicat
         try std.testing.expectError(error.UnsupportedGlinerSpecialtyArtifact, registry.writePulledModelManifest(io, path, null, null));
         try std.testing.expectEqual(download.ManagedDownloadState.incomplete, download.managedDownloadState(a, io, path));
     }
+}
+
+test "resolveVariant rejects multiple legacy suffixes" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/owner/model-q4");
+    try tmp.dir.createDirPath(io, "models/owner/model-q8");
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    try std.testing.expectError(error.AmbiguousModelIdentifier, resolveVariant(a, io, root, "owner/model"));
 }

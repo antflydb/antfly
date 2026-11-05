@@ -3861,7 +3861,7 @@ fn resetRequestWorkTestCounters() void {
 
 fn requestModelResolutionErrorKind(err: anyerror) RequestModelResolutionErrorKind {
     return switch (err) {
-        error.InvalidModelIdentifier, error.ModelOutsideModelsDir => .invalid,
+        error.InvalidModelIdentifier, error.ModelOutsideModelsDir, error.InvalidHubRevision => .invalid,
         error.ModelNotFound, error.ModelNotSpecified, error.FileNotFound, error.NotDir => .missing,
         error.AmbiguousModelIdentifier => .ambiguous,
         else => .internal,
@@ -12893,27 +12893,21 @@ pub const Node = struct {
             const resolved_ref = registry_mod.resolveFriendlyRef(raw) orelse raw;
             const n = if (std.mem.startsWith(u8, resolved_ref, "hf:")) resolved_ref[3..] else resolved_ref;
 
-            // Explicit Hub variants installed by the registry live in stable,
-            // variant-specific leaf directories. Resolve that identity before
-            // the legacy variant-stripping fallback below.
+            // Artifact constraints are resolved against validated receipts before
+            // any legacy path/variant fallback. Never silently discard a pin.
             if (registry_mod.ModelRef.parse(n)) |ref| {
-                if (!std.mem.eql(u8, ref.variant, "auto")) {
-                    const variant_path = try registry_mod.modelInstallDirAlloc(self.allocator, self.config.models_dir, ref);
-                    if (dirContainsModel(variant_path)) return variant_path;
-                    self.allocator.free(variant_path);
-
-                    if (task_type) |tt| {
-                        const task_dir = try std.fmt.allocPrint(self.allocator, "{s}/{s}", .{ self.config.models_dir, tt });
-                        defer self.allocator.free(task_dir);
-                        const task_variant_path = try registry_mod.modelInstallDirAlloc(self.allocator, task_dir, ref);
-                        if (dirContainsModel(task_variant_path)) return task_variant_path;
-                        self.allocator.free(task_variant_path);
-                    }
+                const selection = try @import("../registry/download.zig").parseVariantRevision(ref.variant);
+                if (selection.revision != null or !std.mem.eql(u8, selection.variant, "auto")) {
+                    if (try self.resolveDiscoveredRequestName(io, n, task_type)) |path| return path;
+                    return error.ModelNotFound;
                 }
-            } else |_| {}
+            } else |_| {
+                if (std.mem.indexOfAny(u8, n, ":@") != null) return error.InvalidModelIdentifier;
+            }
 
-            // Strip ":variant" suffix for path resolution (variant is for pulling, not path lookup)
-            const name_without_variant = if (std.mem.indexOfScalar(u8, n, ':')) |colon| n[0..colon] else n;
+            // Constrained Hub references have already returned above. The
+            // remaining legacy identifier must retain its exact spelling.
+            const name_without_variant = n;
 
             // Absolute path
             if (std.mem.startsWith(u8, name_without_variant, "/")) return try self.allocator.dupe(u8, name_without_variant);
@@ -12999,65 +12993,11 @@ pub const Node = struct {
     }
 
     fn discoveredModelInTaskScope(self: *Node, path: []const u8, task_type: ?[]const u8) bool {
-        const task = task_type orelse return true;
-        const root = std.mem.trimEnd(u8, self.config.models_dir, "/");
-        if (!pathHasComponentPrefix(path, root)) return false;
-        const relative = std.mem.trimStart(u8, path[root.len..], "/");
-        const first = relative[0 .. std.mem.indexOfScalar(u8, relative, '/') orelse relative.len];
-        // Flat installations remain shared. Task-scoped discovery must not
-        // introduce collisions from unrelated operation namespaces.
-        return !registry_mod.isLegacyTaskDir(first) or std.mem.eql(u8, first, task);
+        return registry_mod.modelInTaskScope(self.config.models_dir, path, task_type);
     }
 
-    fn resolveDiscoveredRequestName(
-        self: *Node,
-        io: std.Io,
-        request_name: []const u8,
-        task_type: ?[]const u8,
-    ) !?[]u8 {
-        // Model-path resolution is also used by narrow unit and direct-runtime
-        // construction paths that initialize only Node's request fields. Build
-        // this read-only discovery view from the authoritative configured root
-        // instead of relying on the long-lived listing registry to be present.
-        // It also keeps a request resolution race from sharing mutable listing
-        // state with a concurrent inventory refresh.
-        var registry = registry_mod.ModelRegistry.init(self.allocator, self.config.models_dir);
-        const discovered = try registry.discoverShallow(io);
-        defer {
-            for (discovered) |entry| {
-                registry.allocator.free(entry.name);
-                registry.allocator.free(entry.path);
-            }
-            if (discovered.len > 0) registry.allocator.free(discovered);
-        }
-
-        var match: ?[]const u8 = null;
-        for (discovered) |entry| {
-            if (!self.discoveredModelInTaskScope(entry.path, task_type)) continue;
-            if (!std.mem.eql(u8, entry.name, request_name)) continue;
-            if (match != null and !std.mem.eql(u8, match.?, entry.path))
-                return error.AmbiguousModelIdentifier;
-            match = entry.path;
-        }
-        if (match) |path| return try self.allocator.dupe(u8, path);
-
-        // A variant-less owner/name remains convenient while exactly one
-        // validated managed variant is installed. Once variants coexist there
-        // is no implicit default: choosing by the opaque install-directory hash
-        // can select a different precision or even a backend-incompatible
-        // artifact after an unrelated pull.
-        const requested_ref = registry_mod.ModelRef.parse(request_name) catch return null;
-        if (!std.mem.eql(u8, requested_ref.variant, "auto")) return null;
-        for (discovered) |entry| {
-            if (!self.discoveredModelInTaskScope(entry.path, task_type)) continue;
-            const entry_ref = registry_mod.ModelRef.parse(entry.name) catch continue;
-            if (!std.mem.eql(u8, entry_ref.owner, requested_ref.owner) or
-                !std.mem.eql(u8, entry_ref.name, requested_ref.name)) continue;
-            if (match != null and !std.mem.eql(u8, match.?, entry.path))
-                return error.AmbiguousModelIdentifier;
-            match = entry.path;
-        }
-        return if (match) |path| try self.allocator.dupe(u8, path) else null;
+    fn resolveDiscoveredRequestName(self: *Node, io: std.Io, request_name: []const u8, task_type: ?[]const u8) !?[]u8 {
+        return registry_mod.resolveInstalledModelSelector(self.allocator, io, self.config.models_dir, request_name, task_type);
     }
 
     fn findFirstModelInDir(self: *Node, dir_path: []const u8) ?[]const u8 {
@@ -25394,6 +25334,13 @@ pub const Node = struct {
         var rejected_listings = std.ArrayListUnmanaged(RejectedModelListing).empty;
         defer rejected_listings.deinit(a);
         for (discovered, 0..) |entry, entry_index| {
+            // A directory spelling is not proof of a format or immutable pin.
+            // Unmanaged installations may advertise only literal legacy names.
+            if (std.mem.indexOfAny(u8, entry.name, ":@") != null) {
+                var selection_arena = std.heap.ArenaAllocator.init(a);
+                defer selection_arena.deinit();
+                if ((try registry_mod.managedModelSelectorsAlloc(selection_arena.allocator(), io, entry.path)).len == 0) continue;
+            }
             var manifest = switch (try manifest_mod.loadListingCandidateResult(a, entry.path)) {
                 .manifest => |loaded| loaded,
                 .rejected => |err| {
@@ -25772,6 +25719,49 @@ pub const Node = struct {
                 const task = if (is_read) "read" else "extract";
                 try catalog.value.object.getPtr(scope).?.object.put(ca, entry.name, try self.documentCatalogInfo(ca, definition, task));
             }
+        }
+        // Build receipt-derived ownership once per inventory, rather than
+        // rescanning every artifact for every public selector. Resolution uses
+        // these same receipt selectors in resolveDiscoveredRequestName.
+        const SelectorOwner = struct { path: ?[]const u8, default_priority: u2 };
+        const selection_names = try ca.alloc([]const []const u8, discovered.len);
+        for (discovered, selection_names) |entry, *names| {
+            const managed = try registry_mod.managedModelSelectorsAlloc(ca, io, entry.path);
+            names.* = if (managed.len > 0) managed else try ca.dupe([]const u8, &.{entry.name});
+        }
+        for (task_names) |task| {
+            var owners = std.StringHashMapUnmanaged(SelectorOwner).empty;
+            for (discovered, selection_names) |entry, names| {
+                if (!self.discoveredModelInTaskScope(entry.path, task)) continue;
+                for (names) |selector| {
+                    // An exact legacy directory is the existing default.
+                    // Artifact constraints always require receipt ownership.
+                    const unqualified = std.mem.indexOfAny(u8, selector, ":@") == null;
+                    const default_path = if (unqualified) try std.fmt.allocPrint(ca, "{s}/{s}", .{ self.config.models_dir, selector }) else "";
+                    const task_path = if (unqualified) try std.fmt.allocPrint(ca, "{s}/{s}/{s}", .{ self.config.models_dir, task, selector }) else "";
+                    const default_priority: u2 = if (unqualified and std.mem.eql(u8, entry.path, default_path)) 2 else if (unqualified and std.mem.eql(u8, entry.path, task_path)) 1 else 0;
+                    const owner = try owners.getOrPut(ca, selector);
+                    if (!owner.found_existing or default_priority > owner.value_ptr.default_priority) {
+                        owner.value_ptr.* = .{ .path = entry.path, .default_priority = default_priority };
+                    } else if (owner.value_ptr.default_priority == 0 and (owner.value_ptr.path == null or !std.mem.eql(u8, owner.value_ptr.path.?, entry.path))) {
+                        owner.value_ptr.path = null;
+                    }
+                }
+            }
+            const models = catalog.value.object.getPtr(task).?;
+            // Verified revisions keep separate capability descriptors.
+            for (discovered, selection_names) |entry, names| {
+                const descriptor = models.object.get(entry.name) orelse continue;
+                for (names) |selector| {
+                    const owner = owners.get(selector) orelse continue;
+                    const path = owner.path orelse continue;
+                    if (std.mem.eql(u8, path, entry.path)) try models.object.put(ca, selector, descriptor);
+                }
+            }
+            var iterator = owners.iterator();
+            while (iterator.next()) |owner| if (owner.value_ptr.path == null) {
+                _ = models.object.swapRemove(owner.key_ptr.*);
+            };
         }
         return std.json.Stringify.valueAlloc(a, catalog.value, .{});
     }
@@ -36564,6 +36554,12 @@ test "HTTP model resolution is canonical and contained while trusted resolution 
     const explicit_variant_config = try std.fs.path.join(alloc, &.{ explicit_variant_root, "config.json" });
     defer alloc.free(explicit_variant_config);
     try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = explicit_variant_config, .data = "{}" });
+    const explicit_weights_path = try std.fs.path.join(alloc, &.{ explicit_variant_root, "model.gguf" });
+    defer alloc.free(explicit_weights_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = explicit_weights_path, .data = "decoder" });
+    const explicit_receipt_path = try std.fs.path.join(alloc, &.{ explicit_variant_root, ".antfly-download-complete.json" });
+    defer alloc.free(explicit_receipt_path);
+    try std.Io.Dir.cwd().writeFile(std.testing.io, .{ .sub_path = explicit_receipt_path, .data = "{\"version\":2,\"source\":{\"owner\":\"owner\",\"name\":\"model\",\"variant\":\"gguf:Q4_K_M\"},\"artifacts\":[{\"path\":\"config.json\",\"size\":2},{\"path\":\"model.gguf\",\"size\":7}]}" });
     const bge_ref = try registry_mod.ModelRef.parse("BAAI/bge-m3");
     const bge_variant_root = try registry_mod.modelInstallDirAlloc(alloc, models_root, bge_ref);
     defer alloc.free(bge_variant_root);
@@ -36579,7 +36575,7 @@ test "HTTP model resolution is canonical and contained while trusted resolution 
     defer request_arena.deinit();
     const request_allocator = request_arena.allocator();
 
-    const resolved = try node.resolveRequestModelPath(request_allocator, std.testing.io, "hf:owner/model:q4_0", "generators");
+    const resolved = try node.resolveRequestModelPath(request_allocator, std.testing.io, "hf:owner/model", "generators");
     defer request_allocator.free(resolved);
     try std.testing.expectEqualStrings(model_root, resolved);
     const explicit_resolved = try node.resolveRequestModelPath(request_allocator, std.testing.io, "owner/model:gguf:Q4_K_M", "generators");
@@ -36601,7 +36597,7 @@ test "HTTP model resolution is canonical and contained while trusted resolution 
     }
 }
 
-test "trusted model resolution prefers an exact legacy path before receipt discovery" {
+test "trusted unqualified model resolution uses an exact legacy path as its default" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -36630,7 +36626,7 @@ test "trusted model resolution prefers an exact legacy path before receipt disco
     node.config = .{ .models_dir = models_root };
     node.allocator = allocator;
 
-    const resolved = try node.resolveModelPath(io, "owner/model:q4_0", "generators");
+    const resolved = try node.resolveModelPath(io, "owner/model", "generators");
     defer allocator.free(resolved);
     try std.testing.expectEqualStrings(model_root, resolved);
 }
@@ -36758,7 +36754,7 @@ test "HTTP model resolution caller ownership stays flat across repeated requests
     node.allocator = allocator;
 
     for (0..64) |_| {
-        const resolved = try node.resolveRequestModelPath(allocator, std.testing.io, "hf:owner/model:q4_0", "generators");
+        const resolved = try node.resolveRequestModelPath(allocator, std.testing.io, "hf:owner/model", "generators");
         try std.testing.expectEqualStrings(model_root, resolved);
         allocator.free(resolved);
     }
@@ -36784,7 +36780,7 @@ test "trusted model resolution caller ownership stays flat across every return s
     node.allocator = allocator;
 
     for (0..64) |_| {
-        const named = try node.resolveModelPath(std.testing.io, "hf:owner/model:q4_0", "generators");
+        const named = try node.resolveModelPath(std.testing.io, "hf:owner/model", "generators");
         try std.testing.expectEqualStrings(model_root, named);
         allocator.free(named);
 
@@ -50107,4 +50103,123 @@ test "standalone embedding HTTP revision parser and acknowledgements" {
         defer invalid.deinit();
         try std.testing.expectError(error.InvalidEmbeddingRevision, parseEmbedRequest(invalid.value));
     }
+}
+
+// No weights are loaded: these tests exercise the actual receipt, discovery,
+// request-resolution and activation boundaries used before execution.
+fn installModelSelectionFixture(dir: std.Io.Dir, leaf: []const u8, variant: []const u8, revision: ?[]const u8) !void {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    try dir.createDirPath(io, leaf);
+    const weights = try std.fs.path.join(a, &.{ leaf, "model.gguf" });
+    defer a.free(weights);
+    try dir.writeFile(io, .{ .sub_path = weights, .data = "decoder" });
+    const receipt_path = try std.fs.path.join(a, &.{ leaf, ".antfly-download-complete.json" });
+    defer a.free(receipt_path);
+    const receipt = try std.json.Stringify.valueAlloc(a, .{
+        .version = @as(u32, 2),
+        .source = .{ .owner = "acme", .name = "demo", .variant = variant, .resolved_revision = revision },
+        .artifacts = .{.{ .path = "model.gguf", .size = @as(u64, 7) }},
+    }, .{});
+    defer a.free(receipt);
+    try dir.writeFile(io, .{ .sub_path = receipt_path, .data = receipt });
+}
+
+test "model selection verifies immutable revisions and rejects variant fallback" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const revision = "0123456789abcdef0123456789abcdef01234567";
+    try installModelSelectionFixture(tmp.dir, "models/provisioned/one", "gguf:Q4_0@main", revision);
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    const expected = try tmp.dir.realPathFileAlloc(io, "models/provisioned/one", a);
+    defer a.free(expected);
+    var node: Node = undefined;
+    node.allocator = a;
+    node.config = .{ .models_dir = root };
+    for ([_][]const u8{ "acme/demo", "acme/demo:gguf:Q4_0", "acme/demo@" ++ revision, "acme/demo:gguf:Q4_0@" ++ revision }) |name| {
+        const selected = try node.resolveRequestModelPath(a, io, name, "generators");
+        defer a.free(selected);
+        try std.testing.expectEqualStrings(expected, selected);
+    }
+    for ([_][]const u8{ "acme/demo:gguf:Q8_0", "acme/demo:gguf:Q4_0@ffffffffffffffffffffffffffffffffffffffff", "acme/demo:gguf:Q4_0@main" }) |name| {
+        try std.testing.expectError(error.ModelNotFound, node.resolveRequestModelPath(a, io, name, "generators"));
+    }
+    try tmp.dir.createDirPath(io, "models/acme/forged:gguf:Q8_0@" ++ revision);
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/acme/forged:gguf:Q8_0@" ++ revision ++ "/model.gguf", .data = "decoder" });
+    try std.testing.expectError(error.ModelNotFound, node.resolveRequestModelPath(a, io, "acme/forged:gguf:Q8_0@" ++ revision, "generators"));
+    // A legacy exact path must not bypass revision verification either.
+    try installModelSelectionFixture(tmp.dir, "models/acme/demo", "auto", revision);
+    try std.testing.expectError(error.ModelNotFound, node.resolveRequestModelPath(a, io, "acme/demo:gguf:Q8_0@" ++ revision, "generators"));
+}
+
+test "model selection discovery advertises only executable unambiguous selectors" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const revision = "0123456789abcdef0123456789abcdef01234567";
+    try installModelSelectionFixture(tmp.dir, "models/generators/acme/first", "gguf:Q4_0@main", revision);
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root });
+    defer node.deinit();
+    const body = try node.listModelsJsonAlloc(a, io);
+    defer a.free(body);
+    var catalog = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer catalog.deinit();
+    const models = catalog.value.object.get("generators").?.object;
+    for ([_][]const u8{ "acme/demo", "acme/demo:gguf:Q4_0", "acme/demo@" ++ revision, "acme/demo:gguf:Q4_0@" ++ revision }) |name| {
+        try std.testing.expect(models.contains(name));
+        const selected = try node.resolveRequestModelPath(a, io, name, "generators");
+        a.free(selected);
+    }
+    try std.testing.expect(!models.contains("acme/demo:gguf:Q4_0@main"));
+    try installModelSelectionFixture(tmp.dir, "models/generators/acme/second", "gguf:Q8_0", revision);
+    try std.testing.expectError(error.AmbiguousModelIdentifier, node.resolveRequestModelPath(a, io, "acme/demo", "generators"));
+    const next_body = try node.listModelsJsonAlloc(a, io);
+    defer a.free(next_body);
+    var next = try std.json.parseFromSlice(std.json.Value, a, next_body, .{});
+    defer next.deinit();
+    const variants = next.value.object.get("generators").?.object;
+    try std.testing.expect(!variants.contains("acme/demo"));
+    try std.testing.expect(!variants.contains("acme/demo@" ++ revision));
+    try std.testing.expect(variants.contains("acme/demo:gguf:Q4_0@" ++ revision));
+    try std.testing.expect(variants.contains("acme/demo:gguf:Q8_0@" ++ revision));
+    // Different revisions of one variant have distinct descriptors. Neither
+    // the bare nor variant-only spelling may arbitrarily select a revision.
+    const other_revision = "ffffffffffffffffffffffffffffffffffffffff";
+    try installModelSelectionFixture(tmp.dir, "models/generators/acme/third", "gguf:Q4_0", other_revision);
+    try std.testing.expectError(error.AmbiguousModelIdentifier, node.resolveRequestModelPath(a, io, "acme/demo:gguf:Q4_0", "generators"));
+    const third_body = try node.listModelsJsonAlloc(a, io);
+    defer a.free(third_body);
+    var third = try std.json.parseFromSlice(std.json.Value, a, third_body, .{});
+    defer third.deinit();
+    const revisions = third.value.object.get("generators").?.object;
+    try std.testing.expect(!revisions.contains("acme/demo:gguf:Q4_0"));
+    try std.testing.expect(revisions.contains("acme/demo:gguf:Q4_0@" ++ revision));
+    try std.testing.expect(revisions.contains("acme/demo:gguf:Q4_0@" ++ other_revision));
+}
+
+test "model selection activation refuses an uninstalled pin before loading" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try installModelSelectionFixture(tmp.dir, "models/generators/acme/demo", "gguf:Q4_0", "0123456789abcdef0123456789abcdef01234567");
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    var node = try Node.init(a, .{ .models_dir = root });
+    defer node.deinit();
+    var request = try httpx.Request.init(a, .POST, "/ai/v1/models/instances");
+    defer request.deinit();
+    request.body = "{\"model\":\"acme/demo:gguf:Q4_0@ffffffffffffffffffffffffffffffffffffffff\",\"task\":\"generator\"}";
+    var ctx = httpx.Context.init(a, io, &request);
+    defer ctx.deinit();
+    var response = try node.loadModelInstance(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 404), response.status.code);
+    try std.testing.expect(std.mem.indexOf(u8, response.body.?, "MODEL_NOT_FOUND") != null);
 }
