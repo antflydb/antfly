@@ -447,7 +447,44 @@ releases evicted planning candidates instead of retaining the whole input histor
 
 ## Validation
 
-### Latest discovery, preview and identifier fixes (2026-11-04)
+### Restore, invocation memory and prepared reads (2026-11-04)
+
+- Fixes are committed in `d7565d6e9d`, after merging main through
+  `616117cc78ba29dcd6c0212abd78ac076201ee3f`. Both adjacent test additions
+  were retained at the merge conflict sites.
+- Final integrated build: 106/106 steps, 62 API/metadata tests, 164 native
+  privacy/storage checks and two active ABI checks pass without leaks.
+- Six focused HTTP regressions pass (116.09 s): portable and native restore
+  in monitor/protective modes with externalized 5,000-byte scan bounds, plus
+  128 KiB category descriptions in single/two-document preview and backfill.
+  Restored policies, versions, generations and execution controls are preserved;
+  new scans complete, coverage becomes current and protected reads succeed.
+- A real-store regression verifies that valid local publication skips provider
+  execution, while retained producer state with a missing witness regenerates
+  and atomically republishes. The prepared serving/status regression completes
+  under a 32 KiB row budget despite a 128 KiB policy description.
+- Scoped retry worksets, change journals and enrichment replay cursors pass all
+  11 checks; the focused build completes 58/58 steps.
+- The pinned PII model's single-document, two-field long-input HTTP test passes
+  with Metal explicitly required (26.60 s), covering preview, backfill, serving,
+  findings and protected readiness. CUDA kernels/model weights are unchanged;
+  this run does not repeat CUDA qualification.
+- Complete standalone HTTP suite: 29 passed, one optional model skip (618.71 s).
+  Raft HTTP suite: 25 passed, one optional model skip, four standalone backup
+  fixture cases deselected (826.96 s). The skipped pinned-model case passed
+  separately with required Metal on the same binary.
+- The original synthetic 100-document protected-read benchmark passes on the
+  final Debug binary (four samples per policy). With a 16 KiB category
+  description, median latency falls from 115.6 ms in review to 19.8 ms; the
+  no-description control falls from 29.6 ms to 17.1 ms. This measures the HTTP
+  read path, not model inference, recall or production throughput.
+- Formatting, license headers and the Apache boundary check pass (2,407 source
+  files). `make gc` completes and preserves active/recent builds; no eligible
+  build output remained for removal, with 86.3 GiB free at completion.
+- Qualified server binary SHA-256:
+  `f0cc3fe29f76661468e95212803d4fc95d5bdcf8482e2ee7f294fa77f3707025`.
+
+### Earlier discovery, preview and identifier fixes (2026-11-04)
 
 - The initial main fetch was already incorporated through `4bb2b815aa`.
   Main advanced during qualification; merged
