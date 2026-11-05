@@ -21,6 +21,7 @@ runtime loads the resulting shared library and supplies all device scratch.
 """
 
 import argparse
+import ctypes
 import hashlib
 import importlib.metadata
 import importlib.util
@@ -177,7 +178,14 @@ def main():
     ]
     with (out / "build.log").open("w") as log:
         subprocess.run(command, check=True, stdout=log, stderr=subprocess.STDOUT)
+    loaded = ctypes.CDLL(str(library))
+    geometry_abi = loaded.antfly_recurrent_prefill_workspace_geometry_abi
+    geometry_abi.restype = ctypes.c_uint64
+    if geometry_abi() != (1 << 32) | 524:
+        raise RuntimeError("Recurrent prefill workspace geometry ABI mismatch")
     manifest = {
+        "geometry_abi_version": 1,
+        "geometry_packet_bytes": 524,
         "abi_version": 1,
         "packet_bytes": 2408,
         "architecture": "sm_121",

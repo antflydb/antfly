@@ -1689,13 +1689,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
     };
 
-    const ActivePrefillFrameContractStorage = struct {
+    pub const ActivePrefillFrameContractStorage = struct {
+        allocator: ?std.mem.Allocator = null,
         ops: []u16 = &.{},
         barriers: []u8 = &.{},
         quant_dispatches: []u8 = &.{},
         command_ops: []ops.PlannedCommandOp = &.{},
 
-        pub fn deinit(self: *ActivePrefillFrameContractStorage, allocator: std.mem.Allocator) void {
+        pub fn deinit(self: *ActivePrefillFrameContractStorage, fallback_allocator: std.mem.Allocator) void {
+            const allocator = self.allocator orelse fallback_allocator;
             if (self.ops.len != 0) allocator.free(self.ops);
             if (self.barriers.len != 0) allocator.free(self.barriers);
             if (self.quant_dispatches.len != 0) allocator.free(self.quant_dispatches);
@@ -1824,6 +1826,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     engine_operation: ?@import("../execution/backend_operation.zig").Lease = null,
     engine_cleanup_finish: ?*@import("../execution/retirement_finish_holder.zig").Holder = null,
     engine_borrowed_operation: ?@import("../execution/backend_operation.zig").Borrowed = null,
+    // Explicit synchronous receiving-wrapper loan. NEVER on shared Provider,
+    // Engine, graph/cache or escaping tensor. Public free does not read it.
+    workspace_invocation_context: ?*const @import("../execution/invocation_context.zig").Context = null,
     resume_engine_operation: bool = false,
     backend_kv_cache: std.AutoHashMapUnmanaged(BackendKvCacheKey, BackendKvCacheEntry) = .empty,
     cyclic_page_table_cache: runtime_root.kv.storage_runtime.CyclicPageTableCache = .{},
@@ -1990,6 +1995,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         retired: *@import("../backends/metal_custody_cell.zig").Cell,
         compute: ?*MetalCompute = null,
 
+        const Workspace = struct {
+            extern fn antfly_metal_workspace_reader_park_compatible(?*metal_runtime_mod.RawMetalDecodeRuntime) c_int;
+            extern fn antfly_metal_workspace_reader_park_begin(?*metal_runtime_mod.RawMetalDecodeRuntime) c_int;
+            extern fn antfly_metal_workspace_reader_park_end(?*metal_runtime_mod.RawMetalDecodeRuntime) c_int;
+            extern fn antfly_metal_workspace_policy_available(?*metal_runtime_mod.RawMetalDecodeRuntime) c_int;
+            extern fn termite_metal_decode_runtime_release_buffer(?*metal_runtime_mod.RawMetalDecodeRuntime, ?*anyopaque) void;
+        };
+
         pub fn metadataBytes() !usize {
             return std.math.add(usize, try @import("../backends/metal_custody_cell.zig").Cell.metadataBytes(), metal_runtime_mod.antfly_metal_decoder_cache_custody_metadata_bytes());
         }
@@ -2012,11 +2025,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
             if (compute.owned_native_provider or compute.data.shared_metal_native_provider != compute.provider_impl or compute.embedding_stage_suspended or compute.reader_epoch_suspended or compute.shared_provider_lease_io == null or compute.engine_operation == null or compute.engine_borrowed_operation != null or compute.audio_capture != null) return error.ReaderEpochBackendBusy;
             _ = try current.operationFor(cb);
+            // A borrowed receiving Context cannot escape into parked custody.
+            // The actual provider owner serializes these runtime policy facts.
+            if (compute.workspace_invocation_context != null or cb.call_context != null) return error.ReaderEpochBackendBusy;
+            const runtime = compute.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+            if (Workspace.antfly_metal_workspace_reader_park_begin(runtime) != 0) return error.ReaderEpochBackendBusy;
+            // Until self.compute publishes, every failure cancels this exact
+            // marker. After publication only successful restore consumes it.
+            errdefer if (Workspace.antfly_metal_workspace_reader_park_end(runtime) != 0)
+                @import("antfly_platform").inference_process_supervisor.restartWorker();
             // Finish actual numerical work, including a retained empty frame;
             // quota suspension never cancels an admitted cohort's commands.
             try operationQuiesce(compute.provider_impl, false);
             try compute.validateReaderPreparedDeclarations();
-            const runtime = compute.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
             if (metal_runtime_mod.antfly_metal_decoder_cache_custody_take(runtime, self.custody) != 0) return error.ReaderEpochBackendBusy;
             compute.finishEngineOperationWithCleanup(current);
             const io = compute.shared_provider_lease_io.?;
@@ -2031,7 +2052,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
             if (self.compute != compute or !compute.reader_epoch_suspended or compute.data.shared_metal_native_provider != compute.provider_impl or compute.shared_provider_lease_io != null or compute.engine_operation != null) return error.ForeignReaderEpochPark;
             if (current.outside_execution or current.boundary == null) return error.MissingCurrentCleanupEpoch;
+            if (compute.workspace_invocation_context != null or cb.call_context != null) return error.ReaderEpochBackendBusy;
             const io = try lockSharedMetalData(compute.data, compute.io);
+            const runtime = compute.provider_impl.raw_decode_runtime orelse {
+                unlockSharedMetalData(compute.data, io);
+                return error.RuntimeUnavailable;
+            };
+            // Expected peer incompatibility refuses BEFORE publishing receiver
+            // ownership, beginning an Engine or binding the new B. The old
+            // bank/marker remains untouched and can restore after resolution.
+            if (Workspace.antfly_metal_workspace_reader_park_compatible(runtime) != 0) {
+                unlockSharedMetalData(compute.data, io);
+                return error.ReaderEpochBackendBusy;
+            }
             compute.shared_provider_lease_io = io;
             compute.reader_epoch_suspended = false;
             errdefer {
@@ -2047,9 +2080,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             // Epoch-owned source handles/declarations remain live; a peer may
             // retire its own raw slots but must not silently rebind these plans.
             try compute.validateReaderPreparedDeclarations();
-            const runtime = compute.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
             try self.retired.queueForCurrentBoundary(current); // BEFORE any SDK exchange
             if (metal_runtime_mod.antfly_metal_decoder_cache_custody_restore_into(runtime, self.custody, self.retired.custody) != 0) return error.ReaderEpochBackendBusy;
+            // Peer modern allocation has been excluded since park publication.
+            // End only after original backing/configuration is restored. The
+            // independent displaced SDK cell never borrows this runtime.
+            if (Workspace.antfly_metal_workspace_reader_park_end(runtime) != 0)
+                @import("antfly_platform").inference_process_supervisor.restartWorker();
             self.compute = null;
         }
     };
@@ -2161,8 +2198,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             else => false,
         } else b.native_dense_dtype == .bf16 and b.native_dense_bytes != null;
         if (!bf16 or b.mutable_state) return null;
-        const zero = try self.cachedZeroBiasBuf(vocab);
-        defer cb.free(zero);
+        var zero_view: Buf = undefined;
+        var zero_shape: [1]i64 = undefined;
+        const zero = try self.borrowedZeroBiasBuf(&zero_view, &zero_shape, vocab);
         return self.ensureDynamicLinearSlot(weight, zero, dim, vocab);
     }
 
@@ -2407,7 +2445,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer self.allocator.free(host);
         const raw = self.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
         var device = try MetalTensor.deviceAllocateFreshWithAllocator(self.allocator, @ptrCast(raw), host.len * 4, .private, &.{@intCast(host.len)});
-        errdefer device.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&device);
         try device.uploadBytes(std.mem.sliceAsBytes(host));
         // The shared context separately owns an 8 MiB device envelope and
         // 1 MiB host envelope for this cache. Keep each page's original
@@ -2417,7 +2455,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (bytes != 0 and bytes <= 8 * 1024 * 1024 - self.lighton_shared_core_weight_bytes) {
                 try self.lighton_shared_core_weights.ensureUnusedCapacity(self.allocator, 1);
                 var retained = try device.retainedCopy();
-                errdefer retained.deinit();
+                errdefer self.retireTemporaryWorkspaceValue(&retained);
                 self.lighton_shared_core_weights.putAssumeCapacityNoClobber(key, retained);
                 self.lighton_shared_core_weight_bytes += bytes;
                 self.lighton_shared_core_weight_misses += 1;
@@ -2705,8 +2743,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 try cb.checkExecutionControl();
                 const weight = try source.weight(name);
                 plan.weights[index] = weight;
-                const bias = try self.cachedZeroBiasBuf(out_dim);
-                defer freeOp(self, bias);
+                var bias_view: Buf = undefined;
+                var bias_shape: [1]i64 = undefined;
+                const bias = try self.borrowedZeroBiasBuf(&bias_view, &bias_shape, out_dim);
                 plan.slots[index] = (try self.ensureDynamicLinearSlot(weight, bias, in_dim, out_dim)) orelse return null;
                 plan.declarations[index] = self.provider_impl.privateSlotDeclaration(.linear, plan.slots[index]);
                 plan.payload_pins[index] = try self.provider_impl.pinLinearSlotForPersistentUse(plan.slots[index]);
@@ -3099,7 +3138,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             uploadStorageMode(elem_count * @sizeOf(f32)),
             &shape,
         );
-        errdefer device.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&device);
         const host = MetalTensor.borrowed(values.ptr, values.len, &shape);
         try host.copyInto(&device);
         return device;
@@ -3592,7 +3631,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             copied.deinit();
             return err;
         };
-        errdefer freeOp(self, owned_ct);
+        errdefer freeTemporaryWorkspaceCtOp(self, owned_ct);
         // Preserve logical-view metadata so the copy reads back exactly
         // like the original.
         try self.cloneLogicalViewMetadata(toBuf(owned_ct), buf);
@@ -3665,13 +3704,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const buf = toBuf(weight);
         if (canonicalProjectionEligible(buf)) {
             if (try self.canonicalProjectionSpan(buf.lazy_entry.?.tensor_ref.name) == null) {
-                const bias = try self.cachedZeroBiasBuf(768);
-                defer freeOp(self, bias);
+                var bias_view: Buf = undefined;
+                var bias_shape: [1]i64 = undefined;
+                const bias = try self.borrowedZeroBiasBuf(&bias_view, &bias_shape, 768);
                 _ = try self.ensureDynamicLinearSlot(weight, bias, 768, 768);
             }
         } else {
-            const bias = try self.cachedZeroBiasBuf(768);
-            defer freeOp(self, bias);
+            var bias_view: Buf = undefined;
+            var bias_shape: [1]i64 = undefined;
+            const bias = try self.borrowedZeroBiasBuf(&bias_view, &bias_shape, 768);
             _ = try self.ensureDynamicLinearSlot(weight, bias, 768, 768);
         }
         _ = try self.prepareVideoPositions(positions, axis);
@@ -3680,7 +3721,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const buf = toBuf(positions);
         if (bufHasAnyQuantizedStorage(buf) or buf.native_dense_bytes != null) return false;
         var table = try self.ownedMetalTensorFromCt(positions);
-        defer table.deinit();
+        defer self.retireTemporaryWorkspaceValue(&table);
         const runtime = self.provider_impl.raw_decode_runtime;
         const status = if (table.isDevice())
             metal_runtime_mod.termite_metal_decode_runtime_prepare_embedding_table_device(runtime, table.deviceHandle(), table.deviceByteOffset(), axis * 2, 768)
@@ -3714,6 +3755,613 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     pub fn acceptsEmbeddingStage(cb: *const ops.ComputeBackend) bool {
         return cb.vtable == &vtable_impl or cb.vtable == &owned_vtable_impl;
     }
+    pub const WorkspaceInvocationBinding = struct {
+        receiver: *MetalCompute,
+        header: *ops.ComputeBackend,
+        context: *const @import("../execution/invocation_context.zig").Context,
+        existing_service: bool = false,
+        legacy_bounded: bool = false,
+        pub fn deinit(self: *WorkspaceInvocationBinding) void {
+            if (self.receiver.workspace_invocation_context != self.context or self.header.call_context != self.context)
+                platform.inference_process_supervisor.restartWorker();
+            if (self.existing_service) {
+                const runtime = self.receiver.provider_impl.raw_decode_runtime orelse
+                    platform.inference_process_supervisor.restartWorker();
+                // Only an unexpected pre-math guard unwind reaches this path;
+                // committed outcomes end the original raw guard explicitly.
+                if (self.legacy_bounded and metal_runtime.termite_metal_decode_runtime_end_embedding_workspace(runtime) != 0)
+                    platform.inference_process_supervisor.restartWorker();
+                if (antfly_metal_decode_runtime_end_existing_embedding_workspace(@ptrCast(runtime)) != 0)
+                    platform.inference_process_supervisor.restartWorker();
+            }
+            self.receiver.workspace_invocation_context = null;
+            self.header.call_context = null;
+            self.context.workspace_uses.?.unbindReceiver();
+            self.* = undefined;
+        }
+    };
+    /// Install onto the ACTUAL request-local receiving wrapper, under its
+    /// already-owned operation. This uses125's ONE header Context. The guard
+    /// must end before pause, backend teardown or any durable publication.
+    /// Copied/custom tables are vetoed BEFORE casting or reading ctx.
+    pub fn bindWorkspaceInvocation(cb: *ops.ComputeBackend, context: *const @import("../execution/invocation_context.zig").Context) !WorkspaceInvocationBinding {
+        if (!acceptsEmbeddingStage(cb)) return error.UnsupportedWorkspaceReceiver;
+        const uses = context.workspace_uses orelse return error.UnpreparedWorkspaceUses;
+        _ = try context.cleanup.operationFor(cb);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.engine_operation == null or self.engine_borrowed_operation != null or
+            self.shared_provider_lease_io == null or self.owned_native_provider or
+            self.embedding_stage_suspended or
+            self.workspace_invocation_context != null or cb.call_context != null)
+            return error.UnsupportedWorkspaceReceiver;
+        if (uses.allocations) |phase| {
+            const source_runtime = self.provider_impl.raw_decode_runtime orelse return error.WorkspaceTargetChanged;
+            if (phase.target_runtime_address == 0 or phase.target_runtime_address != @intFromPtr(source_runtime))
+                return error.ForeignWorkspaceEndpoint;
+        }
+        try uses.bindReceiver(cb, context.cleanup);
+        self.workspace_invocation_context = context;
+        cb.call_context = context;
+        return .{ .receiver = self, .header = cb, .context = context };
+    }
+    /// Receiving proof for an existing-root-only loan. No fresh-storage
+    /// service is installed and no old charge is spent as request credit.
+    /// Construction may replace cache fields; stale metadata is refused before
+    /// the first mathematical callback, then the caller retries only outside.
+    pub fn bindExistingWorkspaceInvocation(cb: *ops.ComputeBackend, context: *const @import("../execution/invocation_context.zig").Context, runtime_address: usize, expected: *const @import("../backends/metal_workspace_roles.zig").Snapshot, validation: *@import("../backends/metal_workspace_roles.zig").Snapshot) !WorkspaceInvocationBinding {
+        return bindExistingWorkspaceInvocationPolicy(cb, context, runtime_address, expected, validation, null);
+    }
+    /// Original public bounded-Main numerical/cache-growth policy, with the
+    /// SAME original raw bytes guard. This grants NO modern allocation credit;
+    /// the old-root service still cannot take/publish any new charged Root.
+    /// Generic Source/tokenized receivers never opt into this Main-only guard.
+    pub fn bindUnadmittedBoundedWorkspaceInvocation(cb: *ops.ComputeBackend, context: *const @import("../execution/invocation_context.zig").Context, runtime_address: usize, expected: *const @import("../backends/metal_workspace_roles.zig").Snapshot, validation: *@import("../backends/metal_workspace_roles.zig").Snapshot, original_workspace_bytes: usize) !WorkspaceInvocationBinding {
+        return bindExistingWorkspaceInvocationPolicy(cb, context, runtime_address, expected, validation, original_workspace_bytes);
+    }
+    fn bindExistingWorkspaceInvocationPolicy(cb: *ops.ComputeBackend, context: *const @import("../execution/invocation_context.zig").Context, runtime_address: usize, expected: *const @import("../backends/metal_workspace_roles.zig").Snapshot, validation: *@import("../backends/metal_workspace_roles.zig").Snapshot, original_workspace_bytes: ?usize) !WorkspaceInvocationBinding {
+        if (!acceptsEmbeddingStage(cb)) return error.UnsupportedWorkspaceReceiver;
+        _ = try context.cleanup.operationFor(cb);
+        const uses = context.workspace_uses orelse return error.UnpreparedWorkspaceUses;
+        if (uses.allocations != null) return error.ForeignWorkspaceAllowance;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+        if (runtime_address == 0 or runtime_address != @intFromPtr(runtime)) return error.ForeignWorkspaceEndpoint;
+        if (self.engine_operation == null or self.engine_borrowed_operation != null or
+            self.shared_provider_lease_io == null or self.owned_native_provider or self.embedding_stage_suspended or
+            self.workspace_invocation_context != null or cb.call_context != null)
+            return error.UnsupportedWorkspaceReceiver;
+        try validation.capture(@ptrCast(runtime));
+        try expected.validate(validation);
+        if (original_workspace_bytes) |bytes| {
+            if (metal_runtime.termite_metal_decode_runtime_begin_embedding_workspace(runtime, bytes) != 0)
+                return error.MetalWorkspaceBusy;
+        }
+        errdefer if (original_workspace_bytes != null) {
+            if (metal_runtime.termite_metal_decode_runtime_end_embedding_workspace(runtime) != 0)
+                platform.inference_process_supervisor.restartWorker();
+        };
+        var binding = try bindWorkspaceInvocation(cb, context);
+        errdefer binding.deinit();
+        if (antfly_metal_decode_runtime_begin_existing_embedding_workspace(@ptrCast(runtime), existingWorkspaceService(self, runtime)) != 0)
+            return error.MetalWorkspaceBusy;
+        binding.existing_service = true;
+        binding.legacy_bounded = original_workspace_bytes != null;
+        return binding;
+    }
+    /// No-provider/no-tag cold fast decline cannot race a peer's first modern
+    /// publication into an unbound callback. Actual receiving owner proves the
+    /// absence before math; this never fabricates a creation/Engine boundary.
+    pub fn validateNoWorkspaceInvocation(cb: *const ops.ComputeBackend) !void {
+        if (!acceptsEmbeddingStage(cb)) return error.UnsupportedWorkspaceReceiver;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.provider_impl.workspace_creators.head != null) return error.UnpreparedWorkspaceUses;
+    }
+    /// Called while the original actual receiver still owns its Engine/provider,
+    /// before loan deinit and backend destruction. C-internal old cache deaths
+    /// need no fresh allocation service: their creator pins remain until this
+    /// explicit NOWB reconciliation, and the prebound cells block all refunds.
+    /// The final owned-only census ignores new uncharged legacy SDK temporaries;
+    /// its bound is the actual cold old-root count, not a guessed fresh count.
+    pub fn finishExistingWorkspaceInvocation(binding: *WorkspaceInvocationBinding, final_owned: *@import("../backends/metal_workspace_roles.zig").Snapshot, root_storage: []*@import("../backends/metal_workspace_ownership.zig").Root) !void {
+        return (try finishExistingWorkspaceInvocationReported(binding, final_owned, root_storage)).check();
+    }
+    pub fn finishExistingWorkspaceInvocationReported(binding: *WorkspaceInvocationBinding, final_owned: *@import("../backends/metal_workspace_roles.zig").Snapshot, root_storage: []*@import("../backends/metal_workspace_ownership.zig").Root) !WorkspaceCloseOutcome {
+        const current = binding.context.cleanup;
+        _ = try current.operationFor(binding.header);
+        const runtime = binding.receiver.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+        binding.receiver.quiesceEngineOperation() catch platform.inference_process_supervisor.restartWorker();
+        defer binding.deinit();
+        if (antfly_metal_workspace_decoder_custody_compatible(@ptrCast(runtime)) != 0)
+            return error.UnsupportedWorkspaceCustody;
+        try final_owned.captureOwned(@ptrCast(runtime));
+        const roots = try final_owned.copyRoots(root_storage);
+        try binding.receiver.provider_impl.workspace_creators.reconcile(roots, &.{}, current);
+        if (binding.legacy_bounded) {
+            const status = metal_runtime.termite_metal_decode_runtime_end_embedding_workspace(runtime);
+            if (status < 0) platform.inference_process_supervisor.restartWorker();
+            binding.legacy_bounded = false;
+            if (status > 0) return .{ .allocation_denied = error.ResourceLimitExceeded };
+        }
+        return .closed;
+    }
+
+    // SAME service ABI, reuse-only callbacks. The actual receiver is borrowed
+    // synchronously and cleared before header/Context/provider ownership ends.
+    // No Root/SDK late node retains this pointer or service descriptor.
+    fn existingWorkspaceService(self: *MetalCompute, runtime: *metal_runtime.RawMetalDecodeRuntime) @import("../backends/metal_workspace_ownership.zig").AllocationService {
+        return .{
+            .context = self,
+            .runtime_address = @intFromPtr(runtime),
+            .root_operations = &@import("../backends/metal_workspace_ownership.zig").RootOperations.canonical,
+            .take = existingWorkspaceCannotTake,
+            .publish = existingWorkspaceCannotPublish,
+            .cancel = existingWorkspaceCannotCancel,
+            .retire_transient = existingWorkspaceCannotRetire,
+            .retain_cached = existingWorkspaceRetain,
+        };
+    }
+    fn existingWorkspaceCannotTake(_: *anyopaque, _: usize) callconv(.c) ?*anyopaque {
+        return null;
+    }
+    fn existingWorkspaceCannotPublish(_: *anyopaque, _: *anyopaque, _: *anyopaque, _: usize) callconv(.c) c_int {
+        return -1;
+    }
+    fn existingWorkspaceCannotCancel(_: *anyopaque, _: *anyopaque) callconv(.c) void {
+        platform.inference_process_supervisor.restartWorker();
+    }
+    fn existingWorkspaceCannotRetire(_: *anyopaque, _: *anyopaque) callconv(.c) c_int {
+        return -1;
+    }
+    fn existingWorkspaceRetain(raw: *anyopaque, root: *@import("../backends/metal_workspace_ownership.zig").Root, current: *const @import("../execution/cleanup_context.zig").Context) callconv(.c) c_int {
+        const self: *MetalCompute = @ptrCast(@alignCast(raw));
+        const context = self.workspace_invocation_context orelse return -1;
+        const uses = context.workspace_uses orelse return -1;
+        if (uses.allocations != null) return -1;
+        uses.validateRoot(root, current.*) catch return -1;
+        const endpoint = self.provider_impl.workspace_endpoint orelse return -1;
+        if (root.endpoint != endpoint) return -1;
+        self.provider_impl.workspace_creators.adopt(root) catch return -1;
+        return 0;
+    }
+    extern fn antfly_metal_decode_runtime_begin_existing_embedding_workspace(runtime: *anyopaque, owner: @import("../backends/metal_workspace_ownership.zig").AllocationService) c_int;
+    extern fn antfly_metal_decode_runtime_end_existing_embedding_workspace(runtime: *anyopaque) c_int;
+
+    extern fn antfly_metal_decode_runtime_begin_owned_embedding_workspace(runtime: *anyopaque, bytes: usize, owner: @import("../backends/metal_workspace_ownership.zig").AllocationService) c_int;
+    extern fn antfly_metal_decode_runtime_end_owned_embedding_workspace(runtime: *anyopaque) c_int;
+    pub extern fn antfly_metal_workspace_policy_available(runtime: *anyopaque) c_int;
+    pub extern fn antfly_metal_workspace_reader_park_compatible(runtime: *anyopaque) c_int;
+    pub extern fn antfly_metal_workspace_decoder_custody_compatible(runtime: *anyopaque) c_int;
+
+    extern fn antfly_metal_workspace_tail_capabilities(runtime: *anyopaque) u32;
+    extern fn antfly_metal_workspace_frame_staging_capture(runtime: *anyopaque, preceding_frames: usize, span: usize, role: *@import("../backends/metal_workspace_roles.zig").CapturedRole, required: *usize, initial_index: *c_uint) c_int;
+
+    /// Actual selected text tail, composed from the SAME geometry helpers as
+    /// its allocating producers. No declaration covers a generic fallback.
+    pub fn workspaceFrameNormalizeDisabled() bool {
+        const value = platform.env.getenvSlice("TERMITE_METAL_DISABLE_QWEN3_FRAME_NORMALIZE") orelse return false;
+        return value.len > 0 and !std.mem.eql(u8, value, "0") and
+            !std.ascii.eqlIgnoreCase(value, "false") and !std.ascii.eqlIgnoreCase(value, "off") and
+            !std.ascii.eqlIgnoreCase(value, "no");
+    }
+    pub const WorkspaceTailRequest = struct {
+        batch: usize,
+        sequence: usize,
+        width: usize,
+        take_rows: bool,
+        normalize_rows: bool,
+        // null: no external pool; 1: normalize selected rows; sequence: mean.
+        pool_sequence: ?usize = null,
+    };
+    pub const WorkspaceTailDeclaration = struct {
+        const role_types = @import("../backends/metal_workspace_roles.zig");
+        request: WorkspaceTailRequest,
+        allocations: role_types.Plan,
+        staging: role_types.Plan,
+        shared_upload_limit: usize,
+        frame_normalize_disabled: bool,
+        capabilities: u32,
+        frame_index: c_uint,
+        mask_span: usize,
+        host_cpu_bytes: usize,
+
+        const Logical = struct { bytes: [role_types.capacity]usize = @splat(0), shared: u32 = 0, mask: usize = 0, host: usize = 0, capabilities: u32 = 0 };
+        fn describe(request: WorkspaceTailRequest, upload_limit: usize) !Logical {
+            const g = role_types.geometry;
+            if (request.batch == 0 or request.sequence == 0 or request.width == 0 or
+                (request.normalize_rows and (!request.take_rows or request.pool_sequence != null))) return error.UnsupportedWorkspaceTail;
+            const total = try std.math.mul(usize, request.batch, request.sequence);
+            if (total > (1 << 24) or request.width > std.math.maxInt(i32) or
+                try std.math.mul(usize, total, request.width) > std.math.maxInt(u32)) return error.UnsupportedWorkspaceTail;
+            var result: Logical = .{};
+            const embedding = try g.embeddingRoles(total, request.width);
+            result.bytes[0] = embedding.output_private_bytes;
+            result.host = embedding.ids_cpu_bytes;
+            if (request.take_rows) {
+                const ids = try std.math.mul(usize, request.batch, @sizeOf(f32));
+                const gather = try g.takeRowsRoles(request.batch, request.width, ids > upload_limit);
+                result.bytes[1] = gather.ids_device_bytes;
+                if (ids <= upload_limit) result.shared |= 1 << 1;
+                result.bytes[2] = gather.output_private_bytes;
+                result.bytes[3] = gather.ids_upload_shared_bytes;
+                result.shared |= 1 << 3;
+                const selected = try g.selectedRowsCpuRoles(request.batch);
+                result.host = try std.math.add(usize, result.host, try std.math.add(usize, gather.ids_cpu_bytes, try std.math.add(usize, selected.active_rows_i64_bytes, selected.checked_rows_u32_bytes)));
+                result.capabilities |= 1;
+            }
+            if (request.normalize_rows) {
+                const unit = try std.math.mul(usize, request.width, @sizeOf(f32));
+                const norm = try g.directNormalizeRoles(request.batch, request.width, true, unit > upload_limit);
+                result.bytes[4] = norm.unit_device_bytes;
+                if (unit <= upload_limit) result.shared |= 1 << 4;
+                result.bytes[5] = norm.unit_upload_shared_bytes;
+                result.shared |= 1 << 5;
+                result.bytes[6] = norm.rms_private_bytes;
+                result.bytes[7] = norm.scale_private_bytes;
+                result.host = try std.math.add(usize, result.host, norm.unit_cpu_bytes);
+                result.capabilities |= 6;
+            }
+            if (request.pool_sequence) |sequence| {
+                if (sequence == 0 or (request.take_rows and sequence != 1) or (!request.take_rows and sequence != request.sequence))
+                    return error.UnsupportedWorkspaceTail;
+                const pool = try g.framePoolRoles(request.batch, sequence, request.width, true);
+                result.bytes[8] = pool.output_private_bytes;
+                result.mask = pool.mask_staging_span_bytes;
+                result.host = try std.math.add(usize, result.host, try std.math.add(usize, pool.mask_u32_cpu_bytes, pool.forwarded_i64_mask_cpu_bytes));
+                result.capabilities |= 8;
+            }
+            // All supported selected results are authored Private F32 rows;
+            // their final host materialization uses one transient Shared copy.
+            const output_rows = if (request.take_rows or request.pool_sequence != null) request.batch else total;
+            result.bytes[9] = try g.readbackSharedBytes(output_rows, request.width, true);
+            result.shared |= 1 << 9;
+            return result;
+        }
+        fn captureValues(runtime: *anyopaque, logical: Logical, output: *role_types.Capture) !void {
+            output.* = @splat(.{});
+            for (logical.bytes, 0..) |bytes, index| {
+                if (bytes == 0) continue;
+                const bound = role_types.antfly_metal_workspace_allocation_bound(runtime, bytes, @intFromBool((logical.shared & (@as(u32, 1) << @intCast(index))) != 0));
+                if (bound < bytes) return error.MissingWorkspaceAllocationBound;
+                output[index].fresh_allocation_bound = bound;
+            }
+        }
+        pub fn capture(provider: *const ProviderImpl, request: WorkspaceTailRequest) !WorkspaceTailDeclaration {
+            const runtime = provider.raw_decode_runtime orelse return error.RuntimeUnavailable;
+            if (disableRuntimeEmbeddingLookup() or
+                (request.normalize_rows and disableRuntimeElementwise()) or
+                (request.pool_sequence != null and !maskedMeanNormalizeEnabled())) return error.UnsupportedWorkspaceTail;
+            const limit = sharedUploadMaxBytes();
+            const logical = try describe(request, limit);
+            const capabilities = antfly_metal_workspace_tail_capabilities(@ptrCast(runtime));
+            if (capabilities & logical.capabilities != logical.capabilities) return error.UnsupportedWorkspaceTail;
+            var captured: role_types.Capture = undefined;
+            try captureValues(@ptrCast(runtime), logical, &captured);
+            var allocations = try role_types.Plan.capture(.{ .bytes = logical.bytes }, captured);
+            errdefer allocations.deinitOutsideExecution();
+            var required: usize = 0;
+            var initial_index: c_uint = 0;
+            var stage_capture: role_types.Capture = @splat(.{});
+            if (antfly_metal_workspace_frame_staging_capture(@ptrCast(runtime), 1, logical.mask, &stage_capture[0], &required, &initial_index) != 0)
+                return error.WorkspaceRoleCaptureUnavailable;
+            var requirements: role_types.Requirements = .{};
+            requirements.bytes[0] = required;
+            return .{ .request = request, .allocations = allocations, .staging = try role_types.Plan.capture(requirements, stage_capture), .shared_upload_limit = limit, .frame_normalize_disabled = workspaceFrameNormalizeDisabled(), .capabilities = capabilities, .frame_index = initial_index, .mask_span = logical.mask, .host_cpu_bytes = logical.host };
+        }
+        pub fn validate(self: *const WorkspaceTailDeclaration, receiver: *const MetalCompute) !void {
+            if (receiver.audio_capture != null or disableRuntimeEmbeddingLookup() or sharedUploadMaxBytes() != self.shared_upload_limit or
+                workspaceFrameNormalizeDisabled() != self.frame_normalize_disabled or
+                (self.request.normalize_rows and disableRuntimeElementwise()) or
+                (self.request.pool_sequence != null and !maskedMeanNormalizeEnabled())) return error.WorkspaceTailChanged;
+            const runtime = receiver.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+            if (antfly_metal_workspace_tail_capabilities(@ptrCast(runtime)) != self.capabilities) return error.WorkspaceTailChanged;
+            const logical = try describe(self.request, self.shared_upload_limit);
+            var captured: role_types.Capture = undefined;
+            try captureValues(@ptrCast(runtime), logical, &captured);
+            try self.allocations.validate(captured);
+            var required: usize = 0;
+            var initial_index: c_uint = 0;
+            captured = @splat(.{});
+            if (antfly_metal_workspace_frame_staging_capture(@ptrCast(runtime), 1, self.mask_span, &captured[0], &required, &initial_index) != 0 or
+                required != self.staging.requirements.bytes[0] or initial_index != self.frame_index) return error.WorkspaceTailChanged;
+            try self.staging.validate(captured);
+        }
+        pub fn deinitOutsideExecution(self: *WorkspaceTailDeclaration) void {
+            self.allocations.deinitOutsideExecution();
+            self.staging.deinitOutsideExecution();
+        }
+    };
+
+    pub const WorkspaceReferenceProgram = enum { device, host_reference, mixed_unavailable };
+    /// The selected ordinary frame has two fully described FFN domains:
+    /// quantized attention-output + quantized gate/up/down produces a Host
+    /// residual/norm, so the preferred device FFN declines BEFORE any math;
+    /// dense attention-output + dense gate/up/down keeps the original device
+    /// tail. Q/K/V may independently be dense or quantized in either case.
+    /// Other FFN combinations need their actual preferred/pair dataflow plan.
+    fn referenceLayerHostTail(layer: metal_command_planner.GatedFrameCommandLowerer.Layer) ?bool {
+        var all_quantized = true;
+        var all_dense = true;
+        inline for (.{ "q", "k", "v", "attention_output", "gate", "up", "down" }) |field| {
+            if (@field(layer.quant_formats, field) == .unknown) return null;
+        }
+        inline for (.{ "attention_output", "gate", "up", "down" }) |field| {
+            const quantized = @field(layer.quant_formats, field) != .f32;
+            all_quantized = all_quantized and quantized;
+            all_dense = all_dense and !quantized;
+        }
+        if (all_quantized) return true;
+        if (all_dense) return false;
+        return null;
+    }
+    pub fn referenceWorkspaceProgram(reference: bool, layers: []const metal_command_planner.GatedFrameCommandLowerer.Layer) WorkspaceReferenceProgram {
+        if (!reference) return .device;
+        var any_quantized = false;
+        for (layers) |layer| {
+            _ = referenceLayerHostTail(layer) orelse return .mixed_unavailable;
+            inline for (.{ "q", "k", "v", "attention_output", "gate", "up", "down" }) |field| {
+                any_quantized = any_quantized or @field(layer.quant_formats, field) != .f32;
+            }
+        }
+        return if (any_quantized) .host_reference else .device;
+    }
+
+    /// Exact additional constructors for the original Host reference program.
+    /// Slots/bytes are additive storage declarations, never old-root credit.
+    pub const WorkspaceReferenceDeclaration = struct {
+        program: WorkspaceReferenceProgram = .device,
+        reference_policy: bool = false,
+        shared_upload_limit: usize = 0,
+        fresh_slots: usize = 0,
+        fresh_bytes: usize = 0,
+        host_cpu_bytes: usize = 0,
+        device_reference_metadata_bytes: usize = 0,
+
+        fn addSdk(self: *@This(), runtime: *anyopaque, bytes: usize, shared: bool) !void {
+            if (bytes == 0) return;
+            const roles = @import("../backends/metal_workspace_roles.zig");
+            const bound = roles.antfly_metal_workspace_allocation_bound(runtime, bytes, @intFromBool(shared));
+            if (bound < bytes) return error.MissingWorkspaceAllocationBound;
+            self.fresh_slots = try std.math.add(usize, self.fresh_slots, 1);
+            self.fresh_bytes = try std.math.add(usize, self.fresh_bytes, bound);
+        }
+        fn addUpload(self: *@This(), runtime: *anyopaque, bytes: usize) !void {
+            if (bytes == 0) return;
+            const shared = bytes <= self.shared_upload_limit;
+            try self.addSdk(runtime, bytes, shared);
+            if (!shared) try self.addSdk(runtime, bytes, true);
+            self.device_reference_metadata_bytes = try std.math.add(usize, self.device_reference_metadata_bytes, MetalTensor.deviceReferenceMetadataBytes());
+        }
+        pub fn capture(provider: *const ProviderImpl, request: *const ops.DecoderRuntimePrefillFramePlanRequest, layers: []const metal_command_planner.GatedFrameCommandLowerer.Layer) !@This() {
+            const policy = metal_runtime.referenceQuantizedRuntimeLinearDebug();
+            var result: @This() = .{ .reference_policy = policy, .program = referenceWorkspaceProgram(policy, layers), .shared_upload_limit = sharedUploadMaxBytes() };
+            if (result.program == .mixed_unavailable) return error.UnsupportedReferenceWorkspaceGeometry;
+            if (result.program == .device) return result;
+            const runtime = provider.raw_decode_runtime orelse return error.RuntimeUnavailable;
+            if (request.layers.len != layers.len or layers.len == 0) return error.WorkspaceRoleChanged;
+            const geometry = @import("../backends/metal_workspace_geometry.zig");
+            var previous_host = false;
+            for (request.layers, layers) |layer, selected_layer| {
+                const host_tail = referenceLayerHostTail(selected_layer) orelse return error.UnsupportedReferenceWorkspaceGeometry;
+                if (host_tail) {
+                    // CPU fallback parameter bytes are the existing prepared
+                    // Model hosts; no host parameter is required by device tail.
+                    const norm = provider.raw_rms_norm_slot_weights[layer.ffn_pre_norm_slot] orelse return error.UnsupportedReferenceWorkspaceGeometry;
+                    if (norm.isDevice() or norm.dtype != .f32 or norm.elemCount() != request.hidden_size) return error.UnsupportedReferenceWorkspaceGeometry;
+                }
+                const formats = selected_layer.quant_formats;
+                const logical = try geometry.referenceSelectedLayer(request.rows, request.hidden_size, try std.math.mul(usize, request.num_attention_heads, layer.head_dim), try std.math.mul(usize, layer.kv_heads, layer.head_dim), layer.intermediate_size, previous_host, .{ formats.q != .f32, formats.k != .f32, formats.v != .f32 }, host_tail, result.shared_upload_limit);
+                for (logical.uploads) |bytes| try result.addUpload(@ptrCast(runtime), bytes);
+                for (logical.downloads) |bytes| try result.addSdk(@ptrCast(runtime), bytes, true);
+                result.host_cpu_bytes = @max(result.host_cpu_bytes, logical.cpu_peak_bytes);
+                previous_host = host_tail;
+            }
+            // Final RMS uploads only an actual returned Host hidden; a dense
+            // device tail keeps its original already-device input unchanged.
+            if (previous_host) try result.addUpload(@ptrCast(runtime), try std.math.mul(usize, try std.math.mul(usize, request.rows, request.hidden_size), @sizeOf(f32)));
+            result.host_cpu_bytes = try std.math.add(usize, result.host_cpu_bytes, result.device_reference_metadata_bytes);
+            return result;
+        }
+        pub fn validate(self: *const @This(), provider: *const ProviderImpl, request: *const ops.DecoderRuntimePrefillFramePlanRequest, layers: []const metal_command_planner.GatedFrameCommandLowerer.Layer) !void {
+            if (!std.meta.eql(self.*, try capture(provider, request, layers))) return error.WorkspaceReferenceProgramChanged;
+        }
+    };
+
+    /// Borrowed synchronous receiving scope. The caller prepares validation,
+    /// final census/root storage, Phase slots and old-root use cells outside
+    /// all lanes; none of those owners may move while this guard is live.
+    /// A denial is ordinary ONLY after every checked completion, custody,
+    /// physical census and creator transition succeeded. A cleanup error is
+    /// never encoded as this outcome or accepted by an error-name catch.
+    pub const WorkspaceCloseOutcome = union(enum) {
+        closed,
+        allocation_denied: anyerror,
+        pub fn check(self: WorkspaceCloseOutcome) anyerror!void {
+            switch (self) {
+                .closed => {},
+                .allocation_denied => |err| return err,
+            }
+        }
+    };
+
+    pub const WorkspacePhysicalBinding = struct {
+        receiver: *MetalCompute,
+        runtime: *anyopaque,
+        phase: *@import("../backends/metal_workspace_ownership.zig").Phase,
+        invocation: WorkspaceInvocationBinding,
+
+        /// Complete the original numerical owner, reconcile actual creators,
+        /// clear both borrowed header/receiver loans, then return to the caller
+        /// that drops provider/Model/lane owners. Metadata and remaining quota
+        /// are destroyed only AFTER those gates have actually unlocked.
+        pub fn close(self: *WorkspacePhysicalBinding, live: *@import("../backends/metal_workspace_roles.zig").Snapshot, root_storage: []*@import("../backends/metal_workspace_ownership.zig").Root) !void {
+            return (try self.closeReported(live, root_storage)).check();
+        }
+        pub fn closeReported(self: *WorkspacePhysicalBinding, live: *@import("../backends/metal_workspace_roles.zig").Snapshot, root_storage: []*@import("../backends/metal_workspace_ownership.zig").Root) !WorkspaceCloseOutcome {
+            const current = self.invocation.context.cleanup;
+            _ = try current.operationFor(self.invocation.header);
+            // A checked failure cannot permit backend or metadata reuse.
+            self.receiver.quiesceEngineOperation() catch platform.inference_process_supervisor.restartWorker();
+            defer self.* = undefined;
+            defer self.phase.unbind();
+            defer self.invocation.deinit();
+            // This service ends without supplier retention/refund. Actual-B
+            // cells continue to cover quota through all outer gate releases.
+            const status = antfly_metal_decode_runtime_end_owned_embedding_workspace(self.runtime);
+            if (status < 0) return error.MetalWorkspaceBusy;
+            // Modern begin excludes parked Readers; these exact134 fields are
+            // also checked before closing any creator. Unknown tagged custody
+            // is never interpreted as a dead root or silently discarded.
+            if (antfly_metal_workspace_decoder_custody_compatible(self.runtime) != 0)
+                return error.UnsupportedWorkspaceCustody;
+            try live.capture(self.runtime);
+            const roots = try live.copyRoots(root_storage);
+            try self.receiver.provider_impl.workspace_creators.reconcile(roots, &.{}, current);
+            if (status > 0) return .{ .allocation_denied = self.phase.failure orelse error.ResourceLimitExceeded };
+            return .closed;
+        }
+    };
+
+    /// Cold family preparation creates the SAME two greedy banks used by the
+    /// ordinary text-prefill preparer. Their declared bounds and host staging
+    /// identity are captured before admission. No model-weight cache bytes are
+    /// reclassified as transient workspace; those remain in the original floor.
+    /// This scope performs no numerical dispatch and is closed before the
+    /// selected layer-format/lowerer metadata is prepared outside the lanes.
+    pub fn beginPreparedAuxiliaryWorkspaceInvocation(
+        cb: *ops.ComputeBackend,
+        context: *const @import("../execution/invocation_context.zig").Context,
+        expected: *const @import("../backends/metal_workspace_roles.zig").Snapshot,
+        validation: *@import("../backends/metal_workspace_roles.zig").Snapshot,
+        auxiliary: *const @import("../backends/metal_workspace_roles.zig").Auxiliary,
+    ) !WorkspacePhysicalBinding {
+        if (!acceptsEmbeddingStage(cb)) return error.UnsupportedWorkspaceReceiver;
+        _ = try context.cleanup.operationFor(cb);
+        const uses = context.workspace_uses orelse return error.UnpreparedWorkspaceUses;
+        const phase = uses.allocations orelse return error.UnpreparedWorkspaceAllocation;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.engine_operation == null or self.engine_borrowed_operation != null or
+            self.shared_provider_lease_io == null or self.owned_native_provider or
+            self.embedding_stage_suspended or self.workspace_invocation_context != null or cb.call_context != null)
+            return error.UnsupportedWorkspaceReceiver;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+        if (antfly_metal_workspace_policy_available(@ptrCast(runtime)) != 1 or
+            antfly_metal_workspace_decoder_custody_compatible(@ptrCast(runtime)) != 0)
+            return error.UnsupportedWorkspaceCustody;
+        try validation.capture(@ptrCast(runtime));
+        try expected.validate(validation);
+        try auxiliary.validate(@ptrCast(runtime));
+        const endpoint = self.provider_impl.workspace_endpoint orelse return error.MissingWorkspaceEndpoint;
+        const service = try phase.bind(context.cleanup, cb, endpoint, &self.provider_impl.workspace_creators);
+        errdefer phase.unbind();
+        if (antfly_metal_decode_runtime_begin_owned_embedding_workspace(@ptrCast(runtime), phase.envelope.?.reservedBytes(), service) != 0)
+            return error.MetalWorkspaceBusy;
+        errdefer if (antfly_metal_decode_runtime_end_owned_embedding_workspace(@ptrCast(runtime)) != 0)
+            platform.inference_process_supervisor.restartWorker();
+        const invocation = try bindWorkspaceInvocation(cb, context);
+        return .{ .receiver = self, .runtime = @ptrCast(runtime), .phase = phase, .invocation = invocation };
+    }
+
+    /// Actual cold family transaction only: logical lazy slot registration
+    /// precedes this call; selected-plan capture follows after scope close.
+    pub fn prepareOwnedQwenWorkspaceCatalog(cb: *ops.ComputeBackend, cfg: @import("../models/gpt.zig").Config, configured_layers: usize, control: ?@import("../execution_control.zig").InferenceExecutionControl) !bool {
+        if (!acceptsEmbeddingStage(cb)) return error.UnsupportedWorkspaceReceiver;
+        const context = cb.call_context orelse return error.UnpreparedWorkspaceUses;
+        const actual = try context.cleanup.operationFor(cb);
+        const uses = context.workspace_uses orelse return error.UnpreparedWorkspaceUses;
+        const phase = uses.allocations orelse return error.UnpreparedWorkspaceAllocation;
+        const expected = phase.operation orelse return error.WorkspaceReceiverNotBound;
+        if (actual.context != expected.context or actual.nonce != expected.nonce or actual.mode != expected.mode or actual.vtable != expected.vtable or
+            phase.current != context.cleanup.boundary) return error.ForeignWorkspaceUse;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.workspace_invocation_context != context or self.engine_operation == null or self.engine_borrowed_operation != null or
+            self.shared_provider_lease_io == null or self.active_prefill_frame_plan != null or
+            metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) or metal_runtime.hasSubmittedFrame(self.provider_impl.raw_decode_runtime))
+            return error.WorkspaceRequiresColdPreparation;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+        if (phase.target_runtime_address != @intFromPtr(runtime)) return error.ForeignWorkspaceEndpoint;
+        if (!@import("../architectures/gpt.zig").denseQwen3PrefillEligible(cfg)) return false;
+        var storage: [256]ops.DecoderRuntimeLayerSpec = undefined;
+        const layers = try @import("../backends/decoder_gated_runtime.zig").fillDenseQwen3LayerSpecs(cfg, configured_layers, &storage);
+        return metal_runtime.prepareTextPrefillQuantizedCatalog(self.provider_impl, cfg.hidden_size, cfg.num_attention_heads, layers, control);
+    }
+
+    /// Exact old SDK identities/physical sizes and selected role declarations
+    /// are revalidated under the SAME actual receiving owner BEFORE installing
+    /// the allocator. No warm allocation, external callback, alternate math or
+    /// inferred currentB is introduced. Failed metadata validation is pre-math.
+    pub fn beginPreparedWorkspaceInvocation(cb: *ops.ComputeBackend, context: *const @import("../execution/invocation_context.zig").Context, expected: *const @import("../backends/metal_workspace_roles.zig").Snapshot, validation: *@import("../backends/metal_workspace_roles.zig").Snapshot, selected_roles: *const @import("../backends/metal_workspace_roles.zig").Plan, auxiliary: *const @import("../backends/metal_workspace_roles.zig").Auxiliary, tail: *const WorkspaceTailDeclaration, reference: *const WorkspaceReferenceDeclaration, metadata: *QwenWorkspaceMetadata, request: *const ops.DecoderRuntimePrefillFramePlanRequest, failure_census: *@import("../backends/metal_workspace_roles.zig").Snapshot, failure_roots: []*@import("../backends/metal_workspace_ownership.zig").Root) !WorkspacePhysicalBinding {
+        if (!acceptsEmbeddingStage(cb)) return error.UnsupportedWorkspaceReceiver;
+        _ = try context.cleanup.operationFor(cb);
+        const uses = context.workspace_uses orelse return error.UnpreparedWorkspaceUses;
+        const phase = uses.allocations orelse return error.UnpreparedWorkspaceAllocation;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.engine_operation == null or self.engine_borrowed_operation != null or
+            self.shared_provider_lease_io == null or self.owned_native_provider or
+            self.embedding_stage_suspended or self.workspace_invocation_context != null or cb.call_context != null)
+            return error.UnsupportedWorkspaceReceiver;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.RuntimeUnavailable;
+        if (antfly_metal_workspace_policy_available(@ptrCast(runtime)) != 1 or
+            antfly_metal_workspace_decoder_custody_compatible(@ptrCast(runtime)) != 0)
+            return error.UnsupportedWorkspaceCustody;
+        try validation.capture(@ptrCast(runtime));
+        try expected.validate(validation);
+        const roles = @import("../backends/metal_workspace_roles.zig");
+        var captured: roles.Capture = undefined;
+        if (roles.antfly_metal_graph_workspace_capture(@ptrCast(runtime), &selected_roles.requirements.bytes, &captured, roles.capacity) != 0)
+            return error.WorkspaceRoleCaptureUnavailable;
+        try selected_roles.validate(captured);
+        try auxiliary.validate(@ptrCast(runtime));
+        try tail.validate(self);
+        try metadata.validate(self.provider_impl, request);
+        try reference.validate(self.provider_impl, request, metadata.selected_layers);
+        const actual_requirements = try roles.Requirements.fromSelectedDensePrefill(metadata.selected.?.view(), request.rows, request.hidden_size, request.num_attention_heads, request.layers);
+        if (!std.meta.eql(actual_requirements.bytes, selected_roles.requirements.bytes)) return error.WorkspaceRoleChanged;
+        if (self.active_prefill_frame_plan != null or self.active_prefill_frame_contract_storage.command_ops.len != 0)
+            return error.WorkspaceReceiverAlreadyPrepared;
+        const endpoint = self.provider_impl.workspace_endpoint orelse return error.MissingWorkspaceEndpoint;
+        if (reference.program == .host_reference) try phase.requireReferenceHostAllowance(reference.host_cpu_bytes);
+        const service = try phase.bind(context.cleanup, cb, endpoint, &self.provider_impl.workspace_creators);
+        phase.host_reference_prepared = reference.program == .host_reference;
+        var phase_active = true;
+        errdefer if (phase_active) phase.unbind();
+        if (antfly_metal_decode_runtime_begin_owned_embedding_workspace(@ptrCast(runtime), phase.envelope.?.reservedBytes(), service) != 0)
+            return error.MetalWorkspaceBusy;
+        var service_active = true;
+        errdefer if (service_active and antfly_metal_decode_runtime_end_owned_embedding_workspace(@ptrCast(runtime)) != 0)
+            platform.inference_process_supervisor.restartWorker();
+        var invocation = try bindWorkspaceInvocation(cb, context);
+        var invocation_active = true;
+        errdefer if (invocation_active) invocation.deinit();
+        // Original exact graph-slot reserve/commit, through the pre-funded
+        // allocator. No numerical dispatch or alternate schedule occurs here.
+        var slots: [roles.capacity]ops.GraphPlanSlot = undefined;
+        var slot_count: usize = 0;
+        for (actual_requirements.bytes, 0..) |bytes, index| {
+            if (bytes == 0) continue;
+            slots[slot_count] = .{ .slot = index, .bytes = bytes };
+            slot_count += 1;
+        }
+        const reserved = reserveGraphPlanSlotsOp(@ptrCast(self), slots[0..slot_count]) catch |err| {
+            var failed: WorkspacePhysicalBinding = .{ .receiver = self, .runtime = @ptrCast(runtime), .phase = phase, .invocation = invocation };
+            phase_active = false;
+            service_active = false;
+            invocation_active = false;
+            failed.close(failure_census, failure_roots) catch |close_error| return close_error;
+            return err;
+        };
+        if (!reserved) {
+            const failure = phase.failure orelse error.OutOfMemory;
+            var failed: WorkspacePhysicalBinding = .{ .receiver = self, .runtime = @ptrCast(runtime), .phase = phase, .invocation = invocation };
+            phase_active = false;
+            service_active = false;
+            invocation_active = false;
+            failed.close(failure_census, failure_roots) catch |close_error| return close_error;
+            return failure;
+        }
+        metadata.installAfterReserved(self);
+        return .{ .receiver = self, .runtime = @ptrCast(runtime), .phase = phase, .invocation = invocation };
+    }
+
     /// Staged runtime callers supply the actual bound current B. No epoch or
     /// operation is inferred from provider activity or retained for later quota.
     pub fn embeddingStageLeaseWithCleanup(cb: *const ops.ComputeBackend, acquire: bool, current: @import("../execution/cleanup_context.zig").Context) !void {
@@ -4028,7 +4676,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// `ct`, for compact caches. Null when `ct` is not on the device.
     pub fn deviceHalfCopy(self: *MetalCompute, ct: CT) !?MetalTensor {
         var source = (try retainDenseDeviceTensor(ct)) orelse return null;
-        defer source.deinit();
+        defer self.retireTemporaryWorkspaceValue(&source);
         return metal_runtime.decoderRuntimeCastHalfDevice(self.provider_impl, source, true);
     }
 
@@ -5860,10 +6508,27 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn getOrInsertZeroBias(self: *MetalCompute, out_dim: usize) ![]f32 {
         const gop = try self.zero_bias_cache.getOrPut(self.allocator, out_dim);
         if (!gop.found_existing) {
+            errdefer _ = self.zero_bias_cache.remove(out_dim);
             gop.value_ptr.* = try self.allocator.alloc(f32, out_dim);
             @memset(gop.value_ptr.*, 0.0);
         }
         return gop.value_ptr.*;
+    }
+
+    // Final-address synchronous CT view. Prepared slots copy bias bytes and
+    // retain only the stable zero-array identity, never this Buf or shape.
+    fn borrowedZeroBiasBuf(self: *MetalCompute, buf: *Buf, shape: *[1]i64, out_dim: usize) !CT {
+        const data = try self.getOrInsertZeroBias(out_dim);
+        shape.* = .{@intCast(out_dim)};
+        buf.* = .{
+            .cache_identity = nextPreparedValueIdentity(),
+            .data = data,
+            .allocator = self.allocator,
+            .owned = false,
+            .canonical_zero_bias = true,
+            .logical_shape = shape,
+        };
+        return @ptrCast(buf);
     }
 
     fn cachedZeroBiasBuf(self: *MetalCompute, out_dim: usize) !CT {
@@ -6220,6 +6885,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.deinitWithCleanup(.{ .outside_execution = true });
     }
     pub fn deinitWithCleanup(self: *MetalCompute, current: @import("../execution/cleanup_context.zig").Context) void {
+        if (self.workspace_invocation_context != null)
+            platform.inference_process_supervisor.restartWorker();
+        if (self.owned_native_provider)
+            self.provider_impl.validateWorkspaceRetirement(current) catch platform.inference_process_supervisor.restartWorker();
         const Scope = struct {
             compute: *MetalCompute,
             current: @import("../execution/cleanup_context.zig").Context,
@@ -6322,7 +6991,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.lighton_shared_core_weights.deinit(self.allocator);
         self.deinitWeightCaches();
         var unit_it = self.unit_rms_weight_device_cache.iterator();
-        while (unit_it.next()) |entry| entry.value_ptr.deinit();
+        // These are actual per-receiver tensors (the direct graph L2 tail may
+        // allocate one under a workspace Phase). The invocation loan is gone
+        // before backend teardown; retire with the destructor's explicit NOWB
+        // instead of recovering a stale/ambient receiver operation.
+        while (unit_it.next()) |entry| entry.value_ptr.deinitWithCleanup(current);
         self.unit_rms_weight_device_cache.deinit(self.allocator);
         var adjusted_norm_it = self.adjusted_norm_weight_device_cache.iterator();
         while (adjusted_norm_it.next()) |entry| entry.value_ptr.deinit();
@@ -6372,7 +7045,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (self.provider) |provider| provider.deinit();
         }
         if (self.owned_native_provider) {
-            self.provider_impl.deinitOwned();
+            self.provider_impl.deinitOwnedWithCleanup(current);
             std.heap.c_allocator.destroy(self.provider_impl);
         }
     }
@@ -6403,9 +7076,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!k.isDevice() or !v.isDevice()) return;
         if (!metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) return;
         var k_copy = try k.copiedView(0, k.deviceByteLen(), k.shape());
-        errdefer k_copy.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&k_copy);
         var v_copy = try v.copiedView(0, v.deviceByteLen(), v.shape());
-        errdefer v_copy.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&v_copy);
         try self.pending_prefill_kv_device_seeds.append(self.allocator, .{
             .attention = attention,
             .k = k_copy,
@@ -6561,9 +7234,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (buf.lazy_multiply) |*lazy| {
             var lhs = try lazy.lhs.retainedCopy();
-            errdefer lhs.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&lhs);
             var rhs = try lazy.rhs.retainedCopy();
-            errdefer rhs.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&rhs);
             if (try metal_runtime.decoderRuntimeApplyMultiply(self.provider_impl, lhs, rhs, lhs.elemCount())) |product| {
                 lhs.deinit();
                 rhs.deinit();
@@ -6659,7 +7332,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn ownedDeviceMetalTensorFromCtImpl(self: *MetalCompute, tensor: CT, allocator: ?std.mem.Allocator) !MetalTensor {
         var metal_tensor = try self.ownedMetalTensorFromCt(tensor);
-        errdefer metal_tensor.deinit();
+        errdefer self.retireFailedWorkspaceTensor(&metal_tensor);
         if (metal_tensor.isDevice()) return metal_tensor;
         const runtime = self.provider_impl.raw_decode_runtime orelse return metal_tensor;
         var device_tensor = if (allocator) |owner| try MetalTensor.deviceAllocateWithAllocator(
@@ -6674,7 +7347,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             uploadStorageMode(metal_tensor.deviceByteLen()),
             metal_tensor.shape(),
         );
-        errdefer device_tensor.deinit();
+        errdefer self.retireFailedWorkspaceTensor(&device_tensor);
         try metal_tensor.copyInto(&device_tensor);
         metal_tensor.deinit();
         return device_tensor;
@@ -6694,7 +7367,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             cache.* = null;
         }
         var device_tensor = try self.ownedDeviceMetalTensorFromCt(tensor);
-        errdefer device_tensor.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&device_tensor);
         if (!device_tensor.isDevice()) return error.UnsupportedTensorType;
         if (!std.mem.eql(i32, device_tensor.shape(), expected_shape)) return error.InvalidTensorShape;
         cache.* = device_tensor;
@@ -6719,7 +7392,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             uploadStorageMode(data.len * @sizeOf(f32)),
             shape,
         );
-        errdefer device_tensor.deinit();
+        errdefer self.retireFailedWorkspaceTensor(&device_tensor);
         const host_tensor = MetalTensor.borrowed(@constCast(data.ptr), data.len, shape);
         try host_tensor.copyInto(&device_tensor);
         return device_tensor;
@@ -6733,13 +7406,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// upload policy. The returned handle owns its storage until freed.
     pub fn importResidentF32(self: *MetalCompute, data: []const f32, shape: []const i32) !CT {
         var device_tensor = try self.deviceTensorFromF32Slice(data, shape);
-        errdefer device_tensor.deinit();
+        errdefer self.retireFailedWorkspaceTensor(&device_tensor);
         return self.ctFromOwnedMetalTensor(device_tensor);
     }
 
     pub fn trainingOverwriteF32(self: *MetalCompute, tensor: CT, data: []const f32, shape: []const i32) !void {
         var device_tensor = try self.ownedDeviceMetalTensorFromCt(tensor);
-        defer device_tensor.deinit();
+        defer self.retireTemporaryWorkspaceValue(&device_tensor);
         if (device_tensor.elemCount() != data.len) return error.InvalidTensorShape;
         if (!std.mem.eql(i32, device_tensor.shape(), shape)) return error.InvalidTensorShape;
         const host_tensor = MetalTensor.borrowed(@constCast(data.ptr), data.len, shape);
@@ -6757,7 +7430,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             uploadStorageMode(elem_count * @sizeOf(f32)),
             shape,
         );
-        errdefer device_tensor.deinit();
+        errdefer self.retireFailedWorkspaceTensor(&device_tensor);
         const host_tensor = MetalTensor.borrowed(zeros.ptr, zeros.len, shape);
         try host_tensor.copyInto(&device_tensor);
         return self.ctFromOwnedMetalTensor(device_tensor);
@@ -6772,9 +7445,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         first: bool,
     ) !void {
         var accum_mt = try self.ownedDeviceMetalTensorFromCt(accum);
-        defer accum_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&accum_mt);
         var grad_mt = try self.ownedDeviceMetalTensorFromCt(grad);
-        defer grad_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&grad_mt);
         const ok = try metal_runtime.decoderRuntimeTrainingAccumulateF32(
             self.provider_impl,
             accum_mt,
@@ -6800,13 +7473,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         opts: TrainingAdamWOptions,
     ) !void {
         var weight_mt = try self.ownedDeviceMetalTensorFromCt(weight);
-        defer weight_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&weight_mt);
         var grad_mt = try self.ownedDeviceMetalTensorFromCt(grad);
-        defer grad_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&grad_mt);
         var m_mt = try self.ownedDeviceMetalTensorFromCt(m);
-        defer m_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&m_mt);
         var v_mt = try self.ownedDeviceMetalTensorFromCt(v);
-        defer v_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&v_mt);
         const ok = try metal_runtime.decoderRuntimeTrainingAdamWF32(
             self.provider_impl,
             weight_mt,
@@ -6838,13 +7511,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         for (inputs, 0..) |input, idx| {
             var weight = try self.ownedDeviceMetalTensorFromCt(input.weight);
-            errdefer weight.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&weight);
             var grad = try self.ownedDeviceMetalTensorFromCt(input.grad);
-            errdefer grad.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&grad);
             var first_moment = try self.ownedDeviceMetalTensorFromCt(input.m);
-            errdefer first_moment.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&first_moment);
             var second_moment = try self.ownedDeviceMetalTensorFromCt(input.v);
-            errdefer second_moment.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&second_moment);
             batch[idx] = .{
                 .weight = weight,
                 .grad = grad,
@@ -6880,9 +7553,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const output = try self.trainingZeroF32(1, &scalar_shape);
         defer self.computeBackend().free(output);
         var input_mt = try self.ownedDeviceMetalTensorFromCt(input);
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         var output_mt = try self.ownedDeviceMetalTensorFromCt(output);
-        defer output_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&output_mt);
         const ok = try metal_runtime.decoderRuntimeTrainingSumSquaresF32(
             self.provider_impl,
             input_mt,
@@ -6950,7 +7623,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         var output_mt = try self.ownedDeviceMetalTensorFromCt(output);
-        defer output_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&output_mt);
         const ok = try metal_runtime.decoderRuntimeTrainingSumSquaresManyF32(
             self.provider_impl,
             input_mts,
@@ -6991,7 +7664,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedResidentTrainingPrimitive;
         const count = try ops.resident_training.shapeElements(i32, shape, .{});
         var output = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), count * 4, .private, shape);
-        errdefer output.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&output);
         const result = try self.ctFromOwnedMetalTensor(output);
         toBuf(result).mutable_state = true;
         return result;
@@ -7093,7 +7766,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) !void {
         const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
         var replacement = try self.allocateDeviceTensor(rows, cols);
-        errdefer replacement.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&replacement);
         if (tensor.*) |*old| {
             const bytes = @min(preserve_bytes, @min(old.deviceByteLen(), replacement.deviceByteLen()));
             if (bytes > 0) {
@@ -7170,7 +7843,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             uploadStorageMode(elem_count * @sizeOf(f32)),
             reference.shape(),
         );
-        errdefer device_tensor.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&device_tensor);
         const host_tensor = MetalTensor.borrowed(host.ptr, host.len, reference.shape());
         try host_tensor.copyInto(&device_tensor);
         return device_tensor;
@@ -7186,7 +7859,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             uploadStorageMode(@sizeOf(f32)),
             &shape,
         );
-        errdefer device_tensor.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&device_tensor);
         const host_tensor = MetalTensor.borrowed(host[0..].ptr, host.len, &shape);
         try host_tensor.copyInto(&device_tensor);
         return device_tensor;
@@ -7275,7 +7948,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
         _ = runtime;
         var input_mt = self.ownedDeviceMetalTensorFromCt(input) catch return null;
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         if (!input_mt.isDevice()) return null;
         const out_shape_i32 = try self.i32ShapeFromI64(out_shape);
         defer self.allocator.free(out_shape_i32);
@@ -7286,7 +7959,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             perm,
             out_shape_i32,
         )) orelse return null;
-        errdefer transposed.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&transposed);
         const gop = try self.static_transpose_cache.getOrPut(self.allocator, key);
         if (gop.found_existing) {
             transposed.deinit();
@@ -7515,8 +8188,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             try self.prepareSlotMutation();
             metal_runtime.clearRawLinearSlot(self.provider_impl, slot);
         }
-        const zero_bias = try self.cachedZeroBiasBuf(out_dim);
-        defer freeOp(self, zero_bias);
+        var zero_bias_view: Buf = undefined;
+        var zero_bias_shape: [1]i64 = undefined;
+        const zero_bias = try self.borrowedZeroBiasBuf(&zero_bias_view, &zero_bias_shape, out_dim);
         if (!(try decoderRuntimePrepareLinearOp(self, &.{
             .slot = slot,
             .weight = tensor,
@@ -7594,7 +8268,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return null;
         };
         var input = try self.ownedDeviceMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         const output = (try metal_runtime.decoderRuntimeApplyPackedMoeLinear(
             self.provider_impl,
             descriptor,
@@ -7954,7 +8628,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             defer self.allocator.free(routes.route_weights);
 
             var input = try self.ownedDeviceMetalTensorFromCt(request.input);
-            defer input.deinit();
+            defer self.retireTemporaryWorkspaceValue(&input);
             var scale: ?MetalTensor = null;
             defer if (scale) |*value| value.deinit();
             if (request.expert_scale) |scale_ct| scale = try self.ownedDeviceMetalTensorFromCt(scale_ct);
@@ -8037,7 +8711,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.timing_stats.a4b_moe_route_select_successes += 1;
 
             var input = try self.ownedDeviceMetalTensorFromCt(request.input);
-            defer input.deinit();
+            defer self.retireTemporaryWorkspaceValue(&input);
             var scale: ?MetalTensor = null;
             defer if (scale) |*value| value.deinit();
             if (request.expert_scale) |scale_ct| scale = try self.ownedDeviceMetalTensorFromCt(scale_ct);
@@ -8099,7 +8773,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
             self.timing_stats.a4b_moe_route_select_successes += 1;
             var input = try self.ownedDeviceMetalTensorFromCt(request.input);
-            defer input.deinit();
+            defer self.retireTemporaryWorkspaceValue(&input);
             var scale: ?MetalTensor = null;
             defer if (scale) |*value| value.deinit();
             if (request.expert_scale) |scale_ct| scale = try self.ownedDeviceMetalTensorFromCt(scale_ct);
@@ -8252,7 +8926,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.timing_stats.a4b_moe_slot_upload_bytes += upload.len;
 
         var input = try self.ownedDeviceMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         var scale: ?MetalTensor = null;
         defer if (scale) |*value| value.deinit();
         if (request.expert_scale) |scale_ct| scale = try self.ownedDeviceMetalTensorFromCt(scale_ct);
@@ -8344,7 +9018,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return null;
         };
         var input = try self.ownedDeviceMetalTensorFromCt(input_ct);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         var result = (try metal_runtime.decoderRuntimeApplyPackedMoeLinearPair(
             self.provider_impl,
             descriptor_a,
@@ -8379,9 +9053,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (request.rows == 0 or request.row_ids.len != request.rows or request.row_weights.len != request.rows) return null;
         self.timing_stats.a4b_moe_scatter_attempts += 1;
         var base = try self.ownedDeviceMetalTensorFromCt(request.base);
-        defer base.deinit();
+        defer self.retireTemporaryWorkspaceValue(&base);
         var updates = try self.ownedDeviceMetalTensorFromCt(request.updates);
-        defer updates.deinit();
+        defer self.retireTemporaryWorkspaceValue(&updates);
         const output = (try metal_runtime.decoderRuntimeMoeScatterAdd(
             self.provider_impl,
             base,
@@ -8419,7 +9093,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             rows,
             1.0,
         )) orelse return null;
-        defer device_copy.deinit();
+        defer self.retireTemporaryWorkspaceValue(&device_copy);
 
         const host = try device_copy.toHostSlice();
         if (host.len != rows * cols) return null;
@@ -8482,6 +9156,162 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return slot;
     }
 
+    pub const ProjectionMetadataRequest = struct { linear_entries: u32, zero_widths: []const usize };
+
+    fn mapMetadata(comptime Map: type, entries: u32) !struct { bytes: usize, alignment: std.mem.Alignment } {
+        if (entries == 0) return .{ .bytes = 0, .alignment = .of(u8) };
+        const Recorder = struct {
+            bytes: usize = 0,
+            alignment: std.mem.Alignment = .of(u8),
+            fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, _: usize) ?[*]u8 {
+                const recorder: *@This() = @ptrCast(@alignCast(raw));
+                std.debug.assert(recorder.bytes == 0);
+                recorder.bytes = len;
+                recorder.alignment = alignment;
+                return null;
+            }
+            fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+                return false;
+            }
+            fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+                return null;
+            }
+            fn free(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize) void {
+                unreachable;
+            }
+        };
+        var recorder: Recorder = .{};
+        const allocator: std.mem.Allocator = .{ .ptr = &recorder, .vtable = &.{ .alloc = Recorder.alloc, .resize = Recorder.resize, .remap = Recorder.remap, .free = Recorder.free } };
+        var map: Map = .empty;
+        map.ensureTotalCapacity(allocator, entries) catch {
+            if (recorder.bytes == 0) return error.InvalidProjectionMetadataLayout;
+            return .{ .bytes = recorder.bytes, .alignment = recorder.alignment };
+        };
+        return error.InvalidProjectionMetadataLayout;
+    }
+
+    fn validateProjectionMetadata(request: ProjectionMetadataRequest) !void {
+        if (request.linear_entries > metal_runtime.decoder_runtime_linear_slot_capacity or request.zero_widths.len > std.math.maxInt(u32)) return error.ResourceLimitExceeded;
+        for (request.zero_widths, 0..) |width, i| {
+            if (width == 0 or width > std.math.maxInt(i64)) return error.InvalidProjectionMetadataLayout;
+            _ = try std.math.mul(usize, width, @sizeOf(f32));
+            for (request.zero_widths[0..i]) |prior| if (prior == width) return error.InvalidProjectionMetadataLayout;
+        }
+    }
+
+    /// Actual allocator payload plus each original admitted allocation header.
+    /// No provider, SDK, model metadata or external supplier is accessed.
+    pub fn projectionMetadataHostBytes(request: ProjectionMetadataRequest) !usize {
+        try validateProjectionMetadata(request);
+        const Header = @import("../backends/admitted_allocator.zig").AdmittedAllocator;
+        var total: usize = 0;
+        inline for (.{ .{ @FieldType(MetalCompute, "dynamic_linear_slots"), request.linear_entries }, .{ @FieldType(MetalCompute, "zero_bias_cache"), @as(u32, @intCast(request.zero_widths.len)) } }) |entry| {
+            const layout = try mapMetadata(entry[0], entry[1]);
+            if (layout.bytes != 0) total = try std.math.add(usize, total, try std.math.add(usize, layout.bytes, Header.allocationOverhead(layout.alignment)));
+        }
+        for (request.zero_widths) |width| total = try std.math.add(usize, total, try std.math.add(usize, try std.math.mul(usize, width, @sizeOf(f32)), Header.allocationOverhead(.of(f32))));
+        return total;
+    }
+
+    pub fn prepareProjectionMetadata(cb: *const ops.ComputeBackend, request: ProjectionMetadataRequest, current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (!acceptsEmbeddingStage(cb)) return error.UnsupportedEmbeddingStage;
+        const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        if (try epoch.isSealed()) return error.RetirementEpochSealed;
+        _ = try current.operationFor(cb);
+        try validateProjectionMetadata(request);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.shared_provider_lease_io == null or self.engine_operation == null or self.engine_borrowed_operation != null or self.workspace_invocation_context != null or self.embedding_stage_suspended or self.reader_epoch_suspended or metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) or metal_runtime.hasSubmittedFrame(self.provider_impl.raw_decode_runtime)) return error.InvalidProjectionMetadataPhase;
+        if (self.dynamic_linear_slots.count() != 0 or self.zero_bias_cache.count() != 0) return error.InvalidProjectionMetadataPhase;
+        try self.dynamic_linear_slots.ensureTotalCapacity(self.allocator, request.linear_entries);
+        try self.zero_bias_cache.ensureTotalCapacity(self.allocator, @intCast(request.zero_widths.len));
+        for (request.zero_widths) |width| _ = try self.getOrInsertZeroBias(width);
+    }
+
+    /// Value-only authored model inventory. Counts/sizes are supplied by the
+    /// model schema; backend only measures its actual generic metadata types.
+    pub const WeightMetadataRequest = struct {
+        entries: u32,
+        name_bytes: usize,
+        shape_axes: usize,
+        vector_entries: u32,
+        vector_elements: usize,
+        slice_views: u32,
+    };
+    fn metadataAllocationBytes(count: usize, bytes: usize, alignment: std.mem.Alignment) !usize {
+        if (count == 0) return 0;
+        const overhead = @import("../backends/admitted_allocator.zig").AdmittedAllocator.allocationOverhead(alignment);
+        return std.math.add(usize, bytes, try std.math.mul(usize, count, overhead));
+    }
+    fn validateWeightMetadata(request: WeightMetadataRequest) !void {
+        if (request.entries == 0 or request.vector_entries > request.entries or request.shape_axes < request.entries or request.name_bytes < request.entries) return error.InvalidWeightMetadataLayout;
+    }
+    pub fn weightMetadataHostBytes(request: WeightMetadataRequest) !usize {
+        try validateWeightMetadata(request);
+        var total: usize = 0;
+        inline for (.{ .{ "dense_weight_cache", request.entries }, .{ "weight_handles", request.entries } }) |entry| {
+            const layout = try mapMetadata(@FieldType(MetalCompute, entry[0]), entry[1]);
+            total = try std.math.add(usize, total, try metadataAllocationBytes(@intFromBool(layout.bytes != 0), layout.bytes, layout.alignment));
+        }
+        // Original dense cache owns one name/shape and optional F32 vector.
+        // Shared getWeight views own a second name/shape plus one Buf, but
+        // borrow the cached data. Hits do not create another permanent copy.
+        const names = try metadataAllocationBytes(request.entries, request.name_bytes, .of(u8));
+        const shapes = try metadataAllocationBytes(request.entries, try std.math.mul(usize, request.shape_axes, @sizeOf(i64)), .of(i64));
+        total = try std.math.add(usize, total, try std.math.mul(usize, 2, try std.math.add(usize, names, shapes)));
+        const view_bytes = try std.math.mul(usize, request.entries, @sizeOf(Buf));
+        total = try std.math.add(usize, total, try metadataAllocationBytes(request.entries, view_bytes, .of(Buf)));
+        total = try std.math.add(usize, total, try metadataAllocationBytes(request.vector_entries, try std.math.mul(usize, request.vector_elements, @sizeOf(f32)), .of(f32)));
+        // Selected PLE slices own their copied numerical data under the
+        // original six-class floor; declare only their additional actual
+        // Buf, 2-axis shape and owned-host refcount metadata here.
+        total = try std.math.add(usize, total, try metadataAllocationBytes(request.slice_views, try std.math.mul(usize, request.slice_views, @sizeOf(Buf)), .of(Buf)));
+        total = try std.math.add(usize, total, try metadataAllocationBytes(request.slice_views, try std.math.mul(usize, request.slice_views, 2 * @sizeOf(i64)), .of(i64)));
+        total = try std.math.add(usize, total, try metadataAllocationBytes(request.slice_views, try std.math.mul(usize, request.slice_views, @sizeOf(usize)), .of(usize)));
+        return total;
+    }
+    pub fn prepareWeightMetadata(cb: *const ops.ComputeBackend, request: WeightMetadataRequest, current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (!acceptsEmbeddingStage(cb)) return error.UnsupportedEmbeddingStage;
+        const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        if (try epoch.isSealed()) return error.RetirementEpochSealed;
+        _ = try current.operationFor(cb);
+        try validateWeightMetadata(request);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.shared_provider_lease_io == null or self.engine_operation == null or self.engine_borrowed_operation != null or self.workspace_invocation_context != null or self.embedding_stage_suspended or self.reader_epoch_suspended or metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) or metal_runtime.hasSubmittedFrame(self.provider_impl.raw_decode_runtime)) return error.InvalidWeightMetadataPhase;
+        inline for (.{ .{ "dense_weight_cache", request.entries }, .{ "weight_handles", request.entries } }) |entry| {
+            const map = &@field(self, entry[0]);
+            if (map.count() != 0) return error.InvalidWeightMetadataPhase;
+        }
+        inline for (.{ .{ "dense_weight_cache", request.entries }, .{ "weight_handles", request.entries } }) |entry| try @field(self, entry[0]).ensureTotalCapacity(self.allocator, entry[1]);
+    }
+
+    pub const RmsMetadata = struct { entries: u32, bytes: usize, alignment: std.mem.Alignment };
+    /// Measure the PINNED std.HashMap implementation's exact allocation for
+    /// the caller's explicit checked RMS entry capacity. The allocator owns no storage;
+    /// no SDK/provider/source/model metadata or resource supplier is accessed.
+    pub fn rmsMetadata(entries: u32) !RmsMetadata {
+        if (entries > metal_runtime.decoder_runtime_rms_norm_slot_capacity) return error.ResourceLimitExceeded;
+        if (entries == 0) return .{ .entries = 0, .bytes = 0, .alignment = .of(u8) };
+        const layout = try mapMetadata(@FieldType(MetalCompute, "dynamic_rms_norm_slots"), entries);
+        return .{ .entries = entries, .bytes = layout.bytes, .alignment = layout.alignment };
+    }
+
+    pub fn prepareRmsMetadata(cb: *const ops.ComputeBackend, entries: u32, current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (!acceptsEmbeddingStage(cb)) return error.UnsupportedEmbeddingStage;
+        const epoch = current.boundary orelse return error.MissingCurrentCleanupEpoch;
+        if (try epoch.isSealed()) return error.RetirementEpochSealed;
+        _ = try current.operationFor(cb);
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.shared_provider_lease_io == null or self.engine_operation == null or self.engine_borrowed_operation != null or self.workspace_invocation_context != null)
+            return error.InvalidRmsMetadataPhase;
+        if (self.dynamic_rms_norm_slots.count() != 0) return error.InvalidRmsMetadataPhase;
+        if (self.embedding_stage_suspended or self.reader_epoch_suspended or metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) or metal_runtime.hasSubmittedFrame(self.provider_impl.raw_decode_runtime)) return error.InvalidRmsMetadataPhase;
+        const layout = try rmsMetadata(entries);
+        // Original receiving header owns provider/Model, but exact HOST bytes
+        // were admitted before entry. One bulk map allocation avoids every
+        // numerical put's growth and old/new allocation overlap.
+        try self.dynamic_rms_norm_slots.ensureTotalCapacity(self.allocator, layout.entries);
+    }
+
     fn nextFreeDynamicRmsNormSlot(self: *MetalCompute) ?usize {
         while (self.next_dynamic_rms_norm_slot > 0) {
             self.next_dynamic_rms_norm_slot -= 1;
@@ -8532,6 +9362,58 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return slot;
     }
 
+    /// Private function-local value only, with an exact compile-time type
+    /// gate. Group/custom owner destructors keep their original policy; this
+    /// is NOT a generic free vtable fallback or reflective recursive teardown.
+    fn retireTemporaryWorkspaceValue(self: *MetalCompute, value: anytype) void {
+        if (comptime @TypeOf(value.*) == MetalTensor)
+            self.retireFailedWorkspaceTensor(value)
+        else
+            value.*.deinit();
+    }
+    /// Private function-local tensor retirement. A bound receiving header lends
+    /// explicit NOWB and a preowned use for this EXACT root. Public/freeTensor
+    /// callbacks NEVER call this helper or recover an outer Engine epoch.
+    fn retireFailedWorkspaceTensor(self: *MetalCompute, tensor: *MetalTensor) void {
+        const context = self.workspace_invocation_context orelse {
+            tensor.deinit(); // unchanged unbound/legacy error policy
+            return;
+        };
+        const uses = context.workspace_uses orelse platform.inference_process_supervisor.restartWorker();
+        if (tensor.workspaceRootForUse() catch platform.inference_process_supervisor.restartWorker()) |root|
+            uses.validateRoot(root, context.cleanup) catch platform.inference_process_supervisor.restartWorker();
+        tensor.deinitWithCleanup(context.cleanup);
+    }
+    /// Function-local CT retirement in the selected Qwen transitive leaves.
+    /// This is a separate private entry, NEVER the public freeTensor vtable.
+    /// Validate EVERY actual owned MetalTensor/lazy child before mutating the
+    /// header or releasing any SDK owner. Borrowed model headers keep the
+    /// original free policy. No Engine/provider ambient epoch is consulted.
+    fn validateTemporaryWorkspaceCt(self: *MetalCompute, tensor: CT, context: *const @import("../execution/invocation_context.zig").Context) void {
+        const buf = toBuf(tensor);
+        if (buf.persistent_model) return;
+        const uses = context.workspace_uses orelse platform.inference_process_supervisor.restartWorker();
+        if (buf.metal_tensor) |*value| {
+            if (value.workspaceRootForUse() catch platform.inference_process_supervisor.restartWorker()) |root|
+                uses.validateRoot(root, context.cleanup) catch platform.inference_process_supervisor.restartWorker();
+        }
+        if (buf.lazy_multiply) |*lazy| {
+            if (lazy.lhs.workspaceRootForUse() catch platform.inference_process_supervisor.restartWorker()) |root|
+                uses.validateRoot(root, context.cleanup) catch platform.inference_process_supervisor.restartWorker();
+            if (lazy.rhs.workspaceRootForUse() catch platform.inference_process_supervisor.restartWorker()) |root|
+                uses.validateRoot(root, context.cleanup) catch platform.inference_process_supervisor.restartWorker();
+        }
+        if (buf.native_dense_host_cache) |cached| self.validateTemporaryWorkspaceCt(cached, context);
+    }
+    fn freeTemporaryWorkspaceCtOp(ctx: *anyopaque, tensor: CT) void {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const context = self.workspace_invocation_context orelse {
+            freeOp(ctx, tensor); // unchanged unbound/legacy numerical path
+            return;
+        };
+        self.validateTemporaryWorkspaceCt(tensor, context);
+        freeWithCleanupOp(ctx, tensor, context.cleanup);
+    }
     fn ctFromOwnedMetalTensor(self: *MetalCompute, tensor: MetalTensor) !CT {
         // Preserve device residency — host materialization happens lazily
         // via `toHostSlice` at the next host-side access. Required for the
@@ -8590,7 +9472,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             );
         }
         var cloned = try metal_tensor.retainedView(0, byte_len, shape);
-        errdefer cloned.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&cloned);
         return self.ctFromOwnedMetalTensor(cloned);
     }
 
@@ -8608,7 +9490,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const source = src_buf.metal_tensor orelse return error.UnsupportedTensorType;
             const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedResidentTrainingPrimitive;
             var copied = try MetalTensor.deviceAllocateTyped(self.allocator, @ptrCast(runtime), source.dtype, .private, source.shape());
-            errdefer copied.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&copied);
             if (source.deviceByteLen() != 0) try source.copyInto(&copied);
             const result = try self.ctFromOwnedMetalTensor(copied);
             toBuf(result).integer_bounds = src_buf.integer_bounds;
@@ -8627,14 +9509,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
         var src_metal = try src_self.ownedMetalTensorFromCt(src_tensor);
-        defer src_metal.deinit();
+        defer self.retireTemporaryWorkspaceValue(&src_metal);
         var copied = try MetalTensor.deviceAllocate(
             @ptrCast(runtime),
             src_metal.deviceByteLen(),
             uploadStorageMode(src_metal.deviceByteLen()),
             src_metal.shape(),
         );
-        errdefer copied.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&copied);
         try src_metal.copyInto(&copied);
         return self.ctFromOwnedMetalTensor(copied);
     }
@@ -8794,7 +9676,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     uploadStorageMode(data.len * @sizeOf(f32)),
                     shape,
                 );
-                errdefer device_tensor.deinit();
+                errdefer self.retireTemporaryWorkspaceValue(&device_tensor);
                 const host_tensor = MetalTensor.borrowed(@constCast(data.ptr), data.len, shape);
                 try host_tensor.copyInto(&device_tensor);
                 return self.ctFromOwnedMetalTensor(device_tensor);
@@ -8827,7 +9709,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (data.len != try std.math.mul(usize, count, physical.byteSize())) return error.InvalidTensorShape;
         const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
         var device = try MetalTensor.deviceAllocateTyped(self.allocator, @ptrCast(runtime), physical, .private, dims[0..shape.len]);
-        errdefer device.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&device);
         if (data.len != 0) try device.uploadBytes(data);
         const result = try self.ctFromOwnedMetalTensor(device);
         if (count != 0) {
@@ -8882,7 +9764,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         } else null;
         errdefer if (indices) |storage| storage.release();
         var device = try MetalTensor.deviceAllocateWithAllocator(self.allocator, @ptrCast(runtime), count * 4, .private, shape);
-        errdefer device.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&device);
         device.dtype = if (T == i32) .i32 else .f32;
         try device.uploadBytes(std.mem.sliceAsBytes(values));
         const result = try self.ctFromOwnedMetalTensor(device);
@@ -8926,11 +9808,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var output = if (independent) blk: {
             const runtime = self.provider_impl.raw_decode_runtime orelse return error.MetalRuntimeUnavailable;
             var copied = try MetalTensor.deviceAllocateTyped(self.allocator, @ptrCast(runtime), source.dtype, .private, shape);
-            errdefer copied.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&copied);
             if (source.deviceByteLen() != 0) try source.copyInto(&copied);
             break :blk copied;
         } else try source.retainedView(0, source.deviceByteLen(), shape);
-        errdefer output.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&output);
         const result = try self.ctFromOwnedMetalTensor(output);
         toBuf(result).integer_bounds = toBuf(input).integer_bounds;
         toBuf(result).resident_index_bounds = toBuf(input).resident_index_bounds;
@@ -8945,12 +9827,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var output = if (independent) blk: {
             const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedResidentTrainingCapture;
             var copied = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), count * 4, .private, shape);
-            errdefer copied.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&copied);
             copied.dtype = source.dtype;
             try source.copyInto(&copied);
             break :blk copied;
         } else try source.retainedView(0, count * 4, shape);
-        errdefer output.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&output);
         const result = try self.ctFromOwnedMetalTensor(output);
         toBuf(result).integer_bounds = toBuf(input).integer_bounds;
         toBuf(result).resident_index_bounds = toBuf(input).resident_index_bounds;
@@ -8973,7 +9855,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // A retained view: consumers only read gradients, and the producer
         // releases rather than overwrites its buffer, so no copy is needed.
         var view = try source.retainedView(0, count * 4, shape);
-        errdefer view.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&view);
         return self.ctFromOwnedMetalTensor(view);
     }
 
@@ -9020,7 +9902,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         _ = try ops.resident_training.scatterWork(output_count, input_count, limits);
         const storage = toBuf(indices).resident_index_storage orelse return error.UnsupportedResidentTrainingIndexProof;
         var grouped = try @import("resident_training_groups.zig").build(self.allocator, storage.values, rows, .{ .max_metadata_bytes = limits.max_index_metadata_bytes }, control);
-        defer grouped.deinit();
+        defer self.retireTemporaryWorkspaceValue(&grouped);
         const group_rows = try self.residentTrainingUpload(i32, grouped.rows, &.{@intCast(grouped.rows.len)}, limits, false);
         defer freeOp(self, group_rows);
         const offsets = try self.residentTrainingUpload(i32, grouped.offsets, &.{@intCast(grouped.offsets.len)}, limits, false);
@@ -9081,7 +9963,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             initialized += 1;
         }
         var output = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), inputs.len * 12, .private, &.{@intCast(inputs.len * 3)});
-        defer output.deinit();
+        defer self.retireTemporaryWorkspaceValue(&output);
         const summaries = try self.allocator.alloc(f32, inputs.len * 3);
         defer self.allocator.free(summaries);
         // Inside a transaction's batch, reduce in its frame and synchronize
@@ -9100,7 +9982,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (!try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, sources, partials[i]))
                 return error.UnsupportedResidentTrainingPrimitive;
             var merged = try output.retainedView(i * 12, 12, &.{3});
-            defer merged.deinit();
+            defer self.retireTemporaryWorkspaceValue(&merged);
             request = .{ .kind = .norm_merge };
             request.dims[0] = @intCast(partials[i].elemCount() / 3);
             sources[0] = partials[i];
@@ -9187,7 +10069,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (output_shape.rank_ == 0) return input.retainedView(@as(usize, map.base_offset) * 4, 4, &.{});
         const remaining = input.elemCount() - map.base_offset;
         var view = try input.retainedView(@as(usize, map.base_offset) * 4, remaining * 4, &.{@intCast(remaining)});
-        defer view.deinit();
+        defer self.retireTemporaryWorkspaceValue(&view);
         return (try metal_runtime.decoderRuntimeBroadcastF32Device(self.provider_impl, view, map.output_strides[0..map.rank], map.input_strides[0..map.rank], map.rank, remaining, @intCast(output_shape.numElements().?), dimensions[0..output_shape.rank_])) orelse error.UnsupportedResidentProgramInstruction;
     }
 
@@ -9277,7 +10159,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 defer freeOp(self, accumulated);
                 if (inputs.len == 2) return self.residentTrainingReshape(accumulated, shape, limits.primitive, false);
                 var added = (try metal_runtime.decoderRuntimeApplyAddRhsRepeat(self.provider_impl, tensors[0], try self.residentTrainingTensor(accumulated, .f32, limits.primitive))) orelse return error.UnsupportedResidentProgramInstruction;
-                defer added.deinit();
+                defer self.retireTemporaryWorkspaceValue(&added);
                 const result = try added.retainedView(0, geometry.output_elements * 4, shape);
                 return self.boundaryOwnedTensor(result);
             },
@@ -9349,7 +10231,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             },
             else => return error.UnsupportedResidentProgramInstruction,
         };
-        defer result.deinit();
+        defer self.retireTemporaryWorkspaceValue(&result);
         if (control) |active| try active.check();
         const shaped = try result.retainedView(0, geometry.output_elements * 4, shape);
         return self.boundaryOwnedTensor(shaped);
@@ -9393,7 +10275,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (try self.segmentAttentionOnDevice(qkv, control_i32, null, attrs, control)) |output| return output;
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
         const qkv_shape = toBuf(qkv).logical_shape;
         const control_shape = toBuf(control_i32).logical_shape;
         const n_qkv = try self.importCtToHostNative(&native_ctx, qkv, qkv_shape);
@@ -9414,7 +10296,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (try self.segmentAttentionOnDevice(qkv, control_i32, d_out, attrs, control)) |output| return output;
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
         const qkv_shape = toBuf(qkv).logical_shape;
         const control_shape = toBuf(control_i32).logical_shape;
         const dout_shape = toBuf(d_out).logical_shape;
@@ -9496,7 +10378,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .window = attrs.window,
         };
         var qkv = try self.ownedDeviceMetalTensorFromCt(qkv_ct);
-        defer qkv.deinit();
+        defer self.retireTemporaryWorkspaceValue(&qkv);
         var d_out: ?MetalTensor = if (d_out_ct) |value| try self.ownedDeviceMetalTensorFromCt(value) else null;
         defer if (d_out) |*value| value.deinit();
         return try self.modernBertTrainingAttention(qkv, device_control, d_out, device_attrs, control, dropout_probability, dropout_seed);
@@ -9523,16 +10405,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn modernBertTrainingAttentionV1Op(ctx: *anyopaque, qkv_ct: CT, control_i32: CT, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var qkv = try self.ownedDeviceMetalTensorFromCt(qkv_ct);
-        defer qkv.deinit();
+        defer self.retireTemporaryWorkspaceValue(&qkv);
         return self.modernBertTrainingAttention(qkv, control_i32, null, attrs, control, 0, 0);
     }
 
     fn modernBertTrainingAttentionBackwardV1Op(ctx: *anyopaque, qkv_ct: CT, control_i32: CT, d_out_ct: CT, attrs: @import("ml").graph.ModernBertTrainingAttentionAttrs, control: ?@import("../execution_control.zig").InferenceExecutionControl) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var qkv = try self.ownedDeviceMetalTensorFromCt(qkv_ct);
-        defer qkv.deinit();
+        defer self.retireTemporaryWorkspaceValue(&qkv);
         var d_out = try self.ownedDeviceMetalTensorFromCt(d_out_ct);
-        defer d_out.deinit();
+        defer self.retireTemporaryWorkspaceValue(&d_out);
         return self.modernBertTrainingAttention(qkv, control_i32, d_out, attrs, control, 0, 0);
     }
 
@@ -9588,7 +10470,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // Validates the active epoch, dimensions, range and physical runtime
         // without allocating. Retire this probe before binding the token.
         var probe = try borrow.view(0, &.{1});
-        defer probe.deinit();
+        defer self.retireTemporaryWorkspaceValue(&probe);
         if (probe.device.?.ref.runtime != @as(*anyopaque, @ptrCast(self.provider_impl.raw_decode_runtime.?)) or probe.dtype != .f32)
             return error.ForeignGlinerBoundaryResidentRuntime;
         self.boundary_workspace = borrow.*;
@@ -9701,7 +10583,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         for (biases) |bias| if (bias.elemCount() != request.hidden) return error.InvalidBoundaryDeviceShape;
 
         var scratch = try self.boundaryWorkspaceProduct(packed_elements, request.rows, packed_hidden);
-        defer scratch.deinit();
+        defer self.retireTemporaryWorkspaceValue(&scratch);
         const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedGlinerBoundaryPackedQkv;
         const shape = [_]i32{ @intCast(request.rows), @intCast(request.hidden) };
         var outputs: [3]MetalTensor = undefined;
@@ -9786,9 +10668,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             norm_weight.elemCount() != request.hidden or norm_bias.elemCount() != request.hidden) return error.InvalidBoundaryDeviceShape;
 
         var first_product = try self.boundaryWorkspaceProduct(intermediate_elements, request.rows, request.intermediate);
-        defer first_product.deinit();
+        defer self.retireTemporaryWorkspaceValue(&first_product);
         var second_product = try self.boundaryWorkspaceProduct(hidden_elements, request.rows, request.hidden);
-        defer second_product.deinit();
+        defer self.retireTemporaryWorkspaceValue(&second_product);
         const runtime = self.provider_impl.raw_decode_runtime orelse return error.UnsupportedGlinerBoundaryFusedFfn;
         const shape = [_]i32{ @intCast(request.rows), @intCast(request.hidden) };
         var output = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, try std.math.mul(usize, hidden_elements, 4), .private, &shape);
@@ -9829,7 +10711,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const offset = (try self.boundary_workspace_cursor.?.reserve(elements)) orelse
             return error.InvalidGlinerBoundaryWorkspaceRange;
         var product = try self.boundary_workspace.?.view(offset, &.{ @intCast(rows), @intCast(columns) });
-        errdefer product.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&product);
         // Retaining one arena view is sufficient for physical lifetime. The
         // monotonic cursor separately protects every live subrange until fence.
         try self.boundaryRetainScopeOutput(product);
@@ -10070,14 +10952,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn boundaryOwnedTensor(self: *MetalCompute, tensor: MetalTensor) !CT {
         var owned = tensor;
-        errdefer owned.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&owned);
         try self.boundaryRetainScopeOutput(owned);
         return self.ctFromOwnedMetalTensor(owned);
     }
 
     fn boundaryOwnedImmutableTensor(self: *MetalCompute, tensor: MetalTensor) !CT {
         var owned = tensor;
-        errdefer owned.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&owned);
         if (!owned.isDevice() or owned.dtype != .f32) return error.UnsupportedGlinerBoundaryHeadPrecision;
         const output = try self.ctFromOwnedMetalTensor(owned);
         toBuf(output).boundary_immutable_f32 = true;
@@ -10254,7 +11136,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (!r.allow_host_weight or r.source_precision != .f32) return error.GlinerBoundaryRequiresResidentInput;
                 if (buf.native_dense_dtype) |dtype| if (dtype != .f32) return error.UnsupportedGlinerBoundaryHeadPrecision;
                 var tensor = try self.ownedDeviceMetalTensorFromCtImpl(r.input, self.allocator);
-                errdefer tensor.deinit();
+                errdefer self.retireTemporaryWorkspaceValue(&tensor);
                 if (!tensor.isDevice()) return error.UnsupportedGlinerBoundaryDevice;
                 self.boundary_scope.stats.actual_weight_upload_bytes +|= @intCast(tensor.deviceByteLen());
                 return self.ctFromOwnedMetalTensor(tensor);
@@ -10314,7 +11196,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     return error.InvalidBoundaryDeviceShape;
                 if (try self.boundaryWorkspaceElements(request)) |elements| {
                     var scratch = try self.boundaryWorkspaceProduct(elements, r.rows, r.out_dim);
-                    defer scratch.deinit();
+                    defer self.retireTemporaryWorkspaceValue(&scratch);
                     const product = (try metal_runtime.decoderRuntimeDotGeneral2DF32DeviceInto(self.provider_impl, input, weight, r.rows, r.out_dim, r.in_dim, 1, scratch)) orelse
                         return error.UnsupportedGlinerBoundaryDevice;
                     var kernel = ops.gliner_boundary_device.Kernel{ .kind = .bias };
@@ -10385,7 +11267,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const buf = toBuf(tensor);
         var source = if (buf.integer_storage) try buf.metal_tensor.?.retainedCopy() else (try self.deviceWhereOperand(buf)) orelse return null;
-        defer source.deinit();
+        defer self.retireTemporaryWorkspaceValue(&source);
         const output = (try metal_runtime.decoderRuntimeCumulativeSumF32Device(self.provider_impl, source, axis, exclusive, reverse)) orelse return null;
         const result = try self.ctFromOwnedMetalTensor(output);
         toBuf(result).integer_storage = buf.integer_storage;
@@ -10397,7 +11279,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const buf = toBuf(tensor);
         if (buf.quantized_storage != null) return null;
         var source = if (buf.integer_storage) try buf.metal_tensor.?.retainedCopy() else try self.ownedDeviceMetalTensorFromCt(tensor);
-        defer source.deinit();
+        defer self.retireTemporaryWorkspaceValue(&source);
         const physical: metal_tensor_mod.DType = switch (target) {
             .f32, .f16, .bf16, .f64 => .f32,
             inline .i8, .i16, .i32, .i64, .u8, .bool_ => |tag| @field(metal_tensor_mod.DType, @tagName(tag)),
@@ -10545,7 +11427,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (bufHasAnyQuantizedStorage(storage) or hasHostView(storage)) return null;
         const source = if (storage.metal_tensor) |*tensor| tensor else return null;
         var view = try MetalTensor.deviceLeasedView(self.allocator, source, request.storage, request.shape);
-        errdefer view.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&view);
         return self.ctFromOwnedMetalTensor(view);
     }
 
@@ -11007,7 +11889,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (metal_runtime.termite_metal_decode_runtime_ready(runtime) != 0) {
                 const shape = [_]i32{ @intCast(rows), @intCast(dim) };
                 var tensor = try MetalTensor.deviceAllocate(runtime, rows * dim * @sizeOf(f32), .shared, &shape);
-                errdefer tensor.deinit();
+                errdefer self.retireTemporaryWorkspaceValue(&tensor);
                 const handle = tensor.deviceHandle() orelse return null;
                 const raw = metal_runtime.termite_metal_buffer_contents(handle) orelse return null;
                 const host: [*]f32 = @ptrCast(@alignCast(raw));
@@ -11226,9 +12108,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const shape_i32 = try self.i32ShapeFromI64(resolved_slice);
             defer self.allocator.free(shape_i32);
             var lhs_view = try lazy.lhs.retainedView(0, lazy.lhs.deviceByteLen(), shape_i32);
-            errdefer lhs_view.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&lhs_view);
             var rhs_view = try lazy.rhs.retainedView(0, lazy.rhs.deviceByteLen(), shape_i32);
-            errdefer rhs_view.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&rhs_view);
             return self.lazyMultiplyBuf(lhs_view, rhs_view, resolved_slice);
         }
 
@@ -11624,7 +12506,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn hostFallbackUnary(self: *MetalCompute, input: CT, shape_override: ?[]const i64, comptime op_kind: HostUnaryOp) !CT {
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
 
         const n_input = try self.importCtToHostNative(&native_ctx, input, shape_override);
         defer native_ctx.cb.free(n_input);
@@ -11902,7 +12784,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
             break :blk try self.ownedDeviceMetalTensorFromCt(primary);
         };
-        defer lhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lhs);
         var rhs = blk: {
             if (!hasHostView(secondary_buf)) {
                 if (secondary_metal) |*metal| {
@@ -11911,7 +12793,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
             break :blk try self.ownedDeviceMetalTensorFromCt(secondary);
         };
-        defer rhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&rhs);
         if (comptime op_kind == .multiply) {
             if (getenvBool("TERMITE_DUAL_READ_MUL") and primary_len == dualReadMulNumel()) {
                 self.dualReadMulOperand("any_equal_size", "primary", primary);
@@ -11987,9 +12869,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!matrix_metal.isDevice()) return null;
 
         var lhs = try matrix_metal.retainedCopy();
-        defer lhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lhs);
         var row = try self.ownedDeviceMetalTensorFromCt(row_ct);
-        defer row.deinit();
+        defer self.retireTemporaryWorkspaceValue(&row);
         if (!row.isDevice()) return null;
 
         const output_elems = std.math.mul(usize, matrix_shape.rows, matrix_shape.cols) catch return error.InvalidTensorShape;
@@ -12006,7 +12888,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             output_elems,
             &output_shape,
         )) orelse return null;
-        defer broadcasted.deinit();
+        defer self.retireTemporaryWorkspaceValue(&broadcasted);
 
         if (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
             .lhs = lhs,
@@ -12037,7 +12919,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         if (primary_len == secondary_len) {
             var lhs = try primary_metal.retainedCopy();
-            defer lhs.deinit();
+            defer self.retireTemporaryWorkspaceValue(&lhs);
             var rhs = blk: {
                 if (!hasHostView(toBuf(secondary))) {
                     if (toBuf(secondary).metal_tensor) |*secondary_metal| {
@@ -12046,7 +12928,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
                 break :blk try self.ownedDeviceMetalTensorFromCt(secondary);
             };
-            defer rhs.deinit();
+            defer self.retireTemporaryWorkspaceValue(&rhs);
             if (comptime op_kind == .multiply) {
                 if (getenvBool("TERMITE_DUAL_READ_MUL") and primary_len == dualReadMulNumel()) {
                     self.dualReadMulOperand("consume_equal_len", "primary", primary);
@@ -12073,7 +12955,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (secondary_len == 1) scalar_blk: {
             const scalar = tryDirectDenseHostValue(toBuf(secondary), 0) orelse break :scalar_blk;
             var input = try primary_metal.retainedCopy();
-            defer input.deinit();
+            defer self.retireTemporaryWorkspaceValue(&input);
             const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
             defer self.endActivePlannedComputeScope(scope);
             switch (op_kind) {
@@ -12086,7 +12968,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 },
                 .add, .subtract => {
                     var rhs = (try self.deviceScalarTensorLike(&primary_metal, if (op_kind == .subtract) -scalar else scalar)) orelse return null;
-                    defer rhs.deinit();
+                    defer self.retireTemporaryWorkspaceValue(&rhs);
                     if (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
                         .lhs = input,
                         .rhs = rhs,
@@ -12095,7 +12977,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 },
                 .less_than => {
                     var rhs = (try self.deviceScalarValueTensor(scalar)) orelse return null;
-                    defer rhs.deinit();
+                    defer self.retireTemporaryWorkspaceValue(&rhs);
                     if (try metal_runtime.decoderRuntimeApplyLessThan(self.provider_impl, input, rhs)) |tensor| return self.ctFromOwnedMetalTensor(tensor);
                 },
                 else => return null,
@@ -12127,7 +13009,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         if (op_kind == .multiply and primary_len % secondary_len == 0 and secondary_len <= 1_000_000 and flat_repeat_ok) {
             var lhs = try primary_metal.retainedCopy();
-            defer lhs.deinit();
+            defer self.retireTemporaryWorkspaceValue(&lhs);
             var rhs = blk: {
                 if (!hasHostView(toBuf(secondary))) {
                     if (toBuf(secondary).metal_tensor) |*secondary_metal| {
@@ -12136,7 +13018,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
                 break :blk try self.ownedDeviceMetalTensorFromCt(secondary);
             };
-            defer rhs.deinit();
+            defer self.retireTemporaryWorkspaceValue(&rhs);
             if (getenvBool("TERMITE_DUAL_READ_MUL") and primary_len == dualReadMulNumel()) {
                 self.dualReadMulOperand("consume_rhs_repeat", "primary", primary);
                 self.dualReadMulOperand("consume_rhs_repeat", "secondary", secondary);
@@ -12148,7 +13030,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         if (op_kind == .add and primary_len % secondary_len == 0 and secondary_len <= 1_000_000 and flat_repeat_ok) {
             var lhs = try primary_metal.retainedCopy();
-            defer lhs.deinit();
+            defer self.retireTemporaryWorkspaceValue(&lhs);
             var rhs = blk: {
                 if (!hasHostView(toBuf(secondary))) {
                     if (toBuf(secondary).metal_tensor) |*secondary_metal| {
@@ -12157,7 +13039,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
                 break :blk try self.ownedDeviceMetalTensorFromCt(secondary);
             };
-            defer rhs.deinit();
+            defer self.retireTemporaryWorkspaceValue(&rhs);
             const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
             defer self.endActivePlannedComputeScope(scope);
             if (try metal_runtime.decoderRuntimeApplyAddRhsRepeat(self.provider_impl, lhs, rhs)) |tensor| return self.ctFromOwnedMetalTensor(tensor);
@@ -12165,7 +13047,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         if (op_kind == .divide and primary_len % secondary_len == 0 and secondary_len <= 1_000_000 and flat_repeat_ok) {
             var lhs = try primary_metal.retainedCopy();
-            defer lhs.deinit();
+            defer self.retireTemporaryWorkspaceValue(&lhs);
             var rhs = blk: {
                 if (!hasHostView(toBuf(secondary))) {
                     if (toBuf(secondary).metal_tensor) |*secondary_metal| {
@@ -12174,7 +13056,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
                 break :blk try self.ownedDeviceMetalTensorFromCt(secondary);
             };
-            defer rhs.deinit();
+            defer self.retireTemporaryWorkspaceValue(&rhs);
             const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
             defer self.endActivePlannedComputeScope(scope);
             if (try metal_runtime.decoderRuntimeApplyDivideRhsRepeat(self.provider_impl, lhs, rhs)) |tensor| return self.ctFromOwnedMetalTensor(tensor);
@@ -12240,9 +13122,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .{ @tagName(op_kind), a_count, b_count, a_metal.shape(), b_metal.shape() },
         );
         var lhs = try a_metal.retainedCopy();
-        defer lhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lhs);
         var rhs = try b_metal.retainedCopy();
-        defer rhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&rhs);
         if (trace_binary) std.debug.print("metal_flat_binary_trace: phase=retained op={s}\n", .{@tagName(op_kind)});
         const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
         defer self.endActivePlannedComputeScope(scope);
@@ -12363,9 +13245,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const b_metal = b_buf.metal_tensor orelse return null;
         if (!a_metal.isDevice() or !b_metal.isDevice()) return null;
         var lhs = try a_metal.retainedCopy();
-        errdefer lhs.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&lhs);
         var rhs = try b_metal.retainedCopy();
-        errdefer rhs.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&rhs);
         if (getenvBool("TERMITE_DUAL_READ_MUL") and a_len == dualReadMulNumel()) {
             self.dualReadMulOperand("lazy_capture", "a", a);
             self.dualReadMulOperand("lazy_capture", "b", b);
@@ -12400,7 +13282,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const input_metal = input_buf.metal_tensor orelse return null;
             break :blk try input_metal.retainedCopy();
         };
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         if (!input.isDevice() or input.elemCount() == 0) return null;
         if (try metal_runtime.decoderRuntimeApplyPrimitiveUnary(
             self.provider_impl,
@@ -12415,7 +13297,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn hostFallbackReduce(self: *MetalCompute, input: CT, axes: []const u8, input_shape: []const i64, comptime op_kind: HostReduceOp) !CT {
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
 
         const n_input = try self.importCtToHostNative(&native_ctx, input, input_shape);
         defer native_ctx.cb.free(n_input);
@@ -12503,7 +13385,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer self.allocator.free(output_shape_i32);
 
         var input_mt = try input_metal.retainedCopy();
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         if (getenvBool("TERMITE_DUAL_READ_REDUCE")) {
             // Diagnostic: compare the raw device bytes against the host-route
             // read of the same buf to localize host/device content desyncs.
@@ -12559,12 +13441,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 return null;
             }
             var lhs = try lazy.lhs.retainedCopy();
-            defer lhs.deinit();
+            defer self.retireTemporaryWorkspaceValue(&lhs);
             var rhs = try lazy.rhs.retainedCopy();
-            defer rhs.deinit();
+            defer self.retireTemporaryWorkspaceValue(&rhs);
             if (try metal_runtime.decoderRuntimeApplyMultiply(self.provider_impl, lhs, rhs, lazy.lhs.elemCount())) |product_tensor| {
                 const product = try self.ctFromOwnedMetalTensor(product_tensor);
-                defer freeOp(self, product);
+                defer freeTemporaryWorkspaceCtOp(self, product);
                 _ = try self.withLogicalShape(product, input_shape);
                 return try self.tryDeviceReduceAxisF32(product, axes, input_shape, op_kind);
             }
@@ -12603,7 +13485,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const output_shape_i32 = try self.i32ShapeFromI64(output_shape_i64);
         defer self.allocator.free(output_shape_i32);
         var input_mt = try input_metal.retainedCopy();
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         const kind: u32 = switch (op_kind) {
             .sum => 0,
             .max => 1,
@@ -12659,7 +13541,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         const input_ct = try self.ctFromOwnedMetalTensor(input_tensor);
         input_tensor_owned = false;
-        defer freeOp(self, input_ct);
+        defer freeTemporaryWorkspaceCtOp(self, input_ct);
         _ = try self.withLogicalShape(input_ct, input_shape);
 
         const last_axis = [_]u8{1};
@@ -12667,7 +13549,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (trace) std.debug.print("metal_reduce_prim: decline=full2d_last_dim op={s} input_shape={any}\n", .{ @tagName(op_kind), input_shape });
             return null;
         };
-        defer freeOp(self, row_reduced);
+        defer freeTemporaryWorkspaceCtOp(self, row_reduced);
 
         const row_reduced_shape = [_]i64{ input_shape[0], 1 };
         _ = try self.withLogicalShape(row_reduced, &row_reduced_shape);
@@ -12742,9 +13624,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer self.allocator.free(output_shape_i32);
 
         var lhs = try lazy.lhs.retainedCopy();
-        defer lhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lhs);
         var rhs = try lazy.rhs.retainedCopy();
-        defer rhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&rhs);
         if (getenvBool("TERMITE_DUAL_READ_MUL") and physical_len == dualReadMulNumel()) {
             const lhs_raw_abs: f64 = lhs.debugRawDeviceAbsSum() catch -1;
             const rhs_raw_abs: f64 = rhs.debugRawDeviceAbsSum() catch -1;
@@ -12764,7 +13646,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const result = try self.ctFromOwnedMetalTensor(tensor);
             if (physical_len != logical_numel) {
                 _ = self.withLogicalShape(result, logical_output_shape) catch |err| {
-                    freeOp(self, result);
+                    freeTemporaryWorkspaceCtOp(self, result);
                     return err;
                 };
             }
@@ -12840,7 +13722,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const output_shape_i32 = try self.i32ShapeFromI64(out_shape);
         defer self.allocator.free(output_shape_i32);
         var input_mt = try input_metal.retainedCopy();
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         if (try metal_runtime.decoderRuntimeBroadcastLastDimDevice(
             self.provider_impl,
             input_mt,
@@ -12953,7 +13835,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             },
             else => return err,
         };
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         if (!input_mt.isDevice() or input_mt.elemCount() != input_elems) {
             if (trace) std.debug.print("metal_broadcast_prim: decline=general_elem_mismatch is_device={} elems={d} expected={d} metal_shape={any} in_shape={any} out_shape={any}\n", .{ input_mt.isDevice(), input_mt.elemCount(), input_elems, input_mt.shape(), in_shape, out_shape });
             return null;
@@ -12992,7 +13874,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             },
             else => return err,
         };
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         if (!input_mt.isDevice() or input_mt.elemCount() != 1) {
             if (trace) std.debug.print("metal_broadcast_prim: decline=scalar_not_single is_device={} elems={d} metal_shape={any} out_shape={any}\n", .{ input_mt.isDevice(), input_mt.elemCount(), input_mt.shape(), out_shape });
             return null;
@@ -13018,7 +13900,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn hostFallbackArgMax(self: *MetalCompute, input: CT, axis: u8, keepdims: bool, input_shape: []const i64) !CT {
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
 
         const n_input = try self.importCtToHostNative(&native_ctx, input, input_shape);
         defer native_ctx.cb.free(n_input);
@@ -13042,7 +13924,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) !CT {
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
         const out_time = (time_steps + 2 * padding - kernel_size) / stride + 1;
 
         const input_shape = [_]i64{
@@ -13105,7 +13987,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) !CT {
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
         const out_h = (height + 2 * padding_h - kernel_h) / stride_h + 1;
         const out_w = (width + 2 * padding_w - kernel_w) / stride_w + 1;
 
@@ -13161,7 +14043,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
         const shape = [_]i64{ @intCast(num_heads), @intCast(num_buckets) };
         const native_weight = try self.importCtToHostNative(&native_ctx, weight, &shape);
         defer native_ctx.cb.free(native_weight);
@@ -13174,7 +14056,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn hostFallbackSoftmax(self: *MetalCompute, input: CT, last_dim_size: u32, log_softmax: bool) !CT {
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
 
         const n_input = try self.importCtToHostNative(&native_ctx, input, null);
         defer native_ctx.cb.free(n_input);
@@ -13189,7 +14071,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn hostFallbackConcatPrim(self: *MetalCompute, a: CT, b: CT, axis: u8, a_shape: []const i64, b_shape: []const i64) !CT {
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
 
         const n_a = try self.importCtToHostNative(&native_ctx, a, a_shape);
         defer native_ctx.cb.free(n_a);
@@ -13214,7 +14096,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) !CT {
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
 
         const q_shape = toBuf(q_ct).logical_shape;
         const k_shape = toBuf(k_ct).logical_shape;
@@ -13260,7 +14142,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) !CT {
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
 
         const q_shape = toBuf(q_ct).logical_shape;
         const k_shape = toBuf(k_ct).logical_shape;
@@ -13317,7 +14199,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             var native_ctx: HostFallbackNative = undefined;
 
             try native_ctx.initInPlace(self.allocator);
-            defer native_ctx.deinit();
+            defer self.retireTemporaryWorkspaceValue(&native_ctx);
             if (lhs_buf.logical_shape) |lhs_logical| {
                 if (rhs_buf.logical_shape) |rhs_logical| {
                     if (allConcreteShapeDims(lhs_logical) and allConcreteShapeDims(rhs_logical) and dotContractingDimsMatch(lhs_logical, rhs_logical, lhs_contracting, rhs_contracting)) {
@@ -13354,7 +14236,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var native_ctx: HostFallbackNative = undefined;
 
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
 
         if (lhs_batch.len == 0 and rhs_batch.len == 0) {
             if (resolveSimple2DDotShapes(lhs_buf, rhs_buf, lhs_shape, rhs_shape, lhs_contracting, rhs_contracting)) |simple| {
@@ -13570,7 +14452,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (strictFlorence2ResidentMetal() and !isDeviceResidentCt(input)) return error.UnsupportedFlorence2ResidentMetal;
         var input_mt = try self.ownedDeviceMetalTensorFromCt(input);
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         if (!input_mt.isDevice()) return null;
         if (try metal_runtime.decoderRuntimeFlorenceWindowPackF32Device(
             self.provider_impl,
@@ -13604,7 +14486,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (strictFlorence2ResidentMetal() and !isDeviceResidentCt(input)) return error.UnsupportedFlorence2ResidentMetal;
         var input_mt = try self.ownedDeviceMetalTensorFromCt(input);
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         if (!input_mt.isDevice()) return null;
         if (try metal_runtime.decoderRuntimeFlorenceWindowUnpackF32Device(
             self.provider_impl,
@@ -13704,7 +14586,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (strictFlorence2ResidentMetal() and !isDeviceResidentCt(qkv)) return error.UnsupportedFlorence2ResidentMetal;
         var qkv_mt = try self.ownedDeviceMetalTensorFromCt(qkv);
-        defer qkv_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&qkv_mt);
         if (!qkv_mt.isDevice()) return null;
         if (try metal_runtime.decoderRuntimeFlorenceChannelAttentionF32Device(
             self.provider_impl,
@@ -13803,7 +14685,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
 
         const input_shape = [_]i64{ @intCast(batch * height * width), @intCast(dim) };
         const norm_shape = [_]i64{@intCast(dim)};
@@ -13889,7 +14771,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
 
         const input_shape = [_]i64{ @intCast(batch * seq_len), @intCast(dim) };
         const norm_shape = [_]i64{@intCast(dim)};
@@ -13952,7 +14834,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
 
         const q_shape = [_]i64{ @intCast(batch * dec_seq), @intCast(hidden_dim) };
         const kv_shape = [_]i64{ @intCast(batch * enc_seq), @intCast(hidden_dim) };
@@ -14012,11 +14894,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         var q_mt = try self.ownedDeviceMetalTensorFromCt(q_ct);
-        defer q_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&q_mt);
         var k_mt = try self.ownedDeviceMetalTensorFromCt(k_ct);
-        defer k_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&k_mt);
         var v_mt = try self.ownedDeviceMetalTensorFromCt(v_ct);
-        defer v_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&v_mt);
         if (!q_mt.isDevice() or !k_mt.isDevice() or !v_mt.isDevice()) return null;
         const q_rows = std.math.mul(usize, batch, dec_seq) catch return null;
         const kv_rows = std.math.mul(usize, batch, enc_seq) catch return null;
@@ -14080,11 +14962,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             bufHasAnyQuantizedStorage(toBuf(weight)) or
             bufHasAnyQuantizedStorage(toBuf(bias))) return null;
         var input_mt = try self.ownedDeviceMetalTensorFromCt(input);
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         var weight_mt = try self.ownedDeviceMetalTensorFromCt(weight);
-        defer weight_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&weight_mt);
         var bias_mt = try self.ownedDeviceMetalTensorFromCt(bias);
-        defer bias_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&bias_mt);
         if (!input_mt.isDevice() or !weight_mt.isDevice() or !bias_mt.isDevice()) return null;
         if (try metal_runtime.decoderRuntimeConv1dF32Device(self.provider_impl, .{
             .input = input_mt,
@@ -14123,11 +15005,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             bufHasAnyQuantizedStorage(toBuf(weight)) or
             bufHasAnyQuantizedStorage(toBuf(bias))) return null;
         var input_mt = try self.ownedDeviceMetalTensorFromCt(input);
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         var weight_mt = try self.ownedDeviceMetalTensorFromCt(weight);
-        defer weight_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&weight_mt);
         var bias_mt = try self.ownedDeviceMetalTensorFromCt(bias);
-        defer bias_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&bias_mt);
         if (!input_mt.isDevice() or !weight_mt.isDevice() or !bias_mt.isDevice()) return null;
         if (try metal_runtime.decoderRuntimeConv2dF32Device(self.provider_impl, .{
             .input = input_mt,
@@ -14261,7 +15143,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn hostFallbackReshape(self: *MetalCompute, input: CT, new_shape: []const i64) !CT {
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
 
         const input_buf = toBuf(input);
         const resolved_shape = resolveReshapeShape(input_buf.logical_shape, bufElemCount(input_buf), new_shape) catch null;
@@ -14275,7 +15157,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn hostFallbackGather(self: *MetalCompute, input: CT, indices: CT, axis: u8, input_shape: []const i64) !CT {
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
 
         const input_buf = toBuf(input);
         const indices_buf = toBuf(indices);
@@ -14358,7 +15240,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     return self.metalTensorBufWithHostMaterialization(view, false);
                 }
                 var input_mt = try metal_tensor.retainedCopy();
-                defer input_mt.deinit();
+                defer self.retireTemporaryWorkspaceValue(&input_mt);
                 const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
                 defer self.endActivePlannedComputeScope(scope);
                 if (try metal_runtime.decoderRuntimeTransposeF32Device(
@@ -14675,11 +15557,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const out_shape_i32 = try self.i32ShapeFromI64(out_shape_buf[0..out_rank]);
         defer self.allocator.free(out_shape_i32);
         var input_mt = try input_metal.retainedCopy();
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         var bias_mt = try bias_metal.retainedCopy();
-        defer bias_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&bias_mt);
         var indices_mt = try indices_metal.retainedCopy();
-        defer indices_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&indices_mt);
         if (try metal_runtime.decoderRuntimeGatherAxis0AddBiasF32_2DDevice(
             self.provider_impl,
             input_mt,
@@ -14711,9 +15593,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 @memcpy(shape[axis..][0..index_tensor.shape().len], index_tensor.shape());
                 for (resolved[axis + 1 .. input_shape.len], axis + index_tensor.shape().len..) |dim, i| shape[i] = @intCast(dim);
                 var source = if (toBuf(input).integer_storage) try toBuf(input).metal_tensor.?.retainedCopy() else try self.ownedDeviceMetalTensorFromCt(input);
-                defer source.deinit();
+                defer self.retireTemporaryWorkspaceValue(&source);
                 var result = (try metal_runtime.decoderRuntimeGatherTypedDevice(self.provider_impl, source, index_tensor, axis, shape[0..rank])) orelse return error.UnsupportedTensorType;
-                errdefer result.deinit();
+                errdefer self.retireTemporaryWorkspaceValue(&result);
                 return self.ctFromOwnedMetalTensor(result);
             }
             return self.hostFallbackGather(input, indices, axis, input_shape);
@@ -14755,9 +15637,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                             const out_shape_i32 = try self.i32ShapeFromI64(out_shape_buf[0..out_rank]);
                             defer self.allocator.free(out_shape_i32);
                             var input_mt = try input_metal.retainedCopy();
-                            defer input_mt.deinit();
+                            defer self.retireTemporaryWorkspaceValue(&input_mt);
                             var indices_mt = try indices_metal.retainedCopy();
-                            defer indices_mt.deinit();
+                            defer self.retireTemporaryWorkspaceValue(&indices_mt);
                             if (try metal_runtime.decoderRuntimeGatherAxis0F32_2DDevice(
                                 self.provider_impl,
                                 input_mt,
@@ -14827,7 +15709,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const input_buf = toBuf(input);
         if (input_buf.integer_storage) {
             var mt = try self.selectionOperand(input);
-            defer mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&mt);
             var shape: [8]i64 = undefined;
             for (mt.shape(), 0..) |dim, i| shape[i] = dim;
             const plan = try @import("slice_plan.zig").Plan.init(shape[0..mt.shape().len], starts, limits, strides, input_shape);
@@ -15070,9 +15952,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }
         var lhs = if (toBuf(a).integer_storage) try toBuf(a).metal_tensor.?.retainedCopy() else try self.ownedDeviceMetalTensorFromCt(a);
-        defer lhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lhs);
         var rhs = if (toBuf(b).integer_storage) try toBuf(b).metal_tensor.?.retainedCopy() else try self.ownedDeviceMetalTensorFromCt(b);
-        defer rhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&rhs);
         const output = (try metal_runtime.decoderRuntimeIntegerBinaryDevice(self.provider_impl, lhs, rhs, kind)) orelse return error.UnsupportedTensorType;
         const result = try self.ctFromOwnedMetalTensor(output);
         if (kind == 3) {
@@ -15118,9 +16000,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (!b_metal.isDevice()) break :scalar_left_blk;
             const scalar = tryDirectDenseHostValue(toBuf(a), 0) orelse break :scalar_left_blk;
             var lhs = (try self.deviceScalarValueTensor(scalar)) orelse break :scalar_left_blk;
-            defer lhs.deinit();
+            defer self.retireTemporaryWorkspaceValue(&lhs);
             var rhs = try b_metal.retainedCopy();
-            defer rhs.deinit();
+            defer self.retireTemporaryWorkspaceValue(&rhs);
             if (try metal_runtime.decoderRuntimeApplyLessThan(self.provider_impl, lhs, rhs)) |tensor| return self.ctFromOwnedMetalTensor(tensor);
         }
         return self.hostFallbackBinary(a, b, null, null, .less_than);
@@ -15143,11 +16025,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn whereSelectOp(ctx: *anyopaque, cond: CT, on_true: CT, on_false: CT) anyerror!CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var c = try self.selectionOperand(cond);
-        defer c.deinit();
+        defer self.retireTemporaryWorkspaceValue(&c);
         var t = try self.selectionOperand(on_true);
-        defer t.deinit();
+        defer self.retireTemporaryWorkspaceValue(&t);
         var f = try self.selectionOperand(on_false);
-        defer f.deinit();
+        defer self.retireTemporaryWorkspaceValue(&f);
         var shapes: [3][8]i64 = undefined;
         const inputs = [3]MetalTensor{ c, t, f };
         for (inputs, 0..) |input, operand| for (input.shape(), 0..) |dim, axis| {
@@ -15218,7 +16100,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                             const out_shape_i32 = try self.i32ShapeFromI64(out_shape_buf[0..out_rank]);
                             defer self.allocator.free(out_shape_i32);
                             var input_mt = try input_metal.retainedCopy();
-                            defer input_mt.deinit();
+                            defer self.retireTemporaryWorkspaceValue(&input_mt);
                             if (try metal_runtime.decoderRuntimeArgmaxAxisF32Device(
                                 self.provider_impl,
                                 input_mt,
@@ -15252,7 +16134,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         return self.hostFallbackSoftmax(input, request.width, request.logarithmic);
                     if (geometry.rows != 0) {
                         var input_mt = try metal_tensor.retainedCopy();
-                        defer input_mt.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&input_mt);
                         if (try metal_runtime.decoderRuntimeApplySoftmaxDevice(self.provider_impl, input_mt, geometry.rows, geometry.width, request.logarithmic)) |tensor| {
                             return self.ctFromOwnedMetalTensor(tensor);
                         }
@@ -15291,7 +16173,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             uploadStorageMode(count * @sizeOf(f32)),
             &mask_shape,
         );
-        errdefer replacement.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&replacement);
         const host_mask = MetalTensor.borrowed(mask_values.ptr, mask_values.len, &mask_shape);
         try host_mask.copyInto(&replacement);
         const cached_values = try self.allocator.dupe(i64, values);
@@ -15330,7 +16212,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const shape = [_]i32{@intCast(relative_index.len)};
         var replacement = try self.deviceTensorFromF32Slice(values, &shape);
-        errdefer replacement.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&replacement);
         const cached_values = try self.allocator.dupe(i64, relative_index);
         errdefer self.allocator.free(cached_values);
 
@@ -15363,9 +16245,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return null;
         }
         var q = try (entry.q orelse return null).retainedCopy();
-        errdefer q.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&q);
         var k = try (entry.k orelse return null).retainedCopy();
-        errdefer k.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&k);
         const q_ct = try self.ctFromOwnedMetalTensor(q);
         errdefer freeOp(self, q_ct);
         const k_ct = try self.ctFromOwnedMetalTensor(k);
@@ -15400,7 +16282,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 return err;
             };
             self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
-            errdefer tensor.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&tensor);
             return self.ctFromOwnedMetalTensor(tensor);
         }
         self.provider_impl.deberta_relative_projection_cache_mutex.unlock();
@@ -15445,7 +16327,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) !void {
         const runtime = self.provider_impl.raw_decode_runtime orelse return;
         var tensor = try self.ownedDeviceMetalTensorFromCt(gathered);
-        errdefer tensor.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&tensor);
         const frame_active = metal_runtime.hasActiveFrame(runtime);
 
         self.lockDebertaRelativeProjectionCache();
@@ -15495,16 +16377,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!metal_runtime.hasActiveFrame(runtime)) return;
 
         var q_src = try self.ownedDeviceMetalTensorFromCt(q_ct);
-        defer q_src.deinit();
+        defer self.retireTemporaryWorkspaceValue(&q_src);
         var k_src = try self.ownedDeviceMetalTensorFromCt(k_ct);
-        defer k_src.deinit();
+        defer self.retireTemporaryWorkspaceValue(&k_src);
         const shape = [_]i32{ @intCast(relative_count), @intCast(hidden_size) };
         const elements = try std.math.mul(usize, relative_count, hidden_size);
         const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
         var q_cached = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), bytes, .private, &shape);
-        errdefer q_cached.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&q_cached);
         var k_cached = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), bytes, .private, &shape);
-        errdefer k_cached.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&k_cached);
         try q_src.copyInto(&q_cached);
         try k_src.copyInto(&k_cached);
 
@@ -15596,11 +16478,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (total == 0) return null;
 
         var q_mt = try self.ownedDeviceMetalTensorFromCt(q_ct);
-        defer q_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&q_mt);
         var k_mt = try self.ownedDeviceMetalTensorFromCt(k_ct);
-        defer k_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&k_mt);
         var v_mt = try self.ownedDeviceMetalTensorFromCt(v_ct);
-        defer v_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&v_mt);
         if (!q_mt.isDevice() or !k_mt.isDevice() or !v_mt.isDevice()) return null;
         if (q_mt.elemCount() != total or k_mt.elemCount() != total or v_mt.elemCount() != total) return null;
 
@@ -15669,11 +16551,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         device_path: {
             if (toBuf(request.logits).quantized_storage != null or toBuf(request.labels).quantized_storage != null or toBuf(request.mask).quantized_storage != null) break :device_path;
             var logits_mt = self.ownedDeviceMetalTensorFromCt(request.logits) catch break :device_path;
-            defer logits_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&logits_mt);
             var labels_mt = self.ownedDeviceMetalTensorFromCt(request.labels) catch break :device_path;
-            defer labels_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&labels_mt);
             var mask_mt = self.ownedDeviceMetalTensorFromCt(request.mask) catch break :device_path;
-            defer mask_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&mask_mt);
             if (try metal_runtime.decoderRuntimeMaskedBceWithLogitsLossDevice(
                 self.provider_impl,
                 logits_mt,
@@ -15720,13 +16602,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         device_path: {
             if (toBuf(request.logits).quantized_storage != null or toBuf(request.labels).quantized_storage != null or toBuf(request.mask).quantized_storage != null or toBuf(request.upstream).quantized_storage != null) break :device_path;
             var logits_mt = self.ownedDeviceMetalTensorFromCt(request.logits) catch break :device_path;
-            defer logits_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&logits_mt);
             var labels_mt = self.ownedDeviceMetalTensorFromCt(request.labels) catch break :device_path;
-            defer labels_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&labels_mt);
             var mask_mt = self.ownedDeviceMetalTensorFromCt(request.mask) catch break :device_path;
-            defer mask_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&mask_mt);
             var upstream_mt = self.ownedDeviceMetalTensorFromCt(request.upstream) catch break :device_path;
-            defer upstream_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&upstream_mt);
             if (try metal_runtime.decoderRuntimeMaskedBceWithLogitsBackwardDevice(
                 self.provider_impl,
                 logits_mt,
@@ -15798,17 +16680,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             error.UnsupportedTensorType => return null,
             else => return err,
         };
-        defer q.deinit();
+        defer self.retireTemporaryWorkspaceValue(&q);
         var k = self.ownedDeviceMetalTensorFromCt(k_ct) catch |err| switch (err) {
             error.UnsupportedTensorType => return null,
             else => return err,
         };
-        defer k.deinit();
+        defer self.retireTemporaryWorkspaceValue(&k);
         var v = self.ownedDeviceMetalTensorFromCt(v_ct) catch |err| switch (err) {
             error.UnsupportedTensorType => return null,
             else => return err,
         };
-        defer v.deinit();
+        defer self.retireTemporaryWorkspaceValue(&v);
         const output = (try metal_runtime.decoderRuntimeSegmentAttentionF32Device(self.provider_impl, q, k, v, request)) orelse return null;
         return try self.ctFromOwnedMetalTensor(output);
     }
@@ -15831,11 +16713,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn segmentAttentionGroupedOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, request: *const ops.SegmentAttentionGrouped) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var q = try self.ownedDeviceMetalTensorFromCt(q_ct);
-        defer q.deinit();
+        defer self.retireTemporaryWorkspaceValue(&q);
         var k = try self.ownedDeviceMetalTensorFromCt(k_ct);
-        defer k.deinit();
+        defer self.retireTemporaryWorkspaceValue(&k);
         var v = try self.ownedDeviceMetalTensorFromCt(v_ct);
-        defer v.deinit();
+        defer self.retireTemporaryWorkspaceValue(&v);
         var control = GroupedAttentionControl{ .control = request.control orelse .{} };
         try control.control.check();
         const metadata = if (request.metadata) |tensor| blk: {
@@ -15865,7 +16747,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (map.len == 0 or width == 0 or try std.math.mul(usize, map.len, width) > std.math.maxInt(u32)) return error.InvalidTensorShape;
         var pixels = try self.ownedDeviceMetalTensorFromCt(media);
-        defer pixels.deinit();
+        defer self.retireTemporaryWorkspaceValue(&pixels);
         var text: ?MetalTensor = if (wrappers) |tensor| try self.ownedDeviceMetalTensorFromCt(tensor) else null;
         defer if (text) |*tensor| tensor.deinit();
         if (pixels.elemCount() % width != 0 or (text != null and text.?.elemCount() % width != 0)) return error.InvalidTensorShape;
@@ -15879,7 +16761,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
         var output = try MetalTensor.deviceAllocate(runtime, map.len * width * 4, .private, &.{ @intCast(map.len), @intCast(width) });
-        errdefer output.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&output);
         const rc = metal_runtime.antfly_metal_compose_rows(runtime, if (text) |tensor| tensor.deviceHandle() else null, if (text) |tensor| tensor.deviceByteOffset() else 0, wrapper_rows, pixels.deviceHandle(), pixels.deviceByteOffset(), media_rows, map.ptr, map.len, width, output.deviceHandle(), output.deviceByteOffset());
         if (rc == -1) {
             output.deinit();
@@ -15905,7 +16787,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
         var result = try MetalTensor.deviceAllocate(runtime, batch * width * 4, .private, &.{ @intCast(batch), @intCast(width) });
-        errdefer result.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&result);
         const rc = metal_runtime.antfly_metal_masked_mean_batch(runtime, x.deviceHandle(), x.deviceByteOffset(), &metadata, rows, width, width, batch, result.deviceHandle(), result.deviceByteOffset(), false, true);
         if (rc == -1) {
             result.deinit();
@@ -15934,7 +16816,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
         var result = try MetalTensor.deviceAllocate(runtime, batch * dimensions * 4, .private, &.{ @intCast(batch), @intCast(dimensions) });
-        errdefer result.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&result);
         const rc = metal_runtime.antfly_metal_masked_mean_batch(runtime, x.deviceHandle(), x.deviceByteOffset(), metadata.ptr, sequence, width, dimensions, batch, result.deviceHandle(), result.deviceByteOffset(), normalize, false);
         if (rc == -1) {
             result.deinit();
@@ -15946,7 +16828,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn maskedMeanRowsOp(ctx: *anyopaque, input_ct: CT, mask: []const i64, width: usize, dimensions: usize) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedDeviceMetalTensorFromCt(input_ct);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         const output = (try metal_runtime.decoderRuntimeMaskedMeanRows(self.provider_impl, input, mask, width, dimensions)) orelse return null;
         return try self.ctFromOwnedMetalTensor(output);
     }
@@ -15954,7 +16836,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn maskedMeanNormalizedRowsOp(ctx: *anyopaque, input_ct: CT, mask: []const i64, width: usize, dimensions: usize) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedDeviceMetalTensorFromCt(input_ct);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         const output = (try metal_runtime.decoderRuntimeMaskedMeanNormalizedRows(self.provider_impl, input, mask, width, dimensions)) orelse return null;
         return try self.ctFromOwnedMetalTensor(output);
     }
@@ -16038,17 +16920,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const rel_total = (seq_len * 2 - 1) * hidden;
             if (total == 0 or rel_total == 0) break :resident_path;
             var q_mt = self.ownedDeviceMetalTensorFromCt(q_ct) catch break :resident_path;
-            defer q_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&q_mt);
             var k_mt = self.ownedDeviceMetalTensorFromCt(k_ct) catch break :resident_path;
-            defer k_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&k_mt);
             var v_mt = self.ownedDeviceMetalTensorFromCt(v_ct) catch break :resident_path;
-            defer v_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&v_mt);
             var q_r_mt = self.ownedDeviceMetalTensorFromCt(q_r_ct) catch break :resident_path;
-            defer q_r_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&q_r_mt);
             var k_r_mt = self.ownedDeviceMetalTensorFromCt(k_r_ct) catch break :resident_path;
-            defer k_r_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&k_r_mt);
             var dO_mt = self.ownedDeviceMetalTensorFromCt(dO_ct) catch break :resident_path;
-            defer dO_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&dO_mt);
             if (!q_mt.isDevice() or !k_mt.isDevice() or !v_mt.isDevice() or !q_r_mt.isDevice() or !k_r_mt.isDevice() or !dO_mt.isDevice()) break :resident_path;
             if (q_mt.elemCount() != total or k_mt.elemCount() != total or v_mt.elemCount() != total or dO_mt.elemCount() != total) break :resident_path;
             if (q_r_mt.elemCount() < rel_total or k_r_mt.elemCount() < rel_total) break :resident_path;
@@ -16070,7 +16952,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     const runtime = self.provider_impl.raw_decode_runtime orelse break :resident_path;
                     const mshape = [_]i32{ @intCast(batch), @intCast(seq_len) };
                     var dmask = try MetalTensor.deviceAllocate(@ptrCast(runtime), mvals.len * @sizeOf(f32), uploadStorageMode(mvals.len * @sizeOf(f32)), &mshape);
-                    errdefer dmask.deinit();
+                    errdefer self.retireTemporaryWorkspaceValue(&dmask);
                     const hmask = MetalTensor.borrowed(mvals.ptr, mvals.len, &mshape);
                     try hmask.copyInto(&dmask);
                     mask_mt = dmask;
@@ -16097,7 +16979,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // Correctness-first fallback: route through the validated native host backward.
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
 
         const n_q = try self.importCtToHostNative(&native_ctx, q_ct, toBuf(q_ct).logical_shape);
         defer native_ctx.cb.free(n_q);
@@ -16143,11 +17025,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // reference if any operand can't be made device-resident.
         if (rows != 0) device_path: {
             var in_mt = self.ownedDeviceMetalTensorFromCt(input) catch break :device_path;
-            defer in_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&in_mt);
             var gamma_mt = self.ownedDeviceMetalTensorFromCt(gamma) catch break :device_path;
-            defer gamma_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&gamma_mt);
             var dy_mt = self.ownedDeviceMetalTensorFromCt(dy) catch break :device_path;
-            defer dy_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&dy_mt);
             if (!in_mt.isDevice() or !gamma_mt.isDevice() or !dy_mt.isDevice()) break :device_path;
             if (in_mt.elemCount() != rows * dim or dy_mt.elemCount() != rows * dim or gamma_mt.elemCount() < dim) break :device_path;
             const runtime = self.provider_impl.raw_decode_runtime orelse break :device_path;
@@ -16165,7 +17047,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // backward. A fused device kernel can replace this later.
         var native_ctx: HostFallbackNative = undefined;
         try native_ctx.initInPlace(self.allocator);
-        defer native_ctx.deinit();
+        defer self.retireTemporaryWorkspaceValue(&native_ctx);
         const n_in = try self.importCtToHostNative(&native_ctx, input, toBuf(input).logical_shape);
         defer native_ctx.cb.free(n_in);
         const n_gamma = try self.importCtToHostNative(&native_ctx, gamma, toBuf(gamma).logical_shape);
@@ -16215,15 +17097,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             } else if (relative_count != seq_len * 2 - 1) break :resident_path;
 
             var q_mt = try self.ownedDeviceMetalTensorFromCt(q_ct);
-            defer q_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&q_mt);
             var k_mt = try self.ownedDeviceMetalTensorFromCt(k_ct);
-            defer k_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&k_mt);
             var v_mt = try self.ownedDeviceMetalTensorFromCt(v_ct);
-            defer v_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&v_mt);
             var q_r_mt = try self.ownedDeviceMetalTensorFromCt(q_r_ct);
-            defer q_r_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&q_r_mt);
             var k_r_mt = try self.ownedDeviceMetalTensorFromCt(k_r_ct);
-            defer k_r_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&k_r_mt);
             if (!q_mt.isDevice() or !k_mt.isDevice() or !v_mt.isDevice() or !q_r_mt.isDevice() or !k_r_mt.isDevice()) break :resident_path;
             if (q_mt.elemCount() != total or k_mt.elemCount() != total or v_mt.elemCount() != total) break :resident_path;
             if (q_r_mt.elemCount() < rel_total or k_r_mt.elemCount() < rel_total) break :resident_path;
@@ -16256,7 +17138,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .head_dim = head_dim,
             })) |tensor| {
                 var output = tensor;
-                errdefer output.deinit();
+                errdefer self.retireTemporaryWorkspaceValue(&output);
                 return self.ctFromOwnedMetalTensor(output);
             }
         }
@@ -16323,11 +17205,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (q_buf.quantized_storage != null or k_buf.quantized_storage != null or v_buf.quantized_storage != null) return error.UnsupportedTensorType;
         if (batch == 1) {
             var q_mt = try self.ownedMetalTensorFromCt(q_ct);
-            defer q_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&q_mt);
             var k_mt = try self.ownedMetalTensorFromCt(k_ct);
-            defer k_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&k_mt);
             var v_mt = try self.ownedMetalTensorFromCt(v_ct);
-            defer v_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&v_mt);
             var bias_mt: ?MetalTensor = null;
             if (attn_bias_ct) |bias_ct| bias_mt = try self.ownedMetalTensorFromCt(bias_ct);
             defer if (bias_mt) |*tensor| tensor.deinit();
@@ -16390,11 +17272,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
         const total = try std.math.mul(usize, batch, elements);
         var qm = try self.ownedDeviceMetalTensorFromCt(q);
-        defer qm.deinit();
+        defer self.retireTemporaryWorkspaceValue(&qm);
         var km = try self.ownedDeviceMetalTensorFromCt(k);
-        defer km.deinit();
+        defer self.retireTemporaryWorkspaceValue(&km);
         var vm = try self.ownedDeviceMetalTensorFromCt(v);
-        defer vm.deinit();
+        defer self.retireTemporaryWorkspaceValue(&vm);
         if (!qm.isDevice() or !km.isDevice() or !vm.isDevice() or qm.dtype != .f32 or km.dtype != .f32 or vm.dtype != .f32) return null;
         if (qm.elemCount() != total or km.elemCount() != total or vm.elemCount() != total) return null;
         if (bias == null) {
@@ -16429,14 +17311,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const shape = [_]i32{ @intCast(sequence), @intCast(width) };
         const output_shape = [_]i32{ @intCast(try std.math.mul(usize, batch, sequence)), @intCast(width) };
         var output: ?CT = null;
-        errdefer if (output) |tensor| freeOp(self, tensor);
+        errdefer if (output) |tensor| freeTemporaryWorkspaceCtOp(self, tensor);
         for (0..batch) |index| {
             var qv = try qm.retainedView(index * bytes, bytes, &shape);
-            defer qv.deinit();
+            defer self.retireTemporaryWorkspaceValue(&qv);
             var kv = try km.retainedView(index * bytes, bytes, &shape);
-            defer kv.deinit();
+            defer self.retireTemporaryWorkspaceValue(&kv);
             var vv = try vm.retainedView(index * bytes, bytes, &shape);
-            defer vv.deinit();
+            defer self.retireTemporaryWorkspaceValue(&vv);
             var bv: ?MetalTensor = null;
             defer if (bv) |*value| value.deinit();
             if (bm) |*value| {
@@ -16464,11 +17346,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (index == 0) return null;
                 return error.UnsupportedBatchedCausalAttention;
             };
-            defer result.deinit();
+            defer self.retireTemporaryWorkspaceValue(&result);
             if (output == null) output = (try allocUninitF32ShapeOp(self, &output_shape)) orelse return error.MetalRuntimeUnavailable;
             const dst = &toBuf(output.?).metal_tensor.?;
             var row = try dst.retainedView(index * bytes, bytes, &shape);
-            defer row.deinit();
+            defer self.retireTemporaryWorkspaceValue(&row);
             try result.copyInto(&row);
         }
         return output;
@@ -16605,7 +17487,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .raw_owned = true,
             .allocator = self.allocator,
         };
-        errdefer storage.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&storage);
 
         const buf = try self.allocator.create(Buf);
         errdefer self.allocator.destroy(buf);
@@ -16733,7 +17615,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             },
             else => return err,
         };
-        defer a_tensor.deinit();
+        defer self.retireTemporaryWorkspaceValue(&a_tensor);
         var b_tensor = self.ownedDeviceMetalTensorFromCt(b) catch |err| switch (err) {
             error.UnsupportedTensorType => {
                 if (trace) std.debug.print("metal_concat_prim: device_decline=b_convert err={s}\n", .{@errorName(err)});
@@ -16741,7 +17623,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             },
             else => return err,
         };
-        defer b_tensor.deinit();
+        defer self.retireTemporaryWorkspaceValue(&b_tensor);
         if (!a_tensor.isDevice() or !b_tensor.isDevice()) {
             if (trace) std.debug.print("metal_concat_prim: device_decline=not_device a={} b={}\n", .{ a_tensor.isDevice(), b_tensor.isDevice() });
             return null;
@@ -16795,7 +17677,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .private,
             out_shape_i32[0..rank],
         );
-        errdefer output.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&output);
 
         try concatDeviceInto(a_tensor, b_tensor, &output, geometry);
 
@@ -16900,9 +17782,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const k = geometry.k;
 
         var lhs_mt = try self.ownedDeviceMetalTensorFromCt(lhs);
-        defer lhs_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lhs_mt);
         var rhs_mt = try self.ownedDeviceMetalTensorFromCt(rhs);
-        defer rhs_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&rhs_mt);
         if (!lhs_mt.isDevice() or !rhs_mt.isDevice()) return null;
         const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
         defer self.endActivePlannedComputeScope(scope);
@@ -16917,7 +17799,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 rhs_contracting[0],
             )) |tensor| {
                 var owned_tensor = tensor;
-                errdefer owned_tensor.deinit();
+                errdefer self.retireTemporaryWorkspaceValue(&owned_tensor);
                 return try self.ctFromOwnedMetalTensor(owned_tensor);
             }
         }
@@ -16931,7 +17813,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             rhs_contracting[0],
         )) |tensor| {
             var owned_tensor = tensor;
-            errdefer owned_tensor.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&owned_tensor);
             return try self.ctFromOwnedMetalTensor(owned_tensor);
         }
         return null;
@@ -16945,13 +17827,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const n: usize = @intCast(rhs_shape[1 - @as(usize, rhs_contracting)]);
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
         var lhs_mt = try self.ownedDeviceMetalTensorFromCt(lhs);
-        defer lhs_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lhs_mt);
         var rhs_mt = try self.ownedDeviceMetalTensorFromCt(rhs);
-        defer rhs_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&rhs_mt);
         if (!lhs_mt.isDevice() or !rhs_mt.isDevice() or lhs_mt.dtype != .f32 or rhs_mt.dtype != .f32) return null;
         const out_shape = [_]i32{ @intCast(m), @intCast(n) };
         var output = try MetalTensor.deviceAllocate(runtime, m * n * @sizeOf(f32), .private, &out_shape);
-        errdefer output.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&output);
         if (!try metal_runtime.decoderRuntimeGemmF32Device(self.provider_impl, lhs_mt, rhs_mt, output, .{
             .m = m,
             .n = n,
@@ -16988,9 +17870,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         output_shape_buf[rank - 1] = std.math.cast(i32, geometry.n) orelse return null;
 
         var lhs_mt = try self.ownedDeviceMetalTensorFromCt(lhs);
-        defer lhs_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lhs_mt);
         var rhs_mt = try self.ownedDeviceMetalTensorFromCt(rhs);
-        defer rhs_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&rhs_mt);
         if (!lhs_mt.isDevice() or !rhs_mt.isDevice()) return null;
         const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
         defer self.endActivePlannedComputeScope(scope);
@@ -17027,7 +17909,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             error.UnsupportedTensorType => return error.UnsupportedPrimitiveOp,
             else => return err,
         };
-        defer values_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&values_mt);
         var indices_mt = (if (toBuf(indices).integer_storage)
             toBuf(indices).metal_tensor.?.retainedCopy()
         else
@@ -17035,7 +17917,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             error.UnsupportedTensorType => return error.UnsupportedPrimitiveOp,
             else => return err,
         };
-        defer indices_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&indices_mt);
         if (!values_mt.isDevice() or !indices_mt.isDevice()) return error.UnsupportedPrimitiveOp;
 
         const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
@@ -17097,7 +17979,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .private,
             shape,
         );
-        errdefer tensor.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&tensor);
         return try self.ctFromOwnedMetalTensor(tensor);
     }
 
@@ -17120,7 +18002,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!dst_tensor_ptr.isDevice()) return false;
 
         var src_tensor = try self.ownedDeviceMetalTensorFromCt(src);
-        defer src_tensor.deinit();
+        defer self.retireTemporaryWorkspaceValue(&src_tensor);
         if (!src_tensor.isDevice()) return false;
 
         const dst_elems = dst_tensor_ptr.elemCount();
@@ -17133,9 +18015,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const shape = [_]i32{ @intCast(row_count), @intCast(cols) };
 
         var src_view = try src_tensor.retainedView(src_offset, byte_len, &shape);
-        defer src_view.deinit();
+        defer self.retireTemporaryWorkspaceValue(&src_view);
         var dst_view = try dst_tensor_ptr.retainedView(dst_offset, byte_len, &shape);
-        defer dst_view.deinit();
+        defer self.retireTemporaryWorkspaceValue(&dst_view);
         try src_view.copyInto(&dst_view);
         return true;
     }
@@ -17160,7 +18042,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const byte_len = row_count * cols * @sizeOf(f32);
                 const shape = [_]i32{ @intCast(row_count), @intCast(cols) };
                 var view = try metal_tensor.retainedView(byte_offset, byte_len, &shape);
-                errdefer view.deinit();
+                errdefer self.retireTemporaryWorkspaceValue(&view);
                 return self.metalTensorBufWithHostMaterialization(view, false);
             }
         }
@@ -17205,7 +18087,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const stored = source.logical_shape orelse return null;
         if (!std.mem.eql(i64, stored, &shape)) return null;
         const gathered = try primGatherOp(self, weight, indices, 0, &shape);
-        defer freeOp(self, gathered);
+        defer freeTemporaryWorkspaceCtOp(self, gathered);
         return try primReshapeOp(self, gathered, &.{ @intCast(total), @intCast(dim) });
     }
 
@@ -17249,13 +18131,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             // Position tables have multiple leading axes. Flatten a local
             // retained view; model-owned handles and pins stay unchanged.
             var source = try self.ownedMetalTensorFromCt(weight);
-            defer source.deinit();
+            defer self.retireTemporaryWorkspaceValue(&source);
             const matrix_shape = [_]i32{ std.math.cast(i32, rows) orelse return error.InvalidTensorShape, std.math.cast(i32, dim) orelse return error.InvalidTensorShape };
             // Host retainedView clones. That temporary address is not the
             // immutable model address used by the runtime's cache identity.
             if (try embeddingTableView(&source, weight_buf, &matrix_shape)) |view| {
                 var weight_mt = view;
-                defer weight_mt.deinit();
+                defer self.retireTemporaryWorkspaceValue(&weight_mt);
                 if (try metal_runtime.decoderRuntimeEmbeddingLookup(self.provider_impl, .{
                     .weight = weight_mt,
                     .model_identity = embeddingTableIdentity(weight_buf),
@@ -17431,17 +18313,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             error.UnsupportedTensorType => return null,
             else => return err,
         };
-        defer weight_probe.deinit();
+        defer self.retireTemporaryWorkspaceValue(&weight_probe);
         var gamma_probe = self.ownedMetalTensorFromCt(request.layer_norm_weight) catch |err| switch (err) {
             error.UnsupportedTensorType => return null,
             else => return err,
         };
-        defer gamma_probe.deinit();
+        defer self.retireTemporaryWorkspaceValue(&gamma_probe);
         var beta_probe = self.ownedMetalTensorFromCt(request.layer_norm_bias) catch |err| switch (err) {
             error.UnsupportedTensorType => return null,
             else => return err,
         };
-        defer beta_probe.deinit();
+        defer self.retireTemporaryWorkspaceValue(&beta_probe);
         if (weight_probe.ndim() != 2 or gamma_probe.ndim() != 1 or beta_probe.ndim() != 1) return null;
         if (@as(usize, @intCast(weight_probe.dim(1))) != request.hidden_size) return null;
         if (@as(usize, @intCast(gamma_probe.dim(0))) != request.hidden_size or @as(usize, @intCast(beta_probe.dim(0))) != request.hidden_size) return null;
@@ -17459,11 +18341,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const selected_shape = [_]i32{ @intCast(request.total), @intCast(request.hidden_size) };
             break :blk try self.deviceTensorFromF32Slice(compact.?.values, &selected_shape);
         } else try self.cachedDeviceTensorFromCt(&self.deberta_embedding_weight_device_cache, request.word_embeddings, &weight_shape);
-        defer weight_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&weight_mt);
         var gamma_mt = try self.cachedDeviceTensorFromCt(&self.deberta_embedding_ln_weight_device_cache, request.layer_norm_weight, &norm_shape);
-        defer gamma_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&gamma_mt);
         var beta_mt = try self.cachedDeviceTensorFromCt(&self.deberta_embedding_ln_bias_device_cache, request.layer_norm_bias, &norm_shape);
-        defer beta_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&beta_mt);
         const cache_ns = if (trace) monotonicNowNs() - cache_start_ns else 0;
 
         if (request.control) |active| try active.check();
@@ -17479,7 +18361,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .eps = request.eps,
         })) |tensor| {
             var owned_tensor = tensor;
-            errdefer owned_tensor.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&owned_tensor);
             const runtime_ns = if (trace) monotonicNowNs() - runtime_start_ns else 0;
             success = true;
             self.timing_stats.metal_runtime_deberta_embeddings_successes += 1;
@@ -17505,7 +18387,23 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return null;
     }
 
+    /// A selected physical plan cannot reinterpret a failed optional SDK
+    /// callback as permission to execute another implementation after graph
+    /// work. Ordinary compatibility requests preserve their existing declines.
+    fn hasDeclaredWorkspace(self: *const MetalCompute) bool {
+        const context = self.workspace_invocation_context orelse return false;
+        const uses = context.workspace_uses orelse return false;
+        return uses.allocations != null;
+    }
+    fn selectedWorkspaceResult(self: *const MetalCompute, value: ?CT) !?CT {
+        if (value == null and self.hasDeclaredWorkspace()) return error.PreparedWorkspaceKernelUnavailable;
+        return value;
+    }
     fn takeRowsOp(ctx: *anyopaque, request: *const ops.TakeRowsRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.selectedWorkspaceResult(try takeRowsImpl(ctx, request));
+    }
+    fn takeRowsImpl(ctx: *anyopaque, request: *const ops.TakeRowsRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (request.row_ids.len != request.rows or request.rows == 0 or request.dim == 0) return null;
         const input_buf = toBuf(request.input);
@@ -17522,14 +18420,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     if (row_id >= rows_available) return error.InvalidTensorShape;
                 }
                 var input_mt = try self.ownedDeviceMetalTensorFromCt(request.input);
-                defer input_mt.deinit();
+                defer self.retireTemporaryWorkspaceValue(&input_mt);
                 if (input_mt.isDevice()) {
                     const ids = try self.allocator.alloc(f32, request.rows);
                     defer self.allocator.free(ids);
                     for (request.row_ids, 0..) |row_id, i| ids[i] = @floatFromInt(row_id);
                     const ids_shape = [_]i32{@intCast(request.rows)};
                     var ids_mt = try self.deviceTensorFromF32Slice(ids, &ids_shape);
-                    defer ids_mt.deinit();
+                    defer self.retireTemporaryWorkspaceValue(&ids_mt);
                     const out_shape = [_]i32{ @intCast(request.rows), @intCast(request.dim) };
                     const scope = self.beginActivePlannedComputeScopeIfPossible(.embedding, .embedding);
                     defer self.endActivePlannedComputeScope(scope);
@@ -17574,7 +18472,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const token_count = try std.math.mul(usize, request.batch, request.seq_len);
         if (request.words_mask.len < token_count) return error.InvalidTensorShape;
         var hidden_mt = try self.ownedDeviceMetalTensorFromCt(request.hidden);
-        defer hidden_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&hidden_mt);
         if (!hidden_mt.isDevice()) return null;
         if (hidden_mt.elemCount() != try std.math.mul(usize, token_count, request.hidden_size)) return error.InvalidTensorShape;
 
@@ -17585,7 +18483,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const mask_shape = [_]i32{@intCast(token_count)};
         var mask_mt = try self.deviceTensorFromF32Slice(mask_f32, &mask_shape);
-        defer mask_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&mask_mt);
 
         const out_shape = [_]i32{ @intCast(request.batch * request.num_words), @intCast(request.hidden_size) };
         const scope = self.beginActivePlannedComputeScopeIfPossible(.embedding, .embedding);
@@ -17615,7 +18513,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!enableGlinerResidentHead()) return null;
         if (request.num_labels == 0 or request.hidden_size == 0) return null;
         var label_mt = try self.ownedDeviceMetalTensorFromCt(request.label_embeddings);
-        defer label_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&label_mt);
         if (!label_mt.isDevice()) return null;
         if (label_mt.elemCount() != try std.math.mul(usize, request.num_labels, request.hidden_size)) return error.InvalidTensorShape;
 
@@ -17643,7 +18541,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
             const pos_shape = [_]i32{ @intCast(request.num_labels), @intCast(request.hidden_size) };
             var pos_mt = try self.deviceTensorFromF32Slice(pos_broadcast, &pos_shape);
-            errdefer pos_mt.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&pos_mt);
             break :blk try self.ctFromOwnedMetalTensor(pos_mt);
         };
         defer freeOp(ctx, pos_ct);
@@ -17668,9 +18566,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer freeOp(ctx, gh);
 
         var gi_mt = try self.ownedDeviceMetalTensorFromCt(gi);
-        defer gi_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&gi_mt);
         var gh_mt = try self.ownedDeviceMetalTensorFromCt(gh);
-        defer gh_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&gh_mt);
         if (!gi_mt.isDevice() or !gh_mt.isDevice()) return null;
 
         const out_shape = [_]i32{ @intCast(request.num_labels), @intCast(request.hidden_size) };
@@ -17696,13 +18594,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// it never falls back to a host reduction.
     fn rmsNormBareOp(ctx: *anyopaque, input: CT, dim: usize, eps: f32) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.selectedWorkspaceResult(try rmsNormBareImpl(ctx, input, dim, eps));
+    }
+    fn rmsNormBareImpl(ctx: *anyopaque, input: CT, dim: usize, eps: f32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (self.audio_capture != null or disableRuntimeElementwise() or dim == 0 or dim > std.math.maxInt(i32)) return null;
         const source = denseDeviceF32(input) orelse return null;
         if (source.ndim() != 2 or source.dim(1) <= 0 or @as(usize, @intCast(source.dim(1))) != dim) return null;
         var device_weight = (try self.unitRmsWeightDeviceTensor(dim)) orelse return null;
-        defer device_weight.deinit();
+        defer self.retireTemporaryWorkspaceValue(&device_weight);
         var output = (try metal_runtime.decoderRuntimeApplyRmsNormWeightDevice(self.provider_impl, source, device_weight, dim, eps)) orelse return null;
-        errdefer output.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&output);
         return self.ctFromOwnedMetalTensor(output);
     }
 
@@ -17738,9 +18640,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
                 if (input_metal.isDevice() and input_metal.ndim() == 2 and @as(usize, @intCast(input_metal.dim(1))) == dim and bufElemCount(weight_buf) == dim) {
                     var input_mt = try input_metal.retainedCopy();
-                    defer input_mt.deinit();
+                    defer self.retireTemporaryWorkspaceValue(&input_mt);
                     var weight_mt = try self.ownedDeviceMetalTensorFromCt(weight);
-                    defer weight_mt.deinit();
+                    defer self.retireTemporaryWorkspaceValue(&weight_mt);
                     if (try metal_runtime.decoderRuntimeApplyRmsNormWeightDevice(
                         self.provider_impl,
                         input_mt,
@@ -17755,6 +18657,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
         }
+        if (self.hasDeclaredWorkspace()) return error.PreparedWorkspaceKernelUnavailable;
         const input_data = try hostSliceForBuf(input_buf);
         const weight_data = try hostSliceForBuf(weight_buf);
         const output = try self.allocator.dupe(f32, input_data);
@@ -17790,16 +18693,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             bufHasAnyQuantizedStorage(third_weight_buf)) return null;
 
         var input_mt = try self.ownedDeviceMetalTensorFromCt(input);
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         if (input_mt.ndim() != 2 or @as(usize, @intCast(input_mt.dim(1))) != dim) return null;
         const rows: usize = @intCast(input_mt.dim(0));
         if (rows == 0 or rows > 32) return null;
         var first_weight_mt = try self.ownedDeviceMetalTensorFromCt(first_weight);
-        defer first_weight_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&first_weight_mt);
         var second_weight_mt = try self.ownedDeviceMetalTensorFromCt(second_weight);
-        defer second_weight_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&second_weight_mt);
         var third_weight_mt = try self.ownedDeviceMetalTensorFromCt(third_weight);
-        defer third_weight_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&third_weight_mt);
 
         var result = (try metal_runtime.decoderRuntimeApplyRmsNormTripleWeightDevice(
             self.provider_impl,
@@ -17817,14 +18720,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return err;
         };
         const second = self.ctFromOwnedMetalTensor(result.second) catch |err| {
-            freeOp(self, first);
+            freeTemporaryWorkspaceCtOp(self, first);
             result.second.deinit();
             result.third.deinit();
             return err;
         };
         const third = self.ctFromOwnedMetalTensor(result.third) catch |err| {
-            freeOp(self, second);
-            freeOp(self, first);
+            freeTemporaryWorkspaceCtOp(self, second);
+            freeTemporaryWorkspaceCtOp(self, first);
             result.third.deinit();
             return err;
         };
@@ -17854,17 +18757,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         var shared = try self.ownedDeviceMetalTensorFromCt(request.shared);
-        defer shared.deinit();
+        defer self.retireTemporaryWorkspaceValue(&shared);
         var shared_weight = try self.ownedDeviceMetalTensorFromCt(request.shared_weight);
-        defer shared_weight.deinit();
+        defer self.retireTemporaryWorkspaceValue(&shared_weight);
         var routed = try self.ownedDeviceMetalTensorFromCt(request.routed);
-        defer routed.deinit();
+        defer self.retireTemporaryWorkspaceValue(&routed);
         var routed_weight = try self.ownedDeviceMetalTensorFromCt(request.routed_weight);
-        defer routed_weight.deinit();
+        defer self.retireTemporaryWorkspaceValue(&routed_weight);
         var combined_weight = try self.ownedDeviceMetalTensorFromCt(request.combined_weight);
-        defer combined_weight.deinit();
+        defer self.retireTemporaryWorkspaceValue(&combined_weight);
         var residual = try self.ownedDeviceMetalTensorFromCt(request.residual);
-        defer residual.deinit();
+        defer self.retireTemporaryWorkspaceValue(&residual);
         const rows: usize = if (shared.ndim() == 2) @intCast(shared.dim(0)) else 0;
         if (rows == 0 or rows > 32) return null;
 
@@ -17897,13 +18800,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn multiplyScalarOp(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.selectedWorkspaceResult(try multiplyScalarImpl(ctx, input, scale));
+    }
+    fn multiplyScalarImpl(ctx: *anyopaque, input: CT, scale: f32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (disableRuntimeElementwise()) return null;
         const input_buf = toBuf(input);
         if (bufHasAnyQuantizedStorage(input_buf)) return null;
         const input_metal = input_buf.metal_tensor orelse return null;
         if (!input_metal.isDevice() or hasHostView(input_buf)) return null;
         var retained = try input_metal.retainedCopy();
-        defer retained.deinit();
+        defer self.retireTemporaryWorkspaceValue(&retained);
         if (try metal_runtime.decoderRuntimeApplyScale(self.provider_impl, retained, scale)) |tensor| {
             return self.ctFromOwnedMetalTensor(tensor);
         }
@@ -17914,7 +18821,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (disableRuntimeElementwise()) return null;
         var input_mt = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         if (try metal_runtime.decoderRuntimeGemma4AudioClamp(self.provider_impl, input_mt, min_value, max_value)) |tensor| {
             return self.ctFromOwnedMetalTensor(tensor);
         }
@@ -17925,7 +18832,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (disableRuntimeElementwise()) return null;
         var input_mt = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         if (try metal_runtime.decoderRuntimeGemma4AudioGlu(self.provider_impl, input_mt, rows, dim)) |tensor| {
             return self.ctFromOwnedMetalTensor(tensor);
         }
@@ -17936,9 +18843,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (disableRuntimeElementwise()) return null;
         var input_mt = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         var weight_mt = (try self.gemma4AudioDeviceOperand(weight)) orelse return null;
-        defer weight_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&weight_mt);
         if (try metal_runtime.decoderRuntimeGemma4AudioDepthwiseConv(self.provider_impl, input_mt, weight_mt, rows, dim, kernel_size, null)) |tensor| {
             return self.ctFromOwnedMetalTensor(tensor);
         }
@@ -17949,11 +18856,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (disableRuntimeElementwise()) return null;
         var im = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
-        defer im.deinit();
+        defer self.retireTemporaryWorkspaceValue(&im);
         var wm = (try self.gemma4AudioDeviceOperand(weight)) orelse return null;
-        defer wm.deinit();
+        defer self.retireTemporaryWorkspaceValue(&wm);
         var sm = (try self.gemma4AudioDeviceOperand(starts)) orelse return null;
-        defer sm.deinit();
+        defer self.retireTemporaryWorkspaceValue(&sm);
         if (try metal_runtime.decoderRuntimeGemma4AudioDepthwiseConv(self.provider_impl, im, wm, rows, dim, kernel_size, sm)) |tensor| return self.ctFromOwnedMetalTensor(tensor);
         return null;
     }
@@ -17962,7 +18869,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (disableRuntimeElementwise()) return null;
         var input_mt = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         if (try metal_runtime.decoderRuntimeGemma4AudioFlatten(self.provider_impl, input_mt, time_steps, freq_bins, channels)) |tensor| {
             return self.ctFromOwnedMetalTensor(tensor);
         }
@@ -17973,9 +18880,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (disableRuntimeElementwise()) return null;
         var input_mt = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         var weight_mt = (try self.gemma4AudioDeviceOperand(weight)) orelse return null;
-        defer weight_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&weight_mt);
         if (try metal_runtime.decoderRuntimeGemma4AudioChannelNormRelu(self.provider_impl, input_mt, weight_mt, channels, positions, eps)) |tensor| {
             return self.ctFromOwnedMetalTensor(tensor);
         }
@@ -17995,17 +18902,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (disableRuntimeElementwise()) return null;
         var q_mt = (try self.gemma4AudioDeviceOperand(q)) orelse return null;
-        defer q_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&q_mt);
         var k_mt = (try self.gemma4AudioDeviceOperand(k)) orelse return null;
-        defer k_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&k_mt);
         var v_mt = (try self.gemma4AudioDeviceOperand(v)) orelse return null;
-        defer v_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&v_mt);
         var rel_mt = (try self.gemma4AudioDeviceOperand(rel)) orelse return null;
-        defer rel_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&rel_mt);
         var scales_mt = (try self.gemma4AudioDeviceOperand(q_dim_scales)) orelse return null;
-        defer scales_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&scales_mt);
         var valid_mt = (try self.gemma4AudioDeviceOperand(valid)) orelse return null;
-        defer valid_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&valid_mt);
         const raw = metal_runtime.RawGemma4AudioAttentionParams{
             .rows = std.math.cast(u32, params.rows) orelse return null,
             .hidden = std.math.cast(u32, params.hidden) orelse return null,
@@ -18029,13 +18936,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn addScalarOp(ctx: *anyopaque, input: CT, scalar: f32) anyerror!?CT {
-        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (!(a4bHighMemoryFastPathEnabled() or
             getenvBool("TERMITE_METAL_ENABLE_A4B_NORM_WEIGHT_CACHE") or
             getenvBool("TERMITE_METAL_ENABLE_A4B_RMS_NORM_ADD_FUSION") or
             getenvBool("TERMITE_METAL_ENABLE_A4B_HEAD_NORM_ROPE_FUSION") or
             getenvBool("TERMITE_METAL_ENABLE_A4B_PARALLEL_FFN_POST_FUSION")) or
             getenvBool("TERMITE_METAL_DISABLE_A4B_NORM_WEIGHT_CACHE")) return null;
+        return addScalarCacheImpl(ctx, input, scalar);
+    }
+
+    // Same already-selected cache body. The outer callback alone owns policy;
+    // this helper also permits direct ownership-failure testing without flags.
+    fn addScalarCacheImpl(ctx: *anyopaque, input: CT, scalar: f32) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const input_buf = toBuf(input);
         if (bufHasAnyQuantizedStorage(input_buf)) return null;
         const elem_count = bufElemCount(input_buf);
@@ -18052,7 +18965,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .elem_count = elem_count,
         };
         if (self.adjusted_norm_weight_device_cache.getPtr(key)) |cached| {
-            return self.ctFromOwnedMetalTensor(try cached.retainedCopy());
+            return self.retainedCachedTensorCt(cached);
         }
 
         const values = try toFloat32Op(ctx, input, self.allocator);
@@ -18061,14 +18974,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         for (values) |*value| value.* += scalar;
         const shape = [_]i32{@intCast(elem_count)};
         var adjusted = try self.deviceTensorFromF32Slice(values, &shape);
-        errdefer adjusted.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&adjusted);
         const entry = try self.adjusted_norm_weight_device_cache.getOrPut(self.allocator, key);
         if (entry.found_existing) {
             adjusted.deinit();
-            return self.ctFromOwnedMetalTensor(try entry.value_ptr.retainedCopy());
+            adjusted = .empty;
+            return self.retainedCachedTensorCt(entry.value_ptr);
         }
         entry.value_ptr.* = adjusted;
-        return self.ctFromOwnedMetalTensor(try entry.value_ptr.retainedCopy());
+        adjusted = .empty; // ownership moved before fallible publication
+        return self.retainedCachedTensorCt(entry.value_ptr);
+    }
+
+    fn retainedCachedTensorCt(self: *MetalCompute, cached: *const MetalTensor) !CT {
+        var retained = try cached.retainedCopy();
+        errdefer self.retireTemporaryWorkspaceValue(&retained);
+        return self.ctFromOwnedMetalTensor(retained);
     }
 
     fn modelScalarBoundsOp(ctx: *anyopaque, key: []const u8, value: ?[4]?f32) anyerror!?[4]?f32 {
@@ -18090,20 +19011,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (disableRuntimeElementwise()) return null;
         var x = (try self.gemma4AudioDeviceOperand(pcm)) orelse return null;
-        defer x.deinit();
+        defer self.retireTemporaryWorkspaceValue(&x);
         var p = (try self.gemma4AudioDeviceOperand(plan)) orelse return null;
-        defer p.deinit();
+        defer self.retireTemporaryWorkspaceValue(&p);
         var m = (try self.gemma4AudioDeviceOperand(mask)) orelse return null;
-        defer m.deinit();
+        defer self.retireTemporaryWorkspaceValue(&m);
         const out = (try metal_runtime.decoderRuntimeAudioLogMel(self.provider_impl, x, p, m, frames, hop, floor)) orelse return null;
         return self.ctFromOwnedMetalTensor(out);
     }
     fn audioFft512Op(ctx: *anyopaque, input: CT, tw: CT, frames: usize) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
-        defer x.deinit();
+        defer self.retireTemporaryWorkspaceValue(&x);
         var plan = (try self.gemma4AudioDeviceOperand(tw)) orelse return null;
-        defer plan.deinit();
+        defer self.retireTemporaryWorkspaceValue(&plan);
         if (x.elemCount() != frames * 320 or plan.elemCount() != 512) return error.InvalidTensorShape;
         const out = (try metal_runtime.decoderRuntimeAudioFft512(self.provider_impl, x, plan, frames)) orelse return null;
         return self.ctFromOwnedMetalTensor(out);
@@ -18113,7 +19034,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (disableRuntimeElementwise()) return null;
         const n = try params.counts();
         var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
-        defer x.deinit();
+        defer self.retireTemporaryWorkspaceValue(&x);
         var aux = if (auxiliary) |ct| (try self.gemma4AudioDeviceOperand(ct)) orelse return null else null;
         defer if (aux) |*t| t.deinit();
         if (x.elemCount() < n.input or (n.auxiliary != 0 and (aux == null or aux.?.elemCount() != n.auxiliary))) return error.InvalidTensorShape;
@@ -18547,7 +19468,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             state.scalars[layer] = data[0];
         }
         var storage = (try self.audioPlanBuffer(&state.owner, host.items.len * 4, true)) orelse return error.AudioScheduleAdmission;
-        defer storage.deinit();
+        defer self.retireTemporaryWorkspaceValue(&storage);
         try storage.uploadBytes(std.mem.sliceAsBytes(host.items));
         for (counts, 0..) |count, i| if (count != 0) {
             const view = try storage.retainedView(offsets[i] * 4, count * 4, &.{@intCast(count)});
@@ -18622,7 +19543,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             error.OutOfMemory, error.MetalBufferAllocFailed => return,
             else => return err,
         }) orelse return;
-        defer buffer.deinit();
+        defer self.retireTemporaryWorkspaceValue(&buffer);
         const runtime = p.raw_decode_runtime orelse return;
         if (metal_runtime.antfly_metal_rotary_table(runtime, buffer.deviceHandle(), buffer.deviceByteOffset(), spec.dim, spec.x, spec.y, spec.theta, @intFromBool(spec.vision)) != 0) return error.MetalKernelDispatchFailed;
         const view = try buffer.retainedView(0, values * 4, &.{@intCast(values)});
@@ -18771,7 +19692,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             // smaller retained tile to evicting warm weights or falling back.
             tile = @max(minimum, tile / 2);
         };
-        defer storage.deinit();
+        defer self.retireTemporaryWorkspaceValue(&storage);
         workspace.tile = tile;
         workspace.tile_capacity = tile;
         const layout = try plan.layoutForTile(spec.rows, spec.hidden, spec.intermediate, tile);
@@ -18836,7 +19757,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             try coefficients.appendSlice(self.allocator, values);
         };
         var weights = (try self.audioPlanBuffer(&owner.owner, coefficients.items.len * 4, true)) orelse return error.AudioScheduleAdmission;
-        defer weights.deinit();
+        defer self.retireTemporaryWorkspaceValue(&weights);
         try weights.uploadBytes(std.mem.sliceAsBytes(coefficients.items));
         for (counts, offsets, 0..) |count, start, i| {
             var view = try weights.retainedView(start * 4, count * 4, &.{@intCast(count)});
@@ -18955,13 +19876,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             try self.computeBackend().checkExecutionControl();
             const n = @min(rows - first, workspace.tile);
             var source = try x.retainedView(first * h * 4, n * h * 4, &.{ @intCast(n), @intCast(h) });
-            defer source.deinit();
+            defer self.retireTemporaryWorkspaceValue(&source);
             var gate_up = try gate_storage.retainedView(0, n * intermediate * 8, &.{ @intCast(n), @intCast(intermediate * 2) });
-            defer gate_up.deinit();
+            defer self.retireTemporaryWorkspaceValue(&gate_up);
             var activated = try product.retainedView(0, n * intermediate * 4, &.{ @intCast(n), @intCast(intermediate) });
-            defer activated.deinit();
+            defer self.retireTemporaryWorkspaceValue(&activated);
             var destination = try out.retainedView(first * h * 4, n * h * 4, &.{ @intCast(n), @intCast(h) });
-            defer destination.deinit();
+            defer self.retireTemporaryWorkspaceValue(&destination);
             if (!try metal_runtime.decoderRuntimeApplyAudioLinearInto(self.provider_impl, packed_slot, source, n, h, intermediate * 2, gate_up)) return error.MetalKernelDispatchFailed;
             if (metal_runtime.termite_metal_decode_runtime_packed_gelu(runtime, gate_up.deviceHandle(), gate_up.deviceByteOffset(), activated.deviceHandle(), activated.deviceByteOffset(), @intCast(n), @intCast(intermediate)) != 0) return error.MetalKernelDispatchFailed;
             if (!try metal_runtime.decoderRuntimeApplyAudioLinearInto(self.provider_impl, down_slot, activated, n, intermediate, h, destination)) return error.MetalKernelDispatchFailed;
@@ -19073,7 +19994,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             a.destroy(workspace);
         }
         var storage = (try self.audioPlanBuffer(&workspace.owner, bytes, false)) orelse return error.AudioScheduleAdmission;
-        defer storage.deinit();
+        defer self.retireTemporaryWorkspaceValue(&storage);
         for (&workspace.views, 0..) |*dest, i| {
             if (i == 12 and product_bytes == 0) continue;
             const width = if (i < 6) spec.widths[i] else if (i == 11) spec.alternate_qkv_width else if (i == 12) spec.widths[2] / 2 else spec.hidden;
@@ -19221,11 +20142,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const architecture = @import("../architectures/embedding_gemma2.zig");
         const Geometry = @import("metal_embedding_bindings.zig").CompactGeometry;
         var original = try architecture.visibility(self.allocator, mask, batch, seq);
-        defer original.deinit();
+        defer self.retireTemporaryWorkspaceValue(&original);
         const count = original.gather.len;
         if (count > 8192) return error.InvalidEmbeddingInputLength;
         var compact = try architecture.compactVisibility(self.allocator, original);
-        defer compact.deinit();
+        defer self.retireTemporaryWorkspaceValue(&compact);
         compact.windowed = try architecture.windowedRanges(self.allocator, compact, window);
         const bytes = (mask.len + count * 10 + batch + 1) * 8;
         const cache = if (self.data.tier_cache) |*c| c else return error.AudioScheduleAdmission;
@@ -19303,7 +20224,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         @memcpy(words[stride * 2 ..], positions);
         var storage = (try self.audioPlanBuffer(&geometry.owner, words.len * 4, true)) orelse return error.AudioScheduleAdmission;
-        defer storage.deinit();
+        defer self.retireTemporaryWorkspaceValue(&storage);
         try storage.uploadBytes(std.mem.sliceAsBytes(words));
         for (0..3) |i| {
             const length = if (i == 2) count else key_at + count;
@@ -19428,7 +20349,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             @memcpy(target[key_at..][0..rows], positions);
         }
         var storage = (try self.audioPlanBuffer(&geometry.owner, words.len * 4, true)) orelse return error.AudioScheduleAdmission;
-        defer storage.deinit();
+        defer self.retireTemporaryWorkspaceValue(&storage);
         try storage.uploadBytes(std.mem.sliceAsBytes(words));
         for (0..2) |part| {
             var view = try storage.retainedView(part * stride * 4, words_count * 4, &.{@intCast(words_count)});
@@ -19580,7 +20501,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.data.prefetch.unlock();
         };
         var tensor = try MetalTensor.deviceAllocateFreshWithAllocator(std.heap.c_allocator, runtime, bytes, if (shared) .shared else .private, &.{@intCast(bytes / 4)});
-        errdefer tensor.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&tensor);
         const actual = metal_runtime.antfly_metal_audio_buffer_bytes(tensor.deviceHandle());
         if (actual > admitted) {
             tensor.deinit();
@@ -19896,7 +20817,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (!metal_runtime.decoderRuntimeLinearSlotPrepared(self.provider_impl, slot, in_dim, out_dim)) return null;
         var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
-        defer x.deinit();
+        defer self.retireTemporaryWorkspaceValue(&x);
         if (x.elemCount() != rows * in_dim) return error.InvalidTensorShape;
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
         if (output) |ct| if (toBuf(ct).metal_tensor) |*tensor| tensor.invalidateHostMirror();
@@ -20129,10 +21050,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         const runtime = self.provider_impl.raw_decode_runtime orelse return null;
         var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
-        defer x.deinit();
+        defer self.retireTemporaryWorkspaceValue(&x);
         if (x.elemCount() != @as(usize, p.batch) * p.channels * p.rows * p.width) return error.InvalidTensorShape;
         var out = try MetalTensor.deviceAllocate(runtime, @as(usize, p.batch) * p.channels * p.output_rows * p.width * 4, .private, &.{ @intCast(p.batch), @intCast(p.channels), @intCast(p.output_rows), @intCast(p.width) });
-        errdefer out.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&out);
         if (metal_runtime.antfly_metal_audio_pad(runtime, x.deviceHandle(), x.deviceByteOffset(), out.deviceHandle(), out.deviceByteOffset(), &p) != 0) return error.MetalRuntimeUnavailable;
         return self.ctFromOwnedMetalTensor(out);
     }
@@ -20163,9 +21084,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (!self.require_f32_linears or p.dim % 4 != 0 or disableRuntimeElementwise() or audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_UNFUSED_LINEAR")) return null;
         var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
-        defer x.deinit();
+        defer self.retireTemporaryWorkspaceValue(&x);
         var w = try self.ownedDeviceMetalTensorFromCt(weight);
-        defer w.deinit();
+        defer self.retireTemporaryWorkspaceValue(&w);
         const result = (try metal_runtime.decoderRuntimeNormClamped(self.provider_impl, x, w, p)) orelse return null;
         return self.ctFromOwnedMetalTensor(result);
     }
@@ -20177,9 +21098,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (audioExecutionFlag("ANTFLY_EMBEDDINGGEMMA2_METAL_FORCE_FUSED_LINEAR")) choice = 1;
         if (choice == 0 or (choice < 0 and self.data.tier_cache == null)) return null;
         var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
-        defer x.deinit();
-        const bias = try self.cachedZeroBiasBuf(p.out_dim);
-        defer freeOp(ctx, bias);
+        defer self.retireTemporaryWorkspaceValue(&x);
+        var bias_view: Buf = undefined;
+        var bias_shape: [1]i64 = undefined;
+        const bias = try self.borrowedZeroBiasBuf(&bias_view, &bias_shape, p.out_dim);
         const slot = (try self.ensureDynamicLinearSlot(weight, bias, p.in_dim, p.out_dim)) orelse return null;
         if (choice < 0) {
             // Qualification owns separate admitted deterministic-probe scratch, never
@@ -20210,7 +21132,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (disableRuntimeElementwise()) return null;
         var x = (try self.gemma4AudioDeviceOperand(input)) orelse return null;
-        defer x.deinit();
+        defer self.retireTemporaryWorkspaceValue(&x);
         const result = (try metal_runtime.decoderRuntimeClampSilu(self.provider_impl, x, min_value, max_value)) orelse return null;
         return self.ctFromOwnedMetalTensor(result);
     }
@@ -20224,7 +21146,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (denseDeviceF32(weight)) |w| {
             const runtime = self.provider_impl.raw_decode_runtime orelse return null;
             var mt = try MetalTensor.deviceAllocate(runtime, x.elemCount() * 4, .private, x.shape());
-            errdefer mt.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&mt);
             if (metal_runtime.antfly_metal_norm_residual_weight(runtime, x.deviceHandle(), x.deviceByteOffset(), w.deviceHandle(), w.deviceByteOffset(), res.deviceHandle(), res.deviceByteOffset(), x.elemCount() / dim, dim, eps, norm_scale, output_scale, mt.deviceHandle(), mt.deviceByteOffset()) != 0) return error.MetalRuntimeUnavailable;
             return self.ctFromOwnedMetalTensor(mt);
         }
@@ -20271,9 +21193,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (rows == 0) return null;
         const slot = (try self.ensureDynamicRmsNormSlot(weight, dim)) orelse return null;
         var input_mt = try input_metal.retainedCopy();
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         var residual_mt = try residual_metal.retainedCopy();
-        defer residual_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&residual_mt);
         const tensor = (try metal_runtime.decoderRuntimeApplyRmsNormAdd(self.provider_impl, .{
             .input = input_mt,
             .norm_slot = slot,
@@ -20350,7 +21272,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     /// is not a device f32 tensor of `count` elements.
     fn exactDeviceF32(self: *MetalCompute, input: CT, count: usize) !?MetalTensor {
         var tensor = self.ownedDeviceMetalTensorFromCt(input) catch return null;
-        errdefer tensor.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&tensor);
         if (!tensor.isDevice() or tensor.dtype != .f32 or tensor.elemCount() != count) {
             tensor.deinit();
             return null;
@@ -20361,7 +21283,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return null;
         };
         var copy = try MetalTensor.deviceAllocateFresh(@ptrCast(runtime), count * 4, .private, &.{@intCast(count)});
-        errdefer copy.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&copy);
         try tensor.copyInto(&copy);
         tensor.deinit();
         return copy;
@@ -20383,7 +21305,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             sources[i] = tensors[i];
         }
         var output = try MetalTensor.deviceAllocate(runtime, layout.output_elements * @sizeOf(f32), .private, shape);
-        errdefer output.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&output);
         if (!try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, sources, output)) {
             output.deinit();
             return null;
@@ -20560,9 +21482,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (bufElemCount(gamma_buf) != dim or bufElemCount(beta_buf) != dim) return null;
         const slot = (try self.ensureDynamicLayerNormSlot(gamma, beta, dim)) orelse return null;
         var a_mt = try a_metal.retainedCopy();
-        defer a_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&a_mt);
         var b_mt = try b_metal.retainedCopy();
-        defer b_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&b_mt);
         const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
         defer self.endActivePlannedComputeScope(scope);
         const tensor = (try metal_runtime.decoderRuntimeApplyAddLayerNorm(self.provider_impl, .{
@@ -20601,9 +21523,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (bufElemCount(gamma_buf) != dim or bufElemCount(beta_buf) != dim) return null;
         const slot = (try self.ensureDynamicLayerNormSlot(gamma, beta, dim)) orelse return null;
         var a_mt = try a_metal.retainedCopy();
-        defer a_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&a_mt);
         var b_mt = try b_metal.retainedCopy();
-        defer b_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&b_mt);
         const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
         defer self.endActivePlannedComputeScope(scope);
         const result = (try metal_runtime.decoderRuntimeApplyAddLayerNormSum(self.provider_impl, .{
@@ -20632,7 +21554,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (bufHasAnyQuantizedStorage(toBuf(input))) return null;
         if (self.provider_impl.raw_decode_runtime == null) return null;
         var input_mt = try self.ownedDeviceMetalTensorFromCt(input);
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         const tensor = (try metal_runtime.decoderRuntimeConv1dIm2colF32Device(self.provider_impl, .{
             .input = input_mt,
             .batch = batch,
@@ -20665,7 +21587,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const logits_metal = if (logits_buf.metal_tensor) |*tensor| tensor else return false;
         if (!logits_metal.isDevice()) return false;
         var logits_mt = try logits_metal.retainedCopy();
-        defer logits_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&logits_mt);
         return metal_runtime.whisperLogitsStatsEncode(
             self.provider_impl,
             logits_mt,
@@ -20689,7 +21611,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const weight_buf = toBuf(weight);
         if (bufHasAnyQuantizedStorage(weight_buf) or weight_buf.native_dense_bytes != null or disableRuntimeEmbeddingLookup()) return null;
         var weight_mt = try self.ownedMetalTensorFromCt(weight);
-        defer weight_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&weight_mt);
         const tensor = try metal_runtime.decoderRuntimeEmbeddingLookupDeviceToken(self.provider_impl, weight_mt, token_slot, dim, embeddingTableIdentity(toBuf(weight))) orelse return null;
         return try self.ctFromOwnedMetalTensor(tensor);
     }
@@ -20739,13 +21661,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn loraLinearBranchOp(ctx: *anyopaque, request: *const ops.LoraLinearBranchRequest) anyerror!?ops.LoraLinearBranchResult {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedDeviceMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         var base = try self.ownedDeviceMetalTensorFromCt(request.base);
-        defer base.deinit();
+        defer self.retireTemporaryWorkspaceValue(&base);
         var lora_a = try self.ownedDeviceMetalTensorFromCt(request.lora_a);
-        defer lora_a.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lora_a);
         var lora_b = try self.ownedDeviceMetalTensorFromCt(request.lora_b);
-        defer lora_b.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lora_b);
         const result = (try metal_runtime.decoderRuntimeLoraLinearF32Device(
             self.provider_impl,
             input,
@@ -20775,13 +21697,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn loraLinearBackwardOp(ctx: *anyopaque, request: *const ops.LoraLinearBackwardRequest) anyerror!?ops.LoraLinearBackwardResult {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedDeviceMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         var after_a = try self.ownedDeviceMetalTensorFromCt(request.after_a);
-        defer after_a.deinit();
+        defer self.retireTemporaryWorkspaceValue(&after_a);
         var lora_b = try self.ownedDeviceMetalTensorFromCt(request.lora_b);
-        defer lora_b.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lora_b);
         var output_grad = try self.ownedDeviceMetalTensorFromCt(request.output_grad);
-        defer output_grad.deinit();
+        defer self.retireTemporaryWorkspaceValue(&output_grad);
         const result = (try metal_runtime.decoderRuntimeLoraLinearBackwardF32Device(
             self.provider_impl,
             input,
@@ -20811,11 +21733,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn loraLinearBackwardBOp(ctx: *anyopaque, request: *const ops.LoraLinearBackwardBRequest) anyerror!?ops.LoraLinearBackwardBResult {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var after_a = try self.ownedDeviceMetalTensorFromCt(request.after_a);
-        defer after_a.deinit();
+        defer self.retireTemporaryWorkspaceValue(&after_a);
         var lora_b = try self.ownedDeviceMetalTensorFromCt(request.lora_b);
-        defer lora_b.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lora_b);
         var output_grad = try self.ownedDeviceMetalTensorFromCt(request.output_grad);
-        defer output_grad.deinit();
+        defer self.retireTemporaryWorkspaceValue(&output_grad);
         const result = (try metal_runtime.decoderRuntimeLoraLinearBackwardBF32Device(
             self.provider_impl,
             after_a,
@@ -20869,8 +21791,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (tensor.isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
         if (!deviceTensorMatchesLinearRows(tensor, rows, out_dim)) return error.InvalidTensorShape;
         if (!self.provider_impl.hasDecoderRuntime()) return false;
-        const bias = try self.cachedZeroBiasBuf(out_dim);
-        defer freeOp(ctx, bias);
+        var bias_view: Buf = undefined;
+        var bias_shape: [1]i64 = undefined;
+        const bias = try self.borrowedZeroBiasBuf(&bias_view, &bias_shape, out_dim);
         const slot = (try self.ensureDynamicLinearSlot(weight, bias, in_dim, out_dim)) orelse return false;
         if (!try decoderRuntimeApplyLinearIntoOp(ctx, &.{ .slot = slot, .input = input, .in_dim = in_dim, .out_dim = out_dim }, output)) return false;
         tensor.invalidateHostMirror();
@@ -20895,17 +21818,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (try self.canonicalProjectionSpan(entry.tensor_ref.name)) |span| {
                 if (span.in_dim != in_dim or span.width != out_dim) return error.InvalidTensorShape;
                 var device_input = try self.ownedDeviceMetalTensorFromCt(input);
-                defer device_input.deinit();
+                defer self.retireTemporaryWorkspaceValue(&device_input);
                 var matrix = try retainedLinearInputView(&device_input, in_dim);
-                defer matrix.deinit();
+                defer self.retireTemporaryWorkspaceValue(&matrix);
                 if (@as(usize, @intCast(matrix.dim(0))) != rows) return error.InvalidTensorShape;
                 const output = (try metal_runtime.decoderRuntimeApplyLinearRows(self.provider_impl, span.slot, matrix, span.first, out_dim)) orelse return error.UnsupportedPrimitiveOp;
                 return self.ctFromOwnedMetalTensor(output);
             }
         }
         if (weight_buf.native_dense_bytes != null and weight_buf.native_dense_dtype != null and self.provider_impl.hasDecoderRuntime()) {
-            const zero_bias = try self.cachedZeroBiasBuf(out_dim);
-            defer freeOp(ctx, zero_bias);
+            var zero_bias_view: Buf = undefined;
+            var zero_bias_shape: [1]i64 = undefined;
+            const zero_bias = try self.borrowedZeroBiasBuf(&zero_bias_view, &zero_bias_shape, out_dim);
             if (try self.ensureDynamicLinearSlot(weight, zero_bias, in_dim, out_dim)) |slot| {
                 if (try decoderRuntimeApplyLinearOp(ctx, &.{
                     .slot = slot,
@@ -20930,9 +21854,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     !bufHasAnyQuantizedStorage(weight_buf))
                 {
                     var input_mt = try input_metal.retainedCopy();
-                    defer input_mt.deinit();
+                    defer self.retireTemporaryWorkspaceValue(&input_mt);
                     var weight_mt = try weight_metal.retainedCopy();
-                    defer weight_mt.deinit();
+                    defer self.retireTemporaryWorkspaceValue(&weight_mt);
                     if (try metal_runtime.decoderRuntimeDotGeneral2DF32Device(
                         self.provider_impl,
                         input_mt,
@@ -20947,8 +21871,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
             if (deviceTensorMatchesLinearRows(input_metal, rows, in_dim)) {
-                const zero_bias = try self.cachedZeroBiasBuf(out_dim);
-                defer freeOp(ctx, zero_bias);
+                var zero_bias_view: Buf = undefined;
+                var zero_bias_shape: [1]i64 = undefined;
+                const zero_bias = try self.borrowedZeroBiasBuf(&zero_bias_view, &zero_bias_shape, out_dim);
                 if (try self.ensureDynamicLinearSlot(weight, zero_bias, in_dim, out_dim)) |slot| {
                     if (try decoderRuntimeApplyLinearOp(ctx, &.{
                         .slot = slot,
@@ -21126,7 +22051,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (self.require_qwen_vision_resident) return error.PreparedVisionUnavailable;
         const result = try linearNoBiasOpWithPlannedDispatch(ctx, input, weight, rows, in_dim, out_dim, planned_dispatch);
-        errdefer freeOp(ctx, result);
+        errdefer freeTemporaryWorkspaceCtOp(ctx, result);
         const bias_data = try hostSliceForBuf(bias_buf);
         if (bias_data.len != out_dim) return error.InvalidTensorShape;
         const result_buf = toBuf(result);
@@ -21181,8 +22106,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!bufHasAnyQuantizedStorage(input_buf)) {
             if (input_buf.metal_tensor) |*input_metal| {
                 if (deviceTensorMatchesLinearRows(input_metal, rows, in_dim)) {
-                    const zero_bias = try self.cachedZeroBiasBuf(out_dim);
-                    defer freeOp(ctx, zero_bias);
+                    var zero_bias_view: Buf = undefined;
+                    var zero_bias_shape: [1]i64 = undefined;
+                    const zero_bias = try self.borrowedZeroBiasBuf(&zero_bias_view, &zero_bias_shape, out_dim);
                     const slot_a = try self.ensureDynamicLinearSlot(weight_a, zero_bias, in_dim, out_dim);
                     const slot_b = try self.ensureDynamicLinearSlot(weight_b, zero_bias, in_dim, out_dim);
                     if (slot_a != null and slot_b != null) {
@@ -21204,7 +22130,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         const first = try linearNoBiasOp(ctx, input, weight_a, rows, in_dim, out_dim);
-        errdefer freeOp(ctx, first);
+        errdefer freeTemporaryWorkspaceCtOp(ctx, first);
         const second = try linearNoBiasOp(ctx, input, weight_b, rows, in_dim, out_dim);
         return .{
             .first = first,
@@ -21231,9 +22157,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             a_buf.metal_tensor.?.isDevice() and b_buf.metal_tensor.?.isDevice())
         {
             var a_mt = try a_buf.metal_tensor.?.retainedCopy();
-            defer a_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&a_mt);
             var b_mt = try b_buf.metal_tensor.?.retainedCopy();
-            defer b_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&b_mt);
             const out_shape = [_]i32{ @intCast(total), @intCast(dim_a + dim_b) };
             const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
             defer self.endActivePlannedComputeScope(scope);
@@ -21308,9 +22234,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (input_buf.metal_tensor) |*metal_tensor| {
                 if (metal_tensor.isDevice()) {
                     const first = try sliceLastDimOp(ctx, input, 0, dim);
-                    errdefer freeOp(ctx, first);
+                    errdefer freeTemporaryWorkspaceCtOp(ctx, first);
                     const second = try sliceLastDimOp(ctx, input, dim, dim * 2);
-                    errdefer freeOp(ctx, second);
+                    errdefer freeTemporaryWorkspaceCtOp(ctx, second);
                     const third = try sliceLastDimOp(ctx, input, dim * 2, dim * 3);
                     return .{
                         .first = first,
@@ -21390,7 +22316,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         const first = try linearOp(ctx, input, weight_a, bias_a, rows, in_dim, out_dim);
-        errdefer freeOp(ctx, first);
+        errdefer freeTemporaryWorkspaceCtOp(ctx, first);
         const second = try linearOp(ctx, input, weight_b, bias_b, rows, in_dim, out_dim);
         return .{
             .first = first,
@@ -21435,7 +22361,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         )) orelse return null;
 
         var input_view = try input_metal.retainedCopy();
-        defer input_view.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_view);
         const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
         defer self.endActivePlannedComputeScope(scope);
         if (try metal_runtime.tryApplyDenseRuntimeMlp2(
@@ -21450,7 +22376,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.activation,
         )) |tensor| {
             var output = tensor;
-            errdefer output.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&output);
             return self.ctFromOwnedMetalTensor(output);
         }
         return null;
@@ -21502,9 +22428,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         )) orelse return null;
 
         var input_view = try input_metal.retainedCopy();
-        defer input_view.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_view);
         var residual_view = try residual_metal.retainedCopy();
-        defer residual_view.deinit();
+        defer self.retireTemporaryWorkspaceValue(&residual_view);
         if (try metal_runtime.tryApplyDenseRuntimeFfnLayerNorm(
             self.provider_impl,
             first_slot,
@@ -21531,14 +22457,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (self.provider_impl.lookupLinearCache(key)) |entry| {
                 if (entry.in_dim != in_dim or entry.out_dim != 3 * out_dim) return error.InvalidTensorShape;
                 const combined = (try decoderRuntimeApplyLinearOp(ctx, &.{ .slot = entry.slot, .input = input, .in_dim = in_dim, .out_dim = 3 * out_dim })) orelse return error.UnsupportedPrimitiveOp;
-                defer freeOp(ctx, combined);
+                defer freeTemporaryWorkspaceCtOp(ctx, combined);
                 const result = try splitLastDim3Op(ctx, combined, rows, out_dim);
                 return .{ .first = result.first, .second = result.second, .third = result.third };
             }
         }
         var weights: [3]CT = undefined;
         var count: usize = 0;
-        defer for (weights[0..count]) |weight| freeOp(ctx, weight);
+        defer for (weights[0..count]) |weight| freeTemporaryWorkspaceCtOp(ctx, weight);
         for (names, &weights) |name, *weight| {
             weight.* = try getWeightOp(ctx, name);
             count += 1;
@@ -21558,7 +22484,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (bound != cache) return null;
         } else provider.embeddinggemma2_cache_admission = cache;
         var source = try self.ownedDeviceMetalTensorFromCt(input);
-        defer source.deinit();
+        defer self.retireTemporaryWorkspaceValue(&source);
         const bytes = source.deviceByteLen();
         const used = provider.embeddinggemma2_audio_linear_cache_bytes;
         if (bytes == 0 or bytes > policy.prepared_max_bytes - provider.embeddinggemma2_constant_bytes or provider.embeddinggemma2_constant_cache.count() >= policy.prepared_max_entries or used > policy.audio_max_bytes or bytes > policy.audio_max_bytes - used) return null;
@@ -21609,7 +22535,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         var weights: [3]CT = undefined;
         var count: usize = 0;
-        defer for (weights[0..count]) |weight| freeOp(ctx, weight);
+        defer for (weights[0..count]) |weight| freeTemporaryWorkspaceCtOp(ctx, weight);
         for (names, weights[0..names.len]) |name, *weight| {
             weight.* = try getWeightOp(ctx, name);
             count += 1;
@@ -21647,7 +22573,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             var weights: [3]CT = undefined;
             var widths: [3]usize = undefined;
             var count: usize = 0;
-            defer for (weights[0..count]) |weight| freeOp(self, weight);
+            defer for (weights[0..count]) |weight| freeTemporaryWorkspaceCtOp(self, weight);
             var in_dim: usize = 0;
             for (siblings, 0..) |sibling, i| {
                 weights[i] = try getWeightOp(self, sibling);
@@ -21753,13 +22679,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         try provider.embeddinggemma2_linear_cache.ensureUnusedCapacity(owner, 1);
         const slot_owner = try provider.createLinearSlotOwner(slot, bytes);
         defer if (!committed) slot_owner.discardUnpublished();
-        const bias = try self.allocator.alloc(f32, out_dim);
-        defer self.allocator.free(bias);
-        @memset(bias, 0);
         var fill = PackedProjectionFill{ .weights = weights };
         const runtime = provider.raw_decode_runtime orelse return null;
         defer if (!committed) metal_runtime.clearRawLinearSlot(provider, slot);
-        if (metal_runtime.termite_metal_decode_runtime_prepare_linear_generated_f32(runtime, slot, bias.ptr, in_dim, out_dim, 1, &fill, PackedProjectionFill.fill) != 0) return null;
+        if (metal_runtime.termite_metal_decode_runtime_prepare_linear_generated_f32(runtime, slot, null, in_dim, out_dim, 1, &fill, PackedProjectionFill.fill) != 0) return null;
         if (metal_runtime.termite_metal_decode_runtime_prefer_linear_mps(runtime, slot) != 0) return null;
         provider.raw_linear_slot_kinds[slot] = .dense;
         provider.raw_linear_slots_prepared[slot] = true;
@@ -21788,12 +22711,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         if (slot) |combined_weight| {
             const combined = (try decoderRuntimeApplyLinearOp(ctx, &.{ .slot = combined_weight, .input = input, .in_dim = in_dim, .out_dim = 3 * out_dim })) orelse return error.UnsupportedPrimitiveOp;
-            defer freeOp(ctx, combined);
+            defer freeTemporaryWorkspaceCtOp(ctx, combined);
             const result = try splitLastDim3Op(ctx, combined, rows, out_dim);
             return .{ .first = result.first, .second = result.second, .third = result.third };
         }
-        const bias = try self.cachedZeroBiasBuf(out_dim);
-        defer freeOp(ctx, bias);
+        var bias_view: Buf = undefined;
+        var bias_shape: [1]i64 = undefined;
+        const bias = try self.borrowedZeroBiasBuf(&bias_view, &bias_shape, out_dim);
         return linearTripleOp(ctx, input, a, bias, b, bias, c, bias, rows, in_dim, out_dim);
     }
 
@@ -21840,9 +22764,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         const first = try linearOp(ctx, input, weight_a, bias_a, rows, in_dim, out_dim);
-        errdefer freeOp(ctx, first);
+        errdefer freeTemporaryWorkspaceCtOp(ctx, first);
         const second = try linearOp(ctx, input, weight_b, bias_b, rows, in_dim, out_dim);
-        errdefer freeOp(ctx, second);
+        errdefer freeTemporaryWorkspaceCtOp(ctx, second);
         const third = try linearOp(ctx, input, weight_c, bias_c, rows, in_dim, out_dim);
         return .{ .first = first, .second = second, .third = third };
     }
@@ -21864,7 +22788,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const input_len = bufElemCount(input_buf);
         const request = try ops.kernel_descriptor.Rope.init(input_buf.logical_shape, input_len, seq_len, head_dim, rope_dim, theta, freq_scale, position_offset, consecutive_pairs);
         var input_mt = try self.ownedMetalTensorFromCt(input);
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         if (try metal_runtime.decoderRuntimeApplyRegularRope(self.provider_impl, input_mt, request)) |tensor| {
             return self.ctFromOwnedMetalTensor(tensor);
         }
@@ -21921,7 +22845,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // the M-RoPE kernel remains device-only and never falls back through
         // a hidden host implementation.
         var input_mt = try self.ownedDeviceMetalTensorFromCt(input);
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         const result = (try metal_runtime.decoderRuntimeApplyMrope(self.provider_impl, .{
             .input = input_mt,
             .token_count = token_count,
@@ -21939,9 +22863,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         try p.validate();
         if ((p.gather != 0) != (gather != null) or (p.weighted != 0) != (weight != null) or bufElemCount(toBuf(input)) != @as(usize, p.source_rows) * p.stride or (weight != null and bufElemCount(toBuf(weight.?)) != p.dim)) return error.InvalidTensorShape;
         var x = try self.ownedDeviceMetalTensorFromCt(input);
-        defer x.deinit();
+        defer self.retireTemporaryWorkspaceValue(&x);
         var w = if (weight) |tensor| try self.ownedDeviceMetalTensorFromCt(tensor) else try x.retainedCopy();
-        defer w.deinit();
+        defer self.retireTemporaryWorkspaceValue(&w);
         // Model-owned compact position tables survive request wrappers and
         // deliberately carry no pointer to their creating MetalCompute.
         var g = if (gather) |tensor| (if (toBuf(tensor).persistent_model) model: {
@@ -21965,9 +22889,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn visionNormRopeOp(ctx: *anyopaque, input: CT, weight: CT, params: ops.VisionNormRopeParams) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var x = try self.ownedDeviceMetalTensorFromCt(input);
-        defer x.deinit();
+        defer self.retireTemporaryWorkspaceValue(&x);
         var w = try self.ownedDeviceMetalTensorFromCt(weight);
-        defer w.deinit();
+        defer self.retireTemporaryWorkspaceValue(&w);
         const rotary = if (params.rotate != 0) self.rotaryLookup(.{ .vision = true, .dim = params.head_dim, .x = params.grid_x, .y = params.grid_y, .theta = params.theta }) else null;
         var p = params;
         p.cached_rotary = @intFromBool(rotary != null);
@@ -21997,7 +22921,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // explicitly; the RoPE kernel itself remains device-only and never
         // downloads Q/K to execute on the CPU.
         var input_mt = try self.ownedDeviceMetalTensorFromCt(input);
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         const result = (try metal_runtime.decoderRuntimeApplyVisionRope(self.provider_impl, .{
             .input = input_mt,
             .token_count = token_count,
@@ -22041,9 +22965,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (chunks_per_token == 0) return null;
 
         var first_mt = try self.ownedMetalTensorFromCt(first);
-        defer first_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&first_mt);
         var second_mt = try self.ownedMetalTensorFromCt(second);
-        defer second_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&second_mt);
         if (!first_mt.isDevice() or !second_mt.isDevice()) return null;
         const positions = try self.allocator.alloc(usize, total_chunks);
         defer self.allocator.free(positions);
@@ -22113,7 +23037,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!input_metal.isDevice()) return null;
         const slot = (try self.ensureDynamicRmsNormSlot(weight, head_dim)) orelse return null;
         var input_mt = try input_metal.retainedCopy();
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         const tensor = (try metal_runtime.decoderRuntimeApplyHeadRmsNormRopeBatched(self.provider_impl, .{
             .slot = slot,
             .input = input_mt,
@@ -22176,7 +23100,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         var input_mt = try self.ownedMetalTensorFromCt(input);
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         if (try metal_runtime.decoderRuntimeApplyRope(self.provider_impl, .{
             .input = input_mt,
             .positions = positions,
@@ -22531,7 +23455,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         write_serial: u64,
     ) !BackendKvCacheEntry {
         var k = try self.cloneMetalTensorRows(k_rows, token_count, row_width);
-        errdefer k.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&k);
         const v = try self.cloneMetalTensorRows(v_rows, token_count, row_width);
         return .{
             .k = k,
@@ -22595,13 +23519,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             (block_signature == 0 or entry.block_signature == 0 or entry.block_signature == block_signature))
         {
             var k_suffix = try self.cloneMetalTensorRows(k_rows, query_sequence_len, row_width);
-            defer k_suffix.deinit();
+            defer self.retireTemporaryWorkspaceValue(&k_suffix);
             var v_suffix = try self.cloneMetalTensorRows(v_rows, query_sequence_len, row_width);
-            defer v_suffix.deinit();
+            defer self.retireTemporaryWorkspaceValue(&v_suffix);
             var next_k = try metal_runtime.concatenateRows(self.provider_impl, entry.k, k_suffix);
-            errdefer next_k.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&next_k);
             var next_v = try metal_runtime.concatenateRows(self.provider_impl, entry.v, v_suffix);
-            errdefer next_v.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&next_v);
             entry.deinit();
             entry.* = .{
                 .k = next_k,
@@ -22660,14 +23584,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             try entry.k.retainedCopy()
         else
             try entry.k.retainedView(0, token_count * entry.row_width * @sizeOf(f32), &prefix_shape);
-        defer k_tensor.deinit();
+        defer self.retireTemporaryWorkspaceValue(&k_tensor);
         const k = try allocator.dupe(f32, try k_tensor.toHostSlice());
         errdefer allocator.free(k);
         var v_tensor = if (entry.token_count == token_count)
             try entry.v.retainedCopy()
         else
             try entry.v.retainedView(0, token_count * entry.row_width * @sizeOf(f32), &prefix_shape);
-        defer v_tensor.deinit();
+        defer self.retireTemporaryWorkspaceValue(&v_tensor);
         const v = try allocator.dupe(f32, try v_tensor.toHostSlice());
         return .{ .k = k, .v = v };
     }
@@ -23376,17 +24300,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 num_kv_heads,
                 head_dim,
                 null,
+                null,
             )) |tensor| {
                 return self.ctFromOwnedMetalTensor(tensor);
             }
         }
         if (batch == 1) {
             var q_mt = try self.ownedMetalTensorFromCt(Q);
-            defer q_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&q_mt);
             var k_mt = try self.ownedMetalTensorFromCt(K);
-            defer k_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&k_mt);
             var v_mt = try self.ownedMetalTensorFromCt(V);
-            defer v_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&v_mt);
             var bias_mt: ?MetalTensor = null;
             defer if (bias_mt) |*tensor| tensor.deinit();
             if (attn_bias) |bias_tensor| bias_mt = try self.ownedMetalTensorFromCt(bias_tensor);
@@ -23447,6 +24372,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         num_kv_heads: usize,
         head_dim: usize,
         planned_layer_contract: ?ops.PlannedLayerContract,
+        prepared_residual: ?CT,
     ) !?MetalTensor {
         if (batch == 0 or seq_len == 0 or num_heads == 0 or num_kv_heads == 0 or head_dim == 0) return null;
         if (num_heads % num_kv_heads != 0) return null;
@@ -23455,14 +24381,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const kv_width = num_kv_heads * head_dim;
 
         var q_mt = try self.ownedDeviceMetalTensorFromCt(q_ct);
-        defer q_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&q_mt);
         var k_mt = try self.ownedDeviceMetalTensorFromCt(k_ct);
-        defer k_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&k_mt);
         var v_mt = try self.ownedDeviceMetalTensorFromCt(v_ct);
-        defer v_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&v_mt);
         if (q_mt.ndim() != 2 or k_mt.ndim() != 2 or v_mt.ndim() != 2) return null;
         if (@as(usize, @intCast(q_mt.dim(0))) != total or @as(usize, @intCast(k_mt.dim(0))) != total or @as(usize, @intCast(v_mt.dim(0))) != total) return null;
         if (@as(usize, @intCast(q_mt.dim(1))) != q_width or @as(usize, @intCast(k_mt.dim(1))) != kv_width or @as(usize, @intCast(v_mt.dim(1))) != kv_width) return null;
+
+        var prepared_output: ?MetalTensor = null;
+        defer if (prepared_output) |*tensor| self.retireTemporaryWorkspaceValue(tensor);
+        if (prepared_residual) |residual| {
+            // This exact modern Dense schedule has already reserved direct-Q
+            // slot10. Keep all actual inputs/residual disjoint and borrow it;
+            // projected Q is slot0 and RoPE writes3, never this direct-Q bank.
+            const residual_mt = try self.borrowedMetalTensorFromCt(residual);
+            prepared_output = (try metal_runtime.decoderRuntimeDensePrefillAttentionOutput(self.provider_impl, total, q_width, &.{ q_mt, k_mt, v_mt, residual_mt })) orelse return error.PreparedWorkspaceAttentionOutputUnavailable;
+        }
 
         // Preferred path: one attention dispatch per sequence written at its
         // row offset into a single preallocated output. Identical kernels and
@@ -23479,10 +24415,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .num_kv_heads = num_kv_heads,
             .head_dim = head_dim,
             .planned_layer_contract = planned_layer_contract orelse ops.PlannedLayerContract{},
+            .output = prepared_output,
+            .cleanup = if (self.workspace_invocation_context) |context| context.cleanup else @import("../execution/cleanup_context.zig").Context{ .outside_execution = true },
         })) |tensor| {
             return tensor;
         }
 
+        if (prepared_output != null) return error.PreparedWorkspaceAttentionUnavailable;
         var output: ?MetalTensor = null;
         errdefer if (output) |*tensor| tensor.deinit();
         for (0..batch) |b| {
@@ -23493,11 +24432,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const q_shape = [_]i32{ @intCast(seq_len), @intCast(q_width) };
             const kv_shape = [_]i32{ @intCast(seq_len), @intCast(kv_width) };
             var q_view = try q_mt.retainedView(q_offset, q_bytes, &q_shape);
-            defer q_view.deinit();
+            defer self.retireTemporaryWorkspaceValue(&q_view);
             var k_view = try k_mt.retainedView(kv_offset, kv_bytes, &kv_shape);
-            defer k_view.deinit();
+            defer self.retireTemporaryWorkspaceValue(&k_view);
             var v_view = try v_mt.retainedView(kv_offset, kv_bytes, &kv_shape);
-            defer v_view.deinit();
+            defer self.retireTemporaryWorkspaceValue(&v_view);
 
             const chunk = (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
                 .q = q_view,
@@ -23518,9 +24457,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             })) orelse return null;
             if (output) |prior| {
                 var prior_mut = prior;
-                defer prior_mut.deinit();
+                defer self.retireTemporaryWorkspaceValue(&prior_mut);
                 var chunk_mut = chunk;
-                defer chunk_mut.deinit();
+                defer self.retireTemporaryWorkspaceValue(&chunk_mut);
                 output = try metal_runtime.concatenateRows(self.provider_impl, prior_mut, chunk_mut);
             } else {
                 output = chunk;
@@ -23550,11 +24489,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         var q_mt = try self.ownedMetalTensorFromCt(request.q);
-        defer q_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&q_mt);
         var k_mt = try self.ownedMetalTensorFromCt(request.k);
-        defer k_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&k_mt);
         var v_mt = try self.ownedMetalTensorFromCt(request.v);
-        defer v_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&v_mt);
 
         if (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
             .q = q_mt,
@@ -23675,11 +24614,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         var q = try self.ownedDeviceMetalTensorFromCt(request.q);
-        defer q.deinit();
+        defer self.retireTemporaryWorkspaceValue(&q);
         var local_kv = try self.ownedDeviceMetalTensorFromCt(request.local_kv);
-        defer local_kv.deinit();
+        defer self.retireTemporaryWorkspaceValue(&local_kv);
         var sinks = try self.ownedDeviceMetalTensorFromCt(request.sinks);
-        defer sinks.deinit();
+        defer self.retireTemporaryWorkspaceValue(&sinks);
         if (!q.isDevice() or !local_kv.isDevice() or !sinks.isDevice()) return null;
         if (q.elemCount() != request.query_rows * request.num_heads * request.head_dim) return null;
         if (local_kv.elemCount() != request.query_rows * request.head_dim) return null;
@@ -23688,13 +24627,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!deepSeekV4ShapeIs(&local_kv, &.{ request.query_rows, request.head_dim })) return null;
 
         var comp_projected = try self.ownedDeviceMetalTensorFromCt(request.compressor.projected);
-        defer comp_projected.deinit();
+        defer self.retireTemporaryWorkspaceValue(&comp_projected);
         var comp_gate = try self.ownedDeviceMetalTensorFromCt(request.compressor.gate);
-        defer comp_gate.deinit();
+        defer self.retireTemporaryWorkspaceValue(&comp_gate);
         var comp_bias = try self.ownedDeviceMetalTensorFromCt(request.compressor.bias);
-        defer comp_bias.deinit();
+        defer self.retireTemporaryWorkspaceValue(&comp_bias);
         var comp_norm = try self.ownedDeviceMetalTensorFromCt(request.compressor.norm);
-        defer comp_norm.deinit();
+        defer self.retireTemporaryWorkspaceValue(&comp_norm);
         if (comp_projected.elemCount() != request.query_rows * request.compressor.row_dim) return null;
         if (comp_gate.elemCount() != request.query_rows * request.compressor.gate_width) return null;
         if (comp_norm.elemCount() != request.compressor.row_dim) return null;
@@ -23818,7 +24757,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         const output_shape = [_]i32{ @intCast(request.query_rows), @intCast(request.num_heads * request.head_dim) };
         var output = try MetalTensor.deviceAllocate(@ptrCast(runtime), request.query_rows * request.num_heads * request.head_dim * @sizeOf(f32), .private, &output_shape);
-        errdefer output.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&output);
         const rc = metal_runtime.termite_metal_decode_runtime_compressed_attention_hybrid_attention_device(
             runtime,
             q.deviceHandle(),
@@ -24008,7 +24947,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const runtime = self.provider_impl.raw_decode_runtime orelse break :blk null;
                 const shape = [_]i32{ @intCast(batch * max_q_rows), @intCast(h_q) };
                 var tensor = try MetalTensor.deviceAllocate(runtime, batch * q_span * @sizeOf(f32), .shared, &shape);
-                errdefer tensor.deinit();
+                errdefer self.retireTemporaryWorkspaceValue(&tensor);
                 const handle = tensor.deviceHandle() orelse return error.UnsupportedTensorType;
                 const raw = metal_runtime.termite_metal_buffer_contents(handle) orelse return error.UnsupportedTensorType;
                 const zeros: [*]f32 = @ptrCast(@alignCast(raw));
@@ -24116,12 +25055,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) and !has_attention_sink) {
             if (attn_bias != null or disableRuntimeAttentionF32()) return error.UnsupportedTensorType;
             var q_mt = try self.ownedDeviceMetalTensorFromCt(Q);
-            defer q_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&q_mt);
             if (attention.kv_cache == null or (attention.kv_manager == null and attention.kv_storage == null)) {
                 var k_mt = try self.ownedMetalTensorFromCt(K);
-                defer k_mt.deinit();
+                defer self.retireTemporaryWorkspaceValue(&k_mt);
                 var v_mt = try self.ownedMetalTensorFromCt(V);
-                defer v_mt.deinit();
+                defer self.retireTemporaryWorkspaceValue(&v_mt);
                 if (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
                     .q = q_mt,
                     .k = k_mt,
@@ -24196,9 +25135,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
             var k_mt = try self.ownedMetalTensorFromCt(K);
-            defer k_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&k_mt);
             var v_mt = try self.ownedMetalTensorFromCt(V);
-            defer v_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&v_mt);
             var gathered_full: ?GatheredFullKv = null;
             defer if (gathered_full) |*full| full.deinit();
             const source = try attentionKvSource(attention);
@@ -24325,12 +25264,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         if (!disableRuntimeAttentionF32() and attn_bias == null and !has_attention_sink) device_attention: {
             var q_mt = try self.ownedDeviceMetalTensorFromCt(Q);
-            defer q_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&q_mt);
             const prefer_device_kv_suffix = attention.kv_storage != null;
             var k_mt = if (prefer_device_kv_suffix) try self.ownedDeviceMetalTensorFromCt(K) else try self.ownedMetalTensorFromCt(K);
-            defer k_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&k_mt);
             var v_mt = if (prefer_device_kv_suffix) try self.ownedDeviceMetalTensorFromCt(V) else try self.ownedMetalTensorFromCt(V);
-            defer v_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&v_mt);
 
             var gathered_full: ?GatheredFullKv = null;
             defer if (gathered_full) |*full| full.deinit();
@@ -24433,15 +25372,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (dumpDecodeKvLayerTarget()) |target_layer| {
                     if (target_layer == attention.layer_index) {
                         var k_debug = try self.ownedMetalTensorFromCt(K);
-                        defer k_debug.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&k_debug);
                         var v_debug = try self.ownedMetalTensorFromCt(V);
-                        defer v_debug.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&v_debug);
                         try self.maybeDumpDecodeKvTensor("prefill-source-k", attention.layer_index, &k_debug, attention.query_sequence_len, h_kv);
                         try self.maybeDumpDecodeKvTensor("prefill-source-v", attention.layer_index, &v_debug, attention.query_sequence_len, h_kv);
                         if (device_written) {
                             if (try gatherFullKvFromDeviceHook(attention, num_kv_heads, head_dim)) |gathered| {
                                 var gathered_mut = gathered;
-                                defer gathered_mut.deinit();
+                                defer self.retireTemporaryWorkspaceValue(&gathered_mut);
                                 try self.maybeDumpDecodeKvTensor("prefill-device-k", attention.layer_index, &gathered_mut.k, attention.kv_sequence_len, h_kv);
                                 try self.maybeDumpDecodeKvTensor("prefill-device-v", attention.layer_index, &gathered_mut.v, attention.kv_sequence_len, h_kv);
                             }
@@ -24624,11 +25563,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
             var q_mt = try self.ownedMetalTensorFromCt(Q);
-            defer q_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&q_mt);
             var k_mt = try self.ownedMetalTensorFromCt(K);
-            defer k_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&k_mt);
             var v_mt = try self.ownedMetalTensorFromCt(V);
-            defer v_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&v_mt);
             var bias_mt: ?MetalTensor = null;
             defer if (bias_mt) |*tensor| tensor.deinit();
             if (attn_bias) |bias_tensor| bias_mt = try self.ownedMetalTensorFromCt(bias_tensor);
@@ -24670,11 +25609,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         if (attention.kv_cache == null or (attention.kv_manager == null and attention.kv_storage == null)) {
             var q_mt = try self.ownedMetalTensorFromCt(Q);
-            defer q_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&q_mt);
             var k_mt = try self.ownedMetalTensorFromCt(K);
-            defer k_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&k_mt);
             var v_mt = try self.ownedMetalTensorFromCt(V);
-            defer v_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&v_mt);
             var bias_mt: ?MetalTensor = null;
             defer if (bias_mt) |*tensor| tensor.deinit();
             if (attn_bias) |bias_tensor| bias_mt = try self.ownedMetalTensorFromCt(bias_tensor);
@@ -24739,9 +25678,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var fallback_device_written = false;
         if (!attention.skip_kv_write and attention.kv_storage != null) {
             var k_device_mt = try self.ownedDeviceMetalTensorFromCt(K);
-            defer k_device_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&k_device_mt);
             var v_device_mt = try self.ownedDeviceMetalTensorFromCt(V);
-            defer v_device_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&v_device_mt);
             fallback_device_written = try tryEnsurePagedKvSuffixDeviceFromTensors(
                 attention,
                 &k_device_mt,
@@ -24805,12 +25744,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             else
                 (try self.gatherFullKvFromBackendCache(attention, num_kv_heads, head_dim, true)) orelse
                     return error.KvBytesUnavailable;
-            defer gathered_full.deinit();
+            defer self.retireTemporaryWorkspaceValue(&gathered_full);
             try self.maybeDumpDecodeKvTensor("k", attention.layer_index, &gathered_full.k, attention.kv_sequence_len, h_kv);
             try self.maybeDumpDecodeKvTensor("v", attention.layer_index, &gathered_full.v, attention.kv_sequence_len, h_kv);
 
             var q_mt = try self.ownedMetalTensorFromCt(Q);
-            defer q_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&q_mt);
             var bias_mt: ?MetalTensor = null;
             defer if (bias_mt) |*tensor| tensor.deinit();
             if (attn_bias) |bias_tensor| bias_mt = try self.ownedMetalTensorFromCt(bias_tensor);
@@ -25154,16 +26093,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         if (format == null) {
             var q_mt = try self.ownedMetalTensorFromCt(request.q);
-            defer q_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&q_mt);
             var residual_mt = try self.ownedMetalTensorFromCt(request.residual);
-            defer residual_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&residual_mt);
 
             var gathered_full = gathered_blk: {
                 if (frame_active and !attention.skip_kv_write) {
                     var k_mt = try self.ownedMetalTensorFromCt(request.k);
-                    defer k_mt.deinit();
+                    defer self.retireTemporaryWorkspaceValue(&k_mt);
                     var v_mt = try self.ownedMetalTensorFromCt(request.v);
-                    defer v_mt.deinit();
+                    defer self.retireTemporaryWorkspaceValue(&v_mt);
                     const kv = attention.kv_cache.?;
                     const entry = (try metal_runtime.updateGatheredSpan(
                         self.provider_impl,
@@ -25203,7 +26142,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     };
                 };
             };
-            defer gathered_full.deinit();
+            defer self.retireTemporaryWorkspaceValue(&gathered_full);
             try self.maybeDumpDecodeKvTensor("decode-k", attention.layer_index, &gathered_full.k, attention.kv_sequence_len, request.num_kv_heads * request.head_dim);
             try self.maybeDumpDecodeKvTensor("decode-v", attention.layer_index, &gathered_full.v, attention.kv_sequence_len, request.num_kv_heads * request.head_dim);
 
@@ -25315,13 +26254,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         var q_mt = try self.ownedMetalTensorFromCt(request.q);
-        defer q_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&q_mt);
         var k_mt = try self.ownedMetalTensorFromCt(request.k);
-        defer k_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&k_mt);
         var v_mt = try self.ownedMetalTensorFromCt(request.v);
-        defer v_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&v_mt);
         var residual_mt = try self.ownedDeviceMetalTensorFromCt(request.residual);
-        defer residual_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&residual_mt);
 
         var gathered_full: ?GatheredFullKv = null;
         defer if (gathered_full) |*full| full.deinit();
@@ -25388,9 +26327,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn runAttentionOutputResidualOp(ctx: *anyopaque, request: *const ops.RunAttentionOutputResidualRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var attention_output = try self.ownedMetalTensorFromCt(request.attention_output);
-        defer attention_output.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attention_output);
         var residual = try self.ownedMetalTensorFromCt(request.residual);
-        defer residual.deinit();
+        defer self.retireTemporaryWorkspaceValue(&residual);
         const tensor = (try metal_runtime.decoderRuntimeApplyAttentionOutputResidualDevice(self.provider_impl, .{
             .attention_output = attention_output,
             .residual = residual,
@@ -25437,9 +26376,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             );
         }
         var k_mt = try self.ownedMetalTensorFromCt(request.k);
-        defer k_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&k_mt);
         var v_mt = try self.ownedMetalTensorFromCt(request.v);
-        defer v_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&v_mt);
         try self.maybeDumpDecodeKvTensor("prefill-k", attention.layer_index, &k_mt, attention.kv_sequence_len, row_width);
         try self.maybeDumpDecodeKvTensor("prefill-v", attention.layer_index, &v_mt, attention.kv_sequence_len, row_width);
         const seeded = (try metal_runtime.updateGatheredSpan(
@@ -25518,9 +26457,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!input.isDevice() or input.elemCount() != rows * kv_dim) return null;
         const flat_shape = [_]i32{ @intCast(rows * heads), @intCast(head_dim) };
         var flat = try input.retainedView(0, rows * kv_dim * @sizeOf(f32), &flat_shape);
-        defer flat.deinit();
+        defer self.retireTemporaryWorkspaceValue(&flat);
         var ones = (try self.unitRmsWeightDeviceTensor(head_dim)) orelse return null;
-        defer ones.deinit();
+        defer self.retireTemporaryWorkspaceValue(&ones);
         var normed = (try metal_runtime.decoderRuntimeApplyRmsNormWeightDeviceScratch(
             self.provider_impl,
             flat,
@@ -25529,7 +26468,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             eps,
             output_index,
         )) orelse return null;
-        defer normed.deinit();
+        defer self.retireTemporaryWorkspaceValue(&normed);
         const out_shape = [_]i32{ @intCast(rows), @intCast(kv_dim) };
         return try normed.retainedView(0, rows * kv_dim * @sizeOf(f32), &out_shape);
     }
@@ -25577,9 +26516,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         try self.maybeDumpDecodeKvTensor("prefill-k", attention.layer_index, &dump_k, attention.kv_sequence_len, row_width);
         try self.maybeDumpDecodeKvTensor("prefill-v", attention.layer_index, &dump_v, attention.kv_sequence_len, row_width);
         var cache_k = try k_mt.copiedView(0, k_mt.deviceByteLen(), k_mt.shape());
-        defer cache_k.deinit();
+        defer self.retireTemporaryWorkspaceValue(&cache_k);
         var cache_v = try v_mt.copiedView(0, v_mt.deviceByteLen(), v_mt.shape());
-        defer cache_v.deinit();
+        defer self.retireTemporaryWorkspaceValue(&cache_v);
         const seeded = (try metal_runtime.updateGatheredSpan(
             self.provider_impl,
             .{
@@ -25759,7 +26698,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             );
             return null;
         };
-        defer q_rope_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&q_rope_mt);
         try self.maybeDumpDecodeStageTensor("prefill-q-rope", attention.layer_index, q_rope_mt, attention_input_size);
 
         var k_rope_mt: ?MetalTensor = null;
@@ -25822,7 +26761,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         block_request.planned_layer_contract = if (use_planned_block_contract) planned_block_contract else .{};
 
         var residual_mt = try self.ownedDeviceMetalTensorFromCt(request.residual);
-        defer residual_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&residual_mt);
         var kv_suffix_written = false;
         const block_result = (try self.runGatedDecoderBlockF32KvDeviceMt(
             &block_request,
@@ -26004,7 +26943,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             } else null;
 
             var residual_direct_mt = try self.ownedDeviceMetalTensorFromCt(request.residual);
-            defer residual_direct_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&residual_direct_mt);
             const frame_setup_start = if (layer_window) |window| window.setup_start else 0;
             const frame_block_start = if (layer_window) |window| window.block_start else 0;
             const frame_layer_end = if (layer_window) |window| window.layer_end else 0;
@@ -26133,7 +27072,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.timing_stats.prefill_frame_executor_layer_setup_nanos += setup_finished_at - setup_started_at;
         }
         if (setup) |*prefill_setup| {
-            defer prefill_setup.deinit();
+            defer self.retireTemporaryWorkspaceValue(&prefill_setup);
             errdefer self.endActivePlannedComputeScopeIfAny();
             try self.maybeDumpDecodeStageTensor("prefill-q-rope", attention.layer_index, prefill_setup.q, attention_input_size);
             if (!attention.skip_kv_write) {
@@ -26150,7 +27089,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             block_request.planned_layer_contract = fallback_block_contract;
 
             var residual_mt = try self.ownedDeviceMetalTensorFromCt(request.residual);
-            defer residual_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&residual_mt);
             const block_started_at = monotonicNowNs();
             const block_result = (try self.runGatedDecoderBlockF32KvDeviceMt(
                 &block_request,
@@ -26494,9 +27433,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) !?MetalTensor {
         if (request.q == null) return null;
         var q_mt = try self.ownedMetalTensorFromCt(request.q.?);
-        defer q_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&q_mt);
         var residual_mt = try self.ownedMetalTensorFromCt(request.residual);
-        defer residual_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&residual_mt);
         var k_mt: ?MetalTensor = null;
         defer if (k_mt) |*tensor| tensor.deinit();
         var v_mt: ?MetalTensor = null;
@@ -26660,9 +27599,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (cache_rows.k.len != prior_tokens * row_width or cache_rows.v.len != prior_tokens * row_width) return false;
             const shape = [_]i32{ @intCast(prior_tokens), @intCast(row_width) };
             var k_prefix = try MetalTensor.ownedCloneFrom(cache_rows.k, &shape);
-            defer k_prefix.deinit();
+            defer self.retireTemporaryWorkspaceValue(&k_prefix);
             var v_prefix = try MetalTensor.ownedCloneFrom(cache_rows.v, &shape);
-            defer v_prefix.deinit();
+            defer self.retireTemporaryWorkspaceValue(&v_prefix);
 
             if (try writePagedKvSuffixDeviceFromTensors(
                 prefix_attention,
@@ -26685,6 +27624,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         hidden_size: usize,
         intermediate_size: usize,
         activation: ops.DecoderRuntimeActivationKind,
+        prepared_outputs: ?metal_runtime.PreparedDenseFfnOutputs = null,
     };
     const GatedFfnProducts = struct {
         gate: MetalTensor = .empty,
@@ -26692,6 +27632,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         activated: MetalTensor = .empty,
         gated: MetalTensor = .empty,
 
+        fn releaseInputsWithCleanup(self: *@This(), current: @import("../execution/cleanup_context.zig").Context) void {
+            self.activated.deinitWithCleanup(current);
+            self.activated = .empty;
+            self.up.deinitWithCleanup(current);
+            self.up = .empty;
+            self.gate.deinitWithCleanup(current);
+            self.gate = .empty;
+        }
+        fn deinitWithCleanup(self: *@This(), current: @import("../execution/cleanup_context.zig").Context) void {
+            self.gated.deinitWithCleanup(current);
+            self.gated = .empty;
+            self.releaseInputsWithCleanup(current);
+        }
         fn releaseInputs(self: *@This()) void {
             self.activated.deinit();
             self.activated = .empty;
@@ -26725,6 +27678,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     ) !?GatedFfnProducts {
         if (mode != .gathered_f32) {
             if (try metal_runtime.decoderRuntimeTryApplyBf16GateUp(self.provider_impl, .{
+                .prepared_output = try metal_runtime.ffnPreparedTarget(request, .product),
                 .gate_slot = request.gate_slot,
                 .up_slot = request.up_slot,
                 .input = input,
@@ -26735,13 +27689,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         var products = GatedFfnProducts{};
         var transferred = false;
-        defer if (!transferred) products.deinit();
+        defer if (!transferred) {
+            if (request.prepared_outputs) |outputs| products.deinitWithCleanup(outputs.current) else products.deinit();
+        };
         const rows: usize = @intCast(input.dim(0));
         {
             const scope = if (mode != .planned_mixed or block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.dense_linear, .ffn);
             defer self.endActivePlannedComputeScope(scope);
             const pair = if (mode == .staged_mixed or rows == 1)
                 try metal_runtime.decoderRuntimeApplyLinearPair(self.provider_impl, .{
+                    .prepared_outputs = if (try metal_runtime.ffnPreparedTarget(request, .gate)) |first| metal_runtime.PreparedDecoderPairOutputs{ .first = first, .second = (try metal_runtime.ffnPreparedTarget(request, .up)).? } else null,
                     .slot_a = request.gate_slot,
                     .slot_b = request.up_slot,
                     .input = input,
@@ -26757,12 +27714,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 return missingGatedFfnPhase(mode, layer, request, "ffn-pair");
             } else {
                 products.gate = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                    .prepared_output = try metal_runtime.ffnPreparedTarget(request, .gate),
                     .slot = request.gate_slot,
                     .input = input,
                     .in_dim = request.hidden_size,
                     .out_dim = request.intermediate_size,
                 })) orelse return missingGatedFfnPhase(mode, layer, request, "ffn-gate-linear");
                 products.up = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                    .prepared_output = try metal_runtime.ffnPreparedTarget(request, .up),
                     .slot = request.up_slot,
                     .input = input,
                     .in_dim = request.hidden_size,
@@ -26774,20 +27733,60 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const scope = if (mode != .planned_mixed or block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.ffn, .ffn);
             defer self.endActivePlannedComputeScope(scope);
             products.activated = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
+                .prepared_output = try metal_runtime.ffnPreparedTarget(request, .activation),
                 .input = products.gate,
                 .kind = request.activation,
                 .dim = request.intermediate_size,
             }, &self.timing_stats)) orelse return missingGatedFfnPhase(mode, layer, request, "ffn-activation");
             if (mode == .planned_mixed) self.activePlannedComputeBarrier(scope or block_scope);
-            products.gated = (try metal_runtime.decoderRuntimeApplyMultiply(
+            products.gated = (try metal_runtime.decoderRuntimeApplyMultiplyWithOutput(
                 self.provider_impl,
                 products.activated,
                 products.up,
                 request.intermediate_size,
+                try metal_runtime.ffnPreparedTarget(request, .product),
             )) orelse return missingGatedFfnPhase(mode, layer, request, "ffn-multiply");
         }
         transferred = true;
         return products;
+    }
+
+    fn hasOwnedDensePrefillOutputs(self: *MetalCompute) bool {
+        const context = self.workspace_invocation_context orelse return false;
+        const uses = context.workspace_uses orelse return false;
+        return uses.allocations != null;
+    }
+
+    fn denseHostReferencePhase(self: *const MetalCompute) ?*const @import("../backends/metal_workspace_ownership.zig").Phase {
+        const context = self.workspace_invocation_context orelse return null;
+        const uses = context.workspace_uses orelse return null;
+        const phase = uses.allocations orelse return null;
+        return if (phase.host_reference_prepared) phase else null;
+    }
+
+    fn densePrefillOutputCleanup(self: *MetalCompute) @import("../execution/cleanup_context.zig").Context {
+        return if (self.workspace_invocation_context) |context| context.cleanup else .{ .outside_execution = true };
+    }
+
+    fn decoderRuntimeApplyDenseFrameRmsNorm(self: *MetalCompute, request: *const ops.DecoderRuntimeApplyRmsNormRequest) anyerror!?CT {
+        if (!self.hasOwnedDensePrefillOutputs()) return decoderRuntimeApplyRmsNormOp(self, request);
+        const current = self.densePrefillOutputCleanup();
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.PreparedWorkspaceOutputUnavailable;
+        var input = try self.ownedDeviceMetalTensorFromCt(request.input);
+        defer input.deinitWithCleanup(current);
+        var output = try metal_runtime.borrowDensePrefillNormOutput(runtime, @intCast(input.dim(0)), request.hidden_size);
+        defer output.deinitWithCleanup(current);
+        // The SAME C RMS encoder records the actual input/output ranges;
+        // its existing WAR/WAW tracker handles HOT17 reuse (no new barrier).
+        var tensor = (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+            .slot = request.slot,
+            .input = input,
+            .hidden_size = request.hidden_size,
+            .eps = request.eps,
+            .prepared_output = metal_runtime.PreparedDecoderOutput{ .tensor = &output, .current = current },
+        }, &self.timing_stats)) orelse return error.PreparedWorkspaceNormUnavailable;
+        errdefer tensor.deinitWithCleanup(current);
+        return self.ctFromOwnedMetalTensor(tensor);
     }
 
     fn finishGatedDecoderBlockFromAttentionOutputMt(
@@ -26798,6 +27797,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         residual_mt: MetalTensor,
         compare_tensor: ?*MetalTensor,
     ) !?MetalTensor {
+        const current = self.densePrefillOutputCleanup();
+        var prepared_outputs: ?metal_runtime.DensePrefillOutputs = if (request.attention.mode == .dense_causal and self.hasOwnedDensePrefillOutputs())
+            try metal_runtime.borrowDensePrefillOutputs(self.provider_impl.raw_decode_runtime orelse return error.PreparedWorkspaceOutputUnavailable, residual_mt, @intCast(residual_mt.dim(0)), request.hidden_size, request.intermediate_size, current)
+        else
+            null;
+        defer if (prepared_outputs) |*outputs| outputs.deinit(current);
+        const prepared: ?metal_runtime.PreparedDenseFfnOutputs = if (prepared_outputs) |*outputs| .{ .values = outputs, .current = current, .reference_host_phase = self.denseHostReferencePhase() } else null;
         const trace_quant = traceQuantBlockRequested();
         const attention_input_size = request.num_heads * request.head_dim;
         const block_scope = self.beginActivePlannedComputeScopeIfPossible(.layer, .layer);
@@ -26806,14 +27812,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .attention)
         else
             metal_runtime.ComputeRegionScope{ .runtime = null, .previous = 0, .active = false };
-        defer attention_region.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attention_region);
         var ffn_region = metal_runtime.ComputeRegionScope{ .runtime = null, .previous = 0, .active = false };
-        defer ffn_region.deinit();
+        defer self.retireTemporaryWorkspaceValue(&ffn_region);
         var attention_linear_input = attn_out;
         var attention_linear_input_owned: ?MetalTensor = null;
-        defer if (attention_linear_input_owned) |*tensor| tensor.deinit();
+        defer if (attention_linear_input_owned) |*tensor| {
+            if (prepared != null) tensor.deinitWithCleanup(current) else tensor.deinit();
+        };
         if (request.attention_pre_linear_rms_norm_slot) |slot| {
             attention_linear_input_owned = (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+                .prepared_output = try metal_runtime.ffnPreparedTarget(.{ .prepared_outputs = prepared }, .pre_attention),
                 .slot = slot,
                 .input = attn_out,
                 .hidden_size = attention_input_size,
@@ -26867,6 +27876,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 try ocrRowwisePrepared(@ptrCast(self), self, attention_linear_input, request.attention_linear_slot, attention_input_size, request.hidden_size, null)
             else
                 (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                    .prepared_output = try metal_runtime.ffnPreparedTarget(.{ .prepared_outputs = prepared }, .projection),
                     .slot = request.attention_linear_slot,
                     .input = attention_linear_input,
                     .in_dim = attention_input_size,
@@ -26879,15 +27889,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     return null;
                 };
         }
-        defer projected.deinit();
+        defer self.retireTemporaryWorkspaceValue(&projected);
         if (canonical_attention_residual == null) try self.maybeDumpDecodeStageTensor("attn-proj", attention_layer_index, projected, request.hidden_size);
 
         var attn_post = MetalTensor.empty;
-        defer attn_post.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attn_post);
         var attn_res = MetalTensor.empty;
-        defer attn_res.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attn_res);
         var ffn_normed = MetalTensor.empty;
-        defer ffn_normed.deinit();
+        defer self.retireTemporaryWorkspaceValue(&ffn_normed);
         {
             const residual_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.rms_norm, .ffn_norm);
             defer self.endActivePlannedComputeScope(residual_scope);
@@ -26895,6 +27905,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 try projected.retainedCopy()
             else if (request.attention_post_linear_rms_norm_slot) |slot|
                 (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+                    .prepared_output = try metal_runtime.ffnPreparedTarget(.{ .prepared_outputs = prepared }, .post_attention),
                     .slot = slot,
                     .input = projected,
                     .hidden_size = request.hidden_size,
@@ -26914,6 +27925,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 try tensor.retainedCopy()
             else
                 (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+                    .prepared_output = try metal_runtime.ffnPreparedTarget(.{ .prepared_outputs = prepared }, .residual),
                     .lhs = attn_post,
                     .rhs = residual_mt,
                     .dim = request.hidden_size,
@@ -26928,13 +27940,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             self.activePlannedComputeBarrier(residual_scope or block_scope);
             if (request.attention.mode == .dense_causal)
                 ffn_region = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .ffn);
-            ffn_normed = (try metal_runtime.decoderRuntimeApplyFfnNormInternal(
+            ffn_normed = (try metal_runtime.decoderRuntimeApplyFfnNormInternalWithOutput(
                 self.provider_impl,
                 attn_res,
                 request.ffn_layer_norm_slot,
                 request.ffn_rms_norm_slot,
                 request.hidden_size,
                 request.eps,
+                try metal_runtime.ffnPreparedTarget(.{ .prepared_outputs = prepared }, .norm),
             )) orelse {
                 if (trace_quant) std.debug.print(
                     "metal-prefill-staged-null layer={d} reason=ffn-norm layer_norm={?d} rms_norm={?d} hidden={d}\n",
@@ -26946,6 +27959,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         if (try metal_runtime.tryDeviceQuantizedGatedFfnResidual(self.provider_impl, .{
+            .prepared_outputs = prepared,
             .output = if (ffn_output_ct) |ct| try self.borrowedMetalTensorFromCt(ct) else @as(?MetalTensor, null),
             .gate_linear_slot = request.gate_ffn_linear_slot,
             .up_linear_slot = request.up_ffn_linear_slot,
@@ -26967,14 +27981,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         var products = (try self.runGatedFfnPhaseMt(.planned_mixed, .{
+            .prepared_outputs = prepared,
             .gate_slot = request.gate_ffn_linear_slot,
             .up_slot = request.up_ffn_linear_slot,
             .hidden_size = request.hidden_size,
             .intermediate_size = request.intermediate_size,
             .activation = request.activation,
         }, ffn_normed, attention_layer_index, block_scope)) orelse return null;
-        defer products.deinit();
-        products.releaseInputs();
+        defer if (prepared != null) products.deinitWithCleanup(current) else self.retireTemporaryWorkspaceValue(&products);
+        if (prepared != null) products.releaseInputsWithCleanup(current) else products.releaseInputs();
         const gated = products.gated;
 
         var down: MetalTensor = undefined;
@@ -26982,6 +27997,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const ffn_scope = if (block_scope) false else self.beginActivePlannedComputeScopeIfPossible(.dense_linear, .ffn);
             defer self.endActivePlannedComputeScope(ffn_scope);
             down = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+                .prepared_output = try metal_runtime.ffnPreparedTarget(.{ .prepared_outputs = prepared }, .down),
                 .slot = request.down_ffn_linear_slot,
                 .input = gated,
                 .in_dim = request.intermediate_size,
@@ -26994,7 +28010,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 return null;
             };
         }
-        defer down.deinit();
+        defer self.retireTemporaryWorkspaceValue(&down);
 
         var down_post: MetalTensor = undefined;
         var staged_result: MetalTensor = undefined;
@@ -27003,6 +28019,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             defer self.endActivePlannedComputeScope(residual_scope);
             down_post = if (request.ffn_post_down_rms_norm_slot) |slot|
                 (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
+                    .prepared_output = try metal_runtime.ffnPreparedTarget(.{ .prepared_outputs = prepared }, .post_down),
                     .slot = slot,
                     .input = down,
                     .hidden_size = request.hidden_size,
@@ -27016,9 +28033,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             else
                 try down.retainedCopy();
-            errdefer down_post.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&down_post);
             self.activePlannedComputeBarrier(residual_scope or block_scope);
             staged_result = (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
+                .prepared_output = try metal_runtime.ffnPreparedTarget(.{ .prepared_outputs = prepared }, .projection),
                 .lhs = down_post,
                 .rhs = attn_res,
                 .dim = request.hidden_size,
@@ -27030,13 +28048,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 return null;
             };
         }
-        defer down_post.deinit();
-        errdefer staged_result.deinit();
+        defer self.retireTemporaryWorkspaceValue(&down_post);
+        errdefer self.retireTemporaryWorkspaceValue(&staged_result);
         if (compare_tensor) |mono| {
             try compareMetalTensors("metal-quant-monolithic-vs-staged", attention_layer_index, request.hidden_size, mono, &staged_result);
         }
         try self.maybeDumpDecodeStageTensor("ffn-result", attention_layer_index, staged_result, request.hidden_size);
         return staged_result;
+    }
+
+    fn densePrefillScaleOutput(self: *MetalCompute, request: *const ops.RunGatedDecoderBlockRequest, input: MetalTensor, scale: f32) !?MetalTensor {
+        if (request.attention.mode != .dense_causal or !self.hasOwnedDensePrefillOutputs())
+            return metal_runtime.decoderRuntimeApplyScale(self.provider_impl, input, scale);
+        const current = self.densePrefillOutputCleanup();
+        var outputs = try metal_runtime.borrowDensePrefillOutputs(self.provider_impl.raw_decode_runtime orelse return error.PreparedWorkspaceOutputUnavailable, input, @intCast(input.dim(0)), request.hidden_size, request.intermediate_size, current);
+        defer outputs.deinit(current);
+        return metal_runtime.decoderRuntimeApplyScaleWithOutput(self.provider_impl, input, scale, try outputs.target(.projection, current));
     }
 
     fn finishGatedLayerTailMt(
@@ -27047,7 +28074,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         ple_mt_override: ?MetalTensor,
     ) !?MetalTensor {
         var current = block;
-        errdefer current.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&current);
 
         const ple_mt: ?MetalTensor = if (ple_mt_override) |mt|
             mt
@@ -27117,7 +28144,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
             }
             var scale_mt = try self.ownedMetalTensorFromCt(scale_ct);
-            defer scale_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&scale_mt);
             const scaled = if (scale_mt.elemCount() == current.elemCount())
                 try metal_runtime.decoderRuntimeApplyMultiply(
                     self.provider_impl,
@@ -27157,7 +28184,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         const query_position_offset = attention.total_sequence_len - attention.query_sequence_len;
         var direct = try direct_output.retainedCopy();
-        defer direct.deinit();
+        defer self.retireTemporaryWorkspaceValue(&direct);
 
         var attn_out = (try metal_runtime.decoderRuntimeApplyPagedKvAttentionSlot(self.provider_impl, .{
             .q = q_mt,
@@ -27177,7 +28204,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .kv_position_offset = attention.kv_position_offset,
             .sliding_window = attention.sliding_window,
         })) orelse return;
-        defer attn_out.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attn_out);
 
         const block = (try self.finishGatedDecoderBlockFromAttentionOutputMt(
             request,
@@ -27193,7 +28220,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             ple_mt_override,
         )) orelse return;
         var staged_mut = staged;
-        defer staged_mut.deinit();
+        defer self.retireTemporaryWorkspaceValue(&staged_mut);
 
         try compareMetalTensors("metal-paged-direct-vs-staged", attention.layer_index, request.hidden_size, &direct, &staged_mut);
     }
@@ -27505,7 +28532,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (target_layer == attention.layer_index) {
                     if (try gatherFullKvFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) |gathered| {
                         var gathered_full = gathered;
-                        defer gathered_full.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&gathered_full);
                         try self.maybeDumpDecodeKvTensor("paged-k", attention.layer_index, &gathered_full.k, attention.kv_sequence_len, request.num_kv_heads * request.head_dim);
                         try self.maybeDumpDecodeKvTensor("paged-v", attention.layer_index, &gathered_full.v, attention.kv_sequence_len, request.num_kv_heads * request.head_dim);
                     }
@@ -27540,14 +28567,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     );
                     break :paged_attention;
                 };
-                defer attn_out.deinit();
+                defer self.retireTemporaryWorkspaceValue(&attn_out);
                 try self.maybeDumpDecodeStageTensor("attn-out", attention.layer_index, attn_out, request.num_heads * request.head_dim);
                 if (getenvBool("TERMITE_METAL_COMPARE_PAGED_SLOT_DENSE")) {
                     const should_compare = if (dumpDecodeKvLayerTarget()) |target_layer| target_layer == attention.layer_index else true;
                     if (should_compare) {
                         if (try gatherFullKvFromDeviceHook(attention, request.num_kv_heads, request.head_dim)) |gathered| {
                             var gathered_full = gathered;
-                            defer gathered_full.deinit();
+                            defer self.retireTemporaryWorkspaceValue(&gathered_full);
                             if (try metal_runtime.decoderRuntimeApplyAttentionF32(self.provider_impl, .{
                                 .q = q_mt,
                                 .k = gathered_full.k,
@@ -27565,7 +28592,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                                 .total_sequence_len = attention.total_sequence_len,
                             })) |dense_attn| {
                                 var dense_attn_mut = dense_attn;
-                                defer dense_attn_mut.deinit();
+                                defer self.retireTemporaryWorkspaceValue(&dense_attn_mut);
                                 try compareMetalTensors("metal-paged-slot-vs-gathered-attn", attention.layer_index, request.num_heads * request.head_dim, &dense_attn_mut, &attn_out);
                             }
                         }
@@ -27638,12 +28665,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                             try cache_entry.k.retainedCopy()
                         else
                             try cache_entry.k.retainedView(0, prior_tokens * row_width * @sizeOf(f32), &prefix_shape);
-                        defer prefix_k.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&prefix_k);
                         var prefix_v = if (cache_entry.token_count == prior_tokens)
                             try cache_entry.v.retainedCopy()
                         else
                             try cache_entry.v.retainedView(0, prior_tokens * row_width * @sizeOf(f32), &prefix_shape);
-                        defer prefix_v.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&prefix_v);
                         full_k = try metal_runtime.concatenateRows(self.provider_impl, prefix_k, k_mt);
                         full_v = try metal_runtime.concatenateRows(self.provider_impl, prefix_v, v_mt);
                     }
@@ -27794,7 +28821,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .sliding_window = attention.sliding_window,
             .total_sequence_len = attention.total_sequence_len,
         })) orelse return null;
-        defer attn_out.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attn_out);
         try self.maybeDumpDecodeStageTensor("attn-out", attention.layer_index, attn_out, request.num_heads * request.head_dim);
 
         const attention_input_size = request.num_heads * request.head_dim;
@@ -27816,7 +28843,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .in_dim = attention_input_size,
             .out_dim = request.hidden_size,
         })) orelse return null;
-        defer projected.deinit();
+        defer self.retireTemporaryWorkspaceValue(&projected);
 
         var attn_post = if (request.attention_post_linear_rms_norm_slot) |slot|
             (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
@@ -27827,14 +28854,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }, &self.timing_stats)) orelse return null
         else
             try projected.retainedCopy();
-        defer attn_post.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attn_post);
 
         var attn_res = (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
             .lhs = attn_post,
             .rhs = residual_mt,
             .dim = request.hidden_size,
         }, &self.timing_stats)) orelse return null;
-        defer attn_res.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attn_res);
 
         var ffn_normed = (try metal_runtime.decoderRuntimeApplyFfnNormInternal(
             self.provider_impl,
@@ -27844,7 +28871,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.hidden_size,
             request.eps,
         )) orelse return null;
-        defer ffn_normed.deinit();
+        defer self.retireTemporaryWorkspaceValue(&ffn_normed);
 
         if (try metal_runtime.tryDeviceQuantizedGatedFfnResidual(self.provider_impl, .{
             .gate_linear_slot = request.gate_ffn_linear_slot,
@@ -27875,7 +28902,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .intermediate_size = request.intermediate_size,
             .activation = request.activation,
         }, ffn_normed, attention.layer_index, false)) orelse return null;
-        defer products.deinit();
+        defer self.retireTemporaryWorkspaceValue(&products);
         const gated = products.gated;
 
         var down = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
@@ -27884,7 +28911,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .in_dim = request.intermediate_size,
             .out_dim = request.hidden_size,
         })) orelse return null;
-        defer down.deinit();
+        defer self.retireTemporaryWorkspaceValue(&down);
 
         var down_post = if (request.ffn_post_down_rms_norm_slot) |slot|
             (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
@@ -27895,14 +28922,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }, &self.timing_stats)) orelse return null
         else
             try down.retainedCopy();
-        defer down_post.deinit();
+        defer self.retireTemporaryWorkspaceValue(&down_post);
 
         var staged_result = (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
             .lhs = down_post,
             .rhs = attn_res,
             .dim = request.hidden_size,
         }, &self.timing_stats)) orelse return null;
-        errdefer staged_result.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&staged_result);
         if (monolithic_compare) |*mono| {
             try compareMetalTensors("metal-quant-monolithic-vs-staged", attention.layer_index, request.hidden_size, mono, &staged_result);
         }
@@ -27952,8 +28979,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const row_width = heads * head_dim;
         if (!input.isDevice() or input.ndim() != 2) return null;
         if (@as(usize, @intCast(input.dim(0))) != batch * seq_len or @as(usize, @intCast(input.dim(1))) != row_width) return null;
-        _ = output_index;
+        const current = self.densePrefillOutputCleanup();
+        var prepared: ?MetalTensor = if (self.hasOwnedDensePrefillOutputs())
+            try metal_runtime.borrowDensePrefillOutput(self.provider_impl.raw_decode_runtime orelse return error.PreparedWorkspaceOutputUnavailable, output_index, batch * seq_len, row_width)
+        else
+            null;
+        defer if (prepared) |*value| value.deinitWithCleanup(current);
         return metal_runtime.decoderRuntimeApplyHeadRmsNormRopeBatched(self.provider_impl, .{
+            .prepared_output = if (prepared) |*value| metal_runtime.PreparedDecoderOutput{ .tensor = value, .current = current } else null,
             .slot = slot,
             .input = input,
             .total_heads = batch * seq_len * heads,
@@ -27976,7 +29009,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const trace = metalPrefillTraceRequested();
         const shape = self.denseCausalBatchShape(request) orelse return null;
         var attention_region = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .attention);
-        defer attention_region.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attention_region);
         if (request.ple != null) {
             if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=ple\n", .{request.attention.layer_index});
             return null;
@@ -28012,44 +29045,44 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         var q_ct: CT = undefined;
         var q_owned = false;
-        defer if (q_owned) freeOp(ctx, q_ct);
+        defer if (q_owned) freeTemporaryWorkspaceCtOp(ctx, q_ct);
         var k_ct: CT = undefined;
         var k_owned = false;
-        defer if (k_owned) freeOp(ctx, k_ct);
+        defer if (k_owned) freeTemporaryWorkspaceCtOp(ctx, k_ct);
         var v_ct: CT = undefined;
         var v_owned = false;
-        defer if (v_owned) freeOp(ctx, v_ct);
+        defer if (v_owned) freeTemporaryWorkspaceCtOp(ctx, v_ct);
 
         if (request.attention_input) |attention_input| {
             const q_slot_value = q_slot orelse return null;
             const k_slot_value = k_slot orelse return null;
             const v_slot_value = v_slot orelse return null;
-            q_ct = (try decoderRuntimeApplyLinearOp(ctx, &.{
+            q_ct = (try self.decoderRuntimeApplyDenseProjection(&.{
                 .slot = q_slot_value,
                 .input = attention_input,
                 .in_dim = request.hidden_size,
                 .out_dim = attention_input_size,
-            })) orelse {
+            }, 0)) orelse {
                 if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=q-linear slot={d}\n", .{ request.attention.layer_index, q_slot_value });
                 return null;
             };
             q_owned = true;
-            k_ct = (try decoderRuntimeApplyLinearOp(ctx, &.{
+            k_ct = (try self.decoderRuntimeApplyDenseProjection(&.{
                 .slot = k_slot_value,
                 .input = attention_input,
                 .in_dim = request.hidden_size,
                 .out_dim = kv_dim,
-            })) orelse {
+            }, 1)) orelse {
                 if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=k-linear slot={d}\n", .{ request.attention.layer_index, k_slot_value });
                 return null;
             };
             k_owned = true;
-            v_ct = (try decoderRuntimeApplyLinearOp(ctx, &.{
+            v_ct = (try self.decoderRuntimeApplyDenseProjection(&.{
                 .slot = v_slot_value,
                 .input = attention_input,
                 .in_dim = request.hidden_size,
                 .out_dim = kv_dim,
-            })) orelse {
+            }, 2)) orelse {
                 if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=v-linear slot={d}\n", .{ request.attention.layer_index, v_slot_value });
                 return null;
             };
@@ -28065,9 +29098,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const q_norm_value = q_norm_slot orelse return null;
         const k_norm_value = k_norm_slot orelse return null;
         var q_projected_mt = try self.ownedDeviceMetalTensorFromCt(q_ct);
-        defer q_projected_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&q_projected_mt);
         var k_projected_mt = try self.ownedDeviceMetalTensorFromCt(k_ct);
-        defer k_projected_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&k_projected_mt);
 
         var q_rope_mt = (try self.applyBatchedHeadNormRopeDevice(
             q_projected_mt,
@@ -28087,7 +29120,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=q-rope rows={d} batch={d} seq={d} heads={d} head_dim={d} rope={d}\n", .{ request.attention.layer_index, shape.rows, shape.batch, shape.seq_len, request.num_heads, request.head_dim, request.rope_active_dim });
             return null;
         };
-        defer q_rope_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&q_rope_mt);
         var k_rope_mt = (try self.applyBatchedHeadNormRopeDevice(
             k_projected_mt,
             shape.batch,
@@ -28106,12 +29139,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=k-rope rows={d} batch={d} seq={d} heads={d} head_dim={d} rope={d}\n", .{ request.attention.layer_index, shape.rows, shape.batch, shape.seq_len, request.num_kv_heads, request.head_dim, request.rope_active_dim });
             return null;
         };
-        defer k_rope_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&k_rope_mt);
         self.activePlannedComputeBarrier(frame_active);
         const q_ready = try self.ctFromOwnedMetalTensor(try q_rope_mt.retainedCopy());
-        defer freeOp(ctx, q_ready);
+        defer freeTemporaryWorkspaceCtOp(ctx, q_ready);
         const k_ready = try self.ctFromOwnedMetalTensor(try k_rope_mt.retainedCopy());
-        defer freeOp(ctx, k_ready);
+        defer freeTemporaryWorkspaceCtOp(ctx, k_ready);
 
         var attention_output_mt = (try self.applyBatchedDenseCausalAttentionDevice(
             q_ready,
@@ -28123,15 +29156,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.num_kv_heads,
             request.head_dim,
             null,
+            if (self.workspace_invocation_context) |context|
+                if (context.workspace_uses) |uses|
+                    if (uses.allocations != null) request.residual else null
+                else
+                    null
+            else
+                null,
         )) orelse {
             if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=attention batch={d} seq={d}\n", .{ request.attention.layer_index, shape.batch, shape.seq_len });
             return null;
         };
-        defer attention_output_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attention_output_mt);
         self.activePlannedComputeBarrier(frame_active);
 
         var residual_mt = try self.ownedDeviceMetalTensorFromCt(request.residual);
-        defer residual_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&residual_mt);
         var block_mt = (try self.finishGatedDecoderBlockFromAttentionOutputMt(
             request,
             request.attention.layer_index,
@@ -28142,18 +29182,31 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (trace) std.debug.print("prefill-trace: dense-qwen3-block-null layer={d} reason=finish-block\n", .{request.attention.layer_index});
             return null;
         };
-        errdefer block_mt.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&block_mt);
         var result = try self.ctFromOwnedMetalTensor(block_mt);
+        block_mt = .empty;
+        errdefer freeTemporaryWorkspaceCtOp(ctx, result);
 
-        if (request.output_scale_value) |scale| {
+        if (self.hasOwnedDensePrefillOutputs() and request.output_scale_value != null) {
+            var input = try self.ownedDeviceMetalTensorFromCt(result);
+            defer input.deinitWithCleanup(self.densePrefillOutputCleanup());
+            const scaled = (try self.densePrefillScaleOutput(request, input, request.output_scale_value.?)) orelse return error.PreparedWorkspaceScaleUnavailable;
+            errdefer {
+                var failed = scaled;
+                failed.deinitWithCleanup(self.densePrefillOutputCleanup());
+            }
+            const replacement = try self.ctFromOwnedMetalTensor(scaled);
+            freeTemporaryWorkspaceCtOp(ctx, result);
+            result = replacement;
+        } else if (request.output_scale_value) |scale| {
             const scale_ct = try self.scalarDecodeCt(scale);
-            defer freeOp(ctx, scale_ct);
+            defer freeTemporaryWorkspaceCtOp(ctx, scale_ct);
             const scaled = try multiplyOp(ctx, result, scale_ct);
-            freeOp(ctx, result);
+            freeTemporaryWorkspaceCtOp(ctx, result);
             result = scaled;
         } else if (request.output_scale) |scale_ct| {
             const scaled = try multiplyOp(ctx, result, scale_ct);
-            freeOp(ctx, result);
+            freeTemporaryWorkspaceCtOp(ctx, result);
             result = scaled;
         }
 
@@ -28363,9 +29416,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn runDenseFfnResidualOp(ctx: *anyopaque, request: *const ops.RunDenseFfnResidualRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         var residual = try self.ownedMetalTensorFromCt(request.residual);
-        defer residual.deinit();
+        defer self.retireTemporaryWorkspaceValue(&residual);
         if (try metal_runtime.decoderRuntimeApplyLinearActivationLinearResidual(self.provider_impl, .{
             .first_linear_slot = request.first_linear_slot,
             .second_linear_slot = request.second_linear_slot,
@@ -28389,14 +29442,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 request.intermediate_size,
             )) |tensor| {
                 const activated = try self.ctFromOwnedMetalTensor(tensor);
-                defer freeOp(ctx, activated);
+                defer freeTemporaryWorkspaceCtOp(ctx, activated);
                 const projected = (try decoderRuntimeApplyLinearOp(ctx, &.{
                     .slot = request.second_linear_slot,
                     .input = activated,
                     .in_dim = request.intermediate_size,
                     .out_dim = request.hidden_size,
                 })) orelse return null;
-                defer freeOp(ctx, projected);
+                defer freeTemporaryWorkspaceCtOp(ctx, projected);
                 return addOp(ctx, projected, request.residual);
             }
         }
@@ -28407,14 +29460,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .in_dim = request.hidden_size,
             .out_dim = request.intermediate_size,
         })) orelse return null;
-        defer freeOp(ctx, first);
+        defer freeTemporaryWorkspaceCtOp(ctx, first);
 
         const activated = (try decoderRuntimeApplyActivationOp(ctx, &.{
             .input = first,
             .kind = request.activation,
             .dim = request.intermediate_size,
         })) orelse return null;
-        defer freeOp(ctx, activated);
+        defer freeTemporaryWorkspaceCtOp(ctx, activated);
 
         const projected = (try decoderRuntimeApplyLinearOp(ctx, &.{
             .slot = request.second_linear_slot,
@@ -28422,7 +29475,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .in_dim = request.intermediate_size,
             .out_dim = request.hidden_size,
         })) orelse return null;
-        defer freeOp(ctx, projected);
+        defer freeTemporaryWorkspaceCtOp(ctx, projected);
 
         return addOp(ctx, projected, request.residual);
     }
@@ -28575,10 +29628,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const input_buf = toBuf(request.input);
         if (bufHasAnyQuantizedStorage(input_buf)) return null;
-        const gate_zero_bias = try self.cachedZeroBiasBuf(request.intermediate_size);
-        defer freeOp(ctx, gate_zero_bias);
-        const output_zero_bias = try self.cachedZeroBiasBuf(request.hidden_size);
-        defer freeOp(ctx, output_zero_bias);
+        var gate_zero_bias_view: Buf = undefined;
+        var gate_zero_bias_shape: [1]i64 = undefined;
+        const gate_zero_bias = try self.borrowedZeroBiasBuf(&gate_zero_bias_view, &gate_zero_bias_shape, request.intermediate_size);
+        var output_zero_bias_view: Buf = undefined;
+        var output_zero_bias_shape: [1]i64 = undefined;
+        const output_zero_bias = try self.borrowedZeroBiasBuf(&output_zero_bias_view, &output_zero_bias_shape, request.hidden_size);
         const gate_slot = (try self.ensureDynamicLinearSlot(
             request.gate_weight,
             gate_zero_bias,
@@ -28599,7 +29654,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         )) orelse return null;
 
         var input = try self.ownedMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         if (!input.isDevice()) return null;
         if (lighton_prefill) {
             const output = (try metal_runtime.decoderRuntimeTryApplyLightOnPrefillFfn(self.provider_impl, .{
@@ -28623,7 +29678,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .out_dim = request.intermediate_size,
                 .activation = request.activation,
             })) orelse return null;
-            defer gated.deinit();
+            defer self.retireTemporaryWorkspaceValue(&gated);
             const output = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
                 .slot = down_slot,
                 .input = gated,
@@ -28654,9 +29709,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         request: *const ops.RunGatedFfnResidualRequest,
     ) !?CT {
         var input = try self.ownedMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         var residual = try self.ownedMetalTensorFromCt(request.residual);
-        defer residual.deinit();
+        defer self.retireTemporaryWorkspaceValue(&residual);
         if (!input.isDevice() or !residual.isDevice()) return null;
         if (input.ndim() != 2 or residual.ndim() != 2) return null;
         const rows: usize = @intCast(input.dim(0));
@@ -28670,7 +29725,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .intermediate_size = request.intermediate_size,
             .activation = request.activation,
         }, input, 0, false)) orelse return null;
-        defer products.deinit();
+        defer self.retireTemporaryWorkspaceValue(&products);
         products.releaseInputs();
         const gated = products.gated;
 
@@ -28680,7 +29735,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .in_dim = request.intermediate_size,
             .out_dim = request.hidden_size,
         })) orelse return null;
-        defer projected.deinit();
+        defer self.retireTemporaryWorkspaceValue(&projected);
 
         var normalized = if (request.post_down_rms_norm_weight) |weight_ct| blk: {
             var weight = if (request.post_down_rms_norm_slot) |slot| slot_weight: {
@@ -28691,7 +29746,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 }
                 break :slot_weight try self.ownedDeviceMetalTensorFromCt(weight_ct);
             } else try self.ownedDeviceMetalTensorFromCt(weight_ct);
-            defer weight.deinit();
+            defer self.retireTemporaryWorkspaceValue(&weight);
             break :blk (try metal_runtime.decoderRuntimeApplyRmsNormWeightDevice(
                 self.provider_impl,
                 projected,
@@ -28716,7 +29771,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }, &self.timing_stats)) orelse return null
         else
             try projected.retainedCopy();
-        defer normalized.deinit();
+        defer self.retireTemporaryWorkspaceValue(&normalized);
 
         const output = (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
             .lhs = normalized,
@@ -28747,9 +29802,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var owns_q = false;
         var owns_k = false;
         var owns_v = false;
-        defer if (owns_q and q_tensor != null) freeOp(ctx, q_tensor.?);
-        defer if (owns_k and k_tensor != null) freeOp(ctx, k_tensor.?);
-        defer if (owns_v and v_tensor != null) freeOp(ctx, v_tensor.?);
+        defer if (owns_q and q_tensor != null) freeTemporaryWorkspaceCtOp(ctx, q_tensor.?);
+        defer if (owns_k and k_tensor != null) freeTemporaryWorkspaceCtOp(ctx, k_tensor.?);
+        defer if (owns_v and v_tensor != null) freeTemporaryWorkspaceCtOp(ctx, v_tensor.?);
 
         const can_project_from_attention_input = request.attention_input != null and request.fused_qkv_linear_slot != null;
 
@@ -28780,7 +29835,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const residual_buf = toBuf(request.residual);
                 if (residual_buf.quantized_storage == null) {
                     var residual_mt = try self.ownedMetalTensorFromCt(request.residual);
-                    defer residual_mt.deinit();
+                    defer self.retireTemporaryWorkspaceValue(&residual_mt);
                     const kv = attention.kv_cache.?;
                     var bootstrap: ?PagedKvBootstrap = null;
                     defer if (bootstrap) |*owned| owned.deinit(self.allocator);
@@ -28802,11 +29857,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         const v_buf = toBuf(v_ct_fast);
                         if (k_buf.quantized_storage == null and v_buf.quantized_storage == null) {
                             var q_mt = try self.ownedMetalTensorFromCt(q_tensor.?);
-                            defer q_mt.deinit();
+                            defer self.retireTemporaryWorkspaceValue(&q_mt);
                             var k_mt = try self.ownedMetalTensorFromCt(k_ct_fast);
-                            defer k_mt.deinit();
+                            defer self.retireTemporaryWorkspaceValue(&k_mt);
                             var v_mt = try self.ownedMetalTensorFromCt(v_ct_fast);
-                            defer v_mt.deinit();
+                            defer self.retireTemporaryWorkspaceValue(&v_mt);
 
                             if (try metal_runtime.runCompressedAttentionDenseDecoderBlockDirect(self.provider_impl, .{
                                 .q = q_mt,
@@ -28855,7 +29910,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         }
                     } else if (can_project_from_attention_input) {
                         var attention_input_mt = try self.ownedMetalTensorFromCt(request.attention_input.?);
-                        defer attention_input_mt.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&attention_input_mt);
                         if (try metal_runtime.runCompressedAttentionDenseDecoderBlockDirect(self.provider_impl, .{
                             .q = null,
                             .k_suffix = null,
@@ -28918,13 +29973,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (trace) std.debug.print("dense-block-trace: fused_qkv linear returned null rows={d} mode={s}\n", .{ attention.query_sequence_len, @tagName(attention.mode) });
                 return null;
             };
-            errdefer freeOp(ctx, fused_qkv);
+            errdefer freeTemporaryWorkspaceCtOp(ctx, fused_qkv);
             const q = try cb.sliceLastDim(fused_qkv, 0, q_dim);
-            errdefer freeOp(ctx, q);
+            errdefer freeTemporaryWorkspaceCtOp(ctx, q);
             const k = try cb.sliceLastDim(fused_qkv, q_dim, q_dim + kv_dim);
-            errdefer freeOp(ctx, k);
+            errdefer freeTemporaryWorkspaceCtOp(ctx, k);
             const v = try cb.sliceLastDim(fused_qkv, q_dim + kv_dim, q_dim + kv_dim * 2);
-            freeOp(ctx, fused_qkv);
+            freeTemporaryWorkspaceCtOp(ctx, fused_qkv);
             q_tensor = q;
             k_tensor = k;
             v_tensor = v;
@@ -28966,7 +30021,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 request.num_kv_heads,
                 request.head_dim,
             );
-            errdefer freeOp(ctx, attn_out);
+            errdefer freeTemporaryWorkspaceCtOp(ctx, attn_out);
 
             var current = attn_out;
             if (request.attention_pre_linear_rms_norm_slot) |slot| {
@@ -28976,10 +30031,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     .hidden_size = request.num_heads * request.head_dim,
                     .eps = request.eps,
                 })) orelse {
-                    freeOp(ctx, current);
+                    freeTemporaryWorkspaceCtOp(ctx, current);
                     break :blk null;
                 };
-                freeOp(ctx, current);
+                freeTemporaryWorkspaceCtOp(ctx, current);
                 current = normed;
             }
 
@@ -28990,10 +30045,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .out_dim = request.hidden_size,
             })) orelse {
                 if (trace) std.debug.print("dense-block-trace: attention output linear returned null rows={d} mode={s}\n", .{ attention.query_sequence_len, @tagName(attention.mode) });
-                freeOp(ctx, current);
+                freeTemporaryWorkspaceCtOp(ctx, current);
                 break :blk null;
             };
-            freeOp(ctx, current);
+            freeTemporaryWorkspaceCtOp(ctx, current);
             current = projected;
 
             if (request.attention_post_linear_rms_norm_slot) |slot| {
@@ -29003,19 +30058,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     .hidden_size = request.hidden_size,
                     .eps = request.eps,
                 })) orelse {
-                    freeOp(ctx, current);
+                    freeTemporaryWorkspaceCtOp(ctx, current);
                     break :blk null;
                 };
-                freeOp(ctx, current);
+                freeTemporaryWorkspaceCtOp(ctx, current);
                 current = normed;
             }
 
             const result = try addOp(ctx, current, request.residual);
-            freeOp(ctx, current);
+            freeTemporaryWorkspaceCtOp(ctx, current);
             break :blk result;
         };
         const attn_res = maybe_attn_res orelse return null;
-        defer freeOp(ctx, attn_res);
+        defer freeTemporaryWorkspaceCtOp(ctx, attn_res);
 
         const ffn_normed = (try decoderRuntimeApplyBlockFfnNorm(
             ctx,
@@ -29028,7 +30083,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (trace) std.debug.print("dense-block-trace: ffn norm returned null rows={d} mode={s}\n", .{ attention.query_sequence_len, @tagName(attention.mode) });
             return null;
         };
-        defer if (ffn_normed != attn_res) freeOp(ctx, ffn_normed);
+        defer if (ffn_normed != attn_res) freeTemporaryWorkspaceCtOp(ctx, ffn_normed);
 
         const result = try runDenseFfnResidualOp(ctx, &.{
             .first_linear_slot = request.first_ffn_linear_slot,
@@ -29063,9 +30118,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         !hasHostView(a_buf) and !hasHostView(b_buf))
                     {
                         var lhs = try a_metal.retainedCopy();
-                        defer lhs.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&lhs);
                         var rhs = try b_metal.retainedCopy();
-                        defer rhs.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&rhs);
                         if (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
                             .lhs = lhs,
                             .rhs = rhs,
@@ -29078,9 +30133,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (a_metal.isDevice() and bufElemCount(b_buf) == 1 and !hasHostView(a_buf)) {
                     if (tryDirectDenseHostValue(b_buf, 0)) |scalar| {
                         var lhs = try a_metal.retainedCopy();
-                        defer lhs.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&lhs);
                         var rhs = (try self.deviceScalarTensorLike(a_metal, scalar)) orelse return error.UnsupportedTensorType;
-                        defer rhs.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&rhs);
                         if (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
                             .lhs = lhs,
                             .rhs = rhs,
@@ -29095,9 +30150,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (b_metal.isDevice() and bufElemCount(a_buf) == 1) {
                     if (tryDirectDenseHostValue(a_buf, 0)) |scalar| {
                         var lhs = (try self.deviceScalarTensorLike(b_metal, scalar)) orelse return error.UnsupportedTensorType;
-                        defer lhs.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&lhs);
                         var rhs = try b_metal.retainedCopy();
-                        defer rhs.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&rhs);
                         if (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
                             .lhs = lhs,
                             .rhs = rhs,
@@ -29131,16 +30186,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (a_buf.lazy_multiply != null or b_buf.lazy_multiply != null) {
             var materialized_a: ?CT = null;
             var materialized_b: ?CT = null;
-            defer if (materialized_a) |tensor| freeOp(self, tensor);
-            defer if (materialized_b) |tensor| freeOp(self, tensor);
+            defer if (materialized_a) |tensor| freeTemporaryWorkspaceCtOp(self, tensor);
+            defer if (materialized_b) |tensor| freeTemporaryWorkspaceCtOp(self, tensor);
             if (a_buf.lazy_multiply != null) {
                 var tensor = try self.ownedDeviceMetalTensorFromCt(a);
-                errdefer tensor.deinit();
+                errdefer self.retireTemporaryWorkspaceValue(&tensor);
                 materialized_a = try self.ctFromOwnedMetalTensor(tensor);
             }
             if (b_buf.lazy_multiply != null) {
                 var tensor = try self.ownedDeviceMetalTensorFromCt(b);
-                errdefer tensor.deinit();
+                errdefer self.retireTemporaryWorkspaceValue(&tensor);
                 materialized_b = try self.ctFromOwnedMetalTensor(tensor);
             }
             return addOp(ctx, materialized_a orelse a, materialized_b orelse b);
@@ -29178,9 +30233,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // a separate handle so other consumers retain the original lazy pair.
         if (a_buf.lazy_multiply != null or b_buf.lazy_multiply != null) {
             const materialized_a = if (a_buf.lazy_multiply != null) try self.ctFromOwnedMetalTensor(try self.ownedDeviceMetalTensorFromCt(a)) else null;
-            defer if (materialized_a) |value| freeOp(self, value);
+            defer if (materialized_a) |value| freeTemporaryWorkspaceCtOp(self, value);
             const materialized_b = if (b_buf.lazy_multiply != null) try self.ctFromOwnedMetalTensor(try self.ownedDeviceMetalTensorFromCt(b)) else null;
-            defer if (materialized_b) |value| freeOp(self, value);
+            defer if (materialized_b) |value| freeTemporaryWorkspaceCtOp(self, value);
             return multiplyOp(ctx, materialized_a orelse a, materialized_b orelse b);
         }
         if (!disableRuntimeElementwise()) {
@@ -29200,9 +30255,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         !hasHostView(a_buf) and !hasHostView(b_buf))
                     {
                         var lhs = try a_metal.retainedCopy();
-                        defer lhs.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&lhs);
                         var rhs = try b_metal.retainedCopy();
-                        defer rhs.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&rhs);
                         if (try metal_runtime.decoderRuntimeApplyMultiply(
                             self.provider_impl,
                             lhs,
@@ -29218,7 +30273,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (a_metal.isDevice() and bufElemCount(b_buf) == 1 and !hasHostView(a_buf)) {
                     if (tryDirectDenseHostValue(b_buf, 0)) |scale| {
                         var input_mt = try a_metal.retainedCopy();
-                        defer input_mt.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&input_mt);
                         if (try metal_runtime.decoderRuntimeApplyScale(self.provider_impl, input_mt, scale)) |tensor| {
                             return self.ctFromOwnedMetalTensor(tensor);
                         }
@@ -29229,7 +30284,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (b_metal.isDevice() and bufElemCount(a_buf) == 1 and !hasHostView(b_buf)) {
                     if (tryDirectDenseHostValue(a_buf, 0)) |scale| {
                         var input_mt = try b_metal.retainedCopy();
-                        defer input_mt.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&input_mt);
                         if (try metal_runtime.decoderRuntimeApplyScale(self.provider_impl, input_mt, scale)) |tensor| {
                             return self.ctFromOwnedMetalTensor(tensor);
                         }
@@ -29245,9 +30300,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                             shape_i64[1] > 0)
                         {
                             var lhs = try self.ownedMetalTensorFromCt(a);
-                            defer lhs.deinit();
+                            defer self.retireTemporaryWorkspaceValue(&lhs);
                             var rhs = try self.ownedMetalTensorFromCt(b);
-                            defer rhs.deinit();
+                            defer self.retireTemporaryWorkspaceValue(&rhs);
                             if (try metal_runtime.decoderRuntimeApplyMultiply(
                                 self.provider_impl,
                                 lhs,
@@ -29290,9 +30345,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const up_buf = toBuf(up);
         if (bufHasAnyQuantizedStorage(gate_buf) or bufHasAnyQuantizedStorage(up_buf)) return null;
         var gate_tensor = try self.ownedDeviceMetalTensorFromCt(gate);
-        defer gate_tensor.deinit();
+        defer self.retireTemporaryWorkspaceValue(&gate_tensor);
         var up_tensor = try self.ownedDeviceMetalTensorFromCt(up);
-        defer up_tensor.deinit();
+        defer self.retireTemporaryWorkspaceValue(&up_tensor);
         const output = (try metal_runtime.decoderRuntimeApplyActivationMultiply(
             self.provider_impl,
             gate_tensor,
@@ -29313,7 +30368,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn ownedDeviceView(self: *MetalCompute, tensor: *const MetalTensor, offset: usize, bytes: usize, shape: []const i32) !CT {
         var view = try tensor.retainedView(offset, bytes, shape);
-        errdefer view.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&view);
         return self.ctFromOwnedMetalTensor(view);
     }
 
@@ -29340,19 +30395,19 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const packed_storage = denseDeviceF32(workspace.views[2].?).?;
         const product_storage = denseDeviceF32(workspace.views[12].?).?;
         var output = try MetalTensor.deviceAllocate(runtime, rows * hidden * 4, .private, &.{ @intCast(rows), @intCast(hidden) });
-        errdefer output.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&output);
         var start: usize = 0;
         while (start < rows) {
             try self.computeBackend().checkExecutionControl();
             const count = @min(workspace.projection_rows, rows - start);
             var source = try x.retainedView(start * hidden * 4, count * hidden * 4, &.{ @intCast(count), @intCast(hidden) });
-            defer source.deinit();
+            defer self.retireTemporaryWorkspaceValue(&source);
             var projection = try packed_storage.retainedView(0, count * intermediate * 8, &.{ @intCast(count), @intCast(intermediate * 2) });
-            defer projection.deinit();
+            defer self.retireTemporaryWorkspaceValue(&projection);
             var product = try product_storage.retainedView(0, count * intermediate * 4, &.{ @intCast(count), @intCast(intermediate) });
-            defer product.deinit();
+            defer self.retireTemporaryWorkspaceValue(&product);
             var destination = try output.retainedView(start * hidden * 4, count * hidden * 4, &.{ @intCast(count), @intCast(hidden) });
-            defer destination.deinit();
+            defer self.retireTemporaryWorkspaceValue(&destination);
             if (!try metal_runtime.decoderRuntimeApplyAudioLinearInto(self.provider_impl, packed_slot, source, count, hidden, intermediate * 2, projection)) return error.AudioSchedulePreparedSlotMissing;
             if (metal_runtime.termite_metal_decode_runtime_packed_gelu(runtime, projection.deviceHandle(), projection.deviceByteOffset(), product.deviceHandle(), product.deviceByteOffset(), @intCast(count), @intCast(intermediate)) != 0) return error.MetalKernelDispatchFailed;
             if (!try metal_runtime.decoderRuntimeApplyAudioLinearInto(self.provider_impl, down_slot, product, count, intermediate, hidden, destination)) return error.AudioSchedulePreparedSlotMissing;
@@ -29396,16 +30451,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const x = denseDeviceF32(input) orelse return null;
         if (x.elemCount() != rows * hidden) return error.InvalidTensorShape;
         var output = try MetalTensor.deviceAllocate(runtime, rows * intermediate * 4, .private, &.{ @intCast(rows), @intCast(intermediate) });
-        errdefer output.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&output);
         const tile_storage = denseDeviceF32(workspace.views[2].?).?;
         var start: usize = 0;
         while (start < rows) {
             try self.computeBackend().checkExecutionControl();
             const count = @min(workspace.projection_rows, rows - start);
             var source = try x.retainedView(start * hidden * 4, count * hidden * 4, &.{ @intCast(count), @intCast(hidden) });
-            defer source.deinit();
+            defer self.retireTemporaryWorkspaceValue(&source);
             var tile = try tile_storage.retainedView(0, count * intermediate * 8, &.{ @intCast(count), @intCast(intermediate * 2) });
-            defer tile.deinit();
+            defer self.retireTemporaryWorkspaceValue(&tile);
             if (!try metal_runtime.decoderRuntimeApplyAudioLinearInto(self.provider_impl, slot, source, count, hidden, intermediate * 2, tile)) return error.AudioSchedulePreparedSlotMissing;
             if (metal_runtime.termite_metal_decode_runtime_packed_gelu(runtime, tile.deviceHandle(), tile.deviceByteOffset(), output.deviceHandle(), output.deviceByteOffset() + start * intermediate * 4, @intCast(count), @intCast(intermediate)) != 0) return error.MetalKernelDispatchFailed;
             start += count;
@@ -29417,7 +30472,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (rows == 0 or width == 0 or bufElemCount(toBuf(input)) != rows * width * 2) return error.InvalidTensorShape;
         var x = try self.ownedDeviceMetalTensorFromCt(input);
-        defer x.deinit();
+        defer self.retireTemporaryWorkspaceValue(&x);
         const output = try metal_runtime.decoderRuntimePackedGeluMultiply(self.provider_impl, x, rows, width);
         return try self.ctFromOwnedMetalTensor(output);
     }
@@ -29449,7 +30504,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         inputs[1] = position_tensor;
         const plane_bytes = rows * hidden * @sizeOf(f32);
         var output = try MetalTensor.deviceAllocate(runtime, plane_bytes * 3, .private, &.{ 3, @intCast(rows), @intCast(hidden) });
-        defer output.deinit();
+        defer self.retireTemporaryWorkspaceValue(&output);
         if (!try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, inputs, output)) return error.MetalKernelDispatchFailed;
         const shape = [_]i32{ @intCast(rows), @intCast(hidden) };
         const q = try self.ownedDeviceView(&output, 0, plane_bytes, &shape);
@@ -29473,9 +30528,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (bufHasAnyQuantizedStorage(toBuf(gamma)) or bufHasAnyQuantizedStorage(toBuf(beta))) return null;
         if (bufElemCount(toBuf(gamma)) != dim or bufElemCount(toBuf(beta)) != dim) return null;
         var weight = try self.ownedDeviceMetalTensorFromCt(gamma);
-        defer weight.deinit();
+        defer self.retireTemporaryWorkspaceValue(&weight);
         var bias = try self.ownedDeviceMetalTensorFromCt(beta);
-        defer bias.deinit();
+        defer self.retireTemporaryWorkspaceValue(&bias);
         const request = ops.gliner_boundary_device.Kernel{
             .kind = .add_norm_centered,
             .dims = .{ @intCast(rows), @intCast(dim), 1, 0, 0, 0, 0, 0 },
@@ -29489,7 +30544,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         inputs[3] = bias;
         const bytes = left.elemCount() * @sizeOf(f32);
         var output = try MetalTensor.deviceAllocate(runtime, layout.output_elements * 4, .private, &.{ 2, @intCast(rows), @intCast(dim) });
-        defer output.deinit();
+        defer self.retireTemporaryWorkspaceValue(&output);
         if (!try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, inputs, output)) return error.MetalKernelDispatchFailed;
         const shape = [_]i32{ @intCast(rows), @intCast(dim) };
         const normed = try self.ownedDeviceView(&output, 0, bytes, &shape);
@@ -29517,7 +30572,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var inputs: [ops.gliner_boundary_device.max_inputs]?MetalTensor = @splat(null);
         inputs[0] = source;
         var output = try MetalTensor.deviceAllocate(runtime, try std.math.mul(usize, count, 4), .private, &.{ @intCast(rows), @intCast(width) });
-        errdefer output.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&output);
         if (!(try metal_runtime.decoderRuntimeGlinerBoundaryIntoDevice(self.provider_impl, request, inputs, output))) {
             output.deinit();
             return null;
@@ -29940,12 +30995,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const host_ct = try denseBuf(self.allocator, out, true, &out_shape);
             defer freeOp(self, host_ct);
             var device_tensor = try self.ownedDeviceMetalTensorFromCt(host_ct);
-            errdefer device_tensor.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&device_tensor);
             return scaleDecodeTensor(self, device_tensor, scale);
         }
 
         var weight_mt = try self.ownedMetalTensorFromCt(weight);
-        defer weight_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&weight_mt);
         var embedding = (try metal_runtime.decoderRuntimeEmbeddingLookup(self.provider_impl, .{
             .weight = weight_mt,
             .model_identity = embeddingTableIdentity(toBuf(weight)),
@@ -29953,7 +31008,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .total = token_ids.len,
             .dim = dim,
         })) orelse return null;
-        errdefer embedding.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&embedding);
         return scaleDecodeTensor(self, embedding, scale);
     }
 
@@ -29980,7 +31035,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn scaleDecodeTensor(self: *MetalCompute, tensor: MetalTensor, scale: f32) !?MetalTensor {
         if (std.math.approxEqAbs(f32, scale, 1.0, 1e-6)) return tensor;
         var input = tensor;
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         return metal_runtime.decoderRuntimeApplyScale(self.provider_impl, input, scale);
     }
 
@@ -30006,7 +31061,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer self.endPlannedGraphScopeForSelf(planned_scope) catch {};
 
         var ple_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .ple);
-        defer ple_region_scope.deinit();
+        defer self.retireTemporaryWorkspaceValue(&ple_region_scope);
 
         var model_proj = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
             .slot = ple_model_proj_slot,
@@ -30014,11 +31069,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .in_dim = request.hidden_size,
             .out_dim = ple_total_dim,
         })) orelse return null;
-        defer model_proj.deinit();
+        defer self.retireTemporaryWorkspaceValue(&model_proj);
 
         const flat_rows = std.math.mul(usize, request.items.len, request.layer_count) catch return null;
         var projected_flat = (try reshapeDecodeTensorView(&model_proj, flat_rows, request.ple_hidden_size)) orelse return null;
-        defer projected_flat.deinit();
+        defer self.retireTemporaryWorkspaceValue(&projected_flat);
 
         var normed_flat = (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
             .slot = ple_proj_norm_slot,
@@ -30026,10 +31081,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .hidden_size = request.ple_hidden_size,
             .eps = request.norm_eps,
         }, &self.timing_stats)) orelse return null;
-        defer normed_flat.deinit();
+        defer self.retireTemporaryWorkspaceValue(&normed_flat);
 
         var normed_proj = (try reshapeDecodeTensorView(&normed_flat, request.items.len, ple_total_dim)) orelse return null;
-        defer normed_proj.deinit();
+        defer self.retireTemporaryWorkspaceValue(&normed_proj);
 
         return metal_runtime.decoderRuntimeApplyAddScale(self.provider_impl, .{
             .lhs = ple_token_embedding,
@@ -30076,7 +31131,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.ple_hidden_size,
             request.layer_count,
         )) orelse return null;
-        defer ple_input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&ple_input);
         try self.maybeDumpDecodeStageTensor("ple-input", layer_index, ple_input, request.ple_hidden_size);
 
         if (try metal_runtime.decoderRuntimeApplyPleResidualDevice(self.provider_impl, .{
@@ -30099,7 +31154,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .in_dim = request.hidden_size,
             .out_dim = request.ple_hidden_size,
         })) orelse return null;
-        defer gate_proj.deinit();
+        defer self.retireTemporaryWorkspaceValue(&gate_proj);
         try self.maybeDumpDecodeStageTensor("ple-gate-proj", layer_index, gate_proj, request.ple_hidden_size);
 
         var gate = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
@@ -30107,7 +31162,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .kind = request.activation,
             .dim = request.ple_hidden_size,
         }, &self.timing_stats)) orelse return null;
-        defer gate.deinit();
+        defer self.retireTemporaryWorkspaceValue(&gate);
         try self.maybeDumpDecodeStageTensor("ple-gate", layer_index, gate, request.ple_hidden_size);
 
         var gated = (try metal_runtime.decoderRuntimeApplyMultiply(
@@ -30116,7 +31171,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             ple_input,
             request.ple_hidden_size,
         )) orelse return null;
-        defer gated.deinit();
+        defer self.retireTemporaryWorkspaceValue(&gated);
         try self.maybeDumpDecodeStageTensor("ple-gated", layer_index, gated, request.ple_hidden_size);
 
         var projected = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
@@ -30125,7 +31180,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .in_dim = request.ple_hidden_size,
             .out_dim = request.hidden_size,
         })) orelse return null;
-        defer projected.deinit();
+        defer self.retireTemporaryWorkspaceValue(&projected);
         try self.maybeDumpDecodeStageTensor("ple-proj", layer_index, projected, request.hidden_size);
 
         var normed = (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
@@ -30134,7 +31189,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .hidden_size = request.hidden_size,
             .eps = request.norm_eps,
         }, &self.timing_stats)) orelse return null;
-        defer normed.deinit();
+        defer self.retireTemporaryWorkspaceValue(&normed);
         try self.maybeDumpDecodeStageTensor("ple-post", layer_index, normed, request.hidden_size);
 
         return metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
@@ -30192,14 +31247,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!input_mt_ptr.isDevice() or input_mt_ptr.elemCount() != heads * head_dim) return null;
         const flat_shape = [_]i32{ @intCast(heads), @intCast(head_dim) };
         var flat = try input_mt_ptr.retainedView(0, heads * head_dim * @sizeOf(f32), &flat_shape);
-        defer flat.deinit();
+        defer self.retireTemporaryWorkspaceValue(&flat);
         var normed = (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
             .slot = slot,
             .input = flat,
             .hidden_size = head_dim,
             .eps = 0.0,
         }, &self.timing_stats)) orelse return null;
-        errdefer normed.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&normed);
         const out_shape = [_]i32{ 1, @intCast(heads * head_dim) };
         const reshaped = try normed.retainedView(0, heads * head_dim * @sizeOf(f32), &out_shape);
         normed.deinit();
@@ -30403,7 +31458,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const input_mt_ptr = if (input_buf.metal_tensor) |*mt| mt else return null;
         if (!input_mt_ptr.isDevice()) return null;
         var input_mt = try input_mt_ptr.retainedCopy();
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         const scaled = (try metal_runtime.decoderRuntimeApplyScale(self.provider_impl, input_mt, scale)) orelse return null;
         return self.ctFromOwnedMetalTensor(scaled);
     }
@@ -30451,13 +31506,15 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             uploadStorageMode(dim * @sizeOf(f32)),
             &shape,
         );
-        errdefer device_tensor.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&device_tensor);
         try host_tensor.copyInto(&device_tensor);
         const gop = try self.unit_rms_weight_device_cache.getOrPut(self.allocator, dim);
         if (gop.found_existing) {
             device_tensor.deinit();
+            device_tensor = .empty;
         } else {
             gop.value_ptr.* = device_tensor;
+            device_tensor = .empty; // ownership moved before fallible retain
         }
         return try gop.value_ptr.retainedCopy();
     }
@@ -30476,9 +31533,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!input_mt_ptr.isDevice() or input_mt_ptr.elemCount() != kv_dim) return null;
         const flat_shape = [_]i32{ @intCast(heads), @intCast(head_dim) };
         var flat = try input_mt_ptr.retainedView(0, kv_dim * @sizeOf(f32), &flat_shape);
-        defer flat.deinit();
+        defer self.retireTemporaryWorkspaceValue(&flat);
         var ones = (try self.unitRmsWeightDeviceTensor(head_dim)) orelse return null;
-        defer ones.deinit();
+        defer self.retireTemporaryWorkspaceValue(&ones);
         var normed = (try metal_runtime.decoderRuntimeApplyRmsNormWeightDevice(
             self.provider_impl,
             flat,
@@ -30486,7 +31543,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             head_dim,
             eps,
         )) orelse return null;
-        errdefer normed.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&normed);
         const out_shape = [_]i32{ 1, @intCast(kv_dim) };
         const reshaped = try normed.retainedView(0, kv_dim * @sizeOf(f32), &out_shape);
         normed.deinit();
@@ -30505,9 +31562,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!input.isDevice() or input.elemCount() != kv_dim) return null;
         const flat_shape = [_]i32{ @intCast(heads), @intCast(head_dim) };
         var flat = try input.retainedView(0, kv_dim * @sizeOf(f32), &flat_shape);
-        defer flat.deinit();
+        defer self.retireTemporaryWorkspaceValue(&flat);
         var ones = (try self.unitRmsWeightDeviceTensor(head_dim)) orelse return null;
-        defer ones.deinit();
+        defer self.retireTemporaryWorkspaceValue(&ones);
         var normed = (try metal_runtime.decoderRuntimeApplyRmsNormWeightDevice(
             self.provider_impl,
             flat,
@@ -30515,7 +31572,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             head_dim,
             eps,
         )) orelse return null;
-        errdefer normed.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&normed);
         const out_shape = [_]i32{ 1, @intCast(kv_dim) };
         const reshaped = try normed.retainedView(0, kv_dim * @sizeOf(f32), &out_shape);
         normed.deinit();
@@ -30535,9 +31592,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!input.isDevice() or input.elemCount() != kv_dim) return null;
         const flat_shape = [_]i32{ @intCast(heads), @intCast(head_dim) };
         var flat = try input.retainedView(0, kv_dim * @sizeOf(f32), &flat_shape);
-        defer flat.deinit();
+        defer self.retireTemporaryWorkspaceValue(&flat);
         var ones = (try self.unitRmsWeightDeviceTensor(head_dim)) orelse return null;
-        defer ones.deinit();
+        defer self.retireTemporaryWorkspaceValue(&ones);
         var normed = (try metal_runtime.decoderRuntimeApplyRmsNormWeightDeviceScratch(
             self.provider_impl,
             flat,
@@ -30546,7 +31603,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             eps,
             output_index,
         )) orelse return null;
-        defer normed.deinit();
+        defer self.retireTemporaryWorkspaceValue(&normed);
         const out_shape = [_]i32{ 1, @intCast(kv_dim) };
         return try normed.retainedView(0, kv_dim * @sizeOf(f32), &out_shape);
     }
@@ -30565,11 +31622,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!output.isDevice() or output.elemCount() != kv_dim) return false;
         const flat_shape = [_]i32{ @intCast(heads), @intCast(head_dim) };
         var flat_input = try input.retainedView(0, kv_dim * @sizeOf(f32), &flat_shape);
-        defer flat_input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&flat_input);
         var flat_output = try output.retainedView(0, kv_dim * @sizeOf(f32), &flat_shape);
-        defer flat_output.deinit();
+        defer self.retireTemporaryWorkspaceValue(&flat_output);
         var ones = (try self.unitRmsWeightDeviceTensor(head_dim)) orelse return false;
-        defer ones.deinit();
+        defer self.retireTemporaryWorkspaceValue(&ones);
         return metal_runtime.decoderRuntimeApplyRmsNormWeightDeviceInto(
             self.provider_impl,
             flat_input,
@@ -30678,7 +31735,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const scale = output_scale_value orelse return hidden;
         if (@abs(scale - 1.0) <= 0.000001) return hidden;
         var tail_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .tail);
-        defer tail_region_scope.deinit();
+        defer self.retireTemporaryWorkspaceValue(&tail_region_scope);
         const scale_shape = [_]i32{1};
         const scale_ct = try fromFloat32ShapeOp(ctx, &[_]f32{scale}, &scale_shape);
         defer freeOp(ctx, scale_ct);
@@ -30740,9 +31797,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer freeOp(ctx, ffn_normed);
 
         var ffn_normed_mt = try self.ownedDeviceMetalTensorFromCt(ffn_normed);
-        defer ffn_normed_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&ffn_normed_mt);
         var attn_res_mt = try self.ownedDeviceMetalTensorFromCt(attn_res);
-        defer attn_res_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attn_res_mt);
         if (try metal_runtime.tryDeviceQuantizedGatedFfnResidual(self.provider_impl, .{
             .gate_linear_slot = layer.gate_ffn_linear_slot,
             .up_linear_slot = layer.up_ffn_linear_slot,
@@ -30830,9 +31887,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         output_mt: ?MetalTensor,
     ) !?CT {
         var attention_input_mt = try self.ownedDeviceMetalTensorFromCt(attention_input);
-        defer attention_input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attention_input_mt);
         var residual_mt = try self.ownedDeviceMetalTensorFromCt(residual);
-        defer residual_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&residual_mt);
         const ple_mt: ?MetalTensor = if (ple_input_for_block) |ct|
             try self.borrowedMetalTensorFromCt(ct)
         else
@@ -30949,7 +32006,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .in_dim = request.num_attention_heads * layer.head_dim,
             .out_dim = request.hidden_size,
         })) orelse return null;
-        defer projected.deinit();
+        defer self.retireTemporaryWorkspaceValue(&projected);
         // Match the qualified graph path exactly: Gemma's post-attention norm
         // and residual are one fused reduction/epilogue.  Encoding these as
         // two kernels changes rounding before the sensitive MoE router and
@@ -30970,11 +32027,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .hidden_size = request.hidden_size,
             .eps = request.norm_eps,
         }, &self.timing_stats)) orelse return null;
-        defer attn_residual.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attn_residual);
         try self.maybeDumpDecodeStageTensor("attn-residual", layer_index, attn_residual, request.hidden_size);
 
         var ffn_region = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .ffn);
-        defer ffn_region.deinit();
+        defer self.retireTemporaryWorkspaceValue(&ffn_region);
         const use_a4b_ffn_interleave = a4bExplicitCandidateEnabled(
             "TERMITE_METAL_ENABLE_A4B_FFN_INTERLEAVE",
             "TERMITE_METAL_DISABLE_A4B_FFN_INTERLEAVE",
@@ -31087,7 +32144,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .in_dim = request.hidden_size,
             .out_dim = moe.num_experts,
         })) orelse return null;
-        defer router_logits.deinit();
+        defer self.retireTemporaryWorkspaceValue(&router_logits);
         try self.maybeDumpDecodeStageTensor("a4b-router-logits", layer_index, router_logits, moe.num_experts);
         self.beginA4bRooflineOp(
             request,
@@ -31146,7 +32203,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             true,
             prepared_ptr.expert_scale,
         )) orelse return null;
-        defer routed.deinit();
+        defer self.retireTemporaryWorkspaceValue(&routed);
         try self.maybeDumpDecodeStageTensor("a4b-routed", layer_index, routed, request.hidden_size);
 
         self.beginA4bRooflineOp(
@@ -31168,7 +32225,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.hidden_size,
             request.norm_eps,
         )) orelse return null;
-        errdefer current.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&current);
         try self.maybeDumpDecodeStageTensor("a4b-ffn-result", layer_index, current, request.hidden_size);
 
         if (use_a4b_ffn_interleave) {
@@ -31181,7 +32238,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const ple_proj_slot = layer.ple_proj_linear_slot orelse return null;
             const ple_post_slot = layer.ple_post_norm_slot orelse return null;
             var ple_region = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .ple);
-            defer ple_region.deinit();
+            defer self.retireTemporaryWorkspaceValue(&ple_region);
             const ple_result = (try metal_runtime.decoderRuntimeApplyPleResidualDevice(self.provider_impl, .{
                 .hidden = current,
                 .ple = ple_input,
@@ -31298,7 +32355,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .kv_position_offset = attention.kv_position_offset,
             .sliding_window = attention.sliding_window,
         })) orelse return null;
-        defer attn_out.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attn_out);
         if (!attention.skip_kv_write) try commitPagedKvLayerDeviceWrite(attention);
 
         const output = (try self.finishA4bMoeLayerFromAttentionOutputMt(
@@ -31425,7 +32482,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer if (v_projected) |*tensor| tensor.deinit();
 
         var attention_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .attention);
-        defer attention_region_scope.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attention_region_scope);
 
         const layer_plan_has_ple =
             ple_input_for_block != null and
@@ -31569,7 +32626,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .plan = planned_view,
             .command_plan = planned_command_view,
         };
-        defer attention_setup_plan.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attention_setup_plan);
 
         var projection_input_mt = attention_input_mt;
         var projection_input_owned: ?MetalTensor = null;
@@ -31821,7 +32878,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 query_value_scale,
             ));
         } orelse return null;
-        defer q_for_block.deinit();
+        defer self.retireTemporaryWorkspaceValue(&q_for_block);
         self.timing_stats.active_decode_head_norm_ops += 1;
         self.timing_stats.active_decode_rope_ops += 1;
         self.timing_stats.active_decode_head_norm_rope_fused_ops += 1;
@@ -32119,13 +33176,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (entry.* == null or entry.*.?.deviceByteLen() < bytes) {
             const runtime = self.provider_impl.raw_decode_runtime orelse return error.NativeBatchedDecodeUnavailable;
             var tensor = try MetalTensor.deviceAllocateWithAllocator(self.allocator, runtime, bytes, .private, &.{@intCast(count)});
-            errdefer tensor.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&tensor);
             if (entry.*) |*old| old.deinit();
             entry.* = tensor;
             self.ocr_carrier_allocations += 1;
         } else self.ocr_carrier_reuses += 1;
         var view = try entry.*.?.retainedView(0, @as(usize, @intCast(shape[0])) * width * @sizeOf(f32), shape);
-        defer view.deinit();
+        defer self.retireTemporaryWorkspaceValue(&view);
         return retainedCtFromMetalTensor(self, &view);
     }
 
@@ -32149,12 +33206,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         for (0..rows) |row| {
             const row_shape = [_]i32{ 1, @intCast(in_dim) };
             var view = try input.retainedView(row * in_dim * @sizeOf(f32), in_dim * @sizeOf(f32), &row_shape);
-            defer view.deinit();
+            defer self.retireTemporaryWorkspaceValue(&view);
             var result = (if (norm_eps) |eps|
                 try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{ .slot = slot, .input = view, .hidden_size = in_dim, .eps = eps }, &self.timing_stats)
             else
                 try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{ .slot = slot, .input = view, .in_dim = in_dim, .out_dim = out_dim })) orelse return error.NativeBatchedDecodeUnavailable;
-            defer result.deinit();
+            defer self.retireTemporaryWorkspaceValue(&result);
             const ct = try retainedCtFromMetalTensor(self, &result);
             defer freeOp(ctx, ct);
             if (!try copyRows2DOp(ctx, carrier_ct, row, ct, 0, 1, out_dim)) return error.NativeBatchedDecodeUnavailable;
@@ -32175,7 +33232,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer freeOp(ctx, v_ct);
         for (0..rows) |row| {
             var view = try input.retainedView(row * in_dim * @sizeOf(f32), in_dim * @sizeOf(f32), &.{ 1, @intCast(in_dim) });
-            defer view.deinit();
+            defer self.retireTemporaryWorkspaceValue(&view);
             var triple = (try metal_runtime.tryApplyQuantizedRuntimeLinearQkvScratch(self.provider_impl, layer.q_linear_slot, layer.k_linear_slot, layer.v_linear_slot, view, 1, in_dim, q_dim, kv_dim)) orelse
                 (try metal_runtime.tryApplyQuantizedRuntimeLinearQkv(self.provider_impl, layer.q_linear_slot, layer.k_linear_slot, layer.v_linear_slot, view, 1, in_dim, q_dim, kv_dim)) orelse
                 (try metal_runtime.tryApplyDenseRuntimeLinearQkv(self.provider_impl, layer.q_linear_slot, layer.k_linear_slot, layer.v_linear_slot, view, 1, in_dim, q_dim, kv_dim)) orelse return error.NativeBatchedDecodeUnavailable;
@@ -32218,9 +33275,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!active) return false;
         defer if (active) metal_runtime.cancelFrame(runtime) catch {};
         var normed = try ocrRowwisePrepared(self, self, hidden, norm_slot, width, width, eps);
-        defer normed.deinit();
+        defer self.retireTemporaryWorkspaceValue(&normed);
         var logits = try ocrRowwisePrepared(self, self, normed, linear_slot, width, vocab, null);
-        defer logits.deinit();
+        defer self.retireTemporaryWorkspaceValue(&logits);
         // Row packing closes compute for its blits. Reopen the tail scope
         // so argmax consumes this frame rather than flushing and restoring it.
         try metal_runtime.beginPlannedComputeScope(runtime, @backingInt(metal_runtime.ComputeSource.tail), .tail);
@@ -32237,7 +33294,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     // singleton PLE tail. Consumes block just like finishGatedLayerTailMt.
     fn ocrRowwisePle(ctx: *anyopaque, self: *MetalCompute, request: *const ops.RunGatedDecoderBlockRequest, layer_index: usize, block: MetalTensor, ple: MetalTensor) !MetalTensor {
         var owned_block = block;
-        defer owned_block.deinit();
+        defer self.retireTemporaryWorkspaceValue(&owned_block);
         const rows: usize = @intCast(block.dim(0));
         const shape = [_]i32{ @intCast(rows), @intCast(request.hidden_size) };
         const output_ct = try self.ocrCarrier(ctx, .ple_output, &shape);
@@ -32246,11 +33303,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const h_shape = [_]i32{ 1, @intCast(request.hidden_size) };
             const p_shape = [_]i32{ 1, @intCast(request.ple_hidden_size) };
             var p = try ple.retainedView(row * request.ple_hidden_size * @sizeOf(f32), request.ple_hidden_size * @sizeOf(f32), &p_shape);
-            defer p.deinit();
+            defer self.retireTemporaryWorkspaceValue(&p);
             const h = try block.retainedView(row * request.hidden_size * @sizeOf(f32), request.hidden_size * @sizeOf(f32), &h_shape);
             // finishGatedLayerTailMt consumes h on success and error.
             var result = (try self.finishGatedLayerTailMt(request, layer_index, h, p)) orelse return error.NativeBatchedDecodeUnavailable;
-            defer result.deinit();
+            defer self.retireTemporaryWorkspaceValue(&result);
             const ct = try retainedCtFromMetalTensor(self, &result);
             defer freeOp(ctx, ct);
             if (!try copyRows2DOp(ctx, output_ct, row, ct, 0, 1, request.hidden_size)) return error.NativeBatchedDecodeUnavailable;
@@ -32272,11 +33329,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             const a_width = request.num_heads * request.head_dim;
             const a_shape = [_]i32{ 1, @intCast(a_width) };
             var h = try residual.retainedView(row * request.hidden_size * @sizeOf(f32), request.hidden_size * @sizeOf(f32), &h_shape);
-            defer h.deinit();
+            defer self.retireTemporaryWorkspaceValue(&h);
             var a = try attention.retainedView(row * a_width * @sizeOf(f32), a_width * @sizeOf(f32), &a_shape);
-            defer a.deinit();
+            defer self.retireTemporaryWorkspaceValue(&a);
             var result = (try self.finishGatedDecoderBlockFromAttentionOutputMt(request, layer_index, a, h, null)) orelse return error.NativeBatchedDecodeUnavailable;
-            defer result.deinit();
+            defer self.retireTemporaryWorkspaceValue(&result);
             const ct = try retainedCtFromMetalTensor(self, &result);
             defer freeOp(ctx, ct);
             if (!try copyRows2DOp(ctx, output_ct, row, ct, 0, 1, request.hidden_size)) return error.NativeBatchedDecodeUnavailable;
@@ -32302,7 +33359,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             singleton.output_token_ids = request.output_token_ids[row..][0..1];
             const row_inputs = DecodeBatchHostInputs{ .token_ids = inputs.token_ids[row..][0..1], .positions = inputs.positions[row..][0..1] };
             var initial = (try prepareDecodeBatchInitialTensors(self, &singleton, &row_inputs)) orelse return error.NativeBatchedDecodeUnavailable;
-            defer initial.deinit();
+            defer self.retireTemporaryWorkspaceValue(&initial);
             const h = try retainedCtFromMetalTensor(self, &initial.hidden);
             defer freeOp(ctx, h);
             const v = try retainedCtFromMetalTensor(self, &(initial.ple_vectors orelse return error.NativeBatchedDecodeUnavailable));
@@ -32313,7 +33370,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const h = try self.borrowedMetalTensorFromCt(hidden_ct);
         const v = try self.borrowedMetalTensorFromCt(ple_ct);
         var result = DecodeBatchInitialTensors{ .hidden = try h.retainedCopy() };
-        errdefer result.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&result);
         result.ple_vectors = try v.retainedCopy();
         return result;
     }
@@ -32328,13 +33385,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             singleton.output_token_ids = request.output_token_ids[row..][0..1];
             const h_shape = [_]i32{ 1, @intCast(request.hidden_size) };
             var h = try hidden.retainedView(row * request.hidden_size * @sizeOf(f32), request.hidden_size * @sizeOf(f32), &h_shape);
-            defer h.deinit();
+            defer self.retireTemporaryWorkspaceValue(&h);
             const h_ct = try retainedCtFromMetalTensor(self, &h);
             defer freeOp(ctx, h_ct);
             const ple_offset = (row * request.layer_count + layer_index) * request.ple_hidden_size;
             const p_shape = [_]i32{ 1, @intCast(request.ple_hidden_size) };
             var p = try ple.retainedView(ple_offset * @sizeOf(f32), request.ple_hidden_size * @sizeOf(f32), &p_shape);
-            defer p.deinit();
+            defer self.retireTemporaryWorkspaceValue(&p);
             var attention = item.attention;
             attention.layer_index = layer.kv_layer_index;
             attention.skip_kv_write = layer.shares_kv;
@@ -32343,7 +33400,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             // appended. Earlier positions were canonically restored too.
             const result = (try self.runActiveGatedLayerFromAttentionInputDeviceMt(&singleton, layer, layer_index, h, layer.attn_pre_norm_slot, h, h_ct, attention, p, layer.output_scale_value, null)) orelse return error.NativeBatchedDecodeUnavailable;
             var output = result.tensor;
-            defer output.deinit();
+            defer self.retireTemporaryWorkspaceValue(&output);
             const ct = try retainedCtFromMetalTensor(self, &output);
             defer freeOp(ctx, ct);
             if (!try copyRows2DOp(ctx, output_ct, row, ct, 0, 1, request.hidden_size)) return error.NativeBatchedDecodeUnavailable;
@@ -32398,10 +33455,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!active_frame) return false;
         errdefer self.cancelDecoderRuntimeFrame(runtime, &active_frame);
         var initial = (try prepareDecodeBatchInitialTensors(self, request, inputs)) orelse return error.NativeBatchedDecodeUnavailable;
-        defer initial.deinit();
+        defer self.retireTemporaryWorkspaceValue(&initial);
         if (differential) {
             var canonical = try prepareCanonicalOcrInputs(ctx, self, request, inputs);
-            errdefer canonical.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&canonical);
             try self.submitAndWaitDecoderRuntimeFrame(runtime, &active_frame);
             try reportOcrParity(request, "embedding", 0, request.hidden_size, &initial.hidden, &canonical.hidden);
             try reportOcrParity(request, "ple-input", 0, request.ple_hidden_size * request.layer_count, &initial.ple_vectors.?, &canonical.ple_vectors.?);
@@ -32411,7 +33468,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             initial = canonical;
         }
         var hidden = try initial.hidden.retainedCopy();
-        defer hidden.deinit();
+        defer self.retireTemporaryWorkspaceValue(&hidden);
         const ple = if (initial.ple_vectors) |tensor| tensor else return error.NativeBatchedDecodeUnavailable;
         const ple_shape = [_]i32{ @intCast(rows), @intCast(request.ple_hidden_size) };
         const ple_layer_ct = try self.ocrCarrier(ctx, .ple_layer, &ple_shape);
@@ -32431,7 +33488,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .hidden_size = request.hidden_size,
                 .eps = request.norm_eps,
             }, &self.timing_stats)) orelse return error.NativeBatchedDecodeUnavailable;
-            defer normed.deinit();
+            defer self.retireTemporaryWorkspaceValue(&normed);
             const canonical_qkv = getenvBool("ANTFLY_GEMMA4_METAL_OCR_CANONICAL_QKV");
             var paired: ?metal_runtime.RuntimeLinearTripleResult = null;
             if (canonical_qkv and !layer.shares_kv) {
@@ -32450,7 +33507,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .in_dim = request.hidden_size,
                 .out_dim = q_dim,
             })) orelse return error.NativeBatchedDecodeUnavailable;
-            defer q.deinit();
+            defer self.retireTemporaryWorkspaceValue(&q);
             var k: ?MetalTensor = null;
             defer if (k) |*tensor| tensor.deinit();
             var v: ?MetalTensor = null;
@@ -32505,10 +33562,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             for (request.items, 0..) |item, row| {
                 const q_shape = [_]i32{ 1, @intCast(q_dim) };
                 var q_view = try q.retainedView(row * q_dim * @sizeOf(f32), q_dim * @sizeOf(f32), &q_shape);
-                defer q_view.deinit();
+                defer self.retireTemporaryWorkspaceValue(&q_view);
                 const q_scale: f32 = @sqrt(@as(f32, @floatFromInt(layer.head_dim)));
                 var q_rope = (try self.applyDecodeHeadNormRopeDeviceMt(q_view, layer.q_head_norm_slot orelse return error.NativeBatchedDecodeUnavailable, request.num_attention_heads, layer.head_dim, layer.rope_active_dim, item.attention.total_sequence_len - 1, layer.rope_theta, request.rope_freq_scale, request.rope_consecutive_pairs, q_scale)) orelse return error.NativeBatchedDecodeUnavailable;
-                defer q_rope.deinit();
+                defer self.retireTemporaryWorkspaceValue(&q_rope);
                 var k_rope: ?MetalTensor = null;
                 defer if (k_rope) |*tensor| tensor.deinit();
                 var v_norm: ?MetalTensor = null;
@@ -32516,9 +33573,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (!layer.shares_kv) {
                     const kv_shape = [_]i32{ 1, @intCast(kv_dim) };
                     var k_view = try k.?.retainedView(row * kv_dim * @sizeOf(f32), kv_dim * @sizeOf(f32), &kv_shape);
-                    defer k_view.deinit();
+                    defer self.retireTemporaryWorkspaceValue(&k_view);
                     var v_view = try v.?.retainedView(row * kv_dim * @sizeOf(f32), kv_dim * @sizeOf(f32), &kv_shape);
-                    defer v_view.deinit();
+                    defer self.retireTemporaryWorkspaceValue(&v_view);
                     k_rope = (try self.applyDecodeHeadNormRopeDeviceMt(k_view, layer.k_head_norm_slot orelse return error.NativeBatchedDecodeUnavailable, layer.kv_heads, layer.head_dim, layer.rope_active_dim, item.attention.total_sequence_len - 1, layer.rope_theta, request.rope_freq_scale, request.rope_consecutive_pairs, 1.0)) orelse return error.NativeBatchedDecodeUnavailable;
                     v_norm = if (request.global_head_dim != 0)
                         (try self.applyDecodeValueNormDeviceMt(v_view, layer.kv_heads, layer.head_dim, kv_dim, request.norm_eps)) orelse return error.NativeBatchedDecodeUnavailable
@@ -32569,7 +33626,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     .kv_position_offset = attention.kv_position_offset,
                     .sliding_window = attention.sliding_window,
                 })) orelse return error.NativeBatchedDecodeUnavailable;
-                defer result_mt.deinit();
+                defer self.retireTemporaryWorkspaceValue(&result_mt);
                 try commitPagedKvLayerDeviceWrite(attention);
                 const result = try retainedCtFromMetalTensor(self, &result_mt);
                 defer freeOp(ctx, result);
@@ -32577,7 +33634,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const ple_offset = (row * request.layer_count + layer_index) * request.ple_hidden_size;
                 const ple_row_shape = [_]i32{ 1, @intCast(request.ple_hidden_size) };
                 var ple_view = try ple.retainedView(ple_offset * @sizeOf(f32), request.ple_hidden_size * @sizeOf(f32), &ple_row_shape);
-                defer ple_view.deinit();
+                defer self.retireTemporaryWorkspaceValue(&ple_view);
                 const ple_row_ct = try retainedCtFromMetalTensor(self, &ple_view);
                 defer freeOp(ctx, ple_row_ct);
                 if (!try copyRows2DOp(ctx, ple_layer_ct, row, ple_row_ct, 0, 1, request.ple_hidden_size)) return error.NativeBatchedDecodeUnavailable;
@@ -32628,9 +33685,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 break :blk (try self.finishGatedLayerTailMt(&block_request, layer_index, block, ple_layer_mt)) orelse return error.NativeBatchedDecodeUnavailable;
             };
             if (differential) {
-                errdefer next_hidden.deinit();
+                errdefer self.retireTemporaryWorkspaceValue(&next_hidden);
                 var canonical = try canonicalOcrLayer(ctx, self, request, &layer, layer_index, hidden, ple);
-                errdefer canonical.deinit();
+                errdefer self.retireTemporaryWorkspaceValue(&canonical);
                 try self.submitAndWaitDecoderRuntimeFrame(runtime, &active_frame);
                 try reportOcrParity(request, "layer", layer_index, request.hidden_size, &next_hidden, &canonical);
                 active_frame = try self.beginPreparedDecoderRuntimeFrame(runtime);
@@ -32691,7 +33748,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (getenvBool("ANTFLY_GEMMA4_METAL_OCR_DIFFERENTIAL_STEP") or getenvBool("ANTFLY_GEMMA4_METAL_OCR_TRACE_CHOICES")) {
             const borrowed_logits = try self.borrowedMetalTensorFromCt(logits);
             var matrix_logits = try borrowed_logits.retainedCopy();
-            defer matrix_logits.deinit();
+            defer self.retireTemporaryWorkspaceValue(&matrix_logits);
             const values = try matrix_logits.toHostSlice();
             for (request.items, 0..) |item, row| {
                 const summary = try ocrLogitSummary(values[row * request.vocab_size ..][0..request.vocab_size], request.suppress_token_ids);
@@ -32704,16 +33761,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             active_frame = try self.beginPreparedDecoderRuntimeFrame(runtime);
             if (!active_frame) return error.NativeBatchedDecodeUnavailable;
             var canonical_norm = try ocrRowwisePrepared(ctx, self, hidden, request.final_norm_slot, request.hidden_size, request.hidden_size, request.norm_eps);
-            defer canonical_norm.deinit();
+            defer self.retireTemporaryWorkspaceValue(&canonical_norm);
             var canonical_logits = try ocrRowwisePrepared(ctx, self, canonical_norm, request.final_lm_head_slot, request.hidden_size, request.vocab_size, null);
-            defer canonical_logits.deinit();
+            defer self.retireTemporaryWorkspaceValue(&canonical_logits);
             try self.submitAndWaitDecoderRuntimeFrame(runtime, &active_frame);
             const borrowed_norm = try self.borrowedMetalTensorFromCt(final_hidden);
             var matrix_norm = try borrowed_norm.retainedCopy();
-            defer matrix_norm.deinit();
+            defer self.retireTemporaryWorkspaceValue(&matrix_norm);
             const borrowed_logits = try self.borrowedMetalTensorFromCt(logits);
             var matrix_logits = try borrowed_logits.retainedCopy();
-            defer matrix_logits.deinit();
+            defer self.retireTemporaryWorkspaceValue(&matrix_logits);
             try reportOcrParity(request, "final-norm", request.layer_count, request.hidden_size, &matrix_norm, &canonical_norm);
             try reportOcrParity(request, "logits", request.layer_count, request.vocab_size, &matrix_logits, &canonical_logits);
             const a = try matrix_logits.toHostSlice();
@@ -32771,7 +33828,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             singleton.output_token_ids = request.output_token_ids[row..][0..1];
             const row_inputs = DecodeBatchHostInputs{ .token_ids = inputs.token_ids[row..][0..1], .positions = inputs.positions[row..][0..1] };
             var initial = (try prepareDecodeBatchInitialTensors(self, &singleton, &row_inputs)) orelse return false;
-            defer initial.deinit();
+            defer self.retireTemporaryWorkspaceValue(&initial);
             const hidden_ct = try retainedCtFromMetalTensor(self, &initial.hidden);
             defer freeOp(ctx, hidden_ct);
             if (!try copyRows2DOp(ctx, front, row, hidden_ct, 0, 1, request.hidden_size)) return false;
@@ -32798,20 +33855,20 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 const output_carrier = try self.borrowedMetalTensorFromCt(next_hidden);
                 const output_shape = [_]i32{ 1, @intCast(request.hidden_size) };
                 var output_mt = try output_carrier.retainedView(row * request.hidden_size * @sizeOf(f32), request.hidden_size * @sizeOf(f32), &output_shape);
-                defer output_mt.deinit();
+                defer self.retireTemporaryWorkspaceValue(&output_mt);
                 const ple_row = try sliceRows2DOp(ctx, ple, row, 1, ple_width);
                 defer freeOp(ctx, ple_row);
                 const hidden_mt = try self.borrowedMetalTensorFromCt(hidden_view);
                 const ple_row_mt = try self.borrowedMetalTensorFromCt(ple_row);
                 var ple_layer = (try sliceDecodePleLayerView(&ple_row_mt, 1, layer_index, request.ple_hidden_size, request.layer_count)) orelse return error.NativeBatchedDecodeUnavailable;
-                defer ple_layer.deinit();
+                defer self.retireTemporaryWorkspaceValue(&ple_layer);
                 var attention = item.attention;
                 attention.layer_index = layer.kv_layer_index;
                 attention.skip_kv_write = layer.shares_kv;
                 attention.sliding_window = layer.sliding_window;
                 const result = (try self.runActiveGatedLayerFromAttentionInputDeviceMt(&singleton, &layer, layer_index, hidden_mt, layer.attn_pre_norm_slot, hidden_mt, hidden_view, attention, ple_layer, layer.output_scale_value, output_mt)) orelse return error.NativeBatchedDecodeUnavailable;
                 var output = result.tensor;
-                defer output.deinit();
+                defer self.retireTemporaryWorkspaceValue(&output);
                 if (!result.output_mt_used) {
                     const output_ct = try retainedCtFromMetalTensor(self, &output);
                     defer freeOp(ctx, output_ct);
@@ -32876,7 +33933,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (trace) std.debug.print("decoder-runtime-decode: fallback reason=initial-tensors\n", .{});
             return false;
         };
-        defer initial_tensors.deinit();
+        defer self.retireTemporaryWorkspaceValue(&initial_tensors);
 
         var hidden = try retainedCtFromMetalTensor(self, &initial_tensors.hidden);
         var owns_hidden = true;
@@ -33269,7 +34326,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (ple_vectors_mt) |ple| {
                     const ple_result = blk: {
                         var block_mt = try self.ownedMetalTensorFromCt(block_hidden);
-                        defer block_mt.deinit();
+                        defer self.retireTemporaryWorkspaceValue(&block_mt);
                         if (try applyDecodePleLayer(self, request, &layer, layer_index, block_mt, ple)) |tensor| {
                             break :blk try self.ctFromOwnedMetalTensor(tensor);
                         }
@@ -33299,10 +34356,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         var final_input = try self.ownedDeviceMetalTensorFromCt(hidden);
-        errdefer final_input.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&final_input);
         if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) final_tail_blk: {
             var tail_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .tail);
-            defer tail_region_scope.deinit();
+            defer self.retireTemporaryWorkspaceValue(&tail_region_scope);
             const tail_quant_format = self.preparedLinearMatmulFormatForLinearSlot(
                 request.final_lm_head_slot,
                 request.hidden_size,
@@ -33394,7 +34451,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     if (trace) std.debug.print("decoder-runtime-decode: sampled-tail failure=lm-head-logits\n", .{});
                     break :final_tail_blk;
                 };
-                defer resident_logits.deinit();
+                defer self.retireTemporaryWorkspaceValue(&resident_logits);
                 if (!metal_runtime.decoderRuntimeEncodeSampleResidentLogits(self.provider_impl, sample_request)) {
                     if (trace) std.debug.print("decoder-runtime-decode: sampled-tail failure=nucleus-encode\n", .{});
                     break :final_tail_blk;
@@ -33497,14 +34554,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 fuse_token_embedding_scale,
             )) orelse return null;
         var hidden = hidden_raw;
-        errdefer hidden.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&hidden);
 
         var ple_token_embedding: ?MetalTensor = null;
         if (request.ple_hidden_size != 0 and request.layer_count != 0) {
             const ple_scope = try self.beginPlannedGraphScopeForSelf(.ple);
             defer self.endPlannedGraphScopeForSelf(ple_scope) catch {};
             var ple_region_scope = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .ple);
-            defer ple_region_scope.deinit();
+            defer self.retireTemporaryWorkspaceValue(&ple_region_scope);
             const ple_token_embedding_weight = request.ple_token_embedding_weight orelse return null;
             const ple_total_dim = request.ple_hidden_size * request.layer_count;
             const ple_raw = (if (device_token)
@@ -33525,7 +34582,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     true,
                 )) orelse return null;
             var ple = ple_raw;
-            errdefer ple.deinit();
+            errdefer self.retireTemporaryWorkspaceValue(&ple);
             ple_token_embedding = ple;
         }
 
@@ -33533,7 +34590,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .hidden = hidden,
             .ple_token_embedding = ple_token_embedding,
         };
-        errdefer result.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&result);
         if (result.ple_token_embedding != null) {
             result.ple_vectors = (try computeDecodePleVectors(self, request, &result)) orelse return null;
         }
@@ -33835,7 +34892,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (request.output_hidden) |output_hidden| {
                 var hidden_tensor = queued_output_hidden orelse return false;
                 queued_output_hidden = null;
-                errdefer hidden_tensor.deinit();
+                errdefer self.retireTemporaryWorkspaceValue(&hidden_tensor);
                 output_hidden.* = try self.ctFromOwnedMetalTensor(hidden_tensor);
             }
             self.timing_stats.active_decode_frame_successes += 1;
@@ -33845,7 +34902,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         self.cancelDecoderRuntimeFrame(runtime, &active_frame);
         if (prepareDecodeInputsDebug()) {
             var initial_tensors = (try prepareDecodeBatchInitialTensors(self, request, &batch_inputs)) orelse return false;
-            defer initial_tensors.deinit();
+            defer self.retireTemporaryWorkspaceValue(&initial_tensors);
             if (request.layers.len > 0) {
                 if (initial_tensors.ple_vectors) |ple_vectors| {
                     var ple_hidden = (try applyDecodePleLayer(
@@ -33856,7 +34913,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                         initial_tensors.hidden,
                         ple_vectors,
                     )) orelse return false;
-                    defer ple_hidden.deinit();
+                    defer self.retireTemporaryWorkspaceValue(&ple_hidden);
                 }
             }
         }
@@ -33883,20 +34940,101 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         plan: metal_command_planner.GraphCommandPlanView,
     ) !bool {
         self.active_prefill_frame_contract_storage.deinit(self.allocator);
-        if (plan.ops.len == 0 or plan.planned_ops.len == 0) return false;
-        var storage: ActivePrefillFrameContractStorage = .{};
-        errdefer storage.deinit(self.allocator);
-        storage.ops = try self.allocator.alloc(u16, plan.planned_ops.len);
-        storage.barriers = try self.allocator.alloc(u8, plan.planned_ops.len);
-        storage.quant_dispatches = try self.allocator.alloc(u8, plan.ops.len);
-        storage.command_ops = try self.allocator.alloc(ops.PlannedCommandOp, plan.ops.len);
-        if (!metal_runtime.populatePlannedCommandContractStorage(plan, storage.view())) return false;
+        const storage = (try preparePrefillContractStorage(self.allocator, plan)) orelse return false;
         self.active_prefill_frame_contract_storage = storage;
         self.timing_stats.prefill_frame_contract_ops = @intCast(plan.ops.len);
         self.timing_stats.prefill_frame_contract_scopes = @intCast(plan.scopes.len);
         self.timing_stats.prefill_frame_contract_barriers = @intCast(plan.barrier_count);
         return true;
     }
+
+    /// SAME ABI flattening for legacy and cold-owned frames. Ownership of
+    /// allocator is explicit because a cold process-owned value can be moved
+    /// into a request-arena receiver and must never be freed via that arena.
+    pub fn preparePrefillContractStorage(allocator: std.mem.Allocator, plan: metal_command_planner.GraphCommandPlanView) !?ActivePrefillFrameContractStorage {
+        if (plan.ops.len == 0 or plan.planned_ops.len == 0) return null;
+        var storage: ActivePrefillFrameContractStorage = .{ .allocator = allocator };
+        var moved = false;
+        defer if (!moved) storage.deinit(allocator);
+        storage.ops = try allocator.alloc(u16, plan.planned_ops.len);
+        storage.barriers = try allocator.alloc(u8, plan.planned_ops.len);
+        storage.quant_dispatches = try allocator.alloc(u8, plan.ops.len);
+        storage.command_ops = try allocator.alloc(ops.PlannedCommandOp, plan.ops.len);
+        if (!metal_runtime.populatePlannedCommandContractStorage(plan, storage.view())) return null;
+        moved = true;
+        return storage;
+    }
+
+    /// Pure owned declaration for the actual selected frame. Input layers
+    /// compare EXACTLY (not a hash-only authority); published slot formats
+    /// compare again under the receiving provider owner before any SDK reserve.
+    pub const QwenWorkspaceMetadata = struct {
+        allocator: std.mem.Allocator,
+        key: ActivePrefillFramePlanKey,
+        input_layers: []ops.DecoderRuntimeLayerSpec,
+        selected_layers: []metal_command_planner.GatedFrameCommandLowerer.Layer,
+        selected: ?metal_command_planner.GatedFrameCommandLowerer,
+        contract: ActivePrefillFrameContractStorage,
+
+        pub fn requestedMetadataBytes(self: *const QwenWorkspaceMetadata) !usize {
+            var bytes = try std.math.add(usize, try std.math.mul(usize, self.input_layers.len, @sizeOf(ops.DecoderRuntimeLayerSpec)), try std.math.mul(usize, self.selected_layers.len, @sizeOf(metal_command_planner.GatedFrameCommandLowerer.Layer)));
+            if (self.selected) |selected| {
+                inline for (.{ "ops", "resources", "planned_ops", "scopes", "scratch_slots" }) |name| {
+                    const list = @field(selected.frame, name);
+                    const Element = @typeInfo(@TypeOf(list.items)).pointer.child;
+                    bytes = try std.math.add(usize, bytes, try std.math.mul(usize, list.capacity, @sizeOf(Element)));
+                }
+            }
+            inline for (.{ "ops", "barriers", "quant_dispatches", "command_ops" }) |name| {
+                const values = @field(self.contract, name);
+                const Element = @typeInfo(@TypeOf(values)).pointer.child;
+                bytes = try std.math.add(usize, bytes, try std.math.mul(usize, values.len, @sizeOf(Element)));
+            }
+            return bytes;
+        }
+        pub fn prepare(allocator: std.mem.Allocator, request: *const ops.DecoderRuntimePrefillFramePlanRequest, layers: []const metal_command_planner.GatedFrameCommandLowerer.Layer) !QwenWorkspaceMetadata {
+            if (request.contract != .qwen3_dense_text_prefill or request.include_tail or !validPrefillFrameRequest(request))
+                return error.UnsupportedWorkspaceSelection;
+            const inputs = try allocator.dupe(ops.DecoderRuntimeLayerSpec, request.layers);
+            errdefer allocator.free(inputs);
+            const selected_layers = try allocator.dupe(metal_command_planner.GatedFrameCommandLowerer.Layer, layers);
+            errdefer allocator.free(selected_layers);
+            var selected = metal_command_planner.GatedFrameCommandLowerer.init(allocator);
+            errdefer selected.deinit();
+            try buildSelectedPrefillFrame(&selected, request, layers, .unknown);
+            const contract = (try preparePrefillContractStorage(allocator, selected.view())) orelse return error.UnsupportedWorkspaceSelection;
+            return .{ .allocator = allocator, .key = prefillFramePlanKey(request), .input_layers = inputs, .selected_layers = selected_layers, .selected = selected, .contract = contract };
+        }
+        pub fn deinitOutsideExecution(self: *QwenWorkspaceMetadata) void {
+            if (self.selected) |*selected| selected.deinit();
+            self.contract.deinit(self.allocator);
+            self.allocator.free(self.selected_layers);
+            self.allocator.free(self.input_layers);
+            self.* = undefined;
+        }
+        fn validate(self: *const QwenWorkspaceMetadata, provider: *const ProviderImpl, request: *const ops.DecoderRuntimePrefillFramePlanRequest) !void {
+            if (self.selected == null or !std.meta.eql(self.key, prefillFramePlanKey(request)) or
+                request.layers.len != self.input_layers.len) return error.WorkspaceRoleChanged;
+            for (request.layers, self.input_layers) |now, before| if (!std.meta.eql(now, before)) return error.WorkspaceRoleChanged;
+            var current_storage: [256]metal_command_planner.GatedFrameCommandLowerer.Layer = undefined;
+            const current = copyQwenWorkspaceLayers(provider, request, &current_storage) orelse return error.WorkspaceRoleChanged;
+            if (current.len != self.selected_layers.len) return error.WorkspaceRoleChanged;
+            for (current, self.selected_layers) |now, before| if (!std.meta.eql(now, before)) return error.WorkspaceRoleChanged;
+        }
+        fn installAfterReserved(self: *QwenWorkspaceMetadata, receiver: *MetalCompute) void {
+            std.debug.assert(receiver.active_prefill_frame_plan == null and receiver.active_prefill_frame_contract_storage.command_ops.len == 0);
+            const plan = self.selected orelse unreachable;
+            receiver.active_prefill_frame_plan = plan;
+            receiver.active_prefill_frame_plan_key = self.key;
+            receiver.active_prefill_frame_contract_storage = self.contract;
+            const view = plan.view();
+            receiver.timing_stats.prefill_frame_contract_ops = @intCast(view.ops.len);
+            receiver.timing_stats.prefill_frame_contract_scopes = @intCast(view.scopes.len);
+            receiver.timing_stats.prefill_frame_contract_barriers = @intCast(view.barrier_count);
+            self.selected = null;
+            self.contract = .{};
+        }
+    };
 
     fn activePrefillFrameContractWindow(
         self: *MetalCompute,
@@ -34320,7 +35458,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         rows: usize,
     ) !?CT {
         var input_mt = try self.ownedMetalTensorFromCt(request.hidden);
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         if (!input_mt.isDevice()) return null;
         const qkv_mt = (try metal_runtime.decoderRuntimeBorrowActiveLayerProjectionScratch(
             self.provider_impl,
@@ -34387,13 +35525,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (rope_pair != null) self.timing_stats.metal_runtime_nomic_bert_rope_pair_calls += 1;
 
         var rope_q_mt = try self.ownedDeviceMetalTensorFromCt(rope_q);
-        defer rope_q_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&rope_q_mt);
         var rope_k_mt = try self.ownedDeviceMetalTensorFromCt(rope_k);
-        defer rope_k_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&rope_k_mt);
         var v_mt = try self.ownedDeviceMetalTensorFromCt(v);
-        defer v_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&v_mt);
         var mask_mt = try self.attentionMaskDeviceTensor(request.attention_mask, request.batch, request.seq_len);
-        defer mask_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&mask_mt);
         if (!try metal_runtime.decoderRuntimeApplyNomicSdpaF32Into(
             self.provider_impl,
             rope_q_mt,
@@ -34413,7 +35551,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         self.timing_stats.metal_runtime_nomic_bert_attention_calls += 1;
         var residual_mt = try self.ownedDeviceMetalTensorFromCt(request.hidden);
-        defer residual_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&residual_mt);
         if (!try metal_runtime.decoderRuntimeApplyDenseLinearLayerNormInto(
             self.provider_impl,
             request.layer.attention_output_linear_slot,
@@ -34458,9 +35596,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             defer freeOp(self, ffn_out);
 
             var ffn_mt = try self.ownedDeviceMetalTensorFromCt(ffn_out);
-            defer ffn_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&ffn_mt);
             var ffn_residual_mt = try self.ownedDeviceMetalTensorFromCt(after_attn);
-            defer ffn_residual_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&ffn_residual_mt);
             if (!try metal_runtime.decoderRuntimeApplyAddLayerNormInto(self.provider_impl, .{
                 .slot = request.layer.ffn_layer_norm_slot,
                 .a = ffn_mt,
@@ -34473,9 +35611,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
 
         var ffn_input_mt = try self.ownedDeviceMetalTensorFromCt(after_attn);
-        defer ffn_input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&ffn_input_mt);
         var ffn_residual_mt = try self.ownedDeviceMetalTensorFromCt(after_attn);
-        defer ffn_residual_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&ffn_residual_mt);
         var pair = (try metal_runtime.tryApplyDenseRuntimeLinearPair(
             self.provider_impl,
             request.layer.fc11_linear_slot,
@@ -34657,9 +35795,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         if (nomicBertFfnFusionEnabled()) {
             var ffn_input_mt = try self.ownedDeviceMetalTensorFromCt(after_attn);
-            defer ffn_input_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&ffn_input_mt);
             var residual_mt = try self.ownedDeviceMetalTensorFromCt(after_attn);
-            defer residual_mt.deinit();
+            defer self.retireTemporaryWorkspaceValue(&residual_mt);
             const output_mt = (try metal_runtime.decoderRuntimeApplyDenseGatedFfnLayerNorm(self.provider_impl, .{
                 .fc11_slot = request.layer.fc11_linear_slot,
                 .fc12_slot = request.layer.fc12_linear_slot,
@@ -34707,9 +35845,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer freeOp(ctx, ffn_out);
 
         var ffn_mt = try self.ownedDeviceMetalTensorFromCt(ffn_out);
-        defer ffn_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&ffn_mt);
         var residual_mt = try self.ownedDeviceMetalTensorFromCt(after_attn);
-        defer residual_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&residual_mt);
         const output_mt = (try metal_runtime.decoderRuntimeApplyAddLayerNorm(self.provider_impl, .{
             .slot = request.layer.ffn_layer_norm_slot,
             .a = ffn_mt,
@@ -34723,7 +35861,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return output;
     }
 
-    fn maskedMeanNormalizeOp(
+    fn maskedMeanNormalizeOp(ctx: *anyopaque, request: *const ops.MaskedMeanNormalizeRequest) anyerror!?CT {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return self.selectedWorkspaceResult(try maskedMeanNormalizeImpl(ctx, request));
+    }
+    fn maskedMeanNormalizeImpl(
         ctx: *anyopaque,
         request: *const ops.MaskedMeanNormalizeRequest,
     ) anyerror!?CT {
@@ -34742,7 +35884,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const source = denseDeviceF32(request.hidden) orelse return null;
         if (source.elemCount() != elements) return error.InvalidTensorShape;
         var hidden_mt = try source.retainedView(0, elements * @sizeOf(f32), &.{ @intCast(rows), @intCast(request.hidden_size) });
-        defer hidden_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&hidden_mt);
         var output = (try metal_runtime.decoderRuntimeMaskedMeanNormalizeF32Device(self.provider_impl, .{
             .hidden = hidden_mt,
             .attention_mask = request.attention_mask,
@@ -34751,7 +35893,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .hidden_size = request.hidden_size,
             .normalize = request.normalize,
         })) orelse return null;
-        errdefer output.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&output);
         const value = try self.ctFromOwnedMetalTensor(output);
         success = true;
         self.timing_stats.metal_runtime_nomic_bert_pool_normalize_successes += 1;
@@ -34765,9 +35907,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         attn_out: CT,
     ) !?CT {
         var attn_out_mt = try self.ownedDeviceMetalTensorFromCt(attn_out);
-        defer attn_out_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attn_out_mt);
         var hidden_mt = try self.ownedDeviceMetalTensorFromCt(request.hidden);
-        defer hidden_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&hidden_mt);
         const attn_normed_output_mt = (try metal_runtime.tryApplyQuantizedRuntimeLinearLayerNorm(
             self.provider_impl,
             request.layer.attention_output_linear_slot,
@@ -34795,7 +35937,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         defer freeOp(self, attn_normed);
 
         var attn_normed_mt = try self.ownedDeviceMetalTensorFromCt(attn_normed);
-        defer attn_normed_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&attn_normed_mt);
         const output_mt = (try metal_runtime.tryApplyQuantizedRuntimeFfnLayerNorm(
             self.provider_impl,
             request.layer.intermediate_linear_slot,
@@ -34831,11 +35973,75 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         request: *const ops.DecoderRuntimePrefillFramePlanRequest,
     ) anyerror!bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
-        self.timing_stats.prefill_frame_plan_attempts += 1;
+        return self.preparePrefillFramePlan(request, true);
+    }
+
+    /// SAME selected lowering. Description stops before graph SDK reservation;
+    /// the existing numerical adapter retains its original commit behavior.
+    fn preparePrefillFramePlan(
+        self: *MetalCompute,
+        request: *const ops.DecoderRuntimePrefillFramePlanRequest,
+        comptime commit: bool,
+    ) anyerror!bool {
+        if (commit) self.timing_stats.prefill_frame_plan_attempts += 1;
         var plan_success = false;
         defer {
-            if (!plan_success) self.timing_stats.prefill_frame_plan_failures += 1;
+            if (commit and !plan_success) self.timing_stats.prefill_frame_plan_failures += 1;
         }
+        if (!validPrefillFrameRequest(request)) return false;
+        // The verify tail writes one token and one top-k scratch range per row.
+        // Reserve both before any frame work is encoded; replacing either
+        // buffer after row 0 would strand earlier dispatches on stale storage.
+        if (commit and request.include_tail and request.rows <= 16 and !metal_runtime.reserveArgmaxRows(self.provider_impl, request.rows, request.vocab_size)) {
+            traceMetalPrefillFramePlan("decline=tail-argmax-reserve rows={d} vocab={d}", .{ request.rows, request.vocab_size });
+            return false;
+        }
+        const plan_key = prefillFramePlanKey(request);
+        if (commit and self.hasReusablePrefillFramePlan(plan_key)) {
+            plan_success = true;
+            if (commit) self.timing_stats.prefill_frame_plan_successes += 1;
+            return true;
+        }
+
+        const layers = try self.allocator.alloc(metal_command_planner.GatedFrameCommandLowerer.Layer, request.layer_count);
+        defer self.allocator.free(layers);
+        if (!fillSelectedPrefillLayers(self.provider_impl, if (commit) self else null, request, layers)) return false;
+        const tail_quant_format = if (request.include_tail)
+            self.prefillLinearMatmulFormatForLinearSlot(
+                commit,
+                request.final_lm_head_slot,
+                request.hidden_size,
+                request.vocab_size,
+            ) orelse {
+                traceMetalPrefillFramePlan("decline=tail-format slot={d} in={d} out={d}", .{ request.final_lm_head_slot, request.hidden_size, request.vocab_size });
+                return false;
+            }
+        else
+            metal_command_planner.QuantMatmulFormat.unknown;
+
+        self.clearActivePrefillFramePlan();
+        self.active_prefill_frame_plan = metal_command_planner.GatedFrameCommandLowerer.init(self.allocator);
+        self.active_prefill_frame_plan_key = plan_key;
+        errdefer self.clearActivePrefillFramePlan();
+        if (self.active_prefill_frame_plan) |*frame_plan| {
+            buildSelectedPrefillFrame(frame_plan, request, layers, tail_quant_format) catch {
+                self.clearActivePrefillFramePlan();
+                return false;
+            };
+            if (!commit) return true; // metadata only: NO SDK buffers/encoding
+            const reserved = try self.reserveGraphPlanSlotsFromCommandPlan(frame_plan.view());
+            const prepared_contract = reserved and try self.prepareActivePrefillFrameContractStorage(frame_plan.view());
+            if (!prepared_contract) self.clearActivePrefillFramePlan();
+            if (prepared_contract) {
+                plan_success = true;
+                if (commit) self.timing_stats.prefill_frame_plan_successes += 1;
+            }
+            return prepared_contract;
+        }
+        return false;
+    }
+
+    fn validPrefillFrameRequest(request: *const ops.DecoderRuntimePrefillFramePlanRequest) bool {
         if (request.contract != .gemma4_gated_ple_shared_kv and request.contract != .qwen3_dense_text_prefill) {
             traceMetalPrefillFramePlan("decline=contract", .{});
             return false;
@@ -34862,31 +36068,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             traceMetalPrefillFramePlan("decline=ple-hidden", .{});
             return false;
         }
-        if (request.contract == .qwen3_dense_text_prefill and
-            (request.batch == 0 or request.seq_len == 0 or request.rows != request.batch * request.seq_len or request.ple_hidden_size != 0 or request.include_tail))
-        {
-            traceMetalPrefillFramePlan("decline=qwen3-shape batch={d} seq={d} rows={d} ple={d} tail={}", .{ request.batch, request.seq_len, request.rows, request.ple_hidden_size, request.include_tail });
-            return false;
+        if (request.contract == .qwen3_dense_text_prefill) {
+            const rows = std.math.mul(usize, request.batch, request.seq_len) catch return false;
+            if (request.batch == 0 or request.seq_len == 0 or request.rows != rows or request.ple_hidden_size != 0 or request.include_tail) {
+                traceMetalPrefillFramePlan("decline=qwen3-shape batch={d} seq={d} rows={d} ple={d} tail={}", .{ request.batch, request.seq_len, request.rows, request.ple_hidden_size, request.include_tail });
+                return false;
+            }
         }
-        // The verify tail writes one token and one top-k scratch range per row.
-        // Reserve both before any frame work is encoded; replacing either
-        // buffer after row 0 would strand earlier dispatches on stale storage.
-        if (request.include_tail and request.rows <= 16 and !metal_runtime.reserveArgmaxRows(self.provider_impl, request.rows, request.vocab_size)) {
-            traceMetalPrefillFramePlan("decline=tail-argmax-reserve rows={d} vocab={d}", .{ request.rows, request.vocab_size });
-            return false;
-        }
-        const plan_key = prefillFramePlanKey(request);
-        if (self.hasReusablePrefillFramePlan(plan_key)) {
-            plan_success = true;
-            self.timing_stats.prefill_frame_plan_successes += 1;
-            return true;
-        }
-
-        var layers = try self.allocator.alloc(metal_command_planner.GatedFrameCommandLowerer.Layer, request.layer_count);
-        defer self.allocator.free(layers);
+        return true;
+    }
+    fn selectedPrefillSlotFormat(provider: *const ProviderImpl, preparer: ?*MetalCompute, slot: usize, in_dim: usize, out_dim: usize) ?metal_command_planner.QuantMatmulFormat {
+        if (preparer) |owner| return owner.preparedLinearMatmulFormatForLinearSlot(slot, in_dim, out_dim);
+        return publishedSlotFormatForProvider(provider, slot, in_dim, out_dim);
+    }
+    fn fillSelectedPrefillLayers(provider: *const ProviderImpl, preparer: ?*MetalCompute, request: *const ops.DecoderRuntimePrefillFramePlanRequest, layers: []metal_command_planner.GatedFrameCommandLowerer.Layer) bool {
+        if (layers.len != request.layers.len) return false;
         for (request.layers, 0..) |layer, index| {
-            const attention_input_size = request.num_attention_heads * layer.head_dim;
-            const kv_dim = layer.kv_heads * layer.head_dim;
+            const attention_input_size = std.math.mul(usize, request.num_attention_heads, layer.head_dim) catch return false;
+            const kv_dim = std.math.mul(usize, layer.kv_heads, layer.head_dim) catch return false;
             if (layer.attn_pre_norm_slot >= metal_runtime.decoder_runtime_layer_norm_slot_capacity or
                 layer.attn_post_norm_slot >= metal_runtime.decoder_runtime_layer_norm_slot_capacity or
                 layer.ffn_pre_norm_slot >= metal_runtime.decoder_runtime_layer_norm_slot_capacity or
@@ -34916,49 +36115,49 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 traceMetalPrefillFramePlan("decline=ple-slot layer={d}", .{index});
                 return false;
             }
-            const q_format = self.preparedLinearMatmulFormatForLinearSlot(layer.q_linear_slot, request.hidden_size, attention_input_size) orelse {
+            const q_format = selectedPrefillSlotFormat(provider, preparer, layer.q_linear_slot, request.hidden_size, attention_input_size) orelse {
                 traceMetalPrefillFramePlan("decline=q-format layer={d} slot={d} in={d} out={d}", .{ index, layer.q_linear_slot, request.hidden_size, attention_input_size });
                 return false;
             };
             const k_format = if (layer.shares_kv)
                 q_format
             else
-                self.preparedLinearMatmulFormatForLinearSlot(layer.k_linear_slot, request.hidden_size, kv_dim) orelse {
+                selectedPrefillSlotFormat(provider, preparer, layer.k_linear_slot, request.hidden_size, kv_dim) orelse {
                     traceMetalPrefillFramePlan("decline=k-format layer={d} slot={d} in={d} out={d}", .{ index, layer.k_linear_slot, request.hidden_size, kv_dim });
                     return false;
                 };
             const v_format = if (layer.shares_kv)
                 q_format
             else
-                self.preparedLinearMatmulFormatForLinearSlot(layer.v_linear_slot, request.hidden_size, kv_dim) orelse {
+                selectedPrefillSlotFormat(provider, preparer, layer.v_linear_slot, request.hidden_size, kv_dim) orelse {
                     traceMetalPrefillFramePlan("decline=v-format layer={d} slot={d} in={d} out={d}", .{ index, layer.v_linear_slot, request.hidden_size, kv_dim });
                     return false;
                 };
-            const attention_format = self.preparedLinearMatmulFormatForLinearSlot(layer.attention_linear_slot, attention_input_size, request.hidden_size) orelse {
+            const attention_format = selectedPrefillSlotFormat(provider, preparer, layer.attention_linear_slot, attention_input_size, request.hidden_size) orelse {
                 traceMetalPrefillFramePlan("decline=attention-format layer={d} slot={d} in={d} out={d}", .{ index, layer.attention_linear_slot, attention_input_size, request.hidden_size });
                 return false;
             };
-            const gate_format = self.preparedLinearMatmulFormatForLinearSlot(layer.gate_ffn_linear_slot, request.hidden_size, layer.intermediate_size) orelse {
+            const gate_format = selectedPrefillSlotFormat(provider, preparer, layer.gate_ffn_linear_slot, request.hidden_size, layer.intermediate_size) orelse {
                 traceMetalPrefillFramePlan("decline=gate-format layer={d} slot={d} in={d} out={d}", .{ index, layer.gate_ffn_linear_slot, request.hidden_size, layer.intermediate_size });
                 return false;
             };
-            const up_format = self.preparedLinearMatmulFormatForLinearSlot(layer.up_ffn_linear_slot, request.hidden_size, layer.intermediate_size) orelse {
+            const up_format = selectedPrefillSlotFormat(provider, preparer, layer.up_ffn_linear_slot, request.hidden_size, layer.intermediate_size) orelse {
                 traceMetalPrefillFramePlan("decline=up-format layer={d} slot={d} in={d} out={d}", .{ index, layer.up_ffn_linear_slot, request.hidden_size, layer.intermediate_size });
                 return false;
             };
-            const down_format = self.preparedLinearMatmulFormatForLinearSlot(layer.down_ffn_linear_slot, layer.intermediate_size, request.hidden_size) orelse {
+            const down_format = selectedPrefillSlotFormat(provider, preparer, layer.down_ffn_linear_slot, layer.intermediate_size, request.hidden_size) orelse {
                 traceMetalPrefillFramePlan("decline=down-format layer={d} slot={d} in={d} out={d}", .{ index, layer.down_ffn_linear_slot, layer.intermediate_size, request.hidden_size });
                 return false;
             };
             const ple_gate_format = if (request.ple_hidden_size != 0)
-                self.preparedLinearMatmulFormatForLinearSlot(layer.ple_gate_linear_slot.?, request.hidden_size, request.ple_hidden_size) orelse {
+                selectedPrefillSlotFormat(provider, preparer, layer.ple_gate_linear_slot.?, request.hidden_size, request.ple_hidden_size) orelse {
                     traceMetalPrefillFramePlan("decline=ple-gate-format layer={d} slot={d} in={d} out={d}", .{ index, layer.ple_gate_linear_slot.?, request.hidden_size, request.ple_hidden_size });
                     return false;
                 }
             else
                 metal_command_planner.QuantMatmulFormat.unknown;
             const ple_projection_format = if (request.ple_hidden_size != 0)
-                self.preparedLinearMatmulFormatForLinearSlot(layer.ple_proj_linear_slot.?, request.ple_hidden_size, request.hidden_size) orelse {
+                selectedPrefillSlotFormat(provider, preparer, layer.ple_proj_linear_slot.?, request.ple_hidden_size, request.hidden_size) orelse {
                     traceMetalPrefillFramePlan("decline=ple-proj-format layer={d} slot={d} in={d} out={d}", .{ index, layer.ple_proj_linear_slot.?, request.ple_hidden_size, request.hidden_size });
                     return false;
                 }
@@ -34999,55 +36198,41 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 },
             };
         }
-        const tail_quant_format = if (request.include_tail)
-            self.preparedLinearMatmulFormatForLinearSlot(
-                request.final_lm_head_slot,
-                request.hidden_size,
-                request.vocab_size,
-            ) orelse {
-                traceMetalPrefillFramePlan("decline=tail-format slot={d} in={d} out={d}", .{ request.final_lm_head_slot, request.hidden_size, request.vocab_size });
-                return false;
-            }
-        else
-            metal_command_planner.QuantMatmulFormat.unknown;
-
-        self.clearActivePrefillFramePlan();
-        self.active_prefill_frame_plan = metal_command_planner.GatedFrameCommandLowerer.init(self.allocator);
-        self.active_prefill_frame_plan_key = plan_key;
-        errdefer self.clearActivePrefillFramePlan();
-        if (self.active_prefill_frame_plan) |*frame_plan| {
-            frame_plan.build(.{
-                .rows = request.rows,
-                .hidden_size = request.hidden_size,
-                .vocab_size = request.vocab_size,
-                .num_attention_heads = request.num_attention_heads,
-                .global_head_dim = request.global_head_dim,
-                .ple_hidden_size = request.ple_hidden_size,
-                .final_norm_slot = request.final_norm_slot,
-                .lm_head_slot = request.final_lm_head_slot,
-                .tail_quant_format = tail_quant_format,
-                .include_tail = request.include_tail,
-                .activation_dtype = if (request.contract == .qwen3_dense_text_prefill) .f32 else .f16,
-                .attention_storage = if (request.contract == .qwen3_dense_text_prefill) .dense else .paged,
-                .layers = layers,
-                .source = @backingInt(metal_runtime.ComputeSource.layer),
-                .layer_region = @backingInt(metal_runtime.ComputeRegion.layer),
-                .tail_source = @backingInt(metal_runtime.ComputeSource.tail),
-                .tail_region = @backingInt(metal_runtime.ComputeRegion.tail),
-            }) catch {
-                self.clearActivePrefillFramePlan();
-                return false;
-            };
-            const reserved = try self.reserveGraphPlanSlotsFromCommandPlan(frame_plan.view());
-            const prepared_contract = reserved and try self.prepareActivePrefillFrameContractStorage(frame_plan.view());
-            if (!prepared_contract) self.clearActivePrefillFramePlan();
-            if (prepared_contract) {
-                plan_success = true;
-                self.timing_stats.prefill_frame_plan_successes += 1;
-            }
-            return prepared_contract;
-        }
-        return false;
+        return true;
+    }
+    /// Actual cold provider metadata exclusion only. Copies published formats
+    /// into caller-owned fixed storage; no allocator, SDK preparation, Model
+    /// lane, supplier or mutation. A missing published quant representation
+    /// declines before any cold admission decision.
+    pub fn copyQwenWorkspaceLayers(provider: *const ProviderImpl, request: *const ops.DecoderRuntimePrefillFramePlanRequest, storage: []metal_command_planner.GatedFrameCommandLowerer.Layer) ?[]const metal_command_planner.GatedFrameCommandLowerer.Layer {
+        if (request.contract != .qwen3_dense_text_prefill or request.include_tail or
+            request.layer_count > storage.len or !validPrefillFrameRequest(request)) return null;
+        const layers = storage[0..request.layer_count];
+        if (!fillSelectedPrefillLayers(provider, null, request, layers)) return null;
+        // Full reference eligibility/extra resources are described separately
+        // from these exact immutable formats, before admission or any math.
+        return layers;
+    }
+    pub fn buildSelectedPrefillFrame(frame_plan: *metal_command_planner.GatedFrameCommandLowerer, request: *const ops.DecoderRuntimePrefillFramePlanRequest, layers: []const metal_command_planner.GatedFrameCommandLowerer.Layer, tail_quant_format: metal_command_planner.QuantMatmulFormat) !void {
+        try frame_plan.build(.{
+            .rows = request.rows,
+            .hidden_size = request.hidden_size,
+            .vocab_size = request.vocab_size,
+            .num_attention_heads = request.num_attention_heads,
+            .global_head_dim = request.global_head_dim,
+            .ple_hidden_size = request.ple_hidden_size,
+            .final_norm_slot = request.final_norm_slot,
+            .lm_head_slot = request.final_lm_head_slot,
+            .tail_quant_format = tail_quant_format,
+            .include_tail = request.include_tail,
+            .activation_dtype = if (request.contract == .qwen3_dense_text_prefill) .f32 else .f16,
+            .attention_storage = if (request.contract == .qwen3_dense_text_prefill) .dense else .paged,
+            .layers = layers,
+            .source = @backingInt(metal_runtime.ComputeSource.layer),
+            .layer_region = @backingInt(metal_runtime.ComputeRegion.layer),
+            .tail_source = @backingInt(metal_runtime.ComputeSource.tail),
+            .tail_region = @backingInt(metal_runtime.ComputeRegion.tail),
+        });
     }
 
     fn decoderRuntimeExecuteGraphCommandPlanFrameOp(
@@ -35079,7 +36264,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
         var hidden = request.hidden;
         var owns_hidden = false;
-        errdefer if (owns_hidden) freeOp(ctx, hidden);
+        errdefer if (owns_hidden) freeTemporaryWorkspaceCtOp(ctx, hidden);
 
         const full_frame_contract = self.activePrefillFrameFullContract() orelse return self.declinePrefillFrameExecute(.plan_mismatch);
         var frame_cursor = metal_command_planner.GatedFramePlanCursor.init(frame_plan.view());
@@ -35102,7 +36287,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 .hidden_size = request.hidden_size,
                 .eps = request.norm_eps,
             })) orelse return error.UnsupportedOperation;
-            defer freeOp(ctx, attn_normed);
+            defer freeTemporaryWorkspaceCtOp(ctx, attn_normed);
             try self.maybeDumpDecodeStageCt("prefill-attn-norm", layer_index, attn_normed, request.hidden_size);
 
             const ple_offset = layer_index * request.ple_hidden_size;
@@ -35112,7 +36297,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 ple_offset,
                 ple_offset + request.ple_hidden_size,
             );
-            defer freeOp(ctx, block_ple_input);
+            defer freeTemporaryWorkspaceCtOp(ctx, block_ple_input);
 
             var attention = request.attention;
             attention.layer_index = if (layer.shares_kv) layer.kv_layer_index else layer_index;
@@ -35167,7 +36352,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 },
                 .graph_plan_tail_vocab_size = request.vocab_size,
             })) orelse return error.UnsupportedOperation;
-            if (owns_hidden) freeOp(ctx, prev_hidden);
+            if (owns_hidden) freeTemporaryWorkspaceCtOp(ctx, prev_hidden);
             hidden = block_hidden;
             owns_hidden = true;
             try self.maybeDumpDecodeStageCt("prefill-output-scale", layer_index, hidden, request.hidden_size);
@@ -35222,7 +36407,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         var frame_cursor = metal_command_planner.GatedFramePlanCursor.init(frame_plan.view());
         for (request.layers, 0..) |layer, layer_index| {
             var attention_region = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .attention);
-            defer attention_region.deinit();
+            defer self.retireTemporaryWorkspaceValue(&attention_region);
             if (request.execution_control) |control| try control.check();
             if (layer.shares_kv or layer.sliding_window != 0) return self.declinePrefillFrameExecute(.invalid_shape);
             const head_dim = layer.head_dim;
@@ -35241,7 +36426,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 return self.declinePrefillFrameExecute(.plan_mismatch);
             };
 
-            const attn_normed = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+            const attn_normed = (try self.decoderRuntimeApplyDenseFrameRmsNorm(&.{
                 .slot = layer.attn_pre_norm_slot,
                 .input = hidden,
                 .hidden_size = request.hidden_size,
@@ -35322,8 +36507,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return self.declinePrefillFrameExecute(.plan_mismatch);
         }
         var tail_region = metal_runtime.pushComputeRegion(self.provider_impl.raw_decode_runtime, .tail);
-        defer tail_region.deinit();
-        const final_hidden = (try decoderRuntimeApplyRmsNormOp(ctx, &.{
+        defer self.retireTemporaryWorkspaceValue(&tail_region);
+        const final_hidden = (try self.decoderRuntimeApplyDenseFrameRmsNorm(&.{
             .slot = request.final_norm_slot,
             .input = hidden,
             .hidden_size = request.hidden_size,
@@ -35697,6 +36882,37 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
 
     fn quantMatmulFormatForRuntimeKind(kind: metal_runtime.RawQuantizedRuntimeLinearKind) ?metal_command_planner.QuantMatmulFormat {
         return kind.matmulFormat();
+    }
+
+    /// Read only the already-published representation for cold role sizing.
+    /// In particular, inspecting an unprepared quantized slot MUST NOT invoke
+    /// ensureQuantizedRuntimeLinearSlotPrepared or create its SDK resources.
+    fn publishedLinearMatmulFormatForLinearSlot(self: *const MetalCompute, slot: usize, in_dim: usize, out_dim: usize) ?metal_command_planner.QuantMatmulFormat {
+        return publishedSlotFormatForProvider(self.provider_impl, slot, in_dim, out_dim);
+    }
+    fn publishedSlotFormatForProvider(provider: *const ProviderImpl, slot: usize, in_dim: usize, out_dim: usize) ?metal_command_planner.QuantMatmulFormat {
+        if (slot >= metal_runtime.decoder_runtime_linear_slot_capacity) return null;
+        if (!provider.raw_linear_slots_prepared[slot]) return null;
+        if (provider.raw_linear_slot_in_dims[slot] != in_dim or
+            provider.raw_linear_slot_out_dims[slot] != out_dim) return null;
+        return switch (provider.raw_linear_slot_kinds[slot]) {
+            .dense => .f32,
+            .quantized => quantMatmulFormatForRuntimeKind(provider.raw_linear_slot_runtime_prepared_kind[slot]),
+            .none => null,
+        };
+    }
+
+    fn prefillLinearMatmulFormatForLinearSlot(
+        self: *MetalCompute,
+        comptime commit: bool,
+        slot: usize,
+        in_dim: usize,
+        out_dim: usize,
+    ) ?metal_command_planner.QuantMatmulFormat {
+        return if (commit)
+            self.preparedLinearMatmulFormatForLinearSlot(slot, in_dim, out_dim)
+        else
+            self.publishedLinearMatmulFormatForLinearSlot(slot, in_dim, out_dim);
     }
 
     fn preparedLinearMatmulFormatForLinearSlot(
@@ -36241,9 +37457,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimePrepareAbsoluteEmbeddingsOp(ctx: *anyopaque, request: *const ops.DecoderRuntimePrepareAbsoluteEmbeddingsRequest) anyerror!bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var token = try self.ownedMetalTensorFromCt(request.token_embedding);
-        defer token.deinit();
+        defer self.retireTemporaryWorkspaceValue(&token);
         var position = try self.ownedMetalTensorFromCt(request.position_embedding);
-        defer position.deinit();
+        defer self.retireTemporaryWorkspaceValue(&position);
         return metal_runtime.decoderRuntimePrepareAbsoluteEmbeddings(self.provider_impl, .{
             .token_embedding = token,
             .position_embedding = position,
@@ -36270,9 +37486,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         f32_storage: metal_runtime.OwnedF32SlotStorage,
     ) anyerror!bool {
         var weight = try self.ownedMetalTensorFromCt(request.weight);
-        defer weight.deinit();
+        defer self.retireTemporaryWorkspaceValue(&weight);
         var bias = try self.ownedMetalTensorFromCt(request.bias);
-        defer bias.deinit();
+        defer self.retireTemporaryWorkspaceValue(&bias);
         return metal_runtime.decoderRuntimePrepareLayerNorm(self.provider_impl, .{
             .slot = request.slot,
             .weight = weight,
@@ -36295,21 +37511,21 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeApplyLayerNormOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLayerNormRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedDeviceMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         var tensor = (try metal_runtime.decoderRuntimeApplyLayerNorm(self.provider_impl, .{
             .slot = request.slot,
             .input = input,
             .hidden_size = request.hidden_size,
             .eps = request.eps,
         }, &self.timing_stats)) orelse return null;
-        errdefer tensor.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&tensor);
         return self.ctFromOwnedMetalTensor(tensor);
     }
 
     fn decoderRuntimePrepareRmsNormOp(ctx: *anyopaque, request: *const ops.DecoderRuntimePrepareRmsNormRequest) anyerror!bool {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var weight = try self.ownedMetalTensorFromCt(request.weight);
-        defer weight.deinit();
+        defer self.retireTemporaryWorkspaceValue(&weight);
         return metal_runtime.decoderRuntimePrepareRmsNorm(self.provider_impl, .{
             .slot = request.slot,
             .weight = weight,
@@ -36329,7 +37545,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeApplyRmsNormOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyRmsNormRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedDeviceMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         const tensor = (try metal_runtime.decoderRuntimeApplyRmsNorm(self.provider_impl, .{
             .slot = request.slot,
             .input = input,
@@ -36344,8 +37560,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (request.bias) |bias| {
             return self.ensureDynamicLinearSlotForPreparation(request.weight, bias, request.in_dim, request.out_dim, request.preparation_scope);
         }
-        const zero_bias = try self.cachedZeroBiasBuf(request.out_dim);
-        defer freeOp(ctx, zero_bias);
+        var zero_bias_view: Buf = undefined;
+        var zero_bias_shape: [1]i64 = undefined;
+        const zero_bias = try self.borrowedZeroBiasBuf(&zero_bias_view, &zero_bias_shape, request.out_dim);
         return self.ensureDynamicLinearSlotForPreparation(request.weight, zero_bias, request.in_dim, request.out_dim, request.preparation_scope);
     }
 
@@ -36420,7 +37637,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const dummy_weight_shape = [_]i32{0};
         const weight = dense_weight orelse MetalTensor.borrowed((&dummy_weight_value)[0..1].ptr, 0, &dummy_weight_shape);
         var bias = try self.ownedMetalTensorFromCt(request.bias);
-        defer bias.deinit();
+        defer self.retireTemporaryWorkspaceValue(&bias);
         return metal_runtime.decoderRuntimePrepareLinear(self.provider_impl, .{
             .weight = weight,
             .bias = bias,
@@ -36452,6 +37669,22 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn decoderRuntimeApplyLinearOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearRequest) anyerror!?CT {
+        return decoderRuntimeApplyLinearWithPreparedOutput(ctx, request, null);
+    }
+
+    fn decoderRuntimeApplyDenseProjection(self: *MetalCompute, request: *const ops.DecoderRuntimeApplyLinearRequest, index: usize) anyerror!?CT {
+        if (!self.hasOwnedDensePrefillOutputs()) return decoderRuntimeApplyLinearOp(self, request);
+        const current = self.densePrefillOutputCleanup();
+        const runtime = self.provider_impl.raw_decode_runtime orelse return error.PreparedWorkspaceOutputUnavailable;
+        const input = toBuf(request.input);
+        const shape = input.logical_shape orelse return error.InvalidTensorShape;
+        if (shape.len != 2 or shape[0] <= 0) return error.InvalidTensorShape;
+        var target = try metal_runtime.borrowDensePrefillOutput(runtime, index, @intCast(shape[0]), request.out_dim);
+        defer target.deinitWithCleanup(current);
+        return decoderRuntimeApplyLinearWithPreparedOutput(self, request, .{ .tensor = &target, .current = current, .reference_host_phase = self.denseHostReferencePhase() });
+    }
+
+    fn decoderRuntimeApplyLinearWithPreparedOutput(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearRequest, destination: ?metal_runtime.PreparedDecoderOutput) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var strict_runtime: ?*metal_runtime_mod.RawMetalDecodeRuntime = null;
         var previous: c_int = 0;
@@ -36463,26 +37696,27 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             _ = metal_runtime_mod.termite_metal_decode_runtime_require_lighton_vision_mpp(runtime, previous);
         };
         var input = try self.ownedMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         var linear_input = try retainedLinearInputView(&input, request.in_dim);
-        defer linear_input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&linear_input);
         var tensor = (try metal_runtime.decoderRuntimeApplyLinear(self.provider_impl, .{
+            .prepared_output = destination,
             .slot = request.slot,
             .input = linear_input,
             .in_dim = request.in_dim,
             .out_dim = request.out_dim,
             .use_transformed_lm_head = request.use_transformed_lm_head,
         })) orelse return null;
-        errdefer tensor.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&tensor);
         return self.ctFromOwnedMetalTensor(tensor);
     }
 
     fn decoderRuntimeApplyLinearLayerNormOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearLayerNormRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedDeviceMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         var residual = try self.ownedDeviceMetalTensorFromCt(request.residual);
-        defer residual.deinit();
+        defer self.retireTemporaryWorkspaceValue(&residual);
         if (input.ndim() != 2 or residual.ndim() != 2) return null;
         const rows: usize = @intCast(input.dim(0));
 
@@ -36513,9 +37747,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeApplyFfnLayerNormOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyFfnLayerNormRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedDeviceMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         var residual = try self.ownedDeviceMetalTensorFromCt(request.residual);
-        defer residual.deinit();
+        defer self.retireTemporaryWorkspaceValue(&residual);
         if (input.ndim() != 2 or residual.ndim() != 2) return null;
         const rows: usize = @intCast(input.dim(0));
 
@@ -36550,7 +37784,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeApplyLinearArgmaxOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearArgmaxRequest) anyerror!?usize {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         if (try metal_runtime.decoderRuntimeApplyLinearArgmax(self.provider_impl, .{
             .slot = request.slot,
             .input = input,
@@ -36600,7 +37834,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             }
         }
         var uploaded = try self.ownedDeviceMetalTensorFromCt(ordering);
-        errdefer uploaded.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&uploaded);
         if (uploaded.elemCount() != vocab or uploaded.dtype != .f32 or !uploaded.isDevice()) return error.InvalidTensorShape;
         const copied_name = try self.allocator.dupe(u8, name);
         if (self.mtp_ordering_device_cache) |*cached| cached.deinit();
@@ -36617,16 +37851,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             request.num_centroids == 0 or request.top_k == 0 or request.top_k > request.num_centroids or
             request.vocab_size % request.num_centroids != 0) return null;
         if (!self.provider_impl.hasDecoderRuntime()) return null;
-        const lm_bias = try self.cachedZeroBiasBuf(request.vocab_size);
-        defer freeOp(ctx, lm_bias);
-        const centroid_bias = try self.cachedZeroBiasBuf(request.num_centroids);
-        defer freeOp(ctx, centroid_bias);
+        var lm_bias_view: Buf = undefined;
+        var lm_bias_shape: [1]i64 = undefined;
+        const lm_bias = try self.borrowedZeroBiasBuf(&lm_bias_view, &lm_bias_shape, request.vocab_size);
+        var centroid_bias_view: Buf = undefined;
+        var centroid_bias_shape: [1]i64 = undefined;
+        const centroid_bias = try self.borrowedZeroBiasBuf(&centroid_bias_view, &centroid_bias_shape, request.num_centroids);
         const lm_slot = (try self.ensureMtpHeadLinearSlot(request.lm_head_weight, lm_bias, request.hidden_size, request.vocab_size)) orelse return null;
         const centroid_slot = (try self.ensureMtpHeadLinearSlot(request.centroid_weight, centroid_bias, request.hidden_size, request.num_centroids)) orelse return null;
         var input = try self.ownedDeviceMetalTensorFromCt(request.assistant_hidden);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         var ordering = try self.mtpOrderingDeviceTensor(request.token_ordering, request.vocab_size);
-        defer ordering.deinit();
+        defer self.retireTemporaryWorkspaceValue(&ordering);
         if (input.dtype != .f32 or ordering.dtype != .f32 or !input.isDevice() or !ordering.isDevice()) return null;
         if (metal_runtime.hasSubmittedFrame(self.provider_impl.raw_decode_runtime) or
             (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) and !getenvBool("TERMITE_METAL_ENABLE_GEMMA4_MTP_HEAD_FRAME")))
@@ -36665,13 +37901,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!self.provider_impl.hasDecoderRuntime()) return null;
         const weight_buf = toBuf(weight);
         if (weight_buf.quantized_storage != null or weight_buf.runtime_quantized_storage != null) return null;
-        const zero_bias = try self.cachedZeroBiasBuf(out_dim);
-        defer freeOp(ctx, zero_bias);
+        var zero_bias_view: Buf = undefined;
+        var zero_bias_shape: [1]i64 = undefined;
+        const zero_bias = try self.borrowedZeroBiasBuf(&zero_bias_view, &zero_bias_shape, out_dim);
         const slot = (try self.ensureDynamicLinearSlot(weight, zero_bias, in_dim, out_dim)) orelse return null;
         var input_mt = try self.ownedMetalTensorFromCt(input);
-        defer input_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input_mt);
         var linear_input = try retainedLinearInputView(&input_mt, in_dim);
-        defer linear_input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&linear_input);
         if (metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime)) {
             // Input pending in our active frame: encode the lm-head+argmax as
             // the frame's final work, then submit+wait once through the
@@ -36735,7 +37972,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     const shape = [_]i32{ 1, @intCast(dim) };
                     break :blk try metal_tensor.retainedView(byte_offset, byte_len, &shape);
                 };
-                defer last_row.deinit();
+                defer self.retireTemporaryWorkspaceValue(&last_row);
                 if (try metal_runtime.argmaxLogitsDevice(self.provider_impl, last_row, dim)) |token_id| return @intCast(token_id);
             }
         }
@@ -36985,7 +38222,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                     const shape = [_]i32{ 1, @intCast(request.dim) };
                     break :blk try metal_tensor.retainedView(byte_offset, byte_len, &shape);
                 };
-                defer last_row.deinit();
+                defer self.retireTemporaryWorkspaceValue(&last_row);
                 if (try metal_runtime.sampleLogitsDevice(self.provider_impl, .{
                     .input = last_row,
                     .out_dim = request.dim,
@@ -37025,7 +38262,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeApplyLayerNormLinearArgmaxOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLayerNormLinearArgmaxRequest) anyerror!?usize {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         return metal_runtime.decoderRuntimeApplyLayerNormLinearArgmax(self.provider_impl, .{
             .input = input,
             .norm_slot = request.norm_slot,
@@ -37039,7 +38276,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeApplyLayerNormLinearOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLayerNormLinearRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         const tensor = (try metal_runtime.decoderRuntimeApplyLayerNormLinear(self.provider_impl, .{
             .input = input,
             .norm_slot = request.norm_slot,
@@ -37054,7 +38291,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeApplyLayerNormLinearSampleOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLayerNormLinearSampleRequest) anyerror!?usize {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         return metal_runtime.decoderRuntimeApplyLayerNormLinearSample(self.provider_impl, .{
             .input = input,
             .norm_slot = request.norm_slot,
@@ -37076,7 +38313,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeApplyRmsNormLinearArgmaxOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyRmsNormLinearArgmaxRequest) anyerror!?usize {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         if (self.provider_impl.raw_decode_runtime) |runtime| {
             if (metal_runtime.hasActiveFrame(runtime)) {
                 if (self.active_prefill_frame_plan) |*frame_plan| {
@@ -37122,7 +38359,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeApplyRmsNormLinearOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyRmsNormLinearRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         if (self.active_prefill_frame_plan) |*frame_plan| {
             if (input.isDevice() and
                 frame_plan.matchesTail(request.norm_slot, request.linear_slot, request.hidden_size, request.out_dim))
@@ -37177,7 +38414,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeApplyRmsNormLinearSampleOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyRmsNormLinearSampleRequest) anyerror!?usize {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         return metal_runtime.decoderRuntimeApplyRmsNormLinearSample(self.provider_impl, .{
             .input = input,
             .norm_slot = request.norm_slot,
@@ -37222,9 +38459,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeApplyLinearPairOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearPairRequest) anyerror!?ops.LinearNoBiasPairResult {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         var linear_input = try retainedLinearInputView(&input, request.in_dim);
-        defer linear_input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&linear_input);
         const rows: usize = @intCast(linear_input.dim(0));
         const dense_active_frame_pair = rows > 1 and linear_input.isDevice() and
             metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) and
@@ -37294,14 +38531,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const v_metal = if (v_buf.metal_tensor) |*tensor| tensor else return null;
         if (!k_metal.isDevice() or !v_metal.isDevice()) return null;
         var input = try self.ownedMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         var linear_input = try retainedLinearInputView(&input, request.in_dim);
-        defer linear_input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&linear_input);
         if (!linear_input.isDevice()) return null;
         var k_mt = try k_metal.retainedCopy();
-        defer k_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&k_mt);
         var v_mt = try v_metal.retainedCopy();
-        defer v_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&v_mt);
         if (try metal_runtime.tryApplyQuantizedRuntimeLinearQkvInto(
             self.provider_impl,
             request.q_slot,
@@ -37336,13 +38573,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const out_metal = if (out_buf.metal_tensor) |*tensor| tensor else return false;
         if (!out_metal.isDevice()) return false;
         var input = try self.ownedMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         var linear_input = try retainedLinearInputView(&input, request.in_dim);
-        defer linear_input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&linear_input);
         if (!linear_input.isDevice()) return false;
         const rows: usize = @intCast(linear_input.dim(0));
         var out_mt = try out_metal.retainedCopy();
-        defer out_mt.deinit();
+        defer self.retireTemporaryWorkspaceValue(&out_mt);
         if (try metal_runtime.tryApplyQuantizedRuntimeLinearInto(
             self.provider_impl,
             request.slot,
@@ -37384,9 +38621,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeApplyLinearQkvOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyLinearQkvRequest) anyerror!?ops.LinearNoBiasTripleResult {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         var linear_input = try retainedLinearInputView(&input, request.in_dim);
-        defer linear_input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&linear_input);
         const rows: usize = @intCast(linear_input.dim(0));
         const dense_active_frame_qkv = rows > 1 and linear_input.isDevice() and
             metal_runtime.hasActiveFrame(self.provider_impl.raw_decode_runtime) and
@@ -37518,7 +38755,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeApplyActivationOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyActivationRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
         defer self.endActivePlannedComputeScope(scope);
         var tensor = (try metal_runtime.decoderRuntimeApplyActivation(self.provider_impl, .{
@@ -37526,16 +38763,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             .kind = request.kind,
             .dim = request.dim,
         }, &self.timing_stats)) orelse return null;
-        errdefer tensor.deinit();
+        errdefer self.retireTemporaryWorkspaceValue(&tensor);
         return self.ctFromOwnedMetalTensor(tensor);
     }
 
     fn decoderRuntimeApplyGeluBackwardOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyGeluBackwardRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var input = try self.ownedDeviceMetalTensorFromCt(request.input);
-        defer input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&input);
         var upstream_grad = try self.ownedDeviceMetalTensorFromCt(request.upstream_grad);
-        defer upstream_grad.deinit();
+        defer self.retireTemporaryWorkspaceValue(&upstream_grad);
         const tensor = (try metal_runtime.decoderRuntimeApplyGeluBackward(self.provider_impl, .{
             .input = input,
             .upstream_grad = upstream_grad,
@@ -37548,17 +38785,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeFfnGeluBackwardChainOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeFfnGeluBackwardChainRequest) anyerror!?ops.DecoderRuntimeFfnGeluBackwardChainResult {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var first_lhs = try self.ownedDeviceMetalTensorFromCt(request.first_lhs);
-        defer first_lhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&first_lhs);
         var first_rhs = try self.ownedDeviceMetalTensorFromCt(request.first_rhs);
-        defer first_rhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&first_rhs);
         var second_lhs = try self.ownedDeviceMetalTensorFromCt(request.second_lhs);
-        defer second_lhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&second_lhs);
         var second_rhs = try self.ownedDeviceMetalTensorFromCt(request.second_rhs);
-        defer second_rhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&second_rhs);
         var gelu_input = try self.ownedDeviceMetalTensorFromCt(request.gelu_input);
-        defer gelu_input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&gelu_input);
         var output_rhs = try self.ownedDeviceMetalTensorFromCt(request.output_rhs);
-        defer output_rhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&output_rhs);
 
         const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
         defer self.endActivePlannedComputeScope(scope);
@@ -37601,17 +38838,17 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeFfnGeluBackwardOutputOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeFfnGeluBackwardChainRequest) anyerror!?ops.DecoderRuntimeFfnGeluBackwardOutputResult {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var first_lhs = try self.ownedDeviceMetalTensorFromCt(request.first_lhs);
-        defer first_lhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&first_lhs);
         var first_rhs = try self.ownedDeviceMetalTensorFromCt(request.first_rhs);
-        defer first_rhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&first_rhs);
         var second_lhs = try self.ownedDeviceMetalTensorFromCt(request.second_lhs);
-        defer second_lhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&second_lhs);
         var second_rhs = try self.ownedDeviceMetalTensorFromCt(request.second_rhs);
-        defer second_rhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&second_rhs);
         var gelu_input = try self.ownedDeviceMetalTensorFromCt(request.gelu_input);
-        defer gelu_input.deinit();
+        defer self.retireTemporaryWorkspaceValue(&gelu_input);
         var output_rhs = try self.ownedDeviceMetalTensorFromCt(request.output_rhs);
-        defer output_rhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&output_rhs);
 
         const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
         defer self.endActivePlannedComputeScope(scope);
@@ -37648,9 +38885,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     fn decoderRuntimeApplyAddOp(ctx: *anyopaque, request: *const ops.DecoderRuntimeApplyAddRequest) anyerror!?CT {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         var lhs = try self.ownedMetalTensorFromCt(request.lhs);
-        defer lhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lhs);
         var rhs = try self.ownedMetalTensorFromCt(request.rhs);
-        defer rhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&rhs);
         const scope = self.beginActivePlannedComputeScopeIfPossible(.tail, .tail);
         defer self.endActivePlannedComputeScope(scope);
         const tensor = (try metal_runtime.decoderRuntimeApplyAdd(self.provider_impl, .{
@@ -37680,9 +38917,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (request.output) |output| if (!self.assignedDecoderOutputLegal(output, &.{ request.lhs, request.rhs }, request.dim)) return null;
         var lhs = try self.ownedMetalTensorFromCt(request.lhs);
-        defer lhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lhs);
         var rhs = try self.ownedMetalTensorFromCt(request.rhs);
-        defer rhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&rhs);
         var tensor = (try metal_runtime.decoderRuntimeApplyAddScale(self.provider_impl, .{
             .output = if (request.output) |output| &toBuf(output).metal_tensor.? else null,
             .lhs = lhs,
@@ -37701,9 +38938,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (request.output) |output| if (!self.assignedDecoderOutputLegal(output, &.{ request.lhs, request.rhs }, request.dim)) return null;
         var lhs = try self.ownedMetalTensorFromCt(request.lhs);
-        defer lhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lhs);
         var rhs = try self.ownedMetalTensorFromCt(request.rhs);
-        defer rhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&rhs);
         var tensor = (try metal_runtime.decoderRuntimeApplyScaledAddScale(self.provider_impl, .{
             .output = if (request.output) |output| &toBuf(output).metal_tensor.? else null,
             .lhs = lhs,
@@ -37723,11 +38960,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (request.output) |output| if (!self.assignedDecoderOutputLegal(output, &.{ request.addend, request.lhs, request.rhs }, request.dim)) return null;
         var lhs = try self.ownedDeviceMetalTensorFromCt(request.lhs);
-        defer lhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lhs);
         var rhs = try self.ownedDeviceMetalTensorFromCt(request.rhs);
-        defer rhs.deinit();
+        defer self.retireTemporaryWorkspaceValue(&rhs);
         var addend = try self.ownedDeviceMetalTensorFromCt(request.addend);
-        defer addend.deinit();
+        defer self.retireTemporaryWorkspaceValue(&addend);
         var tensor = (try metal_runtime.decoderRuntimeApplyMultiplyAdd(self.provider_impl, .{
             .output = if (request.output) |output| &toBuf(output).metal_tensor.? else null,
             .lhs = lhs,
@@ -37746,13 +38983,13 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (request.output) |output| if (!self.assignedDecoderOutputLegal(output, &.{ request.lhs0, request.rhs0, request.lhs1, request.rhs1 }, request.dim)) return null;
         var lhs0 = try self.ownedDeviceMetalTensorFromCt(request.lhs0);
-        defer lhs0.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lhs0);
         var rhs0 = try self.ownedDeviceMetalTensorFromCt(request.rhs0);
-        defer rhs0.deinit();
+        defer self.retireTemporaryWorkspaceValue(&rhs0);
         var lhs1 = try self.ownedDeviceMetalTensorFromCt(request.lhs1);
-        defer lhs1.deinit();
+        defer self.retireTemporaryWorkspaceValue(&lhs1);
         var rhs1 = try self.ownedDeviceMetalTensorFromCt(request.rhs1);
-        defer rhs1.deinit();
+        defer self.retireTemporaryWorkspaceValue(&rhs1);
         var tensor = (try metal_runtime.decoderRuntimeApplyMultiplyAdd2(self.provider_impl, .{
             .output = if (request.output) |output| &toBuf(output).metal_tensor.? else null,
             .lhs0 = lhs0,
@@ -38438,7 +39675,19 @@ pub fn reclaimEmbeddingGemma2Weights(data: *WeightStore, io: ?std.Io, cache_clas
     };
 }
 
+/// Metadata-only final-owner preflight, before ANY SDK/worker/resource
+/// ownership mutation in compute_factory.closeMetalWeightsWithCleanup.
+pub fn validateSharedNativeProviderWorkspaceRetirement(data: *WeightStore, current: @import("../execution/cleanup_context.zig").Context) !void {
+    if (comptime !build_options.enable_metal) return;
+    if (!data.shared_metal_native_provider_lock.tryLock()) return error.QueueFull;
+    defer data.shared_metal_native_provider_lock.unlock(std.Io.failing);
+    if (data.shared_metal_native_provider) |provider| try provider.validateWorkspaceRetirement(current);
+}
+
 pub fn deinitSharedNativeProvider(data: *WeightStore) void {
+    deinitSharedNativeProviderWithCleanup(data, .{ .outside_execution = true });
+}
+pub fn deinitSharedNativeProviderWithCleanup(data: *WeightStore, current: @import("../execution/cleanup_context.zig").Context) void {
     if (comptime !build_options.enable_metal) return;
     if (comptime false) return;
     if (!data.shared_metal_native_provider_lock.tryLock()) {
@@ -38447,11 +39696,12 @@ pub fn deinitSharedNativeProvider(data: *WeightStore) void {
     }
     defer data.shared_metal_native_provider_lock.unlock(std.Io.failing);
     const provider = data.shared_metal_native_provider orelse return;
+    provider.validateWorkspaceRetirement(current) catch platform.inference_process_supervisor.restartWorker();
     if (data.laya_resident) |owner| {
         owner.destroy();
         data.laya_resident = null;
     }
-    provider.deinitOwned();
+    provider.deinitOwnedWithCleanup(current);
     std.heap.c_allocator.destroy(provider);
     data.shared_metal_native_provider = null;
 }
@@ -55186,4 +56436,1117 @@ test "Metal owned metadata uses exact live Engine and independent nonblocking in
     try std.testing.expect(token.nonce != replacement.nonce);
     try std.testing.expectError(error.BackendOperationChanged, sample(&backend, token));
     try std.testing.expect(metadata.snapshotOwned(&backend, replacement) != null);
+}
+
+test "Qwen workspace cold role format inspection never prepares unpublished quantized SDK storage" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const metal_runtime = @import("../backends/metal_runtime.zig");
+    // Only these published fields are initialized. Any SDK preparation or
+    // unrelated runtime access is invalid, rather than hidden by a fake SDK.
+    var provider: MetalCompute.MetalNativeProvider = undefined;
+    provider.raw_linear_slots_prepared[0] = true;
+    provider.raw_linear_slot_in_dims[0] = 64;
+    provider.raw_linear_slot_out_dims[0] = 128;
+    provider.raw_linear_slot_kinds[0] = .quantized;
+    provider.raw_linear_slot_runtime_prepared_kind[0] = .none;
+    var compute: MetalCompute = undefined;
+    compute.provider_impl = &provider;
+    try std.testing.expect(compute.prefillLinearMatmulFormatForLinearSlot(false, 0, 64, 128) == null);
+    try std.testing.expectEqual(metal_runtime.RawQuantizedRuntimeLinearKind.none, provider.raw_linear_slot_runtime_prepared_kind[0]);
+    provider.raw_linear_slot_runtime_prepared_kind[0] = .q4_0;
+    try std.testing.expectEqual(metal_command_planner.QuantMatmulFormat.q4_0, compute.prefillLinearMatmulFormatForLinearSlot(false, 0, 64, 128).?);
+    try std.testing.expect(compute.prefillLinearMatmulFormatForLinearSlot(false, 0, 65, 128) == null);
+    try std.testing.expect(compute.prefillLinearMatmulFormatForLinearSlot(false, metal_runtime.decoder_runtime_linear_slot_capacity, 64, 128) == null);
+    provider.raw_linear_slot_kinds[0] = .dense;
+    try std.testing.expectEqual(metal_command_planner.QuantMatmulFormat.f32, compute.prefillLinearMatmulFormatForLinearSlot(false, 0, 64, 128).?);
+}
+
+test "Qwen workspace receiving header rejects copied table before context or backend access" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    var copied = MetalCompute.vtable_impl;
+    var cb: ops.ComputeBackend = .{ .ptr = @ptrFromInt(16), .vtable = &copied };
+    const unusable: @import("../execution/invocation_context.zig").Context = undefined;
+    try std.testing.expectError(error.UnsupportedWorkspaceReceiver, MetalCompute.bindWorkspaceInvocation(&cb, &unusable));
+    cb.vtable = &MetalCompute.vtable_impl;
+    const absent: @import("../execution/invocation_context.zig").Context = .{ .cleanup = .{} };
+    try std.testing.expectError(error.UnpreparedWorkspaceUses, MetalCompute.bindWorkspaceInvocation(&cb, &absent));
+    try std.testing.expect(cb.call_context == null);
+}
+
+test "Qwen cold workspace shape overflow declines before provider or SDK access" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    var layer: ops.DecoderRuntimeLayerSpec = undefined;
+    var request: ops.DecoderRuntimePrefillFramePlanRequest = undefined;
+    request.contract = .qwen3_dense_text_prefill;
+    request.layer_count = 1;
+    request.layers = @as(*const [1]ops.DecoderRuntimeLayerSpec, @ptrCast(&layer));
+    request.rows = 2;
+    request.batch = std.math.maxInt(usize);
+    request.seq_len = 2;
+    request.hidden_size = 1;
+    request.num_attention_heads = 1;
+    request.include_tail = false;
+    request.ple_hidden_size = 0;
+    var storage: [1]metal_command_planner.GatedFrameCommandLowerer.Layer = undefined;
+    const invalid_provider: *const MetalCompute.MetalNativeProvider = @ptrFromInt(@alignOf(MetalCompute.MetalNativeProvider));
+    try std.testing.expect(MetalCompute.copyQwenWorkspaceLayers(invalid_provider, &request, &storage) == null);
+    request.batch = 1;
+    request.num_attention_heads = 2;
+    layer.head_dim = std.math.maxInt(usize);
+    try std.testing.expect(MetalCompute.copyQwenWorkspaceLayers(invalid_provider, &request, &storage) == null);
+}
+
+test "Qwen cold frame metadata all OOM and move preserve allocator custody without SDK work" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const cfg = @import("../models/gpt.zig").Config{
+                .family = .qwen3,
+                .hidden_size = 128,
+                .intermediate_size = 256,
+                .num_hidden_layers = 1,
+                .num_attention_heads = 1,
+                .num_key_value_heads = 1,
+                .head_dim = 128,
+                .vocab_size = 64,
+            };
+            const gated = @import("../backends/decoder_gated_runtime.zig");
+            var specs: [256]ops.DecoderRuntimeLayerSpec = undefined;
+            const inputs = try gated.fillDenseQwen3LayerSpecs(cfg, 1, &specs);
+            const input = inputs[0];
+            const layers = [_]metal_command_planner.GatedFrameCommandLowerer.Layer{.{
+                .shares_kv = input.shares_kv,
+                .kv_layer_index = input.kv_layer_index,
+                .kv_heads = input.kv_heads,
+                .head_dim = input.head_dim,
+                .intermediate_size = input.intermediate_size,
+                .attn_pre_norm_slot = input.attn_pre_norm_slot,
+                .attn_post_norm_slot = input.attn_post_norm_slot,
+                .ffn_pre_norm_slot = input.ffn_pre_norm_slot,
+                .ffn_post_norm_slot = input.ffn_post_norm_slot,
+                .q_head_norm_slot = input.q_head_norm_slot,
+                .k_head_norm_slot = input.k_head_norm_slot,
+                .q_linear_slot = input.q_linear_slot,
+                .k_linear_slot = input.k_linear_slot,
+                .v_linear_slot = input.v_linear_slot,
+                .attention_linear_slot = input.attention_linear_slot,
+                .gate_linear_slot = input.gate_ffn_linear_slot,
+                .up_linear_slot = input.up_ffn_linear_slot,
+                .down_linear_slot = input.down_ffn_linear_slot,
+                .ple_gate_linear_slot = null,
+                .ple_proj_linear_slot = null,
+                .ple_post_norm_slot = null,
+                .quant_formats = .{ .q = .f32, .k = .f32, .v = .f32, .attention_output = .f32, .gate = .f32, .up = .f32, .down = .f32 },
+            }};
+            const request: ops.DecoderRuntimePrefillFramePlanRequest = .{
+                .contract = .qwen3_dense_text_prefill,
+                .layer_count = 1,
+                .rows = 2,
+                .batch = 1,
+                .seq_len = 2,
+                .hidden_size = 128,
+                .vocab_size = 64,
+                .num_attention_heads = 1,
+                .global_head_dim = 0,
+                .ple_hidden_size = 0,
+                .final_norm_slot = gated.finalNormSlot(1),
+                .final_lm_head_slot = 0,
+                .include_tail = false,
+                .layers = inputs,
+            };
+            var owned = try MetalCompute.QwenWorkspaceMetadata.prepare(a, &request, &layers);
+            defer owned.deinitOutsideExecution();
+            // Metadata-only partial receiver: no SDK/provider field is ever
+            // initialized or read by the pure ownership move being tested.
+            var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+            var receiver: MetalCompute = undefined;
+            receiver.allocator = arena.allocator();
+            receiver.active_prefill_frame_plan = null;
+            receiver.active_prefill_frame_plan_key = null;
+            receiver.active_prefill_frame_contract_storage = .{};
+            receiver.timing_stats = .{};
+            owned.installAfterReserved(&receiver);
+            arena.deinit(); // cold arrays MUST NOT belong to this dead arena
+            defer receiver.clearActivePrefillFramePlan();
+            try std.testing.expect(owned.selected == null);
+            try std.testing.expectEqual(@as(usize, 0), owned.contract.command_ops.len);
+            try std.testing.expect(receiver.hasReusablePrefillFramePlan(MetalCompute.prefillFramePlanKey(&request)));
+            try std.testing.expect(receiver.active_prefill_frame_contract_storage.command_ops.len > 0);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+}
+
+test "Metal Reader workspace marker rejects borrowed Context and tagged SDK custody before quiesce and preserves old restore" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const Context = @import("../backends/compute_context.zig").BackendContext;
+    const Sink = @import("../execution/retirement_sink.zig");
+    const R = @import("../execution/resource_retirement.zig");
+    const a = std.testing.allocator;
+    var context = try Context.init(a, .metal, null);
+    var context_live = true;
+    defer if (context_live) context.deinit(a);
+    var cb = context.computeBackend();
+    const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    const runtime = compute.provider_impl.raw_decode_runtime orelse return error.ExpectedActualMetalRuntime;
+    var park = try MetalCompute.ReaderEpochPark.prepare();
+    defer park.deinit();
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    // On any assertion failure preserve original parked ownership, reacquire
+    // its actual provider, then close it BEFORE sealing the current B.
+    defer {
+        if (park.compute != null) park.restore(&cb, .{ .boundary = &guard.epoch }) catch @panic("test original Reader restore failed");
+        context.deinit(a);
+        context_live = false;
+        guard.finish();
+    }
+    try compute.beginEngineOperation();
+    try std.testing.expect(try cb.bindCleanupEpoch(&guard.epoch));
+    const receiving = @import("../execution/invocation_context.zig").Context{ .cleanup = .{ .boundary = &guard.epoch } };
+    compute.workspace_invocation_context = &receiving;
+    cb.call_context = &receiving;
+    {
+        defer {
+            cb.call_context = null;
+            compute.workspace_invocation_context = null;
+        }
+        const before = metal_runtime_mod.frameCommandBufferCount(runtime);
+        try std.testing.expectError(error.ReaderEpochBackendBusy, park.park(&cb, .{ .boundary = &guard.epoch, .operation = cb.operationToken() }));
+        try std.testing.expectEqual(before, metal_runtime_mod.frameCommandBufferCount(runtime));
+        try std.testing.expect(park.compute == null and compute.engine_operation != null);
+        try std.testing.expectEqual(@as(c_int, 1), MetalCompute.ReaderEpochPark.Workspace.antfly_metal_workspace_policy_available(runtime));
+    }
+    {
+        // Force a real pre-publication custody refusal, after begin/quiesce,
+        // to prove that its marker rolls back without swallowing original state.
+        {
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.antfly_metal_decoder_cache_custody_take(runtime, park.custody));
+            var occupied = true;
+            defer if (occupied) {
+                if (metal_runtime_mod.antfly_metal_decoder_cache_custody_restore(runtime, park.custody) != 0) @panic("test occupied custody restore failed");
+            };
+            try std.testing.expectError(error.ReaderEpochBackendBusy, park.park(&cb, .{ .boundary = &guard.epoch, .operation = cb.operationToken() }));
+            try std.testing.expect(park.compute == null and park.retired.state.load(.acquire) == .idle);
+            try std.testing.expectEqual(@as(c_int, 1), MetalCompute.ReaderEpochPark.Workspace.antfly_metal_workspace_policy_available(runtime));
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.antfly_metal_decoder_cache_custody_restore(runtime, park.custody));
+            occupied = false;
+        }
+        // A real activation cache entry owns this SDK buffer. A foreign opaque
+        // workspace tag must be rejected without calling or casting its RootOps.
+        const Foreign = struct {
+            calls: std.atomic.Value(usize) = .init(0),
+            payload_refs: std.atomic.Value(usize) = .init(0),
+            references: std.atomic.Value(usize) = .init(1),
+            fn drop(self: *@This()) void {
+                if (self.references.fetchSub(1, .acq_rel) == 1) std.heap.c_allocator.destroy(self);
+            }
+            fn retain(raw: *anyopaque) callconv(.c) c_int {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                _ = self.calls.fetchAdd(1, .monotonic);
+                return -1;
+            }
+            fn release(raw: *anyopaque, _: ?*const anyopaque) callconv(.c) c_int {
+                return retain(raw);
+            }
+            fn beginUse(raw: *anyopaque, _: ?*anyopaque) callconv(.c) ?*anyopaque {
+                _ = retain(raw);
+                return null;
+            }
+            fn metadata(raw: *anyopaque) callconv(.c) void {
+                _ = retain(raw);
+            }
+            fn payloadRetain(raw: *anyopaque) callconv(.c) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                _ = self.references.fetchAdd(1, .monotonic);
+                _ = self.payload_refs.fetchAdd(1, .release);
+            }
+            fn payloadRelease(raw: *anyopaque) callconv(.c) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                _ = self.payload_refs.fetchSub(1, .acq_rel);
+                self.drop();
+            }
+            const Operations = extern struct {
+                retain: *const fn (*anyopaque) callconv(.c) c_int,
+                validate_release: *const fn (*anyopaque, ?*const anyopaque) callconv(.c) c_int,
+                release: *const fn (*anyopaque, ?*const anyopaque) callconv(.c) c_int,
+                begin_runtime_use: *const fn (*anyopaque, ?*anyopaque) callconv(.c) ?*anyopaque,
+                retain_metadata: *const fn (*anyopaque) callconv(.c) void,
+            };
+            const operations = Operations{ .retain = retain, .validate_release = release, .release = release, .begin_runtime_use = beginUse, .retain_metadata = metadata };
+            extern fn antfly_metal_workspace_witness_tag(*anyopaque, *anyopaque, *const Operations) c_int;
+        };
+        const foreign = try std.heap.c_allocator.create(Foreign);
+        foreign.* = .{};
+        defer foreign.drop(); // Payload independently pins actual delayed SDK death
+        // Runtime field clearing is synchronous, but SDK death can be later.
+        // This process-owned opaque spy survives independently of this test.
+        defer {
+            if (metal_runtime_mod.termite_metal_decode_runtime_set_lighton_activation_pool(runtime, 0) != 0) @panic("test cache close failed");
+        }
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.termite_metal_decode_runtime_set_lighton_activation_pool(runtime, 8 * 1024 * 1024));
+        const Produce = struct {
+            runtime: *metal_runtime_mod.RawMetalDecodeRuntime,
+            backing: ?*anyopaque = null, // +0; actual cache owns it
+            failure: ?anyerror = null,
+            fn run(self: *@This()) !void {
+                try metal_runtime_mod.beginFrame(self.runtime);
+                defer {
+                    if (metal_runtime_mod.hasActiveFrame(self.runtime)) metal_runtime_mod.cancelFrame(self.runtime) catch unreachable;
+                    if (metal_runtime_mod.hasSubmittedFrame(self.runtime)) metal_runtime_mod.waitFrame(self.runtime) catch unreachable;
+                }
+                try metal_runtime_mod.setActiveFrameRegime(self.runtime, .decode);
+                const buffer = metal_runtime_mod.termite_metal_buffer_alloc_fresh(self.runtime, 512, 1) orelse return error.OutOfMemory;
+                self.backing = buffer;
+                MetalCompute.ReaderEpochPark.Workspace.termite_metal_decode_runtime_release_buffer(self.runtime, buffer);
+                try metal_runtime_mod.submitFrame(self.runtime);
+                try metal_runtime_mod.waitFrame(self.runtime);
+            }
+            fn pooled(raw: *anyopaque) callconv(.c) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.run() catch |err| {
+                    self.failure = err;
+                };
+            }
+        };
+        var producer = Produce{ .runtime = runtime };
+        metal_runtime_mod.termite_metal_with_autorelease_pool(&producer, Produce.pooled);
+        if (producer.failure) |err| return err;
+        const handles = [_]*anyopaque{producer.backing orelse return error.ExpectedActualCacheBacking};
+        var witnesses_metadata = try R.BackendPreparation.prepare(std.testing.allocator, .metal, 1, 1);
+        defer witnesses_metadata.deinit(std.testing.allocator);
+        const witnesses = try witnesses_metadata.armMetal(null, &handles, R.Payload{ .context = foreign, .retain_fn = Foreign.payloadRetain, .release_fn = Foreign.payloadRelease });
+        var witnesses_live = true;
+        defer if (witnesses_live) metal_runtime_mod.antfly_metal_discard_retirement_witnesses(witnesses);
+        try std.testing.expectEqual(@as(c_int, 0), Foreign.antfly_metal_workspace_witness_tag(witnesses, foreign, &Foreign.operations));
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.antfly_metal_buffer_retirement_attach(witnesses));
+        metal_runtime_mod.antfly_metal_discard_retirement_witnesses(witnesses);
+        witnesses_live = false;
+        try std.testing.expect(foreign.payload_refs.load(.acquire) != 0);
+        const before_tagged = metal_runtime_mod.frameCommandBufferCount(runtime);
+        try std.testing.expectEqual(@as(c_int, 1), MetalCompute.antfly_metal_workspace_decoder_custody_compatible(@ptrCast(runtime)));
+        try std.testing.expectError(error.ReaderEpochBackendBusy, park.park(&cb, .{ .boundary = &guard.epoch, .operation = cb.operationToken() }));
+        try std.testing.expectEqual(before_tagged, metal_runtime_mod.frameCommandBufferCount(runtime));
+        try std.testing.expect(park.compute == null and compute.engine_operation != null and park.retired.state.load(.acquire) == .idle);
+        try std.testing.expectEqual(@as(usize, 0), foreign.calls.load(.acquire));
+        try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.termite_metal_decode_runtime_set_lighton_activation_pool(runtime, 0));
+        try std.testing.expectEqual(@as(c_int, 0), MetalCompute.ReaderEpochPark.Workspace.antfly_metal_workspace_reader_park_compatible(runtime));
+        {
+            // The actual in-frame pool is a separate ingress from the 134
+            // persistent fields: publish untagged first, then attach a real
+            // SDK witness while that pool remains its owning reference.
+            try metal_runtime_mod.beginFrame(runtime);
+            defer if (metal_runtime_mod.hasActiveFrame(runtime)) metal_runtime_mod.cancelFrame(runtime) catch @panic("test pooled frame cancel failed");
+            try metal_runtime_mod.setActiveFrameRegime(runtime, .prefill);
+            const pooled = metal_runtime_mod.termite_metal_buffer_alloc_fresh(runtime, 768, 1) orelse return error.OutOfMemory;
+            MetalCompute.ReaderEpochPark.Workspace.termite_metal_decode_runtime_release_buffer(runtime, pooled);
+            const pool_before = metal_runtime_mod.runtimeMemorySnapshot(runtime);
+            try std.testing.expectEqual(@as(u64, 1), pool_before.reuse_pool_slots);
+            const pool_handles = [_]*anyopaque{pooled};
+            var pool_witness_metadata = try R.BackendPreparation.prepare(std.testing.allocator, .metal, 1, 1);
+            defer pool_witness_metadata.deinit(std.testing.allocator);
+            const pool_witness = try pool_witness_metadata.armMetal(null, &pool_handles, R.Payload{ .context = foreign, .retain_fn = Foreign.payloadRetain, .release_fn = Foreign.payloadRelease });
+            var pool_witness_live = true;
+            defer if (pool_witness_live) metal_runtime_mod.antfly_metal_discard_retirement_witnesses(pool_witness);
+            try std.testing.expectEqual(@as(c_int, 0), Foreign.antfly_metal_workspace_witness_tag(pool_witness, foreign, &Foreign.operations));
+            try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.antfly_metal_buffer_retirement_attach(pool_witness));
+            metal_runtime_mod.antfly_metal_discard_retirement_witnesses(pool_witness);
+            pool_witness_live = false;
+            const before_pool_tag = metal_runtime_mod.frameCommandBufferCount(runtime);
+            try std.testing.expectEqual(@as(c_int, 1), MetalCompute.ReaderEpochPark.Workspace.antfly_metal_workspace_reader_park_compatible(runtime));
+            // The same actual pool owner belongs to the physical census, not
+            // hidden decoder custody. This metadata result does not accept
+            // its opaque descriptor or mint any numerical/use-bank authority.
+            try std.testing.expectEqual(@as(c_int, 0), MetalCompute.antfly_metal_workspace_decoder_custody_compatible(@ptrCast(runtime)));
+            try std.testing.expectError(error.ReaderEpochBackendBusy, park.park(&cb, .{ .boundary = &guard.epoch, .operation = cb.operationToken() }));
+            try std.testing.expect(metal_runtime_mod.hasActiveFrame(runtime));
+            try std.testing.expectEqual(before_pool_tag, metal_runtime_mod.frameCommandBufferCount(runtime));
+            try std.testing.expectEqual(pool_before.reuse_pool_slots, metal_runtime_mod.runtimeMemorySnapshot(runtime).reuse_pool_slots);
+            try std.testing.expect(park.compute == null and compute.engine_operation != null and park.retired.state.load(.acquire) == .idle);
+            try std.testing.expectEqual(@as(usize, 0), foreign.calls.load(.acquire));
+            // Consume the actual pool owner, never fake a physical-death bit.
+            const taken = metal_runtime_mod.termite_metal_buffer_alloc(runtime, 768, 1) orelse return error.OutOfMemory;
+            defer metal_runtime_mod.termite_metal_buffer_release(taken);
+            try std.testing.expect(taken == pooled);
+            try std.testing.expectEqual(@as(u64, 0), metal_runtime_mod.runtimeMemorySnapshot(runtime).reuse_pool_slots);
+            try std.testing.expectEqual(@as(c_int, 0), MetalCompute.ReaderEpochPark.Workspace.antfly_metal_workspace_reader_park_compatible(runtime));
+        }
+    }
+    // The same valid old Reader can now park. Even with no legacy pool policy,
+    // a peer modern scope is excluded BEFORE taking any allocation credit.
+    try park.park(&cb, .{ .boundary = &guard.epoch, .operation = cb.operationToken() });
+    guard.finish();
+    guard = try sink.enter();
+    {
+        const io = try lockSharedMetalData(compute.data, compute.io);
+        defer unlockSharedMetalData(compute.data, io);
+        try std.testing.expectEqual(@as(c_int, 0), MetalCompute.ReaderEpochPark.Workspace.antfly_metal_workspace_policy_available(runtime));
+    }
+    // A foreign receiving loan must refuse before publishing any receiver
+    // flags, beginning an Engine or queueing the displaced SDK cell.
+    {
+        const loan = @import("../execution/invocation_context.zig").Context{ .cleanup = .{ .boundary = &guard.epoch } };
+        compute.workspace_invocation_context = &loan;
+        cb.call_context = &loan;
+        defer {
+            compute.workspace_invocation_context = null;
+            cb.call_context = null;
+        }
+        try std.testing.expectError(error.ReaderEpochBackendBusy, park.restore(&cb, .{ .boundary = &guard.epoch }));
+        try std.testing.expect(park.compute == compute and compute.reader_epoch_suspended and compute.shared_provider_lease_io == null and compute.engine_operation == null and park.retired.state.load(.acquire) == .idle);
+    }
+    // Refused cleanup authority cannot consume the marker or original bank.
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, park.restore(&cb, .{ .outside_execution = true }));
+    try std.testing.expect(park.compute == compute and compute.reader_epoch_suspended);
+    try park.restore(&cb, .{ .boundary = &guard.epoch });
+    try std.testing.expect(park.compute == null and !compute.reader_epoch_suspended);
+    try std.testing.expectEqual(@as(c_int, 1), MetalCompute.ReaderEpochPark.Workspace.antfly_metal_workspace_policy_available(runtime));
+    // A second cycle proves warm marker reuse; no new custody metadata exists.
+    try park.park(&cb, .{ .boundary = &guard.epoch, .operation = cb.operationToken() });
+    guard.finish();
+    guard = try sink.enter();
+    try park.restore(&cb, .{ .boundary = &guard.epoch });
+    try std.testing.expectEqual(@as(c_int, -1), MetalCompute.ReaderEpochPark.Workspace.antfly_metal_workspace_reader_park_end(runtime));
+}
+
+test "Metal Reader old backing survives park and cancellation restores marker before custody destruction" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const Context = @import("../backends/compute_context.zig").BackendContext;
+    const Sink = @import("../execution/retirement_sink.zig");
+    const W = MetalCompute.ReaderEpochPark.Workspace;
+    const a = std.testing.allocator;
+    var context = try Context.init(a, .metal, null);
+    var context_live = true;
+    defer if (context_live) context.deinit(a);
+    var cb = context.computeBackend();
+    const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+    const runtime = compute.provider_impl.raw_decode_runtime orelse return error.ExpectedActualMetalRuntime;
+    var bank = try MetalCompute.ReaderEpochPark.prepare();
+    var bank_live = true;
+    defer if (bank_live) bank.deinit();
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer {
+        if (bank_live and bank.compute != null) bank.restore(&cb, .{ .boundary = &guard.epoch }) catch @panic("test original Reader restore failed");
+        if (context_live) {
+            context.deinit(a);
+            context_live = false;
+        }
+        guard.finish();
+    }
+    try compute.beginEngineOperation();
+    try std.testing.expect(try cb.bindCleanupEpoch(&guard.epoch));
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.termite_metal_decode_runtime_set_lighton_activation_pool(runtime, 8 * 1024 * 1024));
+    const Backing = struct {
+        runtime: *metal_runtime_mod.RawMetalDecodeRuntime,
+        original: ?*anyopaque = null, // +0; actual activation cache owns it
+        expected: [128]u32,
+        verify: bool = false,
+        failure: ?anyerror = null,
+        fn run(self: *@This()) !void {
+            var owned: ?*anyopaque = null;
+            defer {
+                if (metal_runtime_mod.hasActiveFrame(self.runtime)) metal_runtime_mod.cancelFrame(self.runtime) catch unreachable;
+                if (metal_runtime_mod.hasSubmittedFrame(self.runtime)) metal_runtime_mod.waitFrame(self.runtime) catch unreachable;
+                if (owned) |handle| metal_runtime_mod.termite_metal_buffer_release(handle);
+            }
+            try metal_runtime_mod.beginFrame(self.runtime);
+            try metal_runtime_mod.setActiveFrameRegime(self.runtime, .decode);
+            const handle = if (self.verify)
+                metal_runtime_mod.termite_metal_buffer_alloc(self.runtime, @sizeOf(@TypeOf(self.expected)), 1) orelse return error.OutOfMemory
+            else
+                metal_runtime_mod.termite_metal_buffer_alloc_fresh(self.runtime, @sizeOf(@TypeOf(self.expected)), 1) orelse return error.OutOfMemory;
+            owned = handle;
+            if (self.verify) {
+                try std.testing.expect(handle == self.original.?);
+                try metal_runtime_mod.submitFrame(self.runtime);
+                try metal_runtime_mod.waitFrame(self.runtime);
+                var actual: [128]u32 = undefined;
+                try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.termite_metal_buffer_download(self.runtime, handle, 0, &actual, @sizeOf(@TypeOf(actual))));
+                try std.testing.expectEqualSlices(u32, &self.expected, &actual);
+                try metal_runtime_mod.beginFrame(self.runtime);
+                try metal_runtime_mod.setActiveFrameRegime(self.runtime, .decode);
+            } else {
+                self.original = handle;
+                try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.termite_metal_buffer_upload(self.runtime, handle, 0, &self.expected, @sizeOf(@TypeOf(self.expected))));
+            }
+            W.termite_metal_decode_runtime_release_buffer(self.runtime, handle);
+            owned = null;
+            try metal_runtime_mod.submitFrame(self.runtime);
+            try metal_runtime_mod.waitFrame(self.runtime);
+        }
+        fn pooled(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.run() catch |err| {
+                self.failure = err;
+            };
+        }
+        fn checked(self: *@This()) !void {
+            self.failure = null;
+            metal_runtime_mod.termite_metal_with_autorelease_pool(self, pooled);
+            if (self.failure) |err| return err;
+        }
+    };
+    var backing = Backing{ .runtime = runtime, .expected = undefined };
+    for (&backing.expected, 0..) |*value, index| value.* = @intCast(index * 7919 + 17);
+    try backing.checked();
+    try bank.park(&cb, .{ .boundary = &guard.epoch, .operation = cb.operationToken() });
+    guard.finish();
+    guard = try sink.enter();
+    {
+        const io = try lockSharedMetalData(compute.data, compute.io);
+        defer unlockSharedMetalData(compute.data, io);
+        try std.testing.expectEqual(@as(c_int, 0), W.antfly_metal_workspace_policy_available(runtime));
+        var peer_scope: ReaderParkScopeProbe88 = .{};
+        const service = peer_scope.service(runtime);
+        try std.testing.expectEqual(@as(c_int, -1), MetalCompute.antfly_metal_decode_runtime_begin_existing_embedding_workspace(@ptrCast(runtime), service));
+        try std.testing.expectEqual(@as(c_int, -1), MetalCompute.antfly_metal_decode_runtime_begin_owned_embedding_workspace(@ptrCast(runtime), 4096, service));
+        try std.testing.expectEqual(@as(usize, 0), peer_scope.calls);
+        // Both refused BEFORE publication: the old marker and bank remain
+        // valid and the original exact backing/data oracle below must resume.
+        try std.testing.expect(bank.compute == compute and compute.reader_epoch_suspended);
+    }
+    try bank.restore(&cb, .{ .boundary = &guard.epoch });
+    try std.testing.expectEqual(@as(c_int, -1), W.antfly_metal_workspace_reader_park_end(runtime));
+    {
+        // The same descriptor is accepted after real restore: the parked
+        // marker, rather than malformed metadata, caused the earlier refusal.
+        var recovered: ReaderParkScopeProbe88 = .{};
+        const service = recovered.service(runtime);
+        try std.testing.expectEqual(@as(c_int, 0), MetalCompute.antfly_metal_decode_runtime_begin_existing_embedding_workspace(@ptrCast(runtime), service));
+        var active_scope = true;
+        defer if (active_scope) {
+            if (MetalCompute.antfly_metal_decode_runtime_end_existing_embedding_workspace(@ptrCast(runtime)) != 0) @panic("test existing scope close failed");
+        };
+        try std.testing.expectError(error.ReaderEpochBackendBusy, bank.park(&cb, .{ .boundary = &guard.epoch, .operation = cb.operationToken() }));
+        try std.testing.expect(bank.compute == null and compute.engine_operation != null);
+        try std.testing.expectEqual(@as(c_int, 0), MetalCompute.antfly_metal_decode_runtime_end_existing_embedding_workspace(@ptrCast(runtime)));
+        active_scope = false;
+        try std.testing.expectEqual(@as(usize, 0), recovered.calls);
+    }
+    backing.verify = true;
+    try backing.checked(); // SAME backing and uploaded bits after actual restore
+    const CancelledWindow = struct {
+        fn check(_: ?*anyopaque) anyerror!void {
+            return error.Cancelled;
+        }
+        fn run(park: *MetalCompute.ReaderEpochPark, backend: *const ops.ComputeBackend, boundary: *Sink.Guard, source: *Sink.Ref) !void {
+            try park.park(backend, .{ .boundary = &boundary.epoch, .operation = backend.operationToken() });
+            boundary.finish(); // old B seals after actual Engine/provider unlock
+            boundary.* = try source.enter();
+            defer if (park.compute != null) park.restore(backend, .{ .boundary = &boundary.epoch }) catch @panic("test canceled Reader cleanup restore failed");
+            var signal: u8 = 0;
+            const control = @import("../execution_control.zig").InferenceExecutionControl{ .ptr = &signal, .check_fn = check };
+            try control.check();
+        }
+    };
+    try std.testing.expectError(error.Cancelled, CancelledWindow.run(&bank, &cb, &guard, &sink));
+    try std.testing.expect(bank.compute == null and !compute.reader_epoch_suspended and compute.engine_operation != null and compute.shared_provider_lease_io != null);
+    try backing.checked(); // cancellation restored original nonempty SDK state too
+    try std.testing.expectEqual(@as(c_int, 0), metal_runtime_mod.termite_metal_decode_runtime_set_lighton_activation_pool(runtime, 0));
+    try std.testing.expectEqual(@as(c_int, 1), W.antfly_metal_workspace_policy_available(runtime));
+    bank.deinit(); // explicit supported destruction AFTER synchronous restoration
+    bank_live = false;
+    try std.testing.expectEqual(@as(c_int, 1), W.antfly_metal_workspace_policy_available(runtime));
+    context.deinit(a);
+    context_live = false;
+}
+
+// Valid descriptor/callbacks for metadata publication tests. No callback may
+// execute while a parked original Reader excludes the modern scope.
+const ReaderParkScopeProbe88 = struct {
+    calls: usize = 0,
+    const W = @import("../backends/metal_workspace_ownership.zig");
+    fn note(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.calls += 1;
+    }
+    fn take(raw: *anyopaque, _: usize) callconv(.c) ?*anyopaque {
+        note(raw);
+        return null;
+    }
+    fn publish(raw: *anyopaque, _: *anyopaque, _: *anyopaque, _: usize) callconv(.c) c_int {
+        note(raw);
+        return -1;
+    }
+    fn cancel(raw: *anyopaque, _: *anyopaque) callconv(.c) void {
+        note(raw);
+    }
+    fn retire(raw: *anyopaque, _: *anyopaque) callconv(.c) c_int {
+        note(raw);
+        return -1;
+    }
+    fn cached(raw: *anyopaque, _: *W.Root, _: *const @import("../execution/cleanup_context.zig").Context) callconv(.c) c_int {
+        note(raw);
+        return -1;
+    }
+    fn service(self: *@This(), runtime: *metal_runtime_mod.RawMetalDecodeRuntime) W.AllocationService {
+        return .{ .context = self, .runtime_address = @intFromPtr(runtime), .root_operations = &W.RootOperations.canonical, .take = take, .publish = publish, .cancel = cancel, .retire_transient = retire, .retain_cached = cached };
+    }
+};
+
+test "Metal raw bounded Main keeps original byte guard while generic existing receivers remain unbounded" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const roles = @import("../backends/metal_workspace_roles.zig");
+    const ownership = @import("../backends/metal_workspace_ownership.zig");
+    const Invocation = @import("../execution/invocation_context.zig");
+    const Sink = @import("../execution/retirement_sink.zig");
+    const OriginalBinding = struct {
+        receiver: *MetalCompute,
+        header: *ops.ComputeBackend,
+        context: *const Invocation.Context,
+        existing_service: bool,
+    };
+    try std.testing.expectEqual(@sizeOf(OriginalBinding), @sizeOf(MetalCompute.WorkspaceInvocationBinding));
+    var store = testMetalWeightStoreInit(a);
+    defer {
+        deinitSharedNativeProvider(&store);
+        store.lazy_weights.deinit(a);
+    }
+    // Publish ONLY the real empty shared provider, release its actual lease,
+    // then prepare all synchronous snapshots/use cells outside that lease.
+    var initial = try MetalCompute.init(a, &store, null);
+    const runtime = initial.provider_impl.raw_decode_runtime orelse return error.ExpectedActualRuntime;
+    const capacity = roles.antfly_metal_workspace_snapshot_capacity(@ptrCast(runtime));
+    initial.deinit();
+    var expected: [2]roles.Snapshot = undefined;
+    var validation: [2]roles.Snapshot = undefined;
+    var final: [2]roles.Snapshot = undefined;
+    var prepared: usize = 0;
+    defer for (0..prepared) |index| {
+        expected[index].deinitOutsideExecution();
+        validation[index].deinitOutsideExecution();
+        final[index].deinitOutsideExecution();
+    };
+    for (0..2) |index| {
+        expected[index] = try roles.Snapshot.prepare(capacity);
+        validation[index] = roles.Snapshot.prepare(capacity) catch |err| {
+            expected[index].deinitOutsideExecution();
+            return err;
+        };
+        final[index] = roles.Snapshot.prepare(capacity) catch |err| {
+            validation[index].deinitOutsideExecution();
+            expected[index].deinitOutsideExecution();
+            return err;
+        };
+        prepared += 1;
+    }
+    var bank = try ownership.UseBank.prepareExact(0);
+    defer bank.deinitOutsideExecution();
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    try bank.bindOutsideExecution(&.{}, &guard.epoch);
+    var uses: ownership.ReceiverUses = .{ .existing = &bank };
+    // Genuine provider lease + own Engine, never an ambient/shared token.
+    var compute = try MetalCompute.init(a, &store, null);
+    defer compute.deinit();
+    try compute.beginEngineOperation();
+    var cb = compute.computeBackend();
+    cb.execution_control = .{ .native_call_policy = .in_process };
+    try std.testing.expect(try cb.bindCleanupEpoch(&guard.epoch));
+    const current = @import("../execution/cleanup_context.zig").Context{ .boundary = &guard.epoch, .operation = cb.operationToken() orelse return error.ExpectedActualEngineOperation };
+    const context: Invocation.Context = .{ .cleanup = current, .workspace_uses = &uses };
+    var no_roots: [0]*ownership.Root = .{};
+    var copied = cb.vtable.*;
+    var foreign = cb;
+    foreign.vtable = &copied;
+    foreign.ptr = @ptrFromInt(16);
+    try std.testing.expectError(error.UnsupportedWorkspaceReceiver, MetalCompute.bindUnadmittedBoundedWorkspaceInvocation(&foreign, &context, @intFromPtr(runtime), &expected[0], &validation[0], 0));
+    for (0..2) |index| {
+        try expected[index].capture(@ptrCast(runtime));
+        try std.testing.expectEqual(@as(usize, 0), (try expected[index].capturedCoverage()).witnessed_roots);
+        var binding = if (index == 0)
+            try MetalCompute.bindUnadmittedBoundedWorkspaceInvocation(&cb, &context, @intFromPtr(runtime), &expected[index], &validation[index], 0)
+        else
+            try MetalCompute.bindExistingWorkspaceInvocation(&cb, &context, @intFromPtr(runtime), &expected[index], &validation[index]);
+        var active = true;
+        defer if (active) {
+            _ = MetalCompute.finishExistingWorkspaceInvocationReported(&binding, &final[index], &no_roots) catch platform.inference_process_supervisor.restartWorker();
+        };
+        const attempt = MetalTensor.deviceAllocateFreshWithAllocator(a, @ptrCast(runtime), 4, .private, &.{1});
+        if (index == 0) {
+            defer if (attempt) |value| {
+                var tensor = value;
+                tensor.deinitWithCleanup(current);
+            } else |_| {};
+            try std.testing.expectError(error.MetalBufferAllocFailed, attempt);
+        } else {
+            var tensor = try attempt;
+            tensor.deinitWithCleanup(current);
+        }
+        active = false;
+        const closed = try MetalCompute.finishExistingWorkspaceInvocationReported(&binding, &final[index], &no_roots);
+        if (index == 0) {
+            try std.testing.expect(closed == .allocation_denied);
+            try std.testing.expectError(error.ResourceLimitExceeded, closed.check());
+        } else try closed.check();
+        try std.testing.expect(compute.workspace_invocation_context == null and cb.call_context == null);
+        try std.testing.expect(uses.allocations == null and compute.provider_impl.workspace_creators.head == null);
+    }
+}
+
+test "Qwen reference cold program distinguishes all dense neutral all quantized and mixed before math" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const Layer = metal_command_planner.GatedFrameCommandLowerer.Layer;
+    var layer: Layer = .{
+        .shares_kv = false,
+        .kv_layer_index = 0,
+        .kv_heads = 1,
+        .head_dim = 128,
+        .intermediate_size = 256,
+        .attn_pre_norm_slot = 0,
+        .attn_post_norm_slot = 0,
+        .ffn_pre_norm_slot = 0,
+        .ffn_post_norm_slot = 0,
+        .q_head_norm_slot = null,
+        .k_head_norm_slot = null,
+        .q_linear_slot = 0,
+        .k_linear_slot = 0,
+        .v_linear_slot = 0,
+        .attention_linear_slot = 0,
+        .gate_linear_slot = 0,
+        .up_linear_slot = 0,
+        .down_linear_slot = 0,
+        .ple_gate_linear_slot = null,
+        .ple_proj_linear_slot = null,
+        .ple_post_norm_slot = null,
+    };
+    try std.testing.expectEqual(MetalCompute.WorkspaceReferenceProgram.device, MetalCompute.referenceWorkspaceProgram(false, &.{layer}));
+    try std.testing.expectEqual(MetalCompute.WorkspaceReferenceProgram.host_reference, MetalCompute.referenceWorkspaceProgram(true, &.{layer}));
+    inline for (.{ "q", "k", "v", "attention_output", "gate", "up", "down" }) |field| @field(layer.quant_formats, field) = .f32;
+    try std.testing.expectEqual(MetalCompute.WorkspaceReferenceProgram.device, MetalCompute.referenceWorkspaceProgram(true, &.{layer}));
+    layer.quant_formats.q = .q8_0;
+    try std.testing.expectEqual(MetalCompute.WorkspaceReferenceProgram.host_reference, MetalCompute.referenceWorkspaceProgram(true, &.{layer}));
+    layer.quant_formats.gate = .q8_0;
+    try std.testing.expectEqual(MetalCompute.WorkspaceReferenceProgram.mixed_unavailable, MetalCompute.referenceWorkspaceProgram(true, &.{layer}));
+    layer.quant_formats.q = .unknown;
+    try std.testing.expectEqual(MetalCompute.WorkspaceReferenceProgram.mixed_unavailable, MetalCompute.referenceWorkspaceProgram(true, &.{layer}));
+}
+
+test "Metal owned cold catalog rejects copied receiver before pointer cast and missing loan before SDK" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    var backend = context.computeBackend();
+    var copied = backend.vtable.*;
+    var wrapped = backend;
+    wrapped.vtable = &copied;
+    wrapped.ptr = @ptrFromInt(16);
+    const cfg = @import("../models/gpt.zig").Config{ .family = .qwen3, .norm_type = .rms_norm, .activation = .silu, .position_encoding = .rope, .hidden_size = 64, .intermediate_size = 128, .num_hidden_layers = 1, .num_attention_heads = 2, .num_key_value_heads = 1, .attention_head_dim = 64, .vocab_size = 64 };
+    try std.testing.expectError(error.UnsupportedWorkspaceReceiver, MetalCompute.prepareOwnedQwenWorkspaceCatalog(&wrapped, cfg, 1, null));
+    const compute: *MetalCompute = @ptrCast(@alignCast(backend.ptr));
+    const runtime = compute.provider_impl.raw_decode_runtime orelse return error.SkipZigTest;
+    const before = metal_runtime_mod.runtimeMemorySnapshot(runtime);
+    try std.testing.expectError(error.UnpreparedWorkspaceUses, MetalCompute.prepareOwnedQwenWorkspaceCatalog(&backend, cfg, 1, null));
+    try std.testing.expectEqual(before.quant_linear_bytes, metal_runtime_mod.runtimeMemorySnapshot(runtime).quant_linear_bytes);
+    try std.testing.expectEqual(before.compute_encoder_count, metal_runtime_mod.runtimeMemorySnapshot(runtime).compute_encoder_count);
+}
+
+test "reference host producer requires actual source allowance same live Engine full table runtime and B" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const ownership = @import("../backends/metal_workspace_ownership.zig");
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const Sink = @import("../execution/retirement_sink.zig");
+    const a = std.testing.allocator;
+    const domain = try Domain.create();
+    defer domain.release();
+    var source = try domain.controller.tryAcquire(.gpu, .{}, .{ .host_scratch_bytes = 320 }, false);
+    defer source.release();
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    var foreign_sink = try Sink.Ref.create();
+    defer foreign_sink.release();
+    var foreign_guard = try foreign_sink.enter();
+    defer foreign_guard.finish();
+    var foreign_epoch = try foreign_guard.retainEpoch();
+    defer foreign_epoch.release();
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    const owner: *MetalCompute = @ptrCast(@alignCast(backend.ptr));
+    const runtime = owner.provider_impl.raw_decode_runtime orelse return error.ExpectedMetalRuntime;
+    try owner.beginEngineOperation();
+    var engine_live = true;
+    defer if (engine_live) owner.finishEngineOperation();
+    try std.testing.expect(try backend.bindCleanupEpoch(&epoch));
+    const token = backend.operationToken() orelse return error.ExpectedActualEngineOperation;
+    const current: @import("../execution/cleanup_context.zig").Context = .{ .boundary = &epoch, .operation = token };
+    // Only the local host-allowance record is assembled here. All numerical
+    // authority, endpoint and current B are the real canonical provider's;
+    // there is no mocked operation callback or copied numerical implementation.
+    var phase: ownership.Phase = .{
+        .slots = &.{},
+        .domain = domain.pin(),
+        .reference_host_lease = &source,
+        .reference_host_bytes = 256,
+        .reference_host_floor = 64,
+        .host_reference_prepared = true,
+        .reference_implementation = .{ .context = backend.ptr, .table = backend.vtable },
+        .target_runtime_address = @intFromPtr(runtime),
+        .current = &epoch,
+        .operation = token,
+        .endpoint = owner.provider_impl.workspace_endpoint,
+        .creators = &owner.provider_impl.workspace_creators,
+    };
+    defer phase.domain.?.release();
+    defer phase.unbind();
+    const before = metal_runtime_mod.runtimeMemorySnapshot(runtime).compute_encoder_count;
+    try phase.validateReferenceHostUse(@ptrCast(runtime), current);
+    var wrong_b = current;
+    wrong_b.boundary = &foreign_epoch;
+    try std.testing.expectError(error.ForeignWorkspaceUse, phase.validateReferenceHostUse(@ptrCast(runtime), wrong_b));
+    var wrong_token = current;
+    wrong_token.operation.?.nonce += 1;
+    try std.testing.expectError(error.ForeignWorkspaceUse, phase.validateReferenceHostUse(@ptrCast(runtime), wrong_token));
+    try std.testing.expectError(error.ForeignWorkspaceEndpoint, phase.validateReferenceHostUse(@ptrFromInt(1), current));
+    var copied_table = backend.vtable.*;
+    phase.reference_implementation.?.table = &copied_table;
+    try std.testing.expectError(error.BackendOperationChanged, phase.validateReferenceHostUse(@ptrCast(runtime), current));
+    phase.reference_implementation.?.table = backend.vtable;
+    phase.reference_host_lease = null;
+    try std.testing.expectError(error.MissingReferenceHostAllowance, phase.validateReferenceHostUse(@ptrCast(runtime), current));
+    phase.reference_host_lease = &source;
+    try phase.validateReferenceHostUse(@ptrCast(runtime), current);
+    owner.finishEngineOperation();
+    engine_live = false;
+    try std.testing.expectError(error.BackendOperationConsumed, phase.validateReferenceHostUse(@ptrCast(runtime), current));
+    try std.testing.expectEqual(before, metal_runtime_mod.runtimeMemorySnapshot(runtime).compute_encoder_count);
+    try std.testing.expectEqual(@as(usize, 320), domain.controller.snapshot().host_scratch_bytes);
+    phase.unbind();
+    try std.testing.expect(phase.reference_host_lease == null and phase.reference_implementation == null);
+    try std.testing.expectError(error.MissingReferenceHostAllowance, phase.validateReferenceHostUse(@ptrCast(runtime), current));
+}
+
+fn gemmaTextRmsMetadataAllocationCase(a: std.mem.Allocator) !void {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const layout = try MetalCompute.rmsMetadata(try @import("../architectures/embedding_gemma2.zig").textRmsMetadataEntries(24));
+    const Probe = struct {
+        backing: std.mem.Allocator,
+        calls: usize = 0,
+        bytes: usize = 0,
+        alignment: std.mem.Alignment = .of(u8),
+        fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            self.bytes = len;
+            self.alignment = alignment;
+            return self.backing.rawAlloc(len, alignment, ra);
+        }
+        fn resize(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) bool {
+            return false;
+        }
+        fn remap(_: *anyopaque, _: []u8, _: std.mem.Alignment, _: usize, _: usize) ?[*]u8 {
+            return null;
+        }
+        fn free(raw: *anyopaque, bytes: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.backing.rawFree(bytes, alignment, ra);
+        }
+    };
+    var probe: Probe = .{ .backing = a };
+    const allocator: std.mem.Allocator = .{ .ptr = &probe, .vtable = &.{ .alloc = Probe.alloc, .resize = Probe.resize, .remap = Probe.remap, .free = Probe.free } };
+    var map: @FieldType(MetalCompute, "dynamic_rms_norm_slots") = .empty;
+    defer map.deinit(allocator);
+    try map.ensureTotalCapacity(allocator, layout.entries);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expectEqual(layout.bytes, probe.bytes);
+    try std.testing.expectEqual(layout.alignment, probe.alignment);
+    // CPU metadata only: these values are never installed/submitted as SDK
+    // declarations. Every registered role fits with no old/new map overlap.
+    for (0..layout.entries) |index| map.putAssumeCapacity(.{ .weight_buf = index + 1, .hidden_size = 512 }, .{ .slot = index, .generation = 1, .declaration_id = 1 });
+    try std.testing.expectEqual(layout.entries, map.count());
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+}
+
+test "Metal Gemma RMS metadata measures same HashMap allocation and holds every registered role with one allocation across all OOM" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, gemmaTextRmsMetadataAllocationCase, .{});
+    const layout = try MetalCompute.rmsMetadata(try @import("../architectures/embedding_gemma2.zig").textRmsMetadataEntries(24));
+    try std.testing.expectEqual(@as(u32, 170), layout.entries);
+    try std.testing.expect(layout.bytes > 0);
+    const empty = try MetalCompute.rmsMetadata(0);
+    try std.testing.expectEqual(@as(usize, 0), empty.bytes);
+    try std.testing.expectError(error.ResourceLimitExceeded, MetalCompute.rmsMetadata(metal_runtime_mod.decoder_runtime_rms_norm_slot_capacity + 1));
+}
+
+test "generic RMS metadata refuses copied tables missing and sealed current B before receiving pointer cast" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    var copied = MetalCompute.vtable_impl;
+    const foreign: ops.ComputeBackend = .{ .ptr = @ptrFromInt(1), .vtable = &copied };
+    try std.testing.expectError(error.UnsupportedEmbeddingStage, MetalCompute.prepareRmsMetadata(&foreign, 1, .{}));
+    const canonical: ops.ComputeBackend = .{ .ptr = @ptrFromInt(1), .vtable = &MetalCompute.vtable_impl };
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, MetalCompute.prepareRmsMetadata(&canonical, 1, .{}));
+    var owner = try @import("../execution/retirement_sink.zig").Ref.create();
+    defer owner.release();
+    var guard = try owner.enter();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    guard.finish();
+    try std.testing.expectError(error.RetirementEpochSealed, MetalCompute.prepareRmsMetadata(&canonical, 1, .{ .boundary = &epoch }));
+}
+
+fn gemmaProjectionMetadataAllocationCase(allocator: std.mem.Allocator) !void {
+    var compute: MetalCompute = undefined;
+    compute.allocator = allocator;
+    compute.dynamic_linear_slots = .empty;
+    compute.zero_bias_cache = .empty;
+    defer {
+        var it = compute.zero_bias_cache.valueIterator();
+        while (it.next()) |data| allocator.free(data.*);
+        compute.zero_bias_cache.deinit(allocator);
+        compute.dynamic_linear_slots.deinit(allocator);
+    }
+    const authored = try @import("../architectures/embedding_gemma2.zig").textProjectionMetadata(.{});
+    try compute.dynamic_linear_slots.ensureTotalCapacity(allocator, authored.linear_entries);
+    try compute.zero_bias_cache.ensureTotalCapacity(allocator, authored.zero_widths.len);
+    for (authored.zero_widths) |width| _ = try compute.getOrInsertZeroBias(width);
+    // Public heap-returning compatibility API still exercises header/shape
+    // failures; the cache remains valid after every error unwind.
+    const heap_view = try compute.cachedZeroBiasBuf(authored.zero_widths[0]);
+    const heap_buf = MetalCompute.toBuf(heap_view);
+    defer {
+        allocator.free(heap_buf.logical_shape.?);
+        allocator.destroy(heap_buf);
+    }
+    var view: MetalCompute.Buf = undefined;
+    var shape: [1]i64 = undefined;
+    const ct = try compute.borrowedZeroBiasBuf(&view, &shape, authored.zero_widths[0]);
+    try std.testing.expect(MetalCompute.toBuf(ct) == &view);
+    try std.testing.expect(view.data.ptr == heap_buf.data.ptr);
+    try std.testing.expectEqualDeep(MetalCompute.parameterIdentity(heap_buf), MetalCompute.parameterIdentity(&view));
+    try std.testing.expectEqual(MetalCompute.dynamicLinearDenseBufferKey(heap_buf), MetalCompute.dynamicLinearDenseBufferKey(&view));
+}
+
+test "Gemma projection metadata maps zero arrays and legacy heap views unwind every OOM" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, gemmaProjectionMetadataAllocationCase, .{});
+}
+
+test "Gemma zero bias borrowed view uses cached data with no metadata allocation" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    var compute: MetalCompute = undefined;
+    compute.allocator = std.testing.allocator;
+    compute.zero_bias_cache = .empty;
+    defer {
+        var it = compute.zero_bias_cache.valueIterator();
+        while (it.next()) |data| std.testing.allocator.free(data.*);
+        compute.zero_bias_cache.deinit(std.testing.allocator);
+    }
+    const data = try compute.getOrInsertZeroBias(768);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    compute.allocator = failing.allocator();
+    var view: MetalCompute.Buf = undefined;
+    var shape: [1]i64 = undefined;
+    const ct = try compute.borrowedZeroBiasBuf(&view, &shape, 768);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    try std.testing.expect(MetalCompute.toBuf(ct) == &view);
+    try std.testing.expect(view.data.ptr == data.ptr);
+    try std.testing.expectEqualSlices(i64, &.{768}, view.logical_shape.?);
+    for (view.data) |value| try std.testing.expectEqual(@as(f32, 0), value);
+}
+
+test "projection metadata exact capacity rejects duplicate widths and receiver authority before access" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const request: MetalCompute.ProjectionMetadataRequest = .{ .linear_entries = 242, .zero_widths = &.{ 512, 768, 1024, 2048, 12288 } };
+    try std.testing.expect((try MetalCompute.projectionMetadataHostBytes(request)) > 0);
+    try std.testing.expectEqual(@as(usize, 0), try MetalCompute.projectionMetadataHostBytes(.{ .linear_entries = 0, .zero_widths = &.{} }));
+    try std.testing.expectError(error.InvalidProjectionMetadataLayout, MetalCompute.projectionMetadataHostBytes(.{ .linear_entries = 1, .zero_widths = &.{ 2, 2 } }));
+    try std.testing.expectError(error.InvalidProjectionMetadataLayout, MetalCompute.projectionMetadataHostBytes(.{ .linear_entries = 1, .zero_widths = &.{0} }));
+    var copied = MetalCompute.vtable_impl;
+    var cb: ops.ComputeBackend = .{ .ptr = @ptrFromInt(16), .vtable = &copied };
+    try std.testing.expectError(error.UnsupportedEmbeddingStage, MetalCompute.prepareProjectionMetadata(&cb, request, .{}));
+    cb.vtable = &MetalCompute.vtable_impl;
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, MetalCompute.prepareProjectionMetadata(&cb, request, .{}));
+}
+
+fn gemmaTextWeightMetadataAllocationCase(allocator: std.mem.Allocator) !void {
+    var compute: MetalCompute = undefined;
+    compute.allocator = allocator;
+    compute.dense_weight_cache = .empty;
+    compute.weight_handles = .empty;
+    defer {
+        var views = compute.weight_handles.iterator();
+        while (views.next()) |entry| {
+            const buf = MetalCompute.toBuf(entry.value_ptr.*);
+            allocator.free(buf.logical_shape.?);
+            allocator.destroy(buf);
+            allocator.free(entry.key_ptr.*);
+        }
+        compute.weight_handles.deinit(allocator);
+        var values = compute.dense_weight_cache.iterator();
+        while (values.next()) |entry| {
+            entry.value_ptr.deinit(allocator);
+            allocator.free(entry.key_ptr.*);
+        }
+        compute.dense_weight_cache.deinit(allocator);
+    }
+    const schema = @import("../architectures/embedding_gemma2.zig");
+    const request = try schema.textWeightMetadata(.{});
+    try compute.dense_weight_cache.ensureTotalCapacity(allocator, request.entries);
+    try compute.weight_handles.ensureTotalCapacity(allocator, request.entries);
+    const Visitor = struct {
+        fn visit(owner: *MetalCompute, name: []const u8, shape: []const i64) !void {
+            // Real schema representatives cover native rank2 metadata,
+            // converted rank1 coefficients and scalar payload/header paths.
+            if (!std.mem.eql(u8, name, "language_model.ple.per_layer_model_projection.weight") and !std.mem.eql(u8, name, "language_model.norm.weight") and !std.mem.eql(u8, name, "language_model.layers.0.layer_scalar")) return;
+            var values_moved = false;
+            const logical_shape = try owner.allocator.dupe(i64, shape);
+            errdefer if (!values_moved) owner.allocator.free(logical_shape);
+            const data = try owner.allocator.alloc(f32, if (shape.len == 1) @intCast(shape[0]) else 0);
+            errdefer if (!values_moved) owner.allocator.free(data);
+            @memset(data, 0);
+            const cached = try owner.getOrInsertCachedDenseWeight(name, data, logical_shape, null, null, null, null);
+            values_moved = true;
+            const before = owner.dense_weight_cache.count();
+            var handle_moved = false;
+            const handle_name = try owner.allocator.dupe(u8, name);
+            errdefer if (!handle_moved) owner.allocator.free(handle_name);
+            const view = try owner.cachedDenseWeightBuf(cached);
+            // From this point ownership moves to the real shared-handle map.
+            owner.weight_handles.putAssumeCapacityNoClobber(handle_name, view);
+            handle_moved = true;
+            try std.testing.expectEqual(before, owner.dense_weight_cache.count());
+            try std.testing.expect(MetalCompute.toBuf(view).data.ptr == cached.data.ptr);
+        }
+    };
+    try schema.visitTextWeights(.{}, &compute, Visitor.visit);
+    try std.testing.expectEqual(@as(u32, 3), compute.dense_weight_cache.count());
+    try std.testing.expectEqual(@as(u32, 3), compute.weight_handles.count());
+}
+
+test "Gemma complete text metadata inventory maps names shapes vectors and views unwind all OOM" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, gemmaTextWeightMetadataAllocationCase, .{});
+}
+
+test "weight metadata rejects malformed inventory and missing actual cleanup before receiver access" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const schema = try @import("../architectures/embedding_gemma2.zig").textWeightMetadata(.{});
+    const request: MetalCompute.WeightMetadataRequest = .{
+        .entries = schema.entries,
+        .name_bytes = schema.name_bytes,
+        .shape_axes = schema.shape_axes,
+        .vector_entries = schema.vector_entries,
+        .vector_elements = schema.vector_elements,
+
+        .slice_views = schema.slice_views,
+    };
+    try std.testing.expect((try MetalCompute.weightMetadataHostBytes(request)) > 0);
+    var invalid = request;
+    invalid.vector_entries = invalid.entries + 1;
+    try std.testing.expectError(error.InvalidWeightMetadataLayout, MetalCompute.weightMetadataHostBytes(invalid));
+    var copied = MetalCompute.vtable_impl;
+    var cb: ops.ComputeBackend = .{ .ptr = @ptrFromInt(16), .vtable = &copied };
+    try std.testing.expectError(error.UnsupportedEmbeddingStage, MetalCompute.prepareWeightMetadata(&cb, request, .{}));
+    cb.vtable = &MetalCompute.vtable_impl;
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, MetalCompute.prepareWeightMetadata(&cb, request, .{}));
+}
+
+test "Metal adjusted norm cache owns published buffers when cold or warm CT metadata allocation fails" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    // Cold allocations are the copied CPU coefficient vector, cache table,
+    // CT Buf and CT shape. The last two fail AFTER actual SDK publication.
+    for (0..4) |failure_index| {
+        var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, null);
+        defer context.deinit(a);
+        var cb = context.computeBackend();
+        const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        const input = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{4});
+        defer cb.free(input);
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = failure_index });
+        const original_allocator = compute.allocator;
+        compute.allocator = failing.allocator();
+        defer compute.allocator = original_allocator;
+        defer {
+            var iterator = compute.adjusted_norm_weight_device_cache.valueIterator();
+            while (iterator.next()) |value| value.deinit();
+            compute.adjusted_norm_weight_device_cache.deinit(failing.allocator());
+            compute.adjusted_norm_weight_device_cache = .empty;
+        }
+        var scope = try @import("../execution/submission.zig").Scope.begin(&cb);
+        defer scope.deinit();
+        try std.testing.expectError(error.OutOfMemory, MetalCompute.addScalarCacheImpl(compute, input, 1));
+        scope.deinit();
+        const published = compute.adjusted_norm_weight_device_cache.count() != 0;
+        try std.testing.expectEqual(failure_index >= 2, published);
+        if (published) {
+            var cached_values = compute.adjusted_norm_weight_device_cache.valueIterator();
+            const cached = cached_values.next().?;
+            try std.testing.expect(!cached.device.?.ref.released);
+            try std.testing.expectEqual(@as(usize, 1), cached.device.?.ref.ref_count.load(.acquire));
+            const pointer = cached.deviceHandle().?;
+            const values = try cached.toHostSlice();
+            try std.testing.expectEqualSlices(f32, &.{ 2, 3, 4, 5 }, values);
+            // Same real warm entry; fail both CT Buf and shape allocations.
+            for (0..2) |warm_failure_index| {
+                var warm_failure = std.testing.FailingAllocator.init(a, .{ .fail_index = warm_failure_index });
+                compute.allocator = warm_failure.allocator();
+                defer compute.allocator = failing.allocator();
+                var warm_scope = try @import("../execution/submission.zig").Scope.begin(&cb);
+                defer warm_scope.deinit();
+                try std.testing.expectError(error.OutOfMemory, MetalCompute.addScalarCacheImpl(compute, input, 1));
+                warm_scope.deinit();
+                try std.testing.expectEqual(warm_failure.allocated_bytes, warm_failure.freed_bytes);
+                try std.testing.expectEqual(pointer, cached.deviceHandle().?);
+                try std.testing.expectEqual(@as(usize, 1), cached.device.?.ref.ref_count.load(.acquire));
+            }
+        }
+        // Explicitly retire the cache before checking allocator accounting.
+        var iterator = compute.adjusted_norm_weight_device_cache.valueIterator();
+        while (iterator.next()) |value| value.deinit();
+        compute.adjusted_norm_weight_device_cache.deinit(failing.allocator());
+        compute.adjusted_norm_weight_device_cache = .empty;
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+    }
+}
+
+test "Metal unit RMS cache failed table publication frees SDK output and successful move retains cache owner" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metal_runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    for (0..2) |failure_index| {
+        var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, null);
+        defer context.deinit(a);
+        var cb = context.computeBackend();
+        const compute: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = failure_index });
+        const original_allocator = compute.allocator;
+        compute.allocator = failing.allocator();
+        defer compute.allocator = original_allocator;
+        const before = metal_tensor_mod.memoryStatsSnapshot().device_owned_live_bytes;
+        var scope = try @import("../execution/submission.zig").Scope.begin(&cb);
+        defer scope.deinit();
+        try std.testing.expectError(error.OutOfMemory, compute.unitRmsWeightDeviceTensor(4));
+        scope.deinit();
+        try std.testing.expectEqual(@as(u32, 0), compute.unit_rms_weight_device_cache.count());
+        try std.testing.expectEqual(before, metal_tensor_mod.memoryStatsSnapshot().device_owned_live_bytes);
+        try std.testing.expectEqual(failing.allocated_bytes, failing.freed_bytes);
+        compute.allocator = original_allocator;
+        var published = (try compute.unitRmsWeightDeviceTensor(4)).?;
+        const pointer = published.deviceHandle().?;
+        published.deinit();
+        const cached = compute.unit_rms_weight_device_cache.getPtr(4).?;
+        try std.testing.expectEqual(@as(usize, 1), cached.device.?.ref.ref_count.load(.acquire));
+        try std.testing.expectEqualSlices(f32, &.{ 1, 1, 1, 1 }, try cached.toHostSlice());
+        var hit = (try compute.unitRmsWeightDeviceTensor(4)).?;
+        defer hit.deinit();
+        try std.testing.expectEqual(pointer, hit.deviceHandle().?);
+    }
 }

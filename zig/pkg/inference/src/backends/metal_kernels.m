@@ -20,6 +20,7 @@
 #import <objc/runtime.h>
 #import <dispatch/dispatch.h>
 #include "metal_compile_options.h"
+#include "metal_workspace_geometry.h"
 #include "metal_gdn_source.h"
 #include "../ops/gpu/depthwise_program.h"
 #include "../ops/gpu/masked_pool_program.h"
@@ -47,6 +48,53 @@
 #include <unistd.h>
 #include "metal_pipeline_catalog.h"
 #include <crt_externs.h>
+
+int antfly_metal_greedy_workspace_requirements(
+    size_t hidden, size_t intermediate, size_t layers,
+    size_t heads, size_t kv_heads, size_t head_dim,
+    size_t vocab, size_t kv_tokens, antfly_metal_greedy_workspace_sizes *out
+) {
+    return antfly_workspace_geometry_greedy(hidden, intermediate, layers,
+        heads, kv_heads, head_dim, vocab, kv_tokens, out);
+}
+int antfly_metal_dense_f16kv_geometry(const antfly_metal_dense_attention_request *request,
+    uint32_t capabilities, size_t *out) {
+    return antfly_workspace_geometry_dense_f16kv(request, capabilities, out);
+}
+bool antfly_metal_dense_f16kv_replace(size_t capacity, size_t required, bool key_present, bool value_present) {
+    return antfly_workspace_geometry_dense_f16kv_replace(capacity, required, key_present, value_present);
+}
+int antfly_metal_prefill_scratch_requirements(
+    size_t rows, size_t heads, size_t kv_heads, size_t head_dim,
+    size_t hidden, size_t intermediate, size_t tail_vocab,
+    antfly_metal_prefill_scratch_sizes *out
+) {
+    return antfly_workspace_geometry_prefill_scratch(rows, heads, kv_heads,
+        head_dim, hidden, intermediate, tail_vocab, out);
+}
+int antfly_metal_host_staging_requirements(
+    size_t current_capacity, size_t current_offset, size_t length,
+    uint32_t buffer_present, uint32_t standalone,
+    antfly_metal_host_staging_sizes *out
+) {
+    return antfly_workspace_geometry_host_staging(current_capacity, current_offset,
+        length, buffer_present, standalone, out);
+}
+int antfly_metal_row_workspace_requirements(size_t rows, size_t width,
+    antfly_metal_row_workspace_sizes *out) {
+    return antfly_workspace_geometry_rows(rows, width, out);
+}
+int antfly_metal_pool_workspace_requirements(size_t batch, size_t rows,
+    size_t width, size_t dimensions, uint32_t segmented,
+    antfly_metal_pool_workspace_sizes *out) {
+    return antfly_workspace_geometry_pool(batch, rows, width, dimensions, segmented, out);
+}
+int antfly_metal_frame_pool_workspace_requirements(size_t batch, size_t sequence,
+    size_t hidden, antfly_metal_frame_pool_workspace_sizes *out) {
+    return antfly_workspace_geometry_frame_pool(batch, sequence, hidden, out);
+}
+
+
 
 #define ANTFLY_METAL_DECLARE_PIPELINE(Field, Name, Library, Load, Clear, Family) id<MTLComputePipelineState> Field;
 
@@ -1420,12 +1468,26 @@ typedef struct antfly_metal_retirement_payload {
     void (*notify_fn)(void);
 } antfly_metal_retirement_payload;
 
+typedef struct antfly_metal_workspace_root_operations {
+    int (*retain)(void *);
+    int (*validate_release)(void *, const void *);
+    int (*release)(void *, const void *);
+    void *(*begin_runtime_use)(void *, void *);
+    void (*retain_metadata)(void *);
+} antfly_metal_workspace_root_operations;
 @interface AntflyMetalRetirementWitness : NSObject {
 @public
     antfly_metal_retirement_payload _payload;
     id _pending_object;
     AntflyMetalRetirementWitness *_next;
     bool _armed;
+    // Pure metadata only. The Group's metadata pin keeps this exact owner
+    // valid through actual SDK death; no model/provider/IO/arena is captured.
+    void *_workspace_root;
+    const antfly_metal_workspace_root_operations *_workspace_operations;
+    uint64_t _workspace_references; // unfunded compatibility tag only; Root owns charged refs
+    bool _workspace_tag;
+    uint64_t _workspace_birth;
 }
 @end
 @implementation AntflyMetalRetirementWitness
@@ -1478,6 +1540,29 @@ void antfly_metal_retirement_arena_destroy(void *raw) {
         for (size_t i = 0; i < arena->witness_capacity; ++i) if (arena->objects[i] != NULL) CFRelease(arena->objects[i]);
     }
     free(arena->objects); free(arena->views); free(arena->handles); free(arena);
+}
+// Requested authored metadata only; allocator/runtime overhead remains in the
+// original compatibility floor. Uses actual C/ObjC layout, never a guessed
+// cross-language witness size. Same capacities as the constructor below.
+size_t antfly_metal_retirement_arena_requested_bytes(size_t output_capacity, size_t origin_capacity) {
+    if (!origin_capacity || origin_capacity > SIZE_MAX / 2) return 0;
+    size_t frames = 2 * origin_capacity;
+    if (output_capacity > SIZE_MAX - frames) return 0;
+    size_t witnesses = output_capacity + frames;
+    size_t instance = class_getInstanceSize([AntflyMetalRetirementWitness class]);
+    if (!instance || output_capacity > SIZE_MAX / sizeof(void *) ||
+        witnesses > SIZE_MAX / sizeof(CFTypeRef) || witnesses > SIZE_MAX / instance ||
+        origin_capacity > SIZE_MAX / sizeof(antfly_metal_prepared_retirement_witnesses)) return 0;
+    size_t terms[] = { sizeof(antfly_metal_retirement_arena),
+        (output_capacity ? output_capacity : 1) * sizeof(void *),
+        (witnesses ? witnesses : 1) * sizeof(CFTypeRef),
+        origin_capacity * sizeof(antfly_metal_prepared_retirement_witnesses), witnesses * instance };
+    size_t result = 0;
+    for (size_t i = 0; i < sizeof(terms) / sizeof(terms[0]); ++i) {
+        if (terms[i] > SIZE_MAX - result) return 0;
+        result += terms[i];
+    }
+    return result;
 }
 static void *antfly_metal_retirement_arena_prepare_limited(size_t output_capacity, size_t origin_capacity, size_t fail_after) {
     if (origin_capacity == 0 || origin_capacity > SIZE_MAX / 2) return NULL;
@@ -1642,6 +1727,17 @@ void antfly_metal_request_retirement_poll(void) {
 #define ANTFLY_METAL_FRESH_BUFFER_CAPACITY 1024u
 #define ANTFLY_METAL_FRESH_BUFFER_PROBES 16u
 typedef struct { void *handle; uint64_t frame_epoch; } antfly_metal_fresh_buffer;
+typedef struct antfly_metal_workspace_allocation_service {
+    void *context;
+    uintptr_t runtime_address;
+    const antfly_metal_workspace_root_operations *root_operations;
+    void *(*take)(void *, size_t);
+    int (*publish)(void *, void *, void *, size_t);
+    void (*cancel)(void *, void *);
+    int (*retire_transient)(void *, void *);
+    int (*retain_cached)(void *, void *, const void *);
+} antfly_metal_workspace_allocation_service;
+
 typedef struct termite_metal_decode_runtime {
     uint16_t pipeline_quant_formats;
     TermiteMetalMtpHeadWorkspace *mtp_head_workspace;
@@ -1651,6 +1747,18 @@ typedef struct termite_metal_decode_runtime {
     bool embedding_workspace_bounded;
     bool embedding_workspace_denied;
     size_t embedding_workspace_remaining;
+    // Borrowed ONLY during the actual synchronous numerical operation.
+    // Cleared before provider/model unlock; no epoch is stored in a root.
+    bool embedding_workspace_owned;
+    bool embedding_workspace_existing; // synchronous reuse-only service; no allocation credit
+    uint64_t embedding_workspace_generation;
+    pthread_t embedding_workspace_thread;
+    antfly_metal_workspace_allocation_service embedding_workspace_owner;
+    // Actual synchronous Reader park/restore owns this numeric exclusion.
+    // No SDK/custody cell retains a runtime pointer for late callbacks.
+    // calloc-zeroed at all three runtime constructors; every later read/write
+    // holds retirement_lock, including scope publication and charged reuse.
+    size_t workspace_parked_readers;
     id<MTLCommandQueue> queue;
     id<MTLLibrary> library;
     id<MTLLibrary> precise_library;
@@ -4083,16 +4191,35 @@ static uint64_t termite_metal_clock_monotonic_nanos(void) {
     return ((uint64_t)ts.tv_sec * 1000000000ull) + (uint64_t)ts.tv_nsec;
 }
 
-static id<MTLBuffer> termite_metal_workspace_buffer(
-    termite_metal_decode_runtime *runtime, size_t bytes, MTLResourceOptions options
+static size_t antfly_metal_allocation_bytes_for_mode(id<MTLDevice>, size_t, MTLResourceOptions);
+static bool antfly_metal_workspace_note_unfunded(id<MTLBuffer>, uint64_t);
+static void antfly_metal_workspace_set_birth(id<MTLBuffer>, uint64_t);
+static bool antfly_metal_workspace_allow_reuse(termite_metal_decode_runtime *, void *, const void *);
+static id<MTLBuffer> antfly_metal_workspace_buffer_impl(
+    termite_metal_decode_runtime *runtime, size_t bytes, MTLResourceOptions options,
+    const void *initialized_bytes, void **receipt
 ) {
+    if (receipt) *receipt = NULL;
+    if (runtime->embedding_workspace_owned && !pthread_equal(runtime->embedding_workspace_thread, pthread_self())) return nil;
+    if (!bytes || runtime->embedding_workspace_generation == UINT64_MAX) return nil;
+    const uint64_t birth = ++runtime->embedding_workspace_generation;
+    void *prepared_root = NULL;
+    const antfly_metal_workspace_allocation_service owner = runtime->embedding_workspace_owner;
     if (runtime->embedding_workspace_bounded) {
         // Metal may round allocations. Charge a page-rounded upper bound.
         if (bytes > SIZE_MAX - 16383u) {
             runtime->embedding_workspace_denied = true;
             return nil;
         }
-        const size_t charge = (bytes + 16383u) & ~(size_t)16383u;
+        size_t charge = (bytes + 16383u) & ~(size_t)16383u;
+        if (runtime->embedding_workspace_owned) {
+            const size_t physical = antfly_metal_allocation_bytes_for_mode(runtime->device, bytes, options);
+            if (!physical || !owner.context || !owner.take || !owner.publish || !owner.cancel) {
+                runtime->embedding_workspace_denied = true;
+                return nil;
+            }
+            charge = MAX(charge, physical);
+        }
         if (charge > runtime->embedding_workspace_remaining) {
             if (getenv("TERMITE_EMBED_CAPACITY_DIAGNOSTICS") != NULL) {
                 fprintf(stderr, "qwen_embedding_workspace_denied: allocation_bytes=%zu remaining_bytes=%zu\n", charge, runtime->embedding_workspace_remaining);
@@ -4100,23 +4227,142 @@ static id<MTLBuffer> termite_metal_workspace_buffer(
             runtime->embedding_workspace_denied = true;
             return nil;
         }
+        // Both quota and inert witness capacity are taken BEFORE SDK creation.
+        // No allocator/callback fallback may occur after a failed take.
+        if (runtime->embedding_workspace_owned) {
+            prepared_root = owner.take(owner.context, charge);
+            if (!prepared_root) { runtime->embedding_workspace_denied = true; return nil; }
+        }
         runtime->embedding_workspace_remaining -= charge;
     }
-    return antfly_observe_metal_buffer([runtime->device newBufferWithLength:bytes options:options], ANTFLY_BUFFER_OWNED);
+    id<MTLBuffer> buffer __attribute__((objc_precise_lifetime)) = initialized_bytes
+        ? antfly_observe_metal_buffer([runtime->device newBufferWithBytes:initialized_bytes length:bytes options:options], ANTFLY_BUFFER_INITIALIZED)
+        : antfly_observe_metal_buffer([runtime->device newBufferWithLength:bytes options:options], ANTFLY_BUFFER_OWNED);
+    if (prepared_root) {
+        if (buffer == nil) { owner.cancel(owner.context, prepared_root); return nil; }
+        const size_t actual = MAX((size_t)buffer.length, (size_t)buffer.allocatedSize);
+        if (owner.publish(owner.context, prepared_root, (__bridge void *)buffer, actual) != 0) {
+            owner.cancel(owner.context, prepared_root);
+            runtime->embedding_workspace_denied = true;
+            return nil;
+        }
+    }
+    if (buffer != nil) {
+        // Scope the legacy ownership tag to the existing bounded Qwen
+        // workspace protocol. Ordinary unbounded activation allocations do
+        // not gain a new metadata allocation or observation mechanism.
+        if (!prepared_root && runtime->embedding_workspace_bounded && !antfly_metal_workspace_note_unfunded(buffer, birth)) return nil;
+        if (prepared_root || runtime->embedding_workspace_bounded) antfly_metal_workspace_set_birth(buffer, birth);
+    }
+    if (receipt) *receipt = prepared_root;
+    return buffer;
 }
 
-int termite_metal_decode_runtime_begin_embedding_workspace(termite_metal_decode_runtime *runtime, size_t bytes) {
-    if (runtime == NULL || runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -1;
+static id<MTLBuffer> termite_metal_workspace_buffer(
+    termite_metal_decode_runtime *runtime, size_t bytes, MTLResourceOptions options
+) {
+    return antfly_metal_workspace_buffer_impl(runtime, bytes, options, NULL, NULL);
+}
+
+// Stack-local custody for a staging creator, not a persistent SDK capture.
+// Declare AFTER the precise-lifetime staging buffer so this ends the logical
+// creator with NOWB before ARC drops its local SDK reference on every exit.
+// In-flight command buffers retain the actual payload/witness independently.
+typedef struct {
+    antfly_metal_workspace_allocation_service owner;
+    void *receipt;
+} antfly_metal_transient_workspace;
+static void antfly_metal_retire_transient_workspace(antfly_metal_transient_workspace *value) {
+    if (!value->receipt) return;
+    if (!value->owner.retire_transient ||
+        value->owner.retire_transient(value->owner.context, value->receipt) != 0) abort();
+    value->receipt = NULL;
+}
+
+// Immutable pipeline capability snapshot; no compilation or SDK allocation.
+static uint32_t antfly_metal_dense_f16kv_capabilities(termite_metal_decode_runtime *runtime) {
+    if (!runtime) return 0;
+    return (runtime->attention_f32_dense_sg_pipeline != nil ? 1u : 0u) |
+        (runtime->attention_f32_dense_sg_q16_pipeline != nil ? 2u : 0u) |
+        (runtime->attention_f32_dense_sg_q16_f16kv_pipeline != nil ? 4u : 0u) |
+        (runtime->encode_f16_convert_pipeline != nil ? 8u : 0u);
+}
+
+// All scope/marker transitions share retirement_lock. Locked helpers avoid
+// recursively acquiring it when an owned scope uses the legacy bounded guard.
+static int antfly_metal_begin_embedding_workspace_locked(termite_metal_decode_runtime *runtime, size_t bytes) {
+    if (runtime->embedding_workspace_owned || runtime->embedding_workspace_existing || runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -1;
     runtime->embedding_workspace_remaining = bytes;
     runtime->embedding_workspace_denied = false;
     runtime->embedding_workspace_bounded = true;
     return 0;
 }
-
-int termite_metal_decode_runtime_end_embedding_workspace(termite_metal_decode_runtime *runtime) {
-    if (runtime == NULL || runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -1;
+int termite_metal_decode_runtime_begin_embedding_workspace(termite_metal_decode_runtime *runtime, size_t bytes) {
+    if (!runtime) return -1;
+    ANTFLY_METAL_RETIREMENT_SCOPE(runtime);
+    return antfly_metal_begin_embedding_workspace_locked(runtime, bytes);
+}
+static int antfly_metal_end_embedding_workspace_locked(termite_metal_decode_runtime *runtime) {
+    if (runtime->embedding_workspace_owned || runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -1;
     runtime->embedding_workspace_bounded = false;
     return runtime->embedding_workspace_denied ? 1 : 0;
+}
+static int antfly_metal_workspace_policy_available_locked(termite_metal_decode_runtime *runtime) {
+    return runtime->workspace_parked_readers == 0 && runtime->lighton_activation_limit == 0 &&
+        !runtime->lighton_activation_capture_decode && !runtime->audio_reuse_scope;
+}
+int antfly_metal_workspace_policy_available(termite_metal_decode_runtime *runtime) {
+    if (!runtime) return 0;
+    ANTFLY_METAL_RETIREMENT_SCOPE(runtime);
+    return antfly_metal_workspace_policy_available_locked(runtime);
+}
+int antfly_metal_decode_runtime_begin_owned_embedding_workspace(termite_metal_decode_runtime *runtime,
+    size_t bytes, antfly_metal_workspace_allocation_service owner) {
+    if (!runtime) return -1;
+    ANTFLY_METAL_RETIREMENT_SCOPE(runtime);
+    if (!antfly_metal_workspace_policy_available_locked(runtime) || runtime->embedding_workspace_owned || runtime->embedding_workspace_existing || !owner.context ||
+        owner.runtime_address != (uintptr_t)runtime || !owner.root_operations || !owner.take || !owner.publish || !owner.cancel || !owner.retire_transient) return -1;
+    const int status = antfly_metal_begin_embedding_workspace_locked(runtime, bytes);
+    if (status != 0) return status;
+    runtime->embedding_workspace_owner = owner;
+    runtime->embedding_workspace_thread = pthread_self();
+    runtime->embedding_workspace_owned = true;
+    return 0;
+}
+// Existing-root scope has no allocation credit. It still cannot install a
+// charged reuse callback while an admitted Reader owns parked restoration.
+int antfly_metal_decode_runtime_begin_existing_embedding_workspace(termite_metal_decode_runtime *runtime,
+    antfly_metal_workspace_allocation_service owner) {
+    if (!runtime) return -1;
+    ANTFLY_METAL_RETIREMENT_SCOPE(runtime);
+    if (runtime->workspace_parked_readers != 0 || runtime->embedding_workspace_owned || runtime->embedding_workspace_existing ||
+        runtime->active_frame_cb || runtime->submitted_frame_cb || !owner.context ||
+        owner.runtime_address != (uintptr_t)runtime || !owner.root_operations || !owner.retain_cached) return -1;
+    runtime->embedding_workspace_owner = owner;
+    runtime->embedding_workspace_thread = pthread_self();
+    runtime->embedding_workspace_existing = true;
+    return 0;
+}
+int antfly_metal_decode_runtime_end_existing_embedding_workspace(termite_metal_decode_runtime *runtime) {
+    if (!runtime) return -1;
+    ANTFLY_METAL_RETIREMENT_SCOPE(runtime);
+    if (!runtime->embedding_workspace_existing || runtime->embedding_workspace_owned) return -1;
+    runtime->embedding_workspace_existing = false;
+    memset(&runtime->embedding_workspace_owner, 0, sizeof(runtime->embedding_workspace_owner));
+    return 0;
+}
+int antfly_metal_decode_runtime_end_owned_embedding_workspace(termite_metal_decode_runtime *runtime) {
+    if (!runtime) return -1;
+    ANTFLY_METAL_RETIREMENT_SCOPE(runtime);
+    if (!runtime->embedding_workspace_owned || runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -1;
+    runtime->embedding_workspace_owned = false;
+    memset(&runtime->embedding_workspace_owner, 0, sizeof(runtime->embedding_workspace_owner));
+    return antfly_metal_end_embedding_workspace_locked(runtime);
+}
+int termite_metal_decode_runtime_end_embedding_workspace(termite_metal_decode_runtime *runtime) {
+    if (!runtime) return -1;
+    ANTFLY_METAL_RETIREMENT_SCOPE(runtime);
+    return antfly_metal_end_embedding_workspace_locked(runtime);
 }
 
 static bool termite_metal_debug_q80_block_finite(size_t layer_index) {
@@ -16748,22 +16994,15 @@ static size_t termite_metal_align_forward_size(size_t value, size_t alignment) {
 static int termite_metal_decode_runtime_ensure_host_staging_buffer(
     termite_metal_decode_runtime *runtime,
     bool frame_owned,
-    size_t required
+    const antfly_metal_host_staging_sizes *geometry
 ) {
-    if (runtime == NULL || runtime->device == nil || required == 0) return -1;
+    if (runtime == NULL || runtime->device == nil || geometry == NULL || geometry->required_bytes == 0) return -1;
+    const size_t required = geometry->required_bytes;
     id<MTLBuffer> current_buffer = frame_owned ? runtime->host_staging_buffer : runtime->active_frame_host_staging_buffer;
     size_t current_capacity = frame_owned ? runtime->host_staging_capacity : runtime->active_frame_host_staging_capacity;
     if (current_buffer != nil && current_capacity >= required) return 0;
 
-    size_t new_capacity = current_capacity;
-    if (new_capacity < 4096) new_capacity = 4096;
-    while (new_capacity < required) {
-        if (new_capacity > SIZE_MAX / 2) {
-            new_capacity = required;
-            break;
-        }
-        new_capacity *= 2;
-    }
+    const size_t new_capacity = geometry->capacity_bytes;
 
     id<MTLBuffer> new_buffer = termite_metal_workspace_buffer(runtime, new_capacity, MTLResourceStorageModeShared);
     if (new_buffer == nil) return -2;
@@ -16787,14 +17026,14 @@ static int termite_metal_decode_runtime_stage_host_bytes(
     termite_metal_host_staging_slice *slice
 ) {
     if (runtime == NULL || bytes == NULL || length == 0 || slice == NULL) return -1;
-    const size_t alignment = 256;
-    size_t offset = 0;
-    if (!frame_owned) {
-        offset = termite_metal_align_forward_size(runtime->active_frame_host_staging_offset, alignment);
-        if (offset == SIZE_MAX || length > SIZE_MAX - offset) return -2;
-    }
-    const size_t required = offset + length;
-    if (termite_metal_decode_runtime_ensure_host_staging_buffer(runtime, frame_owned, required) != 0) return -3;
+    const uint32_t buffer_present = frame_owned ? runtime->host_staging_buffer != nil : runtime->active_frame_host_staging_buffer != nil;
+    const size_t current_capacity = frame_owned ? runtime->host_staging_capacity : runtime->active_frame_host_staging_capacity;
+    antfly_metal_host_staging_sizes geometry;
+    if (antfly_workspace_geometry_host_staging(current_capacity,
+            frame_owned ? 0 : runtime->active_frame_host_staging_offset,
+            length, buffer_present, frame_owned, &geometry) != 0) return -2;
+    const size_t offset = geometry.offset_bytes;
+    if (termite_metal_decode_runtime_ensure_host_staging_buffer(runtime, frame_owned, &geometry) != 0) return -3;
 
     id<MTLBuffer> buffer = frame_owned ? runtime->host_staging_buffer : runtime->active_frame_host_staging_buffer;
     if (buffer == nil || buffer.contents == NULL || offset + length > buffer.length) return -4;
@@ -16802,8 +17041,7 @@ static int termite_metal_decode_runtime_stage_host_bytes(
     termite_metal_notify_managed_write(buffer, NSMakeRange(offset, length));
 
     if (!frame_owned) {
-        runtime->active_frame_host_staging_offset = termite_metal_align_forward_size(required, alignment);
-        if (runtime->active_frame_host_staging_offset == SIZE_MAX) return -5;
+        runtime->active_frame_host_staging_offset = geometry.next_offset_bytes;
         if (runtime->active_frame_host_staging_retained_buffer != buffer) {
             if (termite_metal_decode_runtime_retain_frame_resource(runtime, buffer) != 0) return -6;
             runtime->active_frame_host_staging_retained_buffer = buffer;
@@ -32536,61 +32774,23 @@ int termite_metal_decode_runtime_reserve_prefill_layer_scratch(
     size_t tail_vocab_size
 ) {
     if (runtime == NULL) return -1;
-    if (rows == 0 || num_heads == 0 || num_kv_heads == 0 || head_dim == 0) return -2;
-    const size_t q_bytes = rows * num_heads * head_dim * sizeof(float);
-    const size_t kv_bytes = rows * num_kv_heads * head_dim * sizeof(float);
-    const size_t hidden_bytes = hidden_size > 0 ? rows * hidden_size * sizeof(float) : 0;
-    const size_t direct_hidden_bytes = q_bytes > hidden_bytes ? q_bytes : hidden_bytes;
-    const size_t hot_hidden_bytes = direct_hidden_bytes;
-    const size_t intermediate_bytes = intermediate_size > 0 ? rows * intermediate_size * sizeof(float) : 0;
-    const size_t tail_logits_bytes = tail_vocab_size * sizeof(float);
-    size_t slots[21] = {
-        0,
-        1,
-        2,
-        3,
-        4,
-        5,
-        TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE + 0,
-        TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE + 1,
-        TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE + 2,
-        TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE + 3,
-        TERMITE_METAL_GRAPH_PLAN_DIRECT_Q_SLOT,
-        TERMITE_METAL_GRAPH_PLAN_SAMPLE_LOGITS_SLOT,
-        TERMITE_METAL_GRAPH_PLAN_HOT_HIDDEN_SLOT_BASE + 0,
-        TERMITE_METAL_GRAPH_PLAN_HOT_HIDDEN_SLOT_BASE + 1,
-        TERMITE_METAL_GRAPH_PLAN_HOT_HIDDEN_SLOT_BASE + 2,
-        TERMITE_METAL_GRAPH_PLAN_HOT_HIDDEN_SLOT_BASE + 3,
-        TERMITE_METAL_GRAPH_PLAN_HOT_INTERMEDIATE_SLOT_BASE + 0,
-        TERMITE_METAL_GRAPH_PLAN_HOT_INTERMEDIATE_SLOT_BASE + 1,
-        TERMITE_METAL_GRAPH_PLAN_HOT_INTERMEDIATE_SLOT_BASE + 2,
-        TERMITE_METAL_GRAPH_PLAN_HOT_INTERMEDIATE_SLOT_BASE + 3,
-        TERMITE_METAL_GRAPH_PLAN_HOT_INTERMEDIATE_SLOT_BASE + 4,
-    };
-    size_t bytes[21] = {
-        q_bytes,
-        kv_bytes,
-        kv_bytes,
-        q_bytes,
-        kv_bytes,
-        kv_bytes,
-        direct_hidden_bytes,
-        direct_hidden_bytes,
-        direct_hidden_bytes,
-        direct_hidden_bytes,
-        q_bytes,
-        tail_logits_bytes,
-        hot_hidden_bytes,
-        hot_hidden_bytes,
-        hot_hidden_bytes,
-        hot_hidden_bytes,
-        intermediate_bytes,
-        intermediate_bytes,
-        intermediate_bytes,
-        intermediate_bytes,
-        intermediate_bytes,
-    };
-    if (termite_metal_decode_runtime_reserve_graph_plan_slots(runtime, slots, bytes, 21) != 0) return -3;
+    _Static_assert(TERMITE_METAL_GRAPH_PLAN_PROJECTION_SLOT_BASE == 0 &&
+        TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE == ANTFLY_PREFILL_DIRECT_HIDDEN_BASE &&
+        TERMITE_METAL_GRAPH_PLAN_DIRECT_Q_SLOT == ANTFLY_PREFILL_DIRECT_Q_SLOT &&
+        TERMITE_METAL_GRAPH_PLAN_SAMPLE_LOGITS_SLOT == ANTFLY_PREFILL_LOGITS_SLOT &&
+        TERMITE_METAL_GRAPH_PLAN_HOT_HIDDEN_SLOT_BASE == ANTFLY_PREFILL_HOT_HIDDEN_BASE &&
+        TERMITE_METAL_GRAPH_PLAN_HOT_INTERMEDIATE_SLOT_BASE == ANTFLY_PREFILL_HOT_INTERMEDIATE_BASE,
+        "prefill scratch slot ABI changed");
+    antfly_metal_prefill_scratch_sizes sizes;
+    if (antfly_workspace_geometry_prefill_scratch(rows, num_heads, num_kv_heads,
+        head_dim, hidden_size, intermediate_size, tail_vocab_size, &sizes) != 0) return -2;
+    const size_t q_bytes = sizes.q_bytes;
+    const size_t kv_bytes = sizes.kv_bytes;
+    const size_t direct_hidden_bytes = sizes.direct_hidden_bytes;
+    const size_t hot_hidden_bytes = sizes.direct_hidden_bytes;
+    const size_t intermediate_bytes = sizes.intermediate_bytes;
+    const size_t tail_logits_bytes = sizes.tail_logits_bytes;
+    if (termite_metal_decode_runtime_reserve_graph_plan_slots(runtime, sizes.slots, sizes.bytes, ANTFLY_PREFILL_SCRATCH_COUNT) != 0) return -3;
     if (termite_metal_decode_runtime_ensure_active_layer_projection_buffer(runtime, 0, q_bytes) != 0) return -3;
     if (termite_metal_decode_runtime_ensure_active_layer_projection_buffer(runtime, 1, kv_bytes) != 0) return -4;
     if (termite_metal_decode_runtime_ensure_active_layer_projection_buffer(runtime, 2, kv_bytes) != 0) return -5;
@@ -32607,6 +32807,32 @@ int termite_metal_decode_runtime_reserve_prefill_layer_scratch(
         runtime->sample_logits_capacity = runtime->graph_plan_capacities[TERMITE_METAL_GRAPH_PLAN_SAMPLE_LOGITS_SLOT];
     }
     return 0;
+}
+
+// Borrow only the already-reserved direct-Q bank. Dense causal attention
+// consumes projection 0..5; its output lives until the later projection/FFN
+// consumes it. This accessor never ensures/grows a slot or changes SDK owners.
+void *antfly_metal_dense_prefill_attention_output(termite_metal_decode_runtime *runtime, size_t bytes) {
+    if (bytes == 0 || !termite_metal_decode_runtime_graph_slot_ready(runtime,
+            TERMITE_METAL_GRAPH_PLAN_DIRECT_Q_SLOT, bytes)) return NULL;
+    id<MTLBuffer> buffer = runtime->graph_plan_buffers[TERMITE_METAL_GRAPH_PLAN_DIRECT_Q_SLOT];
+    if (runtime->direct_block_q_buffer != buffer || buffer.length < bytes) return NULL;
+    return (__bridge void *)buffer;
+}
+
+// Metadata-only views of already-reserved dense block banks. No ensure/grow,
+// allocation, encoder or lifetime transfer occurs here.
+void *antfly_metal_dense_prefill_output(termite_metal_decode_runtime *runtime, size_t slot, size_t bytes) {
+    if (!((slot >= TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE && slot <= TERMITE_METAL_GRAPH_PLAN_DIRECT_HIDDEN_SLOT_BASE + 3) ||
+          (slot >= TERMITE_METAL_GRAPH_PLAN_HOT_HIDDEN_SLOT_BASE && slot <= TERMITE_METAL_GRAPH_PLAN_HOT_INTERMEDIATE_SLOT_BASE + 4)) || bytes == 0 ||
+        !termite_metal_decode_runtime_graph_slot_ready(runtime, slot, bytes)) return NULL;
+    return (__bridge void *)runtime->graph_plan_buffers[slot];
+}
+
+// Q/K/V and batched head RMS/RoPE use only the six original projection banks.
+void *antfly_metal_dense_prefill_projection_output(termite_metal_decode_runtime *runtime, size_t slot, size_t bytes) {
+    if (slot >= 6 || bytes == 0 || !termite_metal_decode_runtime_graph_slot_ready(runtime, slot, bytes)) return NULL;
+    return (__bridge void *)runtime->graph_plan_buffers[slot];
 }
 
 int termite_metal_decode_runtime_reserve_gated_ffn_scratch(
@@ -33211,10 +33437,12 @@ int termite_metal_decode_runtime_embedding_lookup_prepared_device(
     if (total == 0 || dim == 0 || dim != runtime->generic_embedding_dim) return -4;
     @autoreleasepool {
         id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
-        const size_t output_bytes = total * dim * sizeof(float);
+        antfly_metal_row_workspace_sizes geometry;
+        if (antfly_workspace_geometry_rows(total, dim, &geometry) != 0) return -5;
+        const size_t output_bytes = geometry.output_bytes;
         if (output_offset + output_bytes > output_buffer.length) return -5;
         const bool frame_owned = (runtime->active_frame_cb == nil);
-        const size_t ids_bytes = total * sizeof(uint32_t);
+        const size_t ids_bytes = geometry.index_bytes;
         termite_metal_host_staging_slice ids_slice = { nil, 0 };
         if (termite_metal_decode_runtime_stage_host_bytes(runtime, ids, ids_bytes, frame_owned, &ids_slice) != 0) return -6;
         termite_metal_embedding_lookup_params params = {
@@ -33475,10 +33703,12 @@ int termite_metal_decode_runtime_embedding_lookup_bf16_prepared_device(
     if (total == 0 || dim == 0 || dim != runtime->generic_embedding_dim) return -4;
     @autoreleasepool {
         id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
-        const size_t output_bytes = total * dim * sizeof(float);
+        antfly_metal_row_workspace_sizes geometry;
+        if (antfly_workspace_geometry_rows(total, dim, &geometry) != 0) return -5;
+        const size_t output_bytes = geometry.output_bytes;
         if (output_offset + output_bytes > output_buffer.length) return -5;
         const bool frame_owned = (runtime->active_frame_cb == nil);
-        const size_t ids_bytes = total * sizeof(uint32_t);
+        const size_t ids_bytes = geometry.index_bytes;
         termite_metal_host_staging_slice ids_slice = { nil, 0 };
         if (termite_metal_decode_runtime_stage_host_bytes(runtime, ids, ids_bytes, frame_owned, &ids_slice) != 0) return -6;
         termite_metal_embedding_lookup_params params = {
@@ -33536,10 +33766,12 @@ int termite_metal_decode_runtime_embedding_lookup_f16_prepared_device(
     if (total == 0 || dim == 0 || dim != runtime->generic_embedding_dim) return -4;
     @autoreleasepool {
         id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
-        const size_t output_bytes = total * dim * sizeof(float);
+        antfly_metal_row_workspace_sizes geometry;
+        if (antfly_workspace_geometry_rows(total, dim, &geometry) != 0) return -5;
+        const size_t output_bytes = geometry.output_bytes;
         if (output_offset + output_bytes > output_buffer.length) return -5;
         const bool frame_owned = (runtime->active_frame_cb == nil);
-        const size_t ids_bytes = total * sizeof(uint32_t);
+        const size_t ids_bytes = geometry.index_bytes;
         termite_metal_host_staging_slice ids_slice = { nil, 0 };
         if (termite_metal_decode_runtime_stage_host_bytes(runtime, ids, ids_bytes, frame_owned, &ids_slice) != 0) return -6;
         termite_metal_embedding_lookup_params params = {
@@ -35607,17 +35839,17 @@ int termite_metal_decode_runtime_apply_attention_f32_device(
         if (use_dense_sg) {
             const BOOL use_q16 = (runtime->attention_f32_dense_sg_q16_pipeline != nil &&
                 q_len >= 16u && head_dim <= 128u);
-            BOOL use_f16kv = (use_q16 &&
-                runtime->attention_f32_dense_sg_q16_f16kv_pipeline != nil &&
-                runtime->encode_f16_convert_pipeline != nil);
+            const antfly_metal_dense_attention_request staging_request = { q_len, num_heads, num_kv_heads, head_dim };
+            size_t kv_half_bytes;
+            if (antfly_workspace_geometry_dense_f16kv(&staging_request,
+                antfly_metal_dense_f16kv_capabilities(runtime), &kv_half_bytes) != 0) return -5;
+            BOOL use_f16kv = (use_q16 && kv_half_bytes != 0);
             if (use_f16kv) {
-                const size_t kv_half_bytes = kv_len * num_kv_heads * head_dim * sizeof(uint16_t);
                 // Growth only happens on the first layer of a new (larger)
                 // shape; earlier frames have drained, so dropping the old
                 // buffers is safe.
-                if (runtime->dense_sg_f16_kv_capacity < kv_half_bytes ||
-                    runtime->dense_sg_f16_k_buffer == nil ||
-                    runtime->dense_sg_f16_v_buffer == nil) {
+                if (antfly_workspace_geometry_dense_f16kv_replace(runtime->dense_sg_f16_kv_capacity,
+                    kv_half_bytes, runtime->dense_sg_f16_k_buffer != nil, runtime->dense_sg_f16_v_buffer != nil)) {
                     id<MTLBuffer> kb = termite_metal_workspace_buffer(runtime, kv_half_bytes, MTLResourceStorageModePrivate);
                     id<MTLBuffer> vb = termite_metal_workspace_buffer(runtime, kv_half_bytes, MTLResourceStorageModePrivate);
                     if (kb != nil && vb != nil) {
@@ -38601,7 +38833,7 @@ static int termite_metal_decode_runtime_prepare_linear_storage(
     void *fill_context,
     int (*fill_f32)(void *, float *, size_t)
 ) {
-    if (runtime == NULL || bias == NULL || (weight == NULL && bf16_weight == NULL && fill_f32 == NULL)) return -1;
+    if (runtime == NULL || (bias == NULL && fill_f32 == NULL) || (weight == NULL && bf16_weight == NULL && fill_f32 == NULL)) return -1;
     if (runtime->device == nil || runtime->queue == nil || runtime->library == nil) return -2;
     if (slot >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || in_dim == 0 || out_dim == 0) return -3;
     size_t weight_bytes = 0;
@@ -38640,7 +38872,8 @@ static int termite_metal_decode_runtime_prepare_linear_storage(
             if (weight_buffer == nil) return -4;
         }
         bool zero_bias = true;
-        for (size_t i = 0; i < out_dim && zero_bias; ++i) zero_bias = bias[i] == 0.0f && !signbit(bias[i]);
+        // Generated bias-free projections use the same positive-zero cache without a host staging array.
+        for (size_t i = 0; bias != NULL && i < out_dim && zero_bias; ++i) zero_bias = bias[i] == 0.0f && !signbit(bias[i]);
         id<MTLBuffer> bias_buffer = zero_bias
             ? termite_metal_decode_runtime_zero_bias_buffer(runtime, out_dim)
             : use_shared
@@ -51328,9 +51561,11 @@ int termite_metal_decode_runtime_nomic_pool_normalize_f32_device(
     @autoreleasepool {
         id<MTLBuffer> hidden_buffer = (__bridge id<MTLBuffer>)hidden_handle;
         id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
-        const size_t hidden_bytes = rows * hidden_size * sizeof(float);
-        const size_t output_bytes = batch * hidden_size * sizeof(float);
-        const size_t mask_bytes = rows * sizeof(uint32_t);
+        antfly_metal_frame_pool_workspace_sizes geometry;
+        if (antfly_workspace_geometry_frame_pool(batch, seq_len, hidden_size, &geometry) != 0) return -6;
+        const size_t hidden_bytes = geometry.input_bytes;
+        const size_t output_bytes = geometry.output_bytes;
+        const size_t mask_bytes = geometry.mask_bytes;
         if (hidden_offset > hidden_buffer.length || hidden_bytes > hidden_buffer.length - hidden_offset) return -7;
         if (output_offset > output_buffer.length || output_bytes > output_buffer.length - output_offset) return -8;
         bool frame_owned = true;
@@ -51559,9 +51794,11 @@ int termite_metal_decode_runtime_gather_axis0_f32_2d_device(
         id<MTLBuffer> indices_buffer = (__bridge id<MTLBuffer>)indices_handle;
         id<MTLBuffer> output_buffer = (__bridge id<MTLBuffer>)output_handle;
         const size_t input_bytes = rows * cols * sizeof(float);
-        const size_t indices_bytes = index_count * sizeof(float);
+        antfly_metal_row_workspace_sizes geometry;
+        if (antfly_workspace_geometry_rows(index_count, cols, &geometry) != 0) return -5;
+        const size_t indices_bytes = geometry.index_bytes;
         const size_t output_total = index_count * cols;
-        const size_t output_bytes = output_total * sizeof(float);
+        const size_t output_bytes = geometry.output_bytes;
         if (output_total > UINT32_MAX) return -5;
         if (input_offset + input_bytes > input_buffer.length) return -6;
         if (indices_offset + indices_bytes > indices_buffer.length) return -7;
@@ -52867,10 +53104,12 @@ int antfly_metal_masked_mean_batch(termite_metal_decode_runtime *runtime, void *
     @autoreleasepool {
         bool frame_owned = runtime->active_frame_cb == nil;
         id<MTLBuffer> input = (__bridge id<MTLBuffer>)input_handle, output = (__bridge id<MTLBuffer>)output_handle;
-        const size_t input_bytes = (segmented ? 1 : batch) * rows * width * sizeof(float), output_bytes = batch * dimensions * sizeof(float);
+        antfly_metal_pool_workspace_sizes geometry;
+        if (antfly_workspace_geometry_pool(batch, rows, width, dimensions, segmented ? 1u : 0u, &geometry) != 0) return -2;
+        const size_t input_bytes = geometry.input_bytes, output_bytes = geometry.output_bytes;
         if (input_offset > input.length || input_bytes > input.length - input_offset || output_offset > output.length || output_bytes > output.length - output_offset) return -2;
         termite_metal_host_staging_slice staged = { nil, 0 };
-        if (termite_metal_decode_runtime_stage_host_bytes(runtime, mask, (segmented ? 2 * batch : batch * rows + batch) * sizeof(int64_t), frame_owned, &staged) != 0) return -3;
+        if (termite_metal_decode_runtime_stage_host_bytes(runtime, mask, geometry.metadata_bytes, frame_owned, &staged) != 0) return -3;
         id<MTLCommandBuffer> cb = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
         if (cb == nil) return -4;
         termite_metal_planned_encoder_range accesses[2];
@@ -68747,7 +68986,7 @@ int termite_metal_provider_generated_quant_snapshot(
 // Only the dense Qwen owner calls these at an idle boundary. Never reclaim a
 // buffer which a command buffer or an outstanding scratch view can still read.
 int termite_metal_decode_runtime_trim_embedding_workspace(termite_metal_decode_runtime *runtime) {
-    if (runtime == NULL || runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -1;
+    if (runtime == NULL || runtime->embedding_workspace_owned || runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -1;
     for (size_t i = 0; i < TERMITE_METAL_SCRATCH_POOL_CAPACITY; ++i) {
         if (runtime->scratch_pool_in_use[i] || runtime->scratch_pool_pending_frame_release[i]) return -2;
     }
@@ -68798,9 +69037,236 @@ int termite_metal_decode_runtime_trim_embedding_workspace(termite_metal_decode_r
     return 0;
 }
 
+typedef struct antfly_metal_workspace_entry {
+    uintptr_t buffer_identity;
+    void *root;
+    const antfly_metal_workspace_root_operations *operations;
+    uint64_t unfunded_references;
+    size_t bytes;
+    uint64_t birth;
+    int tagged;
+    int metadata_retained;
+} antfly_metal_workspace_entry;
+static void antfly_metal_workspace_entry_info(id<MTLBuffer>, antfly_metal_workspace_entry *);
+size_t antfly_metal_workspace_snapshot_capacity(termite_metal_decode_runtime *runtime) {
+    if (!runtime || runtime->active_frame_cb || runtime->submitted_frame_cb) return 0;
+    const size_t fixed = TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY + TERMITE_METAL_SCRATCH_POOL_CAPACITY +
+        4 + 5 + TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT + TERMITE_METAL_DIRECT_BLOCK_SHARED_BUFFER_COUNT + 6 + 128 + 11;
+    size_t pool_count;
+    { ANTFLY_METAL_RETIREMENT_SCOPE(runtime); pool_count = runtime->frame_reuse_pool_len; }
+    return pool_count > SIZE_MAX - fixed ? 0 : fixed + pool_count;
+}
+static int antfly_metal_workspace_snapshot_impl(termite_metal_decode_runtime *runtime,
+    antfly_metal_workspace_entry *entries, size_t capacity, size_t *out_count, uint64_t *generation,
+    const antfly_metal_workspace_root_operations *accepted_operations, bool owned_only) {
+    if (!runtime || !out_count || !generation || !accepted_operations || runtime->active_frame_cb || runtime->submitted_frame_cb) return -1;
+    *out_count = 0;
+    *generation = 0;
+    const size_t needed = antfly_metal_workspace_snapshot_capacity(runtime);
+    if (!needed || (!owned_only && capacity < needed) || (capacity && !entries)) return -2;
+    size_t count = 0;
+#define ADD_OWNED_WORKSPACE(b) do { \
+    id<MTLBuffer> buffer __attribute__((objc_precise_lifetime)) = (b); \
+    if (buffer != nil) { \
+        antfly_metal_workspace_entry observed; \
+        antfly_metal_workspace_entry_info(buffer, &observed); \
+        if (owned_only && !observed.root) break; \
+        const uintptr_t identity = (uintptr_t)(__bridge void *)buffer; \
+        bool duplicate = false; \
+        for (size_t j = 0; j < count; ++j) if (entries[j].buffer_identity == identity) { duplicate = true; break; } \
+        if (!duplicate) { \
+            if (count == capacity) return -2; \
+            antfly_metal_workspace_entry *entry = &entries[count]; \
+            *entry = observed; \
+            if (entry->root && entry->operations == accepted_operations) { \
+                accepted_operations->retain_metadata(entry->root); \
+                entry->metadata_retained = 1; \
+            } \
+            *out_count = ++count; \
+        } \
+    } \
+} while (0)
+    for (size_t i = 0; i < TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY; ++i) ADD_OWNED_WORKSPACE(runtime->graph_plan_buffers[i]);
+    for (size_t i = 0; i < TERMITE_METAL_SCRATCH_POOL_CAPACITY; ++i) ADD_OWNED_WORKSPACE(runtime->scratch_pool_buffers[i]);
+    for (size_t i = 0; i < 4; ++i) ADD_OWNED_WORKSPACE(runtime->hot_hidden_buffers[i]);
+    for (size_t i = 0; i < 5; ++i) ADD_OWNED_WORKSPACE(runtime->hot_intermediate_buffers[i]);
+    for (size_t i = 0; i < TERMITE_METAL_DIRECT_BLOCK_HIDDEN_BUFFER_COUNT; ++i) ADD_OWNED_WORKSPACE(runtime->direct_block_hidden_buffers[i]);
+    for (size_t i = 0; i < TERMITE_METAL_DIRECT_BLOCK_SHARED_BUFFER_COUNT; ++i) ADD_OWNED_WORKSPACE(runtime->direct_block_shared_buffers[i]);
+    for (size_t i = 0; i < 6; ++i) ADD_OWNED_WORKSPACE(runtime->active_layer_projection_buffers[i]);
+    { ANTFLY_METAL_RETIREMENT_SCOPE(runtime);
+    for (size_t i = 0; i < runtime->frame_reuse_pool_len; ++i) ADD_OWNED_WORKSPACE((__bridge id<MTLBuffer>)runtime->frame_reuse_pool[i]);
+    }
+    for (size_t i = 0; i < 128; i++) ADD_OWNED_WORKSPACE(runtime->lighton_activation_buffers[i]);
+    ADD_OWNED_WORKSPACE(runtime->direct_block_q_buffer);
+    ADD_OWNED_WORKSPACE(runtime->dense_sg_f16_k_buffer);
+    ADD_OWNED_WORKSPACE(runtime->dense_sg_f16_v_buffer);
+    ADD_OWNED_WORKSPACE(runtime->hidden_state_front);
+    ADD_OWNED_WORKSPACE(runtime->hidden_state_back);
+    ADD_OWNED_WORKSPACE(runtime->scratch_buffer);
+    ADD_OWNED_WORKSPACE(runtime->host_staging_buffer);
+    ADD_OWNED_WORKSPACE(runtime->active_frame_host_staging_buffer);
+    for (size_t i = 0; i < 2; ++i) ADD_OWNED_WORKSPACE(runtime->frame_host_staging_buffers[i]);
+    ADD_OWNED_WORKSPACE(runtime->token_buffer);
+#undef ADD_OWNED_WORKSPACE
+    *out_count = count;
+    *generation = runtime->embedding_workspace_generation;
+    return 0;
+}
+
+int antfly_metal_workspace_snapshot(termite_metal_decode_runtime *runtime,
+    antfly_metal_workspace_entry *entries, size_t capacity, size_t *out_count, uint64_t *generation,
+    const antfly_metal_workspace_root_operations *accepted_operations) {
+    return antfly_metal_workspace_snapshot_impl(runtime, entries, capacity, out_count, generation, accepted_operations, false);
+}
+// An existing-root-only receiving loan cannot publish new modern allocations.
+// Its final charged census therefore needs capacity for the actual cold root
+// count, irrespective of growth in uncharged legacy temporary/reuse entries.
+int antfly_metal_workspace_snapshot_owned(termite_metal_decode_runtime *runtime,
+    antfly_metal_workspace_entry *entries, size_t capacity, size_t *out_count, uint64_t *generation,
+    const antfly_metal_workspace_root_operations *accepted_operations) {
+    if (!runtime || runtime->embedding_workspace_owned) return -1;
+    return antfly_metal_workspace_snapshot_impl(runtime, entries, capacity, out_count, generation, accepted_operations, true);
+}
+
+_Static_assert(TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY == 32, "workspace role ABI changed");
+
+// Dependent on full68's existing canonical workspace tag/Root association.
+// Actual provider/numerical owner required; no numerical work or SDK allocation.
+// This preflights the SAME bounded graph-plan commit's allocation length/options.
+typedef struct antfly_metal_graph_workspace_role {
+    uintptr_t buffer_identity;
+    uint64_t birth;
+    size_t capacity_bytes;
+    size_t allocated_bytes;
+    size_t fresh_allocation_bound;
+    void *root;
+    const antfly_metal_workspace_root_operations *operations;
+} antfly_metal_graph_workspace_role;
+
+int antfly_metal_graph_workspace_capture(termite_metal_decode_runtime *runtime,
+    const size_t *required, antfly_metal_graph_workspace_role *roles, size_t count) {
+    if (!runtime || !required || !roles || count != TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY ||
+        runtime->device == nil || runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -1;
+    for (size_t i = 0; i < count; ++i) {
+        roles[i] = (antfly_metal_graph_workspace_role){0};
+        if (required[i] == 0) continue;
+        id<MTLBuffer> buffer __attribute__((objc_precise_lifetime)) = runtime->graph_plan_buffers[i];
+        if (buffer != nil) {
+            antfly_metal_workspace_entry entry;
+            antfly_metal_workspace_entry_info(buffer, &entry);
+            roles[i].buffer_identity = entry.buffer_identity;
+            roles[i].birth = entry.birth;
+            roles[i].root = entry.root;
+            roles[i].operations = entry.operations;
+            roles[i].capacity_bytes = runtime->graph_plan_capacities[i];
+            roles[i].allocated_bytes = MAX((size_t)buffer.length, (size_t)buffer.allocatedSize);
+        }
+        if (buffer == nil || runtime->graph_plan_capacities[i] < required[i]) {
+            if (required[i] > SIZE_MAX - 16383u) return -2;
+            const size_t sdk_bound = antfly_metal_allocation_bytes_for_mode(runtime->device, required[i], MTLResourceStorageModePrivate);
+            if (!sdk_bound) return -2;
+            // SAME guard as termite_metal_workspace_buffer, not post-SDK growth.
+            roles[i].fresh_allocation_bound = MAX(sdk_bound, (required[i] + 16383u) & ~(size_t)16383u);
+        }
+    }
+    return 0;
+}
+
+// Actual concrete physical query for a fresh workspace allocation. This is
+// the SAME pre-SDK bound consumed by workspace_buffer_impl, including its
+// minimum16KiB guard; no post-allocation quota top-up is permitted.
+size_t antfly_metal_workspace_allocation_bound(termite_metal_decode_runtime *runtime, size_t bytes, int shared) {
+    if (!runtime || !bytes || bytes > SIZE_MAX - 16383u || (shared != 0 && shared != 1)) return 0;
+    const size_t sdk = antfly_metal_allocation_bytes_for_mode(runtime->device, bytes,
+        shared ? MTLResourceStorageModeShared : MTLResourceStorageModePrivate);
+    return sdk ? MAX(sdk, (bytes + 16383u) & ~(size_t)16383u) : 0;
+}
+static int antfly_metal_capture_aux_role(termite_metal_decode_runtime *runtime,
+    id<MTLBuffer> buffer, size_t capacity, size_t required, int shared,
+    antfly_metal_graph_workspace_role *role) {
+    *role = (antfly_metal_graph_workspace_role){0};
+    if (!required) return 0;
+    if (buffer) {
+        antfly_metal_workspace_entry entry;
+        antfly_metal_workspace_entry_info(buffer, &entry);
+        role->buffer_identity = entry.buffer_identity;
+        role->birth = entry.birth;
+        role->root = entry.root;
+        role->operations = entry.operations;
+        role->capacity_bytes = capacity;
+        role->allocated_bytes = MAX((size_t)buffer.length, (size_t)buffer.allocatedSize);
+    }
+    if (!buffer || capacity < required) {
+        role->fresh_allocation_bound = antfly_metal_workspace_allocation_bound(runtime, required, shared);
+        if (!role->fresh_allocation_bound) return -2;
+    }
+    return 0;
+}
+// Five exact persistent roles outside graph slots: greedy scratch/token,
+// standalone staging, and the dense attention F16 key/value pair. The pair
+// uses the SAME geometry/capabilities/joint replacement as the SDK producer.
+int antfly_metal_qwen_aux_workspace_capture(termite_metal_decode_runtime *runtime,
+    size_t scratch_bytes, size_t token_bytes, size_t host_ids_bytes,
+    const antfly_metal_dense_attention_request *attention,
+    antfly_metal_graph_workspace_role *roles, size_t *staging_required, size_t *f16kv_required) {
+    if (!runtime || !roles || !staging_required || !f16kv_required || runtime->active_frame_cb || runtime->submitted_frame_cb) return -1;
+    if (antfly_metal_capture_aux_role(runtime, runtime->scratch_buffer, runtime->scratch_capacity, scratch_bytes, 0, &roles[0]) != 0 ||
+        antfly_metal_capture_aux_role(runtime, runtime->token_buffer, runtime->token_capacity, token_bytes, 1, &roles[1]) != 0) return -2;
+    *staging_required = 0;
+    if (host_ids_bytes) {
+        antfly_metal_host_staging_sizes geometry;
+        if (antfly_workspace_geometry_host_staging(runtime->host_staging_capacity, 0, host_ids_bytes,
+            runtime->host_staging_buffer != nil, 1, &geometry) != 0) return -2;
+        *staging_required = geometry.capacity_bytes;
+    }
+    if (antfly_metal_capture_aux_role(runtime, runtime->host_staging_buffer,
+        runtime->host_staging_capacity, *staging_required, 1, &roles[2]) != 0) return -2;
+    if (antfly_workspace_geometry_dense_f16kv(attention, antfly_metal_dense_f16kv_capabilities(runtime), f16kv_required) != 0) return -2;
+    const bool replace = antfly_workspace_geometry_dense_f16kv_replace(runtime->dense_sg_f16_kv_capacity,
+        *f16kv_required, runtime->dense_sg_f16_k_buffer != nil, runtime->dense_sg_f16_v_buffer != nil);
+    const size_t reusable = replace ? 0 : runtime->dense_sg_f16_kv_capacity;
+    if (antfly_metal_capture_aux_role(runtime, runtime->dense_sg_f16_k_buffer, reusable, *f16kv_required, 0, &roles[3]) != 0 ||
+        antfly_metal_capture_aux_role(runtime, runtime->dense_sg_f16_v_buffer, reusable, *f16kv_required, 0, &roles[4]) != 0) return -2;
+    return 0;
+}
+
+// Read-only selected operation capabilities. No pipeline compilation, SDK
+// allocation or alternate kernel selection; actual callers recheck before math.
+uint32_t antfly_metal_workspace_tail_capabilities(termite_metal_decode_runtime *runtime) {
+    if (!runtime || runtime->device == nil) return 0;
+    uint32_t result = 0;
+    if (runtime->gather_axis0_f32_2d_pipeline != nil) result |= 1u;
+    if (runtime->rms_norm_rows_pipeline != nil) result |= 2u;
+    if (runtime->scale_pipeline != nil) result |= 4u;
+    if (runtime->nomic_pool_normalize_pipeline != nil &&
+        runtime->nomic_pool_normalize_pipeline.maxTotalThreadsPerThreadgroup >= 256u &&
+        runtime->nomic_pool_normalize_pipeline.staticThreadgroupMemoryLength <= runtime->device.maxThreadgroupMemoryLength &&
+        256u * sizeof(float) <= runtime->device.maxThreadgroupMemoryLength - runtime->nomic_pool_normalize_pipeline.staticThreadgroupMemoryLength)
+        result |= 8u;
+    return result;
+}
+// Exact upcoming bank, after the declared number of preceding frames. The
+// producer resets this bank's cursor at begin_frame, then stages ONE selected
+// mask. Presence/capacity growth is the SAME geometry as stage_host_bytes.
+int antfly_metal_workspace_frame_staging_capture(termite_metal_decode_runtime *runtime,
+    size_t preceding_frames, size_t span, antfly_metal_graph_workspace_role *role,
+    size_t *required, unsigned *initial_index) {
+    if (!runtime || !role || !required || !initial_index || runtime->active_frame_cb || runtime->submitted_frame_cb) return -1;
+    *initial_index = runtime->frame_host_staging_index;
+    *required = 0;
+    if (!span) { *role = (antfly_metal_graph_workspace_role){0}; return 0; }
+    const unsigned index = (runtime->frame_host_staging_index ^ (unsigned)((preceding_frames & 1u) ^ 1u)) & 1u;
+    antfly_metal_host_staging_sizes geometry;
+    if (antfly_workspace_geometry_host_staging(runtime->frame_host_staging_capacities[index], 0,
+        span, runtime->frame_host_staging_buffers[index] != nil, 0, &geometry) != 0) return -2;
+    *required = geometry.capacity_bytes;
+    return antfly_metal_capture_aux_role(runtime, runtime->frame_host_staging_buffers[index],
+        runtime->frame_host_staging_capacities[index], *required, 1, role);
+}
+
 size_t termite_metal_decode_runtime_embedding_workspace_bytes(termite_metal_decode_runtime *runtime) {
     if (runtime == NULL || runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return SIZE_MAX;
-    const size_t capacity = TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY + TERMITE_METAL_SCRATCH_POOL_CAPACITY + 1024;
+    enum { capacity = TERMITE_METAL_GRAPH_PLAN_SLOT_CAPACITY + TERMITE_METAL_SCRATCH_POOL_CAPACITY + 1024 };
     const void *seen[capacity];
     size_t count = 0, bytes = 0;
     // Count aliases once, and reserve rounding even where allocatedSize is
@@ -69028,7 +69494,7 @@ int antfly_metal_retirement_frame_holds(termite_metal_decode_runtime *runtime, v
     return 0;
 }
 
-static void antfly_metal_release_buffer_impl(termite_metal_decode_runtime *runtime, void *handle, bool allow_reuse) {
+static void antfly_metal_release_buffer_with_cleanup_impl(termite_metal_decode_runtime *runtime, void *handle, bool allow_reuse, const void *current) {
     if (handle == NULL) return;
     if (runtime != NULL) {
         ANTFLY_METAL_RETIREMENT_SCOPE(runtime);
@@ -69041,6 +69507,7 @@ static void antfly_metal_release_buffer_impl(termite_metal_decode_runtime *runti
             runtime->active_frame_retirement_owner_valid &&
             pthread_equal(runtime->active_frame_retirement_owner, pthread_self());
         if (allow_reuse && encoding_owner && (!overlap || fresh) && termite_metal_buffer_reuse_enabled(runtime) &&
+            antfly_metal_workspace_allow_reuse(runtime, handle, current) &&
             !runtime->qwen35_core_batch_active &&
             ((__bridge id<MTLBuffer>)handle).storageMode == MTLStorageModePrivate) {
             if (runtime->frame_reuse_pool_len >= runtime->frame_reuse_pool_cap) {
@@ -69074,10 +69541,14 @@ static void antfly_metal_release_buffer_impl(termite_metal_decode_runtime *runti
 }
 
 void termite_metal_decode_runtime_release_buffer(termite_metal_decode_runtime *runtime, void *handle) {
-    antfly_metal_release_buffer_impl(runtime, handle, true);
+    antfly_metal_release_buffer_with_cleanup_impl(runtime, handle, true, NULL);
 }
 void antfly_metal_decode_runtime_release_charged_buffer(termite_metal_decode_runtime *runtime, void *handle) {
-    antfly_metal_release_buffer_impl(runtime, handle, false);
+    antfly_metal_release_buffer_with_cleanup_impl(runtime, handle, false, NULL);
+}
+
+void antfly_metal_decode_runtime_release_workspace_buffer(termite_metal_decode_runtime *runtime, void *handle, const void *current) {
+    antfly_metal_release_buffer_with_cleanup_impl(runtime, handle, true, current);
 }
 
 void *termite_metal_buffer_contents(void *handle) {
@@ -69100,14 +69571,20 @@ int termite_metal_buffer_upload(
     if (handle == NULL || src == NULL || length == 0) return -1;
     @autoreleasepool {
         id<MTLBuffer> dst = (__bridge id<MTLBuffer>)handle;
-        if (offset + length > dst.length) return -2;
+        if (offset > dst.length || length > dst.length - offset) return -2;
         if (dst.storageMode == MTLStorageModeShared) {
             memcpy((uint8_t *)dst.contents + offset, src, length);
             termite_metal_telemetry_copy(TERMITE_METAL_UPLOAD_BYTES, TERMITE_METAL_UPLOAD_CALLS, length);
             return 0;
         }
         if (runtime == NULL || runtime->device == nil || runtime->queue == nil) return -3;
-        id<MTLBuffer> staging = antfly_observe_metal_buffer([runtime->device newBufferWithBytes:src length:length options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        void *receipt = NULL;
+        id<MTLBuffer> staging __attribute__((objc_precise_lifetime)) = runtime->embedding_workspace_owned
+            ? antfly_metal_workspace_buffer_impl(runtime, length, MTLResourceStorageModeShared, src, &receipt)
+            : antfly_observe_metal_buffer([runtime->device newBufferWithBytes:src length:length options:MTLResourceStorageModeShared], ANTFLY_BUFFER_INITIALIZED);
+        antfly_metal_transient_workspace staging_creator __attribute__((cleanup(antfly_metal_retire_transient_workspace))) = {
+            .owner = runtime->embedding_workspace_owner, .receipt = receipt,
+        };
         if (staging == nil) return -4;
         bool frame_owned = true;
         id<MTLCommandBuffer> command_buffer = termite_metal_decode_runtime_command_buffer(runtime, __func__, &frame_owned);
@@ -69137,7 +69614,7 @@ int termite_metal_buffer_download(
     if (handle == NULL || dst == NULL || length == 0) return -1;
     @autoreleasepool {
         id<MTLBuffer> src = (__bridge id<MTLBuffer>)handle;
-        if (offset + length > src.length) return -2;
+        if (offset > src.length || length > src.length - offset) return -2;
         if (src.storageMode == MTLStorageModeShared) {
             if (termite_metal_trace_frame_lifecycle_enabled()) {
                 fprintf(stderr, "metal_frame_lifecycle: buffer_download storage=shared length=%zu offset=%zu\n", length, offset);
@@ -69152,7 +69629,13 @@ int termite_metal_buffer_download(
             fprintf(stderr, "metal_frame_lifecycle: buffer_download storage=private length=%zu offset=%zu\n", length, offset);
         }
         if (termite_metal_decode_runtime_flush_active_frame(runtime) != 0) return -8;
-        id<MTLBuffer> staging = antfly_observe_metal_buffer([runtime->device newBufferWithLength:length options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        void *receipt = NULL;
+        id<MTLBuffer> staging __attribute__((objc_precise_lifetime)) = runtime->embedding_workspace_owned
+            ? antfly_metal_workspace_buffer_impl(runtime, length, MTLResourceStorageModeShared, NULL, &receipt)
+            : antfly_observe_metal_buffer([runtime->device newBufferWithLength:length options:MTLResourceStorageModeShared], ANTFLY_BUFFER_OWNED);
+        antfly_metal_transient_workspace staging_creator __attribute__((cleanup(antfly_metal_retire_transient_workspace))) = {
+            .owner = runtime->embedding_workspace_owner, .receipt = receipt,
+        };
         if (staging == nil) return -4;
         id<MTLCommandBuffer> command_buffer = termite_metal_new_command_buffer(runtime->queue, __func__);
         if (command_buffer == nil) return -5;
@@ -69587,18 +70070,12 @@ int termite_metal_decode_runtime_prepare_decoder_only_greedy(
     size_t kv_tokens
 ) {
     if (runtime == NULL) return -1;
-    if (hidden_size == 0 || intermediate_size == 0 || num_layers == 0 || num_heads == 0 || num_kv_heads == 0 || head_dim == 0 || vocab_size == 0) return -2;
-
-    const size_t hidden_bytes = hidden_size * sizeof(float);
-    const size_t q_bytes = num_heads * head_dim * sizeof(float);
-    const size_t kv_bytes = num_kv_heads * head_dim * sizeof(float);
-    const size_t attn_bytes = num_heads * head_dim * sizeof(float);
-    const size_t mlp_bytes = intermediate_size * sizeof(float) * 2u;
-    const size_t layer_scratch = hidden_bytes * 2u + q_bytes + kv_bytes * 2u + attn_bytes + mlp_bytes;
-    const size_t kv_span_meta = kv_tokens * sizeof(uint32_t);
-    const size_t scratch_bytes = layer_scratch + hidden_bytes + kv_span_meta + 4096u;
-
-    return termite_metal_decode_runtime_reserve(runtime, scratch_bytes, sizeof(uint32_t));
+    antfly_metal_greedy_workspace_sizes geometry;
+    const int geometry_status = antfly_workspace_geometry_greedy(hidden_size,
+        intermediate_size, num_layers, num_heads, num_kv_heads, head_dim,
+        vocab_size, kv_tokens, &geometry);
+    if (geometry_status != 0) return geometry_status;
+    return termite_metal_decode_runtime_reserve(runtime, geometry.scratch_bytes, geometry.token_bytes);
 }
 
 static int termite_metal_dispatch(termite_metal_provider *provider, id<MTLComputePipelineState> pipeline, const float *input, size_t rows, size_t in_dim, size_t row_blocks, const uint8_t *weight_raw, size_t weight_bytes, size_t out_dim, float *output) {
@@ -72698,6 +73175,242 @@ void antfly_metal_kv_growth_publish(void *raw) {
     stage->published = true;
 }
 
+static AntflyMetalRetirementWitness *antfly_metal_workspace_tag_locked(id<MTLBuffer> buffer) {
+    AntflyMetalRetirementWitness *witness = objc_getAssociatedObject(buffer, &antfly_metal_retirement_witness_key);
+    for (; witness != nil; witness = witness->_next) if (witness->_workspace_tag) return witness;
+    return nil;
+}
+static void antfly_metal_workspace_entry_info(id<MTLBuffer> buffer, antfly_metal_workspace_entry *entry) {
+    *entry = (antfly_metal_workspace_entry){ .buffer_identity = (uintptr_t)(__bridge void *)buffer,
+        .bytes = MAX((size_t)buffer.length, (size_t)buffer.allocatedSize) };
+    os_unfair_lock_lock(&antfly_metal_retirement_witness_lock);
+    AntflyMetalRetirementWitness *tag = antfly_metal_workspace_tag_locked(buffer);
+    if (tag) {
+        entry->tagged = 1;
+        entry->root = tag->_workspace_root;
+        entry->operations = tag->_workspace_operations;
+        entry->birth = tag->_workspace_birth;
+        entry->unfunded_references = tag->_workspace_root ? 0 : tag->_workspace_references;
+    }
+    os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock);
+}
+static bool antfly_metal_workspace_note_unfunded(id<MTLBuffer> buffer, uint64_t birth) {
+    // Raw/unadmitted compatibility records ownership only, with no quota or
+    // external callbacks. Prepared execution uses its cold arena objects.
+    AntflyMetalRetirementWitness *tag = [AntflyMetalRetirementWitness new];
+    if (tag == nil) return false;
+    tag->_workspace_tag = true;
+    tag->_workspace_birth = birth;
+    tag->_workspace_references = 1; // creator/cache, reconciled by typed adoption
+    os_unfair_lock_lock(&antfly_metal_retirement_witness_lock);
+    if (antfly_metal_workspace_tag_locked(buffer) == nil) {
+        tag->_next = objc_getAssociatedObject(buffer, &antfly_metal_retirement_witness_key);
+        objc_setAssociatedObject(buffer, &antfly_metal_retirement_witness_key, tag, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock);
+    return true;
+}
+static void antfly_metal_workspace_set_birth(id<MTLBuffer> buffer, uint64_t birth) {
+    os_unfair_lock_lock(&antfly_metal_retirement_witness_lock);
+    AntflyMetalRetirementWitness *tag = antfly_metal_workspace_tag_locked(buffer);
+    if (tag) tag->_workspace_birth = birth;
+    os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock);
+}
+int antfly_metal_workspace_witness_tag(void *raw, void *root, const antfly_metal_workspace_root_operations *operations) {
+    antfly_metal_prepared_retirement_witnesses *view = raw;
+    if (!view || !root || !operations || !operations->retain || !operations->validate_release || !operations->release || !operations->begin_runtime_use || !operations->retain_metadata || view->published || view->count != 1) return -1;
+    AntflyMetalRetirementWitness *witness = (__bridge AntflyMetalRetirementWitness *)antfly_metal_prepared_witness_at(view, 0);
+    if (!witness || !witness->_pending_object || witness->_workspace_tag) return -1;
+    witness->_workspace_tag = true;
+    witness->_workspace_root = root;
+    witness->_workspace_operations = operations;
+    witness->_workspace_references = 0;
+    return 0;
+}
+// A real owning SDK handle keeps the tag and its canonical pure metadata alive.
+// This never reads an Objective-C retain count or guesses Model ownership.
+int antfly_metal_workspace_root_for_use(void *handle,
+    const antfly_metal_workspace_root_operations *accepted, void **out_root) {
+    if (!handle || !accepted || !out_root) return -1;
+    *out_root = NULL;
+    id<MTLBuffer> buffer __attribute__((objc_precise_lifetime)) = (__bridge id<MTLBuffer>)handle;
+    os_unfair_lock_lock(&antfly_metal_retirement_witness_lock);
+    AntflyMetalRetirementWitness *tag = antfly_metal_workspace_tag_locked(buffer);
+    const int status = tag && tag->_workspace_root ?
+        (tag->_workspace_operations == accepted ? 1 : -1) : 0;
+    if (status == 1) *out_root = tag->_workspace_root;
+    os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock);
+    return status;
+}
+// Existing Reader custody moves these LightOn buffer fields (128 activation,
+// two vision buffers and two attention scratch buffers), plus command fences.
+// Plain dense Qwen does not allocate this family. Explicit bound reuse plus
+// public legacy pool configuration can nevertheless place a Root here. Refuse
+// an unexpected tag BEFORE quiesce/exchange instead of closing an invisible
+// creator or pretending an SDK retain grants logical ownership. No Root cast,
+// callback, metadata allocation, SDK mutation or borrowed call-context lookup.
+static int antfly_metal_workspace_custody_compatible_locked(termite_metal_decode_runtime *runtime, bool include_reuse_pool) {
+    int result = 0;
+    os_unfair_lock_lock(&antfly_metal_retirement_witness_lock);
+    for (size_t i = 0; i < 128 && result == 0; ++i) {
+        AntflyMetalRetirementWitness *tag = antfly_metal_workspace_tag_locked(runtime->lighton_activation_buffers[i]);
+        if (tag && tag->_workspace_root) result = 1;
+    }
+    for (size_t i = 0; i < 2 && result == 0; ++i) {
+        AntflyMetalRetirementWitness *vision = antfly_metal_workspace_tag_locked(runtime->lightonocr3_vision_pack_buffers[i]);
+        AntflyMetalRetirementWitness *attention = antfly_metal_workspace_tag_locked(runtime->lighton_attention_batch_scratch[i]);
+        if ((vision && vision->_workspace_root) || (attention && attention->_workspace_root)) result = 1;
+    }
+    for (size_t i = 0; include_reuse_pool && i < runtime->frame_reuse_pool_len && result == 0; ++i) {
+        AntflyMetalRetirementWitness *tag = antfly_metal_workspace_tag_locked((__bridge id<MTLBuffer>)runtime->frame_reuse_pool[i]);
+        if (tag && tag->_workspace_root) result = 1;
+    }
+    os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock);
+    return result;
+}
+// Modern selected scopes inventory the frame reuse pool through their full
+// physical Snapshot/UseBank. Only decoder custody is invisible to that owner;
+// Reader parking has the stricter separate query below because it moves that
+// custody while dropping the provider lease. Neither query grants Root credit.
+int antfly_metal_workspace_decoder_custody_compatible(termite_metal_decode_runtime *runtime) {
+    if (!runtime) return -1;
+    ANTFLY_METAL_RETIREMENT_SCOPE(runtime);
+    return antfly_metal_workspace_custody_compatible_locked(runtime, false);
+}
+int antfly_metal_workspace_reader_park_compatible(termite_metal_decode_runtime *runtime) {
+    if (!runtime) return -1;
+    ANTFLY_METAL_RETIREMENT_SCOPE(runtime);
+    return antfly_metal_workspace_custody_compatible_locked(runtime, true);
+}
+// Called by the actual Reader owner under its provider lease BEFORE
+// quiesce. Roll back on failure until the original park transaction publishes.
+// An admitted parked page therefore excludes new modern charges throughout
+// its whole gap, not merely when the old page later attempts restoration.
+int antfly_metal_workspace_reader_park_begin(termite_metal_decode_runtime *runtime) {
+    if (!runtime) return -1;
+    ANTFLY_METAL_RETIREMENT_SCOPE(runtime);
+    if (runtime->embedding_workspace_owned || runtime->embedding_workspace_existing ||
+        runtime->workspace_parked_readers == SIZE_MAX ||
+        antfly_metal_workspace_custody_compatible_locked(runtime, true) != 0) return -1;
+    ++runtime->workspace_parked_readers;
+    return 0;
+}
+int antfly_metal_workspace_reader_park_end(termite_metal_decode_runtime *runtime) {
+    if (!runtime) return -1;
+    ANTFLY_METAL_RETIREMENT_SCOPE(runtime);
+    if (runtime->workspace_parked_readers == 0) return -1;
+    --runtime->workspace_parked_readers;
+    return 0;
+}
+int antfly_metal_workspace_retain_reference(void *handle, int owns_handle) {
+    if (!handle) return -1;
+    id<MTLBuffer> buffer __attribute__((objc_precise_lifetime)) = (__bridge id<MTLBuffer>)handle;
+    os_unfair_lock_lock(&antfly_metal_retirement_witness_lock);
+    AntflyMetalRetirementWitness *tag = antfly_metal_workspace_tag_locked(buffer);
+    if (!tag) { os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock); return 0; }
+    if (tag->_workspace_root) {
+        if (tag->_workspace_operations->retain(tag->_workspace_root) != 0) {
+            os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock); return -1;
+        }
+    } else {
+        if (!tag->_workspace_references || tag->_workspace_references == UINT64_MAX) {
+            os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock); return -1;
+        }
+        ++tag->_workspace_references;
+    }
+    os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock);
+    // Borrowed tagged views become actual SDK owners. No storage copy or new
+    // numerical allocation occurs, and existing owned handles are not doubled.
+    if (!owns_handle) CFRetain((__bridge CFTypeRef)buffer);
+    return 1;
+}
+// Validation-only: nonfinal aliases share one SDK retain/physical Root ref.
+// Never acquire/release either here; refuse before the Zig Ref count changes.
+int antfly_metal_workspace_validate_reference_release(void *handle, const void *current,
+    const antfly_metal_workspace_root_operations *accepted) {
+    if (!handle || !current || !accepted) return -1;
+    id<MTLBuffer> buffer __attribute__((objc_precise_lifetime)) = (__bridge id<MTLBuffer>)handle;
+    os_unfair_lock_lock(&antfly_metal_retirement_witness_lock);
+    AntflyMetalRetirementWitness *tag = antfly_metal_workspace_tag_locked(buffer);
+    const int status = !tag ? -1 : (tag->_workspace_root ?
+        (tag->_workspace_operations == accepted ? tag->_workspace_operations->validate_release(tag->_workspace_root, current) : -1) :
+        (tag->_workspace_references ? 0 : -1));
+    os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock);
+    return status;
+}
+void *antfly_metal_workspace_begin_reference_release(void *handle, const void *current) {
+    if (!handle || !current) return NULL;
+    id<MTLBuffer> buffer __attribute__((objc_precise_lifetime)) = (__bridge id<MTLBuffer>)handle;
+    os_unfair_lock_lock(&antfly_metal_retirement_witness_lock);
+    AntflyMetalRetirementWitness *tag = antfly_metal_workspace_tag_locked(buffer);
+    if (!tag || (tag->_workspace_root ? tag->_workspace_operations->validate_release(tag->_workspace_root, current) != 0 : !tag->_workspace_references)) {
+        os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock); return NULL;
+    }
+    // Metadata only; keep it valid through actual SDK release and final B
+    // publication, even when this is the last strong MTLBuffer reference.
+    CFRetain((__bridge CFTypeRef)tag);
+    os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock);
+    return (__bridge void *)tag;
+}
+// The caller owns a retained PURE tag from begin_reference_release. The
+// origin metadata gate protects only the borrowed runtime endpoint; it grants
+// neither numerical/reuse authority nor a cleanup boundary.
+int antfly_metal_workspace_begin_runtime_use(void *raw, void *runtime, void **endpoint_use) {
+    if (!raw || !endpoint_use) return 0;
+    *endpoint_use = NULL;
+    AntflyMetalRetirementWitness *tag = (__bridge AntflyMetalRetirementWitness *)raw;
+    os_unfair_lock_lock(&antfly_metal_retirement_witness_lock);
+    // Return the EXACT metadata lease acquired now. Raw->prepared adoption
+    // cannot cause endUse to reread a different association after SDK release.
+    void *root = tag->_workspace_root;
+    void *pin = root ? tag->_workspace_operations->begin_runtime_use(root, runtime) : NULL;
+    os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock);
+    *endpoint_use = pin;
+    return root == NULL || pin != NULL;
+}
+int antfly_metal_workspace_finish_reference_release(void *raw, const void *current) {
+    if (!raw || !current) return -1;
+    AntflyMetalRetirementWitness *tag = (__bridge AntflyMetalRetirementWitness *)raw;
+    os_unfair_lock_lock(&antfly_metal_retirement_witness_lock);
+    void *root = tag->_workspace_root;
+    const antfly_metal_workspace_root_operations *operations = tag->_workspace_operations;
+    if (!root) {
+        if (!tag->_workspace_references) { os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock); return -1; }
+        --tag->_workspace_references;
+    }
+    os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock);
+    // Retained pure tag keeps Root/Group metadata alive. Outside release may
+    // consume pending padding shrink and invoke a reentrant quota supplier;
+    // neither that nor final metadata destruction may hold the global lock.
+    const int status = root ? operations->release(root, current) : 0;
+    CFRelease((__bridge CFTypeRef)tag);
+    return status;
+}
+static bool antfly_metal_workspace_allow_reuse(termite_metal_decode_runtime *runtime, void *handle, const void *current) {
+    id<MTLBuffer> buffer __attribute__((objc_precise_lifetime)) = (__bridge id<MTLBuffer>)handle;
+    os_unfair_lock_lock(&antfly_metal_retirement_witness_lock);
+    AntflyMetalRetirementWitness *tag = antfly_metal_workspace_tag_locked(buffer);
+    if (!tag || !tag->_workspace_root) {
+        os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock); return true;
+    }
+    // Sole caller already holds retirement_lock: marker and reuse admission
+    // are one transaction. Untagged buffers above retain their original path.
+    if (runtime->workspace_parked_readers != 0 || !current || (!runtime->embedding_workspace_owned && !runtime->embedding_workspace_existing) ||
+        !pthread_equal(runtime->embedding_workspace_thread, pthread_self()) ||
+        !runtime->embedding_workspace_owner.retain_cached ||
+        tag->_workspace_operations != runtime->embedding_workspace_owner.root_operations) {
+        os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock); return false;
+    }
+    // Explicit CURRENT token and exact origin are checked by the synchronous
+    // actual owner service. Mode/thread/open-lifetime flags alone cannot lend
+    // another runtime's root to this pool or mint innermost cleanup authority.
+    void *root = tag->_workspace_root;
+    antfly_metal_workspace_allocation_service owner = runtime->embedding_workspace_owner;
+    os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock);
+    // Precise-lifetime SDK buffer above and the actual receiving cell keep
+    // metadata valid. No service callback runs under the global tag mutex.
+    return owner.retain_cached(owner.context, root, current) >= 0;
+}
 int antfly_metal_buffer_retirement_attach(void *prepared_witnesses) {
     if (!prepared_witnesses) return -1;
     antfly_metal_publish_retirement_witnesses(prepared_witnesses);

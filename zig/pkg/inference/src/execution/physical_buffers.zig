@@ -1519,6 +1519,10 @@ pub const Pool = struct {
             self.mutex.unlock();
             if (owner) |value| value.release();
         }
+        // A prior failed SDK attachment owns cleanup custody only. Even a
+        // raw/claimed fast path must not receive that quarantined bank.
+        for (frame.storages) |maybe| if (maybe) |lease| if (lease.isQuarantined())
+            return error.PhysicalStorageAdmissionQuarantined;
         frame.storage_admission = capability;
         frame.storage_admission_failed = false;
         for (frame.completions) |completion| if (completion) |value| value.beforeReuse() catch |err| {
@@ -1684,6 +1688,7 @@ pub const Frame = struct {
             credit.host_scratch_bytes = hostOwnedAmounts(reserved, self.host_workspace_retirement_owner, self.host_workspace.len).host_scratch_bytes;
         };
         for (self.storages, 0..) |maybe, id| if (maybe) |lease| {
+            if (lease.isQuarantined()) return null;
             const shared_literal = self.pool.plan.allocations[id].kind == .constant_binding;
             if (!shared_literal) {
                 const capture_pin: usize = if (self.replay_ready) @intFromBool(self.capture_pins[id]) else 0;
@@ -3208,3 +3213,32 @@ test "physical frame cold and warm admission callbacks run unlocked with exclusi
 
 // Managed numerical exclusion is required for direct Shared host writes. No
 // cleanup Epoch or metadata scope can upgrade a foreign legacy frame to this.
+
+test "quarantined physical frame refuses raw and prepared reuse before opaque backend or owner access" {
+    const a = std.testing.allocator;
+    // Metadata-only negative fixture: these opaque payloads are intentionally
+    // unreadable. Refusal must precede every backend, quota and owner callback.
+    var cleanup_owner: @import("backing_retirement.zig").BackingOwner = undefined;
+    var lease = storage.Lease{ .allocator = a, .backend = undefined, .tensor = undefined, .byte_size = 16, .retirement_owner = &cleanup_owner };
+    try std.testing.expect(lease.isQuarantined());
+    try std.testing.expectEqual(@as(usize, 0), lease.admittedBytes());
+    try std.testing.expectEqualDeep(@import("../runtime/tier/memory.zig").AdmissionAmounts{}, lease.admittedAmounts());
+    const Never = struct {
+        fn reserve(_: *anyopaque, _: std.mem.Allocator, _: ops.BackendKind, _: accounting.Class, _: usize) !admission.Reservation {
+            return error.UnexpectedQuarantinedReservation;
+        }
+    };
+    var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+    defer controller.deinit();
+    const cap = admission.Capability{ .identity = .{ .controller = &controller, .backend_class = .cpu }, .context = &controller, .services = &.{ .reserve = Never.reserve } };
+    var pool = Pool{ .allocator = a, .plan = .{ .allocator = a, .slots = &.{}, .node_slots = &.{}, .node_positions = &.{}, .allocations = &.{}, .transfers = &.{}, .transfer_index = .empty }, .kernels = &.{}, .transfers = &.{}, .backends = &.{}, .workspace_allocations = &.{} };
+    for ([_]?admission.Capability{ null, cap }) |capability| {
+        var slots = [_]?*storage.Lease{&lease};
+        var frame = Frame{ .pool = &pool, .storages = &slots, .completions = &.{}, .in_use = false };
+        try std.testing.expect((try frame.reusableCredit(null, null)) == null);
+        try std.testing.expect((try frame.reusableCredit(cap.identity, null)) == null);
+        frame.in_use = true;
+        try std.testing.expectError(error.PhysicalStorageAdmissionQuarantined, pool.prepareAcquired(&frame, capability));
+        try std.testing.expect(!frame.in_use and frame.owner_pin == null);
+    }
+}

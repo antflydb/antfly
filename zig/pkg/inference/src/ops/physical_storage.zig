@@ -184,6 +184,7 @@ pub const Lease = struct {
             if (!existing.identity.eql(capability.identity)) return error.PhysicalStorageAdmissionMismatch;
             return;
         }
+        if (self.isQuarantined()) return error.PhysicalStorageAdmissionQuarantined;
         const bytes = self.backing_byte_size orelse self.byte_size;
         if (capability.services.takeBacking != null) {
             try validatePreparedBackingSupport(self.backend);
@@ -194,15 +195,26 @@ pub const Lease = struct {
         }
         if (try capability.reserveBacking(self.allocator, self.backend.kind(), self.accounting_class, bytes)) |backing| {
             const reservation = backing.owner.charge.storageReservation() orelse @panic("prepared physical owner lacks exact storage reservation");
-            // The existing SDK bank has already escaped allocation. Install its
-            // independently retained token BEFORE any fallible witness work;
-            // failure retires the frame, and final bank destruction keeps quota.
-            self.retirement_owner = backing.owner;
-            self.admission = reservation;
+            // Publish admission only after every fallible attachment step.
+            // A failed backend may already own payload witnesses: their Group
+            // independently pins Charge until the actual SDK aliases die.
+            // Validation rollback drops only the construction root. Attachment
+            // failure instead keeps cleanup-only quarantine on the escaped bank.
+            var cleanup_owner_transferred = false;
+            errdefer if (!cleanup_owner_transferred) backing.owner.release(backing.construction_epoch);
             if (!reservation.identity.eql(capability.identity) or backing.owner.admittedBytes() != bytes)
                 return error.InvalidPhysicalStorageReservation;
-            try attachPhysicalCharge(self.backend, self.tensor, backing);
+            attachPhysicalCharge(self.backend, self.tensor, backing) catch |err| {
+                // The escaped raw SDK bank may now own partial witnesses.
+                // Preserve its existing logical owner for ACTUAL later-B
+                // teardown, without publishing admitted-ready cache credit.
+                self.retirement_owner = backing.owner;
+                cleanup_owner_transferred = true;
+                return err;
+            };
             backing.owner.measure(backing.construction_epoch, bytes);
+            self.retirement_owner = backing.owner;
+            self.admission = reservation;
             return;
         }
         const owner = try self.allocator.create(admission.Reservation);
@@ -217,11 +229,18 @@ pub const Lease = struct {
     pub fn unique(self: *const Lease) bool {
         return self.references.load(.acquire) == 1;
     }
+    /// Existing cleanup custody without successful admission is quarantined:
+    /// neither raw nor prepared callers may receive this bank again.
+    pub fn isQuarantined(self: *const Lease) bool {
+        return self.retirement_owner != null and self.admission == null;
+    }
     pub fn admittedBytes(self: *const Lease) usize {
+        if (self.isQuarantined()) return 0;
         if (self.retirement_owner) |owner| return @min(owner.admittedBytes(), self.backing_byte_size orelse self.byte_size);
         return if (self.admission) |value| value.reservedBytes() else 0;
     }
     pub fn admittedAmounts(self: *const Lease) @import("../runtime/tier/memory.zig").AdmissionAmounts {
+        if (self.isQuarantined()) return .{};
         if (self.retirement_owner) |owner| return owner.charge.storageAmountsForBytes(self.admittedBytes());
         return if (self.admission) |value| value.amounts() else .{};
     }

@@ -762,6 +762,7 @@ fn createCudaSessionWithRequiredProfile(
     errdefer archClose(impl);
     try impl.model_lifetime.prepareFinalResources();
     try impl.backend_data.cuda.compute.publishLightOnNormCatalog();
+    try impl.backend_data.cuda.compute.configureOptionalPrefillOutsideExecution();
     return archSessionHandle(impl);
 }
 
@@ -1597,6 +1598,60 @@ fn makeGpuHostedComputeBackend(
     return switch (self.backend_type) {
         .metal => makeMetalHostedComputeBackend(self, allocator, run_budget),
         else => unreachable,
+    };
+}
+
+/// Constructor-only cold publication for the actual dense Qwen workspace
+/// transaction. The caller owns the ORIGINAL uncredited RunPermit and has not
+/// entered any Model/cohort/external lane. This never calls beginRequest and
+/// never supplies a RunBudget (which would widen mutable tier policy).
+///
+/// The strong model pin spans constructor rollback and explicit outside close.
+/// The original Metal constructor takes its real nonblocking provider lease;
+/// a busy peer returns QueueFull to the caller's existing finite ready loop.
+/// No operation.gate-only exclusion is substituted for that real lease.
+pub fn prepareQwenWorkspaceProviderOutsideExecution(session: Session, permit: *const @import("../backends/session.zig").RunPermit, control: ?InferenceExecutionControl) !bool {
+    if (comptime !build_options.enable_metal) return false;
+    if (!acceptsQwenWorkspaceSession(session) or session.backend() != .metal) return false;
+    if (permit.session.ptr != session.ptr or permit.session.vtable != session.vtable)
+        return error.ForeignWorkspacePermit;
+    const request = permit.request orelse return error.MissingWorkspaceRequest;
+    // A charged transaction cannot initialize a provider using credit from
+    // roots it has not yet observed. A later exact snapshot may earn credit.
+    if (request.retained_backend_workspace_bytes != 0) return error.UnobservedWorkspaceCredit;
+    if (session.run_admission != null and permit.lease == null) return error.MissingRunAdmission;
+    const arch: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const cfg = switch (arch.arch_config) {
+        .gpt => |value| value,
+        else => return false,
+    };
+    if (!gpt_arch.denseQwen3PrefillEligible(cfg)) return false;
+    const model = session.model_lifetime orelse return error.MissingWorkspaceModelLifetime;
+    if (session.ptr != model.owner or model.destroy_with_boundary_fn == null or
+        model.prepared_final_resources == null) return error.UnpreparedWorkspaceModelLifetime;
+    _ = model.retain();
+    defer model.release(); // caller is still outside all execution lanes
+    if (try session.coldComputeTarget(control)) |target| return switch (target) {
+        .metal => true,
+        else => error.UnsupportedWorkspaceTarget,
+    };
+    const effective = control orelse InferenceExecutionControl{};
+    try effective.check();
+    var guard = try effective.enterUninterruptible(session.interruption());
+    defer guard.deinit();
+    const metadata = platform.allocator.processAllocator(platform.allocator.concurrentFallback());
+    {
+        var cb = try makeMetalHostedComputeBackend(arch, metadata, null);
+        // Explicit outside authority applies only to this constructor-only
+        // local owner. Close its actual provider lease BEFORE recapturing the
+        // cold target (which takes that SAME non-reentrant mutex).
+        defer cb.deinitWithCleanup(.{ .outside_execution = true });
+        try effective.check();
+    }
+    const target = (try session.coldComputeTarget(control)) orelse return error.WorkspaceTargetChanged;
+    return switch (target) {
+        .metal => true,
+        else => error.UnsupportedWorkspaceTarget,
     };
 }
 
@@ -2801,6 +2856,64 @@ pub fn attachGraphRuntimeStrategy(session: Session, strategy: graph_runtime.Stra
 
 pub const MetalWorkloadProfileExport = if (build_options.enable_metal) metal_runtime.WorkloadProfileExport else void;
 
+/// Full published provider descriptor BEFORE its concrete ctx cast. A forwarded
+/// Session may keep that same provider/model owner; a copied/custom table or
+/// unrelated Model pin cannot certify the actual SDK endpoint.
+/// Lane order follows the ACTUAL model capability, independent of optional
+/// public decoder metadata or batching flags. null is an unknown raw provider;
+/// a known non-Qwen model returns false and cannot be relabelled by metadata.
+pub fn qwenWorkspaceLanePolicy(session: Session) ?bool {
+    const owner: *const ArchSession = actual: {
+        if (session.compute_backend_provider) |provider| {
+            if (session.model_lifetime) |model| {
+                if (provider.services == &archComputeServices and model.owner == provider.ptr)
+                    break :actual @ptrCast(@alignCast(provider.ptr));
+            }
+        }
+        if (session.vtable != &arch_vtable) return null;
+        break :actual @ptrCast(@alignCast(session.ptr)); // exact original table before cast
+    };
+    if (owner.backend_type != .metal) return false;
+    return switch (owner.arch_config) {
+        .gpt => |cfg| gpt_arch.denseQwen3PrefillEligible(cfg),
+        else => false,
+    };
+}
+
+/// Lane order is an immutable ACTUAL model fact, including value-copy
+/// forwarding headers retaining the original published provider/Model owner.
+pub fn gemmaWorkspaceLanePolicy(session: Session) ?bool {
+    const owner: *const ArchSession = actual: {
+        if (session.compute_backend_provider) |provider| {
+            if (session.model_lifetime) |model| {
+                if (provider.services == &archComputeServices and model.owner == provider.ptr and
+                    model.destroy_fn == archClose and model.quiesce_fn == archQuiesce)
+                {
+                    const actual: *const ArchSession = @ptrCast(@alignCast(provider.ptr));
+                    if (&actual.model_lifetime != model) return null;
+                    break :actual actual;
+                }
+            }
+        }
+        if (session.vtable != &arch_vtable) return null;
+        break :actual @ptrCast(@alignCast(session.ptr));
+    };
+    if (session.model_lifetime) |model| if (&owner.model_lifetime != model) return null;
+    return owner.arch_config == .embedding_gemma2;
+}
+
+pub fn acceptsMetalWorkspaceSession(session: Session) bool {
+    const provider = session.compute_backend_provider orelse return false;
+    const model = session.model_lifetime orelse return false;
+    if (provider.services != &archComputeServices or model.owner != provider.ptr) return false;
+    const owner: *ArchSession = @ptrCast(@alignCast(provider.ptr));
+    return owner.backend_type == .metal;
+}
+fn acceptsQwenWorkspaceSession(session: Session) bool {
+    return session.vtable == &arch_vtable and acceptsMetalWorkspaceSession(session) and
+        session.compute_backend_provider.?.ptr == session.ptr;
+}
+
 fn qwenWorkspaceProvider(session: Session) !*@import("../backends/metal_native_provider.zig").MetalNativeProvider {
     if (comptime !build_options.enable_metal) return error.UnsupportedBackend;
     if (session.vtable != &arch_vtable) return error.UnsupportedBackend;
@@ -2809,42 +2922,264 @@ fn qwenWorkspaceProvider(session: Session) !*@import("../backends/metal_native_p
     return gpuBackendData(arch).shared_metal_native_provider orelse error.MissingMetalNativeProvider;
 }
 
-/// All workspace methods require the caller's model execution gate. The
-/// managed backend is retired before inspecting or reclaiming physical buffers.
-pub fn qwenMetalWorkspaceCredit(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !usize {
-    if (comptime !build_options.enable_metal) return 0;
-    var compute = try getComputeBackendWithControl(session, allocator, control);
-    compute.deinit();
-    const provider = try qwenWorkspaceProvider(session);
-    // A denied larger-shape probe must not discard reusable buffers. The
-    // profile includes replacement overlap, and the native guard limits every
-    // fresh allocation to the incremental permit after retained credit.
-    if (provider.embedding_workspace_lease_count == provider.embedding_workspace_leases.len or
-        (provider.embedding_workspace_bytes == 0 and metal_runtime.termite_metal_decode_runtime_embedding_workspace_bytes(provider.raw_decode_runtime) != 0))
-        try provider.trimEmbeddingWorkspace();
-    return provider.embedding_workspace_bytes;
+/// Actual cold physical census. This synchronous owner retains the existing
+/// loaded-model endpoint while copied SDK identities/pure Root pins are used
+/// for admission. The model pin itself grants NO physical workspace credit.
+pub const MetalWorkspaceCensus = struct {
+    target: @import("../backends/cold_compute_target.zig").Retained,
+    physical: @import("../backends/metal_workspace_roles.zig").Snapshot,
+
+    pub fn deinitOutsideExecution(self: *MetalWorkspaceCensus) void {
+        self.physical.deinitOutsideExecution();
+        self.target.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Certified pre-admission caller ONLY: no Model/cohort/outer numerical lane.
+/// Every wait remains with that caller's existing finite readiness protocol.
+/// This helper is nonblocking, including a null/deadline-free raw caller; it
+/// never constructs a compute backend, prepares SDK slots or invokes supplier
+/// callbacks while owning the provider metadata exclusion.
+pub fn snapshotQwenWorkspaceOutsideExecution(session: Session, control: ?InferenceExecutionControl) !?QwenWorkspaceCensus {
+    if (!acceptsQwenWorkspaceSession(session)) return null;
+    return snapshotWorkspaceOutsideExecution(session, control, false);
 }
 
-pub fn trimQwenMetalWorkspace(session: Session) !void {
-    if (comptime !build_options.enable_metal) return;
-    try (try qwenWorkspaceProvider(session)).trimEmbeddingWorkspace();
+/// Generic existing-root census, ZERO storage-credit authority. This fast
+/// declines missing/unpublished providers and copied/custom service tables;
+/// supported forwarded headers retain the SAME actual Model/provider owner.
+/// The returned target is a synchronous pin only. A caller-owned existing-use
+/// holder moves out the pure Snapshot and releases target outside all gates.
+pub fn snapshotMetalWorkspaceOutsideExecution(session: Session, control: ?InferenceExecutionControl) !?MetalWorkspaceCensus {
+    return snapshotWorkspaceOutsideExecution(session, control, true);
 }
 
-pub fn beginQwenMetalWorkspace(session: Session, bytes: usize) !void {
-    if (comptime !build_options.enable_metal) return;
-    const provider = try qwenWorkspaceProvider(session);
-    if (metal_runtime.termite_metal_decode_runtime_begin_embedding_workspace(provider.raw_decode_runtime, bytes) != 0)
-        return error.MetalWorkspaceBusy;
+pub const QwenWorkspaceCensus = MetalWorkspaceCensus;
+
+fn snapshotWorkspaceOutsideExecution(session: Session, control: ?InferenceExecutionControl, require_existing_roots: bool) !?MetalWorkspaceCensus {
+    if (comptime !build_options.enable_metal) return null;
+    if (control) |active| try active.check();
+    if (!acceptsMetalWorkspaceSession(session)) return null;
+    var retained = (try @import("../backends/cold_compute_target.zig").Retained.acquire(session, control)) orelse return null;
+    var target_owned = true;
+    defer if (target_owned) retained.deinit();
+    const target = switch (retained.target) {
+        .metal => |value| value,
+        else => return null,
+    };
+    var ticket = try target.exclusion.prepare();
+    defer ticket.release() catch platform.inference_process_supervisor.restartWorker();
+    const roles = @import("../backends/metal_workspace_roles.zig");
+    // Lexical scopes guarantee metadata destructors run AFTER Gate release,
+    // including every capture/capacity/identity failure, without bool inference.
+    const actual_capacity = blk: {
+        try ticket.begin();
+        defer ticket.end() catch platform.inference_process_supervisor.restartWorker();
+        const provider_owner: *ArchSession = @ptrCast(@alignCast(session.compute_backend_provider.?.ptr));
+        if (provider_owner.backend_type != .metal) return null;
+        const provider = gpuBackendData(provider_owner).shared_metal_native_provider orelse return null;
+        const actual_runtime = provider.raw_decode_runtime orelse return error.WorkspaceTargetChanged;
+        if (@as(*anyopaque, @ptrCast(actual_runtime)) != target.runtime or &provider.operations.gate != target.exclusion)
+            return error.WorkspaceTargetChanged;
+        // Actual metadata exclusion before the no-tag fast decline. The host
+        // receiver rechecks absence before math, closing the publication race.
+        if (require_existing_roots and provider.workspace_creators.head == null) return null;
+        break :blk roles.antfly_metal_workspace_snapshot_capacity(target.runtime);
+    };
+    if (actual_capacity == 0) return error.WorkspaceCensusUnavailable;
+    var physical = try roles.Snapshot.prepare(actual_capacity);
+    var physical_owned = true;
+    defer if (physical_owned) physical.deinitOutsideExecution();
+    if (control) |active| try active.check();
+    {
+        try ticket.begin();
+        defer ticket.end() catch platform.inference_process_supervisor.restartWorker();
+        // Snapshot rechecks actual capacity and refuses a raced pool growth;
+        // it cannot reallocate or retain any SDK object under exclusion.
+        try physical.capture(target.runtime);
+    }
+    physical_owned = false;
+    target_owned = false;
+    return .{ .target = retained, .physical = physical };
 }
 
-pub fn finishQwenMetalWorkspace(session: Session, lease: *?runtime.tier.memory.AdmissionLease) !void {
-    if (comptime !build_options.enable_metal) return;
-    const provider = try qwenWorkspaceProvider(session);
-    errdefer provider.trimEmbeddingWorkspace() catch platform.inference_process_supervisor.restartWorker();
-    const result = metal_runtime.termite_metal_decode_runtime_end_embedding_workspace(provider.raw_decode_runtime);
-    if (result < 0) return error.MetalWorkspaceBusy;
-    if (result > 0) return error.ResourceLimitExceeded;
-    try provider.retainEmbeddingWorkspace(lease);
+/// First-cold preparation has no selected layer formats yet. Its allocation
+/// schedule is exactly the existing greedy scratch/token banks; immutable
+/// weights retain the original model/private admission floor. Capturing this
+/// separate value never guesses a generic activation or model-weight envelope.
+pub const QwenWorkspaceColdAuxiliary = struct {
+    census: QwenWorkspaceCensus,
+    auxiliary: @import("../backends/metal_workspace_roles.zig").Auxiliary,
+
+    pub fn deinitOutsideExecution(self: *QwenWorkspaceColdAuxiliary) void {
+        self.auxiliary.deinitOutsideExecution();
+        self.census.deinitOutsideExecution();
+        self.* = undefined;
+    }
+};
+
+pub fn describeQwenWorkspaceAuxiliaryOutsideExecution(session: Session, host_ids_bytes: usize, control: ?InferenceExecutionControl) !?QwenWorkspaceColdAuxiliary {
+    if (comptime !build_options.enable_metal) return null;
+    var census = (try snapshotQwenWorkspaceOutsideExecution(session, control)) orelse return null;
+    var owned = true;
+    defer if (owned) census.deinitOutsideExecution();
+    const arch: *ArchSession = @ptrCast(@alignCast(session.ptr)); // actual Qwen endpoint already attested
+    const cfg = switch (arch.arch_config) {
+        .gpt => |value| value,
+        else => return null,
+    };
+    if (!gpt_arch.denseQwen3PrefillEligible(cfg)) return null;
+    const roles = @import("../backends/metal_workspace_roles.zig");
+    const reserve_kv_tokens = if (cfg.sliding_window > 0) cfg.sliding_window else if (cfg.max_position_embeddings > 0) cfg.max_position_embeddings else 1;
+    const greedy = try roles.geometry.greedy(.{
+        .hidden = cfg.hidden_size,
+        .intermediate = cfg.intermediate_size,
+        .heads = cfg.num_attention_heads,
+        .kv_heads = cfg.effectiveKVHeads(),
+        .head_dim = cfg.headDim(),
+        .layers = cfg.num_hidden_layers,
+        .vocab = cfg.vocab_size,
+        .kv_tokens = reserve_kv_tokens,
+    });
+    var validation = try roles.Snapshot.prepare(census.physical.entries.len);
+    defer validation.deinitOutsideExecution();
+    const target = census.target.target.metal;
+    var ticket = try target.exclusion.prepare();
+    defer ticket.release() catch platform.inference_process_supervisor.restartWorker();
+    if (control) |active| try active.check();
+    const auxiliary = blk: {
+        try ticket.begin();
+        defer ticket.end() catch platform.inference_process_supervisor.restartWorker();
+        if (MetalCompute.antfly_metal_workspace_policy_available(target.runtime) != 1 or
+            MetalCompute.antfly_metal_workspace_decoder_custody_compatible(target.runtime) != 0) return null;
+        try validation.capture(target.runtime);
+        try census.physical.validate(&validation);
+        break :blk try roles.Auxiliary.capture(target.runtime, greedy, host_ids_bytes, .{});
+    };
+    owned = false;
+    return .{ .census = census, .auxiliary = auxiliary };
+}
+
+/// Exact owned command declarations + physical identities for one actual
+/// pre-admission Qwen frame. It retains no SDK object; its loaded target and
+/// pure metadata pins remain synchronous, and are destroyed outside all lanes.
+pub const QwenWorkspaceColdPlan = struct {
+    census: QwenWorkspaceCensus,
+    metadata: MetalCompute.QwenWorkspaceMetadata,
+    reference: MetalCompute.WorkspaceReferenceDeclaration,
+    tail: MetalCompute.WorkspaceTailDeclaration,
+    roles: @import("../backends/metal_workspace_roles.zig").Plan,
+    auxiliary: @import("../backends/metal_workspace_roles.zig").Auxiliary,
+    pub fn deinitOutsideExecution(self: *QwenWorkspaceColdPlan) void {
+        self.tail.deinitOutsideExecution();
+        self.roles.deinitOutsideExecution();
+        self.auxiliary.deinitOutsideExecution();
+        self.metadata.deinitOutsideExecution();
+        self.census.deinitOutsideExecution();
+        self.* = undefined;
+    }
+};
+
+/// Same actual selected lowerer, no fake numerical receiver. Published slot
+/// formats are copied under short provider exclusion into the existing256-layer
+/// registered frame bound; ALL lowerer allocations run after exclusion ends.
+/// A second exact slot+census check refuses a raced peer BEFORE admission/math.
+pub fn describeQwenWorkspaceOutsideExecution(session: Session, request: *const ops.DecoderRuntimePrefillFramePlanRequest, tail_request: MetalCompute.WorkspaceTailRequest, control: ?InferenceExecutionControl) !?QwenWorkspaceColdPlan {
+    if (comptime !build_options.enable_metal) return null;
+    if (request.contract != .qwen3_dense_text_prefill or request.include_tail) return null;
+    var census = (try snapshotQwenWorkspaceOutsideExecution(session, control)) orelse return null;
+    var census_owned = true;
+    defer if (census_owned) census.deinitOutsideExecution();
+    if (platform.env.getenvBool("TERMITE_METAL_DISABLE_QWEN3_PREPARED_PREFILL")) return null;
+    // Tie the request to the ACTUAL factory-owned config, not a forwarded
+    // model-contract pointer or caller-supplied dimensions. Full table was
+    // accepted by the retained target before this context cast.
+    const arch: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const cfg = switch (arch.arch_config) {
+        .gpt => |value| value,
+        else => return null,
+    };
+    if (!gpt_arch.denseQwen3PrefillEligible(cfg)) return null;
+    const rows = std.math.mul(usize, request.batch, request.seq_len) catch return error.WorkspaceRequestChanged;
+    if (request.batch == 0 or request.seq_len == 0 or request.rows != rows or
+        request.layer_count != cfg.num_hidden_layers or request.hidden_size != cfg.hidden_size or
+        request.vocab_size != cfg.vocab_size or request.num_attention_heads != cfg.num_attention_heads or
+        request.global_head_dim != 0 or request.ple_hidden_size != 0 or
+        request.final_norm_slot != @import("../backends/decoder_gated_runtime.zig").finalNormSlot(cfg.num_hidden_layers) or
+        request.final_lm_head_slot != 0) return error.WorkspaceRequestChanged;
+    var expected_layers_storage: [256]ops.DecoderRuntimeLayerSpec = undefined;
+    const expected_layers = try @import("../backends/decoder_gated_runtime.zig").fillDenseQwen3LayerSpecs(cfg, cfg.num_hidden_layers, &expected_layers_storage);
+    if (request.layers.len != expected_layers.len) return error.WorkspaceRequestChanged;
+    for (request.layers, expected_layers) |given, actual| if (!std.meta.eql(given, actual)) return error.WorkspaceRequestChanged;
+    const target = census.target.target.metal;
+    var ticket = try target.exclusion.prepare();
+    defer ticket.release() catch platform.inference_process_supervisor.restartWorker();
+    const commands = @import("../graph/metal_command_planner.zig");
+    var layer_storage: [256]commands.GatedFrameCommandLowerer.Layer = undefined;
+    const layers = blk: {
+        try ticket.begin();
+        defer ticket.end() catch platform.inference_process_supervisor.restartWorker();
+        const provider = try qwenWorkspaceProvider(session);
+        if (MetalCompute.antfly_metal_workspace_policy_available(target.runtime) != 1 or
+            MetalCompute.antfly_metal_workspace_decoder_custody_compatible(target.runtime) != 0) return null;
+        break :blk MetalCompute.copyQwenWorkspaceLayers(provider, request, &layer_storage) orelse return null;
+    };
+    const metadata = platform.allocator.processAllocator(platform.allocator.concurrentFallback());
+    var selected = try MetalCompute.QwenWorkspaceMetadata.prepare(metadata, request, layers);
+    var selected_owned = true;
+    defer if (selected_owned) selected.deinitOutsideExecution();
+    const role_types = @import("../backends/metal_workspace_roles.zig");
+    const requirements = try role_types.Requirements.fromSelectedDensePrefill(selected.selected.?.view(), request.rows, request.hidden_size, request.num_attention_heads, request.layers);
+    var validation = try role_types.Snapshot.prepare(census.physical.entries.len);
+    defer validation.deinitOutsideExecution();
+    if (control) |active| try active.check();
+    const reserve_kv_tokens = if (cfg.sliding_window > 0) cfg.sliding_window else if (cfg.max_position_embeddings > 0) cfg.max_position_embeddings else 1;
+    const greedy = try role_types.geometry.greedy(.{
+        .hidden = cfg.hidden_size,
+        .intermediate = cfg.intermediate_size,
+        .layers = cfg.num_hidden_layers,
+        .heads = cfg.num_attention_heads,
+        .kv_heads = cfg.effectiveKVHeads(),
+        .head_dim = cfg.headDim(),
+        .vocab = cfg.vocab_size,
+        .kv_tokens = reserve_kv_tokens,
+    });
+    const ids_bytes = try std.math.mul(usize, request.rows, @sizeOf(u32));
+    const captured_plans = blk: {
+        try ticket.begin();
+        defer ticket.end() catch platform.inference_process_supervisor.restartWorker();
+        const provider = try qwenWorkspaceProvider(session);
+        // No supplier/heap/SDK allocation in this revalidation region.
+        var current_storage: [256]commands.GatedFrameCommandLowerer.Layer = undefined;
+        const current = MetalCompute.copyQwenWorkspaceLayers(provider, request, &current_storage) orelse return error.WorkspaceRoleChanged;
+        if (layers.len != current.len) return error.WorkspaceRoleChanged;
+        for (layers, current) |before, now| if (!std.meta.eql(before, now)) return error.WorkspaceRoleChanged;
+        try validation.capture(target.runtime);
+        try census.physical.validate(&validation);
+        var captured: role_types.Capture = undefined;
+        if (role_types.antfly_metal_graph_workspace_capture(target.runtime, &requirements.bytes, &captured, role_types.capacity) != 0)
+            return error.WorkspaceRoleCaptureUnavailable;
+        var graph_roles = try role_types.Plan.capture(requirements, captured);
+        errdefer graph_roles.deinitOutsideExecution();
+        // Standalone embedding upload precedes begin_frame in the actual GPT
+        // body. Its bank and the SAME family greedy banks are separate roles;
+        // neither can borrow graph-slot capacity or credit.
+        var auxiliary = try role_types.Auxiliary.capture(target.runtime, greedy, ids_bytes, .{
+            .sequence = request.seq_len,
+            .heads = cfg.num_attention_heads,
+            .kv_heads = cfg.effectiveKVHeads(),
+            .head_dim = cfg.headDim(),
+        });
+        errdefer auxiliary.deinitOutsideExecution();
+        var tail = try MetalCompute.WorkspaceTailDeclaration.capture(provider, tail_request);
+        errdefer tail.deinitOutsideExecution();
+        const reference = try MetalCompute.WorkspaceReferenceDeclaration.capture(provider, request, selected.selected_layers);
+        break :blk .{ .graph = graph_roles, .auxiliary = auxiliary, .tail = tail, .reference = reference };
+    };
+    census_owned = false;
+    selected_owned = false;
+    return .{ .census = census, .metadata = selected, .roles = captured_plans.graph, .auxiliary = captured_plans.auxiliary, .tail = captured_plans.tail, .reference = captured_plans.reference };
 }
 
 /// Starts an explicit pre-serving/benchmark census on an architecture session.
@@ -4547,6 +4882,27 @@ pub fn getComputeBackendBorrowingSharedProvider(session: Session, allocator: std
 /// Compatibility names for the backend-owned request lifetime protocol.
 pub const ManagedComputeBackend = @import("../backends/compute_provider.zig").ManagedComputeBackend;
 
+/// Constructor ONLY for a preprepared existing/fresh workspace caller.
+/// It returns by value WITHOUT binding a caller-header pointer or starting a
+/// request. Caller assigns its FINAL header, binds actual NOWB/operation/loan,
+/// then invokes the original beginRequestWithCleanup once where required.
+pub fn constructMetalWorkspaceReceiver(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !ManagedComputeBackend {
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+    if (!acceptsMetalWorkspaceSession(session)) return error.UnsupportedWorkspaceTarget;
+    var owner_session = session;
+    owner_session.ptr = session.compute_backend_provider.?.ptr;
+    owner_session.vtable = &arch_vtable; // classify ACTUAL owner, never an opaque forwarded ptr
+    return @import("../backends/compute_provider.zig").acquireWith(owner_session, allocator, null, control, constructCanonicalMetalWorkspaceReceiver);
+}
+fn constructCanonicalMetalWorkspaceReceiver(session: Session, allocator: std.mem.Allocator, options: @import("../backends/session.zig").ComputeBackendOptions) !ops.ComputeBackend {
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+    if (!acceptsMetalWorkspaceSession(session)) return error.UnsupportedWorkspaceTarget;
+    if (options.run_budget != null or options.borrow_shared_provider or options.cleanup.boundary != null or options.cleanup.operation != null or options.cleanup.outside_execution) return error.UnsupportedComputeProviderMode;
+    // Full actual provider/Model attestation above precedes this sole cast.
+    const owner: *ArchSession = @ptrCast(@alignCast(session.compute_backend_provider.?.ptr));
+    return makeMetalHostedComputeBackend(owner, allocator, null);
+}
+
 pub fn getComputeBackendWithControl(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !ManagedComputeBackend {
     return getManagedComputeBackend(session, allocator, null, control);
 }
@@ -5751,6 +6107,29 @@ fn runModernBertGlinerDecision(
     return result;
 }
 
+/// Metadata hint ONLY. A missing/busy provider is rechecked by the actual
+/// receiving header before math, so this cannot mint an unbound Root use.
+/// No arrays, SDK allocation, quota supplier, or Model wait occurs here.
+pub fn metalWorkspaceCreatorsOutsideExecution(session: Session, control: ?InferenceExecutionControl) !bool {
+    if (comptime !build_options.enable_metal) return false;
+    if (!acceptsMetalWorkspaceSession(session)) return false;
+    var retained = (try @import("../backends/cold_compute_target.zig").Retained.acquire(session, control)) orelse return false;
+    defer retained.deinit();
+    const target = switch (retained.target) {
+        .metal => |value| value,
+        else => return false,
+    };
+    var ticket = try target.exclusion.prepare();
+    defer ticket.release() catch platform.inference_process_supervisor.restartWorker();
+    try ticket.begin();
+    defer ticket.end() catch platform.inference_process_supervisor.restartWorker();
+    const owner: *ArchSession = @ptrCast(@alignCast(session.compute_backend_provider.?.ptr));
+    const provider = gpuBackendData(owner).shared_metal_native_provider orelse return false;
+    const actual_runtime = provider.raw_decode_runtime orelse return error.WorkspaceTargetChanged;
+    if (@intFromPtr(actual_runtime) != @intFromPtr(target.runtime) or &provider.operations.gate != target.exclusion) return error.WorkspaceTargetChanged;
+    return provider.workspace_creators.head != null;
+}
+
 const eager_host_services = @import("../backends/session.zig").EagerHostRunServices{
     .accepts = acceptsEagerHostTable,
     .recurrent_layout = eagerHostRecurrentLayout,
@@ -5769,14 +6148,41 @@ fn eagerHostRecurrentLayout(raw: *anyopaque) !?@import("recurrent_state_admissio
     _ = try layout.bytes();
     return layout;
 }
-fn eagerHostRunWithContext(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, context: *const @import("invocation_context.zig").Context) ![]Tensor {
-    _ = (try eagerHostRecurrentLayout(raw)) orelse return error.UnsupportedRecurrentStateTarget;
-    const budget = context.recurrent_state orelse return error.UnpreparedRecurrentStateBudget;
-    const current = try budget.cleanup();
-    if (context.cleanup.boundary == null or current.boundary.?.record != context.cleanup.boundary.?.record or current.boundary.?.nonce != context.cleanup.boundary.?.nonce) return error.ForeignRecurrentStateCleanup;
-    // This exact entry always materializes owning host Tensors. No CT, local
-    // ComputeBackend header, ModelOutput or ResidentOutputs escapes its call.
-    return archRunImplWithContext(raw, inputs, allocator, control, context);
+/// Exact private callback/implementation pairing. A public accepts callback
+/// cannot certify its OWN arbitrary post-math error as pre-entry provenance.
+pub fn acceptsCanonicalHostAttempt(session: Session) bool {
+    if (session.vtable != &arch_vtable or session.vtable.eager_host_services != &eager_host_services) return false;
+    const provider = session.compute_backend_provider orelse return false;
+    const model = session.model_lifetime orelse return false;
+    return provider.services == &archComputeServices and session.ptr == provider.ptr and model.owner == provider.ptr;
+}
+/// Only this exact internal dispatch receives the attempt marker. Public
+/// callbacks/forwarders receive their original ABI and may execute at most once.
+pub fn runCanonicalHostAttempt(session: Session, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, context: ?*const @import("invocation_context.zig").Context, receipt: ?*@import("existing_workspace_receipt.zig").Owner, preentry: *bool) ![]Tensor {
+    preentry.* = false;
+    if (!acceptsCanonicalHostAttempt(session)) return error.UnsupportedRecurrentStateTarget;
+    if (context) |current| return eagerHostRunObserved(session.ptr, inputs, allocator, control, current, receipt, preentry);
+    return archRunImplWithContext(session.ptr, inputs, allocator, control, null, null, preentry);
+}
+fn eagerHostRunWithContext(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, context: *const @import("invocation_context.zig").Context, receipt: ?*@import("existing_workspace_receipt.zig").Owner) ![]Tensor {
+    return eagerHostRunObserved(raw, inputs, allocator, control, context, receipt, null);
+}
+fn eagerHostRunObserved(raw: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, context: *const @import("invocation_context.zig").Context, receipt: ?*@import("existing_workspace_receipt.zig").Owner, preentry: ?*bool) ![]Tensor {
+    const self: *ArchSession = @ptrCast(@alignCast(raw));
+    if (self.backend_type == .metal) {
+        if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+        if (context.cleanup.boundary == null or context.recurrent_state != null) return error.ForeignWorkspaceUse;
+        const expected = if (receipt) |owner| try owner.receiverUses() else null;
+        if (context.workspace_uses != expected) return error.ForeignWorkspaceUse;
+    } else {
+        _ = (try eagerHostRecurrentLayout(raw)) orelse return error.UnsupportedRecurrentStateTarget;
+        const budget = context.recurrent_state orelse return error.UnpreparedRecurrentStateBudget;
+        const current = try budget.cleanup();
+        if (receipt != null or context.workspace_uses != null or context.cleanup.boundary == null or current.boundary.?.record != context.cleanup.boundary.?.record or current.boundary.?.nonce != context.cleanup.boundary.?.nonce) return error.ForeignRecurrentStateCleanup;
+    }
+    // This callback materializes owning host Tensors before any receiving
+    // scope closes. It exports neither this local CB nor its borrowed Context.
+    return archRunImplWithContext(raw, inputs, allocator, control, context, receipt, preentry);
 }
 
 fn archRunImpl(
@@ -5785,20 +6191,68 @@ fn archRunImpl(
     allocator: std.mem.Allocator,
     control: ?InferenceExecutionControl,
 ) ![]Tensor {
-    return archRunImplWithContext(ptr, inputs, allocator, control, null);
+    return archRunImplWithContext(ptr, inputs, allocator, control, null, null, null);
 }
-fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, context: ?*const @import("invocation_context.zig").Context) ![]Tensor {
+fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, context: ?*const @import("invocation_context.zig").Context, receipt: ?*@import("existing_workspace_receipt.zig").Owner, preentry: ?*bool) ![]Tensor {
+    if (preentry) |marker| marker.* = false;
     if (control) |active| try active.check();
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
     const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
     if (debug_cuda_session) std.log.info("arch-run: start backend={s}", .{@tagName(self.backend_type)});
 
-    // Create the appropriate ComputeBackend
+    // One actual receiving header. Its Context remains local through all
+    // callbacks and closes BEFORE backend destruction/host output export.
     var cb = try makeComputeBackend(self, allocator, null);
-    defer if (context) |active| cb.deinitWithCleanup(active.cleanup) else cb.deinit();
+    var current_context = if (context) |value| @as(?@import("invocation_context.zig").Context, value.*) else null;
+    defer if (current_context) |active| cb.deinitWithCleanup(active.cleanup) else cb.deinit();
+    var workspace_binding: if (build_options.enable_metal) ?MetalCompute.WorkspaceInvocationBinding else void = if (build_options.enable_metal) null else {};
+    defer if (comptime build_options.enable_metal) {
+        if (workspace_binding) |*binding| {
+            // Unknown SDK death cannot return a dead local loan with live roots.
+            MetalCompute.finishExistingWorkspaceInvocation(binding, &receipt.?.final_owned, receipt.?.roots) catch platform.inference_process_supervisor.restartWorker();
+        }
+    };
     cb.execution_control = control;
-    cb.call_context = context;
-    if (context) |active| {
+    if (self.backend_type == .metal) {
+        if (comptime build_options.enable_metal) {
+            if (current_context) |*active| {
+                const epoch = active.cleanup.boundary orelse return error.MissingWorkspaceCleanupEpoch;
+                const bound = try cb.bindCleanupEpoch(epoch);
+                active.cleanup.operation = cb.operationToken(); // this NEW actual receiver, never source Engine A
+                if (receipt) |owner| {
+                    if (!bound or active.cleanup.operation == null) return error.BackendOperationCleanupUnavailable;
+                    workspace_binding = MetalCompute.bindExistingWorkspaceInvocation(&cb, active, owner.runtime_address, &owner.expected, &owner.validation) catch |err| switch (err) {
+                        error.WorkspaceCensusChanged, error.WorkspaceCensusCapacityChanged => {
+                            if (preentry) |marker| marker.* = true;
+                            return error.WorkspaceReceiptChangedBeforeExecution;
+                        },
+                        else => return err,
+                    };
+                } else {
+                    // A cold no-provider/no-tag result is NOT a permanent
+                    // permission: prove absence under this actual receiver.
+                    MetalCompute.validateNoWorkspaceInvocation(&cb) catch |err| {
+                        if (err == error.UnpreparedWorkspaceUses) {
+                            if (preentry) |marker| marker.* = true;
+                            return error.WorkspaceReceiptChangedBeforeExecution;
+                        }
+                        return err;
+                    };
+                }
+            } else {
+                // Explicit raw callbacks cannot silently borrow a new modern
+                // root. No-tag legacy/custom semantics remain unchanged.
+                MetalCompute.validateNoWorkspaceInvocation(&cb) catch |err| {
+                    if (err == error.UnpreparedWorkspaceUses) {
+                        if (preentry) |marker| marker.* = true;
+                        return error.WorkspaceReceiptChangedBeforeExecution;
+                    }
+                    return err;
+                };
+            }
+        } else return error.MetalNotEnabled;
+    } else if (current_context) |*active| {
+        cb.call_context = active;
         if (comptime build_options.enable_cuda) {
             const budget = active.recurrent_state orelse return error.UnpreparedRecurrentStateBudget;
             try cuda_compute_mod.CudaCompute.validateTemporaryRecurrentBackend(&cb, budget);
@@ -5806,6 +6260,7 @@ fn archRunImplWithContext(ptr: *anyopaque, inputs: []const Tensor, allocator: st
     }
     if (debug_cuda_session) std.log.info("arch-run: compute backend made kind={s}", .{@tagName(cb.kind())});
 
+    if (preentry) |marker| marker.* = false;
     // Dispatch based on architecture
     switch (self.arch_config) {
         .bert => |cfg| {
@@ -7193,6 +7648,11 @@ fn archCloseWithBoundary(ptr: *anyopaque, boundary: ?*const @import("retirement_
 }
 fn archCloseWithCleanup(ptr: *anyopaque, current: @import("cleanup_context.zig").Context) void {
     const self: *ArchSession = @ptrCast(@alignCast(ptr));
+    if (self.backend_type == .metal) {
+        if (comptime build_options.enable_metal)
+            metal_compute_mod.validateSharedNativeProviderWorkspaceRetirement(gpuBackendData(self), current) catch platform.inference_process_supervisor.restartWorker();
+    }
+
     self.model_lifetime.discardUnpublishedFinalResources();
     if (self.video_coefficients) |*cache| cache.deinit();
     if (self.video_coefficient_permit) |*permit| permit.deinit();
@@ -7208,7 +7668,7 @@ fn archCloseWithCleanup(ptr: *anyopaque, current: @import("cleanup_context.zig")
         .metal => {
             if (comptime build_options.enable_metal) {
                 const gpu_data = gpuBackendData(self);
-                @import("../backends/compute_factory.zig").closeMetalWeights(self.allocator, gpu_data);
+                @import("../backends/compute_factory.zig").closeMetalWeightsWithCleanup(self.allocator, gpu_data, current);
             }
         },
         .pjrt => {
@@ -10083,6 +10543,7 @@ pub const StagedExecution = struct {
     pub const CachePhase = if (build_options.enable_cuda) struct {
         stage: *StagedExecution,
         work: PreparedCache.Workload,
+        recipe: union(enum) { copied, image: ops.EmbeddingImageCacheRequest, vision: ops.EmbeddingVisionCacheRequest, audio: PreparedCache.AudioRecipe, video: PreparedCache.VideoRecipe } = .copied,
         // Official supported topology uses49 encoder requests; vision uses33.
         // Inline values keep warm phases allocator-free and names owned.
         request_storage: [128]PreparedCache.Request = undefined,
@@ -10091,12 +10552,31 @@ pub const StagedExecution = struct {
         bound: bool = false,
         live: bool = false,
 
-        fn initInto(self: *@This(), stage: *StagedExecution, work: PreparedCache.Workload) !void {
+        /// Final-address synchronous phase. Copy Request VALUES (including
+        /// owned names), so no builder stack or caller Workload slice survives
+        /// an actual quota yield. The caller retains all real numerical input
+        /// owners through the phase and explicitly hands off pinned/borrowed
+        /// CTs before initialization; Workload metadata grants no such custody.
+        pub fn initWorkloadInto(self: *@This(), stage: *StagedExecution, work: PreparedCache.Workload) !void {
             if (stage.cache_scope != null or !stage.cold_prepared or !stage.active) return error.InvalidPreparedCacheState;
-            self.* = .{ .stage = stage, .work = work };
+            if (work.requests.len > self.request_storage.len) return error.PreparedCacheRequestCapacityExceeded;
+            const count = work.requests.len;
+            // Inputs may already occupy this final-address inline storage.
+            if (work.requests.ptr != self.request_storage[0..].ptr)
+                @memcpy(self.request_storage[0..count], work.requests);
+            self.stage = stage;
+            self.work = .{ .requests = self.request_storage[0..count], .arena_order = work.arena_order };
+            self.recipe = .copied;
+            self.warm = PreparedCache.Funding.empty();
+            self.cold = null;
+            self.bound = false;
+            self.live = false;
             try self.prepare();
             stage.cache_scope = self;
             self.live = true;
+        }
+        fn initInto(self: *@This(), stage: *StagedExecution, work: PreparedCache.Workload) !void {
+            return self.initWorkloadInto(stage, work);
         }
         pub fn initEncoderInto(self: *@This(), stage: *StagedExecution, config: embedding_gemma2_model.Config, batch: usize, sequence: usize, mask: []const i64) !void {
             if (stage.cache_scope != null or !stage.cold_prepared or !stage.active) return error.InvalidPreparedCacheState;
@@ -10108,6 +10588,36 @@ pub const StagedExecution = struct {
             try self.prepare();
             stage.cache_scope = self;
             self.live = true;
+        }
+        fn initRecipeInto(self: *@This(), stage: *StagedExecution, recipe: @FieldType(@This(), "recipe")) !void {
+            if (stage.cache_scope != null or !stage.cold_prepared or !stage.active) return error.InvalidPreparedCacheState;
+            self.* = .{ .stage = stage, .work = .{ .requests = &.{} }, .recipe = recipe };
+            try self.prepare();
+            stage.cache_scope = self;
+            self.live = true;
+        }
+        fn rebuildLocked(self: *@This()) !void {
+            if (self.recipe == .copied) return;
+            const compute = try self.stage.cudaStageCompute();
+            var builder = PreparedCache.Builder{ .storage = &self.request_storage };
+            switch (self.recipe) {
+                .copied => unreachable,
+                .image => |request| _ = try compute.appendImageCacheWorkload(request, &builder),
+                .audio => |request| try compute.appendAudioCacheWorkload(request, &builder),
+                .video => |request| try cuda_compute_mod.CudaCompute.appendVideoCacheWorkload(self.stage.cb, compute, request, &builder),
+                .vision => |request| {
+                    const arena = try cuda_compute_mod.CudaCompute.qualifyVisionCacheRequest(self.stage.cb, compute, request.batch, request.grid_x, request.grid_y);
+                    try compute.appendVisionCacheWorkload(arena, &builder);
+                },
+            }
+            self.work = builder.workload();
+        }
+        fn refreshMatchesLocked(self: *@This(), funding: *const PreparedCache.Funding) !bool {
+            try self.rebuildLocked();
+            if (funding.entries.len != self.work.requests.len) return false;
+            if (!std.meta.eql(funding.arena_order, self.work.arena_order)) return false;
+            for (funding.entries, self.work.requests) |entry, request| if (!std.meta.eql(entry.request, request)) return false;
+            return true;
         }
         fn binding(self: *@This()) *PreparedCache.Funding {
             return self.cold orelse &self.warm;
@@ -10134,12 +10644,27 @@ pub const StagedExecution = struct {
             self.stage.cache_scope = null;
             self.live = false;
         }
+        fn fundColdOutsideExecution(funding: *PreparedCache.Funding, pin: ?*const @import("../runtime/tier/admission_domain.zig").Pin) !bool {
+            funding.fundOutsideExecution(pin) catch |err| {
+                if (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable) return err;
+                // Decoder misses are mandatory. Reuse the existing exact
+                // required-only fallback before optional compatibility, with
+                // every supplier and failure-shell allocation outside lanes.
+                const required = try funding.retainOnlyRequiredOutsideExecution();
+                if (!required and !funding.hasRawUpgrades()) return false;
+                // Denied optional births cannot discard existing raw-owner
+                // retirement upgrades. They require metadata, not new quota.
+                try funding.fundOutsideExecution(pin);
+            };
+            return true;
+        }
         fn prepare(self: *@This()) anyerror!void {
             const stage = self.stage;
             errdefer stage.restoreAfterQuotaForCleanup();
             for (0..8) |_| {
                 try stage.control.check();
                 var compute = try stage.cudaStageCompute();
+                try self.rebuildLocked();
                 if (!try cuda_compute_mod.CudaCompute.cacheWorkloadNeedsFunding(stage.cb, compute, self.work)) {
                     try cuda_compute_mod.CudaCompute.bindCacheFunding(stage.cb, compute, self.work, &self.warm, stage.epoch() orelse return error.MissingCurrentCleanupEpoch);
                     self.bound = true;
@@ -10157,10 +10682,18 @@ pub const StagedExecution = struct {
                 try stage.enter(stage.control, false);
                 try stage.establishCudaPolicy(stage.cuda_policy);
                 compute = try stage.cudaStageCompute();
+                if (!try self.refreshMatchesLocked(funding)) {
+                    stage.leaveCudaModel();
+                    funding.finishOutsideExecution();
+                    owned = false;
+                    try stage.enter(stage.control, false);
+                    try stage.establishCudaPolicy(stage.cuda_policy);
+                    continue;
+                }
                 const victims = try cuda_compute_mod.CudaCompute.cacheWorkloadVictims(stage.cb, compute, self.work);
                 switch (victims) {
                     .all => return error.InvalidPreparedCacheState,
-                    .geometry => |geometry| if (geometry.resize_plans != 0 or geometry.resize_sources != 0 or geometry.execution_arenas != 0) {
+                    .geometry => |geometry| if (geometry.resize_plans != 0 or geometry.resize_sources != 0 or geometry.execution_arenas != 0 or geometry.video) {
                         stage.retireCudaCachesSelected(victims) catch |err| {
                             if (!retirementSnapshotChanged(err)) return err;
                             if (stage.active) stage.leaveCudaModel();
@@ -10175,6 +10708,14 @@ pub const StagedExecution = struct {
                         compute = try stage.cudaStageCompute();
                     },
                 }
+                if (!try self.refreshMatchesLocked(funding)) {
+                    stage.leaveCudaModel();
+                    funding.finishOutsideExecution();
+                    owned = false;
+                    try stage.enter(stage.control, false);
+                    try stage.establishCudaPolicy(stage.cuda_policy);
+                    continue;
+                }
                 cuda_compute_mod.CudaCompute.snapshotCacheFunding(stage.cb, compute, funding) catch |err| {
                     if (err != error.CacheVictimsRequireRetirement) return err;
                     stage.leaveCudaModel();
@@ -10188,26 +10729,31 @@ pub const StagedExecution = struct {
                 const model = stage.model_retention orelse return error.MissingModelLifetime;
                 var pin = if (funding.admission) |admission| model.retainAdmissionDomain(admission.controller) else null;
                 defer if (pin) |held| held.release();
-                funding.fundOutsideExecution(if (pin) |*held| held else null) catch |err| {
-                    if (err != error.ResourceLimitExceeded and err != error.ResourceTemporarilyUnavailable) return err;
-                    // These are optional cache roots. Keep the fully admitted
-                    // numerical run/floors and use the existing eager/uncached
-                    // body when only the separate cache reservation declines.
-                    // Chosen obsolete geometry may already have retired, just
-                    // as the original discard/recreate cache policy required.
+                if (!try fundColdOutsideExecution(funding, if (pin) |*held| held else null)) {
+                    // Only optional retention declined; original numerical
+                    // floors and same eager/uncached bodies remain unchanged.
                     funding.finishOutsideExecution();
                     owned = false;
                     try stage.enter(stage.control, false);
                     try stage.establishCudaPolicy(stage.cuda_policy);
                     compute = try stage.cudaStageCompute();
+                    try self.rebuildLocked();
                     self.warm = PreparedCache.Funding.compatibility();
                     try cuda_compute_mod.CudaCompute.bindCacheFunding(stage.cb, compute, self.work, &self.warm, stage.epoch() orelse return error.MissingCurrentCleanupEpoch);
                     self.bound = true;
                     return;
-                };
+                }
                 try stage.enter(stage.control, false);
                 try stage.establishCudaPolicy(stage.cuda_policy);
                 compute = try stage.cudaStageCompute();
+                if (!try self.refreshMatchesLocked(funding)) {
+                    stage.leaveCudaModel();
+                    funding.finishOutsideExecution();
+                    owned = false;
+                    try stage.enter(stage.control, false);
+                    try stage.establishCudaPolicy(stage.cuda_policy);
+                    continue;
+                }
                 cuda_compute_mod.CudaCompute.bindCacheFunding(stage.cb, compute, self.work, funding, stage.epoch() orelse return error.MissingCurrentCleanupEpoch) catch |err| {
                     if (err != error.PreparedCachePlanChanged) return err;
                     stage.leaveCudaModel();
@@ -10286,7 +10832,26 @@ pub const StagedExecution = struct {
         const held = gate orelse return;
         if (waiter.owner != null) Scheduler.leave(waiter) else held.unlock();
     }
+    fn enterStageModel(self: *StagedExecution, control: Control) !void {
+        if (self.numerical_lane_lease != null) return error.InvalidStageCohort;
+        try enterModel(self.session, self.gate, control, self.waiter);
+        errdefer leaveModel(self.gate, self.waiter);
+        if (self.execution_lane) |lane| self.numerical_lane_lease = try lane.acquireWithPriority(control, self.execution_lane_interactive);
+    }
+    fn leaveStageModel(self: *StagedExecution) void {
+        if (self.numerical_lane_lease) |lease| lease.release();
+        self.numerical_lane_lease = null;
+        leaveModel(self.gate, self.waiter);
+    }
+    // Borrowed synchronous task policy, not provider/cache/current-B authority.
+    // Every real Model yield releases this numerical lease FIRST.
+    execution_lane: ?*@import("../execution_control.zig").ExecutionLane = null,
+    execution_lane_interactive: bool = false,
+    numerical_lane_lease: ?@import("../execution_control.zig").ExecutionLane.Lease = null,
     cache_scope: if (build_options.enable_cuda) ?*CachePhase else void = if (build_options.enable_cuda) null else {},
+    reusable_cache_phase: if (build_options.enable_cuda) CachePhase else void = undefined,
+    cache_input_custody: ?*ops.EmbeddingCacheInputs = null,
+    frontend_video_consumer: bool = false,
     cache_pending: if (build_options.enable_cuda) ?*PreparedCache.Funding else void = if (build_options.enable_cuda) null else {},
     cuda_policy: CudaPolicy = .{},
     cuda_policy_set: bool = false,
@@ -10308,6 +10873,9 @@ pub const StagedExecution = struct {
     scheduling_enabled: bool = true,
     permit: *RunPermit,
     owns_initial_permit: bool = false,
+    // A separately partitioned final bank never becomes phase/supplement
+    // credit. retain/admitPhase continue to cover ALL original run amounts.
+    host_output_producer: ?@import("../backends/session.zig").HostOutputProducer = null,
     timings: ?*MediaTimings = null,
     idle_backend: usize,
     extra: ?RunPermit = null,
@@ -10389,6 +10957,14 @@ pub const StagedExecution = struct {
         self.model_retention = if (self.session.model_lifetime) |model| model.retain() else null;
         self.cold_prepared = true;
     }
+    /// Adopt the exact already-admitted primary owner after cold validation.
+    /// Reclaim/pressure policy remains with the original caller; teardown now
+    /// retires this permit after SDK death/unlock and before the Stage B seals.
+    pub fn prepareBeforeExecutionOwningPermit(self: *StagedExecution) !void {
+        if (self.owns_initial_permit) return error.InvalidStageAdmissionOwner;
+        try self.prepareBeforeExecution();
+        self.owns_initial_permit = true;
+    }
     pub fn epoch(self: *const StagedExecution) ?*const @import("retirement_sink.zig").Epoch {
         return self.cleanup_owner.epoch();
     }
@@ -10405,14 +10981,14 @@ pub const StagedExecution = struct {
     fn leaveCudaModel(self: *StagedExecution) void {
         std.debug.assert(self.active);
         self.unbindCachePhase();
-        leaveModel(self.gate, self.waiter);
+        self.leaveStageModel();
         self.active = false;
         self.finishCacheFundingOutsideExecution();
     }
     fn enterCudaRetirementOnly(self: *StagedExecution, allocator: std.mem.Allocator) !void {
         if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
         if (!self.cold_prepared or self.managed != null or self.active or self.session.vtable != &arch_vtable) return error.InvalidStageCohort;
-        try enterModel(self.session, self.gate, self.control, self.waiter);
+        try self.enterStageModel(self.control);
         self.active = true;
         errdefer if (self.active) self.leaveCudaModel();
         self.managed = try @import("../backends/compute_provider.zig").acquireWith(self.session, allocator, null, self.control, acquireCudaRetirementOnly);
@@ -10453,7 +11029,7 @@ pub const StagedExecution = struct {
             var consumed = false;
             defer if (!consumed) carrier.deinitUnused();
             try self.control.check();
-            try enterModel(self.session, self.gate, self.control, self.waiter);
+            try self.enterStageModel(self.control);
             self.active = true;
             carrier.detachFenced(self.cb, compute) catch |err| {
                 self.leaveCudaModel();
@@ -10467,7 +11043,7 @@ pub const StagedExecution = struct {
                 carrier.deinitUnused();
                 consumed = true;
                 try self.control.check();
-                try enterModel(self.session, self.gate, self.control, self.waiter);
+                try self.enterStageModel(self.control);
                 self.active = true;
                 continue;
             };
@@ -10489,7 +11065,7 @@ pub const StagedExecution = struct {
             if (CudaPolicy.same(desired, CudaPolicy.from(compute.ctx.video_cache_budget.admission))) return;
             try self.retireCudaCaches();
             try self.control.check();
-            try enterModel(self.session, self.gate, self.control, self.waiter);
+            try self.enterStageModel(self.control);
             self.active = true;
             cuda_compute_mod.CudaCompute.installEmptyEmbeddingGemma2Policy(self.cb, compute, desired.toAdmission()) catch |err| {
                 if (err == error.CachePolicyNotEmpty) continue;
@@ -10511,13 +11087,217 @@ pub const StagedExecution = struct {
         self.cb.freeWithCleanup(original, .{ .boundary = self.epoch() });
     }
 
+    fn cacheReceiver(self: *StagedExecution, cb: *const ops.ComputeBackend) !*cuda_compute_mod.CudaCompute {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        if (!self.active or !self.cold_prepared or cb != self.cb or cb.embedding_stage != &self.hook) return error.UnsupportedEmbeddingStage;
+        try self.requireCudaPolicy();
+        return self.cudaStageCompute();
+    }
+    fn requireCacheSubset(scope: *const CachePhase, work: PreparedCache.Workload) !void {
+        for (work.requests) |required| {
+            var found = false;
+            for (scope.work.requests) |actual| if (std.meta.eql(required, actual)) {
+                found = true;
+                break;
+            };
+            if (!found) return error.UnpreparedFrontendCacheWorkload;
+        }
+    }
+    fn closeCacheInputs(raw: *anyopaque) void {
+        const owner: *ops.EmbeddingCacheInputs = @ptrCast(@alignCast(raw));
+        const self: *StagedExecution = @ptrCast(@alignCast(owner.stage orelse platform.inference_process_supervisor.restartWorker()));
+        if (self.cache_input_custody != owner) platform.inference_process_supervisor.restartWorker();
+        self.cache_input_custody = owner.previous;
+        owner.previous = null;
+        owner.stage = null;
+    }
+    fn cacheInputs(raw: *anyopaque, cb: *const ops.ComputeBackend, owner: *ops.EmbeddingCacheInputs) anyerror!ops.EmbeddingCacheScope {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        const self: *StagedExecution = @ptrCast(@alignCast(raw));
+        _ = try self.cacheReceiver(cb);
+        if (owner.stage != null or owner.previous != null) return error.EmbeddingCacheInputCustodyAlreadyBound;
+        owner.previous = self.cache_input_custody;
+        owner.stage = self;
+        self.cache_input_custody = owner;
+        return .{ .ptr = owner, .close_fn = closeCacheInputs };
+    }
+    fn cacheHandoff(raw: *anyopaque, value: *ops.CT) anyerror!void {
+        const self: *StagedExecution = @ptrCast(@alignCast(raw));
+        if (!self.active) return error.EmbeddingStageNotPrepared;
+        try self.prepareCudaInputHandoff(value);
+    }
+    fn prepareFrontendInputs(self: *StagedExecution, inputs: []const *ops.CT) !void {
+        // Refuse exact shared-header aliases before the first destructive
+        // snapshot; distinct borrowed views retain their established semantics.
+        for (inputs, 0..) |value, index| for (inputs[0..index]) |prior| {
+            if (value != prior and value.* == prior.*) return error.AliasedEmbeddingStageInput;
+        };
+        var cursor = self.cache_input_custody;
+        while (cursor) |owner| {
+            try owner.prepare_fn(owner.ptr, &self.hook);
+            cursor = owner.previous;
+        }
+        for (inputs, 0..) |value, index| {
+            var duplicate = false;
+            for (inputs[0..index]) |prior| if (value == prior) {
+                duplicate = true;
+                break;
+            };
+            if (!duplicate) try self.prepareCudaInputHandoff(value);
+        }
+    }
+    fn checkVideoProbe(raw: ?*const anyopaque) anyerror!void {
+        const self: *const StagedExecution = @ptrCast(@alignCast(raw orelse return error.InvalidVideoProbeContext));
+        try self.control.check();
+    }
+    fn videoCache(raw: *anyopaque, cb: *const ops.ComputeBackend, bytes: []const u8, max_tokens: usize) anyerror!ops.EmbeddingCacheScope {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        const self: *StagedExecution = @ptrCast(@alignCast(raw));
+        _ = try self.cacheReceiver(cb);
+        if (self.cache_scope != null or self.frontend_video_consumer) return error.EmbeddingStageBusy;
+        // All prior Content/aggregate roots become independent before ANY
+        // metadata or funding window can release this actual model owner.
+        try self.prepareFrontendInputs(&.{});
+        errdefer self.restoreAfterQuotaForCleanup();
+        // Drain previous READY funding outside before claiming the parser
+        // pending marker. No supplier callback may run while it is claimed.
+        _ = try self.suspendForQuota();
+        try self.enter(self.control, false);
+        try self.establishCudaPolicy(self.cuda_policy);
+        const compute = try self.cudaStageCompute();
+        try cuda_compute_mod.CudaCompute.quiesceEmbeddingStage(self.cb, compute);
+        var preparation: cuda_compute_mod.CudaCompute.CacheMetadataPreparation = undefined;
+        try preparation.beginInto(self.cb, compute);
+        if (self.cache_pending != null) platform.inference_process_supervisor.restartWorker();
+        self.leaveStageModel();
+        self.active = false;
+        // Parser-only metadata: no surfaces, consumer or numerical work. This
+        // allocator never calls the external quota supplier under the marker;
+        // its temporary footprint replaces the same later MP4 reader lifetime.
+        const metadata = platform.allocator.processAllocator(platform.allocator.concurrentFallback());
+        const observed = @import("../ops/cuda/video.zig").probeEmbeddingMp4(metadata, &compute.ctx, bytes, .{ .context = self, .check_fn = checkVideoProbe }, &preparation) catch |err| {
+            preparation.finishOutsideExecution();
+            return err;
+        };
+        preparation.finishOutsideExecution();
+        // The marker is gone BEFORE any supplier, provider reacquisition or
+        // current-B cache mutation. Cleanup restoration ignores cancellation.
+        self.restoreAfterQuotaForCleanup();
+        try self.control.check();
+        try self.establishCudaPolicy(self.cuda_policy);
+        const recipe = try @import("../architectures/gemma4_projector.zig").embeddingGemma2VideoCacheRecipe(observed, max_tokens);
+        try self.reusable_cache_phase.initRecipeInto(self, .{ .video = recipe });
+        return .{ .ptr = self, .close_fn = closeFrontendCache };
+    }
+    fn closeVideoConsumer(raw: *anyopaque) void {
+        const self: *StagedExecution = @ptrCast(@alignCast(raw));
+        self.frontend_video_consumer = false;
+    }
+    fn videoConsumer(raw: *anyopaque, cb: *const ops.ComputeBackend) anyerror!ops.EmbeddingCacheScope {
+        const self: *StagedExecution = @ptrCast(@alignCast(raw));
+        _ = try self.cacheReceiver(cb);
+        if (self.frontend_video_consumer) return error.EmbeddingStageBusy;
+        self.frontend_video_consumer = true;
+        return .{ .ptr = self, .close_fn = closeVideoConsumer };
+    }
+    fn closeFrontendCache(raw: *anyopaque) void {
+        const self: *StagedExecution = @ptrCast(@alignCast(raw));
+        self.reusable_cache_phase.close();
+    }
+    fn imageCache(raw: *anyopaque, cb: *const ops.ComputeBackend, request: ops.EmbeddingImageCacheRequest, live_inputs: []const *ops.CT) anyerror!ops.EmbeddingCacheScope {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        const self: *StagedExecution = @ptrCast(@alignCast(raw));
+        // The legacy video caller has not entered a cold decoder scope.
+        // Keep that original route unchanged; only a prebound Source141 phase
+        // licenses subset reuse inside the live synchronous cuvid consumer.
+        // In particular NEVER introduce a new quota yield inside that callback.
+        if (self.frontend_video_consumer and self.cache_scope == null) return .{};
+        const compute = try self.cacheReceiver(cb);
+        var storage: [2]PreparedCache.Request = undefined;
+        var builder = PreparedCache.Builder{ .storage = &storage };
+        if (!try compute.appendImageCacheWorkload(request, &builder)) return .{};
+        if (self.cache_scope) |outer| {
+            try requireCacheSubset(outer, builder.workload());
+            return .{}; // Prebound video: no nested phase, handoff or yield.
+        }
+        if (try cuda_compute_mod.CudaCompute.cacheWorkloadNeedsFunding(cb, compute, builder.workload()))
+            try self.prepareFrontendInputs(live_inputs);
+        try self.reusable_cache_phase.initRecipeInto(self, .{ .image = request });
+        return .{ .ptr = self, .close_fn = closeFrontendCache };
+    }
+    fn visionCache(raw: *anyopaque, cb: *const ops.ComputeBackend, request: ops.EmbeddingVisionCacheRequest, live_inputs: []const *ops.CT) anyerror!ops.EmbeddingCacheScope {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        const self: *StagedExecution = @ptrCast(@alignCast(raw));
+        // The legacy video caller has not entered a cold decoder scope.
+        // Keep that original route unchanged; only a prebound Source141 phase
+        // licenses subset reuse inside the live synchronous cuvid consumer.
+        // In particular NEVER introduce a new quota yield inside that callback.
+        if (self.frontend_video_consumer and self.cache_scope == null) return .{};
+        if (!request.allow_yield and self.cache_scope == null) return .{};
+        const compute = try self.cacheReceiver(cb);
+        var storage: [33]PreparedCache.Request = undefined; // actual16 QKV+gate pairs plus one arena
+        var builder = PreparedCache.Builder{ .storage = &storage };
+        const arena = try cuda_compute_mod.CudaCompute.qualifyVisionCacheRequest(cb, compute, request.batch, request.grid_x, request.grid_y);
+        try compute.appendVisionCacheWorkload(arena, &builder);
+        if (self.cache_scope) |outer| {
+            try requireCacheSubset(outer, builder.workload());
+            return .{};
+        }
+        if (try cuda_compute_mod.CudaCompute.cacheWorkloadNeedsFunding(cb, compute, builder.workload()))
+            try self.prepareFrontendInputs(live_inputs);
+        try self.reusable_cache_phase.initRecipeInto(self, .{ .vision = request });
+        return .{ .ptr = self, .close_fn = closeFrontendCache };
+    }
+
+    fn audioCache(raw: *anyopaque, cb: *const ops.ComputeBackend, request: PreparedCache.AudioRecipe, live_inputs: []const *ops.CT) anyerror!ops.EmbeddingCacheScope {
+        if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
+        const self: *StagedExecution = @ptrCast(@alignCast(raw));
+        const compute = try self.cacheReceiver(cb);
+        var builder = PreparedCache.Builder{ .storage = &self.reusable_cache_phase.request_storage };
+        if (self.cache_scope != null) return error.EmbeddingStageBusy; // Audio has no synchronous nested decoder route.
+        try compute.appendAudioCacheWorkload(request, &builder);
+        if (try cuda_compute_mod.CudaCompute.cacheWorkloadNeedsFunding(cb, compute, builder.workload()))
+            try self.prepareFrontendInputs(live_inputs);
+        try self.reusable_cache_phase.initRecipeInto(self, .{ .audio = request });
+        return .{ .ptr = self, .close_fn = closeFrontendCache };
+    }
+
+    /// Consume only the typed initial permit's ADDITIONAL output bank. This
+    /// remains cold even for an already-funded non-CUDA Stage constructor.
+    pub fn prepareHostOutputsBeforeExecution(self: *StagedExecution) !void {
+        if (!self.cold_prepared or self.active or self.managed != null or self.host_output_producer != null)
+            return error.InvalidHostOutputProducerPhase;
+        self.host_output_producer = try self.permit.prepareDeclaredHostOutputOutsideExecution();
+    }
+    pub fn publishHostOutputs(self: *StagedExecution, rows: []const []const f32) !@import("../backends/session.zig").OwnedHostVectors {
+        if (!self.cold_prepared or !self.active or self.managed == null) return error.EmbeddingStageNotPrepared;
+        const producer = if (self.host_output_producer) |*value| value else return error.MissingHostOutputEscrow;
+        for (rows, 0..) |row, index| try producer.writeRow(index, row);
+        return producer.publish();
+    }
     pub fn admitInitialCuda(self: *StagedExecution, allocator: std.mem.Allocator, request: @import("../backends/session.zig").RunRequest, supplied_pressure: ?*?runtime.tier.memory.AdmissionPressure) !void {
+        return self.admitInitialCudaResult(allocator, request, supplied_pressure, null);
+    }
+    /// The SAME initial request/cache-pressure path with an explicitly named
+    /// final-host bank. Supplier/producer preparation precede enterInitial.
+    pub fn admitInitialCudaWithHostOutputs(self: *StagedExecution, allocator: std.mem.Allocator, request: @import("../backends/session.zig").RunRequest, supplied_pressure: ?*?runtime.tier.memory.AdmissionPressure, rows: usize, width: usize) !void {
+        try self.admitInitialCudaResult(allocator, request, supplied_pressure, .{ .rows = rows, .width = width });
+        try self.prepareHostOutputsBeforeExecution();
+    }
+    const HostOutputGeometry = struct { rows: usize, width: usize };
+    fn admitInitialRequest(self: *StagedExecution, request: @import("../backends/session.zig").RunRequest, pressure: *?runtime.tier.memory.AdmissionPressure, output: ?HostOutputGeometry) !RunPermit {
+        return if (output) |geometry|
+            self.session.admitWithHostOutputWithPressure(request, geometry.rows, geometry.width, pressure)
+        else
+            self.session.admitWithPressure(request, pressure);
+    }
+    fn admitInitialCudaResult(self: *StagedExecution, allocator: std.mem.Allocator, request: @import("../backends/session.zig").RunRequest, supplied_pressure: ?*?runtime.tier.memory.AdmissionPressure, output: ?HostOutputGeometry) !void {
         if (comptime !build_options.enable_cuda) return error.CudaNotEnabled;
         if (!self.cold_prepared or self.active or self.managed != null or self.permit.lease != null or self.permit.resource_pin != null or self.session.backend() != .cuda) return error.InvalidStageCohort;
         var own_pressure: ?runtime.tier.memory.AdmissionPressure = null;
         const pressure = supplied_pressure orelse &own_pressure;
         try self.control.check();
-        self.permit.* = self.session.admitWithPressure(request, pressure) catch |err| retry: {
+        self.permit.* = self.admitInitialRequest(request, pressure, output) catch |err| retry: {
             if (err != error.ResourceTemporarilyUnavailable and err != error.ResourceLimitExceeded) return err;
             try self.enterCudaRetirementOnly(allocator);
             defer {
@@ -10528,7 +11308,7 @@ pub const StagedExecution = struct {
             }
             try self.retireCudaCaches();
             try self.control.check();
-            break :retry try self.session.admitWithPressure(request, pressure);
+            break :retry try self.admitInitialRequest(request, pressure, output);
         };
         // This entry created the actual primary lease. The SAME owner returns
         // it only after actual lane unlock, while whole-task B is still live.
@@ -10537,7 +11317,7 @@ pub const StagedExecution = struct {
 
     pub fn enterInitial(self: *StagedExecution, allocator: std.mem.Allocator, control: ?Control) !void {
         if (!self.cold_prepared or self.managed != null) return error.EmbeddingStageNotPrepared;
-        try enterModel(self.session, self.gate, self.control, self.waiter);
+        try self.enterStageModel(self.control);
         self.active = true;
         errdefer if (self.active) self.leaveCudaModel();
         self.managed = if (self.session.backend() == .cuda)
@@ -10565,6 +11345,15 @@ pub const StagedExecution = struct {
     }
     fn finishAfterUnlock(self: *StagedExecution) void {
         self.flushEndedPhases();
+        if (self.host_output_producer) |*producer| {
+            const output_cleanup: @import("cleanup_context.zig").Context = if (self.epoch()) |output_epoch|
+                .{ .boundary = output_epoch }
+            else
+                .{ .outside_execution = true };
+            producer.abortWithCleanup(output_cleanup) catch platform.inference_process_supervisor.restartWorker();
+            producer.finishWithCleanup(output_cleanup) catch platform.inference_process_supervisor.restartWorker();
+        }
+        self.host_output_producer = null;
         if (self.extra) |*extra| extra.deinitWithCleanup(.{ .boundary = self.cleanup_owner.epoch() });
         self.extra = null;
         if (self.owns_initial_permit) self.permit.deinitWithCleanup(.{ .boundary = self.epoch() });
@@ -10610,10 +11399,19 @@ pub const StagedExecution = struct {
             if (!try self.cb.bindCleanupEpoch(b)) return error.BackendOperationCleanupUnavailable;
             _ = try self.current().operationFor(self.cb);
         }
-        if (!self.scheduling_enabled or self.gate == null or platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_STAGE_SCHEDULING")) return;
-        self.hook = .{ .ptr = self, .pause_fn = pause, .resume_fn = acquire, .yield_ready_fn = yieldReady, .cleanup_fn = cleanup, .workspace_fn = if (self.video_phases) workspace else null, .copy_fn = if (self.timings != null) copied else null };
+        const schedule = self.scheduling_enabled and self.gate != null and !platform.env.getenvBool("ANTFLY_EMBEDDINGGEMMA2_DISABLE_STAGE_SCHEDULING");
+        // Cache supplier boundaries depend on actual owner custody, not the
+        // optional cooperative-scheduling policy. Disabled scheduling keeps
+        // every former scheduling callback inert while cache preparation works.
+        if (!schedule and (self.cb.kind() != .cuda or self.gate == null)) return;
+        self.hook = .{ .ptr = self, .pause_fn = if (schedule) pause else noScheduledYield, .resume_fn = if (schedule) acquire else noScheduledYield, .yield_ready_fn = if (schedule) yieldReady else noScheduledYield, .cleanup_fn = if (schedule) cleanup else noScheduledCleanup, .workspace_fn = if (schedule and self.video_phases) workspace else null, .copy_fn = if (schedule and self.timings != null) copied else null, .image_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) imageCache else null else null, .vision_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) visionCache else null else null, .cache_inputs_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) cacheInputs else null else null, .cache_handoff_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) cacheHandoff else null else null, .audio_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) audioCache else null else null, .video_cache_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) videoCache else null else null, .video_consumer_fn = if (comptime build_options.enable_cuda) if (self.session.backend() == .cuda) videoConsumer else null else null };
         self.cb.embedding_stage = &self.hook;
     }
+    fn noScheduledYield(raw: *anyopaque) anyerror!void {
+        const self: *StagedExecution = @ptrCast(@alignCast(raw));
+        try self.control.check();
+    }
+    fn noScheduledCleanup(_: *anyopaque) void {}
     pub fn yieldReady(raw: *anyopaque) !void {
         const self: *StagedExecution = @ptrCast(@alignCast(raw));
         try self.control.check();
@@ -10633,7 +11431,7 @@ pub const StagedExecution = struct {
         } else try @import("../ops/metal_compute.zig").MetalCompute.embeddingStageLeaseWithCleanup(self.cb, false, self.current());
         if (self.timings) |t| t.stage_retire_ns += mediaNow() - retired_at;
         self.unbindCachePhase();
-        leaveModel(self.gate, self.waiter);
+        self.leaveStageModel();
         self.active = false;
         self.finishCacheFundingOutsideExecution();
         if (self.extra) |*extra| extra.deinitWithCleanup(.{ .boundary = self.cleanup_owner.epoch() });
@@ -10654,7 +11452,7 @@ pub const StagedExecution = struct {
             if (self.extra) |*extra| extra.deinit();
             self.extra = null;
         }
-        try enterModel(self.session, self.gate, control, self.waiter);
+        try self.enterStageModel(control);
         self.active = true;
         errdefer if (self.active) self.leaveCudaModel();
         const acquired_at = if (self.timings != null) mediaNow() else 0;
@@ -10734,7 +11532,7 @@ pub const StagedExecution = struct {
             self.phase_provider_suspended = true;
         }
         self.unbindCachePhase();
-        leaveModel(self.gate, self.waiter);
+        self.leaveStageModel();
         self.active = false;
         self.finishCacheFundingOutsideExecution();
         return true;
@@ -10838,6 +11636,7 @@ pub const StagedExecution = struct {
         };
     }
     pub fn deinit(self: *StagedExecution) void {
+        if (self.cache_input_custody != null or self.frontend_video_consumer) platform.inference_process_supervisor.restartWorker();
         if (self.cold_prepared) {
             if (self.managed) |*managed| {
                 if (!self.active) cleanup(self);
@@ -10855,7 +11654,7 @@ pub const StagedExecution = struct {
                 };
                 managed.deinitWithCleanup(.{ .boundary = self.epoch() });
                 self.managed = null;
-                leaveModel(self.gate, self.waiter);
+                self.leaveStageModel();
                 self.active = false;
                 self.finishCacheFundingOutsideExecution();
             }
@@ -10877,7 +11676,7 @@ pub const StagedExecution = struct {
         const original_compute = try self.cudaStageCompute();
         if (!try cuda_compute_mod.CudaCompute.keepEmbeddingStageInput(self.cb, original_compute, input)) return error.CudaStageInputRequiresHandoff;
         if (record_media_batch and batch > 1) (try self.cudaStageCompute()).embedding_gemma2_media_batches += 1;
-        var caches: CachePhase = undefined;
+        const caches = &self.reusable_cache_phase;
         try caches.initEncoderInto(self, config, batch, sequence, mask);
         defer caches.close();
         const compute = try self.cudaStageCompute();
@@ -11489,8 +12288,10 @@ test "actual CUDA staged quota boundaries let same model reenter while owned sna
             defer domain.release();
             session.model_lifetime.?.admission_domain = domain.pin();
             session.run_admission = .{ .controller = &domain.controller, .backend_class = .gpu, .limits = .{ .backend_limit_bytes = 64 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+            var numerical_lane: @import("../execution_control.zig").ExecutionLane = .{};
             const Probe = struct {
                 session: Session,
+                lane: *@import("../execution_control.zig").ExecutionLane,
                 calls: usize = 0,
                 failure: ?anyerror = null,
                 change_policy: bool = false,
@@ -11501,6 +12302,10 @@ test "actual CUDA staged quota boundaries let same model reenter while owned sna
                 failure_callback: ?Callback = null,
                 const Callback = enum { reserve, retain, release };
                 fn check(self: *@This(), callback: Callback) void {
+                    if (self.lane.mutex.tryLock()) {
+                        if (self.lane.owned and self.failure == null) self.failure = error.StageSupplierUnderActualNumericalLane;
+                        self.lane.mutex.unlock();
+                    } else if (self.failure == null) self.failure = error.StageSupplierUnderActualNumericalLane;
                     self.calls += 1;
                     self.reenter() catch |err| {
                         if (self.failure == null) {
@@ -11558,13 +12363,13 @@ test "actual CUDA staged quota boundaries let same model reenter while owned sna
                     self.check(.release);
                 }
             };
-            var probe = Probe{ .session = session };
+            var probe = Probe{ .session = session, .lane = &numerical_lane };
             try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
             var base = @import("../backends/session.zig").RunPermit{ .session = session, .lease = null };
             var base_open = true;
             defer if (base_open) base.deinit();
             var waiter = @import("../runtime/embedding_scheduler.zig").Scheduler.Waiter{};
-            var stage = StagedExecution{ .session = session, .gate = session.execution_gate, .waiter = &waiter, .cb = undefined, .control = .{ .native_call_policy = .in_process }, .permit = &base, .idle_backend = 8192, .active = false, .scheduling_enabled = scheduling };
+            var stage = StagedExecution{ .session = session, .gate = session.execution_gate, .waiter = &waiter, .cb = undefined, .control = .{ .native_call_policy = .in_process }, .permit = &base, .idle_backend = 8192, .active = false, .scheduling_enabled = scheduling, .execution_lane = &numerical_lane };
             var stage_open = true;
             defer if (stage_open) stage.deinit();
             try stage.prepareBeforeExecution();
@@ -11603,13 +12408,19 @@ test "actual CUDA staged quota boundaries let same model reenter while owned sna
             try stage.enterInitial(a, .{ .native_call_policy = .in_process });
             const cb = stage.backend();
             const Cache = @import("../ops/cuda/prepared_cache.zig");
-            const cache_requests = [_]Cache.Request{try Cache.Request.packedSpan("stage.prepared.scope", 64)};
+            var cache_requests = [_]Cache.Request{try Cache.Request.packedSpan("stage.prepared.scope", 64)};
             const cache_work: Cache.Workload = .{ .requests = &cache_requests };
             var cold_packed_ptr: u64 = 0;
             {
                 var cache_phase: StagedExecution.CachePhase = undefined;
-                try cache_phase.initInto(&stage, cache_work);
+                try cache_phase.initWorkloadInto(&stage, cache_work);
                 defer cache_phase.close();
+                // A caller builder can be reused after the copied initializer;
+                // neither names nor the Workload slice remain borrowed.
+                cache_requests[0] = try Cache.Request.packedSpan("caller.builder.reused", 64);
+                try std.testing.expectEqualStrings("stage.prepared.scope", cache_phase.work.requests[0].packed_weight.name.slice());
+                try std.testing.expect(cache_phase.work.requests.ptr == cache_phase.request_storage[0..].ptr);
+                cache_requests[0] = try Cache.Request.packedSpan("stage.prepared.scope", 64);
                 try std.testing.expect(cache_phase.cold != null and compute.ctx.prepared_cache_funding == cache_phase.binding());
                 const calls = probe.calls;
                 const packed_span = (try compute.embedding_gemma2_execution.allocatePacked(a, &compute.ctx, "stage.prepared.scope", 64)) orelse return error.MissingActualPackedCache;
@@ -11651,6 +12462,62 @@ test "actual CUDA staged quota boundaries let same model reenter while owned sna
                 const before_cache = compute.ctx.device_allocations.snapshot();
                 try std.testing.expect((try compute.embedding_gemma2_execution.allocatePacked(a, &compute.ctx, "stage.optional.declined", 64)) == null);
                 try std.testing.expectEqualDeep(before_cache, compute.ctx.device_allocations.snapshot());
+            }
+            if (compute.ctx.info.compute_major >= 8) {
+                // Six chronological resize keys exceed the actual4 retained
+                // slots, while source hosts rotate/grow through both ordinals.
+                // These are the SAME actual plan/upload producer bodies, with
+                // real SDK coefficient buffers, host events and current-B quotas.
+                const InputOwner = struct {
+                    fn prepare(raw: *anyopaque, hook: *const ops.EmbeddingStageControl) anyerror!void {
+                        const input: *ops.CT = @ptrCast(@alignCast(raw));
+                        try hook.handoffCacheInput(input);
+                    }
+                };
+                var input = try cb.fromFloat32(&.{ 3, 7 });
+                defer cb.free(input);
+                var input_node: ops.EmbeddingCacheInputs = .{ .ptr = @ptrCast(&input), .prepare_fn = InputOwner.prepare };
+                var input_scope = try cb.embedding_stage.?.cacheInputs(cb, &input_node);
+                defer input_scope.close();
+                const bytes: [42]u8 = @splat(11);
+                var destination = try @import("../ops/cuda/buffer.zig").DeviceBuffer.alloc(&compute.ctx, bytes.len);
+                defer destination.free(&compute.ctx);
+                for (0..8) |index| {
+                    const width: u32 = if (index < 6) @intCast(index + 2) else 7;
+                    const span: usize = width * 3 * 2;
+                    const request: ops.EmbeddingImageCacheRequest = .{ .width = width, .height = 2, .stride = width * 3, .source_capacity = span, .target_width = 48, .target_height = 48 };
+                    const calls_before = probe.calls;
+                    const allocations_before = compute.ctx.device_allocations.snapshot();
+                    var scope = try cb.embedding_stage.?.imageCache(cb, request, &.{});
+                    defer scope.close();
+                    const old_ordinal = compute.embedding_gemma2_resize.next_source;
+                    try std.testing.expectEqual(@as(u1, @intCast(old_ordinal % 2)), stage.cache_scope.?.work.requests[1].source.index);
+                    if (index == 7) try std.testing.expect(stage.reusable_cache_phase.cold == null);
+                    const cache_key = @import("../ops/cuda/embedding_gemma2_resize.zig").Key{ .width = width, .height = 2, .target_width = 48, .target_height = 48, .resident = false };
+                    _ = try compute.embedding_gemma2_resize.plan(a, &compute.ctx, cache_key);
+                    try compute.embedding_gemma2_resize.uploadSource(&compute.ctx, destination, bytes[0..span]);
+                    try std.testing.expectEqual(old_ordinal + 1, compute.embedding_gemma2_resize.next_source);
+                    try std.testing.expect(compute.embedding_gemma2_resize.contains(cache_key));
+                    // Every new published cache lease must have pure prepared
+                    // custody; no raw final-close compatibility is minted.
+                    for (compute.embedding_gemma2_resize.plans) |entry| if (entry) |plan| try std.testing.expect(plan.quota != .raw);
+                    scope.close();
+                    if (index == 7) {
+                        try std.testing.expectEqual(calls_before, probe.calls);
+                        try std.testing.expectEqualDeep(allocations_before, compute.ctx.device_allocations.snapshot());
+                    }
+                }
+                var retained_plans: usize = 0;
+                for (compute.embedding_gemma2_resize.plans) |entry| if (entry != null) {
+                    retained_plans += 1;
+                };
+                try std.testing.expectEqual(@as(usize, 4), retained_plans);
+                try std.testing.expect(!compute.embedding_gemma2_resize.contains(.{ .width = 2, .height = 2, .target_width = 48, .target_height = 48, .resident = false }));
+                try compute.ctx.synchronize();
+                const actual = try cb.toFloat32(input, a);
+                defer a.free(actual);
+                try std.testing.expectEqualSlices(f32, &.{ 3, 7 }, actual);
+                input_scope.close();
             }
             const source = try cb.fromFloat32(&.{ 1, -2, 3, 4 });
             var source_open = true;
@@ -12205,7 +13072,7 @@ pub const PreparedComputeAdmission = if (build_options.enable_cuda) struct {
         defer if (target_owned) target.deinit();
         const compute = (try Cuda.lightOnNormCompute(target.target)) orelse return null;
         const a = std.heap.smp_allocator;
-        const request_capacity = try std.math.add(usize, 2 + Cache.Auxiliary.count, try std.math.mul(usize, if (config) |cfg| cfg.num_hidden_layers else 0, 6));
+        const request_capacity = try std.math.add(usize, 4 + Cache.Auxiliary.count, try std.math.mul(usize, if (config) |cfg| cfg.num_hidden_layers else 0, 6));
         const requests = try a.alloc(Cache.Request, request_capacity);
         var requests_owned = true;
         defer if (requests_owned) a.free(requests);
@@ -12221,6 +13088,7 @@ pub const PreparedComputeAdmission = if (build_options.enable_cuda) struct {
         }
         const norm_count = builder.len;
         if (config) |cfg| try compute.appendDerivedWeightWorkload(cfg, &builder);
+        try compute.appendExternalPrefillWorkload(config, &builder);
         try compute.appendAuxiliaryCacheWorkload(&builder);
         try compute.appendPinnedInputCacheWorkload(&builder, max_upload_bytes);
         const self = try a.create(@This());
@@ -13259,4 +14127,473 @@ test "admitted inherited eager table refuses actual Session and RunPermit dispat
     try std.testing.expectError(error.UnsupportedRecurrentStateTarget, permit.runWithControl(&.{}, std.testing.allocator, .{ .native_call_policy = .in_process }));
     try std.testing.expectError(error.UnsupportedRecurrentStateTarget, permit.runLayaDecisionsWithControl(&.{}, std.testing.allocator, .{ .native_call_policy = .in_process }));
     try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "generic Metal receiving constructor attests provider before casts and classifies actual forwarded owner before SDK" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const Probe = struct {
+        calls: usize = 0,
+        fn destroy(_: *anyopaque) void {}
+        fn backend(_: *anyopaque) BackendType {
+            @panic("constructor inspected opaque forwarded implementation");
+        }
+        fn interruption(_: *anyopaque) @import("../execution_control.zig").Interruption {
+            @panic("constructor classified opaque forwarded implementation");
+        }
+        fn arm(raw: *anyopaque, _: @import("../execution_control.zig").MonitorControl) anyerror!u64 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            return error.Cancelled; // after actual Metal classification, BEFORE constructor/SDK
+        }
+        fn disarm(_: *anyopaque, _: u64) void {
+            @panic("failed arm was disarmed");
+        }
+    };
+    var probe: Probe = .{};
+    var arch: ArchSession = undefined;
+    arch.backend_type = .metal; // immutable metadata only; no backend data used
+    var model: Session.ModelLifetime = .{ .owner = &arch, .destroy_fn = Probe.destroy };
+    var forwarded = arch_vtable;
+    forwarded.backend = Probe.backend;
+    forwarded.interruption = Probe.interruption;
+    forwarded.eager_host_services = null;
+    var session: Session = .{ .ptr = @ptrFromInt(1), .vtable = &forwarded, .model_lifetime = &model, .compute_backend_provider = .{ .ptr = &arch, .services = &archComputeServices } };
+    try std.testing.expectError(error.Cancelled, constructMetalWorkspaceReceiver(session, std.testing.allocator, .{ .hard_cancellation = .{ .ptr = &probe, .arm_fn = Probe.arm, .disarm_fn = Probe.disarm } }));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    const copied_services = archComputeServices;
+    session.compute_backend_provider.?.services = &copied_services;
+    session.compute_backend_provider.?.ptr = @ptrFromInt(1);
+    try std.testing.expectError(error.UnsupportedWorkspaceTarget, constructMetalWorkspaceReceiver(session, std.testing.allocator, null));
+    session.compute_backend_provider.?.services = &archComputeServices;
+    model.owner = @ptrFromInt(2);
+    try std.testing.expectError(error.UnsupportedWorkspaceTarget, constructMetalWorkspaceReceiver(session, std.testing.allocator, null));
+    session.compute_backend_provider = null;
+    try std.testing.expectError(error.UnsupportedWorkspaceTarget, constructMetalWorkspaceReceiver(session, std.testing.allocator, null));
+}
+
+test "unadmitted canonical Metal receiving rejects inherited copied host table before Source metadata and invalid public ptr" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const Noop = struct {
+        fn destroy(_: *anyopaque) void {}
+    };
+    var arch: ArchSession = undefined;
+    arch.backend_type = .metal; // no SDK/provider/weights touched
+    var model: Session.ModelLifetime = .{ .owner = &arch, .destroy_fn = Noop.destroy };
+    const copied = arch_vtable;
+    const session: Session = .{ .ptr = @ptrFromInt(1), .vtable = &copied, .model_lifetime = &model, .compute_backend_provider = .{ .ptr = &arch, .services = &archComputeServices } };
+    try std.testing.expectError(error.UnsupportedRecurrentStateTarget, session.run(&.{}, std.testing.allocator));
+    try std.testing.expectError(error.UnsupportedRecurrentStateTarget, session.runWithControl(&.{}, std.testing.allocator, .{ .native_call_policy = .in_process }));
+    var permit: @import("../backends/session.zig").RunPermit = .{ .session = session, .lease = null };
+    defer permit.deinit();
+    try std.testing.expectError(error.UnsupportedRecurrentStateTarget, permit.run(&.{}, std.testing.allocator));
+    var source: @import("../backends/session.zig").PreparedSource = .{};
+    defer source.deinit();
+    try std.testing.expectError(error.UnsupportedRecurrentStateTarget, source.initBeforeExecutionInto(session, session, null, .{ .host = &.{} }, .{}, null, .host, std.testing.allocator, null));
+    try std.testing.expectError(error.UnsupportedRecurrentStateTarget, source.initShapesBeforeExecutionInto(session, session, null, .{ .tensors = &.{} }, .{}, null, .host, std.testing.allocator, null));
+    try std.testing.expectEqual(@as(usize, 1), model.references.load(.acquire));
+}
+
+test "Qwen lane capability uses actual provider before opaque forwarded metadata and cannot relabel another model" {
+    var owner: ArchSession = undefined;
+    owner.backend_type = .metal;
+    const cfg = gpt_mod.Config{ .family = .qwen3, .norm_type = .rms_norm, .activation = .silu, .position_encoding = .rope, .hidden_size = 128, .intermediate_size = 256, .num_hidden_layers = 1, .num_attention_heads = 1, .num_key_value_heads = 1, .attention_head_dim = 128, .vocab_size = 64 };
+    try std.testing.expect(gpt_arch.denseQwen3PrefillEligible(cfg));
+    owner.arch_config = .{ .gpt = cfg };
+    var lifetime: Session.ModelLifetime = undefined;
+    lifetime.owner = &owner;
+    var forwarded: Session = .{ .ptr = @ptrFromInt(1), .vtable = @ptrFromInt(@alignOf(Session.VTable)), .model_lifetime = &lifetime, .compute_backend_provider = .{ .ptr = &owner, .services = &archComputeServices } };
+    // Neither arbitrary public ptr/table nor a missing decoder contract is read.
+    try std.testing.expectEqual(@as(?bool, true), qwenWorkspaceLanePolicy(forwarded));
+    forwarded.model_contract.decoder_config = &cfg;
+    owner.backend_type = .native;
+    try std.testing.expectEqual(@as(?bool, false), qwenWorkspaceLanePolicy(forwarded));
+    owner.backend_type = .metal;
+    var other = cfg;
+    other.family = .llama;
+    owner.arch_config = .{ .gpt = other };
+    try std.testing.expectEqual(@as(?bool, false), qwenWorkspaceLanePolicy(forwarded));
+    var copied = archComputeServices;
+    forwarded.compute_backend_provider.?.services = &copied;
+    try std.testing.expectEqual(@as(?bool, null), qwenWorkspaceLanePolicy(forwarded));
+}
+
+test "Qwen canonical Model with absent or foreign admission domain refuses before backend or input inspection" {
+    const Pipeline = @import("../pipelines/embedding.zig").EmbeddingPipeline;
+    const Noop = struct {
+        fn destroy(_: *anyopaque) void {}
+    };
+    var owner: ArchSession = undefined;
+    owner.backend_type = .metal;
+    const cfg = gpt_mod.Config{ .family = .qwen3, .norm_type = .rms_norm, .activation = .silu, .position_encoding = .rope, .hidden_size = 128, .intermediate_size = 256, .num_hidden_layers = 1, .num_attention_heads = 1, .num_key_value_heads = 1, .attention_head_dim = 128, .vocab_size = 64 };
+    try std.testing.expect(gpt_arch.denseQwen3PrefillEligible(cfg));
+    owner.arch_config = .{ .gpt = cfg };
+    var lifetime: Session.ModelLifetime = .{ .owner = &owner, .destroy_fn = Noop.destroy };
+    var controller: runtime.tier.memory.AdmissionController = .{};
+    const session: Session = .{
+        .ptr = &owner,
+        .vtable = &arch_vtable,
+        .model_lifetime = &lifetime,
+        .compute_backend_provider = .{ .ptr = &owner, .services = &archComputeServices },
+        .model_contract = .{ .decoder_config = &cfg },
+        .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false },
+    };
+    // No tensor metadata, IO, weights, provider or GPU fields are initialized:
+    // both refusals must precede access to any of them.
+    var pipeline: Pipeline = .{ .allocator = std.testing.allocator, .session = session, .tok = undefined, .config = .{} };
+    try std.testing.expectError(error.MissingWorkspaceAdmissionDomain, pipeline.embedTokenized(&.{ 1, 2 }, &.{ 1, 1 }, 1, 2));
+    const other = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer other.release();
+    const pin = other.pin();
+    defer pin.release();
+    lifetime.admission_domain = pin;
+    try std.testing.expectError(error.MissingWorkspaceAdmissionDomain, pipeline.embedTokenized(&.{ 1, 2 }, &.{ 1, 1 }, 1, 2));
+    lifetime.admission_domain = null;
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, controller.snapshot());
+    try std.testing.expectEqual(runtime.tier.memory.AdmissionAmounts{}, other.controller.snapshot());
+}
+
+test "canonical host attempt marker is private to exact table provider and implementation before any cast or callback" {
+    const Noop = struct {
+        fn close(_: *anyopaque) void {}
+        fn cancel(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var owner: ArchSession = undefined;
+    owner.backend_type = .metal;
+    var model: Session.ModelLifetime = .{ .owner = &owner, .destroy_fn = Noop.close };
+    var session: Session = .{ .ptr = &owner, .vtable = &arch_vtable, .model_lifetime = &model, .compute_backend_provider = .{ .ptr = &owner, .services = &archComputeServices } };
+    try std.testing.expect(acceptsCanonicalHostAttempt(session));
+    var marker = true;
+    // Real canonical entry checks control before constructing/reading any of
+    // this uninitialized numerical owner. Cancellation cannot arm a retry.
+    try std.testing.expectError(error.Cancelled, runCanonicalHostAttempt(session, &.{}, std.testing.allocator, .{ .check_fn = Noop.cancel }, null, null, &marker));
+    try std.testing.expect(!marker);
+    var copied_table = arch_vtable;
+    session.ptr = @ptrFromInt(1);
+    session.vtable = &copied_table;
+    marker = true;
+    try std.testing.expect(!acceptsCanonicalHostAttempt(session));
+    try std.testing.expectError(error.UnsupportedRecurrentStateTarget, runCanonicalHostAttempt(session, &.{}, std.testing.allocator, null, null, null, &marker));
+    try std.testing.expect(!marker);
+}
+
+test "Gemma actual forwarded Model lane policy cannot be relabelled by copied metadata" {
+    const Probe = struct {
+        fn run(_: *anyopaque, _: []const Tensor, _: std.mem.Allocator) anyerror![]Tensor {
+            return error.UnexpectedGemmaLaneMath;
+        }
+        fn info(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) BackendType {
+            return .metal;
+        }
+        fn close(_: *anyopaque) void {}
+        const table: Session.VTable = .{ .run = run, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+    };
+    var actual: ArchSession = undefined;
+    actual.arch_config = .{ .embedding_gemma2 = undefined }; // no payload field read by immutable classification
+    actual.model_lifetime = .{ .owner = &actual, .destroy_fn = archClose, .quiesce_fn = archQuiesce };
+    var marker: u8 = 0;
+    var session: Session = .{ .ptr = &marker, .vtable = &Probe.table, .model_lifetime = &actual.model_lifetime, .compute_backend_provider = .{ .ptr = &actual, .services = &archComputeServices } };
+    try std.testing.expectEqual(@as(?bool, true), gemmaWorkspaceLanePolicy(session));
+    var wrong = actual.model_lifetime;
+    session.model_lifetime = &wrong;
+    try std.testing.expectEqual(@as(?bool, null), gemmaWorkspaceLanePolicy(session));
+    session.model_lifetime = &actual.model_lifetime;
+    var copied = archComputeServices;
+    session.compute_backend_provider.?.services = &copied;
+    try std.testing.expectEqual(@as(?bool, null), gemmaWorkspaceLanePolicy(session));
+}
+
+test "Gemma original Stage and selected source share Model then numerical lane in both queued orders" {
+    if (comptime build_options.enable_wasm) return error.SkipZigTest;
+    const Scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler;
+    const Lane = @import("../execution_control.zig").ExecutionLane;
+    const memory = runtime.tier.memory;
+    const Probe = struct {
+        gate: *std.atomic.Mutex,
+        lane: *Lane,
+        failure: ?anyerror = null,
+        callbacks: usize = 0,
+        fn observe(self: *@This()) void {
+            self.callbacks += 1;
+            if (!self.gate.tryLock()) {
+                self.failure = error.GemmaSupplierOwnsModel;
+                return;
+            }
+            self.gate.unlock();
+            const lease = self.lane.acquire(.{ .deadline_ns = platform.time.monotonicNs() + 2 * std.time.ns_per_s }) catch |err| {
+                self.failure = err;
+                return;
+            };
+            lease.release();
+        }
+        fn reserve(raw: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            return 1;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn run(_: *anyopaque, _: []const Tensor, _: std.mem.Allocator) anyerror![]Tensor {
+            return error.UnexpectedGemmaLaneMath;
+        }
+        fn info(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) BackendType {
+            return .metal;
+        }
+        fn close(_: *anyopaque) void {}
+        const table: Session.VTable = .{ .run = run, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+    };
+    const Worker = struct {
+        stage: *StagedExecution,
+        source: bool,
+        error_value: ?anyerror = null,
+        done: std.atomic.Value(bool) = .init(false),
+        fn enterSource(stage: *StagedExecution) !void {
+            // Source already selected its ready turn while cold suppliers ran.
+            // Acquire THAT turn; Scheduler.enter would append it a second time.
+            try stage.session.acquireSelectedCohort(stage.control, stage.waiter);
+            errdefer stage.session.releaseSelectedCohortGate(stage.waiter);
+            if (stage.execution_lane) |lane| stage.numerical_lane_lease = try lane.acquireWithPriority(stage.control, stage.execution_lane_interactive);
+        }
+        fn leaveSource(stage: *StagedExecution) void {
+            if (stage.numerical_lane_lease) |lease| lease.release();
+            stage.numerical_lane_lease = null;
+            stage.session.releaseSelectedCohortGate(stage.waiter);
+            stage.session.leaveSelectedCohort(stage.waiter);
+        }
+        fn leave(stage: *StagedExecution, source: bool) void {
+            if (source) leaveSource(stage) else stage.leaveStageModel();
+        }
+        fn execute(self: *@This()) !void {
+            if (self.source) {
+                try self.stage.session.selectReadyCohort(self.stage.gate, self.stage.control, self.stage.waiter);
+                defer leaveSource(self.stage);
+                try enterSource(self.stage);
+            } else {
+                // Stage starts a fresh queued numerical owner; its waiter has
+                // never selected a separate outside-ready Source turn.
+                try self.stage.enterStageModel(self.stage.control);
+                defer self.stage.leaveStageModel();
+            }
+        }
+        fn start(self: *@This()) void {
+            self.execute() catch |err| {
+                self.error_value = err;
+            };
+            self.done.store(true, .release);
+        }
+    };
+    for ([_]bool{ true, false }) |source_first| {
+        var gate: std.atomic.Mutex = .unlocked;
+        var lane: Lane = .{};
+        var scheduler: Scheduler = .{};
+        var probe: Probe = .{ .gate = &gate, .lane = &lane };
+        const session: Session = .{ .ptr = &probe, .vtable = &Probe.table, .execution_gate = &gate, .cohort_scheduler = &scheduler };
+        const control: InferenceExecutionControl = .{ .deadline_ns = platform.time.monotonicNs() + 2 * std.time.ns_per_s };
+        var head_waiter: Scheduler.Waiter = .{};
+        var head_permit: @import("../backends/session.zig").RunPermit = .{ .session = session, .lease = null };
+        var head: StagedExecution = .{ .session = session, .gate = &gate, .waiter = &head_waiter, .cb = undefined, .control = control, .permit = &head_permit, .execution_lane = &lane, .active = false, .idle_backend = 0 };
+        if (source_first) try session.selectReadyCohort(&gate, control, &head_waiter) else try head.enterStageModel(control);
+        var head_live = true;
+        defer if (head_live) {
+            Worker.leave(&head, source_first);
+        };
+        var peer_waiter: Scheduler.Waiter = .{};
+        var peer_permit: @import("../backends/session.zig").RunPermit = .{ .session = session, .lease = null };
+        var peer: StagedExecution = .{ .session = session, .gate = &gate, .waiter = &peer_waiter, .cb = undefined, .control = control, .permit = &peer_permit, .execution_lane = &lane, .active = false, .idle_backend = 0 };
+        var worker: Worker = .{ .stage = &peer, .source = !source_first };
+        const thread = try std.Thread.spawn(.{}, Worker.start, .{&worker});
+        defer {
+            if (head_live) {
+                Worker.leave(&head, source_first);
+                head_live = false;
+            }
+            thread.join();
+        }
+        while (true) {
+            while (!scheduler.mutex.tryLock()) {
+                try control.check();
+                std.Thread.yield() catch {};
+            }
+            const queued = scheduler.head == &head_waiter and head_waiter.next == &peer_waiter;
+            scheduler.mutex.unlock();
+            if (queued) break;
+            try control.check();
+            if (worker.done.load(.acquire)) return worker.error_value orelse error.GemmaPeerSkippedCohort;
+            std.Thread.yield() catch {};
+        }
+        if (source_first) {
+            var controller: memory.AdmissionController = .{};
+            defer controller.deinit();
+            try controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+            var lease = try controller.tryAcquire(.gpu, .{ .backend_limit_bytes = 64 }, .{ .backend_scratch_bytes = 64 }, false);
+            lease.release();
+            try std.testing.expect(probe.failure == null and probe.callbacks == 2);
+            try Worker.enterSource(&head);
+        }
+        try std.testing.expect(!worker.done.load(.acquire));
+        Worker.leave(&head, source_first);
+        head_live = false;
+        while (!worker.done.load(.acquire)) {
+            try control.check();
+            std.Thread.yield() catch {};
+        }
+        if (worker.error_value) |err| return err;
+        try std.testing.expect(!lane.owned and scheduler.head == null);
+    }
+}
+
+test "CUDA Stage copied cache workload refuses capacity before receiver or numerical ownership access" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    var stage: StagedExecution = undefined;
+    stage.cache_scope = null;
+    stage.cold_prepared = true;
+    stage.active = true;
+    var phase: StagedExecution.CachePhase = undefined;
+    const requests: [129]StagedExecution.PreparedCache.Request = @splat(.{ .source = .{ .index = 0, .bytes = 1 } });
+    try std.testing.expectError(error.PreparedCacheRequestCapacityExceeded, phase.initWorkloadInto(&stage, .{ .requests = &requests }));
+    try std.testing.expect(stage.cache_scope == null);
+}
+
+test "CUDA Stage shared cold funding retries mandatory decoder exactly and never masks second denial" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const Cache = @import("../ops/cuda/prepared_cache.zig");
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    const sequence: @import("../ops/cuda/video_cache_budget.zig").Sequence = .{ .width = 160, .height = 96, .coded_width = 160, .coded_height = 96, .surfaces = 4, .codec = 4, .display_left = 0, .display_top = 0, .matrix = 1, .full_range = 0 };
+    const bytes = try sequence.bytes();
+    const requests = [_]Cache.Request{ .{ .decoder = sequence }, try Cache.Request.packedSpan("stage.optional.fixture", 64) };
+    for ([_]usize{ bytes, bytes - 1 }) |limit| {
+        const funding = try Cache.Funding.create(.{ .requests = &requests });
+        defer funding.finishOutsideExecution();
+        try funding.noteMiss(0, .{ .backend_scratch_bytes = bytes }, 0);
+        try funding.noteMiss(1, .{ .backend_scratch_bytes = 64 }, 0);
+        funding.admission = .{ .controller = &domain.controller, .limits = .{ .backend_limit_bytes = limit }, .check_live_memory = false };
+        funding.state = .snapped;
+        if (limit == bytes) {
+            try std.testing.expect(try StagedExecution.CachePhase.fundColdOutsideExecution(funding, &pin));
+            try std.testing.expect(funding.optional_disabled and funding.entries[0].lease != null and funding.entries[1].lease == null);
+            try std.testing.expectEqual(bytes, domain.controller.snapshot().backend_scratch_bytes);
+        } else {
+            try std.testing.expectError(error.ResourceLimitExceeded, StagedExecution.CachePhase.fundColdOutsideExecution(funding, &pin));
+            try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+        }
+    }
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "CUDA frontend outer scope requires exact copied keys and source ordinal before consumer reuse" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const Cache = @import("../ops/cuda/prepared_cache.zig");
+    const requests = [_]Cache.Request{ .{ .source = .{ .index = 0, .bytes = 32 } }, try Cache.Request.packedSpan("actual.vision.key", 64) };
+    var outer: StagedExecution.CachePhase = undefined;
+    outer.work = .{ .requests = &requests };
+    try StagedExecution.requireCacheSubset(&outer, .{ .requests = &requests });
+    try std.testing.expectError(error.UnpreparedFrontendCacheWorkload, StagedExecution.requireCacheSubset(&outer, .{ .requests = &.{.{ .source = .{ .index = 1, .bytes = 32 } }} }));
+    const absent = [_]Cache.Request{try Cache.Request.packedSpan("foreign.vision.key", 64)};
+    try std.testing.expectError(error.UnpreparedFrontendCacheWorkload, StagedExecution.requireCacheSubset(&outer, .{ .requests = &absent }));
+}
+
+test "Stage adopts original cold primary permit and retires after actual unlock on entered cancelled and no-enter paths" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const Scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler;
+    const RunPermit = @import("../backends/session.zig").RunPermit;
+    const memory = @import("../runtime/tier/memory.zig");
+    const Probe = struct {
+        gate: *std.atomic.Mutex,
+        violation: bool = false,
+        releases: usize = 0,
+        fn observe(self: *@This()) void {
+            if (self.gate.tryLock()) self.gate.unlock() else self.violation = true;
+        }
+        fn reserve(raw: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            return 1;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            self.releases += 1;
+        }
+    };
+    for (0..3) |mode| {
+        var fixture = StagedNativeOwnerFixture{ .weights = .{ .allocator = std.testing.allocator, .resident_weights = .{}, .lazy_weights = .{} } };
+        defer fixture.weights.deinitOwned();
+        var gate: std.atomic.Mutex = .unlocked;
+        var scheduler = Scheduler{};
+        var probe = Probe{ .gate = &gate };
+        var controller: memory.AdmissionController = .{};
+        try controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+        defer controller.configureResourceBudget(null) catch @panic("adopted Stage quota leak");
+        const session = Session{ .ptr = &fixture, .vtable = &StagedNativeOwnerFixture.table, .compute_backend_provider = .{ .ptr = &fixture, .services = &StagedNativeOwnerFixture.provider }, .execution_gate = &gate, .cohort_scheduler = &scheduler };
+        var permit = RunPermit{ .session = session, .lease = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 64 }, false) };
+        defer permit.deinit();
+        var waiter = Scheduler.Waiter{};
+        {
+            var stage = StagedExecution{ .session = session, .gate = &gate, .waiter = &waiter, .cb = undefined, .control = .{ .ptr = &fixture, .check_fn = StagedNativeOwnerFixture.check, .native_call_policy = .in_process }, .permit = &permit, .idle_backend = 0, .active = false };
+            defer stage.deinit();
+            try stage.prepareBeforeExecutionOwningPermit();
+            try std.testing.expect(stage.owns_initial_permit and permit.lease != null);
+            if (mode == 1) {
+                fixture.cancelled = true;
+                try std.testing.expectError(error.Cancelled, stage.enterInitial(std.testing.allocator, stage.control));
+            } else if (mode == 2) {
+                try stage.enterInitial(std.testing.allocator, stage.control);
+                const cb = stage.backend();
+                const value = try cb.fromFloat32(&.{ 2, 4 });
+                defer cb.free(value);
+                const values = try cb.toFloat32(value, std.testing.allocator);
+                defer std.testing.allocator.free(values);
+                try std.testing.expectEqualSlices(f32, &.{ 2, 4 }, values);
+            }
+        }
+        try std.testing.expect(permit.lease == null and probe.releases == 1 and !probe.violation);
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+        try std.testing.expect(scheduler.head == null and gate.tryLock());
+        gate.unlock();
+    }
+}
+
+test "CUDA Stage optional denial preserves metadata-only warm owner upgrades with no fresh quota" {
+    if (comptime !build_options.enable_cuda) return error.SkipZigTest;
+    const Cache = @import("../ops/cuda/prepared_cache.zig");
+    const Quota = @import("../ops/cuda/cache_quota.zig").Quota;
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var quota = Quota.fromRawAdmission(try pin.controller().tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 64 }, false));
+    defer quota.releaseOutsideExecution();
+    const requests = [_]Cache.Request{ try Cache.Request.packedSpan("warm.stage.existing", 64), try Cache.Request.packedSpan("cold.stage.optional", 128) };
+    const funding = try Cache.Funding.create(.{ .requests = &requests });
+    defer funding.finishOutsideExecution();
+    funding.admission = .{ .controller = pin.controller(), .limits = .{ .backend_limit_bytes = 64 }, .check_live_memory = false };
+    try funding.noteRawUpgrade(0, quota);
+    try funding.noteMiss(1, .{ .backend_scratch_bytes = 128 }, 0);
+    funding.state = .snapped;
+    try std.testing.expect(try StagedExecution.CachePhase.fundColdOutsideExecution(funding, &pin));
+    try std.testing.expect(funding.optional_disabled and funding.entries[0].upgrade.owner != null);
+    try std.testing.expect(!funding.entries[1].miss and funding.entries[1].lease == null);
+    try std.testing.expectEqual(@as(usize, 64), pin.controller().snapshot().backend_scratch_bytes);
 }

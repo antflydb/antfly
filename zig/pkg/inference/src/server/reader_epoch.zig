@@ -1245,13 +1245,106 @@ pub fn Epoch(comptime Node: type, comptime Hooks: type) type {
             return error.PreparedCachePlanChanged;
         }
 
+        /// Before any forward work, prepare the optional external producer's
+        /// exact values-only storage. Like graph admission this borrows the
+        /// actual step, restores every owner on error, and binds only fresh B.
+        fn prepareExternalPrefill(raw: *anyopaque, cb: *const ops.ComputeBackend, phase: *@import("../ops/cuda/prefill_phase.zig").Phase, control: InferenceExecutionControl) !void {
+            if (comptime !build_options.enable_cuda) return;
+            const ctx: *LightOnStreamContext = @ptrCast(@alignCast(raw));
+            const Cuda = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+            const actual = if (ctx.cb) |*value| value else return error.UnsupportedReaderEpochBackend;
+            if (cb.ptr != actual.ptr or cb.vtable != actual.vtable or actual.kind() != .cuda) return error.ForeignReaderEpochBackend;
+            const model = ctx.model.session.model_lifetime orelse return error.MissingCacheRetirementModel;
+            const preparation = ctx.norm_preparation orelse return error.UnsupportedReaderEpochBackend;
+            try preparation.validateForCohort(ctx.model.session, &ctx.cohort_waiter);
+            if (@as(*anyopaque, @ptrCast(preparation.expectedCudaCompute())) != cb.ptr) return error.ForeignReaderEpochBackend;
+            const descriptor = phase.descriptor;
+            for (0..8) |_| {
+                try control.check();
+                const current = @import("../execution/cleanup_context.zig").Context{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() };
+                switch (try Cuda.inspectExternalPrefillPhase(cb, phase, current)) {
+                    .ready, .unavailable => return,
+                    .outside => {},
+                }
+                var parked = ctx.parkWithOwnedStep(control) catch |err| {
+                    // No ownership transferred on a busy outside window. Only
+                    // optional query/funding work may decline here; raw
+                    // ownership upgrade/geometry authority is never fabricated.
+                    if (err == error.ResourceTemporarilyUnavailable and (phase.mode == .query or phase.mode == .fund)) {
+                        phase.declined = true;
+                        return switch (try Cuda.inspectExternalPrefillPhase(cb, phase, current)) {
+                            .ready => {},
+                            else => error.PreparedCachePlanChanged,
+                        };
+                    }
+                    return err;
+                };
+                phase.prepareOutside(model) catch |err| {
+                    const optional = phase.mode == .fund and switch (err) {
+                        error.OutOfMemory, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => true,
+                        else => false,
+                    };
+                    phase.destroyOutside(); // all lanes and old B are gone
+                    if (optional) phase.declined = true;
+                    parked.restoreKeepingStep() catch platform.inference_process_supervisor.restartWorker();
+                    if (optional) continue; // inspect binds managed decline under fresh B
+                    return err;
+                };
+                parked.restoreKeepingStep() catch platform.inference_process_supervisor.restartWorker();
+                const now = @import("../execution/cleanup_context.zig").Context{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() };
+                const bound = Cuda.bindExternalPrefillPhase(cb, phase, now) catch |err| {
+                    try phase.close(now);
+                    if (err != error.PreparedCachePlanChanged) return err;
+                    try phase.initInto(descriptor);
+                    continue;
+                };
+                if (bound) return; // actual backing published, Funding closed before math
+                // A metadata query keeps its exact values in this synchronous
+                // phase. A raw upgrade already consumed its pure Node under B.
+                // Inspect again; do not discard the successful query and replay it.
+                try phase.close(now);
+            }
+            return error.PreparedCachePlanChanged;
+        }
+
+        /// Mandatory packed CPU arrays precede ALL packet KV mutation/math,
+        /// regardless of whether an optional external DSO exists or declines.
+        /// This is the SAME actual owned-step outside window as graph/DSO
+        /// preparation. Busy/cancel/admission errors restore and propagate.
+        fn preparePackedHost(raw: *anyopaque, cb: *const ops.ComputeBackend, bytes: usize, control: InferenceExecutionControl) !@import("../execution/packed_host_loan.zig").Loan {
+            if (comptime !build_options.enable_cuda) return error.UnsupportedReaderEpochBackend;
+            const ctx: *LightOnStreamContext = @ptrCast(@alignCast(raw));
+            const actual = if (ctx.cb) |*value| value else return error.UnsupportedReaderEpochBackend;
+            if (cb.ptr != actual.ptr or cb.vtable != actual.vtable or actual.kind() != .cuda) return error.ForeignReaderEpochBackend;
+            const preparation = ctx.norm_preparation orelse return error.UnsupportedReaderEpochBackend;
+            try preparation.validateForCohort(ctx.model.session, &ctx.cohort_waiter);
+            if (@as(*anyopaque, @ptrCast(preparation.expectedCudaCompute())) != cb.ptr) return error.ForeignReaderEpochBackend;
+            const identity = @import("../execution/kernel_route.zig").Implementation{ .context = cb.ptr, .table = cb.vtable };
+            var parked = try ctx.parkWithOwnedStep(control);
+            var loan = @import("../execution/packed_host_loan.zig").Loan.prepareOutsideExecution(ctx.model.session, identity, bytes) catch |err| {
+                parked.restoreKeepingStep() catch platform.inference_process_supervisor.restartWorker();
+                return err;
+            };
+            parked.restoreKeepingStep() catch platform.inference_process_supervisor.restartWorker();
+            const now = @import("../execution/cleanup_context.zig").Context{ .boundary = ctx.cleanup_owner.epoch(), .operation = cb.operationToken() };
+            errdefer loan.finishWithCleanup(now) catch platform.inference_process_supervisor.restartWorker();
+            // Cancellation during the cold supplier still restores all actual
+            // owners, then retires this loan under NOW B before any packet math.
+            try control.check();
+            try preparation.validateForCohort(ctx.model.session, &ctx.cohort_waiter);
+            try loan.bind(ctx.model.session, identity, bytes, now);
+            return loan;
+        }
+
         /// Bind the SAME actual Reader-owned hook for its worker and owned
         /// runtime harness. This metadata assignment grants no execution or
         /// outside authority: caller must still use the real step/cohort and
         /// satisfy the callback's exact backend/Model proof before SDK work.
         pub fn configureGraphAdmission(ctx: *LightOnStreamContext, executor: *@import("../graph/decoder_step_executor.zig").Executor) void {
             executor.context.cleanup_owner = &ctx.cleanup_owner;
+            executor.context.before_owned_forward = if (comptime build_options.enable_cuda) .{ .ptr = ctx, .prepare_fn = preparePackedHost } else null;
             executor.context.graph_preparation = if (comptime build_options.enable_cuda) .{ .ptr = ctx, .prepare_fn = prepareCapturedGraph } else null;
+            executor.context.external_prefill_preparation = if (comptime build_options.enable_cuda) .{ .ptr = ctx, .prepare_fn = prepareExternalPrefill } else null;
         }
 
         pub fn runExecutor(ctx: *LightOnStreamContext) void {
@@ -1489,6 +1582,36 @@ fn coldCreatorPageCase(a: std.mem.Allocator, cancel_after_reserve: bool, transie
     var ctx_live = true;
     defer if (ctx_live) Context.destroy(raw);
     try std.testing.expect(!cancel_after_reserve);
+    {
+        // The actual cold Reader installs both synchronous callbacks through
+        // its one worker/harness configuration seam. With no actual backend
+        // yet, the prefill callback must refuse before touching phase/Model
+        // metadata, reserving anything, or changing the active epoch.
+        var configured: @import("../graph/decoder_step_executor.zig").Executor = undefined;
+        ctx.configureGraphAdmission(&configured);
+        try std.testing.expect(configured.context.cleanup_owner == &ctx.cleanup_owner);
+        if (comptime build_options.enable_cuda) {
+            const graph_hook = configured.context.graph_preparation orelse return error.MissingReaderGraphPreparation;
+            const prefill_hook = configured.context.external_prefill_preparation orelse return error.MissingReaderPrefillPreparation;
+            const host_hook = configured.context.before_owned_forward orelse return error.MissingPackedHostPreparation;
+            try std.testing.expect(graph_hook.ptr == @as(*anyopaque, @ptrCast(ctx)) and prefill_hook.ptr == @as(*anyopaque, @ptrCast(ctx)));
+            const F = @import("../ops/cuda/prefill_phase.zig");
+            var phase: F.Phase = undefined;
+            try phase.initInto(.{});
+            const before = controller.snapshot();
+            const epoch_nonce = ctx.cleanup_owner.epoch().?.nonce;
+            var no_backend: ops.ComputeBackend = undefined; // refusal precedes any read
+            try std.testing.expectError(error.UnsupportedReaderEpochBackend, prefill_hook.prepare_fn(prefill_hook.ptr, &no_backend, &phase, .{}));
+            try std.testing.expectError(error.UnsupportedReaderEpochBackend, host_hook.prepare_fn(host_hook.ptr, &no_backend, 35028, .{}));
+            try std.testing.expect(phase.cold == null and !phase.bound and !phase.declined and phase.mode == .none);
+            try std.testing.expectEqual(epoch_nonce, ctx.cleanup_owner.epoch().?.nonce);
+            try std.testing.expectEqualDeep(before, controller.snapshot());
+        } else {
+            try std.testing.expect(configured.context.graph_preparation == null);
+            try std.testing.expect(configured.context.external_prefill_preparation == null);
+            try std.testing.expect(configured.context.before_owned_forward == null);
+        }
+    }
     {
         // Actual cold creator owns native+reader lanes. This finite metadata
         // oracle proves the graph seam returns the SAME borrowed step held;

@@ -59,7 +59,15 @@ fn openDecoderOwned(out: *?*anyopaque, stream: ?*anyopaque, user: *anyopaque, ca
 /// uses an independent parser and stops before the first HW picture decode;
 /// no persistent surface, stream work or consumer callback is created. The
 /// context owner stays pinned by the caller; capture legality is authoritative.
+pub const EmbeddingProbe = struct { sequence: Sequence, samples: u6 = 0, unique_frames: u6 = 0 };
+
 pub fn probeMp4Sequence(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes: []const u8, control: media.source.Control, preparation: *const cuda.CudaCompute.CacheMetadataPreparation) !Sequence {
+    return (try probeSequence(allocator, ctx, bytes, control, preparation, false)).sequence;
+}
+pub fn probeEmbeddingMp4(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes: []const u8, control: media.source.Control, preparation: *const cuda.CudaCompute.CacheMetadataPreparation) !EmbeddingProbe {
+    return probeSequence(allocator, ctx, bytes, control, preparation, true);
+}
+fn probeSequence(allocator: std.mem.Allocator, ctx: *context.CudaContext, bytes: []const u8, control: media.source.Control, preparation: *const cuda.CudaCompute.CacheMetadataPreparation, comptime embedding: bool) !EmbeddingProbe {
     if (!build_options.enable_cuda or builtin.os.tag != .linux) return error.UnsupportedVideoBackend;
     if (bytes.len > 256 * 1024 * 1024) return error.VideoInputTooLarge;
     try preparation.validate(ctx);
@@ -73,7 +81,14 @@ pub fn probeMp4Sequence(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     try validateTrack(track);
     const color = try containerColor(track.color_info);
     if (reader.packets.len == 0) return error.EmptyVideo;
-    _ = try validateTimeline(track, reader.packets);
+    const end_us = try validateTimeline(track, reader.packets);
+    var samples: u6 = 0;
+    var unique_frames: u6 = 0;
+    if (embedding) {
+        const sampler = try embeddingSamplerForReader(&reader, end_us);
+        samples = @intCast(sampler.length);
+        unique_frames = sampler.uniqueFrames();
+    }
     const codec: c_int = switch (track.codec) {
         .avc => 4,
         .hevc => 8,
@@ -106,7 +121,7 @@ pub fn probeMp4Sequence(allocator: std.mem.Allocator, ctx: *context.CudaContext,
         if (status != 7) try checkStatusCode(status);
         if (antfly_nvdec_probe_result(decoder.?, &observed) != 0) {
             _ = try observed.bytes();
-            return observed;
+            return .{ .sequence = observed, .samples = samples, .unique_frames = unique_frames };
         }
         if (status == 7) return error.InvalidVideoGeometry;
     }
@@ -120,7 +135,7 @@ pub fn probeMp4Sequence(allocator: std.mem.Allocator, ctx: *context.CudaContext,
         if (status != 7) try checkStatusCode(status);
         if (antfly_nvdec_probe_result(decoder.?, &observed) != 0) {
             _ = try observed.bytes();
-            return observed;
+            return .{ .sequence = observed, .samples = samples, .unique_frames = unique_frames };
         }
         if (status == 7) return error.InvalidVideoGeometry;
     }
@@ -455,6 +470,17 @@ pub const EmbeddingSampler = struct {
             self.indices[i] = @min(frame_count - 1, sample * frame_count * 1_000_000 / duration);
         }
         return self;
+    }
+    /// Coalesced callback count for the SAME validated selected indices.
+    /// Successful decode already requires sampler.next == sampler.length.
+    pub fn uniqueFrames(self: *const EmbeddingSampler) u6 {
+        var previous: ?usize = null;
+        var count: u6 = 0;
+        for (self.indices[0..self.length]) |frame| {
+            if (previous == null or previous.? != frame) count += 1;
+            previous = frame;
+        }
+        return count;
     }
     pub fn select(self: *EmbeddingSampler, pts: i64) !bool {
         if (self.last_us) |last| if (pts < last) return error.NonMonotonicVideoPresentation;
@@ -1650,4 +1676,152 @@ test "CUDA video parser preflight funds exact opaque surface envelope before dec
     last.finish();
     try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, domain.controller.snapshot());
     try std.testing.expect(!probe.under_gate);
+}
+
+test "CUDA video warm raw decoder upgrades same surfaces at zero spare and retires with later current B" {
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    const Prepared = @import("prepared_cache.zig");
+    const Memory = @import("../../runtime/tier/memory.zig");
+    const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
+    const Session = @import("../../backends/session.zig").Session;
+    const Sink = @import("../../execution/retirement_sink.zig");
+    const a = std.testing.allocator;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var compute = cuda.CudaCompute.initWithKernelJitForProfile(a, .{}, .embedding_gemma2) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const ModelOwner = struct {
+        fn close(_: *anyopaque) void {}
+    };
+    var marker: u8 = 0;
+    var model: Session.ModelLifetime = .{ .owner = &marker, .destroy_fn = ModelOwner.close };
+    const Probe = struct {
+        model: *Session.ModelLifetime,
+        violation: bool = false,
+        calls: usize = 0,
+        fn check(self: *@This()) void {
+            if (!self.model.execution_gate.tryLock()) self.violation = true else self.model.execution_gate.unlock();
+        }
+        fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            self.calls += 1;
+            return self.calls;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+    };
+    var probe: Probe = .{ .model = &model };
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    const bytes = @embedFile("../../testdata/video/codecs/h264.mp4");
+    var preparation: cuda.CudaCompute.CacheMetadataPreparation = undefined;
+    try std.testing.expect(model.execution_gate.tryLock());
+    try cuda.CudaCompute.CacheMetadataPreparation.beginInto(&preparation, &cb, &compute);
+    model.execution_gate.unlock();
+    defer preparation.finishOutsideExecution();
+    const sequence = try probeMp4Sequence(a, &compute.ctx, bytes, .{}, &preparation);
+    preparation.finishOutsideExecution();
+    const amount = try sequence.bytes();
+    compute.ctx.video_cache_budget.admission = .{ .controller = pin.controller(), .limits = .{ .backend_limit_bytes = amount }, .check_live_memory = false };
+    const Counter = struct {
+        frames: usize = 0,
+        fn consume(raw: *anyopaque, _: Frame) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.frames += 1;
+        }
+    };
+    var counter: Counter = .{};
+    const first = try decodeMp4Sampled(a, &compute.ctx, bytes, .{ .context = &counter, .consume = Counter.consume }, .embedding_gemma2);
+    try std.testing.expect(first.selected_frames != 0 and counter.frames == first.selected_frames);
+    try std.testing.expect(compute.ctx.video_cache_budget.quota == .raw);
+    const decoder = compute.ctx.video_decoder_cache;
+    const original = compute.ctx.video_cache_budget.quota.peek().?;
+    const calls = probe.calls;
+    const requests = [_]Prepared.Request{.{ .decoder = sequence }};
+    const work: Prepared.Workload = .{ .requests = &requests };
+    const funding = try Prepared.Funding.create(work);
+    defer funding.finishOutsideExecution();
+    var held = false;
+    defer {
+        if (compute.ctx.prepared_cache_funding == funding) cuda.CudaCompute.unbindCacheFunding(&cb, &compute, funding);
+        if (held) model.execution_gate.unlock();
+    }
+    try std.testing.expect(model.execution_gate.tryLock());
+    held = true;
+    const victims = try cuda.CudaCompute.cacheWorkloadVictims(&cb, &compute, work);
+    try std.testing.expect(!victims.geometry.video);
+    try cuda.CudaCompute.snapshotCacheFunding(&cb, &compute, funding);
+    try std.testing.expect(!funding.entries[0].miss and funding.entries[0].upgrade_raw);
+    model.execution_gate.unlock();
+    held = false;
+    try funding.fundOutsideExecution(&pin);
+    try std.testing.expectEqual(calls, probe.calls);
+    var source = try Sink.Ref.create();
+    defer source.release();
+    var first_guard = try source.enter();
+    defer first_guard.finish();
+    var first_epoch = try first_guard.retainEpoch();
+    defer first_epoch.release();
+    try std.testing.expect(model.execution_gate.tryLock());
+    held = true;
+    try cuda.CudaCompute.bindCacheFunding(&cb, &compute, work, funding, &first_epoch);
+    try std.testing.expect(compute.ctx.video_cache_budget.quota == .prepared);
+    try std.testing.expect(std.meta.eql(original, compute.ctx.video_cache_budget.quota.peek().?));
+    counter.frames = 0;
+    const warm = try decodeMp4Sampled(a, &compute.ctx, bytes, .{ .context = &counter, .consume = Counter.consume }, .embedding_gemma2);
+    try std.testing.expectEqual(first.selected_frames, warm.selected_frames);
+    try std.testing.expectEqual(decoder, compute.ctx.video_decoder_cache);
+    try std.testing.expectEqual(calls, probe.calls);
+    cuda.CudaCompute.unbindCacheFunding(&cb, &compute, funding);
+    model.execution_gate.unlock();
+    held = false;
+    first_guard.finish();
+    var last = try source.enter();
+    defer last.finish();
+    var epoch = try last.retainEpoch();
+    defer epoch.release();
+    try std.testing.expect(model.execution_gate.tryLock());
+    held = true;
+    try closeCachedDecoderWithCleanup(&compute.ctx, .{ .boundary = &epoch });
+    try std.testing.expect(compute.ctx.video_decoder_cache == null);
+    try std.testing.expectEqual(amount, domain.controller.snapshot().backend_scratch_bytes);
+    model.execution_gate.unlock();
+    held = false;
+    last.finish();
+    try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, domain.controller.snapshot());
+    try std.testing.expect(!probe.violation);
+}
+
+test "embedding video cold callback count matches actual coalesced sampler including repeated indices" {
+    const cases = [_]struct { frames: usize, duration: i64, samples: usize, unique: u6 }{
+        .{ .frames = 1, .duration = 5_000_000, .samples = 5, .unique = 1 },
+        .{ .frames = 9, .duration = 9_000_000, .samples = 9, .unique = 9 },
+        .{ .frames = 3, .duration = 60_000_000, .samples = 32, .unique = 3 },
+    };
+    for (cases) |case| {
+        var sampler = try EmbeddingSampler.init(case.frames, case.duration, case.duration);
+        try std.testing.expectEqual(case.samples, sampler.length);
+        try std.testing.expectEqual(case.unique, sampler.uniqueFrames());
+        var callbacks: usize = 0;
+        var samples: usize = 0;
+        for (0..case.frames) |index| if (try sampler.select(@intCast(index * @as(usize, @intCast(case.duration)) / case.frames))) {
+            callbacks += 1;
+            samples += sampler.repetitions;
+        };
+        try std.testing.expectEqual(@as(usize, case.unique), callbacks);
+        try std.testing.expectEqual(case.samples, samples);
+        try std.testing.expectEqual(sampler.length, sampler.next);
+    }
 }

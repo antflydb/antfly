@@ -79,6 +79,40 @@ pub const MetalPolicy = struct {
     projection_fusions: bool = false,
 };
 
+/// Exact caller allocator request for the ORIGINAL receiving-header
+/// constructor. No provider/SDK/weight access occurs in this cold declaration.
+pub const HostConstructionLayout = struct { bytes: usize, alignment: std.mem.Alignment };
+pub fn metalConstructionLayout() !HostConstructionLayout {
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+    return .{ .bytes = @sizeOf(metal.MetalCompute), .alignment = .of(metal.MetalCompute) };
+}
+
+/// Same explicit-capacity/stdlib allocation recipe used by the actual
+/// constructor; only the caller's allocator payload/alignment are returned.
+pub fn metalRmsMetadataLayout(entries: u32) !HostConstructionLayout {
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+    const layout = try metal.MetalCompute.rmsMetadata(entries);
+    return .{ .bytes = layout.bytes, .alignment = layout.alignment };
+}
+
+pub fn metalProjectionMetadataHostBytes(linear_entries: u32, zero_widths: []const usize) !usize {
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+    return metal.MetalCompute.projectionMetadataHostBytes(.{ .linear_entries = linear_entries, .zero_widths = zero_widths });
+}
+
+/// Exact generic metadata requests for the model-authored text inventory.
+pub fn metalWeightMetadataHostBytes(request: anytype) !usize {
+    if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
+    return metal.MetalCompute.weightMetadataHostBytes(.{
+        .entries = request.entries,
+        .name_bytes = request.name_bytes,
+        .shape_axes = request.shape_axes,
+        .vector_entries = request.vector_entries,
+        .vector_elements = request.vector_elements,
+        .slice_views = request.slice_views,
+    });
+}
+
 pub fn createMetal(allocator: std.mem.Allocator, weights: *MetalWeights, budget: ?*memory.RunBudget, io: ?std.Io, jit: MetalJitOptions, policy: MetalPolicy) !ops.ComputeBackend {
     if (comptime !build_options.enable_metal) return error.MetalNotEnabled;
     const compute = try allocator.create(metal.MetalCompute);
@@ -163,13 +197,17 @@ pub fn beginRequestWithCleanup(session: @import("session.zig").Session, backend:
 }
 
 pub fn closeMetalWeights(allocator: std.mem.Allocator, weights: *MetalWeights) void {
+    closeMetalWeightsWithCleanup(allocator, weights, .{ .outside_execution = true });
+}
+pub fn closeMetalWeightsWithCleanup(allocator: std.mem.Allocator, weights: *MetalWeights, current: @import("../execution/cleanup_context.zig").Context) void {
     if (comptime !build_options.enable_metal) return;
+    metal.validateSharedNativeProviderWorkspaceRetirement(weights, current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
     metal.stopPrefetchWorker(weights);
     if (weights.boundary_resident) |owner| {
         owner.destroy();
         weights.boundary_resident = null;
     }
-    metal.deinitSharedNativeProvider(weights);
+    metal.deinitSharedNativeProviderWithCleanup(weights, current);
     metal.deinitPrefetchQueue(weights);
     var it = weights.lazy_weights.iterator();
     while (it.next()) |entry| {
@@ -374,4 +412,60 @@ pub fn describeKvCoverage(target: @import("cold_compute_target.zig").Target, dty
         .cuda => if (comptime build_options.enable_cuda) try @import("../ops/cuda/cuda_compute.zig").ColdKvBank.describeCoverage(target, dtype, window, mode, geometry) else null,
         .metal => if (comptime build_options.enable_metal) try @import("metal_kv_storage.zig").MetalKvStorage.ColdKvBank.describeCoverage(target, dtype, window, mode, geometry) else null,
     };
+}
+
+test "Metal receiving constructor host declaration uses actual type layout without provider or SDK preparation" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const layout = try metalConstructionLayout();
+    try std.testing.expectEqual(@as(usize, @sizeOf(metal.MetalCompute)), layout.bytes);
+    try std.testing.expectEqual(std.mem.Alignment.of(metal.MetalCompute), layout.alignment);
+    const Allocator = @import("admitted_allocator.zig").AdmittedAllocator;
+    const bytes = try Allocator.constructionHostBytes(layout.bytes, layout.alignment);
+    try std.testing.expectEqual(layout.bytes + Allocator.allocationOverhead(layout.alignment) + Allocator.reservation_overhead, bytes);
+}
+
+test "Metal Gemma text Source declares RMS metadata payload and one allocator header without another reservation node" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const layout = try metalRmsMetadataLayout(try @import("../architectures/embedding_gemma2.zig").textRmsMetadataEntries(24));
+    const exact = try metal.MetalCompute.rmsMetadata(try @import("../architectures/embedding_gemma2.zig").textRmsMetadataEntries(24));
+    try std.testing.expectEqual(exact.bytes, layout.bytes);
+    try std.testing.expectEqual(exact.alignment, layout.alignment);
+    const Allocator = @import("admitted_allocator.zig").AdmittedAllocator;
+    const actual = try std.math.add(usize, layout.bytes, Allocator.allocationOverhead(layout.alignment));
+    const declaration_with_extra_node = try Allocator.constructionHostBytes(layout.bytes, layout.alignment);
+    try std.testing.expectEqual(actual + Allocator.reservation_overhead, declaration_with_extra_node);
+}
+
+test "Metal Gemma RMS typed host declaration exactcap and onebelow retain original device floor" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const sessions = @import("session.zig");
+    const Allocator = @import("admitted_allocator.zig").AdmittedAllocator;
+    const metadata = try metalRmsMetadataLayout(try @import("../architectures/embedding_gemma2.zig").textRmsMetadataEntries(24));
+    const constructor = try metalConstructionLayout();
+    const host = try std.math.add(usize, 64 + try Allocator.constructionHostBytes(constructor.bytes, constructor.alignment), metadata.bytes + Allocator.allocationOverhead(metadata.alignment));
+    const Info = struct {
+        fn outputs(_: *anyopaque) []const @import("tensor.zig").TensorInfo {
+            return &.{};
+        }
+    };
+    var table: sessions.Session.VTable = undefined;
+    table.outputInfo = Info.outputs;
+    var controller: memory.AdmissionController = .{};
+    defer controller.deinit();
+    for ([_]usize{ host - 1, host }) |limit| {
+        const session: sessions.Session = .{ .ptr = undefined, .vtable = &table, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = limit, .backend_limit_bytes = 4096 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+        var owner: Allocator = .{ .backing = std.testing.allocator, .session = session };
+        defer owner.deinit();
+        var scope: Allocator.RunScope = undefined;
+        const request: sessions.RunRequest = .{ .host_preprocess_bytes = host, .workspace_bytes = 4096, .output_bytes = 0 };
+        if (limit < host) {
+            try std.testing.expectError(error.ResourceLimitExceeded, owner.admitRunInto(&scope, request));
+            try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+        } else {
+            try owner.admitRunInto(&scope, request);
+            try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = host, .backend_scratch_bytes = 4096 }, scope.permit.lease.?.amounts);
+            scope.deinit();
+            try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());
+        }
+    }
 }

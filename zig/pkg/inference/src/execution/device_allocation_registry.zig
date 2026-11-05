@@ -15,7 +15,7 @@ pub const Report = struct {
     identity: usize = 0,
     backing: @FieldType(Root, "backing") = .cuda_successful_cuMemAlloc_owned_spans,
     scope: enum { registered_root_commit_interval_including_concurrent_users } = .registered_root_commit_interval_including_concurrent_users,
-    semantic_lifetime_classes: enum { exact_kv_owning_lifetime_with_explicit_unclassified_remainder } = .exact_kv_owning_lifetime_with_explicit_unclassified_remainder,
+    semantic_lifetime_classes: enum { exact_authored_owning_lifetimes_with_explicit_unclassified_remainder } = .exact_authored_owning_lifetimes_with_explicit_unclassified_remainder,
     /// OwnedPurpose enum order; each peak is directly measured on this root.
     /// These class peaks are never summed to obtain total interval_peak_bytes.
     purpose_live_bytes: [@import("storage_accounting.zig").owned_purpose_count]u64 = @splat(0),

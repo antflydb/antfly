@@ -27,7 +27,6 @@ const metal_runtime = @import("metal_runtime.zig");
 const kernel_jit = @import("../graph/kernel_jit.zig");
 const metal_tensor = @import("metal_tensor.zig");
 const weight_source_mod = @import("../models/weight_source.zig");
-const memory = @import("../runtime/tier/memory.zig");
 
 const MetalTensor = metal_tensor.MetalTensor;
 const QuantizedStorage = weight_source_mod.QuantizedStorage;
@@ -96,9 +95,8 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     pub const image_coefficient_budget: usize = 16 * 1024 * 1024;
     raw_provider: ?*RawMetalProvider,
     raw_decode_runtime: ?*RawMetalDecodeRuntime,
-    embedding_workspace_leases: [64]?memory.AdmissionLease = @splat(null),
-    embedding_workspace_lease_count: usize = 0,
-    embedding_workspace_bytes: usize = 0,
+    workspace_endpoint: ?*@import("metal_runtime_lifetime.zig").Lifetime = null,
+    workspace_creators: @import("metal_workspace_ownership.zig").Creators = .{},
     /// Protected by the model's shared-provider execution lease. Entries own
     /// their names and raw slots, never a request tensor or allocator. The
     /// admission pointer belongs to the same drained model WeightStore.
@@ -356,11 +354,15 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
 
     /// A null census preserves complete preparation for open or custom stores.
     pub fn createWithKernelJitOptionsAndPipelineFormats(options: metal_runtime.MetalJitOptions, formats: ?u16) !MetalNativeProvider {
+        const endpoint = try @import("metal_runtime_lifetime.zig").Lifetime.prepare();
         const raw_provider = metal_runtime.termite_metal_provider_create();
         const raw_decode_runtime = metal_runtime.termite_metal_decode_runtime_create_for_quant_formats(formats orelse std.math.maxInt(u16));
+        endpoint.bindEndpointAddress(if (raw_decode_runtime) |runtime| @intFromPtr(runtime) else 0);
         var result = MetalNativeProvider{
             .raw_provider = raw_provider,
             .raw_decode_runtime = raw_decode_runtime,
+            .workspace_endpoint = endpoint,
+            .workspace_creators = @import("metal_workspace_ownership.zig").Creators.init(endpoint),
         };
         errdefer result.deinitOwned();
         // Non-generative Metal graphs (embedding, vision, and audio encoders)
@@ -383,7 +385,6 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     pub fn trimEmbeddingWorkspace(self: *MetalNativeProvider) !void {
         if (metal_runtime.termite_metal_decode_runtime_trim_embedding_workspace(self.raw_decode_runtime) != 0)
             return error.MetalWorkspaceBusy;
-        self.releaseEmbeddingWorkspaceLeases();
     }
 
     fn clearRotary(self: *MetalNativeProvider, vision: ?bool) usize {
@@ -533,38 +534,6 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
             std.heap.c_allocator.free(removed.key);
         }
         return reclaimed;
-    }
-
-    fn releaseEmbeddingWorkspaceLeases(self: *MetalNativeProvider) void {
-        for (self.embedding_workspace_leases[0..self.embedding_workspace_lease_count]) |*lease| {
-            if (lease.*) |*owned| owned.release();
-            lease.* = null;
-        }
-        self.embedding_workspace_lease_count = 0;
-        self.embedding_workspace_bytes = 0;
-    }
-
-    /// Called with the model execution gate held, after all GPU frames drain.
-    /// Transfer exactly the newly retained bytes; the request still owns its
-    /// other peak reservation until this transition succeeds.
-    pub fn retainEmbeddingWorkspace(self: *MetalNativeProvider, lease: *?memory.AdmissionLease) !void {
-        const stats = metal_runtime.runtimeMemorySnapshot(self.raw_decode_runtime);
-        if (stats.frame_retained_bytes != 0) return error.MetalWorkspaceBusy;
-        const bytes = metal_runtime.termite_metal_decode_runtime_embedding_workspace_bytes(self.raw_decode_runtime);
-        if (bytes == std.math.maxInt(usize)) return error.InvalidMetalWorkspaceAccounting;
-        if (stats.attention_span_bytes != 0 or bytes < self.embedding_workspace_bytes)
-            return error.InvalidMetalWorkspaceAccounting;
-        const growth = bytes - self.embedding_workspace_bytes;
-        if (growth == 0) return;
-        if (self.embedding_workspace_lease_count == self.embedding_workspace_leases.len)
-            return error.ResourceLimitExceeded;
-        if (lease.*) |*owned| {
-            try owned.retain(.{ .backend_scratch_bytes = growth });
-            self.embedding_workspace_leases[self.embedding_workspace_lease_count] = owned.*;
-            lease.* = null;
-            self.embedding_workspace_lease_count += 1;
-            self.embedding_workspace_bytes = bytes;
-        }
     }
 
     pub fn reserveDecoderRuntime(self: *MetalNativeProvider, scratch_bytes: usize, token_bytes: usize) !bool {
@@ -741,7 +710,18 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
 
     /// Releases every owned resource after checked completion. The provider
     /// is consumed and must not be used or deinitialized again.
+    /// Explicit legacy outside-execution owner close. Managed model/consumer
+    /// teardown must forward its actual current Context through the typed API.
     pub fn deinitOwned(self: *MetalNativeProvider) void {
+        self.deinitOwnedWithCleanup(.{ .outside_execution = true });
+    }
+    pub fn validateWorkspaceRetirement(_: *const MetalNativeProvider, current: @import("../execution/cleanup_context.zig").Context) !void {
+        if (current.boundary) |epoch| {
+            if (try epoch.isSealed()) return error.SealedWorkspaceCleanupEpoch;
+        } else if (!current.outside_execution) return error.MissingWorkspaceCleanupEpoch;
+    }
+    pub fn deinitOwnedWithCleanup(self: *MetalNativeProvider, current: @import("../execution/cleanup_context.zig").Context) void {
+        self.validateWorkspaceRetirement(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         // Release the synchronous JIT session before provider, cache, or
         // pipeline dependencies are released.
         while (!self.linear_slot_index_mutex.tryLock()) std.atomic.spinLoopHint();
@@ -765,6 +745,18 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
                 @import("antfly_platform").inference_process_supervisor.restartWorker();
             }
         };
+        // Validate the WHOLE one-shot close transaction before closing the
+        // endpoint or consuming any permanent close fence. All checked SDK
+        // quiesce and prepared-slot ownership preflights above have succeeded.
+        self.workspace_creators.preflightDetachForProviderClose(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        // Existing users end endpoint access BEFORE their callback-capable
+        // quota release. This drains SDK endpoint borrows only, never waits on
+        // a B seal or external supplier callback while holding the Model.
+        if (self.workspace_endpoint) |endpoint| endpoint.closeAndDrain();
+        // After this point close is destructive and cannot be retried. Every
+        // creator records NOWB even for a nonfinal Ref; no provider/list pointer
+        // survives in the permanent pure close cells or eventual SDK witness.
+        self.workspace_creators.detachForProviderClose(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         metal_runtime.destroyMetalJitSession(self.jit_session);
         metal_runtime.resetGatheredSpans(self);
         _ = self.clearRotary(null);
@@ -806,7 +798,10 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
         for (0..decoder_runtime_rms_norm_slot_capacity) |slot| metal_runtime.releaseRawRmsNormSlot(self, slot);
         metal_runtime.termite_metal_provider_destroy(self.raw_provider);
         metal_runtime.termite_metal_decode_runtime_destroy(self.raw_decode_runtime);
-        self.releaseEmbeddingWorkspaceLeases();
+        if (self.workspace_endpoint) |endpoint| {
+            self.workspace_endpoint = null;
+            endpoint.release();
+        }
         for (&self.jit_pipeline_owners) |*generated| metal_runtime.termite_metal_generated_pipeline_destroy(generated.*);
         for (&self.jit_exact_pipeline_owners) |*generated| metal_runtime.termite_metal_generated_pipeline_destroy(generated.*);
     }

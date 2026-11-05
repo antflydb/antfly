@@ -157,7 +157,7 @@ pub const Cache = struct {
             }
         }
         for (&device, data) |*b, slice| {
-            b.* = try Buffer.alloc(ctx, slice.len);
+            b.* = try Buffer.allocWithPurpose(ctx, slice.len, .model_cache);
             try b.copyFromHost(ctx, slice);
         }
         slot.* = .{ .key = key, .x = x, .y = y, .device = device, .bytes = bytes, .quota = lease.publishQuota() };
@@ -341,6 +341,8 @@ test "embeddinggemma2 resize cache reuses uploads and fences only reused source 
     const key = Key{ .width = 64, .height = 48, .target_width = 32, .target_height = 32, .resident = true };
     const first = try cache.plan(std.testing.allocator, &ctx, key);
     const ptr = first.device[0].ptr;
+    for (first.device) |buffer| try std.testing.expectEqual(@import("allocation_budget.zig").OwnedPurpose.model_cache, buffer.allocation_purpose);
+    try std.testing.expectEqual(@as(u64, @intCast(cache.bytes)), ctx.device_allocations.snapshot().purpose_live[@backingInt(@import("allocation_budget.zig").OwnedPurpose.model_cache)]);
     try std.testing.expectEqual(@as(usize, 6), Mock.uploads);
     try std.testing.expectEqual(ptr, (try cache.plan(std.testing.allocator, &ctx, key)).device[0].ptr);
     try std.testing.expectEqual(@as(usize, 6), Mock.uploads);

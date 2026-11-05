@@ -1428,13 +1428,20 @@ test "catalog resolves model-neutral Gemma 4 attention topologies" {
         .kv_heads = 1,
         .sequence_length = 256,
     }, 8, 9)) == null);
-    try std.testing.expect((try resolve(signature, .{
-        .rows = 1,
-        .head_dim = 512,
-        .query_heads = 16,
-        .kv_heads = 1,
-        .sequence_length = 256,
-    }, 8, 0)) == null);
+    // Execution eligibility is portable; benchmark evidence stays bound
+    // to its original target instead of being relabelled for these devices.
+    for ([_][2]i32{ .{ 7, 5 }, .{ 8, 0 }, .{ 9, 0 }, .{ 12, 1 } }) |device| {
+        const portable = (try resolve(signature, .{
+            .rows = 1,
+            .head_dim = 512,
+            .query_heads = 16,
+            .kv_heads = 1,
+            .sequence_length = 256,
+        }, device[0], device[1])) orelse return error.MissingPortableCatalogEntry;
+        try std.testing.expectEqualStrings(resolved.kernel_id, portable.kernel_id);
+        try std.testing.expectEqualDeep(resolved.target, portable.target);
+        try std.testing.expect(!portable.production_enabled);
+    }
 }
 
 test "catalog resolves long-context SM89 split-K online decode without widening visibility" {

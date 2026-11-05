@@ -64,6 +64,10 @@ const DeviceBufferRef = struct {
     ref_count: std.atomic.Value(usize),
     released: bool,
     release_on_drop: bool,
+    /// Exact SDK-root reference; aliases share this Ref and register once.
+    /// Borrowed tagged buffers own one extra SDK retain, independently of
+    /// cache/provider lifetime. Fits the existing flag padding.
+    workspace_reference: bool = false,
     /// An owned retain of external/runtime storage is not an allocation lease.
     /// Its final release must never make that storage available to the pool.
     recycle_on_drop: bool = true,
@@ -511,6 +515,17 @@ extern fn termite_metal_buffer_alloc_fresh(
 ) ?*anyopaque;
 extern fn termite_metal_buffer_allocated_size(handle: *anyopaque) usize;
 extern fn termite_metal_buffer_release(handle: *anyopaque) void;
+extern fn antfly_metal_workspace_retain_reference(handle: *anyopaque, owns_handle: c_int) c_int;
+extern fn antfly_metal_workspace_validate_reference_release(handle: *anyopaque, current: *const @import("../execution/cleanup_context.zig").Context, accepted: *const anyopaque) c_int;
+extern fn antfly_metal_workspace_begin_reference_release(handle: *anyopaque, current: *const @import("../execution/cleanup_context.zig").Context) ?*anyopaque;
+extern fn antfly_metal_workspace_finish_reference_release(reference: *anyopaque, current: *const @import("../execution/cleanup_context.zig").Context) c_int;
+extern fn antfly_metal_workspace_begin_runtime_use(reference: *anyopaque, runtime: *anyopaque, endpoint_use: *?*@import("metal_runtime_lifetime.zig").Lifetime) c_int;
+extern fn antfly_metal_decode_runtime_release_workspace_buffer(runtime: *anyopaque, handle: *anyopaque, current: *const @import("../execution/cleanup_context.zig").Context) void;
+fn registerWorkspaceReference(handle: *anyopaque, owns_handle: bool) bool {
+    const result = antfly_metal_workspace_retain_reference(handle, @intFromBool(owns_handle));
+    if (result < 0) @import("antfly_platform").inference_process_supervisor.restartWorker();
+    return result != 0;
+}
 extern fn termite_metal_decode_runtime_release_buffer(runtime: *anyopaque, handle: *anyopaque) void;
 extern fn antfly_metal_decode_runtime_release_charged_buffer(runtime: *anyopaque, handle: *anyopaque) void;
 extern fn termite_metal_buffer_contents(handle: *anyopaque) ?*anyopaque;
@@ -665,6 +680,20 @@ pub const MetalTensor = struct {
         byte_len: usize,
         dims: []const i32,
     ) MetalTensor {
+        return deviceBorrowedChecked(runtime, handle, byte_offset, byte_len, dims) catch @panic("Metal buffer ref alloc failed");
+    }
+
+    pub fn deviceReferenceMetadataBytes() usize {
+        return @sizeOf(DeviceBufferRef);
+    }
+
+    pub fn deviceBorrowedChecked(
+        runtime: *anyopaque,
+        handle: *anyopaque,
+        byte_offset: usize,
+        byte_len: usize,
+        dims: []const i32,
+    ) !MetalTensor {
         std.debug.assert(dims.len <= max_dims);
         var t = MetalTensor{
             .shape_len = @intCast(dims.len),
@@ -672,7 +701,7 @@ pub const MetalTensor = struct {
             .len = 0,
             .owned_by_c_allocator = false,
             .device = .{
-                .ref = createDeviceBufferRef(runtime, handle, false, byte_len),
+                .ref = try createDeviceBufferRefChecked(runtime, handle, false, byte_len),
                 .byte_offset = byte_offset,
                 .byte_len = byte_len,
             },
@@ -716,13 +745,34 @@ pub const MetalTensor = struct {
 
     /// True only for storage whose execution-plan lease pins every view and
     /// prevents frame reuse while any published value remains alive.
+    pub fn hasWorkspaceReference(self: *const MetalTensor) bool {
+        return if (self.device) |device| device.ref.workspace_reference else false;
+    }
+
+    /// Private synchronous leaf-use lookup. The actual owning Ref holds the
+    /// SDK/tag/Root metadata throughout this call. Descriptor acceptance is
+    /// checked in C BEFORE returning a typed Root; no retain-count guessing.
+    pub fn workspaceRootForUse(self: *const MetalTensor) !?*@import("metal_workspace_ownership.zig").Root {
+        const device = self.device orelse return null;
+        if (device.ref.released or device.ref.ref_count.load(.acquire) == 0) return error.ReleasedDeviceBuffer;
+        if (!device.ref.workspace_reference) return null;
+        const ownership = @import("metal_workspace_ownership.zig");
+        var root: ?*ownership.Root = null;
+        const status = antfly_metal_workspace_root_for_use(device.ref.handle, &ownership.RootOperations.canonical, &root);
+        if (status < 0) return error.UnsupportedWorkspaceRoot;
+        return root;
+    }
     pub fn hasPhysicalLease(self: *const MetalTensor) bool {
         const device = self.device orelse return false;
         return !device.ref.released and device.ref.ref_count.load(.acquire) != 0 and device.ref.physical_lease != null;
     }
 
     fn createDeviceBufferRef(runtime: *anyopaque, handle: *anyopaque, release_on_drop: bool, byte_len: usize) *DeviceBufferRef {
-        const ref = std.heap.c_allocator.create(DeviceBufferRef) catch @panic("Metal buffer ref alloc failed");
+        return createDeviceBufferRefChecked(runtime, handle, release_on_drop, byte_len) catch @panic("Metal buffer ref alloc failed");
+    }
+
+    fn createDeviceBufferRefChecked(runtime: *anyopaque, handle: *anyopaque, release_on_drop: bool, byte_len: usize) !*DeviceBufferRef {
+        const ref = try std.heap.c_allocator.create(DeviceBufferRef);
         ref.* = .{
             .handle = handle,
             .runtime = runtime,
@@ -730,6 +780,7 @@ pub const MetalTensor = struct {
             .ref_count = .init(1),
             .released = false,
             .release_on_drop = release_on_drop,
+            .workspace_reference = registerWorkspaceReference(handle, release_on_drop),
         };
         return ref;
     }
@@ -749,22 +800,53 @@ pub const MetalTensor = struct {
     fn releaseDeviceBufferWithBoundary(ref: *DeviceBufferRef, boundary: ?*const @import("../execution/retirement_sink.zig").Epoch) void {
         releaseDeviceBufferWithCleanup(ref, .{ .boundary = boundary });
     }
+    fn validateDeviceBufferCleanup(ref: *const DeviceBufferRef, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
+        if (ref.ref_count.load(.acquire) == 0) return; // existing stale diagnostic
+        if (ref.workspace_reference and antfly_metal_workspace_validate_reference_release(ref.handle, &cleanup, &@import("metal_workspace_ownership.zig").RootOperations.canonical) != 0)
+            return error.UnregisteredWorkspaceUse;
+    }
     fn releaseDeviceBufferWithCleanup(ref: *DeviceBufferRef, cleanup: @import("../execution/cleanup_context.zig").Context) void {
+        validateDeviceBufferCleanup(ref, cleanup) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        releaseDeviceBufferWithValidatedCleanup(ref, cleanup);
+    }
+    fn releaseDeviceBufferWithValidatedCleanup(ref: *DeviceBufferRef, cleanup: @import("../execution/cleanup_context.zig").Context) void {
         // Preserve stale-handle diagnostics: their fixture owns a zero-count
         // record directly and must not dispatch a driver release.
         if (ref.ref_count.load(.acquire) == 0) return;
         const previous = ref.ref_count.fetchSub(1, .acq_rel);
         std.debug.assert(previous != 0);
         if (previous != 1) return;
+        // Validate explicit cleanup BEFORE releasing any actual SDK ownership.
+        // The retained object below is PURE witness metadata, not MTLBuffer.
+        const workspace_release = if (ref.workspace_reference)
+            antfly_metal_workspace_begin_reference_release(ref.handle, &cleanup) orelse @import("antfly_platform").inference_process_supervisor.restartWorker()
+        else
+            null;
+        var endpoint_use: ?*@import("metal_runtime_lifetime.zig").Lifetime = null;
+        const endpoint_open = if (workspace_release) |metadata| antfly_metal_workspace_begin_runtime_use(metadata, ref.runtime, &endpoint_use) != 0 else true;
         if (ref.release_on_drop and !ref.released) {
-            if (ref.recycle_on_drop) {
-                if (ref.retirement_witnessed.load(.acquire))
+            // A charged SDK root can outlive its provider. Once the pure
+            // endpoint pin closes, release our actual SDK handle directly.
+            // An open endpoint NEVER changes charged allowReuse=false policy.
+            if (ref.recycle_on_drop and endpoint_open) {
+                if (workspace_release != null)
+                    antfly_metal_decode_runtime_release_workspace_buffer(ref.runtime, ref.handle, &cleanup)
+                else if (ref.retirement_witnessed.load(.acquire))
                     antfly_metal_decode_runtime_release_charged_buffer(ref.runtime, ref.handle)
                 else
                     termite_metal_decode_runtime_release_buffer(ref.runtime, ref.handle);
             } else termite_metal_buffer_release(ref.handle);
             ref.released = true;
             noteDeviceOwnedRelease(ref.handle, ref.byte_len);
+        }
+        // A borrowed tagged view owns a separate SDK retain but remains a
+        // borrowed diagnostic allocation; do not decrement owned-byte stats.
+        if (ref.workspace_reference and !ref.release_on_drop and !ref.released)
+            termite_metal_buffer_release(ref.handle);
+        if (workspace_release) |metadata| {
+            if (endpoint_use) |pin| pin.endUse();
+            if (antfly_metal_workspace_finish_reference_release(metadata, &cleanup) != 0)
+                @import("antfly_platform").inference_process_supervisor.restartWorker();
         }
         const lease = ref.physical_lease;
         ref.allocator.destroy(ref);
@@ -895,6 +977,7 @@ pub const MetalTensor = struct {
             .released = false,
             .release_on_drop = true,
             .retirement_witnessed = .init(admitted),
+            .workspace_reference = registerWorkspaceReference(handle, true),
             .allocator = allocator,
         };
         var result = deviceView(ref, 0, byte_len, dims, dtype);
@@ -1041,13 +1124,19 @@ pub const MetalTensor = struct {
         self.deinitWithCleanup(.{ .boundary = boundary });
     }
     pub fn deinitWithCleanup(self: *MetalTensor, cleanup: @import("../execution/cleanup_context.zig").Context) void {
+        self.deinitWithCleanupChecked(cleanup) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+    }
+    /// Failure-atomic authority check precedes host mirror, shared Ref and SDK
+    /// mutation. The caller holds its actual B through this synchronous drop.
+    pub fn deinitWithCleanupChecked(self: *MetalTensor, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
         if (self.device) |*d| {
+            try validateDeviceBufferCleanup(d.ref, cleanup);
             // If the host view was a c_allocator-owned mirror, free it.
             if (d.mirror_owned and self.owned_by_c_allocator) {
                 noteHostMirrorFree(self.len * @sizeOf(f32));
                 std.heap.c_allocator.free(self.data[0..self.len]);
             }
-            releaseDeviceBufferWithCleanup(d.ref, cleanup);
+            releaseDeviceBufferWithValidatedCleanup(d.ref, cleanup);
         } else if (self.owned_by_c_allocator) {
             std.heap.c_allocator.free(self.data[0..self.len]);
         }
@@ -1601,4 +1690,129 @@ test "dense detached Ref metadata accepts exact stateless process allocators and
     ref.recycle_on_drop = true;
     ref.release_on_drop = false;
     try std.testing.expect(!tensor.canDetachDenseF32Allocation(runtime));
+}
+
+extern fn antfly_metal_workspace_root_for_use(handle: *anyopaque, accepted: *const @import("metal_workspace_ownership.zig").RootOperations, root: *?*@import("metal_workspace_ownership.zig").Root) c_int;
+
+test "Metal nonfinal workspace alias refuses unregistered actual B before mirror Ref or SDK mutation" {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    const runtime_mod = @import("metal_runtime.zig");
+    if (!runtime_mod.metalDeviceAvailable()) return error.SkipZigTest;
+    const ownership = @import("metal_workspace_ownership.zig");
+    const Fence = @import("metal_workspace_fence.zig").Fence;
+    const R = @import("../execution/resource_retirement.zig");
+    const Sink = @import("../execution/retirement_sink.zig");
+    const memory = @import("../runtime/tier/memory.zig");
+    const storage = @import("../execution/storage_admission.zig");
+    const Probe = struct {
+        sdk_refs: std.atomic.Value(usize) = .init(0),
+        deaths: usize = 0,
+        fn retain(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.sdk_refs.fetchAdd(1, .monotonic);
+        }
+        fn release(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            _ = self.sdk_refs.fetchSub(1, .release);
+        }
+        fn metadata(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(self.sdk_refs.load(.acquire) == 0);
+            self.deaths += 1;
+        }
+        extern fn antfly_metal_workspace_witness_tag(*anyopaque, *ownership.Root, *const ownership.RootOperations) c_int;
+    };
+    var probe: Probe = .{};
+    var controller: memory.AdmissionController = .{};
+    defer controller.deinit();
+    var reservation: ?storage.Reservation = .{ .identity = .{ .controller = &controller, .backend_class = .gpu }, .leases = .{ try controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = 4096 }, false), null }, .domain = .backend };
+    var domain: ?@import("../runtime/tier/admission_domain.zig").Pin = null;
+    const charge = try R.Charge.createReservation(&reservation, &domain);
+    var root: ownership.Root = undefined;
+    root.init(charge, .{ .context = &probe, .release = Probe.metadata });
+    var creator_live = true;
+    defer if (creator_live) root.releaseCreator(.{ .outside_execution = true }) catch unreachable;
+    // Actual fixture retains pure metadata until every real SDK owner is gone;
+    // SDK callbacks merely change atomics, never quota or Root metadata.
+    const sdk_pin = root.retainSnapshot();
+    var sdk_pin_live = true;
+    defer if (sdk_pin_live) sdk_pin.release(sdk_pin.context);
+    const initial = try Fence.prepare();
+    defer initial.deinitOutsideExecution();
+    const receiver = try Fence.prepare();
+    defer receiver.deinitOutsideExecution();
+    var source = try Sink.Ref.create();
+    defer source.release();
+    var origin = try source.enter();
+    defer origin.finish();
+    var foreign = try source.enter();
+    defer foreign.finish();
+    var a = try origin.retainEpoch();
+    defer a.release();
+    var b = try foreign.retainEpoch();
+    defer b.release();
+    try initial.bindInitialBackingBeforePublication(&root.backing);
+    try initial.retire(.{ .boundary = &a }); // actual fresh use registered BEFORE SDK
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    var provider_live = true;
+    defer if (provider_live) provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.ExpectedActualMetalRuntime;
+    const handle = runtime_mod.termite_metal_buffer_alloc_fresh(runtime, 512, 1) orelse return error.OutOfMemory;
+    var raw_live = true;
+    defer if (raw_live) runtime_mod.termite_metal_buffer_release(handle);
+    const zeros: [128]f32 = @splat(0);
+    try std.testing.expectEqual(@as(c_int, 0), runtime_mod.termite_metal_buffer_upload(runtime, handle, 0, &zeros, @sizeOf(@TypeOf(zeros))));
+    const handles = [_]*anyopaque{handle};
+    var witness_metadata = try R.BackendPreparation.prepare(std.testing.allocator, .metal, 1, 1);
+    defer witness_metadata.deinit(std.testing.allocator);
+    const witnesses = try witness_metadata.armMetal(null, &handles, R.Payload{ .context = &probe, .retain_fn = Probe.retain, .release_fn = Probe.release });
+    var witnesses_live = true;
+    defer if (witnesses_live) runtime_mod.antfly_metal_discard_retirement_witnesses(witnesses);
+    try std.testing.expectEqual(@as(c_int, 0), Probe.antfly_metal_workspace_witness_tag(witnesses, &root, &ownership.RootOperations.canonical));
+    try std.testing.expectEqual(@as(c_int, 0), runtime_mod.antfly_metal_buffer_retirement_attach(witnesses));
+    var tensor = MetalTensor.deviceOwned(@ptrCast(runtime), handle, 0, 512, &.{128});
+    raw_live = false;
+    var tensor_live = true;
+    defer if (tensor_live) tensor.deinitWithCleanup(.{ .outside_execution = true });
+    var alias = try tensor.retainedCopy();
+    var alias_live = true;
+    defer if (alias_live) alias.deinitWithCleanup(.{ .outside_execution = true });
+    const mirror = try alias.toHostSlice();
+    try std.testing.expect(alias.device.?.mirror_owned and alias.owned_by_c_allocator);
+    const ref = alias.device.?.ref;
+    try std.testing.expectEqual(@as(usize, 2), ref.ref_count.load(.acquire));
+    const logical_before = root.logical_references.load(.acquire);
+    const before = runtime_mod.runtimeMemorySnapshot(runtime);
+    try std.testing.expectError(error.UnregisteredWorkspaceUse, alias.deinitWithCleanupChecked(.{ .boundary = &b }));
+    try std.testing.expect(alias.device.?.ref == ref and alias.data == mirror.ptr and alias.device.?.mirror_owned and alias.owned_by_c_allocator);
+    try std.testing.expectEqual(@as(usize, 2), ref.ref_count.load(.acquire));
+    try std.testing.expectEqual(logical_before, root.logical_references.load(.acquire));
+    try std.testing.expectEqualDeep(before, runtime_mod.runtimeMemorySnapshot(runtime));
+    // An independently prepared receiving cell makes exactly B legal, while
+    // A remains independently registered; one cannot substitute for the other.
+    try receiver.bindBackingOutsideExecution(&root.backing);
+    try receiver.retire(.{ .boundary = &b });
+    try alias.deinitWithCleanupChecked(.{ .boundary = &b });
+    alias_live = false;
+    try std.testing.expectEqual(@as(usize, 1), ref.ref_count.load(.acquire));
+    try std.testing.expectEqual(logical_before, root.logical_references.load(.acquire)); // nonfinal shared Ref did not drop physical Root
+    try root.releaseCreator(.{ .boundary = &a });
+    creator_live = false;
+    try tensor.deinitWithCleanupChecked(.{ .boundary = &a });
+    tensor_live = false;
+    // Checked provider teardown also drains SDK queue/autorelease custody.
+    // The pure use cells/Root remain valid after that actual provider closes.
+    provider.deinitOwned();
+    provider_live = false;
+    runtime_mod.antfly_metal_discard_retirement_witnesses(witnesses);
+    witnesses_live = false;
+    try std.testing.expectEqual(@as(usize, 0), probe.sdk_refs.load(.acquire));
+    sdk_pin.release(sdk_pin.context);
+    sdk_pin_live = false;
+    origin.finish();
+    try std.testing.expectEqual(@as(usize, 4096), controller.snapshot().backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), probe.deaths);
+    foreign.finish();
+    try std.testing.expectEqual(@as(usize, 1), probe.deaths);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
 }

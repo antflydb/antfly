@@ -1745,6 +1745,41 @@ pub const LayaActionFeaturesRequest = struct {
 /// Borrowed from a synchronous media pipeline. Only completed, independently
 /// owned projections may cross a yield. Cleanup restores ownership even after
 /// cancellation; no queue/provider lease escapes its loaded model handle.
+/// Value-only exact image layout at the existing CUDA preprocessing boundary.
+/// source_capacity is the actual host slice/device span, not a quota estimate.
+pub const EmbeddingImageCacheRequest = struct {
+    width: u32,
+    height: u32,
+    stride: usize,
+    source_capacity: usize,
+    target_width: u32,
+    target_height: u32,
+    resident: bool = false,
+};
+pub const EmbeddingVisionCacheRequest = struct { batch: usize, grid_x: usize, grid_y: usize, allow_yield: bool = true };
+/// Borrowed synchronous scope. Its only owner is the existing actual Stage;
+/// close before returning to a caller or publishing any persistent backend.
+pub const EmbeddingCacheScope = struct {
+    ptr: ?*anyopaque = null,
+    close_fn: ?*const fn (*anyopaque) void = null,
+    pub fn close(self: *@This()) void {
+        const close_fn = self.close_fn orelse return;
+        self.close_fn = null;
+        close_fn(self.ptr.?);
+        self.ptr = null;
+    }
+};
+/// Synchronous owner traversal for already-produced media. The Stage calls
+/// it only under the actual owner before a quota yield; neither closure nor
+/// any CT pointer enters a cache/quota owner or survives scope close.
+pub const EmbeddingCacheInputs = struct {
+    ptr: *anyopaque,
+    prepare_fn: *const fn (*anyopaque, *const EmbeddingStageControl) anyerror!void,
+    // Intrusive synchronous owner chain; initialized by the actual Stage and
+    // removed before the caller's final-address node or CT metadata can die.
+    previous: ?*EmbeddingCacheInputs = null,
+    stage: ?*anyopaque = null,
+};
 pub const EmbeddingStageControl = struct {
     ptr: *anyopaque,
     pause_fn: *const fn (*anyopaque) anyerror!void,
@@ -1754,8 +1789,49 @@ pub const EmbeddingStageControl = struct {
     /// restores the composition envelope; zero retains only idle resources.
     workspace_fn: ?*const fn (*anyopaque, ?usize) anyerror!void = null,
     copy_fn: ?*const fn (*anyopaque, usize, u64) void = null,
+    /// Canonical actual Stage validates the receiving header and hands off
+    /// every caller-owned live CT before a cold quota window. No pointer in
+    /// live_inputs or the caller request is stored by a cache or late owner.
+    cache_inputs_fn: ?*const fn (*anyopaque, *const ComputeBackend, *EmbeddingCacheInputs) anyerror!EmbeddingCacheScope = null,
+    cache_handoff_fn: ?*const fn (*anyopaque, *CT) anyerror!void = null,
+    video_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, []const u8, usize) anyerror!EmbeddingCacheScope = null,
+    video_consumer_fn: ?*const fn (*anyopaque, *const ComputeBackend) anyerror!EmbeddingCacheScope = null,
+    image_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, EmbeddingImageCacheRequest, []const *CT) anyerror!EmbeddingCacheScope = null,
+    vision_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, EmbeddingVisionCacheRequest, []const *CT) anyerror!EmbeddingCacheScope = null,
+    audio_cache_fn: ?*const fn (*anyopaque, *const ComputeBackend, @import("cuda/prepared_cache.zig").AudioRecipe, []const *CT) anyerror!EmbeddingCacheScope = null,
     /// A fenced ready-work boundary may keep its provider when uncontended.
     yield_ready_fn: ?*const fn (*anyopaque) anyerror!void = null,
+    /// Marks the actual synchronous cuvid consumer boundary. Only a scope
+    /// already bound before this call may supply frontend cache admissions;
+    /// a newly introduced cold window must never release its live decoder.
+    pub fn videoCache(self: *const @This(), cb: *const ComputeBackend, bytes: []const u8, max_tokens: usize) !EmbeddingCacheScope {
+        const run = self.video_cache_fn orelse return .{};
+        return run(self.ptr, cb, bytes, max_tokens);
+    }
+    pub fn videoConsumer(self: *const @This(), cb: *const ComputeBackend) !EmbeddingCacheScope {
+        const run = self.video_consumer_fn orelse return .{};
+        return run(self.ptr, cb);
+    }
+    pub fn cacheInputs(self: *const @This(), cb: *const ComputeBackend, owner: *EmbeddingCacheInputs) !EmbeddingCacheScope {
+        const run = self.cache_inputs_fn orelse return .{};
+        return run(self.ptr, cb, owner);
+    }
+    pub fn handoffCacheInput(self: *const @This(), value: *CT) !void {
+        const run = self.cache_handoff_fn orelse return error.UnsupportedEmbeddingStage;
+        try run(self.ptr, value);
+    }
+    pub fn imageCache(self: *const @This(), cb: *const ComputeBackend, request: EmbeddingImageCacheRequest, live_inputs: []const *CT) !EmbeddingCacheScope {
+        const run = self.image_cache_fn orelse return .{};
+        return run(self.ptr, cb, request, live_inputs);
+    }
+    pub fn audioCache(self: *const @This(), cb: *const ComputeBackend, recipe: @import("cuda/prepared_cache.zig").AudioRecipe, live_inputs: []const *CT) !EmbeddingCacheScope {
+        const run = self.audio_cache_fn orelse return .{};
+        return run(self.ptr, cb, recipe, live_inputs);
+    }
+    pub fn visionCache(self: *const @This(), cb: *const ComputeBackend, request: EmbeddingVisionCacheRequest, live_inputs: []const *CT) !EmbeddingCacheScope {
+        const run = self.vision_cache_fn orelse return .{};
+        return run(self.ptr, cb, request, live_inputs);
+    }
     pub fn yieldReady(self: *const @This()) !void {
         if (self.yield_ready_fn) |run| return run(self.ptr);
         try self.pause();

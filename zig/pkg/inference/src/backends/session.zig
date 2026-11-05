@@ -1301,6 +1301,32 @@ pub const HostOutputProducer = struct {
     owner: ?*HostOutputAdmission,
     outputs: ?OwnedHostVectors,
 
+    /// Synchronous immutable demand witness ONLY. The producer keeps its
+    /// real lease/Domain alive; this lends no credit and owns no extra pin.
+    pub const HeldAdmission = struct {
+        amounts: memory.AdmissionAmounts,
+        controller: *memory.AdmissionController,
+        domain: *@import("../runtime/tier/admission_domain.zig").Domain,
+        pub fn validateAdditional(self: @This(), session: Session, additional: memory.AdmissionAmounts) !void {
+            const policy = session.run_admission orelse return error.UnmanagedHostOutput;
+            const model = session.model_lifetime orelse return error.MissingSourceModelLifetime;
+            const pin = model.admission_domain orelse return error.ForeignAdmissionDomain;
+            if (pin.owner != self.domain or pin.controller() != self.controller or policy.controller != self.controller) return error.ForeignAdmissionDomain;
+            // Class totals are the SAME independently held physical bank,
+            // never a reduction of the upcoming Source's protected floor.
+            try policy.validateOwnedRunAmounts(try additional.merge(self.amounts));
+        }
+    };
+    pub fn heldAdmission(self: *const HostOutputProducer) !HeldAdmission {
+        const owner = self.owner orelse return error.HostOutputConsumed;
+        if (self.outputs == null or self.outputs.?.owner != owner) return error.HostOutputConsumed;
+        @import("antfly_platform").sync.lockYielding(&owner.mutex);
+        defer owner.mutex.unlock();
+        const lease = owner.lease orelse return error.HostOutputConsumed;
+        if (!owner.producer_pending or lease.controller != owner.domain.controller()) return error.ForeignAdmissionDomain;
+        return .{ .amounts = lease.amounts, .controller = owner.domain.controller(), .domain = owner.domain.owner };
+    }
+
     pub fn requiredBytes(count: usize, width: usize) !usize {
         if (count == 0 or width == 0 or width > std.math.maxInt(i64)) return error.InvalidHostOutputGeometry;
         const row_bytes = try addBytes(try mulBytes(width, @sizeOf(f32)), @sizeOf(i64));
@@ -1550,7 +1576,7 @@ pub const ModelContract = struct {
 pub const EagerHostRunServices = struct {
     accepts: *const fn (*const Session.VTable) bool,
     recurrent_layout: *const fn (*anyopaque) anyerror!?@import("../execution/recurrent_state_admission.zig").Layout,
-    run: *const fn (*anyopaque, []const Tensor, std.mem.Allocator, ?InferenceExecutionControl, *const @import("../execution/invocation_context.zig").Context) anyerror![]Tensor,
+    run: *const fn (*anyopaque, []const Tensor, std.mem.Allocator, ?InferenceExecutionControl, *const @import("../execution/invocation_context.zig").Context, ?*@import("../execution/existing_workspace_receipt.zig").Owner) anyerror![]Tensor,
 };
 
 pub const ComputeBackendOptions = struct {
@@ -2020,11 +2046,13 @@ pub const Session = struct {
     }
 
     /// Run a forward pass with the given input tensors.
+    fn canonicalMetalWorkspaceReceiver(self: Session) bool {
+        if (comptime !@import("build_options").enable_metal) return false;
+        return @import("../execution/architecture_session.zig").acceptsMetalWorkspaceSession(self);
+    }
     fn validateEagerHostServices(self: Session) !void {
-        if (self.run_admission == null) return;
+        if (self.run_admission == null and !self.canonicalMetalWorkspaceReceiver()) return;
         const services = self.vtable.eager_host_services orelse return;
-        // Inherited ownership claims cannot fall through to their old raw
-        // implementation. Truly custom tables with no service keep their ABI.
         if (!services.accepts(self.vtable)) return error.UnsupportedRecurrentStateTarget;
     }
     fn needsEagerRecurrentFunding(self: Session) !bool {
@@ -2033,17 +2061,45 @@ pub const Session = struct {
         const services = self.vtable.eager_host_services orelse return false;
         return try services.recurrent_layout(self.ptr) != null;
     }
-    /// This top-level host execution entry is cold: all external admission
-    /// precedes its numerical Model/provider acquisition.
+    fn needsColdEagerHost(self: Session) !bool {
+        try self.validateEagerHostServices();
+        // Only the actual complete host service may replace its callback.
+        // Forwarded/custom callbacks without this descriptor retain their ABI;
+        // explicit Source consumers can borrow the generic physical receipt.
+        if (self.canonicalMetalWorkspaceReceiver() and self.vtable.eager_host_services != null) {
+            const present = @import("../execution/architecture_session.zig").metalWorkspaceCreatorsOutsideExecution(self, null) catch |err| {
+                if (err == error.QueueFull) return false; // hint only; receiver rechecks
+                return err;
+            };
+            if (present) return true;
+        }
+        return self.needsEagerRecurrentFunding();
+    }
+    /// Top-level cold host entry: all preparation/refunds are outside every
+    /// enclosing lane. Only an explicit PRE-MATH stale receipt may retry.
     fn runColdEager(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) anyerror![]Tensor {
-        var source: PreparedSource = .{};
-        try source.initBeforeExecutionInto(self, self, self.execution_gate, .{ .host = inputs }, try self.planRun(inputs, null), null, .host, allocator, control);
-        defer source.deinit();
-        try source.enter();
-        return source.runHost(inputs);
+        for (0..8) |_| {
+            if (control) |active| try active.check();
+            var source: PreparedSource = .{};
+            source.initBeforeExecutionInto(self, self, self.execution_gate, .{ .host = inputs }, try self.planRun(inputs, null), null, if (self.canonicalMetalWorkspaceReceiver()) .resident_transient else .host, allocator, control) catch |err| {
+                // A peer may physically retire a snapshotted Root before its
+                // use cell binds. init's error unwind has already closed its
+                // complete Source/B/permit outside lanes; never retry a partly
+                // consumed snapshot or retain the failed source's quota.
+                if (err == error.WorkspaceReceiptChangedBeforeExecution and source.canRetryBeforeExecution()) continue;
+                return err;
+            };
+            defer source.deinit();
+            try source.enter();
+            return source.runHost(inputs) catch |err| {
+                if (err == error.WorkspaceReceiptChangedBeforeExecution and source.canRetryBeforeExecution()) continue;
+                return err;
+            };
+        }
+        return error.ResourceTemporarilyUnavailable;
     }
     pub fn run(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator) ![]Tensor {
-        if (try self.needsEagerRecurrentFunding()) return self.runColdEager(inputs, allocator, null);
+        if (try self.needsColdEagerHost()) return self.runColdEager(inputs, allocator, null);
         if (self.preparesInvocation()) {
             var permit: RunPermit = undefined;
             try self.admitInputsInto(inputs, allocator, null, &permit);
@@ -2057,11 +2113,20 @@ pub const Session = struct {
         else
             null;
         errdefer if (resource_lease) |*lease| lease.release();
-        const outputs = try @import("../execution/invocation_observation.zig").call(self.invocation_diagnostics, self.vtable.run, .{
-            self.ptr,
-            inputs,
-            allocator,
-        });
+        var preentry_declined = false;
+        const architecture = @import("../execution/architecture_session.zig");
+        const dispatch = if (self.canonicalMetalWorkspaceReceiver() and architecture.acceptsCanonicalHostAttempt(self))
+            @import("../execution/invocation_observation.zig").call(self.invocation_diagnostics, architecture.runCanonicalHostAttempt, .{ self, inputs, allocator, @as(?InferenceExecutionControl, null), @as(?*const @import("../execution/invocation_context.zig").Context, null), @as(?*@import("../execution/existing_workspace_receipt.zig").Owner, null), &preentry_declined })
+        else
+            @import("../execution/invocation_observation.zig").call(self.invocation_diagnostics, self.vtable.run, .{ self.ptr, inputs, allocator });
+        const outputs = dispatch catch |err| {
+            if (err == error.WorkspaceReceiptChangedBeforeExecution and preentry_declined) {
+                if (resource_lease) |*lease| lease.release();
+                resource_lease = null;
+                return self.runColdEager(inputs, allocator, null);
+            }
+            return err;
+        };
         errdefer deinitTensorSlice(outputs, allocator);
         return attachOutputAdmission(outputs, allocator, &resource_lease, self.resourcePin());
     }
@@ -2072,7 +2137,7 @@ pub const Session = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) ![]Tensor {
-        if (try self.needsEagerRecurrentFunding()) return self.runColdEager(inputs, allocator, control);
+        if (try self.needsColdEagerHost()) return self.runColdEager(inputs, allocator, control);
         if (self.preparesInvocation()) {
             var permit: RunPermit = undefined;
             try self.admitInputsInto(inputs, allocator, control, &permit);
@@ -2095,12 +2160,20 @@ pub const Session = struct {
             resource_lease = null;
             return err;
         };
-        const outputs = try @import("../execution/invocation_observation.zig").call(self.invocation_diagnostics, self.vtable.runWithControl, .{
-            self.ptr,
-            inputs,
-            allocator,
-            active,
-        });
+        var preentry_declined = false;
+        const architecture = @import("../execution/architecture_session.zig");
+        const dispatch = if (self.canonicalMetalWorkspaceReceiver() and architecture.acceptsCanonicalHostAttempt(self))
+            @import("../execution/invocation_observation.zig").call(self.invocation_diagnostics, architecture.runCanonicalHostAttempt, .{ self, inputs, allocator, @as(?InferenceExecutionControl, active), @as(?*const @import("../execution/invocation_context.zig").Context, null), @as(?*@import("../execution/existing_workspace_receipt.zig").Owner, null), &preentry_declined })
+        else
+            @import("../execution/invocation_observation.zig").call(self.invocation_diagnostics, self.vtable.runWithControl, .{ self.ptr, inputs, allocator, active });
+        const outputs = dispatch catch |err| {
+            if (err == error.WorkspaceReceiptChangedBeforeExecution and preentry_declined) {
+                if (resource_lease) |*lease| lease.release();
+                resource_lease = null;
+                return self.runColdEager(inputs, allocator, control);
+            }
+            return err;
+        };
         errdefer deinitTensorSlice(outputs, allocator);
         try active.check();
         return attachOutputAdmission(outputs, allocator, &resource_lease, self.resourcePin());
@@ -2229,11 +2302,17 @@ pub const Session = struct {
     /// This synchronous helper owns complete Session/policy snapshots in the
     /// permit and preparation. Borrowing only avoids intermediate aggregates.
     fn admitShapeRequestInto(self: *const Session, shapes: ShapeInputs, request: RunRequest, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, permit: *RunPermit) !void {
-        return self.admitShapeRequestIntoWithCleanup(shapes, request, allocator, control, permit, .{}, null);
+        return self.admitShapeRequestIntoWithCleanup(shapes, request, allocator, control, permit, .{}, null, null);
     }
 
-    fn admitShapeRequestIntoWithCleanup(self: *const Session, shapes: ShapeInputs, request: RunRequest, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, permit: *RunPermit, cleanup: @import("../execution/cleanup_context.zig").Context, ready_guard: ?*@import("../execution/retirement_sink.zig").Guard) !void {
+    fn admitShapeRequestIntoWithCleanup(self: *const Session, shapes: ShapeInputs, request: RunRequest, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, permit: *RunPermit, cleanup: @import("../execution/cleanup_context.zig").Context, ready_guard: ?*@import("../execution/retirement_sink.zig").Guard, task_output: ?RunPermit.HostOutputGeometry) !void {
         try shapes.validate();
+        if (task_output != null) {
+            const policy = self.run_admission orelse return error.UnmanagedHostOutput;
+            const model = self.model_lifetime orelse return error.MissingSourceModelLifetime;
+            const domain = model.admission_domain orelse return error.ForeignAdmissionDomain;
+            if (domain.controller() != policy.controller) return error.ForeignAdmissionDomain;
+        }
         var boundary = if (control) |active| try active.enterUninterruptible(self.interruption()) else null;
         defer if (boundary) |*scope| scope.deinit();
         permit.* = .{ .session = self.*, .lease = null };
@@ -2251,6 +2330,7 @@ pub const Session = struct {
             permit.prepared = null;
         }
         var physical_credit = memory.AdmissionAmounts{};
+        var output_allowance: ?RunPermit.HostOutputAllowance = null;
         const lease = if (self.run_admission) |admission| blk: {
             const plan = try admission.planRequest(request, self.outputInfo());
             var required = plan.required;
@@ -2268,6 +2348,10 @@ pub const Session = struct {
                 var full = try base.merge(prepared.requirement.physical);
                 full.host_scratch_bytes = try addBytes(full.host_scratch_bytes, plan.retained_host_credit);
                 full.backend_scratch_bytes = try addBytes(full.backend_scratch_bytes, plan.retained_backend_credit);
+                if (task_output) |output| {
+                    full.host_scratch_bytes = try addBytes(full.host_scratch_bytes, try output.freshBytes());
+                    try output.validateHeld(self.*, full);
+                }
                 if (!try full.fitsLimits(admission.limits)) return error.ResourceLimitExceeded;
                 const warm = prepared.requirement.warm_credit;
                 const physical = prepared.requirement.physical;
@@ -2277,6 +2361,12 @@ pub const Session = struct {
                 fresh.backend_scratch_bytes -= warm.backend_scratch_bytes;
                 physical_credit = .{ .host_scratch_bytes = fresh.host_scratch_bytes, .backend_scratch_bytes = fresh.backend_scratch_bytes };
                 required = try base.merge(fresh);
+            }
+            if (task_output) |output| {
+                const bytes = try output.freshBytes();
+                if (output.held == null) output_allowance = .{ .rows = output.rows, .width = output.width, .bytes = bytes, .protected_floor = required, .request = request, .allow_prepared = true, .physical_credit = physical_credit };
+                required.host_scratch_bytes = try addBytes(required.host_scratch_bytes, bytes);
+                try output.validateHeld(self.*, required);
             }
             break :blk admission.acquireAmounts(required) catch |err| retry: {
                 if (err != error.ResourceTemporarilyUnavailable) return err;
@@ -2297,6 +2387,7 @@ pub const Session = struct {
         permit.request = request;
         permit.lease = lease;
         permit.physical_credit = physical_credit;
+        permit.host_output_allowance = output_allowance;
         if (lease != null) if (self.model_lifetime) |lifetime| if (lifetime.resource_pin) |pin| {
             permit.resource_pin = pin.retain();
         };
@@ -2355,6 +2446,9 @@ pub const Session = struct {
     /// numerical/provider/model gate. Cleanup of evicted programs is completed
     /// before any supplier acquisition, and its epoch is never saved in a plan.
     pub fn admitShapeRequestBeforeExecution(self: Session, shapes: ShapeInputs, request: RunRequest, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !RunPermit {
+        return self.admitShapeRequestBeforeExecutionWithTaskOutput(shapes, request, allocator, control, null);
+    }
+    pub fn admitShapeRequestBeforeExecutionWithTaskOutput(self: Session, shapes: ShapeInputs, request: RunRequest, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, task_output: ?RunPermit.HostOutputGeometry) !RunPermit {
         if (self.model_lifetime) |lifetime| {
             var sink = try lifetime.retainRetirementSink();
             defer sink.release();
@@ -2363,9 +2457,10 @@ pub const Session = struct {
             var epoch = try guard.retainEpoch();
             defer epoch.release();
             var permit: RunPermit = undefined;
-            try self.admitShapeRequestIntoWithCleanup(shapes, request, allocator, control, &permit, .{ .boundary = &epoch }, &guard);
+            try self.admitShapeRequestIntoWithCleanup(shapes, request, allocator, control, &permit, .{ .boundary = &epoch }, &guard, task_output);
             return permit;
         }
+        if (task_output != null) return error.MissingSourceModelLifetime;
         return self.admitShapeRequest(shapes, request, allocator, control);
     }
     pub fn admitInputsBeforeExecution(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !RunPermit {
@@ -2445,6 +2540,70 @@ pub const Session = struct {
             .lease = if (self.run_admission) |admission| blk: {
                 break :blk try admission.acquireAmountsWithPressure(try admission.estimateRequest(request, self.outputInfo()), pressure);
             } else null,
+        });
+    }
+
+    /// The actual initial numerical request retains EVERY estimated class.
+    /// Its disjoint final-host bank is added to the SAME supplier acquisition,
+    /// then partitioned cold before any Stage/provider/Model owner is entered.
+    pub fn admitWithHostOutputWithPressure(self: Session, request: RunRequest, rows: usize, width: usize, pressure: *?memory.AdmissionPressure) !RunPermit {
+        return self.admitWithTaskHostOutputWithPressure(request, .{ .rows = rows, .width = width }, pressure);
+    }
+    pub fn admitWithTaskHostOutputWithPressure(self: Session, request: RunRequest, output: RunPermit.HostOutputGeometry, pressure: *?memory.AdmissionPressure) !RunPermit {
+        pressure.* = null;
+        const policy = self.run_admission orelse return error.UnmanagedHostOutput;
+        const model = self.model_lifetime orelse return error.MissingSourceModelLifetime;
+        const domain = model.admission_domain orelse return error.ForeignAdmissionDomain;
+        if (domain.controller() != policy.controller) return error.ForeignAdmissionDomain;
+        const floor = try policy.estimateRequest(request, self.outputInfo());
+        const output_bytes = try output.freshBytes();
+        var total = floor;
+        total.host_scratch_bytes = try addBytes(total.host_scratch_bytes, output_bytes);
+        try output.validateHeld(self, total);
+        var permit = self.retainPermit(.{
+            .session = self,
+            .request = request,
+            .lease = try policy.acquireAmountsWithPressure(total, pressure),
+        });
+        if (output.held == null) permit.host_output_allowance = .{ .rows = output.rows, .width = output.width, .bytes = output_bytes, .protected_floor = floor, .request = request };
+        return permit;
+    }
+
+    /// Cold additive physical admission for an actual externally selected
+    /// owner (for example a concrete native command-frame declaration). This
+    /// does NOT replace any original compatibility/private/opaque/static/IO
+    /// amount. Requirements add disjoint fresh-storage quota to the original
+    /// request peak, using the SAME one supplier acquisition/denial observer.
+    /// Consumers may partition only physical_credit, preserving the recorded
+    /// original floor even after a malformed/reduced permit is presented.
+    pub fn admitDeclaredStorageWithPressure(self: Session, request: RunRequest, requirements: []const @import("../execution/prepared_storage_admission.zig").Requirement, pressure: *?memory.AdmissionPressure) !RunPermit {
+        return self.admitDeclaredStorageWithHeldHostOutputWithPressure(request, requirements, null, pressure);
+    }
+    pub fn admitDeclaredStorageWithHeldHostOutputWithPressure(self: Session, request: RunRequest, requirements: []const @import("../execution/prepared_storage_admission.zig").Requirement, held: ?HostOutputProducer.HeldAdmission, pressure: *?memory.AdmissionPressure) !RunPermit {
+        pressure.* = null;
+        const admission = self.run_admission orelse return error.MissingRunAdmission;
+        // This additive handoff grants no authority to replace a floor or
+        // supply retained-root credit. Such replacement requires the existing
+        // actual complete-coverage protocol, not a naked byte declaration.
+        if (request.workspace_planned or request.retained_backend_workspace_bytes != 0)
+            return error.UnsupportedDeclaredStorageCredit;
+        const original = try admission.planRequest(request, self.outputInfo());
+        var physical = memory.AdmissionAmounts{};
+        for (requirements) |item| {
+            if (item.bytes == 0) return error.InvalidPhysicalStorageReservation;
+            if (item.backend == .native or item.class == .host_workspace)
+                physical.host_scratch_bytes = try addBytes(physical.host_scratch_bytes, item.bytes)
+            else
+                physical.backend_scratch_bytes = try addBytes(physical.backend_scratch_bytes, item.bytes);
+        }
+        const required = try original.required.merge(physical);
+        if (held) |bank| try bank.validateAdditional(self, required);
+        return self.retainPermit(.{
+            .session = self,
+            .request = request,
+            .lease = try admission.acquireAmountsWithPressure(required, pressure),
+            .physical_credit = physical,
+            .declared_storage_floor = original.required,
         });
     }
 
@@ -2585,6 +2744,20 @@ pub const Session = struct {
     pub fn admitHostPreprocess(self: Session, host_scratch_bytes: usize) !RunPermit {
         var pressure: ?memory.AdmissionPressure = null;
         return self.admitHostPreprocessWithPressure(host_scratch_bytes, &pressure);
+    }
+
+    /// One original whole-task host reservation, with a named final-output
+    /// bank ADDITIONAL to the unchanged metadata/raw-result handoff floor.
+    /// Caller consumes it cold before tokenization or any numerical owner.
+    pub fn admitHostPreprocessWithOutput(self: Session, host_floor_bytes: usize, rows: usize, width: usize) !RunPermit {
+        const output_bytes = try HostOutputProducer.requiredBytes(rows, width);
+        const policy = self.run_admission orelse return error.UnmanagedHostOutput;
+        const model = self.model_lifetime orelse return error.MissingSourceModelLifetime;
+        const domain = model.admission_domain orelse return error.ForeignAdmissionDomain;
+        if (domain.controller() != policy.controller) return error.ForeignAdmissionDomain;
+        var permit = try self.admitHostPreprocess(try addBytes(host_floor_bytes, output_bytes));
+        permit.host_output_allowance = .{ .rows = rows, .width = width, .bytes = output_bytes, .protected_floor = .{ .host_scratch_bytes = host_floor_bytes } };
+        return permit;
     }
 
     /// Host-only preflight reports its denial constraint without estimating a
@@ -3053,13 +3226,18 @@ pub const PreparedSource = struct {
     scheduling_model: ?*Session.ModelLifetime = null,
     phase: Phase = .empty,
     executed: bool = false,
+    preentry_declined: bool = false,
     synchronous_consumers: usize = 0,
     host_output_producer: ?HostOutputProducer = null,
+    numerical_lane: ?*@import("../execution_control.zig").ExecutionLane = null,
+    numerical_lane_interactive: bool = false,
+    numerical_lane_lease: ?@import("../execution_control.zig").ExecutionLane.Lease = null,
     host_remaining_charges: [2]?@import("../execution/resource_retirement.zig").PreparedCharge = .{ null, null },
     host_output_finish: ?*@import("../execution/retirement_finish_holder.zig").Holder = null,
 
     pub fn initBeforeExecutionInto(self: *PreparedSource, source: Session, fallback_scheduling: Session, fallback_gate: ?*std.atomic.Mutex, inputs: invocation.Inputs, declared: RunRequest, supplied_preprocess: ?*RunPermit, placement: Placement, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !void {
         if (self.phase != .empty) return error.SourceInvocationAlreadyInitialized;
+        try source.validateEagerHostServices(); // advertised ownership before any metadata callback/cast
         self.allocator = allocator;
         self.control = control;
         const scheduling = if (source.execution_gate != null) source else fallback_scheduling;
@@ -3071,7 +3249,7 @@ pub const PreparedSource = struct {
             self.scheduling_model = model.retain();
         };
         errdefer self.deinit();
-        self.cleanup = if (placement != .host or source.preparesInvocation()) try Owner.beginResident(source) else try Owner.beginAdmitted(source);
+        self.cleanup = if (placement != .host or source.preparesInvocation() or source.canonicalMetalWorkspaceReceiver()) try Owner.beginResident(source) else try Owner.beginAdmitted(source);
         try scheduling.selectReadyCohort(gate, control orelse .{}, &self.waiter);
         const envelope = if (supplied_preprocess) |supplied| original: {
             if (supplied.session.ptr != source.ptr or supplied.session.vtable != source.vtable or supplied.dispatch_cleanup_epoch != null or supplied.invocation_started or supplied.prepared != null or supplied.physical_storage != null) return error.InvalidSourcePreprocessingPermit;
@@ -3114,6 +3292,10 @@ pub const PreparedSource = struct {
             try self.permit.?.prepareResidentOutputRetirement();
         }
         try self.permit.?.preparePhysicalStorage(allocator);
+        self.permit.?.prepareExistingWorkspaceBeforeExecution(self.epoch(), control) catch |err| {
+            self.preentry_declined = self.permit.?.eager_preentry_declined;
+            return err;
+        };
         if (self.epoch()) |b| try self.permit.?.bindPhysicalCleanupEpoch(b);
         self.phase = .ready;
     }
@@ -3122,7 +3304,11 @@ pub const PreparedSource = struct {
     /// the caller's compact geometry and explicit output/workspace envelope;
     /// binding actual inputs selects an execution without reinterpreting it.
     pub fn initShapesBeforeExecutionInto(self: *PreparedSource, source: Session, fallback_scheduling: Session, fallback_gate: ?*std.atomic.Mutex, shapes: ShapeInputs, request: RunRequest, workspace: ?*@import("admitted_allocator.zig").AdmittedAllocator, placement: Placement, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) !void {
+        return self.initShapesBeforeExecutionWithTaskOutputInto(source, fallback_scheduling, fallback_gate, shapes, request, workspace, placement, allocator, control, null);
+    }
+    pub fn initShapesBeforeExecutionWithTaskOutputInto(self: *PreparedSource, source: Session, fallback_scheduling: Session, fallback_gate: ?*std.atomic.Mutex, shapes: ShapeInputs, request: RunRequest, workspace: ?*@import("admitted_allocator.zig").AdmittedAllocator, placement: Placement, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, task_output: ?RunPermit.HostOutputGeometry) !void {
         if (self.phase != .empty) return error.SourceInvocationAlreadyInitialized;
+        try source.validateEagerHostServices(); // advertised ownership before any metadata callback/cast
         self.allocator = allocator;
         self.control = control;
         const scheduling = if (source.execution_gate != null) source else fallback_scheduling;
@@ -3133,7 +3319,7 @@ pub const PreparedSource = struct {
             self.scheduling_model = model.retain();
         };
         errdefer self.deinit();
-        self.cleanup = if (placement != .host or source.preparesInvocation()) try Owner.beginResident(source) else try Owner.beginAdmitted(source);
+        self.cleanup = if (placement != .host or source.preparesInvocation() or source.canonicalMetalWorkspaceReceiver()) try Owner.beginResident(source) else try Owner.beginAdmitted(source);
         try scheduling.selectReadyCohort(source.execution_gate orelse fallback_gate, control orelse .{}, &self.waiter);
         // Both managed and ordinary raw sources bind current B only after
         // the true selected encoder output/workspace has been admitted. A
@@ -3147,10 +3333,20 @@ pub const PreparedSource = struct {
         if (workspace) |owner| {
             const actual = owner.session orelse return error.InvalidSourceWorkspace;
             if (actual.ptr != source.ptr or actual.vtable != source.vtable or source.preparesInvocation()) return error.InvalidSourceWorkspace;
-            self.shape_scope = try owner.admitRun(planned);
+            self.shape_scope = .{ .permit = .{ .session = source, .lease = null } };
+            try owner.admitRunWithTaskHostOutputInto(&self.shape_scope.?, planned, task_output);
         } else {
-            self.shape_scope = .{ .permit = try source.admitShapeRequestBeforeExecution(shapes, planned, allocator, control) };
+            self.shape_scope = .{ .permit = try source.admitShapeRequestBeforeExecutionWithTaskOutput(shapes, planned, allocator, control, task_output) };
         }
+    }
+
+    /// Move ONLY the exact named child bank to a synchronous whole-task
+    /// producer. The caller remains outside every execution lane and owns its
+    /// abort/finish after all original cohort sources have unlocked.
+    pub fn takeTaskHostOutputBeforeExecution(self: *PreparedSource) !HostOutputProducer {
+        if (self.phase != .preparing or self.executed or self.host_output_producer != null) return error.InvalidHostOutputProducerPhase;
+        const scope = if (self.shape_scope) |*value| value else return error.SourceInvocationNotPreparing;
+        return scope.prepareDeclaredTaskHostOutputBeforeExecution();
     }
 
     /// Exact final backing plus cold transient cleanup custody. This remains
@@ -3219,6 +3415,10 @@ pub const PreparedSource = struct {
         const selected = self.selectedPermit();
         if (placement == .resident_consumer) try selected.prepareResidentOutputRetirement();
         try selected.preparePhysicalStorage(self.allocator);
+        selected.prepareExistingWorkspaceBeforeExecution(self.epoch(), self.control) catch |err| {
+            self.preentry_declined = selected.eager_preentry_declined;
+            return err;
+        };
         if (self.epoch()) |b| try selected.bindPhysicalCleanupEpoch(b);
         self.phase = .ready;
     }
@@ -3228,6 +3428,21 @@ pub const PreparedSource = struct {
     fn selectedPermit(self: *PreparedSource) *RunPermit {
         if (self.permit) |*value| return value;
         return &self.shape_scope.?.permit;
+    }
+
+    /// Borrowed only for the SAME synchronous receiving invocation. The
+    /// caller binds its NEW actual backend operation and closes that loan
+    /// before export/Source teardown. Null still requires an actual no-tag
+    /// receiver check; absence is not proof of an outside scope.
+    /// Private canonical construction/dispatch recorded this, never a public
+    /// callback's error name. It survives failed-init cleanup for its caller.
+    pub fn canRetryBeforeExecution(self: *const PreparedSource) bool {
+        return self.preentry_declined;
+    }
+
+    pub fn existingWorkspaceReceipt(self: *PreparedSource) !?*@import("../execution/existing_workspace_receipt.zig").Owner {
+        if (self.phase != .executing) return error.SourceInvocationNotExecuting;
+        return self.selectedPermit().existing_workspace;
     }
 
     /// Borrow a single invocation dispatch. The task may select resident or
@@ -3312,9 +3527,23 @@ pub const PreparedSource = struct {
         return self.cleanup.epoch();
     }
 
+    /// Borrowed synchronous task lane. The SAME Source owns its actual Model
+    /// entry and every early host/resident release, so no task-owned lease can
+    /// remain held after runHost/releaseForConsumer yields the Model.
+    pub fn bindExecutionLaneBeforeExecution(self: *PreparedSource, lane: ?*@import("../execution_control.zig").ExecutionLane, interactive: bool) !void {
+        if (self.phase != .ready or self.executed or self.numerical_lane != null or self.numerical_lane_lease != null)
+            return error.SourceInvocationNotReady;
+        self.numerical_lane = lane;
+        self.numerical_lane_interactive = interactive;
+    }
     pub fn enter(self: *PreparedSource) !void {
         if (self.phase != .ready) return error.SourceInvocationNotReady;
-        try self.scheduling_session.?.acquireSelectedCohort(self.control orelse .{}, &self.waiter);
+        const scheduling = self.scheduling_session.?;
+        if (self.shape_scope) |*scope| try scope.beginNumerical();
+        errdefer if (self.shape_scope) |*scope| scope.endNumerical();
+        try scheduling.acquireSelectedCohort(self.control orelse .{}, &self.waiter);
+        errdefer scheduling.releaseSelectedCohortGate(&self.waiter);
+        if (self.numerical_lane) |lane| self.numerical_lane_lease = try lane.acquireWithPriority(self.control orelse .{}, self.numerical_lane_interactive);
         self.phase = .executing;
     }
 
@@ -3362,7 +3591,11 @@ pub const PreparedSource = struct {
     pub fn runHost(self: *PreparedSource, inputs: []const Tensor) ![]Tensor {
         if (self.phase != .executing or self.executed) return error.SourceInvocationAlreadyExecuted;
         self.executed = true;
-        var outputs = try self.selectedPermit().runWithControl(inputs, self.allocator, self.control);
+        self.preentry_declined = false;
+        var outputs = self.selectedPermit().runWithControl(inputs, self.allocator, self.control) catch |err| {
+            self.preentry_declined = self.selectedPermit().eager_preentry_declined;
+            return err;
+        };
         errdefer deinitTensorSlice(outputs, self.allocator);
         self.finishSourceNumerical();
         if (self.shape_scope) |scope| if (scope.owner != null) return outputs;
@@ -3371,13 +3604,21 @@ pub const PreparedSource = struct {
         return outputs;
     }
 
+    fn releaseNumericalLane(self: *PreparedSource) void {
+        if (self.numerical_lane_lease) |lease| lease.release();
+        self.numerical_lane_lease = null;
+        self.numerical_lane = null;
+    }
+
     fn finishSourceNumerical(self: *PreparedSource) void {
         const current = @import("../execution/cleanup_context.zig").Context{ .boundary = self.epoch() };
         if (self.permit) |*permit| permit.retireExecutionWithCleanup(current);
         if (self.shape_scope) |*scope| scope.permit.retireExecutionWithCleanup(current);
         const scheduling = self.scheduling_session orelse return;
+        self.releaseNumericalLane();
         scheduling.releaseSelectedCohortGate(&self.waiter);
         scheduling.leaveSelectedCohort(&self.waiter);
+        if (self.shape_scope) |*scope| scope.endNumerical();
         self.phase = .released;
     }
 
@@ -3427,10 +3668,12 @@ pub const PreparedSource = struct {
         const b = self.epoch();
         if (self.permit) |*permit| permit.retireExecutionWithCleanup(.{ .boundary = b });
         if (self.shape_scope) |*scope| scope.permit.retireExecutionWithCleanup(.{ .boundary = b });
+        self.releaseNumericalLane();
         if (self.scheduling_session) |scheduling| {
             scheduling.releaseSelectedCohortGate(&self.waiter);
             scheduling.leaveSelectedCohort(&self.waiter);
         }
+        if (self.shape_scope) |*scope| scope.endNumerical();
         self.phase = .closed;
         // All numerical/provider ownership has ended before external callbacks.
         if (consumer.boundary) |current| {
@@ -3474,13 +3717,42 @@ pub const PreparedSource = struct {
 };
 
 pub const RunPermit = struct {
+    pub const HostOutputGeometry = struct {
+        rows: usize,
+        width: usize,
+        held: ?HostOutputProducer.HeldAdmission = null,
+        pub fn freshBytes(self: @This()) !usize {
+            return if (self.held == null) try HostOutputProducer.requiredBytes(self.rows, self.width) else 0;
+        }
+        pub fn validateHeld(self: @This(), session: Session, additional: memory.AdmissionAmounts) !void {
+            if (self.held) |held| try held.validateAdditional(session, additional);
+        }
+    };
+    const HostOutputAllowance = struct {
+        rows: usize,
+        width: usize,
+        bytes: usize,
+        protected_floor: memory.AdmissionAmounts,
+        request: ?RunRequest = null,
+        allow_prepared: bool = false,
+        physical_credit: memory.AdmissionAmounts = .{},
+    };
+    // Only the typed initial admission constructors declare this disjoint bank.
+    // It cannot be reconstructed from fungible host scratch or numerical IO.
+    host_output_allowance: ?HostOutputAllowance = null,
     session: Session,
     resource_pin: ?Session.ModelLifetime.ResourcePin = null,
     prepared: ?invocation.PreparedInvocation = null,
     physical_credit: memory.AdmissionAmounts = .{},
+    /// Present only for additive cold declarations. Never reconstructed from
+    /// fungible scratch or reduced alongside an arbitrary later RunRequest.
+    declared_storage_floor: ?memory.AdmissionAmounts = null,
     physical_storage: ?*@import("../execution/prepared_storage_admission.zig").Prepared = null,
     physical_prepared: bool = false,
     temporary_recurrent: ?*@import("../execution/recurrent_state_admission.zig").Budget = null,
+    existing_workspace: ?*@import("../execution/existing_workspace_receipt.zig").Owner = null,
+    existing_workspace_prepared: bool = false,
+    eager_preentry_declined: bool = false,
     // Synchronous dispatch pin, even when the cold Set is empty/warm. Never
     // transferred to a returned output or used for later physical destruction.
     dispatch_cleanup_epoch: ?@import("../execution/retirement_sink.zig").Epoch = null,
@@ -3489,6 +3761,34 @@ pub const RunPermit = struct {
     lease: ?memory.AdmissionLease,
     request: ?RunRequest = null,
     execution_yielded: bool = false,
+
+    pub fn declaredHostOutputBytes(self: *const RunPermit) !usize {
+        return (self.host_output_allowance orelse return error.MissingHostOutputAllowance).bytes;
+    }
+    pub fn prepareDeclaredHostOutputOutsideExecution(self: *RunPermit) !HostOutputProducer {
+        const a = @import("antfly_platform").allocator.processAllocator(@import("antfly_platform").allocator.concurrentFallback());
+        return self.prepareDeclaredHostOutputUsing(a);
+    }
+    fn prepareDeclaredHostOutputUsing(self: *RunPermit, allocator: std.mem.Allocator) !HostOutputProducer {
+        const declaration = self.host_output_allowance orelse return error.MissingHostOutputAllowance;
+        if (self.invocation_started or self.execution_yielded or !std.meta.eql(self.request, declaration.request) or (self.prepared != null and !declaration.allow_prepared) or self.physical_storage != null or self.dispatch_cleanup_epoch != null or !std.meta.eql(self.physical_credit, declaration.physical_credit))
+            return error.InvalidHostOutputProducerPhase;
+        const lease = if (self.lease) |*value| value else return error.MissingHostOutputEscrow;
+        const policy = self.session.run_admission orelse return error.UnmanagedHostOutput;
+        const model = self.session.model_lifetime orelse return error.MissingSourceModelLifetime;
+        const domain = model.retainAdmissionDomain(policy.controller) orelse return error.ForeignAdmissionDomain;
+        defer domain.release();
+        var total = declaration.protected_floor;
+        total.host_scratch_bytes = try addBytes(total.host_scratch_bytes, declaration.bytes);
+        if (lease.controller != policy.controller or !std.meta.eql(lease.amounts, total) or declaration.bytes != try HostOutputProducer.requiredBytes(declaration.rows, declaration.width))
+            return error.HostOutputAllowanceChanged;
+        const producer = try HostOutputProducer.prepareWithAllocator(allocator, lease, &domain, declaration.rows, declaration.width);
+        // Partition commit is the last fallible operation. All original floor
+        // classes remain intact; only the declared final bank was consumed.
+        std.debug.assert(std.meta.eql(lease.amounts, declaration.protected_floor));
+        self.host_output_allowance = null;
+        return producer;
+    }
 
     fn retirePrepared(self: *RunPermit) void {
         self.retirePreparedWithCleanup(.{});
@@ -3505,6 +3805,11 @@ pub const RunPermit = struct {
         defer if (dispatch_epoch) |*held| held.release();
         if (dispatch_epoch != null and cleanup.boundary == null)
             @import("antfly_platform").inference_process_supervisor.restartWorker();
+        if (self.existing_workspace) |receipt| {
+            self.existing_workspace = null;
+            receipt.retireWithCleanup(cleanup) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        }
+        self.existing_workspace_prepared = false;
         if (self.temporary_recurrent) |budget| {
             self.temporary_recurrent = null; // consume before outside rollback callbacks
             if (budget.current != null or cleanup.boundary != null) {
@@ -3552,6 +3857,43 @@ pub const RunPermit = struct {
         self.physical_prepared = true;
     }
 
+    /// Source owns its actual resident B and real Model pin before calling.
+    /// This runs even for a zero/unadmitted lease, outside numerical owners.
+    pub fn prepareExistingWorkspaceBeforeExecution(self: *RunPermit, epoch: ?*const @import("../execution/retirement_sink.zig").Epoch, control: ?InferenceExecutionControl) !void {
+        if (self.existing_workspace_prepared) return;
+        try self.session.validateEagerHostServices();
+        if (!self.session.canonicalMetalWorkspaceReceiver()) return;
+        if (comptime @import("build_options").enable_metal) {
+            const current = epoch orelse return error.MissingWorkspaceCleanupEpoch;
+            const arch = @import("../execution/architecture_session.zig");
+            for (0..8) |_| {
+                if (control) |active| try active.check();
+                var census = (arch.snapshotMetalWorkspaceOutsideExecution(self.session, control) catch |err| {
+                    if (err == error.WorkspaceCensusCapacityChanged or err == error.QueueFull) continue;
+                    return err;
+                }) orelse {
+                    self.existing_workspace_prepared = true; // actual receiver rechecks no-tag before math
+                    return;
+                };
+                defer census.target.deinit(); // always outside, Source keeps actual Model
+                var owns_snapshot = true;
+                defer if (owns_snapshot) census.physical.deinitOutsideExecution();
+                const runtime = switch (census.target.target) {
+                    .metal => |target| target.runtime,
+                    else => return error.UnsupportedWorkspaceTarget,
+                };
+                const owner = @import("../execution/existing_workspace_receipt.zig").Owner.prepareTake(&census.physical, @intFromPtr(runtime), current) catch |err| {
+                    if (err == error.WorkspaceReceiptChangedBeforeExecution) self.eager_preentry_declined = true;
+                    return err;
+                };
+                owns_snapshot = false;
+                self.existing_workspace = owner;
+                self.existing_workspace_prepared = true;
+                return;
+            }
+            return error.ResourceTemporarilyUnavailable;
+        }
+    }
     fn prepareTemporaryRecurrentBeforeExecution(self: *RunPermit) !void {
         if (self.temporary_recurrent != null) return;
         const services = self.session.vtable.eager_host_services orelse return;
@@ -3580,18 +3922,32 @@ pub const RunPermit = struct {
         self.temporary_recurrent = budget;
     }
     fn eagerHostRun(self: *RunPermit, inputs: []const Tensor, allocator: std.mem.Allocator, control: ?InferenceExecutionControl) anyerror!?[]Tensor {
-        const budget = self.temporary_recurrent orelse {
+        const budget = self.temporary_recurrent;
+        const metal = self.session.canonicalMetalWorkspaceReceiver();
+        if (budget == null and !metal) {
             if (try self.session.needsEagerRecurrentFunding()) return error.UnpreparedRecurrentStateBudget;
             return null;
+        }
+        const services = self.session.vtable.eager_host_services orelse {
+            if (self.existing_workspace != null) return error.UnsupportedWorkspaceHostInterface;
+            return null; // custom unmanaged callback, no claimed receiving loan
         };
-        const services = self.session.vtable.eager_host_services orelse return error.UnsupportedRecurrentStateTarget;
         if (!services.accepts(self.session.vtable)) return error.UnsupportedRecurrentStateTarget;
+        if (metal and !self.existing_workspace_prepared) return null; // actual raw receiver proves no-tag or declines pre-math
         const epoch = if (self.dispatch_cleanup_epoch) |*value| value else return error.MissingCurrentCleanupEpoch;
-        const context = @import("../execution/invocation_context.zig").Context{ .cleanup = .{ .boundary = epoch }, .recurrent_state = budget };
+        const context = @import("../execution/invocation_context.zig").Context{
+            .cleanup = .{ .boundary = epoch },
+            .recurrent_state = budget,
+            .workspace_uses = if (self.existing_workspace) |owner| try owner.receiverUses() else null,
+        };
         if (control) |active| try active.check();
         var hard_cancellation = if (control) |active| try active.enterUninterruptible(self.session.interruption()) else null;
         defer if (hard_cancellation) |*value| value.deinit();
-        const outputs = try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, services.run, .{ self.session.ptr, inputs, allocator, control, &context });
+        const architecture = @import("../execution/architecture_session.zig");
+        const outputs = if (metal and architecture.acceptsCanonicalHostAttempt(self.session))
+            try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, architecture.runCanonicalHostAttempt, .{ self.session, inputs, allocator, control, &context, self.existing_workspace, &self.eager_preentry_declined })
+        else
+            try @import("../execution/invocation_observation.zig").call(self.session.invocation_diagnostics, services.run, .{ self.session.ptr, inputs, allocator, control, &context, self.existing_workspace });
         errdefer deinitTensorSlice(outputs, allocator);
         if (control) |active| try active.check();
         return outputs;
@@ -3867,6 +4223,7 @@ pub const RunPermit = struct {
         inputs: []const Tensor,
         allocator: std.mem.Allocator,
     ) ![]Tensor {
+        self.eager_preentry_declined = false;
         try self.session.validateEagerHostServices();
         try self.resolveGeometry(inputs);
         if (self.execution_yielded) return self.runWithControl(inputs, allocator, null);
@@ -3885,6 +4242,7 @@ pub const RunPermit = struct {
         allocator: std.mem.Allocator,
         control: ?InferenceExecutionControl,
     ) ![]Tensor {
+        self.eager_preentry_declined = false;
         try self.session.validateEagerHostServices();
         try self.resolveGeometry(inputs);
         if (self.execution_yielded) {
@@ -7696,4 +8054,524 @@ test "Native raw Source resolves unequal encoder output and workspace before cur
     try std.testing.expectEqual(@as(usize, 3), probe.calls);
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
     try std.testing.expect(scheduler.head == null and !probe.violation);
+}
+
+test "declared physical admission preserves full original opaque mandatory and IO floors at exact cap" {
+    const Probe = struct {
+        fn output(_: *anyopaque) []const TensorInfo {
+            return &.{};
+        }
+        const table: Session.VTable = blk: {
+            var value: Session.VTable = undefined;
+            value.outputInfo = output;
+            break :blk value;
+        };
+    };
+    var marker: u8 = 0;
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var session: Session = .{ .ptr = &marker, .vtable = &Probe.table, .run_admission = .{
+        .controller = &controller,
+        .backend_class = .gpu,
+        .static_workspace_bytes = 1024,
+        .static_workspace_kind = .mandatory,
+        .opaque_workspace_bytes = 128,
+        .limits = .{ .host_limit_bytes = 28, .backend_limit_bytes = 1200 },
+        .check_live_memory = false,
+    } };
+    const request: RunRequest = .{ .batch = 1, .sequence = 1, .input_bytes = 4, .output_bytes = 4, .workspace_bytes = 64 };
+    const declarations = [_]@import("../execution/prepared_storage_admission.zig").Requirement{
+        .{ .backend = .metal, .class = .activation, .bytes = 48 },
+        .{ .backend = .native, .class = .host_workspace, .bytes = 16 },
+    };
+    const original = try session.run_admission.?.planRequest(request, &.{});
+    try std.testing.expectEqual(@as(usize, 1152), original.required.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 12), original.required.host_scratch_bytes);
+    var pressure: ?memory.AdmissionPressure = null;
+    var permit = try session.admitDeclaredStorageWithPressure(request, &declarations, &pressure);
+    defer permit.deinit();
+    try std.testing.expect(pressure == null);
+    try std.testing.expectEqualDeep(original.required, permit.declared_storage_floor.?);
+    try std.testing.expectEqual(@as(usize, 1200), permit.lease.?.amounts.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 28), permit.lease.?.amounts.host_scratch_bytes);
+    // The same actual token partitions once, preserving every original floor.
+    var split = try permit.lease.?.preparePartition(std.testing.allocator, .{ .backend_scratch_bytes = 48 });
+    defer split.abort();
+    var child = split.commit();
+    defer child.release();
+    try std.testing.expectEqual(@as(usize, 1152), permit.lease.?.amounts.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 28), permit.lease.?.amounts.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 1200), controller.snapshot().backend_scratch_bytes);
+    child.release();
+    permit.deinit();
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    session.run_admission.?.limits.backend_limit_bytes = 1199;
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admitDeclaredStorageWithPressure(request, &declarations, &pressure));
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().backend_scratch_bytes);
+    session.run_admission.?.limits.backend_limit_bytes = 1152;
+    // Zero-fresh warm declarations still preserve the SAME original floor.
+    var warm = try session.admitDeclaredStorageWithPressure(request, &.{}, &pressure);
+    defer warm.deinit();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, warm.physical_credit);
+    try std.testing.expectEqual(@as(usize, 1152), warm.lease.?.amounts.backend_scratch_bytes);
+}
+
+test "host cold and raw entry never replay a public callback error named like canonical pre-entry decline" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn from(raw: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(raw));
+        }
+        fn run(raw: *anyopaque, _: []const Tensor, _: std.mem.Allocator) ![]Tensor {
+            from(raw).calls += 1;
+            return error.WorkspaceReceiptChangedBeforeExecution;
+        }
+        fn controlled(raw: *anyopaque, inputs: []const Tensor, a: std.mem.Allocator, _: InferenceExecutionControl) ![]Tensor {
+            return run(raw, inputs, a);
+        }
+        fn info(_: *anyopaque) []const TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) BackendType {
+            return .metal;
+        }
+        fn close(_: *anyopaque) void {}
+        fn accepts(table_value: *const Session.VTable) bool {
+            return table_value == &table;
+        }
+        fn layout(_: *anyopaque) !?@import("../execution/recurrent_state_admission.zig").Layout {
+            return null;
+        }
+        fn eager(raw: *anyopaque, inputs: []const Tensor, a: std.mem.Allocator, _: ?InferenceExecutionControl, _: *const @import("../execution/invocation_context.zig").Context, _: ?*@import("../execution/existing_workspace_receipt.zig").Owner) ![]Tensor {
+            return run(raw, inputs, a);
+        }
+        const services: EagerHostRunServices = .{ .accepts = accepts, .recurrent_layout = layout, .run = eager };
+        const table: Session.VTable = .{ .run = run, .runWithControl = controlled, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close, .eager_host_services = &services };
+    };
+    var probe: Probe = .{};
+    var gate: std.atomic.Mutex = .unlocked;
+    var scheduler: @import("../runtime/embedding_scheduler.zig").Scheduler = .{};
+    const session = Session{ .ptr = &probe, .vtable = &Probe.table, .execution_gate = &gate, .cohort_scheduler = &scheduler };
+    const control: InferenceExecutionControl = .{ .native_call_policy = .in_process };
+    // A successful public accepts(table) does not attest its execution body.
+    try std.testing.expect(Probe.services.accepts(session.vtable));
+    try std.testing.expect(!@import("../execution/architecture_session.zig").acceptsCanonicalHostAttempt(session));
+    try std.testing.expectError(error.WorkspaceReceiptChangedBeforeExecution, session.runColdEager(&.{}, std.testing.allocator, control));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    probe.calls = 0;
+    try std.testing.expectError(error.WorkspaceReceiptChangedBeforeExecution, session.run(&.{}, std.testing.allocator));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    probe.calls = 0;
+    try std.testing.expectError(error.WorkspaceReceiptChangedBeforeExecution, session.runWithControl(&.{}, std.testing.allocator, control));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try std.testing.expect(scheduler.head == null);
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+}
+
+fn declaredTaskHostOutputAllocationCase(allocator: std.mem.Allocator) !void {
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    const Noop = struct {
+        fn close(_: *anyopaque) void {}
+    };
+    var marker: u8 = 0;
+    var model: Session.ModelLifetime = .{ .owner = &marker, .destroy_fn = Noop.close, .admission_domain = domain.pin() };
+    var model_live = true;
+    defer if (model_live) model.release();
+    const floor: usize = 31;
+    const required = try HostOutputProducer.requiredBytes(3, 4);
+    const session = Session{ .ptr = &marker, .vtable = undefined, .model_lifetime = &model, .run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = floor + required, .combined_limit_bytes = floor + required }, .static_workspace_bytes = 9999, .check_live_memory = false } };
+    var permit = try session.admitHostPreprocessWithOutput(floor, 3, 4);
+    defer permit.deinit();
+    const before = domain.controller.snapshot();
+    var producer = permit.prepareDeclaredHostOutputUsing(allocator) catch |err| {
+        try std.testing.expectEqualDeep(before, domain.controller.snapshot());
+        try std.testing.expect(permit.host_output_allowance != null);
+        try std.testing.expectEqual(floor + required, permit.lease.?.amounts.host_scratch_bytes);
+        return err;
+    };
+    defer {
+        producer.abortWithCleanup(.{ .outside_execution = true }) catch @panic("task host abort failed");
+        producer.finishOutsideExecution();
+    }
+    try std.testing.expectEqualDeep(before, domain.controller.snapshot());
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = floor }, permit.lease.?.amounts);
+    try std.testing.expectError(error.MissingHostOutputAllowance, permit.prepareDeclaredHostOutputUsing(allocator));
+    // Actual sorted chunks write original row indices without an owner reorder
+    // list, a second reservation or any model/runtime pointer in final storage.
+    try producer.writeRow(2, &.{ 9, 10, 11, 12 });
+    try producer.writeRow(0, &.{ 1, 2, 3, 4 });
+    try producer.writeRow(1, &.{ 5, 6, 7, 8 });
+    var output = try producer.publish();
+    defer output.deinitOutsideExecution();
+    producer.finishOutsideExecution();
+    permit.deinit();
+    try std.testing.expectEqual(@as(usize, required), domain.controller.snapshot().host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 1), model.references.load(.acquire));
+    model.release(); // final vectors pin only independent Domain metadata
+    model_live = false;
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, output.values(0));
+    try std.testing.expectEqualSlices(f32, &.{ 9, 10, 11, 12 }, output.values(2));
+    output.deinitOutsideExecution();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "declared whole-task host output preserves original floor and ordered rows through every cold allocation failure" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, declaredTaskHostOutputAllocationCase, .{});
+}
+
+test "declared whole-task host output denies exact cap minus one and refuses forged floor before partition" {
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    const Noop = struct {
+        fn close(_: *anyopaque) void {}
+    };
+    var marker: u8 = 0;
+    var model: Session.ModelLifetime = .{ .owner = &marker, .destroy_fn = Noop.close, .admission_domain = domain.pin() };
+    defer model.release();
+    const required = try HostOutputProducer.requiredBytes(2, 3);
+    const floor: usize = 64;
+    var session = Session{ .ptr = &marker, .vtable = undefined, .model_lifetime = &model, .run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = floor + required - 1 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admitHostPreprocessWithOutput(floor, 2, 3));
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
+    session.run_admission.?.limits.host_limit_bytes += 1;
+    var permit = try session.admitHostPreprocessWithOutput(floor, 2, 3);
+    defer permit.deinit();
+    const before = domain.controller.snapshot();
+    // A caller cannot substitute another class/floor even with enough total
+    // bytes. This identity-only tamper is restored before ordinary cleanup.
+    const amounts = permit.lease.?.amounts;
+    permit.lease.?.amounts.backend_scratch_bytes = 1;
+    try std.testing.expectError(error.HostOutputAllowanceChanged, permit.prepareDeclaredHostOutputOutsideExecution());
+    permit.lease.?.amounts = amounts;
+    try std.testing.expectEqualDeep(before, domain.controller.snapshot());
+    permit.execution_yielded = true;
+    try std.testing.expectError(error.InvalidHostOutputProducerPhase, permit.prepareDeclaredHostOutputOutsideExecution());
+    permit.execution_yielded = false;
+    var producer = try permit.prepareDeclaredHostOutputOutsideExecution();
+    defer producer.finishOutsideExecution();
+    try producer.abortWithCleanup(.{ .outside_execution = true });
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = floor }, permit.lease.?.amounts);
+}
+
+const DeclaredStageOutputTestSession = struct {
+    fn run(_: *anyopaque, _: []const Tensor, _: std.mem.Allocator) anyerror![]Tensor {
+        return error.UnexpectedNumericalDispatch;
+    }
+    fn info(_: *anyopaque) []const TensorInfo {
+        return &.{};
+    }
+    fn backend(_: *anyopaque) BackendType {
+        return .cuda;
+    }
+    fn close(_: *anyopaque) void {}
+    const table: Session.VTable = .{ .run = run, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+};
+fn declaredStageHostOutputAllocationCase(allocator: std.mem.Allocator) !void {
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    var marker: u8 = 0;
+    var model: Session.ModelLifetime = .{ .owner = &marker, .destroy_fn = DeclaredStageOutputTestSession.close, .admission_domain = domain.pin() };
+    defer model.release();
+    const session: Session = .{ .ptr = &marker, .vtable = &DeclaredStageOutputTestSession.table, .model_lifetime = &model, .run_admission = .{ .controller = &domain.controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 4096, .opaque_workspace_bytes = 3072, .check_live_memory = false } };
+    // Real planner retains input/preprocessing, KV, opaque/static/private and
+    // output overlap. The final bank is additional even for planned stages.
+    const initial: RunRequest = .{ .batch = 2, .sequence = 16, .input_bytes = 128, .host_preprocess_bytes = 256, .workspace_bytes = 8192, .workspace_planned = true, .output_bytes = 64, .output_kv_bytes = 16 };
+    const original = try session.run_admission.?.estimateRequest(initial, session.outputInfo());
+    const bank = try HostOutputProducer.requiredBytes(2, 8);
+    var pressure: ?memory.AdmissionPressure = null;
+    var permit = try session.admitWithHostOutputWithPressure(initial, 2, 8, &pressure);
+    defer permit.deinit();
+    var union_amounts = original;
+    union_amounts.host_scratch_bytes += bank;
+    try std.testing.expectEqualDeep(union_amounts, permit.lease.?.amounts);
+    const snapshot = domain.controller.snapshot();
+    var producer = permit.prepareDeclaredHostOutputUsing(allocator) catch |err| {
+        try std.testing.expectEqualDeep(snapshot, domain.controller.snapshot());
+        try std.testing.expectEqualDeep(union_amounts, permit.lease.?.amounts);
+        try std.testing.expect(permit.host_output_allowance != null);
+        return err;
+    };
+    defer {
+        producer.abortWithCleanup(.{ .outside_execution = true }) catch @panic("stage producer abort failed");
+        producer.finishOutsideExecution();
+    }
+    try std.testing.expectEqualDeep(snapshot, domain.controller.snapshot());
+    try std.testing.expectEqualDeep(original, permit.lease.?.amounts);
+    // A smaller phase cannot refund the independently owned final bank.
+    const smaller: RunRequest = .{ .batch = 1, .sequence = 1, .workspace_bytes = 1024, .workspace_planned = true, .output_bytes = 32 };
+    try permit.retainForRun(smaller);
+    const phase = try session.run_admission.?.estimateRequest(smaller, session.outputInfo());
+    try std.testing.expectEqualDeep(phase, permit.lease.?.amounts);
+    var with_bank = phase;
+    with_bank.host_scratch_bytes += bank;
+    try std.testing.expectEqualDeep(with_bank, domain.controller.snapshot());
+    // A later independently funded supplement still receives the complete
+    // numerical deficit. It never borrows final-output host bytes.
+    var phase2 = smaller;
+    phase2.host_preprocess_bytes = 2048;
+    phase2.workspace_bytes = 16384;
+    const target = try session.run_admission.?.estimateRequest(phase2, session.outputInfo());
+    var extra = try session.admitSupplementPair(&permit, null, target);
+    defer extra.deinit();
+    try permit.retainForRunWithSupplement(&extra, phase2);
+    try std.testing.expectEqualDeep(target, try permit.lease.?.amounts.merge(if (extra.lease) |lease| lease.amounts else .{}));
+    try producer.writeRow(1, &.{ 9, 10, 11, 12, 13, 14, 15, 16 });
+    try producer.writeRow(0, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    var result = try producer.publish();
+    defer result.deinitOutsideExecution();
+    producer.finishOutsideExecution();
+    permit.deinit();
+    extra.deinit();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = bank }, domain.controller.snapshot());
+    try std.testing.expectEqualSlices(f32, &.{ 9, 10, 11, 12, 13, 14, 15, 16 }, result.values(1));
+}
+
+test "declared Stage host bank preserves planned request floors through all cold OOM retain and supplemented phases" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, declaredStageHostOutputAllocationCase, .{});
+}
+
+test "declared Stage host bank exact union cap and request identity refuse before partition" {
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    var marker: u8 = 0;
+    var model: Session.ModelLifetime = .{ .owner = &marker, .destroy_fn = DeclaredStageOutputTestSession.close, .admission_domain = domain.pin() };
+    defer model.release();
+    var session: Session = .{ .ptr = &marker, .vtable = &DeclaredStageOutputTestSession.table, .model_lifetime = &model, .run_admission = .{ .controller = &domain.controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 4096, .opaque_workspace_bytes = 2048, .check_live_memory = false } };
+    const request: RunRequest = .{ .input_bytes = 128, .host_preprocess_bytes = 512, .workspace_bytes = 8192, .output_bytes = 64, .output_kv_bytes = 16 };
+    const original = try session.run_admission.?.estimateRequest(request, session.outputInfo());
+    const bank = try HostOutputProducer.requiredBytes(1, 16);
+    session.run_admission.?.limits.host_limit_bytes = original.hostTotalBytes() + bank - 1;
+    var pressure: ?memory.AdmissionPressure = null;
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admitWithHostOutputWithPressure(request, 1, 16, &pressure));
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
+    session.run_admission.?.limits.host_limit_bytes += 1;
+    var permit = try session.admitWithHostOutputWithPressure(request, 1, 16, &pressure);
+    defer permit.deinit();
+    const before = domain.controller.snapshot();
+    permit.request.?.sequence += 1;
+    try std.testing.expectError(error.InvalidHostOutputProducerPhase, permit.prepareDeclaredHostOutputOutsideExecution());
+    permit.request = request;
+    inline for (@typeInfo(memory.AdmissionAmounts).@"struct".field_names) |name| {
+        const old = @field(permit.lease.?.amounts, name);
+        @field(permit.lease.?.amounts, name) += 1;
+        try std.testing.expectError(error.HostOutputAllowanceChanged, permit.prepareDeclaredHostOutputOutsideExecution());
+        @field(permit.lease.?.amounts, name) = old;
+    }
+    try std.testing.expectEqualDeep(before, domain.controller.snapshot());
+    var producer = try permit.prepareDeclaredHostOutputOutsideExecution();
+    defer producer.finishOutsideExecution();
+    try std.testing.expectEqualDeep(original, permit.lease.?.amounts);
+    try producer.abortWithCleanup(.{ .outside_execution = true });
+}
+
+fn firstSourceTaskHostBankCase(allocator: std.mem.Allocator) !void {
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    var producer: ?HostOutputProducer = null;
+    defer if (producer) |*value| {
+        value.abortWithCleanup(.{ .outside_execution = true }) catch @panic("task source abort");
+        value.finishOutsideExecution();
+    };
+    const Probe = struct {
+        calls: usize = 0,
+        fn run(raw: *anyopaque, _: []const Tensor, a: std.mem.Allocator) anyerror![]Tensor {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const result = try a.alloc(Tensor, 1);
+            errdefer a.free(result);
+            result[0] = try Tensor.initFloat32(a, "embedding", &.{ 1, 2 }, &.{ 0.6, 0.8 });
+            return result;
+        }
+        fn controlled(raw: *anyopaque, inputs: []const Tensor, callback_allocator: std.mem.Allocator, callback_control: InferenceExecutionControl) anyerror![]Tensor {
+            try callback_control.check();
+            return run(raw, inputs, callback_allocator);
+        }
+        fn input(_: *anyopaque) []const TensorInfo {
+            return &.{.{ .name = "input", .dtype = .f32, .shape = &.{ 1, 4 } }};
+        }
+        fn output(_: *anyopaque) []const TensorInfo {
+            return &.{.{ .name = "embedding", .dtype = .f32, .shape = &.{ 1, 2 } }};
+        }
+        fn backend(_: *anyopaque) BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        const table: Session.VTable = .{ .run = run, .runWithControl = controlled, .inputInfo = input, .outputInfo = output, .backend = backend, .close = close };
+    };
+    var probe: Probe = .{};
+    var model: Session.ModelLifetime = .{ .owner = &probe, .destroy_fn = Probe.close, .admission_domain = domain.pin() };
+    defer model.release();
+    var gate: std.atomic.Mutex = .unlocked;
+    var scheduler: @import("../runtime/embedding_scheduler.zig").Scheduler = .{};
+    const session: Session = .{ .ptr = &probe, .vtable = &Probe.table, .model_lifetime = &model, .execution_gate = &gate, .cohort_scheduler = &scheduler, .run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var admitted: @import("admitted_allocator.zig").AdmittedAllocator = .{ .backing = allocator, .session = session };
+    defer admitted.deinit();
+    // Existing tokenizer-owned allocations remain independently covered while
+    // the original run's explicit child bank is prepared and transferred.
+    const tokens = try admitted.allocator().alloc(u8, 64);
+    defer admitted.allocator().free(tokens);
+    const bank_bytes = try HostOutputProducer.requiredBytes(3, 2);
+    var source: PreparedSource = .{};
+    defer source.deinit();
+    const control: InferenceExecutionControl = .{ .native_call_policy = .in_process };
+    try source.initShapesBeforeExecutionWithTaskOutputInto(session, session, &gate, .{ .shapes = Probe.input(&probe) }, .{ .input_bytes = 16, .output_bytes = 8, .workspace_bytes = 8192 }, &admitted, .host, admitted.allocator(), control, .{ .rows = 3, .width = 2 });
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    const original = source.shape_scope.?.permit.host_output_allowance.?.protected_floor;
+    const prepaid = admitted.prepaid_host_bytes;
+    const before = domain.controller.snapshot();
+    producer = try source.takeTaskHostOutputBeforeExecution();
+    try std.testing.expectEqualDeep(before, domain.controller.snapshot());
+    try std.testing.expectEqualDeep(original, source.shape_scope.?.permit.lease.?.amounts);
+    try std.testing.expectEqual(prepaid - bank_bytes, admitted.prepaid_host_bytes);
+    try std.testing.expect(admitted.reserved_bytes + admitted.prepaid_host_bytes >= admitted.live_bytes + admitted.metadata_bytes);
+    try std.testing.expectError(error.MissingHostOutputAllowance, source.takeTaskHostOutputBeforeExecution());
+    try source.bindInputsBeforeExecution(.{ .host = &.{} }, .host);
+    var numerical_lane: @import("../execution_control.zig").ExecutionLane = .{};
+    try source.bindExecutionLaneBeforeExecution(&numerical_lane, false);
+    try source.enter();
+    try std.testing.expect(numerical_lane.owned);
+    try std.testing.expect(admitted.numerical_scope_active);
+    const result = source.runHost(&.{}) catch |err| {
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+        return err;
+    };
+    defer deinitTensorSlice(result, admitted.allocator());
+    try std.testing.expect(!numerical_lane.owned and source.numerical_lane_lease == null);
+    try std.testing.expect(!admitted.numerical_scope_active);
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    try producer.?.writeRow(2, result[0].asFloat32());
+    // Later actual sources are independent of the already-partitioned bank;
+    // its three global slots do not change this first source's batch/shape.
+    try producer.?.writeRow(0, &.{ 0.6, 0.8 });
+    try producer.?.writeRow(1, &.{ 0.8, 0.6 });
+    var owned = try producer.?.publish();
+    defer owned.deinitOutsideExecution();
+    try std.testing.expectEqualSlices(f32, &.{ 0.6, 0.8 }, owned.values(2));
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+}
+
+test "first original Source task host bank preserves prepaid allocator floor through metadata and source allocation OOM" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, firstSourceTaskHostBankCase, .{});
+}
+
+test "Source direct destruction releases owned numerical lane before Model and supplier callbacks" {
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const domain = try Domain.create();
+    defer domain.release();
+    var gate: std.atomic.Mutex = .unlocked;
+    var lane: @import("../execution_control.zig").ExecutionLane = .{};
+    const Probe = struct {
+        gate: *std.atomic.Mutex,
+        lane: *@import("../execution_control.zig").ExecutionLane,
+        violation: bool = false,
+        releases: usize = 0,
+        fn observe(self: *@This()) void {
+            if (self.gate.tryLock()) self.gate.unlock() else self.violation = true;
+            if (self.lane.owned) self.violation = true;
+        }
+        fn reserve(raw: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            return 1;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            self.releases += 1;
+        }
+        fn run(_: *anyopaque, _: []const Tensor, _: std.mem.Allocator) anyerror![]Tensor {
+            return error.UnexpectedNumericalDispatch;
+        }
+        fn info(_: *anyopaque) []const TensorInfo {
+            return &.{};
+        }
+        fn backend(_: *anyopaque) BackendType {
+            return .native;
+        }
+        fn close(_: *anyopaque) void {}
+        const table: Session.VTable = .{ .run = run, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
+    };
+    var probe: Probe = .{ .gate = &gate, .lane = &lane };
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    defer domain.controller.configureResourceBudget(null) catch @panic("live Source quota");
+    var model: Session.ModelLifetime = .{ .owner = &probe, .destroy_fn = Probe.close, .admission_domain = domain.pin() };
+    defer model.release();
+    var scheduler: @import("../runtime/embedding_scheduler.zig").Scheduler = .{};
+    const session: Session = .{ .ptr = &probe, .vtable = &Probe.table, .model_lifetime = &model, .execution_gate = &gate, .cohort_scheduler = &scheduler, .run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var source: PreparedSource = .{};
+    defer source.deinitOutsideExecution();
+    try source.initBeforeExecutionInto(session, session, &gate, .{ .host = &.{} }, .{ .workspace_bytes = 4096 }, null, .host, std.testing.allocator, .{ .native_call_policy = .in_process });
+    try source.bindExecutionLaneBeforeExecution(&lane, false);
+    try source.enter();
+    try std.testing.expect(lane.owned);
+    source.deinitOutsideExecution();
+    try std.testing.expect(!lane.owned and source.numerical_lane == null and source.numerical_lane_lease == null);
+    try std.testing.expect(gate.tryLock());
+    gate.unlock();
+    try std.testing.expect(!probe.violation);
+    try std.testing.expect(probe.releases > 0);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "later original Source exact held task bank is intrinsic demand not peer contention or fresh credit" {
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    var marker: u8 = 0;
+    var model: Session.ModelLifetime = .{ .owner = &marker, .destroy_fn = DeclaredStageOutputTestSession.close, .admission_domain = domain.pin() };
+    defer model.release();
+    var session: Session = .{ .ptr = &marker, .vtable = &DeclaredStageOutputTestSession.table, .model_lifetime = &model, .run_admission = .{ .controller = &domain.controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var pressure: ?memory.AdmissionPressure = null;
+    var first = try session.admitWithHostOutputWithPressure(.{ .host_preprocess_bytes = 16 }, 3, 8, &pressure);
+    defer first.deinit();
+    var producer = try first.prepareDeclaredHostOutputOutsideExecution();
+    defer {
+        producer.abortWithCleanup(.{ .outside_execution = true }) catch @panic("held task abort");
+        producer.finishOutsideExecution();
+    }
+    first.deinit();
+    const held = try producer.heldAdmission();
+    try std.testing.expectEqualDeep(held.amounts, domain.controller.snapshot());
+    const later: RunRequest = .{ .host_preprocess_bytes = 8192, .workspace_bytes = 128, .output_bytes = 64 };
+    const floor = try session.run_admission.?.estimateRequest(later, session.outputInfo());
+    const combined = try floor.merge(held.amounts);
+    const geometry: RunPermit.HostOutputGeometry = .{ .rows = 3, .width = 8, .held = held };
+    session.run_admission.?.limits.host_limit_bytes = combined.hostTotalBytes() - 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admitWithTaskHostOutputWithPressure(later, geometry, &pressure));
+    try std.testing.expectEqualDeep(held.amounts, domain.controller.snapshot());
+    session.run_admission.?.limits.host_limit_bytes += 1;
+    var exact = try session.admitWithTaskHostOutputWithPressure(later, geometry, &pressure);
+    try std.testing.expectEqualDeep(floor, exact.lease.?.amounts);
+    try std.testing.expect(exact.host_output_allowance == null);
+    try std.testing.expectEqualDeep(combined, domain.controller.snapshot());
+    exact.deinit();
+    var peer = try domain.controller.tryAcquire(.gpu, .{}, .{ .host_scratch_bytes = 1 }, false);
+    defer peer.release();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admitWithTaskHostOutputWithPressure(later, geometry, &pressure));
+    var foreign = held;
+    foreign.controller = @ptrFromInt(@alignOf(memory.AdmissionController));
+    try std.testing.expectError(error.ForeignAdmissionDomain, foreign.validateAdditional(session, floor));
+    peer.release();
+    try std.testing.expectEqualDeep(held.amounts, domain.controller.snapshot());
+    const declarations = [_]@import("../execution/prepared_storage_admission.zig").Requirement{.{ .backend = .metal, .class = .host_workspace, .bytes = 4096 }};
+    var declared = (try session.run_admission.?.planRequest(later, session.outputInfo())).required;
+    declared.host_scratch_bytes += declarations[0].bytes;
+    const whole_declared = try declared.merge(held.amounts);
+    session.run_admission.?.limits.host_limit_bytes = whole_declared.hostTotalBytes() - 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admitDeclaredStorageWithHeldHostOutputWithPressure(later, &declarations, held, &pressure));
+    session.run_admission.?.limits.host_limit_bytes += 1;
+    var selected = try session.admitDeclaredStorageWithHeldHostOutputWithPressure(later, &declarations, held, &pressure);
+    try std.testing.expectEqualDeep(declared, selected.lease.?.amounts);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 4096 }, selected.physical_credit);
+    selected.deinit();
+    peer = try domain.controller.tryAcquire(.gpu, .{}, .{ .host_scratch_bytes = 1 }, false);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admitDeclaredStorageWithHeldHostOutputWithPressure(later, &declarations, held, &pressure));
+    peer.release();
+    try std.testing.expectEqualDeep(held.amounts, domain.controller.snapshot());
 }

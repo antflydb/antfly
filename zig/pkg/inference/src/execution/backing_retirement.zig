@@ -28,7 +28,19 @@ pub const BackingOwner = struct {
     shrink_ready: bool = false,
     measured: bool = false,
     active_uses: usize = 0,
+    closing_uses: usize = 0,
+    registered_uses: ?*UseRegistration = null,
     shrinking: bool = false,
+
+    /// Embedded in an existing independently retained Fence, never in a
+    /// caller stack. Its Fence owns the Epoch pin and Backing active-use pin.
+    /// Only record identity/nonce live here; no additional Epoch authority.
+    pub const UseRegistration = struct {
+        next: ?*UseRegistration = null,
+        owner: ?*BackingOwner = null,
+        record: ?*const anyopaque = null,
+        nonce: u64 = 0,
+    };
 
     pub const Metadata = struct {
         context: *anyopaque,
@@ -46,7 +58,7 @@ pub const BackingOwner = struct {
     /// Cold construction/pre-admission cancellation only. The caller proves
     /// this owner has never materialized or published SDK/physical storage.
     pub fn discardUnpublished(self: *BackingOwner) void {
-        std.debug.assert(self.references.load(.acquire) == 1 and !self.measured and !self.physical_released and self.shrink_epoch == null and self.cleanup_epoch == null);
+        std.debug.assert(self.references.load(.acquire) == 1 and !self.measured and !self.physical_released and self.shrink_epoch == null and self.cleanup_epoch == null and self.registered_uses == null);
         self.dropMetadata();
     }
 
@@ -67,6 +79,11 @@ pub const BackingOwner = struct {
         const previous = self.references.fetchAdd(1, .monotonic);
         std.debug.assert(previous != 0 and previous != std.math.maxInt(usize));
         return .{ .context = self, .release = releaseMetadataPin };
+    }
+    /// Consume a pure pin transferred by the canonical SDK census. Caller
+    /// owns one exact retained pin and has left every provider/numerical gate.
+    pub fn releaseMetadataPinOutsideExecution(self: *BackingOwner) void {
+        self.dropMetadata();
     }
     fn releaseMetadataPin(raw: *anyopaque) void {
         const self: *BackingOwner = @ptrCast(@alignCast(raw));
@@ -92,6 +109,7 @@ pub const BackingOwner = struct {
         self.lock();
         defer self.mutex.unlock();
         if (self.physical_released) return error.BackingAlreadyRetired;
+        if (self.closing_uses != 0) return error.BackingClosing;
         if (self.shrinking) return error.ResourceTemporarilyUnavailable;
         try self.retainUseLocked();
     }
@@ -101,9 +119,41 @@ pub const BackingOwner = struct {
     pub fn beginInitialUseBeforePublication(self: *BackingOwner) !void {
         self.lock();
         defer self.mutex.unlock();
-        if (self.measured or self.physical_released or self.active_uses != 0 or self.shrinking)
+        if (self.measured or self.physical_released or self.active_uses != 0 or self.closing_uses != 0 or self.shrinking)
             return error.BackingAlreadyPublished;
         try self.retainUseLocked();
+    }
+    /// Permanent creator closure is retirement-only. It can join an already
+    /// running OUTSIDE padding callback, but grants no reuse/numerical loan.
+    /// Caller preflights all roots under actual exclusive provider custody.
+    pub fn preflightClosingUse(self: *BackingOwner) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.physical_released) return error.BackingAlreadyRetired;
+        if (self.closing_uses == std.math.maxInt(usize)) return error.BackingUseReferenceOverflow;
+        const references = self.references.load(.acquire);
+        if (references == 0 or references == std.math.maxInt(usize)) return error.BackingUseReferenceOverflow;
+    }
+    pub fn beginClosingUseBeforeRetirement(self: *BackingOwner) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (self.physical_released) return error.BackingAlreadyRetired;
+        if (self.closing_uses == std.math.maxInt(usize)) return error.BackingUseReferenceOverflow;
+        var references = self.references.load(.monotonic);
+        while (true) {
+            if (references == 0 or references == std.math.maxInt(usize)) return error.BackingUseReferenceOverflow;
+            references = self.references.cmpxchgWeak(references, references + 1, .monotonic, .monotonic) orelse break;
+        }
+        self.closing_uses += 1;
+    }
+    pub fn endClosingUseOutsideExecution(self: *BackingOwner) void {
+        self.lock();
+        std.debug.assert(self.closing_uses != 0);
+        self.closing_uses -= 1;
+        const shrink = self.takeShrinkLocked();
+        self.mutex.unlock();
+        if (shrink) self.runShrinkOutsideExecution();
+        self.dropMetadata();
     }
     fn retainUseLocked(self: *BackingOwner) !void {
         if (self.active_uses == std.math.maxInt(usize)) return error.BackingUseReferenceOverflow;
@@ -121,13 +171,60 @@ pub const BackingOwner = struct {
         self.lock();
         std.debug.assert(self.active_uses != 0);
         self.active_uses -= 1;
+        if (self.active_uses == 0) std.debug.assert(self.registered_uses == null);
         const shrink = self.takeShrinkLocked();
         self.mutex.unlock();
         if (shrink) self.runShrinkOutsideExecution();
         self.dropMetadata(); // this independently prepared use's pure pin
     }
+    /// Caller owns the exact unsealed B plus one independently bound use
+    /// cell. No callbacks/allocation; existing metadata mutex protects links.
+    pub fn registerUseEpoch(self: *BackingOwner, registration: *UseRegistration, epoch: *const sink.Epoch) !void {
+        if (try epoch.isSealed()) return error.SealedBackingUseEpoch;
+        const record = epoch.record orelse return error.InvalidBackingUseEpoch;
+        self.lock();
+        defer self.mutex.unlock();
+        if (registration.owner != null or registration.record != null or registration.nonce != 0 or registration.next != null)
+            return error.BackingUseAlreadyRegistered;
+        if (self.physical_released or self.active_uses == 0) return error.BackingAlreadyRetired;
+        if (self.closing_uses != 0) return error.BackingClosing;
+        registration.* = .{ .next = self.registered_uses, .owner = self, .record = @ptrCast(record), .nonce = epoch.nonce };
+        self.registered_uses = registration;
+    }
+    /// Unlink BEFORE ending its use pin or allowing warm cell reuse/free.
+    /// This method cannot invoke SDK, allocator or quota/lifetime callbacks.
+    pub fn unregisterUseEpoch(self: *BackingOwner, registration: *UseRegistration) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        if (registration.owner != self) return error.ForeignBackingUseRegistration;
+        var link = &self.registered_uses;
+        while (link.*) |entry| {
+            if (entry == registration) {
+                link.* = entry.next;
+                registration.* = .{};
+                return;
+            }
+            link = &entry.next;
+        }
+        return error.ForeignBackingUseRegistration;
+    }
+    /// Every supplied cleanup B must match an ACTUAL registered scope, even
+    /// for a nonfinal shared alias. Merely unsealed B or active-use count is
+    /// not proof. Epoch validation occurs before taking the metadata mutex.
+    pub fn hasUseEpoch(self: *const BackingOwner, epoch: *const sink.Epoch) bool {
+        if (epoch.isSealed() catch return false) return false;
+        const record = epoch.record orelse return false;
+        const mutable = @constCast(self);
+        mutable.lock();
+        defer mutable.mutex.unlock();
+        var cursor = self.registered_uses;
+        while (cursor) |entry| : (cursor = entry.next) {
+            if (entry.record == @as(*const anyopaque, @ptrCast(record)) and entry.nonce == epoch.nonce) return true;
+        }
+        return false;
+    }
     fn takeShrinkLocked(self: *BackingOwner) bool {
-        if (!self.shrink_ready or self.shrinking or self.active_uses != 0 or
+        if (!self.shrink_ready or self.shrinking or self.active_uses != 0 or self.closing_uses != 0 or
             (self.physical_released and !self.physical_finished)) return false;
         self.shrink_ready = false;
         self.shrinking = true;
@@ -139,6 +236,8 @@ pub const BackingOwner = struct {
         self.charge.shrinkStorageBytes(self.measured_bytes);
         const remaining = self.charge.storageBytes().?;
         self.lock();
+        // A retirement-only close may join while this callback is outside.
+        // It never granted numerical reuse of the changing admitted span.
         std.debug.assert(self.shrinking and self.active_uses == 0);
         self.admitted_bytes.store(remaining, .release);
         self.shrinking = false;

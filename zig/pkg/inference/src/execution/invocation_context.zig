@@ -6,5 +6,6 @@
 //! owning host Tensors, never this header or a resident compute tensor.
 pub const Context = struct {
     cleanup: @import("cleanup_context.zig").Context,
+    workspace_uses: ?*@import("../backends/metal_workspace_ownership.zig").ReceiverUses = null,
     recurrent_state: ?*@import("recurrent_state_admission.zig").Budget = null,
 };

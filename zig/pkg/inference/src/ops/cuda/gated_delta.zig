@@ -215,6 +215,15 @@ pub const Module = struct {
         self.* = .{};
     }
 
+    pub fn deinitWithCleanup(self: *Module, ctx: *context.CudaContext, current: @import("../../execution/cleanup_context.zig").Context) !void {
+        if (self.bf16_prefill) |*prefill| {
+            try prefill.deinitWithCleanup(ctx, current);
+            self.bf16_prefill = null;
+        }
+        try self.program.deinitChecked(ctx);
+        self.* = .{};
+    }
+
     pub fn init(self: *Module, ctx: *context.CudaContext) !void {
         try self.program.init(ctx);
     }

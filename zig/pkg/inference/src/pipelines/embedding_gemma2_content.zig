@@ -231,6 +231,15 @@ fn prepareImpl(cb: *const ComputeBackend, allocator: std.mem.Allocator, tok: Tok
         for (media.items) |*item| item.deinit(allocator);
         media.deinit(allocator);
     }
+    const CacheCustody = struct {
+        fn prepare(raw: *anyopaque, stage: *const ops.EmbeddingStageControl) anyerror!void {
+            const values: *std.ArrayListUnmanaged(Media) = @ptrCast(@alignCast(raw));
+            for (values.items) |*item| if (item.tensor) |*tensor| try stage.handoffCacheInput(tensor);
+        }
+    };
+    var cache_owner: ops.EmbeddingCacheInputs = .{ .ptr = &media, .prepare_fn = CacheCustody.prepare };
+    var cache_inputs = if (resident) if (cb.embedding_stage) |stage| try stage.cacheInputs(cb, &cache_owner) else ops.EmbeddingCacheScope{} else ops.EmbeddingCacheScope{};
+    defer cache_inputs.close();
     // Towers run first because their dynamic token counts define marker
     // expansion. Their owned outputs remain in content-part order here.
     for (parts, 0..) |part, part_index| {

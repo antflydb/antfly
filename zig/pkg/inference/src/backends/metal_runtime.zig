@@ -1379,7 +1379,7 @@ fn printRuntimeFinite(comptime label: []const u8, layer_index: usize, data: []co
     );
 }
 
-fn referenceQuantizedRuntimeLinearDebug() bool {
+pub fn referenceQuantizedRuntimeLinearDebug() bool {
     return getenvBool("TERMITE_METAL_REFERENCE_RUNTIME_QUANT_LINEAR");
 }
 
@@ -3424,16 +3424,17 @@ pub fn decoderRuntimeApplyHeadRmsNormRope(self: anytype, request: anytype) !?Met
 }
 
 pub fn decoderRuntimeApplyHeadRmsNormRopeBatched(self: anytype, request: anytype, heads_per_row: usize, position_period: usize) !?MetalTensor {
-    const runtime = self.raw_decode_runtime orelse return null;
-    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
-    if (request.total_heads == 0 or request.head_dim == 0 or request.rope_dim == 0 or heads_per_row == 0 or position_period == 0) return null;
-    if (request.position > std.math.maxInt(u32) or heads_per_row > std.math.maxInt(u32) or position_period > std.math.maxInt(u32)) return null;
-    if (!request.input.isDevice()) return null;
+    const destination = preparedDecoderOutput(request);
+    const runtime = self.raw_decode_runtime orelse return declinePreparedDecoderOutput(destination);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return declinePreparedDecoderOutput(destination);
+    if (request.total_heads == 0 or request.head_dim == 0 or request.rope_dim == 0 or heads_per_row == 0 or position_period == 0) return declinePreparedDecoderOutput(destination);
+    if (request.position > std.math.maxInt(u32) or heads_per_row > std.math.maxInt(u32) or position_period > std.math.maxInt(u32)) return declinePreparedDecoderOutput(destination);
+    if (!request.input.isDevice()) return declinePreparedDecoderOutput(destination);
     const total_values = request.input.elemCount();
-    if (total_values != request.total_heads * request.head_dim) return null;
+    if (total_values != request.total_heads * request.head_dim) return declinePreparedDecoderOutput(destination);
 
-    var output = try MetalTensor.deviceAllocate(runtime, total_values * @sizeOf(f32), .private, request.input.shape());
-    errdefer output.deinit();
+    var output = try decoderPreparedOutputBuffer(runtime, total_values * @sizeOf(f32), request.input.shape(), &.{request.input}, destination);
+    errdefer retirePreparedDecoderOutput(&output, destination);
     const rc = termite_metal_decode_runtime_apply_head_rms_rope_batched_device(
         runtime,
         request.input.deviceHandle(),
@@ -3453,6 +3454,7 @@ pub fn decoderRuntimeApplyHeadRmsNormRopeBatched(self: anytype, request: anytype
         output.deviceHandle(),
         output.deviceByteOffset(),
     );
+    if (rc != 0 and destination != null) return error.PreparedDecoderDispatchFailed;
     return finishDeviceOutput(&output, rc);
 }
 
@@ -3817,6 +3819,49 @@ fn applyAttentionF32DeviceBatched(comptime device_only: bool, self: anytype, req
 /// per-sequence kernel and dispatch geometry — numerically identical to the
 /// per-sequence path. Device tensors only; callers fall back to the legacy
 /// loop when this declines.
+extern fn antfly_metal_dense_prefill_attention_output(runtime: *RawMetalDecodeRuntime, bytes: usize) ?*anyopaque;
+
+/// Validate every live tensor without converting Host values or moving their
+/// original device-consumer upload. Device aliases use exact runtime/handle
+/// identity; Host aliases use the actual mapped output range when available.
+fn densePrefillAttentionInputsDisjoint(runtime: *RawMetalDecodeRuntime, handle: *anyopaque, output_bytes: usize, rows: usize, inputs: []const MetalTensor) bool {
+    const output_host = termite_metal_buffer_contents(handle);
+    for (inputs) |input| {
+        if (input.dtype != .f32 or input.ndim() != 2 or input.dim(0) <= 0 or input.dim(1) <= 0 or
+            @as(usize, @intCast(input.dim(0))) != rows) return false;
+        const count = std.math.mul(usize, rows, @as(usize, @intCast(input.dim(1)))) catch return false;
+        const required = std.math.mul(usize, count, @sizeOf(f32)) catch return false;
+        if (input.device) |device| {
+            if (device.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or input.deviceHandle() == handle or
+                device.byte_offset > device.ref.byte_len or device.byte_len > device.ref.byte_len - device.byte_offset or
+                required > device.byte_len or device.byte_offset % @sizeOf(f32) != 0) return false;
+        } else {
+            if (input.len < count) return false;
+            if (output_host) |mapped| {
+                const source_start = @intFromPtr(input.data);
+                const source_end = std.math.add(usize, source_start, required) catch return false;
+                const target_start = @intFromPtr(mapped);
+                const target_end = std.math.add(usize, target_start, output_bytes) catch return false;
+                if (source_start < target_end and target_start < source_end) return false;
+            }
+        }
+    }
+    return true;
+}
+
+/// Exact reserved-bank view, with an actual alias proof against EVERY value
+/// still live across attention, including a Host reference residual. No new
+/// storage, upload, SDK ownership inference or credit comes from this accessor.
+pub fn decoderRuntimeDensePrefillAttentionOutput(self: anytype, rows: usize, width: usize, inputs: []const MetalTensor) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return null;
+    if (rows == 0 or width == 0 or rows > std.math.maxInt(i32) or width > std.math.maxInt(i32) or inputs.len == 0) return null;
+    const elements = try std.math.mul(usize, rows, width);
+    const bytes = try std.math.mul(usize, elements, @sizeOf(f32));
+    const handle = antfly_metal_dense_prefill_attention_output(runtime, bytes) orelse return null;
+    if (!densePrefillAttentionInputsDisjoint(runtime, handle, bytes, rows, inputs)) return null;
+    return try MetalTensor.deviceBorrowedChecked(@ptrCast(runtime), handle, 0, bytes, &.{ @intCast(rows), @intCast(width) });
+}
+
 pub fn decoderRuntimeApplyBatchedAttentionF32DevicePreallocated(self: anytype, request: anytype) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -3840,8 +3885,21 @@ pub fn decoderRuntimeApplyBatchedAttentionF32DevicePreallocated(self: anytype, r
 
     const out_shape = [_]i32{ @intCast(total_rows), @intCast(q_width) };
     const output_byte_len = std.math.mul(usize, q_elem_count, @sizeOf(f32)) catch return null;
-    var output = try MetalTensor.deviceAllocate(runtime, output_byte_len, .private, &out_shape);
-    errdefer output.deinit();
+    const destination: ?MetalTensor = if (@hasField(@TypeOf(request), "output")) request.output else null;
+    const cleanup: @import("../execution/cleanup_context.zig").Context = if (@hasField(@TypeOf(request), "cleanup")) request.cleanup else .{ .outside_execution = true };
+    if (destination) |target| {
+        const device = target.device orelse return null;
+        const end = std.math.add(usize, device.byte_offset, output_byte_len) catch return null;
+        if (target.dtype != .f32 or target.isReadOnlyPhysical() or device.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or
+            !std.mem.eql(i32, target.shape(), &out_shape) or device.byte_len < output_byte_len or end > device.ref.byte_len) return null;
+        // Whole-handle separation is deliberately stronger than range overlap;
+        // no input may be overwritten before another sequence consumes it.
+        for ([_]MetalTensor{ request.q, request.k, request.v }) |input| {
+            if (input.deviceHandle() == target.deviceHandle()) return null;
+        }
+    }
+    var output = if (destination) |target| try target.retainedCopy() else try MetalTensor.deviceAllocate(runtime, output_byte_len, .private, &out_shape);
+    errdefer if (destination != null) output.deinitWithCleanup(cleanup) else output.deinit();
 
     const per_seq_q_bytes = request.q_len * q_width * @sizeOf(f32);
     const per_seq_kv_bytes = request.q_len * kv_width * @sizeOf(f32);
@@ -3871,7 +3929,7 @@ pub fn decoderRuntimeApplyBatchedAttentionF32DevicePreallocated(self: anytype, r
             output.deviceByteOffset() + b * per_seq_q_bytes,
         );
         if (rc != 0) {
-            output.deinit();
+            if (destination != null) output.deinitWithCleanup(cleanup) else output.deinit();
             return null;
         }
     }
@@ -4884,19 +4942,139 @@ pub fn decoderRuntimeApplyAddLayerNormInto(
     ) == 0;
 }
 
+/// An explicitly selected destination in the already-reserved dense plan.
+/// Borrowed synchronously; cleanup is always supplied by the actual caller.
+pub const PreparedDecoderPairOutputs = struct { first: PreparedDecoderOutput, second: PreparedDecoderOutput };
+pub const PreparedDecoderOutput = struct {
+    reference_host_phase: ?*const @import("metal_workspace_ownership.zig").Phase = null,
+    tensor: *MetalTensor,
+    current: @import("../execution/cleanup_context.zig").Context,
+};
+
+fn preparedDecoderOutput(request: anytype) ?PreparedDecoderOutput {
+    return if (@hasField(@TypeOf(request), "prepared_output")) request.prepared_output else null;
+}
+
+pub fn retirePreparedDecoderOutput(value: *MetalTensor, destination: ?PreparedDecoderOutput) void {
+    if (destination) |target| {
+        value.deinitWithCleanup(target.current);
+    } else value.deinit();
+}
+
+/// Validates exact mutable output extent and all live input handles before
+/// any encoder is called. Whole-handle separation also excludes hidden aliases.
+pub fn preparedDecoderOutputCompatible(runtime: *RawMetalDecodeRuntime, output: MetalTensor, bytes: usize, shape: []const i32, inputs: []const MetalTensor) bool {
+    if (output.isReadOnlyPhysical() or !output.isDevice() or output.dtype != .f32 or
+        !std.mem.eql(i32, output.shape(), shape)) return false;
+    const target = output.device orelse return false;
+    if (target.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or target.byte_len < bytes or
+        target.byte_offset > target.ref.byte_len or bytes > target.ref.byte_len - target.byte_offset) return false;
+    for (inputs) |input| {
+        const source = input.device orelse return false;
+        if (input.dtype != .f32 or source.ref.runtime != target.ref.runtime or source.ref.handle == target.ref.handle or
+            source.byte_offset > source.ref.byte_len or source.byte_len > source.ref.byte_len - source.byte_offset) return false;
+    }
+    return true;
+}
+
+fn declinePreparedDecoderOutput(destination: ?PreparedDecoderOutput) !?MetalTensor {
+    if (destination != null) return error.UnsupportedPreparedDecoderDispatch;
+    return null;
+}
+
+/// CPU fallback is an explicitly declared producer only for an actual bound
+/// reference Phase. Null-target raw compatibility keeps its original path.
+fn validatePreparedDecoderHostOutput(runtime: *RawMetalDecodeRuntime, rows: usize, width: usize, destination: ?PreparedDecoderOutput) !void {
+    const target = destination orelse return;
+    const phase = target.reference_host_phase orelse return error.UnsupportedPreparedDecoderReference;
+    try phase.validateReferenceHostUse(@ptrCast(runtime), target.current);
+    const shape = [_]i32{ std.math.cast(i32, rows) orelse return error.InvalidPreparedDecoderOutput, std.math.cast(i32, width) orelse return error.InvalidPreparedDecoderOutput };
+    const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32));
+    // Host math never writes this region, but its output geometry must still
+    // match the exact role admitted and selected before numerical entry.
+    if (!preparedDecoderOutputCompatible(runtime, target.tensor.*, bytes, &shape, &.{})) return error.InvalidPreparedDecoderOutput;
+}
+
+fn decoderPreparedOutputBuffer(runtime: *RawMetalDecodeRuntime, bytes: usize, shape: []const i32, inputs: []const MetalTensor, destination: ?PreparedDecoderOutput) !MetalTensor {
+    if (destination) |target| {
+        if (!preparedDecoderOutputCompatible(runtime, target.tensor.*, bytes, shape, inputs)) return error.InvalidPreparedDecoderOutput;
+        target.tensor.invalidateHostMirror();
+        return target.tensor.retainedCopy();
+    }
+    return MetalTensor.deviceAllocate(runtime, bytes, .private, shape);
+}
+
+pub const DensePrefillOutputRole = enum { projection, residual, norm, gate, up, activation, product, down, post_down, post_gate, post_attention, pre_attention };
+pub const DensePrefillOutputs = struct {
+    values: [12]MetalTensor = @splat(.empty),
+    handles: [12]*anyopaque = undefined,
+    widths: [12]usize = undefined,
+    rows: usize = 0,
+    runtime: *RawMetalDecodeRuntime = undefined,
+    pub fn target(self: *@This(), role: DensePrefillOutputRole, current: @import("../execution/cleanup_context.zig").Context) !PreparedDecoderOutput {
+        const index = @backingInt(role);
+        const value = &self.values[index];
+        // Materialize metadata only for an actually selected output. All
+        // fallible header allocation precedes SDK/root-reference acquisition.
+        if (value.device == null) value.* = try MetalTensor.deviceBorrowedChecked(@ptrCast(self.runtime), self.handles[index], 0, self.rows * self.widths[index] * @sizeOf(f32), &.{ @intCast(self.rows), @intCast(self.widths[index]) });
+        return .{ .tensor = value, .current = current };
+    }
+    pub fn deinit(self: *@This(), current: @import("../execution/cleanup_context.zig").Context) void {
+        for (&self.values) |*value| value.deinitWithCleanup(current);
+    }
+};
+extern fn antfly_metal_dense_prefill_output(runtime: *RawMetalDecodeRuntime, slot: usize, bytes: usize) ?*anyopaque;
+extern fn antfly_metal_dense_prefill_projection_output(runtime: *RawMetalDecodeRuntime, slot: usize, bytes: usize) ?*anyopaque;
+
+/// All views are acquired before block math, from the exact ready 93 banks.
+/// DIRECT6/7 alternate: the incoming residual is never overwritten by its
+/// attention projection. DIRECT8/9 survive all HOT17..25 fused FFN scratch.
+pub fn borrowDensePrefillOutputs(runtime: *RawMetalDecodeRuntime, residual: MetalTensor, rows: usize, hidden: usize, intermediate: usize, current: @import("../execution/cleanup_context.zig").Context) !DensePrefillOutputs {
+    if (rows <= 1 or hidden == 0 or intermediate == 0 or rows > std.math.maxInt(i32) or hidden > std.math.maxInt(i32) or intermediate > std.math.maxInt(i32)) return error.InvalidTensorShape;
+    var result = DensePrefillOutputs{ .runtime = runtime, .rows = rows };
+    errdefer result.deinit(current);
+    const hidden_bytes = try std.math.mul(usize, try std.math.mul(usize, rows, hidden), @sizeOf(f32));
+    const first = antfly_metal_dense_prefill_output(runtime, 6, hidden_bytes) orelse return error.PreparedWorkspaceOutputUnavailable;
+    const projection: usize = if (residual.deviceHandle() == first) 7 else 6;
+    const slots = [_]usize{ projection, 8, 9, 21, 22, 23, 24, 18, 19, 25, 17, 20 };
+    for (slots, 0..) |slot, index| {
+        const width = if ((index >= 3 and index <= 6) or index == 9) intermediate else hidden;
+        const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32));
+        const handle = antfly_metal_dense_prefill_output(runtime, slot, bytes) orelse return error.PreparedWorkspaceOutputUnavailable;
+        result.handles[index] = handle;
+        result.widths[index] = width;
+    }
+    return result;
+}
+
+pub fn borrowDensePrefillOutput(runtime: *RawMetalDecodeRuntime, slot: usize, rows: usize, width: usize) !MetalTensor {
+    if (rows == 0 or width == 0 or rows > std.math.maxInt(i32) or width > std.math.maxInt(i32)) return error.InvalidTensorShape;
+    const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32));
+    const handle = (if (slot < 6) antfly_metal_dense_prefill_projection_output(runtime, slot, bytes) else antfly_metal_dense_prefill_output(runtime, slot, bytes)) orelse return error.PreparedWorkspaceOutputUnavailable;
+    return MetalTensor.deviceBorrowedChecked(@ptrCast(runtime), handle, 0, bytes, &.{ @intCast(rows), @intCast(width) });
+}
+
+pub fn borrowDensePrefillNormOutput(runtime: *RawMetalDecodeRuntime, rows: usize, hidden: usize) !MetalTensor {
+    if (rows == 0 or hidden == 0 or rows > std.math.maxInt(i32) or hidden > std.math.maxInt(i32)) return error.InvalidTensorShape;
+    const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, hidden), @sizeOf(f32));
+    const handle = antfly_metal_dense_prefill_output(runtime, 17, bytes) orelse return error.PreparedWorkspaceOutputUnavailable;
+    return MetalTensor.deviceBorrowedChecked(@ptrCast(runtime), handle, 0, bytes, &.{ @intCast(rows), @intCast(hidden) });
+}
+
 pub fn decoderRuntimeApplyRmsNorm(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
-    const runtime = self.raw_decode_runtime orelse return null;
-    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
-    if (request.hidden_size == 0 or request.slot >= decoder_runtime_rms_norm_slot_capacity) return null;
-    if (!rawRmsNormSlotPrepared(self, request.slot)) return null;
-    if (self.raw_rms_norm_slot_hidden_sizes[request.slot] != request.hidden_size) return null;
-    if (request.input.ndim() != 2) return null;
+    const destination = preparedDecoderOutput(request);
+    const runtime = self.raw_decode_runtime orelse return declinePreparedDecoderOutput(destination);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return declinePreparedDecoderOutput(destination);
+    if (request.hidden_size == 0 or request.slot >= decoder_runtime_rms_norm_slot_capacity) return declinePreparedDecoderOutput(destination);
+    if (!rawRmsNormSlotPrepared(self, request.slot)) return declinePreparedDecoderOutput(destination);
+    if (self.raw_rms_norm_slot_hidden_sizes[request.slot] != request.hidden_size) return declinePreparedDecoderOutput(destination);
+    if (request.input.ndim() != 2) return declinePreparedDecoderOutput(destination);
     const rows = @as(usize, @intCast(request.input.dim(0)));
-    if (rows == 0) return null;
-    if (@as(usize, @intCast(request.input.dim(1))) != request.hidden_size) return null;
+    if (rows == 0) return declinePreparedDecoderOutput(destination);
+    if (@as(usize, @intCast(request.input.dim(1))) != request.hidden_size) return declinePreparedDecoderOutput(destination);
     if (rows != 1 and request.input.isDevice()) {
-        var output = try MetalTensor.deviceAllocate(runtime, rows * request.hidden_size * @sizeOf(f32), .private, request.input.shape());
-        errdefer output.deinit();
+        var output = try decoderPreparedOutputBuffer(runtime, rows * request.hidden_size * @sizeOf(f32), request.input.shape(), &.{request.input}, destination);
+        errdefer retirePreparedDecoderOutput(&output, destination);
         const device_rc = termite_metal_decode_runtime_apply_rms_norm_rows_device(
             runtime,
             request.slot,
@@ -4909,12 +5087,14 @@ pub fn decoderRuntimeApplyRmsNorm(self: anytype, request: anytype, stats: anytyp
             output.deviceByteOffset(),
         );
         if (device_rc == 0) return output;
+        if (destination != null) return error.PreparedDecoderDispatchFailed;
         output.deinit();
     }
     if (rows != 1) {
-        var weight_tensor = self.raw_rms_norm_slot_weights[request.slot] orelse return null;
+        try validatePreparedDecoderHostOutput(runtime, rows, request.hidden_size, destination);
+        var weight_tensor = self.raw_rms_norm_slot_weights[request.slot] orelse return declinePreparedDecoderOutput(destination);
         var input = try request.input.readView();
-        defer input.deinit();
+        defer retirePreparedDecoderOutput(&input, destination);
         const input_slice = try tensorHostSlice(&input);
         const input_host = try std.heap.c_allocator.alloc(f32, input_slice.len);
         errdefer std.heap.c_allocator.free(input_host);
@@ -4927,8 +5107,8 @@ pub fn decoderRuntimeApplyRmsNorm(self: anytype, request: anytype, stats: anytyp
     stats.decoder_runtime_apply_layer_norm_calls += 1;
     const shape = [_]i32{ 1, @intCast(request.hidden_size) };
     if (request.input.isDevice()) {
-        var output = try MetalTensor.deviceAllocate(runtime, request.hidden_size * @sizeOf(f32), .private, &shape);
-        errdefer output.deinit();
+        var output = try decoderPreparedOutputBuffer(runtime, request.hidden_size * @sizeOf(f32), &shape, &.{request.input}, destination);
+        errdefer retirePreparedDecoderOutput(&output, destination);
         const device_rc = termite_metal_decode_runtime_apply_rms_norm_device(
             runtime,
             request.slot,
@@ -4940,13 +5120,15 @@ pub fn decoderRuntimeApplyRmsNorm(self: anytype, request: anytype, stats: anytyp
             output.deviceByteOffset(),
         );
         if (device_rc == 0) return output;
+        if (destination != null) return error.PreparedDecoderDispatchFailed;
         output.deinit();
     }
 
+    try validatePreparedDecoderHostOutput(runtime, rows, request.hidden_size, destination);
     const output = try std.heap.c_allocator.alloc(f32, request.hidden_size);
     errdefer std.heap.c_allocator.free(output);
     var input = try request.input.readView();
-    defer input.deinit();
+    defer retirePreparedDecoderOutput(&input, destination);
     const rc = termite_metal_decode_runtime_apply_rms_norm(
         runtime,
         request.slot,
@@ -6189,19 +6371,20 @@ pub fn decoderRuntimeEncodeSampleResidentLogits(self: anytype, request: anytype)
 }
 
 pub fn decoderRuntimeApplyActivation(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
-    const runtime = self.raw_decode_runtime orelse return null;
-    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
-    if (request.dim == 0) return null;
-    if (request.input.ndim() != 2) return null;
+    const destination = preparedDecoderOutput(request);
+    const runtime = self.raw_decode_runtime orelse return declinePreparedDecoderOutput(destination);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return declinePreparedDecoderOutput(destination);
+    if (request.dim == 0) return declinePreparedDecoderOutput(destination);
+    if (request.input.ndim() != 2) return declinePreparedDecoderOutput(destination);
     const rows = @as(usize, @intCast(request.input.dim(0)));
-    if (rows == 0) return null;
-    if (@as(usize, @intCast(request.input.dim(1))) != request.dim) return null;
+    if (rows == 0) return declinePreparedDecoderOutput(destination);
+    if (@as(usize, @intCast(request.input.dim(1))) != request.dim) return declinePreparedDecoderOutput(destination);
 
     if (request.input.isDevice()) {
         const elem_count = rows * request.dim;
         const shape = [_]i32{ @intCast(rows), @intCast(request.dim) };
-        var output_device = try MetalTensor.deviceAllocate(runtime, elem_count * @sizeOf(f32), .private, &shape);
-        errdefer output_device.deinit();
+        var output_device = try decoderPreparedOutputBuffer(runtime, elem_count * @sizeOf(f32), &shape, &.{request.input}, destination);
+        errdefer retirePreparedDecoderOutput(&output_device, destination);
         stats.decoder_runtime_apply_activation_calls += 1;
         const device_rc = termite_metal_decode_runtime_apply_activation_device(
             runtime,
@@ -6214,12 +6397,14 @@ pub fn decoderRuntimeApplyActivation(self: anytype, request: anytype, stats: any
             output_device.deviceByteOffset(),
         );
         if (device_rc == 0) return output_device;
+        if (destination != null) return error.PreparedDecoderDispatchFailed;
         output_device.deinit();
     }
 
     if (rows != 1) {
+        try validatePreparedDecoderHostOutput(runtime, rows, request.dim, destination);
         var input = try request.input.readView();
-        defer input.deinit();
+        defer retirePreparedDecoderOutput(&input, destination);
         const input_slice = try tensorHostSlice(&input);
         const input_host = try std.heap.c_allocator.alloc(f32, input_slice.len);
         errdefer std.heap.c_allocator.free(input_host);
@@ -6229,11 +6414,12 @@ pub fn decoderRuntimeApplyActivation(self: anytype, request: anytype, stats: any
         return MetalTensor.owned(input_host, &shape);
     }
 
+    try validatePreparedDecoderHostOutput(runtime, rows, request.dim, destination);
     const output = try std.heap.c_allocator.alloc(f32, request.dim);
     errdefer std.heap.c_allocator.free(output);
     stats.decoder_runtime_apply_activation_calls += 1;
     var input = try request.input.readView();
-    defer input.deinit();
+    defer retirePreparedDecoderOutput(&input, destination);
     const rc = termite_metal_decode_runtime_apply_activation(
         runtime,
         @backingInt(request.kind),
@@ -9353,13 +9539,14 @@ pub fn decoderRuntimeConv2dF32Device(self: anytype, request: anytype) !?MetalTen
 }
 
 pub fn decoderRuntimeApplyAdd(self: anytype, request: anytype, stats: anytype) !?MetalTensor {
-    const runtime = self.raw_decode_runtime orelse return null;
-    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
-    if (request.dim == 0) return null;
+    const destination = preparedDecoderOutput(request);
+    const runtime = self.raw_decode_runtime orelse return declinePreparedDecoderOutput(destination);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return declinePreparedDecoderOutput(destination);
+    if (request.dim == 0) return declinePreparedDecoderOutput(destination);
     if (request.lhs.elemCount() == request.rhs.elemCount() and request.lhs.elemCount() > 0 and request.lhs.isDevice() and request.rhs.isDevice()) {
         const elem_count = request.lhs.elemCount();
-        var output_device = try MetalTensor.deviceAllocate(runtime, elem_count * @sizeOf(f32), .private, request.lhs.shape());
-        errdefer output_device.deinit();
+        var output_device = try decoderPreparedOutputBuffer(runtime, elem_count * @sizeOf(f32), request.lhs.shape(), &.{ request.lhs, request.rhs }, destination);
+        errdefer retirePreparedDecoderOutput(&output_device, destination);
         stats.decoder_runtime_apply_add_calls += 1;
         const device_rc = termite_metal_decode_runtime_apply_add_device(
             runtime,
@@ -9372,20 +9559,22 @@ pub fn decoderRuntimeApplyAdd(self: anytype, request: anytype, stats: anytype) !
             output_device.deviceByteOffset(),
         );
         if (device_rc == 0) return output_device;
+        if (destination != null) return error.PreparedDecoderDispatchFailed;
         output_device.deinit();
     }
-    if (request.lhs.ndim() != 2 or request.rhs.ndim() != 2) return null;
+    if (request.lhs.ndim() != 2 or request.rhs.ndim() != 2) return declinePreparedDecoderOutput(destination);
     const rows = @as(usize, @intCast(request.lhs.dim(0)));
-    if (rows == 0 or @as(usize, @intCast(request.rhs.dim(0))) != rows) return null;
-    if (@as(usize, @intCast(request.lhs.dim(1))) != request.dim or @as(usize, @intCast(request.rhs.dim(1))) != request.dim) return null;
+    if (rows == 0 or @as(usize, @intCast(request.rhs.dim(0))) != rows) return declinePreparedDecoderOutput(destination);
+    if (@as(usize, @intCast(request.lhs.dim(1))) != request.dim or @as(usize, @intCast(request.rhs.dim(1))) != request.dim) return declinePreparedDecoderOutput(destination);
     if (rows != 1) {
+        try validatePreparedDecoderHostOutput(runtime, rows, request.dim, destination);
         var lhs = try request.lhs.readView();
-        defer lhs.deinit();
+        defer retirePreparedDecoderOutput(&lhs, destination);
         var rhs = try request.rhs.readView();
-        defer rhs.deinit();
+        defer retirePreparedDecoderOutput(&rhs, destination);
         const lhs_slice = try tensorHostSlice(&lhs);
         const rhs_slice = try tensorHostSlice(&rhs);
-        if (lhs_slice.len == 0 or rhs_slice.len == 0) return null;
+        if (lhs_slice.len == 0 or rhs_slice.len == 0) return declinePreparedDecoderOutput(destination);
         const out = try std.heap.c_allocator.alloc(f32, request.lhs.elemCount());
         errdefer std.heap.c_allocator.free(out);
         for (out, 0..) |*o, i| {
@@ -9397,8 +9586,8 @@ pub fn decoderRuntimeApplyAdd(self: anytype, request: anytype, stats: anytype) !
 
     if (request.lhs.isDevice() and request.rhs.isDevice()) {
         const shape = [_]i32{ 1, @intCast(request.dim) };
-        var output_device = try MetalTensor.deviceAllocate(runtime, request.dim * @sizeOf(f32), .private, &shape);
-        errdefer output_device.deinit();
+        var output_device = try decoderPreparedOutputBuffer(runtime, request.dim * @sizeOf(f32), &shape, &.{ request.lhs, request.rhs }, destination);
+        errdefer retirePreparedDecoderOutput(&output_device, destination);
         stats.decoder_runtime_apply_add_calls += 1;
         const device_rc = termite_metal_decode_runtime_apply_add_device(
             runtime,
@@ -9411,16 +9600,18 @@ pub fn decoderRuntimeApplyAdd(self: anytype, request: anytype, stats: anytype) !
             output_device.deviceByteOffset(),
         );
         if (device_rc == 0) return output_device;
+        if (destination != null) return error.PreparedDecoderDispatchFailed;
         output_device.deinit();
     }
 
+    try validatePreparedDecoderHostOutput(runtime, rows, request.dim, destination);
     const output = try std.heap.c_allocator.alloc(f32, request.dim);
     errdefer std.heap.c_allocator.free(output);
     stats.decoder_runtime_apply_add_calls += 1;
     var lhs = try request.lhs.readView();
-    defer lhs.deinit();
+    defer retirePreparedDecoderOutput(&lhs, destination);
     var rhs = try request.rhs.readView();
-    defer rhs.deinit();
+    defer retirePreparedDecoderOutput(&rhs, destination);
     const rc = termite_metal_decode_runtime_apply_add(
         runtime,
         try tensorHostConstPtr(&lhs),
@@ -9754,13 +9945,23 @@ pub fn decoderRuntimeApplyMultiply(
     rhs: MetalTensor,
     dim: usize,
 ) !?MetalTensor {
-    const runtime = self.raw_decode_runtime orelse return null;
-    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
-    if (dim == 0) return null;
+    return decoderRuntimeApplyMultiplyWithOutput(self, lhs, rhs, dim, null);
+}
+
+pub fn decoderRuntimeApplyMultiplyWithOutput(
+    self: anytype,
+    lhs: MetalTensor,
+    rhs: MetalTensor,
+    dim: usize,
+    destination: ?PreparedDecoderOutput,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return declinePreparedDecoderOutput(destination);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return declinePreparedDecoderOutput(destination);
+    if (dim == 0) return declinePreparedDecoderOutput(destination);
     if (lhs.elemCount() == rhs.elemCount() and lhs.elemCount() > 0 and lhs.isDevice() and rhs.isDevice()) {
         const elem_count = lhs.elemCount();
-        var output_device = try MetalTensor.deviceAllocate(runtime, elem_count * @sizeOf(f32), .private, lhs.shape());
-        errdefer output_device.deinit();
+        var output_device = try decoderPreparedOutputBuffer(runtime, elem_count * @sizeOf(f32), lhs.shape(), &.{ lhs, rhs }, destination);
+        errdefer retirePreparedDecoderOutput(&output_device, destination);
         const device_rc = termite_metal_decode_runtime_apply_multiply_device(
             runtime,
             lhs.deviceHandle(),
@@ -9772,20 +9973,22 @@ pub fn decoderRuntimeApplyMultiply(
             output_device.deviceByteOffset(),
         );
         if (device_rc == 0) return output_device;
+        if (destination != null) return error.PreparedDecoderDispatchFailed;
         output_device.deinit();
     }
-    if (lhs.ndim() != 2 or rhs.ndim() != 2) return null;
+    if (lhs.ndim() != 2 or rhs.ndim() != 2) return declinePreparedDecoderOutput(destination);
     const rows = @as(usize, @intCast(lhs.dim(0)));
-    if (rows == 0 or @as(usize, @intCast(rhs.dim(0))) != rows) return null;
-    if (@as(usize, @intCast(lhs.dim(1))) != dim or @as(usize, @intCast(rhs.dim(1))) != dim) return null;
+    if (rows == 0 or @as(usize, @intCast(rhs.dim(0))) != rows) return declinePreparedDecoderOutput(destination);
+    if (@as(usize, @intCast(lhs.dim(1))) != dim or @as(usize, @intCast(rhs.dim(1))) != dim) return declinePreparedDecoderOutput(destination);
     if (rows != 1) {
+        try validatePreparedDecoderHostOutput(runtime, rows, dim, destination);
         var lhs_host = try lhs.readView();
-        defer lhs_host.deinit();
+        defer retirePreparedDecoderOutput(&lhs_host, destination);
         var rhs_host = try rhs.readView();
-        defer rhs_host.deinit();
+        defer retirePreparedDecoderOutput(&rhs_host, destination);
         const lhs_slice = try tensorHostSlice(&lhs_host);
         const rhs_slice = try tensorHostSlice(&rhs_host);
-        if (lhs_slice.len == 0 or rhs_slice.len == 0) return null;
+        if (lhs_slice.len == 0 or rhs_slice.len == 0) return declinePreparedDecoderOutput(destination);
         const out = try std.heap.c_allocator.alloc(f32, lhs.elemCount());
         errdefer std.heap.c_allocator.free(out);
         for (out, 0..) |*o, i| {
@@ -9797,8 +10000,8 @@ pub fn decoderRuntimeApplyMultiply(
 
     if (lhs.isDevice() and rhs.isDevice()) {
         const shape = [_]i32{ 1, @intCast(dim) };
-        var output_device = try MetalTensor.deviceAllocate(runtime, dim * @sizeOf(f32), .private, &shape);
-        errdefer output_device.deinit();
+        var output_device = try decoderPreparedOutputBuffer(runtime, dim * @sizeOf(f32), &shape, &.{ lhs, rhs }, destination);
+        errdefer retirePreparedDecoderOutput(&output_device, destination);
         const device_rc = termite_metal_decode_runtime_apply_multiply_device(
             runtime,
             lhs.deviceHandle(),
@@ -9810,15 +10013,17 @@ pub fn decoderRuntimeApplyMultiply(
             output_device.deviceByteOffset(),
         );
         if (device_rc == 0) return output_device;
+        if (destination != null) return error.PreparedDecoderDispatchFailed;
         output_device.deinit();
     }
 
+    try validatePreparedDecoderHostOutput(runtime, rows, dim, destination);
     const output = try std.heap.c_allocator.alloc(f32, dim);
     errdefer std.heap.c_allocator.free(output);
     var lhs_mut = try lhs.readView();
-    defer lhs_mut.deinit();
+    defer retirePreparedDecoderOutput(&lhs_mut, destination);
     var rhs_mut = try rhs.readView();
-    defer rhs_mut.deinit();
+    defer retirePreparedDecoderOutput(&rhs_mut, destination);
     const rc = termite_metal_decode_runtime_apply_multiply(
         runtime,
         try tensorHostConstPtr(&lhs_mut),
@@ -10555,13 +10760,22 @@ pub fn decoderRuntimeApplyScale(
     input: MetalTensor,
     scale: f32,
 ) !?MetalTensor {
-    const runtime = self.raw_decode_runtime orelse return null;
-    if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
-    if (!input.isDevice()) return null;
+    return decoderRuntimeApplyScaleWithOutput(self, input, scale, null);
+}
+
+pub fn decoderRuntimeApplyScaleWithOutput(
+    self: anytype,
+    input: MetalTensor,
+    scale: f32,
+    destination: ?PreparedDecoderOutput,
+) !?MetalTensor {
+    const runtime = self.raw_decode_runtime orelse return declinePreparedDecoderOutput(destination);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return declinePreparedDecoderOutput(destination);
+    if (!input.isDevice()) return declinePreparedDecoderOutput(destination);
     const dim = input.elemCount();
-    if (dim == 0) return null;
-    var output_device = try MetalTensor.deviceAllocate(runtime, dim * @sizeOf(f32), .private, input.shape());
-    errdefer output_device.deinit();
+    if (dim == 0) return declinePreparedDecoderOutput(destination);
+    var output_device = try decoderPreparedOutputBuffer(runtime, dim * @sizeOf(f32), input.shape(), &.{input}, destination);
+    errdefer retirePreparedDecoderOutput(&output_device, destination);
     const rc = termite_metal_decode_runtime_apply_scale_device(
         runtime,
         input.deviceHandle(),
@@ -10571,6 +10785,7 @@ pub fn decoderRuntimeApplyScale(
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
+    if (rc != 0 and destination != null) return error.PreparedDecoderDispatchFailed;
     return finishDeviceOutput(&output_device, rc);
 }
 
@@ -11136,6 +11351,7 @@ pub fn decoderRuntimeTryApplyLightOnPrefillFfn(self: anytype, request: anytype) 
 /// device/shapes by default and explicit experiments elsewhere. Capability or
 /// rollout misses retain the FFN fallback; admitted failures propagate to cleanup.
 pub fn decoderRuntimeTryApplyBf16GateUp(self: anytype, request: anytype) !?MetalTensor {
+    const destination = preparedDecoderOutput(request);
     if (getenvFlagEnabled("TERMITE_METAL_DISABLE_BF16_FUSED_GATE_UP") or
         getenvFlagEnabled("TERMITE_METAL_DISABLE_BF16_MM") or
         getenvFlagEnabled("TERMITE_METAL_DISABLE_BF16_TILED")) return null;
@@ -11149,8 +11365,8 @@ pub fn decoderRuntimeTryApplyBf16GateUp(self: anytype, request: anytype) !?Metal
     if (termite_metal_decode_runtime_should_apply_bf16_gate_up(runtime, request.gate_slot, request.up_slot, request.input.deviceByteOffset(), rows, request.in_dim, request.out_dim) == 0) return null;
     const elements = std.math.mul(usize, rows, request.out_dim) catch return null;
     const bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return null;
-    var output = try MetalTensor.deviceAllocate(runtime, bytes, .private, &.{ @intCast(rows), @intCast(request.out_dim) });
-    errdefer output.deinit();
+    var output = try decoderPreparedOutputBuffer(runtime, bytes, &.{ @intCast(rows), @intCast(request.out_dim) }, &.{request.input}, destination);
+    errdefer retirePreparedDecoderOutput(&output, destination);
     const rc = termite_metal_decode_runtime_apply_bf16_gate_up_device(runtime, request.gate_slot, request.up_slot, request.input.deviceHandle(), request.input.deviceByteOffset(), rows, request.in_dim, request.out_dim, output.deviceHandle(), output.deviceByteOffset());
     if (rc != 0) return error.MetalBf16GateUpFailed;
     return output;
@@ -11172,15 +11388,16 @@ pub fn decoderRuntimeApplyLinearRows(self: anytype, slot: usize, input: MetalTen
 }
 
 pub fn decoderRuntimeApplyLinear(self: anytype, request: anytype) !?MetalTensor {
-    if (request.in_dim == 0 or request.out_dim == 0) return null;
-    if (request.slot >= decoder_runtime_linear_slot_capacity) return null;
-    if (!rawLinearSlotPrepared(self, request.slot)) return null;
+    const destination = preparedDecoderOutput(request);
+    if (request.in_dim == 0 or request.out_dim == 0) return declinePreparedDecoderOutput(destination);
+    if (request.slot >= decoder_runtime_linear_slot_capacity) return declinePreparedDecoderOutput(destination);
+    if (!rawLinearSlotPrepared(self, request.slot)) return declinePreparedDecoderOutput(destination);
     if (self.raw_linear_slot_in_dims[request.slot] != request.in_dim or
-        self.raw_linear_slot_out_dims[request.slot] != request.out_dim) return null;
-    if (request.input.ndim() != 2) return null;
+        self.raw_linear_slot_out_dims[request.slot] != request.out_dim) return declinePreparedDecoderOutput(destination);
+    if (request.input.ndim() != 2) return declinePreparedDecoderOutput(destination);
     const rows = @as(usize, @intCast(request.input.dim(0)));
-    if (rows == 0) return null;
-    if (@as(usize, @intCast(request.input.dim(1))) != request.in_dim) return null;
+    if (rows == 0) return declinePreparedDecoderOutput(destination);
+    if (@as(usize, @intCast(request.input.dim(1))) != request.in_dim) return declinePreparedDecoderOutput(destination);
     // Generic/full-logit consumers (sampling, MTP verification, diagnostics)
     // retain checkpoint semantics. Only the planned greedy tail uses the
     // transformed slot plus exact candidate refinement.
@@ -11196,31 +11413,34 @@ pub fn decoderRuntimeApplyLinear(self: anytype, request: anytype) !?MetalTensor 
         use_transformed_lm_head,
     );
 
-    if (try tryApplyQuantizedRuntimeLinear(
+    if (try tryApplyQuantizedRuntimeLinearWithOutput(
         self,
         effective_slot,
         request.input,
         rows,
         request.in_dim,
         request.out_dim,
+        destination,
     )) |tensor| return tensor;
-    if (try tryApplyDenseRuntimeLinear(
+    if (try tryApplyDenseRuntimeLinearWithOutput(
         self,
         effective_slot,
         request.input,
         rows,
         request.in_dim,
         request.out_dim,
+        destination,
     )) |tensor| return tensor;
 
-    if (rows != 1) return null;
+    if (destination != null) return error.UnsupportedPreparedDecoderDispatch;
+    if (rows != 1) return declinePreparedDecoderOutput(destination);
     const output = try std.heap.c_allocator.alloc(f32, request.out_dim);
     errdefer std.heap.c_allocator.free(output);
     var input = try request.input.readView();
     defer input.deinit();
     if (!(try tryRawLinearHost(self, effective_slot, try tensorHostConstPtr(&input), request.in_dim, request.out_dim, output.ptr))) {
         std.heap.c_allocator.free(output);
-        return null;
+        return declinePreparedDecoderOutput(destination);
     }
 
     const out_shape = [_]i32{ 1, @intCast(request.out_dim) };
@@ -11228,17 +11448,29 @@ pub fn decoderRuntimeApplyLinear(self: anytype, request: anytype) !?MetalTensor 
 }
 
 pub fn decoderRuntimeApplyLinearPair(self: anytype, request: anytype) !?RuntimeLinearPairResult {
-    if (request.in_dim == 0 or request.out_dim == 0) return null;
-    if (request.slot_a >= decoder_runtime_linear_slot_capacity or request.slot_b >= decoder_runtime_linear_slot_capacity) return null;
-    if (!rawLinearSlotPrepared(self, request.slot_a) or !rawLinearSlotPrepared(self, request.slot_b)) return null;
+    const prepared_pair: ?PreparedDecoderPairOutputs = if (@hasField(@TypeOf(request), "prepared_outputs")) request.prepared_outputs else null;
+    if (request.in_dim == 0 or request.out_dim == 0) return if (prepared_pair != null) error.UnsupportedPreparedDecoderPair else null;
+    if (request.slot_a >= decoder_runtime_linear_slot_capacity or request.slot_b >= decoder_runtime_linear_slot_capacity) return if (prepared_pair != null) error.UnsupportedPreparedDecoderPair else null;
+    if (!rawLinearSlotPrepared(self, request.slot_a) or !rawLinearSlotPrepared(self, request.slot_b)) return if (prepared_pair != null) error.UnsupportedPreparedDecoderPair else null;
     if (self.raw_linear_slot_in_dims[request.slot_a] != request.in_dim or
         self.raw_linear_slot_out_dims[request.slot_a] != request.out_dim or
         self.raw_linear_slot_in_dims[request.slot_b] != request.in_dim or
-        self.raw_linear_slot_out_dims[request.slot_b] != request.out_dim) return null;
-    if (request.input.ndim() != 2) return null;
+        self.raw_linear_slot_out_dims[request.slot_b] != request.out_dim) return if (prepared_pair != null) error.UnsupportedPreparedDecoderPair else null;
+    if (request.input.ndim() != 2) return if (prepared_pair != null) error.UnsupportedPreparedDecoderPair else null;
     const rows = @as(usize, @intCast(request.input.dim(0)));
-    if (rows == 0) return null;
-    if (@as(usize, @intCast(request.input.dim(1))) != request.in_dim) return null;
+    if (rows == 0) return if (prepared_pair != null) error.UnsupportedPreparedDecoderPair else null;
+    if (@as(usize, @intCast(request.input.dim(1))) != request.in_dim) return if (prepared_pair != null) error.UnsupportedPreparedDecoderPair else null;
+
+    if (prepared_pair) |outputs| {
+        const runtime = self.raw_decode_runtime orelse return error.PreparedWorkspaceOutputUnavailable;
+        const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, request.out_dim), @sizeOf(f32));
+        const shape = [_]i32{ @intCast(rows), @intCast(request.out_dim) };
+        if (!preparedDecoderOutputCompatible(runtime, outputs.first.tensor.*, bytes, &shape, &.{ request.input, outputs.second.tensor.* }) or
+            !preparedDecoderOutputCompatible(runtime, outputs.second.tensor.*, bytes, &shape, &.{ request.input, outputs.first.tensor.* })) return error.InvalidPreparedDecoderOutput;
+        outputs.first.tensor.invalidateHostMirror();
+        outputs.second.tensor.invalidateHostMirror();
+        return (try tryApplyQuantizedRuntimeLinearPairWithOutputs(self, request.slot_a, request.slot_b, request.input, rows, request.in_dim, request.out_dim, .{ .first = outputs.first.tensor.*, .second = outputs.second.tensor.* }, outputs.first.current)) orelse error.UnsupportedPreparedDecoderPair;
+    }
 
     if (try tryApplyQuantizedRuntimeLinearPair(
         self,
@@ -25694,6 +25926,48 @@ pub fn ensureTl2RuntimeLinearSlotPrepared(self: anytype, slot: usize, in_dim: us
     return true;
 }
 
+/// Prepare the SAME lazy model-parameter SDK representations before a cold
+/// workspace selector reads published kinds. This encodes no model arithmetic
+/// and does not change lazy flags, layouts, quantization or fallback policy.
+/// The managed caller owns the real model/provider and its admitted cold scope.
+const TextPrefillCatalogSlot = struct { index: usize, input: usize, output: usize };
+fn textPrefillCatalogSlots(hidden: usize, heads: usize, layer: ops.DecoderRuntimeLayerSpec) ![7]TextPrefillCatalogSlot {
+    const q = try std.math.mul(usize, heads, layer.head_dim);
+    const kv = try std.math.mul(usize, layer.kv_heads, layer.head_dim);
+    return .{
+        .{ .index = layer.q_linear_slot, .input = hidden, .output = q },
+        .{ .index = layer.k_linear_slot, .input = hidden, .output = kv },
+        .{ .index = layer.v_linear_slot, .input = hidden, .output = kv },
+        .{ .index = layer.attention_linear_slot, .input = q, .output = hidden },
+        .{ .index = layer.gate_ffn_linear_slot, .input = hidden, .output = layer.intermediate_size },
+        .{ .index = layer.up_ffn_linear_slot, .input = hidden, .output = layer.intermediate_size },
+        .{ .index = layer.down_ffn_linear_slot, .input = layer.intermediate_size, .output = hidden },
+    };
+}
+
+pub fn prepareTextPrefillQuantizedCatalog(self: anytype, hidden: usize, heads: usize, layers: []const ops.DecoderRuntimeLayerSpec, control: ?@import("../execution_control.zig").InferenceExecutionControl) !bool {
+    if (control) |actual| try actual.check();
+    if (hidden == 0 or heads == 0 or layers.len == 0) return false;
+    // Validate the whole logical catalogue before the first SDK preparation.
+    for (layers) |layer| {
+        const slots = textPrefillCatalogSlots(hidden, heads, layer) catch return false;
+        for (slots) |slot| {
+            if (!rawLinearSlotPrepared(self, slot.index) or self.raw_linear_slot_in_dims[slot.index] != slot.input or self.raw_linear_slot_out_dims[slot.index] != slot.output) return false;
+            if (self.raw_linear_slot_kinds[slot.index] == .none) return false;
+            if (self.raw_linear_slot_kinds[slot.index] == .quantized and self.raw_linear_slot_quantized_storage[slot.index] == null) return false;
+        }
+    }
+    for (layers) |layer| {
+        if (control) |actual| try actual.check();
+        const slots = try textPrefillCatalogSlots(hidden, heads, layer);
+        for (slots) |slot| {
+            if (control) |actual| try actual.check();
+            if (self.raw_linear_slot_kinds[slot.index] == .quantized and ensureQuantizedRuntimeLinearSlotPrepared(self, slot.index, slot.input, slot.output) == .none) return false;
+        }
+    }
+    return true;
+}
+
 pub fn ensureQuantizedRuntimeLinearSlotPrepared(self: anytype, slot: usize, in_dim: usize, out_dim: usize) RawQuantizedRuntimeLinearKind {
     if (slot >= decoder_runtime_linear_slot_capacity) return .none;
     if (!rawLinearSlotPrepared(self, slot)) return .none;
@@ -26176,6 +26450,21 @@ fn tryApplyGeneratedQuantizedRuntimeLinearEpilogue(
     in_dim: usize,
     out_dim: usize,
 ) !?MetalTensor {
+    return tryApplyGeneratedQuantizedRuntimeLinearEpilogueWithOutput(self, runtime, kind, epilogue, slot, input, rows, in_dim, out_dim, null);
+}
+
+fn tryApplyGeneratedQuantizedRuntimeLinearEpilogueWithOutput(
+    self: anytype,
+    runtime: *RawMetalDecodeRuntime,
+    kind: RawQuantizedRuntimeLinearKind,
+    epilogue: GeneratedRuntimeLinearEpilogue,
+    slot: usize,
+    input: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    destination: ?PreparedDecoderOutput,
+) !?MetalTensor {
     if (!input.isDevice() or rows < 2 or rows > generated_runtime_fused_linear_max_rows) return null;
     if (self.raw_linear_slot_dense_biases[slot] == null) return null;
 
@@ -26191,8 +26480,8 @@ fn tryApplyGeneratedQuantizedRuntimeLinearEpilogue(
         else => return null,
     };
     const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
-    var output = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
-    errdefer output.deinit();
+    var output = try decoderPreparedOutputBuffer(runtime, rows * out_dim * @sizeOf(f32), &shape, &.{input}, destination);
+    errdefer retirePreparedDecoderOutput(&output, destination);
     const rc = apply(
         runtime,
         slot,
@@ -26207,6 +26496,7 @@ fn tryApplyGeneratedQuantizedRuntimeLinearEpilogue(
         output.deviceByteOffset(),
     );
     if (rc != 0) {
+        if (destination != null) return error.PreparedDecoderDispatchFailed;
         output.deinit();
         return null;
     }
@@ -26844,6 +27134,18 @@ pub fn tryApplyQuantizedRuntimeLinear(
     in_dim: usize,
     out_dim: usize,
 ) !?MetalTensor {
+    return tryApplyQuantizedRuntimeLinearWithOutput(self, slot, input, rows, in_dim, out_dim, null);
+}
+
+pub fn tryApplyQuantizedRuntimeLinearWithOutput(
+    self: anytype,
+    slot: usize,
+    input: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    destination: ?PreparedDecoderOutput,
+) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     const kind = ensureQuantizedRuntimeLinearSlotPrepared(self, slot, in_dim, out_dim);
@@ -26851,9 +27153,10 @@ pub fn tryApplyQuantizedRuntimeLinear(
 
     const force_reference = kind == .q4_0 and rows == 1 and !q4_0SingleRowDeviceLinearEnabled();
     if (referenceQuantizedRuntimeLinearDebug() or force_reference) {
+        try validatePreparedDecoderHostOutput(runtime, rows, out_dim, destination);
         const storage = self.raw_linear_slot_quantized_storage[slot] orelse return null;
         var input_host_tensor = try input.readView();
-        defer input_host_tensor.deinit();
+        defer retirePreparedDecoderOutput(&input_host_tensor, destination);
         const input_host = try tensorHostSlice(&input_host_tensor);
         const weight_host = try std.heap.c_allocator.alloc(f32, out_dim * in_dim);
         defer std.heap.c_allocator.free(weight_host);
@@ -26869,7 +27172,7 @@ pub fn tryApplyQuantizedRuntimeLinear(
         return MetalTensor.owned(output, &shape);
     }
 
-    if (try tryApplyGeneratedQuantizedRuntimeLinearEpilogue(
+    if (try tryApplyGeneratedQuantizedRuntimeLinearEpilogueWithOutput(
         self,
         runtime,
         kind,
@@ -26879,6 +27182,7 @@ pub fn tryApplyQuantizedRuntimeLinear(
         rows,
         in_dim,
         out_dim,
+        destination,
     )) |tensor| return tensor;
 
     const frame_active = hasActiveFrame(self.raw_decode_runtime);
@@ -26894,8 +27198,8 @@ pub fn tryApplyQuantizedRuntimeLinear(
             if (!descriptor.supported()) return null;
         }
         const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
-        var output_device = try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
-        errdefer output_device.deinit();
+        var output_device = try decoderPreparedOutputBuffer(runtime, rows * out_dim * @sizeOf(f32), &shape, &.{input}, destination);
+        errdefer retirePreparedDecoderOutput(&output_device, destination);
         const device_rc = termite_metal_decode_runtime_apply_quantized_linear_slot_device(
             runtime,
             @backingInt(format),
@@ -26910,14 +27214,17 @@ pub fn tryApplyQuantizedRuntimeLinear(
         );
         if (device_rc == 0) {
             if (!applyRuntimeLinearBiasDevice(self, slot, &output_device, rows, out_dim)) {
+                if (destination != null) return error.PreparedDecoderDispatchFailed;
                 output_device.deinit();
                 return null;
             }
             return output_device;
         }
+        if (destination != null) return error.PreparedDecoderDispatchFailed;
         output_device.deinit();
     }
 
+    if (destination != null) return error.UnsupportedPreparedDecoderDispatch;
     if (frame_active) return null;
 
     var input_mut = try input.readView();
@@ -27486,7 +27793,7 @@ pub fn tryApplyQuantizedRuntimeLinearPair(
     in_dim: usize,
     out_dim: usize,
 ) !?RuntimeLinearPairResult {
-    return tryApplyQuantizedRuntimeLinearPairWithOutputs(self, slot_a, slot_b, input, rows, in_dim, out_dim, null);
+    return tryApplyQuantizedRuntimeLinearPairWithOutputs(self, slot_a, slot_b, input, rows, in_dim, out_dim, null, .{ .outside_execution = true });
 }
 
 pub fn tryApplyQuantizedRuntimeLinearPairAssigned(
@@ -27504,7 +27811,7 @@ pub fn tryApplyQuantizedRuntimeLinearPairAssigned(
     if (slot_b >= decoder_runtime_linear_slot_capacity or !rawLinearSlotPrepared(self, slot_b) or self.raw_linear_slot_kinds[slot_b] != .quantized or self.raw_linear_slot_in_dims[slot_b] != in_dim or self.raw_linear_slot_out_dims[slot_b] != out_dim or self.raw_linear_slot_runtime_prepared_kind[slot_b] == .none) return false;
     if (!destinations.first.isDevice() or !denseRegionShape(destinations.first, rows, out_dim)) return false;
     if (!destinations.second.isDevice() or !denseRegionShape(destinations.second, rows, out_dim)) return false;
-    var result = (try tryApplyQuantizedRuntimeLinearPairWithOutputs(self, slot_a, slot_b, input, rows, in_dim, out_dim, destinations)) orelse return false;
+    var result = (try tryApplyQuantizedRuntimeLinearPairWithOutputs(self, slot_a, slot_b, input, rows, in_dim, out_dim, destinations, .{ .outside_execution = true })) orelse return false;
     defer result.first.deinit();
     defer result.second.deinit();
     return true;
@@ -27519,6 +27826,7 @@ fn tryApplyQuantizedRuntimeLinearPairWithOutputs(
     in_dim: usize,
     out_dim: usize,
     assigned: ?RuntimeLinearPairResult,
+    current: @import("../execution/cleanup_context.zig").Context,
 ) !?RuntimeLinearPairResult {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
@@ -27549,9 +27857,9 @@ fn tryApplyQuantizedRuntimeLinearPairWithOutputs(
     if (input.isDevice() and has_direct_pair) {
         const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
         var first_device = if (assigned) |destinations| try destinations.first.retainedCopy() else try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
-        errdefer first_device.deinit();
+        errdefer if (assigned != null) first_device.deinitWithCleanup(current) else first_device.deinit();
         var second_device = if (assigned) |destinations| try destinations.second.retainedCopy() else try MetalTensor.deviceAllocate(runtime, rows * out_dim * @sizeOf(f32), .private, &shape);
-        errdefer second_device.deinit();
+        errdefer if (assigned != null) second_device.deinitWithCleanup(current) else second_device.deinit();
         const device_rc = termite_metal_decode_runtime_apply_quantized_linear_pair_slots_device(
             runtime,
             @backingInt(pair_format),
@@ -27652,6 +27960,18 @@ pub fn tryApplyDenseRuntimeLinear(
     in_dim: usize,
     out_dim: usize,
 ) !?MetalTensor {
+    return tryApplyDenseRuntimeLinearWithOutput(self, slot, input, rows, in_dim, out_dim, null);
+}
+
+pub fn tryApplyDenseRuntimeLinearWithOutput(
+    self: anytype,
+    slot: usize,
+    input: MetalTensor,
+    rows: usize,
+    in_dim: usize,
+    out_dim: usize,
+    destination: ?PreparedDecoderOutput,
+) !?MetalTensor {
     const runtime = self.raw_decode_runtime orelse return null;
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (slot >= decoder_runtime_linear_slot_capacity or rows == 0 or in_dim == 0 or out_dim == 0) return null;
@@ -27670,9 +27990,10 @@ pub fn tryApplyDenseRuntimeLinear(
 
     if (input.isDevice()) {
         const shape = [_]i32{ @intCast(rows), @intCast(out_dim) };
-        var output_device = try MetalTensor.deviceAllocate(runtime, output_bytes, .private, &shape);
-        errdefer output_device.deinit();
+        var output_device = try decoderPreparedOutputBuffer(runtime, output_bytes, &shape, &.{input}, destination);
+        errdefer retirePreparedDecoderOutput(&output_device, destination);
         if (try decoderRuntimeApplyLinearDeviceInto(self, slot, input, rows, in_dim, out_dim, output_device)) return output_device;
+        if (destination != null) return error.PreparedDecoderDispatchFailed;
         if (trace_dense and rows == 1) std.debug.print("dense-linear-declined: slot={d} rows=1 in={d} out={d}\n", .{ slot, in_dim, out_dim });
         output_device.deinit();
     } else if (trace_dense and rows == 1) {
@@ -29474,6 +29795,26 @@ pub fn tryRawQuantizedGatedFfnResidualHost(
     };
 }
 
+pub fn retireDenseFfnValue(value: *MetalTensor, request: anytype) void {
+    if (@hasField(@TypeOf(request), "prepared_outputs")) if (request.prepared_outputs) |outputs| {
+        value.deinitWithCleanup(outputs.current);
+        return;
+    };
+    value.deinit();
+}
+pub fn ffnPreparedTarget(request: anytype, role: DensePrefillOutputRole) !?PreparedDecoderOutput {
+    if (@hasField(@TypeOf(request), "prepared_outputs")) if (request.prepared_outputs) |outputs| {
+        var result = try outputs.values.target(role, outputs.current);
+        result.reference_host_phase = outputs.reference_host_phase;
+        return result;
+    };
+    return null;
+}
+pub const PreparedDenseFfnOutputs = struct {
+    reference_host_phase: ?*const @import("metal_workspace_ownership.zig").Phase = null,
+    values: *DensePrefillOutputs,
+    current: @import("../execution/cleanup_context.zig").Context,
+};
 pub fn tryDeviceQuantizedGatedFfnResidual(
     self: anytype,
     request: anytype,
@@ -29544,6 +29885,7 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
 
         const pair_started_at = monotonicNowNs();
         const gate_up = (try decoderRuntimeApplyLinearPair(self, .{
+            .prepared_outputs = if (try ffnPreparedTarget(request, .gate)) |first| PreparedDecoderPairOutputs{ .first = first, .second = (try ffnPreparedTarget(request, .up)).? } else @as(?PreparedDecoderPairOutputs, null),
             .slot_a = request.gate_linear_slot,
             .slot_b = request.up_linear_slot,
             .input = input,
@@ -29552,27 +29894,29 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
         })) orelse return null;
         stats.quantized_gated_pair_nanos += @intCast(monotonicNowNs() - pair_started_at);
         var gate_first = gate_up.first;
-        defer gate_first.deinit();
+        defer retireDenseFfnValue(&gate_first, request);
         var gate_second = gate_up.second;
-        defer gate_second.deinit();
+        defer retireDenseFfnValue(&gate_second, request);
 
         const activation_started_at = monotonicNowNs();
         var activated = (try decoderRuntimeApplyActivation(self, .{
+            .prepared_output = try ffnPreparedTarget(request, .activation),
             .input = gate_first,
             .kind = request.activation,
             .dim = request.intermediate_size,
         }, stats)) orelse return null;
-        defer activated.deinit();
-        var gated = (try decoderRuntimeApplyMultiply(self, activated, gate_second, request.intermediate_size)) orelse return null;
-        defer gated.deinit();
+        defer retireDenseFfnValue(&activated, request);
+        var gated = (try decoderRuntimeApplyMultiplyWithOutput(self, activated, gate_second, request.intermediate_size, try ffnPreparedTarget(request, .product))) orelse return null;
+        defer retireDenseFfnValue(&gated, request);
         stats.quantized_gated_activation_multiply_nanos += @intCast(monotonicNowNs() - activation_started_at);
 
         var post_gate_normed: ?MetalTensor = null;
-        defer if (post_gate_normed) |*tensor| tensor.deinit();
+        defer if (post_gate_normed) |*tensor| retireDenseFfnValue(tensor, request);
         const down_input = if (request.post_gate_rms_norm_slot) |slot| blk: {
             const post_gate_norm_started_at = monotonicNowNs();
             post_gate_normed = (try decoderRuntimeApplyRmsNorm(self, .{
                 .slot = slot,
+                .prepared_output = try ffnPreparedTarget(request, .post_gate),
                 .input = gated,
                 .hidden_size = request.intermediate_size,
                 .eps = request.eps,
@@ -29582,23 +29926,25 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
         } else gated;
 
         const down_started_at = monotonicNowNs();
-        var projected = (try tryApplyQuantizedRuntimeLinear(
+        var projected = (try tryApplyQuantizedRuntimeLinearWithOutput(
             self,
             request.down_linear_slot,
             down_input,
             request.rows,
             request.intermediate_size,
             request.hidden_size,
+            try ffnPreparedTarget(request, .down),
         )) orelse return null;
-        defer projected.deinit();
+        defer retireDenseFfnValue(&projected, request);
         stats.quantized_gated_down_nanos += @intCast(monotonicNowNs() - down_started_at);
 
         var post_down_normed: ?MetalTensor = null;
-        defer if (post_down_normed) |*tensor| tensor.deinit();
+        defer if (post_down_normed) |*tensor| retireDenseFfnValue(tensor, request);
         const add_lhs = if (request.post_down_rms_norm_slot) |slot| blk: {
             const post_down_norm_started_at = monotonicNowNs();
             post_down_normed = (try decoderRuntimeApplyRmsNorm(self, .{
                 .slot = slot,
+                .prepared_output = try ffnPreparedTarget(request, .post_down),
                 .input = projected,
                 .hidden_size = request.hidden_size,
                 .eps = request.eps,
@@ -29609,6 +29955,7 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
 
         const add_started_at = monotonicNowNs();
         const result = (try decoderRuntimeApplyAdd(self, .{
+            .prepared_output = try ffnPreparedTarget(request, .projection),
             .lhs = add_lhs,
             .rhs = residual,
             .dim = request.hidden_size,
@@ -29621,7 +29968,9 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
         (if (@hasField(@TypeOf(request), "multirow_q4")) request.multirow_q4 else getenvFlagEnabled("ANTFLY_GEMMA4_METAL_BATCHED_Q4_FFN") or getenvFlagEnabled("ANTFLY_GEMMA4_METAL_OCR_MULTIROW"));
     const none = std.math.maxInt(usize);
     const out_shape = [_]i32{ @intCast(request.rows), @intCast(request.hidden_size) };
+    const prepared_output = try ffnPreparedTarget(request, .projection);
     var output = output: {
+        if (prepared_output != null) break :output try decoderPreparedOutputBuffer(runtime, request.rows * request.hidden_size * @sizeOf(f32), &out_shape, &.{ input, residual }, prepared_output);
         if (@hasField(@TypeOf(request), "output")) if (request.output) |target| {
             if (!target.isDevice() or target.dtype != .f32 or target.ndim() != 2 or
                 @as(usize, @intCast(target.dim(0))) != request.rows or @as(usize, @intCast(target.dim(1))) != request.hidden_size) return null;
@@ -29629,7 +29978,7 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
         };
         break :output MetalTensor.deviceAllocate(@ptrCast(runtime), request.rows * request.hidden_size * @sizeOf(f32), .private, &out_shape) catch return null;
     };
-    errdefer output.deinit();
+    errdefer retirePreparedDecoderOutput(&output, prepared_output);
 
     const input_handle = input.deviceHandle();
     const residual_handle = residual.deviceHandle();
@@ -29800,6 +30149,7 @@ pub fn tryDeviceQuantizedGatedFfnResidual(
         output.deviceByteOffset(),
     );
     if (rc != 0) {
+        if (prepared_output != null) return error.PreparedDecoderDispatchFailed;
         stats.quantized_gated_ffn_runtime_failures += 1;
     }
     return finishDeviceOutput(&output, rc);
@@ -32387,9 +32737,22 @@ pub fn decoderRuntimeApplyFfnNormInternal(
     hidden_size: usize,
     eps: f32,
 ) !?MetalTensor {
+    return decoderRuntimeApplyFfnNormInternalWithOutput(self, input, layer_norm_slot, rms_norm_slot, hidden_size, eps, null);
+}
+
+pub fn decoderRuntimeApplyFfnNormInternalWithOutput(
+    self: anytype,
+    input: MetalTensor,
+    layer_norm_slot: ?usize,
+    rms_norm_slot: ?usize,
+    hidden_size: usize,
+    eps: f32,
+    destination: ?PreparedDecoderOutput,
+) !?MetalTensor {
     var norm_stats = struct {
         decoder_runtime_apply_layer_norm_calls: u64 = 0,
     }{};
+    if (destination != null and layer_norm_slot != null) return error.UnsupportedPreparedDecoderNorm;
     if (layer_norm_slot) |slot| {
         return try decoderRuntimeApplyLayerNorm(self, .{
             .input = input,
@@ -32401,6 +32764,7 @@ pub fn decoderRuntimeApplyFfnNormInternal(
     if (rms_norm_slot) |slot| {
         return try decoderRuntimeApplyRmsNorm(self, .{
             .input = input,
+            .prepared_output = destination,
             .slot = slot,
             .hidden_size = hidden_size,
             .eps = eps,
@@ -49987,25 +50351,28 @@ test "embeddinggemma2 generated Metal weight snapshot rejects partial replacemen
         }
     };
     for ([_]c_int{ 0, 1 }) |shared_if_unified| {
-        var fill = Fill{ .value = 0.25 };
-        var bias: [8]f32 = @splat(0);
-        defer clearRawLinearSlot(&provider, 0);
-        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_generated_f32(runtime, 0, &bias, 8, 8, shared_if_unified, &fill, Fill.fill));
-        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prefer_linear_mps(runtime, 0));
-        provider.raw_linear_slot_kinds[0] = .dense;
-        provider.raw_linear_slots_prepared[0] = true;
-        provider.raw_linear_slot_in_dims[0] = 8;
-        provider.raw_linear_slot_out_dims[0] = 8;
-        const before = runtimeMemorySnapshot(runtime);
-        fill.value = 99;
-        fill.reject = true;
-        try std.testing.expect(termite_metal_decode_runtime_prepare_linear_generated_f32(runtime, 0, &bias, 8, 8, shared_if_unified, &fill, Fill.fill) != 0);
-        try std.testing.expectEqual(before.dense_linear_bytes, runtimeMemorySnapshot(runtime).dense_linear_bytes);
-        var input = try testDeviceTensorFromSlice(runtime, &@as([16]f32, @splat(1)), &.{ 2, 8 });
-        defer input.deinit();
-        var output = (try decoderRuntimeApplyLinearRows(&provider, 0, input, 0, 8)) orelse return error.UnexpectedNull;
-        defer output.deinit();
-        for (try output.toHostSlice()) |value| try std.testing.expectApproxEqAbs(@as(f32, 2), value, 1e-6);
+        for ([_]bool{ false, true }) |implicit_zero_bias| {
+            var fill = Fill{ .value = 0.25 };
+            var bias: [8]f32 = @splat(0);
+            const bias_pointer: [*c]const f32 = if (implicit_zero_bias) null else &bias;
+            defer clearRawLinearSlot(&provider, 0);
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prepare_linear_generated_f32(runtime, 0, bias_pointer, 8, 8, shared_if_unified, &fill, Fill.fill));
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_prefer_linear_mps(runtime, 0));
+            provider.raw_linear_slot_kinds[0] = .dense;
+            provider.raw_linear_slots_prepared[0] = true;
+            provider.raw_linear_slot_in_dims[0] = 8;
+            provider.raw_linear_slot_out_dims[0] = 8;
+            const before = runtimeMemorySnapshot(runtime);
+            fill.value = 99;
+            fill.reject = true;
+            try std.testing.expect(termite_metal_decode_runtime_prepare_linear_generated_f32(runtime, 0, bias_pointer, 8, 8, shared_if_unified, &fill, Fill.fill) != 0);
+            try std.testing.expectEqual(before.dense_linear_bytes, runtimeMemorySnapshot(runtime).dense_linear_bytes);
+            var input = try testDeviceTensorFromSlice(runtime, &@as([16]f32, @splat(1)), &.{ 2, 8 });
+            defer input.deinit();
+            var output = (try decoderRuntimeApplyLinearRows(&provider, 0, input, 0, 8)) orelse return error.UnexpectedNull;
+            defer output.deinit();
+            for (try output.toHostSlice()) |value| try std.testing.expectApproxEqAbs(@as(f32, 2), value, 1e-6);
+        }
     }
 }
 
@@ -51517,4 +51884,350 @@ test "Metal SDK custody cell delays actual displaced cache death and old A quota
     try std.testing.expectEqual(@as(usize, 0), domain.controller.snapshot().backend_scratch_bytes);
     try std.testing.expectEqual(antfly_metal_decoder_cache_custody_metadata_bytes(), domain.controller.snapshot().host_scratch_bytes);
     try std.testing.expect(!probe.under_gate);
+}
+
+test "metal dense causal attention reuses exact reserved output with original kernels and rejects live aliases" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+    const provider = .{ .raw_decode_runtime = @as(?*RawMetalDecodeRuntime, runtime) };
+    const batch = 2;
+    const sequence = 4;
+    const heads = 2;
+    const kv_heads = 1;
+    const dim = 32;
+    const rows = batch * sequence;
+    const width = heads * dim;
+    var q_values: [rows * width]f32 = undefined;
+    var k_values: [rows * kv_heads * dim]f32 = undefined;
+    var v_values: [rows * kv_heads * dim]f32 = undefined;
+    for (&q_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 19)) / 32 - 0.25;
+    for (&k_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 13)) / 16 - 0.5;
+    for (&v_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 29)) / 32 - 0.125;
+    var q = try testDeviceTensorFromSlice(runtime, &q_values, &.{ rows, width });
+    defer q.deinit();
+    var k = try testDeviceTensorFromSlice(runtime, &k_values, &.{ rows, kv_heads * dim });
+    defer k.deinit();
+    var v = try testDeviceTensorFromSlice(runtime, &v_values, &.{ rows, kv_heads * dim });
+    defer v.deinit();
+    try std.testing.expect(try decoderRuntimeDensePrefillAttentionOutput(&provider, rows, width, &.{ q, k, v }) == null);
+    var reference = (try decoderRuntimeApplyBatchedAttentionF32DevicePreallocated(&provider, .{
+        .q = q,
+        .k = k,
+        .v = v,
+        .batch = batch,
+        .q_len = sequence,
+        .num_heads = heads,
+        .num_kv_heads = kv_heads,
+        .head_dim = dim,
+    })) orelse return error.ExpectedActualDeviceAttention;
+    defer reference.deinit();
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_reserve_prefill_layer_scratch(runtime, rows, heads, kv_heads, dim, width, 128, 0));
+    const before = runtimeMemorySnapshot(runtime);
+    const before_owned = metal_tensor.memoryStatsSnapshot().device_owned_buffers_created;
+    const host_residual = MetalTensor.borrowed(&q_values, q_values.len, &.{ rows, width });
+    // The original reference residual stays Host until its LATER consumer.
+    // Q/K/V here are the original already-converted SDK tensors; permitting
+    // this CPU-only live value must not allocate/upload or change attention.
+    var destination = (try decoderRuntimeDensePrefillAttentionOutput(&provider, rows, width, &.{ q, k, v, reference, host_residual })) orelse return error.ExpectedExactReservedAttentionOutput;
+    defer destination.deinit();
+    try std.testing.expectEqual(@as(usize, rows * width * 4), destination.device.?.byte_len);
+    try std.testing.expect(destination.deviceHandle() != reference.deviceHandle());
+    var actual = (try decoderRuntimeApplyBatchedAttentionF32DevicePreallocated(&provider, .{
+        .q = q,
+        .k = k,
+        .v = v,
+        .batch = batch,
+        .q_len = sequence,
+        .num_heads = heads,
+        .num_kv_heads = kv_heads,
+        .head_dim = dim,
+        .output = @as(?MetalTensor, destination),
+        .cleanup = @import("../execution/cleanup_context.zig").Context{ .outside_execution = true },
+    })) orelse return error.ExpectedActualReservedAttention;
+    defer actual.deinit();
+    try std.testing.expect(actual.deviceHandle() == destination.deviceHandle());
+    try std.testing.expectEqual(before_owned, metal_tensor.memoryStatsSnapshot().device_owned_buffers_created);
+    try std.testing.expectEqual(before.graph_plan_allocations, runtimeMemorySnapshot(runtime).graph_plan_allocations);
+    const before_alias = runtimeMemorySnapshot(runtime).compute_encoder_count;
+    const short_host = MetalTensor.borrowed(q_values[0..1].ptr, 1, &.{ rows, width });
+    try std.testing.expect(try decoderRuntimeDensePrefillAttentionOutput(&provider, rows, width, &.{ q, k, v, short_host }) == null);
+    const wrong_rows = MetalTensor.borrowed(&q_values, q_values.len, &.{ rows + 1, width });
+    try std.testing.expect(try decoderRuntimeDensePrefillAttentionOutput(&provider, rows, width, &.{ q, k, v, wrong_rows }) == null);
+    // Device allocation leaves `.data` as a placeholder until explicit host
+    // materialization. Borrow the ACTUAL Shared SDK contents, without adding
+    // a flush/download or depending on an unpopulated MetalTensor mirror.
+    var shared = try MetalTensor.deviceAllocate(runtime, 2 * rows * width * @sizeOf(f32), .shared, &.{ 2 * rows, width });
+    defer shared.deinit();
+    const mapped = termite_metal_buffer_contents(shared.deviceHandle().?) orelse return error.ExpectedActualSharedContents;
+    const mapped_values: [*]f32 = @ptrCast(@alignCast(mapped));
+    const host_alias = MetalTensor.borrowed(mapped_values, rows * width, &.{ rows, width });
+    try std.testing.expect(!densePrefillAttentionInputsDisjoint(runtime, shared.deviceHandle().?, rows * width * @sizeOf(f32), rows, &.{host_alias}));
+    const host_partial_alias = MetalTensor.borrowed(mapped_values + rows * width / 2, rows * width, &.{ rows, width });
+    try std.testing.expect(!densePrefillAttentionInputsDisjoint(runtime, shared.deviceHandle().?, rows * width * @sizeOf(f32), rows, &.{host_partial_alias}));
+    // The second half is readable SDK storage, exactly adjacent to the
+    // destination range. It must remain eligible, unlike the first half.
+    const host_adjacent = MetalTensor.borrowed(mapped_values + rows * width, rows * width, &.{ rows, width });
+    try std.testing.expect(densePrefillAttentionInputsDisjoint(runtime, shared.deviceHandle().?, rows * width * @sizeOf(f32), rows, &.{host_adjacent}));
+    try std.testing.expect(densePrefillAttentionInputsDisjoint(runtime, shared.deviceHandle().?, rows * width * @sizeOf(f32), rows, &.{host_residual}));
+    // The layer's still-live residual must also be disjoint, even though the
+    // attention kernel itself only receives Q/K/V. Refusal creates no view.
+    try std.testing.expect(try decoderRuntimeDensePrefillAttentionOutput(&provider, rows, width, &.{ q, k, v, destination }) == null);
+    try std.testing.expect(try decoderRuntimeApplyBatchedAttentionF32DevicePreallocated(&provider, .{
+        .q = destination,
+        .k = k,
+        .v = v,
+        .batch = batch,
+        .q_len = sequence,
+        .num_heads = heads,
+        .num_kv_heads = kv_heads,
+        .head_dim = dim,
+        .output = @as(?MetalTensor, destination),
+    }) == null);
+    try std.testing.expectEqual(before_alias, runtimeMemorySnapshot(runtime).compute_encoder_count);
+    var expected_host: [rows * width]f32 = undefined;
+    var actual_host: [rows * width]f32 = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, reference.deviceHandle(), reference.deviceByteOffset(), @ptrCast(&expected_host), @sizeOf(@TypeOf(expected_host))));
+    try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, actual.deviceHandle(), actual.deviceByteOffset(), @ptrCast(&actual_host), @sizeOf(@TypeOf(actual_host))));
+    try std.testing.expectEqualSlices(f32, &expected_host, &actual_host);
+}
+
+fn testDenseReservedTail(provider: anytype, input: MetalTensor, residual: MetalTensor, outputs: ?*DensePrefillOutputs) !MetalTensor {
+    const current = @import("../execution/cleanup_context.zig").Context{ .outside_execution = true };
+    const prepared: ?PreparedDenseFfnOutputs = if (outputs) |value| .{ .values = value, .current = current } else null;
+    const dim: usize = @intCast(input.dim(1));
+    var stats: ops.NativeQuantTimingStats = .{};
+    var projected = (try decoderRuntimeApplyLinear(provider, .{ .slot = @as(usize, 0), .input = input, .in_dim = dim, .out_dim = dim, .prepared_output = try ffnPreparedTarget(.{ .prepared_outputs = prepared }, .projection) })) orelse return error.ExpectedActualLinear;
+    defer retireDenseFfnValue(&projected, .{ .prepared_outputs = prepared });
+    var added = (try decoderRuntimeApplyAdd(provider, .{ .lhs = projected, .rhs = residual, .dim = dim, .prepared_output = try ffnPreparedTarget(.{ .prepared_outputs = prepared }, .residual) }, &stats)) orelse return error.ExpectedActualResidual;
+    defer retireDenseFfnValue(&added, .{ .prepared_outputs = prepared });
+    var normed = (try decoderRuntimeApplyFfnNormInternalWithOutput(provider, added, null, 0, dim, 1e-6, try ffnPreparedTarget(.{ .prepared_outputs = prepared }, .norm))) orelse return error.ExpectedActualNorm;
+    defer retireDenseFfnValue(&normed, .{ .prepared_outputs = prepared });
+    var gate = (try decoderRuntimeApplyLinear(provider, .{ .slot = @as(usize, 0), .input = normed, .in_dim = dim, .out_dim = dim, .prepared_output = try ffnPreparedTarget(.{ .prepared_outputs = prepared }, .gate) })) orelse return error.ExpectedActualGate;
+    defer retireDenseFfnValue(&gate, .{ .prepared_outputs = prepared });
+    var up = (try decoderRuntimeApplyLinear(provider, .{ .slot = @as(usize, 0), .input = normed, .in_dim = dim, .out_dim = dim, .prepared_output = try ffnPreparedTarget(.{ .prepared_outputs = prepared }, .up) })) orelse return error.ExpectedActualUp;
+    defer retireDenseFfnValue(&up, .{ .prepared_outputs = prepared });
+    var activated = (try decoderRuntimeApplyActivation(provider, .{ .input = gate, .kind = ops.DecoderRuntimeActivationKind.silu, .dim = dim, .prepared_output = try ffnPreparedTarget(.{ .prepared_outputs = prepared }, .activation) }, &stats)) orelse return error.ExpectedActualActivation;
+    defer retireDenseFfnValue(&activated, .{ .prepared_outputs = prepared });
+    var product = (try decoderRuntimeApplyMultiplyWithOutput(provider, activated, up, dim, try ffnPreparedTarget(.{ .prepared_outputs = prepared }, .product))) orelse return error.ExpectedActualProduct;
+    defer retireDenseFfnValue(&product, .{ .prepared_outputs = prepared });
+    var down = (try decoderRuntimeApplyLinear(provider, .{ .slot = @as(usize, 0), .input = product, .in_dim = dim, .out_dim = dim, .prepared_output = try ffnPreparedTarget(.{ .prepared_outputs = prepared }, .down) })) orelse return error.ExpectedActualDown;
+    defer retireDenseFfnValue(&down, .{ .prepared_outputs = prepared });
+    return (try decoderRuntimeApplyAdd(provider, .{ .lhs = down, .rhs = added, .dim = dim, .prepared_output = try ffnPreparedTarget(.{ .prepared_outputs = prepared }, .projection) }, &stats)) orelse error.ExpectedActualFinalAdd;
+}
+
+test "metal dense prefill reserved tail preserves F32 and Q8 dispatch bitwise across alternating layers without device allocations" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+    const dim = 128;
+    const rows = 32;
+    const current = @import("../execution/cleanup_context.zig").Context{ .outside_execution = true };
+    var values: [rows * dim]f32 = undefined;
+    for (&values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 19)) - 9)) / 32;
+    var weights: [dim * dim]f32 = undefined;
+    for (&weights, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 13)) - 6)) / 256;
+    var raw: [dim * (dim / 32) * 34]u8 = undefined;
+    for (0..dim * (dim / 32)) |block| {
+        const begin = block * 34;
+        std.mem.writeInt(u16, raw[begin..][0..2], @bitCast(@as(f16, 1.0 / 256.0)), .little);
+        for (0..32) |i| raw[begin + 2 + i] = @bitCast(@as(i8, @intCast(@as(i16, @intCast((block * 7 + i) % 13)) - 6)));
+    }
+    const shape = [_]i64{ dim, dim };
+    const storage = QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = &raw, .shape = &shape, .raw_owned = false, .allocator = std.testing.allocator };
+    var zeros: [dim]f32 = @splat(0);
+    var ones: [dim]f32 = @splat(1);
+    for ([_]bool{ false, true }) |quantized| {
+        var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+        defer provider.deinitOwned();
+        const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+        var weight = MetalTensor.borrowed(&weights, weights.len, &.{ dim, dim });
+        defer weight.deinit();
+        var bias = MetalTensor.borrowed(&zeros, dim, &.{dim});
+        defer bias.deinit();
+        var norm = MetalTensor.borrowed(&ones, dim, &.{dim});
+        defer norm.deinit();
+        var stats: ops.NativeQuantTimingStats = .{};
+        try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{ .slot = @as(usize, 0), .weight = weight, .bias = bias, .quantized_storage = if (quantized) @as(?*const QuantizedStorage, &storage) else null, .in_dim = dim, .out_dim = dim, .retain_dense_fallback = !quantized }, &stats));
+        try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{ .slot = @as(usize, 0), .weight = norm, .hidden_size = dim }));
+        var input = try testDeviceTensorFromSlice(runtime, &values, &.{ rows, dim });
+        defer input.deinit();
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_decode_runtime_reserve_prefill_layer_scratch(runtime, rows, 1, 1, dim, dim, dim, 0));
+        var expected0 = try testDenseReservedTail(&provider, input, input, null);
+        defer expected0.deinit();
+        var expected1 = try testDenseReservedTail(&provider, input, expected0, null);
+        defer expected1.deinit();
+        var expected_host: [rows * dim]f32 = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, expected1.deviceHandle(), expected1.deviceByteOffset(), @ptrCast(&expected_host), @sizeOf(@TypeOf(expected_host))));
+        const before = metal_tensor.memoryStatsSnapshot().device_owned_buffers_created;
+        const before_slots = runtimeMemorySnapshot(runtime).graph_plan_allocations;
+        try beginFrame(runtime);
+        var frame_open = true;
+        defer if (frame_open) cancelFrame(runtime) catch {};
+        try beginPlannedComputeScope(runtime, @backingInt(ComputeSource.layer), .layer);
+        var scope_open = true;
+        defer if (scope_open) endPlannedComputeScope(runtime) catch {};
+        var targets0 = try borrowDensePrefillOutputs(runtime, input, rows, dim, dim, current);
+        defer targets0.deinit(current);
+        var actual0 = try testDenseReservedTail(&provider, input, input, &targets0);
+        defer actual0.deinitWithCleanup(current);
+        const first_handle = actual0.deviceHandle();
+        var targets1 = try borrowDensePrefillOutputs(runtime, actual0, rows, dim, dim, current);
+        defer targets1.deinit(current);
+        var actual1 = try testDenseReservedTail(&provider, input, actual0, &targets1);
+        defer actual1.deinitWithCleanup(current);
+        try endPlannedComputeScope(runtime);
+        scope_open = false;
+        try submitFrame(runtime);
+        try waitFrame(runtime);
+        frame_open = false;
+        try std.testing.expect(first_handle != actual1.deviceHandle());
+        try std.testing.expectEqual(before, metal_tensor.memoryStatsSnapshot().device_owned_buffers_created);
+        try std.testing.expectEqual(before_slots, runtimeMemorySnapshot(runtime).graph_plan_allocations);
+        var actual_host: [rows * dim]f32 = undefined;
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, actual1.deviceHandle(), actual1.deviceByteOffset(), @ptrCast(&actual_host), @sizeOf(@TypeOf(actual_host))));
+        try std.testing.expectEqualSlices(f32, &expected_host, &actual_host);
+        const before_alias = runtimeMemorySnapshot(runtime).compute_encoder_count;
+        try std.testing.expectError(error.InvalidPreparedDecoderOutput, decoderRuntimeApplyLinear(&provider, .{ .slot = @as(usize, 0), .input = input, .in_dim = dim, .out_dim = dim, .prepared_output = PreparedDecoderOutput{ .tensor = &input, .current = current } }));
+        try std.testing.expectEqual(before_alias, runtimeMemorySnapshot(runtime).compute_encoder_count);
+        var final_reference = (try decoderRuntimeApplyRmsNorm(&provider, .{ .slot = @as(usize, 0), .input = actual1, .hidden_size = dim, .eps = @as(f32, 1e-6) }, &stats)) orelse return error.ExpectedActualFinalNorm;
+        defer final_reference.deinit();
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, final_reference.deviceHandle(), 0, @ptrCast(&expected_host), @sizeOf(@TypeOf(expected_host))));
+        var norm_target = try borrowDensePrefillNormOutput(runtime, rows, dim);
+        defer norm_target.deinitWithCleanup(current);
+        const before_norm = metal_tensor.memoryStatsSnapshot().device_owned_buffers_created;
+        var final_actual = (try decoderRuntimeApplyRmsNorm(&provider, .{ .slot = @as(usize, 0), .input = actual1, .hidden_size = dim, .eps = @as(f32, 1e-6), .prepared_output = PreparedDecoderOutput{ .tensor = &norm_target, .current = current } }, &stats)) orelse return error.ExpectedActualReservedFinalNorm;
+        defer final_actual.deinitWithCleanup(current);
+        try std.testing.expectEqual(before_norm, metal_tensor.memoryStatsSnapshot().device_owned_buffers_created);
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, final_actual.deviceHandle(), 0, @ptrCast(&actual_host), @sizeOf(@TypeOf(actual_host))));
+        try std.testing.expectEqualSlices(f32, &expected_host, &actual_host);
+        const rope_request = .{ .slot = @as(usize, 0), .input = input, .total_heads = rows, .head_dim = dim, .rope_dim = dim, .position = @as(usize, 0), .theta = @as(f32, 10000), .freq_scale = @as(f32, 1), .eps = @as(f32, 1e-6), .value_scale = @as(f32, 1), .consecutive_pairs = false };
+        var rope_reference = (try decoderRuntimeApplyHeadRmsNormRopeBatched(&provider, rope_request, 1, 16)) orelse return error.ExpectedActualHeadNormRope;
+        defer rope_reference.deinit();
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, rope_reference.deviceHandle(), 0, @ptrCast(&expected_host), @sizeOf(@TypeOf(expected_host))));
+        var rope_target = try borrowDensePrefillOutput(runtime, 3, rows, dim);
+        defer rope_target.deinitWithCleanup(current);
+        const before_rope = metal_tensor.memoryStatsSnapshot().device_owned_buffers_created;
+        var rope_actual = (try decoderRuntimeApplyHeadRmsNormRopeBatched(&provider, .{ .slot = rope_request.slot, .input = input, .total_heads = rows, .head_dim = dim, .rope_dim = dim, .position = rope_request.position, .theta = rope_request.theta, .freq_scale = rope_request.freq_scale, .eps = rope_request.eps, .value_scale = rope_request.value_scale, .consecutive_pairs = false, .prepared_output = PreparedDecoderOutput{ .tensor = &rope_target, .current = current } }, 1, 16)) orelse return error.ExpectedActualReservedHeadNormRope;
+        defer rope_actual.deinitWithCleanup(current);
+        try std.testing.expectEqual(before_rope, metal_tensor.memoryStatsSnapshot().device_owned_buffers_created);
+        try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, rope_actual.deviceHandle(), 0, @ptrCast(&actual_host), @sizeOf(@TypeOf(actual_host))));
+        try std.testing.expectEqualSlices(f32, &expected_host, &actual_host);
+        if (quantized) {
+            const request = .{ .gate_linear_slot = @as(usize, 0), .up_linear_slot = @as(usize, 0), .down_linear_slot = @as(usize, 0), .rows = rows, .hidden_size = dim, .intermediate_size = dim, .activation = ops.DecoderRuntimeActivationKind.silu, .eps = @as(f32, 1e-6), .post_gate_rms_norm_slot = @as(?usize, null), .post_down_rms_norm_slot = @as(?usize, null) };
+            var fused_reference = (try tryDeviceQuantizedGatedFfnResidual(&provider, request, input, input, &stats)) orelse return error.ExpectedActualQuantizedFfn;
+            defer fused_reference.deinit();
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, fused_reference.deviceHandle(), 0, @ptrCast(&expected_host), @sizeOf(@TypeOf(expected_host))));
+            const before_fused = metal_tensor.memoryStatsSnapshot().device_owned_buffers_created;
+            var fused_actual = (try tryDeviceQuantizedGatedFfnResidual(&provider, .{ .gate_linear_slot = request.gate_linear_slot, .up_linear_slot = request.up_linear_slot, .down_linear_slot = request.down_linear_slot, .rows = rows, .hidden_size = dim, .intermediate_size = dim, .activation = request.activation, .eps = request.eps, .post_gate_rms_norm_slot = request.post_gate_rms_norm_slot, .post_down_rms_norm_slot = request.post_down_rms_norm_slot, .prepared_outputs = @as(?PreparedDenseFfnOutputs, .{ .values = &targets0, .current = current }) }, input, input, &stats)) orelse return error.ExpectedActualReservedQuantizedFfn;
+            defer fused_actual.deinitWithCleanup(current);
+            try std.testing.expectEqual(before_fused, metal_tensor.memoryStatsSnapshot().device_owned_buffers_created);
+            try std.testing.expectEqual(@as(c_int, 0), termite_metal_buffer_download(runtime, fused_actual.deviceHandle(), 0, @ptrCast(&actual_host), @sizeOf(@TypeOf(actual_host))));
+            try std.testing.expectEqualSlices(f32, &expected_host, &actual_host);
+        }
+    }
+}
+
+test "metal cold text catalog publishes actual lazy Q8 slots without math and warm SDK preparation" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+    var raw_bytes: [7][]u8 = undefined;
+    var made: usize = 0;
+    defer for (raw_bytes[0..made]) |bytes| std.testing.allocator.free(bytes);
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.SkipZigTest;
+    // Deliberately non-square attention: real0.6B has Q width != hidden too.
+    const cfg = @import("../models/gpt.zig").Config{ .family = .qwen3, .norm_type = .rms_norm, .activation = .silu, .position_encoding = .rope, .hidden_size = 64, .intermediate_size = 128, .num_hidden_layers = 1, .num_attention_heads = 2, .num_key_value_heads = 1, .attention_head_dim = 64, .vocab_size = 64 };
+    var layers: [1]ops.DecoderRuntimeLayerSpec = undefined;
+    const selected = try @import("decoder_gated_runtime.zig").fillDenseQwen3LayerSpecs(cfg, 1, &layers);
+    const slots = try textPrefillCatalogSlots(cfg.hidden_size, cfg.num_attention_heads, selected[0]);
+    var shapes: [7][2]i64 = undefined;
+    var zeros: [128]f32 = @splat(0);
+    var dummy: [1]f32 = .{0};
+    var stats: ops.NativeQuantTimingStats = .{};
+    for (slots, 0..) |slot, index| {
+        const bytes = slot.output * (slot.input / 32) * 34;
+        raw_bytes[index] = try std.testing.allocator.alloc(u8, bytes);
+        made += 1;
+        for (0..bytes / 34) |block| {
+            std.mem.writeInt(u16, raw_bytes[index][block * 34 ..][0..2], @bitCast(@as(f16, 1.0 / 64.0)), .little);
+            for (0..32) |i| raw_bytes[index][block * 34 + 2 + i] = @bitCast(@as(i8, @intCast(@as(i16, @intCast((block + i) % 7)) - 3)));
+        }
+        shapes[index] = .{ @intCast(slot.output), @intCast(slot.input) };
+        const storage = QuantizedStorage{ .tensor_type = .{ .known = .Q8_0 }, .raw_bytes = raw_bytes[index], .shape = &shapes[index], .raw_owned = false, .allocator = std.testing.allocator };
+        var weight = MetalTensor.borrowed(&dummy, 0, &.{0});
+        defer weight.deinit();
+        var bias = MetalTensor.borrowed(&zeros, slot.output, &.{@intCast(slot.output)});
+        defer bias.deinit();
+        try std.testing.expect(try decoderRuntimePrepareLinear(&provider, .{ .slot = slot.index, .weight = weight, .bias = bias, .quantized_storage = @as(?*const QuantizedStorage, &storage), .in_dim = slot.input, .out_dim = slot.output, .retain_dense_fallback = false }, &stats));
+        try std.testing.expectEqual(RawQuantizedRuntimeLinearKind.none, provider.raw_linear_slot_runtime_prepared_kind[slot.index]);
+    }
+    const before = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(@as(u64, 0), before.quant_linear_bytes);
+    var malformed = layers;
+    malformed[0].down_ffn_linear_slot = decoder_runtime_linear_slot_capacity;
+    try std.testing.expect(!try prepareTextPrefillQuantizedCatalog(&provider, cfg.hidden_size, cfg.num_attention_heads, &malformed, null));
+    try std.testing.expectEqual(before.quant_linear_bytes, runtimeMemorySnapshot(runtime).quant_linear_bytes);
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    try std.testing.expectError(error.Cancelled, prepareTextPrefillQuantizedCatalog(&provider, cfg.hidden_size, cfg.num_attention_heads, selected, .{ .check_fn = Cancel.check, .native_call_policy = .in_process }));
+    try std.testing.expectEqual(before.quant_linear_bytes, runtimeMemorySnapshot(runtime).quant_linear_bytes);
+    try std.testing.expect(try prepareTextPrefillQuantizedCatalog(&provider, cfg.hidden_size, cfg.num_attention_heads, selected, null));
+    for (slots) |slot| try std.testing.expectEqual(RawQuantizedRuntimeLinearKind.q8_0, provider.raw_linear_slot_runtime_prepared_kind[slot.index]);
+    const cold = runtimeMemorySnapshot(runtime);
+    try std.testing.expect(cold.quant_linear_bytes > 0);
+    try std.testing.expectEqual(before.compute_encoder_count, cold.compute_encoder_count);
+    try std.testing.expect(!hasActiveFrame(runtime) and !hasSubmittedFrame(runtime));
+    try std.testing.expect(try prepareTextPrefillQuantizedCatalog(&provider, cfg.hidden_size, cfg.num_attention_heads, selected, null));
+    const warm = runtimeMemorySnapshot(runtime);
+    try std.testing.expectEqual(cold.quant_linear_bytes, warm.quant_linear_bytes);
+    try std.testing.expectEqual(cold.compute_encoder_count, warm.compute_encoder_count);
+    try std.testing.expectEqual(cold.blit_encoder_count, warm.blit_encoder_count);
+}
+
+test "prepared Host RMS activation add multiply refuse missing Phase before SDK while raw arithmetic stays compatible" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!metalDeviceAvailable()) return error.SkipZigTest;
+    var provider = try @import("metal_native_provider.zig").MetalNativeProvider.create();
+    defer provider.deinitOwned();
+    const runtime = provider.raw_decode_runtime orelse return error.ExpectedMetalRuntime;
+    var lhs_data = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    var rhs_data = [_]f32{ 2, 4, 6, 8, 10, 12, 14, 16 };
+    var unit_data = [_]f32{ 1, 1, 1, 1 };
+    const lhs = MetalTensor.borrowed(&lhs_data, lhs_data.len, &.{ 2, 4 });
+    const rhs = MetalTensor.borrowed(&rhs_data, rhs_data.len, &.{ 2, 4 });
+    const weight = MetalTensor.borrowed(&unit_data, unit_data.len, &.{4});
+    try std.testing.expect(try decoderRuntimePrepareRmsNorm(&provider, .{ .slot = 0, .weight = weight, .hidden_size = 4 }));
+    var assigned = try MetalTensor.deviceAllocate(runtime, lhs_data.len * @sizeOf(f32), .private, &.{ 2, 4 });
+    defer assigned.deinit();
+    const destination: PreparedDecoderOutput = .{ .tensor = &assigned, .current = .{ .outside_execution = true } };
+    var stats: ops.NativeQuantTimingStats = .{};
+    const before = runtimeMemorySnapshot(runtime).compute_encoder_count;
+    try std.testing.expectError(error.UnsupportedPreparedDecoderReference, decoderRuntimeApplyRmsNorm(&provider, .{ .prepared_output = destination, .slot = 0, .input = lhs, .hidden_size = 4, .eps = @as(f32, 1e-6) }, &stats));
+    try std.testing.expectError(error.UnsupportedPreparedDecoderReference, decoderRuntimeApplyActivation(&provider, .{ .prepared_output = destination, .input = lhs, .dim = 4, .kind = ops.DecoderRuntimeActivationKind.silu }, &stats));
+    try std.testing.expectError(error.UnsupportedPreparedDecoderReference, decoderRuntimeApplyAdd(&provider, .{ .prepared_output = destination, .lhs = lhs, .rhs = rhs, .dim = 4 }, &stats));
+    try std.testing.expectError(error.UnsupportedPreparedDecoderReference, decoderRuntimeApplyMultiplyWithOutput(&provider, lhs, rhs, 4, destination));
+    try std.testing.expectEqual(before, runtimeMemorySnapshot(runtime).compute_encoder_count);
+    // Genuine null-target raw callers retain the SAME original Host branches.
+    var sum = (try decoderRuntimeApplyAdd(&provider, .{ .lhs = lhs, .rhs = rhs, .dim = 4 }, &stats)) orelse return error.ExpectedRawHostAdd;
+    defer sum.deinit();
+    try std.testing.expect(!sum.isDevice());
+    try std.testing.expectEqualSlices(f32, &.{ 3, 6, 9, 12, 15, 18, 21, 24 }, try sum.toHostSlice());
+    var product = (try decoderRuntimeApplyMultiplyWithOutput(&provider, lhs, rhs, 4, null)) orelse return error.ExpectedRawHostMultiply;
+    defer product.deinit();
+    try std.testing.expect(!product.isDevice());
+    try std.testing.expectEqualSlices(f32, &.{ 2, 8, 18, 32, 50, 72, 98, 128 }, try product.toHostSlice());
+    var normalized = (try decoderRuntimeApplyRmsNorm(&provider, .{ .slot = 0, .input = lhs, .hidden_size = 4, .eps = @as(f32, 1e-6) }, &stats)) orelse return error.ExpectedRawHostNorm;
+    defer normalized.deinit();
+    var activated = (try decoderRuntimeApplyActivation(&provider, .{ .input = lhs, .dim = 4, .kind = ops.DecoderRuntimeActivationKind.silu }, &stats)) orelse return error.ExpectedRawHostActivation;
+    defer activated.deinit();
+    try std.testing.expect(!normalized.isDevice() and !activated.isDevice());
+    for (try normalized.toHostSlice()) |value| try std.testing.expect(std.math.isFinite(value));
+    for (try activated.toHostSlice()) |value| try std.testing.expect(std.math.isFinite(value));
+    try std.testing.expectEqual(before, runtimeMemorySnapshot(runtime).compute_encoder_count);
 }

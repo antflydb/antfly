@@ -2534,6 +2534,13 @@ pub const CudaCompute = struct {
     /// Actual cold weight-load owner ONLY, before publishing this Session.
     /// Records contain copied names/numeric identities, never borrowed map keys.
     /// No SDK, stream, quota callback or numerical work occurs here.
+    /// Actual unpublished compute owner only: resolve immutable DSO callbacks
+    /// before Session/Reader lanes. No tensor packet or numerical work occurs.
+    pub fn configureOptionalPrefillOutsideExecution(self: *CudaCompute) !void {
+        if (self.capability_profile != .lightonocr3 or !self.lighton_ragged_recurrent_enabled or !self.lighton_recurrent_batch_enabled) return;
+        try self.lighton_recurrent.configureBf16Prefill(&self.ctx, platform.env.getenv("ANTFLY_CUDA_LIGHTON_PREFILL_LIBRARY"));
+    }
+
     pub fn publishLightOnNormCatalog(self: *CudaCompute) !void {
         if (self.lighton_norm_catalog_published) return error.ModelWeightsAlreadyPublished;
         if (self.capability_profile != .lightonocr3 or self.lazy_host_store != null) return;
@@ -2986,6 +2993,69 @@ pub const CudaCompute = struct {
         for (self.lighton_norm_catalog) |record| if (record.eligible and record.header == header and record.buffer == device and record.dimension == dimension) return record;
         return error.PreparedCachePlanChanged;
     }
+    fn externalAttentionRequest(self: *const CudaCompute) ?@import("prefill_workspace.zig").Request {
+        if (self.capability_profile != .lightonocr3) return null;
+        const prefill = if (self.lighton_recurrent.bf16_prefill) |*value| value else return null;
+        const attention = if (prefill.attention) |*value| value else return null;
+        const A = @import("lighton_prefill_attention.zig");
+        return .{ .kind = .attention, .library_identity = @intFromPtr(attention.make_plan), .geometry_hash = 0, .device_bytes = A.device_bytes, .host_bytes = A.host_bytes + A.host_plan_bytes };
+    }
+    /// Fixed library scratch is optional independently charged backing. The
+    /// exact runtime storage predicate remains at the original numerical call;
+    /// unused potential storage is only a READY token, never SDK/cache credit.
+    pub fn appendExternalPrefillWorkload(self: *const CudaCompute, config: ?gpt_model.Config, builder: *@import("prepared_cache.zig").Builder) !void {
+        if (self.capability_profile != .lightonocr3) return;
+        const owner = if (self.lighton_recurrent.bf16_prefill) |*value| value else return;
+        try builder.add(.{ .external_prefill = .{ .kind = .recurrent_existing, .library_identity = @intFromPtr(owner.workspace), .geometry_hash = 0, .device_bytes = 0 } });
+        const request = self.externalAttentionRequest() orelse return;
+        const cfg = config orelse return;
+        if (!((cfg.num_attention_heads == 8 and cfg.effectiveKVHeads() == 2) or (cfg.num_attention_heads == 16 and cfg.effectiveKVHeads() == 4)) or cfg.headDim() != 256) return;
+        try builder.add(.{ .external_prefill = request });
+    }
+    fn externalPrefillRawSnapshot(self: *const CudaCompute, request: @import("prefill_workspace.zig").Request) @import("lighton_prefill.zig").Module.QuotaSnapshot {
+        const owner = &self.lighton_recurrent.bf16_prefill.?;
+        if (request.kind == .recurrent_existing) return owner.quotaSnapshot();
+        const value = owner.attention.?.storageSnapshot();
+        return .{ .raw_quota = value.raw_quota, .controller = value.controller, .closing = value.closing };
+    }
+    fn externalPrefillHeaderMiss(self: *const CudaCompute, request: @import("prefill_workspace.zig").Request, desired: ?@import("video_cache_budget.zig").Admission) !bool {
+        if (request.kind == .recurrent_existing) {
+            const owner = if (self.lighton_recurrent.bf16_prefill) |*value| value else return error.PreparedCachePlanChanged;
+            if (request.library_identity != @intFromPtr(owner.workspace) or request.geometry_hash != 0 or request.device_bytes != 0 or request.host_bytes != 0 or owner.quotaSnapshot().closing) return error.PreparedCachePlanChanged;
+            return false; // existing quota only; never grants a storage allocation
+        }
+        const expected = self.externalAttentionRequest() orelse return error.PreparedCachePlanChanged;
+        if (!std.meta.eql(request, expected)) return error.PreparedCachePlanChanged;
+        const snapshot = self.lighton_recurrent.bf16_prefill.?.attention.?.storageSnapshot();
+        if (snapshot.closing) return error.PreparedCachePlanChanged;
+        if (!sameCacheAdmission(self.constant_policy, desired) or !snapshot.ready or snapshot.failed) return true;
+        if (desired) |policy| {
+            if (!snapshot.has_lease) return error.MissingCacheRetirementLease;
+            if (snapshot.controller != policy.controller) return error.ForeignAdmissionDomain;
+        }
+        return false;
+    }
+    /// Called only by the original actual attention operation (or its exact
+    /// Reader precommit descriptor), with this request's already-bound Funding.
+    fn prepareExternalAttentionFromBoundFunding(self: *CudaCompute) !void {
+        const request = self.externalAttentionRequest() orelse return error.RecurrentPrefillColdPreparationRequired;
+        const fast = &self.lighton_recurrent.bf16_prefill.?.attention.?;
+        const snapshot = fast.storageSnapshot();
+        if (snapshot.ready and !snapshot.failed and !snapshot.closing) return;
+        const funding = self.ctx.prepared_cache_funding orelse return error.RecurrentPrefillColdPreparationRequired;
+        if (funding.state != .bound or funding.deny_cold_misses) return error.RecurrentPrefillColdPreparationRequired;
+        var found = false;
+        for (funding.entries) |entry| if (entry.request == .external_prefill and std.meta.eql(entry.request.external_prefill, request)) {
+            if (!entry.miss or entry.optional_declined or entry.state != .ready) return error.RecurrentPrefillColdPreparationRequired;
+            found = true;
+            break;
+        };
+        if (!found) return error.RecurrentPrefillColdPreparationRequired;
+        if (snapshot.failed) try fast.clearWithCleanup(&self.ctx, .{ .boundary = funding.boundary });
+        var token = try funding.take(.{ .external_prefill = request }, request.amounts());
+        errdefer if (token.owner != null) token.cancelBeforeSdk() catch platform.inference_process_supervisor.restartWorker();
+        try fast.reservePrepared(&self.ctx, &token, request, .{ .boundary = funding.boundary });
+    }
     fn lightOnNormMetadataAvailable(self: *const CudaCompute) !void {
         // The same idle/deferred envelope belongs to both OCR profiles.
         // Actual adjusted-norm operands remain strictly LightOn-only below.
@@ -3002,6 +3072,7 @@ pub const CudaCompute = struct {
             // ceiling. A new caller need not replace a smaller pressure result.
             return false;
         }
+        if (request == .external_prefill) return self.externalPrefillHeaderMiss(request.external_prefill, desired);
         if (request == .auxiliary) return self.auxiliaryCacheMissLocked(request, desired);
         if (request == .derived_weight) {
             try self.validateDerivedWeight(request.derived_weight, false);
@@ -3028,6 +3099,7 @@ pub const CudaCompute = struct {
             if (request == .derived_weight) if (self.derivedWeightQuota(request.derived_weight)) |quota| {
                 if (quota.* == .raw) return true;
             };
+            if (request == .external_prefill and self.externalPrefillRawSnapshot(request.external_prefill).raw_quota) return true;
         }
         return false;
     }
@@ -3048,6 +3120,16 @@ pub const CudaCompute = struct {
                 const geometry = entry.request.ocr_retention;
                 const bytes = try std.math.add(usize, geometry.cache_bytes, geometry.deferred_bytes);
                 if (miss) try funding.noteMiss(index, .{ .backend_scratch_bytes = bytes }, 0);
+                continue;
+            }
+            if (entry.request == .external_prefill) {
+                if (miss) try funding.noteMiss(index, entry.request.external_prefill.amounts(), 0);
+                const snapshot = self.externalPrefillRawSnapshot(entry.request.external_prefill);
+                if (snapshot.raw_quota) {
+                    const actual_policy = desired orelse return error.MissingCacheRetirementDomain;
+                    if (snapshot.controller != actual_policy.controller) return error.ForeignAdmissionDomain;
+                    funding.entries[index].upgrade_raw = true;
+                }
                 continue;
             }
             if (entry.request == .auxiliary) {
@@ -3094,6 +3176,10 @@ pub const CudaCompute = struct {
                 if (expected.resident_training_cache) return error.PreparedCachePlanChanged;
                 continue;
             }
+            if (request == .external_prefill) {
+                _ = try expected.externalPrefillHeaderMiss(request.external_prefill, desired);
+                continue;
+            }
             if (request == .auxiliary) {
                 if (expected.auxiliaryCacheRequest(request.auxiliary.kind) == null) return error.PreparedCachePlanChanged;
                 continue;
@@ -3119,7 +3205,7 @@ pub const CudaCompute = struct {
             } else {
                 const entry = funding.entries[index];
                 if (!std.meta.eql(request, entry.request)) return error.PreparedCachePlanChanged;
-                if (entry.optional_declined and (request == .constant or request == .auxiliary or request == .derived_weight)) continue;
+                if (entry.optional_declined and (request == .constant or request == .auxiliary or request == .derived_weight or request == .external_prefill)) continue;
                 if (entry.state == .published) {
                     if ((funding.state == .bound or funding.state == .unbound) and !miss) continue;
                     return error.PreparedCachePlanChanged; // spent token cannot fund a new miss
@@ -3141,6 +3227,38 @@ pub const CudaCompute = struct {
         expected.lockConstantMetadata();
         defer expected.unlockConstantMetadata();
         for (funding.entries) |*entry| if (entry.upgrade_raw) {
+            if (entry.request == .external_prefill) {
+                if (entry.request.external_prefill.kind == .recurrent_existing) {
+                    const owner = &expected.lighton_recurrent.bf16_prefill.?;
+                    while (!owner.metadata_mutex.tryLock()) std.atomic.spinLoopHint();
+                    defer owner.metadata_mutex.unlock();
+                    if (owner.quota == .raw) {
+                        const pin = funding.domain_pin orelse return error.MissingCacheRetirementDomain;
+                        if (entry.upgrade.owner == null or !std.meta.eql(owner.quota.raw.amounts, @import("../../runtime/tier/memory.zig").AdmissionAmounts{ .backend_scratch_bytes = owner.scratch.len })) return error.PreparedCachePlanChanged;
+                        if (owner.quota.raw.controller != pin.controller()) return error.ForeignAdmissionDomain;
+                        var original: ?@import("../../runtime/tier/memory.zig").AdmissionLease = owner.quota.raw;
+                        var held_pin: ?@import("../../runtime/tier/admission_domain.zig").Pin = pin.retain();
+                        errdefer if (held_pin) |owned| owned.release();
+                        owner.quota = try CacheQuota.arm(&entry.upgrade, &original, &held_pin);
+                    }
+                    entry.upgrade_raw = false;
+                    continue;
+                }
+                const fast = &expected.lighton_recurrent.bf16_prefill.?.attention.?;
+                while (!fast.metadata_mutex.tryLock()) std.atomic.spinLoopHint();
+                defer fast.metadata_mutex.unlock();
+                if (fast.quota == .raw) {
+                    const pin = funding.domain_pin orelse return error.MissingCacheRetirementDomain;
+                    if (entry.upgrade.owner == null or !std.meta.eql(fast.quota.raw.amounts, entry.request.external_prefill.amounts())) return error.PreparedCachePlanChanged;
+                    if (fast.quota.raw.controller != pin.controller()) return error.ForeignAdmissionDomain;
+                    var original: ?@import("../../runtime/tier/memory.zig").AdmissionLease = fast.quota.raw;
+                    var held_pin: ?@import("../../runtime/tier/admission_domain.zig").Pin = pin.retain();
+                    errdefer if (held_pin) |owned| owned.release();
+                    fast.quota = try CacheQuota.arm(&entry.upgrade, &original, &held_pin);
+                }
+                entry.upgrade_raw = false;
+                continue;
+            }
             const quota = if (entry.request == .derived_weight) expected.derivedWeightQuota(entry.request.derived_weight) orelse return error.PreparedCachePlanChanged else expected.auxiliaryQuota(entry.request.auxiliary.kind);
             if (quota.* == .raw) {
                 const derived = entry.request == .derived_weight;
@@ -3804,6 +3922,179 @@ pub const CudaCompute = struct {
         defer self.lighton_decode_graph.mutex.unlock();
         try self.clearCapturedGraphWithCleanup(current);
     }
+    pub fn externalPrefillEnabled(cb: *const ops.ComputeBackend) bool {
+        if (!acceptsPhysicalImplementation(cb.vtable)) return false;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.capability_profile == .lightonocr3 and self.lighton_recurrent.bf16_prefill != null;
+    }
+    pub const ExternalPrefillDecision = enum { ready, outside, unavailable };
+    fn externalPrefillSnapshot(self: *const CudaCompute) @import("prefill_phase.zig").Snapshot {
+        const owner = &self.lighton_recurrent.bf16_prefill.?;
+        var result = @import("prefill_phase.zig").Snapshot{
+            .recurrent_revision = owner.revision,
+            .recurrent_ptr = owner.scratch.ptr,
+            .recurrent_bytes = owner.scratch.len,
+            .recurrent_quota = owner.quota,
+            .library_identity = @intFromPtr(owner.workspace),
+            .query = owner.geometry_workspace,
+        };
+        if (owner.attention) |*attention| {
+            result.attention_revision = attention.revision;
+            result.attention_device = attention.device.ptr;
+            result.attention_host = if (attention.host.ptr) |ptr| @intFromPtr(ptr) else 0;
+            result.attention_quota = attention.quota;
+        }
+        return result;
+    }
+    pub fn inspectExternalPrefillPhase(cb: *const ops.ComputeBackend, phase: *@import("prefill_phase.zig").Phase, current: CacheCleanup) !ExternalPrefillDecision {
+        if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (current.outside_execution or current.boundary == null or try current.boundary.?.isSealed()) return error.MissingCurrentCleanupEpoch;
+        if (self.capability_profile != .lightonocr3 or self.lazy_host_store != null or self.resident_training_cache or self.lighton_recurrent.bf16_prefill == null) return .unavailable;
+        if (phase.cold != null or phase.bound) return error.InvalidPreparedCacheState;
+        const owner = &self.lighton_recurrent.bf16_prefill.?;
+        if (phase.descriptor.packet_count == 0 and !phase.descriptor.attention and owner.quota != .raw and (owner.attention == null or owner.attention.?.quota != .raw)) {
+            // Pure decode cannot invoke either optional prefill operation.
+            // No SDK capture query, heap metadata or supplier on this path.
+            owner.managed = true;
+            if (owner.attention) |*attention| attention.managed = true;
+            return .ready;
+        }
+        if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return error.EmbeddingStageBusy;
+        if (phase.descriptor.attention) self.prepareExternalAttentionFromBoundFunding() catch |err| {
+            if (err != error.RecurrentPrefillColdPreparationRequired) return err;
+        };
+        phase.expected_compute = @intFromPtr(self);
+        phase.admission = self.ctx.video_cache_budget.admission;
+        phase.old = self.externalPrefillSnapshot();
+        if (phase.old.recurrent_quota == .raw or phase.old.attention_quota == .raw) {
+            phase.mode = .upgrade;
+            return .outside;
+        }
+        if (phase.declined) {
+            owner.managed = true;
+            owner.managed_decline = true;
+            if (owner.attention) |*attention| attention.managed = true;
+            return .ready;
+        }
+        const hash = phase.descriptor.hash();
+        if (phase.descriptor.packet_count != 0 and !phase.queried) {
+            var same_geometry = owner.planned_geometry_hash != null and owner.planned_geometry_hash.? == hash and owner.planned_packet_count == phase.descriptor.packet_count and owner.planned_attention == phase.descriptor.attention;
+            if (same_geometry) for (phase.descriptor.packets[0..phase.descriptor.packet_count], owner.planned_geometry[0..owner.planned_packet_count]) |expected, actual| {
+                same_geometry = same_geometry and std.meta.eql(expected, actual);
+            };
+            if (same_geometry) {
+                phase.queried = true;
+                phase.recurrent_bytes = owner.planned_workspace_bytes;
+                phase.packet_bytes = owner.planned_packet_bytes;
+            } else if (owner.geometry_workspace != null) {
+                phase.mode = .query;
+                return .outside;
+            } else {
+                // Old DSO has no values-only query. Observable precommit
+                // decline; never fabricate live device addresses for it.
+                owner.managed = true;
+                owner.managed_decline = true;
+                phase.declined = true;
+                self.external_prefill_declines += 1;
+            }
+        }
+        phase.request_count = 0;
+        if (!phase.declined and phase.recurrent_bytes != 0 and (owner.failed or phase.recurrent_bytes > owner.scratch.len)) {
+            try owner.clearRecurrentWorkspaceWithCleanup(&self.ctx, current);
+            phase.requests[phase.request_count] = .{ .external_prefill = .{ .kind = .recurrent, .library_identity = @intFromPtr(owner.workspace), .geometry_hash = hash, .device_bytes = phase.recurrent_bytes } };
+            phase.request_count += 1;
+        }
+        if (phase.descriptor.attention) if (owner.attention) |*attention| {
+            if (attention.device.ptr == 0 or attention.failed) {
+                try attention.clearWithCleanup(&self.ctx, current);
+                const A = @import("lighton_prefill_attention.zig");
+                phase.requests[phase.request_count] = .{ .external_prefill = .{ .kind = .attention, .library_identity = @intFromPtr(owner.workspace), .geometry_hash = hash, .device_bytes = A.device_bytes, .host_bytes = A.host_bytes + A.host_plan_bytes } };
+                phase.request_count += 1;
+            }
+        };
+        phase.old = self.externalPrefillSnapshot(); // checked old storage died BEFORE outside funding
+        if (phase.request_count != 0) {
+            phase.mode = .fund;
+            return .outside;
+        }
+        owner.managed = true;
+        owner.managed_decline = phase.declined;
+        if (!phase.declined) {
+            owner.planned_geometry_hash = hash;
+            owner.planned_packet_count = phase.descriptor.packet_count;
+            owner.planned_packet_bytes = phase.packet_bytes;
+            @memcpy(owner.planned_geometry[0..phase.descriptor.packet_count], phase.descriptor.packets[0..phase.descriptor.packet_count]);
+            owner.planned_attention = phase.descriptor.attention;
+            owner.planned_workspace_bytes = phase.recurrent_bytes;
+        }
+        if (owner.attention) |*attention| attention.managed = true;
+        phase.mode = .none;
+        return .ready;
+    }
+    pub fn bindExternalPrefillPhase(cb: *const ops.ComputeBackend, phase: *@import("prefill_phase.zig").Phase, current: CacheCleanup) !bool {
+        if (!acceptsPhysicalImplementation(cb.vtable) or @intFromPtr(cb.ptr) != phase.expected_compute) return error.UnsupportedReaderEpochBackend;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (current.outside_execution or current.boundary == null or try current.boundary.?.isSealed()) return error.MissingCurrentCleanupEpoch;
+        if (self.execution_scope != null or try self.ctx.streamCaptureActive()) return error.EmbeddingStageBusy;
+        if (self.lighton_recurrent.bf16_prefill == null or !sameCacheAdmission(self.ctx.video_cache_budget.admission, phase.admission) or !std.meta.eql(self.externalPrefillSnapshot(), phase.old)) return error.PreparedCachePlanChanged;
+        const owner = &self.lighton_recurrent.bf16_prefill.?;
+        switch (phase.mode) {
+            .query => {
+                phase.mode = .none;
+                return false;
+            },
+            .upgrade => {
+                while (!owner.metadata_mutex.tryLock()) std.atomic.spinLoopHint();
+                var recurrent_locked = true;
+                defer if (recurrent_locked) owner.metadata_mutex.unlock();
+                if (owner.attention) |*attention| {
+                    while (!attention.metadata_mutex.tryLock()) std.atomic.spinLoopHint();
+                    defer attention.metadata_mutex.unlock();
+                    try phase.installUpgrades(&owner.quota, &attention.quota);
+                } else try phase.installUpgrades(&owner.quota, null);
+                owner.metadata_mutex.unlock();
+                recurrent_locked = false;
+                try phase.close(current);
+                phase.mode = .none;
+                return false;
+            },
+            .fund => {
+                try phase.bindFunding(current);
+                errdefer phase.close(current) catch platform.inference_process_supervisor.restartWorker();
+                const funding = try phase.preparedFunding();
+                for (phase.requests[0..phase.request_count]) |request| {
+                    const role = request.external_prefill;
+                    var lease = try funding.take(request, role.amounts());
+                    errdefer if (lease.owner != null) lease.cancelBeforeSdk() catch platform.inference_process_supervisor.restartWorker();
+                    // Each persistent Module publishes quota before any SDK
+                    // allocation; unknown frees preserve it there for retry.
+                    switch (role.kind) {
+                        .recurrent => _ = try owner.reservePrepared(&self.ctx, &lease, role, current),
+                        .attention => try owner.attention.?.reservePrepared(&self.ctx, &lease, role, current),
+                        .recurrent_existing => return error.UnsupportedPreparedCacheWorkload,
+                    }
+                }
+                self.external_prefill_preparations += 1;
+                owner.managed = true;
+                owner.managed_decline = phase.declined;
+                if (owner.attention) |*attention| attention.managed = true;
+                if (!phase.declined) {
+                    owner.planned_geometry_hash = phase.descriptor.hash();
+                    owner.planned_packet_count = phase.descriptor.packet_count;
+                    owner.planned_packet_bytes = phase.packet_bytes;
+                    @memcpy(owner.planned_geometry[0..phase.descriptor.packet_count], phase.descriptor.packets[0..phase.descriptor.packet_count]);
+                    owner.planned_attention = phase.descriptor.attention;
+                    owner.planned_workspace_bytes = phase.recurrent_bytes;
+                }
+                try phase.close(current); // heap metadata only; no phase loan escapes into math
+                phase.mode = .none;
+                return true;
+            },
+            .none => return error.InvalidPreparedCacheState,
+        }
+    }
+
     pub fn inspectCapturedGraphPhase(cb: *const ops.ComputeBackend, phase: *@import("lighton_decode_graph.zig").GraphPhase, current: CacheCleanup) !GraphPhaseDecision {
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
@@ -4749,11 +5040,17 @@ pub const CudaCompute = struct {
 
     /// Compact query rows and independent per-page initialization. A declined
     /// shape changes no state; any failure after launch poisons the whole claim.
+    /// SAME actual ragged packet owner/count eligibility used by the cold
+    /// optional-library planner. No math, SDK allocation or supplier call.
+    pub fn raggedRecurrentItemsSupported(cb: *const ops.ComputeBackend, items: usize) bool {
+        if (!acceptsPhysicalImplementation(cb.vtable) or !lightOnRaggedCoreEnabled(cb) or items < 2 or items > 128) return false;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        return items <= 64 or self.lighton_physical128_enabled;
+    }
     pub fn qwen35LinearCoreRaggedBatch(cb: *const ops.ComputeBackend, states: []const *@import("gated_delta.zig").State, lengths: []const usize, request: anytype) !?CT {
         if (comptime !cuda_enabled) return null;
-        if (!lightOnRaggedCoreEnabled(cb) or states.len < 2 or states.len > 128) return null;
+        if (!raggedRecurrentItemsSupported(cb, states.len)) return null;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
-        if (states.len > 64 and !self.lighton_physical128_enabled) return null;
         if (((self.debug_cuda_graph_capture_active or self.ctx.debug_graph_capture_active) and !lightOnOwnedDecodeCapture(self))) return error.CudaGraphCaptureUnsafeTempAlloc;
         if (lengths.len != states.len) return error.InvalidTensorShape;
         if (!@import("gated_delta.zig").packetGeometrySupported(request.key_heads, request.value_heads, request.dim, request.value_dim, request.conv_kernel)) return null;
@@ -4852,11 +5149,22 @@ pub const CudaCompute = struct {
         }
         var workspace_bytes: usize = 0;
         if (!only_decode) {
-            try self.lighton_recurrent.configureBf16Prefill(&self.ctx, platform.env.getenv("ANTFLY_CUDA_LIGHTON_PREFILL_LIBRARY"));
+            if (self.managed_external_prefill_publication and !self.lighton_recurrent.bf16_prefill_configured) {
+                // Managed entry cannot dlopen a new opaque runtime beneath
+                // numerical ownership. The actual unpublished ctor resolves it.
+                self.external_prefill_declines += 1;
+            } else try self.lighton_recurrent.configureBf16Prefill(&self.ctx, platform.env.getenv("ANTFLY_CUDA_LIGHTON_PREFILL_LIBRARY"));
             if (self.lighton_recurrent.bf16_prefill) |*prefill| {
+                if (self.managed_external_prefill_publication) prefill.managed = true;
                 if (!fused_decode) return error.LightOnPrefillRequiresFusedDecode;
                 for (packets[0..packet_count], 0..) |*params, index| {
-                    packet_scratch[index] = try prefill.workspaceBytes(params);
+                    packet_scratch[index] = prefill.workspaceBytes(params) catch |err| {
+                        if (err != error.RecurrentPrefillColdPreparationRequired) return err;
+                        self.external_prefill_declines += 1;
+                        @memset(&packet_scratch, 0);
+                        workspace_bytes = 0;
+                        break; // no DSO state update has been queued
+                    };
                     workspace_bytes = @max(workspace_bytes, packet_scratch[index]);
                 }
             }
@@ -4865,7 +5173,13 @@ pub const CudaCompute = struct {
         // stream-ordered buffer serves both packets and survives GPU consumers.
         // Admission/ABI/shape failures above have not consumed any page state.
         const workspace = if (workspace_bytes != 0)
-            try self.lighton_recurrent.bf16_prefill.?.reserve(&self.ctx, workspace_bytes)
+            self.lighton_recurrent.bf16_prefill.?.reserve(&self.ctx, workspace_bytes) catch |err| decline: {
+                if (err != error.RecurrentPrefillColdPreparationRequired) return err;
+                self.external_prefill_declines += 1;
+                workspace_bytes = 0;
+                @memset(&packet_scratch, 0);
+                break :decline buffer_mod.DeviceBuffer{};
+            }
         else
             buffer_mod.DeviceBuffer{};
         for (states) |state| state.failed = true;
@@ -5277,6 +5591,9 @@ pub const CudaCompute = struct {
     lighton_projection_residual_calls: usize = 0,
     lighton_vision_output_residual_calls: usize = 0,
     lighton_vision_norm_qkv_calls: usize = 0,
+    managed_external_prefill_publication: bool = false,
+    external_prefill_declines: usize = 0,
+    external_prefill_preparations: usize = 0,
     lighton_bf16_prefill_ffn: bool = false,
     lighton_bf16_prefill_ffn_calls: usize = 0,
     lighton_fused_ffn: bool = false,
@@ -5880,14 +6197,17 @@ pub const CudaCompute = struct {
                 if (!found) return error.UnpreparedCacheAdmission;
             }
         }
-        if (!current.outside_execution and current.boundary != null) self.managed_derived_weight_publication = true;
+        if (!current.outside_execution and current.boundary != null) {
+            self.managed_derived_weight_publication = true;
+            self.managed_external_prefill_publication = true;
+        }
         if (!std.meta.eql(self.ctx.video_cache_budget.admission, admission)) {
             try self.validateCacheCleanup(current); // before ANY policy/SDK mutation
             var auxiliary_quotas = try self.detachAuxiliaryCacheData(current);
             for (&auxiliary_quotas) |*quota| try quota.releaseAfterSdkDeath(current);
             try self.clearCapturedGraphWithCleanup(current);
             self.lighton_decode_graph.epoch_id = 0;
-            if (self.lighton_recurrent.bf16_prefill) |*prefill| try prefill.clearWorkspace(&self.ctx);
+            if (self.lighton_recurrent.bf16_prefill) |*prefill| try prefill.clearWorkspaceWithCleanup(&self.ctx, current);
             try self.embedding_gemma2_execution.clearWithCleanup(self.allocator, &self.ctx, current);
             try self.embedding_gemma2_resize.clearWithCleanup(&self.ctx, current);
             try self.clearEmbeddingGemma2ConstantsWithCleanup(false, current);
@@ -6185,6 +6505,7 @@ pub const CudaCompute = struct {
         resize: Resize = .{},
         execution: Execution = .{},
         decoder: Decoder = .{},
+        audio_plans: @import("audio_execution_plan.zig").Cache = .{},
         state: enum { prepared, detached, finished } = .prepared,
 
         pub fn prepare(requirements: Requirements, model: *Session.ModelLifetime, old_domain: ?*const Pin) !*CacheRetirement {
@@ -6271,7 +6592,8 @@ pub const CudaCompute = struct {
                 expected.embedding_gemma2_constants.clearRetainingCapacity();
                 expected.embedding_gemma2_constant_generation +%= 1;
                 expected.unlockConstantMetadata();
-                expected.audio_plans.clear();
+                self.audio_plans = expected.audio_plans;
+                expected.audio_plans = .{};
             }
             self.compute = expected;
             self.payload_allocator = expected.allocator;
@@ -6304,6 +6626,9 @@ pub const CudaCompute = struct {
             self.compute = null;
             self.payload_allocator = null;
             self.state = .finished;
+            // Pure plan metadata has no SDK/context borrow. Discharge only
+            // AFTER the pending capture veto clears and all real lanes ended.
+            try self.audio_plans.clearWithCleanup(.{ .outside_execution = true });
             // Only process metadata, pure domains and original opaque quota
             // tokens remain beyond this point. Reentrant suppliers see neither
             // a numerical gate nor a pending-acquire veto.
@@ -6382,6 +6707,15 @@ pub const CudaCompute = struct {
             leases += try CacheRetirement.leaseWord(&hash, arena.quota.peek(), &controller);
         }
         if (selection.full()) {
+            CacheRetirement.word(&hash, expected.audio_plans.clock);
+            for (expected.audio_plans.entries) |entry| {
+                hash.update(std.mem.asBytes(&entry.key));
+                CacheRetirement.word(&hash, entry.stamp);
+                CacheRetirement.word(&hash, @intFromBool(entry.warmed));
+                CacheRetirement.word(&hash, @intFromBool(entry.disabled));
+                CacheRetirement.word(&hash, if (entry.plan) |value| @intFromPtr(value) else 0);
+                CacheRetirement.word(&hash, if (entry.owner) |value| @intFromPtr(value) else 0);
+            }
             var packed_entries = expected.embedding_gemma2_execution.weights.iterator();
             while (packed_entries.next()) |entry| {
                 hash.update(entry.key_ptr.*);
@@ -6421,6 +6755,7 @@ pub const CudaCompute = struct {
     /// producer or refund here; raced cache population retries outside lanes.
     pub fn installEmptyEmbeddingGemma2Policy(cb: *const ops.ComputeBackend, expected: *CudaCompute, desired: ?@import("video_cache_budget.zig").Admission) !void {
         const snapshot = try cacheRetirementRequirements(cb, expected, .all);
+        if (expected.audio_plans.clock != 0) return error.CachePolicyNotEmpty;
         if (snapshot.lease_slots != 0 or snapshot.constant_slots != 0 or expected.embedding_gemma2_execution.weights.count() != 0 or expected.embedding_gemma2_resize.next_plan != 0 or expected.embedding_gemma2_execution.next_arena != 0 or expected.ctx.video_decoder_cache != null) return error.CachePolicyNotEmpty;
         for (expected.embedding_gemma2_resize.sources) |source| if (source.host.ptr != null or source.event != null) return error.CachePolicyNotEmpty;
         for (expected.embedding_gemma2_execution.arenas) |arena| {
@@ -6433,23 +6768,29 @@ pub const CudaCompute = struct {
 
     const CacheFunding = @import("prepared_cache.zig");
     const CacheRequestState = struct {
+        // Actual Model-local borrowed pointer; never copied across a cold window.
+        quota: ?*CacheQuota = null,
         miss: bool = false,
         amounts: @import("../../runtime/tier/memory.zig").AdmissionAmounts = .{},
         temporary_host: usize = 0,
         victims: @FieldType(CacheRetirementSelection, "geometry") = .{},
     };
     fn validateCacheWorkload(work: CacheFunding.Workload) !void {
+        return validateCacheSource(&work);
+    }
+    fn validateCacheSource(source: anytype) !void {
+        try source.arena_order.validate(source);
         var resize: usize = 0;
         var arena: usize = 0;
         var decoder: usize = 0;
-        for (work.requests) |request| switch (request) {
+        for (0..source.requestCount()) |index| switch (source.requestAt(index)) {
             .resize => {
                 resize += 1;
                 if (resize > 1) return error.UnsupportedPreparedCacheWorkload;
             },
             .arena => {
                 arena += 1;
-                if (arena > 1) return error.UnsupportedPreparedCacheWorkload;
+                if (arena > (if (source.arena_order.len == 0) @as(usize, 1) else @as(usize, 8))) return error.UnsupportedPreparedCacheWorkload;
             },
             .decoder => {
                 decoder += 1;
@@ -6460,16 +6801,32 @@ pub const CudaCompute = struct {
     }
     fn cacheRequestState(self: *CudaCompute, request: CacheFunding.Request) !CacheRequestState {
         switch (request) {
+            .audio_learning => |value| {
+                for (self.audio_plans.entries) |entry| if (entry.stamp != 0 and entry.key == value.key and entry.warmed and !entry.disabled) {
+                    if (entry.owner) |owner| {
+                        if (entry.plan != &owner.plan) return error.InvalidAudioPlanOwner;
+                        return .{};
+                    }
+                    return .{ .miss = true, .amounts = .{ .host_scratch_bytes = @sizeOf(@import("audio_execution_plan.zig").Owner) } };
+                };
+                return .{};
+            },
             .decoder => |sequence| {
                 const bytes = try sequence.bytes();
-                if (@import("video.zig").cachedSequenceMatches(&self.ctx, sequence) and self.ctx.video_cache_budget.currentCleanupPrepared()) return .{};
+                if (@import("video.zig").cachedSequenceMatches(&self.ctx, sequence)) {
+                    if (self.ctx.video_cache_budget.bytes != bytes) return error.PreparedCacheAmountChanged;
+                    if (self.ctx.video_cache_budget.admission != null and !self.ctx.video_cache_budget.quota.hasLease()) return error.MissingCacheRetirementLease;
+                    return .{ .quota = &self.ctx.video_cache_budget.quota };
+                }
                 return .{ .miss = true, .amounts = .{ .backend_scratch_bytes = bytes }, .victims = .{ .video = self.ctx.video_decoder_cache != null or self.ctx.video_cache_budget.bytes != 0 } };
             },
-            .ocr_retention, .auxiliary, .derived_weight, .captured_storage, .captured_arena => return error.UnsupportedPreparedCacheWorkload,
+            .ocr_retention, .auxiliary, .derived_weight, .captured_storage, .captured_arena, .external_prefill => return error.UnsupportedPreparedCacheWorkload,
             .resize => |geometry| {
                 const cache = &self.embedding_gemma2_resize;
                 const key: @import("embedding_gemma2_resize.zig").Key = .{ .width = geometry.width, .height = geometry.height, .target_width = geometry.target_width, .target_height = geometry.target_height, .resident = geometry.resident };
-                if (cache.contains(key)) return .{};
+                for (&cache.plans) |*slot| if (slot.*) |*plan| {
+                    if (std.meta.eql(plan.key, key)) return .{ .quota = &plan.quota };
+                };
                 const bytes = try @import("embedding_gemma2_resize.zig").Cache.footprint(key);
                 if (bytes.retained_bytes > @import("embedding_gemma2_resize.zig").plan_limit) return .{};
                 return .{ .miss = true, .amounts = .{ .host_scratch_bytes = bytes.retained_bytes, .backend_scratch_bytes = bytes.retained_bytes }, .temporary_host = bytes.temporary_bytes, .victims = .{ .resize_plans = try cache.victimsFor(key) } };
@@ -6477,18 +6834,18 @@ pub const CudaCompute = struct {
             .source => |source| {
                 if (source.bytes == 0 or source.bytes > @import("embedding_gemma2_resize.zig").source_limit) return error.ResourceLimitExceeded;
                 const value = &self.embedding_gemma2_resize.sources[source.index];
-                if (value.host.len >= source.bytes) return .{};
+                if (value.host.len >= source.bytes) return .{ .quota = &value.quota };
                 return .{ .miss = true, .amounts = .{ .host_scratch_bytes = source.bytes }, .victims = .{ .resize_sources = if (value.host.ptr != null or value.quota.hasLease()) @as(u2, 1) << source.index else 0 } };
             },
             .arena => |geometry| {
                 const selected = (try self.embedding_gemma2_execution.selectArena(geometry)) orelse return .{}; // Original optional hot-shape policy decline.
-                if (selected.hit) return .{};
+                if (selected.hit) return .{ .quota = &self.embedding_gemma2_execution.arenas[selected.index].quota };
                 return .{ .miss = true, .amounts = .{ .backend_scratch_bytes = selected.bytes }, .victims = .{ .execution_arenas = selected.victims } };
             },
             .packed_weight => |span| {
-                if (self.embedding_gemma2_execution.weights.get(span.name.slice())) |value| {
+                if (self.embedding_gemma2_execution.weights.getPtr(span.name.slice())) |value| {
                     if (value.buffer.len != span.bytes) return error.PreparedCacheAmountChanged;
-                    return .{};
+                    return .{ .quota = &value.quota };
                 }
                 if (span.bytes == 0 or span.bytes > @import("embedding_gemma2_execution.zig").packed_limit - self.embedding_gemma2_execution.packed_bytes) return .{};
                 return .{ .miss = true, .amounts = .{ .backend_scratch_bytes = span.bytes } };
@@ -6498,20 +6855,75 @@ pub const CudaCompute = struct {
                 if (!std.mem.startsWith(u8, span.name.slice(), "audio_tower.prepared.")) return error.UnsupportedPreparedCacheWorkload;
                 if (self.embedding_gemma2_constants.get(span.name.slice())) |value| {
                     if (!value.model_constant or value.dtype != .f32 or value.buffer.len != span.bytes) return error.PreparedCacheAmountChanged;
-                    return .{};
+                    var root = value;
+                    while (root.resident_parent) |parent| root = parent;
+                    return .{ .quota = &root.model_constant_quota };
                 }
                 if (span.bytes == 0 or span.bytes > constant_policy.prepared_max_bytes - self.embedding_gemma2_constant_bytes.load(.acquire) or self.embedding_gemma2_constant_count.load(.acquire) >= constant_policy.prepared_max_entries) return .{};
                 return .{ .miss = true, .amounts = .{ .backend_scratch_bytes = span.bytes } };
             },
         }
     }
+    const ArenaTimeline = struct {
+        const Item = struct { request_index: usize = 0, state: CacheRequestState = .{} };
+        items: [8]Item = @splat(.{}),
+        len: usize = 0,
+        fn get(self: *const ArenaTimeline, index: usize) ?CacheRequestState {
+            for (self.items[0..self.len]) |item| if (item.request_index == index) return item.state;
+            return null;
+        }
+    };
+    /// SAME producer selector, advanced only in actual callback chronology.
+    /// Quota pointers below remain Model-local; Funding copies only identities.
+    fn planArenaTimeline(self: *CudaCompute, source: anytype) !ArenaTimeline {
+        var result: ArenaTimeline = .{};
+        if (source.arena_order.len == 0) return result;
+        var cursor = @import("embedding_gemma2_execution.zig").ArenaPreview.fromCache(&self.embedding_gemma2_execution);
+        for (source.arena_order.indices[0..source.arena_order.len]) |request_index| {
+            const request = source.requestAt(request_index);
+            const selected = try cursor.advance(request.arena);
+            var prior: ?usize = null;
+            for (result.items[0..result.len], 0..) |item, index| if (item.request_index == request_index) {
+                prior = index;
+                break;
+            };
+            if (prior) |index| {
+                // A genuinely hot old shape may decline the first attempt,
+                // then age enough for a later chronological attempt to create
+                // this SAME key. Reserve that one later birth, never retry math.
+                if (selected) |choice| if (!choice.hit) {
+                    result.items[index].state.quota = null;
+                    result.items[index].state.miss = true;
+                    result.items[index].state.amounts = .{ .backend_scratch_bytes = choice.bytes };
+                    result.items[index].state.victims.execution_arenas |= choice.victims;
+                };
+                continue;
+            }
+            if (result.len == result.items.len) return error.UnsupportedPreparedArenaChronology;
+            var state: CacheRequestState = .{};
+            if (selected) |choice| {
+                if (choice.hit) state.quota = &self.embedding_gemma2_execution.arenas[choice.index].quota else {
+                    state.miss = true;
+                    state.amounts = .{ .backend_scratch_bytes = choice.bytes };
+                    state.victims.execution_arenas = choice.victims;
+                }
+            }
+            result.items[result.len] = .{ .request_index = request_index, .state = state };
+            result.len += 1;
+        }
+        return result;
+    }
+    fn cacheRequestWithTimeline(self: *CudaCompute, request: CacheFunding.Request, index: usize, timeline: *const ArenaTimeline) !CacheRequestState {
+        return timeline.get(index) orelse try self.cacheRequestState(request);
+    }
     pub fn cacheWorkloadVictims(cb: *const ops.ComputeBackend, expected: *CudaCompute, work: CacheFunding.Workload) !CacheRetirementSelection {
         try validateEmbeddingStage(cb, expected);
         if (expected.capability_profile != .embedding_gemma2) return error.UnsupportedEmbeddingStage;
         try validateCacheWorkload(work);
+        const timeline = try expected.planArenaTimeline(&work);
         var victims: @FieldType(CacheRetirementSelection, "geometry") = .{};
-        for (work.requests) |request| {
-            const state = try expected.cacheRequestState(request);
+        for (work.requests, 0..) |request, index| {
+            const state = try expected.cacheRequestWithTimeline(request, index, &timeline);
             victims.resize_plans |= state.victims.resize_plans;
             victims.resize_sources |= state.victims.resize_sources;
             victims.execution_arenas |= state.victims.execution_arenas;
@@ -6521,39 +6933,29 @@ pub const CudaCompute = struct {
     }
     pub fn cacheWorkloadNeedsFunding(cb: *const ops.ComputeBackend, expected: *CudaCompute, work: CacheFunding.Workload) !bool {
         _ = try cacheWorkloadVictims(cb, expected, work);
-        for (work.requests) |request| if ((try expected.cacheRequestState(request)).miss) return true;
+        const timeline = try expected.planArenaTimeline(&work);
+        for (work.requests, 0..) |request, index| {
+            const actual = try expected.cacheRequestWithTimeline(request, index, &timeline);
+            if (actual.miss or (actual.quota != null and actual.quota.?.* == .raw)) return true;
+        }
         return false;
     }
     pub fn snapshotCacheFunding(cb: *const ops.ComputeBackend, expected: *CudaCompute, funding: *CacheFunding.Funding) !void {
         try validateEmbeddingStage(cb, expected);
         if (expected.capability_profile != .embedding_gemma2 or funding.state != .created) return error.InvalidPreparedCacheState;
-        var resize_count: usize = 0;
-        var arena_count: usize = 0;
-        var decoder_count: usize = 0;
-        for (funding.entries) |entry| switch (entry.request) {
-            .resize => {
-                resize_count += 1;
-                if (resize_count > 1) return error.UnsupportedPreparedCacheWorkload;
-            },
-            .arena => {
-                arena_count += 1;
-                if (arena_count > 1) return error.UnsupportedPreparedCacheWorkload;
-            },
-            .decoder => {
-                decoder_count += 1;
-                if (decoder_count > 1) return error.UnsupportedPreparedCacheWorkload;
-            },
-            else => {},
-        };
+        try validateCacheSource(funding);
+        const timeline = try expected.planArenaTimeline(funding);
         var packed_remaining = @import("embedding_gemma2_execution.zig").packed_limit - expected.embedding_gemma2_execution.packed_bytes;
         const constant_policy = @import("../../models/embedding_gemma2_weight_cache.zig");
         var constant_remaining = constant_policy.prepared_max_bytes - expected.embedding_gemma2_constant_bytes.load(.acquire);
         var constant_slots = constant_policy.prepared_max_entries - expected.embedding_gemma2_constant_count.load(.acquire);
+        funding.admission = expected.ctx.video_cache_budget.admission;
         for (funding.entries, 0..) |*entry, index| {
             entry.miss = false;
             entry.amounts = .{};
             entry.temporary_host_bytes = 0;
-            const actual = try expected.cacheRequestState(entry.request);
+            const actual = try expected.cacheRequestWithTimeline(entry.request, index, &timeline);
+            if (actual.quota) |quota| if (quota.* == .raw) try funding.noteRawUpgrade(index, quota.*);
             if (actual.victims.resize_plans != 0 or actual.victims.resize_sources != 0 or actual.victims.execution_arenas != 0 or actual.victims.video) return error.CacheVictimsRequireRetirement;
             if (actual.miss) {
                 switch (entry.request) {
@@ -6585,13 +6987,22 @@ pub const CudaCompute = struct {
         if (expected.ctx.prepared_cache_funding != null or expected.capability_profile != .embedding_gemma2) return error.InvalidPreparedCacheState;
         try validateCacheWorkload(work);
         const empty = !funding.heap_owned;
-        if (!empty and (funding.compute_identity != @intFromPtr(expected) or !sameCacheAdmission(funding.admission, expected.ctx.video_cache_budget.admission) or funding.entries.len != work.requests.len)) return error.PreparedCachePlanChanged;
+        if (!empty and (funding.compute_identity != @intFromPtr(expected) or !sameCacheAdmission(funding.admission, expected.ctx.video_cache_budget.admission) or funding.entries.len != work.requests.len or !std.meta.eql(funding.arena_order, work.arena_order))) return error.PreparedCachePlanChanged;
+        const timeline = try expected.planArenaTimeline(&work);
         var packed_remaining = @import("embedding_gemma2_execution.zig").packed_limit - expected.embedding_gemma2_execution.packed_bytes;
         const constant_policy = @import("../../models/embedding_gemma2_weight_cache.zig");
         var constant_remaining = constant_policy.prepared_max_bytes - expected.embedding_gemma2_constant_bytes.load(.acquire);
         var constant_slots = constant_policy.prepared_max_entries - expected.embedding_gemma2_constant_count.load(.acquire);
         for (work.requests, 0..) |request, index| {
-            var actual = try expected.cacheRequestState(request);
+            var actual = try expected.cacheRequestWithTimeline(request, index, &timeline);
+            // A raw peer publication cannot enter the compatibility path.
+            // Rebuild outside before math, including zero-fresh-demand work.
+            const upgrade = !empty and funding.entries[index].upgrade_raw;
+            if (actual.quota) |quota| if (quota.* == .raw and !upgrade) return error.PreparedCachePlanChanged;
+            if (upgrade) {
+                if (!std.meta.eql(funding.entries[index].request, request) or actual.miss) return error.PreparedCachePlanChanged;
+                try funding.validateRawUpgrade(index, if (actual.quota) |quota| quota.* else .none);
+            }
             if (funding.deny_cold_misses) {
                 if (request == .decoder and actual.miss) return error.UnpreparedDecoderAdmission;
                 continue; // Only optional cache misses may retain compatibility.
@@ -6619,6 +7030,29 @@ pub const CudaCompute = struct {
         }
 
         try funding.bind(epoch);
+        errdefer funding.unbind();
+        // Legacy event metadata has no typed retained owner. Copy the SAME
+        // learned plan into its cold-funded backing; the old pure allocation
+        // stays in Funding until the actual post-unlock phase destructor.
+        for (funding.entries) |*entry| if (funding.audioLearningReady(entry)) {
+            for (&expected.audio_plans.entries) |*cached| if (cached.stamp != 0 and cached.key == entry.request.audio_learning.key and cached.plan != null and cached.owner == null) {
+                var token = try funding.take(entry.request, .{ .host_scratch_bytes = @sizeOf(@import("audio_execution_plan.zig").Owner) });
+                errdefer if (token.owner != null) token.cancelBeforeSdk() catch platform.inference_process_supervisor.restartWorker();
+                const owner = try token.publishAudioLearning();
+                owner.plan = cached.plan.?.*;
+                entry.retired_audio_plan = cached.plan;
+                cached.owner = owner;
+                cached.plan = &owner.plan;
+                break;
+            };
+        };
+        // Audio metadata publication above completes all fallible work. Every
+        // raw owner/controller and the current epoch already validated before
+        // ANY arm; this second walk keeps the SAME actual Model exclusion.
+        for (funding.entries, 0..) |entry, index| if (entry.upgrade_raw) {
+            const actual = expected.cacheRequestState(entry.request) catch platform.inference_process_supervisor.restartWorker();
+            funding.installRawUpgrade(index, actual.quota orelse platform.inference_process_supervisor.restartWorker());
+        };
         funding.decoder_sequence = null;
         for (work.requests) |request| if (request == .decoder) {
             funding.decoder_sequence = request.decoder;
@@ -6686,6 +7120,37 @@ pub const CudaCompute = struct {
     /// Native vision tower uses the same direct-key projection producer as the
     /// backbone. The caller supplies the already-qualified exact arena request;
     /// qualification may use existing private cuDNN descriptor resources.
+    pub const ImageCacheLayout = struct { source_bytes: usize, horizontal_bytes: usize, grid_x: u32, grid_y: u32, patches: usize };
+    pub fn imageCacheLayout(self: *const CudaCompute, request: ops.EmbeddingImageCacheRequest) !?ImageCacheLayout {
+        if (self.capability_profile != .embedding_gemma2 or self.ctx.info.compute_major < 8) return null;
+        if (request.width == 0 or request.height == 0 or request.target_width == 0 or request.target_height == 0 or request.target_width % 16 != 0 or request.target_height % 16 != 0) return error.InvalidShape;
+        const row_bytes = try checkedMul(request.width, 3);
+        if (request.stride < row_bytes) return error.InvalidShape;
+        const source_bytes = try std.math.add(usize, try checkedMul(request.height - 1, request.stride), row_bytes);
+        if (request.source_capacity < source_bytes) return error.InvalidShape;
+        const grid_x = request.target_width / 16;
+        const grid_y = request.target_height / 16;
+        const patches = try checkedMul(grid_x, grid_y);
+        try (embedding_gemma2_vision.Plan{ .sequence = patches, .grid_x = grid_x, .grid_y = grid_y }).validate();
+        const horizontal_bytes = try checkedMul(try checkedMul(request.height, request.target_width), 3);
+        if (request.width > 65535 or request.height > 65535 or source_bytes > 64 * 1024 * 1024 or horizontal_bytes > 128 * 1024 * 1024) return null;
+        return .{ .source_bytes = source_bytes, .horizontal_bytes = horizontal_bytes, .grid_x = grid_x, .grid_y = grid_y, .patches = patches };
+    }
+    pub fn appendImageCacheWorkload(self: *const CudaCompute, request: ops.EmbeddingImageCacheRequest, builder: *CacheFunding.Builder) !bool {
+        const layout = (try self.imageCacheLayout(request)) orelse return false;
+        try builder.add(@import("embedding_gemma2_resize.zig").Cache.request(.{ .width = request.width, .height = request.height, .target_width = request.target_width, .target_height = request.target_height, .resident = request.resident }));
+        if (!request.resident) try builder.add(.{ .source = .{ .index = @intCast(self.embedding_gemma2_resize.next_source % self.embedding_gemma2_resize.sources.len), .bytes = layout.source_bytes } });
+        return true;
+    }
+    pub fn imageCacheWorkloadMatches(self: *const CudaCompute, request: ops.EmbeddingImageCacheRequest, work: CacheFunding.Workload) !bool {
+        var storage: [2]CacheFunding.Request = undefined;
+        var builder = CacheFunding.Builder{ .storage = &storage };
+        if (!try self.appendImageCacheWorkload(request, &builder)) return work.requests.len == 0;
+        const actual = builder.workload();
+        if (actual.requests.len != work.requests.len) return false;
+        for (actual.requests, work.requests) |a, b| if (!std.meta.eql(a, b)) return false;
+        return true;
+    }
     pub fn appendVisionCacheWorkload(self: *const CudaCompute, arena: ?CacheFunding.Request, builder: *CacheFunding.Builder) !void {
         if (arena) |request| {
             if (request != .arena or request.arena.kind != .vision) return error.InvalidPreparedCacheRequest;
@@ -6699,8 +7164,105 @@ pub const CudaCompute = struct {
             try builder.add(try directProjectionCacheRequest(weights.gate, try checkedMul(embedding_gemma2_vision.intermediate_size, 2), embedding_gemma2_vision.hidden_size));
         }
     }
+    pub fn appendVideoCacheWorkload(cb: *const ops.ComputeBackend, expected: *CudaCompute, recipe: CacheFunding.VideoRecipe, builder: *CacheFunding.Builder) !void {
+        try validateEmbeddingStage(cb, expected);
+        if (expected.capability_profile != .embedding_gemma2) return error.UnsupportedEmbeddingStage;
+        try recipe.validate();
+        try builder.add(.{ .decoder = recipe.sequence });
+        try builder.add(.{ .resize = recipe.resize });
+        try expected.appendVisionCacheWorkload(null, builder);
+        const capacity: usize = if (expected.embedding_gemma2_policy.image_batch) 4 else 1;
+        var remaining: usize = recipe.unique_frames;
+        while (remaining != 0) {
+            const batch = @min(capacity, remaining);
+            const arena = try qualifyVisionCacheRequest(cb, expected, batch, recipe.grid_x, recipe.grid_y);
+            if (arena) |request| try builder.addArenaUse(request);
+            remaining -= batch;
+        }
+    }
     pub fn packedNamedCacheRequest(names: []const []const u8, widths: []const usize, in_dim: usize) !CacheFunding.Request {
         return CacheFunding.Request.joinedPackedSpan(names, widths, in_dim);
+    }
+
+    /// Only immutable actual uploaded weight metadata participates in the
+    /// optional derived constant declaration. Unknown/quantized sources keep
+    /// their original numerical conversion/fallback; no guessed layout credit.
+    fn audioDepthwiseCacheRequest(self: *const CudaCompute, recipe: CacheFunding.AudioRecipe, layer: usize) !?CacheFunding.Request {
+        if (!recipe.depthwise_cached) return null;
+        var logical_buffer: [128]u8 = undefined;
+        const logical = try CacheFunding.AudioRecipe.depthwiseWeightName(&logical_buffer, layer);
+        var name_buffer: [256]u8 = undefined;
+        const name = try @import("../../architectures/gemma4_hf_weights.zig").resolve(&name_buffer, logical);
+        const source = self.resident_weights.getPtr(name) orelse return null;
+        if ((source.dtype != .f32 and source.dtype != .bf16 and source.dtype != .f16) or source.quant_type != null or source.tc_quant != null or source.buffer.ptr == 0) return null;
+        const elements = CacheFunding.AudioRecipe.validateDepthwiseSource(source.shape, recipe.conv_kernel, recipe.hidden, true) catch return null;
+        if (source.elem_count != elements or source.buffer.len < try source.dtype.byteCount(elements)) return null;
+        var key: [256]u8 = undefined;
+        return try CacheFunding.Request.constantSpan(try recipe.towerKey(&key, .depthwise, layer), try checkedMul(elements, @sizeOf(f32)));
+    }
+    fn appendAudioConstant(builder: *CacheFunding.Builder, key: []const u8, elements: usize) !void {
+        try builder.add(try CacheFunding.Request.constantSpan(key, try checkedMul(elements, @sizeOf(f32))));
+    }
+    /// Rebuilt under the actual Stage owner after every yield. Only an already
+    /// learned event layout can contribute an audio arena request.
+    pub fn appendAudioCacheWorkload(self: *const CudaCompute, recipe: CacheFunding.AudioRecipe, builder: *CacheFunding.Builder) !void {
+        try recipe.validate();
+        if (self.capability_profile != .embedding_gemma2) return error.UnsupportedEmbeddingStage;
+        var key: [256]u8 = undefined;
+        const relative = try checkedMul(recipe.context_left, recipe.hidden);
+        try appendAudioConstant(builder, try recipe.towerKey(&key, .relative, 0), relative);
+        try appendAudioConstant(builder, try recipe.towerKey(&key, .ones, 0), recipe.output_hidden);
+        for (0..recipe.blocks) |layer| {
+            try appendAudioConstant(builder, try recipe.towerKey(&key, .query_scale, layer), recipe.hidden / recipe.heads);
+            try appendAudioConstant(builder, try recipe.towerKey(&key, .relative_key, layer), relative);
+            if (try self.audioDepthwiseCacheRequest(recipe, layer)) |request| try builder.add(request);
+            if (self.embedding_gemma2_policy.packed_projections and recipe.packed_layers & (@as(u16, 1) << @intCast(layer)) != 0) {
+                var storage: [3][128]u8 = undefined;
+                var names: [3][]const u8 = undefined;
+                for (&names, 0..) |*name, component| name.* = try CacheFunding.AudioRecipe.qkvWeightName(&storage[component], layer, component);
+                try builder.add(try packedNamedCacheRequest(&names, &.{ recipe.hidden, recipe.hidden, recipe.hidden }, recipe.hidden));
+            }
+        }
+        if (recipe.frontend_device) {
+            if (self.embedding_gemma2_policy.audio_frontend_fused and !recipe.force_dft and !recipe.force_unfused) {
+                try appendAudioConstant(builder, try CacheFunding.AudioRecipe.frontendKey(&key, "logmel_sparse_fft512_v1", 512, 320, recipe.mel_bins), @import("../../architectures/audio_logmel_plan.zig").size);
+            } else {
+                try appendAudioConstant(builder, try CacheFunding.AudioRecipe.frontendKey(&key, "window", 512, 320, recipe.mel_bins), 320);
+                if (!recipe.force_dft and (self.embedding_gemma2_policy.audio_fft or self.embedding_gemma2_policy.audio_frontend_fused))
+                    try appendAudioConstant(builder, try CacheFunding.AudioRecipe.frontendKey(&key, "fft512_twiddles", 512, 320, recipe.mel_bins), 512);
+                if (recipe.force_dft or !self.embedding_gemma2_policy.audio_fft)
+                    try appendAudioConstant(builder, try CacheFunding.AudioRecipe.frontendKey(&key, "basis", 512, 320, recipe.mel_bins), 2 * 257 * 320);
+                try appendAudioConstant(builder, try CacheFunding.AudioRecipe.frontendKey(&key, "filters", 512, 320, recipe.mel_bins), try checkedMul(257, recipe.mel_bins));
+            }
+        }
+        if (recipe.count < 2 or !recipe.graph_allowed or !recipe.host_ops_empty) return;
+        const rows = try recipe.rows();
+        var segments: [4]usize = undefined;
+        for (recipe.frames[0..recipe.count], segments[0..recipe.count]) |frames, *span| span.* = (try checkedAdd(frames, 3)) / 4;
+        var shapes: [17][2]i64 = undefined;
+        shapes[0] = .{ @intCast(rows), @intCast(recipe.hidden) };
+        shapes[1] = .{ @intCast(recipe.context_left), @intCast(recipe.hidden) };
+        var inputs: [17]AudioCacheInput = undefined;
+        inputs[0] = .{ .shape = &shapes[0], .elements = try checkedMul(rows, recipe.hidden) };
+        inputs[1] = .{ .shape = &shapes[1], .elements = relative };
+        for (2..5) |index| {
+            shapes[index][0] = @intCast(rows);
+            inputs[index] = .{ .shape = shapes[index][0..1], .elements = rows };
+        }
+        for (5..17) |index| {
+            shapes[index][0] = @intCast(recipe.hidden / recipe.heads);
+            inputs[index] = .{ .shape = shapes[index][0..1], .elements = recipe.hidden / recipe.heads };
+        }
+        const execution_key = recipe.key(segments[0..recipe.count], 0, 12);
+        const base = try self.audioCacheBase(execution_key, &inputs);
+        if (base.input_bytes > 128 * 1024 * 1024) return;
+        if (self.embedding_gemma2_policy.audio_graph) for (self.audio_plans.entries) |entry| {
+            if (entry.stamp != 0 and entry.key == base.key and entry.warmed and !entry.disabled and entry.owner == null) {
+                try builder.add(.{ .audio_learning = .{ .key = base.key } });
+                break;
+            }
+        };
+        if (try self.audioCacheRequest(execution_key, &inputs)) |request| try builder.add(request);
     }
 
     pub fn visionArenaRequest(self: *const CudaCompute, batch: usize, grid_x: usize, grid_y: usize, rotary: bool) !CacheFunding.Request {
@@ -6713,14 +7275,17 @@ pub const CudaCompute = struct {
     /// It is not a metadata callback or new physical-cache credit. Reuses the
     /// numerical path's exact qualification/body; no supplier is invoked here
     /// (validateEmbeddingStage requires run_budget=null).
+    fn visionExecutionAvailable(self: *const CudaCompute) bool {
+        return self.capability_profile == .embedding_gemma2 and self.cublaslt != null and self.ctx.info.compute_major >= 8;
+    }
     pub fn qualifyVisionCacheRequest(cb: *const ops.ComputeBackend, expected: *CudaCompute, batch: usize, grid_x: usize, grid_y: usize) !?CacheFunding.Request {
         try validateEmbeddingStage(cb, expected);
         if (expected.capability_profile != .embedding_gemma2) return error.UnsupportedEmbeddingStage;
-        if (!expected.embedding_gemma2_policy.graph_replay) return null;
+        if (!expected.visionExecutionAvailable() or !expected.embedding_gemma2_policy.graph_replay) return null;
         const sequence = try checkedMul(grid_x, grid_y);
         const fused = if (expected.embedding_gemma2_policy.fused_vision and !expected.embedding_gemma2_policy.native_vision) try embeddingGemma2VisionPlan(expected, batch, sequence) else null;
         const native = expected.embedding_gemma2_policy.native_vision and cuda_artifact.hasBf16WmmaCodeFor(expected.ctx.info.compute_major, expected.ctx.info.compute_minor);
-        return expected.visionArenaRequest(batch, grid_x, grid_y, fused != null or native);
+        return try expected.visionArenaRequest(batch, grid_x, grid_y, fused != null or native);
     }
     pub const AudioCacheInput = struct { shape: []const i64, elements: usize };
     const AudioCacheBase = struct { key: u64, input_bytes: usize };
@@ -6763,7 +7328,7 @@ pub const CudaCompute = struct {
         for (self.audio_plans.entries) |entry| if (entry.stamp != 0 and entry.key == base.key and entry.warmed and !entry.disabled) {
             const plan = entry.plan orelse return null;
             if (try checkedAdd(base.input_bytes, plan.peak) > @import("audio_execution_plan.zig").limit) return null;
-            return self.audioArenaRequestFromPlan(base, plan);
+            return try self.audioArenaRequestFromPlan(base, plan);
         };
         return null;
     }
@@ -7394,6 +7959,7 @@ pub const CudaCompute = struct {
         var pair_quotas = self.lighton_gate_up_cache.valueIterator();
         while (pair_quotas.next()) |value| try value.quota.validateCleanup(current);
         try self.lighton_decode_graph.validateCleanup(current);
+        try self.audio_plans.validateCleanup(current);
         try self.embedding_gemma2_resize.validateCleanup(current);
         try self.embedding_gemma2_execution.validateCleanup(current);
         try self.validateConstantCleanup(current);
@@ -7404,6 +7970,7 @@ pub const CudaCompute = struct {
         try self.ocr_pinned_metadata_arena.quota.validateCleanup(current);
         try self.ocr_pinned_input.quota.validateCleanup(current);
         try self.lighton_burst_readback.quota.validateCleanup(current);
+        if (self.lighton_recurrent.bf16_prefill) |*prefill| try prefill.validateCleanup(current);
     }
     pub fn deinitWithBoundary(self: *CudaCompute, boundary: ?*const @import("../../execution/retirement_sink.zig").Epoch) void {
         self.deinitWithCleanup(.{ .boundary = boundary });
@@ -7429,7 +7996,7 @@ pub const CudaCompute = struct {
             self.capturing_physical_storage.deinit(self.allocator);
         }
         for (&self.debug_cuda_graph_slots) |*slot| deinitCudaGraphReplaySlot(self, slot);
-        self.audio_plans.clear();
+        self.audio_plans.clearWithCleanup(current) catch platform.inference_process_supervisor.restartWorker();
         const retained_cleanup_failed = failed: {
             self.embedding_gemma2_resize.clearWithCleanup(&self.ctx, current) catch break :failed true;
             self.embedding_gemma2_execution.clearWithCleanup(self.allocator, &self.ctx, current) catch break :failed true;
@@ -7516,12 +8083,13 @@ pub const CudaCompute = struct {
             std.debug.print("LIGHTONOCR3 cuda_packed_state_calls={d} cuda_rms_norm_bf16_mirror_hits={d} activation_mirror_hits={d}\n", .{ self.lighton_packed_state_calls, self.stats.rms_norm_bf16_mirror_hits, self.stats.bf16_cublaslt_activation_mirror_hits });
         if (self.capability_profile == .lightonocr3 and platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
             std.debug.print("LIGHTONOCR3 cuda_fused_gdn_decode_calls={d} cuda_fused_gdn_decode_pages={d}\n", .{ self.lighton_recurrent.fused_decode_calls, self.lighton_recurrent.fused_decode_pages });
-        if (self.lighton_recurrent.bf16_prefill) |prefill| {
+        if (self.lighton_recurrent.bf16_prefill) |*prefill| {
+            if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("CUDA external_prefill_preparations={d} external_prefill_declines={d}\n", .{ self.external_prefill_preparations, self.external_prefill_declines });
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) if (prefill.attention) |fast| std.debug.print("LIGHTONOCR3 cuda_native_prefill_attention_calls={d} plans={d} metadata_slots={d} slot_reuses={d}\n", .{ fast.calls, fast.plans, @import("lighton_prefill_attention.zig").metadata_slots, fast.slot_reuses });
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3"))
                 std.debug.print("LIGHTONOCR3 cuda_bf16_recurrent_prefill_calls={d} workspace_peak={d}\n", .{ prefill.calls, prefill.workspace_peak });
         }
-        self.lighton_recurrent.deinit(&self.ctx);
+        self.lighton_recurrent.deinitWithCleanup(&self.ctx, current) catch platform.inference_process_supervisor.restartWorker();
         if (self.florence_cudnn_conv) |*module| {
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("FLORENCE2 cuda_conv_cudnn_calls={d}\n", .{module.calls});
             module.deinit();
@@ -18392,7 +18960,8 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         canonical_count += 1;
     }
     const base_key = cache_base.key;
-    const entry = self.audio_plans.get(base_key);
+    const plan_cleanup: CacheCleanup = .{ .boundary = if (self.ctx.prepared_cache_funding) |funding| funding.boundary else null };
+    const entry = try self.audio_plans.getWithCleanup(base_key, plan_cleanup);
     if (entry.disabled) return null;
     if (!entry.warmed) {
         const out = try run(context, canonical[0..canonical_count]);
@@ -18401,8 +18970,20 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
     }
     const plan_mod = @import("audio_execution_plan.zig");
     if (entry.plan == null) {
-        const plan = try std.heap.c_allocator.create(plan_mod.Plan);
-        plan.* = .{};
+        const plan = if (self.ctx.prepared_cache_funding) |funding| prepared: {
+            var token = funding.take(.{ .audio_learning = .{ .key = base_key } }, .{ .host_scratch_bytes = @sizeOf(plan_mod.Owner) }) catch |err| {
+                if (err == error.UnpreparedCacheAdmission) return null; // same ordinary body, before layer execution
+                return err;
+            };
+            errdefer if (token.owner != null) token.cancelBeforeSdk() catch platform.inference_process_supervisor.restartWorker();
+            const owner = try token.publishAudioLearning();
+            entry.owner = owner;
+            break :prepared &owner.plan;
+        } else raw: {
+            const value = try std.heap.c_allocator.create(plan_mod.Plan);
+            value.* = .{};
+            break :raw value;
+        };
         entry.plan = plan;
         var scope = plan_mod.Scope{ .plan = plan };
         const h2d_before = self.stats.h2d_bytes;
@@ -18411,7 +18992,10 @@ fn audioExecutionOp(ctx: *anyopaque, key: u64, inputs: []const CT, context: *any
         const out = run(context, canonical[0..canonical_count]) catch |err| {
             self.execution_scope = null;
             if (err == error.Cancelled or err == error.Timeout) {
-                std.heap.c_allocator.destroy(plan);
+                if (entry.owner) |owner| {
+                    try owner.retire(plan_cleanup);
+                    entry.owner = null;
+                } else std.heap.c_allocator.destroy(plan);
                 entry.plan = null;
             } else entry.disabled = true;
             return err;
@@ -27051,20 +27635,10 @@ fn preprocessEmbeddingGemma2ImagePatchesOp(ctx: *anyopaque, rgb: []const u8, wid
 }
 
 fn preprocessEmbeddingGemma2Patches(self: *CudaCompute, rgb: []const u8, resident: ?buffer_mod.DeviceBuffer, width: u32, height: u32, stride: usize, target_width: u32, target_height: u32, destination: ?buffer_mod.DeviceBuffer) !?CT {
-    if (self.capability_profile != .embedding_gemma2 or self.ctx.info.compute_major < 8) return null;
-    if (width == 0 or height == 0 or target_width == 0 or target_height == 0 or target_width % 16 != 0 or target_height % 16 != 0) return error.InvalidShape;
-    const row_bytes = try checkedMul(width, 3);
-    if (stride < row_bytes) return error.InvalidShape;
-    const source_bytes = try std.math.add(usize, try checkedMul(height - 1, stride), row_bytes);
-    if ((if (resident) |device| device.len else rgb.len) < source_bytes) return error.InvalidShape;
-    const grid_x = target_width / 16;
-    const grid_y = target_height / 16;
-    const patches = try checkedMul(grid_x, grid_y);
-    try (embedding_gemma2_vision.Plan{ .sequence = patches, .grid_x = grid_x, .grid_y = grid_y }).validate();
-    const horizontal_bytes = try checkedMul(try checkedMul(height, target_width), 3);
-    // Bound the extra staging independently of the general media admission.
-    // Decline unusually large sources before any device work is submitted.
-    if (width > 65535 or height > 65535 or source_bytes > 64 * 1024 * 1024 or horizontal_bytes > 128 * 1024 * 1024) return null;
+    const layout = (try self.imageCacheLayout(.{ .width = width, .height = height, .stride = stride, .source_capacity = if (resident) |device| device.len else rgb.len, .target_width = target_width, .target_height = target_height, .resident = resident != null })) orelse return null;
+    const source_bytes = layout.source_bytes;
+    const horizontal_bytes = layout.horizontal_bytes;
+    const patches = layout.patches;
     const image = @import("antfly_image");
     try image.work_control.check();
     const resize_misses = self.embedding_gemma2_resize.misses;
@@ -27219,7 +27793,7 @@ fn spatialPoolPrepareOp(ctx: *anyopaque, input_ct: CT, bias_ct: ?CT, scale_ct: ?
 
 fn runEmbeddingGemma2VisionTowerOp(ctx: *anyopaque, input_ct: CT, sequence: usize, grid_x: usize, grid_y: usize, batch: usize, control: ?InferenceExecutionControl) anyerror!?CT {
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
-    if (self.capability_profile != .embedding_gemma2 or self.cublaslt == null or self.ctx.info.compute_major < 8) return null;
+    if (!self.visionExecutionAvailable()) return null;
     const plan = embedding_gemma2_vision.Plan{ .sequence = sequence, .grid_x = grid_x, .grid_y = grid_y };
     try plan.validate();
     if (batch == 0 or batch > 8) return error.InvalidEmbeddingGemma2Shape;
@@ -28488,19 +29062,39 @@ fn gqaPagedAttentionWithCompressedDeviceKv(
     // Optional mixed-precision library only. Retain the original default,
     // decode kernels, and unsupported storage/layout routes. KV suffixes have
     // already been appended exactly once; failures here fail the claim.
-    if (self.capability_profile == .lightonocr3 and batch == 1 and
-        attention.query_sequence_len >= 2 and attention.query_sequence_len <= 4096 and
-        attention.kv_sequence_len <= 4096 and attention.total_sequence_len == attention.kv_sequence_len and
-        attention.kv_position_offset == 0 and attention.sliding_window == 0 and
-        mask_len == 0 and bias_mode == 0 and head_dim == 256 and
-        ((num_heads == 8 and num_kv_heads == 2) or (num_heads == 16 and num_kv_heads == 4)) and
-        paged.page_size_tokens == 16 and paged.format == cuda_kv_format_f16 and
-        layer.value_format == cuda_kv_value_format_f16 and
-        paged.key_row_bytes == h_kv * 2 and paged.base_key_row_bytes == h_kv * 2 and paged.v_row_stride == h_kv * 2 and
+    if (self.capability_profile == .lightonocr3 and (@import("lighton_prefill_attention.zig").Shape{
+        .batch = batch,
+        .rows = attention.query_sequence_len,
+        .tokens = attention.kv_sequence_len,
+        .total_tokens = attention.total_sequence_len,
+        .kv_position_offset = attention.kv_position_offset,
+        .sliding_window = attention.sliding_window,
+        .mask_len = mask_len,
+        .bias_mode = bias_mode,
+        .heads = num_heads,
+        .kv_heads = num_kv_heads,
+        .head_dim = head_dim,
+        .page_size = paged.page_size_tokens,
+        .key_f16 = paged.format == cuda_kv_format_f16,
+        .value_f16 = layer.value_format == cuda_kv_value_format_f16,
+        .key_row_bytes = paged.key_row_bytes,
+        .base_key_row_bytes = paged.base_key_row_bytes,
+        .value_row_bytes = paged.v_row_stride,
+    }).supported() and
         !self.debug_cuda_graph_capture_active and !self.ctx.debug_graph_capture_active)
     {
-        if (self.lighton_recurrent.bf16_prefill) |*prefill| if (prefill.attention) |*fast| {
-            try fast.reserve(&self.ctx);
+        if (self.lighton_recurrent.bf16_prefill) |*prefill| if (prefill.attention) |*fast| fast_library: {
+            if (self.managed_external_prefill_publication) fast.managed = true;
+            if (self.managed_external_prefill_publication) self.prepareExternalAttentionFromBoundFunding() catch |err| {
+                if (err != error.RecurrentPrefillColdPreparationRequired) return err;
+                // The original reserve below declines before any DSO state
+                // mutation; its existing generic attention fallback runs once.
+            };
+            fast.reserve(&self.ctx) catch |err| {
+                if (err != error.RecurrentPrefillColdPreparationRequired) return err;
+                self.external_prefill_declines += 1;
+                break :fast_library;
+            };
             try self.kernels.launchF32ToF16(&self.ctx, fast.query(), q_tensor.buffer, q_count);
             const block_count = (attention.kv_sequence_len + 15) / 16;
             if (logical_blocks.len < block_count) return error.InvalidPagedKvState;
@@ -51809,4 +52403,558 @@ fn derivedWeightColdCase(raw_first: bool) !void {
 test "CUDA derived BF16 input and gate-up caches cold fund exact sources before numerical ownership and keep warm pointers" {
     try derivedWeightColdCase(false);
     try derivedWeightColdCase(true);
+}
+
+test "CUDA optional recurrent prefill actual DSO cold geometry funds real retained SDK storage outside Model and warm raw upgrade preserves addresses" {
+    const CacheFunding = @import("prepared_cache.zig");
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const path = platform.env.getenv("ANTFLY_UNIFIED_CUDA_PREFILL_GEOMETRY_LIBRARY") orelse return error.SkipZigTest;
+    const F = @import("prefill_phase.zig");
+    const S = @import("../../backends/session.zig").Session;
+    const Sink = @import("../../execution/retirement_sink.zig");
+    for ([_]u8{ 0, 1, 2 }) |case| {
+        const raw_warm = case != 0;
+        const replace_policy = case == 2;
+        const domain = try @import("../../runtime/tier/admission_domain.zig").Domain.create();
+        defer domain.release();
+        var gate: std.atomic.Mutex = .unlocked;
+        const Probe = struct {
+            gate: *std.atomic.Mutex,
+            metadata: [2]?*std.atomic.Mutex = @splat(null),
+            violation: bool = false,
+            next: usize = 1,
+            tokens: [16]bool = @splat(false),
+            fn check(self: *@This()) void {
+                if (self.gate.tryLock()) self.gate.unlock() else self.violation = true;
+                for (self.metadata) |entry| if (entry) |mutex| {
+                    if (mutex.tryLock()) mutex.unlock() else self.violation = true;
+                };
+            }
+            fn reserve(raw: *anyopaque, _: @import("../../runtime/tier/memory.zig").AdmissionAmounts) @import("../../runtime/tier/memory.zig").AdmissionResourceError!usize {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.check();
+                const token = self.next;
+                self.next += 1;
+                std.debug.assert(token < self.tokens.len);
+                self.tokens[token] = true;
+                return token;
+            }
+            fn retain(raw: *anyopaque, token: usize, _: @import("../../runtime/tier/memory.zig").AdmissionAmounts) @import("../../runtime/tier/memory.zig").AdmissionResourceError!void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.check();
+                std.debug.assert(self.tokens[token]);
+            }
+            fn release(raw: *anyopaque, token: usize) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.check();
+                std.debug.assert(self.tokens[token]);
+                self.tokens[token] = false;
+            }
+            fn close(_: *anyopaque) void {}
+        };
+        var probe: Probe = .{ .gate = &gate };
+        try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+        defer domain.controller.configureResourceBudget(null) catch @panic("external DSO fixture quota leak");
+        var compute = try CudaCompute.testing.init(std.testing.allocator);
+        defer compute.deinit();
+        if (compute.ctx.info.compute_major != 12 or compute.ctx.info.compute_minor != 1) return error.SkipZigTest;
+        compute.capability_profile = .lightonocr3; // actual cache-owner profile; no model/numerical claim
+        compute.lighton_ragged_recurrent_enabled = true;
+        compute.lighton_recurrent_batch_enabled = true;
+        compute.ctx.video_cache_budget.admission = .{ .controller = &domain.controller, .limits = .{}, .check_live_memory = false };
+        try compute.lighton_recurrent.configureBf16Prefill(&compute.ctx, path);
+        const owner = &compute.lighton_recurrent.bf16_prefill.?;
+        probe.metadata[0] = &owner.metadata_mutex;
+        probe.metadata[1] = if (owner.attention) |*attention| &attention.metadata_mutex else null;
+        if (owner.geometry_workspace == null) return error.RecurrentPrefillColdGeometryUnavailable;
+        var model: S.ModelLifetime = .{ .owner = &compute, .destroy_fn = Probe.close, .admission_domain = domain.pin() };
+        defer model.release();
+        var cb = compute.computeBackend();
+        const descriptor = try F.Descriptor.init(16, 16, &.{ 17, 1, 7, 1 }, true, owner.attention != null);
+        const actual_bytes = try owner.coldWorkspaceBytes(&descriptor.packets[0]);
+        try std.testing.expect(actual_bytes > 0);
+        const before = compute.ctx.device_allocations.snapshot();
+        if (raw_warm) {
+            _ = try owner.reserve(&compute.ctx, actual_bytes); // explicit legacy outside contract
+            if (owner.attention) |*attention| try attention.reserve(&compute.ctx);
+            try std.testing.expect(owner.quota == .raw);
+        }
+        const raw_ptr = owner.scratch.ptr;
+        const raw_attention = if (owner.attention) |*attention| attention.device.ptr else 0;
+        // Exercise the SAME fixed-attention cold Header inventory used by
+        // non-Executor NativeGenerationPipeline requests. It prepares potential
+        // backing outside gates; the exact actual producer consumes it below.
+        var header_desired = compute.ctx.video_cache_budget.admission.?;
+        if (replace_policy) header_desired.limits.host_limit_bytes = 1024 * 1024 * 1024;
+        var header_funding: ?*CacheFunding.Funding = null;
+        defer if (header_funding) |value| value.finishOutsideExecution();
+        if (owner.attention != null) {
+            compute.constant_policy = compute.ctx.video_cache_budget.admission;
+            var request_slots: [3]CacheFunding.Request = undefined;
+            var builder: CacheFunding.Builder = .{ .storage = &request_slots };
+            var cfg: gpt_model.Config = .{ .hidden_size = 1024, .num_attention_heads = 8, .num_key_value_heads = 2, .attention_head_dim = 256 };
+            try compute.appendExternalPrefillWorkload(cfg, &builder);
+            try std.testing.expectEqual(@as(usize, 2), builder.len);
+            cfg.attention_head_dim = 32;
+            try compute.appendExternalPrefillWorkload(cfg, &builder); // unsupported adds nothing
+            try std.testing.expectEqual(@as(usize, 2), builder.len);
+            try builder.add(try compute.lightOnRetentionRequest(header_desired, @bitSizeOf(usize)));
+            const value = try CacheFunding.Funding.create(builder.workload());
+            header_funding = value;
+            try compute.snapshotLightOnNormFunding(value, header_desired);
+            var pin = model.retainAdmissionDomain(&domain.controller).?;
+            defer pin.release();
+            try value.fundLightOnOutsideExecution(&pin);
+        }
+        var reference = try Sink.Ref.create();
+        defer reference.release();
+        var publication = try reference.enter();
+        defer publication.finish();
+        var a = try publication.retainEpoch();
+        defer a.release();
+        if (header_funding) |value| {
+            try std.testing.expect(gate.tryLock());
+            var held = true;
+            defer if (held) gate.unlock();
+            var requests: [3]CacheFunding.Request = undefined;
+            for (value.entries, 0..) |entry, index| requests[index] = entry.request;
+            try CudaCompute.beginLightOnNormFunding(&compute, .{ .requests = &requests }, value, &a, header_desired);
+            var bound = true;
+            defer if (bound) CudaCompute.unbindCacheFunding(&cb, &compute, value);
+            if (raw_warm) try std.testing.expect(owner.quota == .prepared);
+            if (replace_policy) try compute.configureEmbeddingGemma2AdmissionWithCleanup(header_desired, .{ .boundary = &a });
+            try compute.prepareExternalAttentionFromBoundFunding();
+            try std.testing.expect(owner.attention.?.quota == .prepared);
+            if (raw_warm and !replace_policy) try std.testing.expect(owner.quota == .prepared);
+            if (raw_warm and !replace_policy) try std.testing.expectEqual(raw_attention, owner.attention.?.device.ptr);
+            CudaCompute.unbindCacheFunding(&cb, &compute, value);
+            bound = false;
+            gate.unlock();
+            held = false;
+        }
+        var phase: F.Phase = undefined;
+        try phase.initInto(descriptor);
+        defer phase.destroyOutside();
+        var complete = false;
+        for (0..8) |_| {
+            try std.testing.expect(gate.tryLock());
+            var held = true;
+            defer if (held) gate.unlock();
+            const decision = try CudaCompute.inspectExternalPrefillPhase(&cb, &phase, .{ .boundary = &a });
+            if (decision == .unavailable) return error.ExpectedActualPrefillModule;
+            if (decision == .ready) {
+                complete = true;
+                break;
+            }
+            gate.unlock();
+            held = false;
+            const sdk_before_cold = compute.ctx.device_allocations.snapshot();
+            try phase.prepareOutside(&model);
+            try std.testing.expectEqualDeep(sdk_before_cold, compute.ctx.device_allocations.snapshot());
+            try std.testing.expect(gate.tryLock());
+            held = true;
+            if (try CudaCompute.bindExternalPrefillPhase(&cb, &phase, .{ .boundary = &a })) {
+                complete = true;
+                break;
+            }
+        }
+        try std.testing.expect(complete and phase.cold == null and !phase.bound);
+        try std.testing.expect(owner.quota == .prepared and owner.scratch.ptr != 0 and owner.scratch.len == actual_bytes);
+        if (raw_warm and !replace_policy) {
+            try std.testing.expectEqual(raw_ptr, owner.scratch.ptr);
+            if (owner.attention) |*attention| try std.testing.expectEqual(raw_attention, attention.device.ptr);
+        }
+        publication.finish();
+        const paid = domain.controller.snapshot();
+        const device_after = compute.ctx.device_allocations.snapshot();
+        try std.testing.expect(device_after.live > before.live and paid.backend_scratch_bytes >= actual_bytes);
+        var consumer = try reference.enter();
+        defer consumer.finish();
+        var b = try consumer.retainEpoch();
+        defer b.release();
+        var warm: F.Phase = undefined;
+        try warm.initInto(descriptor);
+        defer warm.destroyOutside();
+        try std.testing.expect(gate.tryLock());
+        var held = true;
+        defer if (held) gate.unlock();
+        try std.testing.expectEqual(CudaCompute.ExternalPrefillDecision.ready, try CudaCompute.inspectExternalPrefillPhase(&cb, &warm, .{ .boundary = &b }));
+        try std.testing.expect(warm.cold == null);
+        try std.testing.expectEqualDeep(device_after, compute.ctx.device_allocations.snapshot());
+        try std.testing.expectEqualDeep(paid, domain.controller.snapshot());
+        try std.testing.expect(compute.ctx.driver.fns.cuStreamIsCapturing != null);
+        const syncs = compute.ctx.stats.stream_syncs;
+        try compute.ctx.beginStreamCapture(driver_mod.CU_STREAM_CAPTURE_MODE_RELAXED);
+        var capturing = true;
+        defer if (capturing) {
+            compute.ctx.debug_graph_capture_active = true;
+            var graph = compute.ctx.endStreamCapture() catch platform.inference_process_supervisor.restartWorker();
+            compute.ctx.destroyGraphChecked(&graph) catch platform.inference_process_supervisor.restartWorker();
+        };
+        compute.ctx.debug_graph_capture_active = false;
+        compute.debug_cuda_graph_capture_active = false;
+        var blocked: F.Phase = undefined;
+        try blocked.initInto(descriptor);
+        try std.testing.expectError(error.EmbeddingStageBusy, CudaCompute.inspectExternalPrefillPhase(&cb, &blocked, .{ .boundary = &b }));
+        try std.testing.expectError(error.CudaGraphCaptureUnsafeTempAlloc, owner.clearWorkspaceWithCleanup(&compute.ctx, .{ .boundary = &b }));
+        try std.testing.expectEqual(syncs, compute.ctx.stats.stream_syncs);
+        try std.testing.expectEqualDeep(device_after, compute.ctx.device_allocations.snapshot());
+        compute.ctx.debug_graph_capture_active = true;
+        var graph = try compute.ctx.endStreamCapture();
+        capturing = false;
+        try compute.ctx.destroyGraphChecked(&graph);
+        try owner.clearWorkspaceWithCleanup(&compute.ctx, .{ .boundary = &b });
+        try std.testing.expectEqual(before.live, compute.ctx.device_allocations.snapshot().live);
+        try std.testing.expectEqualDeep(paid, domain.controller.snapshot()); // actual final B, not publication A
+        gate.unlock();
+        held = false;
+        consumer.finish();
+        try std.testing.expectEqualDeep(@import("../../runtime/tier/memory.zig").AdmissionAmounts{}, domain.controller.snapshot());
+        try std.testing.expect(!probe.violation);
+        for (probe.tokens) |live| try std.testing.expect(!live);
+    }
+}
+
+test "CUDA image cold recipe shares exact checked producer geometry and follows rotating source index before SDK" {
+    const CacheFunding = @import("prepared_cache.zig");
+    var compute: CudaCompute = undefined;
+    compute.capability_profile = .embedding_gemma2;
+    compute.ctx.info.compute_major = 8;
+    compute.embedding_gemma2_resize = .{};
+    const request: ops.EmbeddingImageCacheRequest = .{ .width = 17, .height = 9, .stride = 64, .source_capacity = 563, .target_width = 48, .target_height = 48 };
+    const layout = (try compute.imageCacheLayout(request)).?;
+    try std.testing.expectEqual(@as(usize, 563), layout.source_bytes);
+    try std.testing.expectEqual(@as(usize, 9 * 48 * 3), layout.horizontal_bytes);
+    try std.testing.expectEqual(@as(usize, 9), layout.patches);
+    var storage: [2]CacheFunding.Request = undefined;
+    var builder = CacheFunding.Builder{ .storage = &storage };
+    try std.testing.expect(try compute.appendImageCacheWorkload(request, &builder));
+    try std.testing.expectEqual(@as(u1, 0), builder.workload().requests[1].source.index);
+    try std.testing.expect(try compute.imageCacheWorkloadMatches(request, builder.workload()));
+    compute.embedding_gemma2_resize.next_source = 1;
+    try std.testing.expect(!try compute.imageCacheWorkloadMatches(request, builder.workload()));
+    builder.len = 0;
+    try std.testing.expect(try compute.appendImageCacheWorkload(request, &builder));
+    try std.testing.expectEqual(@as(u1, 1), builder.workload().requests[1].source.index);
+    var resident = request;
+    resident.resident = true;
+    builder.len = 0;
+    try std.testing.expect(try compute.appendImageCacheWorkload(resident, &builder));
+    try std.testing.expectEqual(@as(usize, 1), builder.len);
+    var truncated = request;
+    truncated.source_capacity -= 1;
+    try std.testing.expectError(error.InvalidShape, compute.imageCacheLayout(truncated));
+    var stride = request;
+    stride.stride = 50;
+    try std.testing.expectError(error.InvalidShape, compute.imageCacheLayout(stride));
+    var invalid = request;
+    invalid.target_width = 47;
+    try std.testing.expectError(error.InvalidShape, compute.imageCacheLayout(invalid));
+}
+
+test "CUDA audio learning cache state uses actual warm no-plan eligibility and only exact host metadata class" {
+    const CacheFunding = @import("prepared_cache.zig");
+    const plan_mod = @import("audio_execution_plan.zig");
+    var compute: CudaCompute = undefined;
+    compute.audio_plans = .{};
+    const request: CacheFunding.Request = .{ .audio_learning = .{ .key = 71 } };
+    try std.testing.expect(!(try compute.cacheRequestState(request)).miss);
+    compute.audio_plans.entries[0] = .{ .key = 71, .stamp = 1 };
+    try std.testing.expect(!(try compute.cacheRequestState(request)).miss);
+    compute.audio_plans.entries[0].warmed = true;
+    const cold = try compute.cacheRequestState(request);
+    try std.testing.expect(cold.miss);
+    try std.testing.expectEqualDeep(@import("../../runtime/tier/memory.zig").AdmissionAmounts{ .host_scratch_bytes = @sizeOf(plan_mod.Owner) }, cold.amounts);
+    var legacy: plan_mod.Plan = .{};
+    compute.audio_plans.entries[0].plan = &legacy;
+    try std.testing.expect((try compute.cacheRequestState(request)).miss); // raw metadata upgrade, not second learning
+    const owner = try plan_mod.Owner.createOutsideExecution(std.testing.allocator);
+    defer owner.destroyUnusedOutsideExecution();
+    compute.audio_plans.entries[0].owner = owner;
+    compute.audio_plans.entries[0].plan = &owner.plan;
+    try std.testing.expect(!(try compute.cacheRequestState(request)).miss);
+    compute.audio_plans.entries[0].plan = &legacy;
+    try std.testing.expectError(error.InvalidAudioPlanOwner, compute.cacheRequestState(request));
+    compute.audio_plans.entries[0].owner = null;
+    compute.audio_plans.entries[0].disabled = true;
+    try std.testing.expect(!(try compute.cacheRequestState(request)).miss);
+}
+
+test "CUDA warm raw frontend five owners upgrade exact SDK addresses at full cap despite optional miss denial" {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const Cache = @import("prepared_cache.zig");
+    const Memory = @import("../../runtime/tier/memory.zig");
+    const Domain = @import("../../runtime/tier/admission_domain.zig").Domain;
+    const Session = @import("../../backends/session.zig").Session;
+    const Sink = @import("../../execution/retirement_sink.zig");
+    const a = std.testing.allocator;
+    const domain = try Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var compute = CudaCompute.initWithKernelJitForProfile(a, .{}, .embedding_gemma2) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const ModelOwner = struct {
+        fn close(_: *anyopaque) void {}
+    };
+    var marker: u8 = 0;
+    var model: Session.ModelLifetime = .{ .owner = &marker, .destroy_fn = ModelOwner.close };
+    const Probe = struct {
+        model: *Session.ModelLifetime,
+        calls: usize = 0,
+        violation: bool = false,
+        fn check(self: *@This()) void {
+            if (!self.model.execution_gate.tryLock()) self.violation = true else self.model.execution_gate.unlock();
+        }
+        fn reserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+            self.calls += 1;
+            return self.calls;
+        }
+        fn retain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+        fn release(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.check();
+        }
+    };
+    var probe: Probe = .{ .model = &model };
+    try domain.controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
+    compute.ctx.video_cache_budget.admission = .{ .controller = pin.controller(), .limits = .{}, .check_live_memory = false };
+    const key: @import("embedding_gemma2_resize.zig").Key = .{ .width = 16, .height = 16, .target_width = 8, .target_height = 8, .resident = true };
+    const sizes: [11]usize = @splat(16);
+    const plan = try compute.embedding_gemma2_resize.plan(a, &compute.ctx, key);
+    const arena = (try compute.embedding_gemma2_execution.arena(&compute.ctx, 1, 1, 0, sizes)).?;
+    const packed_span = (try compute.embedding_gemma2_execution.allocatePacked(a, &compute.ctx, "warm.raw.sdk.fixture", 64)).?;
+    const source_bytes: [32]u8 = @splat(7);
+    var destination = try buffer_mod.DeviceBuffer.alloc(&compute.ctx, source_bytes.len);
+    defer destination.free(&compute.ctx);
+    const ordinal: u1 = @intCast(compute.embedding_gemma2_resize.next_source % 2);
+    try compute.embedding_gemma2_resize.uploadSource(&compute.ctx, destination, &source_bytes);
+    const input = try cb.fromFloat32Shape(&.{ 1, -2, 3, 4 }, &.{ 2, 2 });
+    defer cb.free(input);
+    const held = (try modelConstantOp(&compute, "audio_tower.prepared.warm.raw.sdk", input)).?;
+    var held_live = true;
+    defer if (held_live) cb.freeWithCleanup(held, .{ .outside_execution = true });
+    try compute.ctx.synchronize();
+    const pointers = .{ plan.device[0].ptr, arena.buffers[0].ptr, packed_span.ptr, compute.embedding_gemma2_resize.sources[ordinal].host.ptr, tensorFromCt(held).buffer.ptr };
+    const requests = [_]Cache.Request{
+        @import("embedding_gemma2_resize.zig").Cache.request(key),
+        .{ .arena = .{ .kind = .encoder, .batch = 1, .sequence = 1, .sizes = sizes } },
+        try Cache.Request.packedSpan("warm.raw.sdk.fixture", 64),
+        .{ .source = .{ .index = ordinal, .bytes = 32 } },
+        try Cache.Request.constantSpan("audio_tower.prepared.warm.raw.sdk", 16),
+        try Cache.Request.packedSpan("optional.denied.raw.upgrade", 64),
+    };
+    const amounts = domain.controller.snapshot();
+    compute.ctx.video_cache_budget.admission.?.limits = .{ .backend_limit_bytes = amounts.backend_scratch_bytes, .host_limit_bytes = amounts.host_scratch_bytes };
+    const funding = try Cache.Funding.create(.{ .requests = &requests });
+    defer funding.finishOutsideExecution();
+    var gate = false;
+    defer {
+        if (compute.ctx.prepared_cache_funding == funding) CudaCompute.unbindCacheFunding(&cb, &compute, funding);
+        if (gate) model.execution_gate.unlock();
+    }
+    try std.testing.expect(model.execution_gate.tryLock());
+    gate = true;
+    try std.testing.expect(try CudaCompute.cacheWorkloadNeedsFunding(&cb, &compute, .{ .requests = requests[0..5] }));
+    try CudaCompute.snapshotCacheFunding(&cb, &compute, funding);
+    for (funding.entries[0..5]) |entry| try std.testing.expect(entry.upgrade_raw and !entry.miss);
+    try std.testing.expect(funding.entries[5].miss);
+    model.execution_gate.unlock();
+    gate = false;
+    if (funding.fundOutsideExecution(&pin)) |_| return error.ExpectedOptionalDenial else |err| switch (err) {
+        error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => {},
+        else => return err,
+    }
+    try std.testing.expect(!try funding.retainOnlyRequiredOutsideExecution());
+    const callbacks = probe.calls;
+    try funding.fundOutsideExecution(&pin);
+    try std.testing.expectEqual(callbacks, probe.calls); // no zero-byte supplier
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    const sdk = compute.ctx.device_allocations.snapshot();
+    try std.testing.expect(model.execution_gate.tryLock());
+    gate = true;
+    try CudaCompute.bindCacheFunding(&cb, &compute, .{ .requests = &requests }, funding, &epoch);
+    for (requests[0..5]) |request| {
+        const live = try compute.cacheRequestState(request);
+        try std.testing.expect(live.quota != null and live.quota.?.* == .prepared);
+    }
+    try std.testing.expectEqualDeep(pointers, .{ plan.device[0].ptr, arena.buffers[0].ptr, packed_span.ptr, compute.embedding_gemma2_resize.sources[ordinal].host.ptr, tensorFromCt(held).buffer.ptr });
+    try std.testing.expectEqualDeep(sdk, compute.ctx.device_allocations.snapshot());
+    try std.testing.expectEqualDeep(amounts, domain.controller.snapshot());
+    try std.testing.expect(!try CudaCompute.cacheWorkloadNeedsFunding(&cb, &compute, .{ .requests = requests[0..5] }));
+    CudaCompute.unbindCacheFunding(&cb, &compute, funding);
+    cb.freeWithCleanup(held, .{ .boundary = &epoch });
+    held_live = false;
+    try compute.clearEmbeddingGemma2ConstantsWithCleanup(false, .{ .boundary = &epoch });
+    try compute.embedding_gemma2_execution.clearWithCleanup(a, &compute.ctx, .{ .boundary = &epoch });
+    try compute.embedding_gemma2_resize.clearWithCleanup(&compute.ctx, .{ .boundary = &epoch });
+    try std.testing.expectEqualDeep(amounts, domain.controller.snapshot());
+    model.execution_gate.unlock();
+    gate = false;
+    guard.finish();
+    try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, domain.controller.snapshot());
+    try std.testing.expect(!probe.violation);
+}
+
+test "CUDA chronological cold arena snapshot reserves later hot-shape birth and both actual full partial keys" {
+    const CacheFunding = @import("prepared_cache.zig");
+    var compute: CudaCompute = undefined;
+    compute.embedding_gemma2_execution = .{};
+    var requests: [2]CacheFunding.Request = undefined;
+    var builder = CacheFunding.Builder{ .storage = &requests };
+    const full: CacheFunding.Request = .{ .arena = .{ .kind = .vision, .batch = 4, .sequence = 16, .grid_x = 4, .grid_y = 4, .sizes = .{ 1024, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } };
+    var partial = full;
+    partial.arena.batch = 1;
+    partial.arena.sizes[0] = 256;
+    for (0..3) |_| try builder.addArenaUse(full);
+    try builder.addArenaUse(partial);
+    const work = builder.workload();
+    try CudaCompute.validateCacheWorkload(work);
+    const first = try compute.planArenaTimeline(&work);
+    try std.testing.expectEqual(@as(usize, 2), first.len);
+    try std.testing.expect(first.items[0].state.miss and first.items[1].state.miss);
+    try std.testing.expectEqual(@as(usize, 1024), first.items[0].state.amounts.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 256), first.items[1].state.amounts.backend_scratch_bytes);
+    try std.testing.expectEqualDeep(@import("embedding_gemma2_execution.zig").Cache{}, compute.embedding_gemma2_execution);
+    compute.embedding_gemma2_execution.clock = 100;
+    for (&compute.embedding_gemma2_execution.arenas, 0..) |*entry, index| {
+        entry.kind = .vision;
+        entry.batch = 1;
+        entry.sequence = index + 100;
+        entry.buffers[0].len = 16; // Metadata-only selection fixture.
+        entry.last_used = 100;
+        entry.uses = 2;
+    }
+    try builder.addArenaUse(full);
+    const aged_work = builder.workload();
+    const aged = try compute.planArenaTimeline(&aged_work);
+    try std.testing.expect(aged.items[0].state.miss);
+    try std.testing.expectEqual(@as(usize, 1024), aged.items[0].state.amounts.backend_scratch_bytes);
+    try std.testing.expect(aged.items[0].state.victims.execution_arenas != 0);
+    try std.testing.expectEqual(@as(u64, 100), compute.embedding_gemma2_execution.clock);
+}
+
+test "CUDA combined video recipe keeps decoder mandatory and exact chronological full partial vision requests" {
+    const Cache = @import("prepared_cache.zig");
+    const sequence: @import("video.zig").Sequence = .{ .width = 160, .height = 96, .coded_width = 160, .coded_height = 96, .surfaces = 4, .codec = 4, .display_left = 0, .display_top = 0, .matrix = 1, .full_range = 0 };
+    // No fake receiver/SDK state: shape chronology is the same copied metadata
+    // builder used by the actual caller; backend qualification remains separate.
+    var requests: [4]Cache.Request = undefined;
+    var builder = Cache.Builder{ .storage = &requests };
+    try builder.add(.{ .decoder = sequence });
+    const full: Cache.Request = .{ .arena = .{ .kind = .vision, .batch = 4, .sequence = 16, .grid_x = 4, .grid_y = 4, .sizes = .{ 1024, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 } } };
+    var partial = full;
+    partial.arena.batch = 1;
+    partial.arena.sizes[0] = 256;
+    try builder.addArenaUse(full);
+    try builder.addArenaUse(full);
+    try builder.addArenaUse(partial);
+    const work = builder.workload();
+    try CudaCompute.validateCacheWorkload(work);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 1, 2 }, work.arena_order.indices[0..work.arena_order.len]);
+    const funding = try Cache.Funding.createWithAllocator(std.testing.allocator, work);
+    defer funding.finishOutsideExecution();
+    try funding.noteMiss(0, .{ .backend_scratch_bytes = try sequence.bytes() }, 0);
+    try funding.noteMiss(1, .{ .backend_scratch_bytes = 1024 }, 0);
+    try funding.noteMiss(2, .{ .backend_scratch_bytes = 256 }, 0);
+    funding.state = .snapped;
+    try std.testing.expect(try funding.retainOnlyRequiredOutsideExecution());
+    try std.testing.expect(funding.entries[0].miss and !funding.entries[1].miss and !funding.entries[2].miss);
+    try std.testing.expectEqualDeep(work.arena_order, funding.arena_order);
+}
+
+test "CUDA vision arena qualification shares actual entry availability without touching unavailable receiver SDK" {
+    var compute: CudaCompute = undefined;
+    compute.capability_profile = .embedding_gemma2;
+    compute.cublaslt = null;
+    try std.testing.expect(!compute.visionExecutionAvailable());
+    // The original entry's first profile veto precedes all other state reads.
+    compute.capability_profile = .lightonocr3;
+    try std.testing.expect(!compute.visionExecutionAvailable());
+}
+
+test "CUDA audio depthwise cold inventory validates actual floating source layout and exact twelve immutable keys" {
+    const Cache = @import("prepared_cache.zig");
+    var compute: CudaCompute = undefined;
+    compute.resident_weights = .empty;
+    defer compute.resident_weights.deinit(std.testing.allocator);
+    compute.capability_profile = .embedding_gemma2;
+    compute.embedding_gemma2_policy = .{};
+    var recipe = std.mem.zeroes(Cache.AudioRecipe);
+    recipe.count = 2;
+    recipe.frames[0] = 99;
+    recipe.frames[1] = 99;
+    recipe.hidden = 1024;
+    recipe.output_hidden = 1536;
+    recipe.intermediate = 4096;
+    recipe.blocks = 12;
+    recipe.heads = 8;
+    recipe.mel_bins = 128;
+    recipe.conv_kernel = 5;
+    recipe.context_left = 13;
+    recipe.depthwise_cached = true;
+    var names: [12][256]u8 = undefined;
+    var source_shape = [_]i64{ 1024, 1, 5 };
+    for (0..12) |layer| {
+        var logical_storage: [128]u8 = undefined;
+        const logical = try Cache.AudioRecipe.depthwiseWeightName(&logical_storage, layer);
+        const name = try @import("../../architectures/gemma4_hf_weights.zig").resolve(&names[layer], logical);
+        // Metadata-only fixture: never dereference or dispatch this SDK address.
+        try compute.resident_weights.put(std.testing.allocator, name, .{ .dtype = .bf16, .shape = &source_shape, .elem_count = 5120, .buffer = .{ .ptr = 0x1000 + layer * 0x10000, .len = 10240 }, .owns_buffer = false, .owns_shape = false });
+        const request = (try compute.audioDepthwiseCacheRequest(recipe, layer)).?;
+        var expected_key: [256]u8 = undefined;
+        const expected = try Cache.AudioRecipe.depthwiseKey(&expected_key, logical, 5, 1024);
+        try std.testing.expectEqualStrings(expected, request.constant.name.slice());
+        try std.testing.expectEqual(@as(usize, 20480), request.constant.bytes);
+        try std.testing.expect(request.constant.name.len < 256);
+        const source = compute.resident_weights.getPtr(name).?;
+        for ([_]tensor_mod.DType{ .f32, .f16, .bf16 }) |dtype| {
+            source.dtype = dtype;
+            source.buffer.len = try dtype.byteCount(5120);
+            try std.testing.expect(try compute.audioDepthwiseCacheRequest(recipe, layer) != null);
+        }
+        source.quant_type = .{ .known = .Q8_0 };
+        try std.testing.expect(try compute.audioDepthwiseCacheRequest(recipe, layer) == null);
+        source.quant_type = null;
+        source.dtype = .i32;
+        try std.testing.expect(try compute.audioDepthwiseCacheRequest(recipe, layer) == null);
+        source.dtype = .bf16;
+        source.buffer.len = 10239;
+        try std.testing.expect(try compute.audioDepthwiseCacheRequest(recipe, layer) == null);
+        source.buffer.len = 10240;
+        source.elem_count = 5119;
+        try std.testing.expect(try compute.audioDepthwiseCacheRequest(recipe, layer) == null);
+        source.elem_count = 5120;
+    }
+    var requests: [128]Cache.Request = undefined;
+    var builder = Cache.Builder{ .storage = &requests };
+    try compute.appendAudioCacheWorkload(recipe, &builder);
+    try std.testing.expectEqual(@as(usize, 38), builder.len); // original26 +exact12
+    var count: usize = 0;
+    for (builder.workload().requests) |request| if (request == .constant and std.mem.startsWith(u8, request.constant.name.slice(), "audio_tower.prepared.depthwise.v1.")) {
+        count += 1;
+        try std.testing.expectEqual(@as(usize, 20480), request.constant.bytes);
+    };
+    try std.testing.expectEqual(@as(usize, 12), count);
+    // Full optional packed/frontend declaration remains below actual128 slots.
+    recipe.frontend_device = true;
+    recipe.packed_layers = (1 << 12) - 1;
+    compute.embedding_gemma2_policy.packed_projections = true;
+    var packed_builder = Cache.Builder{ .storage = &requests };
+    try compute.appendAudioCacheWorkload(recipe, &packed_builder);
+    try std.testing.expectEqual(@as(usize, 53), packed_builder.len); // 38+3frontend+12QKV
 }

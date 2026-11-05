@@ -18,6 +18,17 @@
 const std = @import("std");
 pub const capacity = 128;
 pub const PrefixLogitsLayout = enum { all_host_rows, final_host_rows };
+/// SAME original packed packet peak: independent CPU logits/publication
+/// copies, three-axis positions, head plan/selection metadata, and the
+/// authored32/64KiB mixed-context allowance. Never subtract outer PAGE floors.
+pub fn hostPacketBytes(items: usize, total_query_rows: usize, host_rows: usize, vocab: usize) !usize {
+    if (items == 0 or items > capacity or total_query_rows == 0 or host_rows > items or vocab == 0) return error.InvalidPackedHostGeometry;
+    const logits = try std.math.mul(usize, try std.math.mul(usize, host_rows, vocab), 2 * @sizeOf(f32));
+    const positions = try std.math.mul(usize, total_query_rows, 3 * @sizeOf(u32));
+    const head_metadata = try std.math.add(usize, @sizeOf(Plan) + @sizeOf([capacity]bool), try std.math.mul(usize, items, @sizeOf(u32)));
+    return std.math.add(usize, try std.math.add(usize, logits, positions), try std.math.add(usize, (if (items > 64) @as(usize, 64) else 32) * 1024, head_metadata));
+}
+
 pub const Plan = struct {
     items: [capacity]usize = undefined,
     row_by_item: [capacity]usize = @splat(std.math.maxInt(usize)),
@@ -84,4 +95,19 @@ test "LightOnOCR3 CUDA packed head rows reject malformed compact choices before 
     try std.testing.expectError(error.InvalidBatchDecodeState, mismatched.scatter(a, &.{ 1, 2 }, 10));
     var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
     try std.testing.expectError(error.OutOfMemory, good.scatter(failing.allocator(), &.{ 1, 2 }, 10));
+}
+
+test "packed host packet geometry preserves actual mixed 35028 floor and checked wide logits overlap" {
+    const metadata2 = @sizeOf(Plan) + @sizeOf([capacity]bool) + 2 * @sizeOf(u32);
+    try std.testing.expectEqual(32 * 1024 + metadata2 + 5 * 3 * @sizeOf(u32), try hostPacketBytes(2, 5, 0, 64));
+    if (@sizeOf(usize) == 8) try std.testing.expectEqual(@as(usize, 35028), try hostPacketBytes(2, 5, 0, 64));
+    try std.testing.expectEqual(try hostPacketBytes(2, 5, 0, 64) + 2 * 64 * @sizeOf(f32), try hostPacketBytes(2, 5, 1, 64));
+    const wide = 64 * 1024 + @sizeOf(Plan) + @sizeOf([capacity]bool) + capacity * @sizeOf(u32) + capacity * 3 * @sizeOf(u32) + capacity * 64 * 2 * @sizeOf(f32);
+    try std.testing.expectEqual(wide, try hostPacketBytes(capacity, capacity, capacity, 64));
+    try std.testing.expectError(error.InvalidPackedHostGeometry, hostPacketBytes(0, 1, 0, 64));
+    try std.testing.expectError(error.InvalidPackedHostGeometry, hostPacketBytes(capacity + 1, 1, 0, 64));
+    try std.testing.expectError(error.InvalidPackedHostGeometry, hostPacketBytes(2, 0, 0, 64));
+    try std.testing.expectError(error.InvalidPackedHostGeometry, hostPacketBytes(2, 5, 3, 64));
+    try std.testing.expectError(error.Overflow, hostPacketBytes(2, std.math.maxInt(usize), 0, 64));
+    try std.testing.expectError(error.Overflow, hostPacketBytes(2, 5, 2, std.math.maxInt(usize)));
 }

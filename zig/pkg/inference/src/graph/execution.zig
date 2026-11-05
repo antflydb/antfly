@@ -66,7 +66,25 @@ pub const CapturedGraphPreparation = if (build_options.enable_cuda) struct {
     prepare_fn: *const fn (*anyopaque, *const ops.ComputeBackend, graph.Descriptor, *graph.GraphPhase, CapturedGraphOutside, InferenceExecutionControl) anyerror!bool,
 } else struct {};
 
+/// Actual Reader keeps its SAME worker step while preparing this independent
+/// optional DSO working set outside all numerical owners. No payload pointer
+/// is supplied until cold funding has been adopted under the restored owner.
+pub const ExternalPrefillPreparation = if (build_options.enable_cuda) struct {
+    ptr: *anyopaque,
+    prepare_fn: *const fn (*anyopaque, *const ops.ComputeBackend, *@import("../ops/cuda/prefill_phase.zig").Phase, InferenceExecutionControl) anyerror!void,
+} else struct {};
+
+/// One mandatory packed CPU packet, independent of optional DSO workspace.
+/// The real Reader owns the synchronous outside-window transition; no loan
+/// or borrowed phase can confer Model/provider/step authority by itself.
+pub const PackedHostPreparation = struct {
+    ptr: *anyopaque,
+    prepare_fn: *const fn (*anyopaque, *const ops.ComputeBackend, usize, InferenceExecutionControl) anyerror!@import("../execution/packed_host_loan.zig").Loan,
+};
+
 pub const Context = struct {
+    before_owned_forward: ?PackedHostPreparation = null,
+    external_prefill_preparation: ?ExternalPrefillPreparation = null,
     graph_preparation: ?CapturedGraphPreparation = null,
     allocator: std.mem.Allocator,
     cb: *const ops.ComputeBackend,

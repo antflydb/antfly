@@ -167,6 +167,7 @@ pub const Executor = struct {
     lighton_graph_attempts: u64 = 0,
     lighton_graph_declines: [8]u64 = @splat(0),
     replay_last_logits_fallbacks: u64 = 0,
+    packed_host_preparations: u64 = 0,
     tail_steps: usize = 0,
 
     /// Result publication executes under the same lane and autorelease scope
@@ -217,7 +218,7 @@ pub const Executor = struct {
             publication.publish(claimed, err);
             return;
         };
-        defer result.deinit(self.context.allocator);
+        defer result.deinitWithCleanup(self.context.allocator, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
         publication.publish(claimed, result);
     }
 
@@ -279,13 +280,28 @@ pub const Executor = struct {
         max_query_seq_len: usize,
         last_rows_only: bool = false,
         host_permit: ?@import("../backends/session.zig").RunPermit = null,
+        host_loan: ?@import("../execution/packed_host_loan.zig").Loan = null,
 
         pub fn deinit(self: *StepForwardResult, allocator: std.mem.Allocator) void {
+            self.deinitWithCleanup(allocator, .{}) catch platform.inference_process_supervisor.restartWorker();
+        }
+        pub fn deinitWithCleanup(self: *StepForwardResult, allocator: std.mem.Allocator, current: @import("../execution/cleanup_context.zig").Context) !void {
+            if (self.host_loan) |*loan| try loan.validateCleanup(current);
             if (self.second_greedy_tokens) |values| allocator.free(values);
+            self.second_greedy_tokens = null;
             if (self.packed_greedy_tokens) |values| allocator.free(values);
+            self.packed_greedy_tokens = null;
             if (self.greedy_tokens) |values| allocator.free(values);
+            self.greedy_tokens = null;
             if (self.logits) |values| allocator.free(values);
+            self.logits = null;
             if (self.host_permit) |*permit| permit.deinit();
+            self.host_permit = null;
+            // Publication/CPU copies are complete. A host-read pause may have
+            // rotated B: only the actual caller's dynamically supplied NOW B
+            // can hold this pure charge after its arrays are gone.
+            if (self.host_loan) |*loan| try loan.finishWithCleanup(current);
+            self.host_loan = null;
             self.* = undefined;
         }
     };
@@ -1070,10 +1086,7 @@ pub const Executor = struct {
         // Device-greedy rows return token IDs. Only host-sampled prefixes
         // retain vocabulary rows and their independent publication copies.
         const host_rows = if (!needs_logits) 0 else if (gpu_choices) host_prefills else claimed.len;
-        const logits_bytes = try std.math.mul(usize, try std.math.mul(usize, host_rows, cfg.vocab_size), 2 * @sizeOf(f32));
-        const positions_bytes = try std.math.mul(usize, total, 3 * @sizeOf(u32));
-        const head_metadata_bytes = @sizeOf(packed_head_rows.Plan) + @sizeOf(@TypeOf(active_heads)) + claimed.len * @sizeOf(u32);
-        const host_bytes = try std.math.add(usize, try std.math.add(usize, logits_bytes, positions_bytes), (if (claimed.len > 64) @as(usize, 64) else 32) * 1024 + head_metadata_bytes);
+        const host_bytes = try packed_head_rows.hostPacketBytes(claimed.len, total, host_rows, cfg.vocab_size);
         var recurrent_groups: usize = 0;
         var recurrent_rows: usize = 0;
         var attention_groups: usize = 0;
@@ -1090,8 +1103,22 @@ pub const Executor = struct {
             if (platform.env.getenvBool("ANTFLY_BENCH_LIGHTONOCR3")) std.debug.print("LIGHTONOCR3 packed_gpu_prefill_rows={d} packed_skipped_prefix_heads={d}\n", .{ if (needs_logits and gpu_choices) greedy_prefills else 0, if (!needs_logits) prefill_count else claimed.len - head_rows.count });
         };
         const session = self.context.session orelse return error.InvalidBatchDecodeState;
-        var host_lease = try session.admitHostPreprocess(host_bytes);
-        errdefer host_lease.deinit();
+        var host_lease: @import("../backends/session.zig").RunPermit = .{ .session = session, .lease = null };
+        var host_loan: ?@import("../execution/packed_host_loan.zig").Loan = null;
+        errdefer {
+            if (host_loan) |*loan| loan.finishWithCleanup(.{ .boundary = self.context.cleanupEpoch(), .operation = cb.operationToken() }) catch platform.inference_process_supervisor.restartWorker();
+            host_lease.deinit();
+        }
+        if (cuda_packed and session.run_admission != null) {
+            const before = self.context.before_owned_forward orelse return error.MissingPackedHostPreparation;
+            host_loan = try before.prepare_fn(before.ptr, cb, host_bytes, self.context.execution_control orelse .{});
+            try host_loan.?.validateBound(session, .{ .context = cb.ptr, .table = cb.vtable }, host_bytes, .{ .boundary = self.context.cleanupEpoch(), .operation = cb.operationToken() });
+            self.packed_host_preparations +|= 1;
+        } else {
+            // Original unadmitted compatibility has no lease or callback.
+            // Non-CUDA callers keep their existing independently scoped path.
+            host_lease = try session.admitHostPreprocess(host_bytes);
+        }
         const positions = try a.alloc(u32, try std.math.mul(usize, total, 3));
         defer a.free(positions);
         var reserved_count: usize = 0;
@@ -1159,7 +1186,7 @@ pub const Executor = struct {
         defer cb.free(hidden.hidden);
         if (hidden.total_rows != total) return error.InvalidTensorShape;
         forward_completed = true;
-        if (!needs_logits) return .{ .logits = null, .max_query_seq_len = total, .last_rows_only = true, .host_permit = host_lease };
+        if (!needs_logits) return .{ .logits = null, .max_query_seq_len = total, .last_rows_only = true, .host_permit = host_lease, .host_loan = host_loan };
 
         // Intermediate prefix rows update KV/state but never produce a
         // choice. Exclude them from the head and restore scheduler order
@@ -1242,13 +1269,72 @@ pub const Executor = struct {
             break :blk try cb.toFloat32(prefix_logits, a);
         } else try cb.toFloat32(logits, a);
         gpt_arch.applyFinalLogitSoftcapInPlace(cfg, host);
-        return .{ .logits = host, .packed_greedy_tokens = tokens, .prefix_logits_layout = prefix_logits_layout, .max_query_seq_len = total, .last_rows_only = true, .host_permit = host_lease };
+        return .{ .logits = host, .packed_greedy_tokens = tokens, .prefix_logits_layout = prefix_logits_layout, .max_query_seq_len = total, .last_rows_only = true, .host_permit = host_lease, .host_loan = host_loan };
+    }
+
+    fn packedQwenStepSelected(self: *const Executor, claimed: []const runtime.scheduler.native_generate.StepItem) bool {
+        for (claimed) |item| if (item.phase == .prefill) {
+            const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
+            if (work.prepared_prefix != null) return true;
+        };
+        return claimed.len > 64 and claimed.len <= gpt_arch.max_packed_qwen_items and
+            self.context.cb.kind() == .cuda and self.graph_cache == null and self.context.compiled_partition_backend == null and
+            self.context.gpt_config.hasQwen35VisionArchitectureContract() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PACKED_MIXED") and
+            platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128");
+    }
+    fn prepareExternalPrefill(self: *Executor, claimed: []const runtime.scheduler.native_generate.StepItem) !void {
+        if (comptime !build_options.enable_cuda) return;
+        const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
+        if (!C.externalPrefillEnabled(self.context.cb)) return;
+        const preparation = self.context.external_prefill_preparation orelse return;
+        if (claimed.len == 0 or claimed.len > 128) return;
+        const config = self.context.gpt_config;
+        var lengths: [128]usize = undefined;
+        var attention = false;
+        for (claimed, 0..) |item, index| {
+            if (item.phase == .waiting) return; // original dispatch owns invalid-claim errors
+            lengths[index] = item.query_sequence_len;
+            if (item.phase != .prefill) continue;
+            const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
+            const storage = work.decode_state.kv_storage orelse continue;
+            const pool = storage.storage.config;
+            const head_dim = config.headDim();
+            attention = attention or (@import("../ops/cuda/lighton_prefill_attention.zig").Shape{
+                .batch = 1,
+                .rows = item.query_sequence_len,
+                .tokens = item.kv_sequence_len,
+                .total_tokens = item.total_sequence_len,
+                .kv_position_offset = item.kv_position_offset,
+                .sliding_window = config.sliding_window,
+                .mask_len = 0,
+                .bias_mode = 0,
+                .heads = config.num_attention_heads,
+                .kv_heads = config.effectiveKVHeads(),
+                .head_dim = head_dim,
+                .page_size = pool.page_size_tokens,
+                .key_f16 = pool.dtype == .f16,
+                .value_f16 = pool.dtype == .f16,
+                .key_row_bytes = std.math.mul(usize, pool.keyValuesPerToken(), 2) catch 0,
+                .base_key_row_bytes = std.math.mul(usize, pool.keyValuesPerToken(), 2) catch 0,
+                .value_row_bytes = std.math.mul(usize, pool.valueValuesPerToken(), 2) catch 0,
+            }).supported();
+        }
+        const recurrent = self.packedQwenStepSelected(claimed) and C.raggedRecurrentItemsSupported(self.context.cb, claimed.len) and config.qwen35_device_only_state and
+            @import("../ops/cuda/gated_delta.zig").packetGeometrySupported(config.qwen35_linear_num_key_heads, config.qwen35_linear_num_value_heads, config.qwen35_linear_key_head_dim, config.qwen35_linear_value_head_dim, config.qwen35_linear_conv_kernel_dim);
+        const F = @import("../ops/cuda/prefill_phase.zig");
+        var phase: F.Phase = undefined;
+        try phase.initInto(try F.Descriptor.init(config.qwen35_linear_num_key_heads, config.qwen35_linear_num_value_heads, lengths[0..claimed.len], recurrent, attention));
+        defer phase.close(.{ .boundary = self.context.cleanupEpoch() }) catch platform.inference_process_supervisor.restartWorker();
+        // Callback restores SAME step before returning and closes every cold
+        // token after actual first-birth SDK publication, before model math.
+        try preparation.prepare_fn(preparation.ptr, self.context.cb, &phase, self.context.execution_control orelse .{});
     }
 
     pub fn forward(
         self: *Executor,
         claimed: []const runtime.scheduler.native_generate.StepItem,
     ) !StepForwardResult {
+        var prepare_cuda_matmul = false;
         if (comptime build_options.enable_cuda) {
             if (self.lighton_cuda_execution_id != 0) {
                 var pure_decode = claimed.len >= 2 and claimed.len <= (if (platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128")) @as(usize, 128) else 64);
@@ -1262,21 +1348,17 @@ pub const Executor = struct {
                 if (!pure_decode) {
                     const C = @import("../ops/cuda/cuda_compute.zig").CudaCompute;
                     try C.invalidateLightOnDecodeGraphWithCleanup(self.context.cb, .{ .boundary = self.context.cleanupEpoch(), .operation = self.context.cb.operationToken() });
-                    try C.prepareLightOnMatmulFrame(self.context.cb);
+                    prepare_cuda_matmul = true;
                 }
             }
         }
-        for (claimed) |item| if (item.phase == .prefill) {
-            const work: *PendingPrefillBatchWork = @ptrCast(@alignCast(item.work_ptr));
-            if (work.prepared_prefix != null) return self.forwardPackedScheduledQwenStep(claimed);
-        };
-        // Keep the large CUDA cohort in compact layout for both recurrent
-        // packets and the existing per-page paged-attention partitions.
-        if (claimed.len > 64 and claimed.len <= gpt_arch.max_packed_qwen_items and
-            self.context.cb.kind() == .cuda and self.graph_cache == null and self.context.compiled_partition_backend == null and
-            self.context.gpt_config.hasQwen35VisionArchitectureContract() and platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PACKED_MIXED") and
-            platform.env.getenvBool("ANTFLY_LIGHTONOCR3_PHYSICAL128"))
-            return self.forwardPackedScheduledQwenStep(claimed);
+        // Invalid old graph backing dies under NOW B BEFORE the cold park;
+        // its refund is available before optional replacement reservation.
+        // Original matmul preparation remains after cold admission, before math.
+        try self.prepareExternalPrefill(claimed);
+        if (comptime build_options.enable_cuda) if (prepare_cuda_matmul)
+            try @import("../ops/cuda/cuda_compute.zig").CudaCompute.prepareLightOnMatmulFrame(self.context.cb);
+        if (self.packedQwenStepSelected(claimed)) return self.forwardPackedScheduledQwenStep(claimed);
         // Canonical reader epochs own the CUDA execution lifetime too. Requiring
         // the diagnostic flag here silently downloaded full vocabulary logits
         // instead of selecting greedy tokens on the device for those epochs.

@@ -377,6 +377,20 @@ pub const PreparedCharge = struct {
         self.owner = null;
         return owner;
     }
+    /// Like arm(), but for an exact independently owned physical partition.
+    /// All shell/group/boundary metadata was allocated during cold prepare.
+    pub fn armReservation(self: *PreparedCharge, reservation: *?@import("storage_admission.zig").Reservation, domain: *?admission.Pin) !*Charge {
+        const owner = self.owner orelse return error.PreparedChargeAlreadyArmed;
+        const retained = reservation.* orelse return error.MissingResourceRetirementLease;
+        if (domain.*) |pin| if (pin.controller() != retained.identity.controller) return error.ForeignAdmissionDomain;
+        std.debug.assert(owner.quota == .unarmed);
+        owner.quota = .{ .storage = retained };
+        owner.domain = domain.*;
+        reservation.* = null;
+        domain.* = null;
+        self.owner = null;
+        return owner;
+    }
     /// Outside execution lanes. Safe after successful arm (then empty); the
     /// returned Charge owns all consumed/unused tickets until final retirement.
     pub fn destroyUnused(self: *PreparedCharge) void {
@@ -569,12 +583,19 @@ pub const Charge = struct {
             self.* = undefined;
         }
         pub fn attach(self: *PreparedAttachment, scope: *Scope) !void {
+            return self.attachWithMetadata(scope, null);
+        }
+        /// The caller transfers an independently retained PURE metadata pin
+        /// only on successful ticket consumption. It may not retain a model,
+        /// provider, SDK object, IO, or request allocator. The existing CPU
+        /// collector releases this pin after all backing witnesses have died.
+        pub fn attachWithMetadata(self: *PreparedAttachment, scope: *Scope, owned_metadata: ?@import("backing_retirement.zig").BackingOwner.Metadata) !void {
             try Charge.validateAttachment(scope);
             const group = self.group orelse return error.ResourceRetirementAttachmentConsumed;
             const charge = self.charge;
             self.group = null;
             charge.retain();
-            group.* = .{ .charge = charge, .origin = scope.origin, .batch_references = .init(scope.pending_batches), .notify = if (charge.domain != null) scope.vtable.notify else null };
+            group.* = .{ .charge = charge, .origin = scope.origin, .batch_references = .init(scope.pending_batches), .notify = if (charge.domain != null) scope.vtable.notify else null, .retained_metadata = owned_metadata };
             for (&group.nodes) |*node| node.* = .{ .context = group, .release_fn = Group.releaseBatch };
             collector.append(group);
             (if (charge.prepared_backend) |*metadata| scope.attachPrepared(group.nodes[0..scope.pending_batches], .{ .context = group, .retain_fn = Group.retainPayload, .release_fn = Group.releasePayload, .notify_fn = group.notify }, metadata) else scope.attach(group.nodes[0..scope.pending_batches], .{ .context = group, .retain_fn = Group.retainPayload, .release_fn = Group.releasePayload, .notify_fn = group.notify })) catch |err| {
@@ -648,6 +669,7 @@ const Group = struct {
     payload_references: std.atomic.Value(usize) = .init(0),
     sealed: std.atomic.Value(bool) = .init(false),
     notify: ?*const fn () callconv(.c) void = null,
+    retained_metadata: ?@import("backing_retirement.zig").BackingOwner.Metadata = null,
     fn releaseBatch(raw: *anyopaque) callconv(.c) void {
         const self: *Group = @ptrCast(@alignCast(raw));
         const notify = self.notify;
@@ -706,7 +728,9 @@ const Collector = struct {
             ready = group.next;
             const charge = group.charge;
             const allocator = charge.metadata;
+            const metadata = group.retained_metadata;
             allocator.destroy(group);
+            if (metadata) |pin| pin.release(pin.context);
             charge.release();
             count += 1;
         }

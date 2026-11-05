@@ -329,7 +329,7 @@ pub const SharedLiteralStore = struct {
 
     pub const Value = struct { value: CT, lease: *ops.physical_storage.Lease, fresh: bool };
     pub fn value(self: *SharedLiteralStore, index: usize, capability: ?admission.Capability, ledger: ?*accounting.Ledger) !Value {
-        if (capability) |cap| if (cap.services.takeBacking != null) self.prepared_backings.store(true, .release);
+        const construction_cleanup: @import("cleanup_context.zig").Context = .{ .boundary = if (capability) |cap| cap.constructionEpoch() else null };
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         if (self.initializing) {
             self.mutex.unlock();
@@ -344,6 +344,10 @@ pub const SharedLiteralStore = struct {
             return failure;
         }
         if (owner.lease) |lease| {
+            if (lease.isQuarantined()) {
+                self.mutex.unlock();
+                return error.PhysicalStorageAdmissionQuarantined;
+            }
             // Existing admitted or raw immutable values need no callback.
             if (capability == null or lease.admission != null) {
                 if (capability) |cap| if (!lease.admission.?.identity.eql(cap.identity)) {
@@ -355,6 +359,10 @@ pub const SharedLiteralStore = struct {
                 return result;
             }
         }
+        if (capability) |cap| if (cap.services.takeBacking != null and construction_cleanup.boundary == null) {
+            self.mutex.unlock();
+            return error.MissingCurrentCleanupEpoch;
+        };
         const next_epoch = std.math.add(u64, self.epoch, 1) catch |err| {
             self.mutex.unlock();
             return err;
@@ -366,13 +374,19 @@ pub const SharedLiteralStore = struct {
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             self.initializing = false;
             self.mutex.unlock();
-            self.releaseWithCleanup(.{ .boundary = if (capability) |cap| cap.constructionEpoch() else null });
+            self.releaseWithCleanup(construction_cleanup);
         }
         if (owner.lease) |lease| {
             // This mutation is protected by the initialization claim; every
             // metadata snapshot declines until publication completes.
-            try lease.ensureAdmission(capability.?);
+            lease.ensureAdmission(capability.?) catch |err| {
+                // Cleanup-only quarantine needs actual teardown B, but earns
+                // no ready admission, immutable credit or published epoch.
+                if (lease.retirement_owner != null) self.prepared_backings.store(true, .release);
+                return err;
+            };
             @import("antfly_platform").sync.lockYielding(&self.mutex);
+            if (lease.retirement_owner != null) self.prepared_backings.store(true, .release);
             self.epoch = next_epoch;
             self.cached_claim = null;
             const result = Value{ .value = owner.value.?, .lease = lease, .fresh = false };
@@ -385,11 +399,11 @@ pub const SharedLiteralStore = struct {
         if (self.completions[literal.backend_index]) |completion| try completion.beforeReuse();
         const lease = (try ops.physical_storage.Lease.createAdmitted(self.allocator, cb, try std.math.mul(usize, literal.data.len, 4), ledger, .constant, capability)) orelse return error.PhysicalStorageAllocationDeclined;
         var published = false;
-        errdefer if (!published) lease.release();
+        errdefer if (!published) lease.releaseWithCleanup(construction_cleanup);
         var dimensions: [8]i32 = undefined;
         for (literal.shape.dims[0..literal.shape.rank()], 0..) |dimension, axis| dimensions[axis] = @intCast(dimension);
         const tensor = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = lease, .shape = dimensions[0..literal.shape.rank()] })) orelse return error.UnsupportedPhysicalTensorView;
-        errdefer if (!published) cb.free(tensor);
+        errdefer if (!published) cb.freeWithCleanup(tensor, construction_cleanup);
         var failure: ?anyerror = null;
         functions.writePhysicalFloat32.?(cb.ptr, tensor, literal.data) catch |err| {
             failure = err;
@@ -402,6 +416,7 @@ pub const SharedLiteralStore = struct {
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         self.epoch = next_epoch;
         owner.* = .{ .lease = lease, .value = tensor, .failure = failure, .published_epoch = self.epoch };
+        if (lease.retirement_owner != null) self.prepared_backings.store(true, .release);
         self.cached_claim = null;
         published = true;
         self.mutex.unlock();
@@ -421,6 +436,8 @@ const LiteralCallbackProbe = struct {
     source: *memory.AdmissionLease,
     credit: memory.AdmissionAmounts = .{ .host_scratch_bytes = 16 },
     fail_upload: bool,
+    fail_view_metadata: bool = false,
+    view_failures: usize = 0,
     callbacks: usize = 0,
     writes: usize = 0,
     records: usize = 0,
@@ -471,7 +488,18 @@ const LiteralCallbackProbe = struct {
         return native.vtable_impl.kernels.?.physical_storage_policy.?.allocate(raw, request);
     }
     fn view(raw: *anyopaque, request: ops.physical_storage.View) !?CT {
-        try fromCompute(raw).outsideMutex();
+        const self = fromCompute(raw);
+        try self.outsideMutex();
+        if (self.fail_view_metadata) {
+            // The actual prepared bank already exists. Fail the real Native
+            // view-header allocation, not a synthetic producer result.
+            var failing = std.testing.FailingAllocator.init(self.compute.allocator, .{ .fail_index = 0 });
+            const original = self.compute.allocator;
+            self.compute.allocator = failing.allocator();
+            defer self.compute.allocator = original;
+            self.view_failures += 1;
+            return native.vtable_impl.kernels.?.physicalTensorView.?(raw, request);
+        }
         return native.vtable_impl.kernels.?.physicalTensorView.?(raw, request);
     }
     const physical_policy: ops.physical_storage.Policy = .{ .allocate = allocate };
@@ -485,9 +513,17 @@ const LiteralCallbackProbe = struct {
         result.writePhysicalFloat32 = write;
         break :blk result;
     };
+    fn acceptsCleanup(value: *const ops.ComputeBackend.VTable) bool {
+        return value == &table;
+    }
+    fn freeWithCleanup(raw: *anyopaque, value: CT, current: @import("cleanup_context.zig").Context) void {
+        native.vtable_impl.cold_cleanup_services.?.free(raw, value, current);
+    }
+    const cleanup_services = ops.ColdCleanupServices{ .accepts = acceptsCleanup, .free = freeWithCleanup };
     const table: ops.ComputeBackend.VTable = blk: {
         var result = native.vtable_impl;
         result.kernels = &kernels;
+        result.cold_cleanup_services = &cleanup_services;
         break :blk result;
     };
 };
@@ -560,4 +596,356 @@ test "immutable literal SDK and admission callbacks reenter unlocked without hal
     try literalCallbackCase(std.testing.allocator, false);
     try literalCallbackCase(std.testing.allocator, true);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, literalCallbackOomCase, .{});
+}
+
+fn preparedLiteralConstructionRollbackCase(comptime quarantine_upload: bool) !void {
+    const a = std.testing.allocator;
+    const Memory = @import("../runtime/tier/memory.zig");
+    const Domain = @import("../runtime/tier/admission_domain.zig");
+    const Sink = @import("retirement_sink.zig");
+    const Prepared = @import("prepared_storage_admission.zig").Prepared;
+    const Native = @import("../ops/native_compute.zig");
+    const domain = try Domain.Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    const Source = struct {
+        pin: *const Domain.Pin,
+        run: Memory.AdmissionLease = undefined,
+        credit: Memory.AdmissionAmounts = .{ .host_scratch_bytes = 16 },
+        gate: std.atomic.Mutex = .unlocked,
+        violation: bool = false,
+        next: usize = 0,
+        fn observe(self: *@This()) void {
+            if (self.gate.tryLock()) self.gate.unlock() else self.violation = true;
+        }
+        fn externalReserve(raw: *anyopaque, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            self.next += 1;
+            return self.next;
+        }
+        fn externalRetain(raw: *anyopaque, _: usize, _: Memory.AdmissionAmounts) Memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn externalRelease(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn reserve(raw: *anyopaque, allocator: std.mem.Allocator, kind: @import("../graph/backend_contracts.zig").BackendKind, class: accounting.Class, bytes: usize) !admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            return admission.fromRunLease(allocator, &self.run, .{ .controller = self.pin.controller(), .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 }, .check_live_memory = false, .credit = &self.credit, .lifetime = admission.Lifetime.forAdmissionDomain(self.pin.*) }, kind, class, bytes);
+        }
+    };
+    var source = Source{ .pin = &pin };
+    try pin.controller().configureResourceBudget(.{ .context = &source, .try_reserve = Source.externalReserve, .retain = Source.externalRetain, .release = Source.externalRelease });
+    defer pin.controller().configureResourceBudget(null) catch @panic("prepared literal quota leak");
+    var weights = Native.WeightStore{ .allocator = a, .resident_weights = .{}, .lazy_weights = .{} };
+    defer weights.resident_weights.deinit(a);
+    defer weights.lazy_weights.deinit(a);
+    var probe = LiteralCallbackProbe{ .compute = Native.NativeCompute.init(a, &weights, null), .controller = pin.controller(), .source = &source.run, .fail_upload = quarantine_upload };
+    defer probe.compute.deinit();
+    const backend = ops.ComputeBackend{ .ptr = &probe.compute, .vtable = &LiteralCallbackProbe.table };
+    var owners = [_]Owner{.{}};
+    const values = [_]f32{ 0.5, 1, -3, 7 };
+    var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{4}), .data = &values, .allocation = 0, .backend_index = 0, .cold_bound = 16 }};
+    var backends = [_]ops.ComputeBackend{backend};
+    var completions = [_]?ops.physical_storage.Completion{null};
+    var store = SharedLiteralStore{ .allocator = a, .literals = &literals, .node_indices = &.{}, .publications = &.{}, .consumers = &.{}, .owners = &owners, .backends = &backends, .completions = &completions };
+    probe.store = &store;
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    defer {
+        // Actual test-owned cleanup gate/B, including early assertion errors.
+        var guard = sink.enter() catch @panic("literal cleanup guard");
+        var epoch = guard.retainEpoch() catch @panic("literal cleanup epoch");
+        @import("antfly_platform").sync.lockYielding(&source.gate);
+        if (owners[0].value) |value| backend.freeWithBoundary(value, &epoch);
+        if (owners[0].lease) |lease| lease.releaseWithBoundary(&epoch);
+        source.gate.unlock();
+        guard.finish();
+        epoch.release();
+        for (completions) |maybe| if (maybe) |completion| {
+            completion.wait() catch @panic("literal completion");
+            completion.deinit();
+        };
+    }
+    const ordinary = admission.Capability{ .identity = .{ .controller = pin.controller(), .backend_class = .cpu }, .context = &source, .services = &.{ .reserve = Source.reserve } };
+    const Missing = struct {
+        fn reserve(_: *anyopaque, _: std.mem.Allocator, _: @import("../graph/backend_contracts.zig").BackendKind, _: accounting.Class, _: usize) !admission.Reservation {
+            return error.UnexpectedUnpreparedProducer;
+        }
+        fn take(_: *anyopaque, _: std.mem.Allocator, _: @import("../graph/backend_contracts.zig").BackendKind, _: accounting.Class, _: usize) !admission.BackingReservation {
+            return error.UnexpectedUnpreparedProducer;
+        }
+    };
+    const missing = admission.Capability{ .identity = ordinary.identity, .context = &source, .services = &.{ .reserve = Missing.reserve, .takeBacking = Missing.take } };
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, store.value(0, missing, null));
+    try std.testing.expect(!store.initializing and !store.prepared_backings.load(.acquire));
+    try std.testing.expect(owners[0].lease == null and owners[0].value == null and completions[0] == null);
+    try std.testing.expectEqual(@as(usize, 0), probe.callbacks);
+    try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
+    for (0..2) |attempt| {
+        source.credit = .{ .host_scratch_bytes = 16 };
+        source.run = try pin.controller().tryAcquire(.cpu, .{ .host_limit_bytes = 64 }, .{ .host_scratch_bytes = 16 }, false);
+        defer source.run.release();
+        const prepared = (try Prepared.prepare(ordinary, &.{.{ .backend = .native, .class = .constant, .bytes = 16 }})).?;
+        var prepared_live = true;
+        var bound = false;
+        defer if (prepared_live and !bound) prepared.abortBeforeExecution() catch @panic("literal unused preparation");
+        var guard = try sink.enter();
+        defer guard.finish();
+        var epoch = try guard.retainEpoch();
+        defer epoch.release();
+        try prepared.bindConstructionEpoch(&epoch);
+        bound = true;
+        defer if (prepared_live) prepared.releaseAfterExecution(&epoch);
+        const capability = Prepared.forDispatch(prepared, ordinary.identity);
+        probe.fail_view_metadata = attempt == 0;
+        @import("antfly_platform").sync.lockYielding(&source.gate);
+        var gate_held = true;
+        defer if (gate_held) source.gate.unlock();
+        if (attempt == 0) {
+            try std.testing.expectError(error.OutOfMemory, store.value(0, capability, null));
+            try std.testing.expect(owners[0].lease == null and owners[0].value == null);
+            try std.testing.expectEqual(@as(usize, 1), probe.view_failures);
+        } else if (quarantine_upload) {
+            try std.testing.expectError(error.InjectedLiteralUploadFailure, store.value(0, capability, null));
+            try std.testing.expect(owners[0].lease != null and owners[0].value != null);
+            const callbacks = probe.callbacks;
+            try std.testing.expectError(error.InjectedLiteralUploadFailure, store.value(0, capability, null));
+            try std.testing.expectEqual(callbacks, probe.callbacks);
+        } else {
+            const value = try store.value(0, capability, null);
+            try std.testing.expect(value.fresh and value.lease.retirement_owner != null);
+            const warm = try store.value(0, capability, null);
+            try std.testing.expect(!warm.fresh and warm.lease == value.lease);
+        }
+        if (attempt == 1) {
+            if (owners[0].value) |value| backend.freeWithBoundary(value, &epoch);
+            owners[0].value = null;
+            if (owners[0].lease) |lease| lease.releaseWithBoundary(&epoch);
+            owners[0].lease = null;
+        }
+        prepared.releaseAfterExecution(&epoch);
+        prepared_live = false;
+        try std.testing.expectEqual(@as(usize, 16), pin.controller().snapshot().host_scratch_bytes);
+        try std.testing.expect(!store.initializing);
+        try std.testing.expectEqual(@as(usize, 1), store.references.load(.acquire));
+        source.gate.unlock();
+        gate_held = false;
+        guard.finish();
+        try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
+        try std.testing.expect(!source.violation);
+    }
+}
+
+test "prepared immutable literal actual view metadata OOM rolls real backing under construction B then fresh retry or upload quarantine" {
+    try preparedLiteralConstructionRollbackCase(false);
+    try preparedLiteralConstructionRollbackCase(true);
+}
+
+fn preparedLiteralMetalAttachmentRollbackCase(comptime partial_payload: bool, comptime inject_failure: bool) !void {
+    if (comptime !@import("build_options").enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Memory = @import("../runtime/tier/memory.zig");
+    const Domain = @import("../runtime/tier/admission_domain.zig");
+    const Sink = @import("retirement_sink.zig");
+    const Prepared = @import("prepared_storage_admission.zig").Prepared;
+    const Retirement = @import("resource_retirement.zig");
+    const Cleanup = @import("cleanup_context.zig").Context;
+    const Metal = @import("../ops/metal_compute.zig").MetalCompute;
+    const domain = try Domain.Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, std.testing.io);
+    defer context.deinit(a);
+    const canonical = context.computeBackend();
+    // This test wrapper preserves the actual Metal receiver and SDK callbacks.
+    // Only the attachment return is faulted, once before or after real payload
+    // publication. The latter is legal only with zero pending batch nodes.
+    const Fault = struct {
+        var original: *const ops.ComputeBackend.VTable = undefined;
+        var table: *const ops.ComputeBackend.VTable = undefined;
+        var origin: *const Retirement.Scope.VTable = undefined;
+        var fault: bool = true;
+        var calls: usize = 0;
+        fn accepts(value: *const ops.ComputeBackend.VTable) bool {
+            return value == table;
+        }
+        fn free(raw: *anyopaque, value: CT, current: Cleanup) void {
+            original.cold_cleanup_services.?.free(raw, value, current);
+        }
+        fn begin(raw: *anyopaque, outputs: []const CT) !Retirement.ScopeSet {
+            var result = try original.resource_retirement_services.?.begin(raw, outputs);
+            errdefer result.end();
+            if (result.count != 1) return error.UnexpectedPhysicalOriginCount;
+            origin = result.scopes()[0].vtable;
+            // No asynchronous batch node may be published by a failing attach.
+            if (result.scopes()[0].pending_batches != 0) return error.UnexpectedPendingPhysicalBatch;
+            result.scopes()[0].vtable = &scope_table;
+            return result;
+        }
+        fn beginOrigin(raw: *anyopaque, outputs: []const CT) !Retirement.Scope.Begun {
+            return origin.begin(raw, outputs);
+        }
+        fn attach(raw: *anyopaque, outputs: []const CT, nodes: []Retirement.Node, payload: Retirement.Payload) !void {
+            return origin.attach(raw, outputs, nodes, payload);
+        }
+        fn attachPrepared(raw: *anyopaque, outputs: []const CT, nodes: []Retirement.Node, payload: Retirement.Payload, metadata: *Retirement.BackendPreparation) !void {
+            calls += 1;
+            try std.testing.expectEqual(@as(usize, 0), nodes.len);
+            if (fault and !partial_payload) return error.InjectedPhysicalAttachmentFailure;
+            try origin.attach_prepared.?(raw, outputs, nodes, payload, metadata);
+            if (fault) return error.InjectedPhysicalAttachmentFailure;
+        }
+        fn end(raw: *anyopaque) void {
+            origin.end(raw);
+        }
+        fn notify() callconv(.c) void {
+            if (origin.notify) |callback| callback();
+        }
+        const scope_table = Retirement.Scope.VTable{ .begin = beginOrigin, .attach = attach, .attach_prepared = attachPrepared, .end = end, .notify = notify };
+        const services = Retirement.Services{ .accepts = accepts, .begin = begin };
+        const cleanup_services = ops.ColdCleanupServices{ .accepts = accepts, .free = free };
+    };
+    Fault.original = canonical.vtable;
+    Fault.fault = inject_failure;
+    Fault.calls = 0;
+    var kernels = canonical.vtable.kernels.?.*;
+    kernels.implementation_table = null;
+    kernels.acceptsImplementation = null;
+    var table = canonical.vtable.*;
+    table.kernels = &kernels;
+    table.resource_retirement_services = &Fault.services;
+    table.cold_cleanup_services = &Fault.cleanup_services;
+    Fault.table = &table;
+    const backend = ops.ComputeBackend{ .ptr = canonical.ptr, .vtable = &table };
+    var owners = [_]Owner{.{}};
+    const data = [_]f32{ 0.5, 1, -3, 7 };
+    const upper = try ops.physical_storage.reservationBytes(backend, .{ .byte_size = 16 });
+    var literals = [_]Literal{.{ .node = 0, .shape = ml.graph.Shape.init(.f32, &.{4}), .data = &data, .allocation = 0, .backend_index = 0, .cold_bound = upper }};
+    var backends = [_]ops.ComputeBackend{backend};
+    var completions = [_]?ops.physical_storage.Completion{null};
+    var store = SharedLiteralStore{ .allocator = a, .literals = &literals, .node_indices = &.{}, .publications = &.{}, .consumers = &.{}, .owners = &owners, .backends = &backends, .completions = &completions };
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    // Registered before raw creation so every early failure gets real B cleanup.
+    defer {
+        var guard = sink.enter() catch @panic("Metal literal cleanup guard");
+        var epoch = guard.retainEpoch() catch @panic("Metal literal cleanup epoch");
+        if (owners[0].value) |value| backend.freeWithBoundary(value, &epoch);
+        if (owners[0].lease) |lease| lease.releaseWithBoundary(&epoch);
+        guard.finish();
+        epoch.release();
+        for (completions) |maybe| if (maybe) |completion| {
+            completion.wait() catch @panic("Metal literal completion");
+            completion.deinit();
+        };
+        Retirement.pollRetirementChargesCPU();
+    }
+    const raw = try store.value(0, null, null);
+    try Metal.syncOutputTensor(&canonical, raw.value);
+    // A real independent SDK alias, not another physical Lease retain.
+    var alias = (try Metal.retainDenseDeviceTensor(raw.lease.tensor)).?;
+    var alias_live = true;
+    defer if (alias_live) alias.deinit();
+    const bytes = raw.lease.backing_byte_size orelse raw.lease.byte_size;
+    const Source = struct {
+        pin: *const Domain.Pin,
+        run: Memory.AdmissionLease = undefined,
+        credit: Memory.AdmissionAmounts = .{},
+        fn reserve(raw_source: *anyopaque, allocator: std.mem.Allocator, kind: @import("../graph/backend_contracts.zig").BackendKind, class: accounting.Class, count: usize) !admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw_source));
+            return admission.fromRunLease(allocator, &self.run, .{ .controller = self.pin.controller(), .backend_class = .gpu, .limits = .{}, .check_live_memory = false, .credit = &self.credit, .lifetime = admission.Lifetime.forAdmissionDomain(self.pin.*) }, kind, class, count);
+        }
+    };
+    var source = Source{ .pin = &pin };
+    const ordinary = admission.Capability{ .identity = .{ .controller = pin.controller(), .backend_class = .gpu }, .context = &source, .services = &.{ .reserve = Source.reserve } };
+    for (0..2) |attempt| {
+        source.credit = .{ .backend_scratch_bytes = bytes };
+        source.run = try pin.controller().tryAcquire(.gpu, .{}, source.credit, false);
+        defer source.run.release();
+        const prepared = (try Prepared.prepare(ordinary, &.{.{ .backend = .metal, .class = .constant, .bytes = bytes }})).?;
+        var prepared_live = true;
+        var bound = false;
+        defer if (prepared_live and !bound) prepared.abortBeforeExecution() catch @panic("Metal unused preparation");
+        var guard = try sink.enter();
+        defer guard.finish();
+        var epoch = try guard.retainEpoch();
+        defer epoch.release();
+        try prepared.bindConstructionEpoch(&epoch);
+        bound = true;
+        defer if (prepared_live) prepared.releaseAfterExecution(&epoch);
+        const capability = Prepared.forDispatch(prepared, ordinary.identity);
+        if (attempt == 0 and inject_failure) {
+            try std.testing.expectError(error.InjectedPhysicalAttachmentFailure, store.value(0, capability, null));
+            try std.testing.expect(raw.lease.isQuarantined());
+            try std.testing.expect(!store.initializing and store.prepared_backings.load(.acquire));
+            try std.testing.expectEqual(@as(usize, 0), raw.lease.admittedBytes());
+            try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, raw.lease.admittedAmounts());
+        } else if (inject_failure) {
+            // A fresh capability cannot reuse a partially witnessed SDK bank.
+            try std.testing.expectError(error.PhysicalStorageAdmissionQuarantined, store.value(0, capability, null));
+        } else {
+            const value = try store.value(0, capability, null);
+            try std.testing.expect(value.lease == raw.lease and value.lease.admission != null);
+            const warm = try store.value(0, Prepared.forDispatch(null, ordinary.identity), null);
+            try std.testing.expect(warm.lease == value.lease and !warm.fresh);
+        }
+        if (inject_failure) {
+            try std.testing.expectError(error.PhysicalStorageAdmissionQuarantined, store.value(0, null, null));
+            try std.testing.expectError(error.PhysicalStorageAdmissionQuarantined, raw.lease.ensureAdmission(capability));
+        }
+        try std.testing.expectEqual(@as(usize, 1), Fault.calls);
+        var claim = try store.claimImmutable(ordinary.identity);
+        defer claim.release();
+        try std.testing.expectEqual(if (inject_failure) @as(usize, 0) else bytes, claim.totals.credit.backend_scratch_bytes);
+        prepared.releaseAfterExecution(&epoch);
+        prepared_live = false;
+        guard.finish();
+        const expected_bytes = bytes;
+        var settlement_polls: usize = 0;
+        while (pin.controller().snapshot().backend_scratch_bytes != expected_bytes and settlement_polls < 2000) : (settlement_polls += 1) {
+            Retirement.pollRetirementChargesCPU();
+            try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+        }
+        try std.testing.expectEqual(expected_bytes, pin.controller().snapshot().backend_scratch_bytes);
+    }
+    var final_guard = try sink.enter();
+    defer final_guard.finish();
+    var final_epoch = try final_guard.retainEpoch();
+    defer final_epoch.release();
+    backend.freeWithBoundary(owners[0].value.?, &final_epoch);
+    owners[0].value = null;
+    owners[0].lease.?.releaseWithBoundary(&final_epoch);
+    owners[0].lease = null;
+    Retirement.pollRetirementChargesCPU();
+    // Construction A is sealed. Both cleanup-only quarantine and successful
+    // admission now follow this actual final B, independently of the SDK pin.
+    try std.testing.expectEqual(bytes, pin.controller().snapshot().backend_scratch_bytes);
+    alias.deinitWithBoundary(&final_epoch);
+    alias_live = false;
+    Retirement.pollRetirementChargesCPU();
+    // Both full and quarantined ownership follow the actual unsealed final B.
+    // A raw SDK alias outliving that bank B is an outside-only legacy API;
+    // this test drops it BEFORE B seals and grants no third-boundary authority.
+    try std.testing.expectEqual(bytes, pin.controller().snapshot().backend_scratch_bytes);
+    final_guard.finish();
+    var polls: usize = 0;
+    while (pin.controller().snapshot().backend_scratch_bytes != 0 and polls < 2000) : (polls += 1) {
+        Retirement.pollRetirementChargesCPU();
+        try std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake);
+    }
+    try std.testing.expectEqualDeep(Memory.AdmissionAmounts{}, pin.controller().snapshot());
+}
+
+test "Metal immutable literal failed prepared attachment quarantines reuse and actual SDK alias plus later B fence full and partial witnesses" {
+    try preparedLiteralMetalAttachmentRollbackCase(false, true);
+    try preparedLiteralMetalAttachmentRollbackCase(true, true);
+    try preparedLiteralMetalAttachmentRollbackCase(false, false);
 }
