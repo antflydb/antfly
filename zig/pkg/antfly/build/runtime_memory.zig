@@ -184,6 +184,16 @@ pub fn runtimeCompileMaxRss(unit: RuntimeLibraryUnit, profile: CompileMemoryProf
         // Debug, sanitizers or other runtime units.
         return 15 * 1024 * 1024 * 1024;
     }
+    if (unit == .api_kernel and
+        std.mem.eql(u8, @import("builtin").zig_version_string, "0.17.0") and
+        profile.host.os.tag == .linux and profile.host.cpu.arch == .aarch64 and
+        target.os.tag == .linux and target.cpu.arch == .aarch64 and target.abi == .gnu and
+        profile.optimize == .debug)
+    {
+        // CUDA Debug on a Grace host peaked at 15,747,330,048 bytes, the same on
+        // main as with media changes. 18 GiB retains about 20% headroom.
+        return 18 * 1024 * 1024 * 1024;
+    }
     return switch (unit) {
         // Claims conservatively cover clean production ReleaseFast
         // peaks measured for both aarch64-linux-musl and explicit
