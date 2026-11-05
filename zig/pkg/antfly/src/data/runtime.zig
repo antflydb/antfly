@@ -26401,6 +26401,7 @@ const RemoteMetadataSource = struct {
                 .table_routing_snapshot = remoteTableRoutingSnapshot,
                 .linearizable_routing_snapshot = remoteLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = remoteLinearizableTableRoutingSnapshot,
+                .privacy_policy_binding = remotePrivacyPolicyBinding,
                 .free_routing_snapshot = remoteFreeRoutingSnapshot,
                 .wait_for_routing_change = remoteWaitForRoutingChange,
                 .await_route = remoteAwaitRoute,
@@ -27390,6 +27391,34 @@ const RemoteMetadataSource = struct {
     fn remoteTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
         const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
         return try self.remoteTableRoutingSnapshotWithMode(table_name, deadline_ns, false);
+    }
+
+    fn remotePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.PrivacyPolicyBinding {
+        const self: *RemoteMetadataSource = @ptrCast(@alignCast(ptr));
+        const outer_budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline| .{ .deadline_ns = deadline, .io = self.io } else null;
+        var last_err: anyerror = error.MissingMetadataApi;
+        for (0..self.base_uris.len) |attempt| {
+            ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+            const index = self.metadataReadApiIndexForAttempt(attempt);
+            const budget: ?antfly.metadata_http_client.RequestBudget = if (deadline_ns) |deadline| .{ .deadline_ns = catalogRoutingAttemptDeadline(self.awakeNs(), deadline, self.base_uris.len - attempt), .io = self.io } else null;
+            var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+            defer arena.deinit();
+            var client = self.metadataClient(arena.allocator());
+            var parsed = client.fetchPrivacyPolicyBinding(self.base_uris[index], table_name, budget) catch |err| {
+                last_err = if (err == error.UnsupportedOperation) error.StorageReadTemporarilyUnavailable else normalizeCatalogRoutingSnapshotError(err);
+                continue;
+            };
+            defer parsed.deinit();
+            ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+            self.acceptMetadataIdentityWithBudget(parsed.value.metadata_group_id, parsed.value.metadata_incarnation, budget) catch |err| {
+                last_err = err;
+                continue;
+            };
+            self.noteMetadataReadSuccess(index);
+            return parsed.value;
+        }
+        ensureBudgetActive(outer_budget) catch return error.CatalogRoutingSnapshotTimeout;
+        return last_err;
     }
 
     fn remoteLinearizableTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
@@ -45978,6 +46007,43 @@ fn consumerTests() type {
                 try std.testing.expectEqual(if (status == 202) null else @as(?u32, 1), response.response.retry_after_seconds);
                 try std.testing.expectEqual(if (status == 202) null else @as(?@import("../api/public_table_http.zig").MetadataMutationOutcome, .unknown), response.response.metadata_mutation_outcome);
             };
+        }
+
+        test "privacy remote read bindings pin metadata identity and never fall back to full catalogs" {
+            const a = std.testing.allocator;
+            const Fake = struct {
+                calls: usize = 0,
+                reject_first: bool = true,
+                wrong_identity: bool = false,
+                malformed: bool = false,
+                fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(ptr));
+                    self.calls += 1;
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/catalog/privacy-policy-binding"));
+                    try std.testing.expectEqual(@as(?usize, 4096), request.max_response_bytes);
+                    if (self.reject_first and std.mem.startsWith(u8, request.uri, "http://old")) return .{ .status = 404, .body = try alloc.dupe(u8, "unsupported") };
+                    if (self.malformed) return .{ .status = 200, .body = try alloc.dupe(u8, "{}") };
+                    return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata_api.PrivacyPolicyBinding{ .metadata_group_id = 9, .metadata_incarnation = @splat(if (self.wrong_identity) @as(u8, '2') else '1'), .catalog_revision = 7, .policy_version = @splat('a') }, .{}) };
+                }
+            };
+            var fake: Fake = .{};
+            const executor: antfly.common.http.RequestExecutor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } };
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{ "http://old", "http://new" }, &.{ executor, executor }, std.testing.io);
+            defer source.deinit();
+            const capture = source.catalogSource().vtable.privacy_policy_binding.?;
+            const result = try capture(&source, "docs", null);
+            try std.testing.expectEqual(@as([64]u8, @splat('a')), result.policy_version);
+            try std.testing.expectEqual(@as(usize, 2), fake.calls);
+            fake.wrong_identity = true;
+            fake.reject_first = false;
+            try std.testing.expectError(error.MetadataIncarnationMismatch, capture(&source, "docs", null));
+            fake.wrong_identity = false;
+            fake.malformed = true;
+            try std.testing.expectError(error.MissingField, capture(&source, "docs", null));
+            fake.malformed = false;
+            const calls = fake.calls;
+            try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, capture(&source, "docs", 1));
+            try std.testing.expectEqual(calls, fake.calls);
         }
 
         test "privacy remote table reads observe progress without invalidating semantic caches" {

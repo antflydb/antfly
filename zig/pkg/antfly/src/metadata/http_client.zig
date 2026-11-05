@@ -470,6 +470,15 @@ pub const MetadataHttpClient = struct {
         return try self.fetchRoutingSnapshotAt(base_uri, .POST, path, body, budget);
     }
 
+    pub fn fetchPrivacyPolicyBinding(self: *MetadataHttpClient, base_uri: []const u8, table_name: []const u8, budget: ?RequestBudget) !std.json.Parsed(metadata_api.PrivacyPolicyBinding) {
+        const body = try std.json.Stringify.valueAlloc(self.alloc, metadata_api.CatalogTableRoutingSnapshotRequest{ .table_name = table_name }, .{});
+        defer self.alloc.free(body);
+        var parsed = try self.fetchCatalogReadAt(metadata_api.PrivacyPolicyBinding, base_uri, .POST, routes.Routes.internal_privacy_policy_binding, body, budget);
+        errdefer parsed.deinit();
+        try parsed.value.validate();
+        return parsed;
+    }
+
     fn fetchRoutingSnapshotAt(
         self: *MetadataHttpClient,
         base_uri: []const u8,
@@ -478,6 +487,10 @@ pub const MetadataHttpClient = struct {
         body: ?[]const u8,
         budget: ?RequestBudget,
     ) !std.json.Parsed(metadata_api.CatalogRoutingSnapshot) {
+        return self.fetchCatalogReadAt(metadata_api.CatalogRoutingSnapshot, base_uri, method, path, body, budget);
+    }
+
+    fn fetchCatalogReadAt(self: *MetadataHttpClient, comptime Result: type, base_uri: []const u8, method: http_common.Method, path: []const u8, body: ?[]const u8, budget: ?RequestBudget) !std.json.Parsed(Result) {
         const uri = try join(self.alloc, base_uri, path);
         defer self.alloc.free(uri);
 
@@ -487,6 +500,7 @@ pub const MetadataHttpClient = struct {
             .method = method,
             .uri = uri,
             .timeout_ms = default_request_timeout_ms,
+            .max_response_bytes = if (Result == metadata_api.PrivacyPolicyBinding) 4096 else null,
         };
         if (method == .POST) {
             request.body = body orelse "{}";
@@ -513,7 +527,7 @@ pub const MetadataHttpClient = struct {
         if (resp.status == 504) return error.CatalogRoutingSnapshotTimeout;
         if (resp.status == 404 or resp.status == 405) return error.UnsupportedOperation;
         if (resp.status < 200 or resp.status >= 300) return error.UnexpectedHttpStatus;
-        var parsed = try parseJson(metadata_api.CatalogRoutingSnapshot, self.alloc, resp.body);
+        var parsed = try parseJson(Result, self.alloc, resp.body);
         errdefer parsed.deinit();
         try ensureRoutingBudget(budget);
         return parsed;

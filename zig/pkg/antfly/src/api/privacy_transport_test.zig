@@ -363,3 +363,35 @@ test "privacy remote mutation replies retain upstream outcome on every status wi
         try std.testing.expectEqual(if (fake.unknown) @as(?u32, 1) else null, result.response.retry_after_seconds);
     };
 }
+
+test "privacy compact binding HTTP reads bound replies and reject malformed or unsupported peers" {
+    const a = std.testing.allocator;
+    const api = @import("../metadata/api.zig");
+    const Fake = struct {
+        status: u16 = 200,
+        malformed: bool = false,
+        calls: usize = 0,
+        version: [64]u8 = @splat('a'),
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, "/internal/v1/catalog/privacy-policy-binding"));
+            try std.testing.expectEqual(@as(?usize, 4096), request.max_response_bytes);
+            return .{ .status = self.status, .body = if (self.malformed) try alloc.dupe(u8, "{}") else try std.json.Stringify.valueAlloc(alloc, api.PrivacyPolicyBinding{ .metadata_group_id = 9, .metadata_incarnation = @splat('1'), .catalog_revision = 7, .policy_version = self.version }, .{}) };
+        }
+    };
+    var fake: Fake = .{};
+    var client = @import("../metadata/http_client.zig").MetadataHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    var result = try client.fetchPrivacyPolicyBinding("http://metadata", "docs", null);
+    defer result.deinit();
+    try std.testing.expectEqual(fake.version, result.value.policy_version);
+    fake.version[0] = '!';
+    try std.testing.expectError(error.InvalidPrivacyCatalog, client.fetchPrivacyPolicyBinding("http://metadata", "docs", null));
+    fake.malformed = true;
+    try std.testing.expectError(error.MissingField, client.fetchPrivacyPolicyBinding("http://metadata", "docs", null));
+    fake.status = 404;
+    try std.testing.expectError(error.UnsupportedOperation, client.fetchPrivacyPolicyBinding("http://metadata", "docs", null));
+    const calls = fake.calls;
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchPrivacyPolicyBinding("http://metadata", "docs", .{ .deadline_ns = 1 }));
+    try std.testing.expectEqual(calls, fake.calls);
+}

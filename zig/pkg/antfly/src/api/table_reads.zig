@@ -4150,7 +4150,7 @@ pub const ProvisionedTableReadSource = struct {
             .supports_sql_range_guards = true,
             // Both alternatives have static lifetime. A runtime conditional
             // inside an address-of literal would leave a stack-backed vtable.
-            .vtable = if (self.catalog.vtable.linearizable_table_routing_snapshot != null)
+            .vtable = if (self.catalog.vtable.privacy_policy_binding != null or self.catalog.vtable.linearizable_table_routing_snapshot != null)
                 &comptime sourceVTable(true)
             else
                 &comptime sourceVTable(false),
@@ -7019,7 +7019,7 @@ pub const HostedProvisionedTableReadSource = struct {
             .strict_read_index_absence = if (self.local_read_source) |local| local.strict_read_index_absence else false,
             // Both alternatives have static lifetime. A runtime conditional
             // inside an address-of literal would leave a stack-backed vtable.
-            .vtable = if (self.catalog.vtable.linearizable_table_routing_snapshot != null)
+            .vtable = if (self.catalog.vtable.privacy_policy_binding != null or self.catalog.vtable.linearizable_table_routing_snapshot != null)
                 &comptime sourceVTable(true)
             else
                 &comptime sourceVTable(false),
@@ -15661,7 +15661,7 @@ fn collectProvisionedHostedLocalTextStats(
     defer parsed.deinit(alloc);
     var owner = try provisionedLocalQueryDbOwner(resident_db, cache, replica_root_dir, catalog, alloc, group_id, lsm_root_generation, backend_runtime, table_name, read_activity_held);
     defer owner.deinit();
-    if (catalog.vtable.linearizable_table_routing_snapshot != null) {
+    if (catalog.vtable.privacy_policy_binding != null or catalog.vtable.linearizable_table_routing_snapshot != null) {
         const version = try capturePrivacyPolicyVersion(alloc, catalog, table_name, null);
         if (!std.mem.allEqual(u8, &version, 0)) {
             var summary = try owner.db().collectPlanningStats(alloc, .{ .privacy_policy_version = version }, 1);
@@ -15699,7 +15699,7 @@ fn collectProvisionedHostedLocalAlgebraicPartials(
     defer parsed.deinit(alloc);
     var owner = try provisionedLocalQueryDbOwner(resident_db, cache, replica_root_dir, catalog, alloc, group_id, lsm_root_generation, backend_runtime, table_name, read_activity_held);
     defer owner.deinit();
-    if (catalog.vtable.linearizable_table_routing_snapshot != null) {
+    if (catalog.vtable.privacy_policy_binding != null or catalog.vtable.linearizable_table_routing_snapshot != null) {
         const version = try capturePrivacyPolicyVersion(alloc, catalog, table_name, null);
         if (!std.mem.allEqual(u8, &version, 0)) {
             var summary = try owner.db().collectPlanningStats(alloc, .{ .privacy_policy_version = version }, 1);
@@ -35776,15 +35776,18 @@ test "public graph metric borrowed wire scan producer sink preserves bytes and f
 }
 
 fn capturePrivacyPolicyVersion(a: std.mem.Allocator, catalog: table_catalog.CatalogSource, table_name: []const u8, deadline: ?u64) ![64]u8 {
+    if (catalog.vtable.privacy_policy_binding) |capture| {
+        const binding = try capture(catalog.ptr, table_name, deadline);
+        try binding.validate();
+        return binding.policy_version;
+    }
+    // Foreign/test catalog adapters may only provide the older owned snapshot.
+    // First-party adapters use the compact capability above, including remotely.
     const capture = catalog.vtable.linearizable_table_routing_snapshot orelse return error.PrivacyReadFenceUnavailable;
     var snapshot = try capture(catalog.ptr, table_name, deadline);
     defer catalog.vtable.free_routing_snapshot(catalog.ptr, &snapshot);
     const table = for (snapshot.tables) |*entry| {
         if (std.mem.eql(u8, entry.name, table_name)) break entry;
     } else return @splat(0);
-    var root = try std.json.parseFromSlice(std.json.Value, a, table.indexes_json, .{});
-    defer root.deinit();
-    var resource = (try @import("antfly_local_sources").privacy_catalog.current(a, root.value)) orelse return @splat(0);
-    defer resource.deinit();
-    return if (resource.value.policy.mode == .redact_for_search_and_ai) resource.value.policy_version else @splat(0);
+    return @import("antfly_local_sources").privacy_catalog.policyBinding(a, table.indexes_json);
 }

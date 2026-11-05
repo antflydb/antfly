@@ -4,7 +4,7 @@ Implements the table-scoped **Privacy** design in
 [issue #1401](https://github.com/antflydb/antfly/issues/1401). The user-facing
 contract and examples are in [Table privacy](../reference/table-privacy.md).
 The branch starts at `f2b3baaee1cb508005451843c17fa07f2e069d4b`.
-Main is merged through `81941d33651c582a91341ffcd3bde7e065688352`; privacy uses metadata protocol version 81.
+Main is merged through `6c0b004e95ad947587cbc4bbb60f4812fb714b28`; privacy uses metadata protocol version 82.
 
 ## Policy and user experience
 
@@ -470,6 +470,35 @@ ordering, payloads and checksum validation are unchanged. This avoids quadratic
 field scans during compaction that could stall writes/publication for documents
 with 10,000 indexed fields. Hand-built readers retain the legacy lookup fallback
 until their metadata has been explicitly admitted as sorted.
+
+## Compact authoritative read bindings
+
+Read fences use `/internal/v1/catalog/privacy-policy-binding`, a fixed-size
+metadata response containing the authority identity, semantic catalog revision
+and current protected policy version. The request crosses the same metadata
+linearizable-read barrier and deadline boundary as routing. Unsupported,
+malformed, expired and wrong-incarnation responses fail closed; remote discovery
+never falls back to transferring a full table definition for this capability.
+The client imposes a separate 4 KiB response ceiling. Privacy mutation admission
+requires metadata protocol 82 so the capability is part of the fleet contract.
+
+Metadata derives bindings once per immutable catalog projection, skipping job
+history without constructing its JSON tree. A malformed policy blocks that
+table's fence rather than poisoning healthy tables' routing. Warm captures retain
+the published projection and return its scalar binding without allocating.
+Standalone uses its catalog mutex as the read barrier and caches scalar bindings
+by table ID within the semantic epoch; runtime progress does not invalidate them.
+Policy publication, deletion/recreation, restore and durability failure remain
+part of the existing catalog authority boundary. Schema, producer definitions,
+range descriptors and retained scan failures are absent from the read response.
+
+Policy and scan writes prepare caller-owned acceptance responses before their
+CAS. A successful CAS therefore returns the accepted state without subsequent
+response allocation or a redundant acknowledgment read. Structural reconcile
+scheduling is a best-effort hint; the durable policy and scan queue drive
+convergence. Transport ambiguity continues to require observation before replay.
+The TypeScript HTTP error exposes the server's typed mutation outcome and numeric
+retry delay for JSON and non-JSON errors without replaying writes.
 
 ## Validation
 

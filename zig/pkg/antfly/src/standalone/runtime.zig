@@ -744,6 +744,8 @@ const LocalStandaloneMetadata = struct {
         table_name: []u8,
         bootstrap: @import("antfly_local_sources").storage_db_relational_initial_child_publication.Bootstrap,
     };
+    privacy_binding_epoch: u64 = std.math.maxInt(u64),
+    privacy_binding_versions: std.AutoHashMapUnmanaged(u64, [64]u8) = .empty,
     alloc: std.mem.Allocator,
     mutex: std.atomic.Mutex = .unlocked,
     vector_migration_commands: @import("antfly_local_sources").common_vector_migration.CommandAdmissions = .{},
@@ -1057,6 +1059,7 @@ const LocalStandaloneMetadata = struct {
         if (self.operator_lock) |file| file.close(self.backend_runtime.filesystemIo().?);
         self.extension_catalog.deinit();
         self.manager.deinit();
+        self.privacy_binding_versions.deinit(self.alloc);
         self.alloc.free(self.catalog_path);
         self.alloc.free(self.replica_root_dir);
         self.alloc.free(self.api_url);
@@ -1083,6 +1086,7 @@ const LocalStandaloneMetadata = struct {
                 .linearizable_routing_snapshot = catalogRoutingSnapshot,
                 .table_routing_snapshot = catalogTableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = catalogTableRoutingSnapshot,
+                .privacy_policy_binding = catalogPrivacyPolicyBinding,
                 .free_routing_snapshot = catalogFreeRoutingSnapshot,
                 .wait_for_routing_change = catalogWaitForRoutingChange,
             },
@@ -2062,6 +2066,26 @@ const LocalStandaloneMetadata = struct {
         if (self.lifecycle_store) |store| if (try store.standaloneRevision() != self.durable_revision) try self.reloadLifecycleProjectionLocked();
 
         return self.routingSnapshotLocked(deadline_ns);
+    }
+
+    fn catalogPrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.PrivacyPolicyBinding {
+        const self: *LocalStandaloneMetadata = @ptrCast(@alignCast(ptr));
+        if (!lockAtomicUntil(&self.mutex, deadline_ns)) return error.CatalogRoutingSnapshotTimeout;
+        defer self.mutex.unlock();
+        if (self.catalog_durability_failed) return error.MetadataMutationOutcomeUnknown;
+        if (self.lifecycle_store != null and self.durable_revision == 0) try self.reloadLifecycleProjectionLocked();
+        if (self.privacy_binding_epoch != self.epoch) {
+            self.privacy_binding_versions.clearRetainingCapacity();
+            self.privacy_binding_epoch = self.epoch;
+        }
+        const version: [64]u8 = if (self.manager.findTableByName(table_name)) |table| blk: {
+            if (self.privacy_binding_versions.get(table.table_id)) |version| break :blk version;
+            const version = try @import("antfly_local_sources").privacy_catalog.policyBinding(self.alloc, table.indexes_json);
+            try self.privacy_binding_versions.put(self.alloc, table.table_id, version);
+            break :blk version;
+        } else @splat(0);
+        try (antfly.public_api.table_catalog.RoutingBudget{ .deadline_ns = deadline_ns }).checkpoint();
+        return .{ .metadata_group_id = group_ids.main_metadata_group_id, .metadata_incarnation = self.metadata_incarnation, .catalog_revision = self.epoch, .policy_version = version };
     }
 
     fn catalogTableRoutingSnapshot(ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) !antfly.metadata_api.CatalogRoutingSnapshot {
@@ -4786,6 +4810,8 @@ const LocalStandaloneMetadata = struct {
         // partial replacement failures. Existing readers retain their immutable
         // cut; an in-flight builder must not republish it under a reused epoch.
         self.projection_incarnation += 1;
+        self.privacy_binding_versions.clearRetainingCapacity();
+        self.privacy_binding_epoch = std.math.maxInt(u64);
         if (self.routing_generation) |generation| generation.release();
         self.routing_generation = null;
         if (self.join_planning_generation) |generation| generation.release();
@@ -16472,4 +16498,68 @@ test "standalone metadata admission observes cancellation while queued and after
     try lockAtomicForRequest(&mutex, antfly.public_api.operation.RequestContext{ .cancellation = .{ .ptr = &probe, .is_cancelled_fn = Probe.canceled } });
     mutex.unlock();
     try std.testing.expect(!probe.contended);
+}
+
+test "privacy standalone compact bindings refresh on policy publication and survive progress" {
+    const alloc = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    const path = try std.fmt.allocPrint(a, "{s}/catalog.json", .{root});
+    var backend = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend.deinit();
+    var metadata = try LocalStandaloneMetadata.init(alloc, 1, 1, "http://localhost", root, path, backend.ptr(), null, .local);
+    defer metadata.deinit();
+    try LocalStandaloneMetadata.createTable(&metadata, alloc, "private", .{});
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const absent = try LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null);
+    try std.testing.expect(std.mem.allEqual(u8, &absent.policy_version, 0));
+    var resource = try privacy.next(a, null, .{ .mode = .redact_for_search_and_ai, .fields = &.{"body"} }, null);
+    var before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("private").?.*);
+    var installed = before;
+    installed.indexes_json = try privacy.install(a, "{}", resource);
+    try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, installed);
+    const protected = try LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null);
+    try std.testing.expectEqual(resource.policy_version, protected.policy_version);
+    const epoch = metadata.privacy_binding_epoch;
+    before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("private").?.*);
+    const saved = try std.json.parseFromSliceLeaky(std.json.Value, a, before.indexes_json, .{});
+    var persisted = (try privacy.current(a, saved)).?;
+    defer persisted.deinit();
+    resource = persisted.value;
+    resource.coverage.retry_after_millis = 200;
+    installed.indexes_json = try privacy.replaceResource(a, before.indexes_json, resource);
+    try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, installed);
+    const current = try LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null);
+    try std.testing.expectEqual(epoch, metadata.privacy_binding_epoch);
+    try std.testing.expectEqual(protected.policy_version, current.policy_version);
+    const prior_alloc = metadata.alloc;
+    var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = 0, .resize_fail_index = 0 });
+    metadata.alloc = failing.allocator();
+    const warm = LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null);
+    metadata.alloc = prior_alloc;
+    try std.testing.expectEqual(current.policy_version, (try warm).policy_version);
+    before = try antfly.metadata.table_manager.cloneTable(a, metadata.findTableByNameLocked("private").?.*);
+    const monitor = try privacy.next(a, resource, .{ .mode = .monitor, .fields = &.{"body"} }, try privacy.etag(a, resource));
+    installed.indexes_json = try privacy.install(a, before.indexes_json, monitor);
+    try LocalStandaloneMetadata.replaceTableDefinition(&metadata, before, installed);
+    const unprotected = try LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null);
+    try std.testing.expect(std.mem.allEqual(u8, &unprotected.policy_version, 0));
+    // Restore/HA replacement may reuse the semantic epoch and table identity.
+    // Its old "unprotected" cache entry must not survive the new catalog cut.
+    const restored = try std.json.Stringify.valueAlloc(a, LocalStandaloneMetadata.PersistedCatalog{
+        .epoch = metadata.epoch,
+        .tables = &.{.{ .table_id = before.table_id, .name = "private", .indexes_json = try privacy.install(a, "{}", resource) }},
+    }, .{});
+    try metadata.loadCatalogBytes(restored);
+    const restored_binding = try LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null);
+    try std.testing.expectEqual(resource.policy_version, restored_binding.policy_version);
+    try std.testing.expectEqual(unprotected.catalog_revision, restored_binding.catalog_revision);
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", 1));
+    metadata.catalog_durability_failed = true;
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, LocalStandaloneMetadata.catalogPrivacyPolicyBinding(&metadata, "private", null));
+    metadata.catalog_durability_failed = false;
 }

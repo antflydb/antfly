@@ -5294,6 +5294,11 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = &.{"system catalog standalone relation coordinator"},
     });
     b.step("antfly-standalone-pgwire-ddl-test", "Run standalone relation publication and guarded DDL tests").dependOn(&addFilteredTestRunArtifact(b, standalone_ddl_tests).step);
+    const standalone_privacy_binding_tests = b.addTest(.{
+        .root_module = system_catalog_standalone_test_mod,
+        .filters = &.{"privacy standalone compact bindings refresh on policy publication and survive progress"},
+    });
+    b.step("antfly-standalone-privacy-binding-test", "Verify compact privacy bindings across standalone publication and progress").dependOn(&addFilteredTestRunArtifact(b, standalone_privacy_binding_tests).step);
     const standalone_cdc_tests = b.addTest(.{
         .root_module = system_catalog_standalone_test_mod,
         .filters = &.{"standalone cdc"},
@@ -5329,6 +5334,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .filters = selectTestFilters(b, &.{
             "standalone runtime module compiles",
             "privacy standalone progress retains routing and join planning generations",
+            "privacy standalone compact bindings refresh on policy publication and survive progress",
             "standalone metadata admission observes cancellation",
             "standalone.runtime.test.system catalog",
             "catalog.domain.",

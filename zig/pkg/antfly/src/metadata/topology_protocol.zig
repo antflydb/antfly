@@ -112,11 +112,12 @@ const std = @import("std");
 /// Version 79 admits privacy-owned consumer graphs and serving fences.
 /// Version 80 stores private range checkpoints as immutable, owner-fenced blobs.
 /// Version 81 accounts retained checkpoint bytes through final reclamation.
-pub const current_version: u16 = 81;
+/// Version 82 requires compact, authoritative privacy read bindings.
+pub const current_version: u16 = 82;
 pub const sql_completion_admission_version: u16 = 78;
 pub const sql_completion_owner_version: u16 = 71;
 pub const sql_completion_reference_version: u16 = 69;
-pub const privacy_version: u16 = 81;
+pub const privacy_version: u16 = 82;
 pub fn usesPrivacy(indexes_json: []const u8) bool {
     return std.mem.indexOf(u8, indexes_json, "\"_privacy\"") != null or std.mem.indexOf(u8, indexes_json, "_privacy_document") != null;
 }

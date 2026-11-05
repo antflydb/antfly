@@ -431,6 +431,38 @@ pub fn current(a: A, indexes: std.json.Value) !?std.json.Parsed(Resource) {
     return parsed;
 }
 
+/// Compact read binding extracted once per immutable semantic catalog cut.
+/// Job history and consumer definitions are skipped, never materialized. The
+/// metadata mutation boundary validates the complete policy and its identity.
+pub fn policyBinding(a: A, raw: []const u8) ![64]u8 {
+    const Control = struct {
+        policy: struct { mode: contract.Mode },
+        policy_version: []const u8,
+        resource_version: u64,
+        generation: u64,
+        artifact_name: []const u8,
+    };
+    var parsed = try std.json.parseFromSlice(struct { _privacy: ?Control = null }, a, if (raw.len == 0) "{}" else raw, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    const value = parsed.value._privacy orelse return @splat(0);
+    if (value.resource_version == 0 or value.generation == 0 or value.policy_version.len != 64) return error.InvalidPrivacyCatalog;
+    for (value.policy_version) |byte| if (!std.ascii.isHex(byte)) return error.InvalidPrivacyCatalog;
+    const version: [64]u8 = value.policy_version[0..64].*;
+    switch (value.policy.mode) {
+        .redact_before_storage => return error.InvalidPrivacyCatalog,
+        .monitor => {
+            if (!std.mem.eql(u8, value.artifact_name, projection.artifact_name)) return error.InvalidPrivacyCatalog;
+            return @splat(0);
+        },
+        .redact_for_search_and_ai => {
+            if (value.artifact_name.len != projection.protected_artifact_prefix.len + 64 or
+                !std.mem.startsWith(u8, value.artifact_name, projection.protected_artifact_prefix) or
+                !std.mem.endsWith(u8, value.artifact_name, &version)) return error.InvalidPrivacyCatalog;
+            return version;
+        },
+    }
+}
+
 pub fn etag(a: A, resource: Resource) ![]u8 {
     return std.fmt.allocPrint(a, "\"privacy-{d}-{s}\"", .{ resource.resource_version, resource.policy_version });
 }

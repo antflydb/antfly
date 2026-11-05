@@ -408,7 +408,7 @@ fn coverageForRange(server: anytype, a: A, table: []const u8, resource: catalog.
 }
 
 fn execute(server: anytype, a: A, table: []const u8, action: Action, args: Arguments, request: operation.RequestContext) !Response {
-    if (action != .put and action != .start_scan) return executeAttempt(server, a, table, action, args, request, null);
+    if (action != .put and action != .start_scan) return executeAttempt(server, a, a, table, action, args, request, null);
     var uploads: key_checkpoints.RetryCache = .{ .a = a };
     defer uploads.deinit();
     for (0..8) |attempt| {
@@ -417,38 +417,36 @@ fn execute(server: anytype, a: A, table: []const u8, action: Action, args: Argum
         var arena = std.heap.ArenaAllocator.init(platform_allocator.reclaimingScratch(a));
         defer arena.deinit();
         const scratch = arena.allocator();
-        var result = executeAttempt(server, scratch, table, action, args, request, &uploads) catch |err| {
+        return executeAttempt(server, scratch, a, table, action, args, request, &uploads) catch |err| {
             if (err != error.PrivacyCatalogRetry) return err;
             if (attempt == 7) return error.TableGenerationChanged;
             continue;
         };
-        defer result.deinit(scratch);
-        return result.clone(a);
     }
     unreachable;
 }
 
-fn executeAttempt(server: anytype, a: A, table: []const u8, action: Action, args: Arguments, request: operation.RequestContext, uploads: ?*key_checkpoints.RetryCache) !Response {
+fn executeAttempt(server: anytype, a: A, out: A, table: []const u8, action: Action, args: Arguments, request: operation.RequestContext, uploads: ?*key_checkpoints.RetryCache) !Response {
     try request.ensureActive();
     if (comptime @hasDecl(@TypeOf(server.source), "forwardPrivacyMutation")) {
-        if (action == .put or action == .start_scan) if (try server.source.forwardPrivacyMutation(a, table, args.body, args.if_match, action == .start_scan, request)) |response| {
+        if (action == .put or action == .start_scan) if (try server.source.forwardPrivacyMutation(out, table, args.body, args.if_match, action == .start_scan, request)) |response| {
             var owned = response;
-            errdefer owned.deinit(a);
-            try localizeProcessingDisclosure(server, a, &owned);
+            errdefer owned.deinit(out);
+            try localizeProcessingDisclosure(server, out, &owned);
             return owned;
         };
     }
-    const before = (try server.loadOwnedTableRecord(a, table)) orelse return failure(a, 404, "table_not_found", "Table not found.");
+    const before = (try server.loadOwnedTableRecord(a, table)) orelse return failure(out, 404, "table_not_found", "Table not found.");
     defer metadata.freeTable(a, before);
     var stored = try load(a, before.indexes_json);
     defer if (stored) |*value| value.deinit();
-    if (action == .get) return statusResponse(server, a, table, if (stored) |value| value.value else null, 200, request);
+    if (action == .get) return statusResponse(server, out, table, if (stored) |value| value.value else null, 200, request);
     if (action == .preview or action == .put or action == .start_scan) {
         var schema = try local.schema_mod.parseValidatedTableSchema(a, before.schema_json);
         defer schema.deinit(a);
         if (schema.storage_mode != .document or schema.external_base_source != null) return error.PrivacyRelationalStorageUnsupported;
     }
-    if (action == .preview) return preview(server, a, table, args.body, request);
+    if (action == .preview) return preview(server, out, table, args.body, request);
     if (action == .put) {
         var policy = try std.json.parseFromSlice(contract.Policy, a, args.body, .{});
         defer policy.deinit();
@@ -469,24 +467,32 @@ fn executeAttempt(server: anytype, a: A, table: []const u8, action: Action, args
         defer a.free(raw);
         try @import("indexes.zig").validateArtifactEnrichmentsForTableIndexesJson(a, raw);
         try request.ensureActive();
+        // Prepare the complete caller-owned response before admission. After a
+        // successful CAS no response allocation or reread may relabel this write.
+        var accepted = try statusResponse(server, out, table, resource, 202, request);
+        errdefer accepted.deinit(out);
+        try request.ensureActive();
         var replacement = before;
         replacement.indexes_json = raw;
         server.source.replaceTableDefinition(before, replacement) catch |err| {
             if (err == error.TableGenerationChanged) return error.PrivacyCatalogRetry;
             return err;
         };
-        try acknowledgePolicy(server, a, table, resource, request);
-        if (server.table_writes) |writes| _ = try writes.requestTableStructuralReconcile(a, table);
-        return statusResponse(server, a, table, resource, 202, request);
+        // The durable policy and scan queue drive convergence. This volatile
+        // hint can accelerate it, but cannot undo or obscure a committed write.
+        if (server.table_writes) |writes| _ = writes.requestTableStructuralReconcile(a, table) catch |err| {
+            std.log.warn("privacy committed policy reconcile hint failed: {s}", .{@errorName(err)});
+        };
+        return accepted;
     }
-    const current = if (stored) |value| value.value else return failure(a, 404, "privacy_not_configured", "No privacy policy is configured.");
+    const current = if (stored) |value| value.value else return failure(out, 404, "privacy_not_configured", "No privacy policy is configured.");
     if (action == .get_scan) {
         for (current.scans) |scan| if (std.mem.eql(u8, &scan.scan_id, args.scan_id)) {
             var result = scan;
             if (!std.mem.eql(u8, &scan.policy_version, &current.policy_version)) result.phase = .superseded;
-            return scanResponse(a, 200, result);
+            return scanResponse(out, 200, result);
         };
-        return failure(a, 404, "privacy_scan_not_found", "Scan not found or outside its retention period.");
+        return failure(out, 404, "privacy_scan_not_found", "Scan not found or outside its retention period.");
     }
     if (action == .start_scan) {
         const Start = struct { from_key: []const u8 = "", to_key: []const u8 = "", limit: u32 = 100 };
@@ -502,6 +508,8 @@ fn executeAttempt(server: anytype, a: A, table: []const u8, action: Action, args
         try checkpoint.encodeResource(&resource);
         const raw = try catalog.replaceResource(a, before.indexes_json, resource);
         defer a.free(raw);
+        var accepted = try scanResponse(out, 202, scan);
+        errdefer accepted.deinit(out);
         var replacement = before;
         replacement.indexes_json = raw;
         try request.ensureActive();
@@ -509,12 +517,12 @@ fn executeAttempt(server: anytype, a: A, table: []const u8, action: Action, args
             if (err == error.TableGenerationChanged) return error.PrivacyCatalogRetry;
             return err;
         };
-        return scanResponse(a, 202, scan);
+        return accepted;
     }
     if (args.body.len != 0) {
         var input = try std.json.parseFromSlice(FindingsRequest, a, args.body, .{});
         defer input.deinit();
-        return findings(server, a, table, current, .{
+        return findings(server, out, table, current, .{
             .cursor = input.value.cursor,
             .document = input.value.document,
             .field = input.value.field,
@@ -523,31 +531,7 @@ fn executeAttempt(server: anytype, a: A, table: []const u8, action: Action, args
             .limit = input.value.limit,
         }, request);
     }
-    return findings(server, a, table, current, args, request);
-}
-
-// Progress is independently mutable. Acknowledge the installed resource identity,
-// never its incidental coverage counters or worker cursor JSON.
-fn acknowledged(installed: catalog.Resource, visible: catalog.Resource) bool {
-    return visible.resource_version > installed.resource_version or
-        (visible.resource_version == installed.resource_version and std.mem.eql(u8, &visible.policy_version, &installed.policy_version));
-}
-fn acknowledgePolicy(server: anytype, a: A, table: []const u8, installed: catalog.Resource, request: operation.RequestContext) !void {
-    const deadline = platform_time.monotonicNs() +| 10 * std.time.ns_per_s;
-    while (true) {
-        try request.ensureActive();
-        var arena = std.heap.ArenaAllocator.init(platform_allocator.reclaimingScratch(a));
-        defer arena.deinit();
-        const scratch = arena.allocator();
-        if (try server.loadOwnedTableRecord(scratch, table)) |record| {
-            if (try load(scratch, record.indexes_json)) |visible| {
-                if (acknowledged(installed, visible.value)) return;
-            }
-        }
-        if (platform_time.monotonicNs() >= deadline) return error.DeadlineExceeded;
-        var delay = std.posix.timespec{ .sec = 0, .nsec = 10 * std.time.ns_per_ms };
-        _ = std.posix.system.nanosleep(&delay, null);
-    }
+    return findings(server, out, table, current, args, request);
 }
 
 const Sample = struct { keys: ?[]const []const u8 = null, limit: u32 = 10 };
@@ -1413,19 +1397,6 @@ test "privacy status returns persisted coverage without opening data shards" {
     defer parsed.deinit();
     try std.testing.expect(!parsed.value.object.get("coverage").?.object.get("available").?.bool);
     try std.testing.expect(parsed.value.object.get("external_processing").?.bool);
-}
-
-test "privacy acknowledgement ignores worker progress and accepts a newer committed policy" {
-    const id = contract.fingerprint("policy");
-    const installed = catalog.Resource{ .policy = .{ .mode = .monitor, .fields = &.{"body"} }, .policy_version = id, .resource_version = 3, .generation = 1, .scan_id = id };
-    var visible = installed;
-    visible.coverage.updated_at_millis = 999;
-    try std.testing.expect(acknowledged(installed, visible));
-    visible.resource_version = 2;
-    try std.testing.expect(!acknowledged(installed, visible));
-    visible.resource_version = 4;
-    visible.policy_version = contract.fingerprint("replacement");
-    try std.testing.expect(acknowledged(installed, visible));
 }
 
 test "privacy verification shrinks unavailable pages and durably resumes accumulated evidence" {

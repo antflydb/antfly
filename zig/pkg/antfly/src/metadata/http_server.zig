@@ -227,6 +227,7 @@ pub const AdminSource = struct {
         table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, deadline_ns: ?u64) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         linearizable_routing_snapshot: ?*const fn (ptr: *anyopaque, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
         linearizable_table_routing_snapshot: ?*const fn (ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) anyerror!metadata_api.CatalogRoutingSnapshot = null,
+        privacy_policy_binding: ?*const fn (*anyopaque, []const u8, operation.RequestContext) anyerror!metadata_api.PrivacyPolicyBinding = null,
         free_routing_snapshot: *const fn (ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void = unsupportedFreeRoutingSnapshot,
         wait_for_routing_change: ?*const fn (ptr: *anyopaque, observed_token: metadata_api.CatalogRoutingChangeToken, deadline_ns: u64, confirm_absence: bool) anyerror!metadata_api.CatalogRoutingChangeResult = null,
         validate_publication: ?*const fn (ptr: *anyopaque, contract: metadata_api.CatalogPublicationContract) anyerror!bool = null,
@@ -656,6 +657,7 @@ pub const AdminSource = struct {
                 .table_routing_snapshot = metadataServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataServiceLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataServiceLinearizableTableRoutingSnapshot,
+                .privacy_policy_binding = metadataServicePrivacyPolicyBinding,
                 .free_routing_snapshot = metadataServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataServiceWaitForRoutingChange,
                 .validate_publication = metadataServiceValidatePublication,
@@ -728,6 +730,7 @@ pub const AdminSource = struct {
                 .table_routing_snapshot = metadataHttpServiceTableRoutingSnapshot,
                 .linearizable_routing_snapshot = metadataHttpServiceLinearizableRoutingSnapshot,
                 .linearizable_table_routing_snapshot = metadataHttpServiceLinearizableTableRoutingSnapshot,
+                .privacy_policy_binding = metadataHttpServicePrivacyPolicyBinding,
                 .free_routing_snapshot = metadataHttpServiceFreeRoutingSnapshot,
                 .wait_for_routing_change = metadataHttpServiceWaitForRoutingChange,
                 .validate_publication = metadataHttpServiceValidatePublication,
@@ -962,6 +965,13 @@ pub const AdminSource = struct {
         try svc.ensureLinearizableReadWithContext(request);
         try request.ensureActive();
         return try svc.catalogTableRoutingSnapshot(table_name, request.deadline_ns);
+    }
+
+    fn metadataServicePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) !metadata_api.PrivacyPolicyBinding {
+        const svc: *service.MetadataService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLinearizableReadWithContext(request);
+        try request.ensureActive();
+        return svc.privacyPolicyBinding(table_name, request.deadline_ns);
     }
 
     fn metadataServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
@@ -1479,6 +1489,13 @@ pub const AdminSource = struct {
         return try svc.catalogTableRoutingSnapshot(table_name, request.deadline_ns);
     }
 
+    fn metadataHttpServicePrivacyPolicyBinding(ptr: *anyopaque, table_name: []const u8, request: operation.RequestContext) !metadata_api.PrivacyPolicyBinding {
+        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
+        try svc.ensureLinearizableReadWithContext(request);
+        try request.ensureActive();
+        return svc.privacyPolicyBinding(table_name, request.deadline_ns);
+    }
+
     fn metadataHttpServiceFreeRoutingSnapshot(ptr: *anyopaque, snapshot: *metadata_api.CatalogRoutingSnapshot) void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         svc.freeCatalogRoutingSnapshot(snapshot);
@@ -1977,6 +1994,7 @@ pub const MetadataHttpServer = struct {
         try server.post(routes.Routes.internal_linearizable_routing_snapshot, httpx.Handler.bind(self, metadataLinearizableRoutingSnapshot));
         try server.post(routes.Routes.internal_table_routing_snapshot, httpx.Handler.bind(self, metadataTableRoutingSnapshot));
         try server.post(routes.Routes.internal_linearizable_table_routing_snapshot, httpx.Handler.bind(self, metadataLinearizableTableRoutingSnapshot));
+        try server.post(routes.Routes.internal_privacy_policy_binding, httpx.Handler.bind(self, metadataPrivacyPolicyBinding));
         try server.post(routes.Routes.internal_routing_change, httpx.Handler.bind(self, metadataRoutingChange));
         try server.post(routes.Routes.internal_routing_authority, httpx.Handler.bind(self, metadataRoutingChange));
         try server.post(routes.Routes.internal_await_route, httpx.Handler.bind(self, metadataAwaitRoute));
@@ -2537,6 +2555,18 @@ pub const MetadataHttpServer = struct {
         defer self.source.freeRoutingSnapshot(&result);
         request.ensureActive() catch |err| return metadataReadError(ctx, err);
         return self.trackedRoutingSnapshotJsonUntil(ctx, result);
+    }
+
+    fn metadataPrivacyPolicyBinding(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        applyRoutingBudget(ctx) catch |err| return metadataReadError(ctx, err);
+        var parsed = parseTableRoutingSnapshotRequest(ctx) catch return ctx.status(400).text("invalid privacy binding request");
+        defer parsed.deinit();
+        const request = requestContext(ctx);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        const capture = self.source.vtable.privacy_policy_binding orelse return ctx.status(503).text("privacy binding unavailable");
+        const binding = capture(self.source.ptr, parsed.value.table_name, request) catch |err| return metadataReadError(ctx, err);
+        request.ensureActive() catch |err| return metadataReadError(ctx, err);
+        return ctx.json(binding);
     }
 
     fn metadataLinearizableTableRoutingSnapshot(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {

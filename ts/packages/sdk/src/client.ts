@@ -877,14 +877,20 @@ export class AntflyClient {
       parsed = parseJSON<unknown>(result.text);
     } catch {
       if (!response.ok)
-        throw new AntflyHTTPError("Privacy request failed", response.status, result.text);
+        throw new AntflyHTTPError(
+          "Privacy request failed",
+          response.status,
+          result.text,
+          response.headers
+        );
       throw new AntflyResponseError("Privacy response was not valid JSON");
     }
     if (!response.ok)
       throw new AntflyHTTPError(
         apiErrorMessage(parsed, "Privacy request failed"),
         response.status,
-        parsed
+        parsed,
+        response.headers
       );
     if (result.truncated)
       throw new AntflyResponseError("Privacy response exceeded the response limit");

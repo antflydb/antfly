@@ -133,6 +133,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "remote metadata source restore staging authority binds every owner read",
         "remote metadata mutation failover preserves ambiguous and deterministic outcomes",
         "privacy remote mutation forwarding retains response metadata through the status source",
+        "privacy remote read bindings pin metadata identity and never fall back to full catalogs",
         "remote metadata mutation discovery preserves forwarding budget for the configured leader",
         "remote metadata mutation discovery preserves endpoint coverage and delivery time",
         "remote metadata source retains mutation authority across cache invalidation",
@@ -276,7 +277,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const privacy_forwarding_tests = @import("linked_tests.zig").add(b, .{
         .name = "data-privacy-forwarding-tests",
         .root_module = data_runtime_test_mod,
-        .filters = &.{"privacy remote mutation forwarding retains response metadata through the status source"},
+        .filters = &.{ "privacy remote mutation forwarding retains response metadata through the status source", "privacy remote read bindings pin metadata identity and never fall back to full catalogs" },
         .max_rss = @as(usize, if (target.result.os.tag == .macos) 13 else 7) * 1024 * 1024 * 1024,
     });
     b.step("antfly-data-privacy-forwarding-test", "Verify privacy response metadata through remote discovery and the status-source handoff")

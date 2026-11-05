@@ -108,4 +108,59 @@ describe("table privacy", () => {
       client.privacy.put("private", { mode: "monitor", fields: ["body"] }, { ifMatch: '"old"' })
     ).rejects.toMatchObject({ status: 412, message: "The policy changed" });
   });
+  it.each([
+    409, 503,
+  ])("preserves mutation outcomes and retry delay on HTTP %i without replay", async (status) => {
+    for (const json of [true, false]) {
+      const fetch = vi.fn(
+        async () =>
+          new Response(
+            json ? JSON.stringify({ code: "upstream", retryable: true }) : "upstream unavailable",
+            {
+              status,
+              headers: { "Retry-After": "7", "x-antfly-raft-mutation-outcome": " unknown-v1 " },
+            }
+          )
+      );
+      vi.stubGlobal("fetch", fetch);
+      const client = new AntflyClient({ baseUrl: "https://antfly.test" });
+      await expect(
+        client.privacy.put("docs", { mode: "monitor", fields: ["body"] })
+      ).rejects.toMatchObject({ status, mutationOutcome: "unknown", retryAfterSeconds: 7 });
+      expect(fetch).toHaveBeenCalledTimes(1);
+      await expect(client.privacy.startScan("docs")).rejects.toMatchObject({
+        status,
+        mutationOutcome: "unknown",
+        retryAfterSeconds: 7,
+      });
+      expect(fetch).toHaveBeenCalledTimes(2);
+    }
+  });
+
+  it.each([
+    "0",
+    "1",
+    "9007199254740992",
+    "1junk",
+    "-1",
+    "Wed, 21 Oct 2015 07:28:00 GMT",
+  ])("parses Retry-After conservatively (%s)", async (delay) => {
+    const fetch = vi.fn(async () =>
+      Response.json(
+        { code: "privacy_storage_unavailable" },
+        {
+          status: 503,
+          headers: { "Retry-After": delay, "X-Antfly-Raft-Mutation-Outcome": "unknown-v2" },
+        }
+      )
+    );
+    vi.stubGlobal("fetch", fetch);
+    const client = new AntflyClient({ baseUrl: "https://antfly.test" });
+    await expect(client.privacy.get("docs")).rejects.toMatchObject({
+      status: 503,
+      retryAfterSeconds: delay === "0" || delay === "1" ? Number(delay) : undefined,
+      mutationOutcome: undefined,
+    });
+    expect(fetch).toHaveBeenCalledTimes(1);
+  });
 });

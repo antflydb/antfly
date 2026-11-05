@@ -217,16 +217,27 @@ failures remain HTTP 412/428, and an unknown mutation outcome remains HTTP 409:
 inspect policy/scan state before retrying that mutation. Availability handling
 does not automatically replay policy writes or scan creation.
 
+A successful policy or scan admission returns its prepared `202` response.
+Reconcile scheduling is a best-effort acceleration of durable work; a failed
+hint cannot turn an accepted policy into a retryable rejection. A lost or
+unusable transport response still requires reconciling policy/scan state.
+
+
 An upstream `X-Antfly-Raft-Mutation-Outcome: unknown-v1` marker is preserved
 through metadata and data-node forwarding, alongside the status, response body,
 ETag and `Retry-After`. Treat this marker as an ambiguous write outcome on either
 409 or 503: inspect policy/scan state before deciding whether to submit again.
+The TypeScript SDK exposes these headers on `AntflyHTTPError` as
+`mutationOutcome` (`"unknown"` when marked) and `retryAfterSeconds` (a
+nonnegative numeric delay when supplied). The delay alone never authorizes
+replaying a mutation; the SDK does not retry policy or scan writes.
+
 
 Private range checkpoints have per-table budgets of 256 MiB for staged uploads
 and 8 GiB for retained payloads, including retired generations awaiting cleanup.
 Capacity exhaustion returns HTTP 422 (`privacy_checkpoint_capacity_exceeded`);
 allow cleanup to finish and use fewer or smaller concurrent range scans before
-retrying. Metadata protocol 81 is required for new privacy mutations. Older
+retrying. Metadata protocol 82 is required for new privacy mutations. Older
 checkpoint headers remain readable and are reclaimed during upgrade.
 
 
