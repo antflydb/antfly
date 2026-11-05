@@ -62,6 +62,8 @@ pub const Options = struct {
     specialty_profile: ?@import("../models/gliner_specialty_qualification.zig").Profile = null,
     /// Admitted accelerator classification rows per physical forward.
     classification_batch_items: usize = 1,
+    /// Trusted, caller-owned logits from a drained shared classification forward.
+    classification_results: ?[]const ItemLogits = null,
     /// Physical PII encoder/head rows, admitted with padded word/label geometry.
     extraction_batch_items: usize = 1,
     max_response_bytes: usize = 64 * 1024 * 1024,
@@ -886,9 +888,10 @@ pub fn plan(allocator: Allocator, tokenizer: Tokenizer, request: *const wire.Req
     return .{ .items = items, .prompt_tokens = prompt_tokens };
 }
 
-fn canBatchClassifications(request: *const wire.Request, request_plan: *const Plan) bool {
+pub fn canBatchClassifications(request: *const wire.Request, request_plan: *const Plan) bool {
+    if (request.items.len == 0 or request.items.len != request_plan.items.len) return false;
     for (request.items, request_plan.items) |item, prepared| {
-        if (item.compiled.schema.entities.len != 0 or item.compiled.schema.relations.len != 0 or prepared.document != null or prepared.batches.len != 1 or prepared.ranges.len != 1) return false;
+        if (item.compiled.schema.entities.len != 0 or item.compiled.schema.relations.len != 0 or prepared.document != null or prepared.batches.len != 1 or prepared.batches[0].samples.len != 1 or prepared.ranges.len != 1) return false;
     }
     return true;
 }
@@ -972,7 +975,9 @@ test "gliner span v2 batch admission preserves serial scratch for split tasks" {
     defer request.deinit();
     // Only cardinality is inspected; no token or model buffers are needed for
     // the admission decision. One item later splits into two encoder rows.
+    var samples: [1]processor.Sample = undefined;
     var batches: [2]processor.PreparedBatch = undefined;
+    batches[0].samples = &samples;
     var ranges = [_]TaskRange{ .{ .start = 0, .end = 1 }, .{ .start = 1, .end = 2 } };
     var items = [_]PreparedItem{
         .{ .batches = batches[0..1], .ranges = ranges[0..1], .prompt_tokens = 16 },
@@ -1020,8 +1025,13 @@ fn plannedClassificationBatch(cb: *const compute.ComputeBackend, allocator: Allo
 
 /// Runs a plan built by `plan` for the same request. The caller owns the
 /// managed backend, model lock and admission for the complete execution.
-pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, config: EncoderConfig, request: *const wire.Request, request_plan: *const Plan, options: Options) ![]u8 {
-    if (cb.kind() != .native and cb.kind() != .metal and cb.kind() != .cuda and cb.kind() != .wasm) return error.UnsupportedExtractionBackend;
+pub fn executePlanned(cb: ?*const compute.ComputeBackend, allocator: Allocator, config: EncoderConfig, request: *const wire.Request, request_plan: *const Plan, options: Options) ![]u8 {
+    if (options.classification_results) |results| {
+        if (cb != null or results.len != request.items.len or !canBatchClassifications(request, request_plan)) return error.InvalidExtractionInput;
+    } else {
+        const backend = cb orelse return error.InvalidExtractionInput;
+        if (backend.kind() != .native and backend.kind() != .metal and backend.kind() != .cuda and backend.kind() != .wasm) return error.UnsupportedExtractionBackend;
+    }
     if (request_plan.items.len != request.items.len) return error.InvalidExtractionInput;
     if (options.classification_batch_items == 0) return error.InvalidExtractionInput;
     if (options.extraction_batch_items == 0) return error.InvalidExtractionInput;
@@ -1029,16 +1039,19 @@ pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, c
     var writer = wire.ResponseWriter.init(allocator, options.max_response_bytes, request.items.len);
     defer writer.deinit();
     try writer.begin(request.model);
-    if ((cb.kind() == .cuda or cb.kind() == .metal) and extractionBatchItems(request, request_plan, options) > 1) {
-        try executePiiBatches(cb, allocator, config, request, request_plan, options, &writer);
+    if (options.classification_results == null and (cb.?.kind() == .cuda or cb.?.kind() == .metal) and extractionBatchItems(request, request_plan, options) > 1) {
+        try executePiiBatches(cb.?, allocator, config, request, request_plan, options, &writer);
         return writer.finish(request_plan.prompt_tokens);
     }
-    const batched = if ((cb.kind() == .cuda or cb.kind() == .metal) and classificationBatchItems(request, request_plan, options) > 1)
-        try plannedClassificationBatch(cb, allocator, config, request, request_plan, options)
+    const batched: ?[]const ItemLogits = if (options.classification_results) |results| results else if (options.classification_results == null and (cb.?.kind() == .cuda or cb.?.kind() == .metal) and classificationBatchItems(request, request_plan, options) > 1)
+        try plannedClassificationBatch(cb.?, allocator, config, request, request_plan, options)
     else
         null;
-    defer if (batched) |items| {
-        for (items) |*item| item.deinit(allocator);
+    defer if (options.classification_results == null) if (batched) |items| {
+        for (items) |item| {
+            var owned = item;
+            owned.deinit(allocator);
+        }
         allocator.free(items);
     };
     var remaining_values = options.pipeline.max_output_values;
@@ -1052,7 +1065,7 @@ pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, c
             native_options.max_output_values = remaining_values;
             var extracted = if (prepared_item.document != null)
                 if (config == .modern_bert and extraction_profile.allow_long_documents)
-                    try @import("gliner_span_long_executor.zig").extract(cb, allocator, config.modern_bert, item, prepared_item, native_options)
+                    try @import("gliner_span_long_executor.zig").extract(cb.?, allocator, config.modern_bert, item, prepared_item, native_options)
                 else
                     return error.UnsupportedGlinerSpanV2Task
             else blk: {
@@ -1061,10 +1074,10 @@ pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, c
                 // profiles use the shared hidden-state head and may select the
                 // already-qualified DeBERTa encoder.
                 if (config == .modern_bert and options.span_extraction_profile == null)
-                    break :blk try @import("gliner_span_extraction.zig").run(cb, allocator, config.modern_bert, sample, &item.compiled, native_options);
-                const hidden = try encodeSample(cb, allocator, config, sample);
-                defer cb.free(hidden);
-                break :blk try @import("gliner_span_extraction.zig").runFromHidden(cb, allocator, hidden, @intCast(config.hiddenSize()), sample, &item.compiled, native_options, .{
+                    break :blk try @import("gliner_span_extraction.zig").run(cb.?, allocator, config.modern_bert, sample, &item.compiled, native_options);
+                const hidden = try encodeSample(cb.?, allocator, config, sample);
+                defer cb.?.free(hidden);
+                break :blk try @import("gliner_span_extraction.zig").runFromHidden(cb.?, allocator, hidden, @intCast(config.hiddenSize()), sample, &item.compiled, native_options, .{
                     .max_width = extraction_profile.max_width,
                     .require_device_gru = options.specialty_profile == .pii,
                     .legacy_greedy_overlap = extraction_profile.omitted_overlap == .legacy_greedy and !item.options.overlap_explicit,
@@ -1080,7 +1093,7 @@ pub fn executePlanned(cb: *const compute.ComputeBackend, allocator: Allocator, c
             try writer.append(item.*, sample);
             continue;
         }
-        var logits = if (batched) |items| items[index] else try preparedItemLogits(cb, allocator, config, item, prepared_item, null);
+        var logits = if (batched) |items| items[index] else try preparedItemLogits(cb.?, allocator, config, item, prepared_item, null);
         defer if (batched == null) logits.deinit(allocator);
         const const_rows = try allocator.alloc([]const f64, logits.rows.len);
         defer allocator.free(const_rows);
@@ -1796,7 +1809,7 @@ test "gliner specialty scratch reserves prepared span geometry and every physica
     const markers: [42]usize = undefined;
     var groups = [_]processor.Group{std.mem.zeroes(processor.Group)};
     groups[0].child_markers = markers[0..2];
-    var samples = [_]processor.Sample{std.mem.zeroes(processor.Sample)};
+    var samples: [1]processor.Sample = undefined;
     samples[0].input_ids = &ids;
     samples[0].words = words[0..8];
     samples[0].groups = &groups;

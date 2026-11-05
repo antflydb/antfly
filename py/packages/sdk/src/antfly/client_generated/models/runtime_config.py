@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     from ..models.kernel_jit_config import KernelJitConfig
     from ..models.model_ref import ModelRef
     from ..models.prompt_cache_config import PromptCacheConfig
+    from ..models.runtime_config_cooperative_execution import RuntimeConfigCooperativeExecution
     from ..models.runtime_config_generation_batching import RuntimeConfigGenerationBatching
     from ..models.runtime_config_model_strategies import RuntimeConfigModelStrategies
 
@@ -63,8 +64,13 @@ class RuntimeConfig:
             HTTP(S), file, and S3 content until explicit allowlists are configured.
             Do not assume omission has identical policy semantics across consumers.
         s3_credentials (Credentials | Unset):
-        generation_batching (RuntimeConfigGenerationBatching | Unset): Experimental execution batching; mode on
-            explicitly enables qualified CUDA scheduling. Resource and request ceilings still apply.
+        cooperative_execution (RuntimeConfigCooperativeExecution | Unset): Opt-in interleaving of independently owned
+            requests on backends declaring safe step sharing. Independent of row batching; graph, prefix-cache, speculative
+            and multimodal routes remain exclusive. Currently qualified for at most two active E4B CUDA requests with one
+            row per step.
+        generation_batching (RuntimeConfigGenerationBatching | Unset): Experimental row batching; independent from
+            cooperative_execution. Mode on explicitly enables qualified CUDA row scheduling. Resource and request ceilings
+            still apply.
         keep_alive (str | Unset): How long to keep models loaded in memory after last use (Ollama-compatible).
             Models are automatically unloaded after this duration of inactivity.
             Use Go duration format: "5m" (5 minutes), "1h" (1 hour), or "0".
@@ -133,6 +139,7 @@ class RuntimeConfig:
     ml_dir: str | Unset = UNSET
     content_security: ContentSecurityConfig | Unset = UNSET
     s3_credentials: Credentials | Unset = UNSET
+    cooperative_execution: RuntimeConfigCooperativeExecution | Unset = UNSET
     generation_batching: RuntimeConfigGenerationBatching | Unset = UNSET
     keep_alive: str | Unset = "5m"
     max_loaded_models: int | Unset = 10
@@ -167,6 +174,10 @@ class RuntimeConfig:
         s3_credentials: dict[str, Any] | Unset = UNSET
         if not isinstance(self.s3_credentials, Unset):
             s3_credentials = self.s3_credentials.to_dict()
+
+        cooperative_execution: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.cooperative_execution, Unset):
+            cooperative_execution = self.cooperative_execution.to_dict()
 
         generation_batching: dict[str, Any] | Unset = UNSET
         if not isinstance(self.generation_batching, Unset):
@@ -230,6 +241,8 @@ class RuntimeConfig:
             field_dict["content_security"] = content_security
         if s3_credentials is not UNSET:
             field_dict["s3_credentials"] = s3_credentials
+        if cooperative_execution is not UNSET:
+            field_dict["cooperative_execution"] = cooperative_execution
         if generation_batching is not UNSET:
             field_dict["generation_batching"] = generation_batching
         if keep_alive is not UNSET:
@@ -269,6 +282,7 @@ class RuntimeConfig:
         from ..models.kernel_jit_config import KernelJitConfig
         from ..models.model_ref import ModelRef
         from ..models.prompt_cache_config import PromptCacheConfig
+        from ..models.runtime_config_cooperative_execution import RuntimeConfigCooperativeExecution
         from ..models.runtime_config_generation_batching import RuntimeConfigGenerationBatching
         from ..models.runtime_config_model_strategies import RuntimeConfigModelStrategies
 
@@ -296,6 +310,13 @@ class RuntimeConfig:
             s3_credentials = UNSET
         else:
             s3_credentials = Credentials.from_dict(_s3_credentials)
+
+        _cooperative_execution = d.pop("cooperative_execution", UNSET)
+        cooperative_execution: RuntimeConfigCooperativeExecution | Unset
+        if isinstance(_cooperative_execution, Unset):
+            cooperative_execution = UNSET
+        else:
+            cooperative_execution = RuntimeConfigCooperativeExecution.from_dict(_cooperative_execution)
 
         _generation_batching = d.pop("generation_batching", UNSET)
         generation_batching: RuntimeConfigGenerationBatching | Unset
@@ -365,6 +386,7 @@ class RuntimeConfig:
             ml_dir=ml_dir,
             content_security=content_security,
             s3_credentials=s3_credentials,
+            cooperative_execution=cooperative_execution,
             generation_batching=generation_batching,
             keep_alive=keep_alive,
             max_loaded_models=max_loaded_models,
