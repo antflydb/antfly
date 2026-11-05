@@ -88,6 +88,7 @@ pub const Coordination = struct {
     retire: ?*const fn (*anyopaque, state.Query) void = null,
 };
 pub const Service = struct {
+    build_cache: ?*@import("build_cache.zig").Cache = null,
     a: A,
     state_store: state.Store,
     exchange_store: exchange.Store,
@@ -560,7 +561,7 @@ pub const Service = struct {
         const inputs = try scoped_service.loadDependencies(a, spec, ticket.query, task);
         var objects = self.exchange_store;
         objects.context = context;
-        const executor: runner.Runner = .{ .a = task_allocator, .source = self.source, .exchange_store = objects, .context = context, .spill = preparation.spill };
+        const executor: runner.Runner = .{ .a = task_allocator, .source = self.source, .exchange_store = objects, .context = context, .spill = preparation.spill, .build_cache = self.build_cache };
         const output = try executor.run(ticket.query.id, spec, task, inputs);
         defer task_allocator.free(output.key);
         defer if (output.matches) |witness| task_allocator.free(witness.key);

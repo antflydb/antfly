@@ -232,7 +232,7 @@ pub const Host = struct {
         owner.table = table;
         owner.cut = delta;
         owner.split = split;
-        return .{ .ptr = owner, .next_fn = Owner.next, .close_fn = Owner.close };
+        return .{ .ptr = owner, .next_fn = Owner.next, .next_batch_fn = Owner.nextBatch, .close_fn = Owner.close };
     }
 };
 const Owner = struct {
@@ -255,6 +255,28 @@ const Owner = struct {
     base_prepared: bool = false,
     fn recentEnd(self: *const Owner) usize {
         return if (self.paged) |paged| paged.end else self.cut.pending.changes.len;
+    }
+    fn nextBatch(raw: *anyopaque, a: A, maximum: usize) !?local.sql_execution_batch.Batch {
+        const self: *Owner = @ptrCast(@alignCast(raw));
+        // WAL reconciliation and bucket/filter evaluation retain their scalar
+        // fallback. Clean retained base scans borrow the physical column page.
+        if (self.paged != null or self.cut.changed.count() != 0 or self.cut.pending.changes.len != 0 or self.input.bucket_group != null or self.filter != null)
+            return .{ .rows = (try next(raw, a, maximum)) orelse return null };
+        if (maximum == 0) return error.InvalidSqlBackendResponse;
+        while (!self.base_done) {
+            try self.context.ensureActive();
+            const page = try self.cursor.next_columns.?(self.cursor.ptr, a, @intCast(maximum));
+            try page.validate();
+            if (page.selection.len > maximum) return error.InvalidSqlBackendResponse;
+            self.base_done = page.after == null;
+            if (page.selection.len == 0) continue;
+            const definitions = try a.alloc(local.sql_scalar.Column, self.input.columns.len);
+            for (self.input.columns, definitions) |column, *definition| {
+                definition.* = .{ .name = (try self.table.column(column.name)).path, .type = column.type, .element_type = column.element_type };
+            }
+            return .{ .columns = .{ .page = page, .definitions = definitions } };
+        }
+        return null;
     }
     fn next(raw: *anyopaque, a: A, maximum: usize) !?[]const []const Datum {
         const self: *Owner = @ptrCast(@alignCast(raw));

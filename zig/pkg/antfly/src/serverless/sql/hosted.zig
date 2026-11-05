@@ -108,12 +108,15 @@ const Tickets = struct {
     }
 };
 pub fn execute(a: A, client: storage.Client, io: std.Io, context: Context, raw: []const u8) ![]u8 {
+    return executeCached(a, client, io, context, raw, null);
+}
+pub fn executeCached(a: A, client: storage.Client, io: std.Io, context: Context, raw: []const u8, builds: ?*@import("build_cache.zig").Cache) ![]u8 {
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
-    const result = try executeIn(arena.allocator(), client, io, context, raw);
+    const result = try executeIn(arena.allocator(), client, io, context, raw, builds);
     return a.dupe(u8, result);
 }
-fn executeIn(a: A, client: storage.Client, io: std.Io, context: Context, raw: []const u8) ![]u8 {
+fn executeIn(a: A, client: storage.Client, io: std.Io, context: Context, raw: []const u8, builds: ?*@import("build_cache.zig").Cache) ![]u8 {
     const request = try std.json.parseFromSliceLeaky(Request, a, raw, .{ .allocate = .alloc_always });
     try request.config.artifacts.validate();
     if (request.config.artifacts.protocol != .s3 or request.config.task_memory < 1024 * 1024 or request.config.task_memory > 8 * 1024 * 1024 or request.owner.len == 0 or request.owner.len > 256) return error.InvalidSqlDeployment;
@@ -122,7 +125,7 @@ fn executeIn(a: A, client: storage.Client, io: std.Io, context: Context, raw: []
     var artifacts = object_artifacts.artifactStore();
     defer artifacts.deinit();
     var host: source.Host = .{ .artifacts = &artifacts, .store_identity = try @import("../../api/native_retained_cut.zig").storeIdentity(a, request.config.artifacts), .io = io, .backend = .{ .ptr = &backend, .pin = Backend.pin, .open = Backend.open } };
-    const service: runtime.Service = .{ .a = a, .state_store = .{ .client = client, .bucket = request.config.state.bucket, .prefix = request.config.state.prefix, .now_ms = 0 }, .exchange_store = .{ .client = client, .bucket = request.config.exchange.bucket, .prefix = request.config.exchange.prefix }, .tenant = request.tenant, .poll_query_cancellation = true, .role = .query_only, .owner = request.owner, .context = context, .retention = host.retention(), .source = host.source(), .task_memory_ceiling = request.config.task_memory };
+    const service: runtime.Service = .{ .build_cache = builds, .a = a, .state_store = .{ .client = client, .bucket = request.config.state.bucket, .prefix = request.config.state.prefix, .now_ms = 0 }, .exchange_store = .{ .client = client, .bucket = request.config.exchange.bucket, .prefix = request.config.exchange.prefix }, .tenant = request.tenant, .poll_query_cancellation = true, .role = .query_only, .owner = request.owner, .context = context, .retention = host.retention(), .source = host.source(), .task_memory_ceiling = request.config.task_memory };
     return switch (request.op) {
         .sql_submit => blk: {
             const spec = try std.json.parseFromSliceLeaky(plan.Plan, a, request.raw_plan orelse return error.InvalidSqlDistributedPlan, .{ .allocate = .alloc_always });

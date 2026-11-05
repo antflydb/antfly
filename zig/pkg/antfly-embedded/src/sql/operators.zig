@@ -1585,6 +1585,11 @@ pub const HashJoin = struct {
         }
     }
     /// Mark only after the complete ON residual accepts this candidate.
+    /// Borrow immutable in-memory build keys for rebuilding task-local filters.
+    pub fn buildKeys(self: *const HashJoin) @import("execution_batch.zig").Batch {
+        std.debug.assert(self.disk == null);
+        return .{ .retained = .{ .store = &self.key_columns, .count = self.row_count } };
+    }
     pub fn markMatched(self: *HashJoin, index: usize) !void {
         if (self.disk) |*file| {
             try file.match(index);

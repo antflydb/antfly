@@ -61,30 +61,32 @@ pub fn pair(self: anytype, query: plan.Digest, spec: plan.Plan, task: plan.Task,
     const right = task.right_tile;
     if (dependencies.len != @as(usize, @intFromBool(left.map != null)) + @intFromBool(right.map != null)) return error.InvalidSqlExecutionState;
     if (left.rows +| right.rows > spec.limits.task_scan_rows) return error.SqlJoinBudgetExceeded;
-    const hash = try operators.HashJoin.create(self.a, .{ .bytes = @intCast(spec.limits.task_memory / 2), .rows = @intCast(spec.limits.task_scan_rows) });
-    defer hash.deinit();
+    const right_dependency = dependencies[@intFromBool(left.map != null)..];
+    var lease = if (right.map != null) try self.cachedBuild(query, spec, right_dependency, @intCast(part.partition), @intCast(part.partition + 1)) else null;
+    defer if (lease) |*value| value.release();
+    const hash = if (lease) |value| value.hash() else try operators.HashJoin.create(self.a, .{ .bytes = @intCast(spec.limits.task_memory / 2), .rows = @intCast(spec.limits.task_scan_rows) });
+    defer if (lease == null) hash.deinit();
     var decode = std.heap.ArenaAllocator.init(self.a);
     defer decode.deinit();
     var block_arena = std.heap.ArenaAllocator.init(self.a);
     defer block_arena.deinit();
     var scratch = std.heap.ArenaAllocator.init(self.a);
     defer scratch.deinit();
-    var right_rows: usize = 0;
-    if (right.map != null) {
+    var right_rows: usize = if (lease != null and lease.?.hit) hash.buildKeys().len() else 0;
+    if (right.map != null and (lease == null or !lease.?.hit)) {
         var data = try self.exchange_store.read(decode.allocator(), dependencies[@intFromBool(left.map != null)], part.partition, @intCast(spec.limits.task_memory / 4));
         while (try data.nextBlock(&block_arena, @intCast(spec.limits.task_memory / 4))) |block| {
             defer block.deinit();
-            for (0..block.count()) |row| {
-                try self.context.ensureActive();
-                _ = scratch.reset(.free_all);
-                const cells = try blockRow(scratch.allocator(), block, row);
-                var keys: [32]Datum = undefined;
-                try hash.add(cells, try key(cells, spec.join.right_keys, &keys));
-                right_rows += 1;
-            }
+            try self.context.ensureActive();
+            _ = scratch.reset(.free_all);
+            const batch = block.batch();
+            const build_keys = try runner.batchKeys(scratch.allocator(), batch, spec.join.right_keys);
+            try hash.addBatch(scratch.allocator(), batch, build_keys);
+            right_rows += block.count();
         }
     }
     if (right_rows != right.rows) return error.InvalidSqlExchange;
+    if (lease) |*value| value.complete();
     var result = try output(self, spec);
     defer result.deinit(self.a);
     const right_bits = try self.a.alloc(u8, @intCast((right.rows + 7) / 8));

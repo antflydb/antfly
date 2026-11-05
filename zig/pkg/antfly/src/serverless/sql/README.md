@@ -136,9 +136,31 @@ workers validate the capability, schema incarnation, and snapshot on reopen.
 - Shuffle maps write one object containing contiguous partition runs. The
   accepted output authenticates a version-2 footer with per-block hashes,
   offsets, row counts and retained-memory statistics. A reducer reads one
-  footer and one bounded range per consumed block, without retaining the whole
-  partition. Empty partitions need only the footer. Columnar v2 blocks preserve SQL NULL independently of
+  footer and bounded adjacent-block windows, without retaining the whole
+  partition. Windows are capped at 256 KiB and one quarter of the caller's
+  decode quantum; oversized blocks use individual reads. Each consumed block
+  still verifies its own hash. The 5,000-row regression uses two storage reads
+  rather than 21 when its selected range fits one window. Empty partitions need only the footer. Columnar v2 blocks preserve SQL NULL independently of
   JSON null, exact NUMERIC, arrays, and encoded payloads.
+- Native workers cache up to 8 MiB of immutable exchange ranges/index bytes
+  (64 entries, at most 128 KiB each). Objects up to 16 KiB use one authenticated
+  full-object read. Larger objects retain range reads, so small reducers do not
+  download unrelated partitions. Hosted execution retains its existing bounded
+  immutable byte cache.
+- Clean retained base scans, map partitioning, hash/Grace admission, and hash
+  probe seeding use borrowed typed batches. WAL reconciliation and residual
+  expressions retain scalar fallbacks. Output accumulates in typed columns;
+  the exchange writer retires encoding scratch after every 256-row block.
+- Broadcast probes and skew tile pairs reuse prepared in-memory builds on the
+  same worker. Cache identity includes tenant, execution, accepted dependency
+  descriptors, exchange location, partition range and join keys. A lease is
+  exclusive: busy entries fall back rather than serializing tasks. Skew match
+  witnesses remain task-local. Dynamic filters are rebuilt from cached keys.
+  Native build residency is capped at 32 MiB across four entries; each hosted
+  kernel caps it at 4 MiB. These are additional worker-level residency budgets,
+  separate from task allocation ceilings. Hosted physical binding changes clear
+  residency. Oversized cache builds retry under the ordinary task budget and
+  enter a bounded negative cache to avoid repeatedly paying the failed build.
 - Adaptive coalescing groups adjacent small partitions from accepted map
   statistics. Recovery checkpoints at most eight map directories per turn;
   immutable progress objects and the final boundary list are fenced by the
@@ -189,7 +211,7 @@ Partially assembled and larger internal result
 handles expose a single `manifests` head; follow each authenticated result
 page's `previous` reference to stream its `pages`. Physical output order is
 unspecified; the ordinary SQL engine still owns `ORDER BY`. The native gateway
-keeps only one manifest page and one exchange decode block resident.
+keeps one manifest page, a bounded read-ahead window, and one exchange decode block resident.
 
 For outer/semi/anti skew joins, fan-ins above 32 use deterministic distributed
 bitmap reduction trees. Each merge task consumes at most 32 accepted proofs;

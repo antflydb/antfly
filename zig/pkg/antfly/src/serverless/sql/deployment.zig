@@ -126,6 +126,8 @@ pub const Owned = struct {
     admission: local.common_request_admission.RequestAdmission,
     config: Config,
     cache: local.serverless_query_lake_serving_cache.Cache,
+    builds: @import("build_cache.zig").Cache,
+    exchange_reads: @import("read_cache.zig").Cache,
     spill: local.sql_spill.Manager,
     pub fn init(a: A, io: std.Io, cfg: Config, role: Role, node: ?*const local.common_config.Config, secrets: ?*local.common_secrets.FileStore, deployment: local.common_config.DeploymentMode, local_base: ?[]const u8) !*Owned {
         try cfg.validate();
@@ -146,6 +148,10 @@ pub const Owned = struct {
         self.artifacts = if (role == .maintenance_only) null else try ArtifactStore.openNative(a, node, secrets, false, deployment, local_base);
         errdefer if (self.artifacts) |*store| store.deinit();
         self.artifact_port = if (self.artifacts) |*store| store.artifactStore() else undefined;
+        self.exchange_reads = .{ .a = a };
+        errdefer self.exchange_reads.deinit();
+        self.builds = .{ .a = a, .bytes = 32 * 1024 * 1024 };
+        errdefer self.builds.deinit();
         self.cache = local.serverless_query_lake_serving_cache.Cache.initWithMemoryLimit(a, 64 * 1024 * 1024);
         errdefer self.cache.deinit();
         self.spill = .{ .alloc = a, .io = io, .root = self.config.spill_dir orelse "", .max_bytes = cfg.spill_bytes, .max_files = @as(usize, cfg.concurrency) * 64, .context = self, .checkpoint = struct {
@@ -167,7 +173,7 @@ pub const Owned = struct {
         try io.randomSecure(&nonce);
         const owner = try scratch.dupe(u8, &std.fmt.bytesToHex(nonce, .lower));
         const seed = local.serverless_external_source_mod.lake_catalog.types.digestHex(try std.fmt.allocPrint(scratch, "{s}\x00{s}\x00{s}", .{ cfg.state_uri, cfg.exchange_uri, cfg.authentication.issuer }));
-        self.service = .{ .a = a, .state_store = .{ .client = self.state.client, .bucket = self.state.bucket, .prefix = if (self.state.prefix.len == 0) "sql" else self.state.prefix, .now_ms = 0 }, .exchange_store = .{ .client = self.exchange.client, .bucket = self.exchange.bucket, .prefix = if (self.exchange.prefix.len == 0) "sql" else self.exchange.prefix }, .tenant = seed, .owner = owner, .role = role, .source = if (self.host) |*host| host.source() else .{ .ptr = self, .open = noSource }, .retention = if (self.host) |*host| host.retention() else .{ .ptr = self, .ensure = noRetention }, .context = .{ .io = io }, .task_memory_ceiling = cfg.task_memory, .spill = if (cfg.spill_dir != null) &self.spill else null };
+        self.service = .{ .build_cache = &self.builds, .a = a, .state_store = .{ .client = self.state.client, .bucket = self.state.bucket, .prefix = if (self.state.prefix.len == 0) "sql" else self.state.prefix, .now_ms = 0 }, .exchange_store = .{ .read_cache = &self.exchange_reads, .client = self.exchange.client, .bucket = self.exchange.bucket, .prefix = if (self.exchange.prefix.len == 0) "sql" else self.exchange.prefix }, .tenant = seed, .owner = owner, .role = role, .source = if (self.host) |*host| host.source() else .{ .ptr = self, .open = noSource }, .retention = if (self.host) |*host| host.retention() else .{ .ptr = self, .ensure = noRetention }, .context = .{ .io = io }, .task_memory_ceiling = cfg.task_memory, .spill = if (cfg.spill_dir != null) &self.spill else null };
         self.worker_cancellation = .{ .a = a, .io = io, .store = self.service.state_store, .clock = self.service.clock };
         self.service.worker_cancellation = &self.worker_cancellation;
         self.turns = .{ .scheduler = &self.scheduler };
@@ -230,6 +236,8 @@ pub const Owned = struct {
         if (self.discovery) |*discovery| discovery.stop();
         self.executor.deinit();
         self.spill.deinit();
+        self.exchange_reads.deinit();
+        self.builds.deinit();
         self.cache.deinit();
         self.artifact_port = undefined;
         if (self.artifacts) |*store| store.deinit();

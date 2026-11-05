@@ -40,6 +40,11 @@ pub const Data = struct {
     rows: u64,
     offset: usize = 0,
     consumed: u64 = 0,
+    // Borrowed from the directory arena, independent of the resettable block
+    // arena. Never prefetch outside the requested partition range.
+    window: []u8 = &.{},
+    window_offset: u64 = 0,
+    window_len: usize = 0,
     /// The block arena is separate from the authenticated index's lifetime.
     /// Caller must retire the previous block before advancing.
     pub fn nextBlock(self: *Data, arena: *std.heap.ArenaAllocator, limit: usize) !?spill.ColumnarBlock {
@@ -53,10 +58,29 @@ pub const Data = struct {
         }
         const entry = self.blocks[self.offset];
         if (entry.bytes > limit) return error.SqlJoinBudgetExceeded;
-        var object = try self.store.range(a, self.ref, entry.offset, entry.bytes);
-        defer object.deinit(a);
-        if (!std.mem.eql(u8, &hash(object.body), &entry.hash)) return error.InvalidSqlExchange;
-        const block = try spill.decodeColumnarBlockInArena(a, try a.dupe(u8, object.body), limit);
+        const bytes = try a.alloc(u8, entry.bytes);
+        if (entry.bytes <= self.window.len) {
+            if (entry.offset < self.window_offset or entry.offset + entry.bytes > self.window_offset + self.window_len) {
+                var length: usize = entry.bytes;
+                for (self.blocks[self.offset + 1 ..]) |next_block| {
+                    if (next_block.bytes > self.window.len - length) break;
+                    length += next_block.bytes;
+                }
+                var object = try self.store.range(a, self.ref, entry.offset, length);
+                defer object.deinit(a);
+                @memcpy(self.window[0..length], object.body);
+                self.window_offset = entry.offset;
+                self.window_len = length;
+            }
+            const begin: usize = @intCast(entry.offset - self.window_offset);
+            @memcpy(bytes, self.window[begin..][0..entry.bytes]);
+        } else {
+            var object = try self.store.range(a, self.ref, entry.offset, entry.bytes);
+            defer object.deinit(a);
+            @memcpy(bytes, object.body);
+        }
+        if (!std.mem.eql(u8, &hash(bytes), &entry.hash)) return error.InvalidSqlExchange;
+        const block = try spill.decodeColumnarBlockInArena(a, bytes, limit);
         errdefer block.deinit();
         if (block.count() != entry.rows) return error.InvalidSqlExchange;
         self.offset += 1;
@@ -81,11 +105,28 @@ pub fn collectionYield(parent: catalog.types.Context, child: catalog.types.Conte
     return if (child.deadline_ns) |deadline| @import("antfly_platform").time.monotonicNs() >= deadline else false;
 }
 pub const Store = struct {
+    read_cache: ?*@import("read_cache.zig").Cache = null,
     client: storage.Client,
     bucket: []const u8,
     prefix: []const u8,
     context: catalog.types.Context = .{},
+    pub const Input = struct { values: local.sql_execution_batch.Batch, ordinals: []const u64 };
     pub fn put(self: Store, a: A, query: state.Digest, expires_ms: u64, partitions: []const []const operators.Row, limit: usize) !state.Output {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const inputs = try arena.allocator().alloc(Input, partitions.len);
+        for (partitions, inputs) |rows, *input| {
+            const values = try arena.allocator().alloc([]const local.sql_scalar.Datum, rows.len);
+            const ordinals = try arena.allocator().alloc(u64, rows.len);
+            for (rows, values, ordinals) |row, *cells, *ordinal| {
+                cells.* = row.values;
+                ordinal.* = row.ordinal;
+            }
+            input.* = .{ .values = .{ .rows = values }, .ordinals = ordinals };
+        }
+        return self.putBatches(a, query, expires_ms, inputs, limit);
+    }
+    pub fn putBatches(self: Store, a: A, query: state.Digest, expires_ms: u64, partitions: []const Input, limit: usize) !state.Output {
         try state.validateDigest(query);
         if (partitions.len == 0 or partitions.len > max_partitions or !std.math.isPowerOfTwo(partitions.len) or limit > max_object_bytes) return error.InvalidSqlExchange;
         var bytes: std.ArrayList(u8) = .empty;
@@ -95,44 +136,49 @@ pub const Store = struct {
         var total_rows: u64 = 0;
         var block_directory: std.ArrayList(u8) = .empty;
         defer block_directory.deinit(a);
-        for (partitions, 0..) |rows, index| {
+        for (partitions, 0..) |input, index| {
+            const rows = input.values;
+            if (rows.len() != input.ordinals.len) return error.InvalidSqlExchange;
             try self.context.ensureActive();
             var scratch = std.heap.ArenaAllocator.init(a);
             defer scratch.deinit();
-            var blocks: std.ArrayList(u8) = .empty;
+            const partition_begin = bytes.items.len;
             const first_block = block_directory.items.len / block_entry_bytes;
             var begin: usize = 0;
-            while (begin < rows.len) {
-                const end = @min(rows.len, begin + 256);
-                const block = try spill.encodeColumnarBlockVersionAlloc(scratch.allocator(), rows[begin..end], limit, .v2);
-                if (block.len > limit -| blocks.items.len) return error.SqlJoinBudgetExceeded;
+            while (begin < rows.len()) {
+                _ = scratch.reset(.free_all);
+                const end = @min(rows.len(), begin + 256);
+                const selection = try scratch.allocator().alloc(usize, end - begin);
+                for (selection, begin..) |*position, row| position.* = row;
+                const selected = try rows.select(scratch.allocator(), selection);
+                const block = try spill.encodeColumnarBatchVersionAlloc(scratch.allocator(), selected, input.ordinals[begin..end], limit, .v2);
+                if (block.len > limit -| bytes.items.len) return error.SqlJoinBudgetExceeded;
                 var block_entry: [block_entry_bytes]u8 = undefined;
-                std.mem.writeInt(u64, block_entry[0..8], bytes.items.len + blocks.items.len, .little);
+                std.mem.writeInt(u64, block_entry[0..8], bytes.items.len, .little);
                 std.mem.writeInt(u32, block_entry[8..12], @intCast(block.len), .little);
                 std.mem.writeInt(u32, block_entry[12..16], @intCast(end - begin), .little);
                 @memcpy(block_entry[16..48], &hash(block));
                 try block_directory.appendSlice(a, &block_entry);
                 if (block_directory.items.len + directory.len > max_index_bytes) return error.SqlJoinBudgetExceeded;
-                try blocks.appendSlice(scratch.allocator(), block);
+                try bytes.appendSlice(a, block);
                 begin = end;
             }
-            const encoded = blocks.items;
-            if (encoded.len > limit -| bytes.items.len or directory.len + block_directory.items.len + trailer_bytes > limit -| (bytes.items.len + encoded.len)) return error.SqlJoinBudgetExceeded;
+            const encoded = bytes.items[partition_begin..];
+            if (directory.len + block_directory.items.len + trailer_bytes > limit -| bytes.items.len) return error.SqlJoinBudgetExceeded;
             const entry = directory[index * entry_bytes ..][0..entry_bytes];
-            std.mem.writeInt(u64, entry[0..8], bytes.items.len, .little);
+            std.mem.writeInt(u64, entry[0..8], partition_begin, .little);
             std.mem.writeInt(u64, entry[8..16], encoded.len, .little);
-            std.mem.writeInt(u64, entry[16..24], rows.len, .little);
+            std.mem.writeInt(u64, entry[16..24], rows.len(), .little);
             @memcpy(entry[24..56], &hash(encoded));
             std.mem.writeInt(u32, entry[56..60], @intCast(first_block), .little);
             std.mem.writeInt(u32, entry[60..64], @intCast(block_directory.items.len / block_entry_bytes - first_block), .little);
             var retained_bytes: u64 = 0;
-            for (rows) |row| {
-                retained_bytes +|= @sizeOf(operators.Row) + row.values.len * @sizeOf(local.sql_scalar.Datum);
-                for (row.values) |cell| retained_bytes +|= try operators.datumBytes(cell);
+            for (0..rows.len()) |row| {
+                retained_bytes +|= @sizeOf(operators.Row) + rows.width() * @sizeOf(local.sql_scalar.Datum);
+                for (0..rows.width()) |column| retained_bytes +|= try rows.cellBytes(scratch.allocator(), row, column);
             }
             std.mem.writeInt(u64, entry[64..72], retained_bytes, .little);
-            try bytes.appendSlice(a, encoded);
-            total_rows = try std.math.add(u64, total_rows, rows.len);
+            total_rows = try std.math.add(u64, total_rows, rows.len());
         }
         const index_begin = bytes.items.len;
         try bytes.appendSlice(a, directory);
@@ -165,6 +211,31 @@ pub const Store = struct {
         const allowed = try std.fmt.allocPrint(a, "{s}/sql-exchange/", .{self.prefix});
         defer a.free(allowed);
         if (!std.mem.startsWith(u8, ref.key, allowed) or std.mem.indexOf(u8, ref.key[allowed.len..], "..") != null or offset > ref.bytes or length > ref.bytes - offset or ref.bytes > max_object_bytes) return error.InvalidSqlExchange;
+        if (self.read_cache) |cache| {
+            const whole = ref.bytes <= 16 * 1024;
+            const requested_offset = if (whole) 0 else offset;
+            const requested_length = if (whole) @as(usize, @intCast(ref.bytes)) else length;
+            const identity = try std.json.Stringify.valueAlloc(a, .{ .bucket = self.bucket, .ref = ref, .offset = requested_offset, .length = requested_length }, .{});
+            defer a.free(identity);
+            const cache_key = hash(identity);
+            const body = (try cache.get(a, cache_key)) orelse blk: {
+                var fetched = try self.fetchRange(a, ref, requested_offset, requested_length);
+                defer fetched.deinit(a);
+                if (whole and !std.mem.eql(u8, &std.fmt.bytesToHex(hash(fetched.body), .lower), &ref.hash)) return error.InvalidSqlExchange;
+                cache.put(cache_key, fetched.body);
+                break :blk try a.dupe(u8, fetched.body);
+            };
+            defer a.free(body);
+            const relative: usize = @intCast(offset - requested_offset);
+            const result = try a.dupe(u8, body[relative..][0..length]);
+            errdefer a.free(result);
+            const bucket = try a.dupe(u8, self.bucket);
+            errdefer a.free(bucket);
+            return .{ .body = result, .metadata = .{ .bucket = bucket, .key = try a.dupe(u8, ref.key), .content_length = length } };
+        }
+        return self.fetchRange(a, ref, offset, length);
+    }
+    fn fetchRange(self: Store, a: A, ref: state.Output, offset: u64, length: usize) !storage.GetResult {
         var client = self.client;
         client.allocator = a;
         var object = try client.getObject(self.bucket, ref.key, .{ .skip_metadata_probe = true, .range = .{ .offset = offset, .length = length }, .max_response_bytes = length, .cancellation = catalog.types.contextCancellation(&self.context) });
@@ -231,9 +302,11 @@ pub const Store = struct {
         var rows: u64 = 0;
         for (directory.partitions[begin..end]) |partition| rows = try std.math.add(u64, rows, partition.rows);
         for (blocks) |block| if (block.bytes > limit) return error.SqlJoinBudgetExceeded;
-        // Keep the authenticated directory in the caller's decode arena. Each
-        // next() fetches and authenticates only one bounded columnar block.
-        return .{ .store = self, .ref = ref, .blocks = blocks, .rows = rows };
+        // Bound read-ahead independently of output size and leave most of the
+        // caller's quantum available for decoding. Oversized blocks bypass it.
+        const window_bytes = @min(@min(limit / 4, 256 * 1024), last.offset + last.bytes - first.offset);
+        const window = try a.alloc(u8, @intCast(window_bytes));
+        return .{ .store = self, .ref = ref, .blocks = blocks, .rows = rows, .window = window };
     }
     pub fn collect(self: Store, a: A, now_ms: u64, max_keys: u32) !usize {
         return (try self.collectPage(a, now_ms, max_keys)).deleted;
@@ -321,7 +394,7 @@ test "distributed SQL exchange streams authenticated bounded blocks for large pa
     const ref = try store.put(sa, @splat('a'), 1000000, &.{ rows, &.{} }, 16 * 1024 * 1024);
     const before = faults.get_attempts;
     try std.testing.expect(ref.bytes > 16 * 1024);
-    var data = try store.read(sa, ref, 0, 16 * 1024);
+    var data = try store.read(sa, ref, 0, 1024 * 1024);
     try std.testing.expectEqual(@as(u64, 1), faults.get_attempts - before);
     var count: usize = 0;
     while (try data.next(sa, 16 * 1024)) |block| {
@@ -330,7 +403,7 @@ test "distributed SQL exchange streams authenticated bounded blocks for large pa
         count += block.count();
     }
     try std.testing.expectEqual(@as(usize, 5000), count);
-    try std.testing.expectEqual(@as(u64, 1 + (5000 + 255) / 256), faults.get_attempts - before);
+    try std.testing.expectEqual(@as(u64, 2), faults.get_attempts - before);
     const empty_before = faults.get_attempts;
     try std.testing.expectEqual(@as(u64, 0), (try store.read(sa, ref, 1, 1024)).rows);
     try std.testing.expectEqual(@as(u64, 1), faults.get_attempts - empty_before);
@@ -346,4 +419,31 @@ test "distributed SQL exchange streams authenticated bounded blocks for large pa
     var bad_footer = try client.putObject("queries", ref.key, object.body, .{});
     bad_footer.deinit(a);
     try std.testing.expectError(error.InvalidSqlExchange, store.footer(sa, ref));
+}
+
+test "distributed SQL immutable exchange cache combines small object reads and isolates authenticated identities" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var faults = storage.ScriptedFaultClient.init(a, memory.client());
+    defer faults.deinit();
+    var cache: @import("read_cache.zig").Cache = .{ .a = a };
+    defer cache.deinit();
+    const store: Store = .{ .client = faults.client(), .bucket = "queries", .prefix = "tenant", .read_cache = &cache };
+    const cells = [_]local.sql_scalar.Datum{local.sql_scalar.Datum.json(.{ .integer = 42 })};
+    const ref = try store.put(sa, @splat('a'), 1000000, &.{&.{.{ .values = &cells, .keys = &.{}, .ordinal = 0 }}}, 1024 * 1024);
+    const before = faults.get_attempts;
+    var data = try store.read(sa, ref, 0, 1024 * 1024);
+    const block = (try data.next(sa, 1024 * 1024)).?;
+    defer block.deinit();
+    try std.testing.expectEqual(@as(i64, 42), (try block.cell(0, 0)).value.integer);
+    try std.testing.expectEqual(@as(u64, 1), faults.get_attempts - before);
+    _ = try store.footer(sa, ref);
+    try std.testing.expectEqual(@as(u64, 1), faults.get_attempts - before);
+    var invalid = ref;
+    invalid.hash = @splat('b');
+    try std.testing.expectError(error.InvalidSqlExchange, store.footer(sa, invalid));
 }

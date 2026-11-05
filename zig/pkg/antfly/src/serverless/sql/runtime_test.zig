@@ -142,6 +142,9 @@ test "distributed SQL runtime executes broadcast and shuffle SQL join semantics 
                 var fixture: Fixture = .{};
                 const coordinator = fixture.service(a, memory.client(), "coordinator-a");
                 var dispatch: Dispatch = .{ .workers = .{ fixture.service(a, memory.client(), "worker-a"), fixture.service(a, memory.client(), "worker-b") } };
+                var builds: @import("build_cache.zig").Cache = .{ .a = a, .bytes = 32 * 1024 * 1024 };
+                defer builds.deinit();
+                for (&dispatch.workers) |*worker| worker.build_cache = &builds;
                 var temporary = try local.common_test_directory.TestDirectory.init("distributed-sql-spill");
                 defer temporary.cleanup();
                 const spill_root = temporary.path();
@@ -207,6 +210,7 @@ test "distributed SQL runtime executes broadcast and shuffle SQL join semantics 
                 }
                 if (strategy == .shuffle and aggregate) try std.testing.expect(resumed_adaptive);
                 try std.testing.expect(complete);
+                if (strategy == .broadcast and aggregate) try std.testing.expect(builds.hits > 0);
                 const result = (try replacement.pollResult(sa, query)).?;
                 if (strategy == .shuffle) {
                     const record_key = try replacement.state_store.key(sa, query, null, 0);
@@ -943,6 +947,9 @@ test "distributed SQL skew tiles merge match evidence across pods for every join
             var fixture: Fixture = .{ .custom_right = &rows_ };
             var service = fixture.service(a, memory.client(), "coordinator-a");
             var dispatch: Dispatch = .{ .workers = .{ fixture.service(a, memory.client(), "worker-a"), fixture.service(a, memory.client(), "worker-b") }, .drop_once = false };
+            var builds: @import("build_cache.zig").Cache = .{ .a = a, .bytes = 32 * 1024 * 1024 };
+            defer builds.deinit();
+            for (&dispatch.workers) |*worker| worker.build_cache = &builds;
             const column: plan.Column = .{ .name = "id", .type = .integer };
             const left: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{column}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 2 };
             var right = left;

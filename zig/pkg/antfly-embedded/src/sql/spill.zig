@@ -1415,6 +1415,30 @@ pub const ColumnarBlock = struct {
         for (indices, 0..) |*id, row| id.* = @intCast((try self.dictionaryIdentity(row, column, keys)).?);
         return .{ .dictionary = .{ .values = values, .indices = indices } };
     }
+    /// Borrow the encoded payload without building a scalar row matrix.
+    pub fn batch(self: *const ColumnarBlock) @import("execution_batch.zig").Batch {
+        const Reader = struct {
+            fn block(ptr: *anyopaque) *const ColumnarBlock {
+                return @ptrCast(@alignCast(ptr));
+            }
+            fn cell(ptr: *anyopaque, _: Allocator, row: usize, column: usize) anyerror!Datum {
+                return block(ptr).cell(row, column);
+            }
+            fn frozen(ptr: *anyopaque, row: usize, column: usize) anyerror!?@import("execution_batch.zig").FrozenJson {
+                return block(ptr).frozenJson(row, column, false);
+            }
+            fn json(ptr: *anyopaque, row: usize, column: usize) anyerror!?[]const u8 {
+                return block(ptr).encodedJson(row, column, false);
+            }
+            fn dictionary(ptr: *anyopaque, a: Allocator, column: usize) anyerror!?@import("execution_batch.zig").Batch {
+                return block(ptr).dictionaryColumn(a, column, false);
+            }
+            fn identity(ptr: *anyopaque, row: usize, column: usize) anyerror!?u64 {
+                return block(ptr).dictionaryIdentity(row, column, false);
+            }
+        };
+        return .{ .reader = .{ .ptr = @ptrCast(@constCast(self)), .read = Reader.cell, .read_frozen = Reader.frozen, .read_json = Reader.json, .read_dictionary = Reader.dictionary, .read_identity = Reader.identity, .count = self.count(), .width = self.values.len } };
+    }
     pub fn keyCell(self: ColumnarBlock, row: usize, column: usize) !Datum {
         if (row >= self.count() or column >= self.keys.len) return error.InvalidSqlSpill;
         return self.keys[column].cell(row);
