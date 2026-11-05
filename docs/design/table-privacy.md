@@ -493,6 +493,29 @@ until their metadata has been explicitly admitted as sorted.
 - The merged Go SDK tests pass. TypeScript SDK validation passes 593 tests
   with one opt-in skip and passes type checking. Zig formatting, license headers
   and the Apache boundary check pass.
+- Fix `6010041670` passes all 121 native build steps, 66 API/metadata tests,
+  172 storage/privacy tests, both ABI checks and the focused data-node regression
+  (six response cases through discovery and the status source). Projected
+  hydration retains the 4,712,210/4,715,173-byte peaks for one/twenty documents.
+- Eighteen HTTP cases pass in each deployment mode (267.83 s standalone,
+  300.07 s Raft), covering lifecycle, CAS, protected serving, startup availability,
+  curation transitions, credentials, secret references, category limits and
+  unsupported storage. The other 27 HTTP cases were outside this targeted run;
+  previous full-suite qualification remains below. Logs:
+  `.privacy-forwarding-http-standalone.log`, `.privacy-forwarding-http-raft.log`.
+- The pinned default-model long-document gate passes in 27.18 s with Metal
+  required and selected, covering preview, original offsets, backfill, sanitized
+  reads, findings and protected readiness. Log: `.privacy-forwarding-metal.log`;
+  server evidence: `.benchmark-results/privacy/forwarding-main-6c0/metal-server.log`.
+  Inference/batching implementation is unchanged by this fix; CUDA performance
+  was not remeasured in this qualification.
+- Required cache cleanup completed, preserving active/recent build output and
+  leaving 136.8 GiB free (`.privacy-forwarding-gc.log`).
+- Qualified server SHA-256:
+  `94e5db3eacac3554bc7261ffe53bf881f1dfa4cc6675bd384df8f5205122321f`.
+  Native build log: `.privacy-forwarding-build.log`. SDK logs:
+  `.privacy-forwarding-go.log`, `.privacy-forwarding-ts-tests.log`,
+  `.privacy-forwarding-ts-types.log`.
 
 ### Retryable owner availability (2026-11-05)
 
