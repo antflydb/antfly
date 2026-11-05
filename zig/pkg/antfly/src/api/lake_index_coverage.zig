@@ -33,10 +33,6 @@ fn word(hash: *Hash, value: u64) void {
     std.mem.writeInt(u64, &bytes, value, .little);
     hash.update(&bytes);
 }
-fn optionalWord(hash: *Hash, value: ?u64) void {
-    hash.update(&.{@intFromBool(value != null)});
-    if (value) |number| word(hash, number);
-}
 pub fn versionIsStrong(etag: []const u8, version: []const u8) bool {
     return etag.len != 0 or (version.len != 0 and !std.mem.startsWith(u8, version, "object-stat:v1:") and !std.mem.startsWith(u8, version, "iceberg:"));
 }
@@ -77,12 +73,6 @@ pub fn pinWithFileMap(source: *Source, context: Context, previous: ?local.server
 // An authenticated immutable snapshot can reuse its canonical data proof;
 // delete-object evidence remains fresh for every selection.
 pub const DataProof = Hash;
-pub fn pinData(source: *Source, context: Context, previous: ?local.serverless_external_source_types.Inventory, verified_files: ?*const FileMap) !DataProof {
-    return pinDataMode(source, context, previous, verified_files, true);
-}
-pub fn pinDataLegacy(source: *Source, context: Context, previous: ?local.serverless_external_source_types.Inventory, verified_files: ?*const FileMap) !DataProof {
-    return pinDataMode(source, context, previous, verified_files, false);
-}
 fn merkleData(source: *Source, digest: [32]u8, count: usize) !Hash {
     var hash = Hash.init(.{});
     hash.update("native-lake-source-data-merkle-v2");
@@ -92,9 +82,9 @@ fn merkleData(source: *Source, digest: [32]u8, count: usize) !Hash {
     try jsonPart(source.alloc, &hash, source.inventory.deleted_row_groups);
     return hash;
 }
-fn pinDataMode(source: *Source, context: Context, previous: ?local.serverless_external_source_types.Inventory, verified_files: ?*const FileMap, merkle: bool) !DataProof {
+pub fn pinData(source: *Source, context: Context, previous: ?local.serverless_external_source_types.Inventory, verified_files: ?*const FileMap) !DataProof {
     try context.ensureActive();
-    if (merkle and source.immutable_objects and !source.lazy_versions and source.verified_files == null) if (source.catalog()) |index| {
+    if (source.immutable_objects and !source.lazy_versions and source.verified_files == null) if (source.catalog()) |index| {
         if (index.allStrong()) return merkleData(source, index.coverageDigest(), index.count());
     };
     try source.ensureInventory(context);
@@ -181,9 +171,6 @@ fn pinDataMode(source: *Source, context: Context, previous: ?local.serverless_ex
         begin += count;
     }
     try source.inventory.validateAlloc(a);
-    var hash = Hash.init(.{});
-    hash.update("native-lake-source-coverage-v1");
-    try jsonPart(a, &hash, .{ .format = source.inventory.format, .source_id = source.inventory.source_id, .source_uri = source.inventory.source_uri, .snapshot_id = source.inventory.snapshot_id, .schema = source.inventory.schema_fingerprint });
     const files = source.inventory.files;
     const sorted = for (files, 0..) |file, i| {
         if (i != 0 and std.mem.order(u8, files[i - 1].file_id, file.file_id) != .lt) break false;
@@ -196,37 +183,14 @@ fn pinDataMode(source: *Source, context: Context, previous: ?local.serverless_ex
             return std.mem.order(u8, inventory.files[left].file_id, inventory.files[right].file_id) == .lt;
         }
     }.less);
-    if (merkle) {
-        var builder: local.serverless_query_lake_inventory_catalog.CoverageBuilder = .{};
-        for (0..files.len) |position| {
-            try context.ensureActive();
-            try builder.add(files[if (sorted) position else order[position]]);
-        }
-        return merkleData(source, builder.finish(), files.len);
-    }
-    word(&hash, files.len);
+    var builder: local.serverless_query_lake_inventory_catalog.CoverageBuilder = .{};
     for (0..files.len) |position| {
-        const file = files[if (sorted) position else order[position]];
-        part(&hash, file.file_id);
-        part(&hash, file.object_uri);
-        part(&hash, file.etag);
-        part(&hash, file.version_id);
-        word(&hash, file.byte_len);
-        word(&hash, file.row_count);
-        optionalWord(&hash, if (file.data_sequence_number) |number| @intCast(number) else null);
-        optionalWord(&hash, if (file.partition_spec_id) |number| @intCast(number) else null);
-        word(&hash, file.partition_field_count);
-        word(&hash, file.partition_values.len);
-        for (file.partition_values) |partition| {
-            part(&hash, partition.column_id);
-            part(&hash, partition.string_value);
-        }
+        try context.ensureActive();
+        try builder.add(files[if (sorted) position else order[position]]);
     }
-    // Explicit deletion vectors are part of coverage even for a reused source
-    // label. Native Iceberg plans additionally pin their real object versions.
-    try jsonPart(a, &hash, source.inventory.deleted_row_groups);
-    return hash;
+    return merkleData(source, builder.finish(), files.len);
 }
+
 pub fn dataDigest(data: DataProof) [32]u8 {
     var copy = data;
     return copy.finalResult();
@@ -266,9 +230,6 @@ pub fn finishReadDigest(source: *Source, context: Context, data: [32]u8) !Covera
         part(&hash, version.version);
     }
     return .{ .source = hash.finalResult(), .delete_objects = qualified.digest, .data = data };
-}
-pub fn finishLegacy(source: *Source, context: Context, data: DataProof) !Coverage {
-    return finishHash(source, context, data, dataDigest(data));
 }
 fn finishHash(source: *Source, context: Context, input: Hash, digest: [32]u8) !Coverage {
     const a = source.alloc;

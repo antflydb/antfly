@@ -172,9 +172,17 @@ export class BusyError extends AntflyError {
 }
 
 export class OutcomeUnknownError extends AntflyError {
-  constructor(message?: string) {
+  /**
+   * The receipt the database issued for an autocommit SQL write that ended
+   * with an unknown outcome, if any. Resolve it later with
+   * `Database.outcomeReceiptStatus()`.
+   */
+  readonly outcomeReceipt?: string;
+
+  constructor(message?: string, outcomeReceipt?: string) {
     super(ErrorCode.OutcomeUnknown, message);
     this.name = "OutcomeUnknownError";
+    if (outcomeReceipt !== undefined) this.outcomeReceipt = outcomeReceipt;
     Object.setPrototypeOf(this, new.target.prototype);
   }
 }

@@ -179,19 +179,25 @@ pub const BoundStatement = struct {
 };
 
 pub const Description = struct {
-    arena: std.heap.ArenaAllocator,
+    // Bound view providers may retain this allocator for lazy evaluation.
+    arena: *std.heap.ArenaAllocator,
     binding: BoundStatement,
     settings: ?*@import("setting_catalog.zig").View = null,
 
     pub fn deinit(self: *Description) void {
         if (self.settings) |view| view.deinit();
-        self.arena.deinit();
+        const arena = self.arena;
+        const allocator = arena.child_allocator;
+        arena.deinit();
+        allocator.destroy(arena);
         self.* = undefined;
     }
 };
 
 pub fn describe(allocator: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled, explicit_parameter_types: []const ?ast.ColumnType) !Description {
-    var arena = std.heap.ArenaAllocator.init(allocator);
+    const arena = try allocator.create(std.heap.ArenaAllocator);
+    errdefer allocator.destroy(arena);
+    arena.* = std.heap.ArenaAllocator.init(allocator);
     errdefer arena.deinit();
     var statement_backend = backend;
     var settings: ?*@import("setting_catalog.zig").View = null;
@@ -1495,6 +1501,7 @@ pub fn coerce(raw: Json, kind: ast.ColumnType) !Json {
 
 const FakeBackend = struct {
     resolutions: usize = 0,
+    retained_allocator: ?std.mem.Allocator = null,
     action: ?catalog.Action = null,
     forbidden: bool = false,
     cancelled: bool = false,
@@ -1505,6 +1512,7 @@ const FakeBackend = struct {
     fn resolve(ptr: *anyopaque, allocator: std.mem.Allocator, name: ast.Name, action: catalog.Action) !catalog.Table {
         const self: *FakeBackend = @ptrCast(@alignCast(ptr));
         self.resolutions += 1;
+        self.retained_allocator = allocator;
         self.action = action;
         if (self.forbidden) return error.Forbidden;
         try std.testing.expectEqualStrings("things", name.table);
@@ -2191,4 +2199,37 @@ test "SQL domain window defaults enforce only selected fresh coercions in the pr
             try std.testing.expectEqualStrings(case.value, result.output.rows[0][0].string);
         }
     }
+}
+
+test "SQL binding retains provider allocators across ownership moves and every allocation failure" {
+    const Fixture = struct {
+        noinline fn prepare(a: std.mem.Allocator, backend: catalog.Backend, compiled: *const compiler.Compiled) !Description {
+            return describe(a, backend, compiled, &.{});
+        }
+        fn exercise(a: std.mem.Allocator, compiled: *const compiler.Compiled) !void {
+            var fake: FakeBackend = .{};
+            var original = try prepare(a, fake.backend(), compiled);
+            var transferred = false;
+            defer if (!transferred) original.deinit();
+            const moved = try a.create(Description);
+            defer a.destroy(moved);
+            moved.* = original;
+            transferred = true;
+            original = undefined;
+            defer moved.deinit();
+            const retained = fake.retained_allocator orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@intFromPtr(moved.arena), @intFromPtr(retained.ptr));
+            // Providers may allocate after the builder and original owner have
+            // disappeared. Force new arena storage rather than borrowing a
+            // previously allocated cell which would hide a stale allocator.
+            const bytes = try retained.alloc(u8, 64 * 1024);
+            @memset(bytes, 0x5a);
+            try std.testing.expectEqualStrings("name", moved.binding.columns[0].name);
+            try std.testing.expectEqual(@as(u8, 0x5a), bytes[bytes.len - 1]);
+        }
+    };
+    var compiled = try compiler.compile(std.testing.allocator, "SELECT name FROM things", .{});
+    defer compiled.deinit();
+    try Fixture.exercise(std.testing.allocator, &compiled);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.exercise, .{&compiled});
 }

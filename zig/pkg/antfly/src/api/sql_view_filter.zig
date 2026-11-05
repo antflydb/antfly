@@ -33,6 +33,11 @@ const Required = struct {
         switch (filter) {
             .match_all, .match_none => {},
             .doc_id => try self.names.put(a, "_id", {}),
+            .logical_value => |matcher| {
+                const field = matcher.spec.field;
+                const top = field[0 .. std.mem.indexOfScalar(u8, field, '.') orelse field.len];
+                if (top.len == 0) self.all = true else try self.names.put(a, top, {});
+            },
             .conjuncts, .disjuncts => |children| for (children) |child| try self.collect(a, child, depth + 1),
             .bool_query => |query| {
                 for (query.must) |child| try self.collect(a, child, depth + 1);
@@ -138,4 +143,57 @@ test "SQL view filters preserve wide integers and SQL versus JSON null without r
     cells[0].value.integer += 1;
     cells[1] = .{};
     try std.testing.expect(!try filter.matches(filter.ptr, region, &cells));
+}
+
+test "SQL view filters use native logical value semantics with narrow nested output and intersected identities" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const region = arena.allocator();
+    const usermgr = @import("../usermgr/mod.zig");
+    const columns = [_]catalog.Column{
+        .{ .name = "payload", .path = "payload", .type = .json },
+        .{ .name = "cold_temporal", .path = "cold_temporal", .type = .datetime },
+    };
+    var allowed = [_]scalar.Datum{
+        scalar.Datum.json(try std.json.parseFromSliceLeaky(std.json.Value, region,
+            \\{"names":["other","Kelvin"],"content":"Connection-Refused"}
+        , .{})),
+        // An invalid unreferenced temporal output must not be decoded by RLS.
+        scalar.Datum.json(.{ .string = "invalid cold temporal" }),
+    };
+    const denied = [_]scalar.Datum{
+        scalar.Datum.json(try std.json.parseFromSliceLeaky(std.json.Value, region,
+            \\{"names":["other"],"content":"Connection-Refused"}
+        , .{})),
+        allowed[1],
+    };
+    var caller_filters = [_]usermgr.RowFilterEntry{.{ .table = @constCast("*"), .filter = @constCast(
+        \\{"value":{"kind":"equals","field":"payload.names","text":"kelvin","case_sensitive":false}}
+    ) }};
+    const caller: http.AuthenticatedIdentity = .{ .username = @constCast("caller"), .row_filter = &caller_filters };
+    for ([_][]const u8{
+        \\{"value":{"kind":"contains","field":"payload.content","text":"tion-Ref"}}
+        ,
+        \\{"bool":{"must":[{"value":{"kind":"matches","field":"payload.content","text":"^Connection-.*$"}}],"must_not":[{"value":{"kind":"equals","field":"payload.content","text":"forbidden"}}]}}
+        ,
+        \\{"disjuncts":[{"value":{"kind":"equals","field":"payload.content","text":"absent"}},{"value":{"kind":"contains","field":"payload.content","text":"-Refused"}}]}
+        ,
+    }) |json| {
+        var incoming_filters = [_]usermgr.RowFilterEntry{.{ .table = @constCast("*"), .filter = @constCast(json) }};
+        const incoming: http.AuthenticatedIdentity = .{ .username = @constCast("delegator"), .row_filter = &incoming_filters };
+        const filter = (try prepare(region, .{}, caller, incoming, "nested_view", &columns)).?;
+        const owner: *const Filter = @ptrCast(@alignCast(filter.ptr));
+        try std.testing.expectEqualSlices(usize, &.{0}, owner.ordinals);
+        try std.testing.expect(try filter.matches(filter.ptr, region, &allowed));
+        try std.testing.expect(!try filter.matches(filter.ptr, region, &denied));
+        allowed[0] = .{};
+        try std.testing.expect(!try filter.matches(filter.ptr, region, &allowed));
+        allowed[0] = scalar.Datum.json(try std.json.parseFromSliceLeaky(std.json.Value, region,
+            \\{"names":["Kelvin"],"content":"Connection-Refused"}
+        , .{}));
+    }
+    const filter = (try prepare(region, .{}, caller, null, "nested_view", &columns)).?;
+    allowed[0] = scalar.Datum.json(.null);
+    try std.testing.expect(!try filter.matches(filter.ptr, region, &allowed));
 }

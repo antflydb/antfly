@@ -32,11 +32,12 @@ export interface Source {
   name: string;
   connection: string;
   table: string;
-  publication: "text" | "media";
+  publication: "native" | "text" | "media";
   state: string;
   config: Record<string, unknown>;
   permissions: Permissions;
   permission_ttl_seconds?: number;
+  streams?: Array<TextStream>;
 }
 
 export interface Run {
@@ -79,4 +80,16 @@ export interface Mutation {
 export interface RunInput {
   restart?: boolean;
   operation?: "sync" | "purge";
+}
+
+export interface TextStream {
+  name: string;
+  artifact?: string;
+  index?: string;
+  field: string;
+  purpose?: string;
+  location_field?: string;
+  default: boolean;
+  generated?: boolean;
+  boundary?: "record" | "unit";
 }

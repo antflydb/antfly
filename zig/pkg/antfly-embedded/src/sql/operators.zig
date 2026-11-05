@@ -140,6 +140,9 @@ pub const TopK = struct {
     json_pool: ?*@import("typed_store.zig").Store.JsonPool = null,
     pool_bytes: usize = 0,
     scalar_mutex: std.atomic.Mutex = .unlocked,
+    // Competitive scalar payloads need one reusable descriptor vector. Their
+    // values are copied into winner ownership before this vector is reused.
+    scalar_row: @import("execution_batch.zig").ScalarRow = .{},
     fn syncPool(self: *TopK) void {
         const bytes = if (self.json_pool) |pool| pool.budget.live +| @sizeOf(@TypeOf(pool.*)) else @as(usize, 0);
         self.retained_bytes = self.retained_bytes - self.pool_bytes +| bytes;
@@ -313,6 +316,7 @@ pub const TopK = struct {
         if (self.scratch) |*scratch| scratch.deinit();
         self.alloc.free(self.entries);
         self.alloc.free(self.orders);
+        self.scalar_row.deinit(self.alloc);
         if (self.json_pool) |pool| pool.deinit();
         self.* = undefined;
     }
@@ -388,7 +392,22 @@ pub const TopK = struct {
                     try self.external.?.addBatch(selected, keys[index..][0..1], ordinals[index..][0..1]);
                 };
             } else {
-                row.values = try batch.row(a, index);
+                if (batch == .rows) {
+                    row.values = batch.rows[index];
+                } else {
+                    const old_capacity = self.scalar_row.values.capacity;
+                    const growth = MemoryBudget.arrayListGrowthBytes(self.scalar_row.values, batch.width() -| self.scalar_row.values.items.len);
+                    if (growth > self.max_bytes -| self.retained_bytes) {
+                        try self.startSpill();
+                        const selection = try a.alloc(usize, batch.len() - index);
+                        for (selection, index..) |*position, i| position.* = i;
+                        return self.external.?.addBatch(try batch.select(a, selection), keys[index..], ordinals[index..]);
+                    }
+                    const values = try self.scalar_row.prepare(self.alloc, batch.width());
+                    self.retained_bytes +|= (self.scalar_row.values.capacity - old_capacity) *| @sizeOf(Datum);
+                    for (values, 0..) |*value, column| value.* = try batch.cell(a, index, column);
+                    row.values = values;
+                }
                 self.retainInMemory(row) catch |err| try self.spillCandidate(row, err);
             }
         }
@@ -6649,4 +6668,48 @@ test "SQL collection aggregates own reducer outputs after state destruction" {
     };
     try Harness.run(std.testing.allocator);
     try std.testing.checkAllAllocationFailures(std.testing.allocator, Harness.run, .{});
+}
+
+test "SQL top K reader batches reuse scalar descriptors without page growth and unwind every allocation failure" {
+    const Fixture = struct {
+        start: usize,
+        fn read(raw: *anyopaque, _: Allocator, row: usize, column: usize) !Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return switch (column) {
+                0 => Datum.json(.{ .integer = @intCast(self.start - row) }),
+                1 => Datum.json(.{ .string = "retained payload" }),
+                else => error.InvalidSqlBackendResponse,
+            };
+        }
+        fn run(a: Allocator) !void {
+            var top = try TopK.init(a, 2, &.{.{}}, 64 * 1024);
+            defer top.deinit();
+            var page = std.heap.ArenaAllocator.init(a);
+            defer page.deinit();
+            for (0..3) |part| {
+                var input: @This() = .{ .start = 96 - part * 32 };
+                var values: [32][1]Datum = undefined;
+                var keys: [32][]const Datum = undefined;
+                var ordinals: [32]u64 = undefined;
+                for (&values, &keys, &ordinals, 0..) |*value, *key, *ordinal, row| {
+                    value.* = .{Datum.json(.{ .integer = @intCast(input.start - row) })};
+                    key.* = value;
+                    ordinal.* = part * 32 + row;
+                }
+                try top.addBatch(page.allocator(), .{ .reader = .{ .ptr = &input, .count = 32, .width = 2, .read = read } }, &keys, &ordinals);
+                // Primitive reader rows need no producer-owned transient
+                // vectors, even when all 96 candidates displace winners.
+                try std.testing.expectEqual(@as(usize, 0), page.queryCapacity());
+            }
+            const rows = try top.finish(a);
+            defer a.free(rows);
+            try std.testing.expectEqual(@as(usize, 2), rows.len);
+            for (rows, 1..) |row, expected| {
+                try std.testing.expectEqual(@as(i64, @intCast(expected)), row.values[0].value.integer);
+                try std.testing.expectEqualStrings("retained payload", row.values[1].value.string);
+            }
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }

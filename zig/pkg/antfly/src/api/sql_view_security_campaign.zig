@@ -79,9 +79,10 @@ pub fn beforeRestart(ctx: *fixture.Context) !void {
     try command(ctx, "CREATE POLICY caller_rows ON secured_rows FOR SELECT TO \"pk-reader\" USING(id=2 AND amount>0 AND tags IS NOT NULL)");
     try command(ctx, "ALTER TABLE secured_rows ENABLE ROW LEVEL SECURITY");
     try active(ctx, schema.table_id);
-    try command(ctx, "CREATE VIEW owner_rows_v AS SELECT id,CURRENT_USER AS actor FROM secured_rows");
+    try command(ctx, "CREATE VIEW owner_rows_v AS SELECT id,CURRENT_USER AS actor,id::TEXT AS label FROM secured_rows");
     try command(ctx, "CREATE VIEW invoker_rows_v WITH(security_invoker=true) AS SELECT id,CURRENT_USER AS actor FROM secured_rows");
     try command(ctx, "CREATE VIEW nested_invoker_rows_v AS SELECT id,actor FROM invoker_rows_v");
+    try command(ctx, "CREATE VIEW nested_owner_rows_v AS SELECT id FROM owner_rows_v");
     try afterRestart(ctx);
 
     const api = ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi;
@@ -104,6 +105,32 @@ pub fn afterRestart(ctx: *fixture.Context) !void {
     try read(ctx, "SELECT id FROM owner_rows_v WHERE actor=CURRENT_USER", &.{1});
     try read(ctx, "SELECT id FROM invoker_rows_v WHERE actor=CURRENT_USER", &.{2});
     try read(ctx, "SELECT id FROM nested_invoker_rows_v WHERE actor=CURRENT_USER", &.{2});
+    try logicalValueFilters(ctx);
+}
+
+// Exercise real view-resource policy extraction through authenticated native
+// metadata/data owners, including a hidden filter column and a nested definer.
+// The same campaign runs after complete owner recovery.
+fn logicalValueFilters(ctx: *fixture.Context) !void {
+    const manager = (ctx.metadata.server.owned_public_http_server orelse return error.MissingMetadataPublicApi).cfg.user_manager orelse return error.MissingUserManager;
+    defer manager.removeRowFilter("pk-reader", "owner_rows_v") catch {};
+    for ([_][]const u8{
+        \\{"value":{"kind":"equals","field":"label","text":"1"}}
+        ,
+        \\{"value":{"kind":"contains","field":"label","text":"1"}}
+        ,
+        \\{"bool":{"must":[{"value":{"kind":"matches","field":"label","text":"^1$"}}],"must_not":[{"value":{"kind":"equals","field":"label","text":"2"}}]}}
+        ,
+    }) |filter| {
+        try manager.setRowFilter("pk-reader", "owner_rows_v", filter);
+        try read(ctx, "SELECT id FROM owner_rows_v", &.{1});
+        try read(ctx, "SELECT id FROM nested_owner_rows_v", &.{1});
+    }
+    try manager.setRowFilter("pk-reader", "owner_rows_v",
+        \\{"value":{"kind":"equals","field":"label","text":"2"}}
+    );
+    try read(ctx, "SELECT id FROM owner_rows_v", &.{});
+    try read(ctx, "SELECT id FROM nested_owner_rows_v", &.{});
 }
 
 fn request(ctx: *fixture.Context, cancel: *const std.atomic.Value(bool), sql: []const u8) wire.Request {

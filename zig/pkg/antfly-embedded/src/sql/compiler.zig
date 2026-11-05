@@ -6817,11 +6817,9 @@ test "SQL native index original full-text declarations retain typed intent and r
         "CREATE INDEX i ON t USING antfly_full_text (body) WITH (scoring='tfidf')",
     }) |sql| try std.testing.expectError(error.UnsupportedSqlShape, compile(a, sql, .{}));
     try std.testing.expectError(error.InvalidSqlSyntax, compile(a, "CREATE INDEX i ON t USING antfly_full_text (body) WITH (analyzer='standard',analyzer='standard')", .{}));
-    // Guard unavailable PostgreSQL methods without claiming their execution.
-    for ([_][]const u8{ "sql-0719", "sql-0720", "sql-0721" }) |id| {
-        const original = try corpus.get(id);
-        try std.testing.expectError(error.UnsupportedSqlShape, compile(a, original.sql, .{}));
-    }
+    // GIN originals are qualified by the dedicated test above. BRIN remains
+    // unavailable; retain its guard without contradicting supported methods.
+    try std.testing.expectError(error.UnsupportedSqlShape, compile(a, (try corpus.get("sql-0720")).sql, .{}));
 }
 
 test "SQL statement effect CTE compiler preserves PostgreSQL producer shapes and read fast path" {

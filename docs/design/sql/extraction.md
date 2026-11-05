@@ -129,6 +129,31 @@ from the repository root after `(cd zig && zig build antfly -Doptimize=Debug)`.
 This closes the original locking cohort; it does not imply that every remaining
 SQL feature or every PostgreSQL lock-bearing query shape is implemented.
 
+The plan-cache gate checks all four row-lock strengths, including NOWAIT and
+SKIP LOCKED, retain write admission on cache hits and unwind every allocation
+failure. Invalid SQL, rather than supported FOR UPDATE syntax, exercises failed
+compilation diagnostics and admission cleanup.
+
+Native view-resource filters share the storage compiler's logical value
+predicates, including nested arrays, Unicode matching and boolean composition.
+Required output fields come from the compiled predicate; unrelated typed outputs
+are not converted into the authorization row. Caller and delegated filters
+remain intersected before rows reach an outer projection or nested view.
+
+Prepared native filters and SQL descriptions own arenas at stable addresses.
+Their lazy regex runners and bound view providers may allocate after the builder
+returns or the owning value moves into a cache; retaining a stack arena's
+allocator is invalid. The graph-admission gate checks moves, released JSON,
+cache reuse and allocation failures. The mounted view-lifecycle gate exercises
+hidden filter columns and nested view RLS across complete owner restart.
+
+Scalar Top-K batches reuse one charged descriptor vector instead of retaining
+one temporary row vector per competitive candidate. Already-coerced scalar
+output columns also supply single-column sort keys directly. Winner payloads
+remain owned by the operator before the input page retires. Regression coverage
+keeps the sort/group/join pipeline within its original 256 KiB limit and checks
+zero producer-page growth across 96 competitive rows plus allocation failures.
+
 ## Native GIN index custody
 
 Single-column SQL GIN declarations with explicit `jsonb_path_ops` or `array_ops`

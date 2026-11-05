@@ -779,7 +779,7 @@ pub fn encodeLakeIndexResource(alloc: std.mem.Allocator, table: metadata_table_m
                     const name = mat.object.get("name") orelse break :published null;
                     if (name != .string) break :published null;
                     const found = for (value.declarations) |declaration| {
-                        if (declaration.artifact.kind == .algebraic_segment and try @import("lake_index_names.zig").matches(alloc, declaration.name, index_name, name.string, declaration.artifact.metadata_version)) break true;
+                        if (declaration.artifact.kind == .algebraic_segment and try @import("lake_index_names.zig").matches(alloc, declaration.name, index_name, name.string)) break true;
                     } else false;
                     if (!found) break :published null;
                 }

@@ -83,6 +83,31 @@ pub fn global() *Scheduler {
     return &shared;
 }
 const Class = enum { cpu, io };
+/// One coordinator observes an epoch before inspecting its bounded task set.
+/// Completion publishes readiness before advancing the epoch. Waiting compares
+/// that same epoch atomically; it never clears a concurrently published signal.
+/// At most the bounded cohort can notify between observation and waiting, so
+/// wrapping the counter cannot alias an outstanding observation.
+pub const Completion = struct {
+    epoch: std.atomic.Value(u32) = .init(0),
+    pub fn observe(self: *const Completion) u32 {
+        return self.epoch.load(.acquire);
+    }
+    pub fn set(self: *Completion, io: std.Io) void {
+        _ = self.epoch.fetchAdd(1, .release);
+        io.futexWake(u32, &self.epoch.raw, 1);
+    }
+    pub fn wait(self: *Completion, io: std.Io, observed: u32) !void {
+        try io.futexWait(u32, &self.epoch.raw, observed);
+    }
+    /// Request checkpoints can expire independently of the I/O task's cancel
+    /// token. Return periodically so the owner checks them before parking again.
+    pub fn waitChecked(self: *Completion, io: std.Io, observed: u32, context: anytype) !void {
+        try context.ensureActive();
+        try io.futexWaitTimeout(u32, &self.epoch.raw, observed, .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(10) } });
+        try context.ensureActive();
+    }
+};
 pub const Scheduler = struct {
     mutex: std.atomic.Mutex = .unlocked,
     max_workers: usize = 8,
@@ -243,16 +268,16 @@ pub const Scheduler = struct {
     /// Notify only after execution admission is released and readiness published.
     /// A bounded coordinator can drain whichever phase finishes first without
     /// retaining a CPU slot during provider I/O or polling ordered futures.
-    pub fn submitNotified(self: *Scheduler, io: std.Io, bytes: usize, done: *std.Io.Event, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
+    pub fn submitNotified(self: *Scheduler, io: std.Io, bytes: usize, done: *Completion, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
         return self.submitTransientClass(.cpu, io, bytes, done, false, function, args);
     }
-    pub fn submitIoNotified(self: *Scheduler, io: std.Io, bytes: usize, done: *std.Io.Event, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
+    pub fn submitIoNotified(self: *Scheduler, io: std.Io, bytes: usize, done: *Completion, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
         return self.submitTransientClass(.io, io, bytes, done, false, function, args);
     }
-    pub fn submitNotifiedWithIoReserve(self: *Scheduler, io: std.Io, bytes: usize, done: *std.Io.Event, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
+    pub fn submitNotifiedWithIoReserve(self: *Scheduler, io: std.Io, bytes: usize, done: *Completion, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
         return self.submitTransientClass(.cpu, io, bytes, done, true, function, args);
     }
-    fn submitTransientClass(self: *Scheduler, class: Class, io: std.Io, bytes: usize, done: ?*std.Io.Event, reserve_io: bool, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
+    fn submitTransientClass(self: *Scheduler, class: Class, io: std.Io, bytes: usize, done: ?*Completion, reserve_io: bool, comptime function: anytype, args: anytype) ?Task(@TypeOf(@call(.auto, function, args))) {
         if (!self.acquireClassReserved(class, bytes, reserve_io)) return null;
         const admission = std.heap.page_allocator.create(Admission) catch {
             self.releaseClass(class, bytes);
@@ -404,7 +429,7 @@ pub const Execution = struct {
 };
 
 const Admission = struct {
-    done: ?*std.Io.Event = null,
+    done: ?*Completion = null,
     io: std.Io,
     scheduler: *Scheduler,
     bytes: usize,
@@ -451,13 +476,13 @@ pub fn Task(comptime Result: type) type {
 /// Join notified void jobs in completion order. Failures and caller cancellation
 /// retire every sibling before the coordinator can release callback storage.
 /// Every active task must use submit*Notified with this same readiness event.
-pub fn joinNotified(io: std.Io, ready: *std.Io.Event, tasks: []?Task(anyerror!void)) anyerror!void {
+pub fn joinNotified(io: std.Io, ready: *Completion, tasks: []?Task(anyerror!void)) anyerror!void {
     errdefer for (tasks) |*task| if (task.*) |*held| {
         _ = held.cancel(io) catch {};
         task.* = null;
     };
     while (true) {
-        ready.reset();
+        const observed = ready.observe();
         var pending = false;
         for (tasks) |*task| if (task.*) |*held| {
             std.debug.assert(held.transient != null and held.transient.?.done == ready);
@@ -470,7 +495,7 @@ pub fn joinNotified(io: std.Io, ready: *std.Io.Event, tasks: []?Task(anyerror!vo
             try outcome;
         };
         if (!pending) return;
-        try ready.wait(io);
+        try ready.wait(io, observed);
     }
 }
 
@@ -814,6 +839,56 @@ test "external lake Parquet pull coordinators leave execution and required state
     }
 }
 
+test "SQL shared completion epochs preserve coalesced notifications before parking" {
+    const io = std.testing.io;
+    var ready: Completion = .{};
+    const observed = ready.observe();
+    // Both children can finish after the coordinator's readiness scan but
+    // before its futex wait. No subsequent completion is needed to wake it.
+    ready.set(io);
+    ready.set(io);
+    try ready.wait(io, observed);
+    try std.testing.expectEqual(@as(u32, 2), ready.observe());
+    ready.epoch.store(std.math.maxInt(u32), .release);
+    const previous = ready.observe();
+    ready.set(io);
+    try ready.wait(io, previous);
+    try std.testing.expectEqual(@as(u32, 0), ready.observe());
+}
+
+test "SQL shared completion park checks request expiry without a notification" {
+    const Context = struct {
+        calls: *usize,
+        fn ensureActive(self: @This()) !void {
+            self.calls.* += 1;
+            if (self.calls.* == 2) return error.DeadlineExceeded;
+        }
+    };
+    var calls: usize = 0;
+    const context: Context = .{ .calls = &calls };
+    var ready: Completion = .{};
+    try std.testing.expectError(error.DeadlineExceeded, ready.waitChecked(std.testing.io, ready.observe(), context));
+    try std.testing.expectEqual(@as(usize, 2), calls);
+}
+
+test "SQL shared completion cohorts drain immediate workers without retaining admission" {
+    const Worker = struct {
+        fn run() anyerror!void {}
+    };
+    var scheduler: Scheduler = .{ .max_workers = 2, .max_io_workers = 2 };
+    for (0..2048) |_| {
+        var ready: Completion = .{};
+        var tasks: [2]?Task(anyerror!void) = @splat(null);
+        defer for (&tasks) |*task| if (task.*) |*held| {
+            _ = held.cancel(std.testing.io) catch {};
+        };
+        for (&tasks) |*task| task.* = scheduler.submitIoNotified(std.testing.io, 1, &ready, Worker.run, .{}) orelse return error.TestUnexpectedSaturation;
+        try joinNotified(std.testing.io, &ready, &tasks);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.workers);
+        try std.testing.expectEqual(@as(usize, 0), scheduler.bytes);
+    }
+}
+
 test "SQL shared notified joins cancel parked siblings before callback teardown" {
     const State = struct {
         scheduler: Scheduler = .{ .max_io_workers = 2 },
@@ -829,7 +904,7 @@ test "SQL shared notified joins cancel parked siblings before callback teardown"
         }
         fn coordinator(self: *@This()) anyerror!void {
             const io = std.testing.io;
-            var ready: std.Io.Event = .unset;
+            var ready: Completion = .{};
             var tasks: [2]?Task(anyerror!void) = @splat(null);
             defer for (&tasks) |*task| if (task.*) |*held| {
                 _ = held.cancel(io) catch {};

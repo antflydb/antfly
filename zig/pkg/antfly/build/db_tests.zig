@@ -824,9 +824,18 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const lib_db_text_query_step = b.step("antfly-storage-db-text-query-test", "Run focused full-text query guardrail tests");
     lib_db_text_query_step.dependOn(&run_lib_db_text_query_tests.step);
 
+    const native_artifact_stream_tests = b.addTest(.{
+        .root_module = antfly_test_mod,
+        .filters = &.{ "native asset members hydrate source authority and revision identity", "native unit ancestry uses its configured producer name", "native member logical filters use parent values and shared verification budgets", "missing modality producers and transcription failures remain incomplete" },
+    });
+    b.step("antfly-native-artifact-stream-test", "Test native asset provenance and configurable unit ancestry").dependOn(&b.addRunArtifact(native_artifact_stream_tests).step);
     const lib_db_result_shape_tests = b.addTest(.{
         .root_module = antfly_test_mod,
         .filters = &.{
+            "native asset members hydrate source authority and revision identity",
+            "native unit ancestry uses its configured producer name",
+            "native member logical filters use parent values and shared verification budgets",
+            "missing modality producers and transcription failures remain incomplete",
             "dedupeSearchHitsById uses ordinals when hit page is complete",
             "exact-id dedupe preserves distinct chunks sharing a parent ordinal",
             "applyStoredSearchPatternFilters reports lower-bound total for filtered page window",

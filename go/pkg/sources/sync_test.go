@@ -99,7 +99,7 @@ func TestSharedSyncSkipsUnchangedRecordsAndRetainsIndexingTime(t *testing.T) {
 	backend.mu.Lock()
 	var before []byte
 	for _, row := range backend.records {
-		if grep, ok := row["grep"].(map[string]any); ok {
+		if grep, ok := row["source"].(map[string]any); ok {
 			grep["indexed_at"] = float64(123)
 		}
 		before, _ = json.Marshal(row)

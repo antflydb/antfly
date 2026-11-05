@@ -2764,15 +2764,20 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
 /// constant-time. A plan may be reused for any number of documents while the
 /// caller provides per-document scratch allocation to `matches*`.
 pub const PreparedPatternFilter = struct {
-    arena: std.heap.ArenaAllocator,
+    // Logical matchers retain this allocator for lazy regex VM storage. Keep
+    // its address stable when the prepared filter moves into a cache or plan.
+    arena: *std.heap.ArenaAllocator,
     compiled: CompiledPatternFilter,
 
+    fn empty(backing_alloc: Allocator) !PreparedPatternFilter {
+        const arena = try backing_alloc.create(std.heap.ArenaAllocator);
+        arena.* = std.heap.ArenaAllocator.init(backing_alloc);
+        return .{ .arena = arena, .compiled = undefined };
+    }
+
     pub fn init(backing_alloc: Allocator, filter_query_json: []const u8) !PreparedPatternFilter {
-        var out = PreparedPatternFilter{
-            .arena = std.heap.ArenaAllocator.init(backing_alloc),
-            .compiled = undefined,
-        };
-        errdefer out.arena.deinit();
+        var out = try empty(backing_alloc);
+        errdefer out.deinit();
         const arena_alloc = out.arena.allocator();
         const filter_query = try std.json.parseFromSliceLeaky(
             std.json.Value,
@@ -2785,11 +2790,8 @@ pub const PreparedPatternFilter = struct {
     }
 
     pub fn initValue(backing_alloc: Allocator, filter_query: std.json.Value) !PreparedPatternFilter {
-        var out = PreparedPatternFilter{
-            .arena = std.heap.ArenaAllocator.init(backing_alloc),
-            .compiled = undefined,
-        };
-        errdefer out.arena.deinit();
+        var out = try empty(backing_alloc);
+        errdefer out.deinit();
         const arena_alloc = out.arena.allocator();
         // Parsing an existing Value returns it unchanged, even with alloc_always.
         // Compiled predicates must outlive the caller's JSON parser.
@@ -2799,7 +2801,10 @@ pub const PreparedPatternFilter = struct {
     }
 
     pub fn deinit(self: *PreparedPatternFilter) void {
-        self.arena.deinit();
+        const arena = self.arena;
+        const backing_alloc = arena.child_allocator;
+        arena.deinit();
+        backing_alloc.destroy(arena);
         self.* = undefined;
     }
 
@@ -2892,7 +2897,7 @@ fn bindOrdinalFields(
     layout: *const relational_row_codec.PhysicalLayout,
 ) !void {
     switch (filter) {
-        .match_all, .match_none, .doc_id => {},
+        .match_all, .match_none, .doc_id, .logical_value => {},
         .conjuncts, .disjuncts => |items| for (items) |item|
             try bindOrdinalFields(alloc, ordinals, item, table_schema, layout),
         .bool_query => |query| {
@@ -2951,6 +2956,64 @@ test "prepared pattern filters own source JSON" {
         "doc-1",
         stored,
     ));
+}
+
+const LogicalFilterLifetime = struct {
+    const query =
+        \\{"value":{"kind":"matches","field":"payload.text","text":"^(Connection|Network)-[A-Z][a-z]+$"}}
+    ;
+    const stored =
+        \\{"payload":{"text":["ignored","Connection-Refused"]}}
+    ;
+    noinline fn prepare(a: Allocator, from_value: bool) !PreparedPatternFilter {
+        if (!from_value) {
+            const bytes = try a.dupe(u8, query);
+            defer a.free(bytes);
+            return PreparedPatternFilter.init(a, bytes);
+        }
+        var parsed = try std.json.parseFromSlice(std.json.Value, a, query, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        return PreparedPatternFilter.initValue(a, parsed.value);
+    }
+    fn exercise(a: Allocator, from_value: bool) !void {
+        var original = try prepare(a, from_value);
+        var transferred = false;
+        defer if (!transferred) original.deinit();
+        const moved = try a.create(PreparedPatternFilter);
+        defer a.destroy(moved);
+        moved.* = original;
+        transferred = true;
+        original = undefined;
+        defer moved.deinit();
+        try std.testing.expect(moved.compiled == .logical_value);
+        const matcher = moved.compiled.logical_value;
+        // Assert retained identity directly: immediate unit evaluation can
+        // accidentally reuse the dead builder stack and hide the real bug.
+        try std.testing.expectEqual(@intFromPtr(moved.arena), @intFromPtr(matcher.budget.backing.ptr));
+        try std.testing.expect(!matcher.runner.?.storage_ready);
+        try std.testing.expect(try moved.matchesStored(a, "allowed", stored));
+        try std.testing.expect(matcher.runner.?.storage_ready);
+        try std.testing.expect(!try moved.matchesStored(a, "denied", "{\"payload\":{\"text\":\"Connection.Refused\"}}"));
+        try std.testing.expect(try moved.matchesStored(a, "allowed-again", stored));
+    }
+};
+
+test "prepared pattern filters retain lazy regex allocator ownership across moves JSON retirement and every allocation failure" {
+    for ([_]bool{ false, true }) |from_value| {
+        try LogicalFilterLifetime.exercise(std.testing.allocator, from_value);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, LogicalFilterLifetime.exercise, .{from_value});
+    }
+}
+
+test "prepared pattern filters keep lazy regex owners stable through graph cache admission and reuse" {
+    const a = std.testing.allocator;
+    var cache = PreparedPatternFilterCache.init(a);
+    defer cache.deinit();
+    const filter = try cache.getOrPrepare(LogicalFilterLifetime.query);
+    try std.testing.expectEqual(@intFromPtr(filter.arena), @intFromPtr(filter.compiled.logical_value.budget.backing.ptr));
+    try std.testing.expect(try filter.matchesStored(a, "allowed", LogicalFilterLifetime.stored));
+    try std.testing.expectEqual(filter, try cache.getOrPrepare(LogicalFilterLifetime.query));
+    try std.testing.expect(!try filter.matchesStored(a, "missing", "{}"));
 }
 
 test "prepared pattern filters address large authenticated payloads without scratch allocations" {
@@ -3218,6 +3281,7 @@ pub const CompiledPatternFilter = union(enum) {
     disjuncts: []CompiledPatternFilter,
     bool_query: BoolQuery,
     field_matcher: FieldMatcher,
+    logical_value: *@import("../../../search/value_query.zig").Matcher,
 
     pub const BoolQuery = struct {
         must: []CompiledPatternFilter = &.{},
@@ -3433,6 +3497,42 @@ pub const CompiledPatternFilter = union(enum) {
         prefix_len: u8,
     };
 
+    pub fn hasLogicalValues(self: CompiledPatternFilter) bool {
+        return switch (self) {
+            .logical_value => true,
+            .conjuncts, .disjuncts => |items| blk: {
+                for (items) |item| if (item.hasLogicalValues()) break :blk true;
+                break :blk false;
+            },
+            .bool_query => |b| blk: {
+                for (b.must) |item| if (item.hasLogicalValues()) break :blk true;
+                for (b.should) |item| if (item.hasLogicalValues()) break :blk true;
+                for (b.must_not) |item| if (item.hasLogicalValues()) break :blk true;
+                break :blk false;
+            },
+            else => false,
+        };
+    }
+
+    pub const VerificationInput = enum { scan, known_keys };
+
+    pub fn bindValueWork(self: CompiledPatternFilter, work: *@import("../../../search/value_query.zig").Work, policy: @import("../../../search/value_query.zig").Policy, input: VerificationInput) !void {
+        switch (self) {
+            .logical_value => |matcher| {
+                if (!policy.allow_scan and input != .known_keys) return error.ValueSearchRequiresScan;
+                matcher.work = work;
+                matcher.policy = policy;
+            },
+            .conjuncts, .disjuncts => |items| for (items) |item| try item.bindValueWork(work, policy, input),
+            .bool_query => |b| {
+                for (b.must) |item| try item.bindValueWork(work, policy, input);
+                for (b.should) |item| try item.bindValueWork(work, policy, input);
+                for (b.must_not) |item| try item.bindValueWork(work, policy, input);
+            },
+            else => {},
+        }
+    }
+
     pub fn needsStoredDoc(self: CompiledPatternFilter) bool {
         return switch (self) {
             .match_all, .match_none, .doc_id => false,
@@ -3450,12 +3550,13 @@ pub const CompiledPatternFilter = union(enum) {
                 for (bool_query.must_not) |item| if (item.needsStoredDoc()) break :blk true;
                 break :blk false;
             },
-            .field_matcher => true,
+            .field_matcher, .logical_value => true,
         };
     }
 
     pub fn matches(self: CompiledPatternFilter, alloc: Allocator, key: []const u8, doc: std.json.Value) !bool {
         return switch (self) {
+            .logical_value => |matcher| try matcher.document(doc),
             .match_all => true,
             .match_none => false,
             .doc_id => |ids| blk: {
@@ -3524,6 +3625,7 @@ pub const CompiledPatternFilter = union(enum) {
         ordinal_bindings: ?*const std.StringHashMapUnmanaged(?u32),
     ) !?bool {
         return switch (self) {
+            .logical_value => null,
             .match_all => true,
             .match_none => false,
             .doc_id => |ids| blk: {
@@ -3783,6 +3885,13 @@ fn compilePatternFilterBounded(
     remaining_nodes.* -= 1;
     _ = try pattern_filter_contract.requireSingleRoot(filter_query);
 
+    if (filter_query.object.get("value")) |value| {
+        const values = @import("../../../search/value_query.zig");
+        const spec = try std.json.parseFromValue(values.Spec, alloc, value, .{});
+        const matcher = try alloc.create(values.Matcher);
+        try matcher.init(alloc, spec.value);
+        return .{ .logical_value = matcher };
+    }
     if (filter_query.object.get("match_all") != null) return .match_all;
     if (filter_query.object.get("match_none") != null) return .match_none;
     if (filter_query.object.get("doc_id")) |doc_id| {

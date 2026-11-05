@@ -19,6 +19,7 @@ test {
     _ = @import("api/lake_wal_collectors.zig");
     _ = @import("api/lake_wal_cut_cache.zig");
     _ = @import("serverless/wal/indexed_object_store.zig");
+    _ = @import("serverless/wal/object_store.zig");
     _ = @import("serverless/wal/collector.zig");
     _ = @import("serverless/lake_wal.zig");
 }

@@ -53,6 +53,9 @@ pub const RequestCancellation = struct {
     borrowed: ?*const std.atomic.Value(bool) = null,
     borrowed_context: ?*const anyopaque = null,
     borrowed_is_cancelled: ?*const fn (*const anyopaque) bool = null,
+    /// Preserve both the semantic checkpoint and its error-domain dispatcher.
+    /// Boolean transport probes must remain separate from fallible checkpoints.
+    borrowed_token: CancellationToken = .none,
 
     pub fn cancel(self: *RequestCancellation) void {
         self.cancelled.store(true, .release);
@@ -61,7 +64,7 @@ pub const RequestCancellation = struct {
     pub fn isCancelled(self: *const RequestCancellation) bool {
         return self.cancelled.load(.acquire) or
             (self.borrowed != null and self.borrowed.?.load(.acquire)) or
-            self.isBorrowedCallbackCancelled();
+            self.isBorrowedCallbackCancelled() or self.borrowed_token.isCancelled();
     }
 
     fn isBorrowedCallbackCancelled(self: *const RequestCancellation) bool {
@@ -85,14 +88,20 @@ pub const RequestCancellation = struct {
                     return cancellation.isCancelled();
                 }
             }.call,
+            .check_fn = struct {
+                fn call(raw: *const anyopaque) !void {
+                    const cancellation: *const RequestCancellation = @ptrCast(@alignCast(raw));
+                    if (cancellation.cancelled.load(.acquire) or
+                        (cancellation.borrowed != null and cancellation.borrowed.?.load(.acquire)) or
+                        cancellation.isBorrowedCallbackCancelled()) return error.Canceled;
+                    try cancellation.borrowed_token.check();
+                }
+            }.call,
         };
     }
 
     pub fn fromToken(token_value: CancellationToken) RequestCancellation {
-        return .{
-            .borrowed_context = token_value.ptr,
-            .borrowed_is_cancelled = token_value.is_cancelled_fn,
-        };
+        return .{ .borrowed_token = token_value };
     }
 };
 

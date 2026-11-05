@@ -3,6 +3,8 @@ if [[ ${words[2]} == workspace && CURRENT == 3 ]]; then compadd serve; return; f
 _arguments -s \
  '--after-context[after-context]:value:' \
  '--agent[agent]:value:(codex claude-code opencode)' \
+ '--all-artifacts[all-artifacts]' \
+ '--artifact[artifact]:value:' \
  '--ask[ask]:value:' \
  '--auto-hybrid-regex[auto-hybrid-regex]' \
  '--backend[backend]:value:(http antfly local)' \

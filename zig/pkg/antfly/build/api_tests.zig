@@ -180,6 +180,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "api query contract serializes derived hierarchy ancestry",
         "api query contract serializes mention evidence hierarchy",
         "api query contract validates canonical hierarchy controls",
+        "native member traversal requires producer and private parent admission",
+        "native member ancestry ignores payload source and unit identities",
+        "reshapeChunkBackedResult hydrates direct chunk ancestors",
+        "native member parent admission uses exact source candidates",
+        "native member value verification retains scan policy and work budgets",
+        "native member verification preserves candidate provenance after native filtering",
         "query max score preserves negative relevance scores",
         "query hit exposes relevance score and raw vector distance separately",
         "query merge orders pure dense results by descending relevance score",
@@ -2414,6 +2420,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL EXPLAIN original reads and options preserve full execution RLS and cold owners",
             "mounted SQL original document identity assignment rejects before commit and preserves cold versions",
             "SQL view catalog",
+            "SQL view filters",
             "mounted SQL range values preserve native bytes typed results and cold owners",
             "mounted SQL original temporal keys enforce intervals and retain all cold owners",
             "api http client temporal probes use bounded bodies and preserve constraint rejection",
@@ -2676,7 +2683,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     collection_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-collection-lifecycle-test", "Verify PostgreSQL ordinary aggregates through native columns, views, row filters and cold owners")
         .dependOn(&collection_run.step);
-    const view_domain_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL temporal view domains survive nested replacement and cold owners", "mounted SQL original document identity assignment rejects before commit and preserves cold versions", "SQL view catalog" });
+    const view_domain_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL temporal view domains survive nested replacement and cold owners", "mounted SQL original document identity assignment rejects before commit and preserves cold versions", "SQL view catalog", "SQL view filters" });
     view_domain_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-view-domain-lifecycle-test", "Verify exact view domains and immutable envelope identity across owner recovery")
         .dependOn(&view_domain_run.step);

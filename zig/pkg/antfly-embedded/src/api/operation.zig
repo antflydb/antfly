@@ -217,7 +217,25 @@ pub const RequestContext = struct {
     catalog_route_fence_json: []const u8 = "",
 
     pub fn ensureActive(self: RequestContext) ApiError!void {
-        if (self.cancellation.isCancelled()) return error.Canceled;
+        // This is a fallible operation checkpoint, not a transport probe.
+        // Preserve scoped expiry rather than collapsing it into a client
+        // disconnect through isCancelled(). Unknown fence failures still abort.
+        self.cancellation.check() catch |err| return switch (err) {
+            error.DeadlineExceeded => error.DeadlineExceeded,
+            else => error.Canceled,
+        };
+        try self.ensureDeadlineActive();
+    }
+
+    /// Nonblocking transport probe. Keep explicit parent probes separate from
+    /// fallible checkpoints, which can renew leases or use task-local I/O.
+    pub fn isCancellationRequested(self: RequestContext) bool {
+        if (self.cancellation.isCancelled()) return true;
+        self.ensureDeadlineActive() catch return true;
+        return false;
+    }
+
+    fn ensureDeadlineActive(self: RequestContext) ApiError!void {
         if (self.deadline_ns) |deadline| {
             const now_ns = if (self.deadline_io) |borrow| blk: {
                 var receiver = borrow.receive() catch return error.Internal;

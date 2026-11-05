@@ -770,10 +770,10 @@ func (s *Service) pinMedia(ctx context.Context, source Source, request Request, 
 	if item.Size < 1 {
 		return MediaReference{}, fmt.Errorf("media requires a positive exact length")
 	}
-	if upper, _ := item.Metadata["size_is_upper_bound"].(bool); upper || configString(item.Metadata, "export_mime_type") != "" {
+	if upper, _ := item.Metadata["size_is_upper_bound"].(bool); upper || (configString(item.Metadata, "export_mime_type") != "" && !validContentSHA(configString(item.Metadata, "representation_sha256"))) {
 		return MediaReference{}, fmt.Errorf("media requires an original binary object with exact length")
 	}
-	item.ContentRef, item.ObjectIndex = "", 0
+	item.ObjectIndex = 0
 	item.Metadata = cloneSourceMetadata(item.Metadata)
 	delete(item.Metadata, "object_index")
 	s.mu.Lock()

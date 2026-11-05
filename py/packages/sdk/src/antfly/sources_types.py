@@ -35,11 +35,12 @@ class Source(TypedDict):
     name: str
     connection: str
     table: str
-    publication: Literal["text", "media"]
+    publication: Literal["native", "text", "media"]
     state: str
     config: dict[str, Any]
     permissions: Permissions
     permission_ttl_seconds: NotRequired[int]
+    streams: NotRequired[list[TextStream]]
 
 
 class Run(TypedDict):
@@ -82,3 +83,15 @@ class Mutation(TypedDict):
 class RunInput(TypedDict):
     restart: NotRequired[bool]
     operation: NotRequired[Literal["sync", "purge"]]
+
+
+class TextStream(TypedDict):
+    name: str
+    artifact: NotRequired[str]
+    index: NotRequired[str]
+    field: str
+    purpose: NotRequired[str]
+    location_field: NotRequired[str]
+    default: bool
+    generated: NotRequired[bool]
+    boundary: NotRequired[Literal["record", "unit"]]

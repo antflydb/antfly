@@ -81,6 +81,65 @@ pub fn orderedApplyDisposition(
     return .already_applied;
 }
 
+/// Outcome receipts for exported writes (autocommit SQL and batch exports).
+///
+/// Each writer (one per public handle, rotated after an unknown outcome)
+/// overwrites one marker with the sequence of its latest call, atomically with
+/// that call's primary write. A call that ends with an unknown outcome hands the
+/// caller `(writer, sequence)`, and the writer is retired so its marker never
+/// moves again. Once the store has reconciled the uncertain commit, the marker
+/// answers exactly: equal to the sequence means applied, lower or absent means
+/// not applied.
+pub const OutcomeMarker = struct {
+    writer: [outcome_writer_len]u8,
+    sequence: u64,
+};
+
+pub const outcome_writer_len = 16;
+pub const outcome_marker_key_len = internal_keys.outcome_receipt_prefix.len + outcome_writer_len;
+pub const outcome_marker_value_len = @sizeOf(u64);
+
+pub fn outcomeMarkerKey(writer: [outcome_writer_len]u8) [outcome_marker_key_len]u8 {
+    var key: [outcome_marker_key_len]u8 = undefined;
+    @memcpy(key[0..internal_keys.outcome_receipt_prefix.len], &internal_keys.outcome_receipt_prefix);
+    @memcpy(key[internal_keys.outcome_receipt_prefix.len..], &writer);
+    return key;
+}
+
+pub fn outcomeMarkerWrite(
+    marker: OutcomeMarker,
+    key_buf: *[outcome_marker_key_len]u8,
+    value_buf: *[outcome_marker_value_len]u8,
+) docstore_mod.KVPair {
+    key_buf.* = outcomeMarkerKey(marker.writer);
+    std.mem.writeInt(u64, value_buf, marker.sequence, .little);
+    return .{ .key = key_buf[0..], .value = value_buf[0..] };
+}
+
+/// The writer's last applied sequence, or null if none of its calls applied.
+pub fn readOutcomeMarker(alloc: Allocator, store: *docstore_mod.DocStore, writer: [outcome_writer_len]u8) !?u64 {
+    const key = outcomeMarkerKey(writer);
+    const raw = store.get(alloc, &key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    defer alloc.free(raw);
+    if (raw.len != outcome_marker_value_len) return error.CorruptOutcomeMarker;
+    return std.mem.readInt(u64, raw[0..outcome_marker_value_len], .little);
+}
+
+pub const OutcomeDisposition = enum { applied, not_applied };
+
+pub fn outcomeDisposition(persisted: ?u64, sequence: u64) !OutcomeDisposition {
+    if (sequence == 0) return error.InvalidOutcomeReceipt;
+    const last = persisted orelse return .not_applied;
+    if (last == sequence) return .applied;
+    if (last < sequence) return .not_applied;
+    // A retired writer never writes again, so a later sequence means the
+    // receipt does not belong to this marker.
+    return error.InvalidOutcomeReceipt;
+}
+
 pub const replication_applied_lsn_value_len: usize = @sizeOf(u64);
 
 pub fn replicationAppliedSequenceWrite(lsn: u64, value_buf: *[replication_applied_lsn_value_len]u8) docstore_mod.KVPair {
@@ -125,6 +184,22 @@ test "storage.hot_standby apply receipts preserve independent Raft and HA encodi
     try std.testing.expectEqualSlices(u8, &.{ 8, 7, 6, 5, 4, 3, 2, 1, 9, 0, 0, 0, 0, 0, 0, 0 }, ordered.value);
     try std.testing.expectEqualSlices(u8, &.{ 11, 0, 0, 0, 0, 0, 0, 0 }, replication.value);
     try std.testing.expect(!std.mem.eql(u8, ordered.key, replication.key));
+}
+
+test "outcome receipt markers use a released key family and answer exactly" {
+    var key_buf: [outcome_marker_key_len]u8 = undefined;
+    var value_buf: [outcome_marker_value_len]u8 = undefined;
+    const writer: [outcome_writer_len]u8 = @splat(0xab);
+    const write = outcomeMarkerWrite(.{ .writer = writer, .sequence = 7 }, &key_buf, &value_buf);
+    // The key family is persisted: a rename must not strand receipts.
+    try std.testing.expectEqualSlices(u8, &.{ 0x02, 0xff, 0x55 }, write.key[0..3]);
+    try std.testing.expectEqualSlices(u8, &writer, write.key[3..]);
+    try std.testing.expectEqualSlices(u8, &.{ 7, 0, 0, 0, 0, 0, 0, 0 }, write.value);
+    try std.testing.expectEqual(OutcomeDisposition.applied, try outcomeDisposition(7, 7));
+    try std.testing.expectEqual(OutcomeDisposition.not_applied, try outcomeDisposition(6, 7));
+    try std.testing.expectEqual(OutcomeDisposition.not_applied, try outcomeDisposition(null, 7));
+    try std.testing.expectError(error.InvalidOutcomeReceipt, outcomeDisposition(8, 7));
+    try std.testing.expectError(error.InvalidOutcomeReceipt, outcomeDisposition(null, 0));
 }
 
 test "storage.hot_standby apply receipts reject conflicting identities without advancing progress" {

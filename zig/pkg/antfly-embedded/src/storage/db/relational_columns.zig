@@ -2276,6 +2276,7 @@ const Decoder = struct {
 
 fn supports(filter: graph.CompiledPatternFilter) bool {
     return switch (filter) {
+        .logical_value => false,
         .match_all, .match_none, .doc_id => true,
         .field_matcher => |matcher| switch (matcher.path) {
             .single => true,

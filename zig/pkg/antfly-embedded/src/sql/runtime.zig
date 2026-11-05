@@ -1384,6 +1384,19 @@ pub const Context = struct {
                         if (top_k) |*operator| {
                             const keys = try scratch.alloc([]const Datum, selected_count);
                             for (selection[0..selected_count], keys, 0..) |physical, *out, lane| {
+                                // The output coercion above already owns each
+                                // typed key. Borrow its contiguous one-cell
+                                // slice for the common single-output ordering;
+                                // TopK retains winners before this page retires.
+                                if (self.binding.order_keys.len == 1) {
+                                    const key = self.binding.order_keys[0];
+                                    if (key.source == .output) {
+                                        if (view.coerced[key.source.output]) |values| {
+                                            out.* = values[lane..][0..1];
+                                            continue;
+                                        }
+                                    }
+                                }
                                 const row_keys = try scratch.alloc(Datum, self.binding.order_keys.len);
                                 for (self.binding.order_keys, row_keys) |key, *sort_key| sort_key.* = switch (key.source) {
                                     .output => |column| try batch.cell(scratch, lane, column),
@@ -6408,6 +6421,7 @@ test "SQL runtime executes spilled order group distinct and join under a small s
         defer compiled.deinit();
         var quota: MemoryBudget = .{ .backing = std.heap.page_allocator, .limit = 512 * 1024 };
         defer std.debug.assert(quota.live == 0);
+        errdefer std.debug.print("bounded SQL spill failed sql={s} allocator_peak={d}\n", .{ case.sql, quota.peak });
         var result = try execute(quota.allocator(), backend, &compiled, &.{}, .{ .retained_bytes = 256 * 1024, .page_rows = 16 });
         defer result.deinit();
         try std.testing.expectEqual(@as(usize, 2), result.output.rows.len);

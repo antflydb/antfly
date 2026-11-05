@@ -56,11 +56,12 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topo
     const authority = server.source.lakeIndexLifecycleAuthority(request_context) orelse return error.ExternalLakeIndexUnavailable;
     const state = try authority.readState(scratch, table.table_id);
     const now = @import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms;
-    for (state.publications) |publication| {
+    for (try state.gcPublications(scratch)) |publication| {
+        const building = if (state.checkpoint) |saved| saved.generation == publication.generation and std.mem.eql(u8, &saved.token, &publication.token) else false;
         const live_reader = for (state.readers) |reader| {
             if (reader.generation == publication.generation and reader.expires_ms +| @import("../metadata/lake_index_lifecycle.zig").grace_ms >= now) break true;
         } else false;
-        if (state.current != publication.generation and !live_reader) continue;
+        if (!building and state.current != publication.generation and !live_reader) continue;
         if (publication.base_source != .external_iceberg) return error.InvalidLakeCatalog;
         const id = publication.base_source.external_iceberg.snapshot_id;
         try protected.append(scratch, id);
@@ -71,7 +72,9 @@ pub fn execute(a: A, server: *server_api.ApiHttpServer, table: local.common_topo
         wal_cut = @min(wal_cut, coverage);
     }
     if (request.action == .vacuum) {
-        const result = try @import("../serverless/lake_vacuum.zig").run(a, binding, options, context, .{ .operation_id = request.operation_id, .dry_run = request.dry_run, .exclusive_ownership = request.exclusive_ownership, .retain_ms = request.retain_ms, .keep_latest = request.keep_latest, .max_deleted = request.max_deleted }, protected.items);
+        const vacuum = @import("../serverless/lake_vacuum.zig");
+        const protected_snapshots = try vacuum.protectOverlayAncestry(scratch, root, protected.items);
+        const result = try vacuum.run(a, binding, options, context, .{ .operation_id = request.operation_id, .dry_run = request.dry_run, .exclusive_ownership = request.exclusive_ownership, .retain_ms = request.retain_ms, .keep_latest = request.keep_latest, .max_deleted = request.max_deleted }, protected_snapshots);
         return .{ .body = try std.json.Stringify.valueAlloc(a, result, .{}), .mutated = !request.dry_run and result.expired_snapshots != 0 };
     }
     var opened = try ingestion.openQueue(a, binding, options);

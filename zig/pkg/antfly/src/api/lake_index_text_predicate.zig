@@ -1810,7 +1810,7 @@ fn PredicateResolver(comptime Set: type) type {
 fn columnEvaluable(input: Compiled) bool {
     return switch (input) {
         .match_all, .match_none => true,
-        .doc_id => false,
+        .doc_id, .logical_value => false,
         .field_matcher => |field| column(field.path) != null,
         .conjuncts, .disjuncts => |children| blk: {
             for (children) |child| if (!columnEvaluable(child)) break :blk false;
@@ -1873,7 +1873,7 @@ fn evaluateColumns(a: A, input: Compiled, page: local.sql_catalog.ColumnPage, ma
             match.* = if (active) |lanes| lanes[row] else true;
         },
         .match_none => @memset(mask, false),
-        .doc_id => unreachable,
+        .doc_id, .logical_value => unreachable,
         .field_matcher => |field| {
             const name = column(field.path).?;
             if (page.native == null) if (page.batch.findColumn(name)) |vector| {

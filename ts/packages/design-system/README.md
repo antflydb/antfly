@@ -261,3 +261,9 @@ Tailwind v4 compiles `h-*`, `p-*`, `m-*`, `gap-*`, etc. to `calc(var(--spacing) 
 - **comfortable** — 0.3rem (~20% airier), for marketing pages with breathing room
 
 Scope it globally (on `<html>`) or locally (on a container for a single section). Fine-grained one-offs can still use `className` overrides on individual components.
+
+## License
+
+Apache-2.0. See `LICENSE`. Third-party material, including the shadcn/ui-derived
+components and the Aeonik font files, keeps its own terms; see
+`THIRD_PARTY_NOTICES.md`.

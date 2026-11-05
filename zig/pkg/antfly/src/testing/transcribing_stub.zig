@@ -22,6 +22,11 @@ pub const Provider = enum {
     antfly,
     openai,
     google,
+
+    /// Mirrors `antfly_transcribing.Provider.supportsResolvedAudio`.
+    pub fn supportsResolvedAudio(self: @This()) bool {
+        return self != .antfly;
+    }
 };
 
 pub const Config = struct {

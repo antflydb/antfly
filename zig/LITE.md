@@ -684,6 +684,13 @@ Antfly Lite should match the familiar embedded database model:
 - Serialized threading within a process: one handle may be shared by any
   number of threads, with reads running in parallel and alongside writes. See
   `CAPI.md` "Thread Safety" for the per-call access classes.
+- Background full-text replay holds the writer lease only briefly. One journal
+  record can carry about a thousand changed documents; bounded replay applies
+  it in subchunks (`ANTFLY_LITE_FULL_TEXT_REPLAY_SUBCHUNK_ITEMS`, default 128)
+  and, once a turn exceeds its quantum (`ANTFLY_LITE_FULL_TEXT_REPLAY_QUANTUM_MS`,
+  default 100), publishes the applied prefix, records a durable resume point
+  `(sequence, offset)` and continues the record on the next turn. The record's
+  sequence is marked applied only when all of its items are.
 
 The CLI should expose this plainly:
 

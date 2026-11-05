@@ -351,10 +351,41 @@ test "SQL plan cache failures preserve diagnostics and reclaim all admission" {
     try std.testing.expectEqual(@as(usize, 0), cache.stats(io).compiling);
     var normal = Cache.init(std.testing.allocator, .{});
     defer normal.deinit(io);
-    try std.testing.expectError(error.UnsupportedSqlShape, normal.acquire(io, .{ .statement = "SELECT * FROM t FOR UPDATE" }, &diagnostic));
+    try std.testing.expectError(error.UnsupportedSqlShape, normal.acquire(io, .{ .statement = "SELECT id name extra FROM t" }, &diagnostic));
     try std.testing.expect(diagnostic.start > 0);
     try std.testing.expectEqual(@as(usize, 0), normal.stats(io).entries);
     try std.testing.expectEqual(@as(usize, 0), normal.stats(io).compiling);
+}
+
+test "SQL plan cache retains row-lock write admission across cache hits and allocation failures" {
+    const Fixture = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const io = std.testing.io;
+            var cache = Cache.init(a, .{});
+            defer cache.deinit(io);
+            const statements = [_][]const u8{
+                "SELECT * FROM t FOR UPDATE",
+                "SELECT * FROM t FOR NO KEY UPDATE NOWAIT",
+                "SELECT * FROM t FOR SHARE",
+                "SELECT * FROM t FOR KEY SHARE SKIP LOCKED",
+            };
+            var diagnostic: compiler.Diagnostic = .{};
+            for (statements) |statement| {
+                var original = try cache.acquire(io, .{ .statement = statement }, &diagnostic);
+                defer original.release(io);
+                var hit = try cache.acquire(io, .{ .statement = statement }, &diagnostic);
+                defer hit.release(io);
+                try std.testing.expect(original.compiled() == hit.compiled());
+                try std.testing.expect(hit.compiled().uses_row_locks);
+                try std.testing.expect(hit.compiled().requiresWriteAdmission());
+            }
+            try std.testing.expectEqual(@as(u64, statements.len), cache.stats(io).hits);
+            try std.testing.expectEqual(@as(usize, 0), cache.stats(io).leases);
+            try std.testing.expectEqual(@as(usize, 0), cache.stats(io).compiling);
+        }
+    };
+    try Fixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.run, .{});
 }
 
 test "SQL plan cache bounds actual live allocation through byte-driven eviction" {

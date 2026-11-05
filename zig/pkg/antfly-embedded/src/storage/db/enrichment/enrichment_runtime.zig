@@ -17683,6 +17683,8 @@ fn processDocumentExtractionAsset(
         .ocr_selected_count = collect_ctx.ocr_selected_count,
         .ocr_retained_embedded_count = collect_ctx.ocr_retained_embedded_count,
         .ocr_failed_count = collect_ctx.ocr_failed_count,
+        .incomplete_unit_count = collect_ctx.incomplete_unit_count,
+        .retryable_incomplete_unit_count = collect_ctx.retryable_incomplete_unit_count,
         .ocr_retryable_failed_count = collect_ctx.ocr_retryable_failed_count,
         .ocr_failed_page_numbers = collect_ctx.ocr_failed_page_numbers.items,
         .ocr_failure_details = ocr_failure_details,
@@ -21750,7 +21752,7 @@ fn completeRuntimeDocumentExtractionGeneratedTextBatchWithAllocator(
         .ocr => document_extraction_mod.effectiveOcrConfigJson(config),
         .transcript => config.transcription_config_json,
     };
-    const borrowed_audio = kind == .transcript and (try isAppleGeneratedTextProvider(working_alloc, config_json));
+    const borrowed_audio = kind == .transcript and (try supportsBorrowedTranscriptionAudio(working_alloc, config_json));
     const audio_media = [_]asset_producer_mod.EncodedMedia{.{ .bytes = source_bytes, .mime_type = source_content_type }};
     const method = switch (kind) {
         .ocr => "ocr_text",
@@ -22917,6 +22919,9 @@ fn markRuntimeGeneratedUnitTextFailureNamed(
     unit.method = owned_method;
     unit.extraction_status = owned_status;
     unit.extraction_warning = warning;
+    // Reuse the persisted unit retryability bit for every generated-text route;
+    // its historical OCR spelling does not make transcription failures terminal.
+    unit.ocr_failure_retryable = retryable;
     switch (kind) {
         .ocr => {
             unit.ocr_attempted = true;
@@ -23540,6 +23545,8 @@ const RuntimeDocumentExtractionCollectContext = struct {
     ocr_selected_count: usize = 0,
     ocr_retained_embedded_count: usize = 0,
     ocr_failed_count: usize = 0,
+    incomplete_unit_count: usize = 0,
+    retryable_incomplete_unit_count: usize = 0,
     ocr_retryable_failed_count: usize = 0,
     ocr_failed_page_numbers: std.ArrayListUnmanaged(u32) = .empty,
     ocr_failure_summaries: std.ArrayListUnmanaged(RuntimeOcrFailureSummary) = .empty,
@@ -23710,6 +23717,15 @@ const RuntimeDocumentExtractionCollectContext = struct {
     }
 
     fn recordOcrSummary(self: *@This(), unit: document_extraction_mod.Unit) !void {
+        if (unit.extraction_status) |status| {
+            if (std.mem.startsWith(u8, status, "failed_") or std.mem.startsWith(u8, status, "pending_") or
+                std.mem.eql(u8, status, document_extraction_mod.ocr_not_configured_status) or
+                std.mem.eql(u8, status, document_extraction_mod.transcription_not_configured_status))
+            {
+                self.incomplete_unit_count += 1;
+                if (unit.ocr_failure_retryable orelse false) self.retryable_incomplete_unit_count += 1;
+            }
+        }
         if (!unit.ocr_attempted) return;
         self.ocr_attempted_count += 1;
         if (unit.ocr_used) self.ocr_selected_count += 1;
@@ -34033,6 +34049,8 @@ fn documentExtractionManifestPayloadAlloc(
     try appendJsonFieldUsize(alloc, &out, &first, "ocr_selected_count", extraction.ocr_selected_count);
     try appendJsonFieldUsize(alloc, &out, &first, "ocr_retained_embedded_count", extraction.ocr_retained_embedded_count);
     try appendJsonFieldUsize(alloc, &out, &first, "ocr_failed_count", extraction.ocr_failed_count);
+    try appendJsonFieldUsize(alloc, &out, &first, "incomplete_unit_count", extraction.incomplete_unit_count);
+    try appendJsonFieldUsize(alloc, &out, &first, "retryable_incomplete_unit_count", extraction.retryable_incomplete_unit_count);
     try appendJsonFieldUsize(alloc, &out, &first, "ocr_retryable_failed_count", extraction.ocr_retryable_failed_count);
     try appendJsonFieldName(alloc, &out, &first, "ocr_failed_page_numbers");
     try out.append(alloc, '[');
@@ -35928,7 +35946,11 @@ test "durable enrichment server retry deadline survives restart without early ex
         setRetryAfterHint(&runtime, hint);
         runtime.recordRetryableError(std.testing.io, error.RemoteDocumentFetchFailed, .request);
         const deadline = runtime.next_retry_at_ms;
-        try std.testing.expectEqual(before +| hint, deadline);
+        // Never before the server's minimum; after it, at most the bounded
+        // jitter window (half the capped backoff).
+        const cap = transient_worker_retry_max_sleep_ms;
+        try std.testing.expect(deadline >= before +| hint);
+        try std.testing.expect(deadline <= before +| @max(hint, cap) +| cap / 2);
         try std.testing.expectEqual(@as(u64, 0), runtime.retry_after_hint_ms);
         const persisted = try enrichment_state.loadRuntimeStatus(alloc, runtime.store, scope_name);
         try std.testing.expectEqual(deadline, persisted.next_retry_at_ms);
@@ -35942,7 +35964,10 @@ test "durable enrichment server retry deadline survives restart without early ex
         try std.testing.expectEqual(deadline, runtime.next_retry_at_ms);
         try std.testing.expectEqual(ForegroundCatchUpDecision.retry_in_progress, foregroundCatchUpDecision(runtime.applied_sequence, 7, runtime.target_sequence, runtime.worker_failed, runtime.retrying, clock.clock().nowRealtimeMs() >= runtime.next_retry_at_ms));
         if (hint != std.math.maxInt(u64)) {
-            clock.advanceMs(hint - 30_000);
+            // Still waiting just before the persisted deadline, runnable at it.
+            clock.advanceMs(deadline - 1 - clock.clock().nowRealtimeMs());
+            try std.testing.expectEqual(ForegroundCatchUpDecision.retry_in_progress, foregroundCatchUpDecision(runtime.applied_sequence, 7, runtime.target_sequence, runtime.worker_failed, runtime.retrying, clock.clock().nowRealtimeMs() >= runtime.next_retry_at_ms));
+            clock.advanceMs(1);
             try std.testing.expectEqual(ForegroundCatchUpDecision.run_pass, foregroundCatchUpDecision(runtime.applied_sequence, 7, runtime.target_sequence, runtime.worker_failed, runtime.retrying, clock.clock().nowRealtimeMs() >= runtime.next_retry_at_ms));
         }
     }
@@ -40492,10 +40517,17 @@ test "graph projection routing writer honors root tags without nested suppressio
     }
 }
 
-fn isAppleGeneratedTextProvider(alloc: Allocator, config_json: []const u8) !bool {
-    var parsed = try std.json.parseFromSlice(struct { provider: []const u8 = "" }, alloc, config_json, .{ .ignore_unknown_fields = true });
+/// Whether the transcriber can take the already acquired recording. A provider
+/// this build does not recognize (or a config it cannot read) keeps the
+/// URL-based path; the producer itself validates its configuration.
+fn supportsBorrowedTranscriptionAudio(alloc: Allocator, config_json: []const u8) !bool {
+    const transcribing = @import("antfly_transcribing");
+    var parsed = std.json.parseFromSlice(struct { provider: transcribing.Provider }, alloc, config_json, .{ .ignore_unknown_fields = true }) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
     defer parsed.deinit();
-    return std.mem.eql(u8, parsed.value.provider, "apple");
+    return parsed.value.provider.supportsResolvedAudio();
 }
 
 test "document extraction accepts validated reader no-text results without hiding invalid output" {
@@ -43154,6 +43186,8 @@ test "OCR retryability counts failures beyond the diagnostic sample" {
     collector.ocr_selected_count = 0;
     collector.ocr_retained_embedded_count = 0;
     collector.ocr_failed_count = 0;
+    collector.incomplete_unit_count = 0;
+    collector.retryable_incomplete_unit_count = 0;
     collector.ocr_retryable_failed_count = 0;
     collector.ocr_failed_page_numbers = .empty;
     collector.ocr_failure_summaries = .empty;
