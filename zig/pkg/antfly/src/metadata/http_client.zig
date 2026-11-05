@@ -1521,6 +1521,11 @@ pub const MetadataHttpClient = struct {
         var result: @import("../api/privacy.zig").Response = .{ .response = .{ .status = response.status, .body = try self.alloc.dupe(u8, response.body), .json = true } };
         errdefer result.deinit(self.alloc);
         result.etag = if (responseHeader(response, "ETag")) |etag| try self.alloc.dupe(u8, etag) else null;
+        // Outcome markers are meaningful on 409 as well as 503. Do not use
+        // the leader-retry helper, which intentionally matches only 503.
+        if (responseHasHeaderValueAnyStatus(response, routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown)) {
+            result.response.metadata_mutation_outcome = .unknown;
+        }
         if (responseHeader(response, "Retry-After")) |value| {
             result.response.retry_after_seconds = std.fmt.parseUnsigned(u32, std.mem.trim(u8, value, " \t\r\n"), 10) catch null;
         }

@@ -473,6 +473,27 @@ until their metadata has been explicitly admitted as sorted.
 
 ## Validation
 
+### Mutation outcome forwarding (2026-11-05)
+
+- Merge `8b041aff4c` incorporates main through
+  `6c0b004e95ad947587cbc4bbb60f4812fb714b28`. The Go SDK conflict was resolved
+  by regenerating the client and SQL policy bindings from the combined spec.
+- Metadata HTTP forwarding decodes `X-Antfly-Raft-Mutation-Outcome: unknown-v1`
+  independently of status, including both 409 and 503. Data-node forwarding
+  preserves that typed outcome and `Retry-After` when moving the response out
+  of the discovery arena. Status, body, ETag and JSON metadata are retained.
+- Both allocator handoffs share a response clone that value-copies scalar
+  metadata and duplicates only the body and optional ETag. Failure while
+  allocating either buffer releases only the new allocation and leaves the
+  source intact. This adds no RPCs, retries, body parsing or serialization.
+- Regression cases cover policy and scan mutations with success, 409 and 503
+  replies at the HTTP client and the actual remote status-source boundary.
+  They assert exactly one mutation request per invocation, including ambiguous
+  outcomes. Clone tests exercise every allocation failure with and without ETags.
+- The merged Go SDK tests pass. TypeScript SDK validation passes 593 tests
+  with one opt-in skip and passes type checking. Zig formatting, license headers
+  and the Apache boundary check pass.
+
 ### Retryable owner availability (2026-11-05)
 
 - Merge `1a27bdb5da` incorporates main through

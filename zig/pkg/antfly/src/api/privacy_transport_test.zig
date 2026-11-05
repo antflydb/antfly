@@ -325,3 +325,41 @@ test "privacy scratch preserves both outer and inner invocation limits" {
     try std.testing.expect(inner.limit_exceeded);
     try std.testing.expect(!outer.limit_exceeded);
 }
+
+test "privacy remote mutation replies retain upstream outcome on every status without replay" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        status: u16 = 202,
+        unknown: bool = false,
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, alloc: std.mem.Allocator, req: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(req.method == .PUT or req.method == .POST);
+            try std.testing.expectEqualStrings("{}", req.body);
+            const headers = try alloc.alloc(http.Header, if (self.unknown) 3 else 1);
+            headers[0] = .{ .name = try alloc.dupe(u8, "ETag"), .value = try alloc.dupe(u8, "upstream-etag") };
+            if (self.unknown) {
+                headers[1] = .{ .name = try alloc.dupe(u8, "x-antfly-raft-mutation-outcome"), .value = try alloc.dupe(u8, " unknown-v1 ") };
+                headers[2] = .{ .name = try alloc.dupe(u8, "Retry-After"), .value = try alloc.dupe(u8, "1") };
+            }
+            return .{ .status = self.status, .body = try alloc.dupe(u8, "{\"code\":\"upstream\"}"), .headers = headers };
+        }
+    };
+    var fake: Fake = .{};
+    var client = @import("../metadata/http_client.zig").MetadataHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+    var expected_calls: usize = 0;
+    for ([_]u16{ 202, 409, 503 }) |status| for ([_]bool{ false, true }) |scan| {
+        fake.status = status;
+        fake.unknown = status != 202;
+        var result = try client.forwardPrivacyMutation("http://metadata", "docs", "{}", if (scan) null else "etag", scan, .{});
+        defer result.deinit(a);
+        expected_calls += 1;
+        try std.testing.expectEqual(expected_calls, fake.calls);
+        try std.testing.expectEqual(status, result.response.status);
+        try std.testing.expectEqualStrings("{\"code\":\"upstream\"}", result.response.body);
+        try std.testing.expectEqualStrings("upstream-etag", result.etag.?);
+        try std.testing.expectEqual(if (fake.unknown) @as(?@import("public_table_http.zig").MetadataMutationOutcome, .unknown) else null, result.response.metadata_mutation_outcome);
+        try std.testing.expectEqual(if (fake.unknown) @as(?u32, 1) else null, result.response.retry_after_seconds);
+    };
+}

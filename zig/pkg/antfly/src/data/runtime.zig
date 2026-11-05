@@ -28283,10 +28283,7 @@ const RemoteMetadataSource = struct {
             fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, _: antfly.public_api.raft_mutation_forwarding.Context, ctx: anytype) !@import("../api/privacy.zig").Response {
                 var result = try client.forwardPrivacyMutation(base_uri, ctx.table, ctx.body, ctx.if_match, ctx.scan, ctx.request);
                 defer result.deinit(client.alloc);
-                var owned: @import("../api/privacy.zig").Response = .{ .response = .{ .status = result.response.status, .body = try ctx.a.dupe(u8, result.response.body), .json = true } };
-                errdefer owned.deinit(ctx.a);
-                owned.etag = if (result.etag) |etag| try ctx.a.dupe(u8, etag) else null;
-                return owned;
+                return result.clone(ctx.a);
             }
         }.call, .{ .a = a, .table = table, .body = body, .if_match = if_match, .scan = scan, .request = request }, request);
     }
@@ -45927,6 +45924,60 @@ fn consumerTests() type {
                 error.InvalidMetadataIncarnation,
                 source.acceptMetadataIdentity(9, antfly.metadata.incarnation.zero),
             );
+        }
+
+        test "privacy remote mutation forwarding retains response metadata through the status source" {
+            const a = std.testing.allocator;
+            const Fake = struct {
+                status: u16 = 202,
+                probes: usize = 0,
+                mutations: usize = 0,
+                scan: bool = false,
+                fn execute(raw: *anyopaque, alloc: std.mem.Allocator, request: antfly.common.http.HttpRequest) !antfly.common.http.HttpResponse {
+                    const self: *@This() = @ptrCast(@alignCast(raw));
+                    if (std.mem.endsWith(u8, request.uri, "/metadata/v1/runtime-topology")) {
+                        self.probes += 1;
+                        try std.testing.expectEqual(.GET, request.method);
+                        return .{ .status = 200, .body = try std.json.Stringify.valueAlloc(alloc, antfly.metadata_api.MetadataRuntimeTopology{
+                            .metadata_group_id = 9,
+                            .metadata_incarnation = @splat('1'),
+                            .metadata_raft_local_node_id = 1,
+                            .metadata_raft_leader_id = 1,
+                            .metadata_raft_role = "leader",
+                        }, .{}) };
+                    }
+                    self.mutations += 1;
+                    try std.testing.expectEqual(if (self.scan) antfly.common.http.Method.POST else .PUT, request.method);
+                    try std.testing.expect(std.mem.endsWith(u8, request.uri, if (self.scan) "/privacy/scans" else "/privacy"));
+                    try std.testing.expectEqualStrings("{}", request.body);
+                    const headers = try alloc.alloc(antfly.common.http.Header, if (self.status == 202) 1 else 3);
+                    headers[0] = .{ .name = try alloc.dupe(u8, "ETag"), .value = try alloc.dupe(u8, "upstream-etag") };
+                    if (self.status != 202) {
+                        headers[1] = .{ .name = try alloc.dupe(u8, "X-Antfly-Raft-Mutation-Outcome"), .value = try alloc.dupe(u8, "unknown-v1") };
+                        headers[2] = .{ .name = try alloc.dupe(u8, "Retry-After"), .value = try alloc.dupe(u8, "1") };
+                    }
+                    return .{ .status = self.status, .body = try alloc.dupe(u8, "{\"code\":\"upstream\"}"), .headers = headers };
+                }
+            };
+            var fake: Fake = .{};
+            var source = try RemoteMetadataSource.initWithRequestExecutors(a, &.{"http://metadata.invalid"}, &.{.{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }}, std.testing.io);
+            defer source.deinit();
+            var expected_calls: usize = 0;
+            for ([_]u16{ 202, 409, 503 }) |status| for ([_]bool{ false, true }) |scan| {
+                fake.status = status;
+                fake.scan = scan;
+                var response = (try source.statusSource().forwardPrivacyMutation(a, "docs", "{}", if (scan) null else "etag", scan, .{})).?;
+                defer response.deinit(a);
+                expected_calls += 1;
+                try std.testing.expectEqual(expected_calls, fake.mutations);
+                try std.testing.expectEqual(expected_calls, fake.probes);
+                try std.testing.expectEqual(status, response.response.status);
+                try std.testing.expect(response.response.json);
+                try std.testing.expectEqualStrings("{\"code\":\"upstream\"}", response.response.body);
+                try std.testing.expectEqualStrings("upstream-etag", response.etag.?);
+                try std.testing.expectEqual(if (status == 202) null else @as(?u32, 1), response.response.retry_after_seconds);
+                try std.testing.expectEqual(if (status == 202) null else @as(?@import("../api/public_table_http.zig").MetadataMutationOutcome, .unknown), response.response.metadata_mutation_outcome);
+            };
         }
 
         test "privacy remote table reads observe progress without invalidating semantic caches" {

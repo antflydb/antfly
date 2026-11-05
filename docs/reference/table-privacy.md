@@ -217,6 +217,11 @@ failures remain HTTP 412/428, and an unknown mutation outcome remains HTTP 409:
 inspect policy/scan state before retrying that mutation. Availability handling
 does not automatically replay policy writes or scan creation.
 
+An upstream `X-Antfly-Raft-Mutation-Outcome: unknown-v1` marker is preserved
+through metadata and data-node forwarding, alongside the status, response body,
+ETag and `Retry-After`. Treat this marker as an ambiguous write outcome on either
+409 or 503: inspect policy/scan state before deciding whether to submit again.
+
 Private range checkpoints have per-table budgets of 256 MiB for staged uploads
 and 8 GiB for retained payloads, including retired generations awaiting cleanup.
 Capacity exhaustion returns HTTP 422 (`privacy_checkpoint_capacity_exceeded`);

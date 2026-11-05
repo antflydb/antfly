@@ -43,11 +43,55 @@ pub const Arguments = struct {
 pub const Response = struct {
     response: http.OwnedResponse,
     etag: ?[]u8 = null,
+    /// Re-own the two byte buffers while retaining all scalar response metadata.
+    /// Neither success nor allocation failure changes or frees the source.
+    pub fn clone(self: Response, a: A) !Response {
+        var result = self;
+        result.response.body = try a.dupe(u8, self.response.body);
+        errdefer a.free(result.response.body);
+        result.etag = if (self.etag) |tag| try a.dupe(u8, tag) else null;
+        return result;
+    }
+
     pub fn deinit(self: *Response, a: A) void {
         self.response.deinit(a);
         if (self.etag) |tag| a.free(tag);
     }
 };
+test "privacy response cloning preserves ownership and forwarding metadata on allocation failure" {
+    const a = std.testing.allocator;
+    var source: Response = .{ .response = .{
+        .status = 503,
+        .body = try a.dupe(u8, "upstream-body"),
+        .json = false,
+        .retry_after_seconds = 7,
+        .metadata_mutation_outcome = .unknown,
+    }, .etag = try a.dupe(u8, "upstream-etag") };
+    defer source.deinit(a);
+    const Check = struct {
+        fn run(out: A, input: Response) !void {
+            var result = try input.clone(out);
+            defer result.deinit(out);
+            try std.testing.expectEqual(input.response.status, result.response.status);
+            try std.testing.expectEqual(input.response.json, result.response.json);
+            try std.testing.expectEqual(input.response.retry_after_seconds, result.response.retry_after_seconds);
+            try std.testing.expectEqual(input.response.metadata_mutation_outcome, result.response.metadata_mutation_outcome);
+            try std.testing.expectEqualStrings(input.response.body, result.response.body);
+            try std.testing.expect(input.response.body.ptr != result.response.body.ptr);
+            if (input.etag) |tag| {
+                try std.testing.expectEqualStrings(tag, result.etag.?);
+                try std.testing.expect(tag.ptr != result.etag.?.ptr);
+            } else try std.testing.expect(result.etag == null);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Check.run, .{source});
+    try std.testing.expectEqualStrings("upstream-body", source.response.body);
+    try std.testing.expectEqualStrings("upstream-etag", source.etag.?);
+    var no_tag = source;
+    no_tag.etag = null;
+    try std.testing.checkAllAllocationFailures(a, Check.run, .{no_tag});
+}
+
 fn json(a: A, status: u16, value: anytype) !Response {
     return .{ .response = .{ .status = status, .body = try std.json.Stringify.valueAlloc(a, value, .{}), .json = true } };
 }
@@ -379,11 +423,7 @@ fn execute(server: anytype, a: A, table: []const u8, action: Action, args: Argum
             continue;
         };
         defer result.deinit(scratch);
-        var owned = result;
-        owned.etag = if (result.etag) |tag| try a.dupe(u8, tag) else null;
-        errdefer if (owned.etag) |tag| a.free(tag);
-        owned.response.body = try a.dupe(u8, result.response.body);
-        return owned;
+        return result.clone(a);
     }
     unreachable;
 }
