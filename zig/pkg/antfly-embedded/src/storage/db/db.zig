@@ -139635,11 +139635,14 @@ test "db graph endpoint cleanup pages are replicated bounded and restartable" {
     defer directory.cleanup();
     var follower_directory = try TestDirectory.init("endpoint-cleanup-follower");
     defer follower_directory.cleanup();
-    var follower = try DB.open(alloc, std.mem.span(follower_directory.path().ptr), .{});
+    // This fixture drives ordered pages and derived drains explicitly. A
+    // background owner must not contend with its one-shot replicated applies.
+    const options: OpenOptions = .{ .start_optional_runtimes = false, .start_index_workers = false, .start_independent_maintenance = false };
+    var follower = try DB.open(alloc, std.mem.span(follower_directory.path().ptr), options);
     defer follower.close();
     try follower.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
     {
-        var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+        var db = try DB.open(alloc, std.mem.span(directory.path().ptr), options);
         defer db.close();
         try db.addIndex(.{ .name = "g", .kind = .graph, .config_json = "{}" });
         var arena = std.heap.ArenaAllocator.init(alloc);
@@ -139681,7 +139684,7 @@ test "db graph endpoint cleanup pages are replicated bounded and restartable" {
         try std.testing.expectEqual(remaining.len, unchanged.len);
     }
     {
-        var db = try DB.open(alloc, std.mem.span(directory.path().ptr), .{});
+        var db = try DB.open(alloc, std.mem.span(directory.path().ptr), options);
         defer db.close();
         try std.testing.expect(try db.core.store.hasGraphEndpointCleanup());
         var second_page = (try db.prepareGraphEndpointCleanupBatch(alloc)).?;
