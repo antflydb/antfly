@@ -1079,6 +1079,58 @@ pub fn functionDependents(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, gro
     }
     return result.toOwnedSlice(a);
 }
+/// Stream a covering callable directory with scratch bounded to one resource.
+/// The visitor admits retained bytes before decoding and owns any copy it keeps.
+pub fn visitFunctionDependents(backing: std.mem.Allocator, txn: anytype, group: u64, function: u64, limit: usize, visitor: anytype) !void {
+    const prefix = try functionDependencyPrefix(backing, group, function);
+    defer backing.free(prefix);
+    var cursor = try txn.openCursor();
+    defer cursor.close();
+    var row = try cursor.seekAtOrAfter(prefix);
+    var count: usize = 0;
+    while (row) |item| : (row = try cursor.next()) {
+        if (!std.mem.startsWith(u8, item.key, prefix)) break;
+        if (count == limit) return error.SqlProgramLimitExceeded;
+        count += 1;
+        if (item.value.len != 9) return error.InvalidCatalogRecord;
+        const kind: domain.Kind = switch (item.value[0]) {
+            'r' => .routine,
+            'c' => .cast,
+            else => return error.InvalidCatalogRecord,
+        };
+        const id = std.mem.readInt(u64, item.value[1..9], .little);
+        if (id == 0) return error.InvalidCatalogRecord;
+        var region = std.heap.ArenaAllocator.init(backing);
+        defer region.deinit();
+        const a = region.allocator();
+        if (!std.mem.eql(u8, item.key, try functionDependencyKey(a, group, function, id))) return error.InvalidCatalogRecord;
+        const raw = txn.get(try recordKeyAlloc(a, group, kind, id)) catch |err| return if (err == error.NotFound) error.InvalidCatalogRecord else err;
+        try visitor.admit(kind, id, raw.len);
+        const resource = try std.json.parseFromSliceLeaky(domain.Resource, a, raw, .{ .allocate = .alloc_always });
+        if (resource.kind != kind or resource.id != id) return error.InvalidCatalogRecord;
+        var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(a, resource);
+        defer dependencies.deinit(a);
+        if (dependencies.id() != id) return error.InvalidCatalogRecord;
+        const found = for (dependencies.uses) |use| {
+            if (use.reference.id == function) break true;
+        } else false;
+        if (!found) return error.InvalidCatalogRecord;
+        try visitor.accept(resource);
+    }
+}
+
+fn requireCallableReferencesWritable(a: std.mem.Allocator, txn: anytype, group: u64, resource: domain.Resource) !void {
+    if (resource.kind != .routine and resource.kind != .cast) return;
+    var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(a, resource);
+    defer dependencies.deinit(a);
+    for (dependencies.uses) |use| {
+        const selected = (try @import("../metadata/scope_retirement_ledger.zig").member(txn, group, .routine, use.reference.id)) orelse continue;
+        // Holding a support function freezes its definition. New unrelated
+        // users may still bind it; only retiring sources forbid new edges.
+        if (selected.intent == .retire) return error.TableTransitionActive;
+    }
+}
+
 pub fn validateFunctionUses(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, uses: []const routines.FunctionUse) !void {
     for (uses) |use| {
         const reference = use.reference;
@@ -1346,18 +1398,24 @@ fn writeMeta(alloc: std.mem.Allocator, txn: anytype, group_id: u64, previous: Me
     try txn.put(key, bytes);
 }
 
-pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, delta: domain.Delta, previous: Meta, command_hash: [32]u8) !void {
+/// Pure admission: all source/target scope leases precede the first write.
+pub fn requireScopeDeltaWritable(alloc: std.mem.Allocator, txn: anytype, group_id: u64, delta: domain.Delta) !void {
     // Validate the complete footprint, including old parents of a move, before
     // any settings, ownership, topology or catalog effect can be committed.
     for (delta.removes) |resource| try requireScopeResourceWritableWithParents(alloc, txn, group_id, resource, delta.upserts);
     for (delta.upserts) |resource| {
         try requireScopeResourceWritableWithParents(alloc, txn, group_id, resource, delta.upserts);
+        try requireCallableReferencesWritable(alloc, txn, group_id, resource);
         if (try getById(alloc, txn, group_id, resource.kind, resource.id)) |value| {
             var prior = value;
             defer prior.deinit();
             if (prior.value.parent_id != resource.parent_id) try requireScopeResourceWritableWithParents(alloc, txn, group_id, prior.value, delta.upserts);
         }
     }
+}
+
+pub fn applyDelta(alloc: std.mem.Allocator, txn: *docstore.DocStore.Txn, group_id: u64, delta: domain.Delta, previous: Meta, command_hash: [32]u8) !void {
+    try requireScopeDeltaWritable(alloc, txn, group_id, delta);
     if (delta.presentation_only and (delta.upserts.len != 1 or delta.removes.len != 0 or delta.next_id != previous.next_id or
         (delta.upserts[0].kind != .database and delta.upserts[0].kind != .namespace and delta.upserts[0].kind != .named_type))) return error.InvalidCatalogMutation;
     if (delta.presentation_only and previous.revision != 0) {

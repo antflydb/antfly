@@ -76,11 +76,51 @@ def check():
         db.execute(
             "CREATE FUNCTION tenant_ops.audit(bigint) RETURNS bigint LANGUAGE SQL AS 'SELECT $1'"
         )
+        db.execute(
+            "CREATE FUNCTION tenant_ops.step(text,text) RETURNS text LANGUAGE SQL AS 'SELECT coalesce($1,$2)'"
+        )
+        db.execute(
+            "CREATE FUNCTION tenant_ops.same(text,text) RETURNS boolean LANGUAGE SQL AS 'SELECT $1=$2'"
+        )
+        db.execute(
+            "CREATE FUNCTION tenant_ops.convert(jsonb) RETURNS text LANGUAGE SQL AS $$SELECT 'native'$$"
+        )
+        db.execute(
+            "CREATE FUNCTION scope_finish(text) RETURNS text LANGUAGE SQL AS 'SELECT upper($1)'"
+        )
+        db.execute(
+            "CREATE FUNCTION scope_outside_step(text,text) RETURNS text LANGUAGE SQL AS 'SELECT coalesce($1,$2)'"
+        )
+        db.execute(
+            "CREATE AGGREGATE scope_collect(text)(SFUNC=tenant_ops.step,STYPE=text,FINALFUNC=scope_finish)"
+        )
+        db.execute(
+            "CREATE OPERATOR === (FUNCTION=tenant_ops.same,LEFTARG=text,RIGHTARG=text)"
+        )
+        db.execute(
+            "CREATE CAST (jsonb AS text) WITH FUNCTION tenant_ops.convert(jsonb) AS ASSIGNMENT"
+        )
+        db.execute(
+            "CREATE AGGREGATE scope_unrelated(text)(SFUNC=scope_outside_step,STYPE=text,FINALFUNC=scope_finish)"
+        )
         rejected(db, "DROP SCHEMA tenant_ops", "2BP01")
         equal(scalar(db, "SELECT count(*) FROM tenant_ops.parents"), 2)
         db.execute("BEGIN")
         equal(db.execute(originals["sql-0105"]).statusmessage, "DROP SCHEMA")
         equal(scalar(db, "SELECT to_regnamespace('tenant_ops')"), None)
+        equal(scalar(db, "SELECT to_regprocedure('scope_collect(text)')"), None)
+        equal(scalar(db, "SELECT to_regoperator('===(text,text)')"), None)
+        equal(
+            scalar(
+                db,
+                "SELECT count(*) FROM pg_cast WHERE castsource='jsonb'::regtype AND casttarget='text'::regtype",
+            ),
+            0,
+        )
+        equal(
+            scalar(db, "SELECT scope_unrelated(x) FROM (VALUES('kept'::text)) v(x)"),
+            "KEPT",
+        )
         equal(scalar(db, "SELECT to_regclass('outside_view')"), None)
         equal(scalar(db, "SELECT to_regclass('outside_nested')"), None)
         equal(db.execute("SELECT * FROM survivors").fetchall(), [(3, 1)])

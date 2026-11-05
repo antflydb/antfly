@@ -836,3 +836,118 @@ test "SQL scope retirement raced committed definition and topology commands pres
     try store.snapshotBuilder().applyBatch(.{ .group_id = group, .commit_index = 3 + commands.len, .entries_bytes = try raft.encodeCommittedEntries(scratch, &.{.{ .term = 1, .index = 3 + commands.len, .entry_type = .normal, .data = encoded }}) });
     try std.testing.expectEqualStrings(changed.schema_json, (try store.getTable(scratch, group, 101)).?.schema_json);
 }
+
+test "SQL scope retirement callable closure fences retired sources preserves held users and rejects escaped edges across cold owners" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    const routines = @import("../system_catalog/routines.zig");
+    const casts = @import("../system_catalog/casts.zig");
+    const storage = @import("../system_catalog/storage.zig");
+    const H = struct {
+        fn request(store: *native.RaftApplyStore, alloc: std.mem.Allocator, target: domain.Target, kind: routines.records.Kind, definition: routines.records.Definition, nonce: u8) !routines.Mutation {
+            const cut = try std.json.parseFromSliceLeaky(routines.Snapshot, alloc, try store.sqlRoutineSnapshot(alloc, group, .{ .targets = &.{target}, .kind = kind, .signature = try definition.signatureAlloc(alloc) }, .{}), .{});
+            return .{ .admission = .{ .nonce = @splat(nonce), .head = cut.head }, .target = target, .namespace_id = cut.scopes[0].namespace_id.?, .incarnation = cut.incarnation, .operation = .{ .publish = .{ .kind = kind, .definition = definition } } };
+        }
+        fn apply(store: *native.RaftApplyStore, alloc: std.mem.Allocator, request_value: routines.Mutation) !routines.Outcome {
+            try store.applyStandaloneCommand(group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(alloc, routines.command(request_value), .{}) });
+            return (try std.json.parseFromSliceLeaky(?routines.Outcome, alloc, try store.sqlRoutineOutcome(alloc, group, try routines.observation(alloc, request_value)), .{})).?;
+        }
+        fn publish(store: *native.RaftApplyStore, alloc: std.mem.Allocator, request_value: routines.Mutation) !routines.records.FunctionReference {
+            const identity = (try apply(store, alloc, request_value)).success.identity.?;
+            return .{ .database = request_value.target.database, .namespace = request_value.target.namespace, .name = request_value.target.table, .namespace_id = request_value.namespace_id, .id = identity.id };
+        }
+        fn captureProbe(alloc: std.mem.Allocator, store: *native.RaftApplyStore) !void {
+            const encoded = try store.prepareScopeRetirementManifestJsonWithContext(alloc, group, .{ .kind = .namespace, .name = "retiring", .cascade = true, .creator = .bootstrap }, .{});
+            defer alloc.free(encoded);
+        }
+        fn replaceRaw(store: *native.RaftApplyStore, alloc: std.mem.Allocator, resource: domain.Resource) !void {
+            var txn = try store.store.beginWriteTxn();
+            errdefer txn.abort();
+            try txn.put(try storage.recordKeyAlloc(alloc, group, resource.kind, resource.id), try std.json.Stringify.valueAlloc(alloc, resource, .{}));
+            // The escaped reference is otherwise a valid catalog. Rebuild the
+            // derived directory so its corruption cannot mask the scope check.
+            try storage.rebuildNameIndex(alloc, &txn, group);
+            try storage.validateNameIndex(alloc, &txn, group);
+            try txn.commit();
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(scratch, ".zig-cache/tmp/{s}/callable-scope", .{tmp.sub_path});
+    var admitted: wire.Outcome = undefined;
+    var blocked: routines.Mutation = undefined;
+    var blocked_outcome: routines.Outcome = undefined;
+    for (0..2) |pass| {
+        var store = try native.RaftApplyStore.init(a, .{ .root_dir = path });
+        defer store.deinit();
+        if (pass == 0) {
+            try store.applyStandaloneCommand(group, .{ .initialize_metadata_incarnation = @splat('1') });
+            try store.applyStandaloneCommand(group, .{ .activate_topology_protocol = try std.json.Stringify.valueAlloc(scratch, topology.Activation{ .version = topology.current_version, .incarnation = @splat('1'), .member_count = 1, .membership_fingerprint = @splat(7) }, .{}) });
+            try store.applyStandaloneCommand(group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(scratch, native.SystemCatalogCommand{ .expected_revision = 0, .mutation = .{ .action = .create, .kind = .namespace, .name = "retiring" } }, .{}) });
+            const step_definition: routines.records.Definition = .{ .arguments = &.{ .{ .type = .{ .scalar = .text } }, .{ .type = .{ .scalar = .text } } }, .result = .{ .scalar = .text }, .body = "SELECT coalesce($1,$2)", .owner = .auth_disabled };
+            const step = try H.publish(&store, scratch, try H.request(&store, scratch, .{ .namespace = "retiring", .table = "step" }, .function, step_definition, 1));
+            const outside = try H.publish(&store, scratch, try H.request(&store, scratch, .{ .table = "outside_step" }, .function, step_definition, 2));
+            const finish_request = try H.request(&store, scratch, .{ .table = "finish" }, .function, .{ .arguments = &.{.{ .type = .{ .scalar = .text } }}, .result = .{ .scalar = .text }, .body = "SELECT upper($1)", .owner = .auth_disabled }, 3);
+            const finish = try H.publish(&store, scratch, finish_request);
+            const equal_function = try H.publish(&store, scratch, try H.request(&store, scratch, .{ .namespace = "retiring", .table = "same" }, .function, .{ .arguments = step_definition.arguments, .result = .{ .scalar = .boolean }, .body = "SELECT $1=$2", .owner = .auth_disabled }, 4));
+            const convert = try H.publish(&store, scratch, try H.request(&store, scratch, .{ .namespace = "retiring", .table = "convert" }, .function, .{ .arguments = &.{.{ .type = .{ .scalar = .jsonb } }}, .result = .{ .scalar = .text }, .body = "SELECT 'native'", .owner = .auth_disabled }, 5));
+            const aggregate_definition: routines.records.Definition = .{ .arguments = finish_request.operation.publish.definition.arguments, .result = .{ .scalar = .text }, .body = "", .function_reference = step, .aggregate = .{ .state = .{ .scalar = .text }, .final = finish }, .owner = .auth_disabled };
+            _ = try H.publish(&store, scratch, try H.request(&store, scratch, .{ .table = "collect" }, .aggregate, aggregate_definition, 6));
+            _ = try H.publish(&store, scratch, try H.request(&store, scratch, .{ .table = "===" }, .operator, .{ .arguments = step_definition.arguments, .result = .{ .scalar = .boolean }, .body = "", .function_reference = equal_function, .owner = .auth_disabled }, 7));
+            const pair: casts.records.Pair = .{ .source = .{ .scalar = .jsonb }, .target = .{ .scalar = .text } };
+            const cast_cut = try std.json.parseFromSliceLeaky(casts.Snapshot, scratch, try store.sqlCastSnapshot(scratch, group, .{ .database = "default", .pair = pair }, .{}), .{});
+            const cast_request: casts.Mutation = .{ .admission = .{ .nonce = @splat(8), .head = cast_cut.head }, .database = "default", .database_id = cast_cut.database_id.?, .incarnation = cast_cut.incarnation, .operation = .{ .create = .{ .pair = pair, .function = convert, .context = .assignment, .owner = .auth_disabled } } };
+            try store.applyStandaloneCommand(group, .{ .apply_system_catalog = try std.json.Stringify.valueAlloc(scratch, try casts.command(scratch, cast_request), .{}) });
+            const cast_outcome = (try std.json.parseFromSliceLeaky(?casts.Outcome, scratch, try store.sqlCastOutcome(scratch, group, try casts.observation(scratch, cast_request)), .{})).?;
+            try std.testing.expect(cast_outcome == .success);
+            const manifest = try std.json.parseFromSliceLeaky(contract.Manifest, scratch, try store.prepareScopeRetirementManifestJsonWithContext(scratch, group, .{ .kind = .namespace, .name = "retiring", .cascade = true, .creator = .bootstrap }, .{}), .{});
+            try std.testing.expectEqual(@as(usize, 3), manifest.resources.len);
+            try std.testing.expectEqual(@as(usize, 4), manifest.dependencies.len);
+            for (manifest.dependencies) |dependency| {
+                try std.testing.expectEqual(if (dependency.id == finish.id) @as(@TypeOf(dependency.action), .hold) else .retire, dependency.action);
+            }
+            try @import("antfly_platform").allocator.checkAllAllocationFailures(a, H.captureProbe, .{&store});
+            admitted = (try AdmissionHarness.apply(&store, scratch, .{ .admission = .{ .nonce = @splat(91), .head = manifest.catalog_revision }, .operation = .{ .reserve = manifest } }, 1, false)).outcome.?;
+            blocked = try H.request(&store, scratch, .{ .table = "blocked" }, .aggregate, aggregate_definition, 9);
+            blocked_outcome = try H.apply(&store, scratch, blocked);
+            try std.testing.expectEqual(.TableTransitionActive, blocked_outcome.rejected);
+            try std.testing.expectEqualDeep(blocked_outcome, try H.apply(&store, scratch, blocked));
+            var changed = try H.request(&store, scratch, .{ .table = "finish" }, .function, finish_request.operation.publish.definition, 10);
+            changed.operation.publish.replace = true;
+            changed.operation.publish.expected = .{ .id = finish.id, .generation = 1 };
+            changed.operation.publish.definition.body = "SELECT lower($1)";
+            try std.testing.expectEqual(.TableTransitionActive, (try H.apply(&store, scratch, changed)).rejected);
+            var independent = aggregate_definition;
+            independent.function_reference = outside;
+            const unrelated = try H.publish(&store, scratch, try H.request(&store, scratch, .{ .table = "unrelated" }, .aggregate, independent, 11));
+            var read = try store.store.beginReadTxn();
+            const original = (try storage.getById(scratch, &read, group, .routine, unrelated.id)).?.value;
+            read.abort();
+            var escaped = original;
+            var record = (try routines.records.Record.decode(scratch, escaped.source_json)).value;
+            record.definition.function_reference = step;
+            escaped.source_json = try record.encode(scratch);
+            try H.replaceRaw(&store, scratch, escaped);
+            try std.testing.expectError(error.InvalidMetadataSnapshot, store.snapshotBuilder().buildSnapshot(scratch, group));
+            const checkpoint = try std.fmt.allocPrint(scratch, "{s}/escaped.bin", .{path});
+            try std.testing.expectError(error.InvalidMetadataHACheckpoint, store.exportHotStandbyCheckpoint(store.io_impl.io(), checkpoint));
+            try H.replaceRaw(&store, scratch, original);
+            const snapshot = try store.snapshotBuilder().buildSnapshot(scratch, group);
+            var copy = try native.RaftApplyStore.init(a, .{ .root_dir = try std.fmt.allocPrint(scratch, "{s}-copy", .{path}) });
+            defer copy.deinit();
+            try std.testing.expect(try copy.snapshotBuilder().installSnapshot(scratch, group, 1, snapshot));
+            try std.testing.expectEqualDeep(admitted, (try std.json.parseFromSliceLeaky(wire.Observation, scratch, try copy.scopeRetirementObservationJson(scratch, group, admitted.query), .{})).outcome.?);
+        } else {
+            try std.testing.expectEqualDeep(blocked_outcome, try H.apply(&store, scratch, blocked));
+            const canceled = try AdmissionHarness.apply(&store, scratch, AdmissionHarness.cancel(admitted.query.lookup, 92), 2, false);
+            try std.testing.expectEqual(contract.Phase.canceled, canceled.current.?.progress.phase);
+            try std.testing.expectEqualDeep(blocked_outcome, try H.apply(&store, scratch, blocked));
+            const fresh = try H.request(&store, scratch, blocked.target, .aggregate, blocked.operation.publish.definition, 12);
+            try std.testing.expect((try H.apply(&store, scratch, fresh)) == .success);
+            const snapshot = try store.snapshotBuilder().buildSnapshot(scratch, group);
+            try std.testing.expect(snapshot.len != 0);
+        }
+    }
+}

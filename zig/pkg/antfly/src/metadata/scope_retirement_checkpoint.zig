@@ -32,6 +32,7 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
     var heads: u64 = 0;
     var maximum_sequence: u64 = 0;
     var counter: ?u64 = null;
+    var callable_members: usize = 0;
     try rows.reset();
     while (try rows.next()) |row| {
         if (canceled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
@@ -129,6 +130,12 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
                     !prepared.manifest.creator.eql(head.creator)) return error.InvalidScopeRetirement;
                 try ledger.requireMembers(reader, &prepared, head);
                 try context.verifyManifest(reader, head, prepared.manifest);
+                for (prepared.manifest.resources) |resource| if (resource.kind == .routine or resource.kind == .cast) {
+                    callable_members += 1;
+                };
+                for (prepared.manifest.dependencies) |dependency| if (dependency.kind == .routine or dependency.kind == .cast) {
+                    callable_members += 1;
+                };
                 for (prepared.manifest.view_edges) |edge| {
                     const selected = try @import("../system_catalog/views.zig").dependencyKey(&buffer, group, .{ .kind = if (edge.source_kind == .table) .table else .view, .id = edge.source, .column = edge.column }, edge.view);
                     if (!std.mem.eql(u8, try reader.get(selected), &.{1})) return error.InvalidScopeRetirement;
@@ -156,9 +163,36 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
         var sequence_buffer: [128]u8 = undefined;
         const sequence_leases = @import("../system_catalog/sequence_leases.zig");
         const sequence_prefix = try sequence_leases.prefix(&sequence_buffer, group);
+        var routine_buffer: [160]u8 = undefined;
+        var cast_buffer: [160]u8 = undefined;
+        const routine_prefix = try std.fmt.bufPrint(&routine_buffer, "{s}record:routine:", .{base[0 .. base.len - "scope-retirement:".len]});
+        const cast_prefix = try std.fmt.bufPrint(&cast_buffer, "{s}record:cast:", .{base[0 .. base.len - "scope-retirement:".len]});
         try rows.reset();
         while (try rows.next()) |row| {
             if (canceled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
+            // Callable indexes are derived. Prove reverse closure from native
+            // resource rows, including external declarations not in a manifest.
+            // Only one definition is decoded at a time; table-only scope jobs
+            // do not add a parse of every unrelated callable during recovery.
+            if (callable_members != 0 and (std.mem.startsWith(u8, row.key, routine_prefix) or std.mem.startsWith(u8, row.key, cast_prefix))) {
+                var region = std.heap.ArenaAllocator.init(backing);
+                defer region.deinit();
+                const a = region.allocator();
+                const local = @import("antfly_local_sources");
+                const storage = @import("../system_catalog/storage.zig");
+                const resource = try std.json.parseFromSliceLeaky(local.system_catalog_domain.Resource, a, row.value, .{});
+                if ((resource.kind != .routine and resource.kind != .cast) or !std.mem.eql(u8, row.key, try storage.recordKeyAlloc(a, group, resource.kind, resource.id))) return error.InvalidScopeRetirement;
+                var dependencies = try local.sql_catalog.callable_dependencies.Set.init(a, resource);
+                defer dependencies.deinit(a);
+                const owner = try ledger.member(reader, group, resource.kind, resource.id);
+                for (dependencies.uses) |use| {
+                    const source = try ledger.member(reader, group, .routine, use.reference.id);
+                    if (source != null and source.?.intent == .retire and
+                        (owner == null or owner.?.intent != .retire or !std.meta.eql(owner.?.lookup, source.?.lookup))) return error.InvalidScopeRetirement;
+                    if (owner != null and owner.?.intent == .retire and
+                        (source == null or !std.meta.eql(source.?.lookup, owner.?.lookup))) return error.InvalidScopeRetirement;
+                }
+            }
             if (try @import("schema_validation_dependencies.zig").Key.parse(row.key)) |dependency| {
                 if (dependency.group == group and dependency.parent != null and
                     try @import("scope_retirement_fence.zig").occupied(reader, group, "table", dependency.parent.?)) return error.InvalidScopeRetirement;

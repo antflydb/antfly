@@ -58,7 +58,7 @@ backings assigns stable ordinals, root-derived child IDs and exact definition/ra
 commitments. Held and rewritten tables never receive deletion children. The
 cyclic work read returns the next compact registration using point reads; it does
 not decode the immutable membership body on every idle/coordinator poll. This
-requires metadata capability 166. Registrations identify proposed child work;
+requires metadata capability 167. Registrations identify proposed child work;
 they grant no physical execution or completion authority.
 
 Terminal progress releases leases, body, work and child registrations atomically
@@ -135,15 +135,30 @@ validates survivor preimages, indexed generation fingerprints and exact view-edg
 closure. Catalogs without active scopes do not acquire leases per unrelated
 view edge during checkpoint validation.
 
+Callable support references join that same footprint. A bounded directory walk
+captures external aggregates, operators and casts before any reservation. Their
+supporting functions are held by immutable catalog identity; new references to a
+retiring function are rejected by the shared, no-write catalog preflight. New
+unrelated users of a held support function remain admissible while its definition
+is frozen. Typed previews and committed writers use that same check, so a known
+conflict cannot look like successful preparation.
+
+Callable-directory reads admit retained bytes before decoding and keep scratch
+for only one resource at a time. Snapshot and standby-checkpoint recovery prove
+reverse closure from authoritative callable records, independently of rebuilt
+derived indexes. Table-only scope jobs do not parse every unrelated callable.
+These semantics require metadata capability 167. They supply dependency custody,
+not permission to execute or acknowledge physical retirement.
+
 Reservation does not verify connection drainage, physical child ACKs or final
 catalog withdrawal. Its progress state cannot stand for those proofs. Native
 workers and final publication must verify each independently before advancing.
 
 ## Remaining activation
 
-1. Complete routine/named-type CASCADE evolution beyond the captured FK,
-   sequence-default and view footprint, including external dependent columns and
-   routines. Finish connection/data admission and physical-owner barriers without
+1. Complete named-type and other stored-definition CASCADE evolution beyond
+   the captured FK, sequence-default, view and callable footprint, including
+   external dependent columns. Finish connection/data admission and physical-owner barriers without
    a global query lock. The current metadata footprint and fences do not supply
    deletion authority for those still-unimplemented effects.
 2. Drive proposals from the child identities already registered atomically at

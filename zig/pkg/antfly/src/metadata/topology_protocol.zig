@@ -168,13 +168,14 @@ const std = @import("std");
 // unreleased SQL profile reserves floors above 78; historical notes above
 // describe its development sequence before this rebasing. Published transition
 // tag 81 remains SQL completion references; private SQL tags begin at 82.
-pub const current_version: u16 = 166;
+pub const current_version: u16 = 167;
 /// SQL GIN operator classes bind to typed algebraic sidecars under catalog custody.
 pub const sql_gin_index_version: u16 = 165;
 /// Immutable ancestor reservation custody and body-bound native outcomes.
 /// Scope reservations first appeared at 164. Child registrations extend their
-/// atomic membership and compact work feed; old decoders cannot participate.
-pub const sql_scope_retirement_version: u16 = 166;
+/// atomic membership and compact work feed; 167 additionally captures and fences
+/// external callable dependencies. Old decoders cannot participate.
+pub const sql_scope_retirement_version: u16 = 167;
 /// Database defaults and managed-role snapshots preserve credential policy,
 /// existing login baselines and definition identities.
 pub const sql_database_defaults_version: u16 = 163;

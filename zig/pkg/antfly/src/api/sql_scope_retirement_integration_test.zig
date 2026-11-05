@@ -68,18 +68,19 @@ const Campaign = struct {
         try manifest.validate(a);
         try std.testing.expectEqualStrings("tenant_ops", manifest.scope.root().name);
         try std.testing.expectEqual(@as(usize, 2), manifest.tables.len);
-        try std.testing.expectEqual(@as(usize, 5), manifest.resources.len);
+        try std.testing.expectEqual(@as(usize, 8), manifest.resources.len);
         var routines: usize = 0;
         for (manifest.resources) |resource| if (resource.kind == .routine) {
             routines += 1;
         };
-        try std.testing.expectEqual(@as(usize, 2), routines);
-        try std.testing.expectEqual(@as(usize, 4), manifest.dependencies.len);
+        try std.testing.expectEqual(@as(usize, 5), routines);
+        try std.testing.expectEqual(@as(usize, 8), manifest.dependencies.len);
         try std.testing.expectEqual(@as(usize, 3), manifest.stamps.len);
         try std.testing.expect(manifest.view_edges.len >= 6);
         var rewrites: usize = 0;
         var held: usize = 0;
         var retired_views: usize = 0;
+        var retired_callables: usize = 0;
         for (manifest.dependencies) |dependency| switch (dependency.action) {
             .rewrite => {
                 rewrites += 1;
@@ -95,17 +96,20 @@ const Campaign = struct {
             },
             .hold => {
                 held += 1;
-                try std.testing.expectEqualStrings("scope_unchanged_parent", dependency.resource.?.name);
+                try std.testing.expectEqualStrings(if (dependency.kind == .table) "scope_unchanged_parent" else "scope_finish", dependency.resource.?.name);
                 try std.testing.expect(dependency.schema_after == null);
             },
             .retire => {
-                retired_views += 1;
-                try std.testing.expectEqual(@as(@TypeOf(dependency.kind), .view), dependency.kind);
+                if (dependency.kind == .view) retired_views += 1 else {
+                    try std.testing.expect(dependency.kind == .routine or dependency.kind == .cast);
+                    retired_callables += 1;
+                }
             },
         };
         try std.testing.expectEqual(@as(usize, 1), rewrites);
-        try std.testing.expectEqual(@as(usize, 1), held);
+        try std.testing.expectEqual(@as(usize, 2), held);
         try std.testing.expectEqual(@as(usize, 2), retired_views);
+        try std.testing.expectEqual(@as(usize, 3), retired_callables);
         if (self.admitted) |admitted| {
             var remote = ctx.catalogClient();
             const work_bytes = try remote.forwardSystemCatalog(ctx.metadata_uri, .{ .scope_retirement_work = 0 }, .{ .remaining_ms = 10000, .forwards_remaining = 0, .campaign_allowed = false }, true);
@@ -158,6 +162,17 @@ const Campaign = struct {
             const result = try std.json.parseFromSliceLeaky(wire.Observation, a, response, .{});
             self.admitted = result.outcome.?;
             try std.testing.expectEqual(contract.Phase.draining_connections, self.admitted.?.result.accepted.progress.phase);
+            for ([_][]const u8{
+                "CREATE AGGREGATE scope_blocked(text)(SFUNC=tenant_ops.step,STYPE=text)",
+                "CREATE OR REPLACE FUNCTION scope_finish(text) RETURNS text LANGUAGE SQL AS 'SELECT lower($1)'",
+            }) |statement| {
+                var blocked = try client.execute(ctx, statement, .never);
+                defer blocked.deinit(ctx.alloc);
+                errdefer std.debug.print("scope callable mutation SQL={s} status={d} body={s}\n", .{ statement, blocked.status, blocked.body });
+                try std.testing.expect(blocked.status >= 400);
+            }
+            // Holding a support function must not block new unrelated users.
+            try execute(ctx, "CREATE AGGREGATE scope_unrelated(text)(SFUNC=scope_outside_step,STYPE=text,FINALFUNC=scope_finish)");
             var dependent = try client.execute(ctx, "CREATE VIEW scope_new_dependent AS SELECT id FROM tenant_ops.events", .never);
             defer dependent.deinit(ctx.alloc);
             errdefer std.debug.print("reserved scope dependent status={d} body={s}\n", .{ dependent.status, dependent.body });
@@ -192,6 +207,7 @@ const Campaign = struct {
             try execute(ctx, "ALTER TABLE public.scope_borrower ADD COLUMN scope_after text");
             try execute(ctx, "ALTER TABLE public.scope_unchanged_parent ADD COLUMN scope_after text");
             try execute(ctx, "CREATE TABLE tenant_ops.resumed(id bigint PRIMARY KEY)");
+            try execute(ctx, "CREATE AGGREGATE scope_blocked(text)(SFUNC=tenant_ops.step,STYPE=text)");
         }
     }
     fn rows(ctx: *fixture.Context) !void {
@@ -238,6 +254,14 @@ const Campaign = struct {
         try execute(ctx, "CREATE VIEW public.scope_v2 AS SELECT v.id FROM public.scope_v1 v JOIN tenant_ops.parent2 p ON v.id=p.id");
         try execute(ctx, "CREATE FUNCTION tenant_ops.audit(text) RETURNS text LANGUAGE SQL AS 'SELECT $1'");
         try execute(ctx, "CREATE FUNCTION tenant_ops.audit(bigint) RETURNS bigint LANGUAGE SQL AS 'SELECT $1'");
+        try execute(ctx, "CREATE FUNCTION tenant_ops.step(text,text) RETURNS text LANGUAGE SQL AS 'SELECT coalesce($1,$2)'");
+        try execute(ctx, "CREATE FUNCTION tenant_ops.same(text,text) RETURNS boolean LANGUAGE SQL AS 'SELECT $1=$2'");
+        try execute(ctx, "CREATE FUNCTION tenant_ops.convert(jsonb) RETURNS text LANGUAGE SQL AS $$SELECT 'native'$$");
+        try execute(ctx, "CREATE FUNCTION scope_finish(text) RETURNS text LANGUAGE SQL AS 'SELECT upper($1)'");
+        try execute(ctx, "CREATE FUNCTION scope_outside_step(text,text) RETURNS text LANGUAGE SQL AS 'SELECT coalesce($1,$2)'");
+        try execute(ctx, "CREATE AGGREGATE scope_collect(text)(SFUNC=tenant_ops.step,STYPE=text,FINALFUNC=scope_finish)");
+        try execute(ctx, "CREATE OPERATOR === (FUNCTION=tenant_ops.same,LEFTARG=text,RIGHTARG=text)");
+        try execute(ctx, "CREATE CAST (jsonb AS text) WITH FUNCTION tenant_ops.convert(jsonb) AS ASSIGNMENT");
         try self.observe(ctx);
         try rows(ctx);
         try self.admission(ctx, false);

@@ -23198,6 +23198,54 @@ pub const RaftApplyStore = struct {
         rewrites: std.AutoHashMapUnmanaged(u64, void) = .empty,
         stamps: std.ArrayList(contract.Stamp) = .empty,
         participants: usize = 0,
+        callables: std.ArrayList(system_catalog.Resource) = .empty,
+        callable_work: usize = 0,
+
+        fn callableClosure(self: *@This()) !void {
+            for (self.base.resources) |resource_value| if (resource_value.kind == .routine or resource_value.kind == .cast) try self.callables.append(self.a, resource_value);
+            var visited: std.AutoHashMapUnmanaged(Key, void) = .empty;
+            var position: usize = 0;
+            while (position < self.callables.items.len) : (position += 1) {
+                try self.context.ensureActive();
+                const resource_value = self.callables.items[position];
+                if ((try visited.getOrPut(self.a, .{ .kind = resource_value.kind, .id = resource_value.id })).found_existing) continue;
+                var region = std.heap.ArenaAllocator.init(self.store.alloc);
+                defer region.deinit();
+                const scratch = region.allocator();
+                var dependencies = try @import("antfly_local_sources").sql_catalog.callable_dependencies.Set.init(scratch, resource_value);
+                defer dependencies.deinit(scratch);
+                try system_catalog_storage.validateFunctionUses(scratch, self.txn, self.group, dependencies.uses);
+                for (dependencies.uses) |use| {
+                    try self.callableBudget();
+                    const function = (try self.resource(.routine, use.reference.id)) orelse return error.InvalidCatalogRecord;
+                    try self.catalog(function, .hold);
+                }
+                if (resource_value.kind == .routine) try system_catalog_storage.visitFunctionDependents(self.store.alloc, self.txn, self.group, resource_value.id, contract.max_resources, self);
+            }
+        }
+        fn callableBudget(self: *@This()) !void {
+            try self.context.ensureActive();
+            if (self.callable_work == 16384) return error.SqlProgramLimitExceeded;
+            self.callable_work += 1;
+        }
+        pub fn admit(self: *@This(), kind: system_catalog.Kind, id: u64, bytes: usize) !void {
+            try self.callableBudget();
+            if (self.base.contains(kind, id) or self.slots.contains(.{ .kind = kind, .id = id })) return;
+            if (self.base.resources.len + self.dependencies.items.len == contract.max_resources) return error.SqlProgramLimitExceeded;
+            try self.budget.addRaw(bytes);
+        }
+        pub fn accept(self: *@This(), incoming: system_catalog.Resource) !void {
+            if (self.base.contains(incoming.kind, incoming.id)) return;
+            if (self.slots.get(.{ .kind = incoming.kind, .id = incoming.id })) |slot| {
+                if (self.dependencies.items[slot].action == .retire) return;
+                self.dependencies.items[slot].action = .retire;
+                try self.callables.append(self.a, self.dependencies.items[slot].resource.?);
+                return;
+            }
+            const retained = try system_catalog.cloneResource(self.a, incoming);
+            try self.catalog(retained, .retire);
+            try self.callables.append(self.a, retained);
+        }
 
         fn resource(self: *@This(), kind: system_catalog.Kind, id: u64) !?system_catalog.Resource {
             try self.context.ensureActive();
@@ -23316,6 +23364,7 @@ pub const RaftApplyStore = struct {
             .sequence => try capture.sequence(resource),
             else => {},
         };
+        try capture.callableClosure();
         const closure = try self.captureRetirementViewsFromSourcesTxn(a, self.alloc, txn, group, sources.items, budget, context);
         for (closure.views) |resource| {
             try view_leases.requireUnleased(txn, group, resource.id);
@@ -23807,7 +23856,10 @@ pub const RaftApplyStore = struct {
         fn add(self: *@This(), value: anytype) !void {
             var count = std.Io.Writer.Discarding.init(&.{});
             try std.json.Stringify.value(value, .{}, &count.writer);
-            self.bytes = std.math.add(u64, self.bytes, count.fullCount()) catch return error.SqlProgramLimitExceeded;
+            try self.addRaw(count.fullCount());
+        }
+        fn addRaw(self: *@This(), size: u64) !void {
+            self.bytes = std.math.add(u64, self.bytes, size) catch return error.SqlProgramLimitExceeded;
             if (self.bytes > @import("../table_retirement_manifest.zig").max_bytes) return error.SqlProgramLimitExceeded;
         }
     };
@@ -42258,12 +42310,13 @@ pub const RaftApplyStore = struct {
             },
         }
         const result: sql_casts.Result = .{ .revision = std.math.add(u64, meta.revision, 1) catch return error.CatalogRevisionExhausted, .identity = if (next) |record| .{ .id = record.id, .generation = record.generation } else null, .removed = @intFromBool(next == null) };
-        if (!apply) return result;
         var upserts: [1]system_catalog.Resource = undefined;
         if (next) |record| upserts[0] = .{ .kind = .cast, .id = record.id, .parent_id = database.id, .name = key, .source_json = try record.encode(a) };
         var removes: [1]system_catalog.Resource = undefined;
         if (next == null) removes[0] = previous.?.value;
         const delta: system_catalog.Delta = .{ .upserts = if (next != null) &upserts else &.{}, .removes = if (next == null) &removes else &.{}, .next_id = next_id };
+        try system_catalog_storage.requireScopeDeltaWritable(a, txn, group, delta);
+        if (!apply) return result;
         const bytes = try std.json.Stringify.valueAlloc(a, try sql_casts.command(a, request), .{});
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
@@ -42651,7 +42704,6 @@ pub const RaftApplyStore = struct {
             break :single try std.fmt.allocPrint(a, "drop cascades to {s} {s}({s})", .{ if (record.kind == .operator) "operator" else "function", qualified_name, try record.definition.displaySignatureAlloc(a) });
         } else if (dependents.len > 1) try std.fmt.allocPrint(a, "drop cascades to {d} other objects", .{dependents.len}) else null;
         const result: sql_routines.Result = .{ .revision = revision, .identity = if (next) |value| .{ .id = value.id, .generation = value.generation } else null, .removed = @intFromBool(next == null), .cascade_notice = if (cascade_notice) |text| try sql_routines.outcomes.Notice.init(text) else null };
-        if (!apply) return result;
         var upserts: [1]system_catalog.Resource = undefined;
         if (next) |value| upserts[0] = .{ .kind = .routine, .id = value.id, .parent_id = namespace.id, .name = request.target.table, .signature = storage_signature, .source_json = try value.encode(a), .description = description };
         const removes: []system_catalog.Resource = if (next == null) try a.alloc(system_catalog.Resource, 1 + dependents.len) else &.{};
@@ -42660,6 +42712,8 @@ pub const RaftApplyStore = struct {
             @memcpy(removes[1..], dependents);
         }
         const delta: system_catalog.Delta = .{ .upserts = if (next != null) &upserts else &.{}, .removes = removes, .next_id = next_id };
+        try system_catalog_storage.requireScopeDeltaWritable(a, txn, group, delta);
+        if (!apply) return result;
         const bytes = try std.json.Stringify.valueAlloc(a, sql_routines.command(request), .{});
         var hash: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &hash, .{});

@@ -126,6 +126,7 @@ pub const Dependency = struct {
             .view => if (self.action == .rewrite) return error.InvalidScopeRetirement,
             .sequence => if (self.action != .retire) return error.InvalidScopeRetirement,
             .named_type => if (self.action != .hold) return error.InvalidScopeRetirement,
+            .routine, .cast => if (self.action == .rewrite) return error.InvalidScopeRetirement,
             else => return error.InvalidScopeRetirement,
         }
         if (self.schema_after) |schema| {
