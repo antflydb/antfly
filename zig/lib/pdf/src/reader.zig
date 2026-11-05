@@ -8804,7 +8804,14 @@ pub const Reader = struct {
             for (records) |*record| record.deinit(self.alloc);
             self.alloc.free(records);
         }
-        if (index == null) if (source) |property_source| try cache.deferBindings(self, property_source, records);
+        if (index == null and !dense_direct) if (source) |property_source| {
+            cache.deferBindings(self, property_source, records) catch |err| {
+                // Binding storage is optional metadata too. Records already
+                // contain invalid values, diagnosed only if a scope selects
+                // them. A known direct-table failure needs no deferred retry.
+                _ = try cache.selectedFailure(err);
+            };
+        };
         return records;
     }
 
@@ -36975,5 +36982,46 @@ test "reader inherited property source ownership survives every allocation failu
     defer a.free(sample);
     inline for (.{ false, true }) |analysis_api| {
         try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseInheritedPropertySourceAllocations, .{ sample, analysis_api });
+    }
+}
+
+test "reader deferred binding quotas preserve native fallback and backing OOM" {
+    const a = std.testing.allocator;
+    const sample = try buildTaggedTextTestPdfAlloc(a, .{ .content = "", .extra = &.{"11 0 obj\n<< /Tag << /ActualText (Label) >> >>\nendobj\n"} });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var scanner = syntax.Scanner.init(a, "<< /Properties 11 0 R >>");
+    defer scanner.deinit();
+    var resources = try scanner.readObject();
+    defer resources.deinit(a);
+    inline for (.{ false, true }) |limit_live| {
+        var live = DecodeBudgetAllocator.init(a, 0, if (limit_live) 0 else 1024 * 1024);
+        var retained = DecodeBudgetAllocator.init(live.allocator(), 0, if (limit_live) 1024 * 1024 else 0);
+        var cache = TextResourceCache{ .budget = &retained, .live_budget = &live };
+        defer cache.deinit();
+        inline for (.{ false, true }) |overridden| {
+            const paint = "/Span /Tag BDC BT /F1 10 Tf (SOURCE) Tj ET EMC";
+            const content = if (overridden) "/Span << /ActualText (Outer) >> BDC " ++ paint ++ " EMC" else paint;
+            const records = try reader.collectTextPropertiesFromResourcesAlloc(&resources, content, &cache);
+            defer {
+                for (records) |*record| record.deinit(a);
+                a.free(records);
+            }
+            try std.testing.expect((try findTextProperty(records, "Tag").?.value()).invalid);
+            const text = try extractTextFromContentAlloc(a, content, &.{}, &.{}, records, 0);
+            defer a.free(text);
+            try std.testing.expectEqualStrings(if (overridden) "Outer" else "SOURCE", std.mem.trimEnd(u8, text, "\n"));
+            try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
+            try std.testing.expectEqual(@as(usize, 0), cache.bindings.items.len);
+        }
+        retained.max_live_bytes = 1024 * 1024;
+        live.max_live_bytes = 1024 * 1024;
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        live.backing = failing.allocator();
+        defer live.backing = a;
+        try std.testing.expectError(error.OutOfMemory, reader.collectTextPropertiesFromResourcesAlloc(&resources, "/Span /Tag BDC EMC", &cache));
+        try std.testing.expect(failing.has_induced_failure);
+        try std.testing.expect(!retained.limit_exceeded and !live.limit_exceeded);
     }
 }
