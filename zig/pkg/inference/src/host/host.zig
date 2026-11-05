@@ -3677,8 +3677,11 @@ fn convertLocalGenerateParts(
         break :blk slice;
     } else null;
     // Video occupies its own message; its text is the plain message content.
-    if (video != null and (images.items.len > 0 or audio.items.len > 0)) return error.UnsupportedMixedVideoInput;
-    const content_parts = if (out_parts.items.len > 0 and video == null) blk: {
+    if (video != null) {
+        if (image_slice != null or audio_slice != null) return error.UnsupportedMixedVideoInput;
+        out_parts.clearAndFree(alloc);
+    }
+    const content_parts = if (out_parts.items.len > 0) blk: {
         const slice = try out_parts.toOwnedSlice(alloc);
         var slice_owned = true;
         errdefer if (slice_owned) alloc.free(slice);
@@ -3701,15 +3704,15 @@ test "local generate message conversion gives video its own field and rejects mi
     const alloc = std.testing.allocator;
     const clip = "data:video/mp4;base64,AAAA";
     {
-        var converted = try convertLocalGenerateMessages(alloc, &.{.{ .role = .user, .content = .{ .parts = &.{ .{ .text = "describe" }, .{ .media = .{ .mime_type = "video/mp4", .data = clip } } } } }}, 1024);
-        defer converted.deinit();
+        var converted = try convertLocalGenerateMessages(alloc, &.{.{ .role = .user, .content = .{ .parts = &.{ .{ .text = "describe" }, .{ .media = .{ .mime_type = "video/mp4", .data = clip } } } } }}, 3);
+        defer converted.deinit(alloc);
         const message = converted.messages[0];
         try std.testing.expectEqualStrings("\x00\x00\x00", message.video_bytes.?);
         try std.testing.expectEqualStrings("describe", message.content);
         try std.testing.expect(message.content_parts == null);
     }
-    try std.testing.expectError(error.VideoLimitExceeded, convertLocalGenerateMessages(alloc, &.{.{ .role = .user, .content = .{ .parts = &.{ .{ .media = .{ .mime_type = "video/mp4", .data = clip } }, .{ .media = .{ .mime_type = "video/mp4", .data = clip } } } } }}, 1024));
-    try std.testing.expectError(error.UnsupportedMixedVideoInput, convertLocalGenerateMessages(alloc, &.{.{ .role = .user, .content = .{ .parts = &.{ .{ .media = .{ .mime_type = "audio/wav", .data = "data:audio/wav;base64,AAAA" } }, .{ .media = .{ .mime_type = "video/mp4", .data = clip } } } } }}, 1024));
+    try std.testing.expectError(error.VideoLimitExceeded, convertLocalGenerateMessages(alloc, &.{.{ .role = .user, .content = .{ .parts = &.{ .{ .media = .{ .mime_type = "video/mp4", .data = clip } }, .{ .media = .{ .mime_type = "video/mp4", .data = clip } } } } }}, 6));
+    try std.testing.expectError(error.UnsupportedMixedVideoInput, convertLocalGenerateMessages(alloc, &.{.{ .role = .user, .content = .{ .parts = &.{ .{ .media = .{ .mime_type = "audio/wav", .data = "data:audio/wav;base64,AAAA" } }, .{ .media = .{ .mime_type = "video/mp4", .data = clip } } } } }}, 6));
 }
 
 test "local generate message conversion preserves tool history and admission" {

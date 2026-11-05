@@ -16,6 +16,5 @@
 test {
     _ = @import("pipelines/embedding_gemma2.zig");
     _ = @import("pipelines/embedding_gemma2_video.zig");
-    _ = @import("pipelines/gemma4_video.zig");
     _ = @import("ops/cuda/video.zig");
 }

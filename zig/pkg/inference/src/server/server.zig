@@ -31797,6 +31797,11 @@ test "generate parser consumes generic image and audio media parts strictly" {
     );
 }
 
+test "generate video dependencies declare their tests" {
+    _ = @import("../pipelines/gemma4_video.zig");
+    _ = model_caps;
+}
+
 test "generate parser gives video its own field without counting it as audio" {
     const alloc = std.testing.allocator;
     var node: Node = undefined;
