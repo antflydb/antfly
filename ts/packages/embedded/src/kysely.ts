@@ -178,7 +178,7 @@ export class AntflyDialect implements Dialect {
                 string,
                 {
                   schema?: {
-                    properties?: Record<string, { nullable?: boolean }>;
+                    properties?: Record<string, { type?: string | string[]; nullable?: boolean }>;
                     required?: string[];
                   };
                 }
@@ -195,26 +195,31 @@ export class AntflyDialect implements Dialect {
               schema: "public",
               isView: false,
               isForeign: false,
-              columns: described.columns.map((column) => ({
-                name: column.name,
-                // The embedded decoder returns every integer width as bigint.
-                // Exact NUMERIC uses decimal text; other structured values
-                // retain conservative metadata for schema generation.
-                dataType:
-                  column.element_type === "numeric" && column.type !== "array"
-                    ? "numeric"
-                    : column.type,
-                isNullable:
-                  column.name !== "_id" &&
-                  (document?.properties?.[column.name]?.nullable === true ||
-                    (!document?.required?.includes(column.name) &&
-                      document?.properties?.[column.name]?.nullable !== false)),
-                isAutoIncrementing: false,
-                hasDefaultValue:
-                  schema.column_defaults?.some((entry) => entry.column === column.name) ?? false,
-                isGeneratedAlways:
-                  schema.generated_columns?.some((entry) => entry.column === column.name) ?? false,
-              })),
+              columns: described.columns.map((column) => {
+                const property = document?.properties?.[column.name];
+                return {
+                  name: column.name,
+                  // The embedded decoder returns every integer width as bigint.
+                  // Exact NUMERIC uses decimal text; other structured values
+                  // retain conservative metadata for schema generation.
+                  dataType:
+                    column.element_type === "numeric" && column.type !== "array"
+                      ? "numeric"
+                      : column.type,
+                  isNullable:
+                    column.name !== "_id" &&
+                    (property?.nullable === true ||
+                      property?.type === "null" ||
+                      (Array.isArray(property?.type) && property.type.includes("null")) ||
+                      (!document?.required?.includes(column.name) && property?.nullable !== false)),
+                  isAutoIncrementing: false,
+                  hasDefaultValue:
+                    schema.column_defaults?.some((entry) => entry.column === column.name) ?? false,
+                  isGeneratedAlways:
+                    schema.generated_columns?.some((entry) => entry.column === column.name) ??
+                    false,
+                };
+              }),
             };
           })
         );

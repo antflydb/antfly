@@ -141,6 +141,8 @@ describe("schema tooling", () => {
             column("id", "string"),
             column("quantity", "integer", { hasDefaultValue: true }),
             column("computed", "string", { isGeneratedAlways: true }),
+            column("matrix", "int32[]", { hasDefaultValue: true }),
+            column("exact", "int64[]", { hasDefaultValue: true }),
             column('quote"; injected: never; //', "unknown", { isNullable: true }),
           ],
         },
@@ -152,6 +154,13 @@ describe("schema tooling", () => {
 import type { Insertable, Updateable } from "kysely";
 export const valid: Insertable<Database["items"]> = { id: "1" };
 export const update: Updateable<Database["items"]> = { quantity: 2n };
+export const vector: Updateable<Database["items"]> = { matrix: [1, null, 2] };
+export const matrix: Updateable<Database["items"]> = { matrix: [[1, null], [2, 3]] };
+export const cube: Updateable<Database["items"]> = { matrix: [[[1]], [[2]]] };
+export const empty: Updateable<Database["items"]> = { matrix: [] };
+export const exact: Updateable<Database["items"]> = { exact: [[9007199254740993n, null]] };
+// @ts-expect-error Array elements must retain their scalar type at every rank.
+export const wrongElement: Updateable<Database["items"]> = { matrix: [["x"]] };
 // @ts-expect-error A required column cannot be omitted.
 export const missing: Insertable<Database["items"]> = {};
 // @ts-expect-error A generated column cannot be inserted.
@@ -186,7 +195,15 @@ export const invalid: Insertable<Database["items"]> = { id: "1", computed: "x" }
           schema: {
             default_type: "row",
             document_schemas: {
-              row: { schema: { required: ["id"], properties: { n: { nullable: false } } } },
+              row: {
+                schema: {
+                  required: ["id", "nullable_union"],
+                  properties: {
+                    n: { nullable: false },
+                    nullable_union: { type: ["string", "null"] },
+                  },
+                },
+              },
             },
             column_defaults: [{ column: "n" }],
             generated_columns: [{ column: "computed" }],
@@ -199,6 +216,7 @@ export const invalid: Insertable<Database["items"]> = { id: "1", computed: "x" }
           { name: "n", type: "integer", element_type: "int64" },
           { name: "computed", type: "integer" },
           { name: "values", type: "array", element_type: "int32" },
+          { name: "nullable_union", type: "string" },
         ],
       }),
     };
@@ -215,11 +233,13 @@ export const invalid: Insertable<Database["items"]> = { id: "1", computed: "x" }
       hasDefaultValue: true,
     });
     expect(tables[0]?.columns[2]).toMatchObject({ isGeneratedAlways: true });
+    expect(tables[0]?.columns[4]).toMatchObject({ isNullable: true });
     expect(await introspector.getTables({ withInternalKyselyTables: true })).toHaveLength(2);
     const source = generateKyselyTypes(tables, { integerMode: "string" });
     expect(source).toContain('"n": Generated<string>;');
     expect(source).toContain('"computed": GeneratedAlways<string | null>;');
-    expect(source).toContain('"values": Array<number | null> | null;');
+    expect(source).toContain('"values": SQLArray<number> | null;');
+    expect(source).toContain('"nullable_union": string | null;');
     expect(generateKyselyTypes(tables, { integerMode: "bigint" })).toContain(
       '"n": Generated<bigint>;'
     );

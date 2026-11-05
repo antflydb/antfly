@@ -169,9 +169,50 @@ try {
     1n
   );
 
+  await client.tables.create("kysely_shapes", {
+    schema: {
+      storage_mode: "relational",
+      default_type: "row",
+      document_schemas: {
+        row: {
+          schema: {
+            type: "object",
+            required: ["body", "matrix"],
+            properties: {
+              body: { type: ["string", "null"] },
+              matrix: { type: "sql_array", "x-antfly-sql-type": "int32", nullable: false },
+            },
+          },
+        },
+      },
+    },
+  });
+  await db
+    .insertInto("kysely_shapes")
+    .values({
+      _id: "shape",
+      body: null,
+      matrix: [
+        [1, null],
+        [2, 3],
+      ],
+    })
+    .execute();
+  assert.deepEqual(await db.selectFrom("kysely_shapes").select(["body", "matrix"]).execute(), [
+    {
+      body: null,
+      matrix: [
+        [1, null],
+        [2, 3],
+      ],
+    },
+  ]);
   const metadata = await introspector.getTables({ withInternalKyselyTables: true });
   assert.ok(metadata.find((table) => table.name === "kysely_people"));
   assert.match(generateKyselyTypes(metadata, { integerMode: "string" }), /"n": string \| null;/);
+  const generated = generateKyselyTypes(metadata, { integerMode: "string" });
+  assert.match(generated, /"body": string \| null;/);
+  assert.match(generated, /"matrix": SQLArray<number>;/);
 
   // Server search support is an explicit capability boundary, never an
   // application-side search plus join fallback.

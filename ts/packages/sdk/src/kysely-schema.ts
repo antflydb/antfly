@@ -30,7 +30,10 @@ export function createAntflyIntrospector(
         if (!table) throw new Error(`Missing Antfly metadata for ${JSON.stringify(entry.name)}`);
         const schema = table.migration?.read_schema ?? table.schema;
         const document = schema?.document_schemas?.[schema.default_type ?? "row"]?.schema as
-          | { properties?: Record<string, { nullable?: boolean }>; required?: string[] }
+          | {
+              properties?: Record<string, { type?: string | string[]; nullable?: boolean }>;
+              required?: string[];
+            }
           | undefined;
         const described = await client.executeSQL({
           statement: `SELECT * FROM "${entry.name.replace(/"/g, '""')}" LIMIT 0`,
@@ -46,6 +49,8 @@ export function createAntflyIntrospector(
             isNullable:
               column.name !== "_id" &&
               (property?.nullable === true ||
+                property?.type === "null" ||
+                (Array.isArray(property?.type) && property.type.includes("null")) ||
                 (!document?.required?.includes(column.name) && property?.nullable !== false)),
             isAutoIncrementing: false,
             hasDefaultValue:
@@ -73,7 +78,13 @@ export interface GenerateKyselyTypesOptions {
 }
 
 function scalarType(type: string, integerMode: "bigint" | "string"): string {
-  if (type.endsWith("[]")) return `Array<${scalarType(type.slice(0, -2), integerMode)} | null>`;
+  if (type.endsWith("[]")) {
+    // PostgreSQL's [] type identity does not constrain rank. pg returns nested
+    // arrays for multidimensional values, with null at SQL NULL elements.
+    let element = type;
+    while (element.endsWith("[]")) element = element.slice(0, -2);
+    return `SQLArray<${scalarType(element, integerMode)}>`;
+  }
   switch (type.toLowerCase()) {
     case "integer":
     case "int64":
@@ -119,6 +130,7 @@ export function generateKyselyTypes(
     "export interface Database {",
   ];
   const imports = new Set<string>();
+  let hasArrays = false;
   const names = new Set<string>();
   for (const table of [...tables].sort((a, b) => a.name.localeCompare(b.name, "en"))) {
     const name =
@@ -131,6 +143,7 @@ export function generateKyselyTypes(
       if (columns.has(column.name))
         throw new Error(`Duplicate column ${JSON.stringify(column.name)}`);
       columns.add(column.name);
+      hasArrays ||= column.dataType.endsWith("[]");
       let type = scalarType(column.dataType, options.integerMode);
       if (column.isNullable && type !== "unknown") type += " | null";
       if (column.isGeneratedAlways) {
@@ -144,7 +157,10 @@ export function generateKyselyTypes(
     }
     lines.push("  };");
   }
+  const declarations: string[] = [];
   if (imports.size)
-    lines.splice(1, 0, `import type { ${[...imports].sort().join(", ")} } from "kysely";`, "");
+    declarations.push(`import type { ${[...imports].sort().join(", ")} } from "kysely";`, "");
+  if (hasArrays) declarations.push("export type SQLArray<T> = Array<T | SQLArray<T> | null>;", "");
+  lines.splice(1, 0, ...declarations);
   return `${[...lines, "}", ""].join("\n")}`;
 }

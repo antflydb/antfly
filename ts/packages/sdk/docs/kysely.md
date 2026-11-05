@@ -181,6 +181,13 @@ types, JSON, and timestamps remain `unknown` for application-specific refinement
 Only imports that the generated source uses are included. Run this against a
 stable schema; metadata reads are not an atomic catalog export.
 
+Nullable unions such as `type: ["string", "null"]` retain `null` even when the
+field is required. PostgreSQL array columns use a generated recursive
+`SQLArray<T>` type: `pg` can return one-dimensional or nested arrays for the same
+SQL array type, with nullable elements. Array rank is not fixed by the column's
+type identity. Embedded SQL arrays retain their native envelope and generate as
+`unknown` for application-specific refinement.
+
 Integer mode describes driver behavior; it does not convert results. Embedded
 SQL returns integer columns as `bigint`; pg returns BIGINT as strings and smaller
 integer widths as numbers. Exact NUMERIC is decimal text. Do not coerce BIGINT to

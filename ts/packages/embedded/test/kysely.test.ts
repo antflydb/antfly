@@ -29,6 +29,60 @@ import { AntflyDialect } from "../src/kysely.js";
 import { describeWithLibrary } from "./helpers.js";
 
 describeWithLibrary("Kysely search composition", () => {
+  it("preserves required nullable unions when generating schema types", async () => {
+    const directory = await mkdtemp(join(tmpdir(), "antfly-kysely-nullable-"));
+    const database = await createWithOptions(join(directory, "db.aflite"), { noSync: true });
+    const db = new Kysely<{
+      nullable_fields: { body: string | null; note: string | null; title: string };
+    }>({ dialect: new AntflyDialect({ database }) });
+    try {
+      await database.createTable("nullable_fields", {
+        default_type: "row",
+        document_schemas: {
+          row: {
+            schema: {
+              type: "object",
+              required: ["body", "note", "title"],
+              properties: {
+                body: { type: ["string", "null"] },
+                note: { type: "string", nullable: true },
+                title: { type: "string" },
+                optional: { type: "string" },
+              },
+            },
+          },
+        },
+      });
+      const table = await database.openTable("nullable_fields");
+      try {
+        await table.batchJson({
+          inserts: { a: { body: null, note: null, title: "present" } },
+          sync_level: "write",
+        });
+      } finally {
+        await table.close();
+      }
+      expect(
+        await db.selectFrom("nullable_fields").select(["body", "note", "title"]).execute()
+      ).toEqual([{ body: null, note: null, title: "present" }]);
+      const tables = await db.introspection.getTables();
+      expect(tables[0]?.columns.find((column) => column.name === "body")?.isNullable).toBe(true);
+      expect(tables[0]?.columns.find((column) => column.name === "note")?.isNullable).toBe(true);
+      expect(tables[0]?.columns.find((column) => column.name === "title")?.isNullable).toBe(false);
+      expect(tables[0]?.columns.find((column) => column.name === "optional")?.isNullable).toBe(
+        true
+      );
+      const source = generateKyselyTypes(tables, { integerMode: "bigint" });
+      expect(source).toContain('"body": string | null;');
+      expect(source).toContain('"note": string | null;');
+      expect(source).toContain('"title": string;');
+    } finally {
+      await db.destroy();
+      await database.close();
+      await rm(directory, { recursive: true, force: true });
+    }
+  });
+
   it("joins ranked hits with SQL, bounds candidates, and streams typed results", async () => {
     const directory = await mkdtemp(join(tmpdir(), "antfly-kysely-search-"));
     const database = await createWithOptions(join(directory, "db.aflite"), { noSync: true });
