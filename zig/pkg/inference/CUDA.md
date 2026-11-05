@@ -921,7 +921,10 @@ probing happens at model load, after checking the host's native-call isolation p
 Without a usable device, `auto` keeps the ordinary fallback order. Set
 `ANTFLY_INFERENCE_PREFERRED_BACKEND=native` to opt out.
 The native generation CLI checks load budgets for each resolved backend before
-constructing its session, including draft models. `auto` uses CUDA's weight tier
+constructing its session. Target, draft, and artifact-created host managers share
+one invocation ledger, retaining model and tokenizer-cache reservations until
+close. Matching XLA artifacts receive the same load policy and admit native
+preparation KV/scratch before execution. `auto` uses CUDA's weight tier
 and residency estimate when CUDA is selected; CPU fallback uses the host tier.
 Budget rejection follows the model loader's fallback and CUDA A4B safety policy.
 

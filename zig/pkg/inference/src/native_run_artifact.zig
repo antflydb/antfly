@@ -294,6 +294,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         opts.compare_host,
         opts.no_chat_template,
         opts.raw_prompt,
+        null,
     );
     if (result.has_token) {
         const token_id = result.token_id;
@@ -408,6 +409,7 @@ pub fn runArtifactPrompt(
     compare_host: bool,
     no_chat_template: bool,
     raw_prompt: bool,
+    load_policy: ?model_manager_mod.ModelLoadPolicy,
 ) !RunResult {
     if (compiled_artifact.isPackageManifestPath(artifact_or_manifest_path)) {
         const manifest_path = try resolvePackagePrefillManifestPath(
@@ -417,6 +419,7 @@ pub fn runArtifactPrompt(
             prompt,
             no_chat_template,
             raw_prompt,
+            load_policy,
         );
         defer allocator.free(manifest_path);
 
@@ -431,6 +434,7 @@ pub fn runArtifactPrompt(
             compare_host,
             no_chat_template,
             raw_prompt,
+            load_policy,
         );
     }
 
@@ -448,6 +452,7 @@ pub fn runArtifactPrompt(
         compare_host,
         no_chat_template,
         raw_prompt,
+        load_policy,
     );
 }
 
@@ -460,12 +465,17 @@ pub fn tryRunMatchingArtifact(
     prompt: []const u8,
     no_chat_template: bool,
     raw_prompt: bool,
+    load_policy: ?model_manager_mod.ModelLoadPolicy,
 ) !?RunResult {
     var model_manifest = try manifest_mod.loadFromDir(allocator, model_dir);
-    errdefer model_manifest.deinit();
+    defer model_manifest.deinit();
+
+    if (load_policy) |policy| if (policy.preflight) |preflight| {
+        _ = try preflight.check(preflight.context, model_dir, &model_manifest, .native, null);
+    };
 
     var assets = try loadTokenizerAssets(allocator, model_dir, &model_manifest);
-    errdefer assets.deinit();
+    defer assets.deinit();
 
     const apply_chat_template = !raw_prompt and !no_chat_template and assets.chat_tmpl != null;
     const rendered_prompt = if (raw_prompt)
@@ -474,7 +484,7 @@ pub fn tryRunMatchingArtifact(
         try assets.chat_tmpl.?.apply(allocator, &[_]generation.Message{.{ .role = "user", .content = prompt }}, true)
     else
         try generation.formatMessages(allocator, &[_]generation.Message{.{ .role = "user", .content = prompt }});
-    errdefer allocator.free(rendered_prompt);
+    defer allocator.free(rendered_prompt);
 
     var encoded = try generation.encodePromptForGeneration(
         assets.tokenizer(),
@@ -484,14 +494,10 @@ pub fn tryRunMatchingArtifact(
         model_manifest.add_bos_token,
         model_manifest.bos_token,
     );
-    errdefer encoded.deinit();
+    defer encoded.deinit();
 
     const prompt_tokens = countPromptTokens(encoded.attention_mask);
     if (prompt_tokens == 0) {
-        encoded.deinit();
-        allocator.free(rendered_prompt);
-        assets.deinit();
-        model_manifest.deinit();
         return null;
     }
 
@@ -514,6 +520,7 @@ pub fn tryRunMatchingArtifact(
             false,
             no_chat_template,
             raw_prompt,
+            load_policy,
         );
     }
 
@@ -531,25 +538,15 @@ pub fn tryRunMatchingArtifact(
             "offline artifact lookup miss: backend={s} dir={s} model_dir={s} seq_len={d} query_seq_len={d} attention_mode=paged_prefill",
             .{ backend, search_dir, model_dir, prompt_tokens, prompt_tokens },
         );
-        encoded.deinit();
-        allocator.free(rendered_prompt);
-        assets.deinit();
-        model_manifest.deinit();
         return null;
     };
-    errdefer found.deinit(allocator);
+    defer found.deinit(allocator);
 
     var parsed = try compiled_artifact.readManifest(allocator, io, found.manifest_path);
-    errdefer parsed.deinit();
+    defer parsed.deinit();
 
     const artifact = parsed.value;
     if (artifact.seq_len != prompt_tokens or artifact.query_seq_len != prompt_tokens) {
-        parsed.deinit();
-        found.deinit(allocator);
-        encoded.deinit();
-        allocator.free(rendered_prompt);
-        assets.deinit();
-        model_manifest.deinit();
         return null;
     }
     return try runArtifactPrompt(
@@ -560,6 +557,7 @@ pub fn tryRunMatchingArtifact(
         false,
         no_chat_template,
         raw_prompt,
+        load_policy,
     );
 }
 
@@ -661,6 +659,7 @@ fn resolvePackagePrefillManifestPath(
     prompt: []const u8,
     no_chat_template: bool,
     raw_prompt: bool,
+    load_policy: ?model_manager_mod.ModelLoadPolicy,
 ) ![]u8 {
     var parsed = try compiled_artifact.readPackageManifest(allocator, io, package_manifest_path);
     defer parsed.deinit();
@@ -672,6 +671,12 @@ fn resolvePackagePrefillManifestPath(
         parsed.value.kind,
         if (std.mem.eql(u8, parsed.value.backend, "xla")) parsed.value.pjrt_parameter_mode else null,
     );
+
+    if (load_policy) |policy| if (policy.preflight) |preflight| {
+        var model_manifest = try manifest_mod.loadFromDir(allocator, parsed.value.model_dir);
+        defer model_manifest.deinit();
+        _ = try preflight.check(preflight.context, parsed.value.model_dir, &model_manifest, .native, null);
+    };
 
     const prompt_tokens = try promptTokenCountForModel(
         allocator,
@@ -801,6 +806,7 @@ pub fn tryRunArtifactFromDir(
             false,
             no_chat_template,
             raw_prompt,
+            null,
         ) catch |err| switch (err) {
             error.ArtifactShapeMismatch => {
                 allocator.free(manifest_path);
@@ -865,6 +871,7 @@ fn tryRunPackageArtifactFromDir(
             false,
             no_chat_template,
             raw_prompt,
+            null,
         ) catch |err| switch (err) {
             error.ArtifactShapeMismatch => {
                 allocator.free(package_path);
@@ -891,6 +898,7 @@ fn runParsedArtifactPrompt(
     compare_host: bool,
     no_chat_template: bool,
     raw_prompt: bool,
+    load_policy: ?model_manager_mod.ModelLoadPolicy,
 ) !RunResult {
     const session_manager = backends.SessionManager.init(allocator);
     try validateArtifactBackendPolicy(&session_manager, artifact.backend);
@@ -901,6 +909,10 @@ fn runParsedArtifactPrompt(
         model_manifest.deinit();
         if (pjrtExecDebugEnabled() and std.mem.eql(u8, artifact.backend, "xla")) std.log.info("PJRT run-artifact model manifest deinit complete", .{});
     }
+
+    if (load_policy) |policy| if (policy.preflight) |preflight| {
+        _ = try preflight.check(preflight.context, artifact.model_dir, &model_manifest, .native, null);
+    };
 
     var assets = try loadTokenizerAssets(allocator, artifact.model_dir, &model_manifest);
     defer {
@@ -948,6 +960,7 @@ fn runParsedArtifactPrompt(
         assets.tokenizer(),
         graph_input_ids,
         compare_host,
+        load_policy,
     );
 }
 
@@ -984,12 +997,13 @@ fn runPreparedArtifactPrompt(
     tokenizer: tokenizer_mod.Tokenizer,
     graph_input_ids: []const i32,
     compare_host: bool,
+    load_policy: ?model_manager_mod.ModelLoadPolicy,
 ) !RunResult {
     if (std.mem.eql(u8, artifact.kind, "pjrt_hlo") or
         std.mem.eql(u8, artifact.kind, "pjrt_executable"))
     {
         const full_result = if (std.mem.eql(u8, artifact.backend, "xla"))
-            try runPjrtHloArtifactFull(allocator, io, artifact, graph_input_ids, compare_host)
+            try runPjrtHloArtifactFull(allocator, io, artifact, graph_input_ids, compare_host, load_policy)
         else
             return error.UnsupportedCompileBackend;
         errdefer full_result.deinit(allocator);
@@ -1049,6 +1063,7 @@ fn runPreparedArtifactPrompt(
             artifact,
             graph_input_ids,
             compare_host,
+            load_policy,
         );
         defer partition_result.deinit(allocator);
         return .{
@@ -1084,26 +1099,34 @@ fn modelRuntimeAttentionModeFromArtifact(artifact: compiled_artifact.Manifest) !
     return error.UnsupportedArtifactKind;
 }
 
+fn artifactRunBudget(model: *model_manager_mod.LoadedModel, artifact: compiled_artifact.Manifest, policy: ?model_manager_mod.ModelLoadPolicy) !runtime.tier.memory.RunBudget {
+    const memory = runtime.tier.memory;
+    var limits = session_factory.widenBudgetLimitsForSession(model.session, memory.defaultLimitsForBackend(.cpu));
+    if (policy) |configured| limits = memory.applyLimitOverrides(limits, configured.limits);
+    var budget = memory.RunBudget.init(limits);
+    const cfg = session_factory.getGptConfig(model.session) orelse return error.InvalidModelForGeneration;
+    try budget.reserveEstimate(try memory.estimateGptGeneration(.native, session_factory.recommendedKvDTypeForSession(model.session, .native), cfg, artifact.seq_len, 1, artifact.query_seq_len));
+    return budget;
+}
+
+fn admitArtifactRun(manager: *model_manager_mod.ModelManager, session: backends.Session, budget: runtime.tier.memory.RunBudget) !model_manager_mod.GenerationAdmissionLease {
+    return manager.acquireGenerationResources(&.{.{ .session = session, .resources = .{
+        .backend_class = .cpu,
+        .limits = budget.limits,
+        .amounts = .{ .host_kv_bytes = budget.host_kv_bytes, .host_scratch_bytes = budget.host_scratch_bytes },
+    } }});
+}
+
 fn runPjrtHloArtifactFull(
     allocator: std.mem.Allocator,
     io: std.Io,
     artifact: compiled_artifact.Manifest,
     graph_input_ids: []const i32,
     compare_host: bool,
+    load_policy: ?model_manager_mod.ModelLoadPolicy,
 ) !FullModelRunResult {
     if (comptime !build_options.enable_pjrt) return error.BackendUnavailable;
     if (artifact.pjrt_input_bindings.len == 0 or artifact.pjrt_output_node_ids.len == 0) return error.MissingArtifactMetadata;
-
-    const plugin_path = try native_backend_choice.pjrtPluginPathFromEnv(allocator) orelse return error.MissingPjrtPlugin;
-    defer allocator.free(plugin_path);
-
-    const pjrt_lib = @import("pjrt");
-    var client = try pjrt_lib.pjrt.Client.init(plugin_path);
-    defer {
-        if (pjrtExecDebugEnabled()) std.log.info("PJRT run-artifact client deinit begin", .{});
-        client.deinit();
-        if (pjrtExecDebugEnabled()) std.log.info("PJRT run-artifact client deinit complete", .{});
-    }
 
     var session_manager = backends.SessionManager.initWithIo(allocator, io);
     session_manager.preferred_backends = &.{backends.BackendType.native};
@@ -1113,6 +1136,8 @@ fn runPjrtHloArtifactFull(
         model_manager.deinit();
         if (pjrtExecDebugEnabled()) std.log.info("PJRT run-artifact model manager deinit complete", .{});
     }
+
+    if (load_policy) |policy| try policy.configure(&model_manager);
 
     const model = try model_manager.loadFromDirWithPreferredBackends(
         artifact.model_dir,
@@ -1125,11 +1150,25 @@ fn runPjrtHloArtifactFull(
     defer allocator.free(input_ids);
     for (graph_input_ids, 0..) |id, i| input_ids[i] = id;
 
-    var cb = try session_factory.getComputeBackend(model.session, allocator);
+    var run_budget = try artifactRunBudget(model, artifact, load_policy);
+    var run_admission = try admitArtifactRun(&model_manager, model.session, run_budget);
+    defer run_admission.release();
+    var cb = try session_factory.getComputeBackendWithBudget(model.session, allocator, &run_budget);
     defer {
         if (pjrtExecDebugEnabled()) std.log.info("PJRT run-artifact host backend deinit begin", .{});
         cb.deinit();
         if (pjrtExecDebugEnabled()) std.log.info("PJRT run-artifact host backend deinit complete", .{});
+    }
+
+    const plugin_path = try native_backend_choice.pjrtPluginPathFromEnv(allocator) orelse return error.MissingPjrtPlugin;
+    defer allocator.free(plugin_path);
+
+    const pjrt_lib = @import("pjrt");
+    var client = try pjrt_lib.pjrt.Client.init(plugin_path);
+    defer {
+        if (pjrtExecDebugEnabled()) std.log.info("PJRT run-artifact client deinit begin", .{});
+        client.deinit();
+        if (pjrtExecDebugEnabled()) std.log.info("PJRT run-artifact client deinit complete", .{});
     }
 
     var kv_manager = runtime.kv.manager.KvManager.init(allocator);
@@ -1298,6 +1337,9 @@ const MaterializedPartitionInputs = struct {
     cb: ops.ComputeBackend,
     runtime_inputs: []interpreter.RuntimeInput,
     graph: ?ml.graph.Graph = null,
+    model_manager: *model_manager_mod.ModelManager,
+    run_budget: *runtime.tier.memory.RunBudget,
+    run_admission: model_manager_mod.GenerationAdmissionLease,
 
     pub fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
         var capture = interpreter.CapturedValuesResult{ .values = self.values, .allocator = allocator };
@@ -1307,6 +1349,10 @@ const MaterializedPartitionInputs = struct {
         allocator.free(self.node_ids);
         self.cb.deinit();
         if (self.graph) |*graph| graph.deinit();
+        self.run_admission.release();
+        self.model_manager.deinit();
+        allocator.destroy(self.model_manager);
+        allocator.destroy(self.run_budget);
     }
 };
 
@@ -1328,6 +1374,7 @@ fn runPjrtPartitionArtifact(
     artifact: compiled_artifact.Manifest,
     graph_input_ids: []const i32,
     compare_host: bool,
+    load_policy: ?model_manager_mod.ModelLoadPolicy,
 ) !PartitionRunResult {
     if (comptime !build_options.enable_pjrt) return error.BackendUnavailable;
     if (artifact.pjrt_input_bindings.len == 0 or artifact.pjrt_output_node_ids.len == 0) return error.MissingArtifactMetadata;
@@ -1344,6 +1391,7 @@ fn runPjrtPartitionArtifact(
         artifact,
         graph_input_ids,
         capture_node_ids,
+        load_policy,
     );
     defer materialized.deinit(allocator);
     const graph = if (materialized.graph) |*graph| graph else return error.MissingArtifactMetadata;
@@ -1475,11 +1523,16 @@ fn materializePartitionInputs(
     artifact: compiled_artifact.Manifest,
     graph_input_ids: []const i32,
     capture_node_ids: []const ml.graph.NodeId,
+    load_policy: ?model_manager_mod.ModelLoadPolicy,
 ) !MaterializedPartitionInputs {
     var session_manager = backends.SessionManager.init(allocator);
     session_manager.preferred_backends = &.{backends.BackendType.native};
-    var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
-    defer model_manager.deinit();
+    const model_manager = try allocator.create(model_manager_mod.ModelManager);
+    errdefer allocator.destroy(model_manager);
+    model_manager.* = model_manager_mod.ModelManager.init(allocator, session_manager);
+    errdefer model_manager.deinit();
+
+    if (load_policy) |policy| try policy.configure(model_manager);
 
     const model = try model_manager.loadFromDirWithPreferredBackends(
         artifact.model_dir,
@@ -1492,7 +1545,12 @@ fn materializePartitionInputs(
     defer allocator.free(graph_input_ids_i64);
     for (graph_input_ids, 0..) |id, i| graph_input_ids_i64[i] = id;
 
-    var cb = try session_factory.getComputeBackend(model.session, allocator);
+    const run_budget = try allocator.create(runtime.tier.memory.RunBudget);
+    errdefer allocator.destroy(run_budget);
+    run_budget.* = try artifactRunBudget(model, artifact, load_policy);
+    var run_admission = try admitArtifactRun(model_manager, model.session, run_budget.*);
+    errdefer run_admission.release();
+    var cb = try session_factory.getComputeBackendWithBudget(model.session, allocator, run_budget);
     errdefer cb.deinit();
 
     var kv_manager = runtime.kv.manager.KvManager.init(allocator);
@@ -1592,6 +1650,9 @@ fn materializePartitionInputs(
         .cb = cb,
         .runtime_inputs = runtime_inputs,
         .graph = shape_graph,
+        .model_manager = model_manager,
+        .run_budget = run_budget,
+        .run_admission = run_admission,
     };
 }
 

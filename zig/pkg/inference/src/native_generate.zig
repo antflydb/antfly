@@ -432,9 +432,11 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
         if (artifact_backend != null) .pjrt else null,
     );
 
+    var load_resources = try model_manager_mod.ModelManager.SharedResources.init(allocator, try budgetOverrides(opts).toByteLimits());
+    defer load_resources.deinit();
     var model_manager = model_manager_mod.ModelManager.init(allocator, session_manager);
     defer model_manager.deinit();
-    var load_budget = ModelLoadBudget{ .allocator = allocator, .options = opts };
+    var load_budget = ModelLoadBudget{ .allocator = allocator, .options = opts, .resources = &load_resources };
     try load_budget.configure(&model_manager);
 
     var draft_session_manager = backends.SessionManager.initWithIo(allocator, io);
@@ -463,6 +465,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             opts.prompt,
             opts.no_chat_template,
             opts.raw_prompt,
+            try load_budget.policy(),
         )) |artifact_result_const| {
             var artifact_result = artifact_result_const;
             defer artifact_result.deinit(artifact_allocator);
@@ -562,6 +565,7 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             prompt_tokens,
             prompt_tokens,
             "paged_prefill",
+            try load_budget.policy(),
         )) return;
     }
 
@@ -7055,6 +7059,7 @@ fn tryRunArtifactForPromptShape(
     seq_len: usize,
     query_seq_len: usize,
     attention_mode: []const u8,
+    load_policy: model_manager_mod.ModelLoadPolicy,
 ) !bool {
     const artifact_started_at = std.Io.Timestamp.now(io, .awake);
     var artifact_arena = std.heap.ArenaAllocator.init(allocator);
@@ -7078,6 +7083,7 @@ fn tryRunArtifactForPromptShape(
         false,
         opts.no_chat_template,
         opts.raw_prompt,
+        load_policy,
     );
     defer artifact_result.deinit(artifact_allocator);
     const finished_generate_at = std.Io.Timestamp.now(io, .awake);
@@ -8095,12 +8101,20 @@ fn a4bInferenceRequest(opts: Options) ?ops.A4bInferenceRequest {
 const ModelLoadBudget = struct {
     allocator: std.mem.Allocator,
     options: Options,
+    resources: ?*model_manager_mod.ModelManager.SharedResources = null,
+
+    fn policy(self: *ModelLoadBudget) !model_manager_mod.ModelLoadPolicy {
+        return .{
+            .limits = try budgetOverrides(self.options).toByteLimits(),
+            .resources = self.resources,
+            .preflight = .{ .context = self, .check = check },
+        };
+    }
 
     fn configure(self: *ModelLoadBudget, manager: *model_manager_mod.ModelManager) !void {
         // Pass selective overrides, not defaults: the exact plan must widen
         // its envelope before the operator's caps are applied.
-        manager.configureAdmissionLimits(try budgetOverrides(self.options).toByteLimits());
-        manager.model_load_preflight = .{ .context = self, .check = check };
+        try (try self.policy()).configure(manager);
     }
 
     fn check(raw: *anyopaque, model_dir: []const u8, manifest: *const manifest_mod.ModelManifest, backend: backends.BackendType, a4b_request: ?ops.A4bInferenceRequest) !model_manager_mod.ModelLoadAdmission {
@@ -8145,8 +8159,8 @@ fn preflightModelLoadBudget(
             return .managed;
         }
     }
-    const weight_bytes = estimatePreflightWeightBytes(allocator, manifest, backend) catch 0;
-    if (weight_bytes == 0) return .preflight_checked;
+    const weight_bytes = estimateModelArtifactBytes(allocator, manifest) catch 0;
+    if (weight_bytes == 0) return .managed;
 
     var limits = runtime.tier.memory.defaultLimitsForBackend(switch (reservation_tier) {
         .host => .cpu,
@@ -8173,7 +8187,9 @@ fn preflightModelLoadBudget(
         }
         return err;
     };
-    return .preflight_checked;
+    // The canonical plan accounts for format expansion, host staging and
+    // retained workspace. Keep one source of truth for every CLI load.
+    return .managed;
 }
 
 fn estimateModelArtifactBytes(
@@ -8186,29 +8202,96 @@ fn estimateModelArtifactBytes(
     ) orelse error.ResourceLimitExceeded;
 }
 
-fn estimatePreflightWeightBytes(
-    allocator: std.mem.Allocator,
-    manifest: *const manifest_mod.ModelManifest,
-    backend: backends.BackendType,
-) !usize {
-    const artifact_bytes = try estimateModelArtifactBytes(allocator, manifest);
-    if (backend != .cuda or manifest.safetensors_path == null or manifest.config_path == null) return artifact_bytes;
-
-    const config_bytes = try c_file.readFile(allocator, manifest.config_path.?);
-    defer allocator.free(config_bytes);
-    const cfg = gpt_mod.parseConfig(allocator, config_bytes) catch return artifact_bytes;
-    if (cfg.family != .gemma) return artifact_bytes;
-
-    const embed_elements = std.math.mul(usize, @intCast(cfg.vocab_size), @intCast(cfg.hidden_size)) catch return artifact_bytes;
-    const embed_bytes = std.math.mul(usize, embed_elements, @sizeOf(f32)) catch return artifact_bytes;
-    const overhead_bytes: usize = 512 * 1024 * 1024;
-    return @min(artifact_bytes, embed_bytes + overhead_bytes);
-}
-
 fn validateVideoOptions(opts: Options) !void {
     if (opts.video_path == null) return;
     if (opts.image_count > 0 or opts.audio_count > 0) return error.UnsupportedMixedVideoInput;
     if (opts.raw_prompt or opts.draft_model != null) return error.UnsupportedVideoGenerationOption;
+}
+
+test "native generate shares target draft and artifact admission with refunds" {
+    const a = std.testing.allocator;
+    const mib: usize = 1024 * 1024;
+    var budget = ModelLoadBudget{ .allocator = a, .options = .{
+        .model_dir = "target",
+        .prompt = "hello",
+        .host_budget_mb = 8,
+        .combined_budget_mb = 8,
+        .scratch_budget_mb = 8,
+    } };
+    var resources = try model_manager_mod.ModelManager.SharedResources.init(a, try budgetOverrides(budget.options).toByteLimits());
+    defer resources.deinit();
+    budget.resources = &resources;
+    var draft = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+    defer draft.deinit();
+    try budget.configure(&draft);
+    {
+        var target = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+        defer target.deinit();
+        try budget.configure(&target);
+        var target_lease = try target.admitHostPreflight(5 * mib);
+        defer target_lease.release();
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, draft.admitHostPreflight(5 * mib));
+        var artifact = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+        defer artifact.deinit();
+        try (try budget.policy()).configure(&artifact);
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, artifact.admitHostPreflight(5 * mib));
+        try std.testing.expectEqual(5 * mib, draft.currentAdmissionAmounts().hostTotalBytes());
+    }
+    // Closing a sibling must neither close the shared domain nor keep its
+    // reservations. The still-live draft can now use the released capacity.
+    var retry = try draft.admitHostPreflight(5 * mib);
+    retry.release();
+    try std.testing.expectEqual(@as(usize, 0), draft.currentAdmissionAmounts().hostTotalBytes());
+}
+
+test "native generate artifact fast path rejects load caps before tokenizer or plugin work" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const weights = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(weights);
+    @memset(weights, 0);
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.safetensors", .data = weights });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"llama\",\"hidden_size\":4,\"num_hidden_layers\":1,\"num_attention_heads\":2,\"intermediate_size\":8,\"vocab_size\":16}" });
+    const root = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(root);
+    var budget = ModelLoadBudget{ .allocator = a, .options = .{
+        .model_dir = root,
+        .prompt = "hello",
+        .backend = .xla,
+        .max_tokens = 1,
+        .host_budget_mb = 1,
+    } };
+    // A missing tokenizer/plugin must not mask the caller's load cap. This
+    // invokes the actual pre-model-load artifact entry point without a GPU.
+    try std.testing.expectError(error.MemoryBudgetExceeded, native_run_artifact.tryRunMatchingArtifact(a, std.testing.io, root, "xla", root, "hello", true, true, try budget.policy()));
+    const artifact_path = try std.fs.path.join(a, &.{ root, "model.exec" });
+    defer a.free(artifact_path);
+    const manifest_path = try std.fs.path.join(a, &.{ root, "model.exec.inference.json" });
+    defer a.free(manifest_path);
+    try compiled_artifact.writeManifest(a, std.testing.io, manifest_path, .{
+        .backend = "xla",
+        .kind = "pjrt_executable",
+        .model_dir = root,
+        .artifact_path = artifact_path,
+        .prompt_tokens = 1,
+        .seq_len = 1,
+        .query_seq_len = 1,
+        .attention_mode = "paged_prefill",
+        .raw_prompt = true,
+        .chat_template_applied = false,
+    });
+    try std.testing.expectError(error.MemoryBudgetExceeded, native_run_artifact.runArtifactPrompt(a, std.testing.io, manifest_path, "hello", false, true, true, try budget.policy()));
+    const package_path = try compiled_artifact.packageManifestPath(a, root, "xla", root, "pjrt_executable", compiled_artifact.pjrt_parameter_mode_inputs);
+    defer a.free(package_path);
+    try compiled_artifact.writePackageManifest(a, std.testing.io, package_path, .{
+        .backend = "xla",
+        .model_dir = root,
+        .kind = "pjrt_executable",
+        .pjrt_parameter_mode = compiled_artifact.pjrt_parameter_mode_inputs,
+        .artifacts = &.{.{ .manifest_path = manifest_path, .artifact_path = artifact_path, .artifact_role = compiled_artifact.artifact_role_prefill, .seq_len = 1, .query_seq_len = 1, .attention_mode = "paged_prefill" }},
+    });
+    try std.testing.expectError(error.MemoryBudgetExceeded, native_run_artifact.runArtifactPrompt(a, std.testing.io, package_path, "hello", false, true, true, try budget.policy()));
 }
 
 test "native generate installs selective load caps for target and draft managers" {
@@ -8227,7 +8310,7 @@ test "native generate installs selective load caps for target and draft managers
     for ([_]*model_manager_mod.ModelManager{ &target, &draft }) |manager| {
         try budget.configure(manager);
         try std.testing.expect(manager.model_load_preflight != null);
-        try std.testing.expect(!manager.admission_enabled);
+        try std.testing.expect(manager.admission_enabled);
         const limits = manager.admission_limit_overrides;
         try std.testing.expectEqual(@as(usize, 8192 * 1024 * 1024), limits.backend_limit_bytes);
         try std.testing.expectEqual(@as(usize, 512 * 1024 * 1024), limits.kv_limit_bytes);
@@ -8256,7 +8339,7 @@ test "native generate load budget uses the resolved backend when options are aut
     const options = Options{ .model_dir = root, .prompt = "hello", .backend = .auto, .host_budget_mb = 1, .backend_budget_mb = 8, .combined_budget_mb = 16 };
     // No device is loaded: preflight must charge the actual candidate's tier,
     // rather than rejecting the CUDA candidate against the CPU host cap.
-    try std.testing.expectEqual(.preflight_checked, try preflightModelLoadBudget(a, &manifest, options, .cuda, null));
+    try std.testing.expectEqual(.managed, try preflightModelLoadBudget(a, &manifest, options, .cuda, null));
     try std.testing.expectError(error.MemoryBudgetExceeded, preflightModelLoadBudget(a, &manifest, options, .native, null));
     var capped = options;
     capped.backend_budget_mb = 1;

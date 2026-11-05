@@ -4595,7 +4595,68 @@ const TeardownTicket = struct {
 /// manager's exact construction plan and retained residency/workspace lease.
 pub const ModelLoadAdmission = enum { preflight_checked, managed };
 
+pub const ModelLoadPreflight = struct {
+    context: *anyopaque,
+    check: *const fn (*anyopaque, []const u8, *const manifest_mod.ModelManifest, backends.BackendType, ?backend_contracts.A4bInferenceRequest) anyerror!ModelLoadAdmission,
+};
+
+/// Borrowed invocation policy, also used by artifact-created host managers.
+/// Its shared owner and preflight context must outlive configured managers.
+pub const ModelLoadPolicy = struct {
+    limits: runtime.tier.memory.Limits = .{},
+    resources: ?*ModelManager.SharedResources = null,
+    preflight: ?ModelLoadPreflight = null,
+
+    pub fn configure(self: @This(), manager: *ModelManager) !void {
+        manager.configureAdmissionLimits(self.limits);
+        if (self.resources) |resources| try resources.attach(manager);
+        manager.model_load_preflight = self.preflight;
+        // Admission is an execution policy, independent of serving/model
+        // compatibility policy. Include tokenizer construction and metadata,
+        // not just weights, in the invocation's retained resource domain.
+        manager.admission_enabled = true;
+    }
+};
+
 pub const ModelManager = struct {
+    /// One physical ledger for an invocation's target, draft and artifact
+    /// managers. Managers retain the stable domain; cache/lease lifetimes can
+    /// escape a manager without borrowing this handle's address.
+    pub const SharedResources = struct {
+        domain: *ResourceDomain,
+        limits: runtime.tier.memory.Limits,
+
+        pub fn init(allocator: std.mem.Allocator, limits: runtime.tier.memory.Limits) !@This() {
+            const domain = try ResourceDomain.create(allocator);
+            domain.tokenizer_cache_budget_source = .local_manager;
+            var policy = ModelManager.init(allocator, backends.SessionManager.init(allocator));
+            policy.admission_limit_overrides = limits;
+            policy.configureAdmissionController(domain);
+            return .{ .domain = domain, .limits = limits };
+        }
+
+        pub fn attach(self: *@This(), manager: *ModelManager) !void {
+            if (manager.resource_domain != null or manager.tokenizer_cache_budget_source != .none or
+                manager.resource_ownership != .local or manager.loaded.count() != 0 or
+                manager.composite_assets.count() != 0)
+                return error.ResourceOwnerAlreadyConfigured;
+            if (!std.meta.eql(manager.admission_limit_overrides, self.limits) or manager.process_memory_limit_bytes != 0)
+                return error.SharedResourcePolicyMismatch;
+            if (!self.domain.retain()) return error.ResourceOwnerShuttingDown;
+            manager.resource_domain = self.domain;
+            manager.owns_resource_domain = false;
+            manager.tokenizer_cache_config.resource_budget = self.domain.resourceBudget();
+            manager.tokenizer_cache_budget_source = .local_manager;
+        }
+
+        /// Call after all attached managers have closed. Escaped tokenizers
+        /// retain their domain until their final cache/metadata lease releases.
+        pub fn deinit(self: *@This()) void {
+            self.domain.close();
+            self.domain.release();
+            self.* = undefined;
+        }
+    };
     pub const HostCacheReclaimer = struct {
         context: *anyopaque,
         reclaim: *const fn (*anyopaque, usize) usize,
@@ -4815,10 +4876,7 @@ pub const ModelManager = struct {
     /// Optional caller policy for full-model loads. Borrowed until deinit;
     /// checked per resolved backend before construction, with normal fallback
     /// and CUDA A4B fail-closed rules. No device probing belongs in this hook.
-    model_load_preflight: ?struct {
-        context: *anyopaque,
-        check: *const fn (*anyopaque, []const u8, *const manifest_mod.ModelManifest, backends.BackendType, ?backend_contracts.A4bInferenceRequest) anyerror!ModelLoadAdmission,
-    } = null,
+    model_load_preflight: ?ModelLoadPreflight = null,
     admission_limit_overrides: runtime.tier.memory.Limits = .{},
     process_memory_limit_bytes: usize = 0,
     process_memory_limit_provenance: runtime.tier.memory.ProcessMemoryLimitProvenance = .automatic,
@@ -4869,6 +4927,7 @@ pub const ModelManager = struct {
     unhealthy_model_backends: std.AutoHashMapUnmanaged(ModelBackendHealthKey, u64) = .empty,
     tokenizer_cache_config_mutex: std.atomic.Mutex = .unlocked,
     resource_domain: ?*ResourceDomain = null,
+    owns_resource_domain: bool = true,
     tokenizer_cache_config: hf_tokenizer.HfTokenizer.BpeCacheConfig = .{},
     tokenizer_parallel_bpe_config: hf_tokenizer.HfTokenizer.ParallelBpeConfig = .{},
 
@@ -4928,6 +4987,7 @@ pub const ModelManager = struct {
         limit_bytes: usize,
         provenance: runtime.tier.memory.ProcessMemoryLimitProvenance,
     ) void {
+        std.debug.assert(self.owns_resource_domain);
         std.debug.assert(self.loaded.count() == 0);
         std.debug.assert(self.composite_assets.count() == 0);
         self.process_memory_limit_bytes = limit_bytes;
@@ -4976,6 +5036,9 @@ pub const ModelManager = struct {
         self: *const ModelManager,
         domain: *ResourceDomain,
     ) void {
+        // An attached manager can tighten its own request policy, but only the
+        // invocation owner configures the shared physical envelope.
+        if (!self.owns_resource_domain) return;
         domain.admission.configureSharedLimits(
             runtime.tier.memory.sharedAdmissionLimitsWithOverridesAndProcessLimit(
                 self.admission_limit_overrides,
@@ -5437,6 +5500,7 @@ pub const ModelManager = struct {
         self: *ModelManager,
         overrides: runtime.tier.memory.Limits,
     ) void {
+        std.debug.assert(self.owns_resource_domain);
         std.debug.assert(self.loaded.count() == 0);
         std.debug.assert(self.composite_assets.count() == 0);
         self.admission_limit_overrides = overrides;
@@ -7164,7 +7228,7 @@ pub const ModelManager = struct {
         }
         self.loaded_aliases.deinit(self.allocator);
         if (self.resource_domain) |lifetime| {
-            lifetime.close();
+            if (self.owns_resource_domain) lifetime.close();
             self.tokenizer_cache_config.resource_budget = null;
             self.resource_domain = null;
             lifetime.release();
@@ -11266,6 +11330,89 @@ test "model load preflight checks resolved backends before construction and pres
     probe.deny_all = true;
     try std.testing.expectError(error.MemoryBudgetExceeded, loadSessionForPreferredBackends(&manager, manager.session_manager.preferred_backends, root, manifest, &manager.session_manager, null));
     try std.testing.expectEqualSlices(backends.BackendType, expected, probe.attempts[0..probe.count]);
+}
+
+fn sharedResourceTokenizerLifetimeScenario(a: std.mem.Allocator) !void {
+    const limits = runtime.tier.memory.Limits{ .host_limit_bytes = 16 * 1024 * 1024 };
+    var resources = try ModelManager.SharedResources.init(a, limits);
+    var resources_owned = true;
+    defer if (resources_owned) resources.deinit();
+    var budget: hf_tokenizer.HfTokenizer.BpeCacheResourceBudget = undefined;
+    {
+        var manager = ModelManager.init(a, backends.SessionManager.init(a));
+        defer manager.deinit();
+        try (ModelLoadPolicy{ .limits = limits, .resources = &resources }).configure(&manager);
+        budget = manager.tokenizer_cache_config.resource_budget.?;
+        try std.testing.expect(budget.retainContext());
+    }
+    defer budget.releaseContext();
+    // A cache can escape every manager. Its retained domain must continue to
+    // account growth, and refunds must still work after the owner closes.
+    if (!budget.observe(budget.context, 123, 0, 4096)) return error.OutOfMemory;
+    defer {
+        const refunded = budget.observe(budget.context, 123, 4096, 0);
+        std.debug.assert(refunded);
+    }
+    resources.deinit();
+    resources_owned = false;
+    try std.testing.expect(!budget.observe(budget.context, 123, 4096, 8192));
+}
+
+test "shared model load admission owns escaped tokenizer caches across every allocation failure" {
+    try sharedResourceTokenizerLifetimeScenario(std.testing.allocator);
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, sharedResourceTokenizerLifetimeScenario, .{});
+}
+
+test "shared model load admission denies aggregate residency before a second constructor and refunds" {
+    const a = std.testing.allocator;
+    const memory = runtime.tier.memory;
+    const mib: usize = 1024 * 1024;
+    var dir = std.testing.tmpDir(.{});
+    defer dir.cleanup();
+    try writeCancellationTestModel(dir.dir, a);
+    // Pad the valid tiny GGUF to exercise real canonical residency plans
+    // without allocating a large model or substituting a fake load plan.
+    const original = try dir.dir.readFileAlloc(std.testing.io, "model.gguf", a, .limited(mib));
+    defer a.free(original);
+    const padded = try a.alloc(u8, 2 * mib);
+    defer a.free(padded);
+    @memset(padded, 0);
+    @memcpy(padded[0..original.len], original);
+    try dir.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = padded });
+    const root = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", dir.sub_path[0..] });
+    defer a.free(root);
+    var manifest = try manifest_mod.loadFromDir(a, root);
+    defer manifest.deinit();
+    const Probe = struct {
+        fn check(_: *anyopaque, _: []const u8, _: *const manifest_mod.ModelManifest, _: backends.BackendType, _: ?backend_contracts.A4bInferenceRequest) !ModelLoadAdmission {
+            return .managed;
+        }
+    };
+    var context: u8 = 0;
+    const limits = memory.Limits{ .host_limit_bytes = 3 * mib, .combined_limit_bytes = 3 * mib };
+    var resources = try ModelManager.SharedResources.init(a, limits);
+    defer resources.deinit();
+    const policy = ModelLoadPolicy{ .limits = limits, .resources = &resources, .preflight = .{ .context = &context, .check = Probe.check } };
+    var draft = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.native} });
+    defer draft.deinit();
+    try policy.configure(&draft);
+    {
+        var target = ModelManager.init(a, .{ .allocator = a, .preferred_backends = &.{.native} });
+        defer target.deinit();
+        try policy.configure(&target);
+        var loaded = try loadSessionForPreferredBackends(&target, &.{.native}, root, manifest, &target.session_manager, null);
+        defer loaded.deinit();
+        try std.testing.expect(loaded.resource_lease != null);
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, loadSessionForPreferredBackends(&draft, &.{.native}, root, manifest, &draft.session_manager, null));
+        try std.testing.expectEqual(2 * mib, draft.currentAdmissionAmounts().host_weight_bytes);
+        loaded.deinit();
+        try std.testing.expectEqual(memory.AdmissionAmounts{}, draft.currentAdmissionAmounts());
+    }
+    var retry = try loadSessionForPreferredBackends(&draft, &.{.native}, root, manifest, &draft.session_manager, null);
+    defer retry.deinit();
+    try std.testing.expectEqual(2 * mib, draft.currentAdmissionAmounts().host_weight_bytes);
+    retry.deinit();
+    try std.testing.expectEqual(memory.AdmissionAmounts{}, draft.currentAdmissionAmounts());
 }
 
 test "managed load preflight enforces caps and retains residency without a serving policy" {
