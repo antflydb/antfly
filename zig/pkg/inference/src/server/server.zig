@@ -32365,6 +32365,7 @@ test "generate parser borrows framed media without copying" {
     var png = @as([24]u8, @splat(0));
     png[0..8].* = .{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
     png[12..16].* = .{ 'I', 'H', 'D', 'R' };
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 1, .big);
     std.mem.writeInt(u32, png[20..24], 1, .big);
     const request_json =
@@ -32406,6 +32407,7 @@ test "generate parser releases mixed owned and borrowed media on every allocatio
     var png = @as([24]u8, @splat(0));
     png[0..8].* = .{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
     png[12..16].* = .{ 'I', 'H', 'D', 'R' };
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 1, .big);
     std.mem.writeInt(u32, png[20..24], 1, .big);
     const attachments = [_]httpx.attachment_envelope.Attachment{.{
@@ -32719,6 +32721,7 @@ test "direct generation image admission subtracts resident bytes from capacity" 
     var png = @as([24]u8, @splat(0));
     const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
     @memcpy(png[0..8], &signature);
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 1024, .big);
     std.mem.writeInt(u32, png[20..24], 1024, .big);
     const images = [_][]const u8{&png};
@@ -33180,6 +33183,7 @@ test "direct dense embed rejects borrowed image expansion before model loading" 
     var png = @as([24]u8, @splat(0));
     const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
     @memcpy(png[0..8], &signature);
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 800, .big);
     std.mem.writeInt(u32, png[20..24], 800, .big);
     const parts = [_]Node.DirectDenseEmbedPart{
@@ -33207,6 +33211,7 @@ test "read decoded image budget rejects aggregate expansion and overflow" {
     var png = @as([24]u8, @splat(0));
     const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
     @memcpy(png[0..8], &signature);
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 2, .big);
     std.mem.writeInt(u32, png[20..24], 2, .big);
     try budget.addImage(&png);
@@ -33277,6 +33282,7 @@ test "accepted multimodal routes reject tiny high-pixel batches before model loa
     var png = @as([24]u8, @splat(0));
     const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
     @memcpy(png[0..8], &signature);
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 800, .big);
     std.mem.writeInt(u32, png[20..24], 800, .big);
     const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
@@ -34046,6 +34052,7 @@ test "read image preflight maps malformed dimension and aggregate errors before 
     var png = @as([24]u8, @splat(0));
     const signature = [_]u8{ 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
     @memcpy(png[0..8], &signature);
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 2, .big);
     std.mem.writeInt(u32, png[20..24], 2, .big);
     const encoded = try allocator.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));
@@ -41320,6 +41327,7 @@ test "Qwen3-VL multimodal reranker reserves projector scratch before execution" 
     var png = @as([24]u8, @splat(0));
     png[0..8].* = .{ 0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a };
     png[12..16].* = .{ 'I', 'H', 'D', 'R' };
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 227, .big);
     std.mem.writeInt(u32, png[20..24], 149, .big);
     var images = [_][]const u8{png[0..]};
