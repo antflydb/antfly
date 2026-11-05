@@ -56,7 +56,18 @@ fn failure(a: A, status: u16, code: []const u8, message: []const u8) !Response {
 }
 
 pub fn handle(server: anytype, a: A, table: []const u8, action: Action, args: Arguments, request: operation.RequestContext) !Response {
-    return execute(server, a, table, action, args, try request.platformDeadline()) catch |err| switch (err) {
+    return execute(server, a, table, action, args, try request.platformDeadline()) catch |err| failureResponse(a, err);
+}
+
+fn availabilityResponse(a: A, code: []const u8, message: []const u8) !Response {
+    return .{ .response = try http.queryDependencyErrorOwnedResponse(a, 503, code, message, true) };
+}
+
+// One boundary for reads and mutations, including forwarded metadata replies.
+// Classify availability without replaying an operation: mutation outcomes and
+// authored-policy CAS failures must retain their distinct retry semantics.
+fn failureResponse(a: A, err: anyerror) !Response {
+    return switch (err) {
         error.PrivacyPreconditionRequired => failure(a, 428, "privacy_precondition_required", "Replacing a policy requires its exact If-Match ETag."),
         error.PrivacyPreconditionFailed => failure(a, 412, "privacy_precondition_failed", "The policy changed; reload it before saving."),
         error.PrivacyCheckpointCapacityExceeded => failure(a, 422, "privacy_checkpoint_capacity_exceeded", "This table has reached its checkpoint byte budget; allow cleanup to finish and use fewer or smaller concurrent range scans before retrying."),
@@ -72,13 +83,77 @@ pub fn handle(server: anytype, a: A, table: []const u8, action: Action, args: Ar
             break :blk response;
         },
         error.TableGenerationChanged, error.TableTransitionActive => failure(a, 409, "privacy_catalog_changed", "The table changed; reload and retry."),
-        error.StorageBusy, error.IndexRebuilding, error.StorageReadTemporarilyUnavailable => failure(a, 503, "privacy_storage_unavailable", "Privacy storage is rebuilding or busy; retry."),
-        error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => failure(a, 503, "privacy_leader_unavailable", "The metadata leader is unavailable; retry."),
+        error.StorageBusy,
+        error.IndexRebuilding,
+        error.StorageReadTemporarilyUnavailable,
+        error.UnknownGroup,
+        error.StorageUnavailable,
+        error.StorageKernelOwnerUnavailable,
+        error.PrivacyReadUnavailable,
+        error.HttpExecutorUnavailable,
+        error.ReadIndexUnavailable,
+        error.DistributedQueryUnavailable,
+        error.ConcurrencyUnavailable,
+        => availabilityResponse(a, "privacy_storage_unavailable", "Privacy storage or its data owner is unavailable, rebuilding or busy; retry."),
+        error.NotLeader,
+        error.ProposalDropped,
+        error.LeaderTransferInProgress,
+        error.GroupLeaderUnavailable,
+        error.LeaderUnavailable,
+        error.ReadIndexTimeout,
+        error.CatalogRoutingSnapshotTimeout,
+        => availabilityResponse(a, "privacy_leader_unavailable", "A metadata or data group leader is unavailable; retry."),
         error.Canceled, error.Cancelled => failure(a, 499, "privacy_canceled", "Inspection was canceled."),
         error.Timeout, error.DeadlineExceeded => failure(a, 504, "privacy_timeout", "Inspection did not finish before its deadline."),
         error.OutOfMemory => return err,
-        else => failure(a, 422, @errorName(err), "The privacy operation failed; no clean-scan receipt was created."),
+        // Use the same transport/topology classification as table reads so
+        // split races, unavailable peers and new transport aliases do not
+        // drift into validation failures. Mutation ambiguity is handled above.
+        else => switch (@import("table_reads.zig").normalizeDistributedQueryOperationalError(err)) {
+            error.DistributedQueryUnavailable, error.StorageReadTemporarilyUnavailable => availabilityResponse(a, "privacy_storage_unavailable", "Privacy dependencies are temporarily unavailable; retry."),
+            else => failure(a, 422, @errorName(err), "The privacy operation failed; no clean-scan receipt was created."),
+        },
     };
+}
+
+test "privacy availability errors are retryable without reclassifying validation or mutation outcomes" {
+    const a = std.testing.allocator;
+    for ([_]anyerror{
+        error.TopologyChanged,         error.ConnectionRefused,             error.RemoteUnavailable,                 error.ResourceTemporarilyUnavailable,
+        error.UnknownGroup,            error.StorageUnavailable,            error.StorageKernelOwnerUnavailable,     error.PrivacyReadUnavailable,
+        error.HttpExecutorUnavailable, error.ReadIndexUnavailable,          error.DistributedQueryUnavailable,       error.ConcurrencyUnavailable,
+        error.StorageBusy,             error.IndexRebuilding,               error.StorageReadTemporarilyUnavailable, error.NotLeader,
+        error.ProposalDropped,         error.LeaderTransferInProgress,      error.GroupLeaderUnavailable,            error.LeaderUnavailable,
+        error.ReadIndexTimeout,        error.CatalogRoutingSnapshotTimeout,
+    }) |err| {
+        var response = try failureResponse(a, err);
+        defer response.deinit(a);
+        try std.testing.expectEqual(@as(u16, 503), response.response.status);
+        try std.testing.expectEqual(@as(?u32, 1), response.response.retry_after_seconds);
+        var parsed = try std.json.parseFromSlice(struct { code: []const u8, retryable: bool }, a, response.response.body, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        try std.testing.expect(parsed.value.retryable);
+        try std.testing.expect(std.mem.startsWith(u8, parsed.value.code, "privacy_"));
+        try std.testing.expect(response.response.metadata_mutation_outcome == null);
+    }
+    const Case = struct { err: anyerror, status: u16 };
+    for ([_]Case{
+        .{ .err = error.InvalidPrivacyFields, .status = 422 },
+        .{ .err = error.PrivacyLiteralCredential, .status = 422 },
+        .{ .err = error.PrivacyPreconditionRequired, .status = 428 },
+        .{ .err = error.PrivacyPreconditionFailed, .status = 412 },
+        .{ .err = error.TableGenerationChanged, .status = 409 },
+        .{ .err = error.Canceled, .status = 499 },
+        .{ .err = error.DeadlineExceeded, .status = 504 },
+        .{ .err = error.MetadataMutationOutcomeUnknown, .status = 409 },
+    }) |case| {
+        var response = try failureResponse(a, case.err);
+        defer response.deinit(a);
+        try std.testing.expectEqual(case.status, response.response.status);
+        try std.testing.expect(response.response.retry_after_seconds == null);
+        if (case.err == error.MetadataMutationOutcomeUnknown) try std.testing.expectEqual(http.MetadataMutationOutcome.unknown, response.response.metadata_mutation_outcome.?);
+    }
+    try std.testing.expectError(error.OutOfMemory, failureResponse(a, error.OutOfMemory));
 }
 
 fn load(a: A, raw: []const u8) !?std.json.Parsed(catalog.Resource) {

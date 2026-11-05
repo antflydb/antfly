@@ -2065,10 +2065,6 @@ def test_privacy_accepts_native_secret_references_without_resolving_on_empty_sam
     api = stateful_api
     table = "privacy_secret_ref_" + uuid4().hex[:8]
     api.create_table(table)
-    # A completed write/delete waits for the Raft data owner, while keeping
-    # the preview sample empty and its credential reference unresolved.
-    api.batch_write(table, inserts={"warm": {"other": "hello"}})
-    api.batch_write(table, deletes=["warm"])
     path = f"/tables/{table}/privacy"
     reference = "${secret:privacy.fixture-api_key}"
     policy = {
@@ -2086,8 +2082,53 @@ def test_privacy_accepts_native_secret_references_without_resolving_on_empty_sam
             },
         },
     }
-    preview = api.post(path + "/preview", {"policy": policy})
+    preview = _empty_preview_when_owner_ready(api, path, policy)
     assert preview["sampled"] == 0
     saved = api.put(path, policy)
     assert saved["policy_version"] == preview["policy_version"]
     assert api.get(path)["policy"]["producer"]["config"]["api_key"] == reference
+
+
+def _empty_preview_when_owner_ready(api, path, policy, statuses=None):
+    # Exercise create-to-preview directly. Retry only an explicit availability
+    # response; validation/CAS errors must never be hidden by readiness polling.
+    def poll():
+        response = api.s.post(
+            api.url + path + "/preview", json={"policy": policy}, timeout=30
+        )
+        if statuses is not None:
+            statuses.append(response.status_code)
+        if response.status_code == 503:
+            assert response.headers.get("Retry-After") == "1", response.headers
+            problem = response.json()
+            assert problem["retryable"] is True, problem
+            assert problem["code"] in (
+                "privacy_storage_unavailable",
+                "privacy_leader_unavailable",
+            ), problem
+            assert "documents" not in problem and "policy_version" not in problem
+            return None
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    result = wait_until(poll, timeout_s=30, interval_s=1)
+    assert result is not None, api.debug_logs()[-6000:]
+    return result
+
+
+def test_privacy_empty_preview_after_creation_preserves_retry_contract(stateful_api):
+    api = stateful_api
+    first_responses = []
+    for _ in range(15):
+        table = "privacy_startup_" + uuid4().hex[:8]
+        api.create_table(table)
+        path = f"/tables/{table}/privacy"
+        statuses = []
+        preview = _empty_preview_when_owner_ready(
+            api, path, {"mode": "monitor", "fields": ["absent"]}, statuses
+        )
+        first_responses.append(statuses[0])
+        assert preview["sampled"] == 0 and preview["documents"] == []
+        assert preview["complete_table_scan"] is False
+        assert api.get(path)["configured"] is False
+    print("Empty preview first-attempt statuses:", first_responses)

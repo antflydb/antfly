@@ -247,6 +247,7 @@ test "privacy remote mutations preserve preconditions and never replay ambiguous
     const Fake = struct {
         calls: usize = 0,
         ambiguous: bool = false,
+        unavailable: bool = false,
         fn execute(raw: *anyopaque, alloc: std.mem.Allocator, req: http.HttpRequest) !http.HttpResponse {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
@@ -265,6 +266,11 @@ test "privacy remote mutations preserve preconditions and never replay ambiguous
                 found = true;
             };
             try std.testing.expect(found);
+            if (self.unavailable) {
+                const headers = try alloc.alloc(http.Header, 1);
+                headers[0] = .{ .name = try alloc.dupe(u8, "Retry-After"), .value = try alloc.dupe(u8, "1") };
+                return .{ .status = 503, .body = try alloc.dupe(u8, "{\"code\":\"privacy_storage_unavailable\",\"retryable\":true}"), .headers = headers };
+            }
             const headers = try alloc.alloc(http.Header, 1);
             headers[0] = .{ .name = try alloc.dupe(u8, "ETag"), .value = try alloc.dupe(u8, "new-tag") };
             return .{ .status = 202, .body = try alloc.dupe(u8, "{\"configured\":true}"), .headers = headers };
@@ -277,9 +283,15 @@ test "privacy remote mutations preserve preconditions and never replay ambiguous
     defer result.deinit(a);
     try std.testing.expectEqual(@as(u16, 202), result.response.status);
     try std.testing.expectEqualStrings("new-tag", result.etag.?);
+    fake.unavailable = true;
+    var unavailable = try client.forwardPrivacyMutation("http://metadata", "db/public/docs", "{}", "tag", false, request);
+    defer unavailable.deinit(a);
+    try std.testing.expectEqual(@as(u16, 503), unavailable.response.status);
+    try std.testing.expectEqual(@as(?u32, 1), unavailable.response.retry_after_seconds);
+    try std.testing.expectEqual(@as(usize, 2), fake.calls);
     fake.ambiguous = true;
     try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.forwardPrivacyMutation("http://metadata", "docs", "{}", null, true, request));
-    try std.testing.expectEqual(@as(usize, 2), fake.calls);
+    try std.testing.expectEqual(@as(usize, 3), fake.calls);
 }
 
 test "privacy checkpoint job commands require the same coordinated decoder as catalog attachment" {

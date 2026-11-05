@@ -209,6 +209,14 @@ Exceeding either returns HTTP 422 (`privacy_sample_too_large`); request fewer or
 smaller documents. Automatic sampling streams rows and stops before retaining
 an oversized sample. A rejected preview does not install a policy.
 
+A newly created Raft table can become visible before its data owner is ready.
+Privacy operations return HTTP 503 with `retryable: true` and `Retry-After: 1`
+while an owner, required index, or group leader is temporarily unavailable.
+Retry a preview after that delay. Invalid policies remain HTTP 422, policy CAS
+failures remain HTTP 412/428, and an unknown mutation outcome remains HTTP 409:
+inspect policy/scan state before retrying that mutation. Availability handling
+does not automatically replay policy writes or scan creation.
+
 Private range checkpoints have per-table budgets of 256 MiB for staged uploads
 and 8 GiB for retained payloads, including retired generations awaiting cleanup.
 Capacity exhaustion returns HTTP 422 (`privacy_checkpoint_capacity_exceeded`);

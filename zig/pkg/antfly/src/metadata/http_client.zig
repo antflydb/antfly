@@ -1521,6 +1521,9 @@ pub const MetadataHttpClient = struct {
         var result: @import("../api/privacy.zig").Response = .{ .response = .{ .status = response.status, .body = try self.alloc.dupe(u8, response.body), .json = true } };
         errdefer result.deinit(self.alloc);
         result.etag = if (responseHeader(response, "ETag")) |etag| try self.alloc.dupe(u8, etag) else null;
+        if (responseHeader(response, "Retry-After")) |value| {
+            result.response.retry_after_seconds = std.fmt.parseUnsigned(u32, std.mem.trim(u8, value, " \t\r\n"), 10) catch null;
+        }
         return result;
     }
 
