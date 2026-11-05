@@ -248,8 +248,9 @@ pub fn nativeGenerationMediaAdmissionForBackend(
         return .{ .token_allowance = image_count *| (max_image_tokens +| 1) };
     }
     var admission: NativeGenerationMediaAdmission = .{ .token_allowance = nativeGenerationMediaTokenAllowance(messages, config) };
-    // Portable decoding runs in host memory, and it's CUDA's fallback as well.
-    for (messages) |message| if (message.video_bytes != null) {
+    // CUDA decodes on the device. Portable decoding runs in host memory, and
+    // CUDA's fallback to it admits that memory only when the fallback happens.
+    if (backend != .cuda) for (messages) |message| if (message.video_bytes != null) {
         admission.host_scratch_bytes = gemma4_video.portable_host_bytes;
     };
     return admission;
@@ -5850,7 +5851,7 @@ pub const NativeGenerationPipeline = struct {
                         null;
                     defer if (request_projector) |store| store.close();
                     const projector = self.projector_store orelse request_projector.?;
-                    var projected_video = if (video_bytes) |bytes| try gemma4_video.encode(&self.cb, allocator, projector, bytes) else null;
+                    var projected_video = if (video_bytes) |bytes| try gemma4_video.encode(&self.cb, self.session, allocator, projector, bytes) else null;
                     defer if (projected_video) |*video| video.deinit();
                     const resident_images_enabled = images.len <= 8 and self.cb.supportsCopyRows2D() and self.cb.vtable.concatRows2D != null and
                         self.cb.vtable.multiplyScalar != null and !platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GENERATION_IMAGE_HOST", false);

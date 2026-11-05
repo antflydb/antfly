@@ -23,6 +23,7 @@ const embedding_video = @import("embedding_gemma2_video.zig");
 const embedding_gemma2 = @import("embedding_gemma2.zig");
 const ComputeBackend = @import("../ops/ops.zig").ComputeBackend;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
+const Session = @import("../backends/session.zig").Session;
 
 const sampling: embedding_video.Sampling = .{ .timestamps = .{} };
 
@@ -31,10 +32,9 @@ const portable_pool_bytes: u64 = 512 * 1024 * 1024;
 /// Prepared model-sized frames, plus one displayed frame at the source pixel limit.
 const portable_frame_bytes: usize = 96 * 1024 * 1024 + 48 * 1024 * 1024;
 /// Reserved through generation admission before any portable video work starts.
-/// CUDA holds it too, because NVDEC can hand a clip to the portable route late.
 pub const portable_host_bytes: usize = portable_pool_bytes + portable_frame_bytes;
 
-pub fn encode(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
+pub fn encode(cb: *const ComputeBackend, session: ?Session, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
     if (cb.kind() == .cuda) {
         // NVDEC takes a narrower set of clips than the catalog advertises, and
         // some rejections only surface mid-bitstream. Portable decoding decides
@@ -45,6 +45,10 @@ pub fn encode(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *proje
             if (err != error.NvdecUnavailable and inputError(err) != error.InvalidVideoInput) return err;
             std.log.info("gemma4 video falling back to portable decoding: {s}", .{@errorName(err)});
         }
+        // Admission reserved nothing for this route, since most clips never take it.
+        var permit = if (session) |s| try s.admitHostPreprocess(portable_host_bytes) else null;
+        defer if (permit) |*held| held.deinit();
+        return encodePortable(cb, a, projector, bytes);
     }
     return encodePortable(cb, a, projector, bytes);
 }
@@ -180,7 +184,7 @@ test "gemma4 video reserves portable memory through generation admission" {
     try std.testing.expectEqual(portable_host_bytes, portable.host_scratch_bytes);
     try std.testing.expect(portable.token_allowance >= 60 * 80);
     const cuda = try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &messages, .{ .family = .gemma }, .cuda);
-    try std.testing.expectEqual(portable_host_bytes, cuda.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), cuda.host_scratch_bytes);
     const text = [_]generation.Message{.{ .role = "user", .content = "describe" }};
     try std.testing.expectEqual(@as(usize, 0), (try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &text, .{ .family = .gemma }, .generic)).host_scratch_bytes);
 }
