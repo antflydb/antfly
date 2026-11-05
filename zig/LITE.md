@@ -1375,8 +1375,9 @@ runtime-local. Chunked decoding validates entry bounds and ordering once, so
 repeated hash probes and runtime reopening reuse navigation without repeated
 native range reads. Larger tables retain a fixed navigation cache of 64 pages
 with 128 entries per page, rather than decoding the entire table or repeatedly
-reading individual binary-search probes. Cold page loads read at most 1,536
-encoded bytes, validate the entries, and publish them only on success. The
+reading individual binary-search probes. Cold page loads request at most 1,536
+encoded bytes; a first touch may authenticate an underlying 64 KiB integrity
+frame. They validate the entries and publish them only on success. The
 artifact's existing decoded-cache budget accounts for the cache; exact section
 identity and interpretation bind it across runtime reconstruction. Its
 synchronized slots retain no source callbacks, query capabilities, allocators,

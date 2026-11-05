@@ -4258,7 +4258,11 @@ test "identity lookup large persisted navigation stays bounded and survives runt
             try std.testing.expect(entry.shared.identity_lookup_pages != null);
             if (turn == 0) {
                 original = entry.shared.identity_lookup_pages.?;
-                try std.testing.expect(state.read_bytes - before_bytes < 64 * 1024);
+                // The range facade authenticates 64 KiB integrity frames on
+                // first touch, even for a small logical navigation page.
+                const max_probes = @bitSizeOf(u32) - @clz(@as(u32, documents)) + 2;
+                try std.testing.expect(state.read_bytes - before_bytes <= 2 * max_probes * @import("segment_integrity.zig").page_size);
+                std.debug.print("IDENTITY_PAGED_NAV documents={d} cold_source_calls={d} cold_source_bytes={d} cache_bytes={d}\n", .{ documents, state.read_calls - before_calls, state.read_bytes - before_bytes, @sizeOf(@import("document_identity_lookup.zig").Paged) });
             } else {
                 try std.testing.expectEqual(original, entry.shared.identity_lookup_pages.?);
                 try std.testing.expectEqual(before_calls, state.read_calls);
@@ -4295,10 +4299,14 @@ test "identity lookup paged navigation validates misses and checks warm read aut
     const State = struct {
         bytes: []const u8,
         calls: usize = 0,
+        read_bytes: usize = 0,
+        max_read: usize = 0,
         canceled: bool = false,
         fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             self.calls += 1;
+            self.read_bytes += out.len;
+            self.max_read = @max(self.max_read, out.len);
             @memcpy(out, self.bytes[@intCast(offset)..][0..out.len]);
         }
         fn check(raw: *anyopaque) !void {
@@ -4314,6 +4322,8 @@ test "identity lookup paged navigation validates misses and checks warm read aut
     const ordinal: u32 = 32123;
     try std.testing.expectEqual(ordinal + 1, try pages.seek(view, ordinal * 2 + 1));
     try std.testing.expect(state.calls < 20);
+    try std.testing.expect(state.max_read <= lookup.Paged.page_entries * lookup.entry_size);
+    try std.testing.expect(state.read_bytes < 32 * 1024);
     const warm = state.calls;
     for (0..100) |_| try std.testing.expectEqual(ordinal + 1, try pages.seek(view, ordinal * 2 + 1));
     try std.testing.expectEqual(warm, state.calls);
