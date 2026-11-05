@@ -82,3 +82,27 @@ pub fn seek(view: anytype, doc_count: u32, needle: u64) !u32 {
     }
     return lo;
 }
+
+/// Decode only compact, caller-admitted navigation. Chunked reads authenticate
+/// each range once rather than repeatedly fetching one entry per binary probe.
+pub fn decode(a: std.mem.Allocator, view: anytype, doc_count: u32) ![]Entry {
+    var header: [header_size]u8 = undefined;
+    try view.readInto(0, &header);
+    if (header[0] != version or std.mem.readInt(u32, header[1..5], .little) != doc_count or
+        view.length != header_size + @as(u64, doc_count) * entry_size) return error.InvalidSegment;
+    const entries = try a.alloc(Entry, doc_count);
+    errdefer a.free(entries);
+    var bytes: [128 * entry_size]u8 = undefined;
+    var offset: usize = 0;
+    while (offset < entries.len) {
+        const count = @min(128, entries.len - offset);
+        try view.readInto(header_size + @as(u64, offset) * entry_size, bytes[0 .. count * entry_size]);
+        for (entries[offset..][0..count], 0..) |*entry, i| {
+            const raw = bytes[i * entry_size ..][0..entry_size];
+            entry.* = .{ .hash = std.mem.readInt(u64, raw[0..8], .little), .doc = std.mem.readInt(u32, raw[8..12], .little) };
+            if (entry.doc >= doc_count or (offset + i != 0 and Entry.lessThan({}, entry.*, entries[offset + i - 1]))) return error.InvalidSegment;
+        }
+        offset += count;
+    }
+    return entries;
+}
