@@ -789,7 +789,7 @@ pub const Join = struct {
         // budgets and decision execution must use the evaluator that owns them.
         return limits.steps == defaults.steps and limits.input_bytes == defaults.input_bytes and
             limits.output_bytes == defaults.output_bytes and limits.depth == defaults.depth and
-            limits.decision_values == null and limits.decision_demand == null;
+            limits.decision_values == null and limits.decision_demand == null and limits.shared_budget == null;
     }
     fn evaluateNative(self: *Join, view: *NativeRows) !bool {
         if (view.evaluation.condition) |program| {

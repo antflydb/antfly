@@ -209,6 +209,8 @@ pub const BindLimits = struct {
 };
 const decisions = @import("../functions/decisions.zig");
 pub const DecisionDemand = struct { instruction: u32, function: decisions.Function, args: []const Json };
+/// Load raw data, a canonical value-identity token, or a missing-presence bool.
+/// Derived modes return the function result rather than the underlying datum.
 pub const ColumnRead = enum { value, identity, missing };
 pub const ColumnLoader = struct {
     context: *anyopaque,
@@ -223,11 +225,20 @@ pub const OutputColumnLoader = struct {
     read: *const fn (*anyopaque, Allocator, u32) anyerror!?[]const u8,
     normalized: ?*const fn (*anyopaque, u32) anyerror!?NormalizedOutput = null,
 };
+/// One invocation and its nested lazy readers; parallel workers own separate budgets.
+pub const EvaluationBudget = struct {
+    work: @import("numeric_value.zig").Context,
+    input_bytes: usize = 0,
+    output_bytes: usize = 0,
+};
 pub const EvalLimits = struct {
     output_column_loader: ?OutputColumnLoader = null,
     /// Optional pinned source access. The VM requests only executed branches;
     /// identity/existence reads can use authenticated metadata without payloads.
     column_loader: ?ColumnLoader = null,
+    /// Lazy readers and the VM share one invocation budget when derived reads
+    /// require exact arithmetic or normalization outside the evaluator frame.
+    shared_budget: ?*EvaluationBudget = null,
     steps: usize = 65_536,
     pattern_steps: usize = 8 * 1024 * 1024,
     input_bytes: usize = @import("resource_limits.zig").default_memory_bytes,
@@ -521,6 +532,13 @@ pub const Program = struct {
         const result = try context.runDatum(self.root, 0);
         _ = try context.validateJson(result.value, 0);
         return result;
+    }
+
+    /// Same read-mode semantics used by ordinary scalar function evaluation.
+    /// The allocator owns derived results; limits may share the caller's work.
+    pub fn readColumnValue(self: *const Program, alloc: Allocator, value: Datum, descriptor: Type, demand: ColumnRead, limits: EvalLimits) !Datum {
+        var evaluator: Evaluator = .{ .program = self, .alloc = alloc, .cells = &.{}, .parameters = &.{}, .limits = limits };
+        return evaluator.readColumnValue(value, descriptor, demand);
     }
 
     pub fn directOutputColumn(self: *const Program) ?u32 {
@@ -3178,7 +3196,14 @@ const Evaluator = struct {
     /// One invocation owns all VM, JSON, array and exact-arithmetic work.
     /// Nested codecs may impose tighter local limits, never a fresh request
     /// budget or cancellation identity. Failure remains sticky across them.
+    fn inputBytes(self: *Evaluator) *usize {
+        return if (self.limits.shared_budget) |owner| &owner.input_bytes else &self.input_bytes;
+    }
+    fn outputBytes(self: *Evaluator) *usize {
+        return if (self.limits.shared_budget) |owner| &owner.output_bytes else &self.bytes;
+    }
     fn workOwner(self: *Evaluator) *@import("numeric_value.zig").Context {
+        if (self.limits.shared_budget) |owner| return &owner.work;
         if (self.work_owner == null) self.work_owner = .{
             .alloc = self.alloc,
             .remaining = self.limits.steps,
@@ -3209,9 +3234,9 @@ const Evaluator = struct {
     fn compareJson(self: *Evaluator, left: Json, right: Json) !std.math.Order {
         if (left == .string and right == .string) {
             try self.workOwner().charge(0);
-            const remaining = self.limits.input_bytes -| self.input_bytes;
+            const remaining = self.limits.input_bytes -| self.inputBytes().*;
             var work: json_order.Budget = .{ .remaining = remaining };
-            defer self.input_bytes += remaining - work.remaining;
+            defer self.inputBytes().* += remaining - work.remaining;
             return compareWithBudget(left, right, &work);
         }
         var work = self.workBudget();
@@ -3241,8 +3266,8 @@ const Evaluator = struct {
 
     fn charge(self: *Evaluator, bytes: usize) !void {
         try self.workOwner().charge(0);
-        if (bytes > self.limits.output_bytes -| self.bytes) return self.workOwner().limit();
-        self.bytes += bytes;
+        if (bytes > self.limits.output_bytes -| self.outputBytes().*) return self.workOwner().limit();
+        self.outputBytes().* += bytes;
     }
 
     fn run(self: *Evaluator, index: u32, depth: usize) anyerror!Json {
@@ -3339,7 +3364,7 @@ const Evaluator = struct {
                 if (datum.sql_null) break :blk .{};
                 if (cast.type == .array) {
                     if (datum.array == null and datum.value == .string) {
-                        const decoded = try @import("array_text.zig").decodeLeaky(self.alloc, cast.element_type orelse return error.InvalidSqlProgram, datum.value.string, .{ .values = .{ .bytes = self.limits.output_bytes -| self.bytes, .work = self.remainingSteps() }, .context = self.workOwner() });
+                        const decoded = try @import("array_text.zig").decodeLeaky(self.alloc, cast.element_type orelse return error.InvalidSqlProgram, datum.value.string, .{ .values = .{ .bytes = self.limits.output_bytes -| self.outputBytes().*, .work = self.remainingSteps() }, .context = self.workOwner() });
                         try self.charge(decoded.allocated_bytes + @sizeOf(arrays.Value));
                         const value = try self.alloc.create(arrays.Value);
                         value.* = decoded.value;
@@ -3421,7 +3446,7 @@ const Evaluator = struct {
                 if (left.sql_null or right.sql_null) break :blk .{};
                 if (left.array != null or right.array != null) return error.SqlTypeMismatch;
                 var work = self.workBudget();
-                const joined = try @import("json_concat.zig").concat(self.alloc, left.value, right.value, self.limits.output_bytes -| self.bytes, &work);
+                const joined = try @import("json_concat.zig").concat(self.alloc, left.value, right.value, self.limits.output_bytes -| self.outputBytes().*, &work);
                 try self.charge(joined.allocated_bytes);
                 break :blk Datum.json(joined.value);
             } else if (binary.op == .eq or binary.op == .neq or binary.op == .lt or binary.op == .lte or binary.op == .gt or binary.op == .gte or binary.op == .is_distinct or binary.op == .is_not_distinct) blk: {
@@ -3484,11 +3509,7 @@ const Evaluator = struct {
                             break :blk try loader.read(loader.context, self.alloc, operand.column, if (call.function == .value_identity) .identity else .missing);
                         };
                         const value = try self.runDatum(call.args[0], depth + 1);
-                        if (call.function == .is_missing) break :blk Datum.json(.{ .bool = value.missing });
-                        if (value.missing) break :blk .{};
-                        const logical = if (value.sql_null) Json.null else if (value.array) |array| try @import("array_wire.zig").toJsonLeaky(self.alloc, array.*, .{ .values = .{ .bytes = self.limits.output_bytes }, .wire_bytes = self.limits.output_bytes }) else try self.sqlJson(value, self.program.instructions[call.args[0]].type);
-                        const token = try @import("../common/value_identity.zig").identity(logical);
-                        break :blk Datum.json(.{ .string = try self.alloc.dupe(u8, &token) });
+                        break :blk try self.readColumnValue(value, self.program.instructions[call.args[0]].type, if (call.function == .is_missing) .missing else .identity);
                     },
                     .array_append, .array_prepend, .array_cat => {
                         if (try self.fusedConcat(index, depth)) |value| break :blk value;
@@ -3501,7 +3522,7 @@ const Evaluator = struct {
                             if (right.array.?.cardinality() == 0) break :blk left;
                         }
                         var work = self.workBudget();
-                        const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.bytes };
+                        const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.outputBytes().* };
                         const prepend = call.function == .array_prepend;
                         const input = if (prepend) right else left;
                         const empty: arrays.Value = .{ .element_type = instruction.type.element_type.?, .dimensions = &.{}, .elements = &.{} };
@@ -3528,7 +3549,7 @@ const Evaluator = struct {
                             const answer = if (call.args.len == 2 and self.program.constant_memberships.contains(call.args[0])) try self.program.constant_memberships.get(call.args[0]).?.firstPosition(needle, &work) else try array.position(needle, start, &work);
                             break :blk if (answer) |value| Datum.json(.{ .integer = value }) else .{};
                         }
-                        const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.bytes };
+                        const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.outputBytes().* };
                         const output = if (call.function == .array_positions) try array.positions(self.alloc, needle, limits, &work) else try array.transform(self.alloc, needle, if (call.function == .array_remove) null else third, limits, &work);
                         try self.charge(try output.admissionBytes());
                         const owned = try self.alloc.create(arrays.Value);
@@ -3555,7 +3576,7 @@ const Evaluator = struct {
                         if (input.sql_null) break :blk .{};
                         if (input.value != .string or (!delimiter.sql_null and delimiter.value != .string) or (!null_text.sql_null and null_text.value != .string)) return error.SqlTypeMismatch;
                         var work = self.workBudget();
-                        const output = try @import("text_array.zig").split(self.alloc, input.value.string, if (delimiter.sql_null) null else delimiter.value.string, if (null_text.sql_null) null else null_text.value.string, self.limits.output_bytes -| self.bytes, &work);
+                        const output = try @import("text_array.zig").split(self.alloc, input.value.string, if (delimiter.sql_null) null else delimiter.value.string, if (null_text.sql_null) null else null_text.value.string, self.limits.output_bytes -| self.outputBytes().*, &work);
                         try self.charge(output.bytes);
                         break :blk Datum.typedArray(output.value);
                     },
@@ -3566,7 +3587,7 @@ const Evaluator = struct {
                         if (input.sql_null or delimiter.sql_null) break :blk .{};
                         if (delimiter.value != .string or (!null_text.sql_null and null_text.value != .string)) return error.SqlTypeMismatch;
                         var work = self.workBudget();
-                        const text = try @import("text_array.zig").join(self.alloc, input.array orelse return error.SqlTypeMismatch, delimiter.value.string, if (null_text.sql_null) null else null_text.value.string, self.limits.output_bytes -| self.bytes, &work);
+                        const text = try @import("text_array.zig").join(self.alloc, input.array orelse return error.SqlTypeMismatch, delimiter.value.string, if (null_text.sql_null) null else null_text.value.string, self.limits.output_bytes -| self.outputBytes().*, &work);
                         try self.charge(text.len);
                         break :blk Datum.json(.{ .string = text });
                     },
@@ -3588,7 +3609,7 @@ const Evaluator = struct {
                             // Temporary index bytes are bounded by remaining output
                             // headroom and released before returning the boolean;
                             // they are not retained result bytes to charge again.
-                            break :contains try arrays.dynamicMembership(self.alloc, array.*, other.*, call.function == .@"$overlaps", .{ .bytes = self.limits.output_bytes -| self.bytes }, &work);
+                            break :contains try arrays.dynamicMembership(self.alloc, array.*, other.*, call.function == .@"$overlaps", .{ .bytes = self.limits.output_bytes -| self.outputBytes().* }, &work);
                         } else try @import("json_containment.zig").contains(left.value, right.value, &work, 0);
                         break :blk Datum.json(.{ .bool = accepted });
                     },
@@ -3680,7 +3701,7 @@ const Evaluator = struct {
                         if (target.sql_null or path.sql_null or replacement.sql_null or create.sql_null) break :blk .{};
                         if (target.array != null or replacement.array != null or create.array != null or create.value != .bool) return error.SqlTypeMismatch;
                         var work = self.workBudget();
-                        const changed = try @import("json_path_update.zig").set(self.alloc, target.value, path.array orelse return error.SqlTypeMismatch, replacement.value, create.value.bool, self.limits.output_bytes -| self.bytes, &work);
+                        const changed = try @import("json_path_update.zig").set(self.alloc, target.value, path.array orelse return error.SqlTypeMismatch, replacement.value, create.value.bool, self.limits.output_bytes -| self.outputBytes().*, &work);
                         try self.charge(changed.allocated_bytes);
                         break :blk Datum.json(changed.value);
                     },
@@ -3795,7 +3816,7 @@ const Evaluator = struct {
                         if (value.value == .null) break :blk .{};
                         if (value.value == .string) break :blk value;
                         var work = self.workBudget();
-                        const text = try @import("jsonb_text.zig").format(self.alloc, value.value, self.limits.output_bytes -| self.bytes, &work);
+                        const text = try @import("jsonb_text.zig").format(self.alloc, value.value, self.limits.output_bytes -| self.outputBytes().*, &work);
                         errdefer self.alloc.free(text);
                         try self.charge(text.len);
                         break :blk Datum.json(.{ .string = text });
@@ -4306,7 +4327,7 @@ const Evaluator = struct {
         if (nonempty <= 1 and !has_scalar and identity != null and identity.?.element_type == kind) return Datum.typedArray(identity.?);
         const results = @import("array_compact.zig").ResultBuilder;
         const axes = shape.axes[0..shape.rank];
-        const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.bytes };
+        const limits: arrays.Limits = .{ .bytes = self.limits.output_bytes -| self.outputBytes().* };
         var output = try results.initPlanned(self.alloc, kind, axes, shape.count, present, text_bytes, limits);
         var work = self.workBudget();
         for (leaves) |leaf| switch (leaf) {
@@ -4386,8 +4407,8 @@ const Evaluator = struct {
         return .{
             .alloc = self.alloc,
             .remaining = self.remainingSteps(),
-            .max_output_bytes = self.limits.output_bytes -| self.bytes,
-            .max_groups = (self.limits.output_bytes -| self.bytes) / 2,
+            .max_output_bytes = self.limits.output_bytes -| self.outputBytes().*,
+            .max_groups = (self.limits.output_bytes -| self.outputBytes().*) / 2,
             .parent = self.workOwner(),
         };
     }
@@ -4395,6 +4416,22 @@ const Evaluator = struct {
     /// SQL floating values enter JSONB through their declared output format,
     /// then exact decimal parsing. JSON numbers have neither a float width
     /// nor NaN/infinity payloads; PostgreSQL represents specials as strings.
+    fn readColumnValue(self: *Evaluator, value: Datum, descriptor: Type, demand: ColumnRead) !Datum {
+        return switch (demand) {
+            .value => value,
+            .missing => Datum.json(.{ .bool = value.missing }),
+            .identity => identity: {
+                if (value.missing) break :identity .{};
+                const logical = if (value.sql_null) Json.null else if (value.array) |array|
+                    try @import("array_wire.zig").toJsonLeaky(self.alloc, array.*, .{ .values = .{ .bytes = self.limits.output_bytes }, .wire_bytes = self.limits.output_bytes })
+                else
+                    try self.sqlJson(value, descriptor);
+                const token = try @import("../common/value_identity.zig").identity(logical);
+                break :identity Datum.json(.{ .string = try self.alloc.dupe(u8, &token) });
+            },
+        };
+    }
+
     fn sqlJson(self: *Evaluator, datum: Datum, descriptor: Type) !Json {
         if (datum.sql_null) return .null;
         if (datum.numeric != null) return self.numericJson(datum);
@@ -4568,8 +4605,8 @@ const Evaluator = struct {
             // Linear input decoding has a byte quota independent of the
             // instruction/arithmetic work quota and includes cancellation.
             try self.workOwner().charge(0);
-            if (length > self.limits.input_bytes -| self.input_bytes) return self.workOwner().limit();
-            self.input_bytes += length;
+            if (length > self.limits.input_bytes -| self.inputBytes().*) return self.workOwner().limit();
+            self.inputBytes().* += length;
         }
         if (source == .jsonb and target != .jsonb and target != .text) {
             if (value == .null or value == .array or value == .object or value == .string) return error.SqlTypeMismatch;
@@ -4773,7 +4810,7 @@ const Evaluator = struct {
             var budget: regex_functions.Budget = .{ .remaining = self.limits.pattern_steps -| self.pattern_steps, .checkpoint = self.limits.regex_checkpoint, .ptr = self.limits.regex_context, .checkpoint_interval = 256 };
             const initial = budget.remaining;
             defer self.pattern_steps += initial - budget.remaining;
-            const value = regex_functions.evaluate(self.alloc, session, regex, values[0..args.len], self.limits.output_bytes -| self.bytes, &budget) catch |err|
+            const value = regex_functions.evaluate(self.alloc, session, regex, values[0..args.len], self.limits.output_bytes -| self.outputBytes().*, &budget) catch |err|
                 return if (self.limits.regex_execution) |owner| owner.mapError(err) else err;
             if (value == .string) try self.charge(value.string.len);
             return value;
@@ -7105,4 +7142,24 @@ test "SQL serialized scalar fragments reconstruct unique column dependencies for
     var program = try Program.fromTypedInstructions(std.testing.allocator, instructions, 2, .{ .kind = .boolean }, .{});
     defer program.deinit();
     try std.testing.expectEqualSlices(u32, &.{5}, program.required_columns);
+}
+
+test "SQL derived column reads share invocation work and byte admission with the VM" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const sa = region.allocator();
+    var context: @import("numeric_value.zig").Context = .{ .alloc = sa };
+    const number = try @import("numeric_value.zig").parse(&context, "123456789.01");
+    const instructions: []const Instruction = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = true } } }};
+    var program = try Program.fromTypedInstructions(a, instructions, 0, .{ .kind = .boolean }, .{});
+    defer program.deinit();
+    var budget: EvaluationBudget = .{ .work = .{ .alloc = sa, .remaining = 65536 } };
+    const limits: EvalLimits = .{ .output_bytes = 16, .shared_budget = &budget };
+    const value = Datum.typedNumeric(&number.value);
+    const descriptor: Type = .{ .kind = .number, .element_type = .numeric };
+    try std.testing.expect((try program.readColumnValue(sa, value, descriptor, .identity, limits)).value == .string);
+    try std.testing.expect(budget.output_bytes > 0);
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.readColumnValue(sa, value, descriptor, .identity, limits));
+    try std.testing.expectError(error.SqlProgramLimitExceeded, program.evaluate(sa, &.{}, &.{}, limits));
 }

@@ -29,7 +29,7 @@ pub const Program = struct {
         for (self.instructions, 0..) |instruction, index| switch (instruction.operation) {
             .literal => {},
             .column => |ordinal| if (ordinal >= width) return error.InvalidSqlDistributedPlan,
-            .parameter => |ordinal| if (ordinal == 0 or ordinal > self.parameters.len) return error.InvalidSqlDistributedPlan,
+            .parameter => |ordinal| if (ordinal >= self.parameters.len) return error.InvalidSqlDistributedPlan,
             .unary => |operation| if (operation.operand >= index) return error.InvalidSqlDistributedPlan,
             .binary => |operation| if (operation.left >= index or operation.right >= index) return error.InvalidSqlDistributedPlan,
             .cast => |operation| if (operation.operand >= index) return error.InvalidSqlDistributedPlan,
@@ -118,10 +118,25 @@ pub const Task = struct {
     }
 };
 pub const Prepared = struct {
-    const Cell = struct {
+    const Memo = struct {
         epoch: u64 = 0,
         probe_epoch: u64 = 0,
         value: scalar.Datum = undefined,
+        fn get(self: *const Memo, prepared: *const Prepared, probe: bool) ?scalar.Datum {
+            return if (if (probe) self.probe_epoch == prepared.probe_epoch else self.epoch == prepared.epoch) self.value else null;
+        }
+        fn put(self: *Memo, prepared: *const Prepared, probe: bool, value: scalar.Datum) scalar.Datum {
+            self.value = value;
+            self.epoch = if (probe) 0 else prepared.epoch;
+            self.probe_epoch = if (probe) prepared.probe_epoch else 0;
+            return value;
+        }
+    };
+    const Cell = struct {
+        raw: Memo = .{},
+        identity: Memo = .{},
+        missing: Memo = .{},
+        descriptor: scalar.Type = .{},
         coefficient: Numeric.ScaledInteger = undefined,
         number: Numeric.Value = undefined,
     };
@@ -150,6 +165,9 @@ pub const Prepared = struct {
         result.cells = try a.alloc(Cell, result.program.required_columns.len);
         @memset(result.cells, .{});
         for (result.program.required_columns, 0..) |column, index| result.slots[column] = @intCast(index);
+        for (result.program.instructions) |instruction| if (instruction.operation == .column) {
+            result.cells[result.slots[instruction.operation.column]].descriptor = instruction.type;
+        };
         return result;
     }
     fn deinit(self: *Prepared) void {
@@ -170,7 +188,11 @@ pub const Prepared = struct {
         std.debug.assert(!self.reuse_left);
         self.probe_epoch +%= 1;
         if (self.probe_epoch == 0) {
-            for (self.cells) |*cell| cell.probe_epoch = 0;
+            for (self.cells) |*cell| {
+                cell.raw.probe_epoch = 0;
+                cell.identity.probe_epoch = 0;
+                cell.missing.probe_epoch = 0;
+            }
             self.probe_epoch = 1;
         }
         self.reuse_left = true;
@@ -184,37 +206,46 @@ pub const Prepared = struct {
         left: Batch,
         row: usize,
         right: ?Batch,
-        fn read(raw: *anyopaque, a: A, ordinal: u32, _: scalar.ColumnRead) anyerror!scalar.Datum {
+        limits: scalar.EvalLimits,
+        fn read(raw: *anyopaque, a: A, ordinal: u32, demand: scalar.ColumnRead) anyerror!scalar.Datum {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (ordinal >= self.prepared.slots.len) return error.InvalidSqlBackendResponse;
             const slot = self.prepared.slots[ordinal];
             if (slot == std.math.maxInt(u16)) return error.InvalidSqlBackendResponse;
-            const cached = &self.prepared.cells[slot];
-            const left = ordinal < self.left.width();
-            const probe_value = left and self.prepared.reuse_left;
-            if (probe_value) {
-                if (cached.probe_epoch == self.prepared.probe_epoch) return cached.value;
-            } else if (cached.epoch == self.prepared.epoch) return cached.value;
-            const payload = if (probe_value) self.prepared.left_scratch.allocator() else a;
-            const source = if (left) self.left else self.right orelse {
-                cached.value = .{};
-                cached.epoch = self.prepared.epoch;
-                return .{};
+            const cell = &self.prepared.cells[slot];
+            const memo = switch (demand) {
+                .value => &cell.raw,
+                .identity => &cell.identity,
+                .missing => &cell.missing,
             };
+            const left = ordinal < self.left.width();
+            const probe = left and self.prepared.reuse_left;
+            if (memo.get(self.prepared, probe)) |value| return value;
+            const payload = if (probe) self.prepared.left_scratch.allocator() else a;
+            const source: ?Batch = if (left) self.left else self.right;
             const column = if (left) ordinal else ordinal - self.left.width();
             const row = if (left) self.row else 0;
-            cached.value = if (try source.decimalColumnSelected(payload, column, &.{row})) |decimal|
-                try decimal.cell(0, &cached.coefficient, &cached.number)
-            else
-                try source.cell(payload, row, column);
-            if (probe_value) {
-                cached.probe_epoch = self.prepared.probe_epoch;
-                cached.epoch = 0;
-            } else {
-                cached.epoch = self.prepared.epoch;
-                cached.probe_epoch = 0;
-            }
-            return cached.value;
+            if (demand == .missing) if (source) |batch| {
+                // An authenticated encoded payload proves presence without DOM
+                // materialization. Keep this fact separate from raw-value memo.
+                if (try batch.frozenJson(row, column) != null or try batch.encodedJson(row, column) != null)
+                    return memo.put(self.prepared, probe, scalar.Datum.json(.{ .bool = false }));
+            };
+            const value: scalar.Datum = if (demand == .value) value: {
+                const batch = source orelse break :value .{};
+                break :value if (try batch.decimalColumnSelected(payload, column, &.{row})) |decimal|
+                    try decimal.cell(0, &cell.coefficient, &cell.number)
+                else
+                    try batch.cell(payload, row, column);
+            } else derived: {
+                // Normalization may construct a large logical array/number.
+                // Retain only its opaque token across duplicate probe matches.
+                var result = try self.prepared.program.readColumnValue(a, try read(raw, a, ordinal, .value), cell.descriptor, demand, self.limits);
+                if (probe and demand == .identity and !result.sql_null)
+                    result.value.string = try payload.dupe(u8, result.value.string);
+                break :derived result;
+            };
+            return memo.put(self.prepared, probe, value);
         }
     };
     fn matchesBatch(self: *Prepared, left: Batch, row: usize, right: ?Batch, regex: *RegexExecution) !bool {
@@ -223,11 +254,17 @@ pub const Prepared = struct {
         // Reset is constant-time even for wide, short-circuited predicates.
         self.epoch +%= 1;
         if (self.epoch == 0) {
-            for (self.cells) |*cell| cell.epoch = 0;
+            for (self.cells) |*cell| {
+                cell.raw.epoch = 0;
+                cell.identity.epoch = 0;
+                cell.missing.epoch = 0;
+            }
             self.epoch = 1;
         }
-        var input: Input = .{ .prepared = self, .left = left, .row = row, .right = right };
         var limits = self.evalLimits(regex);
+        var budget: scalar.EvaluationBudget = .{ .work = .{ .alloc = self.scratch.allocator(), .remaining = limits.steps, .checkpoint = limits.checkpoint, .ptr = limits.checkpoint_context } };
+        limits.shared_budget = &budget;
+        var input: Input = .{ .prepared = self, .left = left, .row = row, .right = right, .limits = limits };
         limits.column_loader = .{ .context = &input, .read = Input.read };
         const value = try self.program.evaluate(self.scratch.allocator(), &.{}, self.parameters, limits);
         if (value.sql_null) return false;
@@ -366,11 +403,17 @@ test "distributed SQL joined numeric predicates borrow decimal lanes and reset i
 test "distributed SQL sparse predicate preparation and evaluation unwind allocation failures" {
     const Scenario = struct {
         fn run(a: A) !void {
-            const ir: Program = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .column = 3 } }}, .root = 0, .output = .{ .kind = .boolean } };
-            var task = try Task.init(a, .{}, 16 * 1024 * 1024, ir, null, null);
+            const ir: Program = .{ .instructions = &.{
+                .{ .type = .{ .kind = .boolean }, .operation = .{ .column = 3 } },
+                .{ .type = .{ .kind = .string }, .operation = .{ .call = .{ .function = .value_identity, .args = &.{0} } } },
+                .{ .type = .{ .kind = .boolean }, .operation = .{ .unary = .{ .op = .is_not_null, .operand = 1 } } },
+            }, .root = 2, .output = .{ .kind = .boolean } };
+            var task = try Task.init(a, .{}, 16 * 1024 * 1024, null, null, ir);
             defer task.deinit();
             const batch: Batch = .{ .rows = &.{&.{ .{}, .{}, .{}, scalar.Datum.json(.{ .bool = true }) }} };
-            try std.testing.expect(try task.matchesBatch(.left, batch, 0, null));
+            task.beginProbe();
+            defer task.endProbe();
+            try std.testing.expect(try task.matchesBatch(.condition, batch, 0, null));
         }
     };
     try Scenario.run(std.testing.allocator);
@@ -413,4 +456,145 @@ test "distributed SQL residual probes reuse demanded left values across duplicat
     try std.testing.expect(!try task.matchesBatch(.condition, left.batch(), 0, right.batch()));
     try std.testing.expectEqual(@as(usize, 2), left.reads);
     try std.testing.expectEqual(@as(usize, 101), right.reads);
+}
+
+test "distributed SQL column read modes preserve scalar semantics for nulls missing numerics arrays and floats" {
+    const a = std.testing.allocator;
+    var region = std.heap.ArenaAllocator.init(a);
+    defer region.deinit();
+    const sa = region.allocator();
+    var numeric_context: Numeric.Context = .{ .alloc = sa };
+    const number = try Numeric.parse(&numeric_context, "123.4500");
+    const special = try Numeric.parse(&numeric_context, "NaN");
+    const arrays = @import("antfly_local_sources").sql_array_value;
+    const array = try arrays.Value.init(.int64, &.{.{ .length = 2, .lower = -3 }}, &.{ scalar.Datum.json(.{ .integer = 7 }), .{} }, .{});
+    const Case = struct { value: scalar.Datum, type_: scalar.Type };
+    const cases = [_]Case{
+        .{ .value = scalar.Datum.json(.{ .bool = true }), .type_ = .{ .kind = .boolean } },
+        .{ .value = scalar.Datum.json(.{ .bool = false }), .type_ = .{ .kind = .boolean } },
+        .{ .value = .{}, .type_ = .{ .kind = .boolean } },
+        .{ .value = .{ .missing = true }, .type_ = .{ .kind = .json } },
+        .{ .value = scalar.Datum.json(.null), .type_ = .{ .kind = .json } },
+        .{ .value = scalar.Datum.json(try std.json.parseFromSliceLeaky(std.json.Value, sa, "{\"v\":[1,null,true]}", .{})), .type_ = .{ .kind = .json } },
+        .{ .value = scalar.Datum.json(.{ .string = "quote\" and π" }), .type_ = .{ .kind = .string } },
+        .{ .value = scalar.Datum.typedNumeric(&number.value), .type_ = .{ .kind = .number, .element_type = .numeric } },
+        .{ .value = scalar.Datum.typedNumeric(&special.value), .type_ = .{ .kind = .number, .element_type = .numeric } },
+        .{ .value = scalar.Datum.typedArray(&array), .type_ = .{ .kind = .array, .element_type = .int64 } },
+        .{ .value = scalar.Datum.json(.{ .float = 0.1 }), .type_ = .{ .kind = .number, .element_type = .float32 } },
+        .{ .value = scalar.Datum.json(.{ .float = std.math.inf(f64) }), .type_ = .{ .kind = .number, .element_type = .float64 } },
+    };
+    for (cases) |case| for ([_][]const u8{
+        "is_missing(v)",
+        "value_identity(v) IS NULL",
+        "value_identity(v) = value_identity(v)",
+        "is_missing(v) OR value_identity(v) IS NOT NULL",
+    }) |sql| {
+        var compiled = try @import("antfly_local_sources").sql_compiler.compileScalar(a, sql, .{});
+        defer compiled.deinit();
+        var bound = try scalar.bind(a, compiled.expression, &.{.{ .name = "v", .type = case.type_.kind.?, .element_type = case.type_.element_type }}, &.{}, .{});
+        defer bound.deinit();
+        const ir: Program = .{ .instructions = bound.instructions, .root = bound.root, .output = bound.output_type };
+        try ir.validate(1);
+        var task = try Task.init(a, .{}, 16 * 1024 * 1024, ir, null, null);
+        defer task.deinit();
+        const cells = [_]scalar.Datum{case.value};
+        const expected = try task.matches(.left, &cells);
+        const actual = try task.matchesBatch(.left, .{ .rows = &.{&cells} }, 0, null);
+        try std.testing.expectEqual(expected, actual);
+    };
+}
+
+test "distributed SQL derived reads keep raw memo separate and reuse identities across probe matches" {
+    const a = std.testing.allocator;
+    const Reader = struct {
+        reads: usize = 0,
+        fn cell(raw: *anyopaque, _: A, _: usize, _: usize) anyerror!scalar.Datum {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.reads += 1;
+            return scalar.Datum.json(.{ .bool = true });
+        }
+    };
+    var reader: Reader = .{};
+    var compiled = try @import("antfly_local_sources").sql_compiler.compileScalar(a, "NOT is_missing(v) AND value_identity(v) = value_identity(TRUE) AND v", .{});
+    defer compiled.deinit();
+    var bound = try scalar.bind(a, compiled.expression, &.{.{ .name = "v", .type = .boolean }}, &.{}, .{});
+    defer bound.deinit();
+    const ir: Program = .{ .instructions = bound.instructions, .root = bound.root, .output = bound.output_type };
+    var task = try Task.init(a, .{}, 16 * 1024 * 1024, null, null, ir);
+    defer task.deinit();
+    const batch: Batch = .{ .reader = .{ .ptr = &reader, .read = Reader.cell, .count = 1, .width = 1 } };
+    task.beginProbe();
+    defer task.endProbe();
+    for (0..100) |_| try std.testing.expect(try task.matchesBatch(.condition, batch, 0, null));
+    try std.testing.expectEqual(@as(usize, 1), reader.reads);
+    const memo = &task.condition.?.cells[0];
+    try std.testing.expect(memo.raw.value.value.bool);
+    try std.testing.expect(!memo.missing.value.value.bool);
+    try std.testing.expect(memo.identity.value.value == .string);
+}
+
+test "distributed SQL missing presence reads encoded JSON without materializing payloads" {
+    const a = std.testing.allocator;
+    const Reader = struct {
+        fn cell(_: *anyopaque, _: A, _: usize, _: usize) anyerror!scalar.Datum {
+            return error.UnexpectedPayloadRead;
+        }
+        fn json(_: *anyopaque, _: usize, _: usize) anyerror!?[]const u8 {
+            return "{\"present\":null}";
+        }
+    };
+    var marker: u8 = 0;
+    const batch: Batch = .{ .reader = .{ .ptr = &marker, .read = Reader.cell, .read_json = Reader.json, .count = 1, .width = 1 } };
+    const ir: Program = .{ .instructions = &.{
+        .{ .type = .{ .kind = .json }, .operation = .{ .column = 0 } },
+        .{ .type = .{ .kind = .boolean }, .operation = .{ .call = .{ .function = .is_missing, .args = &.{0} } } },
+    }, .root = 1, .output = .{ .kind = .boolean } };
+    var task = try Task.init(a, .{}, 16 * 1024 * 1024, ir, null, null);
+    defer task.deinit();
+    try std.testing.expect(!try task.matchesBatch(.left, batch, 0, null));
+}
+
+test "distributed SQL parameter ordinals match compiler slots and reject every out of range boundary" {
+    const a = std.testing.allocator;
+    var compiled = try @import("antfly_local_sources").sql_compiler.compileScalar(a, "v = $1", .{});
+    defer compiled.deinit();
+    var bound = try scalar.bind(a, compiled.expression, &.{.{ .name = "v", .type = .boolean }}, &.{.boolean}, .{});
+    defer bound.deinit();
+    var ir: Program = .{ .instructions = bound.instructions, .root = bound.root, .output = bound.output_type, .parameters = &.{.{ .bool = true }} };
+    try ir.validate(1);
+    var task = try Task.init(a, .{}, 16 * 1024 * 1024, ir, null, null);
+    defer task.deinit();
+    try std.testing.expect(try task.matchesBatch(.left, .{ .rows = &.{&.{scalar.Datum.json(.{ .bool = true })}} }, 0, null));
+    ir.parameters = &.{};
+    try std.testing.expectError(error.InvalidSqlDistributedPlan, ir.validate(1));
+    const parameters: [256]std.json.Value = @splat(.{ .bool = true });
+    for ([_]u32{ 0, 1, 255, 256, std.math.maxInt(u32) }) |slot| {
+        const instruction: scalar.Instruction = .{ .type = .{ .kind = .boolean }, .operation = .{ .parameter = slot } };
+        const program: Program = .{ .instructions = &.{instruction}, .root = 0, .output = .{ .kind = .boolean }, .parameters = &parameters };
+        if (slot < parameters.len) try program.validate(0) else try std.testing.expectError(error.InvalidSqlDistributedPlan, program.validate(0));
+    }
+}
+
+test "distributed SQL identity memo retains only the token after large array normalization" {
+    const a = std.testing.allocator;
+    const local = @import("antfly_local_sources");
+    const elements = try a.alloc(scalar.Datum, 10000);
+    defer a.free(elements);
+    @memset(elements, scalar.Datum.json(.{ .integer = 7 }));
+    const array = try local.sql_array_value.Value.init(.int64, &.{.{ .length = 10000, .lower = -2 }}, elements, .{});
+    var compiled = try local.sql_compiler.compileScalar(a, "value_identity(v) = value_identity(v)", .{});
+    defer compiled.deinit();
+    var bound = try scalar.bind(a, compiled.expression, &.{.{ .name = "v", .type = .array, .element_type = .int64 }}, &.{}, .{});
+    defer bound.deinit();
+    const ir: Program = .{ .instructions = bound.instructions, .root = bound.root, .output = bound.output_type };
+    var budget: local.sql_memory_budget = .{ .backing = a, .limit = 4 * 1024 * 1024 };
+    defer std.debug.assert(budget.live == 0);
+    var task = try Task.init(budget.allocator(), .{}, 16 * 1024 * 1024, null, null, ir);
+    defer task.deinit();
+    const cells = [_]scalar.Datum{scalar.Datum.typedArray(&array)};
+    const batch: Batch = .{ .rows = &.{&cells} };
+    task.beginProbe();
+    defer task.endProbe();
+    for (0..5) |_| try std.testing.expect(try task.matchesBatch(.condition, batch, 0, null));
+    try std.testing.expect(budget.live < 128 * 1024);
 }

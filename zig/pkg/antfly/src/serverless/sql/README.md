@@ -103,7 +103,9 @@ lifetimes automatically.
 
 Plans are versioned, pointer-free JSON; scalar fragments contain validated
 instruction DAGs with bound parameter values. Process caches, settings captures,
-external AI calls, and relation-node pointers are not serialized. A scope plus
+external AI calls, and relation-node pointers are not serialized. Parameter
+slots retain the compiler's zero-based ordinals and are validated against the
+bound value count before admission. A scope plus
 plan content identifies a query. Version-2 query references carry that full digest
 and expiry; state objects use an expiry-first namespace, independently of the
 discovery marker, so late writes remain discoverable after cleanup. Deterministic stage/task IDs make dispatch
@@ -151,7 +153,9 @@ workers validate the capability, schema incarnation, and snapshot on reopen.
   partitioning, hash/Grace admission, and hash probe seeding use borrowed typed batches. WAL reconciliation and residual
   expressions retain scalar fallbacks. Predicate fragments rebuild column
   dependencies from typed instructions; lazy loaders read only executed
-  references and borrow exact decimal lanes from per-invocation scratch.
+  references and borrow exact decimal lanes from per-invocation scratch. Raw,
+  identity, and missing-presence reads have separate memo entries; canonical
+  derivatives share ordinary scalar normalization and invocation work/byte limits.
   Demanded probe values are retained once per probe row across duplicate matches;
   build values and expression temporaries retire after each match.
   Hash matches, skew tile matches and finalizers, unmatched build rows, and

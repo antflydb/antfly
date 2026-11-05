@@ -618,14 +618,18 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
             return error.UnexpectedForegroundControl;
         }
     };
-    const queries = [_][]const u8{
-        "SELECT l.id, r.id FROM l JOIN r ON l.id=r.id ORDER BY l.id, r.id",
-        "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id>5 ORDER BY l.id NULLS LAST, r.id NULLS LAST",
-        "SELECT l.id, r.id FROM l FULL JOIN r ON l.id=r.id ORDER BY l.id NULLS LAST, r.id NULLS LAST",
-        "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id WHERE l.id>1 ORDER BY l.id, r.id",
-        "SELECT count(*) AS n FROM l LEFT JOIN r ON l.id=r.id",
+    const Query = struct { sql: []const u8, parameters: []const std.json.Value = &.{} };
+    const queries = [_]Query{
+        .{ .sql = "SELECT l.id, r.id FROM l JOIN r ON l.id=r.id ORDER BY l.id, r.id" },
+        .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id>5 ORDER BY l.id NULLS LAST, r.id NULLS LAST" },
+        .{ .sql = "SELECT l.id, r.id FROM l FULL JOIN r ON l.id=r.id ORDER BY l.id NULLS LAST, r.id NULLS LAST" },
+        .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id WHERE l.id>1 ORDER BY l.id, r.id" },
+        .{ .sql = "SELECT count(*) AS n FROM l LEFT JOIN r ON l.id=r.id" },
+        .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id>$1 ORDER BY l.id NULLS LAST, r.id NULLS LAST", .parameters = &.{.{ .integer = 5 }} },
+        .{ .sql = "SELECT l.id, r.id FROM l JOIN r ON l.id=r.id AND NOT is_missing(r.id) ORDER BY l.id, r.id" },
     };
-    for ([_]bool{ false, true }) |remote| for (queries) |sql| {
+    for ([_]bool{ false, true }) |remote| for (queries) |query_case| {
+        const sql = query_case.sql;
         var memory = storage.MemoryClient.init(a);
         defer memory.deinit();
         var fixture: Fixture = .{};
@@ -638,7 +642,7 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         if (remote) bridge.gateway = &client;
         var compiled = try local.sql_compiler.compile(a, sql, .{});
         defer compiled.deinit();
-        var ordinary = try local.sql_runtime.execute(a, backend.backend(), &compiled, &.{}, .{});
+        var ordinary = try local.sql_runtime.execute(a, backend.backend(), &compiled, query_case.parameters, .{});
         defer ordinary.deinit();
         const baseline = try std.json.Stringify.valueAlloc(a, ordinary.output.rows, .{});
         defer a.free(baseline);
@@ -670,7 +674,7 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         var distributed = backend.backend();
         distributed.distributed_context.cancellation = .{ .ptr = &ReadGuard.canceled, .is_cancelled_fn = ReadGuard.check };
         distributed.distributed_join = bridge.port();
-        var actual = local.sql_runtime.execute(a, distributed, &compiled, &.{}, .{}) catch |err| {
+        var actual = local.sql_runtime.execute(a, distributed, &compiled, query_case.parameters, .{}) catch |err| {
             std.debug.print("failed distributed SQL parity query: {s}\n", .{sql});
             return err;
         };
@@ -690,7 +694,7 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
                 return @as(*const bool, @ptrCast(@alignCast(raw))).*;
             }
         }.check };
-        try std.testing.expectError(error.Canceled, local.sql_runtime.execute(a, distributed, &compiled, &.{}, .{}));
+        try std.testing.expectError(error.Canceled, local.sql_runtime.execute(a, distributed, &compiled, query_case.parameters, .{}));
         try std.testing.expectEqual(@as(usize, 0), backend.scanned);
     };
 }
