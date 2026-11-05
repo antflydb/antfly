@@ -9405,6 +9405,15 @@ pub const NativeFile = struct {
     /// rejected before loading external pages, and no transaction read cache
     /// retains a copy. Only the initialized prefix of out is returned.
     pub fn readDocumentInto(self: *NativeFile, checkpoint: CheckpointSlot, key: []const u8, out: []u8) ![]const u8 {
+        return self.readDocumentIntoBounded(checkpoint, key, out, false);
+    }
+
+    /// Inspect a bounded prefix without allocating or reading the full value.
+    pub fn readDocumentPrefixInto(self: *NativeFile, checkpoint: CheckpointSlot, key: []const u8, out: []u8) ![]const u8 {
+        return self.readDocumentIntoBounded(checkpoint, key, out, true);
+    }
+
+    fn readDocumentIntoBounded(self: *NativeFile, checkpoint: CheckpointSlot, key: []const u8, out: []u8, prefix_only: bool) ![]const u8 {
         const page_id = (try self.lookupDocumentIndexPage(checkpoint, key)) orelse return error.NotFound;
         var reader: ValuePageReader = undefined;
         reader.init();
@@ -9414,13 +9423,14 @@ pub const NativeFile = struct {
         if (!std.mem.eql(u8, entry.key, key)) return error.InvalidDocumentIndex;
         if (entry.is_delete) return error.NotFound;
         const length = if (entry.external_value_root_page != 0) entry.external_value_len else entry.value.len;
-        if (length > out.len) return error.BufferTooSmall;
+        if (!prefix_only and length > out.len) return error.BufferTooSmall;
+        const copied = @min(length, out.len);
         if (entry.external_value_root_page != 0) {
-            try self.readValuePagesRangeInto(entry.external_value_root_page, length, 0, out[0..length], checkpoint);
+            try self.readValuePagesRangeInto(entry.external_value_root_page, length, 0, out[0..copied], checkpoint);
         } else {
-            @memcpy(out[0..length], entry.value);
+            @memcpy(out[0..copied], entry.value[0..copied]);
         }
-        return out[0..length];
+        return out[0..copied];
     }
 
     /// Sorted multi-read: decode each visited index node once, and descend

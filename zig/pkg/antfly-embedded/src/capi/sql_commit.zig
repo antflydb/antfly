@@ -1055,6 +1055,7 @@ test "capi SQL outcome receipt for a Lite batch export of unknown outcome" {
     defer f.deinit();
     var fault: PrimaryFault = .{ .fixture = &f, .err = error.InputOutput, .publication = true };
     fault.arm();
+    defer PrimaryFault.disarm();
     var out: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&out);
     const code = api.antfly_db_batch_json(f.id, .fromSlice("{\"inserts\":{\"receipt-key\":{\"v\":1}}}"), &out);
@@ -1072,6 +1073,7 @@ test "capi SQL outcome receipt for a Lite batch export of unknown outcome" {
     // The same-call variant returns a receipt in its output parameter.
     var again: PrimaryFault = .{ .fixture = &f, .err = error.InputOutput, .publication = true };
     again.arm();
+    defer PrimaryFault.disarm();
     var out2: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&out2);
     var receipt_out: h.capi.Buffer = .{};
@@ -1082,9 +1084,12 @@ test "capi SQL outcome receipt for a Lite batch export of unknown outcome" {
     try std.testing.expect(std.mem.startsWith(u8, second, "or1:"));
     try std.testing.expect(!std.mem.eql(u8, second, receipt));
     try std.testing.expectEqual(if (found) api.ANTFLY_OUTCOME_RECEIPT_APPLIED else api.ANTFLY_OUTCOME_RECEIPT_NOT_APPLIED, resolved.status);
-    // The struct batch has a same-call variant too.
+    // The second uncertain write fenced this owner. A third mutation needs
+    // a fresh recovery boundary, including for the struct same-call variant.
+    try f.reopen();
     var third_fault: PrimaryFault = .{ .fixture = &f, .err = error.InputOutput, .publication = true };
     third_fault.arm();
+    defer PrimaryFault.disarm();
     var struct_receipt: h.capi.Buffer = .{};
     defer api.antfly_buffer_free(&struct_receipt);
     const writes = [_]h.capi.WriteIntent{.{ .key = .fromSlice("receipt-key-3"), .value = .fromSlice("{\"v\":1}") }};

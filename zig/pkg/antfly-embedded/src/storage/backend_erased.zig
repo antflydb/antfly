@@ -728,6 +728,8 @@ pub const CurrentScanTxn = struct {
         /// Optional point reads from this same captured generation. Native
         /// replay references must not resolve through a newer transaction.
         get: ?*const fn (*anyopaque, []const u8) anyerror![]const u8 = null,
+        /// Optional bounded inspection from the same immutable checkpoint.
+        get_prefix_into: ?*const fn (*anyopaque, []const u8, []u8) anyerror![]const u8 = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -739,6 +741,14 @@ pub const CurrentScanTxn = struct {
     pub fn get(self: *CurrentScanTxn, key: []const u8) ![]const u8 {
         const read = self.vtable.get orelse return error.Unsupported;
         return try BoundaryAbi.call("get", self.boundary_dispatch, read, .{ self.ptr, key });
+    }
+
+    pub fn getPrefixInto(self: *CurrentScanTxn, key: []const u8, out: []u8) ![]const u8 {
+        if (self.vtable.get_prefix_into) |read| return BoundaryAbi.call("get_prefix_into", self.boundary_dispatch, read, .{ self.ptr, key, out });
+        const value = try self.get(key);
+        const copied = @min(value.len, out.len);
+        @memcpy(out[0..copied], value[0..copied]);
+        return out[0..copied];
     }
 
     pub fn openCursor(self: *CurrentScanTxn) !Cursor {
@@ -1801,6 +1811,10 @@ pub fn currentScanTxnFrom(allocator: Allocator, handle: anytype) !CurrentScanTxn
             return try unbox(ptr).handle.get(key);
         }
 
+        pub fn getPrefixInto(ptr: *anyopaque, key: []const u8, out: []u8) anyerror![]const u8 {
+            return unbox(ptr).handle.getPrefixInto(key, out);
+        }
+
         pub fn openCursor(alloc: Allocator, ptr: *anyopaque) anyerror!Cursor {
             const parent = unbox(ptr);
             try parent.retainChild();
@@ -1818,6 +1832,7 @@ pub fn currentScanTxnFrom(allocator: Allocator, handle: anytype) !CurrentScanTxn
             .abort = vt.abort,
             .open_cursor = vt.openCursor,
             .get = if (@hasDecl(Handle, "get")) vt.get else null,
+            .get_prefix_into = if (@hasDecl(Handle, "getPrefixInto")) vt.getPrefixInto else null,
         },
     };
 }

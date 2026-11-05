@@ -1198,6 +1198,13 @@ final retirement bounded and atomic; exceptionally large records retain the
 inline representation. Revisions 9 and 10 remain readable without rewriting on
 read-only opens.
 
+Retirement uses keys-only scans and fixed-size manifest prefixes through the
+generic storage facade as well as the native API; inline legacy records are
+not hydrated just to delete them. Namespaces with no managed index consumers
+still schedule separately admitted retirement, subject to producer, resolver,
+replacement and repair fences. Quota is returned by the physical transaction,
+not by scheduling a retirement watermark.
+
 Revision 10 stores one canonical replay payload with checksummed hint-lane
 references. Readers resolve each reference in the same captured checkpoint.
 Retirement removes references before their canonical payload and returns quota

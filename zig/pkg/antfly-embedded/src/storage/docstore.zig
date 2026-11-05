@@ -1295,6 +1295,14 @@ pub const DocStore = struct {
         session: ?*artifact_payload.Session,
         arena: std.heap.ArenaAllocator,
 
+        keys_only: bool = false,
+
+        pub fn setKeysOnly(self: *@This()) void {
+            if (self.physical.vtable.set_keys_only == null) return;
+            self.physical.setKeysOnly();
+            self.keys_only = true;
+        }
+
         pub fn close(self: *@This()) void {
             self.physical.close();
             self.arena.deinit();
@@ -1303,6 +1311,7 @@ pub const DocStore = struct {
         fn resolve(self: *@This(), entry: ?backend_erased.Entry) !?backend_erased.Entry {
             _ = self.arena.reset(.retain_capacity);
             const value = entry orelse return null;
+            if (self.keys_only) return .{ .key = value.key, .value = &.{} };
             if (self.session) |session| return .{ .key = value.key, .value = try session.getAlloc(self.arena.allocator(), value.key, value.value) };
             if (artifact_payload.isEmbeddingKey(value.key) and artifact_payload.isReference(value.value))
                 return error.VectorMigrationReadEpochChanged;
@@ -2937,6 +2946,8 @@ pub const DocStore = struct {
                 defer txn.abort();
                 var cur = try txn.openCursor();
                 defer cur.close();
+                const prefixes = txn.current_scan.?.vtable.get_prefix_into != null and cur.vtable.set_keys_only != null;
+                if (prefixes) cur.setKeysOnly();
                 const lower = internal_keys.replayRangeLower(ordinal, 0);
                 const upper = internal_keys.replayRangeUpper(ordinal);
                 cur.setUpperBound(&upper);
@@ -2948,8 +2959,13 @@ pub const DocStore = struct {
                     if (ordinal == internal_keys.replay_all_kind and txn.current_scan.?.vtable.get != null and
                         !try @import("db/derived/replay_reference.zig").canonicalMayRetire(&txn, sequence)) continue;
                     const chunk_codec = @import("db/derived/replay_chunks.zig");
-                    if (ordinal == internal_keys.replay_all_kind and chunk_codec.isManifest(kv.value)) {
-                        const manifest = try chunk_codec.Manifest.decode(kv.value);
+                    var manifest_buffer: [chunk_codec.manifest_size + 1]u8 = undefined;
+                    const raw = if (ordinal == internal_keys.replay_all_kind and prefixes)
+                        try txn.current_scan.?.getPrefixInto(kv.key, &manifest_buffer)
+                    else
+                        kv.value;
+                    if (ordinal == internal_keys.replay_all_kind and chunk_codec.isManifest(raw)) {
+                        const manifest = try chunk_codec.Manifest.decode(raw);
                         if (deletes.items.len + manifest.count + 1 > ReplayRetirement.max_keys) break;
                         for (manifest.retired_chunks..manifest.count) |chunk_ordinal| {
                             const chunk_key = chunk_codec.chunkKey(sequence, @intCast(chunk_ordinal));
@@ -3008,6 +3024,8 @@ pub const DocStore = struct {
                     defer txn.abort();
                     var cur = try txn.openCursor();
                     defer cur.close();
+                    const prefixes = txn.current_scan.?.vtable.get_prefix_into != null and cur.vtable.set_keys_only != null;
+                    if (prefixes) cur.setKeysOnly();
                     const lower = internal_keys.replayRangeLower(ordinal, from_sequence);
                     const upper = internal_keys.replayRangeUpper(ordinal);
                     cur.setUpperBound(&upper);
@@ -3017,8 +3035,13 @@ pub const DocStore = struct {
                         const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
                         if (sequence > up_to_sequence) break;
                         const chunk_codec = @import("db/derived/replay_chunks.zig");
-                        if (ordinal == internal_keys.replay_all_kind and chunk_codec.isManifest(kv.value)) {
-                            const manifest = try chunk_codec.Manifest.decode(kv.value);
+                        var manifest_buffer: [chunk_codec.manifest_size + 1]u8 = undefined;
+                        const raw = if (ordinal == internal_keys.replay_all_kind and prefixes)
+                            try txn.current_scan.?.getPrefixInto(kv.key, &manifest_buffer)
+                        else
+                            kv.value;
+                        if (ordinal == internal_keys.replay_all_kind and chunk_codec.isManifest(raw)) {
+                            const manifest = try chunk_codec.Manifest.decode(raw);
                             if (deletes.items.len + manifest.count + 1 > replay_truncate_batch_keys) break;
                             for (manifest.retired_chunks..manifest.count) |chunk_ordinal| {
                                 const chunk_key = chunk_codec.chunkKey(sequence, @intCast(chunk_ordinal));

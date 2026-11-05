@@ -3359,6 +3359,13 @@ const RuntimeStore = struct {
         return try Txn.openReadWithPrefix(self.store, self.prefix);
     }
 
+    /// Native snapshots are already constant-size. Preserve the concrete
+    /// transaction's bounded-prefix capability instead of wrapping it through
+    /// another erased ReadTxn before constructing the current scan.
+    pub fn beginCurrentScan(self: *RuntimeStore) !Txn {
+        return self.beginRead();
+    }
+
     pub fn beginWrite(self: *RuntimeStore) !Txn {
         return try Txn.openWriteYieldingWithPrefix(self.store, self.prefix);
     }
@@ -3655,6 +3662,18 @@ pub const Txn = struct {
             return out[0..value.len];
         }
         return (try self.readFile()).readDocumentInto(self.checkpoint, full, out);
+    }
+
+    pub fn getPrefixInto(self: *Txn, key: []const u8, out: []u8) ![]const u8 {
+        const full = try self.prefixedKey(key);
+        defer if (self.prefix.len > 0) self.allocator.free(full);
+        if (self.pending_tree.getEntryFor(full).node) |node| {
+            const value = self.pending.items[pendingNode(node).ordinal].value orelse return error.NotFound;
+            const copied = @min(value.len, out.len);
+            @memcpy(out[0..copied], value[0..copied]);
+            return out[0..copied];
+        }
+        return (try self.readFile()).readDocumentPrefixInto(self.checkpoint, full, out);
     }
 
     pub const ReadScope = struct {
@@ -4968,23 +4987,12 @@ fn truncateReplayLane(store: *Store, prefix: []const u8, yielding: bool, kind: u
             while (true) {
                 const sequence = internal_keys.parseReplayEntrySequence(key, kind) orelse return error.InvalidReplayEntryKey;
                 if (kind == internal_keys.replay_all_kind) {
-                    // Manifests are fixed-size. Never materialize a legacy
-                    // multi-megabyte payload merely to recognize its encoding.
-                    var header: [replay_chunks.manifest_size]u8 = undefined;
-                    const value = write.getInto(key, &header) catch |err| switch (err) {
-                        error.BufferTooSmall => large: {
-                            // Preserve fail-closed handling of a malformed
-                            // oversized manifest using only its discriminator.
-                            var scope = try write.openReadScope(write.allocator);
-                            defer scope.close();
-                            const magic = try scope.getRange(key, 0, 8);
-                            if (replay_chunks.isManifest(magic)) return error.InvalidReplayChunk;
-                            break :large null;
-                        },
-                        else => return err,
-                    };
-                    if (value != null and replay_chunks.isManifest(value.?)) {
-                        const manifest = try replay_chunks.Manifest.decode(value.?);
+                    // One extra byte distinguishes an exact manifest from
+                    // an oversized malformed one without loading legacy blobs.
+                    var header: [replay_chunks.manifest_size + 1]u8 = undefined;
+                    const value = try write.getPrefixInto(key, &header);
+                    if (replay_chunks.isManifest(value)) {
+                        const manifest = try replay_chunks.Manifest.decode(value);
                         if (count + manifest.count + 1 > replay_cleanup_max_keys) break;
                         for (manifest.retired_chunks..manifest.count) |ordinal| {
                             const chunk_key = replay_chunks.chunkKey(sequence, @intCast(ordinal));
@@ -12533,4 +12541,38 @@ test "lite reclamation cooperative shrink preserves parent observer cancellation
     try std.testing.expectError(error.MaintenanceCanceled, store.maintainBackgroundOnce(&cancel));
     try std.testing.expect(!cancel.requested.load(.acquire));
     try std.testing.expectEqual(@as(u64, 0), store.maintenance_policy.status.assessment_preemptions);
+}
+
+test "lite replay cleanup bounded facade avoids materializing large legacy records" {
+    const a = std.testing.allocator;
+    var budget = @import("test_allocator.zig").BudgetAllocator{ .backing = a };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "facade-retirement-prefix.aflite");
+    defer a.free(path);
+    var physical = try Store.createWithOptions(budget.allocator(), path, .{ .reclamation = .{ .page_reuse = false }, .no_sync = true, .io = std.testing.io });
+    defer physical.close();
+    physical.maintenance_start_suppressed = true;
+    const payload = try a.alloc(u8, 4 * 1024 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'v');
+    const key = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    try physical.file.putDocumentBatch(&.{ .{ .key = &internal_keys.replay_meta_init_key, .value = "" }, .{ .key = &key, .value = payload } });
+    const facade = @import("../docstore.zig");
+    var logical = try facade.DocStore.openRuntime(budget.allocator(), try physical.runtimeStore(budget.allocator()));
+    defer logical.close();
+    // Warm only the small replay-index witness, before imposing the ceiling.
+    try std.testing.expect(try logical.hasReplayEntries());
+    var retirement: facade.ReplayRetirement = .{};
+    logical.deferred_replay_retirement = &retirement;
+    defer logical.deferred_replay_retirement = null;
+    logical.bounded_replay_retirement = true;
+    const baseline = budget.live;
+    budget.peak = baseline;
+    budget.limit = baseline + 1024 * 1024;
+    try logical.truncateReplayUpTo(budget.allocator(), 1);
+    budget.limit = std.math.maxInt(usize);
+    try std.testing.expect(budget.peak - baseline < 1024 * 1024);
+    try std.testing.expect((try physical.file.getDocumentAlloc(a, &key)) == null);
+    try std.testing.expect((try physical.file.check()).valid);
 }

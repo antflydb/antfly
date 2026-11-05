@@ -34704,6 +34704,12 @@ pub const DB = struct {
         // source. Optional maintenance runs only after the owner drops that
         // primary epoch, through the index-storage service below.
         try self.flushAppliedSequencesForIdle();
+        if (phase == .replay and !self.core.index_manager.hasManagedIndexes()) {
+            // No executor worker will request retirement for this namespace.
+            // Use the same producer/resolver/replacement/repair clamps, then
+            // let the separate admitted retirement phase delete physical bytes.
+            try truncateReplayJournalIfSafe(self);
+        }
         try self.saveAllLiveIndexStatusSnapshotsWithMode(self.alloc, true);
         if (phase == .replay) {
             const enrichment_pending = if (self.enrichment_runtime) |runtime| pending: {
@@ -58242,14 +58248,24 @@ fn retireConsumedReplayChunkPrefix(ctx: *AsyncContext) !bool {
     const manifest = manifest: {
         var cursor = try txn.openCursor();
         defer cursor.close();
+        cursor.setKeysOnly();
         const lower = internal_keys.replayRangeLower(internal_keys.replay_all_kind, minimum + 1);
         const upper = internal_keys.replayRangeUpper(internal_keys.replay_all_kind);
         cursor.setUpperBound(&upper);
         const entry = (try cursor.seekAtOrAfter(&lower)) orelse return false;
         if (std.mem.order(u8, entry.key, &upper) != .lt) return false;
         const sequence = internal_keys.parseReplayEntrySequence(entry.key, internal_keys.replay_all_kind) orelse return error.InvalidReplayEntryKey;
-        if (!chunks.isManifest(entry.value)) return false;
-        const value = try chunks.Manifest.decode(entry.value);
+        var scope = try txn.openReadScope(ctx.alloc);
+        defer scope.close();
+        var header: [chunks.manifest_size]u8 = undefined;
+        const raw = scope.getInto(entry.key, &header) catch |err| switch (err) {
+            // Inline records have no physical chunk prefix to retire. Keep
+            // them without loading their potentially large document payload.
+            error.BufferTooSmall => return false,
+            else => return err,
+        };
+        if (!chunks.isManifest(raw)) return false;
+        const value = try chunks.Manifest.decode(raw);
         if (value.sequence != sequence) return error.InvalidReplayChunk;
         break :manifest value;
     };
@@ -77353,6 +77369,15 @@ test "db native chunk retirement waits for every text consumer across index repl
     }
     db.borrowed_group_source_state = &state;
     db.core.store.deferred_replay_retirement = &state.replay_retirement;
+    // Even without an executor consumer, a successful source turn must
+    // request separately admitted retirement of its bounded native journal.
+    try std.testing.expect(!db.core.index_manager.hasManagedIndexes());
+    try db.core.store.appendReplayOpaque(a, 1, "unindexed-source");
+    _ = try db.runBackgroundTurnWithCancellation(.none, .replay);
+    try std.testing.expectEqual(@as(u64, 1), state.replay_retirement.watermark);
+    _ = try db.runBackgroundTurnWithCancellation(.none, .retirement);
+    try std.testing.expectEqual(@as(u64, 0), (try backend.native_docstore.?.file.replayAdmission()).?.records);
+    state.replay_retirement = .{};
     try db.addIndex(.{ .name = "fast", .kind = .full_text, .config_json = "{}" });
     try db.addIndex(.{ .name = "slow", .kind = .full_text, .config_json = "{}" });
     var keys: [130][32]u8 = undefined;
@@ -77376,6 +77401,8 @@ test "db native chunk retirement waits for every text consumer across index repl
         const kept = try db.core.store.get(a, &chunk_key);
         a.free(kept);
     }
+    const before = (try backend.native_docstore.?.file.replayAdmission()).?;
+    try std.testing.expectEqualDeep(try backend.native_docstore.?.file.scanReplayAdmission(), before);
     state.replay_budget.max_records = 64;
     state.replay_budget.lanes[0].records = 64;
     try db.runDerivedUntilTargetsWithVisibilityWait(target, &.{"slow"}, .{ .replay_budget = &state.replay_budget });
@@ -77383,7 +77410,6 @@ test "db native chunk retirement waits for every text consumer across index repl
     const partial = db.core.index_manager.textIndex("slow").?.acquireSnapshot();
     defer partial.release();
     try std.testing.expectEqual(@as(u32, 64), partial.liveDocCount());
-    const before = (try backend.native_docstore.?.file.replayAdmission()).?;
     _ = try db.runBackgroundTurnWithCancellation(.none, .retirement);
     {
         const raw = try db.core.store.get(a, &canonical_key);
@@ -77391,6 +77417,7 @@ test "db native chunk retirement waits for every text consumer across index repl
         try std.testing.expectEqual(@as(u32, 1), (try chunks.Manifest.decode(raw)).retired_chunks);
         try std.testing.expectError(error.NotFound, db.core.store.get(a, &chunk_key));
         const after = (try backend.native_docstore.?.file.replayAdmission()).?;
+        try std.testing.expectEqualDeep(try backend.native_docstore.?.file.scanReplayAdmission(), after);
         try std.testing.expect(after.bytes < before.bytes);
         try std.testing.expectEqual(before.records, after.records);
     }
