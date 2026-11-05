@@ -1187,6 +1187,11 @@ pub fn create(b: *std.Build) ?Artifacts {
     const run_antfly_lite_cli_smoke = b.addRunArtifact(lite_cli_smoke);
     run_antfly_lite_cli_smoke.addArtifactArg2(antfly_main, .{ .make_absolute = true });
     b.step("cli-smoke-test", "Exercise public Lite and inference commands without model downloads").dependOn(&run_antfly_lite_cli_smoke.step);
+    const publication_test = b.addSystemCommand(&.{"env"});
+    publication_test.setCwd(b.path("."));
+    publication_test.addArtifactArg2(antfly_main, .{ .prefix = "ANTFLY_BIN=", .make_absolute = true });
+    publication_test.addArgs(&.{ "python3", "-m", "unittest", "discover", "-s", "../scripts", "-p", "test_publication.py", "-v" });
+    b.step("publication-test", "Qualify native Lite shared-search publication, serving and recovery").dependOn(&publication_test.step);
     const library_step = b.step("libantfly", "Build and install the embedding library, header, and pkg-config metadata");
     library_step.dependOn(&b.top_level_steps.get("licenses-libantfly").?.step);
     library_step.dependOn(install_libantfly);
@@ -1196,6 +1201,7 @@ pub fn create(b: *std.Build) ?Artifacts {
     release_step.dependOn(library_step);
 
     const lite_test_step = b.step("lite-test", "Run Lite backend, CLI, bindings, examples, and C ABI packaging checks");
+    if (target.result.os.tag == .linux or target.result.os.tag == .macos) lite_test_step.dependOn(&publication_test.step);
     lite_test_step.dependOn(&run_antfly_main_tests.step);
     lite_test_step.dependOn(&run_lite_cmd_tests.step);
     lite_test_step.dependOn(&run_lite_native_tests.step);

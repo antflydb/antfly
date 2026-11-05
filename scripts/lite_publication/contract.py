@@ -1,3 +1,18 @@
+# Copyright 2026 Antfly, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """The Drive-only portable row profile. No input field is executable."""
 
 import hashlib
@@ -6,7 +21,6 @@ import math
 import re
 import struct
 from importlib.resources import files
-from urllib.parse import parse_qs, urlsplit
 
 DATA = files(__name__.rpartition(".")[0])
 PROFILE = json.loads((DATA / "embedding.json").read_bytes())
@@ -134,32 +148,17 @@ def provenance(doc):
         and path[-1] == doc["filename"],
         "Expected a relative Drive display path",
     )
-    url = urlsplit(doc["source_url"])
-    require(
-        url.scheme == "https"
-        and url.netloc in ("drive.google.com", "docs.google.com")
-        and not url.fragment,
-        "Expected a canonical Google Drive URL",
-    )
-    parts = url.path.strip("/").split("/")
-    valid_path = (
-        parts == ["file", "d", ident, "view"]
-        if url.netloc == "drive.google.com"
-        else parts
-        in [
-            [app, "d", ident, action]
-            for app in ("document", "presentation", "spreadsheets")
-            for action in ("edit", "view")
-        ]
+    urls = {
+        f"https://drive.google.com/open?id={ident}",
+        f"https://drive.google.com/file/d/{ident}/view",
+    }
+    urls.update(
+        f"https://docs.google.com/{app}/d/{ident}/{action}"
+        for app in ("document", "presentation", "spreadsheets")
+        for action in ("edit", "view")
     )
     require(
-        (valid_path and not url.query)
-        or (
-            url.netloc == "drive.google.com"
-            and url.path == "/open"
-            and parse_qs(url.query, strict_parsing=True) == {"id": [ident]}
-        ),
-        "URL must identify the same Drive file",
+        doc["source_url"] in urls, "Expected a canonical Google URL for this Drive ID"
     )
     require(SHA.fullmatch(doc["document_revision"]), "Invalid document revision")
 
