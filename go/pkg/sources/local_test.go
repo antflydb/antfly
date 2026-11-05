@@ -24,8 +24,10 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -50,7 +52,12 @@ func TestLocalPutIsContentAddressedAndIdempotent(t *testing.T) {
 	sum := sha256.Sum256([]byte("image bytes"))
 	require.Equal(t, hex.EncodeToString(sum[:]), first.SHA256)
 	require.Equal(t, "uploads/objects/sha256/"+first.SHA256+".png", first.Path)
+	before, err := os.Stat(filepath.Join(root, first.Path))
+	require.NoError(t, err)
 	require.Equal(t, first, localPut(t, root, "uploads", ".png", "image bytes"))
+	after, err := os.Stat(filepath.Join(root, first.Path))
+	require.NoError(t, err)
+	require.Equal(t, before.ModTime(), after.ModTime(), "a retried put must not invalidate published records")
 	entries, err := os.ReadDir(filepath.Join(root, "uploads", "objects", "sha256"))
 	require.NoError(t, err)
 	require.Len(t, entries, 1, "a retried put must leave no temporary files")
@@ -121,6 +128,11 @@ func TestLocalMediaVerifiesPinnedContent(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "0123456789", string(data))
 
+	acquired, ok, err := c.AcquireMedia(ctx, request, item)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, "0123456789", string(acquired))
+
 	body, err := c.OpenMedia(ctx, request, item, MediaRange{Offset: 2, Length: 4})
 	require.NoError(t, err)
 	part, err := io.ReadAll(body)
@@ -136,6 +148,18 @@ func TestLocalMediaVerifiesPinnedContent(t *testing.T) {
 	require.NoError(t, os.WriteFile(filepath.Join(c.Root, object.Path), []byte("9876543210"), 0o600))
 	_, err = c.Read(ctx, request, item)
 	var changed *RevisionChangedError
+	require.True(t, errors.As(err, &changed), "%v", err)
+	require.True(t, errors.As(c.CheckMedia(ctx, request, item), &changed), "access checks must notice the overwrite")
+
+	// Restoring the old modification time defeats the cheap fence, not the digest.
+	modified, err := strconv.ParseInt(configString(item.Metadata, localModifiedKey), 10, 64)
+	require.NoError(t, err)
+	stamp := time.Unix(0, modified)
+	require.NoError(t, os.Chtimes(filepath.Join(c.Root, object.Path), stamp, stamp))
+	require.NoError(t, c.CheckMedia(ctx, request, item))
+	_, err = c.OpenMedia(ctx, request, item, MediaRange{Offset: 2, Length: 4})
+	require.True(t, errors.As(err, &changed), "%v", err)
+	_, _, err = c.AcquireMedia(ctx, request, item)
 	require.True(t, errors.As(err, &changed), "%v", err)
 
 	require.NoError(t, os.WriteFile(filepath.Join(c.Root, object.Path), []byte("short"), 0o600))
@@ -221,6 +245,26 @@ func TestLocalUploadPublishesThroughASingleSourceRun(t *testing.T) {
 	full := fetchService(s, ref, "GET", "")
 	require.Equal(t, 200, full.Code, full.Body.String())
 	require.Equal(t, "\x89PNG uploaded bytes", full.Body.String())
+
+	part := fetchService(s, ref, "GET", "bytes=2-5")
+	require.Equal(t, 206, part.Code)
+	require.Equal(t, "NG u", part.Body.String())
+
+	// Overwriting must never serve changed bytes under the original ETag, including
+	// when the modification time is restored and only the digest can notice.
+	path := filepath.Join(root, object.Path)
+	original := []byte("\x89PNG uploaded bytes")
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(path, []byte("\x89PNG CHANGED! bytes"), 0o600))
+	require.NoError(t, os.Chtimes(path, info.ModTime(), info.ModTime()))
+	for _, byteRange := range []string{"bytes=2-5", ""} {
+		changed := fetchService(s, ref, "GET", byteRange)
+		require.Equal(t, 412, changed.Code, byteRange)
+		require.NotContains(t, changed.Body.String(), "CHANGED")
+	}
+	require.NoError(t, os.WriteFile(path, original, 0o600))
+	require.NoError(t, os.Chtimes(path, info.ModTime(), info.ModTime()))
 
 	// The bucket-equivalent delete: removing the object retires its row.
 	require.NoError(t, os.Remove(filepath.Join(root, object.Path)))

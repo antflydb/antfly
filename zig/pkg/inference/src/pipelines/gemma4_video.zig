@@ -21,6 +21,7 @@ const video = @import("antfly_video");
 const projector_mod = @import("../architectures/gemma4_projector.zig");
 const embedding_video = @import("embedding_gemma2_video.zig");
 const ComputeBackend = @import("../ops/ops.zig").ComputeBackend;
+const Control = @import("../execution_control.zig").InferenceExecutionControl;
 
 const sampling: embedding_video.Sampling = .{ .timestamps = .{} };
 
@@ -43,13 +44,16 @@ const Observer = struct {
 };
 
 fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
-    const timestamps = try embedding_video.selectedPresentationUs(a, bytes, .{}, sampling);
+    // Indexing and decoding run under the model execution lock, so they must honor
+    // the request's cancellation and deadline between selected frames too.
+    const control = cb.execution_control orelse Control{};
+    const timestamps = try embedding_video.selectedPresentationUs(a, bytes, control, sampling);
     defer a.free(timestamps);
     var frames = try projector_mod.PortableVideoFrames.init(cb, a, projector, timestamps.len);
     defer frames.deinit();
     var observer: Observer = .{ .a = a, .cb = cb, .frames = &frames };
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
-    try embedding_video.observeConfigured(a, bytes, null, .{}, .{
+    try embedding_video.observeConfigured(a, bytes, null, control, .{
         .observer = .{ .context = &observer, .accept = Observer.accept },
         .sampling = sampling,
         .pool = &pool,
@@ -92,5 +96,27 @@ test "gemma4 video timestamps match the frames delivered to the observer" {
         var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
         try embedding_video.observeConfigured(a, bytes, null, .{}, .{ .observer = .{ .context = &counter, .accept = Count.accept }, .sampling = sampling, .pool = &pool });
         for (seen) |value| try std.testing.expect(value);
+    }
+}
+
+test "gemma4 video timestamps honor request cancellation before indexing and decoding" {
+    const a = std.testing.allocator;
+    const Cancelled = struct {
+        fn cancelled(_: ?*anyopaque) bool {
+            return true;
+        }
+    };
+    var unused: u8 = 0;
+    const control: Control = .{ .cancellation = .{ .is_cancelled_fn = Cancelled.cancelled } };
+    inline for (.{ "bframes.mp4", "vp9.webm" }) |name| {
+        const bytes = @embedFile("../testdata/video/" ++ name);
+        try std.testing.expectError(error.Cancelled, embedding_video.selectedPresentationUs(a, bytes, control, sampling));
+        const Refuse = struct {
+            fn accept(_: *anyopaque, _: usize, _: video.preparation.BorrowedFrame, _: video.preparation.Options, _: media.source.Control) anyerror!void {
+                return error.UnexpectedFrame;
+            }
+        };
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+        try std.testing.expectError(error.Cancelled, embedding_video.observeConfigured(a, bytes, null, control, .{ .observer = .{ .context = &unused, .accept = Refuse.accept }, .sampling = sampling, .pool = &pool }));
     }
 }

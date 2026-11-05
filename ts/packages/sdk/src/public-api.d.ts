@@ -30516,6 +30516,13 @@ export interface components {
              */
             allowed_paths?: string[];
             /**
+             * @description Exact source companion base URLs that a chat `source` part may fetch, matched on scheme, host, port and path. This is how a loopback or private companion is allowed; such URLs need no `allowed_hosts` entry. Every other `source` URL needs `allowed_hosts` and always keeps private-IP blocking, whatever `block_private_ips` says. Template fetches ignore this setting.
+             * @example [
+             *       "http://127.0.0.1:8082/v1/media/"
+             *     ]
+             */
+            source_media_base_urls?: string[];
+            /**
              * @description User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
              * @example AntflyDB/1.0
              */

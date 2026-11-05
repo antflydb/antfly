@@ -161,9 +161,13 @@ before choosing a provider. The source URL therefore never reaches a model vendo
 It accepts PNG, JPEG, WebP and GIF images, and `audio/*` and `video/*` types. Only
 `http` and `https` URIs are accepted.
 
-- Fetching requires a nonempty `remote_content.security.allowed_hosts`. Unlike
-  template fetches, an omitted allowlist denies the request (403). A loopback
-  source companion also needs `block_private_ips: false`, so list only that host.
+- A URL must match `remote_content.security.source_media_base_urls` or a nonempty
+  `allowed_hosts`. Unlike template fetches, an omitted allowlist denies the request
+  (403).
+- A loopback or private source companion must be listed in `source_media_base_urls`,
+  such as `http://127.0.0.1:8082/v1/media/`, which matches scheme, host, port and path.
+  All other `source` URLs keep private-IP blocking even if `block_private_ips` is
+  `false`, because host-level policy would also expose that host's other ports.
 - A source whose current version differs fails with 409 rather than serving other
   bytes.
 - The expanded request is limited to 16 MiB, including base64 expansion, so media
@@ -172,8 +176,10 @@ It accepts PNG, JPEG, WebP and GIF images, and `audio/*` and `video/*` types. On
 Declare `video: supported` under `inference_capabilities` for a named target that
 accepts video. Without a declaration, video requests to that target are rejected.
 
-Local Gemma 4 generators with a projector accept one video per message, alongside
-text but not image or audio parts. They sample one frame per second: CUDA takes
+Local Gemma 4 generators with a projector accept one video per request, alongside
+text but not image or audio parts anywhere in that request. Earlier turns can contain
+text. `context_management` rejects video, because it only plans text. Generators
+sample one frame per second: CUDA takes
 H.264 MP4 up to 60 seconds, and CPU and Metal take the
 [portable codecs](../../zig/lib/video/VIDEO.md) up to 32 uniformly spaced frames.
 

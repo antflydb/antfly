@@ -30,6 +30,7 @@ import (
 	"path"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
@@ -39,6 +40,15 @@ import (
 const LocalRootsEnv = "ANTFLY_SOURCE_LOCAL_ROOTS"
 
 const localObjectDir = "objects/sha256"
+
+// maxLocalMediaBytes bounds the verified copy held for one HTTP delivery. A
+// digest-shaped name is not an immutability guarantee, so each delivery reads and
+// checks the complete object instead of trusting ranges of a mutable file.
+const maxLocalMediaBytes = 256 << 20
+
+const localModifiedKey = "local_modified_ns"
+
+func localModified(info fs.FileInfo) string { return strconv.FormatInt(info.ModTime().UnixNano(), 10) }
 
 var localObjectName = regexp.MustCompile(`^([0-9a-f]{64})(\.[A-Za-z0-9]{1,16})?$`)
 
@@ -152,8 +162,11 @@ func (c *LocalConnector) Enumerate(ctx context.Context, r Request) (Inventory, e
 		if len(out.Objects) >= maxImportSourceObjects {
 			return Inventory{}, fmt.Errorf("%w: local inventory limit exceeded", ErrInvalidInput)
 		}
+		if info.Size() > maxLocalMediaBytes {
+			return Inventory{}, fmt.Errorf("%w: local object exceeds the %d byte limit", ErrInvalidInput, maxLocalMediaBytes)
+		}
 		uri := (&url.URL{Scheme: "local", Path: "/" + rel}).String()
-		out.Objects = append(out.Objects, Item{ID: "local://" + strings.Trim(r.SourceNamespace, "/") + "/" + rel, Path: rel, Filename: name, Revision: match[1], URL: uri, Size: info.Size(), SourceKind: ProviderLocal, ReadMode: sourceReadBytes, ObjectIndex: len(out.Objects) + 1, Metadata: map[string]any{"source_namespace": r.SourceNamespace, "canonical_url": uri}})
+		out.Objects = append(out.Objects, Item{ID: "local://" + strings.Trim(r.SourceNamespace, "/") + "/" + rel, Path: rel, Filename: name, Revision: match[1], URL: uri, Size: info.Size(), SourceKind: ProviderLocal, ReadMode: sourceReadBytes, ObjectIndex: len(out.Objects) + 1, Metadata: map[string]any{"source_namespace": r.SourceNamespace, "canonical_url": uri, localModifiedKey: localModified(info)}})
 		if r.Preview {
 			break
 		}
@@ -192,9 +205,10 @@ func (c *LocalConnector) open(r Request, o Item) (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
+	// A cheap fence for HEAD and access checks. Delivery still verifies the digest.
 	info, err := file.Stat()
-	if err == nil && info.Size() != o.Size {
-		err = &RevisionChangedError{Expected: o.Revision, Actual: "different size"}
+	if err == nil && (info.Size() != o.Size || localModified(info) != configString(o.Metadata, localModifiedKey)) {
+		err = &RevisionChangedError{Expected: o.Revision, Actual: "object changed after publication"}
 	}
 	if err != nil {
 		file.Close()
@@ -251,13 +265,40 @@ func (c *LocalConnector) OpenMedia(_ context.Context, r Request, o Item, span Me
 	body := &localMediaBody{file: file, reader: io.NewSectionReader(file, span.Offset, span.Length), remaining: span.Length}
 	if span.Offset == 0 && span.Length == o.Size {
 		body.digest, body.expected = sha256.New(), o.Revision
+		return body, nil
+	}
+	// A partial read cannot prove its own bytes, so check the object first.
+	digest := sha256.New()
+	if _, err := io.Copy(digest, io.NewSectionReader(file, 0, o.Size)); err != nil {
+		file.Close()
+		return nil, err
+	}
+	if actual := hex.EncodeToString(digest.Sum(nil)); actual != o.Revision {
+		file.Close()
+		return nil, &RevisionChangedError{Expected: o.Revision, Actual: actual}
 	}
 	return body, nil
 }
 
-// StableMediaRanges holds because a digest-named object has one valid content.
-// A complete read verifies that digest, and ServeMedia pins it at publication.
-func (*LocalConnector) StableMediaRanges() bool { return true }
+// AcquireMedia gives ServeMedia one verified copy per HTTP delivery, so every
+// range in a response comes from bytes that matched the published digest.
+func (c *LocalConnector) AcquireMedia(ctx context.Context, r Request, o Item) ([]byte, bool, error) {
+	if o.Size > maxLocalMediaBytes {
+		return nil, true, fmt.Errorf("%w: local object exceeds the %d byte limit", ErrInvalidInput, maxLocalMediaBytes)
+	}
+	body, err := c.OpenMedia(ctx, r, o, MediaRange{Length: o.Size})
+	if err != nil {
+		return nil, true, err
+	}
+	data, err := io.ReadAll(body)
+	if closeErr := body.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return nil, true, err
+	}
+	return data, true, nil
+}
 
 // MediaContentScope binds verified digests to the resolved store directory.
 func (c *LocalConnector) MediaContentScope() string { return ProviderLocal + "|" + c.Root }
@@ -339,6 +380,15 @@ func PutLocalObject(root, prefix, ext string, content io.Reader) (LocalObject, e
 	}
 	sum := hex.EncodeToString(digest.Sum(nil))
 	rel := path.Join(dir, sum+ext)
+	// Replacing an identical object would change its modification time and
+	// invalidate records already published for it.
+	if existing, err := store.Lstat(rel); err == nil && existing.Mode().IsRegular() && existing.Size() == size {
+		if err := store.Remove(temp); err != nil {
+			return LocalObject{}, err
+		}
+		committed = true
+		return LocalObject{Path: rel, SHA256: sum, Size: size}, nil
+	}
 	if err := store.Rename(temp, rel); err != nil {
 		return LocalObject{}, err
 	}

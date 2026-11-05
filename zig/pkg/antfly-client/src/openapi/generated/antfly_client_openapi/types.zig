@@ -7408,6 +7408,8 @@ pub const ContentSecurityConfig = struct {
     max_image_dimension: ?i64 = null,
     /// Whitelist of allowed path prefixes for file:// and s3:// URLs. File downloads require an explicit nonempty path allowlist; omission and an empty list deny local file access. For S3 the generic scraper treats omission as unrestricted and an empty list as deny-all; Antfly inference requires explicit path allowlists. For file:// use absolute paths (e.g., /Users/data/). For s3:// use bucket/prefix (e.g., my-bucket/uploads/).
     allowed_paths: ?[]const []const u8 = null,
+    /// Exact source companion base URLs that a chat `source` part may fetch, matched on scheme, host, port and path. This is how a loopback or private companion is allowed; such URLs need no `allowed_hosts` entry. Every other `source` URL needs `allowed_hosts` and always keeps private-IP blocking, whatever `block_private_ips` says. Template fetches ignore this setting.
+    source_media_base_urls: ?[]const []const u8 = null,
     /// User-Agent header for HTTP downloads. Defaults to 'AntflyDB/1.0' if not set. Some servers (e.g., Wikipedia) reject requests without a User-Agent.
     user_agent: ?[]const u8 = null,
 
@@ -7420,6 +7422,7 @@ pub const ContentSecurityConfig = struct {
         .{ "download_timeout_seconds", "download_timeout_seconds", true },
         .{ "max_image_dimension", "max_image_dimension", true },
         .{ "allowed_paths", "allowed_paths", true },
+        .{ "source_media_base_urls", "source_media_base_urls", true },
         .{ "user_agent", "user_agent", true },
     };
 
@@ -7459,6 +7462,10 @@ pub const ContentSecurityConfig = struct {
         }
         if (self.allowed_paths) |value| {
             try jw.objectField("allowed_paths");
+            try jw.write(value);
+        }
+        if (self.source_media_base_urls) |value| {
+            try jw.objectField("source_media_base_urls");
             try jw.write(value);
         }
         if (self.user_agent) |value| {

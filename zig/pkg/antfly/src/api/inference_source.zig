@@ -180,16 +180,36 @@ pub fn fetchResource(a: A, io: std.Io, remote_content: ?*const scraping.RemoteCo
     const config = remote_content orelse return error.Forbidden;
     var snapshot = try config.acquire();
     defer snapshot.deinit();
-    const security = if (snapshot.config.security) |*value| value else return error.Forbidden;
-    const hosts = security.allowed_hosts orelse return error.Forbidden;
-    if (hosts.len == 0) return error.Forbidden;
+    const configured = if (snapshot.config.security) |*value| value else return error.Forbidden;
+    var security = try resourceSecurity(a, configured.*, resource.uri);
     const context: scraping.DownloadContext = .{ .io = io, .timeout_ms = timeout_ms, .cancellation = cancellation };
     const out = try a.alloc(u8, @intCast(resource.length));
-    const range = scraping.PinnedRange.create(a, context, resource.uri, resource.version, resource.version_kind, resource.length, security, null, &.{}) catch |err| return fetchFailure(err);
+    const range = scraping.PinnedRange.create(a, context, resource.uri, resource.version, resource.version_kind, resource.length, &security, null, &.{}) catch |err| return fetchFailure(err);
     defer range.destroy();
     const read = range.readAt(0, out) catch |err| return fetchFailure(err);
     if (read != out.len) return error.InferenceSourceMismatch;
     return out;
+}
+/// The policy for one caller-supplied URL. A configured companion base URL is the
+/// only way to reach a private address; `block_private_ips: false` is not, because
+/// host-level policy would also expose every other port on that host.
+fn resourceSecurity(a: A, configured: scraping.ContentSecurityConfig, uri: []const u8) !scraping.ContentSecurityConfig {
+    var security = configured;
+    const parsed = std.Uri.parse(uri) catch return error.InvalidInferenceSource;
+    for (configured.source_media_base_urls orelse &.{}) |base| {
+        if (!scraping.httpUrlMatchesBase(parsed, base)) continue;
+        const host = try a.alloc(u8, std.Io.net.HostName.max_len);
+        const raw = (parsed.host orelse return error.InvalidInferenceSource).toRaw(host) catch return error.InvalidInferenceSource;
+        const hosts = try a.alloc([]u8, 1);
+        hosts[0] = @constCast(raw);
+        security.allowed_hosts = hosts;
+        security.block_private_ips = false;
+        return security;
+    }
+    const hosts = configured.allowed_hosts orelse return error.Forbidden;
+    if (hosts.len == 0) return error.Forbidden;
+    security.block_private_ips = true;
+    return security;
 }
 fn fetchFailure(err: anyerror) anyerror {
     return switch (err) {
@@ -649,26 +669,91 @@ test "httpx inference gateway chat source parts bound and validate before fetchi
     try std.testing.expectError(error.Forbidden, resolve(a, try chatRequest(a, "audio/wav", 11), failing.port()));
 }
 
-test "httpx inference gateway chat source resources deny fetching without an allowlist" {
+const PinnedFixture = struct {
+    io: std.Io,
+    server: *std.Io.net.Server,
+    served: bool = false,
+    failure: ?anyerror = null,
+    fn serve(self: *@This()) void {
+        var stream = self.server.accept(self.io) catch |err| {
+            if (err != error.Canceled) self.failure = err;
+            return;
+        };
+        defer stream.close(self.io);
+        var read_buffer: [4096]u8 = undefined;
+        var reader = stream.reader(self.io, &read_buffer);
+        while (true) {
+            const line = reader.interface.takeDelimiterInclusive('\n') catch |err| {
+                self.failure = err;
+                return;
+            };
+            if (std.mem.eql(u8, line, "\r\n")) break;
+        }
+        var write_buffer: [512]u8 = undefined;
+        var writer = stream.writer(self.io, &write_buffer);
+        writer.interface.writeAll("HTTP/1.1 206 Partial Content\r\nETag: \"v\"\r\nContent-Range: bytes 0-4/5\r\nContent-Length: 5\r\nConnection: close\r\n\r\nvideo") catch |err| {
+            self.failure = err;
+            return;
+        };
+        writer.interface.flush() catch |err| {
+            self.failure = err;
+            return;
+        };
+        self.served = true;
+    }
+};
+
+test "httpx inference gateway chat source resources reach private addresses only through a base URL" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    const resource: Resource = .{ .type = "source", .uri = "http://127.0.0.1:1/a", .mime_type = "audio/wav", .version = "\"v\"", .length = 1 };
     const io = std.testing.io;
-    try std.testing.expectError(error.Forbidden, fetchResource(a, io, null, resource, null, 100));
-    var remote: scraping.RemoteContentConfig = .{};
-    try std.testing.expectError(error.Forbidden, fetchResource(a, io, &remote, resource, null, 100));
-    remote.security = .{ .block_private_ips = false };
-    try std.testing.expectError(error.Forbidden, fetchResource(a, io, &remote, resource, null, 100));
-    var empty: [0][]u8 = .{};
-    remote.security = .{ .allowed_hosts = &empty, .block_private_ips = false };
-    try std.testing.expectError(error.Forbidden, fetchResource(a, io, &remote, resource, null, 100));
-    var other = [_][]u8{try a.dupe(u8, "sources.example")};
-    remote.security = .{ .allowed_hosts = &other, .block_private_ips = false };
-    try std.testing.expectError(error.Forbidden, fetchResource(a, io, &remote, resource, null, 100));
+    var server = try (try std.Io.net.IpAddress.parse("127.0.0.1", 0)).listen(io, .{});
+    defer server.deinit(io);
+    const port = server.socket.address.getPort();
+    const base = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/v1/media/", .{port});
+    const uri = try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/v1/media/id/sig", .{port});
+    const resource: Resource = .{ .type = "source", .uri = uri, .mime_type = "video/mp4", .version = "\"v\"", .length = 5 };
+
     var loopback = [_][]u8{try a.dupe(u8, "127.0.0.1")};
-    remote.security = .{ .allowed_hosts = &loopback };
+    var empty: [0][]u8 = .{};
+    var other_hosts = [_][]u8{try a.dupe(u8, "sources.example")};
+    var remote: scraping.RemoteContentConfig = .{};
+    try std.testing.expectError(error.Forbidden, fetchResource(a, io, null, resource, null, 100));
     try std.testing.expectError(error.Forbidden, fetchResource(a, io, &remote, resource, null, 100));
+    for ([_]scraping.ContentSecurityConfig{
+        .{ .block_private_ips = false },
+        .{ .allowed_hosts = &empty, .block_private_ips = false },
+        .{ .allowed_hosts = &other_hosts, .block_private_ips = false },
+        // Host-level policy must not reach loopback, even when globally unblocked.
+        .{ .allowed_hosts = &loopback, .block_private_ips = false },
+        .{ .allowed_hosts = &loopback },
+    }) |security| {
+        remote.security = security;
+        try std.testing.expectError(error.Forbidden, fetchResource(a, io, &remote, resource, null, 100));
+    }
+
+    // The base URL pins scheme, host, port and path.
+    var bases = [_][]u8{base};
+    remote.security = .{ .source_media_base_urls = &bases };
+    for ([_][]const u8{
+        try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/v1/media/x", .{port +% 1}),
+        try std.fmt.allocPrint(a, "http://127.0.0.1:{d}/admin", .{port}),
+        try std.fmt.allocPrint(a, "http://localhost:{d}/v1/media/x", .{port}),
+        try std.fmt.allocPrint(a, "https://127.0.0.1:{d}/v1/media/x", .{port}),
+    }) |denied| {
+        var other = resource;
+        other.uri = denied;
+        try std.testing.expectError(error.Forbidden, fetchResource(a, io, &remote, other, null, 100));
+    }
+
+    var fixture: PinnedFixture = .{ .io = io, .server = &server };
+    var thread = try io.concurrent(PinnedFixture.serve, .{&fixture});
+    const bytes = try fetchResource(a, io, &remote, resource, null, 5000);
+    thread.await(io);
+    if (fixture.failure) |err| return err;
+    try std.testing.expect(fixture.served);
+    try std.testing.expectEqualStrings("video", bytes);
 }
 
 test "httpx inference gateway preserves temporary source lookup failures" {

@@ -342,6 +342,7 @@ pub const PortableVideoFrames = struct {
         var rows: usize = 0;
         var done: usize = 0;
         while (done < kept) {
+            try cb.checkExecutionControl();
             const cohort = frames.items[done..@min(done + 8, kept)];
             var projected = try encodePreparedImagesResidentWithWeights(cb, a, &self.weights, self.cfg, cohort, .{});
             defer projected.deinit();

@@ -111,7 +111,7 @@ pub const Message = struct {
     image_bytes: ?[]const []const u8 = null,
     /// One video clip, sampled at one frame per second. CUDA takes H.264 MP4 up
     /// to 60s; CPU and Metal take the portable codecs, capped at 32 uniform frames.
-    /// Video currently occupies its own message without image/audio parts.
+    /// A request has one video, in its own message, with no image or audio parts.
     video_bytes: ?[]const u8 = null,
     /// Raw encoded audio bytes for multimodal messages.
     /// Null or empty for text/image-only messages.
@@ -5579,7 +5579,7 @@ pub const NativeGenerationPipeline = struct {
         if (video_bytes != null) {
             if (!self.cb.supportsCopyRows2D() or self.gpt_config.family != .gemma or !self.gpt_config.usesGemma4Channels() or self.gguf_projector_path == null) return error.UnsupportedVideoBackend;
             for (messages) |message| {
-                if (message.content_parts != null or message.hasAudio() or (if (message.image_bytes) |imgs| imgs.len > 0 else false)) return error.UnsupportedMixedVideoInput;
+                if ((message.video_bytes != null and message.content_parts != null) or message.hasAudio() or (if (message.image_bytes) |imgs| imgs.len > 0 else false)) return error.UnsupportedMixedVideoInput;
             }
         }
         const has_images = messagesHaveImages(messages);

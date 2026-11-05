@@ -2511,6 +2511,7 @@ fn contentSecurityFromOpenApi(
     else
         null;
     out.allowed_paths = if (value.allowed_paths) |paths| try dupOwnedStringSlice(alloc, paths) else null;
+    out.source_media_base_urls = if (value.source_media_base_urls) |urls| try dupOwnedStringSlice(alloc, urls) else null;
     out.user_agent = if (value.user_agent) |user_agent| try alloc.dupe(u8, user_agent) else null;
     scraping.validateNat64Prefixes(out) catch return error.InvalidConfig;
     return out;

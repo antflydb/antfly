@@ -406,9 +406,14 @@ register a connection would otherwise choose which files the service reads.
 The store directory must already exist. A missing directory fails the run rather
 than reading as empty, so a lost mount cannot delete every published row. Removing an
 object retires its row on the next run. Symlinks and unexpected names fail the run.
+Objects are limited to 256 MiB, because each delivery reads and verifies the complete
+object and serves its ranges from that copy. A changed object fails with 412 rather
+than delivering different bytes under the published ETag, so write new content under
+its own digest.
 Antfly reaches the store through `antfly-source serve`, which it must be allowed to
-fetch: list the listener's host in `remote_content.security.allowed_hosts`, and set
-`block_private_ips: false` for a loopback listener. Run one source with
+fetch: list the listener in `remote_content.security.source_media_base_urls`, such as
+`http://127.0.0.1:8082/v1/media/`. This allows that listener without opening other
+private addresses or ports. Run one source with
 `POST /v1/sync` and `{"source_id": "<uuid>"}` to publish a new upload without syncing
 the others. Runs are serialized across the service, so a concurrent run returns 409.
 

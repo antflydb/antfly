@@ -4290,6 +4290,7 @@ pub const Node = struct {
         decoded_media_bytes: usize = 0,
         media_count: usize = 0,
         image_count: usize = 0,
+        video_count: usize = 0,
         has_audio: bool = false,
         /// Internal /read task policy; ordinary audio generation retains its semantics.
         audio_transcription: bool = false,
@@ -5714,8 +5715,8 @@ pub const Node = struct {
         max_tokens: i32,
     ) !DirectGenerateAdmission {
         if (max_tokens < 1 or
-            preflight.image_count > preflight.media_count or
-            preflight.has_audio != (preflight.media_count > preflight.image_count) or
+            preflight.image_count +| preflight.video_count > preflight.media_count or
+            preflight.has_audio != (preflight.media_count > preflight.image_count + preflight.video_count) or
             (preflight.media_count == 0 and
                 (preflight.encoded_media_bytes != 0 or preflight.decoded_media_bytes != 0)))
         {
@@ -5777,6 +5778,7 @@ pub const Node = struct {
             actual.decoded_media_bytes != expected.decoded_media_bytes or
             actual.media_count != expected.media_count or
             actual.image_count != expected.image_count or
+            actual.video_count != expected.video_count or
             actual.has_audio != expected.has_audio)
         {
             return error.InvalidGenerationAdmission;
@@ -6054,6 +6056,7 @@ pub const Node = struct {
             .has_text = preflight.text_bytes > 0,
             .has_image = preflight.image_count > 0,
             .has_audio = preflight.has_audio,
+            .has_video = preflight.video_count > 0,
         });
         var model_handle = if (a4b_request) |request|
             if (preferred_backends) |backends|
@@ -6101,7 +6104,8 @@ pub const Node = struct {
             model.session.backend() == .metal and
             graph_mod.metal_executor.supportsSession(model.session) and
             !generation.NativeDecodeState.requiresDeepSeekV4CompressedCache(gpt_config) and
-            !prompt_cache_requested;
+            !prompt_cache_requested and
+            !generateMessagesHaveMedia(messages);
         var generation_config = generation.GenerationConfig{
             .max_tokens = max_tokens,
             .grammar = preflight.grammar,
@@ -6137,6 +6141,7 @@ pub const Node = struct {
             .has_text = preflight.text_bytes > 0,
             .has_image = preflight.image_count > 0,
             .has_audio = preflight.has_audio,
+            .has_video = preflight.video_count > 0,
         });
         const budget_components = [_]runtime.tier.memory.GptGenerationBudgetComponent{
             .{
@@ -12997,7 +13002,7 @@ pub const Node = struct {
         return 1 + (body_len / bytes_per_unit);
     }
 
-    fn directGeneratePreflightForMessages(messages: []const generation.Message) !DirectGeneratePreflight {
+    pub fn directGeneratePreflightForMessages(messages: []const generation.Message) !DirectGeneratePreflight {
         var preflight: DirectGeneratePreflight = .{};
         for (messages) |message| {
             preflight.text_bytes = std.math.add(
@@ -13023,6 +13028,11 @@ pub const Node = struct {
                         1,
                     ) catch return error.RemoteContentTooLarge;
                 }
+            }
+            if (message.video_bytes) |clip| {
+                preflight.decoded_media_bytes = std.math.add(usize, preflight.decoded_media_bytes, clip.len) catch return error.RemoteContentTooLarge;
+                preflight.media_count = std.math.add(usize, preflight.media_count, 1) catch return error.RemoteContentTooLarge;
+                preflight.video_count += 1;
             }
             if (message.audio_bytes) |audio_clips| {
                 for (audio_clips) |audio_bytes| {
@@ -13050,6 +13060,7 @@ pub const Node = struct {
         for (messages) |msg| {
             text_bytes = std.math.add(usize, text_bytes, msg.textBytes()) catch std.math.maxInt(usize);
             if (msg.image_bytes) |images| media_count = std.math.add(usize, media_count, images.len) catch std.math.maxInt(usize);
+            if (msg.video_bytes != null) media_count = std.math.add(usize, media_count, 1) catch std.math.maxInt(usize);
             if (msg.audio_bytes) |audio| media_count = std.math.add(usize, media_count, audio.len) catch std.math.maxInt(usize);
         }
 
@@ -17070,7 +17081,7 @@ pub const Node = struct {
                                         try msg_audio.append(allocator, attachment.data);
                                         try msg_parts.append(allocator, .{ .audio = msg_audio.items.len - 1 });
                                     } else if (isGenerateVideoMime(declared_essence)) {
-                                        if (msg_video != null) return error.VideoLimitExceeded;
+                                        if (decoded_video.items.len != 0) return error.VideoLimitExceeded;
                                         try decoded_video.ensureUnusedCapacity(allocator, 1);
                                         try decoded_video_owned.ensureUnusedCapacity(allocator, 1);
                                         decoded_video.appendAssumeCapacity(attachment.data);
@@ -17109,7 +17120,7 @@ pub const Node = struct {
                                     try msg_audio.append(allocator, decoded_payload.data);
                                     try msg_parts.append(allocator, .{ .audio = msg_audio.items.len - 1 });
                                 } else if (isGenerateVideoMime(mime_value.string)) {
-                                    if (msg_video != null) return error.VideoLimitExceeded;
+                                    if (decoded_video.items.len != 0) return error.VideoLimitExceeded;
                                     try decoded_video.ensureUnusedCapacity(allocator, 1);
                                     try decoded_video_owned.ensureUnusedCapacity(allocator, 1);
                                     decoded_video.appendAssumeCapacity(decoded_payload.data);
@@ -17152,7 +17163,6 @@ pub const Node = struct {
                 owns_msg_audio_slice = false;
             }
             // Video occupies its own message; its text is the plain message content.
-            if (msg_video != null and (msg_images.items.len > 0 or msg_audio.items.len > 0)) return error.UnsupportedMixedVideoInput;
             const msg_part_slice: ?[]const generation.Message.ContentPart = if (msg_parts.items.len > 0 and msg_video == null)
                 try allocator.dupe(generation.Message.ContentPart, msg_parts.items)
             else
@@ -17189,6 +17199,8 @@ pub const Node = struct {
             owns_content = false;
         }
 
+        // Frames share the image token, so a request cannot also carry other media.
+        if (decoded_video.items.len != 0 and (decoded_images.items.len != 0 or decoded_audio.items.len != 0)) return error.UnsupportedMixedVideoInput;
         const owned_messages = try messages.toOwnedSlice(allocator);
         errdefer {
             for (owned_messages) |msg| {
@@ -17318,8 +17330,8 @@ pub const Node = struct {
                 error.UnsupportedGenerateContentPart => "unsupported content part type",
                 error.InvalidGenerateMessageContent => "message content must be text or an array of content parts",
                 error.GenerateMediaPartLimitExceeded => "generation request contains too many media parts",
-                error.VideoLimitExceeded => "generation request may contain one video per message",
-                error.UnsupportedMixedVideoInput => "a video message cannot also contain image or audio parts",
+                error.VideoLimitExceeded => "generation request may contain one video",
+                error.UnsupportedMixedVideoInput => "a request with video cannot also contain image or audio parts",
                 else => "request messages are invalid",
             },
             .retryable = false,
@@ -31797,6 +31809,19 @@ test "generate parser consumes generic image and audio media parts strictly" {
     );
 }
 
+test "direct generate preflight counts video without treating it as audio" {
+    const messages = [_]generation.Message{
+        .{ .role = "user", .content = "first" },
+        .{ .role = "user", .content = "describe", .video_bytes = "clip" },
+    };
+    const preflight = try Node.directGeneratePreflightForMessages(&messages);
+    try std.testing.expectEqual(@as(usize, 1), preflight.media_count);
+    try std.testing.expectEqual(@as(usize, 1), preflight.video_count);
+    try std.testing.expectEqual(@as(usize, 0), preflight.image_count);
+    try std.testing.expect(!preflight.has_audio);
+    try std.testing.expectEqual(@as(usize, 4), preflight.decoded_media_bytes);
+}
+
 test "generate video dependencies declare their tests" {
     _ = @import("../pipelines/gemma4_video.zig");
     _ = model_caps;
@@ -31822,10 +31847,29 @@ test "generate parser gives video its own field without counting it as audio" {
     try std.testing.expect(messages.messages[0].content_parts == null);
     try std.testing.expect(generateMessagesHaveMedia(messages.messages));
 
+    // An earlier text-part array is ordinary conversation history.
+    const history_json =
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"first"}]},{"role":"assistant","content":"ok"},{"role":"user","content":[{"type":"text","text":"second"},{"type":"media","mime_type":"video/mp4","data":"AAAA"}]}]}
+    ;
+    var history = try std.json.parseFromSlice(api.GenerateRequest, alloc, history_json, .{ .ignore_unknown_fields = true });
+    defer history.deinit();
+    var history_budget = RequestMediaBudget.init(64);
+    var history_messages = try node.parseGenerateMessagesWithBudget(alloc, history.value, &history_budget);
+    defer history_messages.deinit();
+    try std.testing.expect(history_messages.messages[0].content_parts != null);
+    try std.testing.expect(history_messages.messages[2].content_parts == null);
+    try std.testing.expect(history_messages.messages[2].video_bytes != null);
+
     for ([_]struct { body: []const u8, expected: anyerror }{
         .{ .body =
         \\{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"video/mp4","data":"AAAA"},{"type":"media","mime_type":"video/mp4","data":"AAAA"}]}]}
         , .expected = error.VideoLimitExceeded },
+        .{ .body =
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"video/mp4","data":"AAAA"}]},{"role":"assistant","content":"ok"},{"role":"user","content":[{"type":"media","mime_type":"video/mp4","data":"AAAA"}]}]}
+        , .expected = error.VideoLimitExceeded },
+        .{ .body =
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"audio/wav","data":"AAAA"}]},{"role":"assistant","content":"ok"},{"role":"user","content":[{"type":"media","mime_type":"video/mp4","data":"AAAA"}]}]}
+        , .expected = error.UnsupportedMixedVideoInput },
         .{ .body =
         \\{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"audio/wav","data":"AAAA"},{"type":"media","mime_type":"video/mp4","data":"AAAA"}]}]}
         , .expected = error.UnsupportedMixedVideoInput },
@@ -31843,8 +31887,8 @@ test "generate parser gives video its own field without counting it as audio" {
 test "generate parser releases video media on every allocation failure" {
     const backing_allocator = std.testing.allocator;
     const request_json =
-        \\{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"media","mime_type":"video/mp4","data":"AAAA"}]},
-        \\{"role":"user","content":[{"type":"media","mime_type":"video/webm","data":"attachment:0"}]}]}
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"a"}]},
+        \\{"role":"user","content":[{"type":"text","text":"b"},{"type":"media","mime_type":"video/webm","data":"attachment:0"}]}]}
     ;
     var parsed = try std.json.parseFromSlice(api.GenerateRequest, backing_allocator, request_json, .{});
     defer parsed.deinit();
@@ -31856,12 +31900,16 @@ test "generate parser releases video media on every allocation failure" {
             var budget = RequestMediaBudget.init(128);
             var messages = try target.parseGenerateMessagesWithBudgetAndAttachments(allocator, body, &budget, media);
             defer messages.deinit();
-            try std.testing.expectEqual(@as(usize, 2), messages.decoded_video.len);
-            try std.testing.expect(messages.decoded_video_owned[0]);
-            try std.testing.expect(!messages.decoded_video_owned[1]);
+            try std.testing.expectEqual(@as(usize, 1), messages.decoded_video.len);
         }
     };
     try std.testing.checkAllAllocationFailures(backing_allocator, Runner.run, .{ &node, parsed.value, &attachments });
+    const inline_json =
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"media","mime_type":"video/mp4","data":"AAAA"}]}]}
+    ;
+    var inline_parsed = try std.json.parseFromSlice(api.GenerateRequest, backing_allocator, inline_json, .{});
+    defer inline_parsed.deinit();
+    try std.testing.checkAllAllocationFailures(backing_allocator, Runner.run, .{ &node, inline_parsed.value, &.{} });
 }
 
 test "generate parser borrows framed media without copying" {
@@ -41523,7 +41571,7 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
     };
     return switch (err) {
         error.UnsupportedVideoBackend => .{ .status = 400, .code = "UNSUPPORTED_VIDEO_BACKEND", .message = "video input requires a Gemma 4 generator with its projector", .retryable = false },
-        error.UnsupportedMixedVideoInput => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "a video message cannot also contain image or audio parts", .retryable = false },
+        error.UnsupportedMixedVideoInput => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "a request with video cannot also contain image or audio parts", .retryable = false },
         error.VideoLimitExceeded => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "generation request may contain one video", .retryable = false },
         error.InvalidVideoInput, error.EmptyVideo, error.UnsupportedVideoCodec, error.UnsupportedVideoProfile => .{ .status = 400, .code = "INVALID_VIDEO", .message = "unsupported, empty, or corrupt video", .retryable = false },
         error.VideoDurationExceeded, error.VideoInputTooLarge => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds this backend's duration or size limit", .retryable = false },
