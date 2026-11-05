@@ -680,7 +680,7 @@ pub const ObjectStore = struct {
     pub fn deleteWithCancellation(self: *ObjectStore, artifact_id: []const u8, token: CancellationToken) !void {
         try token.check();
         if (self.read_only) return error.ArtifactStoreReadOnly;
-        if (self.local_inventory) |*fs| if (try artifact_store.uploadScopeFromArtifactId(artifact_id)) |scope| try @import("retained_closure.zig").invalidate(fs, scope, .none);
+        if (self.local_inventory) |*fs| if (try artifact_store.uploadScopeFromArtifactId(artifact_id)) |scope| try @import("retained_closure.zig").invalidate(fs, scope, token);
         const key = try keyForArtifactIdAlloc(self.alloc, self.prefix, artifact_id);
         defer self.alloc.free(key);
         if (try self.usesObjectVersions(token)) {

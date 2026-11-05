@@ -189,15 +189,24 @@ fn recordOwnership(a: A, files: Files, relative: []const u8, bytes: []const u8, 
 pub fn read(a: A, files: Files, uri: []const u8) ![]const u8 {
     return readLimited(a, files, uri, 64 * 1024 * 1024);
 }
+/// Read catalog-selected immutable Iceberg files. Mutable catalog heads use
+/// revision-bearing catalog operations instead. A single bounded body GET is
+/// atomic and sufficient here; none of the preflight metadata is consumed.
 pub fn readLimited(a: A, files: Files, uri: []const u8, max_bytes: usize) ![]const u8 {
+    try files.context.ensureActive();
     const root = try std.fmt.allocPrint(a, "{s}/", .{std.mem.trimEnd(u8, files.uri, "/")});
     if (!std.mem.startsWith(u8, uri, root)) return error.LakeArtifactOutsideTable;
     const relative = uri[root.len..];
     if (std.mem.indexOf(u8, relative, "..") != null) return error.LakeArtifactOutsideTable;
     const key = try std.fmt.allocPrint(a, "{s}{s}{s}", .{ files.prefix, if (files.prefix.len == 0) "" else "/", relative });
     var client = files.client;
-    var result = try client.getObject(files.bucket, key, .{ .cancellation = types.contextCancellation(&files.context), .max_response_bytes = max_bytes });
+    var result = client.getObject(files.bucket, key, .{ .skip_metadata_probe = true, .cancellation = types.contextCancellation(&files.context), .max_response_bytes = max_bytes }) catch |err| {
+        try files.context.ensureActive();
+        return err;
+    };
     defer result.deinit(client.allocator);
+    try files.context.ensureActive();
+    if (result.body.len > max_bytes) return error.ResponseTooLarge;
     return a.dupe(u8, result.body);
 }
 pub fn listEntry(a: A, entry: iceberg.ManifestListEntry) !V {
@@ -555,4 +564,62 @@ test "lake catalog manifest merge deduplicates wide schema headers and preserves
         try std.testing.expectEqual(file.data_sequence_number, file.file_sequence_number);
         try std.testing.expectEqual(file.snapshot_id, file.data_sequence_number);
     }
+}
+
+test "external lake immutable file reads use one bounded GCS request" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const gcs = objectstore.gcs;
+    const State = struct {
+        metadata_calls: usize = 0,
+        body_calls: usize = 0,
+        expire_during_read: bool = false,
+        expired: bool = false,
+        const payload = "immutable-avro";
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.expired) return error.DeadlineExceeded;
+        }
+        fn request(raw: ?*anyopaque, alloc: A, method: gcs.HttpMethod, url: []const u8, _: []const gcs.HeaderPair, _: ?[]const u8, _: ?[]const u8, max_response: ?usize, _: ?objectstore.CancellationToken) !gcs.TransportResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            try std.testing.expectEqual(gcs.HttpMethod.GET, method);
+            if (std.mem.indexOf(u8, url, "alt=media") != null) {
+                self.body_calls += 1;
+                if (self.expire_during_read) {
+                    self.expired = true;
+                    return error.Canceled;
+                }
+                try std.testing.expect(max_response != null);
+                if (payload.len > max_response.?) return error.ResponseTooLarge;
+                return .{ .status = 200, .body = try alloc.dupe(u8, payload), .etag = try alloc.dupe(u8, "etag") };
+            }
+            self.metadata_calls += 1;
+            return .{ .status = 200, .body = try alloc.dupe(u8, "{\"bucket\":\"bucket\",\"name\":\"warehouse/metadata/antfly-list.avro\",\"etag\":\"etag\",\"generation\":\"7\",\"size\":\"14\"}") };
+        }
+    };
+    var state: State = .{};
+    const cfg = try gcs.jsonApiClientConfigWithBearerTokenAlloc(a, "test-token", null);
+    var provider = gcs.JsonApiClient.initWithRequestFn(a, cfg, &state, State.request);
+    var client = provider.client();
+    defer client.deinit();
+    var files: Files = .{ .client = client, .bucket = "bucket", .prefix = "warehouse", .uri = "gs://bucket/warehouse" };
+    const uri = "gs://bucket/warehouse/metadata/antfly-list.avro";
+    try std.testing.expectEqualStrings(State.payload, try readLimited(arena.allocator(), files, uri, 64));
+    try std.testing.expectEqual(@as(usize, 1), state.body_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.metadata_calls);
+    try std.testing.expectError(error.ResponseTooLarge, readLimited(arena.allocator(), files, uri, 3));
+    try std.testing.expectError(error.LakeArtifactOutsideTable, readLimited(arena.allocator(), files, "gs://bucket/other/manifest.avro", 64));
+    try std.testing.expectError(error.LakeArtifactOutsideTable, readLimited(arena.allocator(), files, "gs://bucket/warehouse/../manifest.avro", 64));
+    files.context.checkpoint = .{ .ptr = &state, .check = State.check };
+    state.expire_during_read = true;
+    try std.testing.expectError(error.DeadlineExceeded, readLimited(arena.allocator(), files, uri, 64));
+    state.expire_during_read = false;
+    state.expired = false;
+    files.context.checkpoint = null;
+    const calls = state.body_calls;
+    files.context.deadline_ns = 0;
+    try std.testing.expectError(error.DeadlineExceeded, readLimited(arena.allocator(), files, uri, 64));
+    try std.testing.expectEqual(calls, state.body_calls);
+    try std.testing.expectEqual(@as(usize, 0), state.metadata_calls);
 }

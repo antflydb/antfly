@@ -303,7 +303,7 @@ fn loadInto(a: A, store: stores.ArtifactStore, refs: []const Unit, values: Outpu
         var jobs: [max_batch]Job = undefined;
         for (wave, jobs[0..wave.len]) |run, *job| job.* = .{ .store = store, .a = allocations.allocator(), .id = ordered[run.first].object.artifact_id, .units = ordered[run.first..run.end], .begin = run.offset, .length = run.length, .token = token, .cached = cached };
         defer for (jobs[0..wave.len]) |*job| job.deinit();
-        var ready: std.Io.Event = .unset;
+        var ready: local.sql_parallel_scheduler.Completion = .{};
         var tasks: [max_batch]?local.sql_parallel_scheduler.Task(anyerror!void) = @splat(null);
         defer if (io) |active| for (&tasks) |*task| if (task.*) |*held| {
             held.cancel(active) catch {};

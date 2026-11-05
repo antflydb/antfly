@@ -14,8 +14,8 @@
 // limitations under the License.
 
 //! Compact typed refresh tuples. The publication's ordering cohort binds field
-//! positions; every row retains its exact input version. Historical JSON remains
-//! readable, so unchanged entries can migrate without rebuilding source indexes.
+//! positions; every row retains its exact input version. Decoded tuples are
+//! owned by the destination arena.
 const std = @import("std");
 const local = @import("antfly_local_sources");
 const A = std.mem.Allocator;
@@ -112,18 +112,7 @@ const Reader = struct {
 /// retained tuple never borrows a tree cursor's current leaf or input buffer.
 pub fn decodeIntoArena(a: A, bytes: []const u8) !Row {
     if (bytes.len > max_bytes) return error.InvalidLogicalRowIdentity;
-    if (!std.mem.startsWith(u8, bytes, magic)) {
-        if (bytes.len == 0 or bytes[0] != '{') return error.InvalidLogicalRowIdentity;
-        const Legacy = struct { version: [32]u8, keys: []const Bound.Value };
-        const row = try std.json.parseFromSliceLeaky(Legacy, a, bytes, .{ .allocate = .alloc_always });
-        if (row.keys.len > 32) return error.InvalidLogicalRowIdentity;
-        const keys = try a.alloc(Native, row.keys.len);
-        for (keys, row.keys) |*key, value| {
-            key.* = try value.native();
-            if (key.* == .id or (key.* == .f64_val and !std.math.isFinite(key.f64_val))) return error.InvalidLogicalRowIdentity;
-        }
-        return .{ .version = row.version, .keys = keys };
-    }
+    if (!std.mem.startsWith(u8, bytes, magic)) return error.InvalidLogicalRowIdentity;
     if (bytes.len < header_bytes or bytes[header_bytes - 1] == 0 or bytes[header_bytes - 1] > 32) return error.InvalidLogicalRowIdentity;
     const keys = try a.alloc(Native, bytes[header_bytes - 1]);
     var reader: Reader = .{ .bytes = bytes };
@@ -154,7 +143,7 @@ pub fn decodeIntoArena(a: A, bytes: []const u8) !Row {
     return .{ .version = bytes[magic.len..][0..32].*, .keys = keys };
 }
 
-test "external lake logical fragments binary ordering cache owns typed tuples and reads historical JSON" {
+test "external lake logical fragments binary ordering cache owns typed tuples and rejects historical JSON" {
     const a = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
@@ -170,9 +159,7 @@ test "external lake logical fragments binary ordering cache owns typed tuples an
     const legacy_keys = try out.alloc(Bound.Value, values.len);
     for (legacy_keys, values) |*key, value| key.* = try Bound.Value.from(out, value);
     const legacy = try std.json.Stringify.valueAlloc(out, .{ .version = held, .keys = legacy_keys }, .{});
-    const restored = try decodeIntoArena(out, legacy);
-    @memset(legacy, 0);
-    try std.testing.expectEqualDeep(&values, restored.keys);
+    try std.testing.expectError(error.InvalidLogicalRowIdentity, decodeIntoArena(out, legacy));
     const pair = values[1..3];
     const binary = (try encode(out, held, pair)).?;
     const json = try std.json.Stringify.valueAlloc(out, .{ .version = held, .keys = legacy_keys[1..3] }, .{});

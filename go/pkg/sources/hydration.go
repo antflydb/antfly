@@ -112,7 +112,7 @@ type hydrationCheckpoint struct {
 func (c *CollaborationConnector) hydrationSelection(r Request) string {
 	version := c.ExtractorVersion
 	if c.NativeAttachments {
-		version = "native-attachments-v3"
+		version = "native-attachments-v4"
 	}
 	if version == "" {
 		version = "attachment-text-v3"

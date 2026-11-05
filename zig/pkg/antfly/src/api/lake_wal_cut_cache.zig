@@ -223,10 +223,36 @@ pub const Cache = struct {
         const delta = try ingestion.normalizePending(a, cut, suffix.lsn, suffix.records);
         const image = try @import("lake_wal_image.zig").Image.update(owner.budget.backing, if (extension != null) previous.?.image else null, delta);
         owner.image = image;
-        const pending: ingestion.Pending = .{ .key_identity = .canonical, .base_lsn = cut, .lsn = suffix.lsn, .key_fields = image.key_fields, .changes = &.{}, .change_blocks = &image.blocks, .block_digests = &image.block_digests, .cut_identity = key(@splat(0), cut, head) };
+        const pending: ingestion.Pending = .{ .base_lsn = cut, .lsn = suffix.lsn, .key_fields = image.key_fields, .changes = &.{}, .change_blocks = &image.blocks, .block_digests = &image.block_digests, .cut_identity = key(@splat(0), cut, head) };
         owner.overlay = .{ .pending = pending, .rows = .{ .image = image }, .key_filter = "" };
     }
 };
+
+test "external lake bounded WAL cuts normalize publication lag beyond catalog admission" {
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    const store: wal.Store = .{ .client = memory.client(), .bucket = "archive", .prefix = "publication-replay", .context = .{ .io = std.testing.io } };
+    var cache: Cache = .{};
+    defer cache.deinit();
+    for (0..wal.max_pending + 8) |index| {
+        const id = try std.fmt.allocPrint(sa, "batch-{d}", .{index});
+        const bytes = try std.json.Stringify.valueAlloc(sa, .{ .batch_id = id, .source = "test", .epoch = "1", .checkpoint = id, .key_fields = .{"id"}, .changes = .{.{ .op = "upsert", .row = .{ .id = 1, .version = index } }} }, .{});
+        _ = try store.append(sa, id, bytes, index, index);
+    }
+    const pin = try cache.acquire(@splat(3), store, 0, .{ .io = std.testing.io });
+    defer pin.deinit();
+    const overlay = pin.overlay();
+    try std.testing.expectEqual(@as(u64, wal.max_pending + 8), overlay.pending.lsn);
+    try std.testing.expectEqual(@as(usize, 1), overlay.rows.count());
+    try std.testing.expectEqual(@as(usize, 1), overlay.pending.count());
+    for (overlay.pending.change_blocks) |block| for (block) |change| {
+        try std.testing.expectEqual(@as(i64, wal.max_pending + 7), change.row.object.get("version").?.integer);
+    };
+}
 
 test "external lake bounded WAL cuts share normalization masks and immutable chain authority" {
     const a = std.testing.allocator;
