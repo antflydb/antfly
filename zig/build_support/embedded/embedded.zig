@@ -608,6 +608,7 @@ pub fn addEmbedded(b: *std.Build, options: AddEmbeddedOptions) AddEmbeddedResult
         "docstore replay retirement atomically",
         "capi native retirement coalesces",
         "native projection progress and status",
+        "lite artifact construction transfers",
         "capi native recovery agenda",
         "capi native logical generations",
         "capi native close bounds proof work",

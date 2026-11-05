@@ -51,6 +51,24 @@ writes also wrote substantially more bytes: about 7.7 MB versus 0.53 MB across
 all threads for these 128 updates. Sync counts alone do not establish each
 mechanism's contribution to elapsed time.
 
+The operation-count diagnostic is reproducible on macOS without rebuilding a
+reference. Compile `scripts/bench/lite_io_counter.c` as a dylib in the task's
+worktree, then run `scripts/bench/lite_publication_io.py --library <candidate>
+--shim <counter.dylib> --directory <owned-fixture-directory> --output <receipt>`.
+It defaults to Antfly only, verifies the latest values and index visibility,
+and removes the closed fixture. Keep the immutable SQLite count receipt above.
+
+The first candidate's [Debug receipt](commit-io-v37-debug.json) verifies the
+predicted reductions. Calling-thread indexed syncs fell from 36.375 to 18.375
+per update; primary-only remained at three. Across all threads, the indexed run
+performed 2,563 syncs and wrote 27.2 MB, versus 5,024 and 50.3 MB in the reference.
+The candidate coalesces eligible replay-lane deletion, publishes progress and
+status together, and transfers the prepared artifact's existing durable lease
+into its immutable reader. Every latest value, index canary and integrity check
+passed. Fixtures were closed and deleted. These are operation counts across
+Debug and optimized builds; background scheduling can vary. This receipt does
+not establish a throughput improvement or complete qualification.
+
 ## Required publication shape
 
 One prepared index publication should own immutable artifacts, exact source and
@@ -65,7 +83,7 @@ Physical journal deletion belongs to a fair, bounded retirement service. It
 must delete consumer references and eligible canonical chunks together and
 return capacity only after those bytes are physically retired. Explicit drains
 and capacity pressure must service this work, even without background workers.
-The immediate native path is being converted to the existing coalesced deletion
+The immediate native path now uses the existing coalesced deletion
 service to eliminate a separate transaction per replay lane.
 
 Progress is authoritative; diagnostic status snapshots should not require a

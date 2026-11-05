@@ -445,12 +445,7 @@ const NativePreparedArtifact = struct {
         defer registry.endCallback();
         var adapter: Store = .{ .allocator = self.alloc, .docs = owner, .namespace_prefix = self.prefix };
         try validateWritePath(&adapter, path);
-        try self.construction.link(owner, path);
-        // Only successful exclusive creation establishes cleanup ownership.
-        // A colliding destination belongs to somebody else; callers must not
-        // delete it when link fails. Publication admission spans this cleanup.
-        errdefer deleteFileAbsolute(&adapter, path) catch {};
-        return owner.openArtifactSource(path);
+        return self.construction.linkSource(owner, path);
     }
 
     fn deinit(raw: *anyopaque) void {

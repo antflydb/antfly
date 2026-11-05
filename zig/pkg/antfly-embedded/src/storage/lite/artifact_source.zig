@@ -541,21 +541,21 @@ pub const Registry = struct {
             .resource_manager = owner.resource_manager,
             .artifact_key = artifact_key,
         };
-        var identity_digest = std.crypto.hash.sha2.Sha256.init(.{});
-        identity_digest.update("antfly native immutable artifact v1");
-        identity_digest.update(std.mem.asBytes(&captured_inode));
-        identity_digest.update(std.mem.asBytes(&state.value.root));
-        identity_digest.update(std.mem.asBytes(&state.value.length));
-        identity_digest.update(state.value.inline_bytes);
-        state.immutable_identity = identity_digest.finalResult();
-        state.cache = try @import("../../segment_source.zig").ConcurrentBlockCache.init(a, .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.readUncached, .checksum = State.checksum, .visit_range = State.visitUncached, .close = State.closeUncached, .resource_manager = owner.resource_manager } }, source_cache_bytes);
+        try initializeSourceCache(self, state, captured_inode);
+        return self.registerSource(state, owner, captured_inode, false);
+    }
+
+    // Once the source is fully prepared, registration cannot fail. A sealed
+    // construction can transfer its existing registry reference and lease.
+    fn registerSource(self: *Registry, state: *State, owner: *docs.Store, captured_inode: u64, transfer_reference: bool) Source {
+        const runtime = self.io();
         self.mutex.lockUncancelable(runtime);
         state.next = self.first;
         self.first = state;
-        _ = self.references.fetchAdd(1, .monotonic);
+        if (!transfer_reference) _ = self.references.fetchAdd(1, .monotonic);
         self.mutex.unlock(runtime);
-        if (marker != null and owner.artifactPoolLookupAllowed()) {
-            const identity: ArtifactIdentity = .{ .path = self.path, .key = artifact_key, .inode = captured_inode, .root = state.value.root, .length = state.value.length, .inline_bytes = state.value.inline_bytes };
+        if (state.marker != null and owner.artifactPoolLookupAllowed()) {
+            const identity: ArtifactIdentity = .{ .path = self.path, .key = state.artifact_key, .inode = captured_inode, .root = state.value.root, .length = state.value.length, .inline_bytes = state.value.inline_bytes };
             @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
             // A closed old source can remain referenced by a weak LSM cache.
             // Replace its map key too, before its final close frees the bytes.
@@ -625,6 +625,56 @@ pub const Construction = struct {
         try owner.submitIndexMutation(&request, Request.apply, true);
     }
 
+    /// Prepare the immutable reader before linking, then transfer this
+    /// construction's durable value lease into that reader. A second lease
+    /// publication would protect the very same root and require another commit.
+    /// No fallible operation follows link success, so cleanup never removes a
+    /// path whose creation failed or whose publication outcome is uncertain.
+    pub fn linkSource(self: *Construction, owner: *docs.Store, path: []const u8) !Source {
+        const registry = self.registry orelse return error.InvalidArtifactConstructionState;
+        if (!self.sealed) return error.InvalidArtifactConstructionState;
+        const captured_owner = registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
+        defer registry.endCallback();
+        if (captured_owner != owner) return error.StaleArtifactConstruction;
+        const runtime = registry.io();
+        owner.generation_lock.lockSharedUncancelable(owner.file.runtime());
+        defer owner.generation_lock.unlockShared(owner.file.runtime());
+        const a = registry.allocator;
+        const state = try a.create(State);
+        errdefer a.destroy(state);
+        const artifact_key = try a.dupe(u8, path);
+        errdefer a.free(artifact_key);
+        var reader = try native.NativeFile.openWithIo(a, runtime, registry.path, .{ .read_only = true, .internal_reader = true, .reader_coordinator = owner.file.reader_coordinator, .no_sync = true });
+        errdefer reader.close();
+        reader.reader_coordinator = null;
+        reader.page_cache_enabled.store(false, .monotonic);
+        const captured_inode = (try reader.file.stat(reader.runtime())).inode;
+        if (captured_inode != self.inode) return error.StaleArtifactConstruction;
+        const checkpoint = reader.activeCheckpoint();
+        var value = try reader.openArtifactLeaseValue(a, self.key, checkpoint);
+        errdefer value.deinit(a);
+        if (value.length != self.length) return error.StaleArtifactConstruction;
+        state.* = .{
+            .registry = registry,
+            .reader = reader,
+            .value = value,
+            .checkpoint = checkpoint,
+            .generation = owner.assessment_generation,
+            .lease_key = self.key,
+            .release_ticket = self.release_ticket,
+            .marker_path = self.marker_path,
+            .marker = self.marker,
+            .resource_manager = owner.resource_manager,
+            .artifact_key = artifact_key,
+        };
+        try initializeSourceCache(registry, state, captured_inode);
+        errdefer state.cache.?.deinit();
+        try self.link(owner, path);
+        self.registry = null;
+        self.release_ticket = null;
+        return registry.registerSource(state, owner, captured_inode, true);
+    }
+
     pub fn deinit(self: *Construction) void {
         const registry = self.registry orelse return;
         self.registry = null;
@@ -678,6 +728,65 @@ test "lite artifact working set recaptures pooled sources through a new registry
     try std.testing.expectEqualStrings("immutable payload", &bytes);
     working.observe(inode + 1, expiry + 1);
     try std.testing.expectEqual(@as(usize, 0), working.count);
+}
+
+test "lite artifact construction transfers its lease without another publication" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/construction-transfer.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    store.maintenance_start_suppressed = true;
+    var store_live = true;
+    defer if (store_live) store.close();
+    var construction = try store.beginArtifactConstruction();
+    defer construction.deinit();
+    const lease_key = try a.dupe(u8, construction.key);
+    defer a.free(lease_key);
+    const payload: [65536]u8 = @splat('p');
+    try construction.append(&store, &payload);
+    try construction.seal(payload.len);
+    try store.file.putIndexCatalogRecord("/taken", "foreign");
+    const before = store.file.activeCheckpoint();
+    try std.testing.expectError(error.PathAlreadyExists, construction.linkSource(&store, "/taken"));
+    try std.testing.expect(construction.registry != null);
+    try std.testing.expectEqual(before.commit_sequence, store.file.activeCheckpoint().commit_sequence);
+    store.file.test_page_write_fail_after = 0;
+    const failed = construction.linkSource(&store, "/activated");
+    store.file.test_page_write_fail_after = null;
+    try std.testing.expectError(error.TestPageWriteFailure, failed);
+    try std.testing.expect(construction.registry != null);
+    var source = try construction.linkSource(&store, "/activated");
+    var source_live = true;
+    defer if (source_live) source.close();
+    try std.testing.expect(construction.registry == null);
+    try std.testing.expectEqual(before.commit_sequence + 1, store.file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqualSlices(u8, &before.logical.metadata, &store.file.activeCheckpoint().logical.metadata);
+    // The prepared wrapper can close immediately: the source now owns its
+    // existing marker, value lease, release ticket and registry reference.
+    construction.deinit();
+    store.close();
+    store_live = false;
+    store = try docs.Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true });
+    store.maintenance_start_suppressed = true;
+    store_live = true;
+    var sweep: SweepCursor = .{};
+    try std.testing.expectEqual(@as(usize, 0), try cleanupOrphans(&store.file, &sweep));
+    try store.file.deleteIndexCatalogRecord("/activated");
+    _ = try store.file.reclaimPages(4096);
+    var got: [65536]u8 = undefined;
+    try source.readInto(0, &got);
+    try std.testing.expectEqualSlices(u8, &payload, &got);
+    const foreign = (try store.file.getIndexCatalogRecordAlloc(a, "/taken")).?;
+    defer a.free(foreign);
+    try std.testing.expectEqualStrings("foreign", foreign);
+    source.close();
+    source_live = false;
+    sweep = .{};
+    _ = try cleanupOrphans(&store.file, &sweep);
+    try std.testing.expect((try store.file.getCatalogRecordAlloc(a, lease_key)) == null);
+    try std.testing.expect((try store.file.check()).valid);
 }
 
 test "lite artifact construction survives Store refresh and releases orphan ownership after close" {
@@ -753,6 +862,17 @@ test "lite artifact construction rejects publication on a replacement inode" {
     try std.testing.expectError(error.StaleArtifactConstruction, construction.link(&store, "/index/never"));
     try std.testing.expect((try store.file.getIndexCatalogRecordAlloc(a, "/index/never")) == null);
     try std.testing.expect((try store.file.check()).valid);
+}
+
+fn initializeSourceCache(registry: *Registry, state: *State, captured_inode: u64) !void {
+    var identity_digest = std.crypto.hash.sha2.Sha256.init(.{});
+    identity_digest.update("antfly native immutable artifact v1");
+    identity_digest.update(std.mem.asBytes(&captured_inode));
+    identity_digest.update(std.mem.asBytes(&state.value.root));
+    identity_digest.update(std.mem.asBytes(&state.value.length));
+    identity_digest.update(state.value.inline_bytes);
+    state.immutable_identity = identity_digest.finalResult();
+    state.cache = try @import("../../segment_source.zig").ConcurrentBlockCache.init(registry.allocator, .{ .ranges = .{ .ptr = state, .length = state.value.length, .read_into = State.readUncached, .checksum = State.checksum, .visit_range = State.visitUncached, .close = State.closeUncached, .resource_manager = state.resource_manager } }, source_cache_bytes);
 }
 
 const Capture = struct {
