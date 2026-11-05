@@ -2381,6 +2381,8 @@ pub const Owner = struct {
         // A failed physical publication can already have cleared its source
         // witness while leaving the detached DB and its artifact readers live.
         const root = self.maintenance_snapshot orelse return;
+        if (root.db_live and root.maintenance_references == 0 and root.query_borrows == 0 and
+            !needsOutcomeReconciliation(root)) self.preserveImmutableTextHandoff(root, &root.db);
         self.maintenance_snapshot = null;
         closeMaintenanceSnapshot(root);
         if (self.reader_coordinator.hasArtifactReleases()) self.maintenance_storage_pending = true;
@@ -9493,30 +9495,12 @@ test "capi native mixed index turns retain bounded immutable sources after catch
         try std.testing.expect(root.db.detachedTextSourceBlock() != null);
     }
     try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
-    const Probe = struct {
-        owner: *Owner,
-        closed: bool = false,
-        retained: bool = false,
-        fn beforeStorage(raw: *anyopaque, root: *h.Handle, retained_runtime: bool) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            if (root.db_live or retained_runtime) return;
-            self.closed = true;
-            self.retained = self.owner.immutable_sources.count > 0 and
-                self.owner.immutable_sources.range_bytes <= artifact_source.WorkingSet.max_range_bytes;
-        }
-    };
-    var probe: Probe = .{ .owner = owner };
-    owner.test_before_storage_service = .{ .ptr = &probe, .notify = Probe.beforeStorage };
-    defer owner.test_before_storage_service = null;
     var complete = false;
-    for (0..512) |turn| {
-        try h.handleLockIo().sleep(.fromMilliseconds(20), .awake);
+    for (0..32) |_| {
         // Clear prior partial-turn pins: this assertion concerns the turn
         // that completes the target, rather than a cache left by earlier work.
         owner.immutable_sources.clear();
         owner.clearImmutableTextHandoff();
-        probe.closed = false;
-        probe.retained = false;
         _ = try owner.maintenanceTurnForTest();
         var lease = try fixture.connection.acquire();
         defer {
@@ -9527,13 +9511,17 @@ test "capi native mixed index turns retain bounded immutable sources after catch
         const target = root.db.core.nextDerivedSequence();
         const text_applied = try root.db.core.loadAppliedSequence(std.testing.allocator, "text");
         const graph_applied = try root.db.core.loadAppliedSequence(std.testing.allocator, "graph");
-        if (turn == 511) std.debug.print("mixed cache target={d} text={d} graph={d} closed={} retained={} sources={d}\n", .{ target, text_applied, graph_applied, probe.closed, probe.retained, owner.immutable_sources.count });
         if (text_applied < target or graph_applied < target) continue;
-        // Physical service may already have replaced this actor or inode.
-        // Observe retention at the source teardown boundary, before that work.
-        if (!probe.closed) continue;
+        const actor = owner.maintenance_snapshot orelse continue;
+        if (!actor.db_live) continue;
         try std.testing.expect(owner.text_source_runtime_cache == null);
-        try std.testing.expect(probe.retained);
+        // LSM housekeeping can legitimately retain this actor after catch-up.
+        // Exercise the real quiescent retirement path rather than depending on
+        // its idle timer. Only independently leased immutable sources survive.
+        owner.discardMaintenanceRuntime();
+        try std.testing.expect(owner.maintenance_snapshot == null);
+        try std.testing.expect(owner.immutable_sources.count > 0);
+        try std.testing.expect(owner.immutable_sources.range_bytes <= artifact_source.WorkingSet.max_range_bytes);
         complete = true;
         break;
     }

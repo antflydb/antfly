@@ -4968,9 +4968,23 @@ fn truncateReplayLane(store: *Store, prefix: []const u8, yielding: bool, kind: u
             while (true) {
                 const sequence = internal_keys.parseReplayEntrySequence(key, kind) orelse return error.InvalidReplayEntryKey;
                 if (kind == internal_keys.replay_all_kind) {
-                    const value = try write.get(key);
-                    if (replay_chunks.isManifest(value)) {
-                        const manifest = try replay_chunks.Manifest.decode(value);
+                    // Manifests are fixed-size. Never materialize a legacy
+                    // multi-megabyte payload merely to recognize its encoding.
+                    var header: [replay_chunks.manifest_size]u8 = undefined;
+                    const value = write.getInto(key, &header) catch |err| switch (err) {
+                        error.BufferTooSmall => large: {
+                            // Preserve fail-closed handling of a malformed
+                            // oversized manifest using only its discriminator.
+                            var scope = try write.openReadScope(write.allocator);
+                            defer scope.close();
+                            const magic = try scope.getRange(key, 0, 8);
+                            if (replay_chunks.isManifest(magic)) return error.InvalidReplayChunk;
+                            break :large null;
+                        },
+                        else => return err,
+                    };
+                    if (value != null and replay_chunks.isManifest(value.?)) {
+                        const manifest = try replay_chunks.Manifest.decode(value.?);
                         if (count + manifest.count + 1 > replay_cleanup_max_keys) break;
                         for (manifest.retired_chunks..manifest.count) |ordinal| {
                             const chunk_key = replay_chunks.chunkKey(sequence, @intCast(ordinal));
@@ -6905,6 +6919,17 @@ test "lite replay cleanup avoids external values and propagates allocation error
     defer a.free(old);
     try std.testing.expectEqualSlices(u8, value, old);
     try std.testing.expect((try store.checkWithCancel(null)).valid);
+    // An oversized payload with the reserved manifest discriminator is
+    // malformed, not a legacy record. Inspect its prefix without materializing
+    // it and leave every root unchanged on refusal.
+    @memcpy(value[0..8], "AFRCHK01");
+    const malformed = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 3);
+    try store.file.putDocumentBatch(&.{.{ .key = &malformed, .value = value }});
+    const before_bad = store.file.activeCheckpoint();
+    budget.limit = budget.live + 1024 * 1024;
+    try std.testing.expectError(error.InvalidReplayChunk, store.truncateReplayUpTo(a, 4));
+    budget.limit = std.math.maxInt(usize);
+    try std.testing.expectEqualDeep(before_bad, store.file.activeCheckpoint());
 }
 
 test "lite replay cleanup commits bounded chunks isolates namespaces and retries" {

@@ -1856,6 +1856,14 @@ does not decode every nested SST or segment record. Artifact continuations
 preserve the same bounded immutable-source handoff when they eventually release
 a runtime after its source replay has already caught up.
 
+Artifact leases also verify the file's immutable reader-namespace binding.
+Symlink paths resolve to the canonical marker directory; unsafe hard-link aliases
+retain inode fencing and decline fine-grained staging/pooling. Orphan collection
+cannot treat a live marker in another directory as dead. Journal retirement reads
+only the fixed-size chunk manifest or a bounded legacy discriminator, preserving
+bounded memory even for multi-megabyte legacy records and failing closed on an
+oversized malformed manifest.
+
 The `maintenance_priority_turns`, `maintenance_audit_turns` and
 `maintenance_progress_requeues` counters distinguish source service from catalog
 rotation. Compare useful applied prefixes/publications with capture, artifact-open

@@ -113,6 +113,18 @@ pub fn namespaceForPublicationWithDurability(a: Allocator, io: std.Io, path: []c
     return namespace.digest;
 }
 
+/// A path may publish fine-grained leases only in the immutable namespace
+/// bound to this file. Unsafe aliases must retain ordinary inode protection.
+pub fn namespaceMatches(a: Allocator, io: std.Io, path: []const u8, binding: [32]u8) !bool {
+    if (std.mem.allEqual(u8, &binding, 0)) return false;
+    const namespace = Namespace.open(a, io, path, false, true) catch |err| switch (err) {
+        error.FileNotFound, error.InvalidNativeReaderEpoch => return false,
+        else => return err,
+    };
+    defer namespace.close(a, io);
+    return std.mem.eql(u8, &binding, &namespace.digest);
+}
+
 pub fn register(a: Allocator, io: std.Io, path: []const u8, binding: [32]u8, inode: u64, sequence: u64, metadata: bool) !Lease {
     const namespace = Namespace.open(a, io, path, false, true) catch |err| switch (err) {
         error.FileNotFound => return error.UnsafeNativeReaderAlias,

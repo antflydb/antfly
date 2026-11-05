@@ -457,10 +457,11 @@ const NativePreparedArtifact = struct {
     }
 };
 
-fn acquireImmutableStager(raw: *anyopaque, alloc: Allocator) !immutable_artifact.Stager {
+fn acquireImmutableStager(raw: *anyopaque, alloc: Allocator) !?immutable_artifact.Stager {
     const self: *Store = @ptrCast(@alignCast(raw));
     if (self.docs.read_only or self.read_snapshot != null) return error.ReadOnly;
     const registry = try self.docs.artifactRegistry();
+    if (!registry.marker_namespace_safe) return null;
     const state = try alloc.create(NativeArtifactStager);
     errdefer alloc.destroy(state);
     const prefix = try alloc.dupe(u8, self.namespace_prefix);

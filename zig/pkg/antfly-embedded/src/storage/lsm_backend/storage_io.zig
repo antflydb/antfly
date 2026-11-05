@@ -626,7 +626,7 @@ pub const Storage = struct {
         /// descriptor/runtime ownership. Persistent readers use this capability.
         open_leased_immutable_source: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").Source = null,
         acquire_lease: ?*const fn (*anyopaque) anyerror!Lease = null,
-        acquire_immutable_stager: ?*const fn (*anyopaque, Allocator) anyerror!@import("../immutable_artifact.zig").Stager = null,
+        acquire_immutable_stager: ?*const fn (*anyopaque, Allocator) anyerror!?@import("../immutable_artifact.zig").Stager = null,
         fence_uncertain_publication: ?*const fn (*anyopaque) void = null,
         create_dir_path: *const fn (*anyopaque, []const u8) anyerror!void,
         /// Directories are inferred from child files and have no independent

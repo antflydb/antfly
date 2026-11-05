@@ -181,7 +181,8 @@ pub const WorkingSet = struct {
 pub const Registry = struct {
     allocator: Allocator,
     io_impl: std.Io.Threaded,
-    path: []u8,
+    path: [:0]u8,
+    marker_namespace_safe: bool = false,
     store: ?*docs.Store,
     publication_guard: ?std.Io.File = null,
     mutex: std.Io.Mutex = .init,
@@ -199,9 +200,12 @@ pub const Registry = struct {
     pub fn create(allocator: Allocator, store: *docs.Store) !*Registry {
         const self = try allocator.create(Registry);
         errdefer allocator.destroy(self);
-        const path = try allocator.dupe(u8, store.file.path);
+        // Canonicalize symlinks before choosing a marker directory. Hard-link
+        // aliases remain distinct and must prove the persisted namespace below.
+        const path = try std.Io.Dir.cwd().realPathFileAlloc(store.file.runtime(), store.file.path, allocator);
         errdefer allocator.free(path);
-        self.* = .{ .allocator = allocator, .io_impl = limits.initService(allocator), .path = path, .store = store };
+        const marker_namespace_safe = !store.read_only and try @import("reader_epochs.zig").namespaceMatches(allocator, store.file.runtime(), path, store.file.header.reader_epoch_namespace);
+        self.* = .{ .allocator = allocator, .io_impl = limits.initService(allocator), .path = path, .store = store, .marker_namespace_safe = marker_namespace_safe };
         errdefer self.io_impl.deinit();
         self.coordinator = store.file.reader_coordinator;
         if (self.coordinator) |coordinator| coordinator.retain();
@@ -405,6 +409,7 @@ pub const Registry = struct {
         const owner = self.beginCallback() orelse return error.ReadOnly;
         defer self.endCallback();
         if (owner.read_only) return error.ReadOnly;
+        if (!self.marker_namespace_safe) return error.UnsafeNativeReaderAlias;
         const runtime = self.io();
         const a = self.allocator;
         owner.generation_lock.lockSharedUncancelable(owner.file.runtime());
@@ -430,7 +435,7 @@ pub const Registry = struct {
     }
 
     fn findPooled(self: *Registry, owner: *docs.Store, key: []const u8) !?*State {
-        if (!owner.artifactPoolLookupAllowed()) return null;
+        if (!self.marker_namespace_safe or !owner.artifactPoolLookupAllowed()) return null;
         // The pin lasts only for lookup. A hit already owns a durable value
         // lease. Do not recursively acquire generation_lock around beginRead.
         var pin = try owner.beginRead();
@@ -498,7 +503,7 @@ pub const Registry = struct {
         defer a.free(marker_name);
         const marker_path = try std.fs.path.join(a, &.{ std.fs.path.dirname(self.path) orelse ".", marker_name });
         errdefer a.free(marker_path);
-        const reader_fenced = owner.read_only or owner.artifact_reader_fence;
+        const reader_fenced = owner.read_only or owner.artifact_reader_fence or !self.marker_namespace_safe;
         const marker: ?std.Io.File = if (reader_fenced) null else try self.createMarker(marker_path);
         errdefer if (marker) |file| {
             file.close(runtime);
@@ -1053,6 +1058,9 @@ pub const SweepCursor = struct {
 pub fn cleanupOrphans(file: *native.NativeFile, sweep: *SweepCursor) !usize {
     const a = file.allocator;
     const runtime = file.runtime();
+    if (!try @import("reader_epochs.zig").namespaceMatches(a, runtime, file.path, file.header.reader_epoch_namespace)) return 0;
+    const canonical = try std.Io.Dir.cwd().realPathFileAlloc(runtime, file.path, a);
+    defer a.free(canonical);
     const checkpoint = try file.materializeTransactionCheckpoint();
     var cursor = try file.metadataCatalogCursor(checkpoint, key_prefix);
     defer cursor.deinit();
@@ -1075,7 +1083,7 @@ pub fn cleanupOrphans(file: *native.NativeFile, sweep: *SweepCursor) !usize {
         sweep.valid = true;
         const name = try std.mem.concat(a, u8, &.{ marker_prefix, id });
         defer a.free(name);
-        const path = try std.fs.path.join(a, &.{ std.fs.path.dirname(file.path) orelse ".", name });
+        const path = try std.fs.path.join(a, &.{ std.fs.path.dirname(canonical) orelse ".", name });
         defer a.free(path);
         const marker = std.Io.Dir.cwd().openFile(runtime, path, .{ .mode = .read_write, .lock = .exclusive, .lock_nonblocking = true }) catch |err| switch (err) {
             error.WouldBlock => continue,
@@ -1128,7 +1136,9 @@ pub const MarkerSweep = struct {
         try guard.lock(runtime, .exclusive);
         defer guard.unlock(runtime);
         if (self.iterator == null) {
-            const dir = try std.Io.Dir.cwd().openDir(runtime, std.fs.path.dirname(file.path) orelse ".", .{ .iterate = true });
+            const canonical = try std.Io.Dir.cwd().realPathFileAlloc(runtime, file.path, file.allocator);
+            defer file.allocator.free(canonical);
+            const dir = try std.Io.Dir.cwd().openDir(runtime, std.fs.path.dirname(canonical) orelse ".", .{ .iterate = true });
             self.iterator = dir.iterate();
         }
         errdefer self.resetIterator(runtime);
@@ -1160,7 +1170,16 @@ pub const MarkerSweep = struct {
 // This persistent inode is deliberately outside the UUID marker namespace.
 // Never unlink it: replacing its inode could split cross-process coordination.
 fn openPublicationGuard(allocator: Allocator, io: std.Io, root: []const u8) !std.Io.File {
-    const path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(root) orelse ".", ".aflite-lease-publication.lock" });
+    const canonical = std.Io.Dir.cwd().realPathFileAlloc(io, root, allocator) catch |err| switch (err) {
+        error.FileNotFound => missing: {
+            const parent = try std.Io.Dir.cwd().realPathFileAlloc(io, std.fs.path.dirname(root) orelse ".", allocator);
+            defer allocator.free(parent);
+            break :missing try std.fs.path.joinZ(allocator, &.{ parent, std.fs.path.basename(root) });
+        },
+        else => return err,
+    };
+    defer allocator.free(canonical);
+    const path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(canonical) orelse ".", ".aflite-lease-publication.lock" });
     defer allocator.free(path);
     return std.Io.Dir.cwd().createFile(io, path, .{ .read = true, .truncate = false, .permissions = .fromMode(0o600) });
 }
@@ -1235,4 +1254,64 @@ test "lite persistent mapped lease publication excludes cross-root marker sweepi
     try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, marker_path, .{}));
     try std.testing.expect(try probe.tryLock(io, .exclusive));
     probe.unlock(io);
+}
+
+test "lite artifact path aliases retain snapshot protection across orphan cleanup" {
+    if (@import("builtin").os.tag != .linux and @import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |symlink_alias| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/original.aflite", .{tmp.sub_path});
+        defer a.free(path);
+        const other = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/alias", .{tmp.sub_path});
+        defer a.free(other);
+        try std.Io.Dir.cwd().createDirPath(io, other);
+        const alias = try std.fs.path.join(a, &.{ other, "reader.aflite" });
+        defer a.free(alias);
+        var writer = try docs.Store.createWithOptions(a, path, .{ .io = io, .no_sync = true });
+        var writer_live = true;
+        defer if (writer_live) writer.close();
+        writer.maintenance_start_suppressed = true;
+        const bytes: [8192]u8 = @splat('h');
+        try writer.file.putIndexCatalogRecord("/index/kept", &bytes);
+        if (symlink_alias) {
+            const target = try std.Io.Dir.cwd().realPathFileAlloc(io, path, a);
+            defer a.free(target);
+            try std.Io.Dir.cwd().symLink(io, target, alias, .{});
+        } else try std.Io.Dir.cwd().hardLink(path, std.Io.Dir.cwd(), alias, io, .{});
+        writer.close();
+        writer_live = false;
+        var alias_store = try docs.Store.openWithOptions(a, alias, .{ .io = io, .no_sync = true });
+        var alias_live = true;
+        defer if (alias_live) alias_store.close();
+        alias_store.maintenance_start_suppressed = true;
+        var source = try alias_store.openArtifactSource("/index/kept");
+        defer source.close();
+        var adapter = @import("index_storage.zig").Store.init(a, &alias_store);
+        if (try adapter.storage().acquireImmutableStager(a)) |value| {
+            var stager = value;
+            defer stager.deinit();
+            try std.testing.expect(symlink_alias);
+        } else try std.testing.expect(!symlink_alias);
+        if (!symlink_alias) try std.testing.expectError(error.UnsafeNativeReaderAlias, alias_store.beginArtifactConstruction());
+        alias_store.close();
+        alias_live = false;
+        writer = try docs.Store.openWithOptions(a, path, .{ .io = io, .no_sync = true });
+        writer_live = true;
+        writer.maintenance_start_suppressed = true;
+        var sweep: SweepCursor = .{};
+        // A locked live source through another path must never look orphaned.
+        try std.testing.expectEqual(@as(usize, 0), try cleanupOrphans(&writer.file, &sweep));
+        try writer.file.deleteIndexCatalogRecord("/index/kept");
+        for (0..8) |i| {
+            var key: [32]u8 = undefined;
+            try writer.file.putIndexCatalogRecord(try std.fmt.bufPrint(&key, "/other/{d}", .{i}), &bytes);
+        }
+        var actual: [64]u8 = undefined;
+        try source.readInto(4096, &actual);
+        try std.testing.expectEqualSlices(u8, bytes[4096..][0..actual.len], &actual);
+        try std.testing.expect((try writer.file.check()).valid);
+    }
 }
