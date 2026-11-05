@@ -3938,6 +3938,13 @@ fn loadEphemeralQuantizedLazyWeight(
 /// strict_f32 never rounds activations before a quantized weight projection.
 pub const QuantizedActivationPolicy = enum { automatic, strict_f32 };
 
+/// Immutable answer to an original trace lookup. Names are owned by the
+/// program; no backend, payload, allocator context or cleanup authority escapes.
+pub const AuthoredSourceQuery = struct {
+    name: []const u8,
+    shape: ?@import("ml").graph.Shape,
+};
+
 pub const NativeCompute = struct {
     /// Set once by a stable SharedBackendContext before publication. Ordinary
     /// request-owned Native computes retain no operation metadata allocation.
@@ -4068,6 +4075,9 @@ pub const NativeCompute = struct {
         const data = self.data;
         if (data.prefetch_initialized) data.prefetch.lock();
         defer if (data.prefetch_initialized) data.prefetch.unlock();
+        return authoredResidentF32ShapeLocked(data, name);
+    }
+    fn authoredResidentF32ShapeLocked(data: *WeightStore, name: []const u8) !@import("ml").graph.Shape {
         const loaded = data.resident_weights.getPtr(name) orelse {
             if (data.lazy_weights.contains(name)) return error.UnsupportedAuthoredWeight;
             return error.WeightNotFound;
@@ -4080,15 +4090,48 @@ pub const NativeCompute = struct {
         return shape;
     }
 
-    /// Immutable named-model input. The receiving program keeps the actual
-    /// weight handle and its original model/store owner alive; this grants no
-    /// allocator-owned/workspace credit to a generic borrowed tensor.
-    pub fn authoredResidentF32Plane(backend: *const ops.ComputeBackend, name: []const u8, value: CT) !@import("../execution/storage_ownership.zig").Plane {
-        const shape = try authoredResidentF32Shape(backend, name);
+    /// One metadata exclusion window certifies the complete original query
+    /// transcript, including absent optional weights. This does not pin model
+    /// payload against concurrent mutation; actual Model/caller exclusion is
+    /// still required exactly as for the original Native forward.
+    pub fn validateAuthoredSourceQueries(backend: *const ops.ComputeBackend, queries: anytype) !void {
+        if (backend.vtable != &vtable_impl) return error.UnsupportedAuthoredNativeTarget;
         const self: *NativeCompute = @ptrCast(@alignCast(backend.ptr));
         const data = self.data;
         if (data.prefetch_initialized) data.prefetch.lock();
         defer if (data.prefetch_initialized) data.prefetch.unlock();
+        for (queries) |entry| {
+            // Compile-time projection: pure template facts or private receiving
+            // facts plus owning CT witness. No dynamic callback/context loan.
+            const query: AuthoredSourceQuery = if (@TypeOf(entry) == AuthoredSourceQuery) entry else entry.fact;
+            const actual: ?@import("ml").graph.Shape = authoredResidentF32ShapeLocked(data, query.name) catch |err| switch (err) {
+                error.WeightNotFound => null,
+                error.UnsupportedAuthoredWeight => return error.AuthoredResidentTopologyChanged,
+                else => return err,
+            };
+            if (query.shape) |expected| {
+                if (actual == null or !expected.eq(actual.?)) return error.AuthoredResidentTopologyChanged;
+            } else if (actual != null) return error.AuthoredResidentTopologyChanged;
+            if (@TypeOf(entry) != AuthoredSourceQuery) {
+                if ((query.shape != null) != (entry.witness != null)) return error.AuthoredResidentTopologyChanged;
+                if (entry.witness) |witness| _ = try authoredResidentF32PlaneLocked(data, query.name, witness, actual.?);
+            }
+        }
+    }
+
+    /// Immutable named-model input. The receiving program keeps the actual
+    /// weight handle and its original model/store owner alive; this grants no
+    /// allocator-owned/workspace credit to a generic borrowed tensor.
+    pub fn authoredResidentF32Plane(backend: *const ops.ComputeBackend, name: []const u8, value: CT) !@import("../execution/storage_ownership.zig").Plane {
+        if (backend.vtable != &vtable_impl) return error.UnsupportedAuthoredNativeTarget;
+        const self: *NativeCompute = @ptrCast(@alignCast(backend.ptr));
+        const data = self.data;
+        if (data.prefetch_initialized) data.prefetch.lock();
+        defer if (data.prefetch_initialized) data.prefetch.unlock();
+        const shape = try authoredResidentF32ShapeLocked(data, name);
+        return authoredResidentF32PlaneLocked(data, name, value, shape);
+    }
+    fn authoredResidentF32PlaneLocked(data: *WeightStore, name: []const u8, value: CT, shape: @import("ml").graph.Shape) !@import("../execution/storage_ownership.zig").Plane {
         const source = data.resident_weights.getPtr(name) orelse return error.UnsupportedAuthoredWeight;
         const view = toBuf(value);
         if (!view.cached_weight or view.weight_handle == null or view.weight_handle.?.references == 0 or view.owned or view.retained_parent != null or view.physical_lease != null or view.source_tensor != null or view.quantized_storage != null or view.owned_quantized_storage != null or view.view_strides != null or view.view_base_offset != 0 or !std.mem.eql(u8, view.name, name) or @intFromPtr(view.data.ptr) != @intFromPtr(source.tensor.data.ptr) or std.mem.sliceAsBytes(view.data).len != source.tensor.data.len or view.logical_shape == null or !std.mem.eql(i64, view.logical_shape.?, source.tensor.shape)) return error.AuthoredResidentWeightChanged;

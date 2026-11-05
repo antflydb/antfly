@@ -21,7 +21,38 @@ const Cleanup = @import("cleanup_context.zig").Context;
 const Tensor = @import("../backends/tensor.zig").Tensor;
 const CT = ops.CT;
 
-const NamedSource = struct { name: []u8, value: CT };
+/// Request-private owning projection. The fact alone is backend-free; the CT
+/// must remain private to this actual receiving backend, including names whose
+/// parameter nodes the optimizer eliminated.
+const SourceQuery = struct { fact: Native.AuthoredSourceQuery, witness: ?CT = null };
+
+/// Selected original-forward semantics with a fully authored Native lowering.
+/// Keep this independent of Metal's Qwen prefill selector. These two semantic
+/// families share the plain gated dense decoder; their RoPE layouts, epsilon,
+/// optional QK norms and weight names still come from the ORIGINAL trace.
+fn eligible(config: gpt.Config) bool {
+    switch (config.family) {
+        .llama, .qwen3 => {},
+        else => return false,
+    }
+    if (config.usesMoe() or config.num_local_experts != 0 or config.hasPle() or config.isMultimodal() or
+        config.gemma4_mtp_assistant or config.qwen35_has_linear_attention) return false;
+    if (config.num_hidden_layers == 0 or config.num_hidden_layers > 256 or config.hidden_size == 0 or
+        config.num_attention_heads == 0 or config.intermediate_size == 0 or config.vocab_size == 0) return false;
+    if (config.num_kv_shared_layers != 0 or config.global_head_dim != 0 or config.num_global_key_value_heads != 0 or
+        config.sliding_window != 0 or config.shared_layer_intermediate_size != 0) return false;
+    if (config.norm_type != .rms_norm or config.position_encoding != .rope or config.activation != .silu or
+        config.norm_weight_offset != 0 or config.final_logit_softcapping != 0 or
+        config.attention_k_eq_v or config.mrope_interleaved) return false;
+    if (config.attention_head_dim == 0 and config.hidden_size % config.num_attention_heads != 0) return false;
+    const head_dim = config.headDim();
+    if (head_dim == 0 or head_dim % 2 != 0 or config.num_attention_heads % config.effectiveKVHeads() != 0) return false;
+    if (!std.math.isFinite(config.norm_eps) or config.norm_eps <= 0 or
+        !std.math.isFinite(config.rope_theta) or config.rope_theta <= 0 or
+        !std.math.isFinite(config.rope_freq_scale) or config.rope_freq_scale <= 0 or
+        !std.math.isFinite(config.rope_partial_factor) or config.rope_partial_factor <= 0 or config.rope_partial_factor > 1) return false;
+    return true;
+}
 
 pub const Program = struct {
     allocator: std.mem.Allocator,
@@ -35,7 +66,7 @@ pub const Program = struct {
     bindings: []route.InputBinding,
     weights: []?CT,
     weight_planes: []@import("storage_ownership.zig").Plane,
-    named_sources: []NamedSource,
+    source_queries: []SourceQuery,
     values: []?CT,
     steps: []ml.graph.NodeId,
     input: ml.graph.NodeId,
@@ -62,7 +93,7 @@ pub const Program = struct {
     /// program, just as it outlives the existing GraphCache/executable bindings.
     pub fn tryCreate(allocator: std.mem.Allocator, context: *const Context) !?*Program {
         if (comptime !@import("build_options").enable_native) return null;
-        if (context.cb.vtable != &Native.vtable_impl or context.weights != null or !gpt.denseQwen3PrefillEligible(context.gpt_config.*)) return null;
+        if (context.cb.vtable != &Native.vtable_impl or context.weights != null or !eligible(context.gpt_config.*)) return null;
         if (context.session) |source| if (!@import("architecture_session.zig").nativeProgramSourceMatches(source, context.cb)) return null;
         return create(allocator, context) catch |err| switch (err) {
             error.UnsupportedAuthoredWeight, error.UnsupportedAuthoredNativeTarget, error.IncompleteNativeProgram, error.UnsupportedNativeProgramWorkspace, error.MissingPreparedKernelRoute, error.UnsupportedShape => null,
@@ -83,33 +114,54 @@ pub const Program = struct {
         const Resolver = struct {
             original: *const Context,
             allocator: std.mem.Allocator,
-            sources: std.ArrayList(NamedSource) = .empty,
+            queries: std.ArrayList(SourceQuery) = .empty,
+            failure: ?anyerror = null,
+            fn note(recorder: *@This(), name: []const u8, shape: ?ml.graph.Shape) !usize {
+                for (recorder.queries.items, 0..) |query, index| if (std.mem.eql(u8, query.fact.name, name)) {
+                    if ((query.fact.shape == null) != (shape == null) or (shape != null and !query.fact.shape.?.eq(shape.?))) return error.AuthoredResidentTopologyChanged;
+                    return index;
+                };
+                const owned_name = try recorder.allocator.dupe(u8, name);
+                errdefer recorder.allocator.free(owned_name);
+                try recorder.queries.append(recorder.allocator, .{ .fact = .{ .name = owned_name, .shape = shape } });
+                return recorder.queries.items.len - 1;
+            }
             fn get(raw: *anyopaque, name: []const u8) !CT {
                 const value: *@This() = @ptrCast(@alignCast(raw));
-                _ = try Native.NativeCompute.authoredResidentF32Shape(value.original.cb, name);
-                var found = false;
-                for (value.sources.items) |source| if (std.mem.eql(u8, source.name, name)) {
-                    found = true;
-                    break;
+                return value.getImpl(name) catch |err| {
+                    // Original lm-head selection catches all lookup errors.
+                    // It may preserve MissingWeight fallback, but must never
+                    // hide incomplete query bookkeeping or an unsupported
+                    // actual source behind a different authored model.
+                    if (err != error.MissingWeight and err != error.WeightNotFound and value.failure == null) value.failure = err;
+                    return err;
                 };
-                if (!found) {
-                    const owned_name = try value.allocator.dupe(u8, name);
-                    errdefer value.allocator.free(owned_name);
+            }
+            fn getImpl(value: *@This(), name: []const u8) !CT {
+                const shape = Native.NativeCompute.authoredResidentF32Shape(value.original.cb, name) catch |err| switch (err) {
+                    error.WeightNotFound => {
+                        _ = try value.note(name, null);
+                        return err; // preserve the original optional lookup behavior
+                    },
+                    else => return err,
+                };
+                const index = try value.note(name, shape);
+                if (value.queries.items[index].witness == null) {
                     const witness = try value.original.graphWeight(name);
                     errdefer value.original.cb.free(witness);
                     _ = try Native.NativeCompute.authoredResidentF32Plane(value.original.cb, name, witness);
-                    try value.sources.append(value.allocator, .{ .name = owned_name, .value = witness });
+                    value.queries.items[index].witness = witness;
                 }
                 return value.original.graphWeight(name);
             }
         };
         var resolver = Resolver{ .original = context, .allocator = allocator };
         defer {
-            for (resolver.sources.items) |source| {
-                self.backend.free(source.value);
-                allocator.free(source.name);
+            for (resolver.queries.items) |query| {
+                if (query.witness) |witness| self.backend.free(witness);
+                allocator.free(query.fact.name);
             }
-            resolver.sources.deinit(allocator);
+            resolver.queries.deinit(allocator);
         }
         var tracing_context = context.*;
         tracing_context.cb = &self.backend;
@@ -117,6 +169,7 @@ pub const Program = struct {
         var id = [_]i64{0};
         const trace_decode = gpt.DecodeContext{ .attention_mode = .paged_decode, .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 };
         const entry = try @import("../graph/execution.zig").ensureGraphEntry(&tracing_context, &self.cache, &id, 1, 1, &trace_decode);
+        if (resolver.failure) |err| return err;
         self.graph = &entry.graph;
         try normalizeDensePairTrace(self.graph);
         try normalizeDenseGroupedTrace(self.graph);
@@ -190,7 +243,8 @@ pub const Program = struct {
         errdefer self.selected.release();
         if (self.selected.pool.payload_coverage != .complete or self.selected.pool.regions.len != 0) return error.IncompleteNativeProgram;
         _ = try self.selected.storageRequirement();
-        self.named_sources = try resolver.sources.toOwnedSlice(allocator);
+        try Native.NativeCompute.validateAuthoredSourceQueries(&self.backend, resolver.queries.items);
+        self.source_queries = try resolver.queries.toOwnedSlice(allocator);
         self.mutex = .unlocked;
         self.busy = false;
         self.failed = false;
@@ -282,6 +336,13 @@ pub const Program = struct {
         return descriptor;
     }
     pub fn supportsCall(self: *const Program, input_ids: []const i64, batch: usize, decode: *const gpt.DecodeContext) bool {
+        // Request-time side effects/alternate position or packed-media state
+        // are not represented by this cold scalar decoder trace. Decline
+        // before a Frame or any numerical operation so the original caller
+        // executes them once, with its original context.
+        if (decode.selection_query_capture != null or decode.packed_query_lengths != null or
+            decode.mrope_positions != null or decode.qwen3vl_visual_mask != null or
+            decode.qwen3vl_deepstack_embeddings != null or decode.qwen3vl_deepstack_layer_count != 0) return false;
         return batch == 1 and input_ids.len == 1 and input_ids[0] >= 0 and input_ids[0] < self.config.vocab_size and decode.query_sequence_len == 1 and (decode.attention_mode == .paged_decode or decode.attention_mode == .paged_prefill);
     }
     pub fn beginCall(self: *Program, input_ids: []const i64, decode: *const gpt.DecodeContext, identity: ?storage.Identity) !Call {
@@ -336,11 +397,11 @@ pub const Program = struct {
         self.selected.releaseWithCleanup(cleanup);
         self.runtime.deinitWithCleanup(cleanup);
         for (self.weights) |maybe| if (maybe) |value| self.backend.freeWithCleanup(value, cleanup);
-        for (self.named_sources) |source| {
-            self.backend.freeWithCleanup(source.value, cleanup);
-            self.allocator.free(source.name);
+        for (self.source_queries) |query| {
+            if (query.witness) |witness| self.backend.freeWithCleanup(witness, cleanup);
+            self.allocator.free(query.fact.name);
         }
-        self.allocator.free(self.named_sources);
+        self.allocator.free(self.source_queries);
         self.cache.deinitWithBackend(&self.backend);
         self.analysis.deinit(self.allocator);
         const allocator = self.allocator;
@@ -456,7 +517,7 @@ pub const Call = struct {
         if (self.ran or backend.ptr != program.backend.ptr or backend.vtable != program.backend.vtable or config.fingerprint() != program.config.fingerprint() or !program.supportsCall(&.{self.token}, 1, decode)) return error.NativeProgramCallChanged;
         const attention = gpt.attentionContextFromDecode(decode);
         if (attention.kv_manager != self.manager or attention.kv_cache == null or attention.kv_cache.?.sequence_id != self.sequence or attention.kv_cache.?.pool_id != self.pool or attention.total_sequence_len != self.total_tokens) return error.NativeProgramCallChanged;
-        for (program.named_sources) |source| _ = try Native.NativeCompute.authoredResidentF32Plane(backend, source.name, source.value);
+        try Native.NativeCompute.validateAuthoredSourceQueries(backend, program.source_queries);
         try program.selected.validate(program.bindings);
         for (program.selected.pool.kernels) |maybe| if (maybe) |kernel| if (kernel.descriptor.operation == .paged_attention) try Native.NativeCompute.validateAuthoredAttention(backend, kernel.descriptor.operation.paged_attention, &attention);
         if (frame.storage_admission != null and current.boundary == null) return error.MissingCurrentCleanupEpoch;
@@ -537,6 +598,16 @@ const TestModel = struct {
         }
         return result;
     }
+    pub fn initWithoutQkNorms(allocator: std.mem.Allocator) !TestModel {
+        var result = try init(allocator);
+        for ([_][]const u8{ "model.layers.0.self_attn.q_norm.weight", "model.layers.0.self_attn.k_norm.weight" }) |name| {
+            const removed = result.data.resident_weights.fetchRemove(name).?;
+            allocator.free(removed.key);
+            var weight = removed.value;
+            weight.deinit();
+        }
+        return result;
+    }
     pub fn expanded(allocator: std.mem.Allocator, cfg: gpt.Config) !TestModel {
         var template = try init(allocator);
         defer template.data.deinitOwned();
@@ -546,6 +617,8 @@ const TestModel = struct {
             var entries = template.data.resident_weights.iterator();
             while (entries.next()) |entry| {
                 const base = entry.key_ptr.*;
+                if (cfg.family == .llama and (std.mem.endsWith(u8, base, "q_norm.weight") or std.mem.endsWith(u8, base, "k_norm.weight"))) continue;
+                if (cfg.weight_tying and std.mem.eql(u8, base, "lm_head.weight")) continue;
                 const per_layer = std.mem.startsWith(u8, base, "model.layers.0.");
                 if (!per_layer and layer != 0) continue;
                 const key = if (per_layer) try std.fmt.allocPrint(allocator, "model.layers.{d}.{s}", .{ layer, base["model.layers.0.".len..] }) else try allocator.dupe(u8, base);
@@ -577,6 +650,16 @@ const TestModel = struct {
             }
         }
         return result;
+    }
+    pub fn parsedLlamaConfig(allocator: std.mem.Allocator, hidden: u32, layers: u32, tied: bool) !gpt.Config {
+        const json = try std.fmt.allocPrint(allocator, "{{\"model_type\":\"llama\",\"hidden_size\":{d},\"intermediate_size\":{d},\"vocab_size\":128,\"num_hidden_layers\":{d},\"num_attention_heads\":8,\"num_key_value_heads\":2,\"head_dim\":32,\"max_position_embeddings\":64,\"tie_word_embeddings\":{s}}}", .{ hidden, hidden * 2, layers, if (tied) "true" else "false" });
+        defer allocator.free(json);
+        const cfg = try @import("../models/gpt.zig").parseConfig(allocator, json);
+        try std.testing.expectEqual(@import("../models/gpt.zig").ModelFamily.llama, cfg.family);
+        try std.testing.expectEqual(@import("../models/gpt.zig").RopeLayout.consecutive_pairs, cfg.rope_layout);
+        try std.testing.expectEqual(@as(f32, 1e-5), cfg.norm_eps);
+        try std.testing.expect(!gpt.denseQwen3PrefillEligible(cfg));
+        return cfg;
     }
     pub fn config() gpt.Config {
         return .{ .family = .qwen3, .hidden_size = 8, .vocab_size = 16, .num_hidden_layers = 1, .num_attention_heads = 2, .num_key_value_heads = 1, .intermediate_size = 16, .norm_type = .rms_norm, .norm_eps = 1e-6, .position_encoding = .rope, .activation = .silu, .rope_theta = 10000 };
@@ -615,7 +698,7 @@ fn nativeAuthoredDecodeSteps(config: gpt.Config, steps: usize, reset_step: usize
     defer compute.deinit();
     const backend = compute.computeBackend();
     const context = Context{ .allocator = a, .cb = &backend, .gpt_config = &config };
-    try std.testing.expect(gpt.denseQwen3PrefillEligible(config));
+    try std.testing.expect(eligible(config));
     const program = (try Program.tryCreate(a, &context)) orelse return error.MissingAuthoredNativeProgram;
     defer program.destroyWithCleanup(.{ .outside_execution = true });
     const Kv = @import("../runtime/root.zig").kv;
@@ -697,8 +780,23 @@ test "native authored complete program metadata and assigned banks unwind all al
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
     const Case = struct {
         fn run(a: std.mem.Allocator) !void {
-            var model = try TestModel.init(a);
+            return runCase(a, false, false);
+        }
+        fn missing(a: std.mem.Allocator) !void {
+            return runCase(a, true, false);
+        }
+        fn missingHead(a: std.mem.Allocator) !void {
+            return runCase(a, true, true);
+        }
+        fn runCase(a: std.mem.Allocator, omit_optional: bool, omit_head: bool) !void {
+            var model = if (omit_optional) try TestModel.initWithoutQkNorms(a) else try TestModel.init(a);
             defer model.data.deinitOwned();
+            if (omit_head) {
+                const removed = model.data.resident_weights.fetchRemove("lm_head.weight").?;
+                var weight = removed.value;
+                weight.deinit();
+                a.free(removed.key);
+            }
             var compute = Native.NativeCompute.init(a, &model.data, null);
             defer compute.deinit();
             const cb = compute.computeBackend();
@@ -706,6 +804,14 @@ test "native authored complete program metadata and assigned banks unwind all al
             const context = Context{ .allocator = a, .cb = &cb, .gpt_config = &cfg };
             const program = (try Program.tryCreate(a, &context)) orelse return error.MissingAuthoredNativeProgram;
             defer program.destroyWithCleanup(.{ .outside_execution = true });
+            if (omit_head) {
+                var saw_missing_head = false;
+                for (program.source_queries) |query| if (std.mem.eql(u8, query.fact.name, "lm_head.weight")) {
+                    try std.testing.expect(query.fact.shape == null and query.witness == null);
+                    saw_missing_head = true;
+                };
+                try std.testing.expect(saw_missing_head);
+            }
             var manager = @import("../runtime/root.zig").kv.manager.KvManager.init(a);
             defer manager.deinit();
             const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 4 });
@@ -722,24 +828,29 @@ test "native authored complete program metadata and assigned banks unwind all al
         }
     };
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.missing, .{});
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.missingHead, .{});
 }
 
 test "native authored post-entry cancellation poisons without replay and real KV reset restores execution" {
+    try nativeAuthoredCancellationCase(TestModel.config());
+}
+
+fn nativeAuthoredCancellationCase(cfg: gpt.Config) !void {
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
     const a = std.testing.allocator;
-    var model = try TestModel.init(a);
+    var model = if (cfg.fingerprint() == TestModel.config().fingerprint()) try TestModel.init(a) else try TestModel.expanded(a, cfg);
     defer model.data.deinitOwned();
     var compute = Native.NativeCompute.init(a, &model.data, null);
     defer compute.deinit();
     const backend = compute.computeBackend();
-    const cfg = TestModel.config();
     const context = Context{ .allocator = a, .cb = &backend, .gpt_config = &cfg };
     const program = (try Program.tryCreate(a, &context)) orelse return error.MissingAuthoredNativeProgram;
     defer program.destroyWithCleanup(.{ .outside_execution = true });
     const Kv = @import("../runtime/root.zig").kv;
     var manager = Kv.manager.KvManager.init(a);
     defer manager.deinit();
-    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 4 });
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = @intCast(cfg.effectiveKVHeads()), .head_dim = @intCast(cfg.headDim()), .num_layers_packed = @intCast(cfg.num_hidden_layers) });
     var sequence = try manager.attachSequence(pool);
     try manager.appendTokens(sequence, 1);
     var decode = TestModel.decode(&manager, pool, sequence, 1);
@@ -833,4 +944,182 @@ test "native authored BF16 host paged KV and unsupported family or quantized wei
     // The original host pool also explicitly refuses BF16 writes; admitting
     // it here would advertise a dtype that cannot execute the original path.
     try std.testing.expectError(error.UnsupportedKvDType, manager.writeLayerKvSuffix(sequence, 0, 1, 1, &.{ 1, 2, 3, 4 }, &.{ 5, 6, 7, 8 }));
+}
+
+test "native authored parsed Llama original RoPE and no QK norms layered page crossing reset parity" {
+    for ([_]u32{ 128, 256 }) |hidden| {
+        const cfg = try TestModel.parsedLlamaConfig(std.testing.allocator, hidden, if (hidden == 128) 2 else 4, hidden == 256);
+        try nativeAuthoredDecodeSteps(cfg, 8, 6);
+    }
+}
+
+test "native authored parsed Llama post entry cancellation requires real reset without replay" {
+    try nativeAuthoredCancellationCase(try TestModel.parsedLlamaConfig(std.testing.allocator, 128, 2, false));
+}
+
+test "native authored structural eligibility refuses incompatible semantics before native context access" {
+    const a = std.testing.allocator;
+    const cfg = try TestModel.parsedLlamaConfig(a, 128, 2, false);
+    try std.testing.expect(eligible(cfg));
+    inline for (.{ "num_attention_heads", "hidden_size", "num_hidden_layers", "intermediate_size", "vocab_size" }) |field| {
+        var changed = cfg;
+        @field(changed, field) = 0;
+        const invalid = ops.ComputeBackend{ .ptr = @ptrFromInt(8), .vtable = &Native.vtable_impl };
+        const ctx = Context{ .allocator = a, .cb = &invalid, .gpt_config = &changed };
+        try std.testing.expectEqual(@as(?*Program, null), try Program.tryCreate(a, &ctx));
+    }
+    var changed = cfg;
+    inline for (.{ "num_local_experts", "ple_hidden_size", "num_kv_shared_layers", "global_head_dim", "num_global_key_value_heads", "sliding_window", "shared_layer_intermediate_size" }) |field| {
+        changed = cfg;
+        @field(changed, field) = 1;
+        try std.testing.expect(!eligible(changed));
+    }
+    inline for (.{ "gemma4_mtp_assistant", "qwen35_has_linear_attention", "attention_k_eq_v", "mrope_interleaved" }) |field| {
+        changed = cfg;
+        @field(changed, field) = true;
+        try std.testing.expect(!eligible(changed));
+    }
+    inline for (.{ "norm_eps", "rope_theta", "rope_freq_scale", "rope_partial_factor" }) |field| {
+        changed = cfg;
+        @field(changed, field) = std.math.nan(f32);
+        try std.testing.expect(!eligible(changed));
+    }
+    changed = cfg;
+    changed.family = .qwen3_5;
+    try std.testing.expect(!eligible(changed));
+    changed = cfg;
+    changed.norm_type = .layer_norm;
+    try std.testing.expect(!eligible(changed));
+    changed = cfg;
+    changed.activation = .gelu;
+    try std.testing.expect(!eligible(changed));
+    changed = cfg;
+    changed.position_encoding = .absolute;
+    try std.testing.expect(!eligible(changed));
+}
+
+test "native authored parsed Llama quantized sources and BF16 KV retain original precommit refusal" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const cfg = try TestModel.parsedLlamaConfig(a, 128, 2, false);
+    var model = try TestModel.expanded(a, cfg);
+    defer model.data.deinitOwned();
+    try std.testing.expect(!model.data.resident_weights.contains("model.layers.0.self_attn.q_norm.weight"));
+    try std.testing.expect(!model.data.resident_weights.contains("model.layers.0.self_attn.k_norm.weight"));
+    var compute = Native.NativeCompute.init(a, &model.data, null);
+    defer compute.deinit();
+    const backend = compute.computeBackend();
+    const context = Context{ .allocator = a, .cb = &backend, .gpt_config = &cfg };
+    const weight = model.data.resident_weights.getPtr("model.embed_tokens.weight").?;
+    weight.quantized = true;
+    try std.testing.expectEqual(@as(?*Program, null), try Program.tryCreate(a, &context));
+    weight.quantized = false;
+    const program = (try Program.tryCreate(a, &context)) orelse return error.MissingAuthoredNativeProgram;
+    defer program.destroyWithCleanup(.{ .outside_execution = true });
+    const Kv = @import("../runtime/root.zig").kv;
+    var manager = Kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .bf16, .page_size_tokens = 4, .num_kv_heads = @intCast(cfg.effectiveKVHeads()), .head_dim = @intCast(cfg.headDim()), .num_layers_packed = @intCast(cfg.num_hidden_layers) });
+    const sequence = try manager.attachSequence(pool);
+    try manager.appendTokens(sequence, 1);
+    const decode = TestModel.decode(&manager, pool, sequence, 1);
+    try std.testing.expectError(error.UnsupportedAuthoredPagedAttention, program.beginCall(&.{2}, &decode, null));
+    try std.testing.expect(!program.busy and program.calls == 0 and program.assigned_operations == 0);
+}
+
+test "native authored parsed Llama effectful decode falls back before math and preserves actual capture once" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const cfg = try TestModel.parsedLlamaConfig(a, 128, 2, false);
+    var model = try TestModel.expanded(a, cfg);
+    defer model.data.deinitOwned();
+    var compute = Native.NativeCompute.init(a, &model.data, null);
+    defer compute.deinit();
+    const backend = compute.computeBackend();
+    const context = Context{ .allocator = a, .cb = &backend, .gpt_config = &cfg };
+    const program = (try Program.tryCreate(a, &context)) orelse return error.MissingAuthoredNativeProgram;
+    defer program.destroyWithCleanup(.{ .outside_execution = true });
+    const Kv = @import("../runtime/root.zig").kv;
+    var manager = Kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = @intCast(cfg.effectiveKVHeads()), .head_dim = @intCast(cfg.headDim()), .num_layers_packed = @intCast(cfg.num_hidden_layers) });
+    const reference_sequence = try manager.attachSequence(pool);
+    const selected_sequence = try manager.attachSequence(pool);
+    try manager.appendTokens(reference_sequence, 1);
+    try manager.appendTokens(selected_sequence, 1);
+    const Capture = struct {
+        calls: usize = 0,
+        fn capture(raw: *anyopaque, _: usize, _: usize, _: usize, _: usize, _: usize, values: []const f32) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            for (values) |value| try std.testing.expect(std.math.isFinite(value));
+        }
+    };
+    var capture = Capture{};
+    var reference = TestModel.decode(&manager, pool, reference_sequence, 1);
+    reference.selection_query_capture = .{ .ctx = &capture, .allocator = a, .horizon = 1, .captureFn = Capture.capture };
+    const expected = try gpt.forward(&backend, a, cfg, &.{2}, 1, 1, &reference);
+    defer a.free(expected);
+    try std.testing.expectEqual(@as(usize, cfg.num_hidden_layers), capture.calls);
+    capture.calls = 0;
+    var selected = TestModel.decode(&manager, pool, selected_sequence, 1);
+    selected.selection_query_capture = reference.selection_query_capture;
+    try std.testing.expect(!program.supportsCall(&.{2}, 1, &selected));
+    try std.testing.expectError(error.UnsupportedAuthoredNativeCall, program.beginCall(&.{2}, &selected, null));
+    try std.testing.expect(!program.busy);
+    var decoder = @import("decoder_forward.zig").Runtime{ .context = context, .native_program = program };
+    const actual = try decoder.forwardLastLogits(&.{2}, 1, 1, &selected);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
+    try std.testing.expectEqual(@as(usize, cfg.num_hidden_layers), capture.calls);
+    try std.testing.expectEqual(@as(u64, 0), program.calls);
+    try std.testing.expectEqual(@as(u64, 0), program.assigned_operations);
+}
+
+test "native authored full query metadata checks missing answers and actual dtype before canonical casts" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var model = try TestModel.initWithoutQkNorms(a);
+    defer model.data.deinitOwned();
+    var compute = Native.NativeCompute.init(a, &model.data, null);
+    defer compute.deinit();
+    const backend = compute.computeBackend();
+    const name = "model.embed_tokens.weight";
+    const shape = try Native.NativeCompute.authoredResidentF32Shape(&backend, name);
+    const queries = [_]Native.AuthoredSourceQuery{
+        .{ .name = name, .shape = shape },
+        .{ .name = "model.layers.0.self_attn.q_norm.weight", .shape = null },
+        .{ .name = "model.layers.0.self_attn.k_norm.weight", .shape = null },
+    };
+    try Native.NativeCompute.validateAuthoredSourceQueries(&backend, &queries);
+    const inherited = Native.vtable_impl;
+    const fake = ops.ComputeBackend{ .ptr = @ptrFromInt(8), .vtable = &inherited };
+    try std.testing.expectError(error.UnsupportedAuthoredNativeTarget, Native.NativeCompute.validateAuthoredSourceQueries(&fake, &queries));
+    const tensor = &model.data.resident_weights.getPtr(name).?.tensor;
+    tensor.dtype = .bf16;
+    try std.testing.expectError(error.AuthoredResidentTopologyChanged, Native.NativeCompute.validateAuthoredSourceQueries(&backend, &queries));
+    tensor.dtype = .f32;
+    try Native.NativeCompute.validateAuthoredSourceQueries(&backend, &queries);
+    const before = tensor.shape;
+    defer tensor.shape = before;
+    tensor.shape = &.{ 8, 16 }; // same F32 bytes, changed actual semantic shape
+    try std.testing.expectError(error.AuthoredResidentTopologyChanged, Native.NativeCompute.validateAuthoredSourceQueries(&backend, &queries));
+    tensor.shape = before;
+    try Native.NativeCompute.validateAuthoredSourceQueries(&backend, &queries);
+}
+
+test "native authored full query cannot hide unsupported actual lm head behind embedding fallback" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var model = try TestModel.init(a);
+    defer model.data.deinitOwned();
+    var compute = Native.NativeCompute.init(a, &model.data, null);
+    defer compute.deinit();
+    const backend = compute.computeBackend();
+    const cfg = TestModel.config();
+    const context = Context{ .allocator = a, .cb = &backend, .gpt_config = &cfg };
+    const head = model.data.resident_weights.getPtr("lm_head.weight").?;
+    head.quantized = true;
+    try std.testing.expectEqual(@as(?*Program, null), try Program.tryCreate(a, &context));
+    head.quantized = false;
 }

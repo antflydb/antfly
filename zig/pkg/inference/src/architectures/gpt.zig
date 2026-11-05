@@ -11252,16 +11252,16 @@ fn moeFeedForwardInner(
     // optional whole-MoE contract. In particular, qualified Gemma A4B uses
     // gelu_new rather than SiLU.
     if (cb.kind() != .graph and cb.vtable.runMoeBlock != null) {
-        const w1 = getMoeExpertWeight(cb, config, layer, 0, "w1", name_buf) catch null;
-        const w3 = getMoeExpertWeight(cb, config, layer, 0, "w3", name_buf) catch null;
-        const w2 = getMoeExpertWeight(cb, config, layer, 0, "w2", name_buf) catch null;
+        const w1 = try optionalMoeExpertWeight(cb, config, layer, 0, "w1", name_buf);
         defer if (w1) |w| cb.free(w);
+        const w3 = try optionalMoeExpertWeight(cb, config, layer, 0, "w3", name_buf);
         defer if (w3) |w| cb.free(w);
+        const w2 = try optionalMoeExpertWeight(cb, config, layer, 0, "w2", name_buf);
         defer if (w2) |w| cb.free(w);
         if (w1 != null and w3 != null and w2 != null) {
             const expert_scale_ct: ?CT = blk: {
                 const sn = std.fmt.bufPrint(name_buf, "model.layers.{d}.block_sparse_moe.expert_output_scale", .{layer}) catch break :blk null;
-                break :blk getModelWeight(cb, config, sn) catch null;
+                break :blk try optionalModelWeight(cb, config, sn);
             };
             defer if (expert_scale_ct) |s| cb.free(s);
             if (try cb.runMoeBlock(&.{
@@ -11310,16 +11310,16 @@ fn moeFeedForwardInner(
     if (cb.kind() == .graph) {
         const scale_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.block_sparse_moe.expert_output_scale", .{layer}) catch null;
         if (scale_name) |sn| {
-            if (getModelWeight(cb, config, sn)) |scale_w| {
+            if (try optionalModelWeight(cb, config, sn)) |scale_w| {
                 cb.setMoeExpertScale(scale_w);
                 cb.free(scale_w);
-            } else |_| {}
+            }
         }
     }
     const expert_output_scale: ?[]const f32 = if (cb.kind() == .graph) null else blk: {
         const scale_download_started_at = monotonicNowNs();
         const scale_name = std.fmt.bufPrint(name_buf, "model.layers.{d}.block_sparse_moe.expert_output_scale", .{layer}) catch break :blk null;
-        const scale_w = getModelWeight(cb, config, scale_name) catch break :blk null;
+        const scale_w = (try optionalModelWeight(cb, config, scale_name)) orelse break :blk null;
         defer cb.free(scale_w);
         const result = try cb.toFloat32(scale_w, allocator);
         debug_timing_stats.moe_expert_scale_download_nanos += @intCast(monotonicNowNs() - scale_download_started_at);
@@ -12282,18 +12282,18 @@ pub fn applyFinalNormWithCleanup(
         },
         else => {
             // Try common patterns
-            if (getModelWeight(cb, config, "model.norm.weight")) |base_w| {
+            if (try optionalModelWeight(cb, config, "model.norm.weight")) |base_w| {
                 defer freeTensorWithCleanup(cb, base_w, cleanup);
                 const w = try maybeAdjustNormWeight(cb, allocator, config, base_w, dim);
                 defer if (w != base_w) freeTensorWithCleanup(cb, w, cleanup);
                 return cb.rmsNorm(hidden, w, dim, config.norm_eps);
-            } else |_| {}
-            if (cb.getWeight("ln_f.weight")) |w| {
+            }
+            if (try optionalWeight(cb, "ln_f.weight")) |w| {
                 defer freeTensorWithCleanup(cb, w, cleanup);
                 const b = try cb.getWeight("ln_f.bias");
                 defer freeTensorWithCleanup(cb, b, cleanup);
                 return cb.layerNorm(hidden, w, b, dim, config.norm_eps);
-            } else |_| {}
+            }
             return error.MissingFinalNormWeight;
         },
     }
@@ -12675,13 +12675,13 @@ fn attnProject(
         .gpt2 => {
             // Try individual projections first (common in modern GPT-2 checkpoints)
             const w_name = std.fmt.bufPrint(buf, "h.{d}.attn.{s}_proj.weight", .{ layer, proj }) catch return error.NameTooLong;
-            if (cb.getWeight(w_name)) |w| {
+            if (try optionalWeight(cb, w_name)) |w| {
                 defer cb.free(w);
                 const b_name = std.fmt.bufPrint(buf, "h.{d}.attn.{s}_proj.bias", .{ layer, proj }) catch return error.NameTooLong;
                 const b = try getModelWeight(cb, config, b_name);
                 defer cb.free(b);
                 return cb.linear(input, w, b, total, in_dim, out_dim);
-            } else |_| {
+            } else {
                 // Fused c_attn: single [3*hidden, hidden] weight + [3*hidden] bias
                 return fusedCAttnProject(cb, allocator, input, total, in_dim, out_dim, layer, proj, buf);
             }
@@ -12692,10 +12692,10 @@ fn attnProject(
             defer cb.free(w);
 
             const b_name = std.fmt.bufPrint(buf, "h.{d}.attn.attention.{s}_proj.bias", .{ layer, proj }) catch return error.NameTooLong;
-            if (cb.getWeight(b_name)) |b| {
+            if (try optionalWeight(cb, b_name)) |b| {
                 defer cb.free(b);
                 return cb.linear(input, w, b, total, in_dim, out_dim);
-            } else |_| {
+            } else {
                 return cb.linearNoBias(input, w, total, in_dim, out_dim);
             }
         },
@@ -12713,10 +12713,10 @@ fn attnProject(
             const w = try getModelWeight(cb, config, name);
             defer cb.free(w);
             const b_name = std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.{s}_proj.bias", .{ layer, proj }) catch return error.NameTooLong;
-            if (cb.getWeight(b_name)) |b| {
+            if (try optionalWeight(cb, b_name)) |b| {
                 defer cb.free(b);
                 return cb.linear(input, w, b, total, in_dim, out_dim);
-            } else |_| {
+            } else {
                 return cb.linearNoBias(input, w, total, in_dim, out_dim);
             }
         },
@@ -12859,10 +12859,10 @@ fn attnOutputProject(
             const w = try getModelWeight(cb, config, w_name);
             defer cb.free(w);
             const b_name = std.fmt.bufPrint(buf, "h.{d}.attn.attention.out_proj.bias", .{layer}) catch return error.NameTooLong;
-            if (cb.getWeight(b_name)) |b| {
+            if (try optionalWeight(cb, b_name)) |b| {
                 defer cb.free(b);
                 return cb.linear(input, w, b, total, in_dim, out_dim);
-            } else |_| {
+            } else {
                 return cb.linearNoBias(input, w, total, in_dim, out_dim);
             }
         },
@@ -12871,10 +12871,10 @@ fn attnOutputProject(
             const w = try getModelWeight(cb, config, name);
             defer cb.free(w);
             const b_name = std.fmt.bufPrint(buf, "model.layers.{d}.self_attn.o_proj.bias", .{layer}) catch return error.NameTooLong;
-            if (cb.getWeight(b_name)) |b| {
+            if (try optionalWeight(cb, b_name)) |b| {
                 defer cb.free(b);
                 return cb.linear(input, w, b, total, in_dim, out_dim);
-            } else |_| {
+            } else {
                 return cb.linearNoBias(input, w, total, in_dim, out_dim);
             }
         },
@@ -12901,7 +12901,7 @@ pub fn getTracedWeight(allocator: std.mem.Allocator, cb: *const ComputeBackend, 
                 return switch (config.family) {
                     .gpt2 => cb.getWeight("wte.weight"),
                     .llama, .mistral, .qwen2, .qwen3, .qwen3_5, .gemma, .phi => getEmbeddingWeight(cb, config.*),
-                    else => cb.getWeight("model.embed_tokens.weight") catch try cb.getWeight("wte.weight"),
+                    else => (try optionalWeight(cb, "model.embed_tokens.weight")) orelse try cb.getWeight("wte.weight"),
                 };
             }
             var fallback_buf: [128]u8 = undefined;
@@ -12993,6 +12993,27 @@ fn maybePrefixedModelName(config: Config, name: []const u8, buf: *[256]u8) ![]co
     return std.fmt.bufPrint(buf, "{s}.{s}", .{ config.weight_prefix, name["model.".len..] });
 }
 
+/// Only a genuine missing checkpoint tensor licenses an alias or optional
+/// weight. Allocation, cancellation, unsupported data and IO failures retain
+/// their original errors instead of selecting a different model/kernel.
+fn isMissingWeight(err: anyerror) bool {
+    return err == error.MissingWeight or err == error.WeightNotFound;
+}
+
+fn optionalWeight(cb: *const ComputeBackend, name: []const u8) !?CT {
+    return cb.getWeight(name) catch |err| {
+        if (isMissingWeight(err)) return null;
+        return err;
+    };
+}
+
+fn optionalModelWeight(cb: *const ComputeBackend, config: Config, name: []const u8) !?CT {
+    return getModelWeight(cb, config, name) catch |err| {
+        if (isMissingWeight(err)) return null;
+        return err;
+    };
+}
+
 pub fn getModelWeight(cb: *const ComputeBackend, config: Config, name: []const u8) !CT {
     if (config.weight_prefix.len != 0 and std.mem.startsWith(u8, name, "model.")) {
         var buf: [256]u8 = undefined;
@@ -13078,10 +13099,17 @@ fn getMoeRouterWeight(cb: *const ComputeBackend, config: Config, layer: usize, b
     return getModelWeight(cb, config, primary);
 }
 
+fn optionalMoeExpertWeight(cb: *const ComputeBackend, config: Config, layer: usize, expert_index: usize, proj: []const u8, buf: *[256]u8) !?CT {
+    return getMoeExpertWeight(cb, config, layer, expert_index, proj, buf) catch |err| {
+        if (isMissingWeight(err)) return null;
+        return err;
+    };
+}
+
 fn getMoeExpertWeight(cb: *const ComputeBackend, config: Config, layer: usize, expert_index: usize, proj: []const u8, buf: *[256]u8) !CT {
     const packed_name = std.fmt.bufPrint(buf, "model.layers.{d}.block_sparse_moe.packed.{s}.weight", .{ layer, proj }) catch return error.NameTooLong;
     return getModelWeight(cb, config, packed_name) catch |err| switch (err) {
-        error.MissingWeight => {
+        error.MissingWeight, error.WeightNotFound => {
             const primary = std.fmt.bufPrint(buf, "model.layers.{d}.block_sparse_moe.experts.{d}.{s}.weight", .{ layer, expert_index, proj }) catch return error.NameTooLong;
             return getModelWeight(cb, config, primary);
         },
@@ -13636,7 +13664,7 @@ fn scaleMoeRouterInput(
         // Gemma 4's learned router scale is part of the architecture, not an
         // optional optimization. Other MoE families retain their legacy
         // unscaled fallback when no such tensor exists.
-        if (config.family == .gemma and config.usesMoe()) return err;
+        if ((config.family == .gemma and config.usesMoe()) or !isMissingWeight(err)) return err;
         return input;
     };
     defer cb.free(scale_w);
@@ -14294,7 +14322,7 @@ pub fn getEmbeddingWeight(cb: *const ComputeBackend, config: Config) !CT {
     return switch (config.family) {
         .gpt2 => cb.getWeight("wte.weight"),
         .llama, .mistral, .qwen2, .qwen3, .qwen3_vl, .qwen3_5, .gemma, .bitnet, .phi => getModelWeight(cb, config, "model.embed_tokens.weight"),
-        else => getModelWeight(cb, config, "model.embed_tokens.weight") catch try cb.getWeight("wte.weight"),
+        else => (try optionalModelWeight(cb, config, "model.embed_tokens.weight")) orelse try cb.getWeight("wte.weight"),
     };
 }
 
@@ -14302,7 +14330,7 @@ pub fn getLmHeadWeight(cb: *const ComputeBackend, config: Config) !CT {
     if (config.weight_tying) {
         return try getEmbeddingWeight(cb, config);
     }
-    return cb.getWeight("lm_head.weight") catch try getEmbeddingWeight(cb, config);
+    return (try optionalWeight(cb, "lm_head.weight")) orelse try getEmbeddingWeight(cb, config);
 }
 
 test "LightOnOCR3 DeltaNet gated norm uses its scale directly without a plus-one shift" {
@@ -15174,4 +15202,178 @@ test "Qwen explicit cleanup refuses absent authority before backend or model acc
     try std.testing.expectError(error.BackendCleanupAuthorityRequired, tryDenseQwen3Prefill(&backend, std.testing.allocator, undefined, &.{}, @as([]const i32, &.{}), 0, 0, .{ .cleanup = &boundary_without_operation }));
     try std.testing.expectError(error.MissingCurrentCleanupEpoch, applyAttentionWithCleanup(&backend, undefined, undefined, undefined, undefined, 0, 0, 0, 0, 0, 0, 0, false, null, &missing));
     try std.testing.expectError(error.BackendCleanupAuthorityRequired, applyAttentionWithCleanup(&backend, undefined, undefined, undefined, undefined, 0, 0, 0, 0, 0, 0, 0, false, null, &boundary_without_operation));
+}
+
+const WeightLookupProbe = struct {
+    paths: []const []const u8,
+    failures: []const ?anyerror,
+    cursor: usize = 0,
+    live: usize = 0,
+    math: usize = 0,
+    marker: u8 = 0,
+    kind_value: ops.BackendKind = .native,
+    fn self(raw: *anyopaque) *@This() {
+        return @ptrCast(@alignCast(raw));
+    }
+    fn kind(raw: *anyopaque) ops.BackendKind {
+        return self(raw).kind_value;
+    }
+    fn get(raw: *anyopaque, name: []const u8) !CT {
+        const probe = self(raw);
+        try std.testing.expect(probe.cursor < probe.paths.len);
+        try std.testing.expectEqualStrings(probe.paths[probe.cursor], name);
+        const failure = probe.failures[probe.cursor];
+        probe.cursor += 1;
+        if (failure) |err| return err;
+        probe.live += 1;
+        return @ptrCast(&probe.marker);
+    }
+    fn free(raw: *anyopaque, _: CT) void {
+        const probe = self(raw);
+        std.debug.assert(probe.live != 0);
+        probe.live -= 1;
+    }
+    fn result(raw: *anyopaque) CT {
+        const probe = self(raw);
+        probe.math += 1;
+        probe.live += 1;
+        return @ptrCast(&probe.marker);
+    }
+    fn linear(raw: *anyopaque, _: CT, _: CT, _: CT, _: usize, _: usize, _: usize) !CT {
+        return result(raw);
+    }
+    fn linearNoBias(raw: *anyopaque, _: CT, _: CT, _: usize, _: usize, _: usize) !CT {
+        return result(raw);
+    }
+    fn rms(raw: *anyopaque, _: CT, _: CT, _: usize, _: f32) !CT {
+        return result(raw);
+    }
+    fn layer(raw: *anyopaque, _: CT, _: CT, _: CT, _: usize, _: f32) !CT {
+        return result(raw);
+    }
+    fn table() ComputeBackend.VTable {
+        var value = native_compute_mod.vtable_impl;
+        value.backendKind = kind;
+        value.getWeight = get;
+        value.acquireWeight = get;
+        value.getEmbeddingWeight = get;
+        value.freeTensor = free;
+        value.linear = linear;
+        value.linearNoBias = linearNoBias;
+        value.rmsNorm = rms;
+        value.layerNorm = layer;
+        return value;
+    }
+    fn check(self_probe: *@This(), count: usize, math_count: usize) !void {
+        try std.testing.expectEqual(count, self_probe.cursor);
+        try std.testing.expectEqual(math_count, self_probe.math);
+        try std.testing.expectEqual(@as(usize, 0), self_probe.live);
+    }
+};
+
+test "GPT weight lookup aliases propagate real failure without alternate lookup or math" {
+    const a = std.testing.allocator;
+    const table = WeightLookupProbe.table();
+    const input: CT = @ptrFromInt(8);
+    const cfg = Config{ .family = .opt, .hidden_size = 4 };
+    for ([_]ops.BackendKind{ .native, .metal, .cuda }) |kind| for ([_]anyerror{ error.OutOfMemory, error.Cancelled, error.UnsupportedTensorType, error.InvalidTensorData, error.InputOutput, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable }) |err| {
+        var name: [256]u8 = undefined;
+        var probe = WeightLookupProbe{ .paths = &.{"lm_head.weight"}, .failures = &.{err}, .kind_value = kind };
+        const cb = ComputeBackend{ .ptr = &probe, .vtable = &table };
+        try std.testing.expectError(err, getLmHeadWeight(&cb, cfg));
+        try probe.check(1, 0);
+        probe = .{ .paths = &.{ "lm_head.weight", "model.embed_tokens.weight" }, .failures = &.{ error.MissingWeight, err }, .kind_value = kind };
+        try std.testing.expectError(err, getLmHeadWeight(&cb, cfg));
+        try probe.check(2, 0);
+        probe = .{ .paths = &.{"model.embed_tokens.weight"}, .failures = &.{err}, .kind_value = kind };
+        try std.testing.expectError(err, getEmbeddingWeight(&cb, cfg));
+        try probe.check(1, 0);
+        probe = .{ .paths = &.{ "model.embed_tokens.weight", "embed_tokens.weight" }, .failures = &.{ error.WeightNotFound, err }, .kind_value = kind };
+        try std.testing.expectError(err, getEmbeddingWeight(&cb, cfg));
+        try probe.check(2, 0);
+        probe = .{ .paths = &.{"language.norm.weight"}, .failures = &.{err}, .kind_value = kind };
+        var prefixed = cfg;
+        prefixed.weight_prefix = "language";
+        try std.testing.expectError(err, getModelWeight(&cb, prefixed, "model.norm.weight"));
+        try probe.check(1, 0);
+        probe = .{ .paths = &.{"lm_head.weight"}, .failures = &.{err}, .kind_value = kind };
+        try std.testing.expectError(err, getTracedWeight(a, &cb, &cfg, "lm_head.weight"));
+        try probe.check(1, 0);
+        probe = .{ .paths = &.{"model.norm.weight"}, .failures = &.{err}, .kind_value = kind };
+        try std.testing.expectError(err, applyFinalNorm(&cb, a, cfg, input));
+        try probe.check(1, 0);
+        probe = .{ .paths = &.{ "model.norm.weight", "norm.weight", "ln_f.weight", "ln_f.bias" }, .failures = &.{ error.MissingWeight, error.WeightNotFound, null, err }, .kind_value = kind };
+        try std.testing.expectError(err, applyFinalNorm(&cb, a, cfg, input));
+        try probe.check(4, 0);
+        probe = .{ .paths = &.{"h.0.attn.q_proj.weight"}, .failures = &.{err}, .kind_value = kind };
+        var gpt2 = cfg;
+        gpt2.family = .gpt2;
+        try std.testing.expectError(err, attnProject(&cb, a, gpt2, input, 1, 4, 4, 0, "q", &name));
+        try probe.check(1, 0);
+        probe = .{ .paths = &.{ "h.0.attn.attention.q_proj.weight", "h.0.attn.attention.q_proj.bias" }, .failures = &.{ null, err }, .kind_value = kind };
+        var neo = cfg;
+        neo.family = .gpt_neo;
+        try std.testing.expectError(err, attnProject(&cb, a, neo, input, 1, 4, 4, 0, "q", &name));
+        try probe.check(2, 0);
+        probe = .{ .paths = &.{ "h.0.attn.attention.out_proj.weight", "h.0.attn.attention.out_proj.bias" }, .failures = &.{ null, err }, .kind_value = kind };
+        try std.testing.expectError(err, attnOutputProject(&cb, a, neo, input, 1, 4, 4, 0, &name));
+        try probe.check(2, 0);
+        probe = .{ .paths = &.{"model.layers.0.block_sparse_moe.packed.w1.weight"}, .failures = &.{err}, .kind_value = kind };
+        try std.testing.expectError(err, optionalMoeExpertWeight(&cb, cfg, 0, 0, "w1", &name));
+        try probe.check(1, 0);
+        probe = .{ .paths = &.{"model.layers.0.block_sparse_moe.gate.input_scale"}, .failures = &.{err}, .kind_value = kind };
+        try std.testing.expectError(err, scaleMoeRouterInput(&cb, cfg, input, 4, 0, &name, true));
+        try probe.check(1, 0);
+    };
+}
+
+test "GPT weight lookup missing aliases tying and optional bias preserve exact lookup order and owners" {
+    const a = std.testing.allocator;
+    const table = WeightLookupProbe.table();
+    const input: CT = @ptrFromInt(8);
+    const cfg = Config{ .family = .opt, .hidden_size = 4 };
+    for ([_]anyerror{ error.MissingWeight, error.WeightNotFound }) |missing| {
+        var probe = WeightLookupProbe{ .paths = &.{ "lm_head.weight", "model.embed_tokens.weight", "embed_tokens.weight" }, .failures = &.{ missing, missing, null } };
+        const cb = ComputeBackend{ .ptr = &probe, .vtable = &table };
+        var llama = cfg;
+        llama.family = .llama;
+        cb.free(try getLmHeadWeight(&cb, llama));
+        try probe.check(3, 0);
+        probe = .{ .paths = &.{"model.embed_tokens.weight"}, .failures = &.{null} };
+        llama.weight_tying = true;
+        cb.free(try getLmHeadWeight(&cb, llama));
+        try probe.check(1, 0);
+        probe = .{ .paths = &.{ "model.embed_tokens.weight", "embed_tokens.weight", "wte.weight" }, .failures = &.{ missing, missing, null } };
+        cb.free(try getEmbeddingWeight(&cb, cfg));
+        try probe.check(3, 0);
+        probe = .{ .paths = &.{ "lm_head.weight", "model.embed_tokens.weight", "wte.weight" }, .failures = &.{ missing, missing, null } };
+        cb.free(try getTracedWeight(a, &cb, &cfg, "lm_head.weight"));
+        try probe.check(3, 0);
+        probe = .{ .paths = &.{ "model.norm.weight", "norm.weight", "ln_f.weight", "ln_f.bias" }, .failures = &.{ missing, missing, null, null } };
+        cb.free(try applyFinalNorm(&cb, a, cfg, input));
+        try probe.check(4, 1);
+        probe = .{ .paths = &.{ "model.norm.weight", "norm.weight", "ln_f.weight" }, .failures = &.{ missing, missing, missing } };
+        try std.testing.expectError(error.MissingFinalNormWeight, applyFinalNorm(&cb, a, cfg, input));
+        try probe.check(3, 0);
+        var name: [256]u8 = undefined;
+        probe = .{ .paths = &.{ "h.0.attn.attention.q_proj.weight", "h.0.attn.attention.q_proj.bias" }, .failures = &.{ null, missing } };
+        var neo = cfg;
+        neo.family = .gpt_neo;
+        cb.free(try attnProject(&cb, a, neo, input, 1, 4, 4, 0, "q", &name));
+        try probe.check(2, 1);
+        probe = .{ .paths = &.{ "h.0.attn.attention.out_proj.weight", "h.0.attn.attention.out_proj.bias" }, .failures = &.{ null, missing } };
+        cb.free(try attnOutputProject(&cb, a, neo, input, 1, 4, 4, 0, &name));
+        try probe.check(2, 1);
+        probe = .{ .paths = &.{ "model.layers.0.block_sparse_moe.packed.w1.weight", "layers.0.block_sparse_moe.packed.w1.weight", "model.layers.0.block_sparse_moe.experts.0.w1.weight" }, .failures = &.{ missing, missing, null } };
+        cb.free((try optionalMoeExpertWeight(&cb, cfg, 0, 0, "w1", &name)).?);
+        try probe.check(3, 0);
+        probe = .{ .paths = &.{ "language.norm.weight", "model.norm.weight", "norm.weight" }, .failures = &.{ missing, missing, null } };
+        var prefixed = cfg;
+        prefixed.weight_prefix = "language";
+        cb.free(try getModelWeight(&cb, prefixed, "model.norm.weight"));
+        try probe.check(3, 0);
+        probe = .{ .paths = &.{ "model.layers.0.block_sparse_moe.gate.input_scale", "layers.0.block_sparse_moe.gate.input_scale" }, .failures = &.{ missing, missing } };
+        try std.testing.expectEqual(input, try scaleMoeRouterInput(&cb, cfg, input, 4, 0, &name, true));
+        try probe.check(2, 0);
+    }
 }

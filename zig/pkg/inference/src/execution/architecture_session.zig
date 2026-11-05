@@ -5251,15 +5251,63 @@ pub fn replaceBlasResidentWeight(session: Session, name: []const u8, weight: Loa
     if (session.vtable != &arch_vtable) return error.NotArchSession;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     if (self.backend_type != .native) return error.NotNativeSession;
-
-    if (self.backend_data.native.resident_weights.getPtr(name)) |slot| {
-        var old = slot.*;
-        old.deinit();
-        slot.* = weight;
-        return;
+    const data = &self.backend_data.native;
+    const Map = @TypeOf(data.resident_weights);
+    var retired: ?LoadedWeight = null;
+    defer if (retired) |*old| old.deinit();
+    var old_map: Map = .empty;
+    defer old_map.deinit(self.allocator);
+    // Existing replacement is allocation-free. Detach under the same Native
+    // metadata window as trace query validation, retire only after unlock.
+    const replaced = existing: {
+        if (data.prefetch_initialized) data.prefetch.lock();
+        defer if (data.prefetch_initialized) data.prefetch.unlock();
+        if (data.resident_weights.getPtr(name)) |slot| {
+            retired = slot.*;
+            slot.* = weight;
+            break :existing true;
+        }
+        break :existing false;
+    };
+    if (replaced) return;
+    const owned_key = try self.allocator.dupe(u8, name);
+    var key_owned = true;
+    defer if (key_owned) self.allocator.free(owned_key);
+    var staged: Map = .empty;
+    defer staged.deinit(self.allocator);
+    for (0..8) |_| {
+        var needed: u32 = 0;
+        const committed = commit: {
+            if (data.prefetch_initialized) data.prefetch.lock();
+            defer if (data.prefetch_initialized) data.prefetch.unlock();
+            if (data.resident_weights.getPtr(name)) |slot| {
+                retired = slot.*;
+                slot.* = weight;
+                break :commit true;
+            }
+            if (data.resident_weights.available != 0) {
+                data.resident_weights.putAssumeCapacityNoClobber(owned_key, weight);
+                key_owned = false;
+                break :commit true;
+            }
+            needed = try std.math.add(u32, data.resident_weights.count(), 1);
+            if (staged.available < needed) break :commit false;
+            var entries = data.resident_weights.iterator();
+            while (entries.next()) |entry| staged.putAssumeCapacityNoClobber(entry.key_ptr.*, entry.value_ptr.*);
+            staged.putAssumeCapacityNoClobber(owned_key, weight);
+            key_owned = false;
+            old_map = data.resident_weights;
+            data.resident_weights = staged;
+            staged = .empty;
+            break :commit true;
+        };
+        if (committed) return;
+        // No allocation, payload destructor or allocator callback runs while
+        // Native metadata is locked. Caller still owns ordinary Model/math
+        // exclusion; this API does not make concurrent payload mutation safe.
+        try staged.ensureTotalCapacity(self.allocator, needed);
     }
-
-    try self.backend_data.native.resident_weights.put(self.allocator, try self.allocator.dupe(u8, name), weight);
+    return error.ResourceTemporarilyUnavailable;
 }
 
 test "managed direct compute guards construction and cleanup" {
@@ -15296,6 +15344,42 @@ fn nativeAuthoredSourceCase(cfg: gpt_arch.Config) !void {
     try std.testing.expect(!stale.ran);
     try std.testing.expectEqual(@as(u64, 2), program.calls);
     stale.close(.{ .boundary = foreign.epoch() });
+    // The admitted Source path advances its own authoritative four-token
+    // pages with a fresh Source/B for each token; this is not repeated token-1
+    // comparison on an unchanged table.
+    if (cfg.family == .llama) for (2..7) |count| {
+        _ = try logical.appendGeneratedToken();
+        _ = try reference_logical.appendGeneratedToken();
+        decode = logical.makeDecodeContext(count, 1);
+        const ref_decode = reference_logical.makeDecodeContext(count, 1);
+        const token: i64 = @intCast(count + 1);
+        const ref_values = try gpt_arch.forward(cb, a, cfg, &.{token}, 1, count, &ref_decode);
+        defer a.free(ref_values);
+        var next_input = try Tensor.initInt64(a, "input_ids", &.{ 1, 1 }, &.{token});
+        defer next_input.deinit();
+        var step_source: @import("../backends/session.zig").PreparedSource = .{};
+        defer step_source.deinit();
+        var step_call = try program.beginCall(&.{token}, &decode, .{ .controller = &domain.controller, .backend_class = .cpu });
+        defer step_call.close(.{ .outside_execution = true });
+        try step_call.prepareSourceInto(&step_source, session, &.{next_input}, a, .{ .native_call_policy = .in_process });
+        try step_source.enter();
+        // An error must still close actual SDK/Frame state before unlocking B.
+        var step_entered = true;
+        defer if (step_entered) {
+            step_call.close(.{ .boundary = step_source.epoch() });
+            step_source.finishInputLifetime();
+            step_source.leaveExecution();
+        };
+        try step_call.runWithSource(&step_source, cb, &decode, .{ .boundary = step_source.epoch() });
+        const step_values = try step_call.takeOutput();
+        step_call.close(.{ .boundary = step_source.epoch() });
+        step_source.finishInputLifetime();
+        step_source.leaveExecution();
+        step_entered = false;
+        defer a.free(step_values);
+        try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ref_values), std.mem.sliceAsBytes(step_values));
+    };
+    const completed_source_calls = program.calls;
     // Exercise the real createRuntime -> forwardLastLogits installed caller.
     // This API retains its existing explicit raw allocator contract; it is not
     // evidence of a registered Native compiled serving provider.
@@ -15312,19 +15396,44 @@ fn nativeAuthoredSourceCase(cfg: gpt_arch.Config) !void {
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(try first.hostLogits(a)));
     var next = try decoder.decode(a, .{ .token_id = 3, .position = 1 });
     defer next.deinit(a);
+    // The public Runtime owns sixteen-token pages. Cross that independent
+    // physical boundary too, using a new original-GPT reference sequence.
+    if (cfg.family == .llama) {
+        var runtime_reference = @import("../graph/decode_state_runtime.zig").NativeDecodeState.initPaged(a, &manager, pool, null);
+        defer runtime_reference.deinit();
+        var runtime_logical = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&runtime_reference);
+        try runtime_logical.appendPrefillChunk(1);
+        var ref_decode = runtime_logical.makeDecodeContext(1, 1);
+        const seed = try gpt_arch.forward(cb, a, cfg, &.{2}, 1, 1, &ref_decode);
+        a.free(seed);
+        for (1..18) |position| {
+            _ = try runtime_logical.appendGeneratedToken();
+            ref_decode = runtime_logical.makeDecodeContext(position + 1, 1);
+            const token: i64 = @intCast(position + 2);
+            const ref_values = try gpt_arch.forward(cb, a, cfg, &.{token}, 1, position + 1, &ref_decode);
+            defer a.free(ref_values);
+            if (position == 1) {
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ref_values), std.mem.sliceAsBytes(try next.hostLogits(a)));
+            } else {
+                var step_result = try decoder.decode(a, .{ .token_id = @intCast(token), .position = position });
+                defer step_result.deinit(a);
+                try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(ref_values), std.mem.sliceAsBytes(try step_result.hostLogits(a)));
+            }
+        }
+    }
     const before_reset = live.authoredProgramStatistics(decoder).?;
-    try std.testing.expectEqual(@as(u64, 2), before_reset.calls);
+    try std.testing.expectEqual(@as(u64, if (cfg.family == .llama) 18 else 2), before_reset.calls);
     try std.testing.expect(before_reset.assigned_operations > 0 and before_reset.physical_frames == 1);
     try decoder.reset();
     var reset = try decoder.prefill(a, .{ .input_ids = &.{2}, .seq_len = 1, .query_seq_len = 1, .attention_mode = .paged_prefill });
     defer reset.deinit(a);
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(try reset.hostLogits(a)));
-    try std.testing.expectEqual(@as(u64, 3), live.authoredProgramStatistics(decoder).?.calls);
+    try std.testing.expectEqual(before_reset.calls + 1, live.authoredProgramStatistics(decoder).?.calls);
     try decoder.reset();
     var fallback = try decoder.prefill(a, .{ .input_ids = &.{ 2, 3 }, .seq_len = 2, .query_seq_len = 2, .attention_mode = .paged_prefill });
     defer fallback.deinit(a);
     try std.testing.expectEqual(@as(usize, cfg.vocab_size), (try fallback.hostLogits(a)).len);
-    try std.testing.expectEqual(@as(u64, 3), live.authoredProgramStatistics(decoder).?.calls);
+    try std.testing.expectEqual(before_reset.calls + 1, live.authoredProgramStatistics(decoder).?.calls);
     // Native host BF16 is not implemented by the original KvPool. The public
     // Runtime must retain that original refusal, without installing143.
     if (cfg.hidden_size == 8) {
@@ -15351,7 +15460,7 @@ fn nativeAuthoredSourceCase(cfg: gpt_arch.Config) !void {
     try source.enter();
     try std.testing.expectError(error.AuthoredResidentWeightChanged, changed.runWithSource(&source, cb, &decode, .{ .boundary = source.epoch() }));
     try std.testing.expect(!changed.ran);
-    try std.testing.expectEqual(@as(u64, 2), program.calls);
+    try std.testing.expectEqual(completed_source_calls, program.calls);
     changed.close(.{ .boundary = source.epoch() });
     source.finishInputLifetime();
     source.leaveExecution();
@@ -16648,4 +16757,167 @@ fn expectResidentHeadParity118(comptime use_metal: bool, expected: []const f32, 
 
 test "canonical Native dense Source refuses peer-cleared grouped selection before math then explicit recovery" {
     try nativeDenseEncoderCheckpointCase(false, 32 * 1024 * 1024, false, false, true);
+}
+
+test "native authored parsed Llama actual Source and public Runtime exact cap current B and original parity" {
+    for ([_]u32{ 128, 256 }) |hidden| {
+        const cfg = try @import("native_decoder_program.zig").Testing.parsedLlamaConfig(std.testing.allocator, hidden, if (hidden == 128) 2 else 4, hidden == 256);
+        try nativeAuthoredSourceCase(cfg);
+    }
+}
+
+test "native authored trace missing q k norm queries refuse maintained insertion before Source KV or output mutation" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const authored = @import("native_decoder_program.zig");
+    const a = std.testing.allocator;
+    const cfg = authored.Testing.config();
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    defer std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot()) catch @panic("query witness quota leak");
+    var weights = try authored.Testing.initWithoutQkNorms(a);
+    var weights_owned = true;
+    defer if (weights_owned) weights.data.deinitOwned();
+    const owner = try a.create(ArchSession);
+    owner.* = .{ .allocator = a, .arch_config = .{ .gpt = cfg }, .backend_type = .native, .backend_data = .{ .native = weights.data } };
+    owner.model_lifetime.prepareFinalResources() catch |err| {
+        a.destroy(owner);
+        return err;
+    };
+    weights_owned = false;
+    var session = archSessionHandle(owner);
+    defer session.close();
+    session.model_lifetime.?.admission_domain = domain.pin();
+    try session.installOwnedExecutionGate(a);
+    var scheduler = @import("../runtime/embedding_scheduler.zig").Scheduler{};
+    session.cohort_scheduler = &scheduler;
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 64 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    var receiving = try getComputeBackendWithControl(session, a, .{ .native_call_policy = .in_process });
+    defer receiving.deinit();
+    const cb = &receiving.backend;
+    const context = @import("../graph/execution.zig").Context{ .allocator = a, .cb = cb, .gpt_config = &cfg, .session = session };
+    const program = (try authored.Program.tryCreate(a, &context)) orelse return error.MissingAuthoredNativeProgram;
+    defer program.destroyWithCleanup(.{ .outside_execution = true });
+    var absent: usize = 0;
+    for (program.source_queries) |query| if (query.fact.shape == null) {
+        absent += 1;
+    };
+    try std.testing.expect(absent >= 2);
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool_id = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 4 });
+    var state = @import("../graph/decode_state_runtime.zig").NativeDecodeState.initPaged(a, &manager, pool_id, null);
+    defer state.deinit();
+    var logical = @import("../graph/decode_state_runtime.zig").BorrowedDecodeStateRuntime.init(&state);
+    try logical.appendPrefillChunk(1);
+    const decode = logical.makeDecodeContext(1, 1);
+    const before = try manager.gatherLayerKv(a, decode.kv_cache.?.sequence_id, 0, 1);
+    defer a.free(before.k);
+    defer a.free(before.v);
+    var input = try Tensor.initInt64(a, "input_ids", &.{ 1, 1 }, &.{2});
+    defer input.deinit();
+    var source: @import("../backends/session.zig").PreparedSource = .{};
+    defer source.deinit();
+    var call = try program.beginCall(&.{2}, &decode, .{ .controller = &domain.controller, .backend_class = .cpu });
+    defer call.close(.{ .outside_execution = true });
+    try call.prepareSourceInto(&source, session, &.{input}, a, .{ .native_call_policy = .in_process });
+    @memset(call.output.?, @as(f32, 123.5));
+    // Actual maintained named-weight insertion, while no Model is entered.
+    // Only optional names change; all prior positive source planes still match.
+    for ([_][]const u8{ "model.layers.0.self_attn.q_norm.weight", "model.layers.0.self_attn.k_norm.weight" }) |name| {
+        var tensor = try Tensor.initFloat32(a, name, &.{4}, &.{ 1.2, 0.8, 1.1, 0.9 });
+        replaceBlasResidentWeight(session, name, .{ .tensor = tensor }) catch |err| {
+            tensor.deinit();
+            return err;
+        };
+    }
+    for (program.source_queries) |query| if (query.witness) |value| {
+        _ = try native_mod.NativeCompute.authoredResidentF32Plane(cb, query.fact.name, value);
+    };
+    try source.enter();
+    var entered = true;
+    defer if (entered) {
+        call.close(.{ .boundary = source.epoch() });
+        source.finishInputLifetime();
+        source.leaveExecution();
+    };
+    try std.testing.expectError(error.AuthoredResidentTopologyChanged, call.runWithSource(&source, cb, &decode, .{ .boundary = source.epoch() }));
+    try std.testing.expect(!call.ran and !call.completed);
+    try std.testing.expectEqual(@as(u64, 0), program.calls);
+    try std.testing.expectEqual(@as(u64, 0), program.assigned_operations);
+    for (call.output.?) |value| try std.testing.expectEqual(@as(f32, 123.5), value);
+    const table = manager.blockTable(decode.kv_cache.?.sequence_id).?;
+    const row = try manager.getPoolMut(pool_id).?.readToken(table.blocks.items[0], 0, 0);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(before.k), std.mem.sliceAsBytes(row.k));
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(before.v), std.mem.sliceAsBytes(row.v));
+    call.close(.{ .boundary = source.epoch() });
+    source.finishInputLifetime();
+    source.leaveExecution();
+    entered = false;
+    source.deinit();
+    // Explicit fresh preparation sees the new topology; no private retry of
+    // the failed call. Actual Source and original GPT remain fully bitwise.
+    const fresh = (try authored.Program.tryCreate(a, &context)) orelse return error.MissingAuthoredNativeProgram;
+    defer fresh.destroyWithCleanup(.{ .outside_execution = true });
+    const reference_sequence = try manager.attachSequence(pool_id);
+    try manager.appendTokens(reference_sequence, 1);
+    var reference = decode;
+    reference.kv_cache.?.sequence_id = reference_sequence;
+    const rt = manager.blockTable(reference_sequence).?;
+    reference.kv_cache.?.logical_blocks = rt.blocks.items;
+    reference.kv_cache.?.logical_block_count = rt.len();
+    reference.kv_cache.?.tail_tokens = rt.tail_tokens;
+    const expected = try gpt_arch.forward(cb, a, cfg, &.{2}, 1, 1, &reference);
+    defer a.free(expected);
+    source = .{};
+    var fresh_call = try fresh.beginCall(&.{2}, &decode, .{ .controller = &domain.controller, .backend_class = .cpu });
+    defer fresh_call.close(.{ .outside_execution = true });
+    try fresh_call.prepareSourceInto(&source, session, &.{input}, a, .{ .native_call_policy = .in_process });
+    try source.enter();
+    var fresh_entered = true;
+    defer if (fresh_entered) {
+        fresh_call.close(.{ .boundary = source.epoch() });
+        source.finishInputLifetime();
+        source.leaveExecution();
+    };
+    try fresh_call.runWithSource(&source, cb, &decode, .{ .boundary = source.epoch() });
+    const actual = try fresh_call.takeOutput();
+    fresh_call.close(.{ .boundary = source.epoch() });
+    source.finishInputLifetime();
+    source.leaveExecution();
+    fresh_entered = false;
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(expected), std.mem.sliceAsBytes(actual));
+    source.deinit();
+}
+
+test "native authored maintained replacement staging metadata and payload unwind all OOM" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const Case = struct {
+        fn run(a: std.mem.Allocator) !void {
+            const authored = @import("native_decoder_program.zig");
+            const weights = try authored.Testing.initWithoutQkNorms(a);
+            var owner = ArchSession{ .allocator = a, .arch_config = .{ .gpt = authored.Testing.config() }, .backend_type = .native, .backend_data = .{ .native = weights.data } };
+            defer owner.backend_data.native.deinitOwned();
+            var compute = native_mod.NativeCompute.init(a, &owner.backend_data.native, null);
+            defer compute.deinit();
+            const session = Session{ .ptr = &owner, .vtable = &arch_vtable };
+            for (0..24) |index| {
+                var name_buffer: [64]u8 = undefined;
+                const name = try std.fmt.bufPrint(&name_buffer, "model.extra.{d}.weight", .{index});
+                var tensor = try Tensor.initFloat32(a, "extra.weight", &.{4}, &.{ 1, 2, 3, 4 });
+                replaceBlasResidentWeight(session, name, .{ .tensor = tensor }) catch |err| {
+                    tensor.deinit();
+                    return err;
+                };
+                try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, owner.backend_data.native.resident_weights.getPtr(name).?.tensor.asFloat32());
+            }
+            var replacement = try Tensor.initFloat32(a, "extra.weight", &.{4}, &.{ 5, 6, 7, 8 });
+            replaceBlasResidentWeight(session, "model.extra.0.weight", .{ .tensor = replacement }) catch |err| {
+                replacement.deinit();
+                return err;
+            };
+            try std.testing.expectEqualSlices(f32, &.{ 5, 6, 7, 8 }, owner.backend_data.native.resident_weights.getPtr("model.extra.0.weight").?.tensor.asFloat32());
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Case.run, .{});
 }
