@@ -369,9 +369,9 @@ pub fn readSupportMetadata(bytes: []const u8) !SupportMetadata {
     return result;
 }
 
-/// Reads `general.architecture` from a prefix of a GGUF file. Writers place it first,
-/// so listing does not need the tokenizer tables that follow. Returns null when the
-/// prefix ends first, which callers treat as an unknown architecture.
+/// Reads `general.architecture` without materializing unrelated metadata. Accepts
+/// either a prefix or a mapped file; returns null when the supplied bytes end first.
+/// GGUF metadata order is arbitrary, so a prefix cannot prove architecture absent.
 pub fn readArchitectureFromPrefix(prefix: []const u8) ?[]const u8 {
     var cursor = Cursor{ .bytes = prefix };
     const header = parseHeader(&cursor) catch return null;

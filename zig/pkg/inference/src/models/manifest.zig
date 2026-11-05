@@ -1738,7 +1738,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     if (manifest.processor_config_path == null) manifest.processor_config_path = try findFileInSubdirs(allocator, &catalog, &.{"processor_config.json"}, &.{""});
     try fillAutoDetectedGgufPaths(&manifest, allocator, &catalog);
     if (manifest.gguf_path != null and manifest.gguf_projector_path != null and manifest.config_model_arch.len == 0) {
-        manifest.gguf_generator_gemma4 = ggufPrefixIsGemma4(manifest.gguf_path.?);
+        manifest.gguf_generator_gemma4 = ggufMetadataIsGemma4(manifest.gguf_path.?);
     }
 
     try applyImplicitSparseOutputLayout(&manifest, &catalog);
@@ -2392,14 +2392,14 @@ fn artifactExists(
     return c_file.fileExistsInDirChecked(allocator, model_dir_path, relative_path);
 }
 
-fn ggufPrefixIsGemma4(path: []const u8) bool {
-    // Mapping touches only the pages parsed below, not the weights or tokenizer.
+fn ggufMetadataIsGemma4(path: []const u8) bool {
+    // Architecture metadata has no prescribed position. Skip unrelated values
+    // without materializing them; stop before tensor data, even for large files.
     var region = c_file.MmapRegion.init(std.heap.smp_allocator, path) catch return false;
     // Listing runs beside loaded models, whose pages must stay cached.
     region.preserveFileCacheOnDeinit();
     defer region.deinit();
-    const prefix = region.data[0..@min(region.data.len, 64 * 1024)];
-    const architecture = gguf_format.readArchitectureFromPrefix(prefix) orelse return false;
+    const architecture = gguf_format.readArchitectureFromPrefix(region.data) orelse return false;
     return std.mem.eql(u8, architecture, "gemma4");
 }
 
@@ -8063,6 +8063,31 @@ test "listing recognizes Gemma 4 GGUF generators from a header prefix" {
     var manifest = try loadListingFromDir(allocator, dir);
     defer manifest.deinit();
     try std.testing.expect(manifest.gguf_projector_path != null);
+    try std.testing.expect(manifest.gguf_generator_gemma4);
+}
+
+test "listing recognizes Gemma 4 architecture after large unrelated GGUF metadata" {
+    const a = std.testing.allocator;
+    var data: std.ArrayListUnmanaged(u8) = .empty;
+    defer data.deinit(a);
+    try data.appendSlice(a, gguf_format.magic);
+    try appendTestLe(u32, a, &data, 3);
+    try appendTestLe(u64, a, &data, 0);
+    try appendTestLe(u64, a, &data, 2);
+    const description = try a.alloc(u8, 70 * 1024);
+    defer a.free(description);
+    @memset(description, 'x');
+    try appendTestMetadataString(a, &data, "general.description", description);
+    try appendTestMetadataString(a, &data, "general.architecture", "gemma4");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model.gguf", .data = data.items });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "mmproj-model.gguf", .data = data.items });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "model_manifest.json", .data = "{\"type\":\"generator\",\"inputs\":[\"text\",\"image\"]}" });
+    const dir = try tmp.dir.realPathFileAlloc(std.testing.io, ".", a);
+    defer a.free(dir);
+    var manifest = try loadListingFromDir(a, dir);
+    defer manifest.deinit();
     try std.testing.expect(manifest.gguf_generator_gemma4);
 }
 
