@@ -32852,10 +32852,16 @@ pub const IndexManager = struct {
             .embedding_name = embedding_name,
             .embedding_input = chunk_cfg.embedding_input,
             .input_kind = embeddingInputKind(self, generator),
+            // For chunked indexes this is a chunk key; the runtime re-chunks
+            // its parent document with the settings below.
             .doc_key = doc_key,
             .source_field = chunk_cfg.source_field,
             .source_template = chunk_cfg.source_template,
             .expected_dims = entry.dims,
+            .chunk_size = chunk_cfg.chunk_size,
+            .chunk_overlap = chunk_cfg.chunk_overlap,
+            .chunker_json = chunk_cfg.chunker_json,
+            .full_text_index = chunk_cfg.full_text_index,
             .producer_json = embedding_cfg.producer_json,
             .execution_json = chunk_cfg.embedding_execution_json,
         };

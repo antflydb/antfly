@@ -475,11 +475,13 @@ document, which is most of the remaining bytes: at 768 dimensions a stored
 embedding takes 3,100 bytes and its stub 36.
 
 `transient` is the default wherever re-embedding can reproduce the vector:
-the index has its own embedder, one unchunked vector per document (a field
-or template), and the RaBitQ quantizer (rebuilds use the codes). External
-vectors, chunked indexes, indexes fed by other enrichments and PQ resolve to
-`persistent`; asking for `transient` there is rejected. Configs written
-before the option are `persistent`.
+the index has its own embedder, its input is a field or template (whole, or
+split by a fixed text chunker), and the quantizer is RaBitQ (rebuilds use
+the codes). External vectors, indexes fed by other enrichments, chunkers
+that embed audio windows or model outputs (`audio`, `policy`, `outputs`,
+`embedding`, or a non-`fixed` model), and PQ resolve to `persistent`;
+asking for `transient` there is rejected. Configs written before the option
+are `persistent`.
 
 - **Lifecycle.** Writes are unchanged: the enricher stores the full
   embedding, derived replay and the leader planner read it, and the graph
@@ -499,7 +501,10 @@ before the option are `persistent`.
 - **Re-embedding.** The index manager's `DenseReembedder` (installed by the
   DB; it calls `enrichment_runtime.reembedDenseDocuments`) renders each
   document's field or template exactly as the dense producer does and
-  embeds the batch in one request-path call. Search recomputes go through a
+  embeds the batch in one request-path call. A chunk vector's key names its
+  chunk: the runtime re-chunks the parent document with the index's chunker
+  (`chunkEmbeddingSourceSetForRequest`, the producer's own path) and embeds
+  that chunk's text, which is all `store_chunks: false` needs. Search recomputes go through a
   batch loader, so one query makes one embedder call per recompute batch;
   candidates whose embedding is still stored are read instead. Without an
   enrichment runtime, reads of stubs fail with `error.ReembedUnavailable`.
@@ -519,7 +524,9 @@ before the option are `persistent`.
   document, since the graph file is not part of backups yet.
 - **Tests.** `index_manager.zig`: "transient leann vectors become stubs and
   are re-embedded on demand" (local) and "replicated transient leann
-  replicas stub vectors in log order and rebuild from codes".
+  replicas stub vectors in log order and rebuild from codes";
+  `enrichment_runtime.zig`: "transient leann re-embeds one chunk from its
+  re-chunked parent like the producer".
 
 ## Remaining work
 

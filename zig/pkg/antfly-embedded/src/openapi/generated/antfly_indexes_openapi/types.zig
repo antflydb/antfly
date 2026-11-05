@@ -10854,7 +10854,7 @@ pub const LeannIndexConfig = struct {
     max_degree: ?i64 = null,
     /// Compact code used to steer the graph walk. "rabitq" (default) carries error bounds, so only candidates that can still reach the top k are recomputed. "pq" follows the LEANN paper's fixed rerank ratio; prefer it only for very low dimensions (below about 64).
     quantizer: ?[]const u8 = null,
-    /// Whether document embeddings stay stored after the graph covers them. "transient" (the default when possible) keeps only a small stub per document and re-embeds a few candidates per query from the document's field or template through the index's embedder, so the index stores about 15% of the raw vectors' bytes. "persistent" keeps every embedding, and is the only choice for external vectors, chunked indexes, indexes fed by other enrichments, and the pq quantizer.
+    /// Whether document embeddings stay stored after the graph covers them. "transient" (the default when possible) keeps only a small stub per document and re-embeds a few candidates per query from the document's field or template (re-chunked first for chunked indexes) through the index's embedder, so the index stores about 15% of the raw vectors' bytes. "persistent" keeps every embedding, and is the only choice for external vectors, indexes fed by other enrichments, chunkers that embed audio windows or model outputs, and the pq quantizer.
     vector_storage: ?[]const u8 = null,
     /// Beam width for searches. 0 picks the default for the quantizer (512 for rabitq, 64 for pq).
     search_ef: ?i64 = null,

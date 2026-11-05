@@ -602,12 +602,19 @@ pub const LeannStore = struct {
     // ---------------------------------------------------------------------
 
     /// Answers an HBC search request with HBC's result type, so callers map
-    /// vector ids and metadata exactly as they do for HBC.
+    /// vector ids and metadata exactly as they do for HBC. Results are sorted
+    /// nearest first, as HBC returns them: `SearchResults` is a heap that
+    /// keeps the worst result first until sorted.
     pub fn search(self: *LeannStore, alloc: Allocator, req: search_types.SearchRequest) !search_results.SearchResults {
         if (req.query.len != self.opts.dims) return error.DimensionMismatch;
         self.lock.lockSharedUncancelable(self.io);
         defer self.lock.unlockShared(self.io);
-        if (self.replicated) |state| return try state.search(alloc, req);
+        var out = if (self.replicated) |state| try state.search(alloc, req) else try self.searchLocalLocked(alloc, req);
+        out.sort();
+        return out;
+    }
+
+    fn searchLocalLocked(self: *LeannStore, alloc: Allocator, req: search_types.SearchRequest) !search_results.SearchResults {
 
         var out = search_results.SearchResults.init(alloc, req.k);
         errdefer out.deinit();
@@ -997,6 +1004,10 @@ fn addAll(alloc: Allocator, store: *LeannStore, data: []const f32, dims: usize, 
     try store.apply(items.items, &.{});
 }
 
+fn expectAscending(items: []const search_results.SearchResult) !void {
+    for (items[1..], items[0 .. items.len - 1]) |item, prev| try testing.expect(prev.distance <= item.distance);
+}
+
 test "leann store: buffer, build, search, filters, delete, persist" {
     const alloc = testing.allocator;
     const io = testing.io;
@@ -1031,11 +1042,20 @@ test "leann store: buffer, build, search, filters, delete, persist" {
     for ([_]u64{ 5, 250, 599 }) |id| {
         var res = try store.search(alloc, .{ .query = data[id * dims ..][0..dims], .k = 5 });
         defer res.deinit();
-        var best = res.items.items[0];
-        for (res.items.items) |item| if (item.distance < best.distance) {
-            best = item;
-        };
-        try testing.expectEqual(id, best.vector_id);
+        try testing.expectEqual(id, res.items.items[0].vector_id);
+        try expectAscending(res.items.items);
+    }
+
+    // Ranked like HBC: nearest first across the whole result list. The
+    // underlying heap keeps the worst result first, so an unsorted k=10
+    // answer put the nearest at rank 8.
+    {
+        const q = data[123 * dims ..][0..dims];
+        var res = try store.search(alloc, .{ .query = q, .k = 10 });
+        defer res.deinit();
+        try testing.expectEqual(@as(usize, 10), res.items.items.len);
+        try testing.expectEqual(@as(u64, 123), res.items.items[0].vector_id);
+        try expectAscending(res.items.items);
     }
 
     // Filters: exclude the exact match, then allow only a small set.
