@@ -170,8 +170,18 @@ It accepts PNG, JPEG, WebP and GIF images, and `audio/*` and `video/*` types. On
   `false`, because host-level policy would also expose that host's other ports.
 - A source whose current version differs fails with 409 rather than serving other
   bytes.
-- The expanded request is limited to 16 MiB, including base64 expansion, so media
-  is limited to about 12 MiB (413).
+- Images are inlined, so an expanded request is limited to 16 MiB, or about 12 MiB of
+  images (413). Audio and video travel to local and Antfly models as binary attachments,
+  up to 256 MiB per request and `max_download_size_bytes`, which defaults to 100 MiB.
+  Hosted providers receive them inline and may impose smaller request limits.
+- Fetched media, native framing, and hosted base64/JSON copies share a 2 GiB
+  allocation budget across the server. Metadata parsing retains its separate
+  64 MiB budget. Each batch item releases its media before the next item runs.
+  A server at the shared media limit
+  returns 429 and the request can be retried.
+  Malformed image headers in pinned resources or table source references return
+  400 `InvalidInferenceMedia` before provider dispatch. Generation batches report
+  the failure on the affected item.
 
 Declare `video: supported` under `inference_capabilities` for a named target that
 accepts video. Without a declaration, video requests to that target are rejected.
@@ -180,8 +190,13 @@ Local Gemma 4 generators with a projector accept one video per request, alongsid
 text but not image or audio parts anywhere in that request. Earlier turns can contain
 text. `context_management` rejects video, because it only plans text. Generators
 sample one frame per second: CUDA takes
-H.264 MP4 up to 60 seconds, and CPU and Metal take the
+H.264, HEVC, and AV1 MP4 up to 60 seconds, and CPU and Metal take the
 [portable codecs](../../zig/lib/video/VIDEO.md) up to 32 uniformly spaced frames.
+When CUDA rejects a clip, portable decoding reserves host scratch only for the
+fallback. Portable decoding charges the invocation's host, combined, and scratch
+budgets in both serving and the native CLI, and serving also holds shared session
+admission. Explicit memory caps remain authoritative; decoder failures release
+the reservations before returning.
 
 ## Direct Anthropic generation
 
@@ -253,6 +268,9 @@ binary payloads while the gateway resolves and adapts metadata. Generation batch
 validate attachment ownership before dispatch and give each item its own rebased
 envelope. Typed hosted media adapters resolve attachment references into their
 existing inline media formats within the request memory budget.
+Each chain attempt releases its adaptation and upstream response buffers before
+retrying or falling back. Pinned source bytes remain available for reuse across
+attempts, so retries do not download the source again or accumulate encoded copies.
 
 Generated decision and extraction requests select their generator through
 `generator.model`, with no top-level `model`. Native generator IDs and configured

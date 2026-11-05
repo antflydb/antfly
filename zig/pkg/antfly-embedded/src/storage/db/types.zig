@@ -2002,6 +2002,8 @@ pub const SearchRequest = struct {
     document_lookup_groups: []const u64 = &.{},
     /// Borrowed coordinator label; routing and storage continue using immutable identities.
     response_table_name: ?[]const u8 = null,
+    /// Trusted coordinator response annotation. Never accepted from public JSON.
+    response_live_read: bool = false,
     /// Borrowed physical name of the queried table, set by the API read
     /// source together with `graph_index_complete_snapshot`. Graph executors
     /// canonicalize a `target_table` tag naming this table to the local
@@ -2192,6 +2194,7 @@ const hierarchy_children_supported_internal_fields = [_][]const u8{
     "document_output_exact",
     "document_projection_plan",
     "response_table_name",
+    "response_live_read",
     "prepared_read_table_id",
     "native_query_cut",
     // The public retained capability accompanies the authenticated physical cut.

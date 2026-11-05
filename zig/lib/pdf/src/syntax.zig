@@ -203,6 +203,8 @@ pub const Scanner = struct {
     base_offset: usize = 0,
     pos: usize = 0,
     unread: std.ArrayList(Token) = .empty,
+    max_object_depth: usize = std.math.maxInt(usize),
+    object_depth: usize = 0,
 
     pub fn init(alloc: Allocator, bytes: []const u8) Scanner {
         return initWithOffset(alloc, bytes, 0);
@@ -223,6 +225,9 @@ pub const Scanner = struct {
     }
 
     pub fn readObject(self: *Scanner) anyerror!Object {
+        if (self.object_depth >= self.max_object_depth) return error.PdfObjectNestingTooDeep;
+        self.object_depth += 1;
+        defer self.object_depth -= 1;
         var tok = try self.readToken();
         defer tok.deinit(self.alloc);
 
@@ -966,6 +971,14 @@ test "scanner parses dict array object ref and objdef" {
     try std.testing.expectEqual(@as(u32, 5), def.obj_def.ptr.id);
     try std.testing.expect(def.obj_def.value.* == .string);
     try std.testing.expectEqualStrings("hi", def.obj_def.value.string);
+}
+
+test "bounded object scanner rejects nested arrays before recursive expansion" {
+    var scanner = Scanner.init(std.testing.allocator, "[[[[[[[[[[[[[[[[[[[[0]]]]]]]]]]]]]]]]]]]]");
+    defer scanner.deinit();
+    scanner.max_object_depth = 16;
+    try std.testing.expectError(error.PdfObjectNestingTooDeep, scanner.readObject());
+    try std.testing.expectEqual(@as(usize, 0), scanner.object_depth);
 }
 
 test "object clone duplicates nested data" {

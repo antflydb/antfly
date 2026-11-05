@@ -155,5 +155,6 @@ test {
 
 test {
     _ = @import("gemma4_image_broker.zig");
+    _ = @import("gemma4_video.zig");
     _ = @import("audio_preparation.zig");
 }
