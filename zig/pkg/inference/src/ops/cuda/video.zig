@@ -351,7 +351,7 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     ctx.video_cache_budget.failure = null;
     var state = DecodeState{ .ctx = ctx, .consumer = consumer };
     var source = media.source.Source{ .allocator = allocator, .storage = .{ .borrowed = bytes }, .identity = "request-video", .limits = .{ .max_total_bytes = 512 * 1024 * 1024 }, .control = .{ .context = &state, .check_fn = sourceCheck } };
-    var reader = try media.mp4.Reader.init(allocator, &source, mp4Limits(sampling == .embedding_gemma2));
+    var reader = try media.mp4.Reader.init(allocator, &source, mp4Limits(true));
     defer reader.deinit();
     const track = reader.track;
     try validateTrack(track);

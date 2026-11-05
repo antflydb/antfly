@@ -14332,6 +14332,8 @@ export interface components {
             next_source_cursor?: string;
             /** @description Opaque snapshot to echo with ordered pagination. Native tokens retain the complete physical generation; lake tokens retain the archive publication, metadata and accepted WAL cut, for the configured retention period (default five minutes; maximum one hour). Every use rechecks access, incarnation and recipe. Unavailable retained generations return 409. */
             remote_snapshot?: string;
+            /** @description True when an ordered query read live state because this deployment's storage (Lite) cannot retain a snapshot. No remote_snapshot is returned, so the page cannot be continued with search_after or search_before. */
+            live_read?: boolean;
             /** @description Function evaluation scope, population, usage, and scoped aggregations. */
             evaluation?: {
                 [key: string]: unknown;
@@ -21152,7 +21154,7 @@ export interface components {
             mime_type: string;
             sampling?: components["schemas"]["VideoSamplingPolicy"];
         };
-        /** @description Image, audio, or video named by a source record's `content.resource`. Accepted only on the Antfly gateway's generate and chat routes, which fetch the pinned version under `remote_content.security` and replace this part with inline media, so the source URL never reaches a model vendor. Fetching requires a nonempty `allowed_hosts`. The expanded request is limited to 16 MiB. Models that do not support the media type reject the request. */
+        /** @description Image, audio, or video named by a source record's `content.resource`. Accepted only on the Antfly gateway's generate and chat routes, which fetch the pinned version under `remote_content.security` and replace this part with inline media, so the source URL never reaches a model vendor. Fetching requires a nonempty `allowed_hosts`. Images are inlined within a 16 MiB expanded request. Audio and video travel as binary attachments, up to 256 MiB per request and `max_download_size_bytes`. Hosted providers receive them inline and may reject large requests. Models that do not support the media type reject the request. */
         SourceContentPart: {
             /** @enum {string} */
             type: "source";
@@ -21172,7 +21174,7 @@ export interface components {
                 version_kind?: "strong_etag";
                 /**
                  * Format: int64
-                 * @description Exact object length.
+                 * @description Exact object length. Images are limited by the 16 MiB request size.
                  */
                 length: number;
             };
