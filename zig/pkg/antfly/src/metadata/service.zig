@@ -6590,6 +6590,7 @@ fn reconcileLeaseCacheNextRefreshAtMs(
 }
 
 pub const MetadataService = struct {
+    query_population_jobs: ?@import("query_population_job.zig").Port = null,
     online_merge_runtime: ?@import("online_merge_driver.zig").Runtime = null,
     alloc: std.mem.Allocator,
     metadata_group_id: u64,
@@ -9326,6 +9327,7 @@ pub const MetadataService = struct {
 };
 
 pub const MetadataHttpService = struct {
+    query_population_jobs: ?@import("query_population_job.zig").Port = null,
     online_merge_runtime: ?@import("online_merge_driver.zig").Runtime = null,
     alloc: std.mem.Allocator,
     metadata_group_id: u64,

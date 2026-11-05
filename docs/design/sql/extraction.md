@@ -102,6 +102,30 @@ python3 scripts/check_sql_advisory_values_postgres.py
 python3 scripts/check_sql_advisory_wait_postgres.py
 ```
 
+Distributed data APIs open their native node-local session store under the
+persistent replica root by default, independently of metadata-owned restore
+jobs. Explicitly supplied session stores keep their existing ownership. The
+native lock command uses a named operation type so strict archive layout
+fingerprints do not depend on compiler-generated anonymous union identities.
+
+Receiving data leaders obtain their metadata authorization before taking the
+Raft mutex or managed writer admission. Before append they recheck the accepting
+term and replica incarnation and validate the lease against proposal time. The
+native original-case campaign checks that consensus ownership remains available
+at the authorization boundary. Read-admission availability errors consult the
+statement context: an expired or canceled statement returns PostgreSQL `57014`,
+while corruption and uncertain mutation outcomes retain their original errors.
+
+The production-process campaign in `zig/e2e/antfly/test_sql_population.py` runs
+all ten unchanged valid locking originals through the actual Debug archives,
+checks live contention and SKIP LOCKED refill, then restarts separate metadata
+and data processes and reuses the same connection IDs and advisory lock custody.
+Prepared row/table custody is also resolved after its source connection closes
+and both processes restart.
+It also verifies CTAS/materialized refresh and integers above 2^53. Run it with
+`ANTFLY_BIN=zig/zig-out/bin/antfly uv run --project zig/e2e/antfly pytest -q zig/e2e/antfly/test_sql_population.py`
+from the repository root after `(cd zig && zig build antfly -Doptimize=Debug)`.
+
 This closes the original locking cohort; it does not imply that every remaining
 SQL feature or every PostgreSQL lock-bearing query shape is implemented.
 

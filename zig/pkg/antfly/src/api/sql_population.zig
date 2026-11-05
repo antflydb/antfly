@@ -24,6 +24,7 @@ const create = @import("../metadata/relation_create.zig");
 const stages = @import("../metadata/restore_staging.zig");
 const jobs = @import("restore_jobs.zig");
 const delivery = @import("sql_population_delivery.zig");
+const job_control = @import("../metadata/query_population_job.zig");
 const Path = @import("../pgwire/search_path.zig").Path;
 const time = @import("antfly_platform").time;
 const A = std.mem.Allocator;
@@ -56,6 +57,12 @@ fn receiptAlloc(a: A, target: domain.Target, table_id: u64, job_id: u64, key: []
     errdefer a.free(job);
     return .{ .database = database, .namespace = namespace, .table = table, .table_id = id, .schema_version = 1, .state = .pending, .restore_job_id = job, .idempotency_key = try a.dupe(u8, key), .diagnostic = "Table population was admitted. Retain this job receipt and do not replay the DDL." };
 }
+fn unresolved(input: catalog.DdlReceipt) catalog.DdlOutcome {
+    var receipt = input;
+    receipt.state = .admission_unknown;
+    receipt.diagnostic = "Population admission is unresolved. Retain this receipt, poll the job and do not replay the DDL.";
+    return .{ .mutation_outcome = null, .receipt = receipt };
+}
 fn pending(receipt: catalog.DdlReceipt, rows: u64) catalog.DdlOutcome {
     return .{ .rows_affected = rows, .mutation_outcome = .committed_pending, .receipt = receipt };
 }
@@ -63,8 +70,40 @@ fn owner(raw: *anyopaque, a: A, table: []const u8, group: u64, request: @import(
     const server: *http.ApiHttpServer = @ptrCast(@alignCast(raw));
     return server.executeRestoreOwner(a, table, group, request, context);
 }
-fn requestCleanup(server: *http.ApiHttpServer, job_id: u64) void {
-    if (server.restore_job_store.cancel(server.alloc, job_id)) |record| {
+fn remoteJobs(server: *http.ApiHttpServer) bool {
+    return server.cfg.deployment_mode != .standalone and server.restore_job_store.replicated == null;
+}
+fn admitJob(server: *http.ApiHttpServer, a: A, context: operation.RequestContext, request: jobs.StartRequest) !job_control.Admission {
+    if (!remoteJobs(server)) {
+        const result = try server.restore_job_store.startRecoverableObserved(a, request, true, context.sql_completion_submission);
+        return job_control.bindAdmission(a, server.source, context, result);
+    }
+    const raw = try server.source.systemCatalog(a, context, .{ .query_population_job = .{ .admit = request } });
+    defer a.free(raw);
+    var parsed = std.json.parseFromSlice(job_control.Admission, a, raw, .{}) catch return error.MetadataMutationOutcomeUnknown;
+    defer parsed.deinit();
+    return .{ .result = switch (parsed.value.result) {
+        .accepted => |bytes| .{ .accepted = a.dupe(u8, bytes) catch return error.MetadataMutationOutcomeUnknown },
+        .unknown => |bytes| .{ .unknown = a.dupe(u8, bytes) catch return error.MetadataMutationOutcomeUnknown },
+    }, .plan_digest = parsed.value.plan_digest };
+}
+fn observeJob(server: *http.ApiHttpServer, a: A, context: operation.RequestContext, ref: job_control.Reference) !?[]u8 {
+    if (!remoteJobs(server)) return server.restore_job_store.load(a, ref.job_id);
+    const raw = try server.source.systemCatalog(a, context, .{ .query_population_job = .{ .observe = ref } });
+    if (std.mem.eql(u8, raw, "null")) {
+        a.free(raw);
+        return null;
+    }
+    return raw;
+}
+fn requestCleanup(server: *http.ApiHttpServer, ref: job_control.Reference) void {
+    if (remoteJobs(server)) {
+        const context: operation.RequestContext = .{ .setting_admin = true, .deadline_ns = time.monotonicNs() +| std.time.ns_per_s };
+        const bytes = server.source.systemCatalog(server.alloc, context, .{ .query_population_job = .{ .cancel = ref } }) catch return;
+        server.alloc.free(bytes);
+        return;
+    }
+    if (server.restore_job_store.cancel(server.alloc, ref.job_id)) |record| {
         if (record) |bytes| server.alloc.free(bytes);
     } else |_| {}
     server.schedulePendingRestoreJobs() catch {};
@@ -126,7 +165,7 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
     const intent = input.intent;
     if (intent.persistence != .permanent or (intent.operation != .create_table_as and intent.operation != .select_into and intent.operation != .create_materialized_view and !(intent.operation == .refresh_materialized_view and refresh != null))) return error.UnsupportedSqlExecution;
     const source = input.source orelse return error.InvalidSqlBackendResponse;
-    const io = server.restore_job_store.io orelse return error.AsyncRestoreUnavailable;
+    const io = server.sharedApiIo() orelse server.restore_job_store.io orelse return error.AsyncRestoreUnavailable;
     var context = try request_context.platformDeadline();
     if (context.deadline_ns == null) context.deadline_ns = time.monotonicNs() +| 30 * std.time.ns_per_s;
     try context.ensureActive();
@@ -227,7 +266,7 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
     var receipt = try receiptAlloc(allocators.result, target, prepared.child.sql_materialized_view_id orelse prepared.child.table_id, job_id, key);
     var transferred = false;
     defer if (!transferred) freeReceipt(allocators.result, receipt);
-    const result = try server.restore_job_store.startRecoverable(allocators.scratch, .{
+    const start_request: jobs.StartRequest = .{
         .scope = .cluster,
         .source_kind = .query_population,
         .restore_mode = if (refresh != null) "overwrite" else "fail_if_exists",
@@ -239,19 +278,33 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
         .idempotency_key = key,
         .destination_authorization_principal = principal,
         .generation_plan_json = try std.json.Stringify.valueAlloc(a, plan, .{}),
-    });
+    };
+    const reference: job_control.Reference = .{ .job_id = job_id, .namespace = job_namespace, .key = key, .fingerprint = try jobs.requestFingerprintAlloc(a, start_request), .plan_digest = try plan.digest(a) };
+    const admission = admitJob(server, allocators.scratch, trusted, start_request) catch |err| switch (err) {
+        error.MetadataMutationOutcomeUnknown => {
+            transferred = true;
+            return unresolved(receipt);
+        },
+        else => return err,
+    };
+    const result = admission.result;
     const admission_bytes = switch (result) {
         inline else => |bytes| bytes,
     };
     defer allocators.scratch.free(admission_bytes);
     if (result == .unknown) {
-        receipt.state = .admission_unknown;
-        receipt.diagnostic = "Population admission is unresolved. Retain this receipt, poll the job and do not replay the DDL.";
         transferred = true;
-        return .{ .mutation_outcome = null, .receipt = receipt };
+        return unresolved(receipt);
     }
-    const admitted = try std.json.parseFromSlice(jobs.JobState, a, admission_bytes, .{});
+    const admitted = std.json.parseFromSlice(jobs.JobState, a, admission_bytes, .{}) catch {
+        transferred = true;
+        return unresolved(receipt);
+    };
     defer admitted.deinit();
+    reference.requireState(a, admitted.value) catch {
+        transferred = true;
+        return unresolved(receipt);
+    };
     if (admitted.value.phase == .failed) {
         if (std.mem.eql(u8, admitted.value.staging_failure, "CatalogAlreadyExists")) {
             if (intent.if_not_exists) return .{ .population_skipped = true };
@@ -260,15 +313,20 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
         if (std.mem.eql(u8, admitted.value.staging_failure, "RelationalTopologyProtocolUpgradeRequired")) return error.RelationalTopologyProtocolUpgradeRequired;
         return error.CatalogGenerationChanged;
     }
-    errdefer requestCleanup(server, job_id);
-    // The producer nonce, not just source/type equality, proves this request
-    // owns the one evaluation admitted by the durable first row.
-    const persisted = (try server.source.getRestoreStaging(a, id, context)) orelse return error.SqlMutationOutcomeUnknown;
-    const bound = try std.json.parseFromSliceLeaky(stages.Job, a, persisted, .{});
-    if (!std.mem.eql(u8, &bound.plan_digest, &try plan.digest(a))) return error.SqlMutationOutcomeUnknown;
+    // The metadata admission joins the persisted plan, including the producer
+    // nonce. A producer need not host any target replica to prove ownership.
+    const admitted_digest = admission.plan_digest orelse {
+        transferred = true;
+        return unresolved(receipt);
+    };
+    if (!std.mem.eql(u8, &admitted_digest, &reference.plan_digest)) {
+        transferred = true;
+        return unresolved(receipt);
+    }
+    errdefer requestCleanup(server, reference);
     server.schedulePendingRestoreJobs() catch {};
     const destinations = try a.alloc(delivery.Destination, destination.ranges.len);
-    for (destinations, destination.ranges) |*out, range| out.* = .{ .port = .{ .ptr = server, .execute_fn = owner }, .table = destination.table.name, .group = range.group_id, .scope = try stages.ownerScope(a, plan, bound.plan_digest, destination, range), .range = .{ .start = range.start_key, .end = range.end_key orelse "" } };
+    for (destinations, destination.ranges) |*out, range| out.* = .{ .port = .{ .ptr = server, .execute_fn = owner }, .table = destination.table.name, .group = range.group_id, .scope = try stages.ownerScope(a, plan, admitted_digest, destination, range), .range = .{ .start = range.start_key, .end = range.end_key orelse "" } };
     // Wait for all hidden owners before any evaluation or begin RPC. A routing
     // gap during preparation cannot consume half a producer admission.
     for (destinations) |out| while (true) {
@@ -278,17 +336,14 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
                 try io.sleep(.fromMilliseconds(10), .awake);
                 continue;
             },
-            else => {
-                requestCleanup(server, job_id);
-                return err;
-            },
+            else => return err,
         };
         break;
     };
     var stats: delivery.Stats = .{};
     const cursors = delivery.deliverCohort(allocators.scratch, destinations, source, context, .{ .stats = &stats }) catch |err| {
-        requestCleanup(server, job_id);
         if (!stats.seals_started) return err;
+        requestCleanup(server, reference);
         // Sealed output may already have published. Its opaque receipt is the
         // recovery boundary; an error here must not invite query reevaluation.
         transferred = true;
@@ -300,7 +355,7 @@ fn executeInner(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdenti
     server.schedulePendingRestoreJobs() catch {};
     const observe_until = if (allocators.completion == .until_deadline) context.deadline_ns.? else @min(context.deadline_ns.?, time.monotonicNs() +| 250 * std.time.ns_per_ms);
     while (time.monotonicNs() < observe_until) {
-        const bytes = server.restore_job_store.load(allocators.scratch, job_id) catch break;
+        const bytes = observeJob(server, allocators.scratch, trusted, reference) catch break;
         if (bytes) |encoded| {
             defer allocators.scratch.free(encoded);
             const state = std.json.parseFromSlice(jobs.JobState, allocators.scratch, encoded, .{}) catch break;

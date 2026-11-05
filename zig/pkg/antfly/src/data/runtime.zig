@@ -4310,6 +4310,8 @@ pub const DataRequestLifecyclePhase = enum {
     /// Transition runtime/lane cleanup has completed outside writer ownership.
     transition_cleanup_completed,
     query_result_assembled,
+    /// Fresh metadata authorization runs before acquiring Raft/writer ownership.
+    sql_lock_authorization,
 };
 
 pub const DataRequestLifecycleEvent = struct {
@@ -5926,6 +5928,9 @@ pub const DataServer = struct {
     owned_incoming_graph_route_backend: ?lsm_backend_mod.BackendHandle = null,
     owned_incoming_graph_route_io: ?lsm_storage_io.IoStorage = null,
     owned_incoming_graph_route_store: ?antfly.storage_backend_erased.Store = null,
+    /// The API kernel opens and owns the native store. Keep its configured
+    /// path alive across API reinitialization and release it after API teardown.
+    owned_session_store_path: ?[]u8 = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig,
     h1_disconnect_probe: ?httpx.H1DisconnectProbe = null,
     data_request_lifecycle_hook: ?DataRequestLifecycleHook = null,
@@ -7954,6 +7959,21 @@ pub const DataServer = struct {
                 self.owned_incoming_graph_route_store = null;
             }
             api_server_cfg.incoming_graph_route_store = &self.owned_incoming_graph_route_store.?;
+        }
+        // Each distributed API issuer owns connection/session state on its
+        // persistent node volume. Listening alone must not leave transactions,
+        // prepared resources and session locks dependent on test-only injection.
+        // Keep this independent of the metadata-owned workflow job stores.
+        if (api_server_cfg.session_store == null and api_server_cfg.session_store_path == null and
+            api_server_cfg.deployment_mode == .distributed and self.remote_metadata != null and
+            self.status_source.standalone_hot_standby == null)
+        {
+            if (self.write_source.replica_root_dir.len == 0) return error.InvalidApiServerConfig;
+            if (self.owned_session_store_path == null)
+                self.owned_session_store_path = try std.fmt.allocPrint(self.alloc, "{s}/api-transaction-sessions", .{self.write_source.replica_root_dir});
+            api_server_cfg.session_store_path = self.owned_session_store_path;
+            api_server_cfg.session_store_path_only = true;
+            api_server_cfg.session_store_scope = .node_local;
         }
         var owned_restore_job_store_path: ?[]u8 = null;
         defer if (owned_restore_job_store_path) |path| self.alloc.free(path);
@@ -10873,6 +10893,7 @@ pub const DataServer = struct {
         self.artifact_publication_queue.deinit();
         if (self.owned_incoming_graph_route_store) |*store| store.deinit();
         if (self.owned_incoming_graph_route_backend) |*backend| backend.close();
+        if (self.owned_session_store_path) |path| self.alloc.free(path);
         if (self.remote_metadata) |remote_metadata| {
             remote_metadata.deinit();
             self.alloc.destroy(remote_metadata);
@@ -10915,6 +10936,7 @@ pub const DataServer = struct {
         self.query_io_impl = null;
         self.owned_incoming_graph_route_store = null;
         self.owned_incoming_graph_route_backend = null;
+        self.owned_session_store_path = null;
     }
 
     fn ensureHttpRuntime(self: *DataServer) !*httpx.HttpRuntime {
@@ -15137,6 +15159,12 @@ pub const DataServer = struct {
         };
     }
 
+    fn authorizeRaftSqlLock(self: *DataServer, input: @import("../api/sql_data_locks.zig").AuthorizationInput) !@import("antfly_local_sources").storage_pessimistic_lock_control.Command {
+        try self.reachDataRequestLifecycle(.{ .phase = .sql_lock_authorization, .group_id = input.group, .table_name = input.table });
+        const server = if (self.http_server) |*value| value else return error.UnsupportedOperation;
+        return server.authorizeSqlLock(input);
+    }
+
     fn proposeRaftBatchGroupWithLeaderWait(
         self: *DataServer,
         alloc: std.mem.Allocator,
@@ -15219,7 +15247,37 @@ pub const DataServer = struct {
             defer if (protocol_activation_entry) |entry| entry.release(self.alloc);
             defer if (protocol_activation_lock_owned) protocol_activation_entry.?.activation_mutex.unlock();
             defer if (routed_write_admission) |*admission| admission.deinit();
+            var sql_lock_region = std.heap.ArenaAllocator.init(alloc);
+            defer sql_lock_region.deinit();
+            var authorized_sql_lock: @TypeOf(req.sql_lock) = null;
+            var sql_authorization_term: ?u64 = null;
+            var sql_authorization_epoch: ?u64 = null;
             if (preflighted_local_leader) {
+                if (req.sql_lock) |command| {
+                    if (self.dataRaftMonotonicNs() >= deadline_ns) return error.DeadlineExceeded;
+                    // Capture the accepting term under a short ownership
+                    // section. Metadata IO must not hold the progress mutex or
+                    // a managed writer needed by consensus/other controls.
+                    while (!self.data_raft_mutex.tryLock()) {
+                        if (!self.dataRaftProtocolProbeActive(deadline_ns, route.cancellation)) return error.LeaderUnavailable;
+                        try self.sleepDataRaftRetry(std.time.ns_per_ms);
+                    }
+                    {
+                        defer self.data_raft_mutex.unlock();
+                        const status = raft.host.http_host.host.raftStatus(group_id) orelse return error.GroupLeaderUnavailable;
+                        if (!raft.host.http_host.host.isLocalLeader(group_id)) continue;
+                        sql_authorization_term = status.hard.current_term;
+                        sql_authorization_epoch = raft.host.http_host.host.runtime_host.group_incarnations.get(group_id) orelse return error.GroupLeaderUnavailable;
+                    }
+                    authorized_sql_lock = try self.authorizeRaftSqlLock(.{
+                        .alloc = sql_lock_region.allocator(),
+                        .context = .{ .deadline_ns = platform_time.monotonicNs() +| (deadline_ns -| self.dataRaftMonotonicNs()), .cancellation = route.visibility_cancellation },
+                        .group = group_id,
+                        .table = table_name,
+                        .command = command,
+                    });
+                    try ensureDataRaftBatchRouteActive(route);
+                }
                 if (batchMutatesDocuments(req)) {
                     // No proposal has been attempted yet. A transition store
                     // that is not ready is retryable unavailability, not an
@@ -15399,6 +15457,12 @@ pub const DataServer = struct {
                         // so the caller may safely retry another route.
                         const status = raft.host.http_host.host.raftStatus(group_id) orelse
                             return error.LeaderUnavailable;
+                        // A term or replica replacement invalidates the preflight's ownership
+                        // cut. No command/barrier has been appended; obtain a
+                        // fresh authorization on the next pass.
+                        if (req.sql_lock != null and (authorized_sql_lock == null or sql_authorization_term != status.hard.current_term or
+                            sql_authorization_epoch != raft.host.http_host.host.runtime_host.group_incarnations.get(group_id))) continue;
+                        if (self.dataRaftMonotonicNs() >= deadline_ns) return error.DeadlineExceeded;
                         // Recheck the shared state while proposal ordering is
                         // locked. A concurrent request may have appended the
                         // barrier after this request skipped its singleflight
@@ -15467,14 +15531,16 @@ pub const DataServer = struct {
                             active_protocol_version >= data_raft_batch.timestamp_protocol_version,
                             proposal_time,
                         );
-                        var sql_lock_region = std.heap.ArenaAllocator.init(alloc);
-                        defer sql_lock_region.deinit();
-                        if (proposal_req.sql_lock) |command| {
-                            const api_server = if (self.http_server) |*server| server else return error.UnsupportedOperation;
-                            proposal_req.sql_lock = try @import("../api/sql_data_locks.zig").authorize(api_server, sql_lock_region.allocator(), .{
-                                .deadline_ns = platform_time.monotonicNs() +| (deadline_ns -| self.dataRaftMonotonicNs()),
-                                .cancellation = route.visibility_cancellation,
-                            }, group_id, table_name, command);
+                        if (authorized_sql_lock) |authorized| {
+                            var checked = authorized;
+                            // Revalidate lease time at append, after all
+                            // potentially suspending preflight work, without IO.
+                            if (checked.checked) |*cut| {
+                                cut.admitted_at_ms = @intCast(@max(1, @divFloor(proposal_time, std.time.ns_per_ms)));
+                                try cut.validate(checked.admission);
+                                if (checked.operation != .close) try cut.requireExecuting(checked.admission);
+                            }
+                            proposal_req.sql_lock = checked;
                             try ensureDataRaftBatchRouteActive(route);
                         }
                         const proposal_term = status.hard.current_term;

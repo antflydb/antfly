@@ -4886,6 +4886,17 @@
       ],
       "cwd": ".",
       "timeout_seconds": 180
+    },
+    "sql-qualified-population-distributed-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-scope-retirement-test",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
     }
   },
   "entries": [
@@ -11598,6 +11609,11 @@
           "path": "zig/pkg/antfly/src/api/http_server.zig",
           "test": "staged restore worker query population mounted materialized originals retain aliases and physical reads",
           "gate": "sql-population-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_scope_retirement_integration_test.zig",
+          "test": "mounted SQL scope retirement population jobs preserve source evaluation admission cancellation refresh and cold publication",
+          "gate": "sql-qualified-population-distributed-debug"
         }
       ]
     },
@@ -11620,6 +11636,11 @@
           "path": "zig/pkg/antfly/src/api/http_server.zig",
           "test": "staged restore worker query population mounted materialized originals retain aliases and physical reads",
           "gate": "sql-population-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_scope_retirement_integration_test.zig",
+          "test": "mounted SQL scope retirement population jobs preserve source evaluation admission cancellation refresh and cold publication",
+          "gate": "sql-qualified-population-distributed-debug"
         }
       ]
     },
@@ -11642,6 +11663,11 @@
           "path": "zig/pkg/antfly/src/api/http_server.zig",
           "test": "staged restore worker query population mounted materialized originals retain aliases and physical reads",
           "gate": "sql-population-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_scope_retirement_integration_test.zig",
+          "test": "mounted SQL scope retirement population jobs preserve source evaluation admission cancellation refresh and cold publication",
+          "gate": "sql-qualified-population-distributed-debug"
         }
       ]
     },
@@ -11698,6 +11724,11 @@
           "path": "zig/pkg/antfly/src/api/http_server.zig",
           "test": "staged restore worker query population materialized refresh sql-0356 and sql-0357 retain logical identities across fenced replacement",
           "gate": "sql-population-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_scope_retirement_integration_test.zig",
+          "test": "mounted SQL scope retirement population jobs preserve source evaluation admission cancellation refresh and cold publication",
+          "gate": "sql-qualified-population-distributed-debug"
         }
       ]
     },
@@ -11720,6 +11751,11 @@
           "path": "zig/pkg/antfly/src/api/http_server.zig",
           "test": "staged restore worker query population materialized refresh sql-0356 and sql-0357 retain logical identities across fenced replacement",
           "gate": "sql-population-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_scope_retirement_integration_test.zig",
+          "test": "mounted SQL scope retirement population jobs preserve source evaluation admission cancellation refresh and cold publication",
+          "gate": "sql-qualified-population-distributed-debug"
         }
       ]
     },
@@ -11742,6 +11778,11 @@
           "path": "zig/pkg/antfly/src/api/http_server.zig",
           "test": "staged restore worker query population mounted materialized originals retain aliases and physical reads",
           "gate": "sql-population-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_scope_retirement_integration_test.zig",
+          "test": "mounted SQL scope retirement population jobs preserve source evaluation admission cancellation refresh and cold publication",
+          "gate": "sql-qualified-population-distributed-debug"
         }
       ]
     },
@@ -11764,6 +11805,11 @@
           "path": "zig/pkg/antfly/src/api/http_server.zig",
           "test": "staged restore worker query population mounted materialized originals retain aliases and physical reads",
           "gate": "sql-population-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_scope_retirement_integration_test.zig",
+          "test": "mounted SQL scope retirement population jobs preserve source evaluation admission cancellation refresh and cold publication",
+          "gate": "sql-qualified-population-distributed-debug"
         }
       ]
     },
@@ -11801,6 +11847,11 @@
           "path": "zig/pkg/antfly/src/api/http_server.zig",
           "test": "staged restore worker query population mounted HTTP closes original CTAS and SELECT INTO postimages",
           "gate": "sql-population-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_scope_retirement_integration_test.zig",
+          "test": "mounted SQL scope retirement population jobs preserve source evaluation admission cancellation refresh and cold publication",
+          "gate": "sql-qualified-population-distributed-debug"
         }
       ]
     },
@@ -11818,6 +11869,11 @@
           "path": "zig/pkg/antfly/src/api/http_server.zig",
           "test": "staged restore worker query population mounted HTTP closes original CTAS and SELECT INTO postimages",
           "gate": "sql-population-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_scope_retirement_integration_test.zig",
+          "test": "mounted SQL scope retirement population jobs preserve source evaluation admission cancellation refresh and cold publication",
+          "gate": "sql-qualified-population-distributed-debug"
         }
       ]
     },
@@ -11835,6 +11891,11 @@
           "path": "zig/pkg/antfly/src/api/http_server.zig",
           "test": "staged restore worker query population mounted HTTP closes original CTAS and SELECT INTO postimages",
           "gate": "sql-population-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_scope_retirement_integration_test.zig",
+          "test": "mounted SQL scope retirement population jobs preserve source evaluation admission cancellation refresh and cold publication",
+          "gate": "sql-qualified-population-distributed-debug"
         }
       ]
     },
@@ -15536,6 +15597,11 @@
           "path": "zig/pkg/antfly/src/api/http_server.zig",
           "test": "staged restore worker query population mounted HTTP closes original CTAS and SELECT INTO postimages",
           "gate": "sql-population-postgres"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_scope_retirement_integration_test.zig",
+          "test": "mounted SQL scope retirement population jobs preserve source evaluation admission cancellation refresh and cold publication",
+          "gate": "sql-qualified-population-distributed-debug"
         }
       ]
     },

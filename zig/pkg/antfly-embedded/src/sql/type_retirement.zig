@@ -19,12 +19,12 @@
 const std = @import("std");
 const A = std.mem.Allocator;
 const Json = std.json.Value;
-pub const max_tables = 128;
+pub const max_tables = 3 * 128;
 pub const max_bytes = 16 * 1024 * 1024;
 const max_columns = 65535;
 const max_nodes = 1_048_576;
 
-pub const Input = struct { name: []const u8, schema_json: []const u8 };
+pub const Input = struct { name: []const u8, schema_json: []const u8, table_id: u64 = 0 };
 pub const CascadeObject = struct {
     kind: enum { column, default, constraint, index },
     name: []const u8,
@@ -44,7 +44,18 @@ pub const Prepared = struct {
         self.* = undefined;
     }
     pub fn init(backing: A, inputs: []const Input, type_id: u64) !Prepared {
-        if (type_id == 0 or inputs.len == 0 or inputs.len > max_tables) return error.InvalidSqlNamedType;
+        return initMany(backing, inputs, &.{type_id});
+    }
+    /// One dependency graph and successor epoch for a whole retiring type set.
+    /// Chaining single-type plans would repeatedly parse/rewrite schemas and
+    /// could make FK cleanup depend on the producer's type iteration order.
+    pub fn initMany(backing: A, inputs: []const Input, type_ids: []const u64) !Prepared {
+        if (type_ids.len == 0 or type_ids.len > @import("../common/sql_named_type_layout.zig").max_types or inputs.len == 0 or inputs.len > max_tables) return error.InvalidSqlNamedType;
+        var previous: u64 = 0;
+        for (type_ids) |id| {
+            if (id <= previous) return error.InvalidSqlNamedType;
+            previous = id;
+        }
         var region = std.heap.ArenaAllocator.init(backing);
         errdefer region.deinit();
         const a = region.allocator();
@@ -58,12 +69,12 @@ pub const Prepared = struct {
         for (inputs, states, 0..) |input, *state, ordinal| {
             if ((try names.getOrPut(a, input.name)).found_existing) return error.InvalidSqlBackendResponse;
             names.getPtr(input.name).?.* = ordinal;
-            state.* = try State.init(a, input.schema_json, type_id);
+            state.* = try State.init(a, input.schema_json, type_ids);
         }
         const tables = try a.alloc(Table, inputs.len);
         size = 0;
         for (inputs, states, tables) |input, *state, *table| {
-            try state.retire(a, states, names, type_id);
+            try state.retire(a, states, names, type_ids);
             const encoded = if (state.changed) try std.json.Stringify.valueAlloc(a, state.root, .{}) else try a.dupe(u8, input.schema_json);
             size +|= encoded.len;
             if (size > max_bytes) return error.SqlProgramLimitExceeded;
@@ -72,6 +83,17 @@ pub const Prepared = struct {
         return .{ .arena = region, .tables = tables };
     }
 };
+
+fn containsType(ids: []const u64, id: u64) bool {
+    var first: usize = 0;
+    var last = ids.len;
+    while (first < last) {
+        const middle = first + (last - first) / 2;
+        if (ids[middle] == id) return true;
+        if (ids[middle] < id) first = middle + 1 else last = middle;
+    }
+    return false;
+}
 
 fn number(value: Json) !u64 {
     return switch (value) {
@@ -114,7 +136,7 @@ const State = struct {
         if (value.* != .object) return error.InvalidSqlBackendResponse;
         return value;
     }
-    fn init(a: A, encoded: []const u8, type_id: u64) !State {
+    fn init(a: A, encoded: []const u8, type_ids: []const u64) !State {
         var state: State = .{ .root = try std.json.parseFromSliceLeaky(Json, a, encoded, .{ .parse_numbers = false, .allocate = .alloc_always }) };
         if (state.root != .object) return error.InvalidSqlBackendResponse;
         const mode = state.root.object.get("storage_mode") orelse return state;
@@ -128,7 +150,7 @@ const State = struct {
         for (fields.object.keys(), 0..) |name, i| try state.columns.put(a, name, i);
         for (fields.object.keys(), fields.object.values()) |name, property| {
             if (property != .object) return error.InvalidSqlBackendResponse;
-            if (property.object.get("x-antfly-sql-type-id")) |id| if (try number(id) == type_id) try state.drop(a, name);
+            if (property.object.get("x-antfly-sql-type-id")) |id| if (containsType(type_ids, try number(id))) try state.drop(a, name);
         }
         // Build the reverse dependency graph once. Queue propagation visits
         // every generated edge at most once, including reversed declaration
@@ -141,7 +163,7 @@ const State = struct {
                 const name = try text(entry.object.get("column") orelse return error.InvalidSqlBackendResponse);
                 const target = state.columns.get(name) orelse return error.InvalidSqlBackendResponse;
                 const program = entry.object.get("expression") orelse return error.InvalidSqlBackendResponse;
-                if (try state.expression(a, program, type_id, target, &edges, 0)) try state.drop(a, name);
+                if (try state.expression(a, program, type_ids, target, &edges, 0)) try state.drop(a, name);
             }
         }
         const counts = try a.alloc(usize, state.removed.len);
@@ -166,11 +188,11 @@ const State = struct {
 
     // Only typed IR fields grant dependencies. JSON literal payloads, names,
     // descriptions and arbitrary strings never become column references.
-    fn expression(self: *@This(), a: A, value: Json, type_id: u64, target: ?usize, edges: ?*std.ArrayList(Edge), depth: usize) anyerror!bool {
+    fn expression(self: *@This(), a: A, value: Json, type_ids: []const u64, target: ?usize, edges: ?*std.ArrayList(Edge), depth: usize) anyerror!bool {
         try self.checkpoint();
         if (depth > 16 or value != .object) return error.InvalidSqlBackendResponse;
         const op = try text(value.object.get("op") orelse return error.InvalidSqlBackendResponse);
-        var affected = if (value.object.get("named_type_id")) |id| try number(id) == type_id else false;
+        var affected = if (value.object.get("named_type_id")) |id| containsType(type_ids, try number(id)) else false;
         if (std.mem.eql(u8, op, "literal")) return affected;
         if (std.mem.eql(u8, op, "column")) {
             const name = try text(value.object.get("column") orelse return error.InvalidSqlBackendResponse);
@@ -180,7 +202,7 @@ const State = struct {
         }
         if (value.object.get("args")) |args| {
             if (args != .array) return error.InvalidSqlBackendResponse;
-            for (args.array.items) |arg| affected = try self.expression(a, arg, type_id, target, edges, depth + 1) or affected;
+            for (args.array.items) |arg| affected = try self.expression(a, arg, type_ids, target, edges, depth + 1) or affected;
         }
         return affected;
     }
@@ -191,7 +213,7 @@ const State = struct {
         };
         return false;
     }
-    fn declarationAffected(self: *@This(), a: A, entry: Json, type_id: u64, depth: usize) anyerror!bool {
+    fn declarationAffected(self: *@This(), a: A, entry: Json, type_ids: []const u64, depth: usize) anyerror!bool {
         try self.checkpoint();
         if (depth > 64 or entry != .object) return error.InvalidSqlBackendResponse;
         for ([_][]const u8{ "column", "without_overlaps_column" }) |key| if (entry.object.get(key)) |value| {
@@ -200,10 +222,10 @@ const State = struct {
         for ([_][]const u8{ "columns", "include_columns" }) |key| if (entry.object.get(key)) |value| {
             if (try self.namesAffected(value)) return true;
         };
-        if (entry.object.get("expression")) |expr| if (try self.expression(a, expr, type_id, null, null, 0)) return true;
+        if (entry.object.get("expression")) |expr| if (try self.expression(a, expr, type_ids, null, null, 0)) return true;
         for ([_][]const u8{ "keys", "where" }) |key| if (entry.object.get(key)) |parts| {
             if (parts != .array) return error.InvalidSqlBackendResponse;
-            for (parts.array.items) |part| if (try self.declarationAffected(a, part, type_id, depth + 1)) return true;
+            for (parts.array.items) |part| if (try self.declarationAffected(a, part, type_ids, depth + 1)) return true;
         };
         return false;
     }
@@ -227,7 +249,7 @@ const State = struct {
             for (parts.array.items) |part| try self.collectDeclarationTypes(a, part, ids, depth + 1);
         };
     }
-    fn retire(self: *@This(), a: A, states: []State, tables: std.StringHashMapUnmanaged(usize), type_id: u64) !void {
+    fn retire(self: *@This(), a: A, states: []State, tables: std.StringHashMapUnmanaged(usize), type_ids: []const u64) !void {
         if (!self.relational) return;
         for (self.queue.items) |name| try self.cascade_objects.append(a, .{ .kind = .column, .name = name });
         var index_names: std.StringHashMapUnmanaged(void) = .empty;
@@ -236,12 +258,12 @@ const State = struct {
             if (entries.* != .array) return error.InvalidSqlBackendResponse;
             var write: usize = 0;
             for (entries.array.items) |entry| {
-                if (try self.declarationAffected(a, entry, type_id, 0)) {
+                if (try self.declarationAffected(a, entry, type_ids, 0)) {
                     // Dependencies owned by a removed column disappear with
                     // that column. Independent expressions are separate
                     // PostgreSQL CASCADE objects; index-backed UNIQUE occurs
                     // in two executable directories but is one SQL object.
-                    if (!std.mem.eql(u8, key, "generated_columns") and !try self.declarationAffected(a, entry, 0, 0)) {
+                    if (!std.mem.eql(u8, key, "generated_columns") and !try self.declarationAffected(a, entry, &.{}, 0)) {
                         const is_default = std.mem.eql(u8, key, "column_defaults");
                         const is_index = std.mem.eql(u8, key, "relational_indexes");
                         const name = try text(entry.object.get(if (is_default) "column" else "name") orelse return error.InvalidSqlBackendResponse);
@@ -318,7 +340,7 @@ const State = struct {
                 const identity = entry.object.get("identity") orelse return error.InvalidSqlBackendResponse;
                 if (identity != .object) return error.InvalidSqlBackendResponse;
                 const retained_id = try number(identity.object.get("id") orelse return error.InvalidSqlBackendResponse);
-                if (retained_id == type_id or !live_types.contains(retained_id)) {
+                if (containsType(type_ids, retained_id) or !live_types.contains(retained_id)) {
                     self.changed = true;
                     continue;
                 }
@@ -345,7 +367,7 @@ const retirement_document =
     \\{"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"payload":{"type":"json","const":{"x-antfly-sql-type-id":17,"column":"state"}}}}}}}
 ;
 
-fn retirementClosure(backing: A) !void {
+fn retirementClosure(backing: A, many: bool) !void {
     const native = @import("../schema/mod.zig");
     const types = @import("../system_catalog/named_types.zig");
     const layouts = @import("../common/sql_named_type_layout.zig");
@@ -362,12 +384,12 @@ fn retirementClosure(backing: A) !void {
     try layouts.canonicalizeSchemaLeaky(a, &parent, &records);
     const before = try std.json.Stringify.valueAlloc(a, parent, .{});
     const inputs = [_]Input{ .{ .name = "parent", .schema_json = before }, .{ .name = "child", .schema_json = retirement_child }, .{ .name = "document", .schema_json = retirement_document } };
-    var prepared = try Prepared.init(backing, &inputs, 17);
+    var prepared = if (many) try Prepared.initMany(backing, &inputs, &.{ 17, 19 }) else try Prepared.init(backing, &inputs, 17);
     defer prepared.deinit();
     const result = prepared.tables;
     try std.testing.expectEqual(@as(usize, 3), result.len);
     try std.testing.expect(result[0].changed and result[1].changed and !result[2].changed);
-    try std.testing.expectEqual(@as(usize, 3), result[0].cascade_objects.len);
+    try std.testing.expectEqual(@as(usize, if (many) 4 else 3), result[0].cascade_objects.len);
     try std.testing.expectEqual(@as(usize, 1), result[1].cascade_objects.len);
     try std.testing.expectEqualDeep(CascadeObject{ .kind = .constraint, .name = "derived_parent" }, result[1].cascade_objects[0]);
     try std.testing.expectEqual(@as(usize, 0), result[2].cascade_objects.len);
@@ -375,15 +397,17 @@ fn retirementClosure(backing: A) !void {
     defer after.deinit();
     const fields = try @import("schema_columns.zig").properties(after.value);
     for ([_][]const u8{ "state", "caption", "caption2" }) |name| try std.testing.expect(!fields.object.contains(name));
-    for ([_][]const u8{ "id", "payload", "spare" }) |name| try std.testing.expect(fields.object.contains(name));
-    try std.testing.expectEqual(@as(usize, 3), result[0].dropped_columns.len);
+    for ([_][]const u8{ "id", "payload" }) |name| try std.testing.expect(fields.object.contains(name));
+    try std.testing.expectEqual(!many, fields.object.contains("spare"));
+    try std.testing.expectEqual(@as(usize, if (many) 4 else 3), result[0].dropped_columns.len);
     try std.testing.expectEqual(@as(u64, 5), try number(after.value.object.get("version").?));
     try std.testing.expectEqual(@as(usize, 0), after.value.object.get("generated_columns").?.array.items.len);
-    for ([_][]const u8{ "checks", "column_defaults", "unique_constraints", "relational_indexes", "named_types" }) |key| try std.testing.expectEqual(@as(usize, 1), after.value.object.get(key).?.array.items.len);
+    for ([_][]const u8{ "checks", "column_defaults", "unique_constraints", "relational_indexes" }) |key| try std.testing.expectEqual(@as(usize, 1), after.value.object.get(key).?.array.items.len);
     const retained_default = after.value.object.get("column_defaults").?.array.items[0].object.get("expression").?.object.get("value").?;
     try std.testing.expectEqualStrings("12345678901234567890.1234567890123456789", retained_default.object.get("number").?.number_string);
     try std.testing.expectEqualStrings("state", retained_default.object.get("column").?.string);
-    try std.testing.expectEqual(@as(u64, 19), try number(after.value.object.get("named_types").?.array.items[0].object.get("identity").?.object.get("id").?));
+    try std.testing.expectEqual(@as(usize, if (many) 0 else 1), after.value.object.get("named_types").?.array.items.len);
+    if (!many) try std.testing.expectEqual(@as(u64, 19), try number(after.value.object.get("named_types").?.array.items[0].object.get("identity").?.object.get("id").?));
     var child = try std.json.parseFromSlice(Json, backing, result[1].schema_json, .{});
     defer child.deinit();
     try std.testing.expectEqual(@as(usize, 0), child.value.object.get("foreign_keys").?.array.items.len);
@@ -395,11 +419,11 @@ fn retirementClosure(backing: A) !void {
     defer predecessor.deinit(backing);
     var successor = try native.PreparedSchemaDefinition.init(backing, result[0].schema_json);
     defer successor.deinit(backing);
-    try std.testing.expectEqual(@as(usize, 1), successor.runtime_schema.named_types.len);
+    try std.testing.expectEqual(@as(usize, if (many) 0 else 1), successor.runtime_schema.named_types.len);
 }
 
 test "SQL named type retirement closes generated and incoming FK dependencies without matching opaque JSON" {
-    try retirementClosure(std.testing.allocator);
+    try retirementClosure(std.testing.allocator, false);
 }
 
 test "SQL named type retirement owns bounded candidates and unwinds every allocation failure" {
@@ -413,4 +437,13 @@ test "SQL named type retirement owns bounded candidates and unwinds every alloca
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, Run.run, .{});
     try std.testing.expectError(error.InvalidSqlNamedType, Prepared.init(std.testing.allocator, &.{}, 17));
     try std.testing.expectError(error.InvalidSqlBackendResponse, Prepared.init(std.testing.allocator, &.{ .{ .name = "duplicate", .schema_json = retirement_child }, .{ .name = "duplicate", .schema_json = retirement_child } }, 17));
+}
+
+test "SQL named type retirement handles a canonical whole type cohort in one epoch with allocation fault ownership" {
+    const a = std.testing.allocator;
+    try retirementClosure(a, true);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, retirementClosure, .{true});
+    const inputs = [_]Input{.{ .name = "parent", .schema_json = retirement_parent }};
+    for ([_][]const u64{ &.{}, &.{0}, &.{ 19, 17 }, &.{ 17, 17 } }) |ids|
+        try std.testing.expectError(error.InvalidSqlNamedType, Prepared.initMany(a, &inputs, ids));
 }

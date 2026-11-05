@@ -103,11 +103,55 @@ def check():
         db.execute(
             "CREATE AGGREGATE scope_unrelated(text)(SFUNC=scope_outside_step,STYPE=text,FINALFUNC=scope_finish)"
         )
+        db.execute("CREATE DOMAIN tenant_ops.phase AS TEXT CHECK (VALUE <> '')")
+        db.execute("CREATE TYPE tenant_ops.detail AS ENUM ('one','two')")
+        db.execute(
+            "CREATE TABLE typed_borrower(id text PRIMARY KEY,phase tenant_ops.phase,detail tenant_ops.detail,unchanged text,rendered text GENERATED ALWAYS AS (lower(phase)) STORED UNIQUE)"
+        )
+        db.execute(
+            "CREATE TABLE typed_borrower_child(id text PRIMARY KEY,link text REFERENCES typed_borrower(rendered))"
+        )
+        db.execute(
+            "INSERT INTO typed_borrower(id,phase,detail,unchanged) VALUES('typed','Queued','one','preserved')"
+        )
+        db.execute("INSERT INTO typed_borrower_child VALUES('child','queued')")
+        db.execute("CREATE VIEW typed_removed AS SELECT phase FROM typed_borrower")
+        db.execute("CREATE VIEW typed_removed_child AS SELECT phase FROM typed_removed")
+        db.execute("CREATE VIEW typed_kept AS SELECT unchanged FROM typed_borrower")
+        db.execute(
+            "CREATE MATERIALIZED VIEW typed_materialized AS SELECT phase FROM typed_borrower WITH NO DATA"
+        )
         rejected(db, "DROP SCHEMA tenant_ops", "2BP01")
         equal(scalar(db, "SELECT count(*) FROM tenant_ops.parents"), 2)
         db.execute("BEGIN")
         equal(db.execute(originals["sql-0105"]).statusmessage, "DROP SCHEMA")
         equal(scalar(db, "SELECT to_regnamespace('tenant_ops')"), None)
+        equal(scalar(db, "SELECT to_regclass('typed_removed')"), None)
+        equal(scalar(db, "SELECT to_regclass('typed_materialized')"), None)
+        equal(scalar(db, "SELECT to_regclass('typed_removed_child')"), None)
+        equal(
+            db.execute("SELECT id,unchanged FROM typed_borrower").fetchall(),
+            [("typed", "preserved")],
+        )
+        equal(
+            db.execute("SELECT id,link FROM typed_borrower_child").fetchall(),
+            [("child", "queued")],
+        )
+        equal(scalar(db, "SELECT unchanged FROM typed_kept"), "preserved")
+        equal(
+            scalar(
+                db,
+                "SELECT count(*) FROM pg_constraint WHERE conrelid='typed_borrower_child'::regclass AND contype='f'",
+            ),
+            0,
+        )
+        equal(
+            db.execute(
+                "SELECT attname FROM pg_attribute WHERE attrelid='typed_borrower'::regclass AND attnum>0 AND NOT attisdropped ORDER BY attnum"
+            ).fetchall(),
+            [("id",), ("unchanged",)],
+        )
+
         equal(scalar(db, "SELECT to_regprocedure('scope_collect(text)')"), None)
         equal(scalar(db, "SELECT to_regoperator('===(text,text)')"), None)
         equal(

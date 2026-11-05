@@ -27,6 +27,7 @@ pub const domain_types = @import("../system_catalog/domain_types.zig");
 pub const named_types = @import("../system_catalog/named_types.zig");
 pub const named_layouts = @import("../common/sql_named_type_layout.zig");
 pub const type_retirement = @import("type_retirement.zig");
+pub const schema_columns = @import("schema_columns.zig");
 
 test {
     _ = named_types;

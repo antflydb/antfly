@@ -2080,6 +2080,7 @@ pub const MetadataHttpServer = struct {
         try server.post("/internal/v1/system-catalog", httpx.Handler.bind(self, metadataSystemCatalog));
         try server.post(routes.Routes.internal_schema_validation, httpx.Handler.bind(self, metadataSchemaValidation));
         try server.postWithBodyLimit(routes.Routes.internal_table_retirement, @import("table_retirement_ledger.zig").max_command_bytes, httpx.Handler.bind(self, metadataTableRetirement));
+        try server.postWithBodyLimit(routes.Routes.internal_query_population_job, @import("query_population_job.zig").max_command_bytes, httpx.Handler.bind(self, metadataQueryPopulationJob));
         try server.postWithBodyLimit(routes.Routes.internal_scope_retirement, @import("scope_retirement_wire.zig").max_command_bytes, httpx.Handler.bind(self, metadataScopeRetirement));
         try server.post(routes.Routes.internal_catalog_publication_check, httpx.Handler.bind(self, metadataCatalogPublicationCheck));
         try server.post(routes.Routes.internal_catalog_table_publication_check, httpx.Handler.bind(self, metadataCatalogTablePublicationCheck));
@@ -2163,7 +2164,12 @@ pub const MetadataHttpServer = struct {
         return self.metadataSystemCatalogImpl(ctx, .scope);
     }
 
-    fn metadataSystemCatalogImpl(self: *MetadataHttpServer, ctx: *httpx.Context, transport: enum { json, schema, retirement, scope }) !httpx.Response {
+    fn metadataQueryPopulationJob(self: *MetadataHttpServer, ctx: *httpx.Context) !httpx.Response {
+        return self.metadataSystemCatalogImpl(ctx, .population);
+    }
+
+    fn metadataSystemCatalogImpl(self: *MetadataHttpServer, ctx: *httpx.Context, transport: enum { json, schema, retirement, scope, population }) !httpx.Response {
+        const raw_population = transport == .population;
         const raw_scope = transport == .scope;
         const raw_schema = transport == .schema;
         const raw_retirement = transport == .retirement;
@@ -2171,13 +2177,20 @@ pub const MetadataHttpServer = struct {
         const body = (try ctx.body()) orelse return ctx.status(400).text("missing body");
         const Call = @import("../system_catalog/server_call.zig").Call;
         const ledger = @import("schema_validation_ledger.zig");
-        const maximum: usize = if (raw_scope) @import("scope_retirement_wire.zig").max_command_bytes else if (raw_retirement) @import("table_retirement_ledger.zig").max_command_bytes else if (raw_schema) (if (ledger.requiresAdmissionAuthority(body)) ledger.max_command_bytes else ledger.max_control_command_bytes) else system_catalog.max_command_bytes;
+        const maximum: usize = if (raw_population) @import("query_population_job.zig").max_command_bytes else if (raw_scope) @import("scope_retirement_wire.zig").max_command_bytes else if (raw_retirement) @import("table_retirement_ledger.zig").max_command_bytes else if (raw_schema) (if (ledger.requiresAdmissionAuthority(body)) ledger.max_command_bytes else ledger.max_control_command_bytes) else system_catalog.max_command_bytes;
         if (body.len > maximum) return ctx.status(413).text("catalog request too large");
         var parsed: ?std.json.Parsed(Call) = null;
         defer if (parsed) |*value| value.deinit();
         var scope: ?std.json.Parsed(@import("scope_retirement_wire.zig").Request) = null;
         defer if (scope) |*value| value.deinit();
-        const input: Call = if (raw_scope) blk: {
+        var population: ?std.json.Parsed(@import("query_population_job.zig").Request) = null;
+        defer if (population) |*value| value.deinit();
+        const input: Call = if (raw_population) blk: {
+            if (!std.mem.eql(u8, ctx.header("content-type") orelse "", "application/octet-stream")) return ctx.status(415).text("population admission requires raw transport");
+            population = std.json.parseFromSlice(@import("query_population_job.zig").Request, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid population job control");
+            if (!population.?.value.isMutation()) return ctx.status(415).text("population observations require catalog read transport");
+            break :blk .{ .query_population_job = population.?.value };
+        } else if (raw_scope) blk: {
             if (!std.mem.eql(u8, ctx.header("content-type") orelse "", "application/octet-stream")) return ctx.status(415).text("lifecycle submission requires raw transport");
             scope = std.json.parseFromSlice(@import("scope_retirement_wire.zig").Request, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid scope retirement");
             break :blk .{ .scope_retirement_submit = scope.?.value };
@@ -2190,7 +2203,7 @@ pub const MetadataHttpServer = struct {
             break :blk .{ .schema_validation_submit = body };
         } else blk: {
             parsed = std.json.parseFromSlice(Call, ctx.allocator, body, .{}) catch return ctx.status(400).text("invalid catalog request");
-            if (parsed.?.value == .schema_validation_submit or parsed.?.value == .table_retirement_submit or parsed.?.value == .scope_retirement_submit)
+            if ((parsed.?.value == .query_population_job and parsed.?.value.query_population_job.isMutation()) or parsed.?.value == .schema_validation_submit or parsed.?.value == .table_retirement_submit or parsed.?.value == .scope_retirement_submit)
                 return ctx.status(415).text("schema validation requires binary transport");
             break :blk parsed.?.value;
         };
@@ -5572,10 +5585,9 @@ test "metadata http server reports reallocation protocol upgrade gating" {
     try std.testing.expectEqualStrings("metadata voter upgrade required", response.body.?);
 }
 
-test "sequence catalog HTTP grants bind exact bodies and keep status reads nonmutating" {
+fn expectCatalogAdministrativeGrants(calls: []const @import("../system_catalog/server_call.zig").Call) !void {
     const a = std.testing.allocator;
     const Call = @import("../system_catalog/server_call.zig").Call;
-    const sequence = @import("../system_catalog/sequence_catalog.zig");
     const authority = @import("../system_catalog/setting_authority.zig");
     const service_auth = @import("../api/internal_service_auth.zig");
     const Fixture = struct {
@@ -5605,12 +5617,11 @@ test "sequence catalog HTTP grants bind exact bodies and keep status reads nonmu
     };
     var fixture: Fixture = .{};
     var server = MetadataHttpServer.init(a, .{ .setting_authority_secret = "sequence-grant-fixture", .setting_authority_issuer = "cluster-fixture" }, .{ .ptr = &fixture, .vtable = &.{ .status = Fixture.status, .admin_snapshot = Fixture.snapshot, .free_admin_snapshot = Fixture.freeSnapshot, .system_catalog = Fixture.catalog, .catalog_identity = Fixture.identity } });
-    const request: sequence.Mutation = .{ .admission = .{ .nonce = @splat(1), .head = 0 }, .target = .{ .table = "counter" }, .namespace_id = 2, .incarnation = @splat(7), .operation = .{ .create = .{ .options = .{} } } };
-    const counter: sequence.CounterRequest = .{ .target = request.target, .namespace_id = 2, .sequence_id = 41, .incarnation = request.incarnation, .request = .{ .expected = .{ .generation = 1, .revision = 1, .last_value = 1, .is_called = false }, .request_id = @splat(1), .operation = .reserve } };
     // Authorization/framing only; this callback never admits synthetic DDL.
-    for ([_]Call{ .sql_sequence_prepare, .{ .sql_sequence_snapshot = .{ .targets = &.{request.target} } }, .{ .sql_sequence_admission_head = {} }, .{ .sql_sequence_mutate = request }, .{ .sql_sequence_outcome = request }, .{ .sql_sequence_counter_mutate = counter }, .{ .sql_sequence_counter_outcome = counter } }) |call| {
+    for (calls) |call| {
         fixture.expected = std.meta.activeTag(call);
-        const body = try std.json.Stringify.valueAlloc(a, call, .{});
+        const raw_population = call == .query_population_job and call.query_population_job.isMutation();
+        const body = if (raw_population) try std.json.Stringify.valueAlloc(a, call.query_population_job, .{}) else try std.json.Stringify.valueAlloc(a, call, .{});
         defer a.free(body);
         const tampered = try std.fmt.allocPrint(a, "{s} ", .{body});
         defer a.free(tampered);
@@ -5622,9 +5633,10 @@ test "sequence catalog HTTP grants bind exact bodies and keep status reads nonmu
         const before = fixture.calls;
         const reads = fixture.identity_reads;
         for (0..5) |mode| {
-            var req = try httpx.Request.init(a, .POST, "/internal/v1/system-catalog");
+            var req = try httpx.Request.init(a, .POST, if (raw_population) routes.Routes.internal_query_population_job else "/internal/v1/system-catalog");
             defer req.deinit();
             try req.setBody(if (mode == 4) tampered else body);
+            if (raw_population) try req.headers.append("content-type", "application/octet-stream");
             if (mode != 0) try req.headers.append(service_auth.header_name, "host-verified-service-token");
             if (mode != 1) try req.headers.append(authority.header_name, if (mode == 2) wrong else grant);
             try req.headers.append(routes.Routes.raft_mutation_remaining_ms_header, "5000");
@@ -5632,13 +5644,41 @@ test "sequence catalog HTTP grants bind exact bodies and keep status reads nonmu
             try req.headers.append(routes.Routes.raft_mutation_campaign_allowed_header, "false");
             var ctx = httpx.Context.init(a, std.testing.io, &req);
             defer ctx.deinit();
-            var response = try server.metadataSystemCatalog(&ctx);
+            var response = if (raw_population) try server.metadataQueryPopulationJob(&ctx) else try server.metadataSystemCatalog(&ctx);
             defer response.deinit();
             try std.testing.expectEqual(@as(u16, if (mode == 3) 200 else 403), response.status.code);
         }
         try std.testing.expectEqual(before + 1, fixture.calls);
         try std.testing.expectEqual(reads + @as(usize, if (call.isMutation()) 0 else 2), fixture.identity_reads);
     }
+}
+
+test "sequence catalog HTTP grants bind exact bodies and keep status reads nonmutating" {
+    const Call = @import("../system_catalog/server_call.zig").Call;
+    const sequence = @import("../system_catalog/sequence_catalog.zig");
+    const request: sequence.Mutation = .{ .admission = .{ .nonce = @splat(1), .head = 0 }, .target = .{ .table = "counter" }, .namespace_id = 2, .incarnation = @splat(7), .operation = .{ .create = .{ .options = .{} } } };
+    const counter: sequence.CounterRequest = .{ .target = request.target, .namespace_id = 2, .sequence_id = 41, .incarnation = request.incarnation, .request = .{ .expected = .{ .generation = 1, .revision = 1, .last_value = 1, .is_called = false }, .request_id = @splat(1), .operation = .reserve } };
+    try expectCatalogAdministrativeGrants(&[_]Call{ .sql_sequence_prepare, .{ .sql_sequence_snapshot = .{ .targets = &.{request.target} } }, .{ .sql_sequence_admission_head = {} }, .{ .sql_sequence_mutate = request }, .{ .sql_sequence_outcome = request }, .{ .sql_sequence_counter_mutate = counter }, .{ .sql_sequence_counter_outcome = counter } });
+}
+
+test "SQL scope retirement population preparation requires exact administrative HTTP authority" {
+    const Call = @import("../system_catalog/server_call.zig").Call;
+    const request: Call = .{ .query_population_prepare = .{ .namespace_id = 2, .logical_name = "projection", .materialized_view = true, .physical_name = "table:11111111111111111111111111111111", .candidate = .{ .table_id = 0, .name = "", .schema_json = "{}" } } };
+    try std.testing.expect(request.requiresAdministrativeGrant());
+    try std.testing.expect(request.requiresSettingAuthorityReadGrant());
+    try std.testing.expect(!request.isMutation());
+    try expectCatalogAdministrativeGrants(&.{request});
+}
+
+test "SQL scope retirement population job admission observation cancellation require exact administrative HTTP authority" {
+    const wire = @import("query_population_job.zig");
+    const jobs = @import("../api/restore_jobs.zig");
+    const ref: wire.Reference = .{ .job_id = try jobs.jobIdForIdempotency(std.testing.allocator, "population", "capture"), .namespace = "population", .key = "capture", .fingerprint = &@as([64]u8, @splat('a')), .plan_digest = @splat(2) };
+    try expectCatalogAdministrativeGrants(&.{
+        .{ .query_population_job = .{ .admit = .{ .scope = .cluster, .source_kind = .query_population, .backup_id = "definition", .location = "metadata://query-population", .connection = "internal", .idempotency_namespace = "population", .idempotency_key = "capture", .table_names = &.{"projection"}, .generation_plan_json = "{}" } } },
+        .{ .query_population_job = .{ .observe = ref } },
+        .{ .query_population_job = .{ .cancel = ref } },
+    });
 }
 
 test "system catalog read identity avoids diagnostic inventories and fences replacement" {

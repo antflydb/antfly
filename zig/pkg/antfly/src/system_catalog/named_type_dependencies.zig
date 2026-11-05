@@ -22,6 +22,14 @@ const max_types = @import("antfly_local_sources").sql_catalog.named_layouts.max_
 fn tableKey(buffer: []u8, group: u64, table: u64) ![]const u8 {
     return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:system_catalog:{d}:type-table:{d}", .{ group, table });
 }
+pub fn tableFromKey(bytes: []const u8, group: u64) !?u64 {
+    var buffer: [192]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&buffer, "\x00\x00__metadata__:system_catalog:{d}:type-table:", .{group});
+    if (!std.mem.startsWith(u8, bytes, prefix)) return null;
+    const id = std.fmt.parseInt(u64, bytes[prefix.len..], 10) catch return error.InvalidCatalogRecord;
+    if (id == 0 or !std.mem.eql(u8, bytes, try tableKey(&buffer, group, id))) return error.InvalidCatalogRecord;
+    return id;
+}
 fn prefixKey(buffer: []u8, group: u64, id: u64) ![]const u8 {
     return std.fmt.bufPrint(buffer, "\x00\x00__metadata__:system_catalog:{d}:type-dependent:{d}:", .{ group, id });
 }

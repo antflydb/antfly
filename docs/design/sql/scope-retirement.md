@@ -58,7 +58,7 @@ backings assigns stable ordinals, root-derived child IDs and exact definition/ra
 commitments. Held and rewritten tables never receive deletion children. The
 cyclic work read returns the next compact registration using point reads; it does
 not decode the immutable membership body on every idle/coordinator poll. This
-requires metadata capability 167. Registrations identify proposed child work;
+requires metadata capability 168. Registrations identify proposed child work;
 they grant no physical execution or completion authority.
 
 Terminal progress releases leases, body, work and child registrations atomically
@@ -147,18 +147,72 @@ Callable-directory reads admit retained bytes before decoding and keep scratch
 for only one resource at a time. Snapshot and standby-checkpoint recovery prove
 reverse closure from authoritative callable records, independently of rebuilt
 derived indexes. Table-only scope jobs do not parse every unrelated callable.
-These semantics require metadata capability 167. They supply dependency custody,
+These semantics require metadata capability 168. They supply dependency custody,
 not permission to execute or acknowledge physical retirement.
+
+Named-type capture now closes the whole selected domain/enum set through the
+native type/table directories. It admits direct column/expression users and the
+incoming FK borrowers of their generated keys. The shared schema planner walks
+one reverse generated-column graph for the whole set, removes dependent
+constraints/indexes/defaults and gives each survivor exactly one new epoch even
+when table, sequence and type withdrawals overlap. JSON literal payloads stay
+opaque and exact numeric defaults retain their source precision.
+
+Views of removed columns are selected by immutable column ID; views of retained
+columns remain present. Typed materialized backings enter retirement through
+their view owner, producing one backing/deletion child rather than a competing
+schema rewrite. Forward snapshot validation recomputes complete survivor
+postimages rather than trusting the captured successor strings. The streamed
+reverse pass proves every type borrower and every removed-column view has the
+same root custody. Its column cache retains only one bounded scope at a time,
+with independent per-table decoding scratch. Capture also fences new uses of
+selected types before reservation can lose its admitted footprint. This is
+metadata capability 168; it does not replace the required physical row rewrite.
+
+The authenticated materialized-view campaign also qualifies the shared query
+population lane. Preparation uses an exact-body administrative read grant on
+both local and remote metadata paths, matching the service's existing policy.
+Service authentication or a read-only ticket does not substitute for that grant.
+Asynchronous population is observed through its durable job ID and idempotency
+key; a materialized view's logical object ID is not its hidden backing table ID.
+No admitted DDL is replayed to wait for publication.
 
 Reservation does not verify connection drainage, physical child ACKs or final
 catalog withdrawal. Its progress state cannot stand for those proofs. Native
 workers and final publication must verify each independently before advancing.
 
+Query-produced tables and materialized views use the existing metadata-owned
+replicated restore job lane. The requesting data node owns one producer
+evaluation; it does not create a node-local substitute for that durable job.
+Admission returns the persisted staging-plan commitment, which the producer
+checks against its exact prepared definition before evaluating source rows.
+This administrative proof is separate from a receiving replica's placement
+grant; a producer need not be a replica of the new table.
+
+The private job port binds admission, compact status reads and cancellation to
+the exact job ID, idempotency namespace/key, request fingerprint and plan
+commitment. Cancellation checks the persisted plan again. Admission and cancel
+use single-attempt transport with explicit not-proposed witnesses; dropped,
+malformed or substituted accepted replies retain an admission-unknown receipt
+and never trigger source reevaluation. Status polls load the compact job record
+without decoding its staging plan. Metadata leadership controls dispatch through
+the existing restore workers. This port requires metadata capability 169; the
+native API operation boundary is version 25.
+
+The mounted population campaign executes all eleven unchanged permanent
+population/materialized-view originals, exercises lost and malformed admission
+replies and plan substitution, and checks cancellation plus publication after
+complete owner restart. A producer-only forbidden staging-read fixture proves
+that administrative admission does not borrow replica authorization. The scope
+campaign separately checks mixed type/FK/default/view capture and complete
+survivor postimages, without claiming physical scope completion.
+
 ## Remaining activation
 
-1. Complete named-type and other stored-definition CASCADE evolution beyond
-   the captured FK, sequence-default, view and callable footprint, including
-   external dependent columns. Finish connection/data admission and physical-owner barriers without
+1. Publish captured named-type column evolution through the native staged row
+   rewrite and constraint machinery; metadata-only removal is insufficient for
+   physical typed rows. Complete other stored-definition dependency classes as
+   their public execution is activated. Finish connection/data admission and physical-owner barriers without
    a global query lock. The current metadata footprint and fences do not supply
    deletion authority for those still-unimplemented effects.
 2. Drive proposals from the child identities already registered atomically at
@@ -201,12 +255,16 @@ before issuing dependent writes; it never replays an admitted CREATE or INSERT.
 ```sh
 cd zig
 zig build sql-test -Dtest-filter='SQL scope retirement' \
-  -Dtest-filter='SQL qualified foreign key' -Doptimize=Debug -j1
+  -Dtest-filter='SQL qualified foreign key' \
+  -Dtest-filter='SQL named type retirement' \
+  -Dtest-filter='dependent retirement' -Doptimize=Debug -j1
 zig build antfly-metadata-scope-retirement-test -Doptimize=Debug -j1
 zig build antfly-standalone-scope-retirement-test -Doptimize=Debug -j1
 zig build antfly-api-sql-scope-retirement-test \
   -Dtest-filter='mounted SQL scope retirement capture' \
   -Dtest-filter='system catalog binds foreign keys once and authorizes cascades by current logical names' \
+  -Dtest-filter='SQL scope retirement population' \
+  -Dtest-filter='sequence catalog HTTP grants bind exact bodies' \
   -Doptimize=Debug -j1
 ```
 

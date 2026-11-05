@@ -329,9 +329,24 @@ pub fn run(comptime Campaign: type) !void {
     return runWithState(Campaign, .{});
 }
 
+/// Deny only producer-side plan access; the receiving native owner retains
+/// its independently authorized source. Bind before requests can be dispatched.
+fn forbidProducerPlanReads(data: *data_runtime.DataServer, storage: *?http_server.StatusSource.VTable) void {
+    const Guard = struct {
+        fn forbidden(_: *anyopaque, _: std.mem.Allocator, _: [16]u8, _: @import("antfly_local_sources").api_operation.RequestContext) !?[]u8 {
+            return error.TestUnexpectedResult;
+        }
+    };
+    const api = &data.http_server.?;
+    storage.* = api.source.vtable.*;
+    storage.*.?.get_restore_staging = Guard.forbidden;
+    api.source.vtable = &storage.*.?;
+}
+
 /// Runtime campaign data avoids compiling the same mounted owner and restart
 /// machinery once per original contract. Each run still owns isolated roots.
 pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
+    var campaign = initial;
     const alloc = std.testing.allocator;
     const process_alloc = platform.allocator.processAllocator(alloc);
     const rewrite_username = "pk-rewriter";
@@ -380,6 +395,7 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
     const public_anonymous = if (@hasDecl(Campaign, "public_anonymous")) Campaign.public_anonymous else false;
     if (public_anonymous and native_auth) @compileError("anonymous SQL campaign cannot also require public authentication");
     const cold_catalog = if (@hasDecl(Campaign, "cold_catalog")) Campaign.cold_catalog else false;
+    const producer_plan_reads_forbidden = if (@hasDecl(Campaign, "producer_plan_reads_forbidden")) Campaign.producer_plan_reads_forbidden else false;
     const session_path = try std.fmt.allocPrint(alloc, "{s}/sql-sessions", .{root});
     defer alloc.free(session_path);
     const local = @import("antfly_local_sources");
@@ -424,7 +440,13 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
     }, metadata_uri);
     var data_live = true;
     defer if (data_live) data.deinit();
+    // Bind the producer capability before registration or data progress can
+    // dispatch requests. The real data-owner authority source stays intact.
+    var producer_source_vtable: ?http_server.StatusSource.VTable = null;
+    if (@hasDecl(Campaign, "configureData")) try campaign.configureData(&data, io_impl.io());
     try data.start();
+    if (producer_plan_reads_forbidden)
+        forbidProducerPlanReads(&data, &producer_source_vtable);
     for (0..32) |_| {
         data.registerNodeIfConfigured() catch |err| switch (err) {
             error.StoreRegistrationNotVisible => {
@@ -469,7 +491,6 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
         .base = base,
         .progress = .{ &meta_raft, &meta_control, &data_raft, &data_control },
     };
-    var campaign = initial;
     try enrollOwnedTestRoot(&context, data_root);
     try campaign.beforeRestart(&context);
     try context.checkDrivers();
@@ -525,7 +546,10 @@ pub fn runWithState(comptime Campaign: type, initial: Campaign) !void {
         .api_server_cfg = .{ .deployment_mode = .distributed, .auth_enabled = native_auth, .user_manager = if (native_auth) &auth_manager else null, .trusted_principal_secret = if (public_anonymous) null else trusted_secret, .trusted_principal_issuer = issuer, .setting_authority_secret = if (public_anonymous) trusted_secret else null, .setting_authority_issuer = if (public_anonymous) issuer else null, .internal_service_secret = internal_secret, .internal_service_issuer = issuer, .internal_service_auth_capability = "v1; mode=enforce", .session_store = if (sessions) |*store| store else null },
     }, metadata_uri);
     data_live = true;
+    if (@hasDecl(Campaign, "configureData")) try campaign.configureData(&data, io_impl.io());
     try data.start();
+    if (producer_plan_reads_forbidden)
+        forbidProducerPlanReads(&data, &producer_source_vtable);
     for (0..32) |_| {
         data.registerNodeIfConfigured() catch |err| switch (err) {
             error.StoreRegistrationNotVisible => {

@@ -23200,6 +23200,79 @@ pub const RaftApplyStore = struct {
         participants: usize = 0,
         callables: std.ArrayList(system_catalog.Resource) = .empty,
         callable_work: usize = 0,
+        type_ids: std.ArrayList(u64) = .empty,
+
+        fn typeClosure(self: *@This(), sources: *std.ArrayList(RetirementViewSource)) !void {
+            var typed: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
+            for (self.base.resources) |resource_value| if (resource_value.kind == .named_type) {
+                try self.type_ids.append(self.a, resource_value.id);
+                if (try sql_type_uses.retirementLock(self.txn, self.group, resource_value.id) != null or
+                    try schema_validation.activeType(self.txn, self.group, resource_value.id) != null) return error.CatalogPublicationProofPending;
+                var region = std.heap.ArenaAllocator.init(self.store.alloc);
+                defer region.deinit();
+                const ids = try sql_type_uses.dependentsAlloc(region.allocator(), self.txn, self.group, resource_value.id, sql_type_uses.max_dependents);
+                for (ids) |id| {
+                    try self.context.ensureActive();
+                    if (self.retired_ids.contains(id) or (try seen.getOrPut(self.a, id)).found_existing) continue;
+                    // A typed materialization belongs to its view, not an
+                    // independently mutable SQL table. Seed the view walk so
+                    // its one backing/deletion child is captured there.
+                    var buffer: [192]u8 = undefined;
+                    const raw = try self.txn.get(try tableKeyForGroup(&buffer, self.group, id));
+                    // Table rows use the native framed codec, including the
+                    // materialized-owner extension. Borrow only the identity
+                    // projection; never treat durable table bytes as JSON.
+                    const owner = try borrowTableProjection(raw, .identity);
+                    if (owner.table_id != id) return error.InvalidCatalogRecord;
+                    if (owner.sql_materialized_view_id) |view| {
+                        if (view == 0) return error.InvalidSqlViewRecord;
+                        if (sources.items.len == 16384) return error.SqlProgramLimitExceeded;
+                        try sources.append(self.a, .{ .kind = .view, .id = view });
+                        continue;
+                    }
+                    try self.rewrite(id);
+                    try typed.put(self.a, id, {});
+                }
+            };
+            if (typed.count() == 0) return;
+            // A removed key/generated column can invalidate an incoming FK in
+            // another table, even if that table has no column of this type.
+            var direct = typed.keyIterator();
+            while (direct.next()) |id| {
+                const table_value = self.dependencies.items[self.slots.get(.{ .kind = .table, .id = id.* }).?].table.?;
+                var region = std.heap.ArenaAllocator.init(self.store.alloc);
+                defer region.deinit();
+                const incoming = try sql_fk_uses.captureSelectedWithContext(region.allocator(), self.txn, self.group, table_value.physical_name, contract.max_tables, table_value.id, .both, self.context);
+                try self.stamps.append(self.a, .{ .kind = .foreign_key, .id = table_value.id, .digest = try scopeFingerprint(incoming.stamp, "antfly/scope-retirement-fk/v1\x00") });
+                for (incoming.tables) |child| try self.rewrite(child);
+            }
+            var inputs: std.ArrayList(@import("antfly_local_sources").sql_catalog.type_retirement.Input) = .empty;
+            var ids: std.ArrayList(u64) = .empty;
+            var candidates = self.rewrites.keyIterator();
+            while (candidates.next()) |id| {
+                const table_value = self.dependencies.items[self.slots.get(.{ .kind = .table, .id = id.* }).?].table.?;
+                const header = try std.json.parseFromSliceLeaky(Header, self.a, table_value.preimage, .{ .ignore_unknown_fields = true });
+                try inputs.append(self.a, .{ .table_id = id.*, .name = table_value.physical_name, .schema_json = header.schema_json });
+                try ids.append(self.a, id.*);
+            }
+            var prepared = try @import("antfly_local_sources").sql_catalog.type_retirement.Prepared.initMany(self.store.alloc, inputs.items, self.type_ids.items);
+            defer prepared.deinit();
+            const attributes: column_identities.Store(docstore.DocStore.Txn) = .{ .txn = self.txn, .group_id = self.group };
+            for (prepared.tables, ids.items) |table_value, id| {
+                if (table_value.dropped_columns.len == 0) continue;
+                var region = std.heap.ArenaAllocator.init(self.store.alloc);
+                defer region.deinit();
+                const scratch = region.allocator();
+                const state = (try attributes.load(scratch, id)) orelse return error.InvalidColumnIdentityState;
+                var names: std.StringHashMapUnmanaged(u64) = .empty;
+                for (state.value.columns) |column| try names.put(scratch, column.name, column.id);
+                for (table_value.dropped_columns) |name| {
+                    if (sources.items.len == 16384) return error.SqlProgramLimitExceeded;
+                    try sources.append(self.a, .{ .kind = .table, .id = id, .column = names.get(name) orelse return error.InvalidColumnIdentityState });
+                }
+            }
+        }
 
         fn callableClosure(self: *@This()) !void {
             for (self.base.resources) |resource_value| if (resource_value.kind == .routine or resource_value.kind == .cast) try self.callables.append(self.a, resource_value);
@@ -23365,6 +23438,7 @@ pub const RaftApplyStore = struct {
             else => {},
         };
         try capture.callableClosure();
+        try capture.typeClosure(&sources);
         const closure = try self.captureRetirementViewsFromSourcesTxn(a, self.alloc, txn, group, sources.items, budget, context);
         for (closure.views) |resource| {
             try view_leases.requireUnleased(txn, group, resource.id);
@@ -23410,22 +23484,29 @@ pub const RaftApplyStore = struct {
                 return left.sequence_id < right.sequence_id;
             }
         }.less);
-        const selection: selection_domain.Selection = .{ .relations = relations, .sequences = sequence_selection.items };
-        // Rewrites may discover unchanged outgoing parents/type owners. Iterate
-        // stable IDs, since appending those holds may grow the participant list.
+        const selection: selection_domain.Selection = .{ .relations = relations, .sequences = sequence_selection.items, .types = capture.type_ids.items };
+        // Plan all surviving schemas together. Cross-table column dependencies
+        // must see the complete retiring type set, not a previous child's image.
+        var survivor_inputs: std.ArrayList(@import("antfly_local_sources").sql_catalog.type_retirement.Input) = .empty;
+        var survivor_positions: std.ArrayList(usize) = .empty;
         var survivor_iterator = capture.rewrites.keyIterator();
         while (survivor_iterator.next()) |id| {
             const position = capture.slots.get(.{ .kind = .table, .id = id.* }).?;
             const before = capture.dependencies.items[position].table.?;
             try capture.references(before, false, ready);
-            var region: std.heap.ArenaAllocator = .init(self.alloc);
-            defer region.deinit();
-            const header = try std.json.parseFromSliceLeaky(ScopeDependencyCapture.Header, region.allocator(), before.preimage, .{ .ignore_unknown_fields = true });
-            const after = try selection.schemaAlloc(self.alloc, id.*, header.schema_json);
-            defer self.alloc.free(after);
-            try budget.add(after);
-            capture.dependencies.items[position].action = .rewrite;
-            capture.dependencies.items[position].schema_after = try a.dupe(u8, after);
+            const header = try std.json.parseFromSliceLeaky(ScopeDependencyCapture.Header, a, before.preimage, .{ .ignore_unknown_fields = true });
+            try survivor_inputs.append(a, .{ .name = before.physical_name, .schema_json = if (header.schema_json.len == 0) "{}" else header.schema_json, .table_id = id.* });
+            try survivor_positions.append(a, position);
+        }
+        if (survivor_inputs.items.len != 0) {
+            var cohort = try selection.prepareCohort(self.alloc, survivor_inputs.items);
+            defer cohort.deinit();
+            for (cohort.tables, survivor_positions.items) |after, position| {
+                if (!after.changed) continue;
+                try budget.add(after.schema_json);
+                capture.dependencies.items[position].action = .rewrite;
+                capture.dependencies.items[position].schema_after = try a.dupe(u8, after.schema_json);
+            }
         }
         const edges = try a.alloc(contract.ViewEdge, closure.edges.len);
         for (closure.edges, edges) |edge, *output| {
@@ -23921,21 +24002,21 @@ pub const RaftApplyStore = struct {
     fn captureTableRetirementViewsTxn(self: *RaftApplyStore, a: std.mem.Allocator, backing: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, root: u64, budget: *RetirementCaptureBudget, context: @import("antfly_local_sources").api_operation.RequestContext) !RetirementViews {
         return self.captureRetirementViewsFromSourcesTxn(a, backing, txn, group, &.{.{ .kind = .table, .id = root }}, budget, context);
     }
-    const RetirementViewSource = struct { kind: @import("antfly_local_sources").sql_view_definition.SourceKind, id: u64 };
+    const RetirementViewSource = struct { kind: @import("antfly_local_sources").sql_view_definition.SourceKind, id: u64, column: ?u64 = null };
     fn captureRetirementViewsFromSourcesTxn(self: *RaftApplyStore, a: std.mem.Allocator, backing: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, sources: []const RetirementViewSource, budget: *RetirementCaptureBudget, context: @import("antfly_local_sources").api_operation.RequestContext) !RetirementViews {
         const manifest = @import("../table_retirement_manifest.zig");
         var resources: std.ArrayList(system_catalog.Resource) = .empty;
         var backings: std.ArrayList(manifest.Backing) = .empty;
         var seen: std.AutoHashMapUnmanaged(u64, void) = .empty;
-        var roots: std.ArrayList(u64) = .empty;
-        var seen_roots: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        var roots: std.ArrayList(RetirementViewSource) = .empty;
+        var seen_roots: std.AutoHashMapUnmanaged(RetirementViewSource, void) = .empty;
         for (sources) |source| {
             try context.ensureActive();
             if (source.id == 0) return error.InvalidSqlViewRecord;
             if (source.kind == .table) {
-                if ((try seen_roots.getOrPut(a, source.id)).found_existing) continue;
-                if (roots.items.len == system_catalog.scope_retirement.max_tables) return error.SqlProgramLimitExceeded;
-                try roots.append(a, source.id);
+                if ((try seen_roots.getOrPut(a, source)).found_existing) continue;
+                if (roots.items.len == manifest.max_edges) return error.SqlProgramLimitExceeded;
+                try roots.append(a, source);
             } else {
                 if ((try seen.getOrPut(a, source.id)).found_existing) continue;
                 if (resources.items.len == manifest.max_views) return error.SqlProgramLimitExceeded;
@@ -23953,7 +24034,7 @@ pub const RaftApplyStore = struct {
         // A view reached from multiple roots is decoded once, not once/root.
         while (position < roots.items.len + resources.items.len) : (position += 1) {
             try context.ensureActive();
-            const id = if (position < roots.items.len) roots.items[position] else resources.items[position - roots.items.len].id;
+            const id = if (position < roots.items.len) roots.items[position].id else resources.items[position - roots.items.len].id;
             const kind: @import("antfly_local_sources").sql_view_definition.SourceKind = if (position < roots.items.len) .table else .view;
             if (kind == .view) {
                 const resource = resources.items[position - roots.items.len];
@@ -24007,7 +24088,7 @@ pub const RaftApplyStore = struct {
                 }
             }
             var buffer: [192]u8 = undefined;
-            const prefix = try sql_views.dependencyPrefix(&buffer, group, kind, id, null);
+            const prefix = try sql_views.dependencyPrefix(&buffer, group, kind, id, if (position < roots.items.len) roots.items[position].column else null);
             var cursor = try txn.openCursor();
             defer cursor.close();
             var row = try cursor.seekAtOrAfter(prefix);
@@ -51423,6 +51504,7 @@ const ScopeRetirementCheckpoint = struct {
             }
             if (dependency.table) |table| try self.requireTable(reader, table);
         }
+        manifest.requireSurvivorSchemas(self.alloc) catch |err| return if (err == error.OutOfMemory) err else error.InvalidScopeRetirement;
         for (manifest.stamps) |stamp| {
             const digest = switch (stamp.kind) {
                 .foreign_key => try RaftApplyStore.scopeFingerprint(try sql_fk_uses.stamp(reader, self.group, (manifest.tableById(stamp.id) orelse return error.InvalidScopeRetirement).physical_name), "antfly/scope-retirement-fk/v1\x00"),

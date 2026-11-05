@@ -66,7 +66,11 @@ pub const Command = struct {
     admission: participant.Admission,
     /// Supplied only by the accepting leader, never from a public SQL body.
     checked: ?Checked = null,
-    operation: union(enum) {
+    operation: Operation,
+
+    /// A named transport type keeps native layout fingerprints independent of
+    /// compiler-generated anonymous-type identities in separate archives.
+    pub const Operation = union(enum) {
         begin,
         acquire: ledger.Effect,
         row: struct { effect: ledger.Effect, key: []const u8, witness: row.Witness, wait: @FieldType(row.Request, "wait") },
@@ -78,7 +82,7 @@ pub const Command = struct {
         close,
         prepare: scopes.DecisionRef,
         resolve: scopes.DecisionRef,
-    },
+    };
     pub fn validate(self: Command) !void {
         try self.admission.validate();
         switch (self.operation) {

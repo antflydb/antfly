@@ -33,6 +33,9 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
     var maximum_sequence: u64 = 0;
     var counter: ?u64 = null;
     var callable_members: usize = 0;
+    var type_members: usize = 0;
+    var removed_columns: RetiredColumnCache = .{ .arena = .init(backing) };
+    defer removed_columns.arena.deinit();
     try rows.reset();
     while (try rows.next()) |row| {
         if (canceled) |flag| if (flag.load(.acquire)) return error.SnapshotBuildCancelled;
@@ -130,6 +133,10 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
                     !prepared.manifest.creator.eql(head.creator)) return error.InvalidScopeRetirement;
                 try ledger.requireMembers(reader, &prepared, head);
                 try context.verifyManifest(reader, head, prepared.manifest);
+                for (prepared.manifest.resources) |resource| if (resource.kind == .named_type) {
+                    type_members += 1;
+                };
+
                 for (prepared.manifest.resources) |resource| if (resource.kind == .routine or resource.kind == .cast) {
                     callable_members += 1;
                 };
@@ -193,6 +200,17 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
                         (source == null or !std.meta.eql(source.?.lookup, owner.?.lookup))) return error.InvalidScopeRetirement;
                 }
             }
+            if (type_members != 0) {
+                const uses = @import("../system_catalog/named_type_dependencies.zig");
+                if (try uses.tableFromKey(row.key, group)) |table| {
+                    const ids = try uses.loadAlloc(backing, reader, group, table);
+                    defer backing.free(ids);
+                    const owner = try ledger.member(reader, group, .table, table);
+                    for (ids) |id| if (try ledger.member(reader, group, .named_type, id)) |source| {
+                        if (source.intent == .retire and (owner == null or owner.?.intent == .hold or !std.meta.eql(owner.?.lookup, source.lookup))) return error.InvalidScopeRetirement;
+                    };
+                }
+            }
             if (try @import("schema_validation_dependencies.zig").Key.parse(row.key)) |dependency| {
                 if (dependency.group == group and dependency.parent != null and
                     try @import("scope_retirement_fence.zig").occupied(reader, group, "table", dependency.parent.?)) return error.InvalidScopeRetirement;
@@ -208,8 +226,10 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
             const edge = (try @import("../system_catalog/views.zig").dependencyFromKey(row.key, group)) orelse continue;
             const source = try ledger.member(reader, group, if (edge.dependency.kind == .table) .table else .view, edge.dependency.id);
             const owner = try ledger.member(reader, group, .view, edge.view);
-            if (source != null and source.?.intent == .retire and
-                (owner == null or owner.?.intent != .retire or !std.meta.eql(owner.?.lookup, source.?.lookup))) return error.InvalidScopeRetirement;
+            const removed = type_members != 0 and source != null and source.?.intent == .rewrite and edge.dependency.kind == .table and edge.dependency.column != 0 and
+                try removed_columns.contains(reader, source.?.lookup, edge.dependency.id, edge.dependency.column);
+            const retiring_source = if (source != null and (source.?.intent == .retire or removed)) source.?.lookup else null;
+            if (retiring_source) |lookup| if (owner == null or owner.?.intent != .retire or !std.meta.eql(owner.?.lookup, lookup)) return error.InvalidScopeRetirement;
             if (owner != null and owner.?.intent == .retire) {
                 if (source == null or !std.meta.eql(owner.?.lookup, source.?.lookup)) return error.InvalidScopeRetirement;
                 try increment(&received[5], 1);
@@ -225,3 +245,42 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
 fn increment(value: *u64, count: usize) !void {
     value.* = std.math.add(u64, value.*, count) catch return error.SqlProgramLimitExceeded;
 }
+
+/// One immutable root at a time. Ordered view edges reuse its removed-column
+/// set; recovery memory never grows with all active scope manifests.
+const RetiredColumnCache = struct {
+    const Column = struct { table: u64, column: u64 };
+    arena: std.heap.ArenaAllocator,
+    root: ?ledger.Lookup = null,
+    columns: std.AutoHashMapUnmanaged(Column, void) = .empty,
+    fn contains(self: *@This(), reader: anytype, lookup: ledger.Lookup, table: u64, column: u64) !bool {
+        if (self.root == null or !std.meta.eql(self.root.?, lookup)) {
+            _ = self.arena.reset(.retain_capacity);
+            self.columns = .empty;
+            self.root = null;
+            const a = self.arena.allocator();
+            const local = @import("antfly_local_sources");
+            const Image = struct { dependencies: []const struct { kind: local.system_catalog_domain.Kind, id: u64, action: enum { retire, rewrite, hold }, schema_after: ?[]const u8 = null } = &.{} };
+            var buffer: [320]u8 = undefined;
+            const image = try std.json.parseFromSliceLeaky(Image, a, try reader.get(try ledger.key(&buffer, lookup, .manifest)), .{ .ignore_unknown_fields = true });
+            for (image.dependencies) |dependency| if (dependency.action == .rewrite) {
+                if (dependency.kind != .table or dependency.schema_after == null) return error.InvalidScopeRetirement;
+                var scratch = std.heap.ArenaAllocator.init(self.arena.child_allocator);
+                defer scratch.deinit();
+                const region = scratch.allocator();
+                const after = try std.json.parseFromSliceLeaky(std.json.Value, region, dependency.schema_after.?, .{});
+                const mode = after.object.get("storage_mode") orelse continue;
+                if (mode != .string or !std.mem.eql(u8, mode.string, "relational")) continue;
+                const properties = try local.sql_catalog.schema_columns.properties(after);
+                const attributes: local.system_catalog_column_identities.Store(@TypeOf(reader.*)) = .{ .txn = reader, .group_id = lookup.group };
+                const before = (try attributes.load(region, dependency.id)) orelse return error.InvalidScopeRetirement;
+                for (before.value.columns) |removed| if (!properties.object.contains(removed.name)) {
+                    if (self.columns.count() == 16384) return error.InvalidScopeRetirement;
+                    try self.columns.put(a, .{ .table = dependency.id, .column = removed.id }, {});
+                };
+            };
+            self.root = lookup;
+        }
+        return self.columns.contains(.{ .table = table, .column = column });
+    }
+};

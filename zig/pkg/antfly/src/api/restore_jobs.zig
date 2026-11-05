@@ -2902,7 +2902,7 @@ fn encode(alloc: std.mem.Allocator, state: JobState) ![]u8 {
     return try std.json.Stringify.valueAlloc(alloc, state, .{ .emit_null_optional_fields = false });
 }
 
-fn requestFingerprintAlloc(alloc: std.mem.Allocator, req: StartRequest) ![]u8 {
+pub fn requestFingerprintAlloc(alloc: std.mem.Allocator, req: StartRequest) ![]u8 {
     const canonical = try std.json.Stringify.valueAlloc(alloc, .{
         .scope = req.scope,
         .table_name = req.table_name,

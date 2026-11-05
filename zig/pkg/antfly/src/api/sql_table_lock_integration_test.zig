@@ -106,6 +106,25 @@ const Campaign = struct {
     credentials: client.ApiKeyHeaders = .{},
     holder: [32]u8 = undefined,
     contender: [32]u8 = undefined,
+    authorization_server: *@import("../data/runtime.zig").DataServer = undefined,
+    authorization_io: std.Io = undefined,
+    authorization_checks: std.atomic.Value(usize) = .init(0),
+    fn observeAuthorization(raw: *anyopaque, event: @import("../data/runtime.zig").DataRequestLifecycleEvent) !void {
+        if (event.phase != .sql_lock_authorization) return;
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const until = @import("antfly_platform").time.monotonicNs() +| 5 * std.time.ns_per_s;
+        while (!self.authorization_server.data_raft_mutex.tryLock()) {
+            try std.testing.expect(@import("antfly_platform").time.monotonicNs() < until);
+            try self.authorization_io.sleep(.fromMilliseconds(1), .awake);
+        }
+        self.authorization_server.data_raft_mutex.unlock();
+        _ = self.authorization_checks.fetchAdd(1, .monotonic);
+    }
+    pub fn configureData(self: *@This(), data: *@import("../data/runtime.zig").DataServer, io: std.Io) !void {
+        self.authorization_server = data;
+        self.authorization_io = io;
+        data.data_request_lifecycle_hook = .{ .ptr = self, .reach_fn = observeAuthorization };
+    }
     pub fn configureAuth(manager: *@import("../usermgr/mod.zig").UserManager) !void {
         const users = @import("../usermgr/mod.zig");
         inline for (.{ users.ResourceType.database, users.ResourceType.namespace }) |kind| {
@@ -152,6 +171,7 @@ const Campaign = struct {
         try rows(ctx, &self.holder, "SELECT id FROM usage_records WHERE id='a' FOR UPDATE", &.{"a"});
     }
     pub fn afterRestart(self: *@This(), ctx: *fixture.Context) !void {
+        try std.testing.expect(self.authorization_checks.load(.monotonic) > 0);
         ctx.admin_headers = &self.credentials.admin;
         ctx.reader_headers = &self.credentials.reader;
         try command(ctx, &self.contender, "BEGIN", "BEGIN");
@@ -295,14 +315,16 @@ const ReadBarrierCampaign = struct {
         const headers = try ctx.alloc.alloc(http.RequestHeader, ctx.admin_headers.len + 1);
         defer ctx.alloc.free(headers);
         @memcpy(headers[0..ctx.admin_headers.len], ctx.admin_headers);
-        // Include Debug catalog/read-index admission in this budget. A 1s
-        // whole-request timeout can expire before the native waiter is queued,
-        // exercising availability (53300) instead of lock cancellation (57014).
+        // Catalog/read-index admission can reject before the lock waiter is
+        // queued. Only the shared exact nonadmission witness permits another
+        // preparation attempt under the same outer budget. Once admitted, this
+        // read must time out waiting on the real native lock and return 57014.
         headers[ctx.admin_headers.len] = .{ .name = @import("antfly_public_limits").Execution.timeout_header, .value = "5000" };
-        const body = try std.json.Stringify.valueAlloc(ctx.alloc, .{ .connection_id = self.holder, .statement = "SELECT id FROM usage_records" }, .{});
-        defer ctx.alloc.free(body);
-        var blocked = try fixture.requestWithTimeout(ctx.alloc, ctx.transport, headers, ctx.base, "/db/v1/sql", .POST, body, 10000);
+        var waiting = ctx.*;
+        waiting.headers = headers;
+        var blocked = try client.executeConnected(&waiting, null, &self.holder, "SELECT id FROM usage_records", .read);
         defer blocked.deinit(ctx.alloc);
+        errdefer std.debug.print("blocked read cancellation status={d} body={s}\n", .{ blocked.status, blocked.body });
         var parsed = try std.json.parseFromSlice(struct { code: []const u8 }, ctx.alloc, blocked.body, .{ .ignore_unknown_fields = true });
         defer parsed.deinit();
         try std.testing.expectEqualStrings("57014", parsed.value.code);

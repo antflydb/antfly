@@ -228,7 +228,10 @@ pub const MetadataServer = struct {
             alloc.destroy(public_http_server);
         };
         var owned_admin_mux: ?*MetadataAdminMux = null;
-        errdefer if (owned_admin_mux) |mux| alloc.destroy(mux);
+        errdefer if (owned_admin_mux) |mux| {
+            svc.query_population_jobs = null;
+            alloc.destroy(mux);
+        };
         var http_observer_lease: ?@import("antfly_local_sources").storage_background_runtime.BackendRuntime.WorkerLease = null;
         errdefer if (http_observer_lease) |*lease| lease.release();
         var owned_http_runtime: ?*httpx.HttpRuntime = null;
@@ -397,6 +400,7 @@ pub const MetadataServer = struct {
                 .svc = svc,
             };
             owned_admin_mux = mux;
+            svc.query_population_jobs = .{ .ptr = mux, .execute = MetadataAdminMux.queryPopulationJob };
 
             const listener_server_config = metadataAdminHttpxConfig(listener_cfg, null);
             http_observer_lease = try (try svc.ensureBackendRuntime()).acquireWorkers(.{});
@@ -469,6 +473,7 @@ pub const MetadataServer = struct {
         }
         if (self.http_observer_lease) |*lease| lease.release();
         self.http_observer_lease = null;
+        self.svc.query_population_jobs = null;
         if (self.owned_admin_mux) |mux| {
             self.alloc.destroy(mux);
         }
@@ -1018,6 +1023,12 @@ const MetadataAdminMux = struct {
     svc: *service.MetadataHttpService,
     restore_leadership_mutex: std.atomic.Mutex = .unlocked,
     restore_leadership_term: u64 = 0,
+
+    fn queryPopulationJob(ptr: *anyopaque, alloc: std.mem.Allocator, context: @import("antfly_local_sources").api_operation.RequestContext, request: @import("query_population_job.zig").Request) ![]u8 {
+        const self: *MetadataAdminMux = @ptrCast(@alignCast(ptr));
+        if (!try self.ensureRestoreLeadershipIfLocalLeader()) return error.NotLeader;
+        return self.public_api.executeQueryPopulationJob(alloc, context, request);
+    }
 
     fn ensureRestoreLeadershipIfLocalLeader(self: *MetadataAdminMux) !bool {
         const term = self.svc.localMetadataLeadershipTerm() orelse {

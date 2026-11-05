@@ -1277,6 +1277,9 @@ pub const MetadataHttpClient = struct {
             const token = std.mem.trim(u8, media[0 .. std.mem.indexOfScalar(u8, media, ';') orelse media.len], " \t");
             if (!std.ascii.eqlIgnoreCase(token, input.responseContentType())) return error.InvalidGenerationPublication;
         }
+        if (input == .query_population_job and response.status != 200) {
+            if (@import("query_population_job.zig").definiteHttpFailure(response.status, response.body)) |err| return err;
+        }
         if ((input == .sql_catalog_prepare or input == .table_retirement_prepare or input == .fk_initial_create_prepare or input == .query_population_prepare or input == .constraint_name_prepare or input == .constraint_name_check) and response.status != 200) {
             if (system_catalog.definiteNamingError(response.status, response.body)) |err| return err;
             if (response.status == 405 and std.mem.eql(u8, response.body, "ExtensionOwnedObject")) return error.ExtensionOwnedObject;
@@ -1486,6 +1489,21 @@ pub const MetadataHttpClient = struct {
         return self.alloc.dupe(u8, bytes) catch return error.MetadataMutationOutcomeUnknown;
     }
 
+    fn submitQueryPopulationJob(self: *MetadataHttpClient, base_uri: []const u8, request: @import("query_population_job.zig").Request, remaining_ms: u32, setting_admin: bool, control: CatalogControl) ![]u8 {
+        const wire = @import("query_population_job.zig");
+        if (!setting_admin) return error.Forbidden;
+        if (remaining_ms == 0) return error.Timeout;
+        try request.validate(self.alloc);
+        const command = try std.json.Stringify.valueAlloc(self.alloc, request, .{});
+        defer self.alloc.free(command);
+        if (command.len > wire.max_command_bytes) return error.CatalogCommandTooLarge;
+        const authority = @import("../system_catalog/setting_authority.zig");
+        const grant = try authority.sign(self.alloc, self.setting_authority_secret orelse return error.SettingAuthorityUnavailable, self.setting_authority_issuer orelse return error.SettingAuthorityUnavailable, .admin, command, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_s)));
+        defer self.alloc.free(grant);
+        var local_delivery: http_common.RequestDeliveryTracker = .{};
+        return self.executeLifecycleSubmission(base_uri, routes.Routes.internal_query_population_job, command, grant, remaining_ms, control.cancellation, &local_delivery, wire.max_response_bytes, control.submitted);
+    }
+
     fn executeLifecycleSubmission(self: *MetadataHttpClient, base_uri: []const u8, path: []const u8, command: []const u8, grant: []const u8, remaining_ms: u32, cancellation: ?*const http_common.RequestCancellation, delivery: *http_common.RequestDeliveryTracker, max_response_bytes: usize, submitted: ?*bool) ![]u8 {
         const budget_ms = @min(remaining_ms, raft_mutation_forwarding.max_remaining_ms);
         if (budget_ms == 0) return error.Timeout;
@@ -1530,6 +1548,9 @@ pub const MetadataHttpClient = struct {
         };
         if (std.mem.eql(u8, outcome, routes.Routes.raft_mutation_outcome_not_proposed)) {
             possible_submission = false;
+            if (std.mem.eql(u8, path, routes.Routes.internal_query_population_job)) {
+                if (@import("query_population_job.zig").definiteHttpFailure(response.status, response.body)) |err| return err;
+            }
             if (std.mem.eql(u8, path, routes.Routes.internal_scope_retirement)) {
                 if (@import("scope_retirement_wire.zig").definiteHttpFailure(response.status, response.body)) |err| return err;
             }
@@ -1608,6 +1629,7 @@ pub const MetadataHttpClient = struct {
     }
     pub fn forwardSystemCatalogWithControl(self: *MetadataHttpClient, base_uri: []const u8, input: @import("../system_catalog/server_call.zig").Call, forwarding: raft_mutation_forwarding.Context, setting_admin: bool, control: CatalogControl) ![]u8 {
         const cancellation = control.cancellation;
+        if (input == .query_population_job and input.query_population_job.isMutation()) return self.submitQueryPopulationJob(base_uri, input.query_population_job, forwarding.remaining_ms, setting_admin, control);
         if (input == .schema_validation_submit) return self.submitSchemaValidationWithControl(base_uri, input.schema_validation_submit, forwarding.remaining_ms, setting_admin, control);
         if (input == .table_retirement_submit) return self.submitTableRetirementWithControl(base_uri, input.table_retirement_submit, forwarding.remaining_ms, setting_admin, control);
         if (input == .scope_retirement_submit) return self.submitScopeRetirementWithControl(base_uri, input.scope_retirement_submit, forwarding.remaining_ms, setting_admin, control);
@@ -6161,4 +6183,60 @@ test "SQL scope retirement HTTP submission preserves definite conflicts and neve
             try std.testing.expectEqual(previous + 1, executor.calls);
         }
     }
+}
+
+test "SQL scope retirement population HTTP controls never replay unknown delivery and bind exact administrative bodies" {
+    const a = std.testing.allocator;
+    const wire = @import("query_population_job.zig");
+    const authority = @import("../system_catalog/setting_authority.zig");
+    const Executor = struct {
+        calls: usize = 0,
+        mode: enum { lost, not_sent, rejected } = .lost,
+        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.endsWith(u8, request.uri, routes.Routes.internal_query_population_job));
+            try std.testing.expectEqualStrings("application/octet-stream", request.content_type.?);
+            try std.testing.expectEqualStrings("0", request.header(routes.Routes.raft_mutation_forwards_remaining_header).?);
+            try std.testing.expectEqualStrings("false", request.header(routes.Routes.raft_mutation_campaign_allowed_header).?);
+            try authority.verify("population-fixture", "cluster-fixture", .admin, request.body, @intCast(@divFloor(platform_time.realtimeNs(), std.time.ns_per_s)), request.header(authority.header_name).?);
+            switch (self.mode) {
+                .lost => return error.Timeout,
+                .not_sent => {
+                    request.delivery_tracker.?.markNotSent();
+                    return error.ConnectionRefused;
+                },
+                .rejected => {
+                    const body = try alloc.dupe(u8, "IdempotencyConflict");
+                    errdefer alloc.free(body);
+                    const headers = try alloc.alloc(http_common.Header, 1);
+                    errdefer alloc.free(headers);
+                    const name = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_header);
+                    errdefer alloc.free(name);
+                    headers[0] = .{ .name = name, .value = try alloc.dupe(u8, routes.Routes.raft_mutation_outcome_not_proposed) };
+                    return .{ .status = system_catalog.httpStatus(error.IdempotencyConflict), .body = body, .headers = headers };
+                },
+            }
+        }
+    };
+    const ref: wire.Reference = .{ .job_id = try @import("../api/restore_jobs.zig").jobIdForIdempotency(a, "population", "capture"), .namespace = "population", .key = "capture", .fingerprint = &@as([64]u8, @splat('a')), .plan_digest = @splat(1) };
+    var executor: Executor = .{};
+    var client = MetadataHttpClient.init(a, .{ .ptr = &executor, .vtable = &.{ .execute = Executor.execute } });
+    _ = client.withSettingAuthority("population-fixture", "cluster-fixture");
+    const request: wire.Request = .{ .cancel = ref };
+    var submitted = false;
+    try std.testing.expectError(error.Forbidden, client.submitQueryPopulationJob("http://metadata.invalid", request, 1000, false, .{}));
+    try std.testing.expectEqual(@as(usize, 0), executor.calls);
+    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, client.submitQueryPopulationJob("http://metadata.invalid", request, 1000, true, .{ .submitted = &submitted }));
+    try std.testing.expect(submitted);
+    try std.testing.expectEqual(@as(usize, 1), executor.calls);
+    submitted = false;
+    executor.mode = .not_sent;
+    try std.testing.expectError(error.RaftMutationRequestNotSent, client.submitQueryPopulationJob("http://metadata.invalid", request, 1000, true, .{ .submitted = &submitted }));
+    try std.testing.expect(!submitted);
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+    executor.mode = .rejected;
+    try std.testing.expectError(error.IdempotencyConflict, client.submitQueryPopulationJob("http://metadata.invalid", request, 1000, true, .{ .submitted = &submitted }));
+    try std.testing.expect(!submitted);
+    try std.testing.expectEqual(@as(usize, 3), executor.calls);
 }

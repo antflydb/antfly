@@ -24,6 +24,16 @@ const Server = @import("http_server.zig").ApiHttpServer;
 const operation = local.api_operation;
 const A = std.mem.Allocator;
 
+/// The API kernel owns both metadata authorization and failed-command/session
+/// custody. Data runtimes borrow this operation through the opaque API boundary.
+pub const AuthorizationInput = struct {
+    alloc: A,
+    context: operation.RequestContext,
+    group: u64,
+    table: []const u8,
+    command: native.Command,
+};
+
 pub fn authorize(server: *Server, a: A, context: operation.RequestContext, group: u64, table: []const u8, input: native.Command) !native.Command {
     try input.validate();
     if (group == 0 or input.admission.binding.namespace.group != group) return error.IdentityNamespaceMismatch;

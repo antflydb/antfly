@@ -3040,6 +3040,9 @@ const LocalStandaloneMetadata = struct {
             return std.json.Stringify.valueAlloc(alloc, capture.value, .{});
         }
         switch (call) {
+            // Standalone producers use their attached replicated local job
+            // store directly; this service transport belongs to metadata nodes.
+            .query_population_job => return error.UnsupportedOperation,
             .scope_retirement_work, .scope_retirement_manifest, .scope_retirement_observation, .scope_retirement_prepare, .table_retirement_prepare => unreachable,
             .sql_snapshot_cohort => |request| {
                 const store = self.lifecycle_store orelse return error.UnsupportedSqlExecution;

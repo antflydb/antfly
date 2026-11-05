@@ -343,7 +343,10 @@ pub const Manifest = struct {
         for (self.stamps, 0..) |stamp, i| {
             if (stamp.id == 0 or std.mem.allEqual(u8, &stamp.digest, 0) or
                 (i != 0 and !Stamp.less({}, self.stamps[i - 1], stamp))) return error.InvalidScopeRetirement;
-            const kind: domain.Kind = if (stamp.kind == .foreign_key) .table else .sequence;
+            const kind: domain.Kind = switch (stamp.kind) {
+                .foreign_key => .table,
+                .sequence_default => .sequence,
+            };
             const identity: Key = .{ .kind = kind, .id = stamp.id };
             if (!members.contains(identity) and !extras.contains(identity)) return error.InvalidScopeRetirement;
         }
@@ -352,6 +355,55 @@ pub const Manifest = struct {
                 (i != 0 and !ViewEdge.less({}, self.view_edges[i - 1], edge)) or
                 (!members.contains(.{ .kind = if (edge.source_kind == .table) .table else .view, .id = edge.source }) and
                     !extras.contains(.{ .kind = if (edge.source_kind == .table) .table else .view, .id = edge.source }))) return error.InvalidScopeRetirement;
+        }
+    }
+
+    /// Reconstruct complete survivor postimages from the admitted immutable
+    /// selection. Recovery must not trust a producer's weakened schema string.
+    pub fn requireSurvivorSchemas(self: Manifest, backing: A) !void {
+        var region = std.heap.ArenaAllocator.init(backing);
+        defer region.deinit();
+        const a = region.allocator();
+        const retirement = @import("dependency_retirement.zig");
+        const sequences = @import("column_sequences.zig");
+        const planner = @import("../sql/type_retirement.zig");
+        var relations: std.ArrayList(retirement.Relation) = .empty;
+        var counters: std.ArrayList(sequences.DefaultRetirement) = .empty;
+        var types: std.ArrayList(u64) = .empty;
+        var selected = self.retiringTables();
+        while (selected.next()) |table| try relations.append(a, .{ .table_id = table.id, .physical_name = table.physical_name });
+        for (self.resources) |resource| switch (resource.kind) {
+            .sequence => try counters.append(a, .{ .sequence_id = resource.id, .namespace_id = resource.parent_id, .incarnation = self.metadata_incarnation }),
+            .named_type => try types.append(a, resource.id),
+            else => {},
+        };
+        for (self.dependencies) |dependency| if (dependency.kind == .sequence and dependency.action == .retire) {
+            const resource = dependency.resource.?;
+            try counters.append(a, .{ .sequence_id = resource.id, .namespace_id = resource.parent_id, .incarnation = self.metadata_incarnation });
+        };
+        std.mem.sort(sequences.DefaultRetirement, counters.items, {}, struct {
+            fn less(_: void, left: sequences.DefaultRetirement, right: sequences.DefaultRetirement) bool {
+                return left.sequence_id < right.sequence_id;
+            }
+        }.less);
+        var inputs: std.ArrayList(planner.Input) = .empty;
+        var expected: std.ArrayList(?[]const u8) = .empty;
+        for (self.dependencies) |dependency| if (dependency.table != null and dependency.action != .retire) {
+            if (relations.items.len == 0 and counters.items.len == 0 and types.items.len == 0) {
+                if (dependency.action == .rewrite) return error.InvalidScopeRetirement;
+                continue;
+            }
+            const table = dependency.table.?;
+            const header = try std.json.parseFromSliceLeaky(struct { schema_json: []const u8 = "{}" }, a, table.preimage, .{ .ignore_unknown_fields = true });
+            try inputs.append(a, .{ .table_id = table.id, .name = table.physical_name, .schema_json = if (header.schema_json.len == 0) "{}" else header.schema_json });
+            try expected.append(a, dependency.schema_after);
+        };
+        if (inputs.items.len == 0) return;
+        var prepared = try (retirement.Selection{ .relations = relations.items, .sequences = counters.items, .types = types.items }).prepareCohort(backing, inputs.items);
+        defer prepared.deinit();
+        for (prepared.tables, expected.items) |actual, after| {
+            if (actual.changed != (after != null)) return error.InvalidScopeRetirement;
+            if (after) |encoded| if (!std.mem.eql(u8, actual.schema_json, encoded)) return error.InvalidScopeRetirement;
         }
     }
 

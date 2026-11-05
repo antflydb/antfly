@@ -32,26 +32,43 @@ test {
 /// Normalize only snapshot admission failures, before the adapter publishes
 /// rows or admits writes. Pure row normalization is also pre-admission; never
 /// apply this classifier to an unknown mutation outcome or an advanced page.
-fn statementReadAdmissionError(err: anyerror) anyerror {
-    return switch (@import("table_reads.zig").normalizeDistributedQueryOperationalError(err)) {
+fn statementReadAdmissionError(context: operation.RequestContext, err: anyerror) anyerror {
+    const normalized = switch (@import("table_reads.zig").normalizeDistributedQueryOperationalError(err)) {
         error.ReadUnavailable, error.DistributedQueryUnavailable => error.SqlStatementReadUnavailable,
         else => |unchanged| unchanged,
     };
+    // An exhausted statement must report cancellation, not invite a new read
+    // attempt. Preserve corruption, permission and uncertain write outcomes.
+    if (normalized == error.SqlStatementReadUnavailable)
+        context.ensureActive() catch |expired| return expired;
+    return normalized;
 }
 
 /// A bound logical table is already known to exist. Missing physical serving
 /// state while opening its snapshot is availability, not SQL undefined_table.
 /// This classifier must not be used during logical-name resolution, cursor
 /// iteration after admission, or mutation outcome reconciliation.
-fn physicalReadAdmissionError(err: anyerror) anyerror {
-    return if (err == error.TableNotFound) error.SqlStatementReadUnavailable else statementReadAdmissionError(err);
+fn physicalReadAdmissionError(context: operation.RequestContext, err: anyerror) anyerror {
+    return statementReadAdmissionError(context, if (err == error.TableNotFound) error.ReadUnavailable else err);
 }
 
 test "SQL statement read admission distinguishes availability from corruption and unknown outcomes" {
-    for ([_]anyerror{ error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.TopologyChanged, error.ReadIndexTimeout, error.ReadUnavailable, error.ConnectionRefused, error.StorageReadTemporarilyUnavailable }) |err|
-        try std.testing.expectEqual(error.SqlStatementReadUnavailable, statementReadAdmissionError(err));
-    for ([_]anyerror{ error.TableNotFound, error.DeadlineExceeded, error.Cancelled, error.Forbidden, error.InvalidRetainedReadQuery, error.SqlRangeTrackingRequired, error.SqlMutationOutcomeUnknown, error.OutOfMemory, error.InternalFailure }) |err|
-        try std.testing.expectEqual(err, statementReadAdmissionError(err));
+    const live: operation.RequestContext = .{};
+    const expired: operation.RequestContext = .{ .deadline_ns = 0 };
+    var canceled = std.atomic.Value(bool).init(true);
+    const stopped: operation.RequestContext = .{ .cancellation = operation.CancellationToken.fromAtomic(&canceled) };
+    for ([_]anyerror{ error.GroupLeaderUnavailable, error.LeaderUnavailable, error.NotLeader, error.UnknownGroup, error.TopologyChanged, error.ReadIndexTimeout, error.ReadUnavailable, error.ConnectionRefused, error.StorageReadTemporarilyUnavailable, error.SqlStatementReadUnavailable }) |err| {
+        try std.testing.expectEqual(error.SqlStatementReadUnavailable, statementReadAdmissionError(live, err));
+        try std.testing.expectEqual(error.DeadlineExceeded, statementReadAdmissionError(expired, err));
+        try std.testing.expectEqual(error.Canceled, statementReadAdmissionError(stopped, err));
+    }
+    for ([_]operation.RequestContext{ live, expired, stopped }) |context| {
+        for ([_]anyerror{ error.TableNotFound, error.DeadlineExceeded, error.Cancelled, error.Forbidden, error.InvalidRetainedReadQuery, error.SqlRangeTrackingRequired, error.SqlMutationOutcomeUnknown, error.OutOfMemory, error.InternalFailure }) |err|
+            try std.testing.expectEqual(err, statementReadAdmissionError(context, err));
+    }
+    try std.testing.expectEqual(error.SqlStatementReadUnavailable, physicalReadAdmissionError(live, error.TableNotFound));
+    try std.testing.expectEqual(error.DeadlineExceeded, physicalReadAdmissionError(expired, error.TableNotFound));
+    try std.testing.expectEqual(error.Canceled, physicalReadAdmissionError(stopped, error.TableNotFound));
 }
 
 test "SQL statement read admission calls native capture once without write authority" {
@@ -904,7 +921,7 @@ pub const Adapter = struct {
                         zig017_return_error = zig017_err;
                         return zig017_err;
                     })).deadline_ns) catch |zig017_err| {
-                        const read_err = statementReadAdmissionError(zig017_err);
+                        const read_err = statementReadAdmissionError(self.context, zig017_err);
                         zig017_return_error = read_err;
                         return read_err;
                     });
@@ -2373,7 +2390,7 @@ pub const Adapter = struct {
         // Missing physical serving state is availability, never permission
         // to fall back to pages from a different visibility cut.
         self.statistics_reads_started = true;
-        const view = (source.openRelationalRead(alloc, table.physical_name, scan_request.from, scan_request.to, scan_request.opts, .read_index) catch |read_err| return physicalReadAdmissionError(read_err)) orelse return error.SqlStatementReadUnavailable;
+        const view = (source.openRelationalRead(alloc, table.physical_name, scan_request.from, scan_request.to, scan_request.opts, .read_index) catch |read_err| return physicalReadAdmissionError(self.context, read_err)) orelse return error.SqlStatementReadUnavailable;
         errdefer view.deinit();
         try verifyTextPredicate(request, view);
         // Tie the acquired physical snapshot to the SQL binding, not merely
@@ -2468,7 +2485,7 @@ pub const Adapter = struct {
             try writes.activateRangeTracking(a, table.table, self.context);
         }
         self.statistics_reads_started = true;
-        const snapshot = reads.openRelationalSnapshotCohort(self.server.alloc, targets.items, .read_index, self.context.cancellation, (try self.context.platformDeadline()).deadline_ns) catch |err| return physicalReadAdmissionError(err);
+        const snapshot = reads.openRelationalSnapshotCohort(self.server.alloc, targets.items, .read_index, self.context.cancellation, (try self.context.platformDeadline()).deadline_ns) catch |err| return physicalReadAdmissionError(self.context, err);
         const shared = @import("sql_retained_snapshot.zig").Shared.create(self.server.alloc, snapshot, &registry.snapshot_retirement) catch |err| {
             snapshot.deinit();
             return err;
@@ -2522,17 +2539,17 @@ pub const Adapter = struct {
             query.primary_order = true;
             const scan_request = try self.prepareScan(temporary, request.table, query);
             const guarded = snapshot.openGuarded(alloc, .{ .table = bound_table, .from = scan_request.from, .to = scan_request.to, .opts = scan_request.opts }) catch |err| blk: {
-                if (self.dynamic_table == null or err != error.SqlRangeTrackingRequired or retained.view_count != 0 or observed.tables.len != 0) return physicalReadAdmissionError(err);
+                if (self.dynamic_table == null or err != error.SqlRangeTrackingRequired or retained.view_count != 0 or observed.tables.len != 0) return physicalReadAdmissionError(self.context, err);
                 // Activate the capability before any row or absence has been
                 // observed, then replace the stale cut. Once a view exists we
                 // must never silently mix two cuts within one SQL statement.
                 const writes = self.server.table_writes orelse return err;
                 try writes.activateRangeTracking(temporary, bound_table, self.context);
                 const reads = self.server.table_reads orelse return error.SqlStatementSnapshotRequired;
-                const replacement = reads.openRelationalStatementSnapshot(alloc, bound_table, request.table.schema_version, .read_index, self.context.cancellation, (try self.context.platformDeadline()).deadline_ns) catch |read_err| return physicalReadAdmissionError(read_err);
+                const replacement = reads.openRelationalStatementSnapshot(alloc, bound_table, request.table.schema_version, .read_index, self.context.cancellation, (try self.context.platformDeadline()).deadline_ns) catch |read_err| return physicalReadAdmissionError(self.context, read_err);
                 snapshot.deinit();
                 snapshot.* = replacement;
-                break :blk snapshot.openGuarded(alloc, .{ .table = bound_table, .from = scan_request.from, .to = scan_request.to, .opts = scan_request.opts }) catch |read_err| return physicalReadAdmissionError(read_err);
+                break :blk snapshot.openGuarded(alloc, .{ .table = bound_table, .from = scan_request.from, .to = scan_request.to, .opts = scan_request.opts }) catch |read_err| return physicalReadAdmissionError(self.context, read_err);
             };
             defer {
                 for (guarded.owner_proofs) |owner| alloc.free(owner.proofs);
@@ -2632,7 +2649,7 @@ pub const Adapter = struct {
         errdefer alloc.free(cursors);
         self.statistics_reads_started = true;
         const native = read_source.openRelationalStatement(alloc, scans, .read_index) catch |err| blk: {
-            if (err != error.SqlRangeTrackingRequired or self.range_reads == null) return physicalReadAdmissionError(err);
+            if (err != error.SqlRangeTrackingRequired or self.range_reads == null) return physicalReadAdmissionError(self.context, err);
             const writes = self.server.table_writes orelse return error.SqlRangeTrackingRequired;
             // Activation is a replicated, idempotent capability transition.
             // Try native capture first: an already active table needs no new
@@ -2643,7 +2660,7 @@ pub const Adapter = struct {
                 try self.verify(temporary, request.table);
                 try writes.activateRangeTracking(temporary, request.table.physical_name, self.context);
             }
-            break :blk read_source.openRelationalStatement(alloc, scans, .read_index) catch |read_err| return physicalReadAdmissionError(read_err);
+            break :blk read_source.openRelationalStatement(alloc, scans, .read_index) catch |read_err| return physicalReadAdmissionError(self.context, read_err);
         };
         errdefer native.deinit();
         if (native.views.len != requests.len) return error.InvalidSqlBackendResponse;
@@ -2800,7 +2817,7 @@ pub const Adapter = struct {
             const images = @import("antfly_local_sources").sql_mutation_images;
             const writes = try images.writes(db_types.BatchWrite, alloc, input);
             if (writes.len == 0) return input;
-            const normalized = self.view.normalize(alloc, writes) catch |err| return statementReadAdmissionError(err);
+            const normalized = self.view.normalize(alloc, writes) catch |err| return statementReadAdmissionError(self.adapter.context, err);
             const result = try images.merge(alloc, input, normalized);
             if (self.filter) |*filter| for (result) |mutation| if (mutation.row) |row| {
                 if (!try filter.matchesJson(alloc, mutation.key, row)) return error.Forbidden;
@@ -2848,7 +2865,7 @@ pub const Adapter = struct {
             .filter_query_json = mandatory_filter orelse "",
             .execution_deadline_ns = (try self.context.platformDeadline()).deadline_ns,
             .cancellation = self.context.cancellation,
-        }, .read_index) catch |read_err| return physicalReadAdmissionError(read_err)) orelse return error.SqlStatementReadUnavailable;
+        }, .read_index) catch |read_err| return physicalReadAdmissionError(self.context, read_err)) orelse return error.SqlStatementReadUnavailable;
         errdefer view.deinit();
         owner.* = .{ .adapter = self, .table = table, .view = view, .allocator = alloc };
         if (mandatory_filter) |json| {
@@ -2954,10 +2971,10 @@ pub const Adapter = struct {
                     .row_policy_database = scope.database,
                     .execution_deadline_ns = (try self.context.platformDeadline()).deadline_ns,
                     .cancellation = self.context.cancellation,
-                }, .read_index) catch |read_err| return physicalReadAdmissionError(read_err)) orelse return error.SqlStatementReadUnavailable;
+                }, .read_index) catch |read_err| return physicalReadAdmissionError(self.context, read_err)) orelse return error.SqlStatementReadUnavailable;
                 defer view.deinit();
                 try self.verify(alloc, table);
-                break :blk view.normalize(alloc, writes.items) catch |err| return statementReadAdmissionError(err);
+                break :blk view.normalize(alloc, writes.items) catch |err| return statementReadAdmissionError(self.context, err);
             } else writes.items;
             const scope = table.scope orelse return error.InvalidSqlBackendResponse;
             const logical = try (system_catalog.Target{ .database = scope.database, .namespace = scope.namespace, .table = scope.name }).resourceNameAlloc(alloc);

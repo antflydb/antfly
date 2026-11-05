@@ -18,6 +18,7 @@
 const std = @import("std");
 const counters = @import("column_sequences.zig");
 const A = std.mem.Allocator;
+const type_retirement = @import("../sql/type_retirement.zig");
 
 pub const Relation = struct { table_id: u64, physical_name: []const u8 };
 pub const Selection = struct {
@@ -25,11 +26,30 @@ pub const Selection = struct {
     pub const max_schema = 2 * 1024 * 1024;
     relations: []const Relation = &.{},
     sequences: []const counters.DefaultRetirement = &.{},
+    types: []const u64 = &.{},
+
+    pub fn jsonStringify(self: Selection, writer: anytype) !void {
+        try writer.beginObject();
+        try writer.objectField("relations");
+        try writer.write(self.relations);
+        try writer.objectField("sequences");
+        try writer.write(self.sequences);
+        if (self.types.len != 0) {
+            try writer.objectField("types");
+            try writer.write(self.types);
+        }
+        try writer.endObject();
+    }
 
     pub fn validate(self: Selection) !void {
-        if ((self.relations.len == 0 and self.sequences.len == 0) or self.relations.len > max_relations) return error.InvalidSchemaValidationJob;
+        if ((self.relations.len == 0 and self.sequences.len == 0 and self.types.len == 0) or self.relations.len > max_relations or self.types.len > @import("../common/sql_named_type_layout.zig").max_types) return error.InvalidSchemaValidationJob;
         if (self.sequences.len != 0) try (counters.DefaultRetirementSet{ .members = self.sequences }).validate();
         var previous: u64 = 0;
+        for (self.types) |id| {
+            if (id <= previous) return error.InvalidSchemaValidationJob;
+            previous = id;
+        }
+        previous = 0;
         for (self.relations, 0..) |relation, index| {
             if (relation.table_id <= previous or relation.physical_name.len == 0 or relation.physical_name.len > 256 or
                 std.mem.indexOfScalar(u8, relation.physical_name, 0) != null or !std.unicode.utf8ValidateSlice(relation.physical_name)) return error.InvalidSchemaValidationJob;
@@ -41,7 +61,7 @@ pub const Selection = struct {
     pub fn fingerprint(self: Selection) ![32]u8 {
         try self.validate();
         var hash = std.crypto.hash.Blake3.init(.{});
-        hash.update("antfly/dependent-object-retirement/v1\x00");
+        hash.update(if (self.types.len == 0) "antfly/dependent-object-retirement/v1\x00" else "antfly/dependent-object-retirement/v2\x00");
         hashInteger(&hash, self.relations.len);
         for (self.relations) |relation| {
             hashInteger(&hash, relation.table_id);
@@ -50,6 +70,10 @@ pub const Selection = struct {
         }
         hashInteger(&hash, self.sequences.len);
         for (self.sequences) |sequence| hash.update(&try sequence.fingerprint());
+        if (self.types.len != 0) {
+            hashInteger(&hash, self.types.len);
+            for (self.types) |id| hashInteger(&hash, id);
+        }
         var result: [32]u8 = undefined;
         hash.final(&result);
         return result;
@@ -71,6 +95,7 @@ pub const Selection = struct {
     /// arrays use the same omitted representation as ordinary DROP DEFAULT.
     pub fn schemaAlloc(self: Selection, backing: A, table_id: u64, before: []const u8) ![]u8 {
         try self.validate();
+        if (self.types.len != 0) return error.InvalidSchemaValidationJob;
         if (table_id == 0 or before.len == 0 or before.len > max_schema) return error.InvalidSchemaValidationJob;
         for (self.relations) |relation| if (relation.table_id == table_id) return error.InvalidSchemaValidationJob;
         var arena = std.heap.ArenaAllocator.init(backing);
@@ -78,8 +103,13 @@ pub const Selection = struct {
         const a = arena.allocator();
         var root = try std.json.parseFromSliceLeaky(std.json.Value, a, before, .{ .allocate = .alloc_always, .parse_numbers = false });
         counters.advanceSchemaVersion(&root) catch return error.InvalidSchemaValidationJob;
+        const removed = try self.pruneOwnedValue(a, table_id, &root);
+        if (removed == 0) return error.CatalogGenerationChanged;
+        return std.json.Stringify.valueAlloc(backing, root, .{});
+    }
+    fn pruneOwnedValue(self: Selection, a: A, table_id: u64, root: *std.json.Value) !usize {
         var removed: usize = if (self.sequences.len != 0)
-            try (counters.DefaultRetirementSet{ .members = self.sequences }).removeFromOwnedValue(a, table_id, &root)
+            try (counters.DefaultRetirementSet{ .members = self.sequences }).removeFromOwnedValue(a, table_id, root)
         else
             0;
         if (self.relations.len != 0) if (root.object.getPtr("foreign_keys")) |foreign| {
@@ -106,10 +136,62 @@ pub const Selection = struct {
                 removed += retired;
             }
         };
-        if (removed == 0) return error.CatalogGenerationChanged;
-        return std.json.Stringify.valueAlloc(backing, root, .{});
+        return removed;
+    }
+
+    /// Whole-cohort planning keeps cross-table FK dependencies and a single
+    /// successor epoch even when several types, parents and counters retire.
+    /// It never reads user rows or grants physical publication authority.
+    pub fn prepareCohort(self: Selection, backing: A, inputs: []const type_retirement.Input) !Cohort {
+        try self.validate();
+        if (inputs.len == 0 or inputs.len > type_retirement.max_tables) return error.InvalidSchemaValidationJob;
+        var arena = std.heap.ArenaAllocator.init(backing);
+        errdefer arena.deinit();
+        const a = arena.allocator();
+        var typed = if (self.types.len != 0) try type_retirement.Prepared.initMany(backing, inputs, self.types) else null;
+        defer if (typed) |*value| value.deinit();
+        const outputs = try a.alloc(Cohort.Table, inputs.len);
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        var ids: std.AutoHashMapUnmanaged(u64, void) = .empty;
+        var bytes: usize = 0;
+        for (inputs, outputs, 0..) |input, *output, i| {
+            if (input.name.len == 0 or (try names.getOrPut(a, input.name)).found_existing) return error.InvalidSchemaValidationJob;
+            const source = if (typed) |value| value.tables[i].schema_json else input.schema_json;
+            if (source.len == 0 or source.len > max_schema) return error.InvalidSchemaValidationJob;
+            var root = try std.json.parseFromSliceLeaky(std.json.Value, a, source, .{ .allocate = .alloc_always, .parse_numbers = false });
+            if (root != .object) return error.InvalidSchemaValidationJob;
+            // Default references are keyed by immutable table ID, supplied
+            // separately from the display/physical-name map of typed FKs.
+            const table_id = input.table_id;
+            if (table_id == 0 or (try ids.getOrPut(a, table_id)).found_existing) return error.InvalidSchemaValidationJob;
+            for (self.relations) |relation| if (relation.table_id == table_id) return error.InvalidSchemaValidationJob;
+            const removed = try self.pruneOwnedValue(a, table_id, &root);
+            const type_changed = if (typed) |value| value.tables[i].changed else false;
+            const changed = type_changed or removed != 0;
+            if (removed != 0 and !type_changed) try counters.advanceSchemaVersion(&root);
+            const encoded = if (changed) try std.json.Stringify.valueAlloc(a, root, .{}) else try a.dupe(u8, input.schema_json);
+            bytes = std.math.add(usize, bytes, encoded.len) catch return error.SqlProgramLimitExceeded;
+            if (bytes > type_retirement.max_bytes) return error.SqlProgramLimitExceeded;
+            output.* = .{ .name = try a.dupe(u8, input.name), .schema_json = encoded, .changed = changed, .dropped_columns = if (typed) |value| try cloneNames(a, value.tables[i].dropped_columns) else &.{} };
+        }
+        return .{ .arena = arena, .tables = outputs };
     }
 };
+
+pub const Cohort = struct {
+    pub const Table = struct { name: []const u8, schema_json: []const u8, changed: bool, dropped_columns: []const []const u8 };
+    arena: std.heap.ArenaAllocator,
+    tables: []const Table,
+    pub fn deinit(self: *Cohort) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+fn cloneNames(a: A, names: []const []const u8) ![]const []const u8 {
+    const owned = try a.alloc([]const u8, names.len);
+    for (names, owned) |name, *copy| copy.* = try a.dupe(u8, name);
+    return owned;
+}
 
 fn hashInteger(hash: *std.crypto.hash.Blake3, value: u64) void {
     var bytes: [8]u8 = undefined;
@@ -194,4 +276,42 @@ test "dependent retirement preserves exact numeric defaults and rejects rounded 
     try std.testing.expectEqualStrings(expected, after);
     try selection.requireSuccessor(a, 7, before, expected);
     try std.testing.expectError(error.InvalidSchemaValidationJob, selection.requireSuccessor(a, 7, before, "{\"version\":2,\"column_defaults\":[{\"column\":\"precision\",\"expression\":{\"literal\":0.123456789012345678901234567891}}]}"));
+}
+
+fn mixedCohort(a: A) !void {
+    const binding: counters.Binding = .{ .generation = .serial, .incarnation = @splat(1), .sequence_id = 11, .namespace_id = 2, .owner = .{ .table_id = 7, .column_id = 4 }, .target = .{ .table = "counter" } };
+    const before = try std.fmt.allocPrint(a, "{{\"version\":9,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{{\"row\":{{\"schema\":{{\"type\":\"object\",\"properties\":{{\"id\":{{\"type\":\"integer\"}},\"phase\":{{\"type\":\"sql_enum\",\"x-antfly-sql-type-id\":17}},\"detail\":{{\"type\":\"sql_enum\",\"x-antfly-sql-type-id\":19}},\"rendered\":{{\"type\":\"keyword\"}},\"counter\":{{\"type\":\"integer\"}},\"keep\":{{\"type\":\"json\"}}}}}}}}}},\"generated_columns\":[{{\"column\":\"rendered\",\"expression\":{{\"op\":\"cast\",\"type\":\"string\",\"args\":[{{\"op\":\"column\",\"column\":\"phase\"}}]}}}}],\"foreign_keys\":[{{\"name\":\"gone\",\"child_columns\":[\"id\"],\"parent_table\":\"retired\",\"parent_columns\":[\"id\"]}}],\"column_defaults\":[{{\"column\":\"counter\",\"sequence\":{f}}},{{\"column\":\"keep\",\"expression\":{{\"op\":\"literal\",\"type\":\"json\",\"value\":{{\"named_type_id\":17,\"column\":\"phase\",\"number\":12345678901234567890.1234567890123456789}}}}}}]}}", .{std.json.fmt(binding, .{})});
+    defer a.free(before);
+    const child = "{\"version\":0,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"document_schemas\":{\"row\":{\"schema\":{\"properties\":{\"id\":{\"type\":\"integer\"},\"link\":{\"type\":\"keyword\"}}}}},\"foreign_keys\":[{\"name\":\"derived\",\"child_columns\":[\"link\"],\"parent_table\":\"survivor\",\"parent_columns\":[\"rendered\"]}]}";
+    const inputs = [_]type_retirement.Input{
+        .{ .table_id = 7, .name = "survivor", .schema_json = before },
+        .{ .table_id = 8, .name = "child", .schema_json = child },
+        .{ .table_id = 9, .name = "untouched", .schema_json = "{\"storage_mode\":\"document\",\"marker\":true}" },
+    };
+    const selection: Selection = .{ .relations = &.{.{ .table_id = 101, .physical_name = "retired" }}, .sequences = &.{.{ .sequence_id = 11, .namespace_id = 2, .incarnation = @splat(1) }}, .types = &.{ 17, 19 } };
+    var cohort = try selection.prepareCohort(a, &inputs);
+    defer cohort.deinit();
+    var parent = try std.json.parseFromSlice(std.json.Value, a, cohort.tables[0].schema_json, .{ .parse_numbers = false });
+    defer parent.deinit();
+    try std.testing.expectEqualStrings("10", parent.value.object.get("version").?.number_string);
+    try std.testing.expect(!parent.value.object.contains("foreign_keys"));
+    const properties = try @import("../sql/schema_columns.zig").properties(parent.value);
+    for ([_][]const u8{ "phase", "detail", "rendered" }) |name| try std.testing.expect(!properties.object.contains(name));
+    for ([_][]const u8{ "id", "counter", "keep" }) |name| try std.testing.expect(properties.object.contains(name));
+    const defaults = parent.value.object.get("column_defaults").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), defaults.len);
+    try std.testing.expectEqualStrings("12345678901234567890.1234567890123456789", defaults[0].object.get("expression").?.object.get("value").?.object.get("number").?.number_string);
+    try std.testing.expect(cohort.tables[0].changed and cohort.tables[1].changed and !cohort.tables[2].changed);
+    try std.testing.expectEqualStrings(inputs[2].schema_json, cohort.tables[2].schema_json);
+    var after_child = try std.json.parseFromSlice(std.json.Value, a, cohort.tables[1].schema_json, .{});
+    defer after_child.deinit();
+    try std.testing.expectEqual(@as(i64, 1), after_child.value.object.get("version").?.integer);
+    try std.testing.expectEqual(@as(usize, 0), after_child.value.object.get("foreign_keys").?.array.items.len);
+    try std.testing.expect((try @import("../sql/schema_columns.zig").properties(after_child.value)).object.contains("link"));
+    try std.testing.expectEqual(@as(usize, 3), cohort.tables[0].dropped_columns.len);
+}
+
+test "dependent retirement plans mixed type parent and counter cohorts in one epoch and preserves precise opaque defaults under allocation faults" {
+    try mixedCohort(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, mixedCohort, .{});
 }

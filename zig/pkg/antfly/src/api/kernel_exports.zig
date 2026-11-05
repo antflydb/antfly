@@ -272,6 +272,22 @@ pub fn attachReplicatedRestoreStore(
     return .ok;
 }
 
+pub fn authorizeSqlLock(context: *const CallContext) callconv(.c) abi.Status {
+    const Input = @import("sql_data_locks.zig").AuthorizationInput;
+    const Output = @import("antfly_local_sources").storage_pessimistic_lock_control.Command;
+    if (validateCall(Input, Output, context)) |failure| return failure;
+    output(Output, context).* = serverState(context).server.authorizeSqlLock(input(Input, context).*) catch |err| return fail(err);
+    return .ok;
+}
+
+pub fn queryPopulationJob(context: *const CallContext) callconv(.c) abi.Status {
+    const Input = @import("../metadata/query_population_job.zig").Input;
+    if (validateCall(Input, []u8, context)) |failure| return failure;
+    const value = input(Input, context).*;
+    output([]u8, context).* = serverState(context).server.executeQueryPopulationJob(value.alloc, value.context, value.request) catch |err| return fail(err);
+    return .ok;
+}
+
 pub fn resumeRestoreJobs(context: *const CallContext) callconv(.c) abi.Status {
     if (validateCall(void, void, context)) |failure| return failure;
     serverState(context).server.resumeRestoreJobsOnce() catch |err| return fail(err);
@@ -553,6 +569,8 @@ const function_table: abi.FunctionTable = .{
     .set_ha_executor = &setHotStandbyExecutor,
     .attach_runtime_restore_store = &attachRuntimeRestoreStore,
     .attach_replicated_restore_store = &attachReplicatedRestoreStore,
+    .query_population_job = &queryPopulationJob,
+    .authorize_sql_lock = &authorizeSqlLock,
     .resume_restore_jobs = &resumeRestoreJobs,
     .poll_restore_jobs = &pollRestoreJobs,
     .prepare_restore_leadership = &prepareRestoreLeadership,

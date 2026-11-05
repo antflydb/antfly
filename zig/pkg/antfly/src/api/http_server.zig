@@ -5049,6 +5049,53 @@ pub const ApiHttpServer = struct {
         self.* = undefined;
     }
 
+    pub fn authorizeSqlLock(self: *ApiHttpServer, input: @import("sql_data_locks.zig").AuthorizationInput) !@import("antfly_local_sources").storage_pessimistic_lock_control.Command {
+        return @import("sql_data_locks.zig").authorize(self, input.alloc, input.context, input.group, input.table, input.command);
+    }
+
+    pub fn executeQueryPopulationJob(self: *ApiHttpServer, a: std.mem.Allocator, context: api_operation.RequestContext, request: @import("../metadata/query_population_job.zig").Request) ![]u8 {
+        if (!context.setting_admin) return error.Forbidden;
+        try context.ensureActive();
+        try request.validate(a);
+        if (self.restore_job_store.replicated == null) return error.AsyncRestoreUnavailable;
+        try self.ensureRestoreActive(null);
+        switch (request) {
+            .admit => |req| {
+                try self.requireGenerationAuthority(req.destination_authorization_principal, req.table_names.?, true);
+                const result = try self.restore_job_store.startRecoverableObserved(a, req, true, context.sql_completion_submission);
+                const bound = try @import("../metadata/query_population_job.zig").bindAdmission(a, self.source, context, result);
+                defer switch (bound.result) {
+                    inline else => |bytes| a.free(bytes),
+                };
+                self.schedulePendingRestoreJobs() catch {};
+                return std.json.Stringify.valueAlloc(a, bound, .{});
+            },
+            .observe, .cancel => |ref| {
+                const bytes = (try self.restore_job_store.load(a, ref.job_id)) orelse return a.dupe(u8, "null");
+                defer a.free(bytes);
+                var parsed = try std.json.parseFromSlice(restore_jobs.JobState, a, bytes, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                try ref.requireState(a, parsed.value);
+                // A phase read needs only the immutable job identity already
+                // joined by the producer. Do not decode its potentially large
+                // staging plan on every status poll. Cancellation additionally
+                // checks the plan before mutating that job.
+                if (request == .observe) return a.dupe(u8, bytes);
+                const stage_id = try @import("../metadata/restore_staging.zig").idForAttempt(ref.job_id, 1);
+                const stage_bytes = (try self.source.getRestoreStaging(a, stage_id, context)) orelse return error.NotFound;
+                defer a.free(stage_bytes);
+                var staged = try std.json.parseFromSlice(@import("../metadata/restore_staging.zig").Job, a, stage_bytes, .{});
+                defer staged.deinit();
+                if (!std.mem.eql(u8, &staged.value.plan_digest, &ref.plan_digest)) return error.IdempotencyConflict;
+                context.markSQLSubmission();
+                const cancelled = try self.restore_job_store.cancel(a, ref.job_id);
+                self.signalRestoreRetryWakeup();
+                self.schedulePendingRestoreJobs() catch {};
+                return cancelled orelse a.dupe(u8, "null");
+            },
+        }
+    }
+
     pub fn attachRestoreJobRuntimeStore(self: *ApiHttpServer, store: *backend_erased.Store) !void {
         try self.restore_job_store.attachRuntime(store);
     }
@@ -62242,6 +62289,12 @@ test "SQL pgwire native schema rewrite pre-submission failure retires its prepar
     try metadata_store.applyStandaloneCommand(group, .{ .upsert_restore_job = .{ .key = canceled_key, .value = "{\"job_id\":11,\"phase\":\"cancelled\",\"staging_attempt_id\":1,\"staging_resolution\":\"canceled\"}" } });
     try std.testing.expect(try completion_mod.settled(&restarted, a, published_receipt, .{}));
     try std.testing.expect(try completion_mod.acknowledge(&restarted, a, published_receipt, .{}));
+}
+
+test "SQL scope retirement population forwarding preserves administrative read authority" {
+    const call: @import("../system_catalog/server_call.zig").Call = .{ .query_population_prepare = undefined };
+    try std.testing.expectError(error.Forbidden, StatusSource.HttpRoutedCatalog.authorizeRead(.{}, call));
+    try StatusSource.HttpRoutedCatalog.authorizeRead(.{ .setting_admin = true }, call);
 }
 
 test "SQL pgwire native catalog forwarding preserves native read authority" {
