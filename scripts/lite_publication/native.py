@@ -18,6 +18,7 @@
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import tempfile
 from pathlib import Path
@@ -208,11 +209,15 @@ def scan(path):
 def check_catalog(path):
     require(
         lite("root-catalog", path) == {"tables": ["default"], "owner": "embedded"},
-        "Expected a single embedded root",
+        "Expected a single embedded root for publication v1",
     )
-    require(lite("schema get", path) == SCHEMA, "Incompatible publication schema")
     require(
-        lite("enrichment list", path) == [], "Publication has executable enrichments"
+        lite("schema get", path) == SCHEMA,
+        "Incompatible publication schema. Rebuild the copy with publication-v1/schema.json",
+    )
+    require(
+        lite("enrichment list", path) == [],
+        "Publication has executable enrichments. Build the isolated copy with completed vectors and omit local producers",
     )
     actual = lite("index list", path)
     require(
@@ -233,8 +238,11 @@ def check_catalog(path):
 
 
 def inspect(path, expected=None):
-    require(path.stat().st_size <= MAX_ARTIFACT, "Artifact exceeds 2 GiB")
-    initial = path.stat()
+    initial = path.lstat()
+    require(
+        stat.S_ISREG(initial.st_mode) and 0 < initial.st_size <= MAX_ARTIFACT,
+        "Expected a regular nonempty .aflite file of at most 2 GiB",
+    )
     actual_digest = sha256_file(path)
     require(
         expected is None or expected == actual_digest,

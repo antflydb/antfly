@@ -742,11 +742,11 @@ pub fn requireSingleEmbeddedTable(alloc: std.mem.Allocator, txn: *@import("../ba
     if (embedded_tables) |raw| {
         var catalog = try std.json.parseFromSlice(embedded_catalog.Catalog, alloc, raw, .{ .ignore_unknown_fields = true });
         defer catalog.deinit();
-        try embedded_catalog.validate(catalog.value);
         if (catalog.value.tables.len != 0) {
             std.log.err("embedded Lite adoption supports only the default root table; transfer additional embedded tables through a supported explicit restore", .{});
             return error.UnsupportedEmbeddedLiteTables;
         }
+        try embedded_catalog.validate(catalog.value);
     }
     const raw_resolvers = txn.get("\x00\x00__metadata__:resolvers") catch |err| switch (err) {
         error.NotFound => null,

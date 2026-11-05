@@ -1,0 +1,47 @@
+{
+  "zero": {
+    "artifact_sha256": "10dd2b857b5aaecea2489ceaadbb743604d549d0e446843125a32e3d016425b5",
+    "format_version": 7,
+    "size_bytes": 454656,
+    "coverage": {
+      "selected_files": 4,
+      "extracted_documents": 2,
+      "failed_files": 1,
+      "excluded_files": 1,
+      "keyword_documents": 2,
+      "keyword_chunks": 2,
+      "total_chunks": 2,
+      "semantic_chunks": 0
+    }
+  },
+  "partial": {
+    "artifact_sha256": "53a3073ca8c18e2dc454665c1233915313d6b1cbeb5a991e5ee8f209c0bffda4",
+    "format_version": 7,
+    "size_bytes": 2564096,
+    "coverage": {
+      "selected_files": 4,
+      "extracted_documents": 2,
+      "failed_files": 1,
+      "excluded_files": 1,
+      "keyword_documents": 2,
+      "keyword_chunks": 2,
+      "total_chunks": 2,
+      "semantic_chunks": 1
+    }
+  },
+  "full": {
+    "artifact_sha256": "707614732fad5b125d611c0c0a2b685c4dbde230973a7cc6b2a01bdc925cd017",
+    "format_version": 7,
+    "size_bytes": 2617344,
+    "coverage": {
+      "selected_files": 4,
+      "extracted_documents": 2,
+      "failed_files": 1,
+      "excluded_files": 1,
+      "keyword_documents": 2,
+      "keyword_chunks": 2,
+      "total_chunks": 2,
+      "semantic_chunks": 2
+    }
+  }
+}

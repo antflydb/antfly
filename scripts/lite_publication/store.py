@@ -60,8 +60,14 @@ class Destination:
         # Lock the directory itself so probing an unrelated directory never
         # creates a lock file there. New registries are published atomically;
         # readers can never observe an uninitialized registry.
-        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         try:
+            info = os.fstat(fd)
+            require(
+                info.st_uid == os.geteuid() and not info.st_mode & 0o077,
+                "Publication root must be private (mode 0700) and owned by the worker",
+                "destination_mismatch",
+            )
             fcntl.flock(fd, fcntl.LOCK_EX)
             registry = root / "publication.sqlite"
             staging = root / ".publication-bootstrap"
@@ -212,7 +218,10 @@ class Destination:
             try:
                 h = hashlib.sha256()
                 size = 0
-                with artifact.open("rb") as src, tmp.open("wb") as dst:
+                source_fd = os.open(
+                    artifact, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                )
+                with os.fdopen(source_fd, "rb") as src, tmp.open("wb") as dst:
                     info = os.fstat(src.fileno())
                     require(
                         stat.S_ISREG(info.st_mode)
@@ -220,6 +229,8 @@ class Destination:
                         "Expected a regular artifact within size limit",
                     )
                     for block in iter(lambda: src.read(1024 * 1024), b""):
+                        if self.operation(op)["phase"] != "preparing":
+                            return self.status(op)
                         size += len(block)
                         require(
                             size <= native.MAX_ARTIFACT, "Upload exceeded size limit"

@@ -15,6 +15,7 @@
 
 """Run with ANTFLY_BIN pointing at this checkout's native CLI."""
 
+import gzip
 import hashlib
 import json
 import os
@@ -165,6 +166,53 @@ class Runtime(unittest.TestCase):
         inp.write_text(json.dumps(query))
         return self.cmd("search", "--generation", generation, "--input", inp)["hits"]
 
+    def test_golden_native_artifacts(self):
+        inventory = native.load_json(FIXTURES / "artifacts.json")
+        query = native.load_json(FIXTURES / "solar-query.json")
+        for name, expected in inventory.items():
+            with self.subTest(name=name):
+                path = self.root.parent / (name + ".aflite")
+                path.write_bytes(
+                    gzip.decompress((FIXTURES / (name + ".aflite.gz")).read_bytes())
+                )
+                report = worker(
+                    "inspect",
+                    "--artifact",
+                    path,
+                    "--digest",
+                    expected["artifact_sha256"],
+                )
+                self.assertEqual({k: report[k] for k in expected}, expected)
+                hits = native.search(path, query)
+                self.assertEqual(len(hits), expected["coverage"]["semantic_chunks"])
+                if hits:
+                    self.assertEqual(
+                        hits[0]["_source"]["document_id"], "drive-fixture-1"
+                    )
+
+    def test_owner_advances_while_snapshot_is_built(self):
+        # Pause at the real native init after freezing the producer input.
+        # An owner can install newer completed work while that snapshot is in flight.
+        from unittest.mock import patch
+
+        source = self.root.parent / "working.json"
+        shutil.copyfile(FIXTURES / "zero.json", source)
+        native_lite = native.lite
+
+        def advance(command, *args, **kwargs):
+            if command == "init":
+                next_source = source.with_suffix(".next")
+                shutil.copyfile(FIXTURES / "full.json", next_source)
+                os.replace(next_source, source)
+            return native_lite(command, *args, **kwargs)
+
+        with patch.object(native, "lite", side_effect=advance):
+            frozen = native.build(source, self.root.parent / "frozen.aflite")
+        self.assertEqual(frozen["coverage"]["semantic_chunks"], 0)
+        later = native.build(source, self.root.parent / "later.aflite")
+        self.assertEqual(later["coverage"]["semantic_chunks"], 2)
+        self.assertNotEqual(later["artifact_sha256"], frozen["artifact_sha256"])
+
     def test_manual_publication_and_reader(self):
         q = native.load_json(FIXTURES / "solar-query.json")
         for previous, name in enumerate(("zero", "partial", "full")):
@@ -248,7 +296,7 @@ class Runtime(unittest.TestCase):
             error="destination_mismatch",
         )
         foreign = self.root.parent / "foreign"
-        foreign.mkdir()
+        foreign.mkdir(mode=0o700)
         (foreign / "instance.aflite").write_bytes(b"unrelated")
         worker(
             "status",
@@ -383,6 +431,7 @@ else:
             "model",
             "schema",
             "extra-index",
+            "control-row",
             "producer",
             "vector",
             "coverage",
@@ -399,6 +448,15 @@ else:
                         candidate,
                         body={"version": 1, "default_type": "doc"},
                     )
+                elif defect == "control-row":
+                    native.lite(
+                        "batch",
+                        candidate,
+                        body={
+                            "inserts": {"personal-session": {"opaque": "fixture"}},
+                            "sync_level": "full_index",
+                        },
+                    )
                 elif defect == "extra-index":
                     native.lite(
                         "index create",
@@ -414,11 +472,16 @@ else:
                         "enrichment create",
                         candidate,
                         body={
-                            "name": "local_pending",
-                            "kind": "chunk",
+                            "name": "document_chunkvec_v1",
+                            "kind": "embedding",
                             "field": "content",
-                            "chunk_size": 256,
-                            "chunk_overlap": 16,
+                            "expected_dims": 768,
+                            "producer_json": json.dumps(
+                                {
+                                    "provider": "antfly",
+                                    "model": contract.PROFILE["model"],
+                                }
+                            ),
                         },
                     )
                 else:
