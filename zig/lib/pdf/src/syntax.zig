@@ -278,8 +278,14 @@ pub const Scanner = struct {
                 return .{ .integer = value };
             },
             .real => |value| return .{ .real = value },
-            .string => |value| return .{ .string = try self.alloc.dupe(u8, value) },
-            .name => |value| return .{ .name = try self.alloc.dupe(u8, value) },
+            .string => |value| {
+                tok = .eof;
+                return .{ .string = value };
+            },
+            .name => |value| {
+                tok = .eof;
+                return .{ .name = value };
+            },
             .keyword => |kw| {
                 if (std.mem.eql(u8, kw, "null")) return .null;
                 if (std.mem.eql(u8, kw, "[")) return try self.readArray();
@@ -501,6 +507,16 @@ pub const Scanner = struct {
     }
 
     fn readLiteralString(self: *Scanner) anyerror![]u8 {
+        // Most literal strings need no escape or nesting processing. Allocate
+        // their exact size once: geometric growth otherwise retains both old
+        // and new buffers alongside a decoded object stream during relocation.
+        if (std.mem.indexOfAny(u8, self.bytes[self.pos..], "()\\")) |end| {
+            if (self.bytes[self.pos + end] == ')') {
+                const result = try self.alloc.dupe(u8, self.bytes[self.pos .. self.pos + end]);
+                self.pos += end + 1;
+                return result;
+            }
+        }
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
 
