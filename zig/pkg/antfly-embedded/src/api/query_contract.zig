@@ -4462,6 +4462,12 @@ pub fn encodeQueryResponsesWithDelivery(
     result: db_mod.types.SearchResult,
     delivery: ?@import("query_response.zig").Delivery,
 ) !QueryResponse {
+    if (delivery) |sink| if (sink.native_graph_result) |target| {
+        try target.consume(target.ptr, result.graph_results);
+        // Native relations consume the authorized engine result directly.
+        // Do not encode and parse a second public graph representation.
+        return .{ .json = try alloc.alloc(u8, 0), .delivered_bytes = 0 };
+    };
     var delivered: ?usize = null;
     var graph_wire_failure: ?anyerror = null;
     var arena_impl = std.heap.ArenaAllocator.init(alloc);

@@ -44,7 +44,7 @@ pub const receipt_key = "\x00\x00__metadata__:relational_integrity_topology_rece
 
 pub const abort_prefix = "\x00\x00__metadata__:relational_integrity_topology_aborted:";
 
-pub const Role = enum(u8) { split_source = 1, split_destination = 2, merge_source = 3, merge_destination = 4, backup_snapshot = 5, rewrite_source = 6, truncate_parent = 7, child_generation_parent = 8, child_generation_source = 9, child_generation_dual = 10, rewrite_destination = 11, index_build = 12, schema_validation = 13 };
+pub const Role = enum(u8) { split_source = 1, split_destination = 2, merge_source = 3, merge_destination = 4, backup_snapshot = 5, rewrite_source = 6, truncate_parent = 7, child_generation_parent = 8, child_generation_source = 9, child_generation_dual = 10, rewrite_destination = 11, index_build = 12, schema_validation = 13, document_retirement_source = 14 };
 
 pub const ParentRetirementEntry = struct {
     child_table_id: u64,
@@ -249,8 +249,12 @@ pub const Command = struct {
     /// This permits fencing and retire-only control under a stable row policy;
     /// it never grants row, successor-schema or transfer authority.
     sql_drop_control: bool = false,
+    /// Exact document definition rechecked under the owner apply writer.
+    document_schema_digest: ?[32]u8 = null,
 
     pub fn isSqlDropControl(self: Command) bool {
+        if (self.fence.role == .document_retirement_source) return self.sql_drop_control and self.document_schema_digest != null and !self.child_generation_reference_coverage_required and !self.child_reference_coverage_ready and self.action == .begin and self.child_generations == null and self.transfer == null and self.parent_retirement == null and self.parent_activation == null and self.child_schema_install == null and self.initial_child_provision == null and self.initial_child_control == null and self.graph_retirement == null and self.generation_handoff == null and self.generation_handoff_seal == null and self.generation_handoff_install == null;
+        if (self.document_schema_digest != null) return false;
         if (!self.sql_drop_control or (self.fence.role != .child_generation_source and self.fence.role != .child_generation_parent and self.fence.role != .child_generation_dual)) return false;
         if (self.transfer != null or self.parent_retirement != null or self.parent_activation != null or
             self.child_schema_install != null or self.initial_child_provision != null or self.initial_child_control != null or
@@ -269,6 +273,7 @@ pub const Command = struct {
         }
     }
     pub fn nativeJsonSkipField(self: Command, comptime name: []const u8) bool {
+        if (comptime std.mem.eql(u8, name, "document_schema_digest")) return self.document_schema_digest == null;
         if (comptime std.mem.eql(u8, name, "sql_drop_control")) return !self.sql_drop_control;
         if (comptime std.mem.eql(u8, name, "child_generation_reference_coverage_required")) return !self.child_generation_reference_coverage_required;
         if (comptime std.mem.eql(u8, name, "child_reference_coverage_ready")) return !self.child_reference_coverage_ready;

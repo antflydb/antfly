@@ -29,6 +29,7 @@ pub const Request = struct {
         reserve: contract.Manifest,
         cancel: ProgressRequest,
         drain: ProgressRequest,
+        publish: ProgressRequest,
         child_ready: struct { lookup: ledger.Lookup, expected_revision: u64, ordinal: u16 },
     },
     pub fn validate(self: Request, a: A) !void {
@@ -38,7 +39,7 @@ pub const Request = struct {
                 try manifest.validate(a);
                 if (self.admission.head != manifest.catalog_revision) return error.CatalogGenerationChanged;
             },
-            inline .cancel, .drain, .child_ready => |value| {
+            inline .cancel, .drain, .child_ready, .publish => |value| {
                 try value.lookup.validate();
                 if (value.expected_revision == 0) return error.InvalidScopeRetirement;
             },
@@ -78,7 +79,7 @@ pub const Input = struct {
                 if (manifest.metadata_group_id != group) return error.CatalogGenerationChanged;
                 break :blk .{ .group = group, .reference = try manifest.reference(a, request.admission.nonce) };
             },
-            inline .cancel, .drain, .child_ready => |value| value.lookup,
+            inline .cancel, .drain, .child_ready, .publish => |value| value.lookup,
         };
         if (lookup.group != group) return error.CatalogGenerationChanged;
         var digest: [32]u8 = undefined;
@@ -147,7 +148,7 @@ pub const Observation = struct {
             const current = self.current orelse return error.InvalidScopeRetirement;
             const accepted = outcome.result.accepted;
             if (current.sequence != accepted.sequence or !std.mem.eql(u8, &current.metadata_incarnation, &accepted.metadata_incarnation) or
-                !current.creator.eql(accepted.creator) or current.force != accepted.force or current.progress.revision < accepted.progress.revision) return error.InvalidScopeRetirement;
+                !current.creator.eql(accepted.creator) or !std.mem.eql(u8, &current.target_digest, &accepted.target_digest) or current.force != accepted.force or current.progress.revision < accepted.progress.revision) return error.InvalidScopeRetirement;
             if (!accepted.active() and !std.meta.eql(current, accepted)) return error.InvalidScopeRetirement;
         };
     }
@@ -193,7 +194,7 @@ pub fn stageOutcome(txn: anytype, value: Outcome) !void {
         const link = try QueryRecord.init(value.query);
         try txn.put(try childOutcomeKey(&buffer, value.query.lookup, value.result.accepted.progress.completed_tables - 1), link.slice());
     }
-    if (value.result == .accepted and value.result.accepted.progress.phase == .canceled) {
+    if (value.result == .accepted and (value.result.accepted.progress.phase == .canceled or value.result.accepted.progress.phase == .published)) {
         if (std.mem.eql(u8, &value.query.nonce, &value.query.lookup.reference.id)) return error.InvalidScopeRetirement;
         const link = try QueryRecord.init(value.query);
         try txn.put(try ledger.key(&buffer, value.query.lookup, .terminal_outcome), link.slice());

@@ -30,17 +30,36 @@ pub const Step = enum(u3) { source_fenced, parent_staged, parent_activated, pare
 pub const step_count = @typeInfo(Step).@"enum".field_names.len;
 pub const Counts = [step_count]u16;
 pub const Summary = struct {
+    document_source: bool = false,
     plan_digest: [32]u8,
     owners_digest: [32]u8,
     owner_count: u16,
     expected: Counts,
     child: fk.Plan.ChildIdentity,
+    pub fn jsonStringify(self: @This(), writer: anytype) !void {
+        try writer.beginObject();
+        inline for (@typeInfo(@This()).@"struct".field_names) |field| {
+            if (comptime std.mem.eql(u8, field, "document_source")) {
+                if (self.document_source) {
+                    try writer.objectField(field);
+                    try writer.write(true);
+                }
+            } else {
+                try writer.objectField(field);
+                try writer.write(@field(self, field));
+            }
+        }
+        try writer.endObject();
+    }
     pub fn validate(self: @This()) !void {
         if (self.owner_count == 0 or self.owner_count > manifests.max_ranges or self.expected[0] == 0 or
             self.expected[0] > self.owner_count or self.expected[1] > self.owner_count or self.expected[2] != self.expected[1] or
             self.expected[3] != self.expected[1] or self.expected[4] > self.expected[1] or
             std.mem.allEqual(u8, &self.plan_digest, 0) or std.mem.allEqual(u8, &self.owners_digest, 0) or
-            self.child.after_schema_version <= self.child.before_schema_version) return error.InvalidCatalogRecord;
+            (if (self.document_source) self.child.after_schema_version != self.child.before_schema_version else self.child.after_schema_version <= self.child.before_schema_version) or
+            (self.child.after_schema_version == self.child.before_schema_version and
+                (!std.mem.eql(u8, &self.child.before_schema_digest, &self.child.after_schema_digest) or
+                    !std.mem.eql(u8, &self.child.before_catalog_digest, &self.child.after_catalog_digest)))) return error.InvalidCatalogRecord;
     }
 };
 pub const State = struct {
@@ -173,7 +192,7 @@ pub fn prepare(a: A, scratch: A, plan: fk.Plan) !Prepared {
     }
     var owners_digest: [32]u8 = undefined;
     writer.hasher.final(&owners_digest);
-    const summary: Summary = .{ .plan_digest = digest, .owners_digest = owners_digest, .owner_count = @intCast(list.items.len), .expected = expected, .child = try plan.childIdentity(scratch) };
+    const summary: Summary = .{ .plan_digest = digest, .owners_digest = owners_digest, .owner_count = @intCast(list.items.len), .expected = expected, .document_source = plan.isDocumentSource(), .child = try plan.childIdentity(scratch) };
     try summary.validate();
     const encoded = try std.json.Stringify.valueAlloc(a, plan, .{});
     if (encoded.len > fk.max_bytes) return error.CatalogCommandTooLarge;
@@ -252,7 +271,7 @@ pub fn verifyEvidence(lookup: Lookup, state: State, owner: Owner, step: Step, ev
         .source => |receipt| {
             const child = state.summary.child;
             if (!std.mem.eql(u8, &receipt.plan_id, &lookup.id) or receipt.child_table_id != lookup.table or receipt.child_group_id != owner.group or
-                receipt.action != .fence or receipt.reference_coverage_ready or receipt.applied_term == 0 or receipt.applied_index == 0 or
+                receipt.document_source != state.summary.document_source or receipt.action != .fence or receipt.reference_coverage_ready or receipt.applied_term == 0 or receipt.applied_index == 0 or
                 !std.mem.eql(u8, &receipt.plan_digest, &state.summary.plan_digest) or !std.mem.eql(u8, &receipt.fence_digest, &owner.source_fence) or
                 receipt.before_schema_version != child.before_schema_version or receipt.after_schema_version != child.after_schema_version or
                 !std.mem.eql(u8, &receipt.before_schema_digest, &child.before_schema_digest) or !std.mem.eql(u8, &receipt.after_schema_digest, &child.after_schema_digest) or

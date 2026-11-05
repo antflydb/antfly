@@ -40,7 +40,10 @@ pub const batch_acknowledge_many_protocol_version: u16 = 13;
 /// the complete decoder before admission, even for an empty first page.
 /// Version 18 preserves JSON literal-null provenance and unique absence
 /// predicates. Activate once per membership, before admitting these payloads.
-pub const batch_protocol_version: u16 = 32;
+pub const batch_protocol_version: u16 = 33;
+/// Document retirement binds the exact source definition under the apply
+/// writer and persists a source-only proof without a relational catalog.
+pub const batch_document_retirement_protocol_version: u16 = 33;
 /// Version 32 combines execution-bound vector publications and grouped catalog
 /// activation with SQL's independently allocated v26-v31 barriers. A pre-merge
 /// SQL decoder advertising v31 does not implement these publication payloads.

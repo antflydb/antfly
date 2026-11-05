@@ -4068,6 +4068,7 @@ pub const ApiHttpServer = struct {
     row_policy_publication_cursor: std.atomic.Value(u64) = .init(0),
     fk_generation_publication_cursor: std.atomic.Value(u64) = .init(0),
     table_retirement_cursor: std.atomic.Value(u64) = .init(0),
+    scope_retirement_cursor: std.atomic.Value(u64) = .init(0),
     fk_publication_test_control: if (builtin.is_test) struct {
         paused: std.atomic.Value(bool) = .init(false),
         in_flight: std.atomic.Value(u32) = .init(0),
@@ -5623,7 +5624,16 @@ pub const ApiHttpServer = struct {
         try self.maybeRenewOwnedSessionLeases();
     }
     pub fn runSessionMaintenanceOnce(self: *ApiHttpServer) !void {
-        if (self.cfg.session_maintenance_local_only) return self.runLocalSessionMaintenanceOnce();
+        if (self.cfg.session_maintenance_local_only) {
+            // Metadata issuers own native source ACK cleanup and the ancestor
+            // journal, independently of data-owner repair/activation work.
+            // A failed local session quantum must not starve either supervisor.
+            defer {
+                if (self.mutationBackgroundExecutionPermitted()) self.runSqlLockMaintenanceOnce();
+                self.runScopeRetirementMaintenanceOnce();
+            }
+            return self.runLocalSessionMaintenanceOnce();
+        }
         // Policy phase decisions and owner receipts each use the shared HA
         // metadata/owner outbox. Run this coordinator on a writable HA primary
         // as well, while leaving unrelated primary-local jobs frozen.
@@ -5678,6 +5688,7 @@ pub const ApiHttpServer = struct {
             => {},
             else => std.log.warn("relational constraint activation deferred err={s}", .{@errorName(err)}),
         };
+        self.runScopeRetirementMaintenanceOnce();
         self.advanceTableRetirementOnce() catch |err| {
             if (!@import("../metadata/schema_validation_coordinator.zig").isDeferred(err) and err != error.UnsupportedOperation and err != error.TableNotFound)
                 std.log.warn("table retirement deferred err={s}", .{@errorName(err)});
@@ -6183,6 +6194,26 @@ pub const ApiHttpServer = struct {
     }
 
     const FkPublicationStepFault = enum { none, before_metadata_mutate, after_metadata_mutate, repeat_metadata_mutate };
+
+    fn runScopeRetirementMaintenanceOnce(self: *ApiHttpServer) void {
+        if (!self.mutationBackgroundExecutionPermitted()) return;
+        self.advanceScopeRetirementOnce() catch |err| {
+            if (!@import("../metadata/schema_validation_coordinator.zig").isDeferred(err) and err != error.UnsupportedOperation and err != error.TableNotFound)
+                std.log.warn("scope retirement deferred err={s}", .{@errorName(err)});
+        };
+    }
+
+    pub fn advanceScopeRetirementOnce(self: *ApiHttpServer) !void {
+        if (!self.cfg.catalog_publication_authority_available) return;
+        if (builtin.is_test) {
+            _ = self.fk_publication_test_control.in_flight.fetchAdd(1, .acq_rel);
+            defer _ = self.fk_publication_test_control.in_flight.fetchSub(1, .acq_rel);
+            if (self.fk_publication_test_control.paused.load(.acquire)) return;
+        }
+        const context: api_operation.RequestContext = .{ .deadline_ns = platform_time.monotonicNs() +| 20 * std.time.ns_per_s, .setting_admin = true, .schema_validation_authority = true, .fk_generation_publication_authority = true };
+        const next = try @import("scope_retirement_coordinator.zig").step(self, self.scope_retirement_cursor.load(.monotonic), context);
+        self.scope_retirement_cursor.store(next, .monotonic);
+    }
 
     pub fn advanceTableRetirementOnce(self: *ApiHttpServer) !void {
         if (!self.cfg.catalog_publication_authority_available) return;
@@ -15413,6 +15444,23 @@ pub const ApiHttpServer = struct {
         borrowed_identity: ?AuthenticatedIdentity,
     ) !query_api.QueryResponse {
         _ = try system_catalog.Target.literal(logical_name);
+        return self.executeCatalogRetrievalQueryWithDelivery(alloc, context, logical_name, body, borrowed_identity, null);
+    }
+
+    /// An in-process result consumer borrows the same admitted native query
+    /// state; authorization, routing and retry semantics match HTTP retrieval.
+    /// Trusted catalog adapters may pass a length-framed scoped policy key.
+    /// The public literal-name entry above never accepts these private keys.
+    pub fn executeCatalogRetrievalQueryWithDelivery(
+        self: *ApiHttpServer,
+        alloc: std.mem.Allocator,
+        context: api_operation.RequestContext,
+        logical_name: []const u8,
+        body: []const u8,
+        borrowed_identity: ?AuthenticatedIdentity,
+        delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
+    ) !query_api.QueryResponse {
+        _ = try system_catalog.Target.parse(logical_name);
         var identity = try cloneCatalogIdentity(self.alloc, borrowed_identity);
         defer if (identity) |*owned| owned.deinit(self.alloc);
         var catalog_arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -15452,7 +15500,7 @@ pub const ApiHttpServer = struct {
             binding.label,
             if (binding.join) |*join| join else null,
             &resolver,
-            null,
+            delivery,
         ) catch |err| {
             if (query_api.isPublicQueryValidationError(err)) return error.InvalidRetrievalAgentRequest;
             return err;
@@ -16289,7 +16337,7 @@ pub const ApiHttpServer = struct {
         // Source-program preparation is a physical delivery choice, not a
         // change to every ordinary public query. Wire consumers keep the native
         // reader's owned-response shortcut; lake delivery was handled above.
-        const native_delivery = if (delivery) |sink| (if (sink.typed_result != null) sink else null) else null;
+        const native_delivery = if (delivery) |sink| (if (sink.typed_result != null or sink.native_graph_result != null) sink else null) else null;
         if (native_delivery != null) try query_req.prepareEncodedDelivery(alloc);
         return (queryWithTransientReadRetryAndDelivery(
             alloc,

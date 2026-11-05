@@ -780,6 +780,20 @@ test "mounted SQL scope retirement capture drives registered physical children w
                     // No child has independent catalog-publication authority.
                     // The shared survivor and ancestor cut is still retained.
                     try Campaign.execute(ctx, "CREATE TABLE public.scope_disjoint(id BIGINT PRIMARY KEY)");
+                    const request: scope_wire.Request = .{ .admission = .{ .nonce = @splat(199), .head = 0 }, .operation = .{ .publish = .{ .lookup = self.lookup, .expected_revision = scope.head.progress.revision } } };
+                    const published = try std.json.parseFromSliceLeaky(scope_wire.Observation, a, try source(ctx).systemCatalog(a, context(), .{ .scope_retirement_submit = request }), .{});
+                    try std.testing.expect(published.outcome.?.result == .accepted);
+                    try std.testing.expectEqual(.published, published.current.?.progress.phase);
+                    const replay = try std.json.parseFromSliceLeaky(scope_wire.Observation, a, try source(ctx).systemCatalog(a, context(), .{ .scope_retirement_submit = request }), .{});
+                    try std.testing.expectEqualDeep(published.outcome, replay.outcome);
+                    const retired = try ownerWork(ctx, a, self.first);
+                    try std.testing.expectEqual(.published, retired.head.phase);
+                    var removed = try client.execute(ctx, "SELECT id FROM scope_children.first", .read);
+                    defer removed.deinit(ctx.alloc);
+                    try std.testing.expect(removed.status != 200);
+                    // Held parents are free to evolve after the atomic cut;
+                    // archived root proofs must not pin their old definitions.
+                    try Campaign.execute(ctx, "ALTER TABLE public.scope_parent ADD COLUMN label TEXT");
                     const store = ctx.metadata.server.svc.projectedStore() orelse return error.MissingMetadataStore;
                     const snapshot = try store.snapshotBuilder().buildSnapshot(a, self.lookup.group);
                     var tmp = std.testing.tmpDir(.{});
@@ -788,9 +802,11 @@ test "mounted SQL scope retirement capture drives registered physical children w
                     var clone = try @import("../storage/metadata_raft_apply_client.zig").RaftApplyStore.init(ctx.alloc, .{ .root_dir = clone_path });
                     defer clone.deinit();
                     try std.testing.expect(try clone.snapshotBuilder().installSnapshot(a, self.lookup.group, 1, snapshot));
-                    const recovered = try std.json.parseFromSliceLeaky(scopes.Work, a, try clone.scopeRetirementWorkJson(a, self.lookup.group, 0), .{});
-                    try std.testing.expectEqualDeep(scope.head, recovered.head);
-                    try std.testing.expect(recovered.child == null);
+                    const recovered = try std.json.parseFromSliceLeaky(?scopes.Work, a, try clone.scopeRetirementWorkJson(a, self.lookup.group, 0), .{});
+                    try std.testing.expect(recovered == null);
+                    const cold = try std.json.parseFromSliceLeaky(scope_wire.Observation, a, try clone.scopeRetirementObservationJson(a, self.lookup.group, published.outcome.?.query), .{});
+                    try std.testing.expectEqualDeep(published.outcome, cold.outcome);
+                    try std.testing.expectEqualDeep(published.current, cold.current);
                     _ = try clone.exportHotStandbyCheckpoint(ctx.io, try std.fmt.allocPrint(a, "{s}/ready.bin", .{clone_path}));
                     return;
                 }

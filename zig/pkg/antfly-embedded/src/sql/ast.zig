@@ -216,6 +216,15 @@ pub const Cte = struct {
     /// A statement-effect definition binds only earlier sibling slots.
     statement_cte_visibility: ?usize = null,
 };
+/// A linear graph MATCH is a typed relation. Every alias retains its native
+/// identity and expansion depth; SQL projection and pagination run afterwards.
+pub const Graph = struct {
+    index: []const u8,
+    start: Value,
+    aliases: []const []const u8,
+    edge_types: []const []const u8,
+};
+
 pub const Search = struct { request: Value, limit: ?Value = null };
 pub const Relation = union(enum) {
     /// FROM UNNEST expands typed arrays in storage order, zipping multiple
@@ -230,6 +239,7 @@ pub const Relation = union(enum) {
     table: struct {
         name: Name,
         search: ?*const Search = null,
+        graph: ?*const Graph = null,
         alias: ?[]const u8 = null,
         mutation_target: bool = false,
         mutation_document: bool = false,
@@ -524,6 +534,7 @@ pub const CatalogDdl = struct {
     truncate_tables: []const Name = &.{},
     restart_identity: bool = false,
     cascade: bool = false,
+    force: bool = false,
     /// Index names are namespace relations, not names of their owning table.
     index_table: ?Name = null,
     native_index: ?NativeIndex = null,

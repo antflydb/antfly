@@ -255,6 +255,12 @@ const mappings = [_]Mapping{
     .{ .status = .catalog_table_topology_required, .err = error.CatalogTableTopologyRequired },
     .{ .status = .create_table_request_too_large, .err = error.CreateTableRequestTooLarge },
     .{ .status = .database_not_empty, .err = error.DatabaseNotEmpty },
+    .{ .status = .sql_database_in_use, .err = error.SqlDatabaseInUse },
+    .{ .status = .scope_retirement_changed, .err = error.ScopeRetirementChanged },
+    .{ .status = .invalid_scope_retirement, .err = error.InvalidScopeRetirement },
+    .{ .status = .sequence_admission_conflict, .err = error.SequenceAdmissionConflict },
+    .{ .status = .invalid_table_retirement_manifest, .err = error.InvalidTableRetirementManifest },
+    .{ .status = .extension_owned_object, .err = error.ExtensionOwnedObject },
     .{ .status = .database_not_found, .err = error.DatabaseNotFound },
     .{ .status = .forbidden, .err = error.Forbidden },
     .{ .status = .invalid_catalog_mutation, .err = error.InvalidCatalogMutation },
@@ -1226,7 +1232,7 @@ test "seed replica policy mismatch survives compiled runtime boundaries" {
 }
 
 test "registered storage-kernel errors are unique and round trip without losing identity" {
-    for ([_]anyerror{ error.InvalidDocumentCheckpoint, error.TooManyActiveJobs }) |err| {
+    for ([_]anyerror{ error.InvalidDocumentCheckpoint, error.TooManyActiveJobs, error.SqlDatabaseInUse, error.ScopeRetirementChanged, error.InvalidScopeRetirement, error.SequenceAdmissionConflict, error.InvalidTableRetirementManifest, error.ExtensionOwnedObject }) |err| {
         const failure = failureFromError(err, .storage_owner, abi.abi_version, 23);
         try validateFailureEnvelope(failure.status, &failure, abi.abi_version);
         try std.testing.expectError(err, statusToError(failure.status));

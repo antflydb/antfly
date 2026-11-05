@@ -157,6 +157,7 @@ pub fn observe(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
 pub fn recover(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentity, context: Context, a: A, encoded: []const u8) !Receipt {
     try context.ensureActive();
     if (server.cfg.auth_enabled and identity == null) return error.Forbidden;
+    if (try @import("sql_scope_retirement.zig").recoverIfScope(server, identity, context, a, encoded)) |receipt| return receipt;
     if (try @import("sql_ordinary_catalog.zig").recoverIfOrdinary(server, identity, context, a, encoded)) |receipt| return receipt;
     if (try @import("sql_table_retirement.zig").recoverIfTable(server, identity, context, a, encoded)) |receipt| return receipt;
     if (try @import("sql_authorization_recovery.zig").recoverIfAuthorization(server, identity, context, a, encoded)) |receipt| return receipt;

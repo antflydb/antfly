@@ -36,5 +36,27 @@ pub fn requireReservation(a: std.mem.Allocator, reader: anytype, manifest: local
     // FORCE can request termination, never discard a prepared decision. Its
     // actual source drainage is independently checked before physical work.
     if (try prepared.databaseCount(a, reader, manifest.metadata_group_id, manifest.scope.database.id) != 0) return error.SqlDatabaseInUse;
-    if (!manifest.force) try requireConnectionsDrained(a, reader, manifest.metadata_group_id, manifest.metadata_incarnation, manifest.scope.database.id);
+    if (!manifest.force) return requireConnectionsDrained(a, reader, manifest.metadata_group_id, manifest.metadata_incarnation, manifest.scope.database.id);
+    if (manifest.creator.kind == .bootstrap) return;
+    // Resolve termination authority for every live backend before reserving
+    // the database. A privileged owner must not strand an irreversible job or
+    // let a trusted worker amplify the SQL issuer's rights. Stream only this
+    // database's directory and release each decoded source before the next.
+    const locks = local.storage_pessimistic_lock_authority;
+    const ns: locks.ledger.Namespace = .{ .home = .metadata, .group = manifest.metadata_group_id, .incarnation = manifest.metadata_incarnation };
+    const principal = try @import("../system_catalog/lock_authority.zig").principalDigest(a, manifest.creator);
+    const count = try locks.databaseCount(reader, ns, manifest.scope.database.id);
+    var after: ?local.storage_pessimistic_lock_contract.Backend = null;
+    var seen: u64 = 0;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    while (true) {
+        _ = arena.reset(.retain_capacity);
+        const source = (try locks.readDatabaseSource(arena.allocator(), reader, ns, manifest.scope.database.id, after)) orelse break;
+        seen += 1;
+        if (seen > count) return error.InvalidScopeRetirement;
+        if (source.state == .active and !std.mem.eql(u8, &principal, &source.registration.lease.principal)) return error.Forbidden;
+        after = source.registration.lease.backend;
+    }
+    if (seen != count) return error.InvalidScopeRetirement;
 }

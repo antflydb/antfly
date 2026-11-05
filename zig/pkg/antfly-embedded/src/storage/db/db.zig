@@ -7895,7 +7895,7 @@ pub const DB = struct {
         if (comptime storage_engine.enabled) return storage_engine.call("batchNativeFkGenerationApply", .{ self, req });
         const command = req.relational_topology orelse return error.InvalidBatchRequest;
         if (command.fence.role != .child_generation_source and command.fence.role != .child_generation_parent and
-            command.fence.role != .child_generation_dual) return error.InvalidBatchRequest;
+            command.fence.role != .child_generation_dual and command.fence.role != .document_retirement_source) return error.InvalidBatchRequest;
         const ordinal: u64 = switch (command.action) {
             .begin => 1,
             .stage_child_generation => 2,
@@ -30010,6 +30010,8 @@ pub const DB = struct {
             req.merge_checkpoint != null or req.merge_replication != null or
             req.merge_source_transition != null or req.merge_artifacts.len != 0) return error.InvalidBatchRequest;
         if (req.relational_topology != null and req.split_transition != null) return error.InvalidBatchRequest;
+        if (req.relational_topology) |command| if (command.fence.role == .document_retirement_source and !command.isSqlDropControl()) return error.InvalidBatchRequest;
+        if (req.relational_topology) |command| if (command.document_schema_digest != null and command.fence.role != .document_retirement_source) return error.InvalidBatchRequest;
         if (req.relational_topology) |command| if (command.fence.role == .backup_snapshot and (command.action != .begin and command.action != .release and command.action != .cancel)) return error.InvalidBatchRequest;
         if (req.relational_topology) |command| if ((command.action == .seal_graph_retirement and command.graph_retirement == null) or
             (command.graph_retirement != null and command.action != .begin and command.action != .seal_graph_retirement)) return error.InvalidBatchRequest;
@@ -30242,12 +30244,35 @@ pub const DB = struct {
                         if (try manager.hasTopologySensitiveTransactions()) return error.IntegrityTopologyBusy;
                     }
                 }
+                if (command.fence.role == .document_retirement_source) {
+                    // Persist native mode evidence for a pristine owner as
+                    // well as a populated one. Missing integrity metadata on a
+                    // relational owner remains corruption, never document mode.
+                    if (self.core.table_catalog.storage_mode != .document or
+                        (if (self.core.schema) |value| value.storage_mode != .document else false)) return error.IntegrityCatalogChanged;
+                    const source_json = txn.get(public_schema_json_key) catch |err| switch (err) {
+                        error.NotFound => "",
+                        else => return err,
+                    };
+                    var source_digest: [32]u8 = undefined;
+                    std.crypto.hash.Blake3.hash(source_json, &source_digest, .{});
+                    if (!std.mem.eql(u8, &source_digest, &command.document_schema_digest.?)) return error.IntegrityCatalogChanged;
+                    const table = @import("table_catalog.zig");
+                    const raw = txn.get(table.key) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    };
+                    if (raw == null) {
+                        const encoded = self.core.table_catalog.encode();
+                        try txn.put(table.key, &encoded);
+                    }
+                }
                 try topology.stageBeginWithHandoff(&txn, command.fence, command.generation_handoff);
                 if (command.graph_retirement) |scope| {
                     try @import("graph_retirement_seal.zig").stageBegin(&txn, scope);
                     close_graph_after_commit = true;
                 }
-                if (command.fence.role == .child_generation_source or command.fence.role == .child_generation_dual)
+                if (command.fence.role == .child_generation_source or command.fence.role == .child_generation_dual or command.fence.role == .document_retirement_source)
                     try @import("relational_integrity_generation_admission.zig").stageSourceFencedReceipt(&txn, command.fence, if (receipt_entry) |entry| entry.term else 0, if (receipt_entry) |entry| entry.index else 0);
             },
             .seal_graph_retirement => {
@@ -150449,4 +150474,79 @@ test "SQL ordered lock admission yields without holding snapshot or writer owner
     db.core.lockApplyShared();
     defer db.core.unlockApplyShared();
     try std.testing.expect(try db.orderedMutationAlreadyApplied(identity));
+}
+
+test "db document retirement source fences pristine populated and cold owners without relational catalogs" {
+    const alloc = std.testing.allocator;
+    const topology = @import("relational_integrity_topology.zig");
+    const admission = @import("relational_integrity_generation_admission.zig");
+    for (0..3) |variant| {
+        var temporary = try TestDirectory.init("db-document-retirement-source");
+        defer temporary.cleanup();
+        const path = temporary.path().ptr;
+        defer cleanupTempDir(path);
+        const namespace: doc_identity.Namespace = .{ .table_id = 717, .shard_id = 719, .range_id = 719 };
+        var fence: topology.Fence = undefined;
+        var first: admission.AppliedReceipt = undefined;
+        var schema_digest: [32]u8 = undefined;
+        {
+            var db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .online_source_authority = .native, .start_optional_runtimes = false });
+            defer db.close();
+            if (variant == 1) try db.setSchemaJson(alloc, "{\"version\":4}");
+            if (variant != 0) try db.batch(.{ .writes = &.{.{ .key = "doc", .value = "{\"body\":\"retire me\"}" }} });
+            std.crypto.hash.Blake3.hash(if (variant == 1) "{\"version\":4}" else "", &schema_digest, .{});
+            const identity = try db.relationalTopologyIdentity();
+            fence = .{ .transition_id = 71, .attempt = 72, .admission_epoch = identity.next_epoch, .owner_group_id = 719, .peer_group_id = 719, .role = .document_retirement_source, .namespace = namespace, .catalog_digest = identity.catalog_digest };
+            try std.testing.expectError(error.InvalidBatchRequest, db.batchNativeFkGenerationApply(.{ .relational_topology = .{ .action = .begin, .fence = fence } }));
+            try db.batchNativeFkGenerationApply(.{ .relational_topology = .{ .action = .begin, .fence = fence, .sql_drop_control = true, .document_schema_digest = schema_digest } });
+            try std.testing.expectError(error.IntegrityTopologyBusy, db.batch(.{ .writes = &.{.{ .key = "late", .value = "{}" }} }));
+            var read = try db.core.store.beginProbeTxn();
+            defer read.abort();
+            first = (try admission.ownerStatus(&read)).source_fence_receipt.?;
+            try std.testing.expectEqualSlices(u8, &try admission.sourceFenceDigest(fence), &first.digest);
+            try std.testing.expect(first.term != 0 and first.index != 0);
+            try std.testing.expectError(error.NotFound, read.get(@import("relational_integrity_catalog.zig").key));
+        }
+        // The original native source receipt is a cold, durable witness. A
+        // lost response retries the exact barrier without advancing identity.
+        {
+            var db = try DB.open(alloc, std.mem.span(path), .{ .identity_namespace = namespace, .online_source_authority = .native, .start_optional_runtimes = false });
+            defer db.close();
+            try db.batchNativeFkGenerationApply(.{ .relational_topology = .{ .action = .begin, .fence = fence, .sql_drop_control = true, .document_schema_digest = schema_digest } });
+            var read = try db.core.store.beginProbeTxn();
+            defer read.abort();
+            const status = try admission.ownerStatus(&read);
+            try std.testing.expect(status.fence.?.eql(fence));
+            try std.testing.expectEqual(first, status.source_fence_receipt.?);
+            try std.testing.expectError(error.NotFound, read.get(@import("relational_integrity_catalog.zig").key));
+            try std.testing.expectError(error.InvalidBatchRequest, db.batchNativeFkGenerationApply(.{ .relational_topology = .{ .action = .cancel_child_generation_source, .fence = fence, .sql_drop_control = true, .document_schema_digest = schema_digest } }));
+        }
+    }
+}
+
+test "db document retirement waits for producer replay before durable source admission" {
+    const alloc = std.testing.allocator;
+    var directory = try TestDirectory.init("db-document-retirement-producer-drain");
+    defer directory.cleanup();
+    var runtime = try background_runtime_mod.BackendRuntimeHandle.init(alloc, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer runtime.deinit();
+    const namespace: doc_identity.Namespace = .{ .table_id = 717, .shard_id = 719, .range_id = 719 };
+    var db = try DB.open(alloc, directory.path(), .{ .identity_namespace = namespace, .online_source_authority = .native, .backend_runtime = runtime.ptr(), .executor = .{ .backend = .manual }, .start_optional_runtimes = false, .start_independent_maintenance = false });
+    defer db.close();
+    var config: enrichment_runtime_mod.Config = .{ .enable_without_producers = true };
+    try db.initOptionalEnrichmentRuntime(&config);
+    try db.batch(.{ .writes = &.{.{ .key = "pending", .value = "{}" }} });
+    var schema_digest: [32]u8 = undefined;
+    std.crypto.hash.Blake3.hash("", &schema_digest, .{});
+    const identity = try db.relationalTopologyIdentity();
+    const fence: @import("relational_integrity_topology.zig").Fence = .{ .transition_id = 71, .attempt = 72, .admission_epoch = identity.next_epoch, .owner_group_id = 719, .peer_group_id = 719, .role = .document_retirement_source, .namespace = namespace, .catalog_digest = identity.catalog_digest };
+    try std.testing.expectError(error.IntegrityTopologyBusy, db.batchNativeFkGenerationApply(.{ .relational_topology = .{ .action = .begin, .fence = fence, .sql_drop_control = true, .document_schema_digest = schema_digest } }));
+    {
+        var read = try db.core.store.beginProbeTxn();
+        defer read.abort();
+        try std.testing.expect((try @import("relational_integrity_topology.zig").current(&read)) == null);
+        try std.testing.expect((try @import("relational_integrity_generation_admission.zig").ownerStatus(&read)).source_fence_receipt == null);
+    }
+    try db.runUntilIdle();
+    try db.batchNativeFkGenerationApply(.{ .relational_topology = .{ .action = .begin, .fence = fence, .sql_drop_control = true, .document_schema_digest = schema_digest } });
 }

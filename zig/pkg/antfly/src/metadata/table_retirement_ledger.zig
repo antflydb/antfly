@@ -202,6 +202,8 @@ pub const Prepared = struct {
     encoded: []const u8,
     head: Head,
     tables: []u64,
+    /// Derived off the writer; never inferred from an opaque wire marker.
+    admission_decoder_version: u16,
     pub fn deinit(self: *@This()) void {
         self.arena.deinit();
         self.* = undefined;
@@ -209,6 +211,19 @@ pub const Prepared = struct {
 };
 /// Decode/validate outside the metadata writer. The native writer independently
 /// rejoins the transaction-local catalog before calling stageBegin.
+/// Document retirement has a real source barrier only at the scope decoder
+/// epoch. Read just its explicit mode; immutable manifest validation owns the
+/// full schema contract. Legacy reserved-job cancellation needs no new marker.
+pub fn documentSource(a: A, root: local.common_topology_records.TableRecord) !bool {
+    var mode = try std.json.parseFromSlice(struct { storage_mode: enum { document, relational } = .document }, a, if (root.schema_json.len == 0) "{}" else root.schema_json, .{ .ignore_unknown_fields = true });
+    defer mode.deinit();
+    return mode.value.storage_mode == .document;
+}
+pub fn admissionDecoderVersion(a: A, scope: Scope, root: local.common_topology_records.TableRecord) !u16 {
+    const protocol = @import("topology_protocol.zig");
+    if (scope.parent != null or try documentSource(a, root)) return protocol.sql_scope_retirement_version;
+    return if (std.mem.allEqual(u8, &scope.target_digest, 0)) protocol.table_retirement_version else protocol.table_retirement_public_version;
+}
 pub fn prepare(backing: A, id: Id, scope: Scope, bytes: []const u8) !Prepared {
     var decoded = try manifests.Owned.parse(backing, bytes);
     errdefer decoded.deinit();
@@ -220,10 +235,11 @@ fn prepareOwned(decoded: *manifests.Owned, id: Id, scope: Scope) !Prepared {
     const tables = try participantTables(a, decoded.value);
     const value: Head = .{ .lookup = .{ .group = decoded.value.metadata_group_id, .table = decoded.value.root.table_id, .id = id }, .incarnation = decoded.value.metadata_incarnation, .effects = try decoded.value.reference(), .scope = scope, .participant_count = @intCast(tables.len), .range_count = @intCast(rangeCount(decoded.value)), .participants_digest = tableDigest(tables) };
     try value.validate();
+    const admission_decoder_version = try admissionDecoderVersion(a, scope, decoded.value.root);
     // Allocate the final body before copying the arena descriptor. Encoding
     // can grow its chunk list; copying it first would orphan that last chunk.
     const encoded = try decoded.value.encodeAlloc(a);
-    return .{ .arena = decoded.arena, .value = decoded.value, .encoded = encoded, .head = value, .tables = tables };
+    return .{ .arena = decoded.arena, .value = decoded.value, .encoded = encoded, .head = value, .tables = tables, .admission_decoder_version = admission_decoder_version };
 }
 
 pub const max_command_bytes = manifests.max_bytes + 4096;

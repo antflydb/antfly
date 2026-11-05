@@ -64,7 +64,7 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
             try child.validate();
             if (child.lookup.group != group or !std.mem.eql(u8, row.key, try ledger.childKey(&buffer, child.lookup, child.ordinal))) return error.InvalidScopeRetirement;
             const head = (try ledger.head(reader, child.lookup)) orelse return error.InvalidScopeRetirement;
-            if (!head.active()) return error.InvalidScopeRetirement;
+            if (!head.active() and head.progress.phase != .published) return error.InvalidScopeRetirement;
             try increment(&received[6], 1);
         } else if (std.mem.startsWith(u8, suffix, ":") and std.mem.indexOf(u8, suffix, ":child_outcome:") != null) {
             const query = try wire.QueryRecord.decode(row.value);
@@ -83,7 +83,7 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
             try (wire.Observation{ .outcome = outcome, .current = try ledger.head(reader, outcome.query.lookup) }).requireFor(outcome.query);
             if (outcome.result == .accepted) switch (outcome.result.accepted.progress.phase) {
                 .draining_connections => if (!std.mem.eql(u8, &outcome.query.nonce, &outcome.query.lookup.reference.id)) return error.InvalidScopeRetirement,
-                .canceled => {
+                .canceled, .published => {
                     if (!std.meta.eql(try wire.terminalQuery(reader, outcome.query.lookup), outcome.query)) return error.InvalidScopeRetirement;
                     try increment(&received[3], 1);
                 },
@@ -97,7 +97,6 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
                         try increment(&received[10], 1);
                     }
                 },
-                else => return error.InvalidScopeRetirement,
             };
         } else if (std.mem.startsWith(u8, suffix, ":") and std.mem.endsWith(u8, suffix, ":source_cursor")) {
             const cursor = try ledger.SourceCursorRecord.decode(row.value);
@@ -117,7 +116,7 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
             try query.validate();
             if (query.lookup.group != group or !std.mem.eql(u8, row.key, try ledger.key(&buffer, query.lookup, .terminal_outcome))) return error.InvalidScopeRetirement;
             const head = (try ledger.head(reader, query.lookup)) orelse return error.InvalidScopeRetirement;
-            if (head.progress.phase != .canceled) return error.InvalidScopeRetirement;
+            if (head.progress.phase != .canceled and head.progress.phase != .published) return error.InvalidScopeRetirement;
             try increment(&received[4], 1);
         } else if (std.mem.startsWith(u8, suffix, ":") and std.mem.endsWith(u8, suffix, ":manifest")) {
             // A corresponding head must read this exact canonical key below.
@@ -157,7 +156,7 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
                     try increment(&expected[3], 1);
                     try increment(&expected[4], 1);
                 },
-                .retiring_tables, .publishing_catalog => {
+                .retiring_tables, .publishing_catalog, .published => {
                     var drained = initial;
                     drained.progress = try initial.progress.drained();
                     const query = try wire.drainQuery(reader, head.lookup);
@@ -178,22 +177,40 @@ pub fn verifyDirectory(backing: std.mem.Allocator, reader: anytype, group: u64, 
                         try increment(&expected[10], 1);
                         try increment(&expected[11], 1);
                     }
+                    if (head.progress.phase == .published) {
+                        completed.progress = try completed.progress.published(head.progress.catalog_revision, 0);
+                        const terminal_query = try wire.terminalQuery(reader, head.lookup);
+                        const terminal_outcome = try wire.OutcomeRecord.decode(try reader.get(try wire.outcomeKey(&buffer, terminal_query)));
+                        if (terminal_outcome.result != .accepted or !std.meta.eql(terminal_outcome.query, terminal_query) or
+                            !std.meta.eql(terminal_outcome.result.accepted, head)) return error.InvalidScopeRetirement;
+                        try increment(&expected[3], 1);
+                        try increment(&expected[4], 1);
+                    }
                     if (!std.meta.eql(completed, head)) return error.InvalidScopeRetirement;
                 },
-                else => return error.InvalidScopeRetirement,
             }
             const manifest_key = try ledger.key(&buffer, head.lookup, .manifest);
             const body = reader.get(manifest_key) catch |err| switch (err) {
                 error.NotFound => null,
                 else => return err,
             };
-            if (head.active()) {
+            if (head.active() or head.progress.phase == .published) {
                 var prepared = try ledger.prepare(backing, group, head.lookup.reference.id, body orelse return error.InvalidScopeRetirement);
                 defer prepared.deinit();
                 if (!std.meta.eql(prepared.lookup, head.lookup) or
                     !std.mem.eql(u8, prepared.encoded, body.?) or
                     !std.mem.eql(u8, &prepared.manifest.metadata_incarnation, &head.metadata_incarnation) or
-                    !prepared.manifest.creator.eql(head.creator) or prepared.manifest.force != head.force) return error.InvalidScopeRetirement;
+                    !prepared.manifest.creator.eql(head.creator) or !std.mem.eql(u8, &prepared.manifest.scope.labelsDigest(), &head.target_digest) or prepared.manifest.force != head.force) return error.InvalidScopeRetirement;
+                if (head.progress.phase == .published) {
+                    try context.verifyPublished(reader, head, prepared.manifest);
+                    try increment(&expected[0], 1);
+                    try increment(&expected[6], head.lookup.reference.tables);
+                    if ((reader.get(try ledger.queueKey(&buffer, group, head.sequence)) catch |err| switch (err) {
+                        error.NotFound => null,
+                        else => return err,
+                    }) != null) return error.InvalidScopeRetirement;
+                    continue;
+                }
                 try ledger.requireMembers(reader, &prepared, head);
                 try context.verifyManifest(reader, head, prepared.manifest);
                 for (prepared.manifest.resources) |resource| if (resource.kind == .named_type) {

@@ -1757,6 +1757,50 @@ const Parser = struct {
         return order_by.toOwnedSlice(self.alloc);
     }
 
+    /// Keep graph identity/depth in the relational domain. The graph producer
+    /// enumerates the complete bounded relation before ordinary ORDER/LIMIT.
+    fn graphMatch(self: *Parser) Error!ast.Select {
+        var aliases: std.ArrayList([]const u8) = .empty;
+        var types: std.ArrayList([]const u8) = .empty;
+        try self.expect(.lparen);
+        try aliases.append(self.alloc, try self.identifier());
+        try self.expect(.rparen);
+        while (self.take(.minus)) {
+            try self.node();
+            if (types.items.len >= 63) return self.fail(error.SqlLimitExceeded, "graph pattern has too many edges");
+            try self.expect(.lbracket);
+            try self.expect(.colon);
+            try types.append(self.alloc, try self.identifier());
+            try self.expect(.rbracket);
+            try self.expect(.arrow_json);
+            try self.expect(.lparen);
+            const alias = try self.identifier();
+            for (aliases.items) |existing| if (std.mem.eql(u8, existing, alias)) return self.fail(error.UnsupportedSqlShape, "linear MATCH aliases must be distinct");
+            try aliases.append(self.alloc, alias);
+            try self.expect(.rparen);
+        }
+        if (types.items.len == 0) return self.fail(error.InvalidSqlSyntax, "MATCH requires an edge pattern");
+        try self.expectKeyword(.with);
+        if (!self.ddlWord("GRAPH")) return self.fail(error.InvalidSqlSyntax, "MATCH requires WITH GRAPH");
+        const index = try self.identifier();
+        try self.expectKeyword(.on);
+        const table_name = try self.tableReferenceName();
+        if (!self.ddlWord("START")) return self.fail(error.InvalidSqlSyntax, "MATCH requires START");
+        const start = try self.value();
+        if (start != .string and start != .parameter) return self.fail(error.InvalidSqlSyntax, "MATCH START requires a string or parameter");
+        if (!self.ddlWord("RETURN")) return self.fail(error.InvalidSqlSyntax, "MATCH requires RETURN");
+        var columns: std.ArrayList(ast.Projection) = .empty;
+        while (true) {
+            try self.node();
+            try columns.append(self.alloc, try self.parseProjection(true));
+            if (!self.take(.comma)) break;
+        }
+        const graph = try self.alloc.create(ast.Graph);
+        graph.* = .{ .index = index, .start = start, .aliases = try aliases.toOwnedSlice(self.alloc), .edge_types = try types.toOwnedSlice(self.alloc) };
+        const source = try self.relationNode(.{ .table = .{ .name = table_name, .graph = graph } });
+        return self.selectFinish(.{ .source = source, .columns = try columns.toOwnedSlice(self.alloc) });
+    }
+
     fn relationNode(self: *Parser, relation_value: ast.Relation) Error!*const ast.Relation {
         try self.node();
         const result = try self.alloc.create(ast.Relation);
@@ -3238,6 +3282,12 @@ const Parser = struct {
                 ddl.location = location.string;
             }
         } else if (action == .create and self.keyword(.tablespace)) ddl.tablespace = try self.identifier();
+        if (action == .drop and kind == .database and self.keyword(.with)) {
+            try self.expect(.lparen);
+            if (!self.ddlWord("FORCE")) return self.fail(error.InvalidSqlSyntax, "DROP DATABASE WITH requires FORCE");
+            ddl.force = true;
+            try self.expect(.rparen);
+        }
         if (conditional and kind == .table and action == .rename and ddl.action != .alter_schema)
             return self.fail(error.UnsupportedSqlShape, "conditional catalog ALTER requires atomic missing-owner admission");
         return ddl;
@@ -4590,6 +4640,7 @@ const Parser = struct {
             source.* = .{ .derived = .{ .query = query, .alias = "$parenthesized" } };
             return .{ .select = try self.selectFinish(.{ .source = source }) };
         }
+        if (self.keyword(.match)) return .{ .select = try self.graphMatch() };
         if (self.keyword(.select)) {
             var destination: ?ast.RelationPopulation = null;
             const previous_into = self.into_target;
@@ -7044,4 +7095,40 @@ test "SQL COPY server targets retain owned producer identity and direction" {
         };
         try std.testing.expect(target != null);
     }
+}
+
+test "compiler database DROP preserves FORCE without accepting unknown or duplicate options" {
+    const a = std.testing.allocator;
+    var ordinary = try compile(a, "DROP DATABASE tenant_ops", .{});
+    defer ordinary.deinit();
+    try std.testing.expect(!ordinary.statement.catalog_ddl.force);
+    var force = try compile(a, "DROP DATABASE IF EXISTS tenant_ops WITH (FORCE)", .{});
+    defer force.deinit();
+    try std.testing.expect(force.statement.catalog_ddl.force and force.statement.catalog_ddl.conditional);
+    for ([_][]const u8{ "DROP DATABASE tenant_ops WITH (unknown)", "DROP DATABASE tenant_ops WITH (FORCE, FORCE)", "DROP DATABASE tenant_ops WITH (FORCE true)", "DROP SCHEMA tenant_ops WITH (FORCE)" }) |sql| {
+        if (compile(a, sql, .{})) |parsed_| {
+            var parsed = parsed_;
+            parsed.deinit();
+            return error.TestUnexpectedResult;
+        } else |_| {}
+    }
+}
+
+test "compiler original canonical MATCH retains native graph aliases before SQL projection and pagination" {
+    var corpus = try @import("parity_fixtures.zig").Corpus.init(std.testing.allocator);
+    defer corpus.deinit();
+    var compiled = try compile(std.testing.allocator, (try corpus.get("sql-1209")).sql, .{});
+    defer compiled.deinit();
+    const select = compiled.statement.select;
+    const graph = select.source.?.table.graph.?;
+    try std.testing.expectEqualStrings("usage_records", select.source.?.table.name.table);
+    try std.testing.expectEqualStrings("docs_edge_graph", graph.index);
+    try std.testing.expectEqualStrings("doc:root", graph.start.string);
+    try std.testing.expectEqualStrings("doc", graph.aliases[0]);
+    try std.testing.expectEqualStrings("target", graph.aliases[1]);
+    try std.testing.expectEqualStrings("cites", graph.edge_types[0]);
+    try std.testing.expectEqualStrings("source_id", select.columns[0].alias.?);
+    try std.testing.expectEqualStrings("target_id", select.columns[1].alias.?);
+    try std.testing.expectEqualStrings("target\x00depth", select.order_by[0].field);
+    try std.testing.expectEqual(@as(i64, 5), select.limit.?.integer);
 }

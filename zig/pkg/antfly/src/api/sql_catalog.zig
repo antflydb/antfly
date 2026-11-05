@@ -1105,6 +1105,8 @@ fn createConflict(server: *server_mod.ApiHttpServer, context: operation.RequestC
 }
 
 pub fn executeWithAllocators(server: *server_mod.ApiHttpServer, identity: ?server_mod.AuthenticatedIdentity, context: operation.RequestContext, database: []const u8, namespace: []const u8, allocators: catalog.DdlAllocators, input: catalog.Ddl, path: ?*const SearchPath) !catalog.DdlOutcome {
+    if (input == .catalog_ddl and input.catalog_ddl.kind == .database and input.catalog_ddl.action == .drop)
+        return @import("sql_scope_retirement.zig").executeDatabase(server, identity, context, database, allocators, input.catalog_ddl);
     if (input == .populate) return @import("sql_population.zig").execute(server, identity, context, database, namespace, allocators, input.populate, path);
     const alloc = allocators.result;
     try context.ensureActive();

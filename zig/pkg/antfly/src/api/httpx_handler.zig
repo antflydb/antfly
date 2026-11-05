@@ -7206,6 +7206,19 @@ pub const AntflyApiHandler = struct {
             var buffer: [256]u8 = undefined;
             return ctx.status(sql_execution.httpStatus(err)).json(sql_wire.SQLDiagnostic{ .code = sql_execution.sqlState(err), .message = sql_execution.diagnosticMessage(err, &buffer) });
         };
+        var native: @import("sql_command_execution.zig").Native = .{ .server = self.api_server, .context = operationContext(ctx, identity) };
+        var native_controller: ?@import("sql_command_execution.zig").Controller = null;
+        // Cover errors through response construction as well as enrollment.
+        // Ambiguous native admission retains a durable cleanup owner.
+        errdefer {
+            if (native_controller) |controller| controller.retire(ctx.allocator) catch {};
+            _ = @import("sql_connections.zig").mutate(store, .{ .close = connection_id }, principal, owner_node_id, now_ms) catch {};
+        }
+        if (self.api_server.source.vtable.supports_sql_command_ownership) {
+            native_controller = try native.controller(connection_id, identity);
+            try self.api_server.ensureSqlCommandUpkeep();
+            try native_controller.?.enroll(ctx.allocator, parsed.value.database);
+        }
         var owner_buffer: [20]u8 = undefined;
         const owner = try std.fmt.bufPrint(&owner_buffer, "{d}", .{owner_node_id});
         return ctx.status(200).json(.{ .connection_id = &connection_id, .owner_node_id = owner, .expires_at_ms = now_ms +| @import("sql_connection_record.zig").ttl_ms, .database = parsed.value.database, .namespace = parsed.value.namespace });

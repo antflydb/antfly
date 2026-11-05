@@ -121,10 +121,10 @@ expression-index cases run against those declared owners (with duplicate
 `23505`, named-index-alias `42704` and wrong-inference-target `42P10` probes),
 not against an unconstrained baseline.
 
-The restructuring plan excludes graph and lake SQL integration. Any corpus cases
-belonging to those integrations still need explicit scope review. Deferred cases
-continue to block this strict original-corpus gate; a publication scope exception
-must be reviewed as a change to gate policy, not hidden as a passing test.
+The historical restructuring plan excluded graph and lake SQL integration. That
+exclusion does not waive their original corpus contracts. Deferred cases continue
+to block this strict original-corpus gate; a publication scope exception must be
+reviewed as a change to gate policy, not hidden as a passing test.
 
 ### Integration scope confirmed 2026-10-19
 
@@ -157,6 +157,26 @@ complete-postimage and recovery requirements as other cohorts. Unsupported
 responses and successful metadata-only operations do not close positive runtime
 contracts. This scope confirmation does not change the pinned corpus, its
 checksums or any case disposition.
+
+### Graph statement cuts
+
+Standalone canonical `MATCH` can reuse the existing native graph query cut and
+return typed binding keys, depth and distance directly to SQL. SQL still owns
+projection, ordering and limit; a truncated native binding set is an error,
+not a sortable SQL prefix. Table lock admission and native credential filters
+remain shared. This does not activate delegated-view or SQL-only grant/RLS graph
+reads; those require a principal bridge into graph anchor and node reads.
+
+Joined and CTE graph sources additionally require one retained graph/row cut.
+Capture the primary transaction, an index publication lifetime lease and the
+outgoing/reverse edge contexts under the same short owner fence. Attest applied
+watermarks, identity generation, graph generations and ownership fingerprints
+before returning a cursor. Extend retained-read handles with paged graph
+expansion and hydration using those captured contexts. Calling ordinary `/query`
+while holding that fence can deadlock on the read-index apply it blocks and does
+not prove a shared cut. Transactional graph reads also need range/source proofs.
+Concurrent mutation, index drop/rebuild, topology moves, cancellation and cold
+restore must exercise that common provider before mixed-source cases close.
 
 ## Commands and acceptance policy
 

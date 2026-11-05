@@ -197,7 +197,7 @@ fn transparent(query: anytype) bool {
 }
 
 pub fn eligible(scans: []const catalog.StatementScan) bool {
-    for (scans) |scan| if (scan.table.storage_mode == .relational and scan.table.external_base_source == null and scan.request.search == null) return true;
+    for (scans) |scan| if (scan.table.storage_mode == .relational and scan.table.external_base_source == null and scan.request.search == null and scan.request.graph == null) return true;
     return false;
 }
 
@@ -324,7 +324,7 @@ const State = struct {
             targets |= @as(u64, 1) << @intCast(found.scan);
         }
         for (self.relation.scans, 0..) |scan, index| {
-            if (targets & (@as(u64, 1) << @intCast(index)) == 0 or scan.table.storage_mode != .relational or scan.table.external_base_source != null or scan.request.search != null) continue;
+            if (targets & (@as(u64, 1) << @intCast(index)) == 0 or scan.table.storage_mode != .relational or scan.table.external_base_source != null or scan.request.search != null or scan.request.graph != null) continue;
             const canonical = try self.a.dupe(scalar.Column, columns);
             const nullable = try self.a.alloc(bool, columns.len);
             for (canonical, lineage, nullable) |*column, item, *flag| {

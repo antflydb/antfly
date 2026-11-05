@@ -122,10 +122,11 @@ pub fn execute(server: *http.ApiHttpServer, identity: ?http.AuthenticatedIdentit
     defer manifest.deinit();
     const Source = struct { storage_mode: enum { document, relational } = .document };
     const source: Source = if (manifest.value.root.schema_json.len != 0) try std.json.parseFromSliceLeaky(Source, a, manifest.value.root.schema_json, .{ .ignore_unknown_fields = true }) else .{};
-    if (source.storage_mode == .document) {
-        if (manifest.value.survivors.len == 0 and manifest.value.dependent_views.len == 0 and manifest.value.counters.len == 0) return null;
-        return error.UnsupportedSqlShape;
-    }
+    if (source.storage_mode == .document and manifest.value.survivors.len == 0 and
+        manifest.value.dependent_views.len == 0 and manifest.value.counters.len == 0) return null;
+    // Dependency-bearing document sources use the same retained root and
+    // physical-owner barriers. buildTableRetirement captures their raw primary
+    // frontier/catalog without manufacturing a relational successor schema.
     if (manifest.value.view_backings.len != 0 or manifest.value.root_ranges.len == 0) return error.UnsupportedSqlShape;
     if (server.cfg.deployment_mode == .standalone and (server.hotStandbyMutationPolicy().failover_safe_mutations_only or server.cfg.fk_generation_source == null or server.cfg.fk_generation_parent == null)) return error.UnsupportedSqlExecution;
     const io = server.sharedApiIo() orelse return error.UnsupportedSqlExecution;

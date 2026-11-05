@@ -137,7 +137,7 @@ test "SQL scope retirement journal atomically owns membership exact retries cold
     // The native apply owner separately verifies actual publication. Here the
     // journal only proves atomic terminal custody, not a fabricated owner ACK.
     const next = try expected.progress.published(prepared.manifest.catalog_revision + 1, prepared.manifest.catalog_revision);
-    const writes = 4 + prepared.manifest.resources.len + prepared.lookup.reference.tables;
+    const writes = 3 + prepared.manifest.resources.len;
     for (0..writes) |fail_at| {
         var txn = try store.store.beginWriteTxn();
         var open = true;
@@ -1159,18 +1159,15 @@ test "SQL scope retirement FORCE authority cannot turn database administration i
         .standalone = false,
     };
     try ConnectionHarness.submit(&store, scratch, registration, 10, .{ .register = registration });
-    const admitted = (try AdmissionHarness.apply(&store, scratch, request, 1, false)).outcome.?;
-    // The request worker runs as a trusted service principal; the retained SQL
-    // issuer, rather than that service privilege, bounds FORCE authority.
-    try std.testing.expectError(error.Forbidden, ConnectionHarness.submitScoped(&store, scratch, registration, 11, .{ .fence = .close }, .{ .root = admitted.query.lookup }));
+    const refused = (try AdmissionHarness.apply(&store, scratch, request, 1, false)).outcome.?;
+    try std.testing.expectEqual(wire.Rejection.Forbidden, refused.result.rejected);
     var read = try store.store.beginReadTxn();
-    const ns: L.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = manifest.metadata_incarnation };
-    try std.testing.expectEqual(.active, (try L.scopes.read(a, &read, ns, registration.lease.backend)).?.state);
-    try std.testing.expectEqual(@as(u32, 1), try L.scopes.databaseCount(&read, ns, registration.lease.database));
-    read.abort();
-    _ = try AdmissionHarness.apply(&store, scratch, AdmissionHarness.cancel(admitted.query.lookup, 121), 2, false);
-    // A canceled root cannot authorize a new termination command either.
-    try std.testing.expectError(error.Forbidden, ConnectionHarness.submitScoped(&store, scratch, registration, 12, .{ .fence = .close }, .{ .root = admitted.query.lookup }));
+    defer read.abort();
+    try std.testing.expect(try ledger.head(&read, refused.query.lookup) == null);
+    const ns: L.scopes.ledger.Namespace = .{ .home = .metadata, .group = group, .incarnation = registration.lease.backend.incarnation };
+    const source = (try L.scopes.read(scratch, &read, ns, registration.lease.backend)).?;
+    try std.testing.expectEqual(.active, source.state);
+    try std.testing.expectEqual(@as(u64, 1), try L.scopes.databaseCount(&read, ns, manifest.scope.database.id));
 }
 
 test "SQL scope retirement physical children borrow exact root custody without independent catalog publication" {

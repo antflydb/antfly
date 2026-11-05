@@ -399,6 +399,9 @@ pub const Call = union(enum) {
     }
 
     pub fn isSchemaValidationCall(self: @This()) bool {
+        // Database retirement discovery crosses the same authenticated owner
+        // boundary as the retirement journal; ordinary lock reads do not.
+        if (self == .sql_lock_read and self.sql_lock_read.database_work != null) return true;
         if (self == .scope_retirement_prepare or self == .scope_retirement_submit or self == .scope_retirement_observation or self == .scope_retirement_work or self == .scope_retirement_manifest) return true;
         return self == .table_retirement_submit or self == .table_retirement_receipt or self == .table_retirement_queue or self == .table_retirement_effects or self == .table_retirement_owner_work or self == .schema_validation_prepare or self == .schema_validation_submit or self == .schema_validation_discover or self == .schema_validation_work or (self == .sql_sequence_snapshot and self.sql_sequence_snapshot.prepare_retirement) or self.schemaValidationLookup() != null;
     }
@@ -820,4 +823,31 @@ test "SQL scope retirement capture requires owner sensitive authority and cannot
     try std.testing.expect(call.isSchemaValidationCall());
     try std.testing.expect(!call.isMutation());
     try std.testing.expect(!call.tracksSQLSubmission());
+}
+
+test "SQL scope retirement database source reads preserve transport authority" {
+    var ordinary: Call = .{ .sql_lock_read = .{
+        .incarnation = @splat(1),
+        .standalone = false,
+        .actor = .{ .session_user = .bootstrap, .credential = "" },
+        .database = 0,
+        .discovery = "tenant_ops",
+    } };
+    try ordinary.sql_lock_read.validate();
+    try std.testing.expect(!ordinary.isSchemaValidationCall());
+    try std.testing.expect(ordinary.requiresAdministrativeGrant());
+    try std.testing.expect(!ordinary.isMutation());
+
+    ordinary.sql_lock_read.discovery = null;
+    ordinary.sql_lock_read.database = 7;
+    ordinary.sql_lock_read.database_work = .{ .wrap = true };
+    try ordinary.sql_lock_read.validate();
+    try std.testing.expect(ordinary.isSchemaValidationCall());
+    try std.testing.expect(ordinary.requiresAdministrativeGrant());
+    try std.testing.expect(!ordinary.isMutation());
+    try std.testing.expect(!ordinary.tracksSQLSubmission());
+
+    // Body classification cannot authorize a caller to impersonate the worker.
+    ordinary.sql_lock_read.actor.current_role = .{ .kind = .role, .instance = @splat(2) };
+    try std.testing.expectError(error.Forbidden, ordinary.sql_lock_read.validate());
 }

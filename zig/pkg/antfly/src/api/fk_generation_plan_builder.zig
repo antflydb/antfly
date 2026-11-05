@@ -147,6 +147,28 @@ pub fn buildTableRetirement(server: *server_mod.ApiHttpServer, alloc: std.mem.Al
     try context.ensureActive();
     try manifest.validate(alloc);
     if (manifest.view_backings.len != 0) return error.UnsupportedOperation;
+    var root_schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, if (manifest.root.schema_json.len == 0) "{}" else manifest.root.schema_json);
+    defer root_schema.deinit(alloc);
+    if (root_schema.storage_mode == .document) {
+        const document_ranges = try rangesForCut(alloc, .{ .tables = &.{manifest.root}, .ranges = manifest.root_ranges }, manifest.root.table_id);
+        const plan: publication.Plan = .{
+            .historical_reference_coverage = true,
+            .catalog_coverage = .checks_v1,
+            .table_retirement = try manifest.reference(),
+            .sql_drop = try manifest.guard.clone(alloc),
+            .id = id,
+            .child_before = try ownedTableForPlan(alloc, manifest.root),
+            .child_after = try ownedTableForPlan(alloc, manifest.root),
+            .child_catalog_before_b64 = "",
+            .parents = &.{},
+            .child_ranges = document_ranges,
+            .child_fences = try ownerFencesWithCoverage(server, alloc, context, id, manifest.root, document_ranges, .document_retirement_source, .checks_v1),
+        };
+        try plan.validate(alloc);
+        const physical = @import("../metadata/table_retirement_physical.zig");
+        try physical.requireManifest(alloc, .{ .group = manifest.metadata_group_id, .table = manifest.root.table_id, .id = id }, try physical.prepare(alloc, alloc, plan), manifest);
+        return plan;
+    }
     var selected: std.ArrayList(records.TableRecord) = .empty;
     var ranges: std.ArrayList(records.RangeRecord) = .empty;
     try selected.append(alloc, manifest.root);

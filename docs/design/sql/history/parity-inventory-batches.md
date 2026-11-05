@@ -2153,3 +2153,38 @@ records/rows/cursor as well; a terminal header cannot admit invented scan work.
 Public CASCADE and borrowed-default activation still require the coordinated
 catalog finalizer, complete-cohort reservation, durable outcome and restore
 handoff integration. These checks do not change any original case disposition.
+
+
+## 2026-11-05: database retirement, standalone graph reads and document view guards
+
+The pinned inventory moves from 66 to 59 unresolved cases. Original database
+DROP/FORCE (0108/0109) and standalone MATCH (1209) are implemented. Private
+unadmitted view-mapping contracts (0853/0855/0856/0859) are superseded by explicit
+PostgreSQL public views and accepting immutable-source publication guards.
+
+Database evidence uses populated document and relational owners, real views and
+sequences, prepared-transaction/current-database/idle-source refusals, admitted
+FORCE interrupted by complete owner restart, exact operation receipts, snapshot
+verification and same-name recreation. A forced old connection remains unusable
+against the recreated database. All retirement effects reuse the shared native
+barriers and atomic catalog transaction.
+
+View evidence executes unchanged original SELECTs with PostgreSQL cast/projection
+results. Valid native publications bracket forged epoch, digest and column
+signature refusals; each mutation outcome is read back by its body-bound identity.
+Public document schema migration, dependent-source retirement, exact asynchronous
+completion, immutable ID reuse and cold metadata/data reopen exercise the guards.
+Document metadata remains arbitrary JSON; no implicit field retyping is admitted.
+
+Graph evidence exercises the canonical native engine, actual typed bindings,
+outer SQL order/limit, credential filters, hidden anchors and cold restart.
+Explicit native delivery preserves binding metadata without changing public graph
+wire consumers. Exact finite Boolean ID resolution handles combined source and
+credential filters without dropping stored predicates or unbounded complements;
+allocation-failure cleanup is tested.
+
+The required-index private-view case 0854 and joined graph cases 1207/1208 remain
+uncredited. Public SQL-only grants/delegated graph policies, shared graph/row cuts,
+transactional schema retirement with rewritten survivors and archival-proof GC
+remain separate obligations. See the ledger for reproducible native Debug and
+PostgreSQL evidence gates; this checkpoint grants no blanket feature waiver.

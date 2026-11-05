@@ -851,6 +851,7 @@ pub const Scan = struct {
     pub const Search = struct { expression: ast.Search, request_text: ?[]const u8 = null, limit: ?u32 = null };
     pub const TextPredicate = struct { expressions: []const ast.Value, query: ?[]const u8 = null };
     search: ?*const Search = null,
+    graph: ?*const ast.Graph = null,
     text_predicate: ?*const TextPredicate = null,
     /// A request, never proof. Providers explicitly attest the entire order.
     order: []const Order = &.{},
@@ -1711,6 +1712,7 @@ pub const Backend = struct {
     /// Carry an explicit context so lowering can change Backend.ptr safely.
     scalar_control: ?struct { ptr: ?*anyopaque, checkpoint: *const fn (?*anyopaque) anyerror!void } = null,
     supports_search_relations: bool = false,
+    supports_graph_relations: bool = false,
     supports_text_predicates: bool = false,
     /// Advisory expression probes with mandatory SQL residual evaluation.
     /// This is an execution optimization, never a readiness/capability proof.

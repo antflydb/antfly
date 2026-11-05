@@ -4897,6 +4897,62 @@
       ],
       "cwd": "zig",
       "timeout_seconds": 1800
+    },
+    "sql-qualified-database-retirement-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-database-retirement-test",
+        "-Dtest-filter=mounted SQL scope retirement capture completes original database DROP",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-database-retirement-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/check_sql_scope_retirement_postgres.py"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
+    },
+    "sql-qualified-graph-view-native-debug": {
+      "command": [
+        "zig",
+        "build",
+        "antfly-api-sql-case-cohort-test",
+        "-Dtest-filter=mounted SQL document view guards",
+        "-Dtest-filter=mounted SQL original canonical MATCH",
+        "-Dtest-filter=SQL native graph",
+        "-Doptimize=Debug",
+        "-j1"
+      ],
+      "cwd": "zig",
+      "timeout_seconds": 1800
+    },
+    "sql-qualified-document-view-guards-postgres": {
+      "command": [
+        "uv",
+        "run",
+        "--offline",
+        "--no-project",
+        "--with",
+        "psycopg[binary]==3.3.6",
+        "python",
+        "scripts/generate_sql_view_guard_reference.py",
+        "--check",
+        "zig/pkg/antfly/src/api/fixtures/sql_view_guard_reference.json"
+      ],
+      "cwd": ".",
+      "timeout_seconds": 180
     }
   },
   "entries": [
@@ -6775,25 +6831,37 @@
     },
     {
       "id": "sql-0108",
-      "status": "unresolved",
-      "reason": "The unchanged empty-database command passes PostgreSQL and strict native publication/reopen/snapshot gates. Populated database retirement is still guarded by DatabaseNotEmpty and does not yet satisfy PostgreSQL DROP DATABASE semantics; no completion credit is claimed.",
+      "status": "implemented",
+      "reason": "The unchanged original DROP DATABASE retires a populated local document/relational database through one durable ancestor journal, shared source barriers and a single catalog publication. Real views, owned and independent sequences and rows are removed; explicit transactions, the current database and idle connection owners are rejected with PostgreSQL diagnostics. Exact receipt recovery, full owner restart, snapshot verification and immutable name reuse are exercised; external-base storage remains guarded before admission.",
       "evidence": [
         {
-          "path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig",
-          "test": "httpx SQL catalog originals commit through native authority and recover topology",
-          "gate": "sql-native-catalog-campaign"
+          "path": "zig/pkg/antfly/src/api/sql_database_retirement_integration_test.zig",
+          "test": "mounted SQL scope retirement capture completes original database DROP and FORCE with idle custody and cold recovery",
+          "gate": "sql-qualified-database-retirement-native-debug"
         },
         {
-          "path": "zig/pkg/antfly/src/api/sql_catalog_campaign_test.zig",
-          "test": "httpx SQL catalog originals commit through native authority and recover topology",
-          "gate": "sql-postgres-oracle-contracts"
+          "path": "zig/pkg/antfly/src/api/sql_database_retirement_integration_test.zig",
+          "test": "mounted SQL scope retirement capture completes original database DROP and FORCE with idle custody and cold recovery",
+          "gate": "sql-qualified-database-retirement-postgres"
         }
       ]
     },
     {
       "id": "sql-0109",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The unchanged FORCE statement terminates eligible native idle connection owners using the retained SQL issuer authority and common source/transaction ACK cleanup, then uses the same physical/catalog retirement as ordinary DROP. Prepared transactions remain protected with 55006. An admitted operation survives complete metadata/data restart; old handles cannot attach to a recreated same-name database and old receipts remain committed. Native admission separately rejects privileged source termination before reservation.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_database_retirement_integration_test.zig",
+          "test": "mounted SQL scope retirement capture completes original database DROP and FORCE with idle custody and cold recovery",
+          "gate": "sql-qualified-database-retirement-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_database_retirement_integration_test.zig",
+          "test": "mounted SQL scope retirement capture completes original database DROP and FORCE with idle custody and cold recovery",
+          "gate": "sql-qualified-database-retirement-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0110",
@@ -20307,8 +20375,20 @@
     },
     {
       "id": "sql-0853",
-      "status": "unresolved",
-      "reason": "The source defines a private view_mappings object inside docs.indexes_json, not an admitted public SQL view. A missing support_view rejection does not prove the intended typed-path, required-index, source-generation or schema-fingerprint guard. Keep this original unresolved until source-faithful mapping admission and those native execution proofs are implemented."
+      "status": "superseded",
+      "reason": "The unadmitted private view_mappings type override is replaced by a public view with explicit PostgreSQL NUMERIC conversion of the original TEXT title. The unchanged original SELECT fails with 22P02 on alpha and returns exact numeric values/OIDs after valid text replacement; no implicit retyping of document fields is accepted. Actual source rows and public view reads survive complete cold owner restart.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_guard_integration_test.zig",
+          "test": "mounted SQL document view guards reject forged epochs and source reincarnation with PostgreSQL casts and projections",
+          "gate": "sql-qualified-graph-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_guard_integration_test.zig",
+          "test": "mounted SQL document view guards reject forged epochs and source reincarnation with PostgreSQL casts and projections",
+          "gate": "sql-qualified-document-view-guards-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0854",
@@ -20317,13 +20397,37 @@
     },
     {
       "id": "sql-0855",
-      "status": "unresolved",
-      "reason": "The source defines a private view_mappings object inside docs.indexes_json, not an admitted public SQL view. A missing support_view rejection does not prove the intended typed-path, required-index, source-generation or schema-fingerprint guard. Keep this original unresolved until source-faithful mapping admission and those native execution proofs are implemented."
+      "status": "superseded",
+      "reason": "Private mapping generation assertions are replaced by immutable source IDs and accepting native view-publication guards. A valid native publication succeeds first; an independently forged source epoch at the current catalog revision is durably rejected and its body-bound outcome is recovered. Compatible public document-schema evolution preserves existing view reads but rejects old captured definitions. Source DROP/CREATE and complete cold restart cannot rebind the old source ID; unchanged original SELECTs execute through explicit public JSON path views.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_guard_integration_test.zig",
+          "test": "mounted SQL document view guards reject forged epochs and source reincarnation with PostgreSQL casts and projections",
+          "gate": "sql-qualified-graph-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_guard_integration_test.zig",
+          "test": "mounted SQL document view guards reject forged epochs and source reincarnation with PostgreSQL casts and projections",
+          "gate": "sql-qualified-document-view-guards-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0856",
-      "status": "unresolved",
-      "reason": "The source defines a private view_mappings object inside docs.indexes_json, not an admitted public SQL view. A missing support_view rejection does not prove the intended typed-path, required-index, source-generation or schema-fingerprint guard. Keep this original unresolved until source-faithful mapping admission and those native execution proofs are implemented."
+      "status": "superseded",
+      "reason": "Private mapping fingerprints are replaced by accepting native checks of source schema digest and captured column signatures. Independently forged claims are rejected through the prepared native journal with unchanged catalog revision, exact retained outcomes and a valid current-definition control. Public schema evolution, coordinated document-source retirement, new immutable IDs and complete cold reopen exercise real stale-definition protection; original SELECTs retain PostgreSQL public-view semantics.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_guard_integration_test.zig",
+          "test": "mounted SQL document view guards reject forged epochs and source reincarnation with PostgreSQL casts and projections",
+          "gate": "sql-qualified-graph-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_guard_integration_test.zig",
+          "test": "mounted SQL document view guards reject forged epochs and source reincarnation with PostgreSQL casts and projections",
+          "gate": "sql-qualified-document-view-guards-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0857",
@@ -20366,8 +20470,20 @@
     },
     {
       "id": "sql-0859",
-      "status": "unresolved",
-      "reason": "The source defines a private view_mappings object inside docs.indexes_json, not an admitted public SQL view. A missing support_view rejection does not prove the intended typed-path, required-index, source-generation or schema-fingerprint guard. Keep this original unresolved until source-faithful mapping admission and those native execution proofs are implemented."
+      "status": "superseded",
+      "reason": "The private implicit projection-path contract is replaced by an explicit public plan-only view over the original arbitrary-JSON document domain. The unchanged original title projection fails with PostgreSQL 42703 on a real admitted view, while valid plan projections return exact PostgreSQL rows/OIDs before and after cold owner restart. Missing source IDs are tested independently through accepting publication, not used as a substitute for an undefined view column.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_guard_integration_test.zig",
+          "test": "mounted SQL document view guards reject forged epochs and source reincarnation with PostgreSQL casts and projections",
+          "gate": "sql-qualified-graph-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_view_guard_integration_test.zig",
+          "test": "mounted SQL document view guards reject forged epochs and source reincarnation with PostgreSQL casts and projections",
+          "gate": "sql-qualified-document-view-guards-postgres"
+        }
+      ]
     },
     {
       "id": "sql-0860",
@@ -26840,8 +26956,20 @@
     },
     {
       "id": "sql-1209",
-      "status": "unresolved",
-      "reason": "Review the original planner/runtime contract and map it to current executable coverage."
+      "status": "implemented",
+      "reason": "The exact original standalone MATCH executes through the canonical native graph engine with real binding keys/depth, then ordinary SQL projection, ordering and limit. Native in-process delivery avoids graph wire serialization that discards depth. The mounted witness verifies complete binding bags, ordering/limit, credential ID filters, hidden anchors and cold graph restart; native finite Boolean ID resolution preserves authorization and allocation-failure cleanup. Shared graph/table cuts, delegated policy authority and explicit transactions remain guarded; joined originals 1207/1208 are not credited.",
+      "evidence": [
+        {
+          "path": "zig/pkg/antfly/src/api/sql_graph_match_integration_test.zig",
+          "test": "mounted SQL original canonical MATCH preserves binding projection depth order filters and cold graph state",
+          "gate": "sql-qualified-graph-view-native-debug"
+        },
+        {
+          "path": "zig/pkg/antfly/src/api/sql_graph_execution.zig",
+          "test": "SQL native graph original binding retains aliases hidden depth order and exact projected source fields",
+          "gate": "sql-qualified-graph-view-native-debug"
+        }
+      ]
     },
     {
       "id": "sql-1210",

@@ -241,27 +241,61 @@ completion link per ordinal. Native snapshot and standby validation rejoin these
 proofs and reject missing, substituted or orphaned custody. The mounted campaign
 covers a lost source-fence reply, cold recovery, a shared surviving FK parent,
 self/cyclic FKs and a hidden materialized backing, followed by snapshot installation
-and standby export of the completed physical-preparation cut. This establishes
-physical preparation, not successful public DROP or physical namespace deletion.
+and standby export of the completed physical-preparation cut.
+
+## Database publication
+
+The leader-fenced ancestor supervisor advances compact durable work records.
+FORCE traverses the indexed native connection directory and delegates terminated
+owner drainage to the existing lock/transaction acknowledgement supervisor.
+Idle public HTTP connections enroll before their connection IDs are returned.
+Native admission checks termination privileges before reserving an irreversible
+root and refuses prepared transactions even with FORCE.
+
+Metadata API issuers run this leader-owned quantum and native lock ACK cleanup
+alongside their local session upkeep. These do not depend on the data-owner
+repair loop; a failed session quantum cannot starve either supervisor. Scoped
+source-directory reads retain their signed administrative authority across both
+the HTTP classifier and the private compiled storage projection.
+
+After every child supplies its signed physical-ready receipt, a root without
+rewritten survivor schemas publishes in one native writer transaction. It
+removes the scoped catalog resources, native table/range records, dependency
+edges and sequence ownership, and marks every child and the root published at
+one catalog revision. The common relation command journal updates the live
+relation directory with the same decision. No child publishes independently.
+
+Published manifests, child registrations and terminal outcomes remain available
+for exact recovery and checkpoint verification after live leases are released.
+Verification proves the retired immutable IDs absent; it does not pin a
+surviving dependency to an obsolete schema forever. Name reuse cannot retarget
+an old receipt. Public operation-status recovery only observes this decision;
+it never resubmits a name-based DROP.
+
+Local document sources use an explicit document retirement role. They retain
+their real schema identity and do not fabricate a relational integrity catalog
+or schema increment. The source checks the durable document-schema digest under
+the accepting writer before fencing; ordinary producer and transaction replay
+debt must drain before the signed receipt is admitted. Metadata decoder floor172
+and data-Raft floor33 gate this role and its structural markers.
 
 ## Remaining activation
 
-1. Publish the root's combined survivor postimages through the common staged
-   schema machinery, including physical typed-row evolution for withdrawn named
-   types. Preserve surviving rows and unrelated constraints; metadata-only
-   removal is insufficient.
-2. Add the leader-fenced ancestor supervisor. Explicitly admitted physical
-   children already use the existing worker; automatic root drainage, FORCE
-   traversal and final publication remain to be connected. Finish native
-   enrollment of idle HTTP connections and connection-termination delivery.
-3. Publish all ancestor withdrawals, surviving dependency changes and child
-   terminal receipts in one verified native transaction. Preserve every child
-   source fence until that decision, and retain enough exact proof for cold
-   recovery and bounded cleanup.
-4. Integrate transactional schema intent/rollback, public SQL receipts,
-   cancellation, mixed storage capabilities and backup/restore. Complete the
-   data/read admission barriers and fault campaigns before changing the three
-   original dispositions. These cases remain unresolved.
+1. Publish rewritten survivor schemas through the common staged schema machinery,
+   including physical typed-row evolution for withdrawn named types. Preserve
+   surviving rows and unrelated constraints; metadata-only removal is insufficient.
+   Shared manifest derivation already produces the postimages, but roots needing
+   these rewrites remain guarded before public admission.
+2. Integrate transactional schema intent/rollback and public schema DROP with
+   that survivor pipeline. Database DROP intentionally rejects explicit
+   transactions, matching PostgreSQL.
+3. Define bounded archival-proof cleanup without weakening exact terminal
+   recovery or snapshot/standby verification. Published proof retention is
+   durable, but is not yet a garbage collection policy.
+4. Extend admission to external-base and other unsupported storage capabilities
+   only with their own verified physical barriers. Local document and relational
+   sources share the supervisor and final catalog transaction; external owners
+   remain rejected before root reservation.
 
 Raced committed definition/topology mutations are deterministic no-ops while
 scope custody holds their owners. The refusal precedes definition journal and

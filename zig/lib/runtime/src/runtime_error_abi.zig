@@ -1017,6 +1017,15 @@ pub const Detail = enum(c_int) {
     foreign_key_validation_required = 893,
     materialized_view_read_only = 894,
     raft_apply_writer_unavailable = 895,
+    // Append-only scope lifecycle identities; preserve published callback values.
+    sql_database_in_use = 896,
+    invalid_scope_retirement = 897,
+    scope_retirement_changed = 898,
+    sequence_admission_conflict = 899,
+    invalid_table_retirement_manifest = 900,
+    sql_program_limit_exceeded = 901,
+    snapshot_build_cancelled = 902,
+    catalog_generation_exhausted = 903,
 };
 
 test "partial index proof rejection preserves exact callback error identity" {
@@ -1646,6 +1655,15 @@ pub fn statusFromError(err: anyerror) Status {
         error.WriteOutcomeUnknown => status(.retryable, .write_outcome_unknown),
         error.RaftBatchWriteOutcomeUnknown => status(.retryable, .raft_batch_write_outcome_unknown),
         error.RaftApplyWriterUnavailable => status(.retryable, .raft_apply_writer_unavailable),
+        error.SqlDatabaseInUse => status(.conflict, .sql_database_in_use),
+        error.InvalidScopeRetirement => status(.invalid_argument, .invalid_scope_retirement),
+        error.ScopeRetirementChanged => status(.conflict, .scope_retirement_changed),
+        error.SequenceAdmissionConflict => status(.conflict, .sequence_admission_conflict),
+        error.InvalidTableRetirementManifest => status(.invalid_argument, .invalid_table_retirement_manifest),
+        error.SqlProgramLimitExceeded => status(.invalid_argument, .sql_program_limit_exceeded),
+        error.SnapshotBuildCancelled => status(.cancelled, .snapshot_build_cancelled),
+        error.CatalogGenerationExhausted => status(.invalid_argument, .catalog_generation_exhausted),
+
         error.RaftBatchWriteTransportOutcomeUnknown => status(.retryable, .raft_batch_write_transport_outcome_unknown),
         error.HttpConnectionClosing => status(.unavailable, .http_connection_closing),
         error.RaftBatchWritePartialOutcome => status(.retryable, .raft_batch_write_partial_outcome),
@@ -2742,6 +2760,15 @@ fn detailErrorName(comptime detail: Detail) []const u8 {
         .leader_unavailable => "LeaderUnavailable",
         .raft_batch_write_outcome_unknown => "RaftBatchWriteOutcomeUnknown",
         .raft_apply_writer_unavailable => "RaftApplyWriterUnavailable",
+        .sql_database_in_use => "SqlDatabaseInUse",
+        .invalid_scope_retirement => "InvalidScopeRetirement",
+        .scope_retirement_changed => "ScopeRetirementChanged",
+        .sequence_admission_conflict => "SequenceAdmissionConflict",
+        .invalid_table_retirement_manifest => "InvalidTableRetirementManifest",
+        .sql_program_limit_exceeded => "SqlProgramLimitExceeded",
+        .snapshot_build_cancelled => "SnapshotBuildCancelled",
+        .catalog_generation_exhausted => "CatalogGenerationExhausted",
+
         .raft_batch_write_transport_outcome_unknown => "RaftBatchWriteTransportOutcomeUnknown",
         .http_connection_closing => "HttpConnectionClosing",
         .raft_batch_write_partial_outcome => "RaftBatchWritePartialOutcome",
@@ -3592,4 +3619,31 @@ test "native locking callback admission preserves retryable ordered apply identi
     try std.testing.expectEqual(@backingInt(Code.retryable), transported.code);
     try std.testing.expectEqual(error.RaftApplyWriterUnavailable, errorFromStatus(transported));
     try std.testing.expectEqual(@as(c_int, 895), @backingInt(Detail.raft_apply_writer_unavailable));
+}
+
+test "scope retirement callback descriptors preserve exact lifecycle conflict and limit identities" {
+    const cases = .{
+        .{ error.SqlDatabaseInUse, Code.conflict, Detail.sql_database_in_use },
+        .{ error.InvalidScopeRetirement, Code.invalid_argument, Detail.invalid_scope_retirement },
+        .{ error.ScopeRetirementChanged, Code.conflict, Detail.scope_retirement_changed },
+        .{ error.SequenceAdmissionConflict, Code.conflict, Detail.sequence_admission_conflict },
+        .{ error.InvalidTableRetirementManifest, Code.invalid_argument, Detail.invalid_table_retirement_manifest },
+        .{ error.SqlProgramLimitExceeded, Code.invalid_argument, Detail.sql_program_limit_exceeded },
+        .{ error.SnapshotBuildCancelled, Code.cancelled, Detail.snapshot_build_cancelled },
+        .{ error.CatalogGenerationExhausted, Code.invalid_argument, Detail.catalog_generation_exhausted },
+    };
+    inline for (cases) |entry| {
+        const transported = statusFromError(entry[0]);
+        try std.testing.expectEqual(@backingInt(entry[1]), transported.code);
+        try std.testing.expectEqual(@backingInt(entry[2]), transported.detail);
+        try std.testing.expectEqual(entry[0], errorFromStatus(transported));
+        try std.testing.expectEqual(entry[0], errorFromStableName(@errorName(entry[0])).?);
+        try std.testing.expect(errorHasStableDetail(entry[0]));
+    }
+    // Public enum numbers remain independent from the embedded owner ABI.
+    try std.testing.expectEqual(@as(c_int, 895), @backingInt(Detail.raft_apply_writer_unavailable));
+    try std.testing.expectEqual(@as(c_int, 896), @backingInt(Detail.sql_database_in_use));
+    try std.testing.expectEqual(@as(c_int, 903), @backingInt(Detail.catalog_generation_exhausted));
+    try std.testing.expect(errorFromStableName("SqlDatabaseInUse\n") == null);
+    try std.testing.expect(errorFromStableName("ScopeRetirementChangedPrivate") == null);
 }

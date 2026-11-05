@@ -194,7 +194,16 @@ fn stageBeginImpl(txn: anytype, fence: Fence, handoff: ?@import("relational_inte
 /// mode, not catalog absence alone, authorizes this case. A relational owner
 /// with missing integrity metadata remains corruption, never an empty catalog.
 pub fn catalogForFence(txn: anytype, fence: Fence) ![]const u8 {
-    if (try optional(txn, catalog.key)) |bytes| return bytes;
+    if (try optional(txn, catalog.key)) |bytes| {
+        if (fence.role == .document_retirement_source) return error.IntegrityCatalogChanged;
+        return bytes;
+    }
+    if (fence.role == .document_retirement_source) {
+        const table = @import("table_catalog.zig");
+        const facts = try table.Catalog.decode(try optional(txn, table.key) orelse return error.IntegrityCatalogChanged);
+        if (facts.storage_mode != .document or (!facts.mode_initialized and (facts.row_count != 0 or facts.active_schema_version != 0))) return error.IntegrityCatalogChanged;
+        return "";
+    }
     if (fence.role == .backup_snapshot) return "";
     if (fence.role == .merge_source or fence.role == .rewrite_source) {
         const table = @import("table_catalog.zig");

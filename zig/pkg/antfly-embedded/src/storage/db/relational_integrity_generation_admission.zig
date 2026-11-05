@@ -397,7 +397,7 @@ pub fn stageCanceledReceipt(txn: anytype, fence: @import("relational_integrity_t
 }
 
 pub fn sourceFenceDigest(fence: @import("relational_integrity_topology_contract.zig").Fence) !integrity.Digest {
-    if (fence.role != .child_generation_source and fence.role != .child_generation_dual) return error.InvalidGenerationAdmission;
+    if (fence.role != .child_generation_source and fence.role != .child_generation_dual and fence.role != .document_retirement_source) return error.InvalidGenerationAdmission;
     const encoded = try fence.encode();
     var digest: integrity.Digest = undefined;
     std.crypto.hash.Blake3.hash(&encoded, &digest, .{});

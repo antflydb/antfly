@@ -302,7 +302,7 @@ pub fn executeConnected(
     return executeBody(ctx, connection, body, retry);
 }
 
-fn executeBody(ctx: *fixture.Context, connection: ?[]const u8, body: []const u8, retry: Retry) !http.HttpResponse {
+pub fn executeBody(ctx: *fixture.Context, connection: ?[]const u8, body: []const u8, retry: Retry) !http.HttpResponse {
     const deadline = platform.time.monotonicNs() +| 15 * std.time.ns_per_s;
     var timeout_headers = try TimeoutHeaders.init(ctx.alloc, ctx.headers);
     defer if (timeout_headers) |*owned| owned.deinit(ctx.alloc);

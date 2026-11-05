@@ -65,6 +65,9 @@ test {
     _ = @import("api/sql_copy_input_integration_test.zig");
     _ = @import("api/sql_copy_server_integration_test.zig");
     _ = @import("api/sql_scope_retirement_integration_test.zig");
+    _ = @import("api/sql_database_retirement_integration_test.zig");
+    _ = @import("api/sql_view_guard_integration_test.zig");
+    _ = @import("api/sql_graph_match_integration_test.zig");
     _ = @import("api/sql_view_domain_integration_test.zig");
     _ = @import("api/sql_routine_lifecycle_integration_test.zig");
     _ = @import("api/sql_procedure_lifecycle_integration_test.zig");

@@ -37,6 +37,8 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const data_runtime_test_mod = options.data_runtime_test_mod;
     const data_storage_test_mod = options.data_storage_test_mod;
     const lib_data_runtime_default_filters = [_][]const u8{
+        "SQL drop retirement control retains ordered timestamps and requires every applying decoder",
+        "document retirement binds source definition and requires every data applying decoder",
         "data runtime ordered artifact upload handoff",
         "data runtime schema reader",
         "data runtime schema recovery",

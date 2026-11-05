@@ -2031,7 +2031,7 @@ pub fn metadataApplyStoreProjection(
                 },
                 .sql_lock_read => |input| {
                     if (request.control.version != kernel_owner_abi.abi_version) break :blk .invalid_abi;
-                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .setting_admin = true, .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
+                    const context: @import("antfly_local_sources").api_operation.RequestContext = .{ .setting_admin = true, .schema_validation_authority = input.database_work != null, .deadline_ns = if (request.control.has_execution_deadline != 0) request.control.execution_deadline_ns else null, .cancellation = ownerQueryCancellation(&request.control) };
                     const value = handle.store.sqlLockRead(a, group_id, input, context) catch |err| break :blk storageOwnerStatusFromError(switch (err) {
                         error.InvalidLockRecord => error.InvalidCatalogRecord,
                         else => err,

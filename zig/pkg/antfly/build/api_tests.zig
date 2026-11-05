@@ -38,7 +38,7 @@ pub const AddTestsResult = struct {
     run_lib_api_standalone_backup_restore_tests: *std.Build.Step.Run,
     distributed_query_availability_step: *std.Build.Step,
     run_public_api_parity_aggregate_tests: *std.Build.Step.Run,
-    run_sql_owner_lifecycle_tests: [39]*std.Build.Step.Run,
+    run_sql_owner_lifecycle_tests: [41]*std.Build.Step.Run,
     run_lib_api_auth_tests: *std.Build.Step.Run,
     run_algebraic_dynamic_template_tests: *std.Build.Step.Run,
     run_lib_api_connections_tests: *std.Build.Step.Run,
@@ -2395,6 +2395,9 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners",
             "mounted SQL original server COPY",
             "mounted SQL scope retirement capture",
+            "mounted SQL document view guards",
+            "mounted SQL original canonical MATCH",
+            "SQL native graph",
             "SQL scope retirement population",
             "sequence catalog HTTP grants bind exact bodies",
             "system catalog binds foreign keys once and authorizes cascades by current logical names",
@@ -2691,6 +2694,12 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
     const copy_input_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL original COPY input preserves PostgreSQL atomic batches constraints and cold owners", "SQL pgwire retained mutation preparation", "SQL schema cache COPY validator leases" });
     copy_input_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-copy-input-lifecycle-test", "Verify atomic COPY input through authenticated native transactions and cold owners").dependOn(&copy_input_run.step);
+    const case_cohort_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL document view guards", "mounted SQL original canonical MATCH", "SQL native graph" });
+    case_cohort_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-case-cohort-test", "Verify original graph and document view case cohorts across native owners").dependOn(&case_cohort_run.step);
+    const database_retirement_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{"mounted SQL scope retirement capture completes original database DROP"});
+    database_retirement_run.addArg("--require-no-skips");
+    b.step("antfly-api-sql-database-retirement-test", "Verify original populated database DROP and FORCE across native custody and cold owners").dependOn(&database_retirement_run.step);
     const scope_retirement_run = addFilteredTestRunArtifactWithRuntimeFilters(b, sql_owner_lifecycle_tests, &.{ "mounted SQL scope retirement capture", "SQL scope retirement population", "sequence catalog HTTP grants bind exact bodies", "system catalog binds foreign keys once and authorizes cascades by current logical names" });
     scope_retirement_run.addArg("--require-no-skips");
     b.step("antfly-api-sql-scope-retirement-test", "Verify ancestor retirement capture across the native metadata and storage owner boundary").dependOn(&scope_retirement_run.step);
@@ -3219,7 +3228,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .run_lib_api_standalone_backup_restore_tests = run_lib_api_standalone_backup_restore_tests,
         .distributed_query_availability_step = lib_api_distributed_query_availability_test_step,
         .run_public_api_parity_aggregate_tests = run_public_api_parity_aggregate_tests,
-        .run_sql_owner_lifecycle_tests = .{ sql_gin_run, sql_prepared_transaction_run, sql_domain_rows_run, sql_domain_handoff_run, sql_maintenance_run, sql_enum_catalog_run, sql_cast_run, sql_procedure_run, sql_aggregate_run, sql_operator_run, sql_routine_run, sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run, document_alias_run, document_generated_run, temporal_bin_run, temporal_domain_run, view_domain_run, collection_run, explain_run, text_predicate_run, sql_document_integrity_run, cursor_lifecycle_run, copy_input_run, characteristics_run, tablespace_run, drop_retirement_run, sql_writable_cte_run, sql_join_read_run, sql_notification_run },
+        .run_sql_owner_lifecycle_tests = .{ case_cohort_run, database_retirement_run, sql_gin_run, sql_prepared_transaction_run, sql_domain_rows_run, sql_domain_handoff_run, sql_maintenance_run, sql_enum_catalog_run, sql_cast_run, sql_procedure_run, sql_aggregate_run, sql_operator_run, sql_routine_run, sql_primary_key_rewrite_run, sql_index_lifecycle_run, sql_nullability_run, sql_covering_constraint_run, sql_role_defaults_run, fk_validation_run, sql_resource_comment_run, sql_temporal_arithmetic_run, sql_range_run, sql_temporal_key_run, sql_fk_validation_run, document_alias_run, document_generated_run, temporal_bin_run, temporal_domain_run, view_domain_run, collection_run, explain_run, text_predicate_run, sql_document_integrity_run, cursor_lifecycle_run, copy_input_run, characteristics_run, tablespace_run, drop_retirement_run, sql_writable_cte_run, sql_join_read_run, sql_notification_run },
         .run_lib_api_auth_tests = run_lib_api_auth_tests,
         .run_algebraic_dynamic_template_tests = run_algebraic_dynamic_template_tests,
         .run_lib_api_connections_tests = run_lib_api_connections_tests,

@@ -1797,7 +1797,7 @@ const Builder = struct {
                     }
                     break :blk try self.node(columns, .{ .prepared_rows = names });
                 }
-                if (reference.search == null and !reference.mutation_target and !reference.prepared_rows and reference.name.database == null and reference.name.namespace == null) {
+                if (reference.search == null and reference.graph == null and !reference.mutation_target and !reference.prepared_rows and reference.name.database == null and reference.name.namespace == null) {
                     var i = scope.len;
                     while (i != 0) {
                         i -= 1;
@@ -1836,7 +1836,7 @@ const Builder = struct {
                         }
                     }
                 }
-                if (reference.search == null and !reference.mutation_target and !reference.prepared_rows and reference.name.database == null and reference.name.namespace == null) {
+                if (reference.search == null and reference.graph == null and !reference.mutation_target and !reference.prepared_rows and reference.name.database == null and reference.name.namespace == null) {
                     if (self.backend.statement_ctes) |scope_owner| if (scope_owner.binding_scope == self.backend.binding_scope) {
                         if (try scope_owner.lookup(reference.name.table, self.backend.statement_cte_visibility)) |slot| {
                             const definition = scope_owner.definitions[slot];
@@ -1864,7 +1864,7 @@ const Builder = struct {
                 if (!entry.found_existing) entry.value_ptr.* = try self.backend.resolveRead(self.alloc, reference.name);
                 const resolved = entry.value_ptr.*;
                 if (resolved == .view) {
-                    if (reference.search != null or reference.mutation_target or reference.prepared_rows) return error.UnsupportedSqlShape;
+                    if (reference.search != null or reference.graph != null or reference.mutation_target or reference.prepared_rows) return error.UnsupportedSqlShape;
                     const view = resolved.view;
                     if (view.id == 0 or view.generation == 0 or view.backend.binding_scope == 0 or self.view_depth >= self.view_path.len) return error.InvalidSqlBackendResponse;
                     for (self.view_path[0..self.view_depth]) |id| if (id == view.id) return error.SqlViewCycle;
@@ -1931,6 +1931,30 @@ const Builder = struct {
                         column.scope = .{ .database = reference.name.database orelse "", .namespace = reference.name.namespace orelse "", .name = reference.name.table, .revision = 0 };
                     };
                     break :blk result;
+                }
+                if (reference.graph) |graph| {
+                    if (!self.backend.supports_graph_relations or reference.search != null or reference.mutation_target or reference.prepared_rows) return error.UnsupportedSqlExecution;
+                    if (self.capture_dependencies) return error.UnsupportedSqlShape;
+                    if (graph.aliases.len < 2 or graph.aliases.len != graph.edge_types.len + 1 or graph.aliases.len > 64) return error.InvalidSqlBackendResponse;
+                    if (graph.start == .parameter) {
+                        const slot = graph.start.parameter - 1;
+                        if (self.parameters[slot]) |kind| if (kind != .string) return error.ConflictingSqlParameterTypes;
+                        self.parameters[slot] = .string;
+                    }
+                    const width = graph.aliases.len * 3;
+                    const columns = try self.alloc.alloc(Column, width);
+                    const fields = try self.alloc.alloc([]const u8, width);
+                    for (graph.aliases, 0..) |alias, alias_index| for ([_][]const u8{ "key", "depth", "distance" }, 0..) |name, field_index| {
+                        const position = alias_index * 3 + field_index;
+                        const kind: ast.ColumnType = if (field_index == 0) .string else if (field_index == 1) .integer else .number;
+                        columns[position] = .{ .name = name, .internal = try self.internal(), .qualifier = alias, .type = kind, .nullable = false };
+                        fields[position] = try std.fmt.allocPrint(self.alloc, "{s}\x00{s}", .{ alias, name });
+                        if (self.shape_only) try self.shape_columns.append(self.alloc, .{ .name = columns[position].internal, .type = kind, .nullable = false });
+                    };
+                    const index = self.scans.items.len;
+                    if (index >= 64) return error.SqlProgramLimitExceeded;
+                    try self.scans.append(self.alloc, .{ .table = resolved.table, .request = .{ .graph = graph, .fields = fields, .limit = 256 } });
+                    break :blk try self.node(columns, .{ .scan = .{ .index = index, .source_columns = fields } });
                 }
                 var table = resolved.table;
                 if (reference.search) |search| {
@@ -2442,7 +2466,10 @@ fn projectScans(builder: *Builder, node: *const Node, needed: *std.StringHashMap
             for (node.columns, scan.source_columns, demanded) |column, name, *required| {
                 required.* = required.* or needed.contains(column.internal);
                 if (!required.* or std.mem.eql(u8, name, "_id") or @import("joined_mutation.zig").isMetadata(name)) continue;
-                try fields.append(builder.alloc, (try request.table.column(name)).path);
+                // Graph fields belong to the native binding relation, not
+                // the underlying table schema retained for authorization.
+                // Preserve their qualified identities through cold projection.
+                try fields.append(builder.alloc, if (request.request.graph != null) name else (try request.table.column(name)).path);
             }
             request.request.fields = try fields.toOwnedSlice(builder.alloc);
         },

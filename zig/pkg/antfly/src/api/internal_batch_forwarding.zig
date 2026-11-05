@@ -150,6 +150,16 @@ comptime {
     if (@import("builtin").is_test) _ = consumer_tests;
 }
 
+/// Private source retirement has its own decoder boundary; routing a new
+/// source role through the historical SQL-drop floor is insufficient.
+pub fn retirementControlProtocol(req: @import("antfly_local_sources").storage_db_types.BatchRequest) ?u16 {
+    const command = req.relational_topology orelse return null;
+    if (command.fence.role == .document_retirement_source or command.document_schema_digest != null)
+        return data_raft_protocol.batch_document_retirement_protocol_version;
+    if (command.sql_drop_control) return data_raft_protocol.batch_sql_drop_control_protocol_version;
+    return null;
+}
+
 pub fn externalTransactionProtocol(req: @import("antfly_local_sources").storage_db_types.BatchRequest) ?u16 {
     if (req.sql_lock != null) return @import("../common/data_raft_protocol.zig").batch_sql_lock_protocol_version;
     if (req.transaction) |transaction| if (transaction == .begin and transaction.begin.sql_locks != null) return @import("../common/data_raft_protocol.zig").batch_sql_lock_protocol_version;

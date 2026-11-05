@@ -32,6 +32,24 @@ pub const Scope = struct {
     database: domain.Resource,
     namespace: ?domain.Resource = null,
 
+    /// Recovery labels are bound independently of the large immutable body.
+    /// A caller cannot relabel another database job to pass live permissions.
+    pub fn targetDigest(database: []const u8, namespace: ?[]const u8) Digest {
+        var hash = std.crypto.hash.Blake3.init(.{});
+        hash.update("antfly/scope-retirement-target/v1\x00");
+        for ([_][]const u8{ database, namespace orelse "" }) |name| {
+            var size: [8]u8 = undefined;
+            std.mem.writeInt(u64, &size, name.len, .little);
+            hash.update(&size);
+            hash.update(name);
+        }
+        var result: Digest = undefined;
+        hash.final(&result);
+        return result;
+    }
+    pub fn labelsDigest(self: Scope) Digest {
+        return targetDigest(self.database.name, if (self.namespace) |value| value.name else null);
+    }
     pub fn root(self: Scope) domain.Resource {
         return if (self.kind == .database) self.database else self.namespace.?;
     }
@@ -358,12 +376,15 @@ pub const Manifest = struct {
         }
     }
 
-    /// Reconstruct complete survivor postimages from the admitted immutable
-    /// selection. Recovery must not trust a producer's weakened schema string.
-    pub fn requireSurvivorSchemas(self: Manifest, backing: A) !void {
-        var region = std.heap.ArenaAllocator.init(backing);
-        defer region.deinit();
-        const a = region.allocator();
+    /// Own one combined selection and every surviving postimage. Capture,
+    /// owner preparation and recovery use this same derivation; no consumer
+    /// chains per-child rewrites or advances a survivor epoch more than once.
+    pub fn prepareSurvivors(self: Manifest, backing: A) !Survivors {
+        if (self.resources.len > max_resources or self.dependencies.len > max_resources or
+            self.tables.len > max_tables) return error.InvalidScopeRetirement;
+        var arena = std.heap.ArenaAllocator.init(backing);
+        errdefer arena.deinit();
+        const a = arena.allocator();
         const retirement = @import("dependency_retirement.zig");
         const sequences = @import("column_sequences.zig");
         const planner = @import("../sql/type_retirement.zig");
@@ -371,14 +392,17 @@ pub const Manifest = struct {
         var counters: std.ArrayList(sequences.DefaultRetirement) = .empty;
         var types: std.ArrayList(u64) = .empty;
         var selected = self.retiringTables();
-        while (selected.next()) |table| try relations.append(a, .{ .table_id = table.id, .physical_name = table.physical_name });
+        while (selected.next()) |table| {
+            if (relations.items.len == max_tables) return error.InvalidScopeRetirement;
+            try relations.append(a, .{ .table_id = table.id, .physical_name = try a.dupe(u8, table.physical_name) });
+        }
         for (self.resources) |resource| switch (resource.kind) {
             .sequence => try counters.append(a, .{ .sequence_id = resource.id, .namespace_id = resource.parent_id, .incarnation = self.metadata_incarnation }),
             .named_type => try types.append(a, resource.id),
             else => {},
         };
         for (self.dependencies) |dependency| if (dependency.kind == .sequence and dependency.action == .retire) {
-            const resource = dependency.resource.?;
+            const resource = dependency.resource orelse return error.InvalidScopeRetirement;
             try counters.append(a, .{ .sequence_id = resource.id, .namespace_id = resource.parent_id, .incarnation = self.metadata_incarnation });
         };
         std.mem.sort(sequences.DefaultRetirement, counters.items, {}, struct {
@@ -386,24 +410,49 @@ pub const Manifest = struct {
                 return left.sequence_id < right.sequence_id;
             }
         }.less);
+        const selection: retirement.Selection = .{ .relations = relations.items, .sequences = counters.items, .types = types.items };
+        const has_selection = relations.items.len != 0 or counters.items.len != 0 or types.items.len != 0;
         var inputs: std.ArrayList(planner.Input) = .empty;
-        var expected: std.ArrayList(?[]const u8) = .empty;
-        for (self.dependencies) |dependency| if (dependency.table != null and dependency.action != .retire) {
-            if (relations.items.len == 0 and counters.items.len == 0 and types.items.len == 0) {
-                if (dependency.action == .rewrite) return error.InvalidScopeRetirement;
-                continue;
-            }
-            const table = dependency.table.?;
+        var survivors: std.ArrayList(Survivors.Table) = .empty;
+        var bytes: usize = 0;
+        for (self.dependencies, 0..) |dependency, ordinal| if (dependency.table != null and dependency.action != .retire) {
+            if (survivors.items.len == max_participants) return error.InvalidScopeRetirement;
+            var table = dependency.table.?;
+            bytes = std.math.add(usize, bytes, table.preimage.len) catch return error.InvalidScopeRetirement;
+            if (bytes > max_manifest_bytes) return error.InvalidScopeRetirement;
+            try table.validate(a);
+            table.physical_name = try a.dupe(u8, table.physical_name);
+            table.preimage = try a.dupe(u8, table.preimage);
             const header = try std.json.parseFromSliceLeaky(struct { schema_json: []const u8 = "{}" }, a, table.preimage, .{ .ignore_unknown_fields = true });
-            try inputs.append(a, .{ .table_id = table.id, .name = table.physical_name, .schema_json = if (header.schema_json.len == 0) "{}" else header.schema_json });
-            try expected.append(a, dependency.schema_after);
+            const schema = if (header.schema_json.len == 0) "{}" else header.schema_json;
+            try inputs.append(a, .{ .table_id = table.id, .name = table.physical_name, .schema_json = schema });
+            try survivors.append(a, .{ .dependency = @intCast(ordinal), .before = table, .schema_after = schema });
         };
-        if (inputs.items.len == 0) return;
-        var prepared = try (retirement.Selection{ .relations = relations.items, .sequences = counters.items, .types = types.items }).prepareCohort(backing, inputs.items);
+        var changed: u16 = 0;
+        if (has_selection and inputs.items.len != 0) {
+            var prepared = try selection.prepareCohort(backing, inputs.items);
+            defer prepared.deinit();
+            for (prepared.tables, survivors.items) |actual, *survivor| {
+                survivor.changed = actual.changed;
+                survivor.schema_after = try a.dupe(u8, actual.schema_json);
+                const names = try a.alloc([]const u8, actual.dropped_columns.len);
+                for (actual.dropped_columns, names) |name, *copy| copy.* = try a.dupe(u8, name);
+                survivor.dropped_columns = names;
+                if (actual.changed) changed += 1;
+            }
+        }
+        return .{ .arena = arena, .selection = selection, .tables = survivors.items, .changed = changed };
+    }
+
+    /// Reconstruct complete survivor postimages from the admitted immutable
+    /// selection. Recovery must not trust a producer's weakened schema string.
+    pub fn requireSurvivorSchemas(self: Manifest, backing: A) !void {
+        var prepared = try self.prepareSurvivors(backing);
         defer prepared.deinit();
-        for (prepared.tables, expected.items) |actual, after| {
-            if (actual.changed != (after != null)) return error.InvalidScopeRetirement;
-            if (after) |encoded| if (!std.mem.eql(u8, actual.schema_json, encoded)) return error.InvalidScopeRetirement;
+        for (prepared.tables) |actual| {
+            const dependency = self.dependencies[actual.dependency];
+            if (actual.changed != (dependency.schema_after != null)) return error.InvalidScopeRetirement;
+            if (dependency.schema_after) |encoded| if (!std.mem.eql(u8, actual.schema_after, encoded)) return error.InvalidScopeRetirement;
         }
     }
 
@@ -428,6 +477,27 @@ pub const Manifest = struct {
         return result;
     }
 };
+
+/// Independently owned preparation, including unchanged held tables needed by
+/// cross-table dependency analysis. Only changed entries become schema owners.
+pub const Survivors = struct {
+    pub const Table = struct {
+        dependency: u16,
+        before: ManifestTable,
+        schema_after: []const u8,
+        changed: bool = false,
+        dropped_columns: []const []const u8 = &.{},
+    };
+    arena: std.heap.ArenaAllocator,
+    selection: @import("dependency_retirement.zig").Selection,
+    tables: []const Survivors.Table,
+    changed: u16,
+    pub fn deinit(self: *Survivors) void {
+        self.arena.deinit();
+        self.* = undefined;
+    }
+};
+const ManifestTable = Table;
 
 pub const Prepare = struct {
     kind: @FieldType(Scope, "kind"),

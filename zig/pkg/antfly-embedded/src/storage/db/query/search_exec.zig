@@ -11874,7 +11874,7 @@ fn collectExactDocIds(
 }
 
 /// Return an owned, de-duplicated identity set only when the complete stored
-/// predicate is exactly an ID union. This is intentionally narrower than
+/// predicate is exactly a finite identity domain. This is intentionally narrower than
 /// `collectPositiveDocIdSuperset`: callers use it to bypass secondary-index
 /// planning without leaving a residual predicate that could be evaluated
 /// incompletely.
@@ -11885,13 +11885,23 @@ pub fn exactStructuredFilterDocIdsAlloc(
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
-    const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch
-        return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, arena_alloc, filter_query_json, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return null,
+    };
     if (patternFilterValueHasRole(parsed.value)) return null;
     const compiled = (try compilePatternFilterOptional(arena_alloc, parsed.value)) orelse return null;
     var ids = std.ArrayListUnmanaged([]const u8).empty;
     defer ids.deinit(arena_alloc);
-    if (!(try collectExactDocIds(arena_alloc, compiled, &ids))) return null;
+    if (try collectExactDocIds(arena_alloc, compiled, &ids)) return try dupeDocIdSliceAlloc(alloc, ids.items);
+    // Authorization and canonical MATCH anchors intersect exact IDs. Resolve
+    // their complete Boolean domain, never just a positive candidate superset.
+    var domain = (try @import("identity_filter.zig").resolve(alloc, compiled)) orelse return null;
+    defer domain.deinit(alloc);
+    if (domain.complement) return null;
+    ids.clearRetainingCapacity();
+    var keys = domain.ids.keyIterator();
+    while (keys.next()) |key| try ids.append(arena_alloc, key.*);
     return try dupeDocIdSliceAlloc(alloc, ids.items);
 }
 

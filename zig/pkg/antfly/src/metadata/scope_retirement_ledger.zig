@@ -33,6 +33,7 @@ pub const Head = struct {
     lookup: Lookup,
     metadata_incarnation: [16]u8,
     creator: local.system_catalog_privileges.Principal,
+    target_digest: contract.Digest,
     force: bool = false,
     sequence: u64,
     progress: contract.Progress,
@@ -40,7 +41,7 @@ pub const Head = struct {
         try self.lookup.validate();
         try self.creator.validate();
         try self.progress.validate();
-        if (self.creator.kind == .public or self.sequence == 0 or std.mem.allEqual(u8, &self.metadata_incarnation, 0) or
+        if (std.mem.allEqual(u8, &self.target_digest, 0) or self.creator.kind == .public or self.sequence == 0 or std.mem.allEqual(u8, &self.metadata_incarnation, 0) or
             !std.meta.eql(self.lookup.reference, self.progress.reference)) return error.InvalidScopeRetirement;
     }
     pub fn active(self: Head) bool {
@@ -269,12 +270,12 @@ pub fn requireVacant(reader: anytype, prepared: *const Prepared) !void {
 /// canceled operation cannot reacquire reservations or replace its manifest.
 pub fn existing(reader: anytype, prepared: *const Prepared) !?Head {
     const previous = (try head(reader, prepared.lookup)) orelse return null;
-    if (!std.mem.eql(u8, &previous.metadata_incarnation, &prepared.manifest.metadata_incarnation) or !previous.creator.eql(prepared.manifest.creator) or previous.force != prepared.manifest.force) return error.CatalogGenerationChanged;
+    if (!std.mem.eql(u8, &previous.metadata_incarnation, &prepared.manifest.metadata_incarnation) or !previous.creator.eql(prepared.manifest.creator) or previous.force != prepared.manifest.force or !std.mem.eql(u8, &previous.target_digest, &prepared.manifest.scope.labelsDigest())) return error.CatalogGenerationChanged;
     var buffer: [256]u8 = undefined;
     const body = try optional(reader, try key(&buffer, prepared.lookup, .manifest));
-    if (previous.active()) {
+    if (previous.active() or previous.progress.phase == .published) {
         if (body == null or !std.mem.eql(u8, body.?, prepared.encoded)) return error.InvalidScopeRetirement;
-        try requireMembers(reader, prepared, previous);
+        if (previous.active()) try requireMembers(reader, prepared, previous);
     } else if (body != null) return error.InvalidScopeRetirement;
     return previous;
 }
@@ -294,7 +295,7 @@ pub fn stageBegin(txn: anytype, prepared: *const Prepared) !Head {
     } else 0;
     const sequence = std.math.add(u64, previous, 1) catch return error.SqlProgramLimitExceeded;
     if (try optional(txn, try queueKey(&buffer, prepared.lookup.group, sequence)) != null) return error.InvalidScopeRetirement;
-    const value: Head = .{ .lookup = prepared.lookup, .metadata_incarnation = prepared.manifest.metadata_incarnation, .creator = prepared.manifest.creator, .force = prepared.manifest.force, .sequence = sequence, .progress = .{ .reference = prepared.lookup.reference } };
+    const value: Head = .{ .lookup = prepared.lookup, .metadata_incarnation = prepared.manifest.metadata_incarnation, .creator = prepared.manifest.creator, .target_digest = prepared.manifest.scope.labelsDigest(), .force = prepared.manifest.force, .sequence = sequence, .progress = .{ .reference = prepared.lookup.reference } };
     try value.validate();
     for (0..prepared.lookup.reference.tables) |ordinal| {
         if (try child(txn, prepared.lookup, @intCast(ordinal)) != null) return error.InvalidScopeRetirement;
@@ -375,9 +376,13 @@ pub fn stageAdvance(txn: anytype, prepared: *const Prepared, before: Head, next:
         for (prepared.manifest.resources) |resource| try txn.delete(try memberKey(&buffer, result.lookup.group, resource.kind, resource.id));
         for (prepared.manifest.dependencies) |dependency| try txn.delete(try memberKey(&buffer, result.lookup.group, dependency.kind, dependency.id));
         try txn.delete(try queueKey(&buffer, result.lookup.group, result.sequence));
-        try txn.delete(try key(&buffer, result.lookup, .manifest));
-        var child_buffer: [320]u8 = undefined;
-        for (0..result.lookup.reference.tables) |ordinal| try txn.delete(try childKey(&child_buffer, result.lookup, @intCast(ordinal)));
+        // Publication retains its immutable cut and fixed child directory for
+        // cold verification. Cancellation has no physical proof to preserve.
+        if (result.progress.phase == .canceled) {
+            try txn.delete(try key(&buffer, result.lookup, .manifest));
+            var child_buffer: [320]u8 = undefined;
+            for (0..result.lookup.reference.tables) |ordinal| try txn.delete(try childKey(&child_buffer, result.lookup, @intCast(ordinal)));
+        }
     }
     try txn.put(try key(&buffer, result.lookup, .head), encoded.slice());
     return result;

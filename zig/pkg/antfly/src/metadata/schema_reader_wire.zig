@@ -84,7 +84,8 @@ pub fn requiresSqlCast(bytes: []const u8) bool {
 }
 
 pub fn requiresScopeRetirementAuthority(bytes: []const u8) bool {
-    return requiresMarker(bytes, "scope_retirement") or requiresMarker(bytes, "scope_begin") or requiresMarker(bytes, "scope_child");
+    return requiresMarker(bytes, "scope_retirement") or requiresMarker(bytes, "scope_begin") or requiresMarker(bytes, "scope_child") or
+        requiresMarker(bytes, "document_source") or requiresMarker(bytes, "document_schema_digest");
 }
 
 pub fn requiresSqlNotifications(bytes: []const u8) bool {
@@ -555,4 +556,9 @@ test "SQL scope retirement termination decoder projection ignores payloads and r
         try std.testing.expect(!requiresScopeRetirementAuthority(bytes));
     for ([_][]const u8{ "{", "{\"scope_retirement\":{}}", "{\"scope_retire\\u006dent\":{}}", "{\"scope_begin\":{}}", "{\"begin\":{\"manifest\":{\"scope_child\":{}}}}" }) |bytes|
         try std.testing.expect(requiresScopeRetirementAuthority(bytes));
+}
+
+test "document retirement decoder projection follows source identity markers not user payloads" {
+    for ([_][]const u8{ "{}", "{\"document_schema_digest\":null}", "{\"payload\":\"document_source document_schema_digest\"}" }) |bytes| try std.testing.expect(!requiresScopeRetirementAuthority(bytes));
+    for ([_][]const u8{ "{\"document_source\":false}", "{\"document_source\":true}", "{\"document_sou\\u0072ce\":true}", "{\"document_schema_digest\":[1]}", "{\"summary\":{\"document_source\":true}}" }) |bytes| try std.testing.expect(requiresScopeRetirementAuthority(bytes));
 }

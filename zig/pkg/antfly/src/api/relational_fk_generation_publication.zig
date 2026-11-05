@@ -120,6 +120,7 @@ pub const SourceRequest = struct {
 };
 
 pub const SourceReceipt = struct {
+    document_source: bool = false,
     plan_id: [16]u8,
     child_table_id: u64,
     child_group_id: u64,
@@ -139,7 +140,12 @@ pub const SourceReceipt = struct {
     pub fn jsonStringify(self: @This(), writer: anytype) !void {
         try writer.beginObject();
         inline for (@typeInfo(@This()).@"struct".field_names) |field| {
-            if (comptime !std.mem.eql(u8, field, "reference_coverage_ready")) {
+            if (comptime std.mem.eql(u8, field, "document_source")) {
+                if (self.document_source) {
+                    try writer.objectField(field);
+                    try writer.write(true);
+                }
+            } else if (comptime !std.mem.eql(u8, field, "reference_coverage_ready")) {
                 try writer.objectField(field);
                 try writer.write(@field(self, field));
             } else if (self.reference_coverage_ready) {
@@ -156,7 +162,9 @@ pub const SourceReceipt = struct {
             self.child_table_id != request.child_table_id or
             self.child_group_id != request.child_group_id or
             self.action != request.action or
-            self.after_schema_version <= self.before_schema_version or
+            (if (self.document_source) self.action != .fence or self.after_schema_version != self.before_schema_version or
+                !std.mem.eql(u8, &self.before_schema_digest, &self.after_schema_digest) or
+                !std.mem.eql(u8, &self.before_catalog_digest, &self.after_catalog_digest) else self.after_schema_version <= self.before_schema_version) or
             self.applied_term == 0 or self.applied_index == 0 or
             std.mem.allEqual(u8, &self.plan_digest, 0) or
             std.mem.allEqual(u8, &self.fence_digest, 0) or
@@ -187,6 +195,7 @@ pub const SourceReceipt = struct {
         hash.update(&self.before_catalog_digest);
         hash.update(&self.after_schema_digest);
         hash.update(&self.after_catalog_digest);
+        if (self.document_source) hash.update("document-retirement-source/v1");
         if (self.reference_coverage_ready) hash.update("reference-coverage-ready/v1");
         var result: integrity.Digest = undefined;
         hash.final(&result);

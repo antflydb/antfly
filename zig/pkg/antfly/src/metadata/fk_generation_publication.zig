@@ -34,7 +34,7 @@ pub const CatalogCoverage = @import("antfly_local_sources").schema_relational_de
 fn writeCoverageFields(value: anytype, writer: anytype) !void {
     try writer.beginObject();
     inline for (@typeInfo(@TypeOf(value)).@"struct".field_names) |field| {
-        const include = if (comptime std.mem.eql(u8, field, "sql_drop_control")) value.sql_drop_control else if (comptime std.mem.eql(u8, field, "catalog_coverage")) value.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field, "historical_reference_coverage")) value.historical_reference_coverage else if (comptime std.mem.eql(u8, field, "reference_coverage_ready")) value.reference_coverage_ready else true;
+        const include = if (comptime std.mem.eql(u8, field, "document_source")) value.document_source else if (comptime std.mem.eql(u8, field, "sql_drop_control")) value.sql_drop_control else if (comptime std.mem.eql(u8, field, "catalog_coverage")) value.catalog_coverage != .legacy else if (comptime std.mem.eql(u8, field, "historical_reference_coverage")) value.historical_reference_coverage else if (comptime std.mem.eql(u8, field, "reference_coverage_ready")) value.reference_coverage_ready else true;
         if (include) {
             try writer.objectField(field);
             try writer.write(@field(value, field));
@@ -357,7 +357,38 @@ pub const Plan = struct {
         try writer.endObject();
     }
 
+    /// A retirement source has no successor schema or integrity catalog. Its
+    /// identity is the exact public document definition plus an absent catalog.
+    pub fn isDocumentSource(self: Plan) bool {
+        return self.child_fences.len != 0 and self.child_fences[0].role == .document_retirement_source;
+    }
+
+    fn validateDocumentSource(self: Plan, alloc: std.mem.Allocator) !void {
+        const root = self.table_retirement orelse return error.InvalidGenerationPublication;
+        try root.validate();
+        const guard = self.sql_drop orelse return error.InvalidGenerationPublication;
+        try guard.validate();
+        if (root.root_table != self.child_before.table_id or self.child_before.table_id == 0 or
+            std.mem.allEqual(u8, &self.id, 0) or self.parents.len != 0 or
+            self.child_ranges.len == 0 or self.child_ranges.len > max_owners or
+            self.child_ranges.len != self.child_fences.len or self.child_catalog_before_b64.len != 0 or
+            self.constraint_name_guard != null or self.object_rename_guard != null or
+            !@import("table_manager.zig").tableDefinitionsEqual(self.child_before, self.child_after) or
+            guard.owner.kind != .table or guard.hasDefinitionIntent() or
+            guard.owner.table_id != self.child_before.table_id or
+            !std.mem.eql(u8, guard.target.name, guard.logical_table)) return error.InvalidGenerationPublication;
+        var schema = try @import("antfly_local_sources").schema_mod.parseValidatedTableSchema(alloc, if (self.child_before.schema_json.len == 0) "{}" else self.child_before.schema_json);
+        defer schema.deinit(alloc);
+        if (schema.storage_mode != .document or guard.owner.schema_version != try @import("../api/tables.zig").schemaVersion(self.child_before.schema_json)) return error.InvalidGenerationPublication;
+        const identity = try self.childIdentity(alloc);
+        if (!std.mem.eql(u8, &identity.before_schema_digest, &guard.owner.schema_digest)) return error.InvalidGenerationPublication;
+        try table_manager.validateCompleteKeyspaceRanges(self.child_ranges);
+        try validateOwnerFences(self.id, self.child_before, self.child_ranges, self.child_fences, .document_retirement_source);
+        for (self.child_fences) |fence| if (!std.mem.eql(u8, &fence.catalog_digest, &identity.before_catalog_digest)) return error.InvalidGenerationPublication;
+    }
+
     pub fn validate(self: Plan, alloc: std.mem.Allocator) !void {
+        if (self.isDocumentSource()) return self.validateDocumentSource(alloc);
         if (self.table_retirement) |root| {
             try root.validate();
             if (self.sql_drop == null or root.root_table != self.child_before.table_id) return error.InvalidGenerationPublication;
@@ -576,6 +607,15 @@ pub const Plan = struct {
     }
 
     pub fn childIdentity(self: Plan, alloc: std.mem.Allocator) !ChildIdentity {
+        if (self.isDocumentSource()) {
+            var schema_digest: Digest = undefined;
+            var catalog_digest: Digest = undefined;
+            std.crypto.hash.Blake3.hash(self.child_before.schema_json, &schema_digest, .{});
+            std.crypto.hash.Blake3.hash("", &catalog_digest, .{});
+            const version = try @import("../api/tables.zig").schemaVersion(self.child_before.schema_json);
+            return .{ .before_schema_version = version, .after_schema_version = version, .before_schema_digest = schema_digest, .after_schema_digest = schema_digest, .before_catalog_digest = catalog_digest, .after_catalog_digest = catalog_digest };
+        }
+
         const catalog_len = std.base64.standard.Decoder.calcSizeForSlice(self.child_catalog_before_b64) catch return error.InvalidGenerationPublication;
         if (catalog_len == 0 or catalog_len > integrity_catalog.max_catalog_bytes) return error.InvalidGenerationPublication;
         const old_bytes = try alloc.alloc(u8, catalog_len);
@@ -604,6 +644,7 @@ pub const Plan = struct {
     }
 
     pub fn verifySourceReceipt(self: Plan, identity: ChildIdentity, plan_digest: Digest, receipt: @import("../api/relational_fk_generation_publication.zig").SourceReceipt) !void {
+        if (receipt.document_source != self.isDocumentSource() or (self.isDocumentSource() and receipt.action != .fence)) return error.InvalidGenerationPublication;
         if (self.historical_reference_coverage and receipt.action == .install and !receipt.reference_coverage_ready) return error.InvalidGenerationPublication;
         if (!std.mem.eql(u8, &receipt.plan_id, &self.id) or
             !std.mem.eql(u8, &receipt.plan_digest, &plan_digest) or
@@ -1846,6 +1887,7 @@ pub const Decision = struct {
 };
 
 pub const SourceDecision = struct {
+    document_source: bool = false,
     sql_drop_control: bool = false,
     historical_reference_coverage: bool = false,
     phase: Phase,

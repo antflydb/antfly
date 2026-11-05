@@ -137,3 +137,29 @@ pub fn requireReady(backing: std.mem.Allocator, reader: anytype, child: scopes.C
     _ = try tables.verifyPhysical(backing, reader, value, body.value);
     return value;
 }
+
+/// Cold publication verifies the retained physical proof, the root's exact
+/// catalog decision and the immutable child registration. No live reservation
+/// is required after that atomic decision has withdrawn the whole scope.
+pub fn requirePublished(backing: std.mem.Allocator, reader: anytype, child: scopes.Child) !tables.Head {
+    try child.validate();
+    const parent = (try scopes.head(reader, child.lookup)) orelse return error.InvalidScopeRetirement;
+    if (parent.progress.phase != .published or parent.progress.completed_tables != parent.lookup.reference.tables or
+        !std.meta.eql((try scopes.child(reader, child.lookup, child.ordinal)) orelse return error.InvalidScopeRetirement, child)) return error.InvalidScopeRetirement;
+    const value = (try tables.head(reader, .{ .group = child.lookup.group, .table = child.table, .id = child.id })) orelse return error.InvalidScopeRetirement;
+    try value.validate();
+    if (value.phase != .published or value.direct_catalog_revision != parent.progress.catalog_revision or
+        !std.meta.eql(value.scope.parent, @as(?scopes.Child, child)) or !value.scope.creator.eql(parent.creator) or
+        !std.mem.eql(u8, &value.incarnation, &std.fmt.bytesToHex(parent.metadata_incarnation, .lower))) return error.InvalidScopeRetirement;
+    var buffer: [256]u8 = undefined;
+    var body = try manifests.Owned.parse(backing, try reader.get(try tables.key(&buffer, value.lookup, .effects)));
+    defer body.deinit();
+    if (!std.meta.eql(body.value.scope_child, value.scope.parent) or !std.meta.eql(try body.value.reference(), value.effects) or
+        !std.mem.eql(u8, &try fingerprint(body.value.root, "antfly/scope-retirement-table/v1\x00"), &child.definition) or
+        !std.mem.eql(u8, &try fingerprint(body.value.root_ranges, "antfly/scope-retirement-ranges/v1\x00"), &child.ranges) or
+        try optional(reader, try tables.key(&buffer, value.lookup, .active)) != null or
+        try tables.member(reader, child.lookup.group, child.table) != null) return error.InvalidScopeRetirement;
+    for (body.value.root_ranges) |range| if (try optional(reader, try tables.rangeKey(&buffer, value.lookup.group, range.group_id)) != null) return error.InvalidScopeRetirement;
+    _ = try tables.verifyPhysical(backing, reader, value, body.value);
+    return value;
+}

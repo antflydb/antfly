@@ -20,10 +20,21 @@
 /// mutation inputs. Never write parameter values into the immutable plan.
 pub fn bindSearchScans(a: Allocator, input_scans: []const catalog.StatementScan, parameters: []const std.json.Value) ![]const catalog.StatementScan {
     const has_search = for (input_scans) |scan| {
-        if (scan.request.search != null or scan.request.text_predicate != null) break true;
+        if (scan.request.graph != null or scan.request.search != null or scan.request.text_predicate != null) break true;
     } else false;
     return if (has_search) bound: {
         const bound_scans = try a.dupe(catalog.StatementScan, input_scans);
+        for (bound_scans) |*scan| if (scan.request.graph) |original| {
+            const graph = try a.create(@import("ast.zig").Graph);
+            graph.* = original.*;
+            if (graph.start == .parameter) {
+                if (graph.start.parameter == 0 or graph.start.parameter > parameters.len) return error.InvalidSqlParameters;
+                const value = parameters[graph.start.parameter - 1];
+                if (value != .string) return error.InvalidSqlParameters;
+                graph.start = .{ .string = value.string };
+            }
+            scan.request.graph = graph;
+        };
         for (bound_scans) |*scan| if (scan.request.search) |original| {
             const search = try a.create(catalog.Scan.Search);
             search.* = original.*;

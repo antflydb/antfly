@@ -2912,9 +2912,9 @@ pub const BoundTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
         requested_delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
     ) !?query_api.QueryResponse {
-        // Retained carriers and graph dialects keep their finalized wire
-        // response; a typed consumer cannot infer continuation/exhaustion.
-        const delivery = if (req.native_query_cut != null or req.graph_queries.len != 0) null else requested_delivery;
+        // Keep public continuation/graph wire semantics, while a dedicated
+        // native graph consumer validates its own complete binding relation.
+        const delivery = @import("antfly_local_sources").api_query_response.Delivery.forQuery(requested_delivery, req.native_query_cut != null, req.graph_queries.len != 0);
         const self: *BoundTableReadSource = @ptrCast(@alignCast(ptr));
         try validateDecisionRequest(alloc, req, self.decision_registry);
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
@@ -5052,9 +5052,9 @@ pub const ProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
         requested_delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
     ) !?query_api.QueryResponse {
-        // Retained carriers and graph dialects keep their finalized wire
-        // response; a typed consumer cannot infer continuation/exhaustion.
-        const delivery = if (req.native_query_cut != null or req.graph_queries.len != 0) null else requested_delivery;
+        // Keep public continuation/graph wire semantics, while a dedicated
+        // native graph consumer validates its own complete binding relation.
+        const delivery = @import("antfly_local_sources").api_query_response.Delivery.forQuery(requested_delivery, req.native_query_cut != null, req.graph_queries.len != 0);
         const self: *ProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try validateDecisionRequest(alloc, req, self.decision_registry);
         try self.ensureHotStandbyReadAllowed(consistency);
@@ -7619,9 +7619,9 @@ pub const HostedProvisionedTableReadSource = struct {
         consistency: raft_mod.ReadConsistency,
         requested_delivery: ?@import("antfly_local_sources").api_query_response.Delivery,
     ) !?query_api.QueryResponse {
-        // Retained carriers and graph dialects keep their finalized wire
-        // response; a typed consumer cannot infer continuation/exhaustion.
-        const delivery = if (req.native_query_cut != null or req.graph_queries.len != 0) null else requested_delivery;
+        // Keep public continuation/graph wire semantics, while a dedicated
+        // native graph consumer validates its own complete binding relation.
+        const delivery = @import("antfly_local_sources").api_query_response.Delivery.forQuery(requested_delivery, req.native_query_cut != null, req.graph_queries.len != 0);
         const hosted: *HostedProvisionedTableReadSource = @ptrCast(@alignCast(ptr));
         try validateDecisionRequest(alloc, req, hosted.decision_registry);
         const timed_req = graphTimedSearchRequest(req);

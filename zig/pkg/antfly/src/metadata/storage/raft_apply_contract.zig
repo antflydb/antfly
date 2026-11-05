@@ -338,6 +338,7 @@ pub fn transitionMutatesRelationSource(command: anytype) bool {
         .apply_system_catalog,
         .apply_schema_validation,
         .apply_table_retirement,
+        .apply_scope_retirement,
         .apply_restore_staging,
         .create_restore_job_with_staging,
         .apply_sql_completion_reference,

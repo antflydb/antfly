@@ -913,6 +913,12 @@ pub const Status = enum(u32) {
     lock_owner_not_registered = 954,
     lock_plan_limit_exceeded = 955,
     raft_apply_writer_unavailable = 956,
+    sql_database_in_use = 957,
+    scope_retirement_changed = 958,
+    invalid_scope_retirement = 959,
+    sequence_admission_conflict = 960,
+    invalid_table_retirement_manifest = 961,
+    extension_owned_object = 962,
 };
 
 /// Lossless failure metadata for compiled operation and per-item boundaries.
