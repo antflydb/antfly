@@ -1571,6 +1571,64 @@ test "lite allocator v4 external readers and deferred durability fence reuse" {
     try std.testing.expect((try file.check()).valid);
 }
 
+// WS1(d): a page retired by a not-yet-durable commit must stay out of the
+// reusable pool until a durability barrier actually makes that commit
+// durable. Without `durable_header` folded into the reuse frontier
+// (`metadataReuseFrontier`/`reuseFrontier`), reclamation driven purely off
+// `self.header` (which a deferred commit already advances in memory) would
+// promote these pages for reuse before the generation that retired them is
+// durable — unsafe once a future pipelined group commit lets the next
+// group stage while the current one's fsync is still outstanding, since a
+// crash mid-fsync must still recover a prior checkpoint whose pages were
+// never overwritten.
+test "lite allocator v4 reuse frontier withholds pages retired by undurable commits" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reuse-durable-epoch.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true });
+    defer file.close();
+    const first: [32768]u8 = @splat('a');
+    const second: [32768]u8 = @splat('b');
+    // A durable baseline: "doc" occupies a whole page, not a packed record.
+    try file.putDocument("doc", &first);
+    try std.testing.expect(try file.certifyAllocator());
+
+    // Many deferred (non-durable) overwrites retire that page's successive
+    // replacements, all at epochs above the durable checkpoint, without
+    // ever crossing a durability barrier.
+    for (0..48) |i| {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        try file.putDocument("doc", if (i % 2 == 0) &second else &first);
+        try file.commitTransactionWithDurability(false);
+    }
+    try std.testing.expect(file.durable_header != null);
+    const pending_before = (try file.allocatorStats()).?.pending_data_objects;
+    try std.testing.expect(pending_before > 0);
+
+    // Reclamation must not free any of those pages yet: at the moment its
+    // own drain runs, `durable_header` still pins the frontier at the
+    // pre-barrier checkpoint, even though reclaimPages's own commit will
+    // itself cross the barrier by the time it returns.
+    _ = try file.reclaimPages(4096);
+    try std.testing.expectEqual(@as(u64, 0), (try file.allocatorStats()).?.reusable_pages);
+    try std.testing.expect(file.durable_header == null);
+    try std.testing.expect((try file.check()).valid);
+
+    // Now that the barrier crossed, the same backlog is eligible: drive
+    // reclamation until the ledger reports no more service is due, and
+    // confirm pages were actually freed for reuse.
+    var rounds: usize = 0;
+    while (try file.retirementNeedsService()) : (rounds += 1) {
+        try std.testing.expect(rounds < 1000);
+        _ = try file.reclaimPages(4096);
+    }
+    try std.testing.expect((try file.allocatorStats()).?.reusable_pages > 0);
+    try std.testing.expect((try file.check()).valid);
+}
+
 test "lite allocator v4 rollback and recovery retain the fallback root" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
