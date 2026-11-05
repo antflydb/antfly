@@ -261,9 +261,12 @@ function collectionStorage(){
  const values=new Map();let alarm=null;
  return{values,async get(key){return values.get(key);},async put(key,value){values.set(key,structuredClone(value));},async delete(key){values.delete(key);},async getAlarm(){return alarm;},async setAlarm(time){alarm=time;},async deleteAlarm(){alarm=null;}};
 }
-for(const slow of ['list','delete'])test(`WASM GC ${slow} quantum yields without starving exchange or inducing failure backoff`,async()=>{
+for(const slow of ['list','delete'])test(`WASM GC ${slow} quantum yields without starving exchange or inducing failure backoff`,async(t)=>{
  const fixture=JSON.parse(await readFile(new URL('../dist/sql-fixture.json',import.meta.url)));
  let now=Date.now();
+ // WASM deadlines use the monotonic clock; advancing wall time alone models a
+ // clock jump, not slow I/O. Keep both clocks advancing by the provider delay.
+ t.mock.method(performance,'now',()=>now);
  const prefix=fixture.config.state.prefix+'/sql-execution-v2/';
  class SlowState extends Bucket{
   async list(options){if(slow==='list'&&options.prefix===prefix)now+=16000;return super.list(options);}
@@ -287,9 +290,9 @@ for(const slow of ['list','delete'])test(`WASM GC ${slow} quantum yields without
  else assert.ok(result.lanes.state.deleted>0&&result.lanes.state.deleted<64);
 });
 
-test('WASM GC durable lane rotation serves healthy storage even after an unabortable call exhausts a pass',async()=>{
+test('WASM GC durable lane rotation serves healthy storage even after an unabortable call exhausts a pass',async(t)=>{
  const fixture=JSON.parse(await readFile(new URL('../dist/sql-fixture.json',import.meta.url)));
- let now=Date.now();const prefix=fixture.config.state.prefix+'/sql-execution-v2/';
+ let now=Date.now();t.mock.method(performance,'now',()=>now);const prefix=fixture.config.state.prefix+'/sql-execution-v2/';
  class SlowState extends Bucket{
   async delete(key){if(typeof key==='string'&&key.startsWith(prefix))now+=60000;return super.delete(key);}
  }
