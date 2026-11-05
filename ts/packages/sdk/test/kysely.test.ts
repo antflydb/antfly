@@ -150,6 +150,7 @@ describe("schema tooling", () => {
             column("exact", "int64[]", { hasDefaultValue: true }),
             column("amounts", "numeric[]", { hasDefaultValue: true }),
             column("amount", "numeric", { hasDefaultValue: true }),
+            column("payloads", "jsonb[]", { hasDefaultValue: true, isNullable: true }),
             column('quote"; injected: never; //', "unknown", { isNullable: true }),
           ],
         },
@@ -158,7 +159,7 @@ describe("schema tooling", () => {
     );
     const fileName = fileURLToPath(new URL("./generated-kysely.ts", import.meta.url));
     const input = `${source}
-import type { Insertable, Updateable } from "kysely";
+import type { Insertable, Selectable, Updateable } from "kysely";
 export const valid: Insertable<Database["items"]> = { id: "1" };
 export const update: Updateable<Database["items"]> = { quantity: 2n };
 export const vector: Updateable<Database["items"]> = { matrix: [1, null, 2] };
@@ -168,6 +169,10 @@ export const empty: Updateable<Database["items"]> = { matrix: [] };
 export const exact: Updateable<Database["items"]> = { exact: [[9007199254740993n, null]] };
 export const amounts: Updateable<Database["items"]> = { amounts: [[${numericArrayMode === "string" ? '"9007199254740993.1200"' : "1.25"}, null]] };
 export const amount: Updateable<Database["items"]> = { amount: "9007199254740993.1200" };
+declare const selected: Selectable<Database["items"]>;
+// @ts-expect-error Unmanaged array codecs require root-shape refinement.
+selected.payloads.length;
+if (Array.isArray(selected.payloads)) selected.payloads.map(value => value);
 // @ts-expect-error Array types must match the selected NUMERIC parser mode.
 export const wrongNumeric: Updateable<Database["items"]> = { amounts: [[${numericArrayMode === "string" ? "1.25" : '"1.25"'}]] };
 // @ts-expect-error Array elements must retain their scalar type at every rank.
@@ -309,4 +314,34 @@ describe("PostgreSQL NUMERIC parsing", () => {
       generateKyselyTypes(tables, { integerMode: "string", numericArrayMode: "string" })
     ).toContain('"amounts": SQLArray<string> | null;');
   });
+});
+
+it.each([
+  "json[]",
+  "jsonb[][]",
+  "timestamptz[]",
+  "future_type[][]",
+])("keeps unmanaged %s codecs unknown at the root and omits unused array declarations", (dataType) => {
+  const source = generateKyselyTypes(
+    [
+      {
+        name: "events",
+        schema: "public",
+        isView: false,
+        isForeign: false,
+        columns: [
+          {
+            name: "payloads",
+            dataType,
+            isNullable: true,
+            isAutoIncrementing: false,
+            hasDefaultValue: false,
+          },
+        ],
+      },
+    ],
+    { integerMode: "string" }
+  );
+  expect(source).toContain('"payloads": unknown;');
+  expect(source).not.toContain("SQLArray");
 });

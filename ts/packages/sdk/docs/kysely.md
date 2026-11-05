@@ -351,7 +351,9 @@ await writeFile("database.ts", generateKyselyTypes(tables, {
 
 The generator emits quoted table/column names, nullability, `Generated<T>` for
 defaults, and `GeneratedAlways<T>` for output-only generated columns. Unknown
-types, JSON, and timestamps remain `unknown` for application-specific refinement.
+types, JSON, timestamps, and arrays of unmanaged element types remain `unknown`
+for application-specific refinement. An unmanaged array codec can return any
+root shape; generation does not assume it returns a JavaScript array.
 Only imports that the generated source uses are included. Run this against a
 stable schema; metadata reads are not an atomic catalog export.
 
@@ -365,11 +367,14 @@ in every document type to be non-nullable. Default introspection excludes
 `kysely_migration`, `kysely_migration_lock`, and the private
 `_antfly_kysely_migration_claims` table; other `kysely_` names and custom
 bookkeeping table names remain visible, matching Kysely's standard introspector.
-PostgreSQL array columns use a generated recursive
+PostgreSQL arrays with concretely mapped element types use a generated recursive
 `SQLArray<T>` type: `pg` can return one-dimensional or nested arrays for the same
 SQL array type, with nullable elements. Array rank is not fixed by the column's
-type identity. Embedded SQL arrays retain their native envelope and generate as
-`unknown` for application-specific refinement.
+type identity. Arrays whose element mapping is `unknown` (including JSONB[] and
+future types) generate as plain `unknown`, rather than `SQLArray<unknown>`. Their
+custom codecs and runtime values remain unchanged; refine the decoded value
+before assuming its shape or element types. Embedded SQL arrays retain their
+native envelope and generate as `unknown` for application-specific refinement.
 
 Integer mode describes driver behavior; it does not convert results. Embedded
 SQL returns integer columns as `bigint`; pg returns BIGINT as strings and smaller

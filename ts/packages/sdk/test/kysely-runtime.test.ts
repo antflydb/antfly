@@ -243,3 +243,52 @@ it("pins an ordered namespace path on every checkout in a named database", async
     await runtime.close();
   }
 });
+
+it.each([
+  "exact",
+  "pg-default",
+] as const)("keeps custom JSONB[] results and generated %s types aligned", async (values) => {
+  let types!: AntflyPostgresOptions["pg"]["types"];
+  const decode = vi.fn((value: string) => `custom:${value}`);
+  const registry = {
+    getTypeParser: (oid: number, format?: "text" | "binary") =>
+      oid === 3807 ? decode : pg.types.getTypeParser(oid, format),
+  };
+  class Pool extends EventEmitter {
+    options = {};
+    constructor(config: { types: AntflyPostgresOptions["pg"]["types"] }) {
+      super();
+      types = config.types;
+    }
+    async connect(): Promise<never> {
+      throw new Error("No SQL needed for metadata");
+    }
+    async end() {}
+  }
+  const client = {
+    tables: {
+      list: async () => [{ name: "events" }],
+      get: async () => ({ schema: { document_schemas: {} } }),
+    },
+    executeSQL: async () => ({
+      columns: [{ name: "payloads", type: "array", element_type: "jsonb" }],
+    }),
+  } as unknown as AntflyClient;
+  const runtime = createAntflyPostgres({
+    pg: { Pool, types: registry },
+    client,
+    pool: { connectionString: "postgres://localhost/default" },
+    values,
+  });
+  try {
+    expect(types.getTypeParser(3807, "text")).toBe(decode);
+    expect((types.getTypeParser(3807, "text") as typeof decode)('{"null",NULL}')).toBe(
+      'custom:{"null",NULL}'
+    );
+    const source = await runtime.generateTypes();
+    expect(source).toContain('"payloads": unknown;');
+    expect(source).not.toContain("SQLArray");
+  } finally {
+    await runtime.close();
+  }
+});

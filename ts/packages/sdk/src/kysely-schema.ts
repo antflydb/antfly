@@ -168,7 +168,13 @@ function scalarType(type: string, options: GenerateKyselyTypesOptions): string {
     // arrays for multidimensional values, with null at SQL NULL elements.
     let element = type;
     while (element.endsWith("[]")) element = element.slice(0, -2);
-    return `SQLArray<${element.toLowerCase() === "numeric" ? (options.numericArrayMode ?? "number") : scalarType(element, options)}>`;
+    const elementType =
+      element.toLowerCase() === "numeric"
+        ? (options.numericArrayMode ?? "number")
+        : scalarType(element, options);
+    // An unmanaged codec can change the whole value, not only its elements.
+    // Preserve unknown at the root rather than promising an array shape.
+    return elementType === "unknown" ? "unknown" : `SQLArray<${elementType}>`;
   }
   switch (type.toLowerCase()) {
     case "integer":
@@ -255,8 +261,8 @@ export function generateKyselyTypes(
       if (columns.has(column.name))
         throw new Error(`Duplicate column ${JSON.stringify(column.name)}`);
       columns.add(column.name);
-      hasArrays ||= column.dataType.endsWith("[]");
       let type = scalarType(column.dataType, options);
+      hasArrays ||= type.startsWith("SQLArray<");
       if (column.isNullable && type !== "unknown") type += " | null";
       if (column.isGeneratedAlways) {
         imports.add("GeneratedAlways");
