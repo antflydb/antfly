@@ -21,9 +21,10 @@ pub const Capabilities = struct {
     structured_output: Support = .unknown,
     images: Support = .unknown,
     audio: Support = .unknown,
+    video: Support = .unknown,
 
     pub fn require(self: Capabilities, request: Requirements) !void {
-        inline for (.{ "streaming", "tools", "structured_output", "images", "audio" }) |field| {
+        inline for (.{ "streaming", "tools", "structured_output", "images", "audio", "video" }) |field| {
             if (@field(request, field) and @field(self, field) != .supported)
                 return error.UnsupportedInferenceFeature;
         }
@@ -35,4 +36,5 @@ pub const Requirements = struct {
     structured_output: bool = false,
     images: bool = false,
     audio: bool = false,
+    video: bool = false,
 };

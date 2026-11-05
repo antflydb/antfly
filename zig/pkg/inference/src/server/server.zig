@@ -1752,6 +1752,17 @@ fn generateMessagesHaveMedia(messages: []const generation.Message) bool {
     for (messages) |message| {
         if (message.image_bytes) |images| if (images.len > 0) return true;
         if (message.audio_bytes) |clips| if (clips.len > 0) return true;
+        if (message.video_bytes != null) return true;
+    }
+    return false;
+}
+
+pub const generatorAcceptsVideo = model_caps.generatorAcceptsVideo;
+
+fn isGenerateVideoMime(mime: []const u8) bool {
+    const essence = data_uri_mod.mediaTypeEssence(mime) catch return false;
+    for ([_][]const u8{ "video/mp4", "video/quicktime", "video/webm", "video/mp2t" }) |candidate| {
+        if (std.ascii.eqlIgnoreCase(essence, candidate)) return true;
     }
     return false;
 }
@@ -15286,6 +15297,7 @@ pub const Node = struct {
             .media_parts_per_item = media_shape.media_count,
             .has_image = owned_messages.decoded_images.len > 0,
             .has_audio = owned_messages.decoded_audio.len > 0,
+            .has_video = owned_messages.decoded_video.len > 0,
         }) catch |err| {
             const failure = generateExecutorContractError(err);
             return ctx.status(failure.status).json(.{
@@ -15696,6 +15708,7 @@ pub const Node = struct {
             .media_parts_per_item = media_shape.media_count,
             .has_image = owned_messages.decoded_images.len > 0,
             .has_audio = owned_messages.decoded_audio.len > 0,
+            .has_video = owned_messages.decoded_video.len > 0,
         }) catch |err| return inferenceExecutorContractFailureResponse(ctx, err);
 
         const gpt_config = session_factory.getGptConfig(model.session) orelse {
@@ -16798,6 +16811,8 @@ pub const Node = struct {
         decoded_image_owned: []bool = &.{},
         decoded_audio: [][]const u8 = &.{},
         decoded_audio_owned: []bool = &.{},
+        decoded_video: [][]const u8 = &.{},
+        decoded_video_owned: []bool = &.{},
         image_slices: [][]const []const u8 = &.{},
         audio_slices: [][]const []const u8 = &.{},
         content_parts: [][]const generation.Message.ContentPart = &.{},
@@ -16814,6 +16829,9 @@ pub const Node = struct {
             for (self.decoded_audio, self.decoded_audio_owned) |clip, owned| if (owned) self.allocator.free(clip);
             self.allocator.free(self.decoded_audio);
             self.allocator.free(self.decoded_audio_owned);
+            for (self.decoded_video, self.decoded_video_owned) |clip, owned| if (owned) self.allocator.free(clip);
+            self.allocator.free(self.decoded_video);
+            self.allocator.free(self.decoded_video_owned);
             for (self.image_slices) |slice| self.allocator.free(slice);
             self.allocator.free(self.image_slices);
             for (self.audio_slices) |slice| self.allocator.free(slice);
@@ -16922,6 +16940,13 @@ pub const Node = struct {
             decoded_images.deinit(allocator);
             decoded_image_owned.deinit(allocator);
         }
+        var decoded_video = std.ArrayListUnmanaged([]const u8).empty;
+        var decoded_video_owned = std.ArrayListUnmanaged(bool).empty;
+        errdefer {
+            for (decoded_video.items, decoded_video_owned.items) |clip, owned| if (owned) allocator.free(clip);
+            decoded_video.deinit(allocator);
+            decoded_video_owned.deinit(allocator);
+        }
         var decoded_audio = std.ArrayListUnmanaged([]const u8).empty;
         var decoded_audio_owned = std.ArrayListUnmanaged(bool).empty;
         errdefer {
@@ -16959,6 +16984,7 @@ pub const Node = struct {
             defer text_buf.deinit(allocator);
             var msg_images = std.ArrayListUnmanaged([]const u8).empty;
             defer msg_images.deinit(allocator);
+            var msg_video: ?[]const u8 = null;
             var msg_audio = std.ArrayListUnmanaged([]const u8).empty;
             defer msg_audio.deinit(allocator);
             var msg_parts = std.ArrayListUnmanaged(generation.Message.ContentPart).empty;
@@ -17043,6 +17069,13 @@ pub const Node = struct {
                                         decoded_audio_owned.appendAssumeCapacity(false);
                                         try msg_audio.append(allocator, attachment.data);
                                         try msg_parts.append(allocator, .{ .audio = msg_audio.items.len - 1 });
+                                    } else if (isGenerateVideoMime(declared_essence)) {
+                                        if (msg_video != null) return error.VideoLimitExceeded;
+                                        try decoded_video.ensureUnusedCapacity(allocator, 1);
+                                        try decoded_video_owned.ensureUnusedCapacity(allocator, 1);
+                                        decoded_video.appendAssumeCapacity(attachment.data);
+                                        decoded_video_owned.appendAssumeCapacity(false);
+                                        msg_video = attachment.data;
                                     } else {
                                         return error.UnsupportedGenerateMediaMimeType;
                                     }
@@ -17075,6 +17108,14 @@ pub const Node = struct {
                                     owns_decoded_data = false;
                                     try msg_audio.append(allocator, decoded_payload.data);
                                     try msg_parts.append(allocator, .{ .audio = msg_audio.items.len - 1 });
+                                } else if (isGenerateVideoMime(mime_value.string)) {
+                                    if (msg_video != null) return error.VideoLimitExceeded;
+                                    try decoded_video.ensureUnusedCapacity(allocator, 1);
+                                    try decoded_video_owned.ensureUnusedCapacity(allocator, 1);
+                                    decoded_video.appendAssumeCapacity(decoded_payload.data);
+                                    decoded_video_owned.appendAssumeCapacity(true);
+                                    owns_decoded_data = false;
+                                    msg_video = decoded_payload.data;
                                 } else {
                                     return error.UnsupportedGenerateMediaMimeType;
                                 }
@@ -17110,7 +17151,9 @@ pub const Node = struct {
                 try audio_slices.append(allocator, slice);
                 owns_msg_audio_slice = false;
             }
-            const msg_part_slice: ?[]const generation.Message.ContentPart = if (msg_parts.items.len > 0)
+            // Video occupies its own message; its text is the plain message content.
+            if (msg_video != null and (msg_images.items.len > 0 or msg_audio.items.len > 0)) return error.UnsupportedMixedVideoInput;
+            const msg_part_slice: ?[]const generation.Message.ContentPart = if (msg_parts.items.len > 0 and msg_video == null)
                 try allocator.dupe(generation.Message.ContentPart, msg_parts.items)
             else
                 null;
@@ -17140,6 +17183,7 @@ pub const Node = struct {
                 .tool_call_id = msg.tool_call_id,
                 .image_bytes = msg_img_slice,
                 .audio_bytes = msg_audio_slice,
+                .video_bytes = msg_video,
                 .content_parts = msg_part_slice,
             });
             owns_content = false;
@@ -17165,6 +17209,12 @@ pub const Node = struct {
             allocator.free(owned_audio_media.bytes);
             allocator.free(owned_audio_media.owned);
         }
+        const owned_video_media = try takeOwnedMediaSlices(allocator, &decoded_video, &decoded_video_owned);
+        errdefer {
+            for (owned_video_media.bytes, owned_video_media.owned) |clip, owned| if (owned) allocator.free(clip);
+            allocator.free(owned_video_media.bytes);
+            allocator.free(owned_video_media.owned);
+        }
         const owned_image_slices = try image_slices.toOwnedSlice(allocator);
         errdefer {
             for (owned_image_slices) |slice| allocator.free(slice);
@@ -17183,6 +17233,8 @@ pub const Node = struct {
             .decoded_image_owned = owned_image_media.owned,
             .decoded_audio = owned_audio_media.bytes,
             .decoded_audio_owned = owned_audio_media.owned,
+            .decoded_video = owned_video_media.bytes,
+            .decoded_video_owned = owned_video_media.owned,
             .image_slices = owned_image_slices,
             .audio_slices = owned_audio_slices,
             .content_parts = owned_content_parts,
@@ -17262,10 +17314,12 @@ pub const Node = struct {
                 error.GenerateMediaContentPartMissingMimeType => "media content part missing 'mime_type' field",
                 error.InvalidGenerateMediaBase64 => "invalid base64 media data",
                 error.GenerateMediaDataMimeTypeMismatch => "media data URI mime_type does not match content part mime_type",
-                error.UnsupportedGenerateMediaMimeType => "media content part must have an image/* or audio/* mime_type",
+                error.UnsupportedGenerateMediaMimeType => "media content part must have an image/*, audio/*, or supported video/* mime_type",
                 error.UnsupportedGenerateContentPart => "unsupported content part type",
                 error.InvalidGenerateMessageContent => "message content must be text or an array of content parts",
                 error.GenerateMediaPartLimitExceeded => "generation request contains too many media parts",
+                error.VideoLimitExceeded => "generation request may contain one video per message",
+                error.UnsupportedMixedVideoInput => "a video message cannot also contain image or audio parts",
                 else => "request messages are invalid",
             },
             .retryable = false,
@@ -18064,6 +18118,7 @@ pub const Node = struct {
                     .media_parts_per_item = item_media_shape.media_count,
                     .has_image = owned_messages[idx].decoded_images.len > 0,
                     .has_audio = owned_messages[idx].decoded_audio.len > 0,
+                    .has_video = owned_messages[idx].decoded_video.len > 0,
                 }) catch |err| {
                     results[idx].@"error" = generateExecutorContractError(err).batch;
                     pending[idx] = false;
@@ -18160,6 +18215,7 @@ pub const Node = struct {
                         .media_parts_per_item = item_media_shape.media_count,
                         .has_image = owned_messages[idx].decoded_images.len > 0,
                         .has_audio = owned_messages[idx].decoded_audio.len > 0,
+                        .has_video = owned_messages[idx].decoded_video.len > 0,
                     }) catch |err| {
                         results[idx].@"error" = generateExecutorContractError(err).batch;
                         pending[idx] = false;
@@ -25091,6 +25147,7 @@ pub const Node = struct {
                         "compatible",
                         false,
                         self.config.request_limits,
+                        false,
                     );
                     try listed_model_names.put(a, name, {});
                     model_count += 1;
@@ -25141,6 +25198,7 @@ pub const Node = struct {
                     listing.compatibility_level,
                     std.mem.eql(u8, task, "extractors") and rebel_mod.isRebelModel(a, entry.path),
                     self.config.request_limits,
+                    model_caps.generatorAcceptsVideo(&listing.manifest),
                 );
                 try appendModelMetadata(&body, a, &listing.manifest, task);
                 if (isOpenAiListTask(task)) {
@@ -25215,6 +25273,7 @@ pub const Node = struct {
                     @tagName(loaded_compatibility.level),
                     std.mem.eql(u8, task, "extractors") and rebel_mod.isRebelModel(a, listing.canonical_model_dir),
                     self.config.request_limits,
+                    model_caps.generatorAcceptsVideo(&model.manifest),
                 );
                 try appendModelMetadata(&body, a, &model.manifest, task);
                 if (isOpenAiListTask(task)) {
@@ -28091,6 +28150,8 @@ fn appendModelInfo(
     /// REBEL emits generic ENTITY nodes and accepts untyped relation names.
     untyped_entities: bool,
     request_limits: RequestLimits,
+    /// Gemma 4 generators, whose manifests predate a declared video input.
+    generator_accepts_video: bool,
 ) !void {
     const inferred_classification = model_caps.modelSupportsCapability(model_kind, gliner_model_type, capabilities, "classification") and !model_caps.hasCapability(capabilities, "classification");
     const inferred_zero_shot = zero_shot_classification and !model_caps.hasCapability(capabilities, "zero_shot");
@@ -28200,7 +28261,7 @@ fn appendModelInfo(
     const accepts_image = executor_modalities.image;
     const accepts_audio = executor_modalities.audio;
     const accepts_document = executor_modalities.document;
-    const accepts_video = executor_kind == .grouped_dense_embedding and model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "video");
+    const accepts_video = generator_accepts_video or executor_kind == .grouped_dense_embedding and model_caps.modelKindAcceptsInput(model_kind, gliner_model_type, inputs, has_visual, has_audio, "video");
     var input_index: usize = 0;
     for ([_]struct { bool, []const u8 }{
         .{ accepts_text, "text" },
@@ -28378,7 +28439,7 @@ test "specialty catalog advertises entity-only PII and classification-only GLiGu
         try std.testing.expect(!manifestMatchesModelListingTask("deciders", "extractor", &manifest));
         var body = std.ArrayListUnmanaged(u8).empty;
         defer body.deinit(a);
-        try appendModelInfo(&body, a, "extractor", manifest.gliner_model_type, capabilities, manifest.inputs, zero_shot, false, false, .native_gliner_span_extraction, null, "extractors", 16 * 1024 * 1024, 32 * 1024 * 1024, false, "compatible", false, .{});
+        try appendModelInfo(&body, a, "extractor", manifest.gliner_model_type, capabilities, manifest.inputs, zero_shot, false, false, .native_gliner_span_extraction, null, "extractors", 16 * 1024 * 1024, 32 * 1024 * 1024, false, "compatible", false, .{}, false);
         const parsed = try std.json.parseFromSlice(std.json.Value, a, body.items, .{});
         defer parsed.deinit();
         const published = parsed.value.object.get("capabilities").?.array.items;
@@ -28422,6 +28483,7 @@ test "REBEL catalog advertises generic entity schema independently of model name
         "compatible",
         true,
         .{},
+        false,
     );
     const parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
     defer parsed.deinit();
@@ -28456,6 +28518,7 @@ test "reranker catalog advertises rerank documents" {
         "compatible",
         false,
         .{},
+        false,
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
     defer parsed.deinit();
@@ -28487,6 +28550,7 @@ test "fixed chunk catalog advertises its multimodal transport truth" {
         "compatible",
         false,
         .{},
+        false,
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, body.items, .{});
     defer parsed.deinit();
@@ -29424,7 +29488,7 @@ fn resolvedInferenceExecutorContract(
 ) !ResolvedInferenceExecutorContract {
     const manifest_text = model_caps.modelAcceptsInput(manifest, "text");
     const manifest_image = model_caps.modelAcceptsInput(manifest, "image");
-    const manifest_video = std.mem.eql(u8, resolved_task, "embed") and manifest.embedding_style == .embedding_gemma2 and (model_caps.modelAcceptsInput(manifest, "video") or manifest_image);
+    const manifest_video = std.mem.eql(u8, resolved_task, "generate") and model_caps.generatorAcceptsVideo(manifest) or std.mem.eql(u8, resolved_task, "embed") and manifest.embedding_style == .embedding_gemma2 and (model_caps.modelAcceptsInput(manifest, "video") or manifest_image);
     const manifest_audio = model_caps.modelAcceptsInput(manifest, "audio");
     const manifest_document = model_caps.modelAcceptsInput(manifest, "document") or
         model_caps.modelAcceptsInput(manifest, "pdf");
@@ -30081,6 +30145,7 @@ test "standalone inference model catalog publishes resolved native reader batchi
         "compatible",
         false,
         .{},
+        false,
     );
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
     defer parsed.deinit();
@@ -30332,6 +30397,7 @@ test "normalized inference capabilities cover every model family" {
             "compatible",
             false,
             .{},
+            false,
         );
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body.items, .{});
         defer parsed.deinit();
@@ -31729,6 +31795,68 @@ test "generate parser consumes generic image and audio media parts strictly" {
         error.InvalidInferenceMedia,
         node.parseGenerateMessagesWithBudget(alloc, mismatched.value, &mismatched_budget),
     );
+}
+
+test "generate parser gives video its own field without counting it as audio" {
+    const alloc = std.testing.allocator;
+    var node: Node = undefined;
+    node.config = .{};
+    const video_json =
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"describe"},{"type":"media","mime_type":"video/mp4","data":"AAAA"}]}]}
+    ;
+    var parsed = try std.json.parseFromSlice(api.GenerateRequest, alloc, video_json, .{ .ignore_unknown_fields = true });
+    defer parsed.deinit();
+    var budget = RequestMediaBudget.init(64);
+    var messages = try node.parseGenerateMessagesWithBudget(alloc, parsed.value, &budget);
+    defer messages.deinit();
+    try std.testing.expectEqual(@as(usize, 1), messages.decoded_video.len);
+    try std.testing.expectEqual(@as(usize, 0), messages.decoded_audio.len);
+    try std.testing.expectEqual(@as(usize, 0), messages.decoded_images.len);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, messages.messages[0].video_bytes.?);
+    try std.testing.expectEqualStrings("describe", messages.messages[0].content);
+    try std.testing.expect(messages.messages[0].content_parts == null);
+    try std.testing.expect(generateMessagesHaveMedia(messages.messages));
+
+    for ([_]struct { body: []const u8, expected: anyerror }{
+        .{ .body =
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"video/mp4","data":"AAAA"},{"type":"media","mime_type":"video/mp4","data":"AAAA"}]}]}
+        , .expected = error.VideoLimitExceeded },
+        .{ .body =
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"audio/wav","data":"AAAA"},{"type":"media","mime_type":"video/mp4","data":"AAAA"}]}]}
+        , .expected = error.UnsupportedMixedVideoInput },
+        .{ .body =
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"media","mime_type":"video/x-matroska","data":"AAAA"}]}]}
+        , .expected = error.UnsupportedGenerateMediaMimeType },
+    }) |case| {
+        var invalid = try std.json.parseFromSlice(api.GenerateRequest, alloc, case.body, .{ .ignore_unknown_fields = true });
+        defer invalid.deinit();
+        var invalid_budget = RequestMediaBudget.init(64);
+        try std.testing.expectError(case.expected, node.parseGenerateMessagesWithBudget(alloc, invalid.value, &invalid_budget));
+    }
+}
+
+test "generate parser releases video media on every allocation failure" {
+    const backing_allocator = std.testing.allocator;
+    const request_json =
+        \\{"model":"m","messages":[{"role":"user","content":[{"type":"text","text":"a"},{"type":"media","mime_type":"video/mp4","data":"AAAA"}]},
+        \\{"role":"user","content":[{"type":"media","mime_type":"video/webm","data":"attachment:0"}]}]}
+    ;
+    var parsed = try std.json.parseFromSlice(api.GenerateRequest, backing_allocator, request_json, .{});
+    defer parsed.deinit();
+    const attachments = [_]httpx.attachment_envelope.Attachment{.{ .mime_type = "video/webm", .data = "webm" }};
+    var node: Node = undefined;
+    node.config = .{};
+    const Runner = struct {
+        fn run(allocator: std.mem.Allocator, target: *Node, body: api.GenerateRequest, media: []const httpx.attachment_envelope.Attachment) !void {
+            var budget = RequestMediaBudget.init(128);
+            var messages = try target.parseGenerateMessagesWithBudgetAndAttachments(allocator, body, &budget, media);
+            defer messages.deinit();
+            try std.testing.expectEqual(@as(usize, 2), messages.decoded_video.len);
+            try std.testing.expect(messages.decoded_video_owned[0]);
+            try std.testing.expect(!messages.decoded_video_owned[1]);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(backing_allocator, Runner.run, .{ &node, parsed.value, &attachments });
 }
 
 test "generate parser borrows framed media without copying" {
@@ -41389,6 +41517,12 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
         .retryable = true,
     };
     return switch (err) {
+        error.UnsupportedVideoBackend => .{ .status = 400, .code = "UNSUPPORTED_VIDEO_BACKEND", .message = "video input requires a Gemma 4 generator with its projector", .retryable = false },
+        error.UnsupportedMixedVideoInput => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "a video message cannot also contain image or audio parts", .retryable = false },
+        error.VideoLimitExceeded => .{ .status = 400, .code = "INVALID_MEDIA_LAYOUT", .message = "generation request may contain one video", .retryable = false },
+        error.InvalidVideoInput, error.EmptyVideo, error.UnsupportedVideoCodec, error.UnsupportedVideoProfile => .{ .status = 400, .code = "INVALID_VIDEO", .message = "unsupported, empty, or corrupt video", .retryable = false },
+        error.VideoDurationExceeded, error.VideoInputTooLarge => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds this backend's duration or size limit", .retryable = false },
+        error.NvdecUnavailable => .{ .status = 503, .code = "VIDEO_BACKEND_UNAVAILABLE", .message = "the CUDA video decoder is unavailable on this server", .retryable = true },
         error.InvalidToolArguments => .{
             .status = 502,
             .code = "TOOL_ARGUMENTS_INVALID",

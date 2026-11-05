@@ -21141,8 +21141,33 @@ export interface components {
             mime_type: string;
             sampling?: components["schemas"]["VideoSamplingPolicy"];
         };
-        /** @description A content part for multimodal input (text, image URL, or inline media). */
-        ContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["ImageURLContentPart"] | components["schemas"]["MediaContentPart"];
+        /** @description Image, audio, or video named by a source record's `content.resource`. Accepted only on the Antfly gateway's generate and chat routes, which fetch the pinned version under `remote_content.security` and replace this part with inline media, so the source URL never reaches a model vendor. Fetching requires a nonempty `allowed_hosts`. The expanded request is limited to 16 MiB. Models that do not support the media type reject the request. */
+        SourceContentPart: {
+            /** @enum {string} */
+            type: "source";
+            source: {
+                /** @enum {string} */
+                type: "source";
+                /** @description HTTP(S) URL. Treat source media URLs as private. */
+                uri: string;
+                /** @description image/png, image/jpeg, image/webp, image/gif, or an audio/* or video/* type. */
+                mime_type: string;
+                /** @description Quoted strong ETag. The fetch fails if the source no longer has this version. */
+                version: string;
+                /**
+                 * @default strong_etag
+                 * @enum {string}
+                 */
+                version_kind?: "strong_etag";
+                /**
+                 * Format: int64
+                 * @description Exact object length.
+                 */
+                length: number;
+            };
+        };
+        /** @description A content part for multimodal input (text, image URL, inline media, or a pinned source reference). */
+        ContentPart: components["schemas"]["TextContentPart"] | components["schemas"]["ImageURLContentPart"] | components["schemas"]["MediaContentPart"] | components["schemas"]["SourceContentPart"];
         /**
          * @description Message content. Supports two formats:
          *     - Simple string: "Hello, how are you?"

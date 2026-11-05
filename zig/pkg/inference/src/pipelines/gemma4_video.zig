@@ -1,0 +1,96 @@
+// Copyright 2026 Antfly, Inc.
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+//! Gemma 4 video input. CUDA decodes on the device; every other backend reuses
+//! the qualified lib/video routes and projects frames as ordinary images.
+const std = @import("std");
+const media = @import("antfly_media");
+const video = @import("antfly_video");
+const projector_mod = @import("../architectures/gemma4_projector.zig");
+const embedding_video = @import("embedding_gemma2_video.zig");
+const ComputeBackend = @import("../ops/ops.zig").ComputeBackend;
+
+const sampling: embedding_video.Sampling = .{ .timestamps = .{} };
+
+pub fn encode(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
+    if (cb.kind() == .cuda) return projector_mod.encodeProjectedVideoResident(cb, a, projector, bytes);
+    return encodePortable(cb, a, projector, bytes);
+}
+
+const Observer = struct {
+    a: std.mem.Allocator,
+    cb: *const ComputeBackend,
+    frames: *projector_mod.PortableVideoFrames,
+    fn accept(raw: *anyopaque, slot: usize, frame: video.preparation.BorrowedFrame, options: video.preparation.Options, control: media.source.Control) anyerror!void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        try self.cb.checkExecutionControl();
+        var displayed = try frame.display(self.a, options, control);
+        defer displayed.deinit(self.a);
+        try self.frames.prepare(slot, displayed.view());
+    }
+};
+
+fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
+    const timestamps = try embedding_video.selectedPresentationUs(a, bytes, .{}, sampling);
+    defer a.free(timestamps);
+    var frames = try projector_mod.PortableVideoFrames.init(cb, a, projector, timestamps.len);
+    defer frames.deinit();
+    var observer: Observer = .{ .a = a, .cb = cb, .frames = &frames };
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+    try embedding_video.observeConfigured(a, bytes, null, .{}, .{
+        .observer = .{ .context = &observer, .accept = Observer.accept },
+        .sampling = sampling,
+        .pool = &pool,
+    });
+    return frames.project(timestamps);
+}
+
+test "gemma4 video timestamps follow presentation order on every portable container" {
+    const a = std.testing.allocator;
+    inline for (.{ "mjpeg.mov", "bframes.mp4", "closed.mp4", "vp9.webm", "av1.webm" }) |name| {
+        const times = try embedding_video.selectedPresentationUs(a, @embedFile("../testdata/video/" ++ name), .{}, sampling);
+        defer a.free(times);
+        try std.testing.expect(times.len > 0 and times.len <= 32);
+        try std.testing.expectEqual(@as(i64, 0), times[0]);
+        for (times[1..], times[0 .. times.len - 1]) |next, previous| try std.testing.expect(next > previous);
+    }
+}
+
+test "gemma4 video timestamps match the frames delivered to the observer" {
+    const a = std.testing.allocator;
+    inline for (.{ "mjpeg.mov", "bframes.mp4", "vp9.webm" }) |name| {
+        const bytes = @embedFile("../testdata/video/" ++ name);
+        const times = try embedding_video.selectedPresentationUs(a, bytes, .{}, sampling);
+        defer a.free(times);
+        const Count = struct {
+            seen: []bool,
+            fn accept(raw: *anyopaque, slot: usize, frame: video.preparation.BorrowedFrame, options: video.preparation.Options, control: media.source.Control) anyerror!void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                var displayed = try frame.display(std.testing.allocator, options, control);
+                defer displayed.deinit(std.testing.allocator);
+                try std.testing.expect(displayed.width > 0);
+                try std.testing.expect(!self.seen[slot]);
+                self.seen[slot] = true;
+            }
+        };
+        const seen = try a.alloc(bool, times.len);
+        defer a.free(seen);
+        @memset(seen, false);
+        var counter: Count = .{ .seen = seen };
+        var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
+        try embedding_video.observeConfigured(a, bytes, null, .{}, .{ .observer = .{ .context = &counter, .accept = Count.accept }, .sampling = sampling, .pool = &pool });
+        for (seen) |value| try std.testing.expect(value);
+    }
+}

@@ -65,7 +65,7 @@ pub const Support = capability_contract.Support;
 pub const Capabilities = capability_contract.Capabilities;
 
 fn typedDecisionCapabilities(images: bool) Capabilities {
-    return .{ .images = if (images) .supported else .unsupported, .audio = .unsupported, .streaming = .unsupported, .tools = .unsupported };
+    return .{ .images = if (images) .supported else .unsupported, .audio = .unsupported, .video = .unsupported, .streaming = .unsupported, .tools = .unsupported };
 }
 
 pub const Requirements = capability_contract.Requirements;

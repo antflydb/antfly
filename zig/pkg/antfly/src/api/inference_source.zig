@@ -15,8 +15,11 @@
 
 //! Request-local table media references. Lookup must execute the ordinary
 //! authorized query path with the ingress identity. Digests never grant reads.
+//! Chat `source` parts also accept a pinned source-record resource, fetched here
+//! under remote-content policy so its private URL never reaches a model vendor.
 const std = @import("std");
 const images = @import("antfly_image");
+const scraping = @import("antfly_scraping");
 const A = std.mem.Allocator;
 const V = std.json.Value;
 pub const Reference = @import("antfly_decisions").evidence.TableSourceReference;
@@ -26,7 +29,38 @@ pub const Port = struct {
     /// permission, membership and the expected revision in the SAME query.
     lookup: *const fn (*anyopaque, A, Reference) anyerror![]const u8,
     lookup_many: ?*const fn (*anyopaque, A, []const Reference) anyerror![]const []const u8 = null,
+    /// Returns exactly resource.length bytes of the pinned version.
+    fetch: ?*const fn (*anyopaque, A, Resource) anyerror![]const u8 = null,
 };
+/// The `content.resource` object of a source record. Unknown fields are rejected.
+pub const Resource = struct {
+    type: []const u8,
+    uri: []const u8,
+    mime_type: []const u8,
+    version: []const u8,
+    version_kind: scraping.PinnedRange.VersionKind = .strong_etag,
+    length: u64,
+
+    pub fn validate(self: Resource) !void {
+        if (!std.mem.eql(u8, self.type, "source") or self.version_kind != .strong_etag) return error.InvalidInferenceSource;
+        const parsed = scraping.PinnedRange.validateReference(self.uri, self.version, self.version_kind, self.length) catch return error.InvalidInferenceSource;
+        if (!std.ascii.eqlIgnoreCase(parsed.scheme, "http") and !std.ascii.eqlIgnoreCase(parsed.scheme, "https")) return error.InferenceSourceUnsupported;
+        if (!supportedResourceMime(self.mime_type)) return error.InvalidInferenceSource;
+    }
+};
+const max_expanded_request_bytes = 16 * 1024 * 1024;
+const image_mime_types = [_][]const u8{ "image/png", "image/jpeg", "image/webp", "image/gif" };
+fn isImageMime(mime: []const u8) bool {
+    for (image_mime_types) |candidate| if (std.mem.eql(u8, mime, candidate)) return true;
+    return false;
+}
+fn supportedResourceMime(mime: []const u8) bool {
+    if (isImageMime(mime)) return true;
+    const subtype = if (std.mem.startsWith(u8, mime, "audio/")) mime[6..] else if (std.mem.startsWith(u8, mime, "video/")) mime[6..] else return false;
+    if (subtype.len == 0 or subtype.len > 127) return false;
+    for (subtype) |c| if (!std.ascii.isLower(c) and !std.ascii.isDigit(c) and std.mem.indexOfScalar(u8, ".+-", c) == null) return false;
+    return true;
+}
 const Selected = struct { part: *V, reference: Reference };
 // Guard data before typed cloning or fixed-depth encoders. Recursion is bounded
 // before entry; strings/base64 are scalar nodes and are not walked bytewise.
@@ -64,8 +98,119 @@ fn collect(a: A, value: V, selected: *std.ArrayList(Selected)) !void {
         }
     }
 }
+/// Chat `source` parts in `messages`, split by locator. Table parts become
+/// `input_image` for the existing authorized path, then return to chat shape.
+const ChatSources = struct {
+    tables: std.ArrayList(*V) = .empty,
+    resources: std.ArrayList(struct { part: *V, resource: Resource }) = .empty,
+};
+fn collectChatSources(a: A, request: V) !ChatSources {
+    var found: ChatSources = .{};
+    const messages = request.object.get("messages") orelse return found;
+    if (messages != .array) return found;
+    for (messages.array.items) |message| {
+        if (message != .object) continue;
+        const content = message.object.get("content") orelse continue;
+        if (content != .array) continue;
+        for (content.array.items) |*part| {
+            if (part.* != .object) continue;
+            const kind = part.object.get("type") orelse continue;
+            if (kind != .string or !std.mem.eql(u8, kind.string, "source")) continue;
+            const source = part.object.get("source") orelse return error.InvalidInferenceSource;
+            if (source != .object or part.object.count() != 2) return error.InvalidInferenceSource;
+            if (found.tables.items.len + found.resources.items.len == 128) return error.InferenceRequestTooLarge;
+            if (source.object.contains("table")) {
+                try part.object.put(a, "type", .{ .string = "input_image" });
+                try found.tables.append(a, part);
+                continue;
+            }
+            try validateDepth(source, 0);
+            const resource = std.json.parseFromValueLeaky(Resource, a, source, .{}) catch |err| return if (err == error.OutOfMemory) err else error.InvalidInferenceSource;
+            try resource.validate();
+            try found.resources.append(a, .{ .part = part, .resource = resource });
+        }
+    }
+    return found;
+}
+fn setChatImage(a: A, part: *V, url: []const u8) !void {
+    var image: V = .{ .object = .empty };
+    try image.object.put(a, "url", .{ .string = url });
+    var replacement: V = .{ .object = .empty };
+    try replacement.object.put(a, "type", .{ .string = "image_url" });
+    try replacement.object.put(a, "image_url", image);
+    part.* = replacement;
+}
+fn resolveChatResources(a: A, request: V, found: ChatSources, port: ?Port) !void {
+    if (found.resources.items.len == 0) return;
+    const fetch = (port orelse return error.InferenceSourceUnsupported).fetch orelse return error.InferenceSourceUnsupported;
+    // Reject before any I/O. Table parts are already expanded in this count.
+    var counter: std.Io.Writer.Discarding = .init(&.{});
+    try std.json.Stringify.value(request, .{}, &counter.writer);
+    var expanded = std.math.cast(usize, counter.fullCount()) orelse return error.InferenceRequestTooLarge;
+    for (found.resources.items) |item| {
+        const length = std.math.cast(usize, item.resource.length) orelse return error.InferenceRequestTooLarge;
+        if (length > max_expanded_request_bytes) return error.InferenceRequestTooLarge;
+        expanded = std.math.add(usize, expanded, std.base64.standard.Encoder.calcSize(length) + 256) catch return error.InferenceRequestTooLarge;
+        if (expanded > max_expanded_request_bytes) return error.InferenceRequestTooLarge;
+    }
+    for (found.resources.items) |item| {
+        const resource = item.resource;
+        const bytes = try fetch(port.?.ptr, a, resource);
+        if (bytes.len != resource.length) return error.InferenceSourceMismatch;
+        const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(bytes.len));
+        _ = std.base64.standard.Encoder.encode(encoded, bytes);
+        if (isImageMime(resource.mime_type)) {
+            const mime = images.inferenceMimeEssenceForFormat(images.detectFormat(bytes)) orelse return error.InferenceSourceMismatch;
+            if (!std.mem.eql(u8, mime, resource.mime_type)) return error.InferenceSourceMismatch;
+            const info = try images.inspectEncoded(bytes);
+            if (try info.pixels() > 64 * 1024 * 1024) return error.InferenceRequestTooLarge;
+            try setChatImage(a, item.part, try std.fmt.allocPrint(a, "data:{s};base64,{s}", .{ resource.mime_type, encoded }));
+            continue;
+        }
+        var replacement: V = .{ .object = .empty };
+        try replacement.object.put(a, "type", .{ .string = "media" });
+        try replacement.object.put(a, "mime_type", .{ .string = resource.mime_type });
+        try replacement.object.put(a, "data", .{ .string = encoded });
+        item.part.* = replacement;
+    }
+}
+/// Fetches one pinned resource. Unlike template fetches, an omitted allowlist
+/// denies: a caller-supplied URL must never reach an unrestricted fetcher.
+pub fn fetchResource(a: A, io: std.Io, remote_content: ?*const scraping.RemoteContentConfig, resource: Resource, cancellation: ?scraping.CancellationToken, timeout_ms: ?u64) ![]const u8 {
+    const config = remote_content orelse return error.Forbidden;
+    var snapshot = try config.acquire();
+    defer snapshot.deinit();
+    const security = if (snapshot.config.security) |*value| value else return error.Forbidden;
+    const hosts = security.allowed_hosts orelse return error.Forbidden;
+    if (hosts.len == 0) return error.Forbidden;
+    const context: scraping.DownloadContext = .{ .io = io, .timeout_ms = timeout_ms, .cancellation = cancellation };
+    const out = try a.alloc(u8, @intCast(resource.length));
+    const range = scraping.PinnedRange.create(a, context, resource.uri, resource.version, resource.version_kind, resource.length, security, null, &.{}) catch |err| return fetchFailure(err);
+    defer range.destroy();
+    const read = range.readAt(0, out) catch |err| return fetchFailure(err);
+    if (read != out.len) return error.InferenceSourceMismatch;
+    return out;
+}
+fn fetchFailure(err: anyerror) anyerror {
+    return switch (err) {
+        error.HostNotAllowed, error.PrivateIpBlocked => error.Forbidden,
+        error.SourceVersionChanged, error.InvalidRemoteRange => error.InferenceSourceMismatch,
+        error.StreamTooLong => error.InferenceRequestTooLarge,
+        error.InvalidHost, error.InvalidSourceReference, error.ImmutableVersionRequired, error.UnsupportedUrlScheme => error.InvalidInferenceSource,
+        else => err,
+    };
+}
 pub fn resolve(a: A, request: V, port: ?Port) !void {
     if (request != .object) return;
+    const chat = try collectChatSources(a, request);
+    try resolveTables(a, request, port);
+    for (chat.tables.items) |part| {
+        const url = part.object.get("image_url") orelse return error.InferenceSourceMismatch;
+        try setChatImage(a, part, url.string);
+    }
+    try resolveChatResources(a, request, chat, port);
+}
+fn resolveTables(a: A, request: V, port: ?Port) !void {
     var selected: std.ArrayList(Selected) = .empty;
     defer selected.deinit(a);
     if (request.object.get("input")) |input| try collect(a, input, &selected);
@@ -394,6 +539,136 @@ pub fn groups(a: A, references: []const Reference) ![]Group {
         for (parent.ids.items) |id| try add(a, &group.ids, id);
     }
     return output.items;
+}
+
+const ChatFake = struct {
+    bytes: []const u8 = "audio bytes",
+    calls: usize = 0,
+    failure: ?anyerror = null,
+    fn lookup(_: *anyopaque, _: A, _: Reference) ![]const u8 {
+        return error.Unexpected;
+    }
+    fn fetch(ptr: *anyopaque, _: A, _: Resource) ![]const u8 {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        self.calls += 1;
+        if (self.failure) |err| return err;
+        return self.bytes;
+    }
+    fn port(self: *@This()) Port {
+        return .{ .ptr = self, .lookup = lookup, .fetch = fetch };
+    }
+};
+fn chatRequest(a: A, mime: []const u8, length: u64) !V {
+    const body = try std.fmt.allocPrint(a,
+        \\{{"model":"m","messages":[{{"role":"user","content":[{{"type":"text","text":"hi"}},{{"type":"source","source":{{"type":"source","uri":"https://sources.example/v1/media/a/b","mime_type":"{s}","version":"\"abc\"","version_kind":"strong_etag","length":{d}}}}}]}}]}}
+    , .{ mime, length });
+    return std.json.parseFromSliceLeaky(V, a, body, .{});
+}
+
+test "httpx inference gateway chat source parts inline audio and video without their URL" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    for ([_][]const u8{ "audio/wav", "video/mp4" }) |mime| {
+        var fake: ChatFake = .{};
+        const request = try chatRequest(a, mime, fake.bytes.len);
+        try resolve(a, request, fake.port());
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+        const part = request.object.get("messages").?.array.items[0].object.get("content").?.array.items[1];
+        try std.testing.expectEqualStrings("media", part.object.get("type").?.string);
+        try std.testing.expectEqualStrings(mime, part.object.get("mime_type").?.string);
+        try std.testing.expectEqualStrings("YXVkaW8gYnl0ZXM=", part.object.get("data").?.string);
+        const rendered = try std.json.Stringify.valueAlloc(a, request, .{});
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "sources.example") == null);
+        const requirements = try @import("antfly_local_sources").common_inference_tasks.chatRequirements(request);
+        try std.testing.expectEqual(std.mem.startsWith(u8, mime, "audio/"), requirements.audio);
+        try std.testing.expectEqual(std.mem.startsWith(u8, mime, "video/"), requirements.video);
+    }
+}
+
+test "httpx inference gateway chat source parts verify images and return chat shape" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const encoded = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+a7S8AAAAASUVORK5CYII=";
+    var png: [68]u8 = undefined;
+    try std.base64.standard.Decoder.decode(&png, encoded);
+    var fake: ChatFake = .{ .bytes = &png };
+    const request = try chatRequest(a, "image/png", png.len);
+    try resolve(a, request, fake.port());
+    const part = request.object.get("messages").?.array.items[0].object.get("content").?.array.items[1];
+    try std.testing.expectEqualStrings("image_url", part.object.get("type").?.string);
+    try std.testing.expectEqualStrings("data:image/png;base64," ++ encoded, part.object.get("image_url").?.object.get("url").?.string);
+    // Declared and actual formats must agree.
+    const wrong = try chatRequest(a, "image/jpeg", png.len);
+    try std.testing.expectError(error.InferenceSourceMismatch, resolve(a, wrong, fake.port()));
+}
+
+test "httpx inference gateway chat source parts bound and validate before fetching" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var fake: ChatFake = .{};
+    try std.testing.expectError(error.InferenceRequestTooLarge, resolve(a, try chatRequest(a, "video/mp4", max_expanded_request_bytes + 1), fake.port()));
+    // Base64 expansion counts: 13 MiB of bytes exceeds the 16 MiB request bound.
+    try std.testing.expectError(error.InferenceRequestTooLarge, resolve(a, try chatRequest(a, "video/mp4", 13 * 1024 * 1024), fake.port()));
+    for ([_][]const u8{ "application/pdf", "text/plain", "image/svg+xml", "video/", "audio/WAV", "audio/x;y" }) |mime| {
+        try std.testing.expectError(error.InvalidInferenceSource, resolve(a, try chatRequest(a, mime, 11), fake.port()));
+    }
+    for ([_][]const u8{
+        \\{"messages":[{"role":"user","content":[{"type":"source"}]}]}
+        ,
+        \\{"messages":[{"role":"user","content":[{"type":"source","source":"https://example.org/a"}]}]}
+        ,
+        \\{"messages":[{"role":"user","content":[{"type":"source","detail":"auto","source":{"type":"source","uri":"https://e.org/a","mime_type":"audio/wav","version":"\"v\"","length":1}}]}]}
+        ,
+        \\{"messages":[{"role":"user","content":[{"type":"source","source":{"type":"source","uri":"https://e.org/a","mime_type":"audio/wav","version":"\"v\"","length":1,"extra":true}}]}]}
+        ,
+        \\{"messages":[{"role":"user","content":[{"type":"source","source":{"type":"source","uri":"https://e.org/a","mime_type":"audio/wav","version":"W/\"v\"","length":1}}]}]}
+        ,
+        \\{"messages":[{"role":"user","content":[{"type":"source","source":{"type":"source","uri":"https://u:p@e.org/a","mime_type":"audio/wav","version":"\"v\"","length":1}}]}]}
+        ,
+        \\{"messages":[{"role":"user","content":[{"type":"source","source":{"type":"source","uri":"file:///etc/passwd","mime_type":"audio/wav","version":"\"v\"","length":1}}]}]}
+    }) |body| {
+        const request = try std.json.parseFromSliceLeaky(V, a, body, .{});
+        try std.testing.expectError(error.InvalidInferenceSource, resolve(a, request, fake.port()));
+    }
+    const s3 = try std.json.parseFromSliceLeaky(V, a,
+        \\{"messages":[{"role":"user","content":[{"type":"source","source":{"type":"source","uri":"s3://bucket/a","mime_type":"audio/wav","version":"\"v\"","length":1}}]}]}
+    , .{});
+    try std.testing.expectError(error.InferenceSourceUnsupported, resolve(a, s3, fake.port()));
+    try std.testing.expectEqual(@as(usize, 0), fake.calls);
+    try std.testing.expectError(error.InferenceSourceUnsupported, resolve(a, try chatRequest(a, "audio/wav", 11), null));
+    var no_fetch: ChatFake = .{};
+    var port = no_fetch.port();
+    port.fetch = null;
+    try std.testing.expectError(error.InferenceSourceUnsupported, resolve(a, try chatRequest(a, "audio/wav", 11), port));
+    var short: ChatFake = .{};
+    try std.testing.expectError(error.InferenceSourceMismatch, resolve(a, try chatRequest(a, "audio/wav", 12), short.port()));
+    var failing: ChatFake = .{ .failure = error.Forbidden };
+    try std.testing.expectError(error.Forbidden, resolve(a, try chatRequest(a, "audio/wav", 11), failing.port()));
+}
+
+test "httpx inference gateway chat source resources deny fetching without an allowlist" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const resource: Resource = .{ .type = "source", .uri = "http://127.0.0.1:1/a", .mime_type = "audio/wav", .version = "\"v\"", .length = 1 };
+    const io = std.testing.io;
+    try std.testing.expectError(error.Forbidden, fetchResource(a, io, null, resource, null, 100));
+    var remote: scraping.RemoteContentConfig = .{};
+    try std.testing.expectError(error.Forbidden, fetchResource(a, io, &remote, resource, null, 100));
+    remote.security = .{ .block_private_ips = false };
+    try std.testing.expectError(error.Forbidden, fetchResource(a, io, &remote, resource, null, 100));
+    var empty: [0][]u8 = .{};
+    remote.security = .{ .allowed_hosts = &empty, .block_private_ips = false };
+    try std.testing.expectError(error.Forbidden, fetchResource(a, io, &remote, resource, null, 100));
+    var other = [_][]u8{try a.dupe(u8, "sources.example")};
+    remote.security = .{ .allowed_hosts = &other, .block_private_ips = false };
+    try std.testing.expectError(error.Forbidden, fetchResource(a, io, &remote, resource, null, 100));
+    var loopback = [_][]u8{try a.dupe(u8, "127.0.0.1")};
+    remote.security = .{ .allowed_hosts = &loopback };
+    try std.testing.expectError(error.Forbidden, fetchResource(a, io, &remote, resource, null, 100));
 }
 
 test "httpx inference gateway preserves temporary source lookup failures" {

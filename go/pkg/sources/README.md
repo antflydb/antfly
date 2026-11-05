@@ -46,6 +46,8 @@ Create `sources.json` with secret **references**, rather than secret values:
 Source UUIDs and connection map keys are durable identities. Multiple sources can
 reuse a connection. Other connection forms:
 
+- Local store: `provider: "local"`, `local_root: "/var/lib/antfly-uploads"`; for
+  deployments with no object store. See [local content store](#local-content-store).
 - GitHub: `provider: "github"`, `token_env: "SOURCE_GITHUB_TOKEN"`; use a token
   scoped to the selected repositories/resources. Config accepts `repositories`
   with per-repository `repository`, `ref`, `prefix` and `include` selections.
@@ -387,6 +389,28 @@ extraction, the qualification gate, and owner-side bucket/prefix/version rejecti
 These tests do not qualify real Google identity exchange or model-based OCR,
 embeddings, relationship extraction, or production GPU capacity. They are
 explicitly opt-in and do not make normal source-module tests build Antfly.
+
+## Local content store
+
+The `local` provider serves a content-addressed directory through the same records
+and media protocol as a bucket, so an application keeps the same code when it moves
+to object storage. Objects live at `<local_root>/<prefix>/objects/sha256/<digest>[.ext]`.
+The name is the revision, and the extension selects the MIME type. Go applications
+can write with `PutLocalObject`; others write to a temporary dot-file in that
+directory and rename it. Source config accepts an optional `prefix`.
+
+`ANTFLY_SOURCE_LOCAL_ROOTS` lists the directories a connection may use, separated by
+the platform path-list separator. Unset denies local connections, because whoever can
+register a connection would otherwise choose which files the service reads.
+
+The store directory must already exist. A missing directory fails the run rather
+than reading as empty, so a lost mount cannot delete every published row. Removing an
+object retires its row on the next run. Symlinks and unexpected names fail the run.
+Antfly reaches the store through `antfly-source serve`, which it must be allowed to
+fetch: list the listener's host in `remote_content.security.allowed_hosts`, and set
+`block_private_ips: false` for a loopback listener. Run one source with
+`POST /v1/sync` and `{"source_id": "<uuid>"}` to publish a new upload without syncing
+the others. Runs are serialized across the service, so a concurrent run returns 409.
 
 ## Media and runtime source registration
 

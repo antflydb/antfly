@@ -56,7 +56,7 @@ func NewCatalogRecord(binding Binding, provider, revision string, permissions Pe
 }
 func (r CatalogRecord) Validate() error {
 	switch r.Provider {
-	case ProviderS3, ProviderGCS, ProviderGoogleDrive, ProviderGitHub, ProviderSlack, ProviderDiscord, ProviderGoogleWorkspace:
+	case ProviderS3, ProviderLocal, ProviderGCS, ProviderGoogleDrive, ProviderGitHub, ProviderSlack, ProviderDiscord, ProviderGoogleWorkspace:
 	default:
 		return fmt.Errorf("unsupported catalog provider")
 	}

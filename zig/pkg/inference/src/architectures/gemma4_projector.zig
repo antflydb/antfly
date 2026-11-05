@@ -295,6 +295,74 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
     return .{ .images = .{ .allocator = allocator, .backend = cb, .embeddings = embeddings, .tokens_per_image = counts, .hidden_size = cfg.text_hidden, .batches_executed = state.count, .max_batch_executed = 1 }, .timestamps_us = timestamps, .stats = stats };
 }
 
+/// Frames decoded by the portable or Apple routes. Decoders call `prepare` from
+/// their own delivery path, so preparation stays on the host and retains only
+/// model-sized pixels. `project` runs afterward under the caller's execution lock.
+pub const PortableVideoFrames = struct {
+    allocator: std.mem.Allocator,
+    weights: ProjectorWeights,
+    cfg: Config,
+    prepared: []?PreparedImage,
+
+    pub fn init(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, frames: usize) !PortableVideoFrames {
+        var cfg = try parseConfig(&projector.gguf.parsed);
+        cfg.max_image_tokens = 70;
+        const prepared = try allocator.alloc(?PreparedImage, frames);
+        @memset(prepared, null);
+        return .{ .allocator = allocator, .weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector), .cfg = cfg, .prepared = prepared };
+    }
+    pub fn deinit(self: *PortableVideoFrames) void {
+        for (self.prepared) |item| if (item) |value| value.deinit();
+        self.allocator.free(self.prepared);
+        self.weights.deinit();
+    }
+    pub fn prepare(self: *PortableVideoFrames, slot: usize, frame: image.ImageU8) !void {
+        if (slot >= self.prepared.len or self.prepared[slot] != null) return error.InvalidVideoFrame;
+        self.prepared[slot] = try prepareImageView(self.allocator, &self.weights, self.cfg, frame);
+    }
+    /// Consumes `timestamps_us`. A repeated selection is delivered once, so its
+    /// later slots stay empty and leave the prompt rather than repeat a frame.
+    pub fn project(self: *PortableVideoFrames, timestamps_us: []i64) !ProjectedVideo {
+        const a = self.allocator;
+        const cb = self.weights.cb;
+        if (timestamps_us.len != self.prepared.len) return error.InvalidVideoFrame;
+        var frames: std.ArrayList(PreparedImage) = .empty;
+        defer frames.deinit(a);
+        var kept: usize = 0;
+        for (self.prepared, 0..) |item, slot| if (item) |value| {
+            try frames.append(a, value);
+            timestamps_us[kept] = timestamps_us[slot];
+            kept += 1;
+        };
+        if (kept == 0) return error.EmptyVideo;
+        const output = (try cb.allocUninitF32Shape(&.{ @intCast(kept * 70), @intCast(self.cfg.text_hidden) })) orelse return error.UnsupportedVideoBackend;
+        defer cb.free(output);
+        const counts = try a.alloc(usize, kept);
+        errdefer a.free(counts);
+        var rows: usize = 0;
+        var done: usize = 0;
+        while (done < kept) {
+            const cohort = frames.items[done..@min(done + 8, kept)];
+            var projected = try encodePreparedImagesResidentWithWeights(cb, a, &self.weights, self.cfg, cohort, .{});
+            defer projected.deinit();
+            const added = sumUsize(projected.tokens_per_image);
+            if (!try cb.copyRows2D(a, output, rows, projected.embeddings, 0, added, self.cfg.text_hidden)) return error.UnsupportedVideoBackend;
+            @memcpy(counts[done..][0..cohort.len], projected.tokens_per_image);
+            rows += added;
+            done += cohort.len;
+        }
+        const embeddings = try ownVideoRows(cb, a, output, rows, self.cfg.text_hidden);
+        errdefer cb.free(embeddings);
+        const timestamps = try a.dupe(i64, timestamps_us[0..kept]);
+        return .{ .images = .{ .allocator = a, .backend = cb, .embeddings = embeddings, .tokens_per_image = counts, .hidden_size = self.cfg.text_hidden, .batches_executed = (kept + 7) / 8, .max_batch_executed = @min(kept, 8) }, .timestamps_us = timestamps, .stats = .{ .decoded_frames = kept, .selected_frames = kept } };
+    }
+};
+fn sumUsize(values: []const usize) usize {
+    var total: usize = 0;
+    for (values) |value| total += value;
+    return total;
+}
+
 /// CUDA row slices borrow their source allocation. Return an owned compact
 /// tensor before the decode accumulator leaves scope; later token lookup can
 /// otherwise reuse that allocation and overwrite the projected frame rows.

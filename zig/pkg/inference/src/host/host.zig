@@ -3263,6 +3263,9 @@ fn localModelCapabilitiesInScope(
             try result.accepted_mime_types.add(mime_type);
         }
     }
+    if (task == .generate and inference.server.generatorAcceptsVideo(&manifest)) {
+        for ([_][]const u8{ "video/mp4", "video/quicktime", "video/webm", "video/mp2t" }) |mime_type| try result.accepted_mime_types.add(mime_type);
+    }
     if (task == .embed) {
         result.model_aware_chunking_v1 = true;
         result.dense_output = if (manifest.denseEmbeddingOutput()) |shape| .{ .native_dimensions = shape.native_dimensions, .minimum_dimensions = shape.minimum_dimensions } else null;
@@ -3576,6 +3579,7 @@ fn convertLocalGenerateParts(
     errdefer text_buf.deinit(alloc);
     var images = std.ArrayListUnmanaged([]const u8).empty;
     errdefer images.deinit(alloc);
+    var video: ?[]const u8 = null;
     var audio = std.ArrayListUnmanaged([]const u8).empty;
     errdefer audio.deinit(alloc);
     var out_parts = std.ArrayListUnmanaged(inference.pipelines.GenerationMessage.ContentPart).empty;
@@ -3618,6 +3622,9 @@ fn convertLocalGenerateParts(
                     } else if (mimeEssenceStartsWith(attachment.content_type, "audio/")) {
                         try audio.append(alloc, attachment.bytes);
                         try out_parts.append(alloc, .{ .audio = audio.items.len - 1 });
+                    } else if (mimeEssenceStartsWith(attachment.content_type, "video/")) {
+                        if (video != null) return error.VideoLimitExceeded;
+                        video = attachment.bytes;
                     } else return error.UnsupportedGeneratorProvider;
                     attachment_index.* += 1;
                     continue;
@@ -3636,6 +3643,11 @@ fn convertLocalGenerateParts(
                     try out_parts.append(alloc, .{ .audio = audio.items.len - 1 });
                     try owner.owned_media.append(alloc, decoded.data);
                     decoded_owned = false;
+                } else if (mimeEssenceStartsWith(decoded.mime_type, "video/")) {
+                    if (video != null) return error.VideoLimitExceeded;
+                    try owner.owned_media.append(alloc, decoded.data);
+                    decoded_owned = false;
+                    video = decoded.data;
                 } else {
                     return error.UnsupportedGeneratorProvider;
                 }
@@ -3664,7 +3676,9 @@ fn convertLocalGenerateParts(
         slice_owned = false;
         break :blk slice;
     } else null;
-    const content_parts = if (out_parts.items.len > 0) blk: {
+    // Video occupies its own message; its text is the plain message content.
+    if (video != null and (images.items.len > 0 or audio.items.len > 0)) return error.UnsupportedMixedVideoInput;
+    const content_parts = if (out_parts.items.len > 0 and video == null) blk: {
         const slice = try out_parts.toOwnedSlice(alloc);
         var slice_owned = true;
         errdefer if (slice_owned) alloc.free(slice);
@@ -3678,8 +3692,24 @@ fn convertLocalGenerateParts(
         .content = text,
         .image_bytes = image_slice,
         .audio_bytes = audio_slice,
+        .video_bytes = video,
         .content_parts = content_parts,
     };
+}
+
+test "local generate message conversion gives video its own field and rejects mixed media" {
+    const alloc = std.testing.allocator;
+    const clip = "data:video/mp4;base64,AAAA";
+    {
+        var converted = try convertLocalGenerateMessages(alloc, &.{.{ .role = .user, .content = .{ .parts = &.{ .{ .text = "describe" }, .{ .media = .{ .mime_type = "video/mp4", .data = clip } } } } }}, 1024);
+        defer converted.deinit();
+        const message = converted.messages[0];
+        try std.testing.expectEqualStrings("\x00\x00\x00", message.video_bytes.?);
+        try std.testing.expectEqualStrings("describe", message.content);
+        try std.testing.expect(message.content_parts == null);
+    }
+    try std.testing.expectError(error.VideoLimitExceeded, convertLocalGenerateMessages(alloc, &.{.{ .role = .user, .content = .{ .parts = &.{ .{ .media = .{ .mime_type = "video/mp4", .data = clip } }, .{ .media = .{ .mime_type = "video/mp4", .data = clip } } } } }}, 1024));
+    try std.testing.expectError(error.UnsupportedMixedVideoInput, convertLocalGenerateMessages(alloc, &.{.{ .role = .user, .content = .{ .parts = &.{ .{ .media = .{ .mime_type = "audio/wav", .data = "data:audio/wav;base64,AAAA" } }, .{ .media = .{ .mime_type = "video/mp4", .data = clip } } } } }}, 1024));
 }
 
 test "local generate message conversion preserves tool history and admission" {
