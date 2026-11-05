@@ -303,6 +303,7 @@ fn nativeLakeSource(bucketed: bool) !void {
     const execution_uri = try std.fmt.allocPrint(sa, "file://{s}", .{execution_root});
     const deployed = try @import("deployment.zig").Owned.init(a, std.testing.io, .{ .state_uri = execution_uri, .exchange_uri = execution_uri, .workers = &.{"http://127.0.0.1:1"}, .authentication = .{ .secret = "0123456789abcdef0123456789abcdef", .issuer = "sql-test" } }, .query_only, &config, null, .standalone, directory.path());
     defer deployed.deinit();
+    try deployed.worker_cancellation.start();
 
     _ = try ingestion.accept(sa, binding.binding, options, .{}, "{\"batch_id\":\"later\",\"source\":\"s\",\"epoch\":\"1\",\"checkpoint\":\"3\",\"expected_checkpoint\":\"2\",\"key_fields\":[\"id\"],\"changes\":[{\"op\":\"delete\",\"row\":{\"id\":1}},{\"op\":\"upsert\",\"row\":{\"id\":4}}]}");
     // Both publication and WAL truncation can advance after capture. Readers
@@ -2197,4 +2198,65 @@ test "distributed SQL single worker control does not reserve a nonexistent peer 
     const request: transport.QueryRequest = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 1000000 } };
     const context: Context = .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s };
     try std.testing.expect(!try client.turn(request, context));
+}
+
+test "distributed SQL cancellation stops active delivery and immediately serves another query" {
+    const a = std.testing.allocator;
+    var memory = storage.MemoryClient.init(a);
+    defer memory.deinit();
+    var fixture: Fixture = .{};
+    var service = fixture.service(a, memory.client(), "owner");
+    const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "old-left", .wal_cut = 7, .cut = "retained-accepted-cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 100, .estimated_rows = 3, .splits = 1 };
+    var right = input;
+    right.table_id = 2;
+    right.snapshot = "old-right";
+    right.wal_cut = 8;
+    const spec = try plan.choose(input, right, service.tenant, 1000000, .{ .left_keys = &.{0}, .right_keys = &.{0} }, .{}, fixture.now);
+    const query = try service.submit(spec);
+    const Gate = struct {
+        entered: std.Io.Event = .unset,
+        release: std.Io.Event = .unset,
+        finished: std.Io.Event = .unset,
+        cancelled: std.atomic.Value(bool) = .init(false),
+        fn dispatch(raw: *anyopaque, _: []const plan.Ticket, context: Context) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.entered.set(std.testing.io);
+            defer self.finished.set(std.testing.io);
+            while (!self.release.isSet()) {
+                context.ensureActive() catch |err| {
+                    self.cancelled.store(true, .release);
+                    return err;
+                };
+                self.release.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromMilliseconds(10), .clock = .awake } }) catch |err| switch (err) {
+                    error.Timeout => continue,
+                    error.Canceled => return err,
+                };
+            }
+        }
+    };
+    var gate: Gate = .{};
+    const Scheduler = @import("scheduler.zig");
+    var scheduler: Scheduler.Scheduler = .{ .io = std.testing.io, .clock = service.clock, .delivery = .{ .ptr = &gate, .dispatch = Gate.dispatch } };
+    try scheduler.start(1);
+    defer {
+        gate.release.set(std.testing.io);
+        scheduler.stop();
+    }
+    var turns: Scheduler.Turns = .{ .scheduler = &scheduler };
+    service.coordination = turns.port();
+    _ = try service.turn(query, scheduler.dispatcher());
+    try gate.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } });
+    try service.requestCancel(query);
+    try std.testing.expect(try service.turn(query, scheduler.dispatcher()));
+    try std.testing.expectError(error.Canceled, service.pollResult(a, query));
+    try gate.finished.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } });
+    try std.testing.expect(gate.cancelled.load(.acquire));
+    // The one delivery lane is available without releasing the blocked gate.
+    var second = spec;
+    second.expires_ms -= 1;
+    const next = try service.submit(second);
+    gate.entered.reset();
+    gate.release.set(std.testing.io);
+    _ = try service.turn(next, scheduler.dispatcher());
+    try gate.entered.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromMilliseconds(1000), .clock = .awake } });
 }

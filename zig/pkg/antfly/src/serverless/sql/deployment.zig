@@ -120,6 +120,7 @@ pub const Owned = struct {
     driver: @import("driver.zig").Driver,
     scheduler: @import("scheduler.zig").Scheduler,
     turns: @import("scheduler.zig").Turns,
+    worker_cancellation: @import("cancellation.zig").Registry,
     admission: local.common_request_admission.RequestAdmission,
     config: Config,
     cache: local.serverless_query_lake_serving_cache.Cache,
@@ -161,6 +162,8 @@ pub const Owned = struct {
         const owner = try scratch.dupe(u8, &std.fmt.bytesToHex(nonce, .lower));
         const seed = local.serverless_external_source_mod.lake_catalog.types.digestHex(try std.fmt.allocPrint(scratch, "{s}\x00{s}\x00{s}", .{ cfg.state_uri, cfg.exchange_uri, cfg.authentication.issuer }));
         self.service = .{ .a = a, .state_store = .{ .client = self.state.client, .bucket = self.state.bucket, .prefix = if (self.state.prefix.len == 0) "sql" else self.state.prefix, .now_ms = 0 }, .exchange_store = .{ .client = self.exchange.client, .bucket = self.exchange.bucket, .prefix = if (self.exchange.prefix.len == 0) "sql" else self.exchange.prefix }, .tenant = seed, .owner = owner, .role = role, .source = if (self.host) |*host| host.source() else .{ .ptr = self, .open = noSource }, .retention = if (self.host) |*host| host.retention() else .{ .ptr = self, .ensure = noRetention }, .context = .{ .io = io }, .task_memory_ceiling = cfg.task_memory, .spill = if (cfg.spill_dir != null) &self.spill else null };
+        self.worker_cancellation = .{ .a = a, .io = io, .store = self.service.state_store, .clock = self.service.clock };
+        self.service.worker_cancellation = &self.worker_cancellation;
         self.turns = .{ .scheduler = &self.scheduler };
         self.service.coordination = self.turns.port();
         self.scheduler = .{ .io = io, .delivery = self.client.dispatcher() };
@@ -217,6 +220,7 @@ pub const Owned = struct {
     pub fn deinit(self: *Owned) void {
         self.driver.stop();
         self.scheduler.stop();
+        self.worker_cancellation.stop();
         self.executor.deinit();
         self.spill.deinit();
         self.cache.deinit();

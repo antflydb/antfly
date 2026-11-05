@@ -73,6 +73,7 @@ pub const Coordination = struct {
     delivery_ready: *const fn (*anyopaque, state.Query) bool,
     has_progress: *const fn (*anyopaque, state.Query) bool,
     retry: *const fn (*anyopaque, state.Query) void,
+    retire: ?*const fn (*anyopaque, state.Query) void = null,
 };
 pub const Service = struct {
     a: A,
@@ -91,6 +92,12 @@ pub const Service = struct {
     coordination: ?Coordination = null,
     /// Native RPCs schedule work; only the bounded driver executes metadata turns.
     async_control: bool = false,
+    worker_cancellation: ?*@import("cancellation.zig").Registry = null,
+    poll_query_cancellation: bool = false,
+    pub fn retire(self: Service, query: state.Query) void {
+        if (self.worker_cancellation) |registry| registry.retire(query);
+        if (self.coordination) |coordination| if (coordination.retire) |callback| callback(coordination.ptr, query);
+    }
     fn notify(self: Service, query: state.Query) void {
         if (self.notification) |notification| notification.notify(notification.ptr, self.tenant, query);
     }
@@ -251,6 +258,7 @@ pub const Service = struct {
         defer current.deinit(a);
         if (current.value.cancel_requested) {
             try self.store().terminate(a, query_key, claim, .cancelled, "Cancelled");
+            self.retire(query);
             return true;
         }
         // submit() retained both inputs through the immutable query expiry.
@@ -409,6 +417,14 @@ pub const Service = struct {
     /// Invoke only after authenticating the internal caller. Tickets contain no
     /// caller-controlled scan URLs or credentials; the shared plan is authority.
     pub fn execute(self: Service, ticket: plan.Ticket) !void {
+        var watch: @import("cancellation.zig").Task = .{ .a = self.a, .store = self.state_store, .query = ticket.query, .tenant = self.tenant, .clock = self.clock, .registry = self.worker_cancellation, .hosted = self.poll_query_cancellation, .parent = self.context };
+        defer watch.deinit();
+        self.executeTask(ticket, &watch) catch |err| {
+            if (watch.isCancelled()) return;
+            return err;
+        };
+    }
+    fn executeTask(self: Service, ticket: plan.Ticket, watch: *@import("cancellation.zig").Task) !void {
         try self.requireQueryRole();
         if (!std.mem.eql(u8, &ticket.tenant, &self.tenant)) return error.SqlExecutionUnauthorized;
         var task_memory: local.sql_memory_budget = .{ .backing = self.a, .limit = @intCast(self.task_memory_ceiling) };
@@ -421,17 +437,19 @@ pub const Service = struct {
         var query = (try self.store().load(a, query_key)) orelse return error.SqlExecutionNotFound;
         defer query.deinit(a);
         try self.authorize(a, ticket.query, query.value);
-        if (query.value.terminal()) return;
+        if (query.value.terminal() or query.value.cancel_requested) return;
+        try watch.enter();
+        if (watch.isCancelled()) return;
         if (query.value.stage != ticket.stage or !std.mem.eql(u8, &query.value.plan, &ticket.query.id)) return error.SqlExecutionFenced;
         const key = try self.store().key(a, ticket.query, ticket.stage, ticket.task);
-        const claim_started = self.clock.now();
-        const claim = (try self.store().claim(a, key, self.owner, 60_000)) orelse return;
         var context = self.context;
-        const remaining = @min(query.value.expires_ms -| self.clock.now(), 55_000 -| (self.clock.now() -| claim_started));
+        const remaining: u64 = @min(query.value.expires_ms -| self.clock.now(), 55_000);
         const deadline = @import("antfly_platform").time.monotonicNs() +| remaining *| std.time.ns_per_ms;
         context.deadline_ns = if (context.deadline_ns) |parent| @min(parent, deadline) else deadline;
+        context = watch.scoped(context);
         var scoped_service = self;
         scoped_service.context = context;
+        const claim = (try scoped_service.store().claim(a, key, self.owner, 60_000)) orelse return;
         var spec = scoped_service.loadPlan(a, ticket.query) catch |err| {
             if (err == error.OutOfMemory and task_memory.exhausted) {
                 try self.store().terminate(self.a, key, claim, .failed, "SqlJoinBudgetExceeded");
@@ -979,6 +997,7 @@ pub const Service = struct {
             var current = (try self.store().load(self.a, key)) orelse return error.SqlExecutionNotFound;
             defer current.deinit(self.a);
             try self.authorize(self.a, query, current.value);
+            if (current.value.terminal()) self.retire(query);
             if (current.value.status == .succeeded) return true;
             if (current.value.terminal()) return error.SqlExecutionFailed;
             self.notify(query);
@@ -1009,6 +1028,7 @@ pub const Service = struct {
         var current = (try self.store().load(self.a, key)) orelse return error.SqlExecutionNotFound;
         defer current.deinit(self.a);
         try self.authorize(self.a, query, current.value);
+        if (current.value.terminal()) self.retire(query);
         if (current.value.status == .succeeded) return true;
         if (current.value.status == .failed or current.value.status == .cancelled) return error.SqlExecutionFailed;
         // Native delivery completion wakes orchestration. While a bounded
@@ -1031,6 +1051,7 @@ pub const Service = struct {
         defer current.deinit(a);
         try self.authorize(a, query, current.value);
         try self.store().requestCancel(a, key);
+        self.retire(query);
         self.notify(query);
     }
     pub fn cancel(self: Service, query: state.Query, claim: state.Claim) !void {
@@ -1040,6 +1061,7 @@ pub const Service = struct {
         defer current.deinit(self.a);
         try self.authorize(self.a, query, current.value);
         try self.store().terminate(self.a, key, claim, .cancelled, "Cancelled");
+        self.retire(query);
     }
     pub fn pollResult(self: Service, a: A, query: state.Query) !?Result {
         const key = try self.store().key(a, query, null, 0);
@@ -1047,6 +1069,7 @@ pub const Service = struct {
         var current = (try self.store().load(a, key)) orelse return error.SqlExecutionNotFound;
         defer current.deinit(a);
         try self.authorize(a, query, current.value);
+        if (current.value.terminal()) self.retire(query);
         if (current.value.expires_ms <= self.clock.now()) return error.SqlQueryExpired;
         if (current.value.status == .failed) {
             if (current.value.failure) |failure| {

@@ -157,3 +157,35 @@ for(const strategy of ['shuffle','broadcast']) test(`WASM ordinary ${strategy} c
  assert.ok(complete);assert.ok(maximum<150,`unbounded fan-in: ${maximum}`);
  const result=await host.request({...request,op:'sql_result'},options);assert.equal(result.rows,strategy==='broadcast'?0:322);
 });
+
+
+test('WASM active task observes durable cancellation after a suspended source read', async()=>{
+  const fixture=JSON.parse(await readFile(new URL('../dist/sql-fixture.json',import.meta.url)));
+  const buckets=Object.fromEntries(['source','execution'].map(name=>[name,new Bucket()]));
+  for(const object of fixture.objects) await buckets[object.bucket].put(object.key,new Uint8Array(Buffer.from(object.body_base64,'base64')));
+  const transport=createR2Transport(buckets,{maxPutBytes:8*1024*1024});
+  const host=await instantiateHost(module,transport);
+  const request={config:fixture.config,tenant:fixture.tenant,owner:'coordinator'};
+  request.query=(await host.request({...request,op:'sql_submit',raw_plan:fixture.raw_plan})).query;
+  const turn=await host.request({...request,op:'sql_turn'});
+  assert.ok(turn.tickets.length);
+  const queryKey=[...buckets.execution.objects.keys()].find(key=>key.endsWith('/query.json'));
+  let interrupted=false;
+  const cancelDuringRead=async(call,body)=>{
+    const result=await transport(call,body);
+    if(!interrupted&&call.op==='get'&&call.bucket==='source'){
+      interrupted=true;
+      const record=JSON.parse(new TextDecoder().decode(buckets.execution.objects.get(queryKey).body));
+      record.cancel_requested=true;
+      await buckets.execution.put(queryKey,JSON.stringify(record));
+      await new Promise(resolve=>setTimeout(resolve,1100));
+    }
+    return result;
+  };
+  const outcome=await host.request({...request,op:'sql_execute',owner:'worker',ticket:turn.tickets[0]},{transport:cancelDuringRead,maxOperations:900});
+  assert.ok(interrupted);
+  assert.equal(outcome.status,'cancelled');
+  for(const [key,object] of buckets.execution.objects){
+    if(key.includes('/stage/')) assert.notEqual(JSON.parse(new TextDecoder().decode(object.body)).status,'succeeded','cancelled task accepted output');
+  }
+});

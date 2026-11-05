@@ -281,3 +281,18 @@ quantum. Native status waves retain successful sibling reads when one task times
 out. Known free window slots persist admission priority for the next turn when a
 scan consumes the work phase. Recent wave latency avoids launching another
 scan wave that is unlikely to fit.
+
+Query cancellation also releases live execution capacity. The owning native
+scheduler drains queued deliveries and signals active RPCs with a per-query
+atomic token; a bounded retirement history rejects racing queue replay. Workers
+reject the durable cancellation flag before claiming a task. Each native worker
+pod shares one background status watch per active query, with at most eight
+concurrent reads, a one-second poll interval, and a two-second read budget.
+Execution checkpoints only inspect cached atomic signals, including inside
+storage cancellation callbacks; they never perform network I/O. Remote
+cancellation propagates at the next successful watch, with transient storage
+failures retried without failing healthy execution. Hosted workers poll the same
+durable record at cooperative checkpoints, at most once per second, and preserve
+host deadline and cancellation hooks. Once observed, cancellation stops task
+completion; the durable query flag also fences result acceptance during races.
+Query expiry still bounds work when the status store is unavailable.

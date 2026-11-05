@@ -121,7 +121,7 @@ fn executeIn(a: A, client: storage.Client, io: std.Io, context: Context, raw: []
     var artifacts = object_artifacts.artifactStore();
     defer artifacts.deinit();
     var host: source.Host = .{ .artifacts = &artifacts, .store_identity = try @import("../../api/native_retained_cut.zig").storeIdentity(a, request.config.artifacts), .io = io, .backend = .{ .ptr = &backend, .pin = Backend.pin, .open = Backend.open } };
-    const service: runtime.Service = .{ .a = a, .state_store = .{ .client = client, .bucket = request.config.state.bucket, .prefix = request.config.state.prefix, .now_ms = 0 }, .exchange_store = .{ .client = client, .bucket = request.config.exchange.bucket, .prefix = request.config.exchange.prefix }, .tenant = request.tenant, .role = .query_only, .owner = request.owner, .context = context, .retention = host.retention(), .source = host.source(), .task_memory_ceiling = request.config.task_memory };
+    const service: runtime.Service = .{ .a = a, .state_store = .{ .client = client, .bucket = request.config.state.bucket, .prefix = request.config.state.prefix, .now_ms = 0 }, .exchange_store = .{ .client = client, .bucket = request.config.exchange.bucket, .prefix = request.config.exchange.prefix }, .tenant = request.tenant, .poll_query_cancellation = true, .role = .query_only, .owner = request.owner, .context = context, .retention = host.retention(), .source = host.source(), .task_memory_ceiling = request.config.task_memory };
     return switch (request.op) {
         .sql_submit => blk: {
             const spec = try std.json.parseFromSliceLeaky(plan.Plan, a, request.raw_plan orelse return error.InvalidSqlDistributedPlan, .{ .allocate = .alloc_always });
@@ -138,6 +138,7 @@ fn executeIn(a: A, client: storage.Client, io: std.Io, context: Context, raw: []
             const query_key = try service.state_store.key(a, ticket.query, null, 0);
             var query = (try service.state_store.load(a, query_key)) orelse return error.SqlExecutionNotFound;
             defer query.deinit(a);
+            if (query.value.cancel_requested) break :blk std.json.Stringify.valueAlloc(a, .{ .status = @import("state.zig").Status.cancelled, .until_ms = @as(u64, 0) }, .{});
             if (query.value.terminal()) break :blk std.json.Stringify.valueAlloc(a, .{ .status = query.value.status, .until_ms = @as(u64, 0) }, .{});
             const key = try service.state_store.key(a, ticket.query, ticket.stage, ticket.task);
             var value = (try service.state_store.load(a, key)) orelse return error.SqlExecutionNotFound;

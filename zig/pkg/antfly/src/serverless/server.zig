@@ -135,6 +135,8 @@ pub const ServerlessServer = struct {
     pub fn start(self: *ServerlessServer) !void {
         try self.stack.runtime.start();
         errdefer self.stack.runtime.stop();
+        if (self.sql_driver != null) if (self.sql_owned) |owned| try owned.worker_cancellation.start();
+        errdefer if (self.sql_owned) |owned| owned.worker_cancellation.stop();
         if (self.sql_driver != null) if (self.sql_owned) |owned| try owned.scheduler.start(owned.config.query_concurrency);
         errdefer if (self.sql_owned) |owned| owned.scheduler.stop();
         try self.startListener();
@@ -149,7 +151,10 @@ pub const ServerlessServer = struct {
     pub fn stopWithDeadline(self: *ServerlessServer, deadline: runtime_lifecycle.ShutdownDeadline) void {
         if (self.sql_driver) |driver| driver.stop();
         self.stopListenerWithDeadline(deadline);
-        if (self.sql_owned) |owned| owned.scheduler.stop();
+        if (self.sql_owned) |owned| {
+            owned.scheduler.stop();
+            owned.worker_cancellation.stop();
+        }
         self.stack.runtime.stopWithDeadline(deadline);
     }
 

@@ -260,6 +260,7 @@ pub const Driver = struct {
         var current = (try records.load(a, key)) orelse return;
         defer current.deinit(a);
         if (current.value.terminal()) {
+            service.retire(hint.query);
             var client = records.client;
             client.allocator = a;
             const index = try std.fmt.allocPrint(a, "{s}/sql-query-expiry/{d:0>20}/{s}.json", .{ records.prefix, hint.query.expires_ms, hint.query.id });

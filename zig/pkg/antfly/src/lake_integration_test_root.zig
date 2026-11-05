@@ -122,6 +122,7 @@ comptime {
     _ = @import("serverless/sql/runner.zig");
     _ = @import("serverless/sql/runtime.zig");
     _ = @import("serverless/sql/runtime_test.zig");
+    _ = @import("serverless/sql/cancellation.zig");
     _ = @import("serverless/sql/scheduler.zig");
     _ = @import("serverless/sql/driver.zig");
     _ = @import("serverless/sql/exchange.zig");

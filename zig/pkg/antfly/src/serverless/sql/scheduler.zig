@@ -26,7 +26,7 @@ pub const Turns = struct {
     scheduler: ?*Scheduler = null,
     active: [256]?state.Query = @splat(null),
     pub fn port(self: *Turns) runtime.Coordination {
-        return .{ .ptr = self, .enter = enter, .leave = leave, .delivery_pending = pending, .delivery_ready = ready, .has_progress = progress, .retry = retry };
+        return .{ .ptr = self, .enter = enter, .leave = leave, .delivery_pending = pending, .delivery_ready = ready, .has_progress = progress, .retry = retry, .retire = retire };
     }
     fn pending(raw: *anyopaque, query: state.Query) bool {
         const self: *Turns = @ptrCast(@alignCast(raw));
@@ -43,6 +43,10 @@ pub const Turns = struct {
     fn retry(raw: *anyopaque, query: state.Query) void {
         const self: *Turns = @ptrCast(@alignCast(raw));
         if (self.scheduler) |scheduler| scheduler.retry(query);
+    }
+    fn retire(raw: *anyopaque, query: state.Query) void {
+        const self: *Turns = @ptrCast(@alignCast(raw));
+        if (self.scheduler) |scheduler| scheduler.retireQuery(query);
     }
     fn enter(raw: *anyopaque, query: state.Query) bool {
         const self: *Turns = @ptrCast(@alignCast(raw));
@@ -73,7 +77,7 @@ pub const Turns = struct {
 
 pub const Scheduler = struct {
     const Node = struct { ticket: ?plan.Ticket = null, next: ?u16 = null, slot: u16 = 0, failures: u8 = 0, not_before_ns: u64 = 0 };
-    const Slot = struct { query: ?state.Query = null, tenant: state.Digest = undefined, head: ?u16 = null, tail: ?u16 = null, active: u16 = 0, dirty: bool = false };
+    const Slot = struct { query: ?state.Query = null, tenant: state.Digest = undefined, head: ?u16 = null, tail: ?u16 = null, active: u16 = 0, dirty: bool = false, cancelled: std.atomic.Value(bool) = .init(false) };
     io: std.Io,
     clock: runtime.Clock = .{},
     delivery: runtime.Dispatcher,
@@ -83,6 +87,8 @@ pub const Scheduler = struct {
     nodes: [1024]Node = @splat(.{}),
     slots: [256]Slot = @splat(.{}),
     cursor: usize = 0,
+    retired: [256]?state.Query = @splat(null),
+    retired_cursor: usize = 0,
     group: std.Io.Group = .init,
     started: bool = false,
     stopping: std.atomic.Value(bool) = .init(false),
@@ -145,6 +151,35 @@ pub const Scheduler = struct {
         defer self.mutex.unlock(self.io);
         self.nodes = @splat(.{});
         self.slots = @splat(.{});
+        self.retired = @splat(null);
+        self.retired_cursor = 0;
+    }
+    fn wasRetired(self: *Scheduler, query: state.Query) bool {
+        for (self.retired) |value| if (value) |entry| if (std.meta.eql(entry, query)) return true;
+        return false;
+    }
+    pub fn retireQuery(self: *Scheduler, query: state.Query) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        // Bounded recent history rejects racing replay without retaining scarce
+        // query slots. Workers also reject durable cancel flags before claiming.
+        if (!self.wasRetired(query)) {
+            self.retired[self.retired_cursor] = query;
+            self.retired_cursor = (self.retired_cursor + 1) % self.retired.len;
+        }
+        for (&self.slots) |*slot| if (slot.query) |value| {
+            if (!std.meta.eql(value, query)) continue;
+            slot.cancelled.store(true, .release);
+            var queued = slot.head;
+            while (queued) |id| {
+                queued = self.nodes[id].next;
+                self.nodes[id] = .{};
+            }
+            slot.head = null;
+            slot.tail = null;
+            if (slot.active == 0) slot.* = .{};
+        };
+        self.available.broadcast(self.io);
     }
     fn enqueue(raw: *anyopaque, tickets: []const plan.Ticket, context: Context) !void {
         const self: *Scheduler = @ptrCast(@alignCast(raw));
@@ -155,7 +190,7 @@ pub const Scheduler = struct {
         self.retireExpired();
         var overflow = false;
         for (tickets) |ticket| {
-            if (ticket.query.expires_ms <= self.clock.now()) continue;
+            if (ticket.query.expires_ms <= self.clock.now() or self.wasRetired(ticket.query)) continue;
             var slot_id: ?usize = null;
             var free_slot: ?usize = null;
             for (self.slots, 0..) |slot, i| {
@@ -188,6 +223,7 @@ pub const Scheduler = struct {
                 continue;
             };
             const slot = &self.slots[slot_index];
+            if (slot.cancelled.load(.acquire)) continue;
             if (slot.query == null) slot.* = .{ .query = ticket.query, .tenant = ticket.tenant };
             self.nodes[id] = .{ .ticket = ticket, .slot = @intCast(slot_index) };
             if (slot.tail) |tail| self.nodes[tail].next = @intCast(id) else slot.head = @intCast(id);
@@ -243,6 +279,14 @@ pub const Scheduler = struct {
         self.mutex.lockUncancelable(self.io);
         defer self.mutex.unlock(self.io);
         const node = &self.nodes[id];
+        const owner = &self.slots[node.slot];
+        if (owner.cancelled.load(.acquire) or self.stopping.load(.acquire)) {
+            owner.active -= 1;
+            node.* = .{};
+            if (owner.active == 0 and owner.head == null) owner.* = .{};
+            self.available.broadcast(self.io);
+            return;
+        }
         node.failures += 1;
         const delay_ms = @min(@as(u64, 5000), @as(u64, 250) << @as(u6, @intCast(node.failures - 1)));
         const jitter = std.hash.Wyhash.hash(node.failures, &node.ticket.?.query.id) % @max(@as(u64, 1), delay_ms / 4);
@@ -264,12 +308,6 @@ pub const Scheduler = struct {
         self.nodes[id] = .{};
     }
     fn run(self: *Scheduler) void {
-        const context: Context = .{ .io = self.io, .cancellation = .{ .ptr = self, .is_cancelled_fn = struct {
-            fn canceled(raw: *const anyopaque) bool {
-                const scheduler: *const Scheduler = @ptrCast(@alignCast(raw));
-                return scheduler.stopping.load(.acquire);
-            }
-        }.canceled } };
         while (!self.stopping.load(.acquire)) {
             self.mutex.lock(self.io) catch return;
             const id = while (true) {
@@ -288,7 +326,18 @@ pub const Scheduler = struct {
                 }
             };
             const ticket = self.nodes[id].ticket.?;
+            const owner = &self.slots[self.nodes[id].slot];
             self.mutex.unlock(self.io);
+            const Guard = struct {
+                scheduler: *Scheduler,
+                slot: *Slot,
+                fn cancelled(raw: *const anyopaque) bool {
+                    const guard: *const @This() = @ptrCast(@alignCast(raw));
+                    return guard.scheduler.stopping.load(.acquire) or guard.slot.cancelled.load(.acquire);
+                }
+            };
+            const guard: Guard = .{ .scheduler = self, .slot = owner };
+            const context: Context = .{ .io = self.io, .cancellation = .{ .ptr = &guard, .is_cancelled_fn = Guard.cancelled } };
             // Query expiry bounds even a slow/unreachable worker RPC.
             var delivery_context = context;
             const remaining: u64 = @min(@as(u64, 55_000), ticket.query.expires_ms -| self.clock.now());
@@ -299,13 +348,13 @@ pub const Scheduler = struct {
             }
             // No request-owned context or pointer escapes into delivery.
             self.delivery.dispatch(self.delivery.ptr, &.{ticket}, delivery_context) catch |err| {
-                if (!self.stopping.load(.acquire) and self.clock.now() < ticket.query.expires_ms and self.nodes[id].failures < 7) {
+                if (!Guard.cancelled(&guard) and self.clock.now() < ticket.query.expires_ms and self.nodes[id].failures < 7) {
                     // Retain identity through backpressure; immediate completion
                     // notifications would turn 503 responses into a hot loop.
                     self.deferDelivery(id);
                     continue;
                 }
-                if (!self.stopping.load(.acquire)) std.log.warn("distributed SQL delivery deferred: {s}", .{@errorName(err)});
+                if (!Guard.cancelled(&guard)) std.log.warn("distributed SQL delivery deferred: {s}", .{@errorName(err)});
             };
             self.finish(id);
             if (self.notification) |notification| notification.notify(notification.ptr, ticket.tenant, ticket.query);
@@ -490,4 +539,43 @@ test "distributed SQL expired delivery failure is retired without retry" {
     try fixture.expired.waitTimeout(std.testing.io, .{ .duration = .{ .raw = .fromSeconds(5), .clock = .awake } });
     scheduler.stop();
     try std.testing.expectEqual(@as(u32, 1), fixture.calls.load(.acquire));
+}
+
+test "distributed SQL cancellation drains queues and defeats a racing retry without disturbing another query" {
+    var scheduler: Scheduler = .{ .io = std.testing.io, .clock = .{ .read = testClock }, .delivery = undefined };
+    defer scheduler.stop();
+    const first: plan.Ticket = .{ .tenant = @splat('a'), .query = .{ .id = @splat('b'), .expires_ms = 100000 }, .stage = 0, .task = 0 };
+    var queued = first;
+    queued.task = 1;
+    var other = first;
+    other.query.id = @splat('c');
+    const port = scheduler.dispatcher();
+    try port.dispatch(port.ptr, &.{ first, queued }, .{});
+    const active = scheduler.take().?;
+    const owner = &scheduler.slots[scheduler.nodes[active].slot];
+    try port.dispatch(port.ptr, &.{other}, .{});
+    scheduler.retireQuery(first.query);
+    try std.testing.expect(owner.cancelled.load(.acquire));
+    try std.testing.expect(owner.head == null);
+    // Retiring many queries consumes only bounded tombstones, never queue slots.
+    for (0..300) |i| {
+        var query = first.query;
+        query.expires_ms += i;
+        scheduler.retireQuery(query);
+    }
+    // A live cancelled slot remains protected even after its tombstone is evicted.
+    try port.dispatch(port.ptr, &.{queued}, .{});
+    try std.testing.expect(owner.head == null);
+    // A delivery may have decided to retry just before retirement took the lock.
+    scheduler.deferDelivery(active);
+    scheduler.retireQuery(first.query);
+    try port.dispatch(port.ptr, &.{ first, queued }, .{});
+    const remaining = scheduler.take().?;
+    try std.testing.expect(std.meta.eql(other, scheduler.nodes[remaining].ticket.?));
+    scheduler.finish(remaining);
+    try std.testing.expect(scheduler.take() == null);
+    for (scheduler.nodes) |node| try std.testing.expect(node.ticket == null);
+    for (scheduler.slots) |slot| try std.testing.expect(slot.query == null);
+    try port.dispatch(port.ptr, &.{other}, .{});
+    scheduler.finish(scheduler.take().?);
 }
