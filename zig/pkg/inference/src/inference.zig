@@ -153,6 +153,7 @@ pub const native_compute = struct {
 
 test {
     _ = server;
+    _ = @import("documents/sources.zig");
     _ = @import("extractors/gliner_span_long_executor.zig");
     _ = @import("architectures/modern_bert.zig");
     _ = @import("models/tokenizer_special_tokens.zig");
