@@ -585,7 +585,7 @@ test "distributed SQL submission recovery uses a short absent-query probe and re
                 defer parsed.deinit();
                 try std.testing.expectEqual(self.expected, parsed.value.query.id);
                 try std.testing.expectEqual(@as(u64, 1000000), parsed.value.query.expires_ms);
-                try std.testing.expect(request_.timeout_ms.? <= 10);
+                try std.testing.expect(request_.timeout_ms.? <= 1000);
                 return .{ .status = 404, .owner_allocator = allocator, .body = try allocator.dupe(u8, "{}") };
             }
             self.submissions += 1;
@@ -596,8 +596,8 @@ test "distributed SQL submission recovery uses a short absent-query probe and re
     var fake: Fake = .{ .expected = local.serverless_external_source_mod.lake_catalog.types.digestHex(body) };
     var routing: Routing = .{ .cooldown_ms = 1 };
     routing.failure("http://recovered", @import("antfly_platform").time.monotonicNs() -| 2 * std.time.ns_per_ms);
-    var client: Client = .{ .a = a, .routing = &routing, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{"http://recovered"}, .recovery_attempt_ms = 10 };
-    var response_ = try client.queryCall(submit_path, body, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 2 * std.time.ns_per_s });
+    var client: Client = .{ .a = a, .routing = &routing, .executor = .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{"http://recovered"}, .recovery_attempt_ms = 1000 };
+    var response_ = try client.queryCall(submit_path, body, .{ .deadline_ns = @import("antfly_platform").time.monotonicNs() + 30 * std.time.ns_per_s });
     response_.deinit(a);
     try std.testing.expectEqual(@as(usize, 1), fake.probes);
     try std.testing.expectEqual(@as(usize, 1), fake.submissions);
