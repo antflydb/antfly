@@ -2398,6 +2398,7 @@ pub const Runtime = struct {
             var body = try antflyGenerateBatchRequestAlloc(alloc, cfg, chunk, attachment_transport);
             defer body.deinit(alloc);
             var request_options = httpx.RequestOptions{
+                .follow_redirects = false,
                 .attempt_observer = quota.limiter().observer(
                     try generating_runtime.generationOutputTokenBudget(cfg, chunk.len),
                 ),
