@@ -105,7 +105,13 @@ Plans are versioned, pointer-free JSON; scalar fragments contain validated
 instruction DAGs with bound parameter values. Process caches, settings captures,
 external AI calls, and relation-node pointers are not serialized. Parameter
 slots retain the compiler's zero-based ordinals and are validated against the
-bound value count before admission. A scope plus
+bound value count before admission. Scalar V2 carries referenced canonical typed
+parameters with explicit SQL NULL tags, preserving JSON null, exact NUMERIC scale
+and SQL array dimensions. Workers decode one bounded statement frame per fragment;
+scalar, vector and Grace evaluation borrow it without repeated input conversion.
+V1 fragments remain readable. Fragment decoding preserves numeric lexemes before
+JSON can round them through floating point, keeping literals and plan digests
+stable across native HTTP, durable storage and hosted WASM. A scope plus
 plan content identifies a query. Version-2 query references carry that full digest
 and expiry; state objects use an expiry-first namespace, independently of the
 discovery marker, so late writes remain discoverable after cleanup. Deterministic stage/task IDs make dispatch
@@ -416,3 +422,7 @@ replace the durable task record when deciding query completion. Task slot and
 spill pressure return HTTP 429 for bounded peer failover without endpoint
 quarantine. Authority races and backpressure are distinct from worker transport
 failures on all task listener paths.
+
+API and dedicated query listeners share SQL control dispatch and terminal status
+mapping. Both register signed submit, turn, result, cancellation and task routes;
+control requests do not consume task execution admission slots.

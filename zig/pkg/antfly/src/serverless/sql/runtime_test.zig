@@ -627,6 +627,9 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         .{ .sql = "SELECT count(*) AS n FROM l LEFT JOIN r ON l.id=r.id" },
         .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id>$1 ORDER BY l.id NULLS LAST, r.id NULLS LAST", .parameters = &.{.{ .integer = 5 }} },
         .{ .sql = "SELECT l.id, r.id FROM l JOIN r ON l.id=r.id AND NOT is_missing(r.id) ORDER BY l.id, r.id" },
+        .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id = ANY($1::bigint[]) ORDER BY l.id NULLS LAST, r.id NULLS LAST", .parameters = &.{.{ .string = "[-2:0]={1,6,NULL}" }} },
+        .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id::numeric < $1::numeric ORDER BY l.id NULLS LAST, r.id NULLS LAST", .parameters = &.{.{ .string = "5.00000000000000000001" }} },
+        .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id::numeric < 5.00000000000000000001 ORDER BY l.id NULLS LAST, r.id NULLS LAST" },
     };
     for ([_]bool{ false, true }) |remote| for (queries) |query_case| {
         const sql = query_case.sql;

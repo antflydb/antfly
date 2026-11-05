@@ -1597,11 +1597,7 @@ pub const AntflyApiHandler = struct {
         const table_prefix = group_prefix ++ "/tables/:table_name";
         const internal_table_prefix = routes.internal_tables_prefix ++ ":table_name";
         try server.get(routes.internal_capabilities, httpx.Handler.bind(self, internalCapabilities));
-        const sql_transport = @import("../serverless/sql/transport.zig");
-        try server.post(sql_transport.task_path, httpx.Handler.bind(self, internalSqlTask));
-        try server.post(sql_transport.submit_path, httpx.Handler.bind(self, internalSqlSubmit));
-        try server.post(sql_transport.turn_path, httpx.Handler.bind(self, internalSqlTurn));
-        try server.post(sql_transport.result_path, httpx.Handler.bind(self, internalSqlResult));
+        try self.registerInternalSqlRoutes(server);
         try server.get(group_prefix ++ routes.group_db_median_key_suffix, httpx.Handler.bind(self, internalGroupMedianKey));
         try server.post(group_prefix ++ routes.group_db_index_activation_suffix, httpx.Handler.bind(self, internalGroupIndexActivation));
         try server.get(table_prefix ++ routes.documents_marker ++ ":key", httpx.Handler.bind(self, internalGroupLookup));
@@ -3026,28 +3022,31 @@ pub const AntflyApiHandler = struct {
         return ownedJsonResponse(ctx, 200, &result.json, ctx.allocator);
     }
 
-    fn internalSqlService(self: *AntflyApiHandler, ctx: *httpx.Context, tenant: @import("../serverless/sql/plan.zig").Digest) !@import("../serverless/sql/runtime.zig").Service {
+    /// SQL control and execution use the same route set in production and
+    /// focused transport conformance checks, without linking every public API.
+    fn registerInternalSqlRoutes(self: *AntflyApiHandler, server: anytype) !void {
+        const sql_transport = @import("../serverless/sql/transport.zig");
+        try server.post(sql_transport.task_path, httpx.Handler.bind(self, internalSqlTask));
+        try server.post(sql_transport.submit_path, httpx.Handler.bind(self, internalSqlSubmit));
+        try server.post(sql_transport.turn_path, httpx.Handler.bind(self, internalSqlTurn));
+        try server.post(sql_transport.result_path, httpx.Handler.bind(self, internalSqlResult));
+        try server.post(sql_transport.cancel_path, httpx.Handler.bind(self, internalSqlCancel));
+    }
+    fn internalSqlAuthority(self: *AntflyApiHandler, ctx: *httpx.Context) !void {
         // New task RPCs never accept the rolling-upgrade unsigned escape hatch.
         const token = ctx.header(internal_service_auth.header_name) orelse return error.SqlExecutionUnauthorized;
         var identity = self.api_server.authenticateInternalServiceRequest(token) catch return error.SqlExecutionUnauthorized;
         defer identity.deinit(self.api_server.alloc);
         if (!identity.is_internal_service) return error.SqlExecutionUnauthorized;
+    }
+    fn internalSqlService(self: *AntflyApiHandler, ctx: *httpx.Context, tenant: @import("../serverless/sql/plan.zig").Digest) !@import("../serverless/sql/runtime.zig").Service {
+        try self.internalSqlAuthority(ctx);
         const factory = self.api_server.cfg.distributed_sql orelse return error.SqlWorkerUnavailable;
         const request = try operationContext(ctx, null).platformDeadline();
         return factory.open(factory.ptr, ctx.allocator, tenant, .{ .deadline_ns = request.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(request.cancellation.ptr, request.cancellation.is_cancelled_fn) });
     }
     fn internalSqlError(ctx: *httpx.Context, err: anyerror) !httpx.Response {
-        return textResponse(ctx, switch (err) {
-            error.SqlExecutionUnauthorized => 403,
-            error.SqlTaskAdmissionUnavailable => 429,
-            error.SqlWorkerUnavailable, error.SqlQueryRoleRequired, error.SqlExecutionFenced, error.PreconditionFailed => 503,
-            error.SqlExecutionNotFound => 404,
-            error.SqlQueryExpired => 410,
-            error.DeadlineExceeded => 504,
-            error.Canceled => 408,
-            error.SqlJoinBudgetExceeded => 422,
-            else => 500,
-        }, @errorName(err));
+        return textResponse(ctx, @import("../serverless/sql/transport.zig").errorStatus(err), @errorName(err));
     }
     fn internalSqlTask(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
         const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing SQL task ticket");
@@ -3063,32 +3062,30 @@ pub const AntflyApiHandler = struct {
         };
         return ctx.json(.{ .accepted = true });
     }
+    fn internalSqlControl(self: *AntflyApiHandler, ctx: *httpx.Context, path: []const u8) !httpx.Response {
+        try self.internalSqlAuthority(ctx);
+        const factory = self.api_server.cfg.distributed_sql orelse return error.SqlWorkerUnavailable;
+        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing SQL control request");
+        const request = try operationContext(ctx, null).platformDeadline();
+        var arena = std.heap.ArenaAllocator.init(ctx.allocator);
+        defer arena.deinit();
+        var response = try @import("../serverless/sql/transport.zig").control(factory, ctx.allocator, arena.allocator(), path, body, .{ .deadline_ns = request.deadline_ns, .cancellation = @import("antfly_local_sources").storage_object_storage.CancellationToken.fromCallback(request.cancellation.ptr, request.cancellation.is_cancelled_fn) });
+        defer response.deinit(ctx.allocator);
+        var output = try ctx.allocator.dupe(u8, response.body);
+        errdefer ctx.allocator.free(output);
+        return ownedJsonResponse(ctx, response.status, &output, ctx.allocator);
+    }
     fn internalSqlSubmit(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
-        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing SQL fragment plan");
-        if (body.len > 1024 * 1024) return textResponse(ctx, 413, "SQL fragment plan too large");
-        var input = std.json.parseFromSlice(@import("../serverless/sql/plan.zig").Plan, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid SQL fragment plan");
-        defer input.deinit();
-        const service = self.internalSqlService(ctx, input.value.tenant) catch |err| return internalSqlError(ctx, err);
-        const query = service.submit(input.value) catch |err| return internalSqlError(ctx, err);
-        return ctx.json(.{ .query = query });
+        return self.internalSqlControl(ctx, @import("../serverless/sql/transport.zig").submit_path) catch |err| internalSqlError(ctx, err);
     }
     fn internalSqlTurn(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
-        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing SQL query handle");
-        if (body.len > 1024) return textResponse(ctx, 413, "SQL query handle too large");
-        var input = std.json.parseFromSlice(@import("../serverless/sql/transport.zig").QueryRequest, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid SQL query handle");
-        defer input.deinit();
-        const service = self.internalSqlService(ctx, input.value.tenant) catch |err| return internalSqlError(ctx, err);
-        const done = service.turn(input.value.query, self.api_server.cfg.distributed_sql.?.dispatcher) catch |err| return internalSqlError(ctx, err);
-        return ctx.json(.{ .complete = done });
+        return self.internalSqlControl(ctx, @import("../serverless/sql/transport.zig").turn_path) catch |err| internalSqlError(ctx, err);
     }
     fn internalSqlResult(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
-        const body = (try ctx.body()) orelse return textResponse(ctx, 400, "missing SQL query handle");
-        if (body.len > 1024) return textResponse(ctx, 413, "SQL query handle too large");
-        var input = std.json.parseFromSlice(@import("../serverless/sql/transport.zig").QueryRequest, ctx.allocator, body, .{}) catch return textResponse(ctx, 400, "invalid SQL query handle");
-        defer input.deinit();
-        const service = self.internalSqlService(ctx, input.value.tenant) catch |err| return internalSqlError(ctx, err);
-        const result = service.pollResult(ctx.allocator, input.value.query) catch |err| return internalSqlError(ctx, err);
-        return ctx.json(result);
+        return self.internalSqlControl(ctx, @import("../serverless/sql/transport.zig").result_path) catch |err| internalSqlError(ctx, err);
+    }
+    fn internalSqlCancel(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
+        return self.internalSqlControl(ctx, @import("../serverless/sql/transport.zig").cancel_path) catch |err| internalSqlError(ctx, err);
     }
 
     fn internalJoinJobState(self: *AntflyApiHandler, ctx: *httpx.Context) !httpx.Response {
@@ -22084,4 +22081,70 @@ test "distributed SQL API worker RPC requires signed service authority even duri
         defer response.deinit();
         try std.testing.expectEqual(@as(u16, if (index == 2) 503 else 403), response.status.code);
     }
+}
+
+test "distributed SQL API control routes authenticate cancellation and share terminal status semantics" {
+    const a = std.testing.allocator;
+    const transport = @import("../serverless/sql/transport.zig");
+    const runtime = @import("../serverless/sql/runtime.zig");
+    const state = @import("../serverless/sql/state.zig");
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    const now: u64 = @intCast(@import("antfly_platform").time.realtimeNs() / std.time.ns_per_ms);
+    const query: state.Query = .{ .id = @splat('b'), .expires_ms = now + 60000 };
+    const tenant: state.Digest = @splat('a');
+    const store: state.Store = .{ .client = memory.client(), .bucket = "queries", .prefix = "sql", .now_ms = now, .tenant = tenant };
+    const key = try store.key(a, query, null, 0);
+    defer a.free(key);
+    try store.create(a, key, query.id, query.expires_ms);
+    const Fixture = struct {
+        store: state.Store,
+        fn open(raw: *anyopaque, alloc: std.mem.Allocator, scope: state.Digest, context: @import("antfly_local_sources").serverless_query_lake_read_context.Context) !runtime.Service {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return .{ .a = alloc, .state_store = self.store, .exchange_store = undefined, .tenant = scope, .role = .query_only, .owner = "test", .context = context, .source = undefined, .retention = undefined };
+        }
+        fn dispatch(_: *anyopaque, _: []const @import("../serverless/sql/plan.zig").Ticket, _: @import("antfly_local_sources").serverless_query_lake_read_context.Context) !void {}
+    };
+    var fixture: Fixture = .{ .store = store };
+    const secret = "0123456789abcdef0123456789abcdef";
+    var api = ApiHttpServer.init(a, .{ .internal_service_secret = secret, .internal_service_issuer = "sql-workers", .internal_service_accept_legacy_unauthenticated = true, .distributed_sql = .{ .ptr = &fixture, .open = Fixture.open, .dispatcher = .{ .ptr = &fixture, .dispatch = Fixture.dispatch } } }, .{ .ptr = undefined, .vtable = &.{ .status = undefined } }, null, null);
+    defer api.deinit();
+    var handler: AntflyApiHandler = .{ .api_server = &api };
+    var server = httpx.Server.init(a, std.testing.io);
+    defer server.deinit();
+    try handler.registerInternalSqlRoutes(&server);
+    var params: [16]httpx.RouteParam = undefined;
+    for ([_][]const u8{ transport.submit_path, transport.turn_path, transport.result_path, transport.cancel_path, transport.task_path }) |path| try std.testing.expect(server.router.find(.POST, path, &params) != null);
+    const route = server.router.find(.POST, transport.cancel_path, &params).?;
+    const token = try internal_service_auth.tokenAlloc(a, .{ .secret = secret, .issuer = "sql-workers" }, @intCast(now / 1000));
+    defer a.free(token);
+    const body = try std.json.Stringify.valueAlloc(a, transport.QueryRequest{ .tenant = tenant, .query = query }, .{});
+    defer a.free(body);
+    for ([_]?[]const u8{ null, "invalid", token }, 0..) |credential, index| {
+        var request = try httpx.Request.init(a, .POST, "http://localhost/internal/v1/sql/queries/cancel");
+        defer request.deinit();
+        request.body = body;
+        if (credential) |value| try request.headers.set(internal_service_auth.header_name, value);
+        var ctx = httpx.Context.init(a, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try route.handler.invoke(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, if (index == 2) 200 else 403), response.status.code);
+        var record = (try store.load(a, key)).?;
+        defer record.deinit(a);
+        try std.testing.expectEqual(index == 2, record.value.cancel_requested);
+    }
+    // The API must return authoritative failure to gateway routing rather than
+    // quarantine a healthy worker as though it had returned a provider error.
+    const claim = (try store.claim(a, key, "test", 60000)).?;
+    try store.terminate(a, key, claim, .failed, "TaskFailed");
+    var request = try httpx.Request.init(a, .POST, "http://localhost/internal/v1/sql/queries/result");
+    defer request.deinit();
+    request.body = body;
+    try request.headers.set(internal_service_auth.header_name, token);
+    var ctx = httpx.Context.init(a, std.testing.io, &request);
+    defer ctx.deinit();
+    var response = try server.router.find(.POST, transport.result_path, &params).?.handler.invoke(&ctx);
+    defer response.deinit();
+    try std.testing.expectEqual(@as(u16, 409), response.status.code);
 }

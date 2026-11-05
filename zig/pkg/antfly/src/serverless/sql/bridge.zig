@@ -70,7 +70,7 @@ pub const Bridge = struct {
             left_keys[index] = std.math.cast(u16, left_key.directOutputColumn() orelse return null) orelse return null;
             right_keys[index] = std.math.cast(u16, right_key.directOutputColumn() orelse return null) orelse return null;
         }
-        const condition: ?expression.Program = if (join.condition) |program| .{ .instructions = program.instructions, .root = program.root, .output = program.output_type, .parameters = parameters } else null;
+        const condition: ?expression.Program = if (join.condition) |program| try expression.Program.fromBound(scratch, &program, parameters) else null;
         if (condition) |value| value.validate(join.left.columns.len + join.right.columns.len) catch return null;
         const left_filter = conditions(scratch, scans[left.index], left.source_columns) catch |err| switch (err) {
             error.SqlDistributedJoinUnsupported => return null,

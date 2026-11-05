@@ -313,3 +313,43 @@ test('WASM GC durable lane rotation serves healthy storage even after an unabort
  assert.equal(await storage.get('gc_lane'),2);
  assert.equal(buckets.execution.objects.has(output),false,'the slow first lane pinned healthy exchange collection after eviction');
 });
+
+test('WASM scalar V2 retains exact literal identity and prepares typed array parameters', async()=>{
+ const fixture=JSON.parse(await readFile(new URL('../dist/sql-fixture.json',import.meta.url)));
+ const buckets=Object.fromEntries(['source','execution'].map(name=>[name,new Bucket()]));
+ for(const object of fixture.objects)await buckets[object.bucket].put(object.key,new Uint8Array(Buffer.from(object.body_base64,'base64')));
+ const plan=JSON.parse(fixture.raw_plan);
+ const numeric={kind:'number',element_type:'numeric'},boolean={kind:'boolean'},integer={kind:'integer',element_type:'int64'};
+ plan.join.condition={version:2,instructions:[
+  {type:numeric,operation:{parameter:0}},
+  {type:numeric,operation:{literal:'EXACT_NUMERIC_LITERAL'}},
+  {type:boolean,operation:{binary:{op:'eq',left:0,right:1}}},
+  {type:{kind:'array',element_type:'int64'},operation:{parameter:1}},
+  {type:integer,operation:{literal:1}},
+  {type:integer,operation:{call:{function:'array_lower',args:[3,4]}}},
+  {type:integer,operation:{literal:-2}},
+  {type:boolean,operation:{binary:{op:'eq',left:5,right:6}}},
+  {type:boolean,operation:{binary:{op:'and',left:2,right:7}}},
+ ],root:8,output:boolean,parameters:[],parameter_values:[
+  {value:'9007199254740993.1200',text:true},
+  {value:{dimensions:[{length:3,lower_bound:-2}],values:['9007199254740993',null,'2'],sql_nulls:[false,true,false]}},
+ ]};
+ // Inject the original numeric token without a JavaScript Number conversion.
+ const raw=JSON.stringify(plan).replace('"EXACT_NUMERIC_LITERAL"','9007199254740993.1200');
+ const host=await instantiateHost(module,createR2Transport(buckets));
+ const request={config:fixture.config,tenant:fixture.tenant,owner:'typed-parameters'};
+ const submitted=await host.request({...request,op:'sql_submit',raw_plan:raw});
+ const id=typeof submitted.query.id==='string'?submitted.query.id:String.fromCharCode(...submitted.query.id);
+ const stored=buckets.execution.objects.get(`${fixture.config.state.prefix}/sql-execution-v2/${String(submitted.query.expires_ms).padStart(20,'0')}/${id}/plan.json`).body;
+ assert.match(new TextDecoder().decode(stored),/"literal":9007199254740993\.1200/);
+ assert.equal(id,Buffer.from(await crypto.subtle.digest('SHA-256',stored)).toString('hex'));
+ request.query=submitted.query;
+ let complete=false;
+ for(let turn=0;turn<128;turn++){
+  const result=await host.request({...request,op:'sql_turn'});
+  if(result.complete){complete=true;break;}
+  for(const ticket of result.tickets)assert.equal((await host.request({...request,op:'sql_execute',owner:'typed-worker',ticket})).status,'succeeded');
+ }
+ assert.ok(complete);
+ assert.equal((await host.request({...request,op:'sql_result'})).rows,fixture.expected_rows??2);
+});

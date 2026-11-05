@@ -19,17 +19,81 @@ const std = @import("std");
 const scalar = @import("antfly_local_sources").sql_scalar;
 const A = std.mem.Allocator;
 pub const Program = struct {
-    version: u16 = 1,
+    version: u16 = 2,
     instructions: []const scalar.Instruction,
     root: u32,
     output: scalar.Type,
     parameters: []const std.json.Value = &.{},
+    /// V2 preserves SQL NULL separately from logical JSON null and transports
+    /// canonical typed inputs, including exact numbers and SQL array envelopes.
+    parameter_values: ?[]const Parameter = null,
+    pub const Parameter = struct { sql_null: bool = false, value: std.json.Value = .null, text: bool = false };
+    const Wire = struct {
+        version: u16 = 1,
+        instructions: []scalar.Instruction,
+        root: u32,
+        output: scalar.Type,
+        parameters: []const std.json.Value = &.{},
+        parameter_values: ?[]const Parameter = null,
+    };
+    /// Every enclosing plan decoder enters here. Preserve numeric lexemes
+    /// before any std.json.Value can round through f64; strong integer fields
+    /// (ordinals, dimensions, versions) retain their normal typed decoding.
+    pub fn jsonParse(a: A, source: anytype, options: std.json.ParseOptions) !Program {
+        var lossless = options;
+        lossless.parse_numbers = false;
+        const wire = try std.json.innerParse(Wire, a, source, lossless);
+        for (wire.instructions) |*instruction| {
+            if (instruction.operation != .literal) continue;
+            const literal = &instruction.operation.literal;
+            if (literal.* != .number_string) continue;
+            const text = literal.number_string;
+            if (instruction.type.kind == .integer) {
+                literal.* = .{ .integer = std.fmt.parseInt(i64, text, 10) catch return error.InvalidNumber };
+            } else if (instruction.type.kind == .number and instruction.type.element_type != .numeric) {
+                literal.* = if (std.mem.indexOfAny(u8, text, ".eE") == null) .{ .integer = std.fmt.parseInt(i64, text, 10) catch return error.InvalidNumber } else .{ .float = std.fmt.parseFloat(f64, text) catch return error.InvalidNumber };
+            }
+        }
+        return .{ .version = wire.version, .instructions = wire.instructions, .root = wire.root, .output = wire.output, .parameters = wire.parameters, .parameter_values = wire.parameter_values };
+    }
+    pub fn fromBound(a: A, bound: *const scalar.Program, parameters: []const std.json.Value) !Program {
+        var result: Program = .{ .instructions = bound.instructions, .root = bound.root, .output = bound.output_type, .parameters = parameters };
+        if (bound.invocation) |invocation| if (invocation.frame) |frame| {
+            const values = try a.alloc(Parameter, frame.values.len);
+            @memset(values, .{ .sql_null = true });
+            // Export only demanded slots. Other programs may own large arrays
+            // in the same statement frame; their payloads do not cross this IR.
+            for (bound.instructions) |instruction| {
+                if (instruction.operation != .parameter) continue;
+                const slot = instruction.operation.parameter;
+                if (slot >= values.len) return error.InvalidSqlParameters;
+                if (!values[slot].sql_null) continue;
+                const datum = frame.values[slot];
+                if (datum.sql_null) continue;
+                values[slot] = .{ .value = datum.value };
+                if (datum.numeric) |number| {
+                    var context: Numeric.Context = .{ .alloc = a };
+                    values[slot] = .{ .value = .{ .string = try Numeric.format(&context, number.*) }, .text = true };
+                } else if (datum.array) |array| {
+                    values[slot].value = try @import("antfly_local_sources").sql_array_wire.toJsonLeaky(a, array.*, .{});
+                } else if (datum.value == .float and !std.math.isFinite(datum.value.float)) {
+                    values[slot] = .{ .value = .{ .string = if (std.math.isNan(datum.value.float)) "NaN" else if (datum.value.float < 0) "-Infinity" else "Infinity" }, .text = true };
+                }
+            }
+            result.parameter_values = values;
+            result.parameters = &.{};
+        };
+        return result;
+    }
+    fn parameterCount(self: Program) usize {
+        return if (self.parameter_values) |values| values.len else self.parameters.len;
+    }
     pub fn validate(self: Program, width: usize) !void {
-        if (self.version != 1 or self.instructions.len == 0 or self.instructions.len > 4096 or self.root >= self.instructions.len or self.parameters.len > 256) return error.InvalidSqlDistributedPlan;
+        if ((self.version != 1 and self.version != 2) or self.instructions.len == 0 or self.instructions.len > 4096 or self.root >= self.instructions.len or self.parameterCount() > 256 or (self.parameter_values != null and (self.version != 2 or self.parameters.len != 0))) return error.InvalidSqlDistributedPlan;
         for (self.instructions, 0..) |instruction, index| switch (instruction.operation) {
             .literal => {},
             .column => |ordinal| if (ordinal >= width) return error.InvalidSqlDistributedPlan,
-            .parameter => |ordinal| if (ordinal >= self.parameters.len) return error.InvalidSqlDistributedPlan,
+            .parameter => |ordinal| if (ordinal >= self.parameterCount()) return error.InvalidSqlDistributedPlan,
             .unary => |operation| if (operation.operand >= index) return error.InvalidSqlDistributedPlan,
             .binary => |operation| if (operation.left >= index or operation.right >= index) return error.InvalidSqlDistributedPlan,
             .cast => |operation| if (operation.operand >= index) return error.InvalidSqlDistributedPlan,
@@ -53,13 +117,9 @@ pub const Program = struct {
         if (!std.meta.eql(self.instructions[self.root].type, self.output)) return error.InvalidSqlDistributedPlan;
     }
     pub fn matches(self: Program, a: A, cells: []const scalar.Datum) !bool {
-        var arena = std.heap.ArenaAllocator.init(a);
-        defer arena.deinit();
-        const program: scalar.Program = .{ .arena = &arena, .instructions = self.instructions, .root = self.root, .output_type = self.output, .parameter_types = &.{}, .parameter_descriptors = &.{}, .required_columns = &.{} };
-        const value = try program.evaluate(arena.allocator(), cells, self.parameters, .{});
-        if (value.sql_null) return false;
-        if (value.value != .bool) return error.InvalidSqlDistributedPlan;
-        return value.value.bool;
+        var task = try Task.init(a, .{}, 128 * 1024 * 1024, self, null, null);
+        defer task.deinit();
+        return task.matches(.left, cells);
     }
 };
 
@@ -79,9 +139,9 @@ pub const Task = struct {
         var result: Task = .{ .regex = RegexExecution.init(a, @intCast(@min(@as(u64, 16 * 1024 * 1024), memory / 2))) };
         errdefer result.deinit();
         const constants: usize = @intCast(@min(@as(u64, 4 * 1024 * 1024), memory / 32));
-        if (left) |ir| result.left = try Prepared.init(a, ir, context, constants);
-        if (right) |ir| result.right = try Prepared.init(a, ir, context, constants);
-        if (condition) |ir| result.condition = try Prepared.init(a, ir, context, constants);
+        if (left) |ir| result.left = try Prepared.init(a, ir, context, constants, @intCast(memory / 4));
+        if (right) |ir| result.right = try Prepared.init(a, ir, context, constants, @intCast(memory / 4));
+        if (condition) |ir| result.condition = try Prepared.init(a, ir, context, constants, @intCast(memory / 4));
         return result;
     }
     pub fn deinit(self: *Task) void {
@@ -151,10 +211,11 @@ pub const Prepared = struct {
     scratch: std.heap.ArenaAllocator,
     left_scratch: std.heap.ArenaAllocator,
     context: Context,
-    fn init(a: A, ir: Program, context: Context, constants: usize) !Prepared {
+    fn init(a: A, ir: Program, context: Context, constants: usize, parameter_bytes: usize) !Prepared {
         try context.ensureActive();
         var result: Prepared = .{ .a = a, .program = try scalar.Program.fromTypedInstructions(a, ir.instructions, ir.root, ir.output, .{ .constant_bytes = constants }), .parameters = ir.parameters, .scratch = .init(a), .left_scratch = .init(a), .context = context };
         errdefer result.deinit();
+        try result.prepareParameters(ir, parameter_bytes);
         var width: usize = 0;
         for (result.program.required_columns) |column| {
             if (column >= 2048) return error.InvalidSqlDistributedPlan;
@@ -170,11 +231,62 @@ pub const Prepared = struct {
         };
         return result;
     }
+    fn prepareParameters(self: *Prepared, ir: Program, bytes: usize) !void {
+        const count = ir.parameterCount();
+        if (count > 256) return error.InvalidSqlDistributedPlan;
+        const local = @import("antfly_local_sources");
+        const owner = try local.sql_parameter_binding.Invocation.initLeaky(self.program.arena.allocator(), count);
+        for (ir.instructions) |instruction| {
+            if (instruction.operation != .parameter) continue;
+            const slot = instruction.operation.parameter;
+            if (slot >= count) return error.InvalidSqlDistributedPlan;
+            if (owner.descriptors[slot].kind != null and !std.meta.eql(owner.descriptors[slot], instruction.type)) return error.ConflictingSqlParameterTypes;
+            owner.descriptors[slot] = instruction.type;
+        }
+        if (count == 0) return;
+        const inputs = try self.program.arena.allocator().alloc(local.sql_parameter_frame.Input, count);
+        for (owner.descriptors, inputs, 0..) |descriptor, *input, slot| {
+            // Unreferenced statement slots do not constrain or allocate inputs.
+            input.* = .sql_null;
+            if (descriptor.kind == null) continue;
+            if (ir.parameter_values) |values| {
+                const value = values[slot];
+                if (value.sql_null) {
+                    if (value.text or value.value != .null) return error.InvalidSqlParameters;
+                } else if (value.text or (value.value == .number_string and (descriptor.kind == .integer or descriptor.kind == .number))) {
+                    if (value.value != .string and value.value != .number_string) return error.InvalidSqlParameters;
+                    input.* = .{ .text = if (value.value == .string) value.value.string else value.value.number_string };
+                } else input.* = if (descriptor.kind == .array) .{ .array_envelope = value.value } else .{ .datum = scalar.Datum.json(value.value) };
+            } else {
+                const value = ir.parameters[slot];
+                input.* = if (value == .null) .sql_null else if (descriptor.kind == .array) switch (value) {
+                    .string => .{ .text = value.string },
+                    .object => .{ .array_envelope = value },
+                    else => return error.SqlTypeMismatch,
+                } else if (descriptor.kind != .json and (value == .string or (value == .number_string and (descriptor.kind == .integer or descriptor.kind == .number))))
+                    .{ .text = if (value == .string) value.string else value.number_string }
+                else
+                    .{ .datum = scalar.Datum.json(value) };
+            }
+        }
+        // Invocation/frame addresses are arena-owned and survive Prepared moves.
+        // All scalar and native vector/grace consumers borrow this same frame.
+        for (owner.descriptors) |*descriptor| {
+            if (descriptor.kind == null) descriptor.* = .{ .kind = .string };
+            try scalar.validateParameterType(descriptor.*);
+            if (descriptor.kind != .datetime and descriptor.element_type == null) descriptor.element_type = try scalar.parameterElementType(descriptor.*);
+        }
+        owner.frame = try local.sql_parameter_frame.Frame.prepare(self.a, owner.descriptors, inputs, .{ .bytes = bytes, .wire_bytes = @min(bytes, 1024 * 1024) });
+        owner.phase = .prepared;
+        self.program.parameter_descriptors = owner.descriptors;
+        self.program.invocation = owner;
+    }
     fn deinit(self: *Prepared) void {
         self.a.free(self.cells);
         self.a.free(self.slots);
         self.scratch.deinit();
         self.left_scratch.deinit();
+        if (self.program.invocation) |owner| owner.deinitFrame();
         self.program.deinit();
     }
     fn checkpoint(raw: ?*anyopaque) !void {
@@ -597,4 +709,127 @@ test "distributed SQL identity memo retains only the token after large array nor
     defer task.endProbe();
     for (0..5) |_| try std.testing.expect(try task.matchesBatch(.condition, batch, 0, null));
     try std.testing.expect(budget.live < 128 * 1024);
+}
+
+test "distributed SQL scalar transport preserves exact numeric literals and canonical bytes" {
+    const local = @import("antfly_local_sources");
+    const a = std.testing.allocator;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const sa = arena.allocator();
+    var context: Numeric.Context = .{ .alloc = sa };
+    const number = try Numeric.parse(&context, "9007199254740993.1200");
+    var compiled = try local.sql_compiler.compileScalar(a, "v = 9007199254740993.1200", .{});
+    defer compiled.deinit();
+    var bound = try scalar.bindTyped(a, compiled.expression, &.{.{ .name = "v", .type = .number, .element_type = .numeric }}, &.{}, .{});
+    defer bound.deinit();
+    const ir = try Program.fromBound(sa, &bound, &.{});
+    const encoded = try std.json.Stringify.valueAlloc(sa, ir, .{});
+    const decoded = try std.json.parseFromSliceLeaky(Program, sa, encoded, .{});
+    try decoded.validate(1);
+    try std.testing.expectEqualStrings(encoded, try std.json.Stringify.valueAlloc(sa, decoded, .{}));
+    var task = try Task.init(a, .{}, 16 * 1024 * 1024, decoded, null, null);
+    defer task.deinit();
+    const cells: []const scalar.Datum = &.{scalar.Datum.typedNumeric(&number.value)};
+    try std.testing.expect(try task.matchesBatch(.left, .{ .rows = &.{cells} }, 0, null));
+    // Strong integer literal consumers keep integer datums, while JSON and
+    // NUMERIC consumers retain original number lexemes, including scale.
+    for ([_]scalar.Type{ .{ .kind = .integer }, .{ .kind = .number }, .{ .kind = .number, .element_type = .numeric }, .{ .kind = .json } }) |descriptor| {
+        for ([_]std.json.Value{ .{ .integer = 7 }, .{ .number_string = "7" } }) |literal| {
+            const input: Program = .{ .instructions = &.{.{ .type = descriptor, .operation = .{ .literal = literal } }}, .root = 0, .output = descriptor };
+            const wire = try std.json.Stringify.valueAlloc(sa, input, .{});
+            const restored = try std.json.parseFromSliceLeaky(Program, sa, wire, .{});
+            try std.testing.expectEqualStrings(wire, try std.json.Stringify.valueAlloc(sa, restored, .{}));
+        }
+    }
+}
+
+test "distributed SQL typed parameter frames preserve exact numbers arrays JSON null and sparse slots" {
+    const local = @import("antfly_local_sources");
+    const a = std.testing.allocator;
+    const Case = struct { sql: []const u8, types: []const scalar.Type, values: []const std.json.Value };
+    const cases = [_]Case{
+        .{ .sql = "$1 = 9007199254740993.1200", .types = &.{.{ .kind = .number, .element_type = .numeric }}, .values = &.{.{ .string = "9007199254740993.1200" }} },
+        .{ .sql = "9007199254740993 = ANY($1)", .types = &.{.{ .kind = .array, .element_type = .int64 }}, .values = &.{.{ .string = "[-2:0]={9007199254740993,NULL,2}" }} },
+        .{ .sql = "array_lower($1, 1) = -2", .types = &.{.{ .kind = .array, .element_type = .int64 }}, .values = &.{.{ .string = "[-2:0]={9007199254740993,NULL,2}" }} },
+        .{ .sql = "$1 IS NOT NULL AND jsonb_typeof($1) = 'null'", .types = &.{.{ .kind = .json, .element_type = .jsonb }}, .values = &.{.null} },
+        .{ .sql = "$1 = 0.1::real", .types = &.{.{ .kind = .number, .element_type = .float32 }}, .values = &.{.{ .string = "0.1" }} },
+        .{ .sql = "$1 = 'Infinity'::double precision", .types = &.{.{ .kind = .number, .element_type = .float64 }}, .values = &.{.{ .string = "Infinity" }} },
+        .{ .sql = "$2 = 7", .types = &.{ .{ .kind = .array, .element_type = .int64 }, .{ .kind = .integer, .element_type = .int64 } }, .values = &.{ .{ .string = "{1,2}" }, .{ .integer = 7 } } },
+    };
+    for (cases) |case| {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const sa = arena.allocator();
+        var compiled = try local.sql_compiler.compileScalar(a, case.sql, .{});
+        defer compiled.deinit();
+        var bound = try scalar.bindTyped(a, compiled.expression, &.{}, case.types, .{});
+        defer bound.deinit();
+        const owner = try local.sql_parameter_binding.Invocation.initLeaky(sa, case.types.len);
+        @memcpy(owner.descriptors, case.types);
+        if (case.types[0].kind == .json) {
+            owner.frame = try local.sql_parameter_frame.Frame.prepare(a, case.types, &.{.{ .datum = scalar.Datum.json(.null) }}, .{});
+            owner.phase = .prepared;
+        } else try owner.prepareJson(a, case.values, .{});
+        defer owner.deinitFrame();
+        bound.invocation = owner;
+        const expected = try bound.evaluate(sa, &.{}, &.{}, .{});
+        try std.testing.expect(!expected.sql_null and expected.value.bool);
+        // The compatibility slice deliberately contains no array/NUMERIC data.
+        const ir = try Program.fromBound(sa, &bound, try owner.compatibilityValues(sa));
+        const wire = try std.json.Stringify.valueAlloc(sa, ir, .{});
+        const restored = try std.json.parseFromSliceLeaky(Program, sa, wire, .{});
+        try restored.validate(0);
+        try std.testing.expectEqualStrings(wire, try std.json.Stringify.valueAlloc(sa, restored, .{}));
+        var task = try Task.init(a, .{}, 16 * 1024 * 1024, restored, null, null);
+        defer task.deinit();
+        const frame = &task.left.?.program.invocation.?.frame.?;
+        const original_work = frame.work;
+        for (0..100) |_| try std.testing.expect(try task.matches(.left, &.{}));
+        try std.testing.expectEqual(original_work, frame.work);
+    }
+    // Legacy V1 plans retain typed ingress and lossless literal decoding.
+    var legacy_arena = std.heap.ArenaAllocator.init(a);
+    defer legacy_arena.deinit();
+    const legacy = try std.json.parseFromSliceLeaky(Program, legacy_arena.allocator(),
+        \\{"version":1,"instructions":[{"type":{"kind":"number","element_type":"numeric"},"operation":{"parameter":0}},{"type":{"kind":"number","element_type":"numeric"},"operation":{"literal":9007199254740993.1200}},{"type":{"kind":"boolean"},"operation":{"binary":{"op":"eq","left":0,"right":1}}}],"root":2,"output":{"kind":"boolean"},"parameters":[9007199254740993.1200]}
+    , .{});
+    try legacy.validate(0);
+    try std.testing.expect(try legacy.matches(a, &.{}));
+}
+
+test "distributed SQL typed parameter ownership unwinds allocation failures" {
+    const local = @import("antfly_local_sources");
+    const a = std.testing.allocator;
+    var compiled = try local.sql_compiler.compileScalar(a, "9007199254740993 = ANY($1)", .{});
+    defer compiled.deinit();
+    var bound = try scalar.bindTyped(a, compiled.expression, &.{}, &.{.{ .kind = .array, .element_type = .int64 }}, .{});
+    defer bound.deinit();
+    const ir: Program = .{ .instructions = bound.instructions, .root = bound.root, .output = bound.output_type, .parameters = &.{.{ .string = "[-2:0]={9007199254740993,NULL,2}" }} };
+    const Scenario = struct {
+        fn run(backing: A, fragment: Program) !void {
+            var task = try Task.init(backing, .{}, 16 * 1024 * 1024, fragment, null, null);
+            defer task.deinit();
+            for (0..3) |_| try std.testing.expect(try task.matches(.left, &.{}));
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Scenario.run, .{ir});
+    const Canonical = struct {
+        fn run(backing: A, program: *const scalar.Program) !void {
+            var region = std.heap.ArenaAllocator.init(backing);
+            defer region.deinit();
+            const alloc = region.allocator();
+            const owner = try local.sql_parameter_binding.Invocation.initLeaky(alloc, 1);
+            owner.descriptors[0] = .{ .kind = .array, .element_type = .int64 };
+            try owner.prepareJson(backing, &.{.{ .string = "[-2:0]={9007199254740993,NULL,2}" }}, .{});
+            defer owner.deinitFrame();
+            var source = program.*;
+            source.invocation = owner;
+            const fragment = try Program.fromBound(alloc, &source, &.{.null});
+            const bytes = try std.json.Stringify.valueAlloc(alloc, fragment, .{});
+            const decoded = try std.json.parseFromSliceLeaky(Program, alloc, bytes, .{});
+            try Scenario.run(backing, decoded);
+        }
+    };
+    try std.testing.checkAllAllocationFailures(a, Canonical.run, .{&bound});
 }

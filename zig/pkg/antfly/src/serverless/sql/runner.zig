@@ -902,7 +902,13 @@ test "distributed SQL grace typed cohorts preserve residual rejection and unmatc
     defer memory.deinit();
     const objects: exchange.Store = .{ .client = memory.client(), .bucket = "queries", .prefix = "tenant" };
     const input: plan.Input = .{ .table_id = 1, .schema = @splat('b'), .snapshot = "snapshot", .wal_cut = 0, .cut = "cut", .columns = &.{.{ .name = "id", .type = .integer }}, .estimated_bytes = 1, .estimated_rows = 300, .splits = 1 };
-    const condition: @import("expression.zig").Program = .{ .instructions = &.{.{ .type = .{ .kind = .boolean }, .operation = .{ .literal = .{ .bool = false } } }}, .root = 0, .output = .{ .kind = .boolean } };
+    var compiled = try local.sql_compiler.compileScalar(a, "l = ANY($1)", .{});
+    defer compiled.deinit();
+    var bound = try local.sql_scalar.bindTyped(a, compiled.expression, &.{ .{ .name = "l", .type = .integer }, .{ .name = "r", .type = .integer } }, &.{.{ .kind = .array, .element_type = .int64 }}, .{});
+    defer bound.deinit();
+    // The ordinary scalar and vector/grace consumers must borrow the same
+    // task-prepared typed frame, even though the raw parameter is SQL text.
+    const condition: @import("expression.zig").Program = .{ .instructions = bound.instructions, .root = bound.root, .output = bound.output_type, .parameters = &.{.{ .string = "[-2:-2]={-1}" }} };
     const spec: plan.Plan = .{ .tenant = @splat('a'), .expires_ms = 1000, .left = input, .right = input, .join = .{ .kind = .full, .left_keys = &.{0}, .right_keys = &.{0}, .condition = condition, .projection = &.{ 1, 0, 1 } }, .strategy = .shuffle, .partitions = 1, .limits = .{} };
     var build = try OutputRows.init(a, 1, 1024 * 1024);
     defer build.deinit(a);

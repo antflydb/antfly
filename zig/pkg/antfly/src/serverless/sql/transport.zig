@@ -338,6 +338,42 @@ pub const Client = struct {
     }
 };
 
+/// Shared by API and query listeners after their respective service auth.
+/// Control requests never consume a task execution slot.
+pub fn control(factory: runtime.Factory, a: A, scratch: A, path: []const u8, body: []const u8, context: Context) !http.HttpResponse {
+    try context.ensureActive();
+    if (body.len > (if (std.mem.eql(u8, path, submit_path)) @as(usize, 1024 * 1024) else 1024)) return Server.response(a, 413, "{}");
+    if (std.mem.eql(u8, path, submit_path)) {
+        const input = std.json.parseFromSliceLeaky(plan.Plan, scratch, body, .{}) catch return Server.response(a, 400, "{}");
+        const service = try factory.open(factory.ptr, scratch, input.tenant, context);
+        const query = try service.submit(input);
+        return Server.json(a, .{ .query = query });
+    }
+    const input = std.json.parseFromSliceLeaky(QueryRequest, scratch, body, .{}) catch return Server.response(a, 400, "{}");
+    const service = try factory.open(factory.ptr, scratch, input.tenant, context);
+    if (std.mem.eql(u8, path, cancel_path)) {
+        try service.requestCancel(input.query);
+        return Server.response(a, 200, "{}");
+    }
+    if (std.mem.eql(u8, path, turn_path)) return Server.json(a, .{ .complete = try service.turn(input.query, factory.dispatcher) });
+    if (std.mem.eql(u8, path, result_path)) return Server.json(a, try service.pollResult(scratch, input.query));
+    return Server.response(a, 404, "{}");
+}
+pub fn errorStatus(err: anyerror) u16 {
+    return switch (err) {
+        error.SqlExecutionUnauthorized => 403,
+        error.SqlTaskAdmissionUnavailable => 429,
+        error.SqlQueryRoleRequired, error.SqlExecutionFenced, error.PreconditionFailed, error.SqlWorkerUnavailable => 503,
+        error.SqlQueryExpired => 410,
+        error.SqlExecutionFailed => 409,
+        error.SqlExecutionNotFound => 404,
+        error.DeadlineExceeded => 504,
+        error.Canceled, error.Cancelled => 408,
+        error.SqlJoinBudgetExceeded, error.SqlProgramLimitExceeded => 422,
+        else => 500,
+    };
+}
+
 /// Installed on query/combined listeners. No migration path accepts unsigned
 /// execution requests, and tasks share the listener's foreground admission.
 pub const Server = struct {
@@ -360,18 +396,7 @@ pub const Server = struct {
         defer arena.deinit();
         return self.execute(a, arena.allocator(), path, body, context) catch |err| {
             if (err == error.Canceled or err == error.Cancelled) context.ensureActive() catch return response(a, 504, "{}");
-            return response(a, switch (err) {
-                error.SqlExecutionUnauthorized => 403,
-                error.SqlTaskAdmissionUnavailable => 429,
-                error.SqlQueryRoleRequired, error.SqlExecutionFenced, error.PreconditionFailed, error.SqlWorkerUnavailable => 503,
-                error.SqlQueryExpired => 410,
-                error.SqlExecutionFailed => 409,
-                error.SqlExecutionNotFound => 404,
-                error.DeadlineExceeded => 504,
-                error.Canceled => 408,
-                error.SqlJoinBudgetExceeded => 422,
-                else => 500,
-            }, "{}");
+            return response(a, errorStatus(err), "{}");
         };
     }
     fn execute(self: Server, a: A, scratch: A, path: []const u8, body: []const u8, context: Context) !http.HttpResponse {
@@ -385,21 +410,7 @@ pub const Server = struct {
             };
             return response(a, 200, "{}");
         }
-        if (std.mem.eql(u8, path, submit_path)) {
-            const input = std.json.parseFromSliceLeaky(plan.Plan, scratch, body, .{}) catch return response(a, 400, "{}");
-            const service = try self.factory.open(self.factory.ptr, scratch, input.tenant, context);
-            const query = try service.submit(input);
-            return json(a, .{ .query = query });
-        }
-        const input = std.json.parseFromSliceLeaky(QueryRequest, scratch, body, .{}) catch return response(a, 400, "{}");
-        const service = try self.factory.open(self.factory.ptr, scratch, input.tenant, context);
-        if (std.mem.eql(u8, path, cancel_path)) {
-            try service.requestCancel(input.query);
-            return response(a, 200, "{}");
-        }
-        if (std.mem.eql(u8, path, turn_path)) return json(a, .{ .complete = try service.turn(input.query, self.factory.dispatcher) });
-        if (std.mem.eql(u8, path, result_path)) return json(a, try service.pollResult(scratch, input.query));
-        return response(a, 404, "{}");
+        return control(self.factory, a, scratch, path, body, context);
     }
     fn json(a: A, value: anytype) !http.HttpResponse {
         const bytes = try std.json.Stringify.valueAlloc(a, value, .{});
