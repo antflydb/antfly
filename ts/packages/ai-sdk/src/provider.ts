@@ -1,4 +1,4 @@
-import type { ImageModelV4, ProviderV4 } from "@ai-sdk/provider";
+import type { ImageModelV4, ProviderV4, RerankingModelV4 } from "@ai-sdk/provider";
 import { NoSuchModelError } from "@ai-sdk/provider";
 import {
   type AntflyClient,
@@ -21,6 +21,9 @@ export type AntflyProviderOptions = SDKConfig;
 export interface AntflyProvider extends ProviderV4 {
   readonly client: AntflyClient;
   readonly inference: InferenceClient;
+  // Narrowed from ProviderV4's optional `rerankingModel?`: this provider
+  // always implements it, so callers don't need an `?.` or non-null assertion.
+  rerankingModel(modelId: string): RerankingModelV4;
 }
 
 /**
