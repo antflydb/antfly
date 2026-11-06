@@ -60763,7 +60763,7 @@ fn nativeOrdinaryProjectionIntoCase(a: std.mem.Allocator) !void {
     const source_alias = NativeCompute.applyDenseProjectionInto(&cb, &tall_descriptor, &.{ tall_input, square_weight }, tall_output);
     toBuf(square_weight).source_tensor = null;
     try std.testing.expect(!try source_alias);
-    dual_source.data = std.mem.sliceAsBytes(&weights)[0..64];
+    dual_source.data = std.mem.sliceAsBytes(getData(square_weight));
     dual_source.shape = &.{ 2, 8 }; // Same count, wrong original layout.
     toBuf(square_weight).source_tensor = &dual_source;
     const source_shape = NativeCompute.applyDenseProjectionInto(&cb, &tall_descriptor, &.{ tall_input, square_weight }, tall_output);
