@@ -226,6 +226,9 @@ pub const Schedule = struct {
         self.selected = (try self.root.prepareRoutesWithPolicy(self.bindings, .compatibility_regions)) orelse return error.UnsupportedDenseSchedule;
         errdefer self.selected.release();
         if (self.selected.pool.payload_coverage != .complete or self.selected.pool.regions.len != 0) return error.UnsupportedDenseSchedule;
+        // A ready authored plan owns its complete cold resource recipe before
+        // admission, metadata sealing, or the first numerical Model scope.
+        _ = try self.selected.storageRequirement();
         self.frame = null;
         self.numerical_epoch = null;
         self.borrowed = .empty;

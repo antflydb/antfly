@@ -5098,10 +5098,6 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     };
     self.weights = try whisper_arch.PreparedDecoderWeights.initWithSource(cb, metadata.allocator(), config, true, .{ .expected_data = data, .domain = domain });
     try NativeCompute.stampHeldF32WeightSources(cb, data, self.weights.?.fetcher.handles.items);
-    for (self.weights.?.fetcher.handles.items) |weight| {
-        const plane = try NativeCompute.heldF32WeightPrimary(cb, data, weight);
-        if (plane.descriptor.shape.dtype != .f32 or plane.descriptor.quant_format != null) return false;
-    }
     self.program = (try whisper_arch.PreparedSingleToken.init(cb, data, metadata.allocator(), config, self.encoder.?, geometry.encoder_rows, &self.weights.?)) orelse return false;
     try self.program.?.schedule.setHostWorkspaceAllocator(allocator);
     var requirements = @import("prepared_storage_admission.zig").Builder{ .allocator = metadata.allocator() };
@@ -18567,6 +18563,8 @@ fn nativeWhisperAssignedSourceCase(a: std.mem.Allocator, admitted: bool) !void {
     try std.testing.expect(decoder.cache.native_program != null);
     const program = &decoder.cache.native_program.?;
     const frame = program.schedule.frame.?;
+    try std.testing.expect(program.schedule.selected.pool.storage_requirement != null);
+    try std.testing.expectEqual(program.schedule.selected.pool.plan.allocations.len, program.schedule.selected.pool.storage_requirement_bounds.len);
     const immutable = program.schedule.root.immutable_bindings orelse return error.MissingWhisperSourceBindings;
     for (immutable.entries) |binding| {
         try std.testing.expect(binding.value == .resident);
@@ -18616,13 +18614,17 @@ fn nativeWhisperAssignedSourceCase(a: std.mem.Allocator, admitted: bool) !void {
     try std.testing.expectEqual(positions, decoder.positions());
     try std.testing.expectEqual(generation, frame.host_input_generation);
     try std.testing.expect(!frame.retired);
+    // Cold dummy inputs were released before the real numerical scope. This
+    // first multi-token prompt deliberately uses the original eager path, so
+    // no planned single-token ingress is currently bound.
+    try std.testing.expectEqual(@as(usize, 0), frame.bound_host_input_count);
     var invalid_ids = [_]i64{ 0, 1 };
     var current_position = [_]i64{@intCast(positions)};
     var malformed = Tensor{ .allocator = a, .name = "bad.token", .dtype = .i64, .shape = &.{2}, .data = std.mem.asBytes(&invalid_ids), .owns_data = false, .owns_shape = false };
     var valid_position = Tensor{ .allocator = a, .name = "position", .dtype = .i64, .shape = &.{1}, .data = std.mem.asBytes(&current_position), .owns_data = false, .owns_shape = false };
     try std.testing.expectError(error.InvalidHostIngressBinding, frame.rebindNativeProgramHostInputs(&.{ .{ .node_id = program.token_node, .value = &malformed }, .{ .node_id = program.position_node, .value = &valid_position } }));
     try std.testing.expectEqual(generation, frame.host_input_generation);
-    try std.testing.expectEqual(@as(usize, 2), frame.bound_host_input_count);
+    try std.testing.expectEqual(@as(usize, 0), frame.bound_host_input_count);
     const after = try decoder.cb.backend.toFloat32(decoder.cache.layers[0].k_self.?, a);
     defer a.free(after);
     try std.testing.expectEqualSlices(f32, initialized[0 .. positions * cfg.d_model], after[0 .. positions * cfg.d_model]);
@@ -18643,6 +18645,34 @@ fn nativeWhisperAssignedSourceCase(a: std.mem.Allocator, admitted: bool) !void {
         defer a.free(actual);
         try std.testing.expectEqualSlices(f32, expected, actual);
         try std.testing.expectEqualSlices(f32, held, first);
+        // A real planned step now owns both scalar bindings. Failed metadata
+        // validation must preserve their exact bank bytes, CTs and generation,
+        // not merely leave a counter looking plausible.
+        try std.testing.expectEqual(@as(usize, 2), frame.bound_host_input_count);
+        try std.testing.expectEqual(@as(usize, 2), frame.pool.host_input_plans.len);
+        const bound_before = frame.host_bound_inputs[0..2].*;
+        const bound_generation = frame.host_input_generation;
+        var ingress_before: [2][@sizeOf(i64)]u8 = undefined;
+        for (frame.pool.host_input_plans, &ingress_before) |input, *snapshot| {
+            const bank = frame.storages[input.allocation] orelse return error.MissingWhisperIngressBank;
+            const raw = (try decoder.cb.backend.hostFloat32Read(bank.tensor)) orelse return error.MissingWhisperIngressBytes;
+            const bytes = std.mem.sliceAsBytes(raw);
+            try std.testing.expect(bytes.len >= snapshot.len);
+            @memcpy(snapshot, bytes[0..snapshot.len]);
+        }
+        try std.testing.expectError(error.InvalidHostIngressBinding, frame.rebindNativeProgramHostInputs(&.{ .{ .node_id = program.token_node, .value = &malformed }, .{ .node_id = program.position_node, .value = &valid_position } }));
+        try std.testing.expectEqual(bound_generation, frame.host_input_generation);
+        try std.testing.expectEqual(@as(usize, 2), frame.bound_host_input_count);
+        try std.testing.expect(!frame.retired);
+        for (frame.host_bound_inputs[0..2], bound_before) |current, previous| {
+            try std.testing.expectEqual(previous.node_id, current.node_id);
+            try std.testing.expect(current.value == previous.value);
+        }
+        for (frame.pool.host_input_plans, &ingress_before) |input, *snapshot| {
+            const bank = frame.storages[input.allocation] orelse return error.MissingWhisperIngressBank;
+            const raw = (try decoder.cb.backend.hostFloat32Read(bank.tensor)) orelse return error.MissingWhisperIngressBytes;
+            try std.testing.expectEqualSlices(u8, snapshot, std.mem.sliceAsBytes(raw)[0..snapshot.len]);
+        }
         try std.testing.expectEqual(program.schedule.steps.len, program.schedule.cursor);
     }
     try std.testing.expect(frame.host_input_generation > generation);

@@ -1003,11 +1003,6 @@ pub const PreparedSingleToken = struct {
         if (embed_shape.rank() != 2 or position_shape.rank() != 2 or embed_shape.dims[1] != config.d_model or position_shape.dims[1] != config.d_model) return null;
         const geometry = try CacheGeometry.init(config, rows);
         if (config.decoder_attention_heads == 0 or config.d_model % config.decoder_attention_heads != 0 or rows > std.math.maxInt(i32) or geometry.capacity > std.math.maxInt(i32) or config.d_model > std.math.maxInt(i32) or config.decoder_ffn_dim > std.math.maxInt(i32) or config.vocab_size > std.math.maxInt(i32) or embed_shape.dims[0] <= 0 or position_shape.dims[0] <= 0) return null;
-        // Reject opaque/reduced model inputs before constructing or mutating KV.
-        for (weights.fetcher.handles.items) |ct| {
-            const plane = try Native.NativeCompute.heldF32WeightPrimary(cb, source_data, ct);
-            if (plane.descriptor.shape.dtype != .f32 or plane.descriptor.quant_format != null) return null;
-        }
         const slabs = try a.alloc(Slab, config.decoder_layers);
         var built: usize = 0;
         errdefer {

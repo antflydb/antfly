@@ -153,11 +153,9 @@ pub const Pipeline = struct {
             for (prepared_images.items) |*image| image.deinit();
             prepared_images.deinit(self.allocator);
         }
+        try prepared_images.ensureTotalCapacityPrecise(self.allocator, images.len);
         for (images) |image| {
-            try prepared_images.append(
-                self.allocator,
-                try qwen2vl.prepareImage(self.allocator, image, self.prep_cfg),
-            );
+            prepared_images.appendAssumeCapacity(try qwen2vl.prepareImage(self.allocator, image, self.prep_cfg));
         }
         var prepared_document = try prepareDocumentPrompt(
             self.allocator,
@@ -265,10 +263,13 @@ pub fn scoreDocument(
         for (prepared_images.items) |*img| img.deinit();
         prepared_images.deinit(allocator);
     }
+    // Reserve list metadata before producing any owner. Appending a completed
+    // image cannot then fail between its producer and the list cleanup owner.
+    try prepared_images.ensureTotalCapacityPrecise(allocator, images.len);
     for (images, 0..) |img, index| {
         if (execution_control) |control|
             try control.update(.tokenizing, @intCast(index), @intCast(images.len));
-        try prepared_images.append(allocator, try qwen2vl.prepareImage(allocator, img, prep_cfg));
+        prepared_images.appendAssumeCapacity(try qwen2vl.prepareImage(allocator, img, prep_cfg));
     }
 
     var prepared_doc = try prepareDocumentPrompt(allocator, tok, prompt_cfg, gpt_cfg, prepared_images.items, document_text, max_length, add_bos_token);
@@ -283,19 +284,21 @@ pub fn scoreDocument(
         native_image_embeddings.deinit(allocator);
     }
     if (vision_session == null) {
+        try native_image_embeddings.ensureTotalCapacityPrecise(allocator, prepared_images.items.len);
         for (prepared_images.items, 0..) |prepared, index| {
             if (execution_control) |control|
                 try control.update(.executing, @intCast(index), @intCast(prepared_images.items.len));
-            try native_image_embeddings.append(allocator, .{
+            native_image_embeddings.appendAssumeCapacity(.{
                 .tensor = try qwen2vl_vision.encodePreparedImageTokensTensor(cb, allocator, gpt_cfg, prep_cfg, prepared),
                 .token_count = prepared.image_token_count,
             });
         }
     } else {
+        try image_embeddings.ensureTotalCapacityPrecise(allocator, prepared_images.items.len);
         for (prepared_images.items, 0..) |prepared, index| {
             if (execution_control) |control|
                 try control.update(.executing, @intCast(index), @intCast(prepared_images.items.len));
-            try image_embeddings.append(allocator, try encodeImageTokens(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared, execution_control));
+            image_embeddings.appendAssumeCapacity(try encodeImageTokens(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared, execution_control));
         }
     }
 
@@ -492,6 +495,17 @@ pub fn encodeDocumentFromPrepared(
     prepared_doc: qwen2vl.PreparedTextInput,
     image_embeddings: []const []const f32,
 ) !EncodedSequence {
+    return encodeDocumentFromPreparedImpl(true, cb, allocator, gpt_cfg, prepared_doc, image_embeddings);
+}
+
+fn encodeDocumentFromPreparedImpl(
+    comptime resident_tail: bool,
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    gpt_cfg: gpt_mod.Config,
+    prepared_doc: qwen2vl.PreparedTextInput,
+    image_embeddings: []const []const f32,
+) !EncodedSequence {
     const ids_i64 = try allocator.alloc(i64, prepared_doc.input_ids.len);
     defer allocator.free(ids_i64);
     for (prepared_doc.input_ids, 0..) |id, idx| ids_i64[idx] = id;
@@ -540,6 +554,15 @@ pub fn encodeDocumentFromPrepared(
         break :embeddings try cb.fromFloat32Shape(prompt_embeddings, &embedding_shape);
     };
 
+    if (comptime resident_tail) {
+        // Host image production, prompt scaling and overwrite order stay above.
+        // The decoder consumes this owned input; only final retrieval vectors
+        // cross the host boundary when its physical F32 contract is supported.
+        var hidden = try decoder_prefill.ResidentHiddenRows.fromEmbeddings(cb, allocator, gpt_cfg, input_embeddings, prepared_doc.input_ids.len);
+        defer hidden.deinit();
+        return finishEncodedSequence(allocator, prepared_doc, try applyResidentRetrievalProjection(cb, allocator, &hidden));
+    }
+    // Original host tail retained as the independent test oracle.
     const hidden = try gpt_arch.hiddenForwardFromEmbeddings(cb, allocator, gpt_cfg, input_embeddings, 1, prepared_doc.input_ids.len, null, null);
     defer allocator.free(hidden);
     const projected = try applyRetrievalProjection(cb, allocator, hidden, prepared_doc.input_ids.len, hidden_size);
@@ -778,9 +801,7 @@ fn getEmbeddingWeight(cb: *const ComputeBackend, config: gpt_mod.Config) !ops.CT
     };
 }
 
-test "encodeDocumentPromptWithImageExpansion truncates image placeholder run to max length" {
-    const allocator = std.testing.allocator;
-
+const DocumentPromptTestTokenizer = struct {
     const TestTokenizer = struct {
         fn encode(_: @This(), alloc: std.mem.Allocator, text: []const u8) ![]i32 {
             if (std.mem.eql(u8, text, "<|im_start|>user\n<|vision_start|>")) {
@@ -828,57 +849,65 @@ test "encodeDocumentPromptWithImageExpansion truncates image placeholder run to 
         pub fn deinit(_: @This()) void {}
     };
 
-    const tok = Tokenizer{ .ptr = @constCast(&TestTokenizer{}), .vtable = &.{
-        .encode = struct {
-            fn f(ptr: *anyopaque, alloc: std.mem.Allocator, text: []const u8) anyerror![]i32 {
-                const self: *TestTokenizer = @ptrCast(@alignCast(ptr));
-                return self.encode(alloc, text);
-            }
-        }.f,
-        .encodeInto = struct {
-            fn f(ptr: *anyopaque, alloc: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32)) anyerror!void {
-                const self: *TestTokenizer = @ptrCast(@alignCast(ptr));
-                const ids = try self.encode(alloc, text);
-                defer alloc.free(ids);
-                try out.appendSlice(alloc, ids);
-            }
-        }.f,
-        .encodeForModel = struct {
-            fn f(ptr: *anyopaque, alloc: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!tokenizer_mod.EncodeResult {
-                const self: *TestTokenizer = @ptrCast(@alignCast(ptr));
-                return self.encodeForModel(alloc, text, max_length);
-            }
-        }.f,
-        .encodeGeneration = struct {
-            fn f(ptr: *anyopaque, alloc: std.mem.Allocator, text: []const u8, max_length: usize, add_bos_token: bool) anyerror!tokenizer_mod.EncodeResult {
-                const self: *TestTokenizer = @ptrCast(@alignCast(ptr));
-                return self.encodeGeneration(alloc, text, max_length, add_bos_token);
-            }
-        }.f,
-        .decode = struct {
-            fn f(_: *anyopaque, _: std.mem.Allocator, _: []const i32) anyerror![]u8 {
-                return error.UnsupportedOperation;
-            }
-        }.f,
-        .specialTokens = struct {
-            fn f(ptr: *anyopaque) tokenizer_mod.SpecialTokens {
-                const self: *TestTokenizer = @ptrCast(@alignCast(ptr));
-                return self.specialTokens();
-            }
-        }.f,
-        .vocabSize = struct {
-            fn f(ptr: *anyopaque) usize {
-                const self: *TestTokenizer = @ptrCast(@alignCast(ptr));
-                return self.vocabSize();
-            }
-        }.f,
-        .deinit = struct {
-            fn f(ptr: *anyopaque) void {
-                const self: *TestTokenizer = @ptrCast(@alignCast(ptr));
-                self.deinit();
-            }
-        }.f,
-    } };
+    fn make() Tokenizer {
+        return Tokenizer{ .ptr = @constCast(&TestTokenizer{}), .vtable = &.{
+            .encode = struct {
+                fn f(ptr: *anyopaque, alloc: std.mem.Allocator, text: []const u8) anyerror![]i32 {
+                    const self: *TestTokenizer = @ptrCast(@alignCast(ptr));
+                    return self.encode(alloc, text);
+                }
+            }.f,
+            .encodeInto = struct {
+                fn f(ptr: *anyopaque, alloc: std.mem.Allocator, text: []const u8, out: *std.ArrayListUnmanaged(i32)) anyerror!void {
+                    const self: *TestTokenizer = @ptrCast(@alignCast(ptr));
+                    const ids = try self.encode(alloc, text);
+                    defer alloc.free(ids);
+                    try out.appendSlice(alloc, ids);
+                }
+            }.f,
+            .encodeForModel = struct {
+                fn f(ptr: *anyopaque, alloc: std.mem.Allocator, text: []const u8, max_length: usize) anyerror!tokenizer_mod.EncodeResult {
+                    const self: *TestTokenizer = @ptrCast(@alignCast(ptr));
+                    return self.encodeForModel(alloc, text, max_length);
+                }
+            }.f,
+            .encodeGeneration = struct {
+                fn f(ptr: *anyopaque, alloc: std.mem.Allocator, text: []const u8, max_length: usize, add_bos_token: bool) anyerror!tokenizer_mod.EncodeResult {
+                    const self: *TestTokenizer = @ptrCast(@alignCast(ptr));
+                    return self.encodeGeneration(alloc, text, max_length, add_bos_token);
+                }
+            }.f,
+            .decode = struct {
+                fn f(_: *anyopaque, _: std.mem.Allocator, _: []const i32) anyerror![]u8 {
+                    return error.UnsupportedOperation;
+                }
+            }.f,
+            .specialTokens = struct {
+                fn f(ptr: *anyopaque) tokenizer_mod.SpecialTokens {
+                    const self: *TestTokenizer = @ptrCast(@alignCast(ptr));
+                    return self.specialTokens();
+                }
+            }.f,
+            .vocabSize = struct {
+                fn f(ptr: *anyopaque) usize {
+                    const self: *TestTokenizer = @ptrCast(@alignCast(ptr));
+                    return self.vocabSize();
+                }
+            }.f,
+            .deinit = struct {
+                fn f(ptr: *anyopaque) void {
+                    const self: *TestTokenizer = @ptrCast(@alignCast(ptr));
+                    self.deinit();
+                }
+            }.f,
+        } };
+    }
+};
+
+test "encodeDocumentPromptWithImageExpansion truncates image placeholder run to max length" {
+    const allocator = std.testing.allocator;
+
+    const tok = DocumentPromptTestTokenizer.make();
 
     const cfg = gpt_mod.Config{
         .family = .qwen2,
@@ -944,8 +973,64 @@ const ResidentDocumentFixture = struct {
         const images = [_]NativeImageEmbedding{ .{ .tensor = first, .token_count = 3 }, .{ .tensor = second, .token_count = 2 } };
         // Original genuine-host feature path supplies an independent assembly
         // oracle, including partial image runs and separated text segments.
-        var reference = try encodeDocumentFromPrepared(cb, a, config(), prepared, &.{ &first_image, &second_image });
+        var reference = try encodeDocumentFromPreparedImpl(false, cb, a, config(), prepared, &.{ &first_image, &second_image });
         defer reference.deinit();
+        var imported = try encodeDocumentFromPrepared(cb, a, config(), prepared, &.{ &first_image, &second_image });
+        defer imported.deinit();
+        try std.testing.expectEqual(reference.hidden_size, imported.hidden_size);
+        if (cb.kind() == .native) {
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.hidden_states), std.mem.sliceAsBytes(imported.hidden_states));
+        } else {
+            for (reference.hidden_states, imported.hidden_states) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+        }
+        if (cb.kind() == .metal or cb.kind() == .cuda) {
+            // The individually executed original/public calls above warm the
+            // same real provider and weights before these request-local scopes.
+            const transfer = @import("../execution/transfer_audit.zig");
+            var host_audit = transfer.Audit{};
+            var observed_host = measured: {
+                try transfer.begin(&host_audit);
+                defer transfer.end();
+                break :measured try encodeDocumentFromPreparedImpl(false, cb, a, config(), prepared, &.{ &first_image, &second_image });
+            };
+            defer observed_host.deinit();
+            var resident_audit = transfer.Audit{};
+            var observed_resident = measured: {
+                try transfer.begin(&resident_audit);
+                defer transfer.end();
+                break :measured try encodeDocumentFromPrepared(cb, a, config(), prepared, &.{ &first_image, &second_image });
+            };
+            defer observed_resident.deinit();
+            for (observed_host.hidden_states, observed_resident.hidden_states) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+            if (reference.hidden_size == 3) {
+                // Original host tail exports all hidden rows and the three
+                // bias values, then uploads hidden rows to the SAME linear.
+                // Prompt staging and final requested-vector exports are shared.
+                const hidden_bytes: u64 = prepared.input_ids.len * config().hidden_size * @sizeOf(f32);
+                const bias_bytes: u64 = reference.hidden_size * @sizeOf(f32);
+                try std.testing.expectEqual(resident_audit.upload_bytes + hidden_bytes, host_audit.upload_bytes);
+                try std.testing.expectEqual(resident_audit.download_bytes + hidden_bytes + bias_bytes, host_audit.download_bytes);
+            } else {
+                // Missing projection still exports the requested hidden rows;
+                // no hidden re-upload or bias read existed in the old path.
+                try std.testing.expectEqual(@as(usize, config().hidden_size), reference.hidden_size);
+                try std.testing.expectEqual(host_audit.upload_bytes, resident_audit.upload_bytes);
+                try std.testing.expectEqual(host_audit.download_bytes, resident_audit.download_bytes);
+            }
+        }
+        const imported_held = try a.dupe(f32, imported.hidden_states);
+        defer a.free(imported_held);
+        var scaled = config();
+        scaled.family = .gemma;
+        var scaled_reference = try encodeDocumentFromPreparedImpl(false, cb, a, scaled, prepared, &.{ &first_image, &second_image });
+        defer scaled_reference.deinit();
+        var scaled_imported = try encodeDocumentFromPrepared(cb, a, scaled, prepared, &.{ &first_image, &second_image });
+        defer scaled_imported.deinit();
+        if (cb.kind() == .native) {
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(scaled_reference.hidden_states), std.mem.sliceAsBytes(scaled_imported.hidden_states));
+        } else {
+            for (scaled_reference.hidden_states, scaled_imported.hidden_states) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+        }
         var encoded = try encodeDocumentFromPreparedNative(cb, a, config(), prepared, &images);
         defer encoded.deinit();
         try std.testing.expectEqual(reference.hidden_size, encoded.hidden_size);
@@ -981,6 +1066,7 @@ const ResidentDocumentFixture = struct {
         var later = try encodeDocumentFromPreparedNative(cb, a, config(), prepared, &images);
         defer later.deinit();
         try std.testing.expectEqualSlices(f32, held, encoded.hidden_states);
+        try std.testing.expectEqualSlices(f32, imported_held, imported.hidden_states);
         const image_after = try cb.toFloat32(first, a);
         defer a.free(image_after);
         try std.testing.expectEqualSlices(f32, &first_image, image_after);
@@ -1002,6 +1088,9 @@ const ResidentDocumentFixture = struct {
         var encoded = try encodeDocumentFromPreparedNative(&cb, a, config(), prepared, &.{ .{ .tensor = first, .token_count = 3 }, .{ .tensor = second, .token_count = 2 } });
         defer encoded.deinit();
         try std.testing.expectEqual(@as(usize, 18), encoded.hidden_states.len);
+        var imported = try encodeDocumentFromPrepared(&cb, a, config(), prepared, &.{ &first_image, &second_image });
+        defer imported.deinit();
+        try std.testing.expectEqualSlices(f32, encoded.hidden_states, imported.hidden_states);
     }
 };
 
@@ -1071,10 +1160,82 @@ test "Native ColQwen packed logical F32 image declines resident copy before pres
     var config = ResidentDocumentFixture.config();
     config.hidden_size = 32;
     config.intermediate_size = 32;
-    var reference = try encodeDocumentFromPrepared(&cb, a, config, prepared, &.{decoded});
+    var reference = try encodeDocumentFromPreparedImpl(false, &cb, a, config, prepared, &.{decoded});
     defer reference.deinit();
     var actual = try encodeDocumentFromPreparedNative(&cb, a, config, prepared, &.{.{ .tensor = image, .token_count = 2 }});
     defer actual.deinit();
     try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.hidden_states), std.mem.sliceAsBytes(actual.hidden_states));
     try std.testing.expectEqualSlices(i32, &ids, actual.input_ids);
+}
+
+test "CUDA ColQwen imported vision tail preserves host oracle scaling projection and held vectors" {
+    try ResidentDocumentFixture.helper.onCuda(ResidentDocumentFixture.populateProjection, ResidentDocumentFixture.check);
+}
+
+const DocumentProducerOomFixture = struct {
+    const png_1x1 = [_]u8{
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+        0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+        0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41,
+        0x54, 0x78, 0xda, 0x63, 0xfc, 0xff, 0x9f, 0xa1,
+        0x1e, 0x00, 0x07, 0x82, 0x02, 0x7f, 0x3d, 0xc8,
+        0x48, 0xef, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+        0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    };
+
+    fn encode(_: *anyopaque, a: std.mem.Allocator, _: []const u8) ![]i32 {
+        return a.dupe(i32, &.{1});
+    }
+    fn info(_: *anyopaque) []const backends.TensorInfo {
+        return &.{};
+    }
+    fn backend(_: *anyopaque) backends.BackendType {
+        return .native;
+    }
+    fn close(_: *anyopaque) void {}
+    fn vision(_: *anyopaque, _: []const Tensor, a: std.mem.Allocator) ![]Tensor {
+        const values = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+        const outputs = try a.alloc(Tensor, 1);
+        errdefer a.free(outputs);
+        outputs[0] = try Tensor.initFloat32(a, "image", &.{ 4, 4 }, &values);
+        return outputs;
+    }
+    fn run(a: std.mem.Allocator) !void {
+        const native = ResidentDocumentFixture.native;
+        var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+        defer weights.deinitOwned();
+        try ResidentDocumentFixture.populateProjection(&weights);
+        var compute = native.NativeCompute.init(a, &weights, null);
+        defer compute.deinit();
+        const cb = compute.computeBackend();
+        var token = DocumentPromptTestTokenizer.make();
+        var table = token.vtable.*;
+        table.encode = encode;
+        token.vtable = &table;
+        var context: u8 = 0;
+        const imported = backends.Session{ .ptr = &context, .vtable = &.{ .run = vision, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close } };
+        var config = ResidentDocumentFixture.config();
+        config.vision_embed_dim = 4;
+        config.vision_num_hidden_layers = 1;
+        config.vision_num_attention_heads = 1;
+        const prep = qwen2vl.PreprocessorConfig{ .min_pixels = 16, .max_pixels = 16, .patch_size = 2, .merge_size = 1, .temporal_patch_size = 1 };
+        const query = EncodedSequence{ .allocator = a, .input_ids = @constCast(&[_]i32{1}), .attention_mask = @constCast(&[_]i32{1}), .hidden_states = @constCast(&[_]f32{ 1, 2, 3 }), .hidden_size = 3 };
+        const score = try scoreDocument(&cb, a, imported, token, .{}, config, prep, query, "doc", &.{ &png_1x1, &png_1x1 }, 12, false, null);
+        try std.testing.expect(std.math.isFinite(score));
+        // The canonical Native branch reaches its real patch-weight lookup
+        // after image preparation/list ownership, then fails without vision weights.
+        _ = scoreDocument(&cb, a, null, token, .{}, config, prep, query, "doc", &.{ &png_1x1, &png_1x1 }, 12, false, null) catch |err| switch (err) {
+            error.MissingWeight => return,
+            else => return err,
+        };
+        return error.ExpectedMissingVisionWeight;
+    }
+};
+
+test "Native ColQwen document producers preserve actual imported and native ownership through allocation failures" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try DocumentProducerOomFixture.run(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, DocumentProducerOomFixture.run, .{});
 }

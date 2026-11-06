@@ -651,7 +651,7 @@ fn defaultImportedOnnxBackend() BackendType {
     return if (build_options.enable_wasm) .wasm else .native;
 }
 
-fn isOnnxFilePath(path: []const u8) bool {
+pub fn isOnnxFilePath(path: []const u8) bool {
     return std.mem.endsWith(u8, path, ".onnx");
 }
 

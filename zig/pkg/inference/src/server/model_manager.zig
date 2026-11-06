@@ -3120,7 +3120,10 @@ pub const ModelManager = struct {
             backend_runtime.backend,
             self.process_memory_limit_bytes,
         );
-        limits = try session_factory.widenBudgetLimitsForModelPath(
+        // Direct Imported components already have the artifact-derived ONNX
+        // floor below. Their actual file path is not an architecture directory.
+        // Use the SAME classifier as SessionManager's real Imported entry.
+        if (!backends.isOnnxFilePath(model_path)) limits = try session_factory.widenBudgetLimitsForModelPath(
             self.allocator,
             model_path,
             limits,
@@ -11881,6 +11884,12 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
         var operation = try @import("../execution/backend_operation.zig").enter(target.cb, target.executable.graph, null, .managed);
         defer operation.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
         try std.testing.expect(try operation.bindCleanupEpoch(&guard.epoch));
+        var generic_qkv: ?@import("../ops/ops.zig").LinearNoBiasTripleResult = null;
+        defer if (generic_qkv) |triple| {
+            target.cb.free(triple.first);
+            target.cb.free(triple.second);
+            target.cb.free(triple.third);
+        };
         var frame = try metal.AssignedDenseFrame.begin(current_runtime);
         defer frame.drain() catch platform.inference_process_supervisor.restartWorker();
         var outputs: [3]@import("../ops/ops.zig").CT = undefined;
@@ -11889,7 +11898,22 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
             outputs[0] = pair.first;
             outputs[1] = pair.second;
         } else {
-            const triple = try target.cb.linearNoBiasQkv(resident, weights[0], weights[1], weights[2], rows, width, width, width);
+            // Metal intentionally leaves this generic hook absent: its public
+            // fallback is Q + a KV pair, which does NOT read the triple pack.
+            try std.testing.expect(target.cb.vtable.linearNoBiasQkv == null);
+            generic_qkv = try target.cb.linearNoBiasQkv(resident, weights[0], weights[1], weights[2], rows, width, width, width);
+            try std.testing.expectEqual(owner_references, cached.owner.references);
+            // This is the actual grouped-QKV compatibility consumer used by
+            // the production Metal partition executor, with its real slots.
+            const triple = (try target.cb.decoderRuntimeApplyLinearQkv(&.{
+                .q_slot = request.slots[0],
+                .k_slot = request.slots[1],
+                .v_slot = request.slots[2],
+                .input = resident,
+                .in_dim = request.width,
+                .q_out_dim = request.widths[0],
+                .kv_out_dim = request.widths[1],
+            })) orelse return error.MissingGroupedCompatibilityQkv;
             outputs[0] = triple.first;
             outputs[1] = triple.second;
             outputs[2] = triple.third;
@@ -11901,6 +11925,11 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
         guard.finish();
         try std.testing.expectEqual(owner_references, cached.owner.references);
         try std.testing.expectEqual(@as(c_int, 3), metal.antfly_metal_packed_projection_is_cached(current_runtime, cached.owner.entry));
+        if (generic_qkv) |triple| for ([_]@import("../ops/ops.zig").CT{ triple.first, triple.second, triple.third }, 0..) |output, index| {
+            const actual = try target.cb.toFloat32(output, a);
+            defer a.free(actual);
+            for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)), got, 0.0001);
+        };
         for (outputs[0..count], 0..) |output, index| {
             const actual = try target.cb.toFloat32(output, a);
             defer a.free(actual);
@@ -12004,4 +12033,27 @@ test "managed Imported Metal packed pair cold service owns direct reduce roots o
 }
 test "managed Imported Metal packed QKV cold service owns direct tiled roots outputs and Model close" {
     try checkManagedPackedProjectionHead(3, 128);
+}
+
+test "direct Imported component floors use file classification and preserve explicit hard caps" {
+    const a = std.testing.allocator;
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var manager = ModelManager.init(failing.allocator(), .{ .allocator = failing.allocator() });
+    defer manager.deinit();
+    const memory = runtime.tier.memory;
+    const backend = backends.BackendRuntime{ .backend = .metal };
+    const floor = memory.Limits{ .host_limit_bytes = 4096, .backend_limit_bytes = 8192, .combined_limit_bytes = 12288 };
+    manager.admission_limit_overrides = .{ .host_limit_bytes = 1024, .backend_limit_bytes = 2048, .combined_limit_bytes = 3072 };
+    const expected = backends.clampPhysicalMemoryLimits(backend.backend, memory.applyLimitOverrides(memory.maxCompositeLimits(backends.defaultMemoryLimits(backend.backend, manager.process_memory_limit_bytes), floor), manager.admission_limit_overrides), manager.process_memory_limit_bytes);
+    // The artifact estimator validates/maps the real ONNX before this policy
+    // callback. Policy must neither reopen a file as a directory nor allocate
+    // an architecture manifest; the genuine public component case is above.
+    const actual = try manager.admissionLimitsForModelPath("direct-component.onnx", backend, floor);
+    try std.testing.expectEqualDeep(expected, actual);
+    try std.testing.expectEqual(@as(usize, 1024), actual.host_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 2048), actual.backend_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 3072), actual.combined_limit_bytes);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expect(backends.isOnnxFilePath("direct-component.onnx"));
+    try std.testing.expect(!backends.isOnnxFilePath("native-model"));
 }
