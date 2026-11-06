@@ -5438,6 +5438,8 @@ const ResourceTableLookup = struct {
     source: syntax.Object,
     selected: std.StringHashMapUnmanaged(?syntax.Object) = .empty,
     scans: usize = 0,
+    dependency_requests: ?*ReferencedResourceNames = null,
+    waiting_for_dependency: bool = false,
     frame_budget: ?DecodeBudgetAllocator = null,
     frames: MetadataObjectStreamCache = .{},
     encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty,
@@ -5468,6 +5470,7 @@ const ResourceTableLookup = struct {
     }
 
     fn deinit(self: *@This(), a: Allocator) void {
+        std.debug.assert(self.dependency_requests == null);
         var entries = self.selected.iterator();
         while (entries.next()) |entry| {
             a.free(entry.key_ptr.*);
@@ -5502,13 +5505,13 @@ const ResourceTableLookup = struct {
         // Preserve first-key semantics without quadratic searches when many
         // names are selected. Partial successful entries survive allocation
         // failure; negative results are published only after parsing succeeds.
-        if (table == .dict) for (table.dict) |entry| {
+        if (table == .dict) for (table.dict) |*entry| {
             try reader.checkCancellation();
             if (!pending.contains(entry.key) or self.selected.contains(entry.key)) continue;
-            const owned_key = try reader.alloc.dupe(u8, entry.key);
-            errdefer reader.alloc.free(owned_key);
-            const value = try entry.value.clone(reader.alloc);
-            self.selected.putAssumeCapacity(owned_key, value);
+            // The projected table already owns these allocations through the
+            // caller allocator. Transfer them instead of deep-cloning again.
+            self.selected.putAssumeCapacity(entry.key, entry.value);
+            entry.* = .{ .key = &.{}, .value = .null };
         };
         keys = pending.keyIterator();
         while (keys.next()) |key| {
@@ -5521,6 +5524,14 @@ const ResourceTableLookup = struct {
 
     fn get(self: *@This(), reader: *const Reader, name: []const u8) !?syntax.Object {
         if (self.selected.get(name)) |value| return value;
+        if (self.dependency_requests) |requests| {
+            // Classification is probing this frontier. Its result cannot be
+            // committed until every requested name has been loaded or proved
+            // absent. Own names because the classifier frees temporary values.
+            self.waiting_for_dependency = true;
+            try requests.add(reader.alloc, name);
+            return null;
+        }
         var names: std.StringHashMapUnmanaged(void) = .empty;
         defer names.deinit(reader.alloc);
         try names.put(reader.alloc, name, {});
@@ -9157,6 +9168,10 @@ pub const Reader = struct {
                     4 => .device_cmyk,
                     else => unreachable,
                 });
+            if (resource_entries.dependency_requests != null and resource_entries.waiting_for_dependency) {
+                deinitColorSpaceSelection(&selection, self.alloc);
+                return colorSpaceSelectionForKind(.unsupported);
+            }
             if (selection.kind == .pattern or
                 selection.kind == .unsupported or
                 colorSpaceComponentCount(selection.kind) != components)
@@ -9198,6 +9213,10 @@ pub const Reader = struct {
             if (input_components != 1) return colorSpaceSelectionForKind(.unsupported);
 
             var alternate = try self.classifyColorSpaceResource(&resolved.array[2], resource_entries, depth + 1, allow_default_remap);
+            if (resource_entries.dependency_requests != null and resource_entries.waiting_for_dependency) {
+                deinitColorSpaceSelection(&alternate, self.alloc);
+                return colorSpaceSelectionForKind(.unsupported);
+            }
             if (alternate.value.tint != null or (alternate.pattern_base != null and alternate.pattern_base.?.tint != null)) {
                 deinitColorSpaceSelection(&alternate, self.alloc);
                 return colorSpaceSelectionForKind(.unsupported);
@@ -9373,31 +9392,62 @@ pub const Reader = struct {
         var out = std.ArrayList(PageColorSpace).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*color_space| color_space.deinit(self.alloc);
+        var unresolved: std.ArrayList([]const u8) = .empty;
+        defer unresolved.deinit(self.alloc);
         var names = references.names.keyIterator();
-        while (names.next()) |key| {
+        while (names.next()) |key| try unresolved.append(self.alloc, key.*);
+        while (unresolved.items.len != 0) {
+            var requests = ReferencedResourceNames{};
+            defer requests.deinit(self.alloc);
+            try self.collectColorSpaceFrontier(lookup, &unresolved, &out, &requests);
+            // Each unresolved root discovered at least one uncached dependency.
+            // Classifier depth bounds the number of frontiers independently of
+            // the number of selected names. Successful roots are never retried.
+            if (unresolved.items.len != 0) {
+                std.debug.assert(requests.names.count() != 0);
+                try lookup.prime(self, &requests.names);
+            }
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn collectColorSpaceFrontier(
+        self: *const Reader,
+        lookup: *ResourceTableLookup,
+        unresolved: *std.ArrayList([]const u8),
+        out: *std.ArrayList(PageColorSpace),
+        requests: *ReferencedResourceNames,
+    ) !void {
+        std.debug.assert(lookup.dependency_requests == null);
+        lookup.dependency_requests = requests;
+        defer lookup.dependency_requests = null;
+        var remaining: usize = 0;
+        for (unresolved.items) |key| {
             try self.checkCancellation();
-            const entry = (try lookup.get(self, key.*)) orelse continue;
-            var name: ?[]u8 = try self.alloc.dupe(u8, key.*);
-            errdefer if (name) |owned| self.alloc.free(owned);
+            lookup.waiting_for_dependency = false;
+            const entry = (try lookup.get(self, key)) orelse continue;
             var selection = self.classifyColorSpaceResource(
                 &entry,
                 lookup,
                 0,
-                !isDefaultDeviceColorSpaceName(key.*),
+                !isDefaultDeviceColorSpaceName(key),
             ) catch |err| switch (err) {
                 error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.PdfMetadataWorkLimit, error.Canceled => return err,
                 else => colorSpaceSelectionForKind(.unsupported),
             };
             var selection_owned = true;
-            errdefer if (selection_owned) deinitColorSpaceSelection(&selection, self.alloc);
-            try out.append(self.alloc, .{
-                .name = name.?,
-                .selection = selection,
-            });
+            defer if (selection_owned) deinitColorSpaceSelection(&selection, self.alloc);
+            if (lookup.waiting_for_dependency) {
+                unresolved.items[remaining] = key;
+                remaining += 1;
+                continue;
+            }
+            const name = try self.alloc.dupe(u8, key);
+            errdefer self.alloc.free(name);
+            try out.append(self.alloc, .{ .name = name, .selection = selection });
             selection_owned = false;
-            name = null;
         }
-        return try out.toOwnedSlice(self.alloc);
+        unresolved.shrinkRetainingCapacity(remaining);
     }
 
     fn collectPageColorSpacesForContentAlloc(self: *const Reader, page: *const syntax.Object, content: []const u8) ![]PageColorSpace {
@@ -39770,4 +39820,151 @@ test "reader standalone selective color aliases reuse compressed source frames" 
     try std.testing.expectEqual(ColorSpaceKind.device_rgb, selected.kind);
     try std.testing.expectEqual(@as(usize, 1), lookup.frames.decodes);
     try std.testing.expectEqual(@as(usize, 1), lookup.frames.loads);
+}
+
+fn buildColorFrontierTestPdfAlloc(a: Allocator, aliases: usize, links: usize, unused: usize, compressed: bool) ![]u8 {
+    var table: std.ArrayList(u8) = .empty;
+    defer table.deinit(a);
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(a);
+    try table.appendSlice(a, "<< ");
+    for (0..aliases) |i| {
+        for (0..links) |level| try table.print(a, "/C{d}_{d} /C{d}_{d} ", .{ level, i, level + 1, i });
+        try table.print(a, "/C{d}_{d} /DeviceRGB ", .{ links, i });
+        try content.print(a, "/C0_{d} cs 0 0 0 sc ", .{i});
+    }
+    for (0..unused) |i| try table.print(a, "/Unused{d} /DeviceRGB ", .{i});
+    try table.appendSlice(a, ">>");
+    try content.appendSlice(a, "BT /F1 10 Tf 10 100 Td (Hello) Tj ET");
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ if (compressed) "<< /Font << /F1 5 0 R >> /ColorSpace 8 0 R >>" else "<< /Font << /F1 5 0 R >> /ColorSpace 9 0 R >>", if (compressed) table.items else "null" },
+        .extra = if (compressed) &.{} else &.{table.items},
+        .content = content.items,
+    });
+}
+
+fn freePageColorSpaces(a: Allocator, spaces: []PageColorSpace) void {
+    for (spaces) |*space| space.deinit(a);
+    a.free(spaces);
+}
+
+test "reader color dependency frontier scans depend on depth rather than alias count" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 16, 64 }) |aliases| {
+        for ([_]usize{ 1, 3 }) |links| {
+            for ([_]bool{ false, true }) |compressed| {
+                const sample = try buildColorFrontierTestPdfAlloc(a, aliases, links, 4096, compressed);
+                defer a.free(sample);
+                var reader = try Reader.init(a, sample);
+                defer reader.deinit();
+                var cache = ResourceLookupCache{};
+                defer cache.deinit(a);
+                reader.resource_lookup_cache = &cache;
+                var resources = try reader.readIndirectObjectProjected(.{ .id = 7, .gen = 0 }, .required_resources);
+                defer resources.deinit(a);
+                try reader.ensurePageIndex();
+                const content = try reader.collectPageContentAlloc(&reader.page_index.?[0].object);
+                defer a.free(content);
+                const spaces = try reader.collectColorSpacesFromResourcesAlloc(&resources, content);
+                defer freePageColorSpaces(a, spaces);
+                try std.testing.expectEqual(aliases, spaces.len);
+                for (spaces) |space| try std.testing.expectEqual(ColorSpaceKind.device_rgb, space.selection.kind);
+                const lookup = try cache.table(&reader, resources.get("ColorSpace").?.*);
+                try std.testing.expectEqual(links + 2, lookup.scans);
+                try std.testing.expectEqual(aliases * (links + 1) + 2, lookup.selected.count());
+                try std.testing.expect(lookup.dependency_requests == null);
+                if (compressed) try std.testing.expectEqual(@as(usize, 1), lookup.frames.decodes);
+                const repeated = try reader.collectColorSpacesFromResourcesAlloc(&resources, content);
+                defer freePageColorSpaces(a, repeated);
+                try std.testing.expectEqual(aliases, repeated.len);
+                try std.testing.expectEqual(links + 2, lookup.scans);
+            }
+        }
+    }
+}
+
+fn exerciseColorFrontierAllocations(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqualStrings("Hello\n", analysis.text);
+    try std.testing.expect(reader.resource_lookup_cache == null);
+}
+
+test "reader color dependency frontiers preserve ownership at every allocation failure" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |compressed| {
+        const sample = try buildColorFrontierTestPdfAlloc(a, 4, 3, 16, compressed);
+        defer a.free(sample);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseColorFrontierAllocations, .{sample});
+    }
+}
+
+test "reader interrupted color frontiers clear discovery state and retry unresolved names" {
+    const a = std.testing.allocator;
+    const sample = try buildColorFrontierTestPdfAlloc(a, 16, 1, 256, false);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var resources = try reader.readIndirectObjectProjected(.{ .id = 7, .gen = 0 }, .required_resources);
+    defer resources.deinit(a);
+    var cache = ResourceLookupCache{};
+    defer cache.deinit(a);
+    reader.resource_lookup_cache = &cache;
+    const lookup = try cache.table(&reader, resources.get("ColorSpace").?.*);
+    var names = ReferencedResourceNames{};
+    defer names.deinit(a);
+    try names.add(a, "C0_0");
+    try names.add(a, "DefaultGray");
+    try lookup.prime(&reader, &names.names);
+    var control = syntax.ScanControl{ .remaining_work = 128 };
+    reader.metadata_scan = &control;
+    try std.testing.expectError(error.PdfMetadataWorkLimit, reader.collectColorSpacesFromResourcesAlloc(&resources, "/C0_0 cs"));
+    try std.testing.expect(lookup.dependency_requests == null);
+    try std.testing.expect(!lookup.selected.contains("C1_0"));
+    reader.metadata_scan = null;
+    const spaces = try reader.collectColorSpacesFromResourcesAlloc(&resources, "/C0_0 cs");
+    defer freePageColorSpaces(a, spaces);
+    try std.testing.expectEqual(@as(usize, 1), spaces.len);
+    try std.testing.expectEqual(ColorSpaceKind.device_rgb, spaces[0].selection.kind);
+}
+
+test "reader color frontiers preserve nested spaces default aliases ICC metadata and cycles" {
+    const a = std.testing.allocator;
+    const sample = try buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "<< /ColorSpace 9 0 R >>", "null" },
+        .extra = &.{
+            "<< /P [/Pattern /RGB] /S [/Separation /Ink /RGB << /FunctionType 2 /Domain [0 1] /C0 [0 0 0] /C1 [1 1 1] /N 1 >>] /I [/ICCBased 10 0 R] /RGB /DeviceRGB /DefaultGray /G /G [/CalGray << /WhitePoint [0.9505 1 1.089] >>] /Loop /Loop >>",
+            "<< /N 3 /Alternate /RGB /Length 99 0 R >>\nstream\nx\nendstream",
+        },
+    });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var resources = try reader.readIndirectObjectProjected(.{ .id = 7, .gen = 0 }, .required_resources);
+    defer resources.deinit(a);
+    var cache = ResourceLookupCache{};
+    defer cache.deinit(a);
+    reader.resource_lookup_cache = &cache;
+    const spaces = try reader.collectColorSpacesFromResourcesAlloc(&resources, "/P cs /S cs /I cs /Loop cs");
+    defer freePageColorSpaces(a, spaces);
+    try std.testing.expectEqual(@as(usize, 5), spaces.len);
+    for (spaces) |space| {
+        if (std.mem.eql(u8, space.name, "P")) {
+            try std.testing.expectEqual(ColorSpaceKind.pattern, space.selection.kind);
+            try std.testing.expectEqual(ColorSpaceKind.device_rgb, space.selection.pattern_base.?.kind);
+        } else if (std.mem.eql(u8, space.name, "S")) {
+            try std.testing.expect(space.selection.value.tint != null);
+        } else if (std.mem.eql(u8, space.name, "I")) {
+            try std.testing.expectEqual(ColorSpaceKind.device_rgb, space.selection.kind);
+        } else if (std.mem.eql(u8, space.name, "Loop")) {
+            try std.testing.expectEqual(ColorSpaceKind.unsupported, space.selection.kind);
+        } else if (std.mem.eql(u8, space.name, "DefaultGray")) {
+            try std.testing.expect(space.selection.value.calibrated != null);
+        } else return error.TestUnexpectedResult;
+    }
+    const lookup = try cache.table(&reader, resources.get("ColorSpace").?.*);
+    try std.testing.expectEqual(@as(usize, 3), lookup.scans);
+    try std.testing.expect(lookup.dependency_requests == null);
 }

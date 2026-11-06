@@ -2003,15 +2003,22 @@ count. When content selects a large table, font, XObject, and graphics-state
 collectors retain only referenced entries, including escaped PDF names. Common
 indexed tables consume opaque values and comments once; large-table fallback
 trades a later bounded scan for constant initial index storage. Color-space
-resolution batches content-selected names and follows aliases/default-space
-references on demand. Only requested entries and missing-name results enter a
+resolution batches content-selected names and discovers alias/default-space
+dependencies in breadth-first frontiers. Each frontier collects misses from the
+normal classifier and loads them in one source scan. Completed roots leave the
+work list, so source-scan count depends on dependency depth rather than alias
+count; cycles retain the classifier's existing depth bound. Incomplete roots
+cannot publish a color selection, and tint/range materialization waits until
+their dependencies are available. Only requested entries and missing-name results enter a
 page-local lookup cache; unused names and definitions are scanned without being
 allocated. Stable lookup records keyed by source object and span let Forms share
 those results without borrowing dictionary storage from a Form scope. Common
 direct dictionaries use a scoped lookup. Image resource-dependency and decode
 lookups use the same interface, with bounded decoded-frame reuse when no native
-page cache is active and a scoped encryption registry. Alias recursion remains bounded, and cancelled scans or
-allocation failures never publish negative results. Indirect tables use the same projections.
+page cache is active and a scoped encryption registry. Interrupted scans do not
+publish negative results, and discovery state is cleared on every exit. Owned
+projected entries transfer into the lookup cache without a second deep copy.
+Indirect tables use the same projections.
 Properties retain their separate optional-metadata limits and lazy lookup.
 Collectors resolve entries only after determining which names the content uses.
 Source views preserve their owning object's identity so encrypted nested values
