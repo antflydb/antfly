@@ -2190,6 +2190,133 @@ pub const PersistentIndex = struct {
         try self.indexSegmentOwned(owned);
     }
 
+    /// WS4 phase 2: this index's own catalog scope string -- the same
+    /// value `openMainStore` passed as `native_catalog_backend.Options.
+    /// scope` -- when `main_backend == .native_catalog`, else `null`. A
+    /// caller building `commit_participant.IndexCatalogMutation`s for this
+    /// index's segment/range/active-set records must scope them exactly
+    /// the same way `native_catalog_sink.zig`'s `Sink.submit` does, or
+    /// they will not be found by this index's own reads.
+    pub fn nativeCatalogScope(self: *const PersistentIndex) ?[]const u8 {
+        return switch (self.main_store_owner) {
+            .native_catalog => |backend| backend.scope,
+            .mem, .lsm => null,
+        };
+    }
+
+    /// A small ("inline") segment publication prepared for a
+    /// `.native_catalog` index, built OUTSIDE any lock and without
+    /// committing anything: `prepareInlineSegmentPublication` below
+    /// reserves a segment id, computes the key range, and stages every
+    /// mutation `persistSegment`/`updateActiveSegments` would otherwise
+    /// write through its own `MainTxn` -- as a plain, backend-agnostic
+    /// `native_catalog_backend.Mutation` list a caller folds into an
+    /// externally-owned native transaction via `commit_participant.View.
+    /// putIndexCatalog`, instead of this index opening and committing its
+    /// own. Exactly one of `installInlineSegmentPublication` (the
+    /// mutations committed durably) or `abort` (they did not) must run
+    /// exactly once for every value this returns.
+    pub const InlineSegmentPublication = struct {
+        seg_id: u64,
+        segment_bytes: []u8,
+        range_value: []u8,
+        seg_key: [8]u8,
+        range_key: [meta_segment_range_prefix.len + 8]u8,
+        active_key: [meta_active_segment_prefix.len + 8]u8,
+        /// Staged (fallible) before any commit; `.publish()` is the only
+        /// infallible step left once the mutations below are durable --
+        /// see `indexSegmentOwned`'s identical staged/infallible split.
+        writer_publication: index_mod.IndexWriter.PreparedSegmentReplacement,
+
+        /// Valid only while `self` stays at this address: every mutation's
+        /// `key`/`value` slice points back into one of `self`'s own
+        /// fields. Callers must consume the result before `self` is moved,
+        /// which holds naturally for the immediate
+        /// `view.putIndexCatalog(scope, &publication.mutations())` use.
+        pub fn mutations(self: *const InlineSegmentPublication) [4]native_catalog_backend.Mutation {
+            return .{
+                .{ .namespace = "segments", .key = &self.seg_key, .value = self.segment_bytes },
+                .{ .namespace = "meta", .key = &self.range_key, .value = self.range_value },
+                .{ .namespace = "meta", .key = &self.active_key, .value = &.{1} },
+                // Mirrors `updateActiveSegments`'s own cache invalidation:
+                // drop any previously cached decoded active-segment list.
+                .{ .namespace = "meta", .key = meta_active_segments, .is_delete = true },
+            };
+        }
+
+        /// Discards a publication whose mutations were never committed
+        /// durably (or whose commit failed): nothing becomes visible to
+        /// either this index's readers or its own in-memory writer.
+        pub fn abort(self: *InlineSegmentPublication, alloc: Allocator) void {
+            self.writer_publication.abort();
+            alloc.free(self.segment_bytes);
+            alloc.free(self.range_value);
+            self.* = undefined;
+        }
+    };
+
+    /// Builds `segment_bytes`'s `InlineSegmentPublication`. Takes ownership
+    /// of `segment_bytes` on success (freed by `abort`, or transferred into
+    /// the writer snapshot by `installInlineSegmentPublication`); on
+    /// failure the caller still owns it. Requires `main_backend ==
+    /// .native_catalog` (`segment_files == null` is that backend's own
+    /// invariant -- see `open`'s "publishes small segments inline" note --
+    /// so this never needs the file-backed artifact path
+    /// `indexSegmentFromSinkBuilder` uses).
+    pub fn prepareInlineSegmentPublication(self: *PersistentIndex, segment_bytes: []u8) !InlineSegmentPublication {
+        if (self.read_only) return error.ReadOnly;
+        if (self.main_backend != .native_catalog) return error.NotNativeCatalogBackend;
+        std.debug.assert(self.segment_files == null);
+
+        var key_range = try extractSegmentKeyRange(self.alloc, segment_bytes);
+        defer key_range.deinit(self.alloc);
+
+        self.writer.lockMutex();
+        const seg_id = self.writer.next_segment_id;
+        self.writer.next_segment_id += 1;
+        self.writer.mu.unlock();
+
+        const range_value = try self.alloc.alloc(u8, 8 + key_range.min_doc_key.len + key_range.max_doc_key.len);
+        errdefer self.alloc.free(range_value);
+        range_value[0..4].* = @bitCast(@as(u32, @intCast(key_range.min_doc_key.len)));
+        @memcpy(range_value[4..][0..key_range.min_doc_key.len], key_range.min_doc_key);
+        const max_off = 4 + key_range.min_doc_key.len;
+        range_value[max_off..][0..4].* = @bitCast(@as(u32, @intCast(key_range.max_doc_key.len)));
+        @memcpy(range_value[max_off + 4 ..][0..key_range.max_doc_key.len], key_range.max_doc_key);
+
+        // Every fallible snapshot allocation is staged here, before this
+        // publication's mutations ever reach an external commit -- see
+        // `indexSegmentOwned`'s identical ordering and its "publication is
+        // now infallible" note.
+        const segment_data = index_mod.SegmentData.fromOwnedHeap(segment_bytes);
+        var replacement = [_]index_mod.ReplacementSegmentData{.{ .id = seg_id, .data = segment_data }};
+        var writer_publication = try self.writer.prepareSegmentsManyData(&.{}, &replacement);
+        errdefer writer_publication.abort();
+
+        return .{
+            .seg_id = seg_id,
+            .segment_bytes = segment_bytes,
+            .range_value = range_value,
+            .seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id)),
+            .range_key = segmentRangeMetaKey(seg_id),
+            .active_key = activeSegmentMetaKey(seg_id),
+            .writer_publication = writer_publication,
+        };
+    }
+
+    /// Runs only after `publication`'s mutations (`publication.mutations()`)
+    /// are already durable in an externally-owned native transaction's
+    /// commit. Installs the in-memory writer snapshot so this index's own
+    /// reads see the new segment -- the step after which a synchronous
+    /// `full_text` write's ack may return. `publication.segment_bytes`'
+    /// ownership transfers into the writer snapshot; `range_value` is
+    /// freed here, its job done once the mutation above was committed.
+    pub fn installInlineSegmentPublication(self: *PersistentIndex, publication: *InlineSegmentPublication) void {
+        publication.writer_publication.publish();
+        self.alloc.free(publication.range_value);
+        publication.* = undefined;
+    }
+
     /// Like indexSegment(), but takes ownership of segment_bytes.
     pub fn indexSegmentOwned(self: *PersistentIndex, segment_bytes: []u8) !void {
         self.lockStorage();
@@ -4854,6 +4981,130 @@ test "persistent merge replacement carries deletion bitmap across reopen" {
         try std.testing.expectEqual(@as(u64, 1), snap.liveDocCount());
         try std.testing.expect(snap.segments[0].shared.deleted.?.contains(1));
     }
+}
+
+const InlinePublicationTestSink = struct {
+    entries: std.ArrayListUnmanaged(native_catalog_backend.Entry) = .empty,
+    allocator: Allocator,
+
+    fn findIndex(self: *@This(), namespace: ?[]const u8, key: []const u8) ?usize {
+        for (self.entries.items, 0..) |e, i| {
+            const ns_match = (e.namespace == null and namespace == null) or
+                (e.namespace != null and namespace != null and std.mem.eql(u8, e.namespace.?, namespace.?));
+            if (ns_match and std.mem.eql(u8, e.key, key)) return i;
+        }
+        return null;
+    }
+
+    fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation, durable: bool) anyerror!void {
+        _ = scope;
+        _ = durable;
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        for (mutations) |m| {
+            if (m.is_delete) {
+                if (self.findIndex(m.namespace, m.key)) |i| {
+                    const removed = self.entries.swapRemove(i);
+                    if (removed.namespace) |n| self.allocator.free(n);
+                    self.allocator.free(removed.key);
+                    self.allocator.free(removed.value);
+                }
+                continue;
+            }
+            if (self.findIndex(m.namespace, m.key)) |i| {
+                self.allocator.free(self.entries.items[i].value);
+                self.entries.items[i].value = try self.allocator.dupe(u8, m.value);
+                continue;
+            }
+            try self.entries.append(self.allocator, .{
+                .namespace = if (m.namespace) |n| try self.allocator.dupe(u8, n) else null,
+                .key = try self.allocator.dupe(u8, m.key),
+                .value = try self.allocator.dupe(u8, m.value),
+            });
+        }
+    }
+
+    fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {
+        _ = scope;
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try allocator.dupe(native_catalog_backend.Entry, self.entries.items);
+    }
+
+    fn sink(self: *@This()) NativeCatalogSink {
+        return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc };
+    }
+
+    fn deinit(self: *@This(), allocator: Allocator) void {
+        for (self.entries.items) |e| {
+            if (e.namespace) |n| allocator.free(n);
+            allocator.free(e.key);
+            allocator.free(e.value);
+        }
+        self.entries.deinit(allocator);
+    }
+};
+
+test "persistent index prepares an inline segment publication, applies it through an external commit, and installs it" {
+    // WS4 phase 2: proves `prepareInlineSegmentPublication` /
+    // `installInlineSegmentPublication` in isolation, standing in for the
+    // externally-owned native transaction (here: a direct call to
+    // `applyExternallyCommittedMutations`, exactly what
+    // `lite/docstore.zig`'s `Txn.putIndexCatalogBatch` + `commit()` does
+    // for real once the commit returns) that a caller would otherwise
+    // drive via `commit_participant.View.putIndexCatalog`.
+    const alloc = std.testing.allocator;
+
+    var test_sink = InlinePublicationTestSink{ .allocator = alloc };
+    defer test_sink.deinit(alloc);
+
+    var path_buf: [256]u8 = undefined;
+    const path = persistTmpPath(&path_buf);
+    defer cleanupPersistDir(path);
+
+    var pi = try PersistentIndex.open(alloc, .{
+        .path = path,
+        .main_backend = .native_catalog,
+        .main_native_catalog_sink = test_sink.sink(),
+    });
+    defer pi.close();
+
+    const scope = pi.nativeCatalogScope() orelse return error.TestUnexpectedResult;
+
+    const seg = try buildSimpleSegment(alloc, "doc:a", "alpha");
+    var publication = try pi.prepareInlineSegmentPublication(seg);
+    // Not committed yet: this index's own reads must not see it.
+    {
+        var txn = try pi.beginReadMainTxn();
+        defer txn.abort();
+        const active_ids = try pi.loadActiveSegmentIds(&txn, alloc);
+        defer alloc.free(active_ids);
+        try std.testing.expectEqual(@as(usize, 0), active_ids.len);
+    }
+    try std.testing.expectEqual(@as(usize, 0), test_sink.entries.items.len);
+
+    const mutations = publication.mutations();
+    switch (pi.main_store_owner) {
+        .native_catalog => |backend| try backend.applyExternallyCommittedMutations(&mutations),
+        else => return error.TestUnexpectedResult,
+    }
+    // The sink itself was never called: these mutations were "already
+    // committed" by an external transaction this test stands in for.
+    try std.testing.expectEqual(@as(usize, 0), test_sink.entries.items.len);
+    pi.installInlineSegmentPublication(&publication);
+
+    var txn = try pi.beginReadMainTxn();
+    defer txn.abort();
+    const active_ids = try pi.loadActiveSegmentIds(&txn, alloc);
+    defer alloc.free(active_ids);
+    try std.testing.expectEqual(@as(usize, 1), active_ids.len);
+
+    const ranges = try pi.activeSegmentRanges(alloc);
+    defer {
+        for (ranges) |*range| range.deinit(alloc);
+        alloc.free(ranges);
+    }
+    try std.testing.expectEqual(@as(usize, 1), ranges.len);
+
+    _ = scope;
 }
 
 test "persistent index open prunes stale active segment references" {

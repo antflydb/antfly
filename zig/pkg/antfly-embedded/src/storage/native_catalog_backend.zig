@@ -232,6 +232,55 @@ pub const Backend = struct {
         return try backend_erased.namespaceStoreFrom(allocator, self, backend_types.Namespace, identityNamespace);
     }
 
+    /// WS4 phase 2: bring this backend's in-memory read mirror in sync with
+    /// `mutations` that an EXTERNAL native transaction already committed
+    /// durably -- bypassing this backend's own `Sink.submit` entirely (see
+    /// `lite/docstore.zig`'s `Txn.putIndexCatalogBatch`, which writes the
+    /// durable index-catalog records directly, in the same commit as a
+    /// primary write). Call only after that external commit has returned
+    /// successfully: this never talks to `sink`, so calling it any earlier
+    /// would let a reader observe state with no durability behind it yet.
+    ///
+    /// Not safe to call concurrently with another write against this same
+    /// `Backend` (a `NamespaceTxn.commit()`, or another call to this
+    /// method): the caller must already hold whatever per-index
+    /// serialization lock excludes that (every writer of one
+    /// `PersistentIndex`, inline or not, already serializes through one
+    /// such lock -- see `IndexManager.lockManagedIndexApply`). This mirrors
+    /// `NamespaceTxn.commit`'s own clone-then-swap, without re-deriving the
+    /// pending-mutation bookkeeping `NamespaceTxn` needs for its own
+    /// (separate) commit.
+    pub fn applyExternallyCommittedMutations(self: *Backend, mutations: []const Mutation) !void {
+        if (mutations.len == 0) return;
+        lockBackend(self);
+        const current = self.state;
+        self.mutex.unlock();
+
+        var cloned = current.state.clone();
+        errdefer cloned.deinit(self.allocator);
+        for (mutations) |m| {
+            const namespace: backend_types.Namespace = .{ .name = m.namespace };
+            if (m.is_delete) {
+                // Matches `NamespaceTxn.delete`'s own unconditional `try`
+                // below: a missing key is not an error for this mirror's
+                // backing tree (unlike the real `get`, which does fail
+                // with `error.NotFound`).
+                try cloned.delete(self.allocator, namespace, m.key);
+            } else {
+                try cloned.put(self.allocator, namespace, m.key, m.value);
+            }
+        }
+
+        const new_rc = try self.allocator.create(RcState);
+        new_rc.* = .{ .refs = 1, .state = cloned };
+
+        lockBackend(self);
+        const old = self.state;
+        self.state = new_rc;
+        releaseState(self.allocator, old);
+        self.mutex.unlock();
+    }
+
     const NamespaceTxn = struct {
         allocator: Allocator,
         backend: *Backend,
@@ -732,4 +781,50 @@ test "native catalog backend sink failure aborts the transaction without publish
     var read = try runtime.beginRead();
     defer read.abort();
     try std.testing.expectError(error.NotFound, read.get(.{}, "k"));
+}
+
+test "native catalog backend applyExternallyCommittedMutations syncs the read mirror without calling the sink" {
+    // WS4 phase 2: an externally-driven native commit (lite/docstore.zig's
+    // Txn.putIndexCatalogBatch) never calls this backend's Sink.submit --
+    // it writes the durable index-catalog records itself, in the same
+    // transaction as a primary write. This is the "install the in-memory
+    // snapshot" step that must run after that commit succeeds, so this
+    // backend's own readers (and later writers computing e.g. the next
+    // segment id from what they can read back) see it.
+    const a = std.testing.allocator;
+    var test_sink = TestSink{ .allocator = a };
+    defer test_sink.deinit();
+
+    var backend = try Backend.init(a, .{ .sink = test_sink.sink(), .scope = "idx1" });
+    defer backend.close();
+    var runtime = try backend.runtimeNamespaceStore(a);
+    defer runtime.deinit();
+
+    // A snapshot taken before the external mutations must stay frozen
+    // (copy-on-write, exactly like a transaction's own commit).
+    var read_before = try runtime.beginRead();
+    defer read_before.abort();
+
+    try backend.applyExternallyCommittedMutations(&.{
+        .{ .namespace = "segments", .key = "seg:1", .value = "bytes-1" },
+        .{ .namespace = "meta", .key = "active-segment/1", .value = "1" },
+    });
+    try std.testing.expectEqual(@as(usize, 0), test_sink.submit_calls);
+
+    try std.testing.expectError(error.NotFound, read_before.get(.{ .name = "segments" }, "seg:1"));
+
+    var read_after = try runtime.beginRead();
+    defer read_after.abort();
+    try std.testing.expectEqualStrings("bytes-1", try read_after.get(.{ .name = "segments" }, "seg:1"));
+    try std.testing.expectEqualStrings("1", try read_after.get(.{ .name = "meta" }, "active-segment/1"));
+
+    // A delete of a record this mirror never had is tolerated, not an error.
+    try backend.applyExternallyCommittedMutations(&.{
+        .{ .namespace = "segments", .key = "never-existed", .is_delete = true },
+        .{ .namespace = "meta", .key = "active-segment/1", .is_delete = true },
+    });
+    var read_final = try runtime.beginRead();
+    defer read_final.abort();
+    try std.testing.expectError(error.NotFound, read_final.get(.{ .name = "meta" }, "active-segment/1"));
+    try std.testing.expectEqualStrings("bytes-1", try read_final.get(.{ .name = "segments" }, "seg:1"));
 }

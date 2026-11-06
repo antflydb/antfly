@@ -460,6 +460,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_maintenance;
     _ = @import("antfly_local_sources").storage_mem_backend;
     _ = @import("antfly_local_sources").storage_native_catalog_backend;
+    _ = @import("antfly_local_sources").storage_commit_participant;
     _ = @import("antfly_local_sources").storage_mem_ordered;
     _ = @import("antfly_local_sources").storage_object_storage;
     _ = @import("antfly_local_sources").storage_persistent;

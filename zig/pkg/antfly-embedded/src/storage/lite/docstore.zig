@@ -3510,6 +3510,13 @@ pub const Txn = struct {
     pending_tree: PendingTree = .{},
     pending_count: usize = 0,
     borrowed_versions: std.ArrayListUnmanaged([]u8) = .empty,
+    // WS4 phase 2: index-catalog-root mutations staged by
+    // `putIndexCatalogBatch`, applied in the SAME native transaction as
+    // this `Txn`'s own primary-keyspace `pending` writes (see
+    // `PrimaryCommitContext.apply`). Encoded keys are owned by
+    // `index_catalog_arena`, created lazily on first use.
+    index_catalog_pending: std.ArrayListUnmanaged(native.CatalogMutation) = .empty,
+    index_catalog_arena: ?std.heap.ArenaAllocator = null,
     read_only: bool = true,
     writer_reserved: bool = false,
     prefix: []const u8 = "",
@@ -3646,6 +3653,7 @@ pub const Txn = struct {
 
     pub fn abort(self: *Txn) void {
         self.freePending();
+        self.freeIndexCatalogPending();
         self.freeOwnedReads();
         self.releaseGenerationReadLock();
         self.releaseWriterSlot();
@@ -3666,9 +3674,16 @@ pub const Txn = struct {
 
     const PrimaryCommitContext = struct {
         mutations: []const native.DocumentMutation,
+        // WS4 phase 2: index-catalog-root mutations (segment/range/active-
+        // set records, projection seal, progress) applied in this SAME
+        // `apply` invocation -- i.e. the same native transaction/commit --
+        // as `mutations` above. Empty for every write that does not use
+        // `Txn.putIndexCatalogBatch`.
+        index_catalog_mutations: []const native.CatalogMutation = &.{},
         fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
             const context: *@This() = @ptrCast(@alignCast(ptr));
             try file.putDocumentBatch(context.mutations);
+            if (context.index_catalog_mutations.len != 0) try file.putIndexCatalogBatch(context.index_catalog_mutations);
         }
     };
 
@@ -3709,6 +3724,7 @@ pub const Txn = struct {
             // matching `commit`'s original contract before this split.
             if (self.txn) |txn| {
                 txn.freePending();
+                txn.freeIndexCatalogPending();
                 txn.freeOwnedReads();
                 txn.* = undefined;
             }
@@ -3726,7 +3742,7 @@ pub const Txn = struct {
         // Metadata probes may use a write transaction without staging changes.
         // Release their admission and snapshot directly: entering publication
         // would unnecessarily run retirement pressure and allocator proof work.
-        if (self.pending_count == 0) {
+        if (self.pending_count == 0 and self.index_catalog_pending.items.len == 0) {
             self.abort();
             return .{};
         }
@@ -3742,10 +3758,16 @@ pub const Txn = struct {
             estimated_bytes += pending.key.len + mutations[i].value.len;
             node = current.next();
         }
+        for (self.index_catalog_pending.items) |m| estimated_bytes += m.key.len + m.value.len;
 
         const context = try allocator.create(PrimaryCommitContext);
         errdefer allocator.destroy(context);
-        context.* = .{ .mutations = mutations };
+        // `index_catalog_mutations` borrows `self.index_catalog_arena`'s
+        // memory directly (no copy): that arena is only freed in
+        // `StagedCommit.wait()`/`abort()`, both of which run after the
+        // group's `apply` callback has already consumed it, mirroring how
+        // `mutations` above borrows `self.pending`'s own buffers.
+        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items };
         errdefer {
             if (self.writer_reserved) {
                 store.releaseWriterSlot();
@@ -4450,6 +4472,42 @@ pub const Txn = struct {
             try std.mem.concat(self.allocator, u8, &.{ self.prefix, key });
         errdefer self.allocator.free(owned_key);
         try self.appendPending(.{ .key = owned_key });
+    }
+
+    /// WS4 phase 2: stage `mutations` (as produced by a `PersistentIndex`
+    /// opened with `main_backend == .native_catalog`, scoped by that
+    /// index's own catalog path) into this `Txn`'s index-catalog root,
+    /// encoded with the exact key shape `native_catalog_sink.zig`'s
+    /// `Sink.submit` uses, so they stay readable through the ordinary
+    /// `native_catalog_backend`/`Sink.loadAllAlloc` path regardless of
+    /// which commit happened to publish them. Applied together with this
+    /// `Txn`'s own primary-keyspace writes in ONE native transaction --
+    /// `PrimaryCommitContext.apply` calls `file.putIndexCatalogBatch` right
+    /// alongside `file.putDocumentBatch` -- instead of the separate
+    /// `Store.submitIndexMutation` round trip `native_catalog_sink.zig`'s
+    /// `Sink.submit` normally takes. This is what lets a synchronous
+    /// `full_text` write publish its segment/range/active-set records in
+    /// the same commit as the documents it indexes.
+    pub fn putIndexCatalogBatch(self: *Txn, scope: []const u8, mutations: []const @import("../native_catalog_backend.zig").Mutation) !void {
+        if (self.read_only) return error.ReadOnly;
+        if (mutations.len == 0) return;
+        if (self.index_catalog_arena == null) self.index_catalog_arena = std.heap.ArenaAllocator.init(self.allocator);
+        const a = self.index_catalog_arena.?.allocator();
+        try self.index_catalog_pending.ensureUnusedCapacity(a, mutations.len);
+        for (mutations) |m| {
+            const key = try @import("native_catalog_sink.zig").durableKeyAlloc(a, scope, m.namespace, m.key);
+            self.index_catalog_pending.appendAssumeCapacity(.{
+                .key = key,
+                .value = if (m.is_delete) "" else try a.dupe(u8, m.value),
+                .is_delete = m.is_delete,
+            });
+        }
+    }
+
+    fn freeIndexCatalogPending(self: *Txn) void {
+        if (self.index_catalog_arena) |*arena| arena.deinit();
+        self.index_catalog_arena = null;
+        self.index_catalog_pending = .empty;
     }
 
     fn pendingNode(node: *PendingTree.Node) *PendingNode {
@@ -5982,6 +6040,85 @@ test "lite native docstore reserves one writer until abort or commit" {
     var next_writer = try store.beginWrite();
     defer next_writer.abort();
     try std.testing.expectEqualStrings("committed", try next_writer.get("doc:a"));
+}
+
+test "lite native docstore putIndexCatalogBatch publishes primary and index-catalog records in one native commit" {
+    // WS4 phase 2: a synchronous full_text write's segment/range/active-set
+    // records must land in the SAME native commit as the primary rows it
+    // indexes, not a separate round trip through Store.submitIndexMutation.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-docstore-index-catalog-inline.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+
+    const before_sequence = store.file.activeCheckpoint().commit_sequence;
+
+    {
+        var txn = try store.beginWrite();
+        try txn.put("doc:a", "primary-row");
+        try txn.putIndexCatalogBatch("idx1", &.{
+            .{ .namespace = "segments", .key = "seg:1", .value = "segment-bytes" },
+            .{ .namespace = "meta", .key = "active-segment/1", .value = "1" },
+        });
+        try txn.commit();
+    }
+
+    // Exactly one native commit for both the primary row and the
+    // index-catalog records together.
+    try std.testing.expectEqual(before_sequence + 1, store.file.activeCheckpoint().commit_sequence);
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("primary-row", try read.get("doc:a"));
+
+    const encoded_segment_key = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "idx1", "segments", "seg:1");
+    defer allocator.free(encoded_segment_key);
+    const segment_value = (try store.file.getIndexCatalogRecordAlloc(allocator, encoded_segment_key)).?;
+    defer allocator.free(segment_value);
+    try std.testing.expectEqualStrings("segment-bytes", segment_value);
+
+    const encoded_active_key = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "idx1", "meta", "active-segment/1");
+    defer allocator.free(encoded_active_key);
+    const active_value = (try store.file.getIndexCatalogRecordAlloc(allocator, encoded_active_key)).?;
+    defer allocator.free(active_value);
+    try std.testing.expectEqualStrings("1", active_value);
+}
+
+test "lite native docstore putIndexCatalogBatch alone (no primary writes) still commits once" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-docstore-index-catalog-only.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+
+    const before_sequence = store.file.activeCheckpoint().commit_sequence;
+
+    {
+        var txn = try store.beginWrite();
+        try txn.putIndexCatalogBatch("idx1", &.{
+            .{ .namespace = "meta", .key = "lone", .value = "v" },
+        });
+        try txn.commit();
+    }
+
+    try std.testing.expectEqual(before_sequence + 1, store.file.activeCheckpoint().commit_sequence);
+
+    const encoded_key = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "idx1", "meta", "lone");
+    defer allocator.free(encoded_key);
+    const value = (try store.file.getIndexCatalogRecordAlloc(allocator, encoded_key)).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("v", value);
 }
 
 fn expectIndexCursorMatchesDiskRebuild(store: *Store) !void {

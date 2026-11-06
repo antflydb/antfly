@@ -1170,6 +1170,16 @@ pub const DocStore = struct {
             pub fn setReplayOpaque(self: @This(), sequence: u64, payload: []const u8) !void {
                 try writeReplayEntries(self.alloc, self, sequence, payload);
             }
+
+            /// WS4 phase 2: forwards to `backend_erased.Batch.putIndexCatalogBatch`
+            /// -- supported only on Lite (`error.Unsupported` elsewhere) --
+            /// so a `commit_participant.Participant` reached through this
+            /// `BatchTxn` (see `commit_participant.View.putIndexCatalog`)
+            /// can publish index-catalog records in the same native
+            /// transaction as this batch's own primary-keyspace writes.
+            pub fn putIndexCatalogBatch(self: @This(), scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
+                try self.runtime.?.putIndexCatalogBatch(scope, mutations);
+            }
         };
 
         pub const Adapter = backend_adapter.Batch(Batch, .{
