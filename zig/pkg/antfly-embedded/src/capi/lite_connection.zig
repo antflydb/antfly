@@ -1083,6 +1083,18 @@ pub const Owner = struct {
     /// `test_background_turn_count == 0`, a delta here is wholly
     /// attributable to the calling writes themselves.
     test_refresh_count: if (h.builtin.is_test) std.atomic.Value(u64) else void = if (h.builtin.is_test) .init(0) else {},
+    /// Per-owner, test-local running total of `native.NativeFile.
+    /// test_sync_calls` across every generation this owner has ever had as
+    /// `current`. `refresh`'s slow path replaces `current` (and therefore
+    /// the whole `NativeFile`, with a fresh, zeroed `test_sync_calls`) on a
+    /// vacuum/compaction-triggered reopen or any of its other reasons; a
+    /// test that samples the live file's counter at two points in time reads
+    /// a meaningless (and, under a plain saturating subtraction, silently
+    /// wrong) number if a swap happened in between -- see `capi/db.zig`'s
+    /// `ws3WriterLaneTestSyncCalls` doc comment for a confirmed case. Reading
+    /// `test_cumulative_sync_calls + current's own test_sync_calls` is
+    /// stable across any number of swaps.
+    test_cumulative_sync_calls: if (h.builtin.is_test) std.atomic.Value(u64) else void = if (h.builtin.is_test) .init(0) else {},
 
     /// Caller holds the path lease, so the checkpoint and catalog cannot race
     /// a different process's publication. Cursor continuation deliberately
@@ -1201,6 +1213,15 @@ pub const Owner = struct {
                 h.invalidateQueryProducer(child);
             }
         }
+        // Carry the outgoing generation's sync count forward before it is
+        // replaced (see `test_cumulative_sync_calls`'s doc comment): this is
+        // the one place `self.current` is ever reassigned.
+        if (comptime h.builtin.is_test) if (self.current) |outgoing| {
+            _ = self.test_cumulative_sync_calls.fetchAdd(
+                outgoing.owned_lite_backend.?.native_docstore.?.file.test_sync_calls.load(.monotonic),
+                .monotonic,
+            );
+        };
         self.current = replacement;
         for (self.connections.items) |connection| {
             connection.current = replacement;

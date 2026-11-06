@@ -6367,7 +6367,7 @@ pub fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out
         (if (@import("sql.zig").statementMayMutate(value.compiled.statement)) .mutation else .read_only)
     else |_|
         .read_only;
-    const guard = enterWithAdmissionRetry(entry, handle_ptr, .exclusive, intent, true).?;
+    var guard = enterWithAdmissionRetry(entry, handle_ptr, .exclusive, intent, true).?;
     defer guard.leaveAccess();
     if (guard.entry_error) |code| {
         return capi.ensureError(code, @src().fn_name);
@@ -6378,8 +6378,12 @@ pub fn antfly_db_sql_json(handle_ptr: ?*anyopaque, request_json: capi.Slice, out
     defer receipt_scope.end();
     // Managed owners require Raft routing and credentials supplied by API SQL.
     if (handle.storage_owner_context != null or handle.storage_owner_path != null or handle.storage_owner_group_id != 0 or handle.readable_lease_hook != null) return capi.recordError(.unsupported, @src().fn_name ++ ": storage owner binding is already configured");
+    // WS3: thread this call's own `HandleGuard` into the single-table SQL
+    // mutate path (see `sql.zig`'s `Adapter.writer_lane_hook`) so a write
+    // issued through `antfly_db_sql_json` releases the connection-level locks
+    // across its durability wait too, like every other capi write export.
     const result = if (prepared) |*value|
-        executePreparedEmbeddedSql(handle, "default", request_json.bytes(), &budget, value, out_buf)
+        executePreparedEmbeddedSql(handle, "default", request_json.bytes(), &budget, value, out_buf, writerLaneHookFromGuard(&guard))
     else |err|
         embeddedSqlPreparationFailure(handle, request_json.bytes(), err);
     result catch |err| {
@@ -6452,10 +6456,20 @@ pub fn executeEmbeddedSql(handle: *Handle, table_name: []const u8, request_json:
     var budget = EmbeddedSqlBudget{ .backing = handle.alloc, .limit = @import("sql.zig").runtime.resource_limits.preparation_bytes };
     var prepared = PreparedEmbeddedSql.init(&budget, request_json) catch |err| return embeddedSqlPreparationFailure(handle, request_json, err);
     defer prepared.deinit();
-    return executePreparedEmbeddedSql(handle, table_name, request_json, &budget, &prepared, out_buf);
+    // No `HandleGuard` in scope at this table-scoped entry point (unlike
+    // `antfly_db_sql_json`): keep pre-WS3 behavior rather than fabricate one.
+    return executePreparedEmbeddedSql(handle, table_name, request_json, &budget, &prepared, out_buf, null);
 }
 
-fn executePreparedEmbeddedSql(handle: *Handle, table_name: []const u8, request_json: []const u8, budget: *EmbeddedSqlBudget, prepared: *PreparedEmbeddedSql, out_buf: *capi.Buffer) !void {
+fn executePreparedEmbeddedSql(
+    handle: *Handle,
+    table_name: []const u8,
+    request_json: []const u8,
+    budget: *EmbeddedSqlBudget,
+    prepared: *PreparedEmbeddedSql,
+    out_buf: *capi.Buffer,
+    writer_lane_hook: ?@import("../storage/db/execution_resources.zig").WriterLaneReleaseHook,
+) !void {
     const session = try @import("sql_session.zig").requestSession(handle, request_json);
     errdefer if (session) |value| {
         if (value.active) value.failed = true;
@@ -6500,7 +6514,7 @@ fn executePreparedEmbeddedSql(handle: *Handle, table_name: []const u8, request_j
         if (value.failed) return error.SqlTransactionAborted;
         if (value.active and (compiled.statement == .create_table or compiled.statement == .drop_table or compiled.statement == .catalog_ddl or compiled.statement == .policy_ddl)) return error.UnsupportedSqlExecution;
     }
-    var adapter = sql.Adapter(antfly){ .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false) };
+    var adapter = sql.Adapter(antfly){ .transaction = session, .handle = handle, .db = handle.database(), .table_name = table_name, .read_only = !liteOpenModeCanWrite(handle.open_mode) or (if (session) |value| value.read_only else false), .writer_lane_hook = writer_lane_hook };
     var error_context: antfly.capi_dependencies.sql_errors.Context = .{};
     var result = sql.runtime.execute(handle.alloc, adapter.backend(), compiled, parsed.value.parameters, .{ .result_rows = parsed.value.limit, .error_context = &error_context }) catch |err| {
         if (err == error.SqlNotNullViolation or err == error.SqlUntranslatableCharacter) out_buf.* = try stringifyJson(.{ .@"error" = error_context.diagnostic(err) });
@@ -10242,15 +10256,33 @@ fn ws3WriterLaneProbeWrite(handle: ?*anyopaque, ordinal: usize, index: usize) !v
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .{ .ptr = request.ptr, .len = request.len }, &output));
 }
 
+/// This used to read `connection.owner.current`'s live `NativeFile.
+/// test_sync_calls` directly. That counter resets to zero every time
+/// `Owner.refresh`'s slow path replaces `owner.current` with a fresh
+/// `NativeFile` (a vacuum/compaction-triggered reopen, or any of `refresh`'s
+/// other slow-path reasons) -- which measurably happens even within one of
+/// this test's short 64-write runs (confirmed empirically: before this fix,
+/// a plain saturating subtraction across such a swap silently read as "0
+/// syncs" for the shared-handle scenario -- the new file's barely-
+/// incremented counter minus the old file's much larger one, floored at 0
+/// instead of underflowing -- a measurement artifact that looked like
+/// perfect fsync sharing rather than an invalid sample spanning two
+/// generations). `Owner.test_cumulative_sync_calls` (lite_connection.zig)
+/// carries every outgoing generation's final count forward across such a
+/// swap, so `that + the live generation's own counter` is a true running
+/// total regardless of how many swaps happened in between two reads.
 fn ws3WriterLaneTestSyncCalls(handle_ptr: ?*anyopaque) u64 {
     const entry = HandleEntry.capture(handle_ptr).?;
     defer entry.release();
     const connection = entry.lock_handle.lite_connection.?;
-    // `owner.current`, not `connection.current`: all connections to the same
-    // path share one `Owner` and one underlying `NativeFile`, so this stays
-    // correct even if a different connection's refresh moved the owner's
-    // current generation since this handle last looked.
-    return connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file.test_sync_calls.load(.monotonic);
+    // `owner.current`/`owner.test_cumulative_sync_calls`, not
+    // `connection.current`: all connections to the same path share one
+    // `Owner`, so this stays correct even if a different connection's
+    // refresh moved the owner's current generation since this handle last
+    // looked.
+    const owner = connection.owner;
+    return owner.test_cumulative_sync_calls.load(.monotonic) +
+        owner.current.?.owned_lite_backend.?.native_docstore.?.file.test_sync_calls.load(.monotonic);
 }
 
 // WS3 acceptance test (lite-single-commit-write-path.md §6 test 9's shape,
@@ -10286,7 +10318,22 @@ test "WS3 writer lane: concurrent public-API writers share group-commit fsyncs" 
             var start = std.atomic.Value(bool).init(false);
             var workers: [writer_count]Worker = undefined;
             var threads: [writer_count]std.Thread = undefined;
-            const per_writer = writes_per_run / writer_handles.len;
+            // `writer_count` threads are spawned below regardless of how
+            // many distinct handles back them (1 for "shared", writer_count
+            // for "separate"), so the total write volume this scenario
+            // issues scales with `writer_count`, not `writer_handles.len`.
+            // Dividing by `writer_handles.len` here (as this used to) only
+            // happened to be correct for "separate" (where the two are
+            // equal); for "shared" it silently ran `writer_count`x the
+            // intended total writes (512 instead of 64 for this test's
+            // numbers) while still reporting the smaller, intended total --
+            // undercounting `.writes` by exactly `writer_count` and making
+            // the shared-handle scenario look `writer_count`x worse per
+            // write than it actually was. Confirmed empirically: before this
+            // fix, the shared-handle case measured 1024 real syncs over 512
+            // real writes (2.000/write, identical to solo) but reported
+            // 1024/64 = 16.000/write.
+            const per_writer = writes_per_run / writer_count;
             for (&workers, &threads, 0..) |*worker, *thread, ordinal| {
                 worker.* = .{ .handle = writer_handles[ordinal % writer_handles.len], .ordinal = ordinal, .count = per_writer, .start = &start };
                 thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
@@ -10296,12 +10343,10 @@ test "WS3 writer lane: concurrent public-API writers share group-commit fsyncs" 
             for (workers) |worker| if (worker.failure) |err| return err;
             const after = ws3WriterLaneTestSyncCalls(writer_handles[0]);
             _ = dir_name;
-            // Saturating: a generation swap (vacuum/compaction) between the
-            // two reads would otherwise show as a smaller counter on a
-            // fresh `NativeFile`, underflowing a plain subtraction. None of
-            // these short runs should trigger one, but this is a counting
-            // probe, not the write path itself -- never let it panic.
-            return .{ .syncs = after -| before, .writes = per_writer * writer_handles.len };
+            // Plain subtraction is safe now: `ws3WriterLaneTestSyncCalls`
+            // returns a running total stable across any `Owner.refresh`
+            // generation swap in between (see its doc comment).
+            return .{ .syncs = after - before, .writes = per_writer * writer_count };
         }
     };
 
@@ -10317,7 +10362,7 @@ test "WS3 writer lane: concurrent public-API writers share group-commit fsyncs" 
     const solo_before = ws3WriterLaneTestSyncCalls(solo_handle);
     for (0..writes_per_run) |i| try ws3WriterLaneProbeWrite(solo_handle, 0, i);
     const solo_after = ws3WriterLaneTestSyncCalls(solo_handle);
-    const solo_syncs = solo_after -| solo_before;
+    const solo_syncs = solo_after - solo_before;
     const solo_per_write: f64 = @as(f64, @floatFromInt(solo_syncs)) / @as(f64, @floatFromInt(writes_per_run));
 
     // Eight writer threads sharing one handle (one Connection, one QueuedMutex
