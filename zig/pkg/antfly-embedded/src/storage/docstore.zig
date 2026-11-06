@@ -2715,6 +2715,13 @@ pub const DocStore = struct {
         var batch = try self.beginWriteBatch();
         errdefer batch.abort();
         try batch.put(internal_keys.replay_meta_init_key[0..], "");
+        // WS5: this bootstrap path stamps the journal exactly like the first
+        // real append in writeReplayEntries does. Without it, a destination
+        // store seeded this way (e.g. a DB split destination, via
+        // ensureReplayFloor) looks "already initialized" with no version
+        // marker, and its first real append fails UnsupportedReplayJournalFormat.
+        const version_raw = internal_keys.encodeReplayJournalFormatVersion(internal_keys.replay_journal_format_v2);
+        try batch.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
         const next_raw = encodeReplayNextSequence(1);
         try batch.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
         try batch.commit();
@@ -2733,6 +2740,12 @@ pub const DocStore = struct {
         var batch = try self.beginWriteBatch();
         errdefer batch.abort();
         try batch.put(internal_keys.replay_meta_init_key[0..], "");
+        // See ensureReplayIndexInitialized: this must stamp the same version
+        // marker writeReplayEntries stamps on its own bootstrap path, or a
+        // store seeded only through this helper is rejected on its first
+        // real append.
+        const version_raw = internal_keys.encodeReplayJournalFormatVersion(internal_keys.replay_journal_format_v2);
+        try batch.put(internal_keys.replay_journal_format_version_key[0..], version_raw[0..]);
         try batch.put(internal_keys.replay_meta_next_sequence_key[0..], next_raw[0..]);
         try batch.commit();
 
@@ -5285,6 +5298,25 @@ test "ordered artifact inventory replay reservations do not publish a committed 
     defer reopened.close();
     try std.testing.expectEqual(@as(u64, 3), reopened.lastReplaySequence(0));
     try std.testing.expectEqual(@as(u64, 4), reopened.nextReplaySequence(1));
+}
+
+test "a store seeded only through ensureReplayNextSequenceAtLeast accepts its first real append" {
+    // db.zig's ensureReplayFloor (used to bootstrap a DB split destination)
+    // calls ensureReplayNextSequenceAtLeast before the destination ever takes
+    // a real write. That bootstrap must stamp the same journal-format marker
+    // writeReplayEntries stamps on its own first append: otherwise the store
+    // looks "already initialized" (replay_meta_init_key is set) with no
+    // version marker, and the first real append is rejected outright as an
+    // unsupported pre-ledger journal.
+    const alloc = std.testing.allocator;
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try DocStore.openRuntime(alloc, try backend.runtimeStore(alloc, .{}));
+    defer store.close();
+    try store.ensureReplayNextSequenceAtLeast(5);
+    try std.testing.expectEqual(@as(u64, 4), store.lastReplaySequence(0));
+    try store.appendReplayOpaque(alloc, 5, "payload");
+    try std.testing.expectEqual(@as(u64, 5), store.lastReplaySequence(0));
 }
 
 test "ordered artifact inventory ambiguous replay commit reloads durable cut without reusing reservation" {
