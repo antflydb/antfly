@@ -140,6 +140,43 @@ Rejected: an in-file redo log with lazy checkpoints. Every reader process would 
 
 - The hosted LSM backend implements `commitStaged` as an already-durable ticket.
 
+### 3.2a Durability budget: one fsync per group, background rides along
+
+Lite has a single durability domain: the native file. Primary rows, journal records, index publications, consumer progress, the credit ledger and durable obligations all change through native transactions. Nothing keeps its own WAL.
+
+**Who pays for an fsync.** A foreground group pays exactly one `syncData` for all of its members. The only other durability barriers are:
+
+- close;
+- cross-process path-lease handoff, so the next owner sees a durable tip;
+- page reuse that needs the durable epoch to advance;
+- an idle-flush timer or undurable-bytes threshold, so ride-along work becomes durable when no foreground writer comes.
+
+**Ride-along members.** Background work joins the group-commit queue as ride-along members: `Store.stageRideAlong(plan)`, committed with `durability = false`. It never closes a group and never forces a sync. The next foreground group's fsync makes it durable, because the next durable copy-on-write checkpoint includes every earlier transaction. This covers retirement, reclamation, merges, catch-up progress and status.
+
+Each kind of ride-along work is safe to lose in a crash because it can be recomputed:
+
+| Work | Why losing it is safe |
+|---|---|
+| Retirement | Redone from the durable progress watermark. Its ledger release is in the same transaction. |
+| Reclamation | A freed page is reusable only at the durable epoch. |
+| Merge | Redone. Readers see the inputs until the merged output is durable. |
+| Catch-up progress | Replay restarts from durable progress, and the work is idempotent. |
+| Status | Derived from live state. |
+
+**Credits.** A credit release takes effect for producers only once `durableSequence()` covers the transaction that released it. So credits still return only after deletion is durable, with no dedicated fsync.
+
+**Journal.** A consumer whose publication rides in the acknowledgement's commit (a synchronous `full_text` write) needs no journal record for that write.
+
+**Crash invariant.** Ride-along work may be lost at a crash. Acknowledged work may not, and credits may not leak.
+
+**Prefix-ordered durability.** A durable copy-on-write checkpoint makes every earlier transaction durable, in apply order. After recovery, the set of applied transactions is always a prefix of apply order. This is what makes ride-along safe: retirement applied after the progress it depends on is lost or kept together with that progress.
+
+**Group membership, not standalone commits.** On Lite, `BatchOptions.durability = .ride_along` maps to `Store.stageRideAlong`. The plan joins the next foreground group's native transaction, so one copy-on-write publication (one path copy, one allocator-ledger write, one slot write) covers the whole group. Standalone non-durable commits would still pay those bytes on every commit. Only the idle flush commits ride-along work without a foreground group.
+
+**Manifest coverage.** A durable commit's manifest covers every page written since the last durable checkpoint, not just the current transaction's pages. Otherwise a torn page from an earlier non-durable transaction would pass verification.
+
+**Hosted follow-up (not in this change).** The hosted LSM backend treats `.ride_along` as durable. The equivalent there is a WAL append that doesn't wait for a sync and becomes durable with the next group sync in `storage/wal.zig`.
+
 ### 3.3 One physical commit for a small indexed write
 
 **`CommitPlan`** is a typed list of native operations in one native transaction:
@@ -272,14 +309,16 @@ Landing order:
 
 ## 5. Acceptance gates (1 KB documents, one document per transaction)
 
+Throughput gates compare against SQLite in the same run of `scripts/bench/lite_sqlite_comparison.py` on the same quiet host, with a ReleaseFast `libantfly`. Sync and byte gates are build-independent and checked in Debug.
+
 | Metric | Baseline | Target |
 |---|---|---|
 | Primary calling-path syncs/update | 3.0 | ≤ 1.0 with 1 writer; ≤ 0.25 with 8 |
 | Primary bytes/update | about 60 KB | ≤ 40 KB with 1 writer; ≤ 12 KB with 8 |
-| Primary throughput | 743 / 473 writes/s | ≥ 8k with 1 writer; 8 writers ≥ 1.5× one writer |
+| Primary throughput | 743 / 473 writes/s | ≥ SQLite WAL/FULL on the same host (17,630 / 17,255 on wolfspider); 8 writers above 1 writer |
 | Indexed calling-path syncs/update | 36.4 | ≤ 1.0 with 1 writer; ≤ 0.3 with 8 |
 | Indexed bytes/update | about 393 KB | ≤ 64 KB |
-| Indexed throughput | 102 / 43 writes/s | ≥ 1,000 (stretch ≥ 4,000), rising with writers |
+| Indexed throughput | 102 / 43 writes/s | ≥ SQLite + FTS5 on the same host (11,349 / 10,522 on wolfspider); 8 writers above 1 writer |
 | Primary-only background work | 418 turns / 1,612 leases / 418 refreshes | 0 / 0 / 0 |
 
 ## 6. Required crash and recovery tests

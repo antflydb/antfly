@@ -26,6 +26,7 @@ const bridge = @import("bridge.zig");
 const capabilities = @import("capabilities.zig");
 const docstore = @import("docstore.zig");
 const index_storage = @import("index_storage.zig");
+const native_catalog_sink = @import("native_catalog_sink.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
 
 const Allocator = std.mem.Allocator;
@@ -163,6 +164,11 @@ pub const Handle = struct {
     native_docstore: ?*docstore.Store = null,
     native_index_storage: ?*index_storage.Store = null,
     native_runtime_store: ?*backend_erased.Store = null,
+    /// Backs `opts.index_backends.text_main_native_catalog_sink` for every
+    /// `.native_catalog`-backed managed index this handle opens. Shared,
+    /// not per-namespace: `native_catalog_backend.Sink`'s `scope` parameter
+    /// (each index's own path) disambiguates callers.
+    native_catalog_sink: ?*native_catalog_sink.Sink = null,
     namespace_mutex: std.atomic.Mutex = .unlocked,
     namespace_runtimes: std.StringHashMapUnmanaged(NamespaceRuntime) = .empty,
     root_namespace_alias: ?[]u8 = null,
@@ -240,6 +246,10 @@ pub const Handle = struct {
                     self.allocator.destroy(storage);
                     self.native_index_storage = null;
                 }
+                if (self.native_catalog_sink) |sink| {
+                    self.allocator.destroy(sink);
+                    self.native_catalog_sink = null;
+                }
                 if (self.native_runtime_store) |runtime_store| {
                     runtime_store.deinit();
                     self.allocator.destroy(runtime_store);
@@ -276,7 +286,6 @@ pub const Handle = struct {
                 opts.index_backends.sparse_lsm_storage = storage;
                 opts.index_backends.graph_lsm_storage = storage;
                 opts.index_repair_checkpoint_storage = storage;
-                opts.external_derived_checkpoints = false;
                 opts.physical_root_mode = .external_backend;
             },
             .native_single_file => {
@@ -288,7 +297,15 @@ pub const Handle = struct {
                 opts.primary_backend = .{ .mem = .{} };
                 opts.primary_runtime_store = self.native_runtime_store.?;
                 const storage = self.native_index_storage.?.storage();
-                opts.index_backends.text_main_backend = .lsm;
+                // Full-text's own metadata/catalog (segment ranges, active
+                // segment set, generation metadata, and small segments
+                // themselves) is a native-catalog view, not an embedded LSM
+                // instance stored through the virtual filesystem below: see
+                // storage/native_catalog_backend.zig and
+                // lite/native_catalog_sink.zig. Dense/sparse/graph indexes
+                // are unaffected and stay on `.lsm`.
+                opts.index_backends.text_main_backend = .native_catalog;
+                opts.index_backends.text_main_native_catalog_sink = self.native_catalog_sink.?.sink();
                 opts.index_backends.dense_storage_backend = .lsm;
                 opts.index_backends.sparse_backend = .lsm;
                 opts.index_backends.graph_reverse_backend = .lsm;
@@ -306,7 +323,6 @@ pub const Handle = struct {
                 opts.index_repair_checkpoint_storage = storage;
                 opts.index_base_path = native_index_base_path;
                 opts.index_open_parallelism = 1;
-                opts.external_derived_checkpoints = false;
                 opts.physical_root_mode = .external_backend;
                 opts.external_root_incarnation = try self.durableRootIncarnationLocked("root");
             },
@@ -362,7 +378,13 @@ pub const Handle = struct {
         opts.primary_backend = .{ .mem = .{} };
         opts.primary_runtime_store = runtime.runtime_store;
         const storage = self.native_index_storage.?.storage();
-        opts.index_backends.text_main_backend = .lsm;
+        // See the root-namespace configureDbOpenOptions above: full text's
+        // own metadata/catalog is native-catalog-backed here too. The
+        // per-index `scope` (derived from `opts.index_base_path` below)
+        // disambiguates this namespace's indexes from the root's and from
+        // every other namespace sharing this same Sink.
+        opts.index_backends.text_main_backend = .native_catalog;
+        opts.index_backends.text_main_native_catalog_sink = self.native_catalog_sink.?.sink();
         opts.index_backends.dense_storage_backend = .lsm;
         opts.index_backends.sparse_backend = .lsm;
         opts.index_backends.graph_reverse_backend = .lsm;
@@ -380,7 +402,6 @@ pub const Handle = struct {
         opts.index_repair_checkpoint_storage = storage;
         opts.index_base_path = runtime.index_base_path;
         opts.index_open_parallelism = 1;
-        opts.external_derived_checkpoints = false;
         opts.physical_root_mode = .external_backend;
         opts.external_root_incarnation = try self.durableRootIncarnationLocked(canonical_namespace);
     }
@@ -768,6 +789,10 @@ fn initNativeSingleFile(
     errdefer allocator.destroy(native_index_storage);
     native_index_storage.* = index_storage.Store.initWithNamespace(allocator, store, native_index_base_path);
 
+    const catalog_sink = try allocator.create(native_catalog_sink.Sink);
+    errdefer allocator.destroy(catalog_sink);
+    catalog_sink.* = .{ .store = store, .allocator = allocator };
+
     const runtime_store = try allocator.create(backend_erased.Store);
     errdefer allocator.destroy(runtime_store);
 
@@ -796,6 +821,7 @@ fn initNativeSingleFile(
         .engine = .native_single_file,
         .native_docstore = store,
         .native_index_storage = native_index_storage,
+        .native_catalog_sink = catalog_sink,
         .native_runtime_store = runtime_store,
         .root_namespace_alias = root_namespace_alias,
         .owned_resource_manager = owned_resource_manager,
@@ -1163,7 +1189,8 @@ test "lite backend native engine creates and checks aflite file" {
     try std.testing.expect(db_opts.resource_manager == handle.owned_resource_manager.?);
     try std.testing.expect(db_opts.primary_runtime_store != null);
     try std.testing.expect(db_opts.primary_backend == .mem);
-    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.text_main_backend), .lsm), db_opts.index_backends.text_main_backend);
+    try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.text_main_backend), .native_catalog), db_opts.index_backends.text_main_backend);
+    try std.testing.expect(db_opts.index_backends.text_main_native_catalog_sink != null);
     try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.dense_storage_backend), .lsm), db_opts.index_backends.dense_storage_backend);
     try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.sparse_backend), .lsm), db_opts.index_backends.sparse_backend);
     try std.testing.expectEqual(@as(@TypeOf(db_opts.index_backends.graph_reverse_backend), .lsm), db_opts.index_backends.graph_reverse_backend);
@@ -1173,7 +1200,6 @@ test "lite backend native engine creates and checks aflite file" {
     try std.testing.expect(db_opts.index_backends.graph_lsm_storage != null);
     try std.testing.expectEqualStrings(native_index_base_path, db_opts.index_base_path.?);
     try std.testing.expectEqual(@as(?usize, 1), db_opts.index_open_parallelism);
-    try std.testing.expect(!db_opts.external_derived_checkpoints);
     try std.testing.expectEqual(
         db_mod.OpenOptions.PhysicalRootMode.external_backend,
         db_opts.physical_root_mode,

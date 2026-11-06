@@ -759,6 +759,60 @@ test "lite reclamation shrinking observes partially live packed records" {
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
+test "startMaintenanceAssumeLocked skips the ledger-rebase check once the cheap byte threshold alone forces a start" {
+    const a = std.testing.allocator;
+
+    // Case 1: reclamation enabled and the checkpoint is already past
+    // minimum_reclaim_bytes. `maintenance_policy.options.enabled and
+    // checkpoint_bytes >= minimum_reclaim_bytes` alone forces a start
+    // regardless of `retirement`'s value, so retirementNeedsServiceWithCancel's
+    // ledger load (native.zig's loadLedgerWithCancel, a real per-commit
+    // cost even when it finds nothing to do -- see the no-consumer wakeup
+    // target in docs/design/lite-performance/lite-single-commit-write-path.md
+    // §3.6) must be skipped entirely here, not merely cheap.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "retirement-check-skip-above-threshold.aflite");
+        defer a.free(path);
+        var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = true, .minimum_reclaim_bytes = 4096, .assessment_bytes = 64 * 1024 * 1024 } });
+        defer store.close();
+        const value = try a.alloc(u8, 128 * 1024);
+        defer a.free(value);
+        @memset(value, 'v');
+        var write = try store.beginWrite();
+        try write.put("large", value);
+        try write.commit();
+        try std.testing.expectEqual(@as(u64, 0), store.test_retirement_check_count.load(.acquire));
+        // The skip must still start maintenance (the pre-existing combined
+        // condition this change preserves), not silently drop it.
+        try std.testing.expect(store.maintenance_started.load(.acquire));
+    }
+
+    // Case 2: reclamation disabled, so the cheap threshold can never force
+    // a start on its own; the ledger-rebase check must still run exactly
+    // as it did before this change.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "retirement-check-runs-when-not-cheaply-due.aflite");
+        defer a.free(path);
+        var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .minimum_reclaim_bytes = 4096, .assessment_bytes = 64 * 1024 * 1024 } });
+        defer store.close();
+        var write = try store.beginWrite();
+        try write.put("small", "value");
+        try write.commit();
+        // Not pinning an exact count: startMaintenance() is called from
+        // more than one site per commit (submitScopedMutation's defer,
+        // releaseWriterSlot's defer), and each re-runs the check while
+        // maintenance never actually starts (disabled here), so the count
+        // reflects those call sites, not a single check per commit. The
+        // guarantee this preserves is simply that the check still runs at
+        // least once when the cheap threshold doesn't already decide it.
+        try std.testing.expect(store.test_retirement_check_count.load(.acquire) > 0);
+    }
+}
+
 test "lite reclamation capacity reserve sustains bounded overwrites" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1514,6 +1568,14 @@ pub const Store = struct {
     maintenance_start_suppressed: bool = false,
     test_maintenance_hook: if (@import("builtin").is_test) ?MaintenanceTestHook else void = if (@import("builtin").is_test) null else {},
     test_maintenance_cycles: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
+    /// Count and total elapsed ns of startMaintenanceAssumeLocked's
+    /// `retirementNeedsServiceWithCancel` ledger-rebase check, measured so
+    /// its per-write cost on the no-consumer path can be reported without
+    /// changing native.zig (which WS1 owns). Every commit calls
+    /// startMaintenance(), which calls that check unconditionally until
+    /// `maintenance_started` flips true; see submitScopedMutation's defer.
+    test_retirement_check_count: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
+    test_retirement_check_ns: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
     admission_refresh_size: u64 = 0,
     admission_artifact_revision: u64 = 0,
     disk_admission_limit: ?u64 = null,
@@ -2049,8 +2111,31 @@ pub const Store = struct {
     fn startMaintenanceAssumeLocked(self: *Store) void {
         if (self.read_only or self.maintenance_start_suppressed or self.maintenance_cancel.requested.load(.acquire) or
             self.maintenance_future != null) return;
-        const retirement = self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false;
-        if (!retirement and (!self.maintenance_policy.options.enabled or self.file.activeCheckpoint().page_count *| self.file.header.page_size < self.maintenance_policy.options.minimum_reclaim_bytes)) return;
+        // retirementNeedsServiceWithCancel loads (and, once the checkpoint's
+        // free-map root has moved, rebases) the allocator ledger -- a real
+        // per-commit cost (native.zig's loadLedgerWithCancel /
+        // allocator_work.journal_rebase_ns), even when the answer ends up
+        // "nothing to do" (see the no-consumer wakeup target in
+        // docs/design/lite-performance/lite-single-commit-write-path.md
+        // §3.6). `retirement`'s value is only ever consulted below when the
+        // cheap byte-threshold check doesn't already force a start on its
+        // own: when maintenance is enabled and the checkpoint is already
+        // past minimum_reclaim_bytes, the combined condition below starts
+        // maintenance unconditionally, so the ledger load is skipped
+        // entirely in that case -- this is exactly equivalent to the
+        // previous unconditional check, not a new heuristic.
+        const cheap_already_due = self.maintenance_policy.options.enabled and
+            self.file.activeCheckpoint().page_count *| self.file.header.page_size >= self.maintenance_policy.options.minimum_reclaim_bytes;
+        if (!cheap_already_due) {
+            const retirement_check_started = if (@import("builtin").is_test) std.Io.Clock.awake.now(self.file.runtime()).nanoseconds else 0;
+            const retirement = self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false;
+            if (@import("builtin").is_test) {
+                const elapsed: u64 = @intCast(@max(0, std.Io.Clock.awake.now(self.file.runtime()).nanoseconds - retirement_check_started));
+                _ = self.test_retirement_check_count.fetchAdd(1, .release);
+                _ = self.test_retirement_check_ns.fetchAdd(elapsed, .release);
+            }
+            if (!retirement) return;
+        }
         self.maintenance_future = self.file.runtime().concurrent(maintenanceLoop, .{self}) catch |err| {
             self.maintenance_policy.status.state = .deferred;
             self.maintenance_policy.status.reason = .concurrency_unavailable;
@@ -3234,6 +3319,20 @@ pub const Store = struct {
         return self.submitScopedMutation(context, apply, durable, false, false);
     }
 
+    /// WS7/WS5 interim ride-along commit, one named helper so every caller
+    /// (owner-turn retirement, reclamation, catch-up/status) goes through
+    /// a single place: WS2's upcoming `Store.stageRideAlong` ticketed
+    /// group-commit queue replaces this body, not its callers. Never closes
+    /// a group and never forces a sync on its own (design doc §3.2a); it
+    /// becomes durable for free the next time any grouped member -- most
+    /// commonly a concurrent foreground write -- commits with durable=true,
+    /// or at this owner's own idle-flush/close/lease-handoff barriers.
+    /// Crash invariant: whatever this writes may be lost and redone; it must
+    /// never be the only record of acknowledged work or a released credit.
+    pub fn commitRideAlong(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
+        return self.submitMutationWithDurability(context, apply, false);
+    }
+
     /// Immutable source aliases are read-path metadata, not authored writes.
     /// Only groups containing exclusively these aliases may defer reuse proof.
     pub fn submitArtifactLeaseMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
@@ -3455,13 +3554,15 @@ pub const Store = struct {
     }
 
     pub fn beginBatchWithOptions(self: *Store, options: backend_types.BatchOptions) !Txn {
-        _ = options;
-        return try self.beginBatch();
+        var txn = try self.beginBatch();
+        txn.ride_along = options.durability == .ride_along;
+        return txn;
     }
 
     pub fn beginBatchWithOptionsYielding(self: *Store, options: backend_types.BatchOptions) !Txn {
-        _ = options;
-        return try self.beginBatchYielding();
+        var txn = try self.beginBatchYielding();
+        txn.ride_along = options.durability == .ride_along;
+        return txn;
     }
 
     pub fn lastReplaySequence(self: *Store, fallback_last: u64) u64 {
@@ -3543,9 +3644,15 @@ pub const Store = struct {
     /// path-lease holder or the Raft leader) -- `is_owner` is not derived
     /// here, it is asserted, so a caller cannot mistake a skipped turn for a
     /// completed one.
+    ///
+    /// Commits non-durably (WS7/§3.2a's commitRideAlong): retirement is
+    /// always safe to lose and redo from the durable progress watermark, so
+    /// it must never force its own fsync. It becomes durable for free on
+    /// the next foreground group, or at this owner's own idle-flush/close
+    /// barrier.
     pub fn serviceRetirement(self: *Store, is_owner: bool, budget: replay_chunks.RetirementBudget) !replay_chunks.RetirementStats {
         if (!is_owner) return error.RetirementRequiresOwner;
-        return try retireReplaySlice(self, "", false, self.retirement_queue.requested(), budget);
+        return try retireReplaySlice(self, "", false, self.retirement_queue.requested(), budget, false);
     }
 };
 
@@ -3570,8 +3677,9 @@ const RuntimeStore = struct {
     }
 
     pub fn beginBatchWithOptions(self: *RuntimeStore, options: backend_types.BatchOptions) !Txn {
-        _ = options;
-        return try Txn.openWriteYieldingWithPrefix(self.store, self.prefix);
+        var txn = try Txn.openWriteYieldingWithPrefix(self.store, self.prefix);
+        txn.ride_along = options.durability == .ride_along;
+        return txn;
     }
 
     pub fn lastReplaySequence(self: *RuntimeStore, fallback_last: u64) u64 {
@@ -3640,6 +3748,13 @@ pub const Txn = struct {
     pending_tree: PendingTree = .{},
     pending_count: usize = 0,
     borrowed_versions: std.ArrayListUnmanaged([]u8) = .empty,
+    // WS4 phase 2: index-catalog-root mutations staged by
+    // `putIndexCatalogBatch`, applied in the SAME native transaction as
+    // this `Txn`'s own primary-keyspace `pending` writes (see
+    // `PrimaryCommitContext.apply`). Encoded keys are owned by
+    // `index_catalog_arena`, created lazily on first use.
+    index_catalog_pending: std.ArrayListUnmanaged(native.CatalogMutation) = .empty,
+    index_catalog_arena: ?std.heap.ArenaAllocator = null,
     read_only: bool = true,
     writer_reserved: bool = false,
     prefix: []const u8 = "",
@@ -3649,6 +3764,12 @@ pub const Txn = struct {
     read_generation: ?*ReadGeneration = null,
     read_pin: ?*ReadPin = null,
     checkpoint: native.CheckpointSlot = .{},
+    /// Set by beginBatchWithOptions() from BatchOptions.durability ==
+    /// .ride_along. commit() reads this to pick commitWithDurability's
+    /// argument, so callers that go through the generic backend_adapter
+    /// Store interface (a bare `try txn.commit()`, no durability
+    /// parameter available there) still get ride-along semantics.
+    ride_along: bool = false,
 
     pub fn decodedResultsNamespace(self: *const Txn) []const u8 {
         return self.prefix;
@@ -3770,25 +3891,105 @@ pub const Txn = struct {
 
     pub fn abort(self: *Txn) void {
         self.freePending();
+        self.freeIndexCatalogPending();
         self.freeOwnedReads();
         self.releaseGenerationReadLock();
         self.releaseWriterSlot();
         self.* = undefined;
     }
 
-    pub fn commit(self: *Txn) !void {
+    /// `durable = false` commits through Store.commitRideAlong instead of a
+    /// group-commit ticket, so this transaction never forces its own fsync:
+    /// it becomes durable when a later durable commit's checkpoint covers it
+    /// (design doc §3.2a). Only owner-turn background work (retirement,
+    /// reclamation, catch-up, status) may pass false; foreground and
+    /// acknowledgement callers keep `commit()`'s durable default, or an
+    /// acknowledged write could be lost on crash.
+    pub fn commitWithDurability(self: *Txn, durable: bool) !void {
+        self.ride_along = !durable;
+        return self.commit();
+    }
+
+    const PrimaryCommitContext = struct {
+        mutations: []const native.DocumentMutation,
+        // WS4 phase 2: index-catalog-root mutations (segment/range/active-
+        // set records, projection seal, progress) applied in this SAME
+        // `apply` invocation -- i.e. the same native transaction/commit --
+        // as `mutations` above. Empty for every write that does not use
+        // `Txn.putIndexCatalogBatch`.
+        index_catalog_mutations: []const native.CatalogMutation = &.{},
+        fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+            const context: *@This() = @ptrCast(@alignCast(ptr));
+            try file.putDocumentBatch(context.mutations);
+            if (context.index_catalog_mutations.len != 0) try file.putIndexCatalogBatch(context.index_catalog_mutations);
+        }
+    };
+
+    /// Returned by `commitStaged` (WS3). The write is staged (applied into
+    /// the group's in-memory buffer, or already past that point) by the
+    /// time this is returned; `wait` blocks only for the group's fsync. Any
+    /// locks scoped to "a transaction is open" may be released by the
+    /// caller between `commitStaged` returning and calling `wait`, so an
+    /// outer caller (storage/docstore.zig's `commitStaged`, and above that
+    /// the DB apply lock and the capi connection gate) can drop its own
+    /// locks before paying for durability instead of holding them across it.
+    ///
+    /// `mutations`/`context` must stay alive until the group's apply runs,
+    /// which is only guaranteed once the ticket resolves -- not merely once
+    /// it is staged, since staging may just enqueue behind an in-flight
+    /// group. `wait` is therefore also where the transaction's pending
+    /// buffers (which `mutations`' key/value slices borrow from) are freed:
+    /// freeing them any earlier would race the group leader's apply.
+    pub const StagedCommit = struct {
+        allocator: Allocator = undefined,
+        txn: ?*Txn = null,
+        staged: ?Store.Staged = null,
+        context: ?*PrimaryCommitContext = null,
+
+        pub fn wait(self: StagedCommit) !void {
+            // Unconditional: `mutations`/`context` are never touched again
+            // after the ticket resolves, success or failure, since the
+            // group's apply (the only reader) has already run either way.
+            defer if (self.context) |ctx| {
+                self.allocator.free(ctx.mutations);
+                self.allocator.destroy(ctx);
+            };
+            if (self.staged) |staged| {
+                staged.drive();
+                try staged.ticket().wait();
+            }
+            // Only on success: a failed ticket (OutcomeUnknown, a rejected
+            // apply) leaves the transaction exactly as `commitStaged` left
+            // it -- generation lock and writer slot already released, but
+            // pending writes intact -- so the caller can still call `abort`,
+            // matching `commit`'s original contract before this split.
+            if (self.txn) |txn| {
+                txn.freePending();
+                txn.freeIndexCatalogPending();
+                txn.freeOwnedReads();
+                txn.* = undefined;
+            }
+        }
+    };
+
+    /// Stage this transaction's writes and return once they are enqueued
+    /// (WS3): the writer slot and the generation read lock are released
+    /// here, before any durability wait. `commit` is this plus an
+    /// immediate `wait`, for callers with no locks of their own to drop
+    /// in between.
+    pub fn commitStaged(self: *Txn) !StagedCommit {
         if (self.read_only) return error.ReadOnly;
         const store = self.store orelse return error.ReadOnly;
         // Metadata probes may use a write transaction without staging changes.
         // Release their admission and snapshot directly: entering publication
         // would unnecessarily run retirement pressure and allocator proof work.
-        if (self.pending_count == 0) {
+        if (self.pending_count == 0 and self.index_catalog_pending.items.len == 0) {
             self.abort();
-            return;
+            return .{};
         }
         const allocator = self.allocator;
         var mutations = try allocator.alloc(native.DocumentMutation, self.pending_count);
-        defer allocator.free(mutations);
+        errdefer allocator.free(mutations);
         var node = self.pending_tree.getMin();
         var i: usize = 0;
         var estimated_bytes: usize = 0;
@@ -3798,15 +3999,16 @@ pub const Txn = struct {
             estimated_bytes += pending.key.len + mutations[i].value.len;
             node = current.next();
         }
+        for (self.index_catalog_pending.items) |m| estimated_bytes += m.key.len + m.value.len;
 
-        const Commit = struct {
-            mutations: []const native.DocumentMutation,
-            fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
-                const context: *@This() = @ptrCast(@alignCast(ptr));
-                try file.putDocumentBatch(context.mutations);
-            }
-        };
-        var context = Commit{ .mutations = mutations };
+        const context = try allocator.create(PrimaryCommitContext);
+        errdefer allocator.destroy(context);
+        // `index_catalog_mutations` borrows `self.index_catalog_arena`'s
+        // memory directly (no copy): that arena is only freed in
+        // `StagedCommit.wait()`/`abort()`, both of which run after the
+        // group's `apply` callback has already consumed it, mirroring how
+        // `mutations` above borrows `self.pending`'s own buffers.
+        context.* = .{ .mutations = mutations, .index_catalog_mutations = self.index_catalog_pending.items };
         errdefer {
             if (self.writer_reserved) {
                 store.releaseWriterSlot();
@@ -3815,30 +4017,30 @@ pub const Txn = struct {
         }
         const wal_trace_scope = wal_trace.scope(.primary_commit);
         defer wal_trace_scope.end();
-        // Enqueue, then release the writer slot, and only then drive the
-        // coordinator (WS2): the slot only serializes who may stage the
-        // next write, not who must wait for this one's fsync. If staging
-        // and driving were one call (`store.stage`), a caller that becomes
-        // its queue's leader would not return from it until its own group
-        // -- fsync included -- had already committed, holding the slot
-        // across that durability wait exactly like the pre-WS2 code. Doing
-        // these in three explicit steps releases the slot while the request
-        // is merely queued, before this thread (if it is the leader) ever
-        // drives the coordinator, so the next writer can open and stage
-        // into the same group while this one's commit is still running
-        // regardless of whether this one ends up leading that commit.
-        const staged = try store.enqueue(.{ .context = &context, .apply = Commit.apply, .estimated_bytes = estimated_bytes });
+        // Enqueue, then release the writer slot, and drive the coordinator
+        // only in `StagedCommit.wait()` (WS2/WS3). The slot only serializes
+        // who may stage the next write, not who must wait for this one's
+        // fsync. Driving here would make a leader run its whole group
+        // (fsync included) while the caller still holds the DB apply lock
+        // and the capi writer lane, so no other writer could join the group.
+        // Ride-along work commits synchronously without a ticket; it has no
+        // durability wait of its own.
+        const staged: ?Store.Staged = if (self.ride_along) staged: {
+            try store.commitRideAlong(context, PrimaryCommitContext.apply);
+            break :staged null;
+        } else try store.enqueue(.{ .context = context, .apply = PrimaryCommitContext.apply, .estimated_bytes = estimated_bytes });
         self.releaseGenerationReadLock();
         if (self.writer_reserved) {
             store.releaseWriterSlot();
             self.writer_reserved = false;
         }
-        staged.drive();
-        try staged.ticket().wait();
 
-        self.freePending();
-        self.freeOwnedReads();
-        self.* = undefined;
+        return .{ .allocator = allocator, .txn = self, .staged = staged, .context = context };
+    }
+
+    pub fn commit(self: *Txn) !void {
+        var staged = try self.commitStaged();
+        try staged.wait();
     }
 
     /// Caller owns the result. Unlike get(), this does not retain keys or
@@ -4512,6 +4714,42 @@ pub const Txn = struct {
             try std.mem.concat(self.allocator, u8, &.{ self.prefix, key });
         errdefer self.allocator.free(owned_key);
         try self.appendPending(.{ .key = owned_key });
+    }
+
+    /// WS4 phase 2: stage `mutations` (as produced by a `PersistentIndex`
+    /// opened with `main_backend == .native_catalog`, scoped by that
+    /// index's own catalog path) into this `Txn`'s index-catalog root,
+    /// encoded with the exact key shape `native_catalog_sink.zig`'s
+    /// `Sink.submit` uses, so they stay readable through the ordinary
+    /// `native_catalog_backend`/`Sink.loadAllAlloc` path regardless of
+    /// which commit happened to publish them. Applied together with this
+    /// `Txn`'s own primary-keyspace writes in ONE native transaction --
+    /// `PrimaryCommitContext.apply` calls `file.putIndexCatalogBatch` right
+    /// alongside `file.putDocumentBatch` -- instead of the separate
+    /// `Store.submitIndexMutation` round trip `native_catalog_sink.zig`'s
+    /// `Sink.submit` normally takes. This is what lets a synchronous
+    /// `full_text` write publish its segment/range/active-set records in
+    /// the same commit as the documents it indexes.
+    pub fn putIndexCatalogBatch(self: *Txn, scope: []const u8, mutations: []const @import("../native_catalog_backend.zig").Mutation) !void {
+        if (self.read_only) return error.ReadOnly;
+        if (mutations.len == 0) return;
+        if (self.index_catalog_arena == null) self.index_catalog_arena = std.heap.ArenaAllocator.init(self.allocator);
+        const a = self.index_catalog_arena.?.allocator();
+        try self.index_catalog_pending.ensureUnusedCapacity(a, mutations.len);
+        for (mutations) |m| {
+            const key = try @import("native_catalog_sink.zig").durableKeyAlloc(a, scope, m.namespace, m.key);
+            self.index_catalog_pending.appendAssumeCapacity(.{
+                .key = key,
+                .value = if (m.is_delete) "" else try a.dupe(u8, m.value),
+                .is_delete = m.is_delete,
+            });
+        }
+    }
+
+    fn freeIndexCatalogPending(self: *Txn) void {
+        if (self.index_catalog_arena) |*arena| arena.deinit();
+        self.index_catalog_arena = null;
+        self.index_catalog_pending = .empty;
     }
 
     fn pendingNode(node: *PendingTree.Node) *PendingNode {
@@ -5307,6 +5545,7 @@ fn retireReplaySlice(
     yielding: bool,
     up_to_sequence: u64,
     budget: replay_chunks.RetirementBudget,
+    durable: bool,
 ) !replay_chunks.RetirementStats {
     var stats = replay_chunks.RetirementStats{ .done = true, .no_op = true };
     if (up_to_sequence == 0) return stats;
@@ -5380,7 +5619,7 @@ fn retireReplaySlice(
     ledger = ledger.released(freed_bytes, freed_records);
     try storeJournalCreditLedger(&write, ledger);
 
-    try write.commit();
+    try write.commitWithDurability(durable);
     committed = true;
 
     stats.retired_through = if (max_retired_exclusive == 0) 0 else max_retired_exclusive - 1;
@@ -5393,7 +5632,11 @@ fn retireReplaySlice(
 /// catches up to `up_to_sequence` or there is nothing left to do.
 fn drainRetireReplaySlice(store: *Store, prefix: []const u8, yielding: bool, up_to_sequence: u64) !void {
     while (true) {
-        const stats = try retireReplaySlice(store, prefix, yielding, up_to_sequence, default_retirement_budget);
+        // Durable: callers of this back-compat path (direct tests,
+        // shard-transfer donor/receiver) expect the drain itself to be the
+        // durability barrier, unlike serviceRetirement's owner-turn
+        // ride-along commits.
+        const stats = try retireReplaySlice(store, prefix, yielding, up_to_sequence, default_retirement_budget, true);
         if (stats.done) return;
     }
 }
@@ -6039,6 +6282,85 @@ test "lite native docstore reserves one writer until abort or commit" {
     var next_writer = try store.beginWrite();
     defer next_writer.abort();
     try std.testing.expectEqualStrings("committed", try next_writer.get("doc:a"));
+}
+
+test "lite native docstore putIndexCatalogBatch publishes primary and index-catalog records in one native commit" {
+    // WS4 phase 2: a synchronous full_text write's segment/range/active-set
+    // records must land in the SAME native commit as the primary rows it
+    // indexes, not a separate round trip through Store.submitIndexMutation.
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-docstore-index-catalog-inline.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+
+    const before_sequence = store.file.activeCheckpoint().commit_sequence;
+
+    {
+        var txn = try store.beginWrite();
+        try txn.put("doc:a", "primary-row");
+        try txn.putIndexCatalogBatch("idx1", &.{
+            .{ .namespace = "segments", .key = "seg:1", .value = "segment-bytes" },
+            .{ .namespace = "meta", .key = "active-segment/1", .value = "1" },
+        });
+        try txn.commit();
+    }
+
+    // Exactly one native commit for both the primary row and the
+    // index-catalog records together.
+    try std.testing.expectEqual(before_sequence + 1, store.file.activeCheckpoint().commit_sequence);
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("primary-row", try read.get("doc:a"));
+
+    const encoded_segment_key = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "idx1", "segments", "seg:1");
+    defer allocator.free(encoded_segment_key);
+    const segment_value = (try store.file.getIndexCatalogRecordAlloc(allocator, encoded_segment_key)).?;
+    defer allocator.free(segment_value);
+    try std.testing.expectEqualStrings("segment-bytes", segment_value);
+
+    const encoded_active_key = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "idx1", "meta", "active-segment/1");
+    defer allocator.free(encoded_active_key);
+    const active_value = (try store.file.getIndexCatalogRecordAlloc(allocator, encoded_active_key)).?;
+    defer allocator.free(active_value);
+    try std.testing.expectEqualStrings("1", active_value);
+}
+
+test "lite native docstore putIndexCatalogBatch alone (no primary writes) still commits once" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-docstore-index-catalog-only.aflite");
+    defer allocator.free(path);
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+
+    const before_sequence = store.file.activeCheckpoint().commit_sequence;
+
+    {
+        var txn = try store.beginWrite();
+        try txn.putIndexCatalogBatch("idx1", &.{
+            .{ .namespace = "meta", .key = "lone", .value = "v" },
+        });
+        try txn.commit();
+    }
+
+    try std.testing.expectEqual(before_sequence + 1, store.file.activeCheckpoint().commit_sequence);
+
+    const encoded_key = try @import("native_catalog_sink.zig").durableKeyAlloc(allocator, "idx1", "meta", "lone");
+    defer allocator.free(encoded_key);
+    const value = (try store.file.getIndexCatalogRecordAlloc(allocator, encoded_key)).?;
+    defer allocator.free(value);
+    try std.testing.expectEqualStrings("v", value);
 }
 
 fn expectIndexCursorMatchesDiskRebuild(store: *Store) !void {
@@ -7770,7 +8092,13 @@ test "lite replay cleanup propagates record corruption without deleting a partia
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
-fn expectLedgerMatchesScanForTest(store: *Store) !void {
+/// WS5 invariant, reusable from other test files: the durable journal
+/// credit ledger must always equal a fresh scan over every replay lane
+/// (the all-kind lane plus every hinted lane). There is no other
+/// bookkeeping path (see `internal_keys.JournalCreditLedger`'s doc
+/// comment), so any divergence is a real leak or double-release, not a
+/// benign timing difference.
+pub fn expectLedgerMatchesScanForTest(store: *Store) !void {
     const Collector = struct {
         bytes: u64 = 0,
         records: u64 = 0,

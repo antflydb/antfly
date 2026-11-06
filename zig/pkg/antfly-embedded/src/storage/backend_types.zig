@@ -159,6 +159,17 @@ pub const BatchOptions = struct {
     // default reusable, but let those callers avoid filling the shared block
     // cache with source blocks that already have a bounded native workspace.
     block_cache_admission: Namespace.BlockCacheAdmission = .retain,
+    /// WS7/§3.2a: `.ride_along` marks this batch as background work that
+    /// must never force its own durability barrier -- it becomes durable
+    /// only when a later durable commit's checkpoint happens to cover it
+    /// (retirement, reclamation, deferred progress/catch-up, status). Only
+    /// a caller that can prove the work is safe to lose and redo on crash
+    /// may pass this; every synchronous-ack caller must keep `.durable`, or
+    /// an acknowledged write could be lost. Distinct from
+    /// `defer_commit_flush`, which only defers an LSM memtable flush and
+    /// carries no durability meaning (see apply_state.zig's
+    /// contributeProgressDeferred for why that distinction matters).
+    durability: enum { durable, ride_along } = .durable,
 };
 
 pub const BulkIngestFinishOptions = struct {

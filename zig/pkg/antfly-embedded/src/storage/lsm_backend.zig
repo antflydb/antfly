@@ -40,6 +40,7 @@ const recovery_mod = @import("lsm_backend/recovery.zig");
 const storage_io = @import("lsm_backend/storage_io.zig");
 const cache_mod = @import("lsm_backend/cache.zig");
 const wal_mod = @import("lsm_backend/wal.zig");
+const wal_trace = @import("write_amplification_trace.zig");
 const internal_keys = @import("internal_keys.zig");
 const resource_manager_mod = @import("resource_manager.zig");
 const platform_time = @import("antfly_platform").time;
@@ -1504,6 +1505,8 @@ pub const Backend = struct {
         ) !wal_mod.AppendResult {
             self.reset_proven = false;
             errdefer self.invalidatePrimary();
+            const wal_trace_scope = wal_trace.scope(.lsm_backend_wal);
+            defer wal_trace_scope.end();
             const result = try wal_mod.appendStateWithOptionsResult(
                 storage,
                 allocator,

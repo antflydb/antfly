@@ -3408,7 +3408,6 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         .alloc = ctx.alloc,
                         .io = ctx.io,
                         .store = ctx.store,
-                        .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
                         .index_manager = ctx.index_manager,
                         .apply_mutex = ctx.apply_mutex,
                         .snapshot_replay_admission = ctx.snapshot_replay_admission,
@@ -3430,7 +3429,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 }
             }
             const applied_sequence_start_ns = monotonicTimeNs();
-            try saveAppliedSequencesBatchContext(ctx, updates.items);
+            // Reached from a synchronous-ack caller when no background
+            // workers are running (DB.open with start_index_workers=false),
+            // as well as from the executor's own worker threads. Keep this
+            // commit durable rather than guess which call stack got here;
+            // only the unambiguously background entry points (replay
+            // catch-up, the applied-sequence coalescer's non-forced flush)
+            // defer their flush.
+            try saveAppliedSequencesBatchContext(ctx, updates.items, false);
             if (profile) |active_profile| recordProfileNs(profile, &active_profile.applied_sequence_save_ns, applied_sequence_start_ns);
             const truncate_start_ns = monotonicTimeNs();
             try truncateReplayJournalIfSafeContext(ctx);

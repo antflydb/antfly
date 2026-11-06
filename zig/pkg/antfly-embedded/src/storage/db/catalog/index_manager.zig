@@ -1369,6 +1369,7 @@ pub const IndexManager = struct {
     }
 
     pub const dense_native_backup_backend_id = "hbc-native-v1";
+    pub const default_status_persist_interval_ns: u64 = 5 * std.time.ns_per_s;
     const max_retired_lsm_owner_stats: usize = 1024;
     const retired_lsm_owner_overflow_name = "__retired_owner_overflow__";
     /// Stable-address lifetime admission shared by DB searches and background
@@ -1393,6 +1394,7 @@ pub const IndexManager = struct {
     /// vectors fail with `error.ReembedUnavailable`.
     dense_reembedder: ?DenseReembedder = null,
     text_main_backend: persistent_mod.MainBackend,
+    text_main_native_catalog_sink: ?persistent_mod.NativeCatalogSink = null,
     text_lsm_storage: ?lsm_backend_mod.Storage,
     text_main_lsm_options: lsm_backend_mod.Options,
     text_wal_lsm_options: lsm_backend_mod.Options,
@@ -1440,7 +1442,15 @@ pub const IndexManager = struct {
     // publication admission; explicit stable lifecycle fences do not consult
     // it. The backend outlives IndexManager in DBCore.
     primary_lsm_backend: ?*lsm_backend_mod.Backend = null,
-    applied_sequence_checkpoint_path: ?[]const u8,
+    /// Gate for how often the applied-sequence/progress write path also
+    /// persists a derived `IndexStatusSnapshot`. Status is cheap to recompute
+    /// from live state and is not needed for recovery (progress v2 is), so
+    /// outside a forced flush or close it piggybacks on an existing progress
+    /// commit at most once per `status_persist_interval_ns`. Shared by both
+    /// the sync (`BatchExecutionContext`) and async (`AsyncContext`) applied-
+    /// sequence paths, which both hold a pointer to this same `IndexManager`.
+    last_status_persist_ns: std.atomic.Value(u64) = .init(0),
+    status_persist_interval_ns: u64 = default_status_persist_interval_ns,
     vector_block_generation_mu: std.atomic.Mutex = .unlocked,
     vector_block_build_mu: std.atomic.Mutex = .unlocked,
     // A snapshot builder writes its reserved immutable generation without
@@ -3283,6 +3293,7 @@ pub const IndexManager = struct {
             .relaxed_split_durability = false,
             .leann_replication = opts.leann_replication,
             .text_main_backend = opts.text_main_backend,
+            .text_main_native_catalog_sink = opts.text_main_native_catalog_sink,
             .text_lsm_storage = opts.text_lsm_storage,
             .text_main_lsm_options = text_main_lsm_options,
             .text_wal_lsm_options = text_wal_lsm_options,
@@ -3311,7 +3322,6 @@ pub const IndexManager = struct {
             .dense_native_candidate_build_authorized = opts.dense_native_candidate_build_authorized,
             .primary_store = null,
             .relational_base_rows = false,
-            .applied_sequence_checkpoint_path = null,
             .vector_block_generation = null,
             .load_parallelism = null,
             .full_text_pending_bytes_accounted = 0,
@@ -3329,10 +3339,6 @@ pub const IndexManager = struct {
 
     pub fn setRelaxedSplitDurability(self: *IndexManager, enabled: bool) void {
         self.relaxed_split_durability = enabled;
-    }
-
-    pub fn setAppliedSequenceCheckpointPath(self: *IndexManager, path: ?[]const u8) void {
-        self.applied_sequence_checkpoint_path = path;
     }
 
     fn allocIndexApplyMutex(self: *IndexManager) !*std.atomic.Mutex {
@@ -6975,37 +6981,22 @@ pub const IndexManager = struct {
         const entry = self.textIndexEntry(index_name) orelse return error.IndexNotFound;
         const rebuild_state = self.rebuildState(.full_text, entry.rebuild_root_path, entry.config);
 
-        var checkpoint = try apply_state.loadProjectionCheckpointWithSidecarWithStorage(self.generation_storage, self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, entry.config.name);
+        var checkpoint = try apply_state.loadProjectionCheckpoint(self.alloc, store, entry.config.name);
         checkpoint.status = .rebuilding;
         checkpoint.generation = std.math.add(u64, checkpoint.generation, 1) catch return error.ResourceLimitExceeded;
         checkpoint.config_hash = types.indexConfigHash(entry.config);
         // A crash anywhere after this boundary leaves explicit repair debt,
         // never an old clean watermark attached to an empty physical index.
-        try apply_state.saveProjectionCheckpointWithSidecarWithStorage(self.generation_storage, self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, entry.config.name, checkpoint);
+        try apply_state.saveProjectionCheckpoint(store, entry.config.name, checkpoint);
         try rebuild_state.updateWithIo(self.checkpointIo(), "");
         try entry.persistent.resetAllForRebuild();
         try self.backfillTextIndex(store, entry, null);
         try entry.persistent.sync(true);
         try self.saveBackfilledAppliedSequence(store, entry.config);
-        checkpoint = try apply_state.loadProjectionCheckpointWithSidecarWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            entry.config.name,
-        );
+        checkpoint = try apply_state.loadProjectionCheckpoint(self.alloc, store, entry.config.name);
         checkpoint.status = .clean;
         checkpoint.config_hash = types.indexConfigHash(entry.config);
-        try apply_state.saveProjectionCheckpointWithSidecarWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            entry.config.name,
-            checkpoint,
-        );
+        try apply_state.saveProjectionCheckpoint(store, entry.config.name, checkpoint);
 
         const rebuilt = entry.persistent.snapshot().liveDocCount();
         const compaction_pending = try self.textIndexNeedsMerge(&entry.persistent, activeTextMergePolicy());
@@ -9619,10 +9610,32 @@ pub const IndexManager = struct {
         }
     }
 
+    /// True when the owner should persist a derived `IndexStatusSnapshot`
+    /// now: always on a forced/close flush, otherwise at most once per
+    /// `status_persist_interval_ns`. Pure decision — does not touch storage
+    /// or update the gate; call `markStatusPersisted` after the write
+    /// actually commits.
+    pub fn statusPersistDue(self: *const IndexManager, now_ns: u64, force: bool) bool {
+        if (force) return true;
+        const last = self.last_status_persist_ns.load(.monotonic);
+        // Never persisted yet: due immediately, regardless of how large (or
+        // how close to the process/clock origin) `now_ns` happens to be.
+        // Comparing against an absolute clock reading here would make the
+        // very first persist depend on how much time has passed since
+        // whatever epoch the clock counts from, not on this gate's own
+        // state.
+        if (last == 0) return true;
+        return now_ns -| last >= self.status_persist_interval_ns;
+    }
+
+    pub fn markStatusPersisted(self: *IndexManager, now_ns: u64) void {
+        self.last_status_persist_ns.store(now_ns, .monotonic);
+    }
+
     pub const FullTextProjectionGuard = struct {
         alloc: Allocator,
         apply_guard: ManagedIndexApplyGuard,
-        snapshot: *const apply_state.ProjectionSnapshot,
+        snapshot: *apply_state.ProjectionSnapshot,
         admission_key: []u8,
         index_name: []const u8,
         seal: @import("../../projection_seal.zig").Seal,
@@ -9655,7 +9668,7 @@ pub const IndexManager = struct {
     pub fn tryValidateFullTextProjection(
         self: *IndexManager,
         alloc: Allocator,
-        snapshot: *const apply_state.ProjectionSnapshot,
+        snapshot: *apply_state.ProjectionSnapshot,
         index_name: []const u8,
         expected_generation: u64,
     ) !?FullTextProjectionGuard {
@@ -9668,7 +9681,7 @@ pub const IndexManager = struct {
     pub fn tryValidateFullTextProjectionWithAdoptionHint(
         self: *IndexManager,
         alloc: Allocator,
-        snapshot: *const apply_state.ProjectionSnapshot,
+        snapshot: *apply_state.ProjectionSnapshot,
         index_name: []const u8,
         expected_generation: u64,
         needs_adoption: ?*bool,
@@ -9771,15 +9784,13 @@ pub const IndexManager = struct {
     /// reads never mint certificates or inspect the live mutable cardinality.
     pub fn preserveCertifiedEmptyDenseCheckpoint(
         self: *IndexManager,
-        alloc: Allocator,
         store: anytype,
-        checkpoint_path: ?[]const u8,
         index_name: []const u8,
     ) !void {
         const entry = self.denseIndex(index_name) orelse return error.IndexNotFound;
         const checkpoint = self.denseProjectionCheckpointMetadata(index_name) orelse return error.InvalidDerivedApplyState;
         const certified = entry.certifiedEmptyNativeCheckpoint(checkpoint) orelse return;
-        try apply_state.saveProjectionCheckpointWithSidecarWithStorage(self.generation_storage, alloc, self.checkpointIo(), store, checkpoint_path, index_name, certified);
+        try apply_state.saveProjectionCheckpoint(store, index_name, certified);
         _ = entry.validateServingCertificate(certified);
     }
 
@@ -13980,13 +13991,14 @@ pub const IndexManager = struct {
     }
 
     fn clearAppliedSequenceAfterCatalogRemoval(self: *IndexManager, store: anytype, name: []const u8) void {
+        _ = self;
         if (builtin.is_test) {
             if (test_inject_index_removal_cleanup_error) |err| {
                 std.log.warn("index removal committed with injected stale applied-sequence metadata name={s} err={s}", .{ name, @errorName(err) });
                 return;
             }
         }
-        apply_state.clearAppliedSequenceWithCheckpointWithStorage(self.generation_storage, self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, name) catch |err| {
+        apply_state.clearAppliedSequence(store, name) catch |err| {
             std.log.warn("index removal committed with stale applied-sequence metadata name={s} err={s}", .{ name, @errorName(err) });
         };
     }
@@ -14600,14 +14612,7 @@ pub const IndexManager = struct {
         // The durable cleanup tombstone prevents same-name admission until
         // finalization succeeds, so checkpoint and filesystem I/O need not hold
         // the catalog lock used by unrelated indexes.
-        try apply_state.clearAppliedSequenceWithCheckpointWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            name,
-        );
+        try apply_state.clearAppliedSequence(store, name);
         // Algebraic keyspaces are drained in bounded, cursor-backed outbox
         // phases before finalization reaches this filesystem-only tail.
         if (active_path) |path| {
@@ -22141,18 +22146,12 @@ pub const IndexManager = struct {
         cfg: types.IndexConfig,
         sequence: u64,
     ) !void {
-        try apply_state.saveAppliedSequenceUpdateWithCheckpointWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            .{
-                .index_name = cfg.name,
-                .sequence = sequence,
-                .config_hash = types.indexConfigHash(cfg),
-            },
-        );
+        _ = self;
+        try apply_state.saveAppliedSequenceUpdate(store, .{
+            .index_name = cfg.name,
+            .sequence = sequence,
+            .config_hash = types.indexConfigHash(cfg),
+        });
     }
 
     /// Complete a fresh physical generation before the logical catalog makes
@@ -22231,15 +22230,7 @@ pub const IndexManager = struct {
             .generation = projection_checkpoint.generation,
             .config_hash = projection_checkpoint.config_hash,
         });
-        try apply_state.saveProjectionCheckpointWithSidecarWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            cfg.name,
-            projection_checkpoint,
-        );
+        try apply_state.saveProjectionCheckpoint(store, cfg.name, projection_checkpoint);
         try index_generation_manifest.writeReadyForPhysicalFormatWithStorage(
             self.generation_storage,
             self.alloc,
@@ -22299,7 +22290,7 @@ pub const IndexManager = struct {
         self.invalidateIndexPathCaches(canonical_path);
         try self.deleteIndexDirUsingIoIfPresentFallible(canonical_path);
         if (cfg.kind == .dense_vector) try self.deleteDenseIndexMetadata(store, cfg.name);
-        try apply_state.clearAppliedSequenceWithCheckpointWithStorage(self.generation_storage, self.alloc, self.checkpointIo(), store, self.applied_sequence_checkpoint_path, cfg.name);
+        try apply_state.clearAppliedSequence(store, cfg.name);
     }
 
     fn invalidateIndexPathCaches(self: *const IndexManager, path: []const u8) void {
@@ -23007,18 +22998,11 @@ pub const IndexManager = struct {
         if (comptime storeSupportsLatestReplaySequenceForHint(@TypeOf(store))) {
             backfilled_sequence = try store.latestReplaySequenceForHint(replayHintForIndexKind(cfg.kind), backfilled_sequence);
         }
-        try apply_state.saveAppliedSequenceUpdateWithCheckpointWithStorage(
-            self.generation_storage,
-            self.alloc,
-            self.checkpointIo(),
-            store,
-            self.applied_sequence_checkpoint_path,
-            .{
-                .index_name = cfg.name,
-                .sequence = backfilled_sequence,
-                .config_hash = types.indexConfigHash(cfg),
-            },
-        );
+        try apply_state.saveAppliedSequenceUpdate(store, .{
+            .index_name = cfg.name,
+            .sequence = backfilled_sequence,
+            .config_hash = types.indexConfigHash(cfg),
+        });
     }
 
     fn storeSupportsLatestReplaySequenceForHint(comptime T: type) bool {
@@ -23202,6 +23186,7 @@ pub const IndexManager = struct {
                     .path = zpath,
                     .io = self.io,
                     .main_backend = self.text_main_backend,
+                    .main_native_catalog_sink = self.text_main_native_catalog_sink,
                     .main_lsm_storage = self.effectiveTextMainStorage(),
                     .wal_storage = self.effectiveTextWalStorage(),
                     .main_lsm_options = self.text_main_lsm_options,
@@ -23577,12 +23562,9 @@ pub const IndexManager = struct {
                             return error.PostingWalMutationStoreRequiresRebuild;
                         }
                     } else {
-                        const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
-                            self.generation_storage,
+                        const applied_sequence = try apply_state.loadAppliedSequence(
                             self.alloc,
-                            self.checkpointIo(),
                             store,
-                            self.applied_sequence_checkpoint_path,
                             cfg.name,
                         );
                         posting_sequence = applied_sequence;
@@ -23918,14 +23900,7 @@ pub const IndexManager = struct {
                 // projection and must not turn reopen into a full rebuild.
                 const reverse_edges = entry.index.edge_count;
 
-                const applied_sequence = try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
-                    self.generation_storage,
-                    self.alloc,
-                    self.checkpointIo(),
-                    store,
-                    self.applied_sequence_checkpoint_path,
-                    cfg.name,
-                );
+                const applied_sequence = try apply_state.loadAppliedSequence(self.alloc, store, cfg.name);
                 const latest_replay_sequence = store.nextReplaySequence(1) -| 1;
                 const graph_replay_pending = applied_sequence < latest_replay_sequence;
                 const has_replay_history = latest_replay_sequence != 0;

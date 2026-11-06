@@ -590,6 +590,7 @@ pub const DocStore = struct {
         .begin_current_scan = beginCurrentScanTxn,
         .begin_write = beginWriteTxn,
         .begin_batch = beginWriteBatch,
+        .begin_batch_with_options = beginWriteBatchWithOptions,
     });
 
     pub const Txn = struct {
@@ -1169,6 +1170,16 @@ pub const DocStore = struct {
             pub fn setReplayOpaque(self: @This(), sequence: u64, payload: []const u8) !void {
                 try writeReplayEntries(self.alloc, self, sequence, payload);
             }
+
+            /// WS4 phase 2: forwards to `backend_erased.Batch.putIndexCatalogBatch`
+            /// -- supported only on Lite (`error.Unsupported` elsewhere) --
+            /// so a `commit_participant.Participant` reached through this
+            /// `BatchTxn` (see `commit_participant.View.putIndexCatalog`)
+            /// can publish index-catalog records in the same native
+            /// transaction as this batch's own primary-keyspace writes.
+            pub fn putIndexCatalogBatch(self: @This(), scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
+                try self.runtime.?.putIndexCatalogBatch(scope, mutations);
+            }
         };
 
         pub const Adapter = backend_adapter.Batch(Batch, .{
@@ -1199,7 +1210,64 @@ pub const DocStore = struct {
             self.* = undefined;
         }
 
-        pub fn commit(self: *Batch) !void {
+        /// Returned by `commitStaged` (WS3). The batch's effects are applied
+        /// (and, for backends with a staged commit phase, enqueued into a
+        /// group some thread will drive to a shared fsync) by the time this
+        /// is returned; `wait` blocks only for that durability. A caller may
+        /// drop locks scoped to "a write is in flight" (the DB apply lock,
+        /// the capi connection gate) between `commitStaged` returning and
+        /// calling `wait`, instead of holding them across the fsync.
+        ///
+        /// `batch` must stay heap-resident until `wait` runs: it owns the
+        /// staging captures (`retained`/`artifact_inputs`/`document_revisions`)
+        /// that `source_certificates` and the payload session still reference
+        /// while the group is in flight, mirroring the bracket `commit` used
+        /// to hold open for its own duration.
+        pub const StagedBatch = struct {
+            alloc: Allocator,
+            batch: *Batch,
+            ticket: backend_erased.Ticket,
+            /// Captured eagerly in `commitStaged`, not read back through
+            /// `batch` here: success frees/invalidates `batch` before these
+            /// run, so a lazy `batch.columnar_owner` read would be undefined
+            /// memory by the time these fire.
+            source_owner: ?*DocStore,
+            payload_session: ?*artifact_payload.Session,
+            /// Only set when this batch actually touched columnar state;
+            /// bumped on successful durability, matching `commit`'s original
+            /// success-only `columnar_revision` bump.
+            bump_columnar_revision: ?*DocStore,
+
+            /// Does not free `batch`'s own memory: that allocation (if any
+            /// -- a plain `commit` caller's `batch` is typically a stack
+            /// local it owns itself) belongs to whoever created it, not to
+            /// this generic staged-commit path. The staged `put*` entry
+            /// points below, which heap-allocate it, free it themselves
+            /// after this returns.
+            pub fn wait(self: StagedBatch) !void {
+                defer if (self.source_owner) |owner| owner.source_certificates.end();
+                self.ticket.wait() catch |err| {
+                    self.batch.retained.poisoned = true;
+                    if (self.source_owner) |owner| owner.committed_replay_next_cached.store(0, .release);
+                    return err;
+                };
+                if (self.payload_session) |session| {
+                    session.committed = true;
+                    session.release();
+                }
+                self.batch.retained.deinit(self.batch.alloc);
+                self.batch.artifact_inputs.deinit(self.batch.alloc);
+                self.batch.document_revisions.deinit(self.batch.alloc);
+                if (self.bump_columnar_revision) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
+                self.batch.* = undefined;
+            }
+        };
+
+        /// Stage this batch's writes and return once they are applied and
+        /// enqueued for durability (WS3), instead of blocking for the fsync.
+        /// `commit` is this plus an immediate `wait`, for callers with no
+        /// locks of their own to drop in between.
+        pub fn commitStaged(self: *Batch) !StagedBatch {
             if (self.columnar_owner) |owner| _ = owner.query_generation_revision.fetchAdd(1, .release);
             errdefer self.retained.poisoned = true;
             errdefer if (self.columnar_owner) |owner| owner.committed_replay_next_cached.store(0, .release);
@@ -1211,26 +1279,28 @@ pub const DocStore = struct {
                 try self.artifact_footprint.stage(self.asTxn());
                 try self.document_revisions.stage(self.asTxn());
             }
-            const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
+            const bump_columnar_revision = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             const source_owner = self.columnar_owner;
-            if (source_owner) |owner| owner.source_certificates.begin(&self.document_revisions.documents);
-            defer if (source_owner) |owner| owner.source_certificates.end();
             const payload_session = self.payload_session;
+            if (source_owner) |owner| owner.source_certificates.begin(&self.document_revisions.documents);
+            errdefer if (source_owner) |owner| owner.source_certificates.end();
             if (payload_session) |session| try session.stageReferenceEpoch(self);
             if (payload_session) |session| try session.prepareCommit();
             if (payload_session) |session| session.primary_commit_attempted = true;
-            if (self.runtime) |*runtime| {
-                try runtime.commit();
-            }
-            if (payload_session) |session| {
-                session.committed = true;
-                session.release();
-            }
-            self.retained.deinit(self.alloc);
-            self.artifact_inputs.deinit(self.alloc);
-            self.document_revisions.deinit(self.alloc);
-            self.* = undefined;
-            if (columnar_owner) |owner| _ = owner.columnar_revision.fetchAdd(1, .release);
+            const ticket = if (self.runtime) |*runtime| try runtime.commitStaged() else backend_erased.Ticket.alreadyDurable();
+            return .{
+                .alloc = self.alloc,
+                .batch = self,
+                .ticket = ticket,
+                .source_owner = source_owner,
+                .payload_session = payload_session,
+                .bump_columnar_revision = bump_columnar_revision,
+            };
+        }
+
+        pub fn commit(self: *Batch) !void {
+            const staged = try self.commitStaged();
+            try staged.wait();
         }
 
         pub fn asTxn(self: *Batch) BatchTxn {
@@ -2423,14 +2493,18 @@ pub const DocStore = struct {
         return self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, null);
     }
 
-    fn putBatchWithReplayOnceAndParticipant(
+    /// Shared preparation for `putBatchWithReplayOnceAndParticipant` and its
+    /// staged twin (WS3): builds and populates a `Batch`, stopping just
+    /// short of committing it so the caller can choose `commit` (wait
+    /// inline) or `commitStaged` (return a ticket instead).
+    fn prepareBatchWithReplayAndParticipant(
         self: *DocStore,
         writes: []const KVPair,
         deletes: []const []const u8,
         replay: ?ReplayAppend,
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
-    ) !void {
+    ) !Batch {
         const has_owner_job = blk: {
             for (writes) |write| if (internal_keys.isGraphOwnerReplayJobKey(write.key)) break :blk true;
             break :blk false;
@@ -2474,7 +2548,112 @@ pub const DocStore = struct {
         if (replay) |entry| {
             try batch.setReplayOpaque(entry.sequence, entry.payload);
         }
+        return batch;
+    }
+
+    fn putBatchWithReplayOnceAndParticipant(
+        self: *DocStore,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+    ) !void {
+        var batch = try self.prepareBatchWithReplayAndParticipant(writes, deletes, replay, options, participant);
+        errdefer batch.abort();
         try batch.commit();
+    }
+
+    /// A pending `markReplayIndexAvailable`/`observeCommittedReplaySequence`
+    /// call, run from `StagedDocBatch.wait` only once the write is durable
+    /// (WS2 §3.2: visibility only after durability) rather than eagerly when
+    /// it is merely staged.
+    const StagedReplayObservation = struct {
+        store: *DocStore,
+        sequence: u64,
+    };
+
+    /// Returned by the staged `put*` entry points (WS3): the batch is
+    /// applied and enqueued for durability by the time this is returned.
+    /// `wait` blocks only for that durability; a caller (mutation_commit.zig's
+    /// `batchInternalPreparedOwned`) releases the DB apply lock and the capi
+    /// connection gate between getting this and calling `wait`.
+    pub const StagedDocBatch = struct {
+        inner: Batch.StagedBatch,
+        /// Owns `inner.batch`'s own heap allocation (the staged `put*` entry
+        /// points below heap-box it so it survives past their return; `wait`
+        /// is where it is finally freed, after `inner.wait` is done with it).
+        heap_batch: *Batch,
+        heap_alloc: Allocator,
+        replay_observation: ?StagedReplayObservation = null,
+
+        pub fn wait(self: StagedDocBatch) !void {
+            defer self.heap_alloc.destroy(self.heap_batch);
+            try self.inner.wait();
+            if (self.replay_observation) |observation| {
+                observation.store.markReplayIndexAvailable();
+                observation.store.observeCommittedReplaySequence(observation.sequence);
+            }
+        }
+    };
+
+    fn putBatchWithReplayStagedOnceAndParticipant(
+        self: *DocStore,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+    ) !StagedDocBatch {
+        const batch_box = try self.alloc.create(Batch);
+        errdefer self.alloc.destroy(batch_box);
+        batch_box.* = try self.prepareBatchWithReplayAndParticipant(writes, deletes, replay, options, participant);
+        errdefer batch_box.abort();
+        const staged = try batch_box.commitStaged();
+        return .{
+            .inner = staged,
+            .heap_batch = batch_box,
+            .heap_alloc = self.alloc,
+            .replay_observation = if (replay) |entry| .{ .store = self, .sequence = entry.sequence } else null,
+        };
+    }
+
+    /// Stage a batch and return once it is applied and enqueued for
+    /// durability (WS3), instead of blocking for the fsync. Retries exactly
+    /// like `putBatchWithReplayAndParticipant` on `error.WriterLocked`;
+    /// unlike it, this never retries after staging succeeds, since there is
+    /// nothing left to retry once a ticket has been handed out.
+    pub fn putBatchWithReplayStagedAndParticipant(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+    ) !StagedDocBatch {
+        var attempt: usize = 0;
+        while (true) : (attempt += 1) {
+            return self.putBatchWithReplayStagedOnceAndParticipant(writes, deletes, replay, options, participant) catch |err| switch (err) {
+                error.WriterLocked => {
+                    if (attempt >= writer_locked_retry_count) return err;
+                    backoffWriterLockRetry(io);
+                    continue;
+                },
+                else => return err,
+            };
+        }
+    }
+
+    pub fn putBatchWithReplayStagedWithOptions(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+    ) !StagedDocBatch {
+        return self.putBatchWithReplayStagedAndParticipant(io, writes, deletes, replay, options, null);
     }
 
     fn putBatchWithReplayOnce(self: *DocStore, writes: []const KVPair, deletes: []const []const u8, replay: ?ReplayAppend) !void {

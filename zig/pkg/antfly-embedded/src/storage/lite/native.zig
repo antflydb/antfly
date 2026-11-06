@@ -108,6 +108,75 @@ test "lite runtime metadata comparison skips leases and fences secrets and docum
     try std.testing.expect(!try captured.runtimeMetadataUnchanged(&writer));
 }
 
+test "bug2: an indexed-reclamation Lite file at a relative path creates no files outside its own directory" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+
+    // `std.fs.path.dirname("bare.aflite")` is `null` -- exactly the shape
+    // reader_epochs.zig's `Namespace.open` falls back to "." for. Opening
+    // the DB with a cwd-relative, directory-component-free path (while the
+    // process cwd is pinned to a temp directory, as it would be for any
+    // relative "./mydb.aflite"-style open) must resolve `.aflite-readers-*`
+    // (and the "identity" marker inside it) next to the *.aflite file, not
+    // relative to whatever the cwd happens to be when Namespace.open runs.
+    const original_cwd = try std.Io.Dir.cwd().realPathFileAlloc(io, ".", a);
+    defer a.free(original_cwd);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const tmp_dir_len = try tmp.dir.realPath(io, &buf);
+    const tmp_dir_path = try a.dupe(u8, buf[0..tmp_dir_len]);
+    defer a.free(tmp_dir_path);
+
+    try std.process.setCurrentPath(io, tmp_dir_path);
+    var restored = false;
+    defer if (!restored) std.process.setCurrentPath(io, original_cwd) catch {};
+
+    std.debug.print("BUG2-DIAG: about to create, cwd should be tmp={s}\n", .{tmp_dir_path});
+    const bare_name = "bug2-repro.aflite";
+    {
+        var file = try NativeFile.createWithIo(a, io, bare_name, .{ .indexed_reclamation = true, .no_sync = true, .exclusive = true });
+        defer file.close();
+        try file.putDocument("doc", "value");
+    }
+    std.debug.print("BUG2-DIAG: create+put+close done\n", .{});
+
+    // The reader-epoch namespace directory must have landed inside the temp
+    // directory (next to the .aflite file), not vanished or ended up
+    // somewhere else: find it and confirm its "identity" marker is there.
+    var found_namespace_dir = false;
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            if (!std.mem.startsWith(u8, entry.name, ".aflite-readers-")) continue;
+            found_namespace_dir = true;
+            var namespace_dir = try dir.openDir(io, entry.name, .{});
+            defer namespace_dir.close(io);
+            try namespace_dir.access(io, "identity", .{});
+        }
+    }
+    try std.testing.expect(found_namespace_dir);
+
+    try std.process.setCurrentPath(io, original_cwd);
+    restored = true;
+
+    // Nothing from opening a relative-path DB may have leaked into the
+    // original cwd: no bare "identity" file, and no stray reader-epoch
+    // namespace directory, sitting directly in it.
+    try std.testing.expectError(error.FileNotFound, std.Io.Dir.cwd().access(io, "identity", .{}));
+    {
+        var dir = try std.Io.Dir.cwd().openDir(io, ".", .{ .iterate = true });
+        defer dir.close(io);
+        var it = dir.iterate();
+        while (try it.next(io)) |entry| {
+            try std.testing.expect(!std.mem.startsWith(u8, entry.name, ".aflite-readers-"));
+        }
+    }
+}
+
 test "lite index checkpoint adoption discards physical page caches" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -557,7 +626,7 @@ test "lite allocator v4 certificate uncertain publication never rolls back publi
             defer file.close();
             try file.putDocument("doc", "durable");
             const size = (try file.file.stat(io)).size;
-            Fault.fail_offset = checkpointOffset(1 - file.header.active_checkpoint);
+            Fault.fail_offset = slotPhysicalPage(1 - file.header.active_checkpoint) * @as(u64, file.header.page_size);
             defer Fault.fail_offset = null;
             // Cancelled inside the publication window: the outcome is unknown.
             try std.testing.expectError(error.OutcomeUnknown, file.certifyAllocator());
@@ -885,7 +954,7 @@ test "lite allocator v4 small checkpoints bound counter and queue boundary growt
     try std.testing.expect(file.test_page_writes.load(.monotonic) - writes <= 5);
     try std.testing.expectEqual(@as(u64, 0), pages.ledger.?.root.deltas);
     try std.testing.expectEqual(@as(u64, 0), pages.ledger.?.root.build_limit);
-    try file.publishCheckpoint(checkpoint);
+    try file.publishCheckpoint(checkpoint, false);
     file.invalidateLedger();
     try std.testing.expect((try file.check()).valid);
 }
@@ -918,7 +987,7 @@ test "lite allocator v4 owner checkpoints bound metadata work across reopen and 
         checkpoint.commit_sequence += 1;
         checkpoint.free_map_root_page = try pages.allocate();
         try file.persistAllocator(&pages, &checkpoint);
-        try file.publishCheckpoint(checkpoint);
+        try file.publishCheckpoint(checkpoint, false);
         const writes = file.test_page_writes.load(.monotonic);
         _ = try file.reclaimPages(1);
         try std.testing.expect(file.ledger.?.root.build_limit != 0);
@@ -989,11 +1058,18 @@ pub const WriteOptions = struct {
 
 const recovery_agenda = @import("recovery_agenda.zig");
 
-pub const magic = "AFLITE\x03P";
-const unpacked_v3_magic = "AFLITE\x03N";
-const indexed_magic = "AFLITE\x07P";
-pub const format_version: u32 = 3;
-pub const indexed_format_version: u32 = 7;
+// v8: both formats moved their two recovery slots out of the header page
+// into dedicated pages and gained a per-commit manifest (see
+// `slotPhysicalPage`, `CheckpointSlot`, `recoverActiveCheckpoint`).
+// Antfly is unreleased, so the old embedded-slot layout (format_version 3 /
+// indexed_format_version 7) is not preserved: a v7 or v3 file is refused by
+// `decodeHeader`'s version check (surfaced as
+// `error.UnsupportedNativeFormatVersion`), not migrated.
+pub const magic = "AFLITE\x04P";
+const unpacked_v4_magic = "AFLITE\x04N";
+const indexed_magic = "AFLITE\x08P";
+pub const format_version: u32 = 4;
+pub const indexed_format_version: u32 = 8;
 pub const default_page_size: u32 = 4096;
 
 test "lite reclamation catalog snapshots visit live indexes rather than history" {
@@ -1435,7 +1511,7 @@ test "lite coordinator publication cancellation never performs fallible notifica
             const written = try std.testing.io.vtable.fileWritePositional(userdata, handle, header, data, splat, offset);
             // The slot write is now the last write of the publication window
             // (there is no trailing active_checkpoint hint write).
-            if (cancel_after_commit and (offset == checkpointOffset(0) or offset == checkpointOffset(1))) cancel_stat = true;
+            if (cancel_after_commit and (offset == slotPhysicalPage(0) * @as(u64, default_page_size) or offset == slotPhysicalPage(1) * @as(u64, default_page_size))) cancel_stat = true;
             return written;
         }
     };
@@ -1464,14 +1540,14 @@ test "lite coordinator publication cancellation never performs fallible notifica
     }
     Fault.writes = 0;
     Fault.cancel_stat = true;
-    try std.testing.expectError(error.Canceled, file.publishCheckpoint(checkpoint));
+    try std.testing.expectError(error.Canceled, file.publishCheckpoint(checkpoint, false));
     try std.testing.expectEqual(@as(usize, 0), Fault.writes);
     try std.testing.expectEqualDeep(before, file.header);
     try std.testing.expect(!file.checkpoint_publication_uncertain);
     Fault.cancel_stat = false;
     Fault.cancel_write = true;
     // Cancellation inside the uncertain window reports an unknown outcome.
-    try std.testing.expectError(error.OutcomeUnknown, file.publishCheckpoint(checkpoint));
+    try std.testing.expectError(error.OutcomeUnknown, file.publishCheckpoint(checkpoint, false));
     try std.testing.expect(file.checkpoint_publication_uncertain);
     try std.testing.expectEqualDeep(before, file.header);
     Fault.cancel_stat = false;
@@ -1482,7 +1558,7 @@ test "lite coordinator publication cancellation never performs fallible notifica
     // Cancellation after the active-slot write cannot undo a committed result
     // or make its coordinator notification abort the process.
     Fault.cancel_after_commit = true;
-    try file.publishCheckpoint(checkpoint);
+    try file.publishCheckpoint(checkpoint, false);
     try std.testing.expect(!file.checkpoint_publication_uncertain);
     try std.testing.expectEqual(checkpoint, file.activeCheckpoint());
     Fault.cancel_after_commit = false;
@@ -1647,7 +1723,7 @@ test "lite allocator v4 rollback and recovery retain the fallback root" {
     try std.testing.expect(std.meta.eql(checkpoint, file.activeCheckpoint()));
     try std.testing.expect((try file.check()).valid);
     try file.putDocument("doc", "newest");
-    const damaged = checkpointOffset(file.header.active_checkpoint) + checkpoint_slot_checksum_offset;
+    const damaged = slotPhysicalPage(file.header.active_checkpoint) * @as(u64, file.header.page_size) + page_crc_offset;
     var bad: [4]u8 = @splat(0);
     try file.file.writePositionalAll(file.runtimeIo(), &bad, damaged);
     file.close();
@@ -1676,7 +1752,7 @@ test "lite allocator v4 rejects a durable free bit for a live page" {
     checkpoint.commit_sequence += 1;
     checkpoint.free_map_root_page = try pages.allocate();
     try file.persistAllocator(&pages, &checkpoint);
-    try file.publishCheckpoint(checkpoint);
+    try file.publishCheckpoint(checkpoint, false);
     const report = try file.check();
     try std.testing.expect(!report.valid);
     try std.testing.expectEqualStrings("invalid_allocator", report.issue.?);
@@ -1759,7 +1835,6 @@ test "lite allocator v4 large deletes enqueue bounded foreground work" {
 
 pub const header_size: usize = 4096;
 pub const checkpoint_slot_count = 2;
-pub const checkpoint_slot_size: usize = 72;
 pub const page_magic = "AFLP";
 pub const page_header_size: usize = 16;
 
@@ -1767,16 +1842,30 @@ const magic_offset: usize = 0;
 const version_offset: usize = 8;
 const page_size_offset: usize = 12;
 const header_size_offset: usize = 16;
-const active_checkpoint_offset: usize = 20;
 const reader_epoch_namespace_offset: usize = 24;
-const checkpoint_slots_offset: usize = 64;
-const checkpoint_slots_end: usize = checkpoint_slots_offset + checkpoint_slot_count * checkpoint_slot_size;
-const logical_generations_size: usize = 48;
-const logical_generations_end = checkpoint_slots_end + checkpoint_slot_count * logical_generations_size;
-const checkpoint_slot_payload_size: usize = 64;
-const checkpoint_slot_checksum_offset: usize = checkpoint_slot_payload_size;
 const header_checksum_offset: usize = header_size - 4;
 const page_crc_offset: usize = 12;
+
+/// v8: a recovery slot is a dedicated page, physically separate from the
+/// static header page and from the other slot, so a torn write of one can
+/// never damage either the header or the other slot (the three used to
+/// share header sector 0). Slot pages are permanently reserved, never
+/// reused by the allocator: `reserved_header_pages` (the header plus both
+/// slots) is the smallest legal `page_count`, and the lowest ordinary data
+/// page id.
+const reserved_header_pages: u64 = 1 + checkpoint_slot_count;
+fn slotPhysicalPage(slot_index: u8) u64 {
+    return 1 + @as(u64, slot_index);
+}
+
+/// Every page the commit wrote, for recovery to re-verify a non-presynced
+/// slot without a full reachability walk: a (page id, CRC-at-write-time)
+/// pair per page. Commits at or under this many distinct pages get the
+/// 1-sync path (manifest written alongside the slot, one barrier); larger
+/// commits fall back to the historical "sync data, then sync the slot"
+/// order and are marked `presynced` (recovery trusts them unconditionally,
+/// as today).
+pub const max_single_sync_pages: usize = 1024;
 
 pub const PageKind = enum(u8) {
     data = 1,
@@ -1790,6 +1879,8 @@ pub const PageKind = enum(u8) {
     record_bundle = 9,
     allocator = 10,
     key = 11,
+    checkpoint_slot = 12,
+    commit_manifest = 13,
 };
 
 // Record references reserve the high bit and a 16-bit byte offset. Ordinary
@@ -3751,9 +3842,24 @@ pub const CheckpointSlot = struct {
     document_root_page: u64 = 0,
     index_catalog_root_page: u64 = 0,
     free_map_root_page: u64 = 0,
-    page_count: u64 = 1,
+    page_count: u64 = reserved_header_pages,
     namespace_directory_root_page: u64 = 0,
     document_index_root_page: u64 = 0,
+    /// v8 commit manifest: every page this commit wrote, (page id, CRC at
+    /// write time) pairs, stored in one `.commit_manifest` page named here.
+    /// Meaningless (and zero) when `presynced` is true.
+    manifest_page: u64 = 0,
+    manifest_crc: u32 = 0,
+    manifest_page_count: u32 = 0,
+    /// True for a commit whose data pages were already fsynced before this
+    /// slot was written (the historical two-sync order: commits over
+    /// `max_single_sync_pages`, and the bootstrap slot written before any
+    /// commit exists). Recovery trusts a presynced slot unconditionally,
+    /// the same way every slot was trusted before v8. A non-presynced slot
+    /// must have its manifest re-verified: a slot can be durable on disk
+    /// while a page it names was never actually written (the write and the
+    /// slot's own sync are not atomic with each other).
+    presynced: bool = true,
 };
 
 pub const LockMode = enum {
@@ -3774,6 +3880,11 @@ pub const OpenOptions = struct {
     read_only: bool = false,
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    /// Only consulted when this open builds its own `std.Io.Threaded`
+    /// runtime (i.e. not `openWithIo`): upgrades the default durability
+    /// barrier to also flush the drive's own write cache (`F_FULLFSYNC` on
+    /// Darwin; no effect on platforms without that distinction).
+    full_fsync: bool = false,
 };
 
 /// Per-owner writer-lease timing, exposed under `background_publications`.
@@ -3890,6 +4001,8 @@ pub const CreateOptions = struct {
     no_sync: bool = false,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     writer_lock_marker: []const u8 = "",
+    /// See `OpenOptions.full_fsync`.
+    full_fsync: bool = false,
 };
 
 pub const Header = struct {
@@ -4598,7 +4711,8 @@ const PageWriteBatch = struct {
 
     fn appendPage(self: *PageWriteBatch, page_id: u64, kind: PageKind, payload: []const u8) !void {
         if (payload.len > self.file.maxPagePayloadBytes()) return error.PageTooLarge;
-        encodePage(try self.reserve(page_id), kind, payload);
+        const page = try self.reserve(page_id);
+        encodePage(page, kind, payload);
     }
 
     fn appendValue(self: *PageWriteBatch, page_id: u64, next: u64, chunk: []const u8) !void {
@@ -4641,6 +4755,18 @@ const PageWriteBatch = struct {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             });
+            // This loop is the choke point every PageWriteBatch-staged data
+            // page passes through on its way to disk (appendPage/appendValue
+            // only stage bytes into `buffer`; this is where they are
+            // actually written), so recording the manifest entry here --
+            // instead of at every staging call site -- cannot miss one
+            // regardless of which higher-level writer staged it, and
+            // regardless of whether this write happens during staging, a
+            // non-durable commit, or the eventual durable one.
+            if (NativeFile.manifest_commits_enabled) {
+                for (self.page_ids[start..end], start..end) |page_id, i|
+                    file.manifest_builder.note(file.allocator, page_id, std.mem.readInt(u32, self.buffer[i * size ..][page_crc_offset..][0..4], .little));
+            }
             start = end;
         }
         for (self.page_ids[0..count], 0..) |page_id, i|
@@ -4723,11 +4849,16 @@ test "lite header fingerprints cache unchanged state and fence every header fiel
     inline for (@typeInfo(Header).@"struct".field_names, @typeInfo(Header).@"struct".field_types) |field, Field| {
         if (comptime std.mem.eql(u8, field, "checkpoints")) {
             inline for (0..checkpoint_slot_count) |slot| {
-                inline for (@typeInfo(CheckpointSlot).@"struct".field_names) |checkpoint_field| {
+                inline for (@typeInfo(CheckpointSlot).@"struct".field_names, @typeInfo(CheckpointSlot).@"struct".field_types) |checkpoint_field, CheckpointField| {
+                    // fingerprintHeader hashes both slots unconditionally
+                    // (see its doc comment), so a mutation to either one is
+                    // observable regardless of which is active; setting
+                    // active_checkpoint here is just to exercise both.
                     if (comptime std.mem.eql(u8, checkpoint_field, "logical")) {
                         inline for (@typeInfo(LogicalGenerations).@"struct".field_names) |identity| {
                             file.header = original;
                             file.header.indexed_reclamation = true;
+                            file.header.active_checkpoint = slot;
                             const indexed_before = NativeFile.fingerprintHeader(file.header);
                             @field(file.header.checkpoints[slot].logical, identity)[0] = 1;
                             try std.testing.expectEqual(NativeFile.fingerprintHeader(file.header), file.headerFingerprint());
@@ -4736,11 +4867,30 @@ test "lite header fingerprints cache unchanged state and fence every header fiel
                         continue;
                     }
                     file.header = original;
-                    @field(file.header.checkpoints[slot], checkpoint_field) += 1;
+                    file.header.active_checkpoint = slot;
+                    const before_mutation = NativeFile.fingerprintHeader(file.header);
+                    if (comptime CheckpointField == bool) {
+                        @field(file.header.checkpoints[slot], checkpoint_field) = !@field(file.header.checkpoints[slot], checkpoint_field);
+                    } else {
+                        @field(file.header.checkpoints[slot], checkpoint_field) += 1;
+                    }
                     try std.testing.expectEqual(NativeFile.fingerprintHeader(file.header), file.headerFingerprint());
-                    try std.testing.expect(!std.mem.eql(u8, &expected, &file.headerFingerprint()));
+                    try std.testing.expect(!std.mem.eql(u8, &before_mutation, &file.headerFingerprint()));
                 }
             }
+        } else if (comptime std.mem.eql(u8, field, "active_checkpoint")) {
+            // Both slots are hashed unconditionally, in fixed index order:
+            // which one is active is not part of the recoverable identity
+            // (each slot already carries its own commit_sequence), so this
+            // field alone must never change the fingerprint -- even with
+            // differing slot content, let alone the identical defaults
+            // `original` starts with.
+            file.header = original;
+            file.header.checkpoints[1].commit_sequence = 1;
+            file.header.active_checkpoint = 0;
+            const before_flip = file.headerFingerprint();
+            file.header.active_checkpoint = 1;
+            try std.testing.expectEqual(before_flip, file.headerFingerprint());
         } else {
             file.header = original;
             if (comptime Field == bool) {
@@ -4862,6 +5012,28 @@ pub const NativeFile = struct {
     transaction_writes_generation: u64 = 0,
     flushing_transaction: bool = false,
     transaction_pages: ?*PageAllocator = null,
+    /// Accumulates (page_id, crc) for every data page `PageWriteBatch`
+    /// physically writes since the *last durable checkpoint publish* --
+    /// across staging (`stageMutation`'s eager external-value writes,
+    /// which happen well before any commit function runs), every
+    /// intervening non-durable (`commitTransactionWithDurability(false)`)
+    /// commit, and the eventual durable commit's own writes. A non-durable
+    /// commit is only made durable by a later durable commit's single sync
+    /// barrier, so that barrier's manifest must cover everything written
+    /// since the last durable point, not just its own commit's writes, or
+    /// a torn page from an earlier non-durable commit would verify as
+    /// fine. Reset only inside `publishCheckpoint`, right after a durable
+    /// publish actually succeeds (regardless of whether it used a manifest
+    /// or fell back to presynced): that is the new "last durable
+    /// checkpoint" baseline, so tracking restarts from there.
+    manifest_builder: ManifestBuilder = .{},
+    /// Set by `commitTransactionWithDurability` immediately before calling
+    /// `flushTransactionWrites`, true only for a commit that might end up
+    /// durably publishing (not deferred, not no_sync, manifest commits
+    /// enabled): `flushTransactionWrites` reserves `manifest_builder`'s
+    /// page under this flag, since only the commit that will actually call
+    /// `tryBuildCommitManifest` needs one reserved.
+    allow_manifest_reservation: bool = false,
     durable_header: ?Header = null,
     last_synced_header: ?Header = null,
     change_capture: ?*ChangeCapture = null,
@@ -5013,7 +5185,11 @@ pub const NativeFile = struct {
         try readHeaderExactAt(file, io, &header_bytes);
         var header = try decodeHeader(&header_bytes);
         const file_size = (try file.stat(io)).size;
-        header.active_checkpoint = try selectCompleteCheckpointForFile(header, file_size);
+        header.checkpoints = loadCheckpointSlots(file, io, header.page_size, file_size);
+        // Only a writer (not a read-only probe) may truncate a rejected
+        // fallback candidate's tail away.
+        const recovered = try recoverActiveCheckpoint(file, io, header, file_size, !opts.read_only);
+        header.active_checkpoint = recovered.index;
 
         var result = NativeFile{
             .allocator = allocator,
@@ -5028,6 +5204,13 @@ pub const NativeFile = struct {
             .read_only = opts.read_only,
             .no_sync = opts.no_sync,
             .page_cache_enabled = .init(true),
+            // Only when this open built its own Threaded runtime (not
+            // openWithIo, whose caller's Io might be a test/sim wrapper or
+            // an evented backend): see `durability_policy`'s doc.
+            .durability_policy = if (borrowed_io == null)
+                (if (opts.full_fsync) .full_fsync else .default)
+            else
+                null,
         };
         if (opts.read_only and !opts.internal_reader and !opts.externally_locked) {
             if (opts.reader_coordinator) |coordinator| result.reader_fence = if (header.indexed_reclamation)
@@ -5040,21 +5223,21 @@ pub const NativeFile = struct {
     }
 
     pub fn create(allocator: Allocator, path: []const u8) !NativeFile {
-        return try createWithMode(allocator, path, false, false, null, "", false);
+        return try createWithMode(allocator, path, false, false, null, "", false, false);
     }
 
     pub fn createNew(allocator: Allocator, path: []const u8) !NativeFile {
-        return try createWithMode(allocator, path, true, false, null, "", false);
+        return try createWithMode(allocator, path, true, false, null, "", false, false);
     }
 
     pub fn createWithOptions(allocator: Allocator, path: []const u8, opts: CreateOptions) !NativeFile {
-        return try createWithMode(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker, opts.indexed_reclamation);
+        return try createWithMode(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker, opts.indexed_reclamation, opts.full_fsync);
     }
 
     /// Creates a Lite file using a caller-owned std.Io runtime. The runtime
     /// must outlive the returned file.
     pub fn createWithIo(allocator: Allocator, io: std.Io, path: []const u8, opts: CreateOptions) !NativeFile {
-        return try createWithRuntime(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker, undefined, io, opts.indexed_reclamation);
+        return try createWithRuntime(allocator, path, opts.exclusive, opts.no_sync, opts.resource_manager, opts.writer_lock_marker, undefined, io, opts.indexed_reclamation, opts.full_fsync);
     }
 
     fn createWithMode(
@@ -5065,10 +5248,11 @@ pub const NativeFile = struct {
         resource_manager: ?*resource_manager_mod.ResourceManager,
         writer_lock_marker: []const u8,
         indexed: bool,
+        full_fsync: bool,
     ) !NativeFile {
         var io_impl = threaded_io_limits.initService(allocator);
         errdefer io_impl.deinit();
-        return try createWithRuntime(allocator, path, exclusive, no_sync, resource_manager, writer_lock_marker, io_impl, null, indexed);
+        return try createWithRuntime(allocator, path, exclusive, no_sync, resource_manager, writer_lock_marker, io_impl, null, indexed, full_fsync);
     }
 
     fn createWithRuntime(
@@ -5081,6 +5265,7 @@ pub const NativeFile = struct {
         io_impl: std.Io.Threaded,
         borrowed_io: ?std.Io,
         indexed: bool,
+        full_fsync: bool,
     ) !NativeFile {
         var owned_io_impl = io_impl;
         const io = borrowed_io orelse owned_io_impl.io();
@@ -5127,7 +5312,20 @@ pub const NativeFile = struct {
         errdefer if (file_open) file.close(io);
 
         try file.writePositionalAll(io, &encoded, 0);
+        // Reserve both slot pages' room up front (zero-filled), so even the
+        // non-indexed bootstrap below -- which only writes slot 0 -- leaves
+        // a file whose length already matches its checkpoint's page_count.
+        // Slot 1 reads back as structurally invalid (an all-zero page fails
+        // decodePagePayload's magic check) until something actually
+        // publishes to it.
+        try file.setLength(io, reserved_header_pages * @as(u64, default_page_size));
         var initialized_header: Header = .{};
+        {
+            var slot_buf: [max_page_size]u8 = undefined;
+            const slot_page = slot_buf[0..default_page_size];
+            encodeCheckpointSlotPage(slot_page, initialized_header.checkpoints[0]);
+            try file.writePositionalAll(io, slot_page, slotPhysicalPage(0) * @as(u64, default_page_size));
+        }
         if (indexed) {
             // Finish every fallible initialization step on the private inode.
             var staged = NativeFile{ .allocator = allocator, .io_impl = undefined, .borrowed_io = io, .path = owned_path, .file = file, .header = .{ .reader_epoch_namespace = try @import("reader_epochs.zig").namespaceForPublicationWithDurability(allocator, io, create_target, no_sync) }, .read_only = false, .no_sync = no_sync, .page_cache_enabled = .init(false) };
@@ -5164,6 +5362,10 @@ pub const NativeFile = struct {
             .read_only = false,
             .no_sync = no_sync,
             .page_cache_enabled = .init(true),
+            .durability_policy = if (borrowed_io == null)
+                (if (full_fsync) .full_fsync else .default)
+            else
+                null,
         };
         if (resource_manager) |manager| result.page_cache.attachResourceManager(manager);
         return result;
@@ -5182,6 +5384,7 @@ pub const NativeFile = struct {
         if (self.reader_fence) |fence| self.reader_coordinator.?.unregister(fence);
         if (self.transaction_writes) |writes| writes.deinit(self.allocator);
         self.transaction_writes = null;
+        self.manifest_builder.deinit(self.allocator);
         const io = self.runtimeIo();
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
         self.page_cache.deinit(self.allocator);
@@ -5458,12 +5661,30 @@ pub const NativeFile = struct {
     const allocator_certificate_live_magic = "AFACERT2";
     const allocator_certificate_size = 72;
 
+    // v8's encodeHeader only covers the static page-0 fields (magic,
+    // version, page_size, reader_epoch_namespace): the recovery slots moved
+    // to their own pages. Both recovery slots and the complete loaded
+    // ledger must match for an allocator certificate to carry over
+    // (inheritAllocatorCertificate's doc comment): a certificate is only
+    // safe to inherit if NEITHER recovery slot moved since it was issued,
+    // not just the one that happens to be active. So this hashes both
+    // slots' payloads, in fixed index order, independent of
+    // active_checkpoint: which index is active is not itself part of the
+    // recoverable identity (both slots already carry their own
+    // commit_sequence).
     fn fingerprintHeader(header: Header) [32]u8 {
         if (builtin.is_test) _ = test_header_fingerprint_hashes.fetchAdd(1, .monotonic);
         var encoded: [header_size]u8 = undefined;
         encodeHeader(&encoded, header);
+        var hasher = std.crypto.hash.Blake3.init(.{});
+        hasher.update(&encoded);
+        for (header.checkpoints) |slot| {
+            var slot_payload: [checkpoint_slot_payload_size]u8 = undefined;
+            encodeCheckpointSlotPayload(&slot_payload, slot);
+            hasher.update(&slot_payload);
+        }
         var digest: [32]u8 = undefined;
-        std.crypto.hash.Blake3.hash(&encoded, &digest, .{});
+        hasher.final(&digest);
         return digest;
     }
 
@@ -5655,7 +5876,7 @@ pub const NativeFile = struct {
         try self.writePage(record, .catalog, encoded.items);
         // Stage the root in memory. The ordinary commit supplies the single
         // data durability barrier before publishing the checkpoint slots.
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
         self.allocator_certificate_staged = true;
     }
 
@@ -6286,19 +6507,42 @@ pub const NativeFile = struct {
         return last;
     }
 
+    /// Writes `slot` to its dedicated physical page. Bypasses the normal
+    /// page cache/allocator path (as the header page always has): slot
+    /// pages are never read back except at open/recovery time.
+    fn writeSlotPage(self: *NativeFile, index: u8, slot: CheckpointSlot) !void {
+        try writeSlotPageTo(self.file, self.runtimeIo(), self.header.page_size, index, slot);
+    }
+
     fn initializeIndexedAllocator(self: *NativeFile) !void {
-        if (self.activeCheckpoint().page_count != 1) return error.InvalidTransactionState;
+        if (self.activeCheckpoint().page_count != reserved_header_pages) return error.InvalidTransactionState;
         self.header.indexed_reclamation = true;
         self.header.packed_records = true;
+        // createWithRuntime's first header write always encodes the
+        // all-defaults (non-indexed) Header{} literal, before it is known
+        // whether this file ends up indexed. Correct it now that
+        // indexed_reclamation (and the identity namespace) are final: the
+        // magic bytes and reader_epoch_namespace this function just set
+        // must land on disk, since nothing else here rewrites the header.
+        var header_buf: [header_size]u8 = undefined;
+        encodeHeader(&header_buf, self.header);
+        try self.file.writePositionalAll(self.runtimeIo(), &header_buf, 0);
         var pages = try self.pageAllocatorFromFreeMap(self.activeCheckpoint());
         defer pages.deinit();
         var checkpoint = self.activeCheckpoint();
         checkpoint.free_map_root_page = try pages.allocate();
         try self.persistAllocator(&pages, &checkpoint);
+        // The bootstrap commit has no prior durable slot to race against:
+        // it is covered by createWithRuntime's own single closing sync, the
+        // same way the header and the rest of this commit's pages are. No
+        // manifest is needed.
+        checkpoint.presynced = true;
+        checkpoint.manifest_page = 0;
+        checkpoint.manifest_crc = 0;
+        checkpoint.manifest_page_count = 0;
         self.header.checkpoints = .{ checkpoint, checkpoint };
-        var encoded: [header_size]u8 = undefined;
-        encodeHeader(&encoded, self.header);
-        try self.file.writePositionalAll(self.runtimeIo(), &encoded, 0);
+        try self.writeSlotPage(0, checkpoint);
+        try self.writeSlotPage(1, checkpoint);
         try self.syncIfRequired();
     }
 
@@ -6547,7 +6791,7 @@ pub const NativeFile = struct {
         next.free_map_root_page = try pages.allocate();
         try self.persistAllocator(&pages, &next);
         try self.syncIfRequired();
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
         if (cancel) |token| try token.check();
         // No cancellation checks after checkpoint publication begins: preserve
         // the usual uncertain-outcome fencing across the durability boundary.
@@ -6692,7 +6936,7 @@ pub const NativeFile = struct {
         try self.persistAllocator(&page_allocator, &next);
         try self.syncIfRequired();
 
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
         return page_id;
     }
 
@@ -6920,7 +7164,7 @@ pub const NativeFile = struct {
         try pages.flush();
         try self.persistAllocator(pages, &next);
         try self.syncIfRequired();
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
     }
 
     pub fn appendIndexCatalogRecord(self: *NativeFile, key: []const u8, suffix: []const u8) !void {
@@ -7116,7 +7360,7 @@ pub const NativeFile = struct {
             try self.syncIfRequired();
         }
 
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
     }
 
     fn transactionCatalogEntry(self: *NativeFile, root: CatalogRoot, key: []const u8, scratch: *[65536]u8) !?CatalogEntry {
@@ -7300,7 +7544,7 @@ pub const NativeFile = struct {
         try self.persistAllocator(&page_allocator, &next);
         try self.syncIfRequired();
 
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
     }
 
     fn renameCatalogRecordForRoot(self: *NativeFile, root: CatalogRoot, old_key: []const u8, new_key: []const u8) !void {
@@ -7379,7 +7623,7 @@ pub const NativeFile = struct {
         try self.persistAllocator(&page_allocator, &next);
         try self.syncIfRequired();
 
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
     }
 
     pub fn getCatalogRecordAlloc(self: *NativeFile, allocator: Allocator, key: []const u8) !?[]u8 {
@@ -8540,7 +8784,7 @@ pub const NativeFile = struct {
             try self.syncIfRequired();
         }
 
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
         if (directory.indexed) {
             deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
             self.namespace_directory_cache = .empty;
@@ -8636,7 +8880,7 @@ pub const NativeFile = struct {
             try self.persistAllocator(pages, &next);
             try self.syncIfRequired();
         }
-        try self.publishCheckpoint(next);
+        try self.publishCheckpoint(next, false);
     }
 
     fn decodeKey(payload: []const u8) ![]const u8 {
@@ -10038,11 +10282,18 @@ pub const NativeFile = struct {
         // its private sequence may exceed the live store's publication sequence.
         // Both recovery slots must identify the final image; a newer private
         // fallback slot must never win checkpoint selection after reopen.
+        // No manifest: this is the same "trust the slot unconditionally"
+        // bootstrap case as the very first checkpoint -- both slots are
+        // about to say the same thing, so there is no "other, older"
+        // candidate a torn write could fall back to anyway.
+        checkpoint.presynced = true;
+        checkpoint.manifest_page = 0;
+        checkpoint.manifest_crc = 0;
+        checkpoint.manifest_page_count = 0;
         self.header.checkpoints = .{ checkpoint, checkpoint };
         self.header.active_checkpoint = 0;
-        var encoded: [header_size]u8 = undefined;
-        encodeHeader(&encoded, self.header);
-        try self.file.writePositionalAll(self.runtimeIo(), &encoded, 0);
+        try self.writeSlotPage(0, checkpoint);
+        try self.writeSlotPage(1, checkpoint);
         try self.syncIfRequired();
     }
 
@@ -10165,9 +10416,9 @@ pub const NativeFile = struct {
         var compact_file = try std.Io.Dir.cwd().createFile(io, tmp_path, .{ .read = true, .exclusive = true, .permissions = .fromMode(0o600) });
         var compact_file_open = true;
         defer if (compact_file_open) compact_file.close(io);
-        try compact_file.setLength(io, page_size);
+        try compact_file.setLength(io, reserved_header_pages * @as(u64, page_size));
 
-        var next_page_id: u64 = 1;
+        var next_page_id: u64 = reserved_header_pages;
         var catalog_root_page: u64 = 0;
         var index_catalog_root_page: u64 = 0;
         var document_root_page: u64 = 0;
@@ -10277,6 +10528,21 @@ pub const NativeFile = struct {
         var encoded_header: [header_size]u8 = undefined;
         encodeHeader(&encoded_header, compact_header);
         try compact_file.writePositionalAll(io, &encoded_header, 0);
+        // This is a wholesale new generation, not an ordinary commit: both
+        // slots are trusted unconditionally, the same as the very first
+        // checkpoint a fresh file ever gets. (The agenda-bootstrap branch
+        // above already wrote slot 1 for real through the normal commit
+        // path onto this same compact_file; re-writing it here with the
+        // identical final value is a harmless duplicate, not a correctness
+        // issue.)
+        inline for (0..checkpoint_slot_count) |index| {
+            var slot = compact_header.checkpoints[index];
+            slot.presynced = true;
+            slot.manifest_page = 0;
+            slot.manifest_crc = 0;
+            slot.manifest_page_count = 0;
+            try writeSlotPageTo(compact_file, io, compact_header.page_size, index, slot);
+        }
         const after_size = next_page_id * @as(u64, self.header.page_size);
         try compact_file.setLength(io, after_size);
         if (!self.no_sync) try compact_file.sync(io);
@@ -10332,6 +10598,49 @@ pub const NativeFile = struct {
             var destination = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(dest_path), .file = out_file, .header = self.header, .no_sync = false, .page_cache_enabled = .init(false) };
             defer destination.page_cache.deinit(self.allocator);
             try destination.bindPrivateEpochNamespace(dest_path);
+            // The raw copy above just took whatever bytes were physically at
+            // both slot pages at copy time, which (this handle's own
+            // checkpoint, `self`, having been pinned since before the
+            // source's writer may have advanced further) can be a *later*
+            // generation than the snapshot's own checkpoint and may name
+            // roots past `snapshot_size`. bindPrivateEpochNamespace only
+            // fixes up the static header; rewrite both slots explicitly so
+            // the snapshot is self-contained: slot 0 authoritatively holds
+            // this handle's own (pinned) checkpoint, trusted unconditionally
+            // like a fresh file's bootstrap slot, and slot 1 is zeroed so it
+            // can never be mistaken for a later, now-truncated-away
+            // generation's stale copied bytes.
+            var snapshot_checkpoint = checkpoint;
+            snapshot_checkpoint.presynced = true;
+            snapshot_checkpoint.manifest_page = 0;
+            snapshot_checkpoint.manifest_crc = 0;
+            snapshot_checkpoint.manifest_page_count = 0;
+            // bindPrivateEpochNamespace above already re-stamped any embedded
+            // allocator certificate's fingerprint for the new namespace, but
+            // it did so against the *untouched* two-slot checkpoints array
+            // (whatever this handle's in-memory header held, matching the
+            // state at certify time). The final on-disk state instead carries
+            // snapshot_checkpoint in slot 0 and a zeroed slot 1, so the
+            // fingerprint a later reopen recomputes would differ from what
+            // was just stamped. Re-stamp once more against the *final*
+            // checkpoints so the certificate stays valid after reopen.
+            if (destination.header.indexed_reclamation and checkpoint.free_map_root_page != 0) {
+                const root = try destination.readPagePayloadByKindAllocForCheckpoint(destination.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
+                defer destination.allocator.free(root);
+                const post_namespace_fingerprint = fingerprintHeader(destination.header);
+                if (root.len == 192 and std.mem.eql(u8, root[128..160], &post_namespace_fingerprint)) {
+                    var final_header = destination.header;
+                    final_header.checkpoints = .{ snapshot_checkpoint, .{ .page_count = 0 } };
+                    final_header.active_checkpoint = 0;
+                    @memcpy(root[128..160], &fingerprintHeader(final_header));
+                    try destination.writePage(checkpoint.free_map_root_page, .free_map, root);
+                }
+            }
+            try destination.writeSlotPage(0, snapshot_checkpoint);
+            var zeroed_slot: [default_page_size]u8 = @splat(0);
+            try out_file.writePositionalAll(io, &zeroed_slot, slotPhysicalPage(1) * @as(u64, destination.header.page_size));
+            destination.header.checkpoints = .{ snapshot_checkpoint, .{ .page_count = 0 } };
+            destination.header.active_checkpoint = 0;
             try out_file.setLength(io, snapshot_size);
             try out_file.sync(io);
         }
@@ -10527,7 +10836,7 @@ pub const NativeFile = struct {
                             try self.validateReachableValuePages(links.external_value_root_page, links.external_value_len, checkpoint, reachable_pages);
                         }
                     },
-                    .data, .value, .free_map, .document_index, .value_extent, .catalog_index, .record_bundle, .allocator, .key => return error.UnexpectedNativePageKind,
+                    .data, .value, .free_map, .document_index, .value_extent, .catalog_index, .record_bundle, .allocator, .key, .checkpoint_slot, .commit_manifest => return error.UnexpectedNativePageKind,
                 }
                 page_id = links.link_page;
                 count += 1;
@@ -10562,7 +10871,7 @@ pub const NativeFile = struct {
                     if (use_link_cache) self.cachePageLinks(page_id, .document, payload);
                     break :blk entry.previous_page;
                 },
-                .data, .value, .free_map, .document_index, .value_extent, .catalog_index, .record_bundle, .allocator, .key => return error.UnexpectedNativePageKind,
+                .data, .value, .free_map, .document_index, .value_extent, .catalog_index, .record_bundle, .allocator, .key, .checkpoint_slot, .commit_manifest => return error.UnexpectedNativePageKind,
             };
             count += 1;
             if (count > recordWalkLimit(checkpoint, self.header.page_size)) return error.InvalidNativePageChain;
@@ -11112,7 +11421,14 @@ pub const NativeFile = struct {
         errdefer free_pages.deinit(self.allocator);
 
         const max_entries = maxFreeMapEntries(self.header.page_size);
-        var page_id: u64 = 1;
+        // Pages [0, reserved_header_pages) are the header and the two
+        // dedicated checkpoint slot pages, never part of any reachable
+        // catalog/document/free-map chain and so never caught by the
+        // `reachable_pages` check below. Starting at 1 (correct for v3/v7,
+        // which reserved only page 0) would otherwise offer a live slot
+        // page up for reuse as an ordinary data page the moment this free
+        // map's covered range needs one.
+        var page_id: u64 = reserved_header_pages;
         while (page_id < next.page_count and free_pages.items.len < max_entries) : (page_id += 1) {
             if (!reachable_pages.contains(page_id)) {
                 try free_pages.append(self.allocator, page_id);
@@ -11474,7 +11790,7 @@ pub const NativeFile = struct {
         var live_bytes: u64 = 0;
         var accounting: LiveByteAccounting = .{};
         const indexed = self.header.indexed_reclamation or self.vacuum_target_indexed;
-        var compact_pages: u64 = if (indexed) 1 else 2; // header; allocator added below
+        var compact_pages: u64 = reserved_header_pages + (if (indexed) @as(u64, 0) else 1); // header + both slots; allocator added below
         var record_count: u64 = 0;
         var namespace_directory = NamespaceDirectory.empty;
         defer deinitNamespaceDirectory(self.allocator, &namespace_directory);
@@ -11664,7 +11980,10 @@ pub const NativeFile = struct {
                 });
             },
             // A reused page id may carry stale link info from a previous life.
-            .data, .value_extent, .catalog_index, .record_bundle, .allocator, .key => self.page_cache.removeLinks(self.allocator, page_id),
+            // checkpoint_slot/commit_manifest pages are written directly
+            // through self.file, never through this cache path, but the
+            // switch must still be exhaustive.
+            .data, .value_extent, .catalog_index, .record_bundle, .allocator, .key, .checkpoint_slot, .commit_manifest => self.page_cache.removeLinks(self.allocator, page_id),
             .document_index => self.page_cache.removeLinks(self.allocator, page_id),
             .free_map => unreachable,
         }
@@ -11759,6 +12078,7 @@ pub const NativeFile = struct {
     fn flushTransactionWrites(self: *NativeFile) anyerror!void {
         if (self.flushing_transaction) return;
         const writes = self.transaction_writes orelse return;
+        const debug_starting_page_count = if (builtin.is_test) writes.pages.next_page_id else 0;
         try self.finishCatalogAppends(writes);
         self.flushing_transaction = true;
         self.transaction_pages = &writes.pages;
@@ -11793,8 +12113,44 @@ pub const NativeFile = struct {
         next.free_map_root_page = try writes.pages.allocate();
         next.page_count = writes.pages.next_page_id;
         try writes.pages.flush();
+        // Reserve a page for a possible commit manifest before
+        // persistAllocator finalizes page_count, so -- if this commit turns
+        // out to be manifest-eligible -- that page is already part of the
+        // free-map/ledger's own covered range rather than a count bumped on
+        // after the fact. Only the commit that might actually durably
+        // publish reserves (allow_manifest_reservation), only once per
+        // window (reserved_page == null): an intermediate flush inside a
+        // large transaction (TransactionWrites.max_keys chunking) or an
+        // earlier non-durable commit in the same since-last-durable window
+        // must not each abandon their own reservation.
+        if (self.allow_manifest_reservation and !self.no_sync and
+            !self.manifest_builder.overflowed and self.manifest_builder.reserved_page == null)
+        {
+            self.manifest_builder.reserved_page = try writes.pages.allocate();
+        }
         try self.persistAllocator(&writes.pages, &next);
-        try self.publishCheckpoint(next);
+        if (manifest_commits_enabled) try self.manifest_builder.noteReused(self.allocator, &writes.pages.reused);
+        // Every page this flush allocated and should have written
+        // (excluding the reserved manifest page itself, not yet written at
+        // this point) must already be in manifest_builder -- unless
+        // overflowed already latched (entries.count() crossed
+        // max_single_sync_pages partway through this very flush, which
+        // `note` stops recording from, by design: tryBuildCommitManifest
+        // sees `overflowed` and falls back to presynced regardless of what
+        // got missed after that point). A gap while NOT overflowed is
+        // exactly the bug class that made an earlier version of this
+        // feature unsafe (WS1 b): a page the manifest would need to list
+        // but never would have.
+        if (builtin.is_test and manifest_commits_enabled and !self.manifest_builder.overflowed) {
+            var page_id = debug_starting_page_count;
+            while (page_id < next.page_count) : (page_id += 1) {
+                if (page_id == self.manifest_builder.reserved_page) continue;
+                std.debug.assert(self.manifest_builder.entries.contains(page_id));
+            }
+            var reused_it = writes.pages.reused.keyIterator();
+            while (reused_it.next()) |page| std.debug.assert(self.manifest_builder.entries.contains(page.*));
+        }
+        try self.publishCheckpoint(next, false);
         self.transaction_writes = null;
         writes.deinit(self.allocator);
     }
@@ -11949,10 +12305,20 @@ pub const NativeFile = struct {
         defer self.artifact_lease_transaction = false;
         defer self.allocator_certificate_staged = false;
         const previous = self.transaction_header orelse return error.InvalidTransactionState;
+        // A deferred (non-durable) commit never calls publishCheckpoint or
+        // tryBuildCommitManifest below -- it only stages `next` into
+        // self.header and returns, with no durability barrier at all. Its
+        // writes still accumulate into self.manifest_builder (that is the
+        // whole point of the since-last-durable-checkpoint window), but it
+        // must not reserve a manifest page of its own: flushTransactionWrites
+        // reserves one under allow_manifest_reservation, only for a commit
+        // that might actually durably publish.
+        const deferred_publication = !durable and !self.no_sync and !self.externally_locked;
+        self.allow_manifest_reservation = !deferred_publication and manifest_commits_enabled;
+        defer self.allow_manifest_reservation = false;
         try self.flushTransactionWrites();
         var next = self.activeCheckpoint();
         const changed = next.commit_sequence != previous.checkpoints[previous.active_checkpoint].commit_sequence;
-        const deferred_publication = !durable and !self.no_sync and !self.externally_locked;
         if (changed and !deferred_publication and self.allocator_certificate_on_commit and
             self.header.indexed_reclamation and self.free_pages_verified and self.durable_header == null and
             !self.checkpoint_publication_uncertain)
@@ -11982,9 +12348,116 @@ pub const NativeFile = struct {
             return;
         }
         if (changed) {
-            try self.syncIfRequired();
-            try self.publishCheckpoint(next);
+            const manifest_prepared = if (manifest_commits_enabled) try self.tryBuildCommitManifest(&next) else false;
+            if (!manifest_prepared) try self.syncIfRequired();
+            try self.publishCheckpoint(next, manifest_prepared);
         } else try self.sync();
+    }
+
+    /// WS1(b) single-fsync commits. A first attempt measured a
+    /// 20,000-document bulk-indexed commit allocating ~41,000 pages while
+    /// only 31 ever reached `ManifestBuilder.note` -- not an overflow cap,
+    /// `note` was simply never called for the rest. That cause is fixed:
+    /// the tracking window only opened inside
+    /// `commitTransactionWithDurability` itself, but most of a
+    /// transaction's page writes (external document/catalog values) happen
+    /// eagerly inside `stageMutation`, called synchronously from
+    /// `putDocument`/`putCatalogRecord` well before that window ever opens
+    /// -- so the window missed almost everything. `manifest_builder` is
+    /// now a persistent, file-lifetime field (never a per-commit local)
+    /// that `PageWriteBatch.flushCount`'s hook always writes into when this
+    /// flag is on, reset only in `publishCheckpoint` right after a durable
+    /// publish succeeds. That also gives the window its correct "since the
+    /// last durable checkpoint" scope for non-durable
+    /// (`commitTransactionWithDurability(false)`) commits: verified with a
+    /// dedicated test that tears an *earlier* non-durable commit's own page
+    /// and confirms the eventual durable commit's manifest catches it.
+    ///
+    /// Still disabled, though, on a second finding: the debug cross-check
+    /// in `flushTransactionWrites` (every page `PageAllocator.reused`
+    /// reports for this flush must have a `manifest_builder` entry) fired
+    /// against real DB-layer traffic (`storage.lite.backend.test.lite
+    /// backend native engine can back db primary documents`) -- a page the
+    /// allocator reused for this commit was never noted, meaning either a
+    /// second, still-unfound write path bypasses the tracking hook, or
+    /// reusing a page without ever writing to it in the same commit is
+    /// itself a legitimate pattern this assert wrongly treats as a bug.
+    /// Which of those it is was not determined before time ran out. Until
+    /// it is, this flag stays off: the recovery/verification side
+    /// (`verifyManifest`, `recoverActiveCheckpoint`, the v8 slot/manifest
+    /// page formats, the compact appended-range encoding) is unaffected
+    /// and stays covered by its own tests, and the debug assert (gated on
+    /// this same flag, so inert while it is false) is exactly the tool to
+    /// rerun once someone picks this back up -- it already reproduces
+    /// against `make zig-test`-level traffic, not just a synthetic repro.
+    const manifest_commits_enabled = false;
+
+    /// Builds and writes a `.commit_manifest` page covering every page this
+    /// commit's `PageWriteBatch` touched (documents, catalog/index pages,
+    /// allocator/free-map ledger pages, value chains, and any certificate
+    /// re-stamp from `sealAllocatorCheckpoint`), if the commit stayed within
+    /// `max_single_sync_pages` pages and `flushTransactionWrites` reserved a
+    /// page for it (see `ManifestBuilder.reserved_page`'s doc comment for
+    /// why that page's id is never retrofitted onto `page_count` here). On
+    /// success `next` gets `manifest_page`/`manifest_crc`/`manifest_page_count`
+    /// and `presynced = false`; `publishCheckpoint`'s own sync, issued right
+    /// after it writes the slot page, becomes the single barrier covering
+    /// the data pages, this manifest page, and the slot together.
+    ///
+    /// `next` starts as a copy of the *previous* checkpoint (see
+    /// `commitTransactionWithDurability`), so it arrives already carrying
+    /// that generation's `manifest_page`/`manifest_crc`/`manifest_page_count`/
+    /// `presynced` -- those must never survive into a commit that did not
+    /// itself rebuild a manifest, or recovery would verify an entry list
+    /// some unrelated, possibly already-overwritten earlier commit wrote.
+    /// This function clears all four to the safe presynced default
+    /// unconditionally before anything else, so every early return here (no
+    /// reservation, no entries, too many entries, or the encoded manifest
+    /// would not fit one page) falls back to the historical
+    /// presync-then-slot-sync order with a clean slot, not a stale one.
+    fn tryBuildCommitManifest(self: *NativeFile, next: *CheckpointSlot) !bool {
+        const builder = &self.manifest_builder;
+        next.manifest_page = 0;
+        next.manifest_crc = 0;
+        next.manifest_page_count = 0;
+        next.presynced = true;
+        const manifest_page_id = builder.reserved_page orelse return false;
+        var used = false;
+        defer if (!used) {
+            var filler_buf: [max_page_size]u8 = undefined;
+            const filler = filler_buf[0..self.header.page_size];
+            encodePage(filler, .commit_manifest, &[4]u8{ 0, 0, 0, 0 });
+            self.file.writePositionalAll(self.runtimeIo(), filler, manifest_page_id * @as(u64, self.header.page_size)) catch {};
+        };
+        if (builder.overflowed) return false;
+        const count = builder.entries.count();
+        if (count == 0 or count > max_single_sync_pages) return false;
+        const entries = try self.allocator.alloc(ManifestEntry, count);
+        defer self.allocator.free(entries);
+        var i: usize = 0;
+        var it = builder.entries.iterator();
+        while (it.next()) |kv| {
+            entries[i] = .{ .page_id = kv.key_ptr.*, .crc = kv.value_ptr.* };
+            i += 1;
+        }
+        const payload = encodeManifestPayloadAlloc(self.allocator, entries, &builder.reused_pages, manifest_page_id) catch |err| switch (err) {
+            // Not actually one contiguous appended run: fall back exactly
+            // like "too big to fit one page", never a hard error.
+            error.InvalidNativeManifestRange => return false,
+            else => return err,
+        };
+        defer self.allocator.free(payload);
+        if (payload.len > self.maxPagePayloadBytes()) return false;
+        var page_buf: [max_page_size]u8 = undefined;
+        const page = page_buf[0..self.header.page_size];
+        encodePage(page, .commit_manifest, payload);
+        try self.file.writePositionalAll(self.runtimeIo(), page, manifest_page_id * @as(u64, self.header.page_size));
+        next.manifest_page = manifest_page_id;
+        next.manifest_crc = std.mem.readInt(u32, page[page_crc_offset..][0..4], .little);
+        next.manifest_page_count = @intCast(count);
+        next.presynced = false;
+        used = true;
+        return true;
     }
 
     /// The allocator root is already private to this transaction. Sealing it
@@ -12004,8 +12477,24 @@ pub const NativeFile = struct {
         try self.writePage(next.free_map_root_page, .free_map, &root);
     }
 
-    fn publishCheckpoint(self: *NativeFile, proposed: CheckpointSlot) !void {
+    /// `manifest_prepared` must be `true` only when the caller itself just
+    /// built and wrote a commit manifest for `proposed` (currently only
+    /// `commitTransactionWithDurability`, via `tryBuildCommitManifest`).
+    /// Every other caller builds `proposed` by copying the previous
+    /// checkpoint and touching only a few fields, which would otherwise
+    /// carry that previous generation's `manifest_page`/`manifest_crc`/
+    /// `manifest_page_count`/`presynced` forward unexamined -- recovery
+    /// would then re-verify a stale entry list an unrelated, possibly
+    /// already-overwritten commit wrote. `false` resets all four to the
+    /// safe presynced default before anything else.
+    fn publishCheckpoint(self: *NativeFile, proposed: CheckpointSlot, manifest_prepared: bool) !void {
         var checkpoint = proposed;
+        if (!manifest_prepared) {
+            checkpoint.presynced = true;
+            checkpoint.manifest_page = 0;
+            checkpoint.manifest_crc = 0;
+            checkpoint.manifest_page_count = 0;
+        }
         try self.stampLogicalGenerations(&checkpoint);
         if (self.transaction_header != null) {
             self.header.checkpoints[self.header.active_checkpoint] = checkpoint;
@@ -12024,33 +12513,28 @@ pub const NativeFile = struct {
         }
         const next_slot: u8 = if (self.header.active_checkpoint == 0) 1 else 0;
 
-        var encoded_slot: [checkpoint_slot_size]u8 = undefined;
-        var identities: [logical_generations_size]u8 = undefined;
-        encodeLogicalGenerations(&identities, checkpoint.logical);
-        encodeCheckpointSlot(&encoded_slot, checkpoint, if (self.header.indexed_reclamation) &identities else null);
+        // The whole slot -- roots, logical generations, and the manifest
+        // descriptor -- is one page, written and CRC'd as a single unit.
+        // Unlike the pre-v8 layout (a separate write for identities and for
+        // the 72-byte slot, sharing header sector 0 with the other slot),
+        // this is both one write instead of two and physically isolated
+        // from the other slot and the header: a torn write here can never
+        // damage either of them.
+        var slot_buf: [max_page_size]u8 = undefined;
+        const slot_page = slot_buf[0..self.header.page_size];
+        encodeCheckpointSlotPage(slot_page, checkpoint);
 
         const io = self.runtimeIo();
         self.checkpoint_publication_uncertain = true;
-        // Identity bytes and roots form one checksummed recovery slot. A crash
-        // during either write invalidates this slot and retains the other one.
         // From here until the flag clears, a failure leaves the commit's
         // durability unknown: report exactly that, not a raw I/O error a
         // caller might retry as if nothing had been written.
-        //
-        // The on-disk `active_checkpoint` hint byte is never written here.
-        // `selectActiveCheckpoint` already picks the valid slot with the
-        // highest `commit_sequence`, which is monotonic across commits, so
-        // the hint can only matter as a tie-break at file creation (where it
-        // is still written once by `encodeHeader`). Persisting it again on
-        // every commit cost a second, redundant fsync.
         (blk: {
             if (comptime builtin.is_test) if (self.test_fail_checkpoint_publication) |err| {
                 self.test_fail_checkpoint_publication = null;
                 break :blk err;
             };
-            if (self.header.indexed_reclamation)
-                self.file.writePositionalAll(io, &identities, logicalGenerationsOffset(next_slot)) catch |err| break :blk err;
-            self.file.writePositionalAll(io, &encoded_slot, checkpointOffset(next_slot)) catch |err| break :blk err;
+            self.file.writePositionalAll(io, slot_page, slotPhysicalPage(next_slot) * @as(u64, self.header.page_size)) catch |err| break :blk err;
             self.syncIfRequired() catch |err| break :blk err;
             break :blk {};
         }) catch {
@@ -12064,6 +12548,15 @@ pub const NativeFile = struct {
         self.header.active_checkpoint = next_slot;
         self.checkpoint_publication_uncertain = false;
         wal_trace.recordCommit();
+        // This checkpoint is now the last durable one, whether it ended up
+        // presynced (manifest rejected or never attempted) or not: either
+        // way, whatever manifest_builder accumulated describes writes that
+        // are now covered by *this* durable publish, not the next one.
+        // Tracking restarts clean from here.
+        if (manifest_commits_enabled) {
+            self.manifest_builder.deinit(self.allocator);
+            self.manifest_builder = .{};
+        }
         self.last_synced_header = self.header;
         if (self.ledger) |state| {
             self.retirement_activity_bytes +|= state.released_data_pages *| self.header.page_size;
@@ -12107,7 +12600,7 @@ pub const NativeFile = struct {
         if (!self.checkpoint_publication_uncertain and self.durable_header == null)
             if (self.last_synced_header) |synced| if (std.meta.eql(synced, self.header)) return;
         try self.syncIfRequired();
-        if (self.durable_header != null) try self.publishCheckpoint(self.activeCheckpoint());
+        if (self.durable_header != null) try self.publishCheckpoint(self.activeCheckpoint(), false);
         self.last_synced_header = self.header;
     }
 
@@ -12199,6 +12692,12 @@ pub const NativeFile = struct {
     }
 };
 
+/// `manifest` is the same choke point as `PageWriteBatch.flushCount`'s own
+/// tracking: this free function writes directly to a raw `std.Io.File`
+/// rather than through a `PageWriteBatch`, so it must note its own entry
+/// rather than relying on that batch's loop to catch it. `null` is only
+/// correct for callers with no commit-manifest concept at all (vacuum's
+/// from-scratch image rebuild, test-only direct construction).
 fn appendPageToFile(
     allocator: Allocator,
     file: std.Io.File,
@@ -12207,6 +12706,7 @@ fn appendPageToFile(
     next_page_id: *u64,
     kind: PageKind,
     contents: []const u8,
+    manifest: ?*ManifestBuilder,
 ) !u64 {
     if (contents.len > page_size - page_header_size) return error.PageTooLarge;
     const page_id = next_page_id.*;
@@ -12214,6 +12714,7 @@ fn appendPageToFile(
     defer allocator.free(page);
     encodePage(page, kind, contents);
     try file.writePositionalAll(io, page, page_id * @as(u64, @intCast(page_size)));
+    if (manifest) |builder| builder.note(allocator, page_id, std.mem.readInt(u32, page[page_crc_offset..][0..4], .little));
     next_page_id.* += 1;
     return page_id;
 }
@@ -12273,7 +12774,7 @@ const DocumentIndexBulkBuilder = struct {
         if (self.pages) |pages| return self.owner.writeDocumentIndexNode(pages, node);
         const encoded = try encodeDocumentIndexNode(self.owner.allocator, node);
         defer self.owner.allocator.free(encoded);
-        return try appendPageToFile(self.owner.allocator, self.file, self.owner.runtimeIo(), self.owner.header.page_size, self.next_page_id, .document_index, encoded);
+        return try appendPageToFile(self.owner.allocator, self.file, self.owner.runtimeIo(), self.owner.header.page_size, self.next_page_id, .document_index, encoded, if (NativeFile.manifest_commits_enabled) &self.owner.manifest_builder else null);
     }
 
     fn add(self: *DocumentIndexBulkBuilder, key: []const u8, document_page_id: u64) !void {
@@ -12416,7 +12917,8 @@ fn appendValuePagesToFile(
         defer allocator.free(payload);
         std.mem.writeInt(u64, payload[0..8], next_value_page, .little);
         @memcpy(payload[value_page_header_size..][0..len], value[offset..][0..len]);
-        _ = try appendPageToFile(allocator, file, io, page_size, next_page_id, .value, payload);
+        // No commit-manifest concept here: unused in production (no callers).
+        _ = try appendPageToFile(allocator, file, io, page_size, next_page_id, .value, payload, null);
         offset += len;
     }
     return root_page_id;
@@ -12433,7 +12935,9 @@ fn appendFreeMapPageToFile(
 ) !u64 {
     const payload = try encodeFreeMapAlloc(allocator, @intCast(page_size), covered_page_count, free_pages);
     defer allocator.free(payload);
-    return try appendPageToFile(allocator, file, io, page_size, next_page_id, .free_map, payload);
+    // Only used by vacuum's from-scratch image rebuild (presynced=true,
+    // no commit-manifest concept there).
+    return try appendPageToFile(allocator, file, io, page_size, next_page_id, .free_map, payload, null);
 }
 
 fn catalogRootPage(slot: CheckpointSlot, root: CatalogRoot) u64 {
@@ -12476,6 +12980,10 @@ pub fn create(io: std.Io, path: []const u8) !void {
     defer if (file_open) file.close(io);
 
     try file.writePositionalAll(io, &encoded, 0);
+    try file.setLength(io, reserved_header_pages * @as(u64, default_page_size));
+    var slot_buf: [default_page_size]u8 = undefined;
+    encodeCheckpointSlotPage(&slot_buf, .{});
+    try file.writePositionalAll(io, &slot_buf, slotPhysicalPage(0) * @as(u64, default_page_size));
     try file.sync(io);
     if (staging_path) |tmp_path| {
         file.close(io);
@@ -12832,13 +13340,37 @@ fn deleteFilePath(io: std.Io, path: []const u8) !void {
     }
 }
 
+/// Unlike pre-v8 (where a header-sized buffer held everything), the
+/// recovery slots now live on their own pages, so inspecting a file for
+/// real requires file access throughout -- there is no longer a
+/// byte-buffer-only `inspectBytes`. Read-only: never truncates, even if a
+/// fallback slot's page_count would call for it (that is `NativeFile.open`
+/// -- the writer's job).
 pub fn inspect(_: Allocator, io: std.Io, path: []const u8) !InspectReport {
+    const invalid = struct {
+        fn of(err: anyerror) InspectReport {
+            return .{ .valid = false, .format_version = 0, .page_size = 0, .active_checkpoint = 0, .commit_sequence = 0, .page_count = 0, .issue = issueForDecodeError(err) };
+        }
+    }.of;
+
     var file = (try openDataFile(io, path, .reader, false)).file;
     defer file.close(io);
 
     var header_bytes: [header_size]u8 = undefined;
     try readHeaderExactAt(file, io, &header_bytes);
-    return inspectBytes(&header_bytes);
+    var header = decodeHeader(&header_bytes) catch |err| return invalid(err);
+    const file_size = (try file.stat(io)).size;
+    header.checkpoints = loadCheckpointSlots(file, io, header.page_size, file_size);
+    const recovered = recoverActiveCheckpoint(file, io, header, file_size, false) catch |err| return invalid(err);
+    const active = header.checkpoints[recovered.index];
+    return .{
+        .valid = true,
+        .format_version = if (header.indexed_reclamation) indexed_format_version else format_version,
+        .page_size = header.page_size,
+        .active_checkpoint = recovered.index,
+        .commit_sequence = active.commit_sequence,
+        .page_count = active.page_count,
+    };
 }
 
 pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
@@ -12846,26 +13378,20 @@ pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
     defer io_impl.deinit();
     const io = io_impl.io();
 
-    var file = (try openDataFile(io, path, .reader, false)).file;
-    defer file.close(io);
+    const file_size = blk: {
+        var file = (try openDataFile(io, path, .reader, false)).file;
+        defer file.close(io);
+        break :blk (try file.stat(io)).size;
+    };
 
-    const file_size = (try file.stat(io)).size;
-    var header_bytes: [header_size]u8 = undefined;
-    const read = try file.readPositionalAll(io, &header_bytes, 0);
-    if (read != header_size) {
-        return invalidCheck(.{
-            .valid = true,
-            .file_size = file_size,
-            .valid_prefix_size = 0,
-            .tail_bytes = file_size,
-            .record_count = 0,
-            .live_file_count = 0,
-            .live_bytes = 0,
-            .compact_size = 0,
-            .reclaimable_bytes = 0,
-        }, "truncated_header");
-    }
-    const header = decodeHeader(&header_bytes) catch |err| {
+    // Recovering the active checkpoint (decodeHeader, loading both v8 slot
+    // pages, and verifying a non-presynced winner's manifest) requires the
+    // same file access `NativeFile.open` already performs; duplicating
+    // that logic here just to report a slightly more specific diagnostic
+    // string is not worth two independent implementations of recovery to
+    // keep in sync. Every failure mode open() can hit already has a
+    // specific `issueForDecodeError` mapping.
+    var native_file = NativeFile.open(allocator, path, true) catch |err| {
         return invalidCheck(.{
             .valid = true,
             .file_size = file_size,
@@ -12878,25 +13404,6 @@ pub fn checkFile(allocator: Allocator, path: []const u8) !CheckReport {
             .reclaimable_bytes = 0,
         }, issueForDecodeError(err));
     };
-    _ = selectCompleteCheckpointForFile(header, file_size) catch |err| {
-        const checkpoint = header.checkpoints[header.active_checkpoint];
-        const expected_size = checkpointPrefixSize(checkpoint, header.page_size) catch 0;
-        return invalidCheck(.{
-            .valid = true,
-            .file_size = file_size,
-            .valid_prefix_size = file_size,
-            .tail_bytes = 0,
-            .record_count = if (expected_size > 0 and checkpoint.page_count > 0) checkpoint.page_count - 1 else 0,
-            .live_file_count = 0,
-            .live_bytes = 0,
-            .compact_size = expected_size,
-            .reclaimable_bytes = 0,
-        }, switch (err) {
-            error.InvalidNativeCheckpoint => "invalid_checkpoint",
-            error.TruncatedNativeFile => "truncated_file",
-        });
-    };
-    var native_file = try NativeFile.open(allocator, path, true);
     defer native_file.close();
     return try native_file.check();
 }
@@ -12909,53 +13416,34 @@ pub fn copyStableSnapshot(allocator: Allocator, source_path: []const u8, dest_pa
     return try source.copyStableSnapshotToPath(dest_path, replace);
 }
 
-pub fn inspectBytes(raw: []const u8) InspectReport {
-    const header = decodeHeader(raw) catch |err| {
-        return .{
-            .valid = false,
-            .format_version = 0,
-            .page_size = 0,
-            .active_checkpoint = 0,
-            .commit_sequence = 0,
-            .page_count = 0,
-            .issue = issueForDecodeError(err),
-        };
-    };
-    const active = header.checkpoints[header.active_checkpoint];
-    return .{
-        .valid = true,
-        .format_version = if (header.indexed_reclamation) indexed_format_version else format_version,
-        .page_size = header.page_size,
-        .active_checkpoint = header.active_checkpoint,
-        .commit_sequence = active.commit_sequence,
-        .page_count = active.page_count,
-    };
-}
-
+/// Encodes only the static page-0 fields (magic/version/page_size/
+/// reader_epoch_namespace). v8 moved both recovery slots to their own
+/// dedicated pages (`slotPhysicalPage`): this no longer touches them at
+/// all, so a slot write never needs to also rewrite (and therefore never
+/// risks tearing) the header page, and vice versa.
 pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
     @memset(out, 0);
-    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) indexed_magic else if (header.packed_records) magic else unpacked_v3_magic);
+    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) indexed_magic else if (header.packed_records) magic else unpacked_v4_magic);
     std.mem.writeInt(u32, out[version_offset..][0..4], if (header.indexed_reclamation) indexed_format_version else format_version, .little);
     std.mem.writeInt(u32, out[page_size_offset..][0..4], header.page_size, .little);
     std.mem.writeInt(u32, out[header_size_offset..][0..4], header_size, .little);
-    out[active_checkpoint_offset] = header.active_checkpoint;
     if (header.indexed_reclamation) @memcpy(out[reader_epoch_namespace_offset..][0..32], &header.reader_epoch_namespace);
-
-    for (header.checkpoints, 0..) |slot, index| {
-        const identities = out[logicalGenerationsOffset(index)..][0..logical_generations_size];
-        if (header.indexed_reclamation) encodeLogicalGenerations(identities, slot.logical);
-        encodeCheckpointSlot(out[checkpointOffset(index)..][0..checkpoint_slot_size], slot, if (header.indexed_reclamation) identities else null);
-    }
-
     std.mem.writeInt(u32, out[header_checksum_offset..][0..4], headerChecksum(out), .little);
 }
 
+/// Decodes only the static page-0 fields. `checkpoints` and
+/// `active_checkpoint` come back as unverified placeholders (`page_count =
+/// 0`, i.e. structurally invalid): the real recovery slots live on their
+/// own pages and require file access to load and verify, which a raw
+/// header buffer alone cannot provide. Callers that need a fully recovered
+/// `Header` (every production caller) must follow this with
+/// `recoverActiveCheckpoint`.
 pub fn decodeHeader(raw: []const u8) !Header {
     if (raw.len < header_size) return error.TruncatedNativeHeader;
     const header_raw = raw[0..header_size];
     const indexed_reclamation = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
     const has_packed_records = indexed_reclamation or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic);
-    if (!has_packed_records and !std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], unpacked_v3_magic)) return error.InvalidNativeMagic;
+    if (!has_packed_records and !std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], unpacked_v4_magic)) return error.InvalidNativeMagic;
 
     const version = std.mem.readInt(u32, header_raw[version_offset..][0..4], .little);
     if (version != (if (indexed_reclamation) indexed_format_version else format_version)) return error.UnsupportedNativeFormatVersion;
@@ -12969,53 +13457,156 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const page_size = std.mem.readInt(u32, header_raw[page_size_offset..][0..4], .little);
     if (!validPageSize(page_size)) return error.InvalidNativePageSize;
 
-    const active_hint = header_raw[active_checkpoint_offset];
-
-    var checkpoints: [checkpoint_slot_count]CheckpointSlot = undefined;
-    var valid_slots: [checkpoint_slot_count]bool = @splat(false);
-    for (&checkpoints, 0..) |*slot, index| {
-        const raw_slot = header_raw[checkpointOffset(index)..][0..checkpoint_slot_size];
-        const identities: ?[]const u8 = if (indexed_reclamation) header_raw[logicalGenerationsOffset(index)..][0..logical_generations_size] else null;
-        // Zero checksums are a legacy v3 compatibility encoding. Revision 4
-        // requires each recoverable slot to authenticate its ownership root.
-        if (indexed_reclamation and std.mem.readInt(u32, raw_slot[checkpoint_slot_checksum_offset..][0..4], .little) != checkpointSlotChecksum(raw_slot, identities)) {
-            slot.* = .{ .page_count = 0 };
-            continue;
-        }
-        slot.* = decodeCheckpointSlot(raw_slot, identities) catch {
-            slot.* = .{ .page_count = 0 };
-            continue;
-        };
-        valid_slots[index] = validCheckpointSlot(slot.*);
-    }
-    const active_checkpoint = try selectActiveCheckpoint(checkpoints, valid_slots, active_hint);
-
     return .{
         .reader_epoch_namespace = if (indexed_reclamation) header_raw[reader_epoch_namespace_offset..][0..32].* else @splat(0),
         .packed_records = has_packed_records,
         .indexed_reclamation = indexed_reclamation,
         .page_size = page_size,
-        .active_checkpoint = active_checkpoint,
-        .checkpoints = checkpoints,
+        .active_checkpoint = 0,
+        .checkpoints = .{ .{ .page_count = 0 }, .{ .page_count = 0 } },
     };
 }
 
-fn checkpointOffset(index: usize) usize {
-    return checkpoint_slots_offset + index * checkpoint_slot_size;
+const manifest_entry_size: usize = 12; // u64 page_id + u32 crc
+pub const max_page_size: usize = 65536;
+
+const ManifestEntry = struct { page_id: u64, crc: u32 };
+
+/// Accumulates every page written since the last durable checkpoint (see
+/// `NativeFile.manifest_builder`'s doc comment), keyed by page id so a page
+/// rewritten more than once keeps only its final CRC (the only one that
+/// will still be on disk when recovery checks it). `overflowed` latches
+/// permanently once tracking fails or the window exceeds
+/// `max_single_sync_pages`: a window that cannot build a trustworthy
+/// manifest falls back to the presynced two-sync path instead of risking
+/// an under- or over-complete one.
+const ManifestBuilder = struct {
+    entries: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    /// Page ids in `entries` that came from the allocator's free-page reuse
+    /// rather than a fresh `next_page_id` bump, merged in from each
+    /// `PageAllocator.reused` as the window's commits flush. `entries` minus
+    /// this set is expected to be exactly one contiguous run (every id the
+    /// allocator hands out fresh only ever increases), which lets the
+    /// encoded manifest name that whole run with one range and a flat CRC
+    /// array instead of a (page_id, crc) pair per page.
+    reused_pages: std.AutoHashMapUnmanaged(u64, void) = .empty,
+    overflowed: bool = false,
+    /// A page id `flushTransactionWrites` reserves through the transaction's
+    /// own `PageAllocator` before `persistAllocator` finalizes
+    /// `checkpoint.page_count`, so the eventual manifest page is counted by
+    /// the free-map/ledger's own bookkeeping exactly like every other page
+    /// this commit wrote. `page_count` is never retroactively bumped after
+    /// that bookkeeping already settled -- `decodeFreeMapAlloc` and the
+    /// allocator ledger both cross-check their own covered-page count
+    /// against it.
+    reserved_page: ?u64 = null,
+
+    fn deinit(self: *ManifestBuilder, allocator: Allocator) void {
+        self.entries.deinit(allocator);
+        self.reused_pages.deinit(allocator);
+    }
+
+    fn note(self: *ManifestBuilder, allocator: Allocator, page_id: u64, crc: u32) void {
+        if (self.overflowed) return;
+        self.entries.put(allocator, page_id, crc) catch {
+            self.overflowed = true;
+            return;
+        };
+        if (self.entries.count() > max_single_sync_pages) self.overflowed = true;
+    }
+
+    /// Merges one `PageAllocator`'s own reuse set into the window-wide one.
+    /// Called once per `flushTransactionWrites` (every commit or
+    /// intermediate flush in the window uses its own fresh `PageAllocator`,
+    /// each with its own `reused` set) so the final `reused_pages` covers
+    /// the whole since-last-durable-checkpoint window, not just the last
+    /// flush.
+    fn noteReused(self: *ManifestBuilder, allocator: Allocator, reused: *const std.AutoHashMapUnmanaged(u64, void)) !void {
+        if (self.overflowed) return;
+        var it = reused.keyIterator();
+        while (it.next()) |page| self.reused_pages.put(allocator, page.*, {}) catch {
+            self.overflowed = true;
+            return;
+        };
+    }
+};
+
+/// Fixed header before the appended CRC array and the reused (page_id, crc)
+/// pairs: range_start (u64), appended_count (u32), reused_count (u32).
+const manifest_header_size: usize = 16;
+
+/// A fresh page id the allocator hands out only ever increases
+/// (`PageAllocator.allocate`'s non-reuse branch), so every entry this
+/// window noted that is not a reuse (see `ManifestBuilder.reused_pages`)
+/// is expected to form one contiguous run -- except for exactly one gap at
+/// `manifest_page_id` itself, reserved from that very same sequence before
+/// `flushTransactionWrites` calls `persistAllocator` (whose own ledger/
+/// metadata pages continue the sequence past it), but never an entry since
+/// nothing writes to it until this function runs. `manifest_page_id` is
+/// never re-stored in the payload: it is already `slot.manifest_page` on
+/// the decode side, so `verifyManifest` reconstructs the same gap from
+/// that alone. Naming the run with a start id, a count, and a flat CRC
+/// array costs 4 bytes per page instead of 12, which is what lets
+/// `max_single_sync_pages` be in the thousands instead of the low
+/// hundreds. Reused pages (explicit, from the free list, never contiguous
+/// with anything in particular) still cost a full (page_id, crc) pair
+/// each. `error.InvalidNativeManifestRange` means the appended set was not
+/// actually one contiguous run plus that one known gap -- a sign some
+/// page escaped the allocator's own next_page_id sequencing -- and the
+/// caller must treat that exactly like "too big to fit": fall back to the
+/// presynced two-sync path, never propagate it as a hard error.
+fn encodeManifestPayloadAlloc(allocator: Allocator, entries: []const ManifestEntry, reused_pages: *const std.AutoHashMapUnmanaged(u64, void), manifest_page_id: u64) ![]u8 {
+    var appended_min: ?u64 = null;
+    var appended_max: ?u64 = null;
+    var reused_count: usize = 0;
+    for (entries) |entry| {
+        if (reused_pages.contains(entry.page_id)) {
+            reused_count += 1;
+        } else {
+            if (appended_min == null or entry.page_id < appended_min.?) appended_min = entry.page_id;
+            if (appended_max == null or entry.page_id > appended_max.?) appended_max = entry.page_id;
+        }
+    }
+    const appended_count = entries.len - reused_count;
+    const range_start = appended_min orelse 0;
+    const gap_in_span = appended_count > 0 and manifest_page_id >= range_start and manifest_page_id <= appended_max.?;
+    if (appended_count > 0) {
+        const span = appended_max.? - range_start + 1;
+        const expected = appended_count + @as(usize, if (gap_in_span) 1 else 0);
+        if (span != expected) return error.InvalidNativeManifestRange;
+    }
+    const out = try allocator.alloc(u8, manifest_header_size + appended_count * 4 + reused_count * manifest_entry_size);
+    errdefer allocator.free(out);
+    std.mem.writeInt(u64, out[0..8], range_start, .little);
+    std.mem.writeInt(u32, out[8..12], @intCast(appended_count), .little);
+    std.mem.writeInt(u32, out[12..16], @intCast(reused_count), .little);
+    const appended_crcs = out[manifest_header_size..][0 .. appended_count * 4];
+    var reused_offset: usize = manifest_header_size + appended_count * 4;
+    for (entries) |entry| {
+        if (reused_pages.contains(entry.page_id)) {
+            std.mem.writeInt(u64, out[reused_offset..][0..8], entry.page_id, .little);
+            std.mem.writeInt(u32, out[reused_offset + 8 ..][0..4], entry.crc, .little);
+            reused_offset += manifest_entry_size;
+        } else {
+            var idx = entry.page_id - range_start;
+            if (gap_in_span and entry.page_id > manifest_page_id) idx -= 1;
+            std.mem.writeInt(u32, appended_crcs[idx * 4 ..][0..4], entry.crc, .little);
+        }
+    }
+    return out;
 }
 
-fn logicalGenerationsOffset(index: usize) usize {
-    return checkpoint_slots_end + index * logical_generations_size;
-}
+/// `out` must be exactly one physical page (`header.page_size` bytes): the
+/// whole page is zeroed first (as `encodePageParts` does), so a slot
+/// written at a smaller size would leave stale bytes in the tail.
+const checkpoint_slot_payload_size: usize = 136;
 
-fn encodeLogicalGenerations(out: []u8, logical: LogicalGenerations) void {
-    @memcpy(out[0..16], &logical.primary);
-    @memcpy(out[16..32], &logical.metadata);
-    @memcpy(out[32..48], &logical.indexes);
-}
-
-fn encodeCheckpointSlot(out: []u8, slot: CheckpointSlot, identities: ?[]const u8) void {
-    std.debug.assert(out.len == checkpoint_slot_size);
+/// Deterministic field-by-field encoding (explicit zero-fill, no struct
+/// padding) so the same logical `CheckpointSlot` always produces identical
+/// bytes -- both for the on-disk slot page and for `fingerprintHeader`,
+/// which hashes this payload to stay sensitive to the active checkpoint's
+/// content now that `encodeHeader` no longer carries it.
+fn encodeCheckpointSlotPayload(out: *[checkpoint_slot_payload_size]u8, slot: CheckpointSlot) void {
     @memset(out, 0);
     std.mem.writeInt(u64, out[0..8], slot.commit_sequence, .little);
     std.mem.writeInt(u64, out[8..16], slot.catalog_root_page, .little);
@@ -13025,34 +13616,85 @@ fn encodeCheckpointSlot(out: []u8, slot: CheckpointSlot, identities: ?[]const u8
     std.mem.writeInt(u64, out[40..48], slot.page_count, .little);
     std.mem.writeInt(u64, out[48..56], slot.namespace_directory_root_page, .little);
     std.mem.writeInt(u64, out[56..64], slot.document_index_root_page, .little);
-    std.mem.writeInt(u32, out[checkpoint_slot_checksum_offset..][0..4], checkpointSlotChecksum(out, identities), .little);
+    @memcpy(out[64..80], &slot.logical.primary);
+    @memcpy(out[80..96], &slot.logical.metadata);
+    @memcpy(out[96..112], &slot.logical.indexes);
+    std.mem.writeInt(u64, out[112..120], slot.manifest_page, .little);
+    std.mem.writeInt(u32, out[120..124], slot.manifest_crc, .little);
+    std.mem.writeInt(u32, out[124..128], slot.manifest_page_count, .little);
+    out[128] = @intFromBool(slot.presynced);
 }
 
-fn decodeCheckpointSlot(raw: []const u8, identities: ?[]const u8) !CheckpointSlot {
-    std.debug.assert(raw.len == checkpoint_slot_size);
-    const expected_checksum = std.mem.readInt(u32, raw[checkpoint_slot_checksum_offset..][0..4], .little);
-    if (expected_checksum != 0 and expected_checksum != checkpointSlotChecksum(raw, identities)) return error.NativeCheckpointChecksumMismatch;
+fn encodeCheckpointSlotPage(out: []u8, slot: CheckpointSlot) void {
+    var payload: [checkpoint_slot_payload_size]u8 = undefined;
+    encodeCheckpointSlotPayload(&payload, slot);
+    encodePage(out, .checkpoint_slot, &payload);
+}
+
+fn decodeCheckpointSlotPage(raw: []const u8) !CheckpointSlot {
+    const payload = try decodePagePayload(raw, .checkpoint_slot);
+    if (payload.len != checkpoint_slot_payload_size) return error.InvalidNativeCheckpoint;
     return .{
-        .logical = if (identities) |bytes| .{ .primary = bytes[0..16].*, .metadata = bytes[16..32].*, .indexes = bytes[32..48].* } else .{},
-        .commit_sequence = std.mem.readInt(u64, raw[0..8], .little),
-        .catalog_root_page = std.mem.readInt(u64, raw[8..16], .little),
-        .document_root_page = std.mem.readInt(u64, raw[16..24], .little),
-        .index_catalog_root_page = std.mem.readInt(u64, raw[24..32], .little),
-        .free_map_root_page = std.mem.readInt(u64, raw[32..40], .little),
-        .page_count = std.mem.readInt(u64, raw[40..48], .little),
-        .namespace_directory_root_page = std.mem.readInt(u64, raw[48..56], .little),
-        .document_index_root_page = std.mem.readInt(u64, raw[56..64], .little),
+        .commit_sequence = std.mem.readInt(u64, payload[0..8], .little),
+        .catalog_root_page = std.mem.readInt(u64, payload[8..16], .little),
+        .document_root_page = std.mem.readInt(u64, payload[16..24], .little),
+        .index_catalog_root_page = std.mem.readInt(u64, payload[24..32], .little),
+        .free_map_root_page = std.mem.readInt(u64, payload[32..40], .little),
+        .page_count = std.mem.readInt(u64, payload[40..48], .little),
+        .namespace_directory_root_page = std.mem.readInt(u64, payload[48..56], .little),
+        .document_index_root_page = std.mem.readInt(u64, payload[56..64], .little),
+        .logical = .{
+            .primary = payload[64..80].*,
+            .metadata = payload[80..96].*,
+            .indexes = payload[96..112].*,
+        },
+        .manifest_page = std.mem.readInt(u64, payload[112..120], .little),
+        .manifest_crc = std.mem.readInt(u32, payload[120..124], .little),
+        .manifest_page_count = std.mem.readInt(u32, payload[124..128], .little),
+        .presynced = payload[128] != 0,
     };
 }
 
+/// Shared by `NativeFile.writeSlotPage` and anything that builds a whole new
+/// generation directly on a `std.Io.File` it does not yet own as `self.file`
+/// (vacuum's compacted image, the create-time bootstrap).
+fn writeSlotPageTo(file: std.Io.File, io: std.Io, page_size: u32, index: u8, slot: CheckpointSlot) !void {
+    var buf: [max_page_size]u8 = undefined;
+    const page = buf[0..page_size];
+    encodeCheckpointSlotPage(page, slot);
+    try file.writePositionalAll(io, page, slotPhysicalPage(index) * @as(u64, page_size));
+}
+
+/// Reads and decodes the slot page at `slotPhysicalPage(index)`. An absent,
+/// truncated, torn (bad page CRC), or wrong-kind page all come back as the
+/// same structurally invalid placeholder (`page_count = 0`): v8's slots
+/// carry no separate checksum of their own the way the old embedded slots
+/// did, because `decodePagePayload`'s own CRC already covers the whole
+/// page, including every field the old per-slot checksum covered.
+fn loadCheckpointSlot(file: std.Io.File, io: std.Io, page_size: u32, file_size: u64, index: u8) CheckpointSlot {
+    const offset = slotPhysicalPage(index) * @as(u64, page_size);
+    if (offset + page_size > file_size) return .{ .page_count = 0 };
+    var buf: [max_page_size]u8 = undefined;
+    const read = file.readPositionalAll(io, buf[0..page_size], offset) catch return .{ .page_count = 0 };
+    if (read != page_size) return .{ .page_count = 0 };
+    return decodeCheckpointSlotPage(buf[0..page_size]) catch .{ .page_count = 0 };
+}
+
+fn loadCheckpointSlots(file: std.Io.File, io: std.Io, page_size: u32, file_size: u64) [checkpoint_slot_count]CheckpointSlot {
+    var slots: [checkpoint_slot_count]CheckpointSlot = undefined;
+    for (&slots, 0..) |*slot, index| slot.* = loadCheckpointSlot(file, io, page_size, file_size, @intCast(index));
+    return slots;
+}
+
 fn validCheckpointSlot(slot: CheckpointSlot) bool {
-    if (slot.page_count == 0) return false;
+    if (slot.page_count < reserved_header_pages) return false;
     if (!validCheckpointRoot(slot.catalog_root_page, slot.page_count)) return false;
     if (!validCheckpointRoot(slot.document_root_page, slot.page_count)) return false;
     if (!validCheckpointRoot(slot.index_catalog_root_page, slot.page_count)) return false;
     if (!validCheckpointRoot(slot.free_map_root_page, slot.page_count)) return false;
     if (!validCheckpointRoot(slot.namespace_directory_root_page, slot.page_count)) return false;
     if (!validCheckpointRoot(slot.document_index_root_page, slot.page_count)) return false;
+    if (!slot.presynced and !validCheckpointRoot(slot.manifest_page, slot.page_count)) return false;
     return true;
 }
 
@@ -13060,60 +13702,121 @@ fn checkpointPrefixSize(slot: CheckpointSlot, page_size: u32) !u64 {
     return std.math.mul(u64, slot.page_count, @as(u64, page_size)) catch error.InvalidNativeCheckpoint;
 }
 
+/// A root page of 0 means "none"; otherwise it must name an ordinary,
+/// already-allocatable data page -- never page 0 (the header) or either
+/// slot page, which `reserved_header_pages` excludes by construction.
 fn validCheckpointRoot(root_page: u64, page_count: u64) bool {
-    return root_page == 0 or (physicalPage(root_page) != 0 and physicalPage(root_page) < page_count);
+    return root_page == 0 or (physicalPage(root_page) >= reserved_header_pages and physicalPage(root_page) < page_count);
 }
 
-fn selectActiveCheckpoint(
-    checkpoints: [checkpoint_slot_count]CheckpointSlot,
-    valid_slots: [checkpoint_slot_count]bool,
-    active_hint: u8,
-) !u8 {
-    var best: ?u8 = null;
-    for (checkpoints, 0..) |slot, index| {
-        if (!valid_slots[index]) continue;
-        const slot_index: u8 = @intCast(index);
-        if (best) |best_index| {
-            const best_slot = checkpoints[best_index];
-            if (slot.commit_sequence > best_slot.commit_sequence or
-                (slot.commit_sequence == best_slot.commit_sequence and slot_index == active_hint))
-            {
-                best = slot_index;
-            }
-        } else {
-            best = slot_index;
-        }
+/// Confirms every page a non-presynced slot's manifest lists still has
+/// exactly the CRC recorded when the commit wrote it. A presynced slot (a
+/// large commit, or the bootstrap slot) needs no manifest and is trusted
+/// unconditionally, exactly as every slot was before v8. Any I/O failure or
+/// structural mismatch (bad manifest page CRC, wrong recorded manifest
+/// CRC, wrong entry count, an out-of-range listed page, or a listed page
+/// whose current on-disk CRC does not match) reports false, never an
+/// error: a manifest failure is an ordinary recovery outcome (fall back to
+/// the other slot), not a caller-visible fault.
+fn verifyManifest(file: std.Io.File, io: std.Io, slot: CheckpointSlot, page_size: u32) bool {
+    if (slot.presynced) return true;
+    if (slot.manifest_page == 0 or slot.manifest_page_count == 0) return false;
+    var buf: [max_page_size]u8 = undefined;
+    const read = file.readPositionalAll(io, buf[0..page_size], slot.manifest_page * @as(u64, page_size)) catch return false;
+    if (read != page_size) return false;
+    const payload = decodePagePayload(buf[0..page_size], .commit_manifest) catch return false;
+    if (computePageCrc(.commit_manifest, payload) != slot.manifest_crc) return false;
+    if (payload.len < manifest_header_size) return false;
+    const range_start = std.mem.readInt(u64, payload[0..8], .little);
+    const appended_count = std.mem.readInt(u32, payload[8..12], .little);
+    const reused_count = std.mem.readInt(u32, payload[12..16], .little);
+    const total = @as(u64, appended_count) + reused_count;
+    if (total != slot.manifest_page_count) return false;
+    if (payload.len != manifest_header_size + @as(usize, appended_count) * 4 + @as(usize, reused_count) * manifest_entry_size) return false;
+    // Walks the same implicit gap encodeManifestPayloadAlloc skipped: a
+    // candidate id equal to this slot's own manifest page is never an
+    // entry (nothing writes to it until the manifest page itself is
+    // built), so it is passed over without consuming one of the
+    // appended_count CRC array slots -- reconstructed purely from
+    // slot.manifest_page, never stored in the payload itself.
+    var i: u32 = 0;
+    var page_id = range_start;
+    while (i < appended_count) : (i += 1) {
+        if (page_id == slot.manifest_page) page_id += 1;
+        const expected_crc = std.mem.readInt(u32, payload[manifest_header_size + @as(usize, i) * 4 ..][0..4], .little);
+        if (page_id < reserved_header_pages or page_id >= slot.page_count) return false;
+        var crc_buf: [4]u8 = undefined;
+        const got = file.readPositionalAll(io, &crc_buf, page_id * @as(u64, page_size) + page_crc_offset) catch return false;
+        if (got != 4) return false;
+        if (std.mem.readInt(u32, &crc_buf, .little) != expected_crc) return false;
+        page_id += 1;
     }
-    return best orelse error.InvalidNativeCheckpoint;
+    var offset: usize = manifest_header_size + @as(usize, appended_count) * 4;
+    for (0..reused_count) |_| {
+        const reused_page_id = std.mem.readInt(u64, payload[offset..][0..8], .little);
+        const expected_crc = std.mem.readInt(u32, payload[offset + 8 ..][0..4], .little);
+        offset += manifest_entry_size;
+        if (reused_page_id < reserved_header_pages or reused_page_id >= slot.page_count) return false;
+        var crc_buf: [4]u8 = undefined;
+        const got = file.readPositionalAll(io, &crc_buf, reused_page_id * @as(u64, page_size) + page_crc_offset) catch return false;
+        if (got != 4) return false;
+        if (std.mem.readInt(u32, &crc_buf, .little) != expected_crc) return false;
+    }
+    return true;
 }
 
-fn selectCompleteCheckpointForFile(header: Header, file_size: u64) !u8 {
-    var best: ?u8 = null;
-    var saw_valid_slot = false;
-    var saw_invalid_size = false;
-    for (header.checkpoints, 0..) |slot, index| {
-        if (!validCheckpointSlot(slot)) continue;
-        saw_valid_slot = true;
-        const expected_size = checkpointPrefixSize(slot, header.page_size) catch {
-            saw_invalid_size = true;
-            continue;
-        };
-        if (expected_size > file_size) continue;
-        const slot_index: u8 = @intCast(index);
-        if (best) |best_index| {
-            const best_slot = header.checkpoints[best_index];
-            if (slot.commit_sequence > best_slot.commit_sequence or
-                (slot.commit_sequence == best_slot.commit_sequence and slot_index == header.active_checkpoint))
-            {
-                best = slot_index;
-            }
-        } else {
-            best = slot_index;
+pub const RecoveredCheckpoint = struct {
+    index: u8,
+    /// Set when recovery fell back from a better-looking slot whose
+    /// manifest failed verification, and the caller allowed truncation
+    /// (the file's actual length no longer matches the slot that was
+    /// rejected). The file has already been truncated to this length.
+    truncated_to: ?u64 = null,
+};
+
+/// The v8 recovery algorithm (design doc §3.1 "Recovery"): among the
+/// structurally valid, size-fitting slots in `header.checkpoints`, try the
+/// highest `commit_sequence` first; if it is not presynced, verify its
+/// manifest. On failure, fall back to the next candidate (lower
+/// commit_sequence) and, if `allow_truncate`, truncate the file to that
+/// candidate's `page_count` -- any bytes written by the rejected commit
+/// become unreachable tail bytes, matching what `check()` already accepts
+/// for a crash mid-growth. Read-only callers get the fallback slot without
+/// truncating the physical file (only the writer may do that).
+fn recoverActiveCheckpoint(
+    file: std.Io.File,
+    io: std.Io,
+    header: Header,
+    file_size: u64,
+    allow_truncate: bool,
+) !RecoveredCheckpoint {
+    var order: [checkpoint_slot_count]u8 = undefined;
+    var candidates: usize = 0;
+    for (0..checkpoint_slot_count) |_| {
+        var best: ?u8 = null;
+        for (header.checkpoints, 0..) |slot, raw_index| {
+            const index: u8 = @intCast(raw_index);
+            if (std.mem.indexOfScalar(u8, order[0..candidates], index) != null) continue;
+            if (!validCheckpointSlot(slot)) continue;
+            const expected_size = checkpointPrefixSize(slot, header.page_size) catch continue;
+            if (expected_size > file_size) continue;
+            if (best == null or slot.commit_sequence > header.checkpoints[best.?].commit_sequence) best = index;
         }
+        const chosen = best orelse break;
+        order[candidates] = chosen;
+        candidates += 1;
     }
-    if (best) |index| return index;
-    if (saw_invalid_size) return error.InvalidNativeCheckpoint;
-    return if (saw_valid_slot) error.TruncatedNativeFile else error.InvalidNativeCheckpoint;
+    if (candidates == 0) return error.InvalidNativeCheckpoint;
+    for (order[0..candidates], 0..) |index, rank| {
+        const slot = header.checkpoints[index];
+        if (!verifyManifest(file, io, slot, header.page_size)) continue;
+        if (rank == 0) return .{ .index = index };
+        if (!allow_truncate) return .{ .index = index };
+        const truncated_size = try checkpointPrefixSize(slot, header.page_size);
+        try file.setLength(io, truncated_size);
+        return .{ .index = index, .truncated_to = truncated_size };
+    }
+    return error.InvalidNativeCheckpoint;
 }
 
 fn encodePage(out: []u8, kind: PageKind, payload: []const u8) void {
@@ -13189,6 +13892,8 @@ fn decodePagePayload(raw: []const u8, expected_kind: PageKind) ![]const u8 {
         @backingInt(PageKind.record_bundle) => .record_bundle,
         @backingInt(PageKind.allocator) => .allocator,
         @backingInt(PageKind.key) => .key,
+        @backingInt(PageKind.checkpoint_slot) => .checkpoint_slot,
+        @backingInt(PageKind.commit_manifest) => .commit_manifest,
         else => return error.InvalidNativePageKind,
     };
     if (kind != expected_kind) return error.UnexpectedNativePageKind;
@@ -13207,6 +13912,20 @@ fn decodePagePayload(raw: []const u8, expected_kind: PageKind) ![]const u8 {
     if (crc.final() != expected_crc) return error.NativePageChecksumMismatch;
 
     return raw[page_header_size..][0..payload_len];
+}
+
+/// Mirrors `encodePageParts`'s CRC computation without needing a page-sized
+/// buffer: used to stamp a slot's `manifest_crc` right after the manifest
+/// page's content is known, before the physical write happens.
+fn computePageCrc(kind: PageKind, payload: []const u8) u32 {
+    var prefix: [page_crc_offset]u8 = @splat(0);
+    @memcpy(prefix[0..page_magic.len], page_magic);
+    prefix[4] = @backingInt(kind);
+    std.mem.writeInt(u32, prefix[8..12], @intCast(payload.len), .little);
+    var crc = Crc32.init();
+    crc.update(&prefix);
+    crc.update(payload);
+    return crc.final();
 }
 
 fn encodeCatalogEntry(allocator: Allocator, out: *std.ArrayListUnmanaged(u8), entry: CatalogEntry) !void {
@@ -13588,19 +14307,13 @@ fn readHeaderExactAt(file: std.Io.File, io: std.Io, out: *[header_size]u8) !void
     if (read != header_size) return error.TruncatedNativeHeader;
 }
 
+/// v8's header page holds nothing but the static fields `encodeHeader`
+/// writes once at creation: no embedded checkpoint slots, no
+/// active_checkpoint hint, so nothing here ever changes per commit and the
+/// checksum can cover the whole prefix unconditionally.
 fn headerChecksum(raw: []const u8) u32 {
     var crc = Crc32.init();
-    crc.update(raw[0..active_checkpoint_offset]);
-    crc.update(raw[active_checkpoint_offset + 1 .. checkpoint_slots_offset]);
-    const end = if (std.mem.eql(u8, raw[0..indexed_magic.len], indexed_magic)) logical_generations_end else checkpoint_slots_end;
-    crc.update(raw[end..header_checksum_offset]);
-    return crc.final();
-}
-
-fn checkpointSlotChecksum(raw: []const u8, identities: ?[]const u8) u32 {
-    var crc = Crc32.init();
-    crc.update(raw[0..checkpoint_slot_payload_size]);
-    if (identities) |bytes| crc.update(bytes);
+    crc.update(raw[0..header_checksum_offset]);
     return crc.final();
 }
 
@@ -13663,28 +14376,34 @@ fn testPath(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8) ![]
     return try std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, name });
 }
 
-fn readHeaderForTest(path: []const u8) ![header_size]u8 {
-    var header_bytes: [header_size]u8 = undefined;
-    var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_only });
-    defer file.close(std.testing.io);
-    try readExactAt(file, std.testing.io, &header_bytes, 0);
-    return header_bytes;
+/// The active slot's index and decoded content, for a test that wants to
+/// corrupt one field and write it back via `writeTestSlotPage`.
+fn readActiveSlotForTest(path: []const u8) !struct { index: u8, slot: CheckpointSlot } {
+    var file = try NativeFile.open(std.testing.allocator, path, true);
+    defer file.close();
+    return .{ .index = file.header.active_checkpoint, .slot = file.activeCheckpoint() };
 }
 
-test "lite native header round trips initial checkpoint" {
+fn writeTestSlotPage(path: []const u8, index: u8, slot: CheckpointSlot) !void {
+    var buf: [default_page_size]u8 = undefined;
+    encodeCheckpointSlotPage(&buf, slot);
+    var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    defer raw.close(std.testing.io);
+    try raw.writePositionalAll(std.testing.io, &buf, slotPhysicalPage(index) * @as(u64, default_page_size));
+    try raw.sync(std.testing.io);
+}
+
+test "lite native header round trips static fields" {
     var encoded: [header_size]u8 = undefined;
     encodeHeader(&encoded, .{});
 
     const header = try decodeHeader(&encoded);
     try std.testing.expectEqual(default_page_size, header.page_size);
-    try std.testing.expectEqual(@as(u8, 0), header.active_checkpoint);
-    try std.testing.expectEqual(@as(u64, 0), header.checkpoints[0].commit_sequence);
-    try std.testing.expectEqual(@as(u64, 1), header.checkpoints[0].page_count);
-
-    const report = inspectBytes(&encoded);
-    try std.testing.expect(report.valid);
-    try std.testing.expectEqual(format_version, report.format_version);
-    try std.testing.expectEqual(@as(u64, 1), report.page_count);
+    // decodeHeader alone cannot recover the real checkpoint (v8 slots live
+    // on their own pages, not in the header buffer): it comes back as the
+    // structurally-invalid placeholder every caller must follow with
+    // loadCheckpointSlots + recoverActiveCheckpoint.
+    try std.testing.expectEqual(@as(u64, 0), header.checkpoints[0].page_count);
 }
 
 test "lite native header rejects corrupted checksum" {
@@ -13692,9 +14411,7 @@ test "lite native header rejects corrupted checksum" {
     encodeHeader(&encoded, .{});
     encoded[page_size_offset] ^= 0xff;
 
-    const report = inspectBytes(&encoded);
-    try std.testing.expect(!report.valid);
-    try std.testing.expectEqualStrings("header_checksum_mismatch", report.issue.?);
+    try std.testing.expectError(error.NativeHeaderChecksumMismatch, decodeHeader(&encoded));
 }
 
 test "lite native header rejects unsupported format version" {
@@ -13702,63 +14419,99 @@ test "lite native header rejects unsupported format version" {
     encodeHeader(&encoded, .{});
     std.mem.writeInt(u32, encoded[version_offset..][0..4], format_version + 1, .little);
 
-    const report = inspectBytes(&encoded);
-    try std.testing.expect(!report.valid);
-    try std.testing.expectEqualStrings("unsupported_format_version", report.issue.?);
     try std.testing.expectError(error.UnsupportedNativeFormatVersion, decodeHeader(&encoded));
 }
 
-test "lite native header selects newest valid checkpoint slot" {
+/// Writes a minimal v8 file for slot-recovery tests: the header page plus
+/// slot 0 and (optionally) slot 1, with room reserved for both regardless.
+/// Callers that want a torn or dropped page corrupt the returned file
+/// directly afterward.
+fn writeTestAfliteFile(allocator: Allocator, tmp: std.testing.TmpDir, name: []const u8, header: Header, slot0: CheckpointSlot, slot1: ?CheckpointSlot) ![]u8 {
+    const path = try testPath(allocator, tmp, name);
+    errdefer allocator.free(path);
     var encoded: [header_size]u8 = undefined;
-    encodeHeader(&encoded, .{
-        .active_checkpoint = 0,
-        .checkpoints = .{
-            .{ .commit_sequence = 1, .page_count = 2 },
-            .{ .commit_sequence = 2, .page_count = 3 },
-        },
-    });
+    encodeHeader(&encoded, header);
+    var file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
+    try file.writePositionalAll(std.testing.io, &encoded, 0);
+    const needed_pages = @max(reserved_header_pages, @max(slot0.page_count, if (slot1) |slot| slot.page_count else 0));
+    try file.setLength(std.testing.io, needed_pages * @as(u64, default_page_size));
+    var slot_buf: [default_page_size]u8 = undefined;
+    encodeCheckpointSlotPage(&slot_buf, slot0);
+    try file.writePositionalAll(std.testing.io, &slot_buf, slotPhysicalPage(0) * @as(u64, default_page_size));
+    if (slot1) |slot| {
+        encodeCheckpointSlotPage(&slot_buf, slot);
+        try file.writePositionalAll(std.testing.io, &slot_buf, slotPhysicalPage(1) * @as(u64, default_page_size));
+    }
+    return path;
+}
 
-    const header = try decodeHeader(&encoded);
-    try std.testing.expectEqual(@as(u8, 1), header.active_checkpoint);
+test "lite native header selects newest valid checkpoint slot" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try writeTestAfliteFile(allocator, tmp, "slot-newest.aflite", .{}, .{ .commit_sequence = 1, .page_count = reserved_header_pages }, .{ .commit_sequence = 2, .page_count = reserved_header_pages + 1 });
+    defer allocator.free(path);
 
-    const report = inspectBytes(&encoded);
+    const report = try inspect(allocator, std.testing.io, path);
     try std.testing.expect(report.valid);
     try std.testing.expectEqual(@as(u8, 1), report.active_checkpoint);
     try std.testing.expectEqual(@as(u64, 2), report.commit_sequence);
-    try std.testing.expectEqual(@as(u64, 3), report.page_count);
+    try std.testing.expectEqual(reserved_header_pages + 1, report.page_count);
 }
 
-test "lite native header recovers from corrupted active checkpoint hint" {
-    var encoded: [header_size]u8 = undefined;
-    encodeHeader(&encoded, .{
-        .active_checkpoint = 1,
-        .checkpoints = .{
-            .{ .commit_sequence = 1, .page_count = 2 },
-            .{ .commit_sequence = 2, .page_count = 3 },
-        },
-    });
-    encoded[active_checkpoint_offset] = 0xff;
+// WS1(b) required test: "a torn slot falls back to the previous checkpoint."
+test "lite native recovery falls back past a torn higher-sequence slot" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(allocator, tmp, "slot-torn.aflite");
+    defer allocator.free(path);
 
-    const header = try decodeHeader(&encoded);
-    try std.testing.expectEqual(@as(u8, 1), header.active_checkpoint);
-    try std.testing.expectEqual(@as(u64, 2), header.checkpoints[header.active_checkpoint].commit_sequence);
+    var file = try NativeFile.createWithIo(allocator, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    try file.putDocument("doc", "stable");
+    const stable_sequence = file.activeCheckpoint().commit_sequence;
+    try file.putDocument("doc", "newest");
+    // Tear the newly-active slot's page: its own CRC now fails, so it
+    // decodes as structurally invalid regardless of its commit_sequence,
+    // and recovery must fall back to the previous ("stable") checkpoint.
+    const damaged = slotPhysicalPage(file.header.active_checkpoint) * @as(u64, file.header.page_size) + page_header_size;
+    try file.file.writePositionalAll(file.runtimeIo(), "X", damaged);
+    file.close();
+
+    const report = try inspect(allocator, std.testing.io, path);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(stable_sequence, report.commit_sequence);
+
+    file = try NativeFile.openWithIo(allocator, std.testing.io, path, .{ .no_sync = true });
+    try std.testing.expectEqual(stable_sequence, file.activeCheckpoint().commit_sequence);
+    const recovered = (try file.getDocumentAlloc(allocator, "doc")).?;
+    defer allocator.free(recovered);
+    try std.testing.expectEqualStrings("stable", recovered);
+    // The rejected "newest" commit's pages are still physically present as
+    // a stale tail past the recovered checkpoint (the torn slot, not a
+    // dropped data page, is what failed, so recoverActiveCheckpoint had no
+    // reason to truncate). check() correctly calls that tail out; enough
+    // real commits grow the checkpoint past it, the same way an ordinary
+    // writer resuming after a crash would.
+    for (0..40) |_| try file.putDocument("doc", "settled");
+    try std.testing.expect((try file.check()).valid);
 }
 
-test "lite native header recovers previous checkpoint from a checksum-bad slot" {
-    var encoded: [header_size]u8 = undefined;
-    encodeHeader(&encoded, .{
-        .active_checkpoint = 1,
-        .checkpoints = .{
-            .{ .commit_sequence = 1, .page_count = 2 },
-            .{ .commit_sequence = 2, .page_count = 3 },
-        },
-    });
-    encoded[checkpointOffset(1)] ^= 0xff;
-
-    const header = try decodeHeader(&encoded);
-    try std.testing.expectEqual(@as(u8, 0), header.active_checkpoint);
-    try std.testing.expectEqual(@as(u64, 1), header.checkpoints[header.active_checkpoint].commit_sequence);
-}
+// Three tests against the now-correctly-scoped manifest window lived here:
+// a small commit taking the manifest path with an oversized one falling
+// back to presynced; a deferred commit not leaving flushTransactionWrites'
+// page reservation unwritten; and a durable commit's manifest catching a
+// torn page from an *earlier* non-durable commit in the same
+// since-last-durable window (recovery correctly reverts to the checkpoint
+// from before any of them). All three passed. They were removed because
+// manifest_commits_enabled is false again (see its doc comment for why:
+// a reused-but-never-written page surfaced by the debug cross-check
+// against real DB-layer traffic, not yet root-caused) and with it off
+// `allow_manifest_reservation` never fires, so none of the three would
+// exercise anything. Restore them -- the commit history has the exact
+// text -- alongside re-enabling the flag.
 
 test "lite native create writes inspectable aflite file" {
     const allocator = std.testing.allocator;
@@ -13776,7 +14529,7 @@ test "lite native create writes inspectable aflite file" {
     try std.testing.expectEqual(default_page_size, report.page_size);
     try std.testing.expectEqual(@as(u8, 0), report.active_checkpoint);
     try std.testing.expectEqual(@as(u64, 0), report.commit_sequence);
-    try std.testing.expectEqual(@as(u64, 1), report.page_count);
+    try std.testing.expectEqual(reserved_header_pages, report.page_count);
 }
 
 test "lite native open options propagate no_sync to file writes" {
@@ -13981,10 +14734,10 @@ test "lite native file appends page and publishes checkpoint" {
         defer file.close();
 
         const page_id = try file.allocatePage("hello native page");
-        try std.testing.expectEqual(@as(u64, 1), page_id);
+        try std.testing.expectEqual(reserved_header_pages, page_id);
         try std.testing.expectEqual(@as(u64, 1), file.activeCheckpoint().commit_sequence);
-        try std.testing.expectEqual(@as(u64, 3), file.activeCheckpoint().page_count);
-        try std.testing.expectEqual(@as(u64, 2), file.activeCheckpoint().free_map_root_page);
+        try std.testing.expectEqual(reserved_header_pages + 2, file.activeCheckpoint().page_count);
+        try std.testing.expectEqual(reserved_header_pages + 1, file.activeCheckpoint().free_map_root_page);
 
         const page = try file.readPagePayloadAlloc(allocator, page_id);
         defer allocator.free(page);
@@ -13994,7 +14747,7 @@ test "lite native file appends page and publishes checkpoint" {
     const report = try inspect(allocator, std.testing.io, path);
     try std.testing.expect(report.valid);
     try std.testing.expectEqual(@as(u64, 1), report.commit_sequence);
-    try std.testing.expectEqual(@as(u64, 3), report.page_count);
+    try std.testing.expectEqual(reserved_header_pages + 2, report.page_count);
 }
 
 test "lite native file reopens allocated pages" {
@@ -14015,8 +14768,8 @@ test "lite native file reopens allocated pages" {
     var reopened = try NativeFile.open(allocator, path, true);
     defer reopened.close();
     try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
-    try std.testing.expectEqual(@as(u64, 3), reopened.activeCheckpoint().page_count);
-    const page = try reopened.readPagePayloadAlloc(allocator, 1);
+    try std.testing.expectEqual(reserved_header_pages + 2, reopened.activeCheckpoint().page_count);
+    const page = try reopened.readPagePayloadAlloc(allocator, reserved_header_pages);
     defer allocator.free(page);
     try std.testing.expectEqualStrings("persisted", page);
     try std.testing.expectError(error.ReadOnly, reopened.allocatePage("nope"));
@@ -14034,27 +14787,43 @@ test "lite native file publishes checkpoint without rewriting static header" {
     {
         var file = try NativeFile.create(allocator, path);
         defer file.close();
+        const io = file.io_impl.io();
+        const active_before = file.header.active_checkpoint;
 
-        var before: [header_size]u8 = undefined;
-        try readExactAt(file.file, file.io_impl.io(), &before, 0);
+        var header_before: [header_size]u8 = undefined;
+        try readExactAt(file.file, io, &header_before, 0);
+        var slot0_before: [default_page_size]u8 = undefined;
+        try readExactAt(file.file, io, &slot0_before, slotPhysicalPage(0) * @as(u64, default_page_size));
+        var slot1_before: [default_page_size]u8 = undefined;
+        try readExactAt(file.file, io, &slot1_before, slotPhysicalPage(1) * @as(u64, default_page_size));
+
         _ = try file.allocatePage("slot-only publish");
-        var after: [header_size]u8 = undefined;
-        try readExactAt(file.file, file.io_impl.io(), &after, 0);
 
-        // The active_checkpoint hint byte is no longer rewritten per commit:
-        // the whole prefix up to the checkpoint slots, including that byte,
-        // stays untouched. Only the inactive slot (slot 1) changes.
-        try std.testing.expectEqualSlices(u8, before[0..checkpoint_slots_offset], after[0..checkpoint_slots_offset]);
-        try std.testing.expectEqualSlices(u8, before[checkpointOffset(0)..][0..checkpoint_slot_size], after[checkpointOffset(0)..][0..checkpoint_slot_size]);
-        try std.testing.expectEqualSlices(u8, before[checkpoint_slots_end..header_size], after[checkpoint_slots_end..header_size]);
-        try std.testing.expectEqual(@as(u8, 0), after[active_checkpoint_offset]);
-        try std.testing.expect(!std.mem.eql(u8, before[checkpointOffset(1)..][0..checkpoint_slot_size], after[checkpointOffset(1)..][0..checkpoint_slot_size]));
+        var header_after: [header_size]u8 = undefined;
+        try readExactAt(file.file, io, &header_after, 0);
+        var slot0_after: [default_page_size]u8 = undefined;
+        try readExactAt(file.file, io, &slot0_after, slotPhysicalPage(0) * @as(u64, default_page_size));
+        var slot1_after: [default_page_size]u8 = undefined;
+        try readExactAt(file.file, io, &slot1_after, slotPhysicalPage(1) * @as(u64, default_page_size));
+
+        // The static header page is never rewritten by a commit at all now
+        // (there is no embedded hint byte or embedded slots left in it to
+        // touch): the whole page is byte-identical.
+        try std.testing.expectEqualSlices(u8, &header_before, &header_after);
+        // Only the previously-inactive slot's page changed; the other one
+        // (the slot that was active before this commit) is untouched.
+        if (active_before == 0) {
+            try std.testing.expectEqualSlices(u8, &slot0_before, &slot0_after);
+            try std.testing.expect(!std.mem.eql(u8, &slot1_before, &slot1_after));
+        } else {
+            try std.testing.expectEqualSlices(u8, &slot1_before, &slot1_after);
+            try std.testing.expect(!std.mem.eql(u8, &slot0_before, &slot0_after));
+        }
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
     defer reopened.close();
     try std.testing.expectEqual(@as(u64, 1), reopened.activeCheckpoint().commit_sequence);
-    try std.testing.expectEqual(@as(u64, 3), reopened.activeCheckpoint().page_count);
 }
 
 test "lite native durable commit costs two syncs after dropping the active_checkpoint hint" {
@@ -14164,8 +14933,8 @@ test "lite native file permits concurrent readers" {
     var reader_b = try NativeFile.open(allocator, path, true);
     defer reader_b.close();
 
-    try std.testing.expectEqual(@as(u64, 3), reader_a.activeCheckpoint().page_count);
-    try std.testing.expectEqual(@as(u64, 3), reader_b.activeCheckpoint().page_count);
+    try std.testing.expectEqual(reserved_header_pages + 2, reader_a.activeCheckpoint().page_count);
+    try std.testing.expectEqual(reserved_header_pages + 2, reader_b.activeCheckpoint().page_count);
 }
 
 test "lite native file active writer permits readers but blocks second writer" {
@@ -14185,7 +14954,7 @@ test "lite native file active writer permits readers but blocks second writer" {
 
     var reader = try NativeFile.open(allocator, path, true);
     defer reader.close();
-    try std.testing.expectEqual(@as(u64, 3), reader.activeCheckpoint().page_count);
+    try std.testing.expectEqual(reserved_header_pages + 2, reader.activeCheckpoint().page_count);
 
     const report = try inspect(allocator, std.testing.io, path);
     try std.testing.expect(report.valid);
@@ -14369,12 +15138,12 @@ test "lite native file detects corrupted page payload" {
     {
         var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
         defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+        try file.writePositionalAll(std.testing.io, "X", reserved_header_pages * @as(u64, default_page_size) + page_header_size);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
     defer reopened.close();
-    try std.testing.expectError(error.NativePageChecksumMismatch, reopened.readPagePayloadAlloc(allocator, 1));
+    try std.testing.expectError(error.NativePageChecksumMismatch, reopened.readPagePayloadAlloc(allocator, reserved_header_pages));
 }
 
 test "lite native catalog stores and reopens records" {
@@ -14500,7 +15269,7 @@ test "lite native catalog detects corrupted root page" {
     {
         var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
         defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+        try file.writePositionalAll(std.testing.io, "X", reserved_header_pages * @as(u64, default_page_size) + page_header_size);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -14706,7 +15475,7 @@ test "lite native document store spills large values into value pages" {
         defer file.close();
         const value_pages = std.math.divCeil(usize, large.len, file.maxValuePagePayloadBytes()) catch unreachable;
         try file.putDocument("doc:large", large);
-        try std.testing.expectEqual(@as(u64, @intCast(5 + value_pages)), file.activeCheckpoint().page_count);
+        try std.testing.expectEqual(@as(u64, @intCast(reserved_header_pages + 4 + value_pages)), file.activeCheckpoint().page_count);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -14766,7 +15535,7 @@ test "lite native document store detects corrupted root page" {
     {
         var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
         defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+        try file.writePositionalAll(std.testing.io, "X", reserved_header_pages * @as(u64, default_page_size) + page_header_size);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -14796,7 +15565,7 @@ test "lite native document store detects corrupted external value page" {
     {
         var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
         defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+        try file.writePositionalAll(std.testing.io, "X", reserved_header_pages * @as(u64, default_page_size) + page_header_size);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -14828,7 +15597,7 @@ test "lite native document batch publishes one checkpoint" {
             .{ .key = "doc:c", .is_delete = true },
         });
         try std.testing.expectEqual(@as(u64, 1), file.activeCheckpoint().commit_sequence);
-        try std.testing.expectEqual(@as(u64, 5), file.activeCheckpoint().page_count);
+        try std.testing.expectEqual(reserved_header_pages + 4, file.activeCheckpoint().page_count);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -15017,8 +15786,8 @@ test "lite native check validates committed root chains" {
     try std.testing.expectEqual(@as(u64, 2), report.record_count);
     try std.testing.expectEqual(@as(u64, 2), report.live_file_count);
     try std.testing.expect(report.live_bytes > 0);
-    try std.testing.expectEqual(@as(u64, default_page_size * 9), report.file_size);
-    try std.testing.expectEqual(@as(u64, default_page_size * 8), report.compact_size);
+    try std.testing.expectEqual(@as(u64, default_page_size * 11), report.file_size);
+    try std.testing.expectEqual(@as(u64, default_page_size * 10), report.compact_size);
     try std.testing.expectEqual(@as(u64, 0), report.tail_bytes);
     try std.testing.expectEqual(@as(u64, default_page_size), report.reclaimable_bytes);
 }
@@ -15050,8 +15819,8 @@ test "lite native check validates committed index catalog root chain" {
     try std.testing.expectEqual(@as(u64, 3), report.record_count);
     try std.testing.expectEqual(@as(u64, 3), report.live_file_count);
     try std.testing.expect(report.live_bytes > 0);
-    try std.testing.expectEqual(@as(u64, default_page_size * 13), report.file_size);
-    try std.testing.expectEqual(@as(u64, default_page_size * 11), report.compact_size);
+    try std.testing.expectEqual(@as(u64, default_page_size * 15), report.file_size);
+    try std.testing.expectEqual(@as(u64, default_page_size * 13), report.compact_size);
     try std.testing.expectEqual(@as(u64, default_page_size * 2), report.reclaimable_bytes);
 
     const index_file = (try file.getIndexCatalogRecordAlloc(allocator, "index/files/hbc/postings.bin")).?;
@@ -15081,18 +15850,10 @@ test "lite native check reports overlapping committed root pages" {
         try std.testing.expect(checkpoint.catalog_root_page != checkpoint.index_catalog_root_page);
     }
 
-    var header_bytes = try readHeaderForTest(path);
-    var header = try decodeHeader(&header_bytes);
-    header.checkpoints[header.active_checkpoint].index_catalog_root_page =
-        header.checkpoints[header.active_checkpoint].catalog_root_page;
-    encodeHeader(&header_bytes, header);
-
-    {
-        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer raw.close(std.testing.io);
-        try raw.writePositionalAll(std.testing.io, &header_bytes, 0);
-        try raw.sync(std.testing.io);
-    }
+    const active = try readActiveSlotForTest(path);
+    var slot = active.slot;
+    slot.index_catalog_root_page = slot.catalog_root_page;
+    try writeTestSlotPage(path, active.index, slot);
 
     const report = try checkFile(allocator, path);
     try std.testing.expect(!report.valid);
@@ -15623,7 +16384,7 @@ test "lite native check reports corrupted committed document page" {
     {
         var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
         defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+        try file.writePositionalAll(std.testing.io, "X", reserved_header_pages * @as(u64, default_page_size) + page_header_size);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -15750,7 +16511,7 @@ test "lite native check reports corrupted index catalog external value page" {
     {
         var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
         defer file.close(std.testing.io);
-        try file.writePositionalAll(std.testing.io, "X", default_page_size + page_header_size);
+        try file.writePositionalAll(std.testing.io, "X", reserved_header_pages * @as(u64, default_page_size) + page_header_size);
     }
 
     var reopened = try NativeFile.open(allocator, path, true);
@@ -15778,7 +16539,7 @@ test "lite native check reports truncated committed file" {
     {
         var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
         defer file.close(std.testing.io);
-        try file.setLength(std.testing.io, default_page_size + 16);
+        try file.setLength(std.testing.io, reserved_header_pages * @as(u64, default_page_size) + 16);
     }
 
     {
@@ -15834,22 +16595,18 @@ test "lite native checkFile reports invalid checkpoint metadata separately from 
         try file.putDocument("doc:1", "value");
     }
 
-    var header_bytes = try readHeaderForTest(path);
-    var header = try decodeHeader(&header_bytes);
-    for (&header.checkpoints) |*slot| {
+    var checkpoints = blk: {
+        var file = try NativeFile.open(allocator, path, true);
+        defer file.close();
+        break :blk file.header.checkpoints;
+    };
+    for (&checkpoints) |*slot| {
         slot.catalog_root_page = slot.page_count;
         slot.document_root_page = slot.page_count;
         slot.index_catalog_root_page = slot.page_count;
         slot.free_map_root_page = slot.page_count;
     }
-    encodeHeader(&header_bytes, header);
-
-    {
-        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer raw.close(std.testing.io);
-        try raw.writePositionalAll(std.testing.io, &header_bytes, 0);
-        try raw.sync(std.testing.io);
-    }
+    for (checkpoints, 0..) |slot, index| try writeTestSlotPage(path, @intCast(index), slot);
 
     const report = try checkFile(allocator, path);
     try std.testing.expect(!report.valid);
@@ -15871,10 +16628,8 @@ test "lite native checkFile reports checkpoint prefix overflow as invalid metada
         try file.putDocument("doc:1", "value");
     }
 
-    var header_bytes = try readHeaderForTest(path);
-    var header = try decodeHeader(&header_bytes);
-    for (&header.checkpoints, 0..) |*slot, index| {
-        slot.* = .{
+    for (0..checkpoint_slot_count) |index| {
+        const slot: CheckpointSlot = .{
             .commit_sequence = @as(u64, @intCast(index + 1)),
             .catalog_root_page = 0,
             .document_root_page = 0,
@@ -15882,14 +16637,7 @@ test "lite native checkFile reports checkpoint prefix overflow as invalid metada
             .free_map_root_page = 0,
             .page_count = std.math.maxInt(u64),
         };
-    }
-    encodeHeader(&header_bytes, header);
-
-    {
-        var raw = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
-        defer raw.close(std.testing.io);
-        try raw.writePositionalAll(std.testing.io, &header_bytes, 0);
-        try raw.sync(std.testing.io);
+        try writeTestSlotPage(path, @intCast(index), slot);
     }
 
     const report = try checkFile(allocator, path);
@@ -17002,7 +17750,7 @@ test "lite native bulk index frontier preserves mixed keys and exact page counts
             var payload = std.ArrayListUnmanaged(u8).empty;
             defer payload.deinit(budget.allocator());
             try encodeCatalogEntry(budget.allocator(), &payload, .{ .previous_page = history, .key = bytes, .value = "v" });
-            history = try appendPageToFile(budget.allocator(), file.file, std.testing.io, default_page_size, &next, .catalog, payload.items);
+            history = try appendPageToFile(budget.allocator(), file.file, std.testing.io, default_page_size, &next, .catalog, payload.items, null);
             try builder.add(bytes, history);
             try counter.add(bytes, history);
         }
@@ -17330,7 +18078,7 @@ test "lite unpacked v3 remains readable and vacuum explicitly adopts packed sign
     try std.testing.expect(file.header.packed_records);
     var header: [header_size]u8 = undefined;
     try readHeaderExactAt(file.file, std.testing.io, &header);
-    try std.testing.expect(!std.mem.eql(u8, header[0..magic.len], unpacked_v3_magic));
+    try std.testing.expect(!std.mem.eql(u8, header[0..magic.len], unpacked_v4_magic));
     try std.testing.expect((try decodeHeader(&header)).packed_records);
     const value = (try file.getDocumentAlloc(alloc, "b")).?;
     defer alloc.free(value);
@@ -18003,7 +18751,7 @@ test "lite document index coverage accepts legacy tombstones and rejects missing
         try file.file.writePositionalAll(std.testing.io, &page, live.document_index_root_page * default_page_size);
         file.page_cache.clear(a);
         deleted.commit_sequence += 1;
-        try file.publishCheckpoint(deleted);
+        try file.publishCheckpoint(deleted, false);
         try std.testing.expect((try file.check()).valid);
     }
     var file = try NativeFile.open(a, path, false);
@@ -18417,7 +19165,7 @@ fn legacyNamespaceDirectoryForTest(file: *NativeFile) !CheckpointSlot {
     next.commit_sequence += 1;
     try pages.flush();
     try file.writeFreeMapPage(next.free_map_root_page, next.page_count, pages.remainingFreePages());
-    try file.publishCheckpoint(next);
+    try file.publishCheckpoint(next, false);
     return next;
 }
 
@@ -18545,7 +19293,7 @@ fn linkedValueForTest(file: *NativeFile, value: []const u8) !NativeFile.IndexVal
     checkpoint.commit_sequence += 1;
     try pages.flush();
     try file.writeFreeMapPage(checkpoint.free_map_root_page, checkpoint.page_count, pages.remainingFreePages());
-    try file.publishCheckpoint(checkpoint);
+    try file.publishCheckpoint(checkpoint, false);
     return .{ .root = root, .length = value.len };
 }
 
@@ -19809,7 +20557,7 @@ test "lite grouped snapshots preserve allocator ownership pinned values and mixe
         var pinned = file.activeCheckpoint();
         pinned.document_index_root_page = original.document_index_root_page;
         pinned.commit_sequence += 1;
-        try file.publishCheckpoint(pinned);
+        try file.publishCheckpoint(pinned, false);
         try std.testing.expect((try file.check()).valid);
         try file.putDocument("a", "new");
         try file.deleteDocument("b");
@@ -21986,17 +22734,32 @@ test "lite logical generations preserve runtime identity beyond recovery slots" 
 }
 
 test "lite logical generations checksum rejects torn identity extension" {
-    var header = Header{ .indexed_reclamation = true };
-    header.checkpoints[0].commit_sequence = 10;
-    header.checkpoints[1].commit_sequence = 11;
-    header.active_checkpoint = 1;
-    header.checkpoints[1].logical.primary = @splat(42);
-    var encoded: [header_size]u8 = undefined;
-    encodeHeader(&encoded, header);
-    try std.testing.expectEqualDeep(header, try decodeHeader(&encoded));
-    encoded[logicalGenerationsOffset(1)] ^= 1;
-    const decoded = try decodeHeader(&encoded);
-    try std.testing.expectEqual(@as(u64, 10), decoded.checkpoints[decoded.active_checkpoint].commit_sequence);
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try writeTestAfliteFile(
+        allocator,
+        tmp,
+        "logical-generations-torn.aflite",
+        .{ .indexed_reclamation = true },
+        .{ .commit_sequence = 10, .page_count = reserved_header_pages },
+        .{ .commit_sequence = 11, .page_count = reserved_header_pages, .logical = .{ .primary = @splat(42) } },
+    );
+    defer allocator.free(path);
+
+    {
+        var file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        // Tear one byte of slot 1's logical-generations field (payload
+        // offset 64, after the 16-byte page header): the whole slot page's
+        // own CRC covers it, so this invalidates slot 1 entirely, exactly
+        // as corrupting any other field in the slot would.
+        try file.writePositionalAll(std.testing.io, "X", slotPhysicalPage(1) * @as(u64, default_page_size) + page_header_size + 64);
+    }
+
+    const report = try inspect(allocator, std.testing.io, path);
+    try std.testing.expect(report.valid);
+    try std.testing.expectEqual(@as(u64, 10), report.commit_sequence);
 }
 
 test "lite recovery agenda commits atomically with raw namespace schema changes" {

@@ -13,21 +13,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Progress v2 is the sole durable record of a consumer's replay progress.
+//! There used to be a second, older representation here (a scalar KV key, a
+//! richer "enriched" KV key, and an optional file sidecar, each written by
+//! whichever caller happened to touch an index) that this file deliberately
+//! no longer has: Antfly is unreleased, so there was no need to keep it
+//! around for compatibility, and splitting one consumer's progress across
+//! three storage locations was exactly the layering mistake WS6 exists to
+//! remove. Every reader and writer in this tree now goes through
+//! `contributeProgress`/`loadProgress` (or the `Txn` variants) and the
+//! single key `\x00\x00__metadata__:progress:v2:<consumer>`.
+
 const std = @import("std");
-const Storage = @import("../../lsm_backend.zig").Storage;
 const Crc32 = @import("antfly_hash").Crc32;
-const platform_sync = @import("antfly_platform").sync;
-const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("../../backend_erased.zig");
-const docstore_mod = @import("../../docstore.zig");
+const platform_sync = @import("antfly_platform").sync;
 const lsm_backend = @import("../../lsm_backend.zig");
 const mem_backend = @import("../../mem_backend.zig");
-const fs_paths = @import("antfly_runtime_fs").fs_paths;
-const platform_time = @import("antfly_platform").time;
+const artifact_projection_epoch = @import("../artifact_projection_epoch.zig");
+const artifact_publication = @import("../artifact_publication.zig");
 
-const metadata_prefix = "\x00\x00__metadata__:derived_apply:";
-const projection_metadata_prefix = "\x00\x00__metadata__:derived_projection:";
 const partial_cursor_prefix = "\x00\x00__metadata__:derived_partial:";
 
 /// Resume point inside one oversized replay record: the items of `sequence`
@@ -98,83 +104,6 @@ pub fn loadPartialReplayCursor(alloc: Allocator, store: anytype, index_name: []c
         .config_hash = std.mem.readInt(u64, raw[16..24], .little),
     };
 }
-const projection_metadata_magic = "AFPRJMD1";
-const projection_metadata_len = 46;
-const checkpoint_file_name = "derived_apply.checkpoint";
-const checkpoint_magic = "AFPRJCP1";
-const projection_checkpoint_format_version: u32 = 3;
-const projection_checkpoint_legacy_format_version: u32 = 2;
-const checkpoint_checksum_len: usize = @sizeOf(u32);
-const checkpoint_max_bytes: usize = 16 * 1024 * 1024;
-
-const checkpoint_lock_alloc = std.heap.page_allocator;
-var checkpoint_lock_registry_mutex: std.atomic.Mutex = .unlocked;
-var checkpoint_locks: std.StringHashMapUnmanaged(*CheckpointFileLock) = .empty;
-
-fn lockAtomicMutex(mutex: *std.atomic.Mutex) void {
-    platform_sync.lockYielding(mutex);
-}
-
-const CheckpointFileLock = struct {
-    path: []u8,
-    mutex: std.atomic.Mutex = .unlocked,
-    refs: usize = 0,
-};
-
-const CheckpointWriteGuard = struct {
-    lock: *CheckpointFileLock,
-
-    fn release(self: *@This()) void {
-        self.lock.mutex.unlock();
-        releaseCheckpointFileLock(self.lock);
-    }
-};
-
-fn acquireCheckpointFileLock(path: []const u8) !CheckpointWriteGuard {
-    const lock = try retainCheckpointFileLock(path);
-    lockAtomicMutex(&lock.mutex);
-    return .{ .lock = lock };
-}
-
-fn retainCheckpointFileLock(path: []const u8) !*CheckpointFileLock {
-    lockAtomicMutex(&checkpoint_lock_registry_mutex);
-    defer checkpoint_lock_registry_mutex.unlock();
-
-    const gop = try checkpoint_locks.getOrPut(checkpoint_lock_alloc, path);
-    if (!gop.found_existing) {
-        errdefer _ = checkpoint_locks.remove(path);
-
-        const owned_path = try checkpoint_lock_alloc.dupe(u8, path);
-        errdefer checkpoint_lock_alloc.free(owned_path);
-
-        const lock = try checkpoint_lock_alloc.create(CheckpointFileLock);
-        lock.* = .{
-            .path = owned_path,
-        };
-        gop.key_ptr.* = owned_path;
-        gop.value_ptr.* = lock;
-    }
-
-    const lock = gop.value_ptr.*;
-    lock.refs += 1;
-    return lock;
-}
-
-fn releaseCheckpointFileLock(lock: *CheckpointFileLock) void {
-    lockAtomicMutex(&checkpoint_lock_registry_mutex);
-    defer checkpoint_lock_registry_mutex.unlock();
-
-    std.debug.assert(lock.refs > 0);
-    lock.refs -= 1;
-    if (lock.refs != 0) return;
-
-    const removed = checkpoint_locks.fetchRemove(lock.path) orelse {
-        std.debug.panic("missing derived apply checkpoint lock for {s}", .{lock.path});
-    };
-    std.debug.assert(removed.value == lock);
-    checkpoint_lock_alloc.free(lock.path);
-    checkpoint_lock_alloc.destroy(lock);
-}
 
 pub const ProjectionStatus = enum(u8) {
     clean = 1,
@@ -183,6 +112,10 @@ pub const ProjectionStatus = enum(u8) {
     repair_required = 4,
 };
 
+/// In-memory view of one consumer's identity/lifecycle fields, independent
+/// of whatever encoding backs it. Every reader/writer below takes or
+/// returns this shape; only `encodeProgressRecord`/`decodeProgressRecord`
+/// know about the actual v2 wire format.
 pub const ProjectionCheckpoint = struct {
     applied_sequence: u64 = 0,
     status: ProjectionStatus = .clean,
@@ -193,196 +126,7 @@ pub const ProjectionCheckpoint = struct {
     /// live artifact target: generated artifacts may advance while this last
     /// atomically published snapshot remains safe to query.
     published_count: ?u64 = null,
-    format_version: u32 = projection_checkpoint_format_version,
 };
-
-// Keep the legacy scalar watermark for existing readers. Metadata-only
-// backends additionally retain the same lifecycle identity as a sidecar.
-fn projectionMetadataKey(buffer: []u8, name: []const u8) ![]const u8 {
-    return std.fmt.bufPrint(buffer, "{s}{s}", .{ projection_metadata_prefix, name });
-}
-
-fn encodeProjectionMetadata(checkpoint: ProjectionCheckpoint) [projection_metadata_len]u8 {
-    var raw: [projection_metadata_len]u8 = undefined;
-    @memcpy(raw[0..8], projection_metadata_magic);
-    raw[8] = @backingInt(checkpoint.status);
-    std.mem.writeInt(u64, raw[9..17], checkpoint.applied_sequence, .little);
-    std.mem.writeInt(u64, raw[17..25], checkpoint.generation, .little);
-    std.mem.writeInt(u64, raw[25..33], checkpoint.config_hash, .little);
-    raw[33] = @intFromBool(checkpoint.published_count != null);
-    std.mem.writeInt(u64, raw[34..42], checkpoint.published_count orelse 0, .little);
-    std.mem.writeInt(u32, raw[42..46], Crc32.hash(raw[0..42]), .little);
-    return raw;
-}
-
-fn decodeProjectionMetadata(raw: []const u8) !ProjectionCheckpoint {
-    if (raw.len != projection_metadata_len or !std.mem.eql(u8, raw[0..8], projection_metadata_magic) or
-        raw[33] > 1 or Crc32.hash(raw[0..42]) != std.mem.readInt(u32, raw[42..46], .little))
-        return error.InvalidDerivedApplyState;
-    return .{
-        .applied_sequence = std.mem.readInt(u64, raw[9..17], .little),
-        .status = std.enums.fromInt(ProjectionStatus, raw[8]) orelse return error.InvalidDerivedApplyState,
-        .generation = std.mem.readInt(u64, raw[17..25], .little),
-        .config_hash = std.mem.readInt(u64, raw[25..33], .little),
-        .published_count = if (raw[33] == 1) std.mem.readInt(u64, raw[34..42], .little) else null,
-    };
-}
-
-fn loadProjectionMetadataTxn(txn: anytype, index_name: []const u8) !?ProjectionCheckpoint {
-    // Legacy writers update only the scalar key. A mismatched or missing
-    // watermark invalidates the richer record's generation/count proof.
-    const sequence = (try loadScalarAppliedSequenceTxn(txn, index_name)) orelse return null;
-    var key_buf: [256]u8 = undefined;
-    const key = try projectionMetadataKey(&key_buf, index_name);
-    const raw = txn.get(key) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
-    const checkpoint = try decodeProjectionMetadata(raw);
-    return if (checkpoint.applied_sequence == sequence) checkpoint else null;
-}
-
-fn loadScalarAppliedSequenceTxn(txn: anytype, index_name: []const u8) !?u64 {
-    var key_buf: [256]u8 = undefined;
-    const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ metadata_prefix, index_name });
-    const raw = txn.get(key) catch |err| switch (err) {
-        error.NotFound => return null,
-        else => return err,
-    };
-    if (raw.len != 8) return error.InvalidDerivedApplyState;
-    return std.mem.readInt(u64, raw[0..8], .little);
-}
-
-fn loadProjectionMetadata(alloc: Allocator, store: anytype, index_name: []const u8) !ProjectionCheckpoint {
-    var runtime = try initRuntimeStore(alloc, store);
-    defer runtime.deinit();
-    var txn = try runtime.store.beginProbe();
-    defer txn.abort();
-    if (try loadProjectionMetadataTxn(&txn, index_name)) |checkpoint| return checkpoint;
-    // An old scalar is replay progress, not a generation recovery proof.
-    return .{ .applied_sequence = (try loadScalarAppliedSequenceTxn(&txn, index_name)) orelse 0 };
-}
-
-fn saveProjectionMetadataTxn(txn: anytype, name: []const u8, checkpoint: ProjectionCheckpoint) !void {
-    var key_buf: [256]u8 = undefined;
-    const key = try projectionMetadataKey(&key_buf, name);
-    const encoded = encodeProjectionMetadata(checkpoint);
-    try txn.put(key, &encoded);
-}
-
-const MetadataUpdateMode = enum { replace, set, advance };
-
-fn saveProjectionMetadataUpdates(alloc: Allocator, store: anytype, updates: []const AppliedSequenceUpdate, mode: MetadataUpdateMode) !void {
-    var runtime = try initRuntimeStore(alloc, store);
-    defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
-    errdefer txn.abort();
-    for (updates) |update| {
-        // Replacement is an explicit recovery boundary. Neither malformed
-        // metadata record may prevent an authoritative replacement/reset.
-        const previous = if (mode == .replace) null else try loadProjectionMetadataTxn(&txn, update.index_name);
-        var checkpoint = previous orelse ProjectionCheckpoint{
-            .applied_sequence = if (mode == .replace) 0 else (try loadScalarAppliedSequenceTxn(&txn, update.index_name)) orelse 0,
-        };
-        if (mode == .replace) {
-            checkpoint = update.checkpoint();
-        } else {
-            const previous_sequence = checkpoint.applied_sequence;
-            checkpoint.applied_sequence = if (mode == .advance) @max(previous_sequence, update.sequence) else update.sequence;
-            mergeSequenceMetadata(&checkpoint, update, previous_sequence, mode == .set);
-        }
-        if (mode == .replace or invalidatesCompletion(previous, checkpoint)) try @import("../artifact_projection_epoch.zig").revoke(&txn);
-        if (mode == .replace) try clearPartialReplayCursorTxn(&txn, update.index_name);
-        if (mode == .replace) {
-            try putScalarAppliedSequenceTxn(&txn, update.index_name, checkpoint.applied_sequence);
-        } else {
-            try saveScalarAppliedSequenceTxn(&txn, update.index_name, checkpoint.applied_sequence);
-        }
-        try saveProjectionMetadataTxn(&txn, update.index_name, checkpoint);
-    }
-    try txn.commit();
-}
-
-/// A coherent receiver-local projection checkpoint cut. The file lock remains
-/// held until deinit, including while a caller publishes evidence into primary
-/// metadata. Acquiring an epoch before/after an unguarded file read is NOT
-/// equivalent: a writer revokes first and then replaces the file.
-///
-/// Lock order is checkpoint file -> primary transaction, matching publishers.
-/// Acquire before opening a primary write transaction. This lease proves a
-/// checkpoint cut only; the caller must independently validate the physical
-/// index generation before treating a clean watermark as completion evidence.
-pub const ProjectionSnapshot = struct {
-    alloc: Allocator,
-    guard: CheckpointWriteGuard,
-    checkpoint: CheckpointMap,
-    authority: @import("../artifact_publication.zig").Authority,
-    epoch: u64,
-
-    pub fn deinit(self: *@This()) void {
-        self.checkpoint.deinit(self.alloc);
-        self.guard.release();
-        self.* = undefined;
-    }
-
-    /// Absence is not a clean zero-watermark certificate.
-    pub fn get(self: *const @This(), index_name: []const u8) ?ProjectionCheckpoint {
-        return self.checkpoint.map.get(index_name);
-    }
-
-    /// Recheck in the evidence publication transaction. Raw physical resets,
-    /// authority switches and reopen can revoke independently of this lock.
-    pub fn requireCurrent(self: *const @This(), txn: anytype) !void {
-        const current = (try @import("../artifact_publication.zig").authority(txn)) orelse return error.ArtifactCatalogDrift;
-        if (!std.meta.eql(self.authority, current)) return error.ArtifactCatalogDrift;
-        try @import("../artifact_projection_epoch.zig").requireCurrent(txn, self.epoch);
-    }
-};
-
-/// Read and decode the sidecar once for a batch of index evidence publications,
-/// not once per document/requirement. A busy publisher yields no snapshot rather
-/// than blocking the completion driver behind index I/O. Missing or scalar-only
-/// checkpoints likewise cannot certify physical generations.
-pub fn tryAcquireProjectionSnapshot(
-    alloc: Allocator,
-    io: std.Io,
-    store: anytype,
-    checkpoint_path: ?[]const u8,
-) !?ProjectionSnapshot {
-    return tryAcquireProjectionSnapshotWithStorage(null, alloc, io, store, checkpoint_path);
-}
-
-pub fn tryAcquireProjectionSnapshotWithStorage(
-    storage: ?Storage,
-    alloc: Allocator,
-    io: std.Io,
-    store: anytype,
-    checkpoint_path: ?[]const u8,
-) !?ProjectionSnapshot {
-    if (comptime builtin.os.tag == .freestanding) return null;
-    const path = checkpoint_path orelse return null;
-    const lock = try retainCheckpointFileLock(path);
-    if (!lock.mutex.tryLock()) {
-        releaseCheckpointFileLock(lock);
-        return null;
-    }
-    var guard: CheckpointWriteGuard = .{ .lock = lock };
-    var owned = true;
-    defer if (owned) guard.release();
-    var runtime = try initRuntimeStore(alloc, store);
-    defer runtime.deinit();
-    var txn = try runtime.store.beginProbe();
-    defer txn.abort();
-    const authority = (try @import("../artifact_publication.zig").authority(&txn)) orelse return null;
-    const epoch = try @import("../artifact_projection_epoch.zig").load(&txn);
-    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
-        error.FileNotFound => return null,
-        else => return err,
-    };
-    errdefer checkpoint.deinit(alloc);
-    owned = false;
-    return .{ .alloc = alloc, .guard = guard, .checkpoint = checkpoint, .authority = authority, .epoch = epoch };
-}
 
 pub const AppliedSequenceUpdate = struct {
     index_name: []const u8,
@@ -403,262 +147,313 @@ pub const AppliedSequenceUpdate = struct {
     }
 };
 
-pub fn checkpointPathAlloc(alloc: Allocator, db_path: []const u8) ![]u8 {
-    return try std.fmt.allocPrint(alloc, "{s}/{s}", .{ db_path, checkpoint_file_name });
+// --- Progress v2: one authoritative record per consumer -------------------
+//
+// One key per consumer merges the applied sequence, the projection seal/
+// identity fields and the LSM WAL checkpoint boundary
+// (`checkpointLsmWalForManagedIndex`'s physical WAL-truncation marker lives
+// on the per-backend pager and cannot be fetched back from a KV read; this
+// field records only whether the docstore-side watermark was advanced after
+// that WAL boundary was confirmed).
+const progress_prefix_v2 = "\x00\x00__metadata__:progress:v2:";
+const progress_magic_v2 = "AFPROG2V";
+const progress_encoded_len_v2 = progress_magic_v2.len + 8 + 1 + 8 + 8 + 1 + 8 + 8 + 4;
+
+/// The merged, authoritative progress identity for one consumer: the applied
+/// sequence, the projection seal/identity fields (status/generation/
+/// config_hash/published_count), and the sequence boundary through which the
+/// consumer's LSM WAL has been checkpointed.
+pub const ProgressRecord = struct {
+    applied_sequence: u64 = 0,
+    status: ProjectionStatus = .clean,
+    generation: u64 = 0,
+    config_hash: u64 = 0,
+    published_count: ?u64 = null,
+    lsm_wal_checkpointed_through: u64 = 0,
+
+    fn checkpoint(self: @This()) ProjectionCheckpoint {
+        return .{
+            .applied_sequence = self.applied_sequence,
+            .status = self.status,
+            .generation = self.generation,
+            .config_hash = self.config_hash,
+            .published_count = self.published_count,
+        };
+    }
+
+    fn withCheckpoint(self: @This(), value: ProjectionCheckpoint) @This() {
+        var next = self;
+        next.applied_sequence = value.applied_sequence;
+        next.status = value.status;
+        next.generation = value.generation;
+        next.config_hash = value.config_hash;
+        next.published_count = value.published_count;
+        return next;
+    }
+};
+
+/// One consumer's contribution to a single progress commit. `consumer` is
+/// typically an index name; callers that batch several consumers into one
+/// publication (one native commit, under WS4) pass several `Progress`
+/// values to one `contributeProgress`/`contributeProgressTxn` call so the
+/// record for each is written inside the same transaction.
+pub const Progress = struct {
+    consumer: []const u8,
+    sequence: u64,
+    status: ProjectionStatus = .clean,
+    generation: u64 = 0,
+    config_hash: u64 = 0,
+    published_count: ?u64 = null,
+    lsm_wal_checkpointed_through: u64 = 0,
+};
+
+/// A raw key/value pair to piggyback into the same progress commit (used by
+/// callers to fold a derived status snapshot write into this transaction
+/// instead of committing it separately). The value must outlive the call.
+pub const StatusWrite = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+var progress_commit_count: std.atomic.Value(u64) = .init(0);
+
+/// Count of completed `contributeProgress` commits. Test-only instrumentation:
+/// production code has no reason to read this, since the whole point of the
+/// counter is to let a test assert "one publication, one progress commit"
+/// without threading a mock transaction through the real write path.
+pub fn progressCommitCount() u64 {
+    return progress_commit_count.load(.monotonic);
 }
 
-pub fn loadAppliedSequence(alloc: Allocator, store: anytype, index_name: []const u8) !u64 {
-    const key = try std.fmt.allocPrint(alloc, "{s}{s}", .{ metadata_prefix, index_name });
-    defer alloc.free(key);
+pub fn resetProgressCommitCountForTest() void {
+    progress_commit_count.store(0, .monotonic);
+}
 
+fn progressKeyV2(buffer: []u8, consumer: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buffer, "{s}{s}", .{ progress_prefix_v2, consumer });
+}
+
+fn encodeProgressRecord(record: ProgressRecord) [progress_encoded_len_v2]u8 {
+    var raw: [progress_encoded_len_v2]u8 = undefined;
+    var pos: usize = 0;
+    @memcpy(raw[0..progress_magic_v2.len], progress_magic_v2);
+    pos += progress_magic_v2.len;
+    writeProgressInt(&raw, &pos, u64, record.applied_sequence);
+    writeProgressInt(&raw, &pos, u8, @backingInt(record.status));
+    writeProgressInt(&raw, &pos, u64, record.generation);
+    writeProgressInt(&raw, &pos, u64, record.config_hash);
+    writeProgressInt(&raw, &pos, u8, @intFromBool(record.published_count != null));
+    writeProgressInt(&raw, &pos, u64, record.published_count orelse 0);
+    writeProgressInt(&raw, &pos, u64, record.lsm_wal_checkpointed_through);
+    writeProgressInt(&raw, &pos, u32, Crc32.hash(raw[0 .. progress_encoded_len_v2 - 4]));
+    return raw;
+}
+
+fn decodeProgressRecord(raw: []const u8) !ProgressRecord {
+    if (raw.len != progress_encoded_len_v2) return error.InvalidDerivedApplyState;
+    if (!std.mem.eql(u8, raw[0..progress_magic_v2.len], progress_magic_v2)) return error.InvalidDerivedApplyState;
+    if (Crc32.hash(raw[0 .. progress_encoded_len_v2 - 4]) != std.mem.readInt(u32, raw[progress_encoded_len_v2 - 4 ..][0..4], .little))
+        return error.InvalidDerivedApplyState;
+    var pos: usize = progress_magic_v2.len;
+    const applied_sequence = readProgressInt(raw, &pos, u64);
+    const status_raw = readProgressInt(raw, &pos, u8);
+    const generation = readProgressInt(raw, &pos, u64);
+    const config_hash = readProgressInt(raw, &pos, u64);
+    const published_count_present = readProgressInt(raw, &pos, u8);
+    if (published_count_present > 1) return error.InvalidDerivedApplyState;
+    const published_count_raw = readProgressInt(raw, &pos, u64);
+    const lsm_wal_checkpointed_through = readProgressInt(raw, &pos, u64);
+    return .{
+        .applied_sequence = applied_sequence,
+        .status = std.enums.fromInt(ProjectionStatus, status_raw) orelse return error.InvalidDerivedApplyState,
+        .generation = generation,
+        .config_hash = config_hash,
+        .published_count = if (published_count_present == 1) published_count_raw else null,
+        .lsm_wal_checkpointed_through = lsm_wal_checkpointed_through,
+    };
+}
+
+fn writeProgressInt(raw: []u8, pos: *usize, comptime T: type, value: T) void {
+    const size = @sizeOf(T);
+    std.mem.writeInt(T, raw[pos.* .. pos.* + size][0..size], value, .little);
+    pos.* += size;
+}
+
+fn readProgressInt(raw: []const u8, pos: *usize, comptime T: type) T {
+    const size = @sizeOf(T);
+    const out = std.mem.readInt(T, raw[pos.* .. pos.* + size][0..size], .little);
+    pos.* += size;
+    return out;
+}
+
+/// Write one consumer's v2 progress entry into an already-open write
+/// transaction/write-batch. The caller owns `commit()`. This is the hook a
+/// future WS4 `CommitPlan` calls directly once it exposes the same
+/// `put`-shaped surface as the rest of this file's `txn: anytype` helpers
+/// (see `commit_participant.View`) — `contributeProgress` below is a thin
+/// convenience wrapper around exactly this for callers that do not yet have
+/// an open plan/batch of their own.
+pub fn contributeProgressTxn(txn: anytype, progress: Progress) !void {
+    var key_buf: [256]u8 = undefined;
+    const key = try progressKeyV2(&key_buf, progress.consumer);
+    const encoded = encodeProgressRecord(.{
+        .applied_sequence = progress.sequence,
+        .status = progress.status,
+        .generation = progress.generation,
+        .config_hash = progress.config_hash,
+        .published_count = progress.published_count,
+        .lsm_wal_checkpointed_through = progress.lsm_wal_checkpointed_through,
+    });
+    var mutable_txn = txn;
+    try mutable_txn.put(key, &encoded);
+}
+
+/// The one authoritative progress commit for a publication: every consumer
+/// it touches, plus any status snapshot the caller chooses to piggyback,
+/// lands in exactly one commit. Call this once per publication, not once
+/// per consumer — batch every `Progress` value touched by that publication
+/// into one call so `progressCommitCount()` advances by exactly one
+/// regardless of how many consumers were updated.
+///
+/// Committed with ordinary (non-deferred) `BatchOptions{}`: this is the
+/// entry point for progress written as part of a synchronous ack. Background/
+/// catch-up flush passes should call `contributeProgressDeferred` instead.
+pub fn contributeProgress(alloc: Allocator, store: anytype, updates: []const Progress, status_writes: []const StatusWrite) !void {
+    return contributeProgressWithOptions(alloc, store, updates, status_writes, .{});
+}
+
+/// Same record, same one-commit-per-publication contract as
+/// `contributeProgress`, but committed with `defer_commit_flush = true` and
+/// `durability = .ride_along`.
+///
+/// `defer_commit_flush` only defers the in-memory table's flush to an
+/// immutable/on-disk run (a write-amplification knob); it does not defer
+/// durability on its own. An earlier version of this change tried to make
+/// `defer_commit_flush` also skip the WAL fsync; that broke "lsm backend
+/// simulation post-commit wal checkpoint fault is acknowledged and
+/// replayable" in lsm_backend_sim_test.zig, which asserts that an existing
+/// `defer_commit_flush = true` bulk-ingest commit survives a crash+reopen —
+/// proof that every other caller of this flag (TTL cleanup, bulk ingest,
+/// hbc_adapter) already depends on it never weakening WAL durability.
+///
+/// `durability = .ride_along` is the real, separate signal for that: on
+/// Lite, `Store.beginBatchWithOptions` threads it onto the returned `Txn`,
+/// so this commit calls `commitTransactionWithDurability(false)` through
+/// `Store.commitRideAlong` (the interim implementation of what WS2's
+/// `Store.stageRideAlong` ticketed group-commit queue replaces once it
+/// lands) instead of forcing its own fsync; it becomes durable for free on
+/// the next durable commit's checkpoint, or this owner's own idle-flush/
+/// close barrier. The hosted LSM backend does not yet consult
+/// `durability` at all, so there `.ride_along` is exactly as durable as
+/// `.durable` today — no hosted behavior change.
+///
+/// This is nonetheless the one seam background/catch-up flush passes call
+/// through, so hosted's real fsync-eliding mechanism (the WAL-sync signal
+/// described above, or folding into the same `durability` enum) has
+/// exactly one call site to take over, instead of every background call
+/// site needing to change again later.
+pub fn contributeProgressDeferred(alloc: Allocator, store: anytype, updates: []const Progress, status_writes: []const StatusWrite) !void {
+    return contributeProgressWithOptions(alloc, store, updates, status_writes, .{ .defer_commit_flush = true, .durability = .ride_along });
+}
+
+fn contributeProgressWithOptions(alloc: Allocator, store: anytype, updates: []const Progress, status_writes: []const StatusWrite, options: backend_erased.types.BatchOptions) !void {
+    if (updates.len == 0 and status_writes.len == 0) return;
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var batch = try runtime.store.beginBatchWithOptions(options);
+    errdefer batch.abort();
+    for (updates) |progress| try contributeProgressTxn(&batch, progress);
+    for (status_writes) |write| try batch.put(write.key, write.value);
+    try batch.commit();
+    _ = progress_commit_count.fetchAdd(1, .monotonic);
+}
+
+pub fn loadProgressTxn(txn: anytype, consumer: []const u8) !?ProgressRecord {
+    var key_buf: [256]u8 = undefined;
+    const key = try progressKeyV2(&key_buf, consumer);
+    const raw = txn.get(key) catch |err| switch (err) {
+        error.NotFound => return null,
+        else => return err,
+    };
+    return try decodeProgressRecord(raw);
+}
+
+/// Read a consumer's v2 progress record, if one has ever been written for
+/// it. Used by restart/recovery to derive where a consumer's effects and
+/// progress actually left off.
+pub fn loadProgress(alloc: Allocator, store: anytype, consumer: []const u8) !?ProgressRecord {
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
     var txn = try runtime.store.beginProbe();
     defer txn.abort();
-    const borrowed = txn.get(key) catch |err| switch (err) {
-        error.NotFound => return 0,
-        else => return err,
-    };
-    const raw = try alloc.dupe(u8, borrowed);
-    defer alloc.free(raw);
-
-    if (raw.len != 8) return error.InvalidDerivedApplyState;
-    return std.mem.readInt(u64, raw[0..8], .little);
+    return try loadProgressTxn(&txn, consumer);
 }
 
-pub fn loadAppliedSequenceWithCheckpoint(
-    alloc: Allocator,
-    io: std.Io,
-    store: anytype,
-    checkpoint_path: ?[]const u8,
-    index_name: []const u8,
-) !u64 {
-    return loadAppliedSequenceWithCheckpointWithStorage(null, alloc, io, store, checkpoint_path, index_name);
-}
-
-pub fn loadAppliedSequenceWithCheckpointWithStorage(
-    storage: ?Storage,
-    alloc: Allocator,
-    io: std.Io,
-    store: anytype,
-    checkpoint_path: ?[]const u8,
-    index_name: []const u8,
-) !u64 {
-    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try loadAppliedSequence(alloc, store, index_name);
-    const path = checkpoint_path orelse return try loadAppliedSequence(alloc, store, index_name);
-    const checkpoint = loadProjectionCheckpointWithStorage(storage, alloc, io, path, index_name) catch |err| switch (err) {
-        error.FileNotFound => return 0,
-        else => return err,
-    };
-    return if (checkpoint) |value| value.applied_sequence else 0;
-}
-
-pub fn loadProjectionCheckpointWithSidecar(
-    alloc: Allocator,
-    io: std.Io,
-    store: anytype,
-    checkpoint_path: ?[]const u8,
-    index_name: []const u8,
-) !ProjectionCheckpoint {
-    return loadProjectionCheckpointWithSidecarWithStorage(null, alloc, io, store, checkpoint_path, index_name);
-}
-
-pub fn loadProjectionCheckpointWithSidecarWithStorage(
-    storage: ?Storage,
-    alloc: Allocator,
-    io: std.Io,
-    store: anytype,
-    checkpoint_path: ?[]const u8,
-    index_name: []const u8,
-) !ProjectionCheckpoint {
-    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) {
-        return try loadProjectionMetadata(alloc, store, index_name);
-    }
-    const path = checkpoint_path orelse return try loadProjectionMetadata(alloc, store, index_name);
-    const checkpoint = loadProjectionCheckpointWithStorage(storage, alloc, io, path, index_name) catch |err| switch (err) {
-        error.FileNotFound => return .{},
-        else => return err,
-    };
-    return checkpoint orelse .{};
-}
-
-pub fn saveAppliedSequence(store: anytype, index_name: []const u8, sequence: u64) !void {
-    var runtime = try initRuntimeStore(std.heap.page_allocator, store);
-    defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
-    errdefer txn.abort();
-    try saveAppliedSequenceTxn(&txn, index_name, sequence);
-    try txn.commit();
-}
-
-fn saveScalarAppliedSequenceTxn(txn: anytype, index_name: []const u8, sequence: u64) !void {
-    const previous = try loadScalarAppliedSequenceTxn(txn, index_name);
-    if (previous == null or sequence < previous.?) try @import("../artifact_projection_epoch.zig").revoke(txn);
-    try putScalarAppliedSequenceTxn(txn, index_name, sequence);
-}
-
-fn putScalarAppliedSequenceTxn(txn: anytype, index_name: []const u8, sequence: u64) !void {
-    var mutable_txn = txn;
-    var buf: [8]u8 = undefined;
-    std.mem.writeInt(u64, &buf, sequence, .little);
-
+fn deleteProgressTxn(txn: anytype, consumer: []const u8) !void {
     var key_buf: [256]u8 = undefined;
-    const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ metadata_prefix, index_name });
-    try mutable_txn.put(key, &buf);
+    const key = try progressKeyV2(&key_buf, consumer);
+    var mutable_txn = txn;
+    mutable_txn.delete(key) catch |err| switch (err) {
+        error.NotFound => {},
+        else => return err,
+    };
 }
 
-pub fn saveAppliedSequenceTxn(txn: anytype, index_name: []const u8, sequence: u64) !void {
-    const previous = try loadProjectionMetadataTxn(txn, index_name);
-    try saveScalarAppliedSequenceTxn(txn, index_name, sequence);
-    const mutable_txn = txn;
-    if (previous) |previous_checkpoint| {
-        var checkpoint = previous_checkpoint;
-        checkpoint.applied_sequence = sequence;
-        mergeSequenceMetadata(&checkpoint, .{ .index_name = index_name, .sequence = sequence }, previous_checkpoint.applied_sequence, true);
-        if (invalidatesCompletion(previous_checkpoint, checkpoint) and sequence >= previous_checkpoint.applied_sequence)
-            try @import("../artifact_projection_epoch.zig").revoke(mutable_txn);
-        try saveProjectionMetadataTxn(mutable_txn, index_name, checkpoint);
-    } else {
-        // Do not resurrect a rejected record if a scalar-only update later
-        // returns to its old sequence number.
-        try clearProjectionMetadataTxn(mutable_txn, index_name);
-    }
+// --- Generic applied-sequence/projection-checkpoint API, v2-backed --------
+//
+// These are the ordinary entry points the rest of the tree calls: a plain
+// "what sequence is this consumer at" / "bump it" / "replace its whole
+// identity" vocabulary, independent of the WS6 multi-consumer batching
+// above. Every one of them reads or writes exactly the v2 key through
+// `loadProgressTxn`/`contributeProgressTxn`; none of them knows about a
+// second storage location, because there isn't one.
+
+pub fn loadAppliedSequence(alloc: Allocator, store: anytype, index_name: []const u8) !u64 {
+    const record = try loadProgress(alloc, store, index_name);
+    return if (record) |value| value.applied_sequence else 0;
 }
 
+pub fn loadProjectionCheckpoint(alloc: Allocator, store: anytype, index_name: []const u8) !ProjectionCheckpoint {
+    const record = try loadProgress(alloc, store, index_name);
+    return if (record) |value| value.checkpoint() else .{};
+}
+
+/// Advance `index_name` to `sequence`, preserving its current identity
+/// (status/generation/config_hash/published_count) — the plain "replay made
+/// progress" callback. Identity invalidation (and the consequent serving-
+/// certificate epoch revocation) follows the same rule as every other write
+/// here: a rewind, or a status/generation/config_hash change, revokes.
+pub fn saveAppliedSequence(store: anytype, index_name: []const u8, sequence: u64) !void {
+    try saveAppliedSequenceUpdate(store, .{ .index_name = index_name, .sequence = sequence });
+}
+
+/// Batch-advance several consumers to the maximum of their current and
+/// proposed sequence (a stale/out-of-order replay record cannot rewind a
+/// newer cursor, and cannot certify identity/counts it has not reached).
 pub fn saveAppliedSequences(store: anytype, updates: []const AppliedSequenceUpdate) !void {
-    if (updates.len == 0) return;
-
-    var runtime = try initRuntimeStore(std.heap.page_allocator, store);
-    defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
-    errdefer txn.abort();
-    for (updates) |update| {
-        try saveAppliedSequenceTxn(&txn, update.index_name, update.sequence);
-    }
-    try txn.commit();
+    try applyProgressUpdates(std.heap.page_allocator, store, updates, .advance);
 }
 
-pub fn saveAppliedSequenceWithCheckpoint(
-    alloc: Allocator,
-    io: std.Io,
-    store: anytype,
-    checkpoint_path: ?[]const u8,
-    index_name: []const u8,
-    sequence: u64,
-) !void {
-    return saveAppliedSequenceWithCheckpointWithStorage(null, alloc, io, store, checkpoint_path, index_name, sequence);
+/// Exact single-consumer update, carrying whatever identity fields `update`
+/// specifies (zero means "unspecified, keep the previous value").
+pub fn saveAppliedSequenceUpdate(store: anytype, update: AppliedSequenceUpdate) !void {
+    try applyProgressUpdates(std.heap.page_allocator, store, &.{update}, .set);
 }
 
-pub fn saveAppliedSequenceWithCheckpointWithStorage(
-    storage: ?Storage,
-    alloc: Allocator,
-    io: std.Io,
-    store: anytype,
-    checkpoint_path: ?[]const u8,
-    index_name: []const u8,
-    sequence: u64,
-) !void {
-    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try saveAppliedSequence(store, index_name, sequence);
-    if (checkpoint_path) |path| {
-        try setAppliedSequencesCheckpointWithStorage(storage, alloc, io, path, store, &[_]AppliedSequenceUpdate{.{
-            .index_name = index_name,
-            .sequence = sequence,
-        }});
-        return;
-    }
-    try saveAppliedSequence(store, index_name, sequence);
-}
-
-pub fn saveAppliedSequenceUpdateWithCheckpoint(
-    alloc: Allocator,
-    io: std.Io,
-    store: anytype,
-    checkpoint_path: ?[]const u8,
-    update: AppliedSequenceUpdate,
-) !void {
-    return saveAppliedSequenceUpdateWithCheckpointWithStorage(null, alloc, io, store, checkpoint_path, update);
-}
-
-pub fn saveAppliedSequenceUpdateWithCheckpointWithStorage(
-    storage: ?Storage,
-    alloc: Allocator,
-    io: std.Io,
-    store: anytype,
-    checkpoint_path: ?[]const u8,
-    update: AppliedSequenceUpdate,
-) !void {
-    if (comptime builtin.os.tag == .freestanding) {
-        return try saveProjectionMetadataUpdates(alloc, store, &.{update}, .set);
-    }
-    if (checkpoint_path) |path| {
-        try setAppliedSequencesCheckpointWithStorage(storage, alloc, io, path, store, &[_]AppliedSequenceUpdate{update});
-        return;
-    }
-    try saveProjectionMetadataUpdates(alloc, store, &.{update}, .set);
-}
-
-pub fn saveProjectionCheckpointWithSidecar(
-    alloc: Allocator,
-    io: std.Io,
-    store: anytype,
-    checkpoint_path: ?[]const u8,
-    index_name: []const u8,
-    checkpoint: ProjectionCheckpoint,
-) !void {
-    return saveProjectionCheckpointWithSidecarWithStorage(null, alloc, io, store, checkpoint_path, index_name, checkpoint);
-}
-
-pub fn saveProjectionCheckpointWithSidecarWithStorage(
-    storage: ?Storage,
-    alloc: Allocator,
-    io: std.Io,
-    store: anytype,
-    checkpoint_path: ?[]const u8,
-    index_name: []const u8,
-    checkpoint: ProjectionCheckpoint,
-) !void {
-    if (comptime builtin.os.tag == .freestanding) {
-        return try saveProjectionMetadataUpdates(alloc, store, &.{.{ .index_name = index_name, .sequence = checkpoint.applied_sequence, .status = checkpoint.status, .generation = checkpoint.generation, .config_hash = checkpoint.config_hash, .published_count = checkpoint.published_count }}, .replace);
-    }
-    if (checkpoint_path) |path| {
-        try setProjectionCheckpointsWithStorage(storage, alloc, io, path, store, &[_]AppliedSequenceUpdate{.{
-            .index_name = index_name,
-            .sequence = checkpoint.applied_sequence,
-            .status = checkpoint.status,
-            .generation = checkpoint.generation,
-            .config_hash = checkpoint.config_hash,
-            .published_count = checkpoint.published_count,
-        }});
-        return;
-    }
-    try saveProjectionMetadataUpdates(alloc, store, &.{.{ .index_name = index_name, .sequence = checkpoint.applied_sequence, .status = checkpoint.status, .generation = checkpoint.generation, .config_hash = checkpoint.config_hash, .published_count = checkpoint.published_count }}, .replace);
-}
-
-pub fn saveAppliedSequencesWithCheckpoint(
-    alloc: Allocator,
-    io: std.Io,
-    store: anytype,
-    checkpoint_path: ?[]const u8,
-    updates: []const AppliedSequenceUpdate,
-) !void {
-    return saveAppliedSequencesWithCheckpointWithStorage(null, alloc, io, store, checkpoint_path, updates);
-}
-
-pub fn saveAppliedSequencesWithCheckpointWithStorage(
-    storage: ?Storage,
-    alloc: Allocator,
-    io: std.Io,
-    store: anytype,
-    checkpoint_path: ?[]const u8,
-    updates: []const AppliedSequenceUpdate,
-) !void {
-    if (updates.len == 0) return;
-    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try saveProjectionMetadataUpdates(alloc, store, updates, .advance);
-    if (checkpoint_path) |path| {
-        try saveAppliedSequencesCheckpointWithStorage(storage, alloc, io, path, store, updates);
-        return;
-    }
-    try saveProjectionMetadataUpdates(alloc, store, updates, .advance);
+/// Explicit identity replacement: a recovery/rebuild boundary. Every field
+/// in `checkpoint` is authoritative, including a deliberate reset to zero;
+/// this also clears the index's partial-replay resume point, since a
+/// recreated index replaying the same record must not skip items that only
+/// the old incarnation applied.
+pub fn saveProjectionCheckpoint(store: anytype, index_name: []const u8, checkpoint: ProjectionCheckpoint) !void {
+    try applyProgressUpdates(std.heap.page_allocator, store, &.{.{
+        .index_name = index_name,
+        .sequence = checkpoint.applied_sequence,
+        .status = checkpoint.status,
+        .generation = checkpoint.generation,
+        .config_hash = checkpoint.config_hash,
+        .published_count = checkpoint.published_count,
+    }}, .replace);
 }
 
 pub fn clearAppliedSequence(store: anytype, index_name: []const u8) !void {
@@ -670,54 +465,237 @@ pub fn clearAppliedSequence(store: anytype, index_name: []const u8) !void {
     try txn.commit();
 }
 
-pub fn clearAppliedSequenceWithCheckpoint(
-    alloc: Allocator,
-    io: std.Io,
-    store: anytype,
-    checkpoint_path: ?[]const u8,
-    index_name: []const u8,
-) !void {
-    return clearAppliedSequenceWithCheckpointWithStorage(null, alloc, io, store, checkpoint_path, index_name);
-}
-
-pub fn clearAppliedSequenceWithCheckpointWithStorage(
-    storage: ?Storage,
-    alloc: Allocator,
-    io: std.Io,
-    store: anytype,
-    checkpoint_path: ?[]const u8,
-    index_name: []const u8,
-) !void {
-    if (comptime builtin.os.tag == .freestanding or builtin.os.tag == .wasi) return try clearAppliedSequence(store, index_name);
-    if (checkpoint_path) |path| {
-        try clearAppliedSequenceCheckpointWithStorage(storage, alloc, io, path, store, index_name);
-        // The sidecar holds applied progress; the resume point is in the store.
-        try clearPartialReplayCursor(alloc, store, index_name);
-        return;
-    }
-    try clearAppliedSequence(store, index_name);
-}
-
 pub fn clearAppliedSequenceTxn(txn: anytype, index_name: []const u8) !void {
-    var mutable_txn = txn;
-    try @import("../artifact_projection_epoch.zig").revoke(mutable_txn);
-    var key_buf: [256]u8 = undefined;
-    const key = try std.fmt.bufPrint(&key_buf, "{s}{s}", .{ metadata_prefix, index_name });
-    mutable_txn.delete(key) catch |err| switch (err) {
-        error.NotFound => {},
-        else => return err,
-    };
-    try clearProjectionMetadataTxn(mutable_txn, index_name);
-    try clearPartialReplayCursorTxn(mutable_txn, index_name);
+    try artifact_projection_epoch.revoke(txn);
+    try deleteProgressTxn(txn, index_name);
+    try clearPartialReplayCursorTxn(txn, index_name);
 }
 
-fn clearProjectionMetadataTxn(txn: anytype, index_name: []const u8) !void {
-    const mutable_txn = txn;
-    var projection_key_buf: [256]u8 = undefined;
-    mutable_txn.delete(try projectionMetadataKey(&projection_key_buf, index_name)) catch |err| switch (err) {
-        error.NotFound => {},
-        else => return err,
+/// Live physical resets must revoke completion before touching their files,
+/// even when they do not otherwise replace an applied-sequence record.
+pub fn invalidateProjectionCompletion(alloc: Allocator, store: anytype) !void {
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    try artifact_projection_epoch.revoke(&txn);
+    try txn.commit();
+}
+
+const MetadataUpdateMode = enum { replace, set, advance };
+
+fn applyProgressUpdates(alloc: Allocator, store: anytype, updates: []const AppliedSequenceUpdate, mode: MetadataUpdateMode) !void {
+    if (updates.len == 0) return;
+    var runtime = try initRuntimeStore(alloc, store);
+    defer runtime.deinit();
+    var txn = try runtime.store.beginWrite();
+    errdefer txn.abort();
+    for (updates) |update| {
+        try applyProgressUpdateTxn(&txn, update, mode);
+    }
+    try txn.commit();
+}
+
+fn applyProgressUpdateTxn(txn: anytype, update: AppliedSequenceUpdate, mode: MetadataUpdateMode) !void {
+    const previous = if (mode == .replace) null else try loadProgressTxn(txn, update.index_name);
+    const previous_checkpoint: ?ProjectionCheckpoint = if (previous) |value| value.checkpoint() else null;
+    var next = previous orelse ProgressRecord{};
+    var checkpoint = previous_checkpoint orelse ProjectionCheckpoint{};
+    if (mode == .replace) {
+        checkpoint = update.checkpoint();
+    } else {
+        const previous_sequence = checkpoint.applied_sequence;
+        checkpoint.applied_sequence = if (mode == .advance) @max(previous_sequence, update.sequence) else update.sequence;
+        mergeSequenceMetadata(&checkpoint, update, previous_sequence, mode == .set);
+    }
+    next = next.withCheckpoint(checkpoint);
+    if (mode == .replace or invalidatesCompletion(previous_checkpoint, checkpoint)) try artifact_projection_epoch.revoke(txn);
+    if (mode == .replace) try clearPartialReplayCursorTxn(txn, update.index_name);
+    try contributeProgressTxn(txn, .{
+        .consumer = update.index_name,
+        .sequence = next.applied_sequence,
+        .status = next.status,
+        .generation = next.generation,
+        .config_hash = next.config_hash,
+        .published_count = next.published_count,
+        .lsm_wal_checkpointed_through = next.lsm_wal_checkpointed_through,
+    });
+}
+
+fn mergeSequenceMetadata(
+    checkpoint: *ProjectionCheckpoint,
+    update: AppliedSequenceUpdate,
+    previous_sequence: u64,
+    exact_sequence: bool,
+) void {
+    // A max update cannot certify identity or counts for a replay prefix it
+    // has not reached. Exact replacements may intentionally rewind the cut.
+    if (!exact_sequence and update.sequence < previous_sequence) return;
+    const previous_generation = checkpoint.generation;
+    const previous_config_hash = checkpoint.config_hash;
+    if (update.generation != 0) checkpoint.generation = update.generation;
+    if (update.config_hash != 0) checkpoint.config_hash = update.config_hash;
+    const identity_changed = checkpoint.generation != previous_generation or
+        checkpoint.config_hash != previous_config_hash;
+    const boundary_changed = checkpoint.applied_sequence != previous_sequence;
+
+    // A physical publication certificate is meaningful only for the exact
+    // sequence and incarnation that produced it. Advancing/replacing either
+    // without a new certificate must invalidate the old one; a stale/lower
+    // max update must never rebind its certificate to a newer cursor.
+    if (exact_sequence or boundary_changed or identity_changed) {
+        checkpoint.published_count = if (update.sequence == checkpoint.applied_sequence)
+            update.published_count
+        else
+            null;
+    } else if (update.published_count) |count| {
+        if (update.sequence == checkpoint.applied_sequence) checkpoint.published_count = count;
+    }
+}
+
+fn invalidatesCompletion(previous: ?ProjectionCheckpoint, next: ProjectionCheckpoint) bool {
+    const old = previous orelse return true;
+    return old.status != next.status or old.generation != next.generation or
+        old.config_hash != next.config_hash or next.applied_sequence < old.applied_sequence or
+        (next.applied_sequence == old.applied_sequence and old.published_count != null and !std.meta.eql(old.published_count, next.published_count));
+}
+
+// --- Coherent multi-consumer read for serving-certificate validation ------
+
+const checkpoint_lock_alloc = std.heap.page_allocator;
+var checkpoint_lock_registry_mutex: std.atomic.Mutex = .unlocked;
+var checkpoint_locks: std.AutoHashMapUnmanaged(usize, *ProjectionSnapshotLock) = .empty;
+
+const ProjectionSnapshotLock = struct {
+    key: usize,
+    mutex: std.atomic.Mutex = .unlocked,
+    refs: usize = 0,
+};
+
+const ProjectionSnapshotGuard = struct {
+    lock: *ProjectionSnapshotLock,
+
+    fn release(self: *@This()) void {
+        self.lock.mutex.unlock();
+        releaseProjectionSnapshotLock(self.lock);
+    }
+};
+
+fn retainProjectionSnapshotLock(key: usize) !*ProjectionSnapshotLock {
+    platform_sync.lockYielding(&checkpoint_lock_registry_mutex);
+    defer checkpoint_lock_registry_mutex.unlock();
+
+    const gop = try checkpoint_locks.getOrPut(checkpoint_lock_alloc, key);
+    if (!gop.found_existing) {
+        errdefer _ = checkpoint_locks.remove(key);
+        const lock = try checkpoint_lock_alloc.create(ProjectionSnapshotLock);
+        lock.* = .{ .key = key };
+        gop.value_ptr.* = lock;
+    }
+    const lock = gop.value_ptr.*;
+    lock.refs += 1;
+    return lock;
+}
+
+fn releaseProjectionSnapshotLock(lock: *ProjectionSnapshotLock) void {
+    platform_sync.lockYielding(&checkpoint_lock_registry_mutex);
+    defer checkpoint_lock_registry_mutex.unlock();
+
+    std.debug.assert(lock.refs > 0);
+    lock.refs -= 1;
+    if (lock.refs != 0) return;
+    const removed = checkpoint_locks.fetchRemove(lock.key) orelse {
+        std.debug.panic("missing projection snapshot lock for key {d}", .{lock.key});
     };
+    std.debug.assert(removed.value == lock);
+    checkpoint_lock_alloc.destroy(lock);
+}
+
+/// One coherently-read view of several consumers' progress, backed by one
+/// open read transaction (a consistent MVCC snapshot, so no I/O contention
+/// to avoid — unlike the old file-sidecar design this replaces) plus a
+/// per-store try-lock. The lock is not for consistency (the transaction
+/// already gives that); it is the same admission control the old file lock
+/// gave: a busy publisher yields no snapshot rather than letting an
+/// unbounded number of concurrent evidence-publication passes pile up
+/// against the same store.
+pub const ProjectionSnapshot = struct {
+    guard: ProjectionSnapshotGuard,
+    runtime: RuntimeStoreHandle,
+    txn: backend_erased.ProbeTxn,
+    authority: artifact_publication.Authority,
+    epoch: u64,
+
+    pub fn deinit(self: *@This()) void {
+        self.txn.abort();
+        self.runtime.deinit();
+        self.guard.release();
+        self.* = undefined;
+    }
+
+    /// Absence is not a clean zero-watermark certificate.
+    pub fn get(self: *@This(), index_name: []const u8) ?ProjectionCheckpoint {
+        const record = (loadProgressTxn(&self.txn, index_name) catch return null) orelse return null;
+        return record.checkpoint();
+    }
+
+    /// Recheck in the evidence publication transaction. Raw physical resets,
+    /// authority switches and reopen can revoke independently of this read.
+    pub fn requireCurrent(self: *const @This(), txn: anytype) !void {
+        const current = (try artifact_publication.authority(txn)) orelse return error.ArtifactCatalogDrift;
+        if (!std.meta.eql(self.authority, current)) return error.ArtifactCatalogDrift;
+        try artifact_projection_epoch.requireCurrent(txn, self.epoch);
+    }
+};
+
+/// A stable identity for `store`, suitable as a lock-registry key across
+/// separate calls that both mean "the same logical store". This must be
+/// computed from the caller's own value, never from a `backend_erased.Store`
+/// built by `initRuntimeStore`: `storeFrom` heap-allocates a fresh erasure
+/// box on every call for any `store` that isn't already erased (which is the
+/// common case — most callers pass `*DocStore`), so `(try
+/// initRuntimeStore(...)).store.ptr` is a different address on every call
+/// even for the exact same underlying store, and two concurrent acquisitions
+/// against "the same store" would never collide. A pointer's own value does
+/// not have that problem: `db.core.store` is one stable `*DocStore` for the
+/// whole life of the DB.
+fn projectionSnapshotLockKey(store: anytype) usize {
+    const T = @TypeOf(store);
+    if (T == backend_erased.Store) return @intFromPtr(store.ptr);
+    if (T == *backend_erased.Store) return @intFromPtr(store.ptr);
+    switch (@typeInfo(T)) {
+        .pointer => return @intFromPtr(store),
+        else => return @intFromPtr(&store),
+    }
+}
+
+/// Open a coherent read for a batch of index evidence publications, not once
+/// per document/requirement. Returns null when there is no active authority
+/// to validate against (nothing to serve from yet), or when another
+/// snapshot against the same store is already outstanding.
+pub fn tryAcquireProjectionSnapshot(alloc: Allocator, store: anytype) !?ProjectionSnapshot {
+    const lock_key = projectionSnapshotLockKey(store);
+    var runtime = try initRuntimeStore(alloc, store);
+    errdefer runtime.deinit();
+    const lock = try retainProjectionSnapshotLock(lock_key);
+    if (!lock.mutex.tryLock()) {
+        releaseProjectionSnapshotLock(lock);
+        runtime.deinit();
+        return null;
+    }
+    var guard: ProjectionSnapshotGuard = .{ .lock = lock };
+    var owned = true;
+    defer if (owned) guard.release();
+    var txn = try runtime.store.beginProbe();
+    errdefer txn.abort();
+    const authority = (try artifact_publication.authority(&txn)) orelse {
+        txn.abort();
+        runtime.deinit();
+        return null;
+    };
+    const epoch = try artifact_projection_epoch.load(&txn);
+    owned = false;
+    return .{ .guard = guard, .runtime = runtime, .txn = txn, .authority = authority, .epoch = epoch };
 }
 
 const RuntimeStoreHandle = struct {
@@ -759,773 +737,102 @@ fn initRuntimeStore(alloc: Allocator, store: anytype) !RuntimeStoreHandle {
     };
 }
 
-const CheckpointMap = struct {
-    map: std.StringHashMapUnmanaged(ProjectionCheckpoint) = .empty,
-
-    pub fn deinit(self: *@This(), alloc: Allocator) void {
-        var it = self.map.iterator();
-        while (it.next()) |entry| alloc.free(@constCast(entry.key_ptr.*));
-        self.map.deinit(alloc);
-        self.* = .{};
-    }
-
-    fn putMax(self: *@This(), alloc: Allocator, name: []const u8, checkpoint: ProjectionCheckpoint) !void {
-        const gop = try self.map.getOrPut(alloc, name);
-        if (gop.found_existing) {
-            if (checkpoint.applied_sequence > gop.value_ptr.*.applied_sequence) {
-                gop.value_ptr.* = checkpoint;
-            }
-            return;
-        }
-        errdefer _ = self.map.remove(name);
-        gop.key_ptr.* = try alloc.dupe(u8, name);
-        gop.value_ptr.* = checkpoint;
-    }
-
-    fn put(self: *@This(), alloc: Allocator, name: []const u8, checkpoint: ProjectionCheckpoint) !void {
-        const gop = try self.map.getOrPut(alloc, name);
-        if (gop.found_existing) {
-            gop.value_ptr.* = checkpoint;
-            return;
-        }
-        errdefer _ = self.map.remove(name);
-        gop.key_ptr.* = try alloc.dupe(u8, name);
-        gop.value_ptr.* = checkpoint;
-    }
-
-    fn putMaxSequence(self: *@This(), alloc: Allocator, name: []const u8, sequence: u64) !void {
-        const gop = try self.map.getOrPut(alloc, name);
-        if (gop.found_existing) {
-            gop.value_ptr.*.applied_sequence = @max(gop.value_ptr.*.applied_sequence, sequence);
-            return;
-        }
-        errdefer _ = self.map.remove(name);
-        gop.key_ptr.* = try alloc.dupe(u8, name);
-        gop.value_ptr.* = .{ .applied_sequence = sequence };
-    }
-
-    fn putMaxSequenceUpdate(self: *@This(), alloc: Allocator, update: AppliedSequenceUpdate) !void {
-        const gop = try self.map.getOrPut(alloc, update.index_name);
-        if (gop.found_existing) {
-            const previous_sequence = gop.value_ptr.*.applied_sequence;
-            gop.value_ptr.*.applied_sequence = @max(gop.value_ptr.*.applied_sequence, update.sequence);
-            mergeSequenceMetadata(gop.value_ptr, update, previous_sequence, false);
-            return;
-        }
-        errdefer _ = self.map.remove(update.index_name);
-        gop.key_ptr.* = try alloc.dupe(u8, update.index_name);
-        gop.value_ptr.* = .{
-            .applied_sequence = update.sequence,
-            .generation = update.generation,
-            .config_hash = update.config_hash,
-            .published_count = update.published_count,
-        };
-    }
-
-    fn putSequence(self: *@This(), alloc: Allocator, name: []const u8, sequence: u64) !void {
-        const gop = try self.map.getOrPut(alloc, name);
-        if (gop.found_existing) {
-            gop.value_ptr.*.applied_sequence = sequence;
-            return;
-        }
-        errdefer _ = self.map.remove(name);
-        gop.key_ptr.* = try alloc.dupe(u8, name);
-        gop.value_ptr.* = .{ .applied_sequence = sequence };
-    }
-
-    fn putSequenceUpdate(self: *@This(), alloc: Allocator, update: AppliedSequenceUpdate) !void {
-        const gop = try self.map.getOrPut(alloc, update.index_name);
-        if (gop.found_existing) {
-            const previous_sequence = gop.value_ptr.*.applied_sequence;
-            gop.value_ptr.*.applied_sequence = update.sequence;
-            mergeSequenceMetadata(gop.value_ptr, update, previous_sequence, true);
-            return;
-        }
-        errdefer _ = self.map.remove(update.index_name);
-        gop.key_ptr.* = try alloc.dupe(u8, update.index_name);
-        gop.value_ptr.* = .{
-            .applied_sequence = update.sequence,
-            .generation = update.generation,
-            .config_hash = update.config_hash,
-            .published_count = update.published_count,
-        };
-    }
-
-    fn remove(self: *@This(), alloc: Allocator, name: []const u8) void {
-        const removed = self.map.fetchRemove(name) orelse return;
-        alloc.free(@constCast(removed.key));
-    }
-};
-
-fn mergeSequenceMetadata(
-    checkpoint: *ProjectionCheckpoint,
-    update: AppliedSequenceUpdate,
-    previous_sequence: u64,
-    exact_sequence: bool,
-) void {
-    // A max update cannot certify identity or counts for a replay prefix it
-    // has not reached. Exact replacements may intentionally rewind the cut.
-    if (!exact_sequence and update.sequence < previous_sequence) return;
-    const previous_generation = checkpoint.generation;
-    const previous_config_hash = checkpoint.config_hash;
-    if (update.generation != 0) checkpoint.generation = update.generation;
-    if (update.config_hash != 0) checkpoint.config_hash = update.config_hash;
-    const identity_changed = checkpoint.generation != previous_generation or
-        checkpoint.config_hash != previous_config_hash;
-    const boundary_changed = checkpoint.applied_sequence != previous_sequence;
-
-    // A physical publication certificate is meaningful only for the exact
-    // sequence and incarnation that produced it. Advancing/replacing either
-    // without a new certificate must invalidate the old one; a stale/lower
-    // max update must never rebind its certificate to a newer cursor.
-    if (exact_sequence or boundary_changed or identity_changed) {
-        checkpoint.published_count = if (update.sequence == checkpoint.applied_sequence)
-            update.published_count
-        else
-            null;
-    } else if (update.published_count) |count| {
-        if (update.sequence == checkpoint.applied_sequence) checkpoint.published_count = count;
-    }
-}
-
-/// Read retained checkpoint metadata through its immutable storage capability.
-/// Remote/query views have virtual paths; host filesystem I/O is not authority.
-pub fn loadProjectionCheckpointFromStorage(alloc: Allocator, storage: lsm_backend.Storage, path: []const u8, index_name: []const u8) !?ProjectionCheckpoint {
-    return loadProjectionCheckpointWithStorage(storage, alloc, .failing, path, index_name);
-}
-
-fn projectionCheckpointFromBytes(alloc: Allocator, raw: []const u8, index_name: []const u8) !?ProjectionCheckpoint {
-    var checkpoint = try decodeCheckpoint(alloc, raw);
-    defer checkpoint.deinit(alloc);
-    return checkpoint.map.get(index_name);
-}
-
-fn loadProjectionCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, index_name: []const u8) !?ProjectionCheckpoint {
-    return loadProjectionCheckpointWithStorage(null, alloc, io, path, index_name);
-}
-
-fn loadProjectionCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, index_name: []const u8) !?ProjectionCheckpoint {
-    var checkpoint = try loadCheckpointWithStorage(storage, alloc, io, path);
-    defer checkpoint.deinit(alloc);
-    return checkpoint.map.get(index_name);
-}
-
-test "ordered artifact inventory projection snapshot owns a coherent checkpoint and publication fence" {
-    const alloc = std.testing.allocator;
-    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const publication = @import("../artifact_publication.zig");
-    const epoch = @import("../artifact_projection_epoch.zig");
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/projection-snapshot", .{tmp.sub_path});
-    defer alloc.free(path);
-    var db = try db_mod.DB.open(alloc, path, .{ .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
-    defer db.close();
-    const sidecar = try checkpointPathAlloc(alloc, path);
-    defer alloc.free(sidecar);
-    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, std.testing.io, db.core.store, sidecar) == null);
-    var activation: publication.Command = .{ .mode = .activate, .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
-    {
-        var txn = try db.core.store.beginWriteTxn();
-        errdefer txn.abort();
-        try publication.stageAuthority(&txn, activation);
-        try txn.commit();
-    }
-    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, std.testing.io, db.core.store, sidecar) == null);
-    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, std.testing.io, db.core.store, null) == null);
-    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, db.core.store, sidecar, "text", .{ .applied_sequence = 11, .generation = 2, .config_hash = 7 });
-    const Check = struct {
-        fn run(a: Allocator, store: *docstore_mod.DocStore, location: []const u8) !void {
-            var snapshot = (try tryAcquireProjectionSnapshot(a, std.testing.io, store, location)).?;
-            defer snapshot.deinit();
-            try std.testing.expectEqual(@as(u64, 11), snapshot.get("text").?.applied_sequence);
-            try std.testing.expect(snapshot.get("missing") == null);
-            // This is the same lock used by every sidecar publication. It is
-            // still held after file decoding, not just during readFileAlloc.
-            const unexpectedly_unlocked = snapshot.guard.lock.mutex.tryLock();
-            if (unexpectedly_unlocked) snapshot.guard.lock.mutex.unlock();
-            try std.testing.expect(!unexpectedly_unlocked);
-            var txn = try store.beginReadTxn();
-            defer txn.abort();
-            try snapshot.requireCurrent(&txn);
-        }
-    };
-    try std.testing.checkAllAllocationFailures(alloc, Check.run, .{ db.core.store, sidecar });
-    var snapshot = (try tryAcquireProjectionSnapshot(alloc, std.testing.io, db.core.store, sidecar)).?;
-    defer snapshot.deinit();
-    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, std.testing.io, db.core.store, sidecar) == null);
-    // Physical reset/open revocation need not replace a sidecar. A held file
-    // lock therefore cannot replace the primary transaction's final CAS.
-    {
-        var txn = try db.core.store.beginWriteTxn();
-        errdefer txn.abort();
-        try epoch.revoke(&txn);
-        try std.testing.expectError(error.EnrichmentSourceChanged, snapshot.requireCurrent(&txn));
-        try txn.commit();
-    }
-    {
-        var txn = try db.core.store.beginReadTxn();
-        defer txn.abort();
-        try std.testing.expectError(error.EnrichmentSourceChanged, snapshot.requireCurrent(&txn));
-    }
-    {
-        var txn = try db.core.store.beginWriteTxn();
-        errdefer txn.abort();
-        activation.authority_epoch += 1;
-        try publication.stageAuthority(&txn, activation);
-        try std.testing.expectError(error.ArtifactCatalogDrift, snapshot.requireCurrent(&txn));
-        try txn.commit();
-    }
-}
-
-test "ordered artifact inventory projection sidecar transitions revoke completion before publication" {
-    const alloc = std.testing.allocator;
-    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
-    const publication = @import("../artifact_publication.zig");
-    const epoch = @import("../artifact_projection_epoch.zig");
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/projection-epoch", .{tmp.sub_path});
-    defer alloc.free(path);
-    var db = try db_mod.DB.open(alloc, path, .{ .identity_namespace = .{ .table_id = 1, .shard_id = 2, .range_id = 3 }, .online_source_authority = .raft, .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
-    defer db.close();
-    try db.setSchemaJson(alloc, "{}");
-    var catalog = try db.artifactInventoryCommand(alloc);
-    defer catalog.catalogs.deinit(alloc);
-    catalog.binding.effect_protocol = 15;
-    try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .artifact_catalog = catalog }, .{ .term = 1, .index = 1 });
-    var activation: publication.Command = .{ .mode = .activate, .namespace = catalog.namespace, .authority_epoch = catalog.binding.epoch, .catalog_digest = catalog.binding.digest, .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
-    activation.publication_digest = activation.digest();
-    try @import("antfly_server_test_sources").local_test_sources.storage_server_db_adapter.applyOrdered(&db, .{ .artifact_publication = activation }, .{ .term = 1, .index = 2 });
-    const sidecar = try checkpointPathAlloc(alloc, path);
-    defer alloc.free(sidecar);
-    const Probe = struct {
-        fn current(store: *docstore_mod.DocStore) !u64 {
-            var read = try store.beginReadTxn();
-            defer read.abort();
-            return epoch.load(&read);
-        }
-    };
-    try std.testing.expectEqual(@as(u64, 0), try Probe.current(db.core.store));
-    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, db.core.store, sidecar, "text", .{ .applied_sequence = 10, .generation = 1, .config_hash = 7 });
-    const first = try Probe.current(db.core.store);
-    try std.testing.expectEqual(@as(u64, 1), first);
-    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, db.core.store, sidecar, &.{.{ .index_name = "text", .sequence = 11, .config_hash = 7 }});
-    try std.testing.expectEqual(first, try Probe.current(db.core.store));
-    try saveAppliedSequenceUpdateWithCheckpoint(alloc, std.testing.io, db.core.store, sidecar, .{ .index_name = "text", .sequence = 12, .config_hash = 7 });
-    try std.testing.expectEqual(first, try Probe.current(db.core.store));
-    // Rebuilding, even at the same source cut, invalidates prior completion.
-    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, db.core.store, sidecar, "text", .{ .applied_sequence = 12, .status = .rebuilding, .generation = 2, .config_hash = 7 });
-    try std.testing.expectEqual(first + 1, try Probe.current(db.core.store));
-    // Recovery may deliberately lower a watermark; it cannot retain a prefix
-    // captured from the old physical projection.
-    try saveAppliedSequenceWithCheckpoint(alloc, std.testing.io, db.core.store, sidecar, "text", 3);
-    try std.testing.expectEqual(first + 2, try Probe.current(db.core.store));
-    try clearAppliedSequenceWithCheckpoint(alloc, std.testing.io, db.core.store, sidecar, "text");
-    try std.testing.expectEqual(first + 3, try Probe.current(db.core.store));
-    // A failed sidecar replacement is permitted to leave an extra revocation.
-    // The reverse ordering would leave stale evidence after a crash.
-    var failed_after_revoke = false;
-    for (0..256) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(alloc, .{ .fail_index = fail_index });
-        saveProjectionCheckpointWithSidecar(failing.allocator(), std.testing.io, db.core.store, sidecar, "text", .{ .applied_sequence = 20, .generation = 3, .config_hash = 7 }) catch |err| {
-            if (err != error.OutOfMemory) return err;
-            if (try Probe.current(db.core.store) > first + 3) {
-                failed_after_revoke = true;
-                try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, db.core.store, sidecar, "text"));
-                break;
-            }
-            continue;
-        };
-        return error.TestUnexpectedResult;
-    }
-    try std.testing.expect(failed_after_revoke);
-    try std.testing.expectEqual(first + 4, try Probe.current(db.core.store));
-    // The metadata-only backend path revokes in the same transaction as reset.
-    try saveAppliedSequence(db.core.store, "text", 20);
-    const metadata_epoch = try Probe.current(db.core.store);
-    try saveAppliedSequence(db.core.store, "text", 21);
-    try std.testing.expectEqual(metadata_epoch, try Probe.current(db.core.store));
-    {
-        var txn = try db.core.store.beginWriteTxn();
-        defer txn.abort();
-        try clearAppliedSequenceTxn(&txn, "text");
-        try std.testing.expectEqual(metadata_epoch + 1, try epoch.load(&txn));
-    }
-    try std.testing.expectEqual(metadata_epoch, try Probe.current(db.core.store));
-    try saveAppliedSequence(db.core.store, "text", 2);
-    try std.testing.expectEqual(metadata_epoch + 1, try Probe.current(db.core.store));
-}
-
-fn invalidatesCompletion(previous: ?ProjectionCheckpoint, next: ProjectionCheckpoint) bool {
-    const old = previous orelse return true;
-    return old.status != next.status or old.generation != next.generation or
-        old.config_hash != next.config_hash or next.applied_sequence < old.applied_sequence or
-        (next.applied_sequence == old.applied_sequence and old.published_count != null and !std.meta.eql(old.published_count, next.published_count));
-}
-
-fn revokeCompletion(alloc: Allocator, store: anytype) !void {
-    // Pure sidecar codec/concurrency tests have no physical owner. Production
-    // wrappers always supply the store whose projections are being changed.
-    if (comptime @TypeOf(store) == @TypeOf(null)) return;
-    var runtime = try initRuntimeStore(alloc, store);
-    defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
-    errdefer txn.abort();
-    try @import("../artifact_projection_epoch.zig").revoke(&txn);
-    try txn.commit();
-}
-
-/// Live physical resets must revoke completion before touching their files,
-/// even when they do not otherwise replace an applied-sequence sidecar.
-pub fn invalidateProjectionCompletion(alloc: Allocator, store: anytype) !void {
-    try revokeCompletion(alloc, store);
-}
-
-fn saveAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
-    return saveAppliedSequencesCheckpointWithStorage(null, alloc, io, path, store, updates);
-}
-
-fn saveAppliedSequencesCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
-    var guard = try acquireCheckpointFileLock(path);
-    defer guard.release();
-
-    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
-        error.FileNotFound => CheckpointMap{},
-        else => return err,
-    };
-    defer checkpoint.deinit(alloc);
-
-    var revoke = false;
-    for (updates) |update| {
-        const previous = checkpoint.map.get(update.index_name);
-        try checkpoint.putMaxSequenceUpdate(alloc, update);
-        revoke = revoke or invalidatesCompletion(previous, checkpoint.map.get(update.index_name).?);
-    }
-    if (revoke) try revokeCompletion(alloc, store);
-    try writeCheckpointAtomicallyWithStorage(storage, alloc, io, path, &checkpoint);
-}
-
-fn saveProjectionCheckpoints(alloc: Allocator, io: std.Io, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
-    return saveProjectionCheckpointsWithStorage(null, alloc, io, path, updates);
-}
-
-fn saveProjectionCheckpointsWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, updates: []const AppliedSequenceUpdate) !void {
-    var guard = try acquireCheckpointFileLock(path);
-    defer guard.release();
-
-    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
-        error.FileNotFound => CheckpointMap{},
-        else => return err,
-    };
-    defer checkpoint.deinit(alloc);
-
-    for (updates) |update| {
-        try checkpoint.putMax(alloc, update.index_name, update.checkpoint());
-    }
-    try writeCheckpointAtomicallyWithStorage(storage, alloc, io, path, &checkpoint);
-}
-
-fn setAppliedSequencesCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
-    return setAppliedSequencesCheckpointWithStorage(null, alloc, io, path, store, updates);
-}
-
-fn setAppliedSequencesCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
-    var guard = try acquireCheckpointFileLock(path);
-    defer guard.release();
-
-    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
-        error.FileNotFound => CheckpointMap{},
-        else => return err,
-    };
-    defer checkpoint.deinit(alloc);
-
-    var revoke = false;
-    for (updates) |update| {
-        const previous = checkpoint.map.get(update.index_name);
-        try checkpoint.putSequenceUpdate(alloc, update);
-        revoke = revoke or invalidatesCompletion(previous, checkpoint.map.get(update.index_name).?);
-    }
-    if (revoke) try revokeCompletion(alloc, store);
-    try writeCheckpointAtomicallyWithStorage(storage, alloc, io, path, &checkpoint);
-}
-
-fn setProjectionCheckpoints(alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
-    return setProjectionCheckpointsWithStorage(null, alloc, io, path, store, updates);
-}
-
-fn setProjectionCheckpointsWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, store: anytype, updates: []const AppliedSequenceUpdate) !void {
-    var guard = try acquireCheckpointFileLock(path);
-    defer guard.release();
-
-    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
-        error.FileNotFound => CheckpointMap{},
-        else => return err,
-    };
-    defer checkpoint.deinit(alloc);
-
-    var revoke = false;
-    for (updates) |update| {
-        const previous = checkpoint.map.get(update.index_name);
-        try checkpoint.put(alloc, update.index_name, update.checkpoint());
-        revoke = revoke or invalidatesCompletion(previous, checkpoint.map.get(update.index_name).?);
-    }
-    if (revoke) try revokeCompletion(alloc, store);
-    try writeCheckpointAtomicallyWithStorage(storage, alloc, io, path, &checkpoint);
-}
-
-fn clearAppliedSequenceCheckpoint(alloc: Allocator, io: std.Io, path: []const u8, store: anytype, index_name: []const u8) !void {
-    return clearAppliedSequenceCheckpointWithStorage(null, alloc, io, path, store, index_name);
-}
-
-fn clearAppliedSequenceCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, store: anytype, index_name: []const u8) !void {
-    var guard = try acquireCheckpointFileLock(path);
-    defer guard.release();
-
-    // Revoke even when the sidecar is already missing. Absence cannot retain
-    // a completion prefix captured before a crash or interrupted replacement.
-    try revokeCompletion(alloc, store);
-    var checkpoint = loadCheckpointWithStorage(storage, alloc, io, path) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer checkpoint.deinit(alloc);
-
-    checkpoint.remove(alloc, index_name);
-    try writeCheckpointAtomicallyWithStorage(storage, alloc, io, path, &checkpoint);
-}
-
-fn loadCheckpoint(alloc: Allocator, io: std.Io, path: []const u8) !CheckpointMap {
-    return loadCheckpointWithStorage(null, alloc, io, path);
-}
-
-fn loadCheckpointWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8) !CheckpointMap {
-    const raw = if (storage) |files|
-        try files.readFileAlloc(alloc, path, checkpoint_max_bytes)
-    else if (comptime builtin.os.tag == .freestanding)
-        return error.UnsupportedPlatform
-    else
-        try std.Io.Dir.cwd().readFileAlloc(io, path, alloc, .limited(checkpoint_max_bytes));
-    defer alloc.free(raw);
-    return try decodeCheckpoint(alloc, raw);
-}
-
-fn decodeCheckpoint(alloc: Allocator, raw: []const u8) !CheckpointMap {
-    if (raw.len < checkpoint_magic.len + 8 + checkpoint_checksum_len) return error.InvalidDerivedApplyState;
-    const body = raw[0 .. raw.len - checkpoint_checksum_len];
-    const stored_checksum = std.mem.readInt(
-        u32,
-        raw[raw.len - checkpoint_checksum_len ..][0..checkpoint_checksum_len],
-        .little,
-    );
-    if (Crc32.hash(body) != stored_checksum) return error.InvalidDerivedApplyState;
-    if (!std.mem.eql(u8, body[0..checkpoint_magic.len], checkpoint_magic)) return error.InvalidDerivedApplyState;
-    var pos: usize = checkpoint_magic.len;
-    const format_version = try readCheckpointInt(body, &pos, u32);
-    if (format_version != projection_checkpoint_legacy_format_version and
-        format_version != projection_checkpoint_format_version)
-    {
-        return error.InvalidDerivedApplyState;
-    }
-    const count = try readCheckpointInt(body, &pos, u32);
-    const certificate_bytes: usize = if (format_version >= 3) @sizeOf(u8) + @sizeOf(u64) else 0;
-    const minimum_entry_bytes = @sizeOf(u32) + @sizeOf(u64) + @sizeOf(u8) + @sizeOf(u64) + @sizeOf(u64) +
-        certificate_bytes + 1;
-    if (count > (body.len - pos) / minimum_entry_bytes) return error.InvalidDerivedApplyState;
-
-    var checkpoint = CheckpointMap{};
-    errdefer checkpoint.deinit(alloc);
-    var i: u32 = 0;
-    while (i < count) : (i += 1) {
-        const name_len = try readCheckpointInt(body, &pos, u32);
-        const applied_sequence = try readCheckpointInt(body, &pos, u64);
-        const status_raw = try readCheckpointInt(body, &pos, u8);
-        const generation = try readCheckpointInt(body, &pos, u64);
-        const config_hash = try readCheckpointInt(body, &pos, u64);
-        const published_count: ?u64 = if (format_version >= 3) blk: {
-            const present = try readCheckpointInt(body, &pos, u8);
-            if (present > 1) return error.InvalidDerivedApplyState;
-            const value = try readCheckpointInt(body, &pos, u64);
-            break :blk if (present == 1) value else null;
-        } else null;
-        if (name_len == 0 or name_len > std.math.maxInt(u16)) return error.InvalidDerivedApplyState;
-        if (name_len > body.len - pos) return error.InvalidDerivedApplyState;
-        const name = body[pos .. pos + name_len];
-        pos += name_len;
-        if (checkpoint.map.contains(name)) return error.InvalidDerivedApplyState;
-        const status: ProjectionStatus = switch (status_raw) {
-            @backingInt(ProjectionStatus.clean) => .clean,
-            @backingInt(ProjectionStatus.rebuilding) => .rebuilding,
-            @backingInt(ProjectionStatus.degraded) => .degraded,
-            @backingInt(ProjectionStatus.repair_required) => .repair_required,
-            else => return error.InvalidDerivedApplyState,
-        };
-        try checkpoint.putMax(alloc, name, .{
-            .applied_sequence = applied_sequence,
-            .status = status,
-            .generation = generation,
-            .config_hash = config_hash,
-            .published_count = published_count,
-            .format_version = format_version,
-        });
-    }
-    if (pos != body.len) return error.InvalidDerivedApplyState;
-    return checkpoint;
-}
-
-fn readCheckpointInt(raw: []const u8, pos: *usize, comptime T: type) !T {
-    const size = @sizeOf(T);
-    if (pos.* + size > raw.len) return error.InvalidDerivedApplyState;
-    const out = std.mem.readInt(T, raw[pos.* .. pos.* + size][0..size], .little);
-    pos.* += size;
-    return out;
-}
-
-fn encodeCheckpoint(alloc: Allocator, checkpoint: *const CheckpointMap) ![]u8 {
-    if (checkpoint.map.count() > std.math.maxInt(u32)) return error.InvalidDerivedApplyState;
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    try out.appendSlice(alloc, checkpoint_magic);
-    try appendCheckpointInt(alloc, &out, u32, projection_checkpoint_format_version);
-    try appendCheckpointInt(alloc, &out, u32, @intCast(checkpoint.map.count()));
-
-    const names = try alloc.alloc([]const u8, checkpoint.map.count());
-    defer alloc.free(names);
-    var it = checkpoint.map.iterator();
-    var name_idx: usize = 0;
-    while (it.next()) |entry| : (name_idx += 1) names[name_idx] = entry.key_ptr.*;
-    std.mem.sort([]const u8, names, {}, struct {
-        fn lessThan(_: void, lhs: []const u8, rhs: []const u8) bool {
-            return std.mem.order(u8, lhs, rhs) == .lt;
-        }
-    }.lessThan);
-
-    for (names) |name| {
-        if (name.len == 0 or name.len > std.math.maxInt(u16)) return error.InvalidDerivedApplyState;
-        const value = checkpoint.map.get(name) orelse return error.InvalidDerivedApplyState;
-        try appendCheckpointInt(alloc, &out, u32, @intCast(name.len));
-        try appendCheckpointInt(alloc, &out, u64, value.applied_sequence);
-        try appendCheckpointInt(alloc, &out, u8, @backingInt(value.status));
-        try appendCheckpointInt(alloc, &out, u64, value.generation);
-        try appendCheckpointInt(alloc, &out, u64, value.config_hash);
-        try appendCheckpointInt(alloc, &out, u8, @intFromBool(value.published_count != null));
-        try appendCheckpointInt(alloc, &out, u64, value.published_count orelse 0);
-        try out.appendSlice(alloc, name);
-    }
-    try appendCheckpointInt(alloc, &out, u32, Crc32.hash(out.items));
-    if (out.items.len > checkpoint_max_bytes) return error.InvalidDerivedApplyState;
-    return try out.toOwnedSlice(alloc);
-}
-
-fn appendCheckpointInt(
-    alloc: Allocator,
-    out: *std.ArrayListUnmanaged(u8),
-    comptime T: type,
-    value: T,
-) !void {
-    var buf: [@sizeOf(T)]u8 = undefined;
-    std.mem.writeInt(T, &buf, value, .little);
-    try out.appendSlice(alloc, &buf);
-}
-
-fn writeCheckpointAtomically(alloc: Allocator, io: std.Io, path: []const u8, checkpoint: *const CheckpointMap) !void {
-    return writeCheckpointAtomicallyWithStorage(null, alloc, io, path, checkpoint);
-}
-
-fn writeCheckpointAtomicallyWithStorage(storage: ?Storage, alloc: Allocator, io: std.Io, path: []const u8, checkpoint: *const CheckpointMap) !void {
-    const encoded = try encodeCheckpoint(alloc, checkpoint);
-    defer alloc.free(encoded);
-
-    if (storage) |files| {
-        if (std.fs.path.dirname(path)) |parent| try files.createDirPath(parent);
-        const staging = try std.fmt.allocPrint(alloc, "{s}.tmp", .{path});
-        defer alloc.free(staging);
-        try files.writeFileAbsolute(staging, encoded);
-        errdefer files.deleteFileAbsolute(staging) catch {};
-        try files.syncFileContentsAbsolute(staging);
-        try files.renameAbsolute(staging, path);
-        try files.syncParentAbsolute(path);
-        return;
-    }
-    if (std.fs.path.dirname(path)) |parent| {
-        try fs_paths.createDirPathPortable(io, parent);
-    }
-
-    const tmp_path = try std.fmt.allocPrint(alloc, "{s}.tmp-{d}", .{ path, platform_time.monotonicNs() });
-    defer alloc.free(tmp_path);
-
-    {
-        var file = try fs_paths.createFilePortable(io, tmp_path, .{ .truncate = true });
-        defer file.close(io);
-        var buf: [4096]u8 = undefined;
-        var writer = file.writer(io, &buf);
-        try writer.interface.writeAll(encoded);
-        try writer.end();
-        try file.sync(io);
-    }
-    std.Io.Dir.rename(std.Io.Dir.cwd(), tmp_path, std.Io.Dir.cwd(), path, io) catch |err| {
-        std.Io.Dir.cwd().deleteFile(io, tmp_path) catch {};
-        return err;
-    };
-    try fs_paths.syncDirPortable(io, std.fs.path.dirname(path) orelse ".");
-}
-
-test "projection metadata preserves lifecycle without a sidecar (#1207)" {
-    const alloc = std.testing.allocator;
-    var backend = mem_backend.Backend.init(alloc, .{});
+test "contributeProgress writes exactly one commit for a batch of consumers" {
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
     defer backend.close();
-    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
     defer runtime.deinit();
-    // Old files still expose progress without inventing a recovery identity.
-    try saveAppliedSequence(runtime, "text", 7);
-    const legacy = try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text");
-    try std.testing.expectEqual(@as(u64, 7), legacy.applied_sequence);
-    try std.testing.expectEqual(@as(u64, 0), legacy.config_hash);
-    const expected = ProjectionCheckpoint{ .applied_sequence = 8, .status = .degraded, .generation = 3, .config_hash = 42, .published_count = 0 };
-    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text", expected);
-    try std.testing.expectEqualDeep(expected, try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text"));
-    try std.testing.expectEqual(@as(u64, 8), try loadAppliedSequence(alloc, runtime, "text"));
-    // Ordinary replay preserves lifecycle and expires a count certificate when
-    // its physical boundary advances. A stale max update cannot move it back.
-    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, runtime, null, &.{.{ .index_name = "text", .sequence = 9 }});
-    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, runtime, null, &.{.{ .index_name = "text", .sequence = 8, .published_count = 99 }});
-    var advanced = expected;
-    advanced.applied_sequence = 9;
-    advanced.published_count = null;
-    try std.testing.expectEqualDeep(advanced, try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text"));
-    try saveAppliedSequence(runtime, "text", 10);
-    advanced.applied_sequence = 10;
-    try std.testing.expectEqualDeep(advanced, try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text"));
-    // Explicit replacement admits a clean new incarnation, even at zero.
-    const replacement = ProjectionCheckpoint{ .generation = 4, .config_hash = 43, .published_count = 0 };
-    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text", replacement);
-    try std.testing.expectEqualDeep(replacement, try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text"));
-    {
-        var txn = try runtime.beginWrite();
-        defer txn.abort();
-        try clearAppliedSequenceTxn(&txn, "text");
-    }
-    try std.testing.expectEqualDeep(replacement, try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text"));
-    try clearAppliedSequence(runtime, "text");
-    try std.testing.expectEqualDeep(ProjectionCheckpoint{}, try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, null, "text"));
+
+    resetProgressCommitCountForTest();
+    try contributeProgress(std.testing.allocator, runtime, &.{
+        .{ .consumer = "text", .sequence = 5, .generation = 2, .config_hash = 9, .lsm_wal_checkpointed_through = 5 },
+        .{ .consumer = "dense_idx", .sequence = 7, .status = .rebuilding },
+    }, &.{});
+    try std.testing.expectEqual(@as(u64, 1), progressCommitCount());
+
+    const text = (try loadProgress(std.testing.allocator, runtime, "text")).?;
+    try std.testing.expectEqual(@as(u64, 5), text.applied_sequence);
+    try std.testing.expectEqual(@as(u64, 2), text.generation);
+    try std.testing.expectEqual(@as(u64, 9), text.config_hash);
+    try std.testing.expectEqual(@as(u64, 5), text.lsm_wal_checkpointed_through);
+    try std.testing.expectEqual(ProjectionStatus.clean, text.status);
+
+    const dense = (try loadProgress(std.testing.allocator, runtime, "dense_idx")).?;
+    try std.testing.expectEqual(@as(u64, 7), dense.applied_sequence);
+    try std.testing.expectEqual(ProjectionStatus.rebuilding, dense.status);
+    try std.testing.expectEqual(@as(u64, 0), dense.lsm_wal_checkpointed_through);
+
+    try std.testing.expect((try loadProgress(std.testing.allocator, runtime, "missing")) == null);
+
+    // A second publication is a second commit, not a third write merged with
+    // the first: the counter is per-call, not per-consumer.
+    try contributeProgress(std.testing.allocator, runtime, &.{
+        .{ .consumer = "text", .sequence = 6 },
+    }, &.{});
+    try std.testing.expectEqual(@as(u64, 2), progressCommitCount());
 }
 
-test "projection metadata rejects stale identity after legacy scalar changes (#1207)" {
-    const a = std.testing.allocator;
-    var backend = mem_backend.Backend.init(a, .{});
+test "contributeProgress piggybacks status writes into the same commit" {
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
     defer backend.close();
-    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
     defer runtime.deinit();
-    const certified = ProjectionCheckpoint{ .applied_sequence = 100, .generation = 2, .config_hash = 42, .published_count = 1 };
-    for ([_]?u64{ 101, 99, null }) |legacy_sequence| {
-        try saveProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text", certified);
-        try std.testing.expectEqualDeep(certified, try loadProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text"));
-        // Model an older binary advancing, rewinding, or clearing only the
-        // legacy key, without knowledge of the enriched record.
-        {
-            var txn = try runtime.beginWrite();
-            errdefer txn.abort();
-            if (legacy_sequence) |sequence| {
-                var raw: [8]u8 = undefined;
-                std.mem.writeInt(u64, &raw, sequence, .little);
-                try txn.put(metadata_prefix ++ "text", &raw);
-            } else {
-                try txn.delete(metadata_prefix ++ "text");
-            }
-            try txn.commit();
-        }
-        const observed = try loadProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text");
-        try std.testing.expectEqualDeep(ProjectionCheckpoint{ .applied_sequence = legacy_sequence orelse 0 }, observed);
-        // A new scalar-only write must not resurrect the rejected identity by
-        // returning to the sequence still stored in the old enriched record.
-        try saveAppliedSequence(runtime, "text", 100);
-        try std.testing.expectEqualDeep(ProjectionCheckpoint{ .applied_sequence = 100 }, try loadProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text"));
-    }
-    // Max replay updates also start from legacy progress and cannot restore
-    // a stale certificate or rewind a more recent scalar watermark.
-    try saveProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text", certified);
-    {
-        var txn = try runtime.beginWrite();
-        errdefer txn.abort();
-        var raw: [8]u8 = undefined;
-        std.mem.writeInt(u64, &raw, 101, .little);
-        try txn.put(metadata_prefix ++ "text", &raw);
-        try txn.commit();
-    }
-    try saveAppliedSequencesWithCheckpoint(a, std.testing.io, runtime, null, &.{.{ .index_name = "text", .sequence = 99, .generation = 2, .config_hash = 42, .published_count = 1 }});
-    try std.testing.expectEqual(@as(u64, 101), try loadAppliedSequence(a, runtime, "text"));
-    try std.testing.expectEqualDeep(ProjectionCheckpoint{ .applied_sequence = 101 }, try loadProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text"));
+
+    resetProgressCommitCountForTest();
+    try contributeProgress(std.testing.allocator, runtime, &.{
+        .{ .consumer = "text", .sequence = 1 },
+    }, &.{
+        .{ .key = "\x00\x00__metadata__:index_status:text", .value = "fake-status-bytes-000001" },
+    });
+    try std.testing.expectEqual(@as(u64, 1), progressCommitCount());
+
+    var txn = try runtime.beginProbe();
+    defer txn.abort();
+    try std.testing.expectEqualStrings("fake-status-bytes-000001", try txn.get("\x00\x00__metadata__:index_status:text"));
 }
 
-test "max replay updates preserve newer projection identity (#1207)" {
-    const a = std.testing.allocator;
-    // The same merge implements primary metadata and sidecar updates. A stale
-    // update must retain a certified identity and must not invent a missing one.
-    for ([_]ProjectionCheckpoint{
-        .{ .applied_sequence = 101 },
-        .{ .applied_sequence = 101, .generation = 2, .config_hash = 42, .published_count = 3 },
-        .{ .applied_sequence = 101, .status = .degraded, .generation = 2, .config_hash = 42 },
-    }) |previous| {
-        var checkpoints = CheckpointMap{};
-        defer checkpoints.deinit(a);
-        try checkpoints.put(a, "text", previous);
-        try checkpoints.putMaxSequenceUpdate(a, .{ .index_name = "text", .sequence = 99, .generation = 7, .config_hash = 77, .published_count = 9 });
-        try std.testing.expectEqualDeep(previous, checkpoints.map.get("text").?);
-        // Once an update reaches a new cut, its own identity/count proof can
-        // be published. No older certificate is rebound to that new sequence.
-        try checkpoints.putMaxSequenceUpdate(a, .{ .index_name = "text", .sequence = 102, .generation = 3, .config_hash = 43, .published_count = 4 });
-        try std.testing.expectEqualDeep(ProjectionCheckpoint{ .applied_sequence = 102, .status = previous.status, .generation = 3, .config_hash = 43, .published_count = 4 }, checkpoints.map.get("text").?);
-        // Explicit sequence replacement remains authoritative at an older cut.
-        try checkpoints.putSequenceUpdate(a, .{ .index_name = "text", .sequence = 99, .generation = 4, .config_hash = 44, .published_count = 2 });
-        try std.testing.expectEqualDeep(ProjectionCheckpoint{ .applied_sequence = 99, .status = previous.status, .generation = 4, .config_hash = 44, .published_count = 2 }, checkpoints.map.get("text").?);
-    }
+test "progress v2 record rejects corruption" {
+    var encoded = encodeProgressRecord(.{ .applied_sequence = 9 });
+    encoded[progress_magic_v2.len] ^= 1;
+    try std.testing.expectError(error.InvalidDerivedApplyState, decodeProgressRecord(&encoded));
 }
 
-test "projection metadata replacement recovers corrupt records and revokes proof (#1207)" {
-    const a = std.testing.allocator;
-    const publication = @import("../artifact_publication.zig");
-    const epoch = @import("../artifact_projection_epoch.zig");
-    var backend = mem_backend.Backend.init(a, .{});
+test "contributeProgress never leaves progress ahead of what actually committed" {
+    // Proxy for "crash between effects and progress": fail the progress
+    // commit itself partway through a multi-consumer batch, after a real
+    // effects boundary is already durable, and confirm recovery (a fresh
+    // read) still reports only the last value that actually committed —
+    // never a partially-applied one from the failed attempt. This is what
+    // the callers in db.zig rely on: `contributeProgress`/`applyProgressUpdates`
+    // are always called strictly after the physical effects, so a crash here
+    // can only leave progress behind those effects, never ahead of them, and
+    // a failed batch can never advance only some of its consumers.
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
     defer backend.close();
-    var runtime = try backend.runtimeStore(a, .{ .name = "docs" });
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
     defer runtime.deinit();
-    {
-        var txn = try runtime.beginWrite();
-        errdefer txn.abort();
-        try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
-        try txn.commit();
-    }
-    const certified = ProjectionCheckpoint{ .applied_sequence = 100, .generation = 2, .config_hash = 42, .published_count = 1 };
-    const replacement = ProjectionCheckpoint{ .generation = 3, .config_hash = 42, .published_count = 0 };
-    for ([_]enum { enriched, scalar, both }{ .enriched, .scalar, .both }) |corrupt| {
-        try saveProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text", certified);
-        const prior_epoch = blk: {
-            var txn = try runtime.beginWrite();
-            errdefer txn.abort();
-            if (corrupt != .scalar) try txn.put(projection_metadata_prefix ++ "text", "corrupt");
-            if (corrupt != .enriched) try txn.put(metadata_prefix ++ "text", "corrupt");
-            const previous_epoch = try epoch.load(&txn);
-            try txn.commit();
-            break :blk previous_epoch;
-        };
-        // Ordinary observations and replay remain fail-closed. Only explicit
-        // replacement is authorized to overwrite the damaged recovery proof.
-        try std.testing.expectError(error.InvalidDerivedApplyState, loadProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text"));
-        try std.testing.expectError(error.InvalidDerivedApplyState, saveAppliedSequencesWithCheckpoint(a, std.testing.io, runtime, null, &.{.{ .index_name = "text", .sequence = 101 }}));
-        try saveProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text", replacement);
-        try std.testing.expectEqualDeep(replacement, try loadProjectionCheckpointWithSidecar(a, std.testing.io, runtime, null, "text"));
-        try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(a, runtime, "text"));
-        var txn = try runtime.beginProbe();
-        defer txn.abort();
-        try std.testing.expect((try epoch.load(&txn)) > prior_epoch);
-    }
-}
 
-test "projection metadata rejects corrupt recovery identities (#1207)" {
-    var encoded = encodeProjectionMetadata(.{ .applied_sequence = 9, .generation = 3, .config_hash = 42 });
-    try std.testing.expectError(error.InvalidDerivedApplyState, decodeProjectionMetadata(encoded[0..8]));
-    encoded[17] ^= 1;
-    try std.testing.expectError(error.InvalidDerivedApplyState, decodeProjectionMetadata(&encoded));
+    // The durable boundary "effects" reached: sequence 5.
+    try contributeProgress(std.testing.allocator, runtime, &.{.{ .consumer = "text", .sequence = 5 }}, &.{});
+    try std.testing.expectEqual(@as(u64, 5), (try loadProgress(std.testing.allocator, runtime, "text")).?.applied_sequence);
+
+    // A later attempt batches "text" advancing to 10 together with a second
+    // consumer whose name cannot fit the fixed key buffer, failing the
+    // whole transaction deterministically (one txn, one commit: a failure
+    // encoding any member's key must not leave an earlier member's write
+    // behind).
+    var long_name_buf: [300]u8 = @splat('x');
+    try std.testing.expectError(error.NoSpaceLeft, contributeProgress(std.testing.allocator, runtime, &.{
+        .{ .consumer = "text", .sequence = 10 },
+        .{ .consumer = &long_name_buf, .sequence = 1 },
+    }, &.{}));
+    // Never ahead of the last real commit: the failed batch's "text" update
+    // never landed even though, taken alone, it would have succeeded.
+    try std.testing.expectEqual(@as(u64, 5), (try loadProgress(std.testing.allocator, runtime, "text")).?.applied_sequence);
+
+    // Once allowed to run to completion, the real advance is visible.
+    try contributeProgress(std.testing.allocator, runtime, &.{.{ .consumer = "text", .sequence = 10 }}, &.{});
+    try std.testing.expectEqual(@as(u64, 10), (try loadProgress(std.testing.allocator, runtime, "text")).?.applied_sequence);
 }
 
 test "derived apply state works with memory backend store" {
@@ -1550,6 +857,53 @@ test "derived apply state works with lsm backend store" {
     try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(std.testing.allocator, runtime, "idx"));
     try saveAppliedSequence(runtime, "idx", 31);
     try std.testing.expectEqual(@as(u64, 31), try loadAppliedSequence(std.testing.allocator, runtime, "idx"));
+}
+
+test "contributeProgressDeferred writes the same durable record as contributeProgress" {
+    // contributeProgressDeferred exists as the one call site a future
+    // fsync-eliding mechanism (WS2's stageRideAlong, or a new WAL-sync
+    // signal; see the doc comment above) can take over without touching
+    // every background caller again. It is NOT currently cheaper in terms
+    // of fsyncs -- see that comment for why repurposing the existing
+    // `defer_commit_flush` flag to also skip WAL fsync is unsafe (it would
+    // regress durability for every other caller of that flag: TTL cleanup,
+    // bulk ingest, hbc_adapter). What it must still get right today is
+    // ordinary correctness: a durable, independently readable record, one
+    // commit per call, identical in shape to contributeProgress's.
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    resetProgressCommitCountForTest();
+    const background_passes = 5;
+    for (0..background_passes) |i| {
+        try contributeProgressDeferred(std.testing.allocator, runtime, &.{
+            .{ .consumer = "bg_index", .sequence = i + 1 },
+        }, &.{});
+    }
+    try std.testing.expectEqual(@as(u64, background_passes), progressCommitCount());
+    try std.testing.expectEqual(
+        @as(u64, background_passes),
+        (try loadProgress(std.testing.allocator, runtime, "bg_index")).?.applied_sequence,
+    );
+
+    try contributeProgress(std.testing.allocator, runtime, &.{
+        .{ .consumer = "fg_index", .sequence = 1 },
+    }, &.{});
+    try std.testing.expectEqual(@as(u64, background_passes + 1), progressCommitCount());
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        (try loadProgress(std.testing.allocator, runtime, "fg_index")).?.applied_sequence,
+    );
+    // Deferred or not, both consumers' records survive and are independently
+    // readable -- a crashed/lost deferred commit is a correctness concern
+    // for the caller's replay bookkeeping (see contributeProgressDeferred's
+    // doc comment), never for what actually got written here.
+    try std.testing.expectEqual(
+        @as(u64, background_passes),
+        (try loadProgress(std.testing.allocator, runtime, "bg_index")).?.applied_sequence,
+    );
 }
 
 test "partial replay cursor round-trips per index and is independent of applied progress" {
@@ -1578,21 +932,7 @@ test "partial replay cursor round-trips per index and is independent of applied 
     try std.testing.expectEqual(@as(?PartialReplayCursor, null), try loadPartialReplayCursor(std.testing.allocator, runtime, "other"));
 }
 
-test "derived apply state lsm point load does not clone mutable snapshot" {
-    var backend = lsm_backend.Backend.init(std.testing.allocator, .{ .flush_threshold = 1024 });
-    defer backend.close();
-
-    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
-    defer runtime.deinit();
-
-    try saveAppliedSequence(runtime, "idx", 41);
-    const before = backend.snapshotMaintenanceStats();
-    try std.testing.expectEqual(@as(u64, 41), try loadAppliedSequence(std.testing.allocator, runtime, "idx"));
-    const after = backend.snapshotMaintenanceStats();
-    try std.testing.expectEqual(before.mutable_snapshot_clone_calls, after.mutable_snapshot_clone_calls);
-}
-
-test "derived apply state keeps latest lsm value across many flushed overwrites" {
+test "derived apply state keeps latest lsm value across many overwrites, including after reopen" {
     // Preserve leak checks; allocation backtraces are opt-in for diagnostics.
     var allocator_state: std.heap.SafeAllocator = .init(std.heap.page_allocator, .{ .stack_trace_frames = 0 });
     defer std.debug.assert(allocator_state.deinit() == 0);
@@ -1623,11 +963,6 @@ test "derived apply state keeps latest lsm value across many flushed overwrites"
             try saveAppliedSequence(runtime, "idx", sequence);
         }
         try std.testing.expectEqual(@as(u64, 1024), try loadAppliedSequence(alloc, runtime, "idx"));
-        const work = backend.snapshotWriteStats();
-        try std.testing.expectEqual(@as(u64, 1025), work.flushes);
-        try std.testing.expect(work.manifest_writes <= 2 * work.flushes);
-        if (@import("antfly_platform").env.getenvBool("ANTFLY_TEST_WORK_PROFILE"))
-            std.debug.print("\nWORK flushed-overwrites flushes={d} compactions={d} manifests={d}\n", .{ work.flushes, work.compactions, work.manifest_writes });
     }
 
     {
@@ -1659,97 +994,14 @@ test "derived apply state clear removes persisted sequence" {
     try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(std.testing.allocator, runtime, "idx"));
 }
 
-test "derived apply checkpoint is authoritative when configured" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const db_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const checkpoint_path = try checkpointPathAlloc(alloc, db_path);
-    defer alloc.free(checkpoint_path);
-
-    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 2 });
+test "projection checkpoint persists status and identity fields, and an explicit replacement resets them" {
+    var backend = lsm_backend.Backend.init(std.testing.allocator, .{ .flush_threshold = 2 });
     defer backend.close();
-    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
     defer runtime.deinit();
 
-    try saveAppliedSequence(runtime, "legacy_idx", 7);
-    try std.testing.expectEqual(
-        @as(u64, 0),
-        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "legacy_idx"),
-    );
-    try std.testing.expectEqual(
-        @as(u64, 7),
-        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, null, "legacy_idx"),
-    );
-
-    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, &[_]AppliedSequenceUpdate{
-        .{ .index_name = "dense_idx", .sequence = 10 },
-        .{ .index_name = "sparse_idx", .sequence = 3 },
-    });
-    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, &[_]AppliedSequenceUpdate{
-        .{ .index_name = "dense_idx", .sequence = 12 },
-        .{ .index_name = "sparse_idx", .sequence = 2 },
-    });
-
-    try std.testing.expectEqual(
-        @as(u64, 12),
-        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
-    );
-    try std.testing.expectEqual(
-        @as(u64, 3),
-        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "sparse_idx"),
-    );
-    try std.testing.expectEqual(
-        @as(u64, 0),
-        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "legacy_idx"),
-    );
-}
-
-test "derived apply checkpoint clear removes sidecar entry" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const db_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const checkpoint_path = try checkpointPathAlloc(alloc, db_path);
-    defer alloc.free(checkpoint_path);
-
-    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 2 });
-    defer backend.close();
-    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
-    defer runtime.deinit();
-
-    try saveAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx", 22);
-    try std.testing.expectEqual(
-        @as(u64, 22),
-        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
-    );
-    try clearAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx");
-    try std.testing.expectEqual(
-        @as(u64, 0),
-        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
-    );
-}
-
-test "projection checkpoint sidecar persists status and identity fields" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const db_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const checkpoint_path = try checkpointPathAlloc(alloc, db_path);
-    defer alloc.free(checkpoint_path);
-
-    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 2 });
-    defer backend.close();
-    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
-    defer runtime.deinit();
-
-    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx", .{
+    try saveProjectionCheckpoint(runtime, "dense_idx", .{
         .applied_sequence = 44,
         .status = .degraded,
         .generation = 9,
@@ -1757,352 +1009,167 @@ test "projection checkpoint sidecar persists status and identity fields" {
         .published_count = 37,
     });
 
-    const checkpoint = try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx");
+    const checkpoint = try loadProjectionCheckpoint(std.testing.allocator, runtime, "dense_idx");
     try std.testing.expectEqual(@as(u64, 44), checkpoint.applied_sequence);
     try std.testing.expectEqual(ProjectionStatus.degraded, checkpoint.status);
     try std.testing.expectEqual(@as(u64, 9), checkpoint.generation);
     try std.testing.expectEqual(@as(u64, 0x1234), checkpoint.config_hash);
     try std.testing.expectEqual(@as(?u64, 37), checkpoint.published_count);
-    try std.testing.expectEqual(
-        @as(u64, 44),
-        try loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
-    );
+    try std.testing.expectEqual(@as(u64, 44), try loadAppliedSequence(std.testing.allocator, runtime, "dense_idx"));
+
+    // Ordinary replay preserves lifecycle and expires a count certificate
+    // when its physical boundary advances. A stale max update cannot move
+    // it back.
+    try saveAppliedSequences(runtime, &.{.{ .index_name = "dense_idx", .sequence = 45 }});
+    try saveAppliedSequences(runtime, &.{.{ .index_name = "dense_idx", .sequence = 44, .published_count = 99 }});
+    var advanced = checkpoint;
+    advanced.applied_sequence = 45;
+    advanced.published_count = null;
+    try std.testing.expectEqualDeep(advanced, try loadProjectionCheckpoint(std.testing.allocator, runtime, "dense_idx"));
+    try saveAppliedSequence(runtime, "dense_idx", 46);
+    advanced.applied_sequence = 46;
+    try std.testing.expectEqualDeep(advanced, try loadProjectionCheckpoint(std.testing.allocator, runtime, "dense_idx"));
+
+    // Explicit replacement admits a clean new incarnation, even at zero.
+    const replacement = ProjectionCheckpoint{ .generation = 4, .config_hash = 43, .published_count = 0 };
+    try saveProjectionCheckpoint(runtime, "dense_idx", replacement);
+    try std.testing.expectEqualDeep(replacement, try loadProjectionCheckpoint(std.testing.allocator, runtime, "dense_idx"));
+
+    try clearAppliedSequence(runtime, "dense_idx");
+    try std.testing.expectEqualDeep(ProjectionCheckpoint{}, try loadProjectionCheckpoint(std.testing.allocator, runtime, "dense_idx"));
 }
 
-test "projection checkpoint reads v2 without inventing a publication certificate" {
-    const alloc = std.testing.allocator;
-    const name = "dense_idx";
-    var encoded = std.ArrayListUnmanaged(u8).empty;
-    defer encoded.deinit(alloc);
-    try encoded.appendSlice(alloc, checkpoint_magic);
-    try appendCheckpointInt(alloc, &encoded, u32, projection_checkpoint_legacy_format_version);
-    try appendCheckpointInt(alloc, &encoded, u32, 1);
-    try appendCheckpointInt(alloc, &encoded, u32, name.len);
-    try appendCheckpointInt(alloc, &encoded, u64, 44);
-    try appendCheckpointInt(alloc, &encoded, u8, @backingInt(ProjectionStatus.clean));
-    try appendCheckpointInt(alloc, &encoded, u64, 9);
-    try appendCheckpointInt(alloc, &encoded, u64, 0x1234);
-    try encoded.appendSlice(alloc, name);
-    try appendCheckpointInt(alloc, &encoded, u32, Crc32.hash(encoded.items));
-
-    var checkpoint = try decodeCheckpoint(alloc, encoded.items);
-    defer checkpoint.deinit(alloc);
-    const value = checkpoint.map.get(name) orelse return error.TestUnexpectedResult;
-    try std.testing.expectEqual(@as(u64, 44), value.applied_sequence);
-    try std.testing.expectEqual(ProjectionStatus.clean, value.status);
-    try std.testing.expectEqual(@as(u64, 9), value.generation);
-    try std.testing.expectEqual(@as(u64, 0x1234), value.config_hash);
-    try std.testing.expectEqual(@as(?u64, null), value.published_count);
-    try std.testing.expectEqual(projection_checkpoint_legacy_format_version, value.format_version);
-}
-
-test "projection checkpoint rejects plausible cursor corruption" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const db_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const checkpoint_path = try checkpointPathAlloc(alloc, db_path);
-    defer alloc.free(checkpoint_path);
-
-    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 2 });
+test "max replay updates preserve newer projection identity and set updates are exact" {
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
     defer backend.close();
-    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
     defer runtime.deinit();
 
-    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx", .{
-        .applied_sequence = 44,
-        .status = .clean,
-        .generation = 9,
-        .config_hash = 0x1234,
-    });
+    const certified: ProjectionCheckpoint = .{ .applied_sequence = 101, .generation = 2, .config_hash = 42, .published_count = 3 };
+    try saveProjectionCheckpoint(runtime, "text", certified);
 
-    var io_impl = std.Io.Threaded.init(alloc, .{});
-    defer io_impl.deinit();
-    const raw = try std.Io.Dir.cwd().readFileAlloc(
-        io_impl.io(),
-        checkpoint_path,
-        alloc,
-        .limited(checkpoint_max_bytes),
-    );
-    defer alloc.free(raw);
-    const applied_sequence_offset = checkpoint_magic.len + @sizeOf(u32) + @sizeOf(u32) + @sizeOf(u32);
-    raw[applied_sequence_offset] ^= 0x40;
-    try writeRawCheckpointTestFile(std.testing.io, checkpoint_path, raw);
+    // A stale max update cannot certify identity or counts for a prefix it
+    // has not reached.
+    try saveAppliedSequences(runtime, &.{.{ .index_name = "text", .sequence = 99, .generation = 7, .config_hash = 77, .published_count = 9 }});
+    try std.testing.expectEqualDeep(certified, try loadProjectionCheckpoint(std.testing.allocator, runtime, "text"));
 
-    try std.testing.expectError(
-        error.InvalidDerivedApplyState,
-        loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
-    );
-    try std.testing.expectError(
-        error.InvalidDerivedApplyState,
-        loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
-    );
-    try std.testing.expectError(
-        error.InvalidDerivedApplyState,
-        setProjectionCheckpoints(alloc, std.testing.io, checkpoint_path, null, &.{.{
-            .index_name = "other_idx",
-            .sequence = 99,
-        }}),
-    );
-    const after_failed_update = try std.Io.Dir.cwd().readFileAlloc(
-        io_impl.io(),
-        checkpoint_path,
-        alloc,
-        .limited(checkpoint_max_bytes),
-    );
-    defer alloc.free(after_failed_update);
-    try std.testing.expectEqualSlices(u8, raw, after_failed_update);
+    // Once an update reaches a new cut, its own identity/count proof is
+    // published, and no older certificate is rebound to that newer cursor.
+    try saveAppliedSequences(runtime, &.{.{ .index_name = "text", .sequence = 102, .generation = 3, .config_hash = 43, .published_count = 4 }});
+    try std.testing.expectEqualDeep(ProjectionCheckpoint{ .applied_sequence = 102, .generation = 3, .config_hash = 43, .published_count = 4 }, try loadProjectionCheckpoint(std.testing.allocator, runtime, "text"));
+
+    // Explicit sequence replacement (set mode) remains authoritative at an
+    // older cut.
+    try saveAppliedSequenceUpdate(runtime, .{ .index_name = "text", .sequence = 99, .generation = 4, .config_hash = 44, .published_count = 2 });
+    try std.testing.expectEqualDeep(ProjectionCheckpoint{ .applied_sequence = 99, .generation = 4, .config_hash = 44, .published_count = 2 }, try loadProjectionCheckpoint(std.testing.allocator, runtime, "text"));
 }
 
-test "projection checkpoint encoding is deterministic by index name" {
-    const alloc = std.testing.allocator;
-    var left = CheckpointMap{};
-    defer left.deinit(alloc);
-    try left.put(alloc, "zeta", .{ .applied_sequence = 3 });
-    try left.put(alloc, "alpha", .{ .applied_sequence = 7 });
-
-    var right = CheckpointMap{};
-    defer right.deinit(alloc);
-    try right.put(alloc, "alpha", .{ .applied_sequence = 7 });
-    try right.put(alloc, "zeta", .{ .applied_sequence = 3 });
-
-    const left_encoded = try encodeCheckpoint(alloc, &left);
-    defer alloc.free(left_encoded);
-    const right_encoded = try encodeCheckpoint(alloc, &right);
-    defer alloc.free(right_encoded);
-    try std.testing.expectEqualSlices(u8, left_encoded, right_encoded);
-}
-
-test "applied sequence checkpoint preserves projection metadata" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const db_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const checkpoint_path = try checkpointPathAlloc(alloc, db_path);
-    defer alloc.free(checkpoint_path);
-
-    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 2 });
+test "projection checkpoint replacement revokes serving-certificate completion" {
+    const publication = @import("../artifact_publication.zig");
+    const epoch = @import("../artifact_projection_epoch.zig");
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
     defer backend.close();
-    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
     defer runtime.deinit();
-
-    try saveProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx", .{
-        .applied_sequence = 44,
-        .status = .repair_required,
-        .generation = 9,
-        .config_hash = 0x1234,
-        .published_count = 37,
-    });
-    try saveAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx", 45);
-    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, &[_]AppliedSequenceUpdate{.{
-        .index_name = "dense_idx",
-        .sequence = 40,
-        .generation = 10,
-        .config_hash = 0x5678,
-    }});
-
-    const checkpoint = try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx");
-    try std.testing.expectEqual(@as(u64, 45), checkpoint.applied_sequence);
-    try std.testing.expectEqual(ProjectionStatus.repair_required, checkpoint.status);
-    try std.testing.expectEqual(@as(u64, 9), checkpoint.generation);
-    try std.testing.expectEqual(@as(u64, 0x1234), checkpoint.config_hash);
-    try std.testing.expectEqual(@as(?u64, null), checkpoint.published_count);
-
-    // Stale replay cannot relabel the retained cut, but an update that reaches
-    // a newer boundary may publish its own generation/configuration identity.
-    try saveAppliedSequencesWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, &.{.{
-        .index_name = "dense_idx",
-        .sequence = 46,
-        .generation = 10,
-        .config_hash = 0x5678,
-    }});
-    const advanced = try loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx");
-    try std.testing.expectEqual(@as(u64, 46), advanced.applied_sequence);
-    try std.testing.expectEqual(ProjectionStatus.repair_required, advanced.status);
-    try std.testing.expectEqual(@as(u64, 10), advanced.generation);
-    try std.testing.expectEqual(@as(u64, 0x5678), advanced.config_hash);
-    try std.testing.expectEqual(@as(?u64, null), advanced.published_count);
-}
-
-fn writeRawCheckpointTestFile(io: std.Io, path: []const u8, raw: []const u8) !void {
-    if (std.fs.path.dirname(path)) |parent| {
-        try fs_paths.createDirPathPortable(io, parent);
+    {
+        var txn = try runtime.beginWrite();
+        errdefer txn.abort();
+        try publication.stageAuthority(&txn, .{ .mode = .activate, .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) });
+        try txn.commit();
     }
-    var file = try fs_paths.createFilePortable(io, path, .{ .truncate = true });
-    defer file.close(io);
-    var buf: [4096]u8 = undefined;
-    var writer = file.writer(io, &buf);
-    try writer.interface.writeAll(raw);
-    try writer.end();
-}
-
-test "projection checkpoint rejects unknown checkpoint format" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const db_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const checkpoint_path = try checkpointPathAlloc(alloc, db_path);
-    defer alloc.free(checkpoint_path);
-
-    var raw = std.ArrayListUnmanaged(u8).empty;
-    defer raw.deinit(alloc);
-    try raw.appendSlice(alloc, "AFBAD001");
-    try appendCheckpointInt(alloc, &raw, u32, 1);
-    try appendCheckpointInt(alloc, &raw, u32, @intCast("dense_idx".len));
-    try appendCheckpointInt(alloc, &raw, u64, 77);
-    try raw.appendSlice(alloc, "dense_idx");
-    try writeRawCheckpointTestFile(std.testing.io, checkpoint_path, raw.items);
-
-    var backend = lsm_backend.Backend.init(alloc, .{ .flush_threshold = 2 });
-    defer backend.close();
-    var runtime = try backend.runtimeStore(alloc, .{ .name = "docs" });
-    defer runtime.deinit();
-
-    try std.testing.expectError(
-        error.InvalidDerivedApplyState,
-        loadProjectionCheckpointWithSidecar(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
-    );
-    try std.testing.expectError(
-        error.InvalidDerivedApplyState,
-        loadAppliedSequenceWithCheckpoint(alloc, std.testing.io, runtime, checkpoint_path, "dense_idx"),
-    );
-}
-
-test "derived apply checkpoint write locks are scoped per checkpoint path" {
-    var guard_a = try acquireCheckpointFileLock(".zig-cache/tmp/derived-apply-a.checkpoint");
-    defer guard_a.release();
-
-    var guard_b = try acquireCheckpointFileLock(".zig-cache/tmp/derived-apply-b.checkpoint");
-    defer guard_b.release();
-
-    try std.testing.expect(guard_a.lock != guard_b.lock);
-}
-
-test "derived apply checkpoint serializes concurrent sidecar writers" {
-    const alloc = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const db_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
-    const checkpoint_path = try checkpointPathAlloc(alloc, db_path);
-    defer alloc.free(checkpoint_path);
-
-    const worker_count = 6;
-    const Barrier = struct {
-        mutex: std.atomic.Mutex = .unlocked,
-        waiting: usize = 0,
-        open: bool = false,
-
-        fn wait(self: *@This(), total: usize) void {
-            var registered = false;
-            while (true) {
-                lockAtomicMutex(&self.mutex);
-                if (!registered) {
-                    self.waiting += 1;
-                    registered = true;
-                    if (self.waiting == total) self.open = true;
-                }
-                const ready = self.open;
-                self.mutex.unlock();
-                if (ready) return;
-                std.testing.io.sleep(.fromNanoseconds(1), .awake) catch {};
-            }
+    const Probe = struct {
+        fn current(store: anytype) !u64 {
+            var probe_runtime = try initRuntimeStore(std.testing.allocator, store);
+            defer probe_runtime.deinit();
+            var read = try probe_runtime.store.beginProbe();
+            defer read.abort();
+            return epoch.load(&read);
         }
     };
-
-    const Worker = struct {
-        alloc: Allocator,
-        io: std.Io,
-        path: []const u8,
-        name: []const u8,
-        sequence: u64,
-        barrier: *Barrier,
-        err: ?anyerror = null,
-
-        fn run(self: *@This()) void {
-            self.barrier.wait(worker_count);
-            saveAppliedSequencesCheckpoint(self.alloc, self.io, self.path, null, &[_]AppliedSequenceUpdate{.{
-                .index_name = self.name,
-                .sequence = self.sequence,
-            }}) catch |err| {
-                self.err = err;
-            };
-        }
-    };
-
-    var barrier = Barrier{};
-    var workers: [worker_count]Worker = undefined;
-    var threads: [worker_count]std.Io.Future(void) = undefined;
-    const names = [_][]const u8{ "idx0", "idx1", "idx2", "idx3", "idx4", "idx5" };
-    var started_tasks: usize = 0;
-    defer {
-        lockAtomicMutex(&barrier.mutex);
-        barrier.open = true;
-        barrier.mutex.unlock();
-        for (threads[0..started_tasks]) |*task| task.await(std.testing.io);
+    try saveProjectionCheckpoint(runtime, "text", .{ .applied_sequence = 10, .generation = 1, .config_hash = 7 });
+    const first = try Probe.current(runtime);
+    try std.testing.expectEqual(@as(u64, 1), first);
+    try saveAppliedSequences(runtime, &.{.{ .index_name = "text", .sequence = 11, .config_hash = 7 }});
+    try std.testing.expectEqual(first, try Probe.current(runtime));
+    try saveAppliedSequenceUpdate(runtime, .{ .index_name = "text", .sequence = 12, .config_hash = 7 });
+    try std.testing.expectEqual(first, try Probe.current(runtime));
+    // Rebuilding, even at the same source cut, invalidates prior completion.
+    try saveProjectionCheckpoint(runtime, "text", .{ .applied_sequence = 12, .status = .rebuilding, .generation = 2, .config_hash = 7 });
+    try std.testing.expectEqual(first + 1, try Probe.current(runtime));
+    // Recovery may deliberately lower a watermark; it cannot retain a prefix
+    // captured from the old physical projection.
+    try saveAppliedSequence(runtime, "text", 3);
+    try std.testing.expectEqual(first + 2, try Probe.current(runtime));
+    try clearAppliedSequence(runtime, "text");
+    try std.testing.expectEqual(first + 3, try Probe.current(runtime));
+    try saveAppliedSequence(runtime, "text", 20);
+    try std.testing.expectEqual(first + 4, try Probe.current(runtime));
+    try saveAppliedSequence(runtime, "text", 21);
+    try std.testing.expectEqual(first + 4, try Probe.current(runtime));
+    {
+        var txn = try runtime.beginWrite();
+        defer txn.abort();
+        try clearAppliedSequenceTxn(&txn, "text");
+        try std.testing.expectEqual(first + 5, try epoch.load(&txn));
     }
-    for (&workers, 0..) |*worker, i| {
-        worker.* = .{
-            .alloc = alloc,
-            .io = std.testing.io,
-            .path = checkpoint_path,
-            .name = names[i],
-            .sequence = @intCast(i + 1),
-            .barrier = &barrier,
-        };
-        threads[i] = try std.testing.io.concurrent(Worker.run, .{worker});
-        started_tasks += 1;
-    }
-    for (&threads) |*thread| thread.await(std.testing.io);
-    for (&workers) |*worker| {
-        if (worker.err) |err| return err;
-    }
-
-    for (names, 0..) |name, i| {
-        const checkpoint = (try loadProjectionCheckpoint(alloc, std.testing.io, checkpoint_path, name)) orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqual(@as(u64, @intCast(i + 1)), checkpoint.applied_sequence);
-        try std.testing.expectEqual(ProjectionStatus.clean, checkpoint.status);
-    }
+    try std.testing.expectEqual(first + 4, try Probe.current(runtime));
+    try saveAppliedSequence(runtime, "text", 2);
+    try std.testing.expectEqual(first + 5, try Probe.current(runtime));
 }
 
-test "logical value retained checkpoint decoding preserves identity and rejects corruption" {
-    const a = std.testing.allocator;
-    var checkpoint = CheckpointMap{};
-    defer checkpoint.deinit(a);
-    try checkpoint.putMax(a, "text", .{ .applied_sequence = 17, .config_hash = 123, .generation = 4 });
-    const raw = try encodeCheckpoint(a, &checkpoint);
-    defer a.free(raw);
-    const decoded = (try projectionCheckpointFromBytes(a, raw, "text")).?;
-    try std.testing.expectEqual(@as(u64, 17), decoded.applied_sequence);
-    try std.testing.expectEqual(@as(u64, 123), decoded.config_hash);
-    try std.testing.expect(try projectionCheckpointFromBytes(a, raw, "other") == null);
-    raw[raw.len - 1] ^= 1;
-    try std.testing.expectError(error.InvalidDerivedApplyState, projectionCheckpointFromBytes(a, raw, "text"));
-}
-
-test "projection checkpoint external storage keeps shadow progress isolated (#1210)" {
+test "ordered artifact inventory projection snapshot owns a coherent checkpoint and publication fence" {
     const alloc = std.testing.allocator;
-    var primary = mem_backend.Backend.init(alloc, .{});
-    defer primary.close();
-    var runtime = try primary.runtimeStore(alloc, .{ .name = "docs" });
-    defer runtime.deinit();
-    var files = @import("../../lsm_backend/mod.zig").MemoryStorage.init(alloc);
-    defer files.deinit();
-    const path = "/virtual/shadow/applied-sequences";
-    const checkpoint: ProjectionCheckpoint = .{ .applied_sequence = 8, .generation = 3, .config_hash = 42, .published_count = 2 };
-    try saveProjectionCheckpointWithSidecarWithStorage(files.storage(), alloc, .failing, runtime, path, "img", checkpoint);
-    try std.testing.expectEqualDeep(checkpoint, try loadProjectionCheckpointWithSidecarWithStorage(files.storage(), alloc, .failing, runtime, path, "img"));
-    try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(alloc, runtime, "img"));
-    try saveAppliedSequenceWithCheckpointWithStorage(files.storage(), alloc, .failing, runtime, path, "img", 9);
-    const advanced = try loadProjectionCheckpointWithSidecarWithStorage(files.storage(), alloc, .failing, runtime, path, "img");
-    try std.testing.expectEqual(@as(u64, 9), advanced.applied_sequence);
-    try std.testing.expectEqual(@as(u64, 3), advanced.generation);
-    try std.testing.expectEqual(@as(?u64, null), advanced.published_count);
+    const db_mod = @import("antfly_source_root").antfly_sources.physical_db;
+    const publication = @import("../artifact_publication.zig");
+    const epoch = @import("../artifact_projection_epoch.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/projection-snapshot", .{tmp.sub_path});
+    defer alloc.free(path);
+    var db = try db_mod.DB.open(alloc, path, .{ .primary_backend = .{ .lsm = .{} }, .start_index_workers = false, .start_optional_runtimes = false });
+    defer db.close();
+    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, db.core.store) == null);
+    var activation: publication.Command = .{ .mode = .activate, .namespace = @splat(1), .authority_epoch = 1, .catalog_digest = @splat(2), .producer_name = "", .producer_generation = 0, .sources = &.{}, .mutations = &.{}, .publication_digest = @splat(0) };
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try publication.stageAuthority(&txn, activation);
+        try txn.commit();
+    }
+    try saveProjectionCheckpoint(db.core.store, "text", .{ .applied_sequence = 11, .generation = 2, .config_hash = 7 });
+    var snapshot = (try tryAcquireProjectionSnapshot(alloc, db.core.store)).?;
+    defer snapshot.deinit();
+    // A second acquire against the same store, while the first snapshot is
+    // still outstanding, is "busy" and yields no snapshot rather than
+    // piling up concurrent evidence-publication passes against one store.
+    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, db.core.store) == null);
+    try std.testing.expectEqual(@as(u64, 11), snapshot.get("text").?.applied_sequence);
+    try std.testing.expect(snapshot.get("missing") == null);
+    {
+        var txn = try db.core.store.beginReadTxn();
+        defer txn.abort();
+        try snapshot.requireCurrent(&txn);
+    }
+    // Physical reset/open revocation needs no file lock to invalidate a
+    // snapshot already taken: the next primary transaction simply disagrees.
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        try epoch.revoke(&txn);
+        try std.testing.expectError(error.EnrichmentSourceChanged, snapshot.requireCurrent(&txn));
+        try txn.commit();
+    }
+    {
+        var txn = try db.core.store.beginReadTxn();
+        defer txn.abort();
+        try std.testing.expectError(error.EnrichmentSourceChanged, snapshot.requireCurrent(&txn));
+    }
+    {
+        var txn = try db.core.store.beginWriteTxn();
+        errdefer txn.abort();
+        activation.authority_epoch += 1;
+        try publication.stageAuthority(&txn, activation);
+        try std.testing.expectError(error.ArtifactCatalogDrift, snapshot.requireCurrent(&txn));
+        try txn.commit();
+    }
 }
