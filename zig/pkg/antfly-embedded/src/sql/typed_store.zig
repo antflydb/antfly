@@ -198,6 +198,16 @@ const Fixed = struct {
         self.values.deinit(a);
         self.scales.deinit(a);
     }
+    /// Scalar adapters borrow their result from the consumer's region. Shared
+    /// indexes must never grow persistent per-row NUMERIC memo tables on reads.
+    fn scratchCell(self: Fixed, a: A, row: usize) !Datum {
+        var context: @import("numeric_value.zig").Context = .{ .alloc = a };
+        var owned = try @import("numeric_value.zig").fromScaledInteger(&context, self.values.items[row], self.scales.items[row]);
+        errdefer owned.deinit();
+        const number = try a.create(@import("numeric_value.zig").Value);
+        number.* = owned.value;
+        return Datum.typedNumeric(number);
+    }
     fn cell(self: Fixed, a: A, row: usize) !Datum {
         if (self.cells.get(row)) |number| return Datum.typedNumeric(number);
         var context: @import("numeric_value.zig").Context = .{ .alloc = a };
@@ -613,9 +623,11 @@ pub const Store = struct {
     len: usize = 0,
     initialized: bool = false,
     failed: bool = false,
-    /// Scalar materialization shares the retained owner's arena. Physical
-    /// consumers remain allocation-free; concurrent readers serialize only
-    /// the uncommon cache miss / canonical cell path.
+    /// Shared indexes never grow NUMERIC scalar memo tables after publication.
+    /// Their scalar adapters use the consumer region; decimal views stay native.
+    shared_reads: bool = false,
+    /// Unshared retained stores keep stable memoized NUMERIC cells in their
+    /// owner arena. Protect that lazy path when local consumers overlap.
     reader_mutex: std.atomic.Mutex = .unlocked,
     json_cache: ?*JsonCache = null,
     json_pool: ?*JsonPool = null,
@@ -930,37 +942,44 @@ pub const Store = struct {
             lease.generation = 1;
         }
         var bytes: usize = 0;
-        for (0..batch.width()) |column| for (0..batch.len()) |index| {
-            const payload: ?JsonPayload = if (try batch.frozenJson(index, column)) |frozen|
-                .{ .frozen = frozen }
-            else if (try batch.encodedJson(index, column)) |text|
-                .{ .text = text }
-            else
-                null;
-            if (payload) |native| {
-                bytes +|= @sizeOf(?*JsonPayload) + 1;
-                if (bytes > maximum) return bytes;
-                const source = if (native.frozen) |frozen| frozen.bytes else native.text.?;
-                if (source.len >= 256) {
-                    const resolved = try lease.resolve(self, native);
-                    if (resolved.estimated == lease.generation) continue;
-                    resolved.estimated = lease.generation;
-                    if (resolved.owned == null) resolved.owned = self.json_payloads.get(resolved.key);
-                    if (resolved.owned != null) continue;
-                    if (self.json_pool) |pool| if (pool.bodies.contains(resolved.key)) continue;
-                    const prior_growth = if (self.json_pool) |pool| pool.growthBytes(incoming.count()) else @as(usize, 0);
-                    const entry = try incoming.getOrPut(work, resolved.key);
-                    if (entry.found_existing) continue;
-                    if (self.json_pool) |pool| bytes +|= pool.growthBytes(incoming.count()) -| prior_growth;
+        for (0..batch.width()) |column| {
+            const decimal = try batch.decimalColumnSelected(work, column, null);
+            const physical = if (decimal == null) try batch.physicalColumnSelected(work, column, null) else null;
+            for (0..batch.len()) |index| {
+                const payload: ?JsonPayload = if (try batch.frozenJson(index, column)) |frozen|
+                    .{ .frozen = frozen }
+                else if (try batch.encodedJson(index, column)) |text|
+                    .{ .text = text }
+                else
+                    null;
+                if (payload) |native| {
+                    bytes +|= @sizeOf(?*JsonPayload) + 1;
+                    if (bytes > maximum) return bytes;
+                    const source = if (native.frozen) |frozen| frozen.bytes else native.text.?;
+                    if (source.len >= 256) {
+                        const resolved = try lease.resolve(self, native);
+                        if (resolved.estimated == lease.generation) continue;
+                        resolved.estimated = lease.generation;
+                        if (resolved.owned == null) resolved.owned = self.json_payloads.get(resolved.key);
+                        if (resolved.owned != null) continue;
+                        if (self.json_pool) |pool| if (pool.bodies.contains(resolved.key)) continue;
+                        const prior_growth = if (self.json_pool) |pool| pool.growthBytes(incoming.count()) else @as(usize, 0);
+                        const entry = try incoming.getOrPut(work, resolved.key);
+                        if (entry.found_existing) continue;
+                        if (self.json_pool) |pool| bytes +|= pool.growthBytes(incoming.count()) -| prior_growth;
+                    }
+                    bytes +|= source.len +| @sizeOf(JsonPayload) +| 64;
+                } else {
+                    _ = cell_region.reset(.retain_capacity);
+                    var coefficient: @import("numeric_value.zig").ScaledInteger = undefined;
+                    var number: @import("numeric_value.zig").Value = undefined;
+                    const datum = if (decimal) |view| try view.cell(index, &coefficient, &number) else if (physical) |view| try view.cell(index) else try batch.cell(cell_region.allocator(), index, column);
+                    bytes +|= try self.cellAppendBytes(column, datum);
                 }
-                bytes +|= source.len +| @sizeOf(JsonPayload) +| 64;
-            } else {
-                _ = cell_region.reset(.retain_capacity);
-                bytes +|= try self.cellAppendBytes(column, try batch.cell(cell_region.allocator(), index, column));
+                // Reject before temporary identity state can outgrow admission.
+                if (bytes > maximum) return bytes;
             }
-            // Reject before temporary identity state can outgrow admission.
-            if (bytes > maximum) return bytes;
-        };
+        }
         return bytes;
     }
 
@@ -1031,7 +1050,7 @@ pub const Store = struct {
         return self.appendBatchLeased(batch, &lease);
     }
     pub fn appendBatchLeased(self: *Store, batch: @import("execution_batch.zig").Batch, lease: *JsonLease) !void {
-        if (self.failed or (self.initialized and self.columns.len != batch.width())) return error.InvalidSqlBackendResponse;
+        if (self.shared_reads or self.failed or (self.initialized and self.columns.len != batch.width())) return error.InvalidSqlBackendResponse;
         errdefer self.failed = true;
         if (!self.initialized) {
             self.columns = try self.a.alloc(Column, batch.width());
@@ -1056,6 +1075,10 @@ pub const Store = struct {
             if (try batch.dictionaryColumn(scratch.allocator(), ordinal)) |encoded| {
                 if (encoded.len() != batch.len()) return error.InvalidSqlBackendResponse;
                 if (try column.appendDictionary(self.a, self.arena.allocator(), self.len, encoded)) continue;
+            }
+            if (try batch.physicalColumnSelected(scratch.allocator(), ordinal, null)) |physical| {
+                for (0..batch.len()) |index| try column.append(self.a, self.arena.allocator(), scratch.allocator(), self.len + index, try physical.cell(index));
+                continue;
             }
             _ = scratch.reset(.free_all);
             for (0..batch.len()) |index| {
@@ -1133,9 +1156,16 @@ pub const Store = struct {
         if (try self.encodedJson(index, column)) |bytes| return bytes.len;
         return @import("operators.zig").datumBytes(try self.cell(a, index, column));
     }
+    pub fn freezeShared(self: *Store) void {
+        self.shared_reads = true;
+    }
     pub fn cell(self: *const Store, a: A, index: usize, column: usize) !Datum {
         if (self.failed or index >= self.len or column >= self.columns.len) return error.InvalidSqlBackendResponse;
-        if (self.columns[column].fixed != null) {
+        if (self.columns[column].fixed) |fixed| {
+            if (self.shared_reads) {
+                if (self.columns[column].isNull(index)) return .{};
+                return fixed.scratchCell(a, index);
+            }
             const owner = @constCast(self);
             while (!owner.reader_mutex.tryLock()) std.atomic.spinLoopHint();
             defer owner.reader_mutex.unlock();

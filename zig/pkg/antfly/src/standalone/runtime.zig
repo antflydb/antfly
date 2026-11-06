@@ -6266,6 +6266,9 @@ pub fn runFromIterator(
     if (hot_standby_role_requested and cli.hot_standby_table_id == 0 and cli.hot_standby_shard_id == 0) {
         local_metadata.hot_standby_catalog_server = &data_server;
     }
+    var sql_configuration = std.heap.ArenaAllocator.init(alloc);
+    defer sql_configuration.deinit();
+    data_server.api_server_cfg.sql_deployment = try @import("../serverless/sql/deployment.zig").Config.fromEnv(sql_configuration.allocator(), init.environ_map, &secret_store);
     try data_server.initApiServer();
     local_metadata.data_server = &data_server;
     defer local_metadata.shutdownCdc();

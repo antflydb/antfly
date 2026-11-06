@@ -59,8 +59,19 @@ const Table = struct {
     current: types.Table,
     commits: usize = 0,
     fn init(a: A, client: storage.Client, bucket: []const u8, prefix: []const u8, source_uri: []const u8, files_uri: []const u8) !Table {
+        return initWithSpec(a, client, bucket, prefix, source_uri, files_uri, false);
+    }
+    fn initWithSpec(a: A, client: storage.Client, bucket: []const u8, prefix: []const u8, source_uri: []const u8, files_uri: []const u8, bucketed: bool) !Table {
+        var arena = std.heap.ArenaAllocator.init(a);
+        defer arena.deinit();
+        const scratch = arena.allocator();
+        var request = try std.json.parseFromSliceLeaky(V, scratch, schema_request, .{});
+        if (bucketed) try request.object.put(scratch, "partition-spec", try std.json.parseFromSliceLeaky(V, scratch,
+            \\{"spec-id":1,"fields":[{"source-id":1,"field-id":1000,"name":"id_bucket","transform":"bucket[12]"}]}
+        , .{}));
+        const encoded = try std.json.Stringify.valueAlloc(scratch, request, .{});
         const catalog: managed.Managed = .{ .client = client, .bucket = bucket, .prefix = prefix, .source_uri = source_uri };
-        return .{ .catalog = catalog, .files = .{ .client = client, .bucket = bucket, .prefix = prefix, .uri = files_uri }, .current = try catalog.create(a, "create", schema_request, 1) };
+        return .{ .catalog = catalog, .files = .{ .client = client, .bucket = bucket, .prefix = prefix, .uri = files_uri }, .current = try catalog.create(a, "create", encoded, 1) };
     }
     fn deinit(self: *Table, a: A) void {
         self.current.deinit(a);
@@ -141,10 +152,14 @@ fn currentManifests(a: A, table: Table) !iceberg.ManifestList {
 }
 
 test "lake catalog row commits merge small manifests and keep every file sequence" {
+    try mergeManifests(false);
+    try mergeManifests(true);
+}
+fn mergeManifests(bucketed: bool) !void {
     const alloc = std.testing.allocator;
     var memory = storage.MemoryClient.init(alloc);
     defer memory.deinit();
-    var table = try Table.init(alloc, memory.client(), "archive", "events", "gs://archive/events", "gs://archive/events");
+    var table = try Table.initWithSpec(alloc, memory.client(), "archive", "events", "gs://archive/events", "gs://archive/events", bucketed);
     defer table.deinit(alloc);
     const commits = 2 * row_commit.manifest_merge_min_count + 17;
     for (1..commits + 1) |i| try table.commitRow(alloc, @intCast(i + 1));
@@ -164,6 +179,12 @@ test "lake catalog row commits merge small manifests and keep every file sequenc
             if (raw.status == .deleted) continue;
             const file = try @import("../iceberg_inventory.zig").resolveManifestEntry(raw, entry, 2);
             // Sequence N belongs to commit N: one data file and one equality delete.
+            if (bucketed and file.content == .data) {
+                try std.testing.expectEqual(@as(u32, 1), file.partition_field_count);
+                try std.testing.expectEqual(@as(usize, 1), file.partition_values.len);
+                const expected = (@import("bucket.zig").hashInteger(@mod(file.data_sequence_number.?, 97)) & 0x7fffffff) % 12;
+                try std.testing.expectEqual(expected, try std.fmt.parseInt(u32, file.partition_values[0].string_value, 10));
+            }
             const sequence: usize = @intCast(file.data_sequence_number.?);
             try std.testing.expect(sequence >= 1 and sequence <= commits);
             try std.testing.expectEqual(file.data_sequence_number.?, file.file_sequence_number.?);
