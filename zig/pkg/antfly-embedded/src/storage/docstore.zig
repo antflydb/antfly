@@ -462,6 +462,8 @@ pub const ReplayRetirement = struct {
     lane: usize = 0,
     clean_lanes: usize = 0,
     sweep_bound: u64 = 0,
+    sweep_lane_bounds: [9]u64 = @splat(0),
+    canonical_after: u64 = 0,
     runnable: bool = false,
 };
 
@@ -2924,15 +2926,40 @@ pub const DocStore = struct {
         try self.truncateReplayEntries(alloc, up_to_sequence);
     }
 
+    /// Bounds are durable acknowledgments for the eight hint consumers and
+    /// the canonical lane. Canonical payloads additionally retain every live
+    /// reference; advancing one consumer cannot release another's bytes.
+    pub fn truncateReplayByConsumerBounds(self: *DocStore, alloc: Allocator, bounds: [9]u64) !void {
+        var maximum: u64 = 0;
+        for (bounds) |bound| maximum = @max(maximum, bound);
+        if (self.deferred_replay_retirement) |state| {
+            if (!self.bounded_replay_retirement) {
+                if (maximum > state.watermark) state.clean_lanes = 0;
+                state.watermark = @max(state.watermark, maximum);
+                return;
+            }
+            return self.truncateReplaySliceWithBounds(alloc, maximum, bounds, state);
+        }
+        var state: ReplayRetirement = .{ .watermark = maximum, .runnable = true };
+        while (state.runnable) try self.truncateReplaySliceWithBounds(alloc, maximum, bounds, &state);
+    }
+
     // At most one atomic batch and one bounded sweep of lanes per turn. The watermark is reclamped by
     // the DB against current consumer/repair checkpoints under owner admission.
     fn truncateReplaySlice(self: *DocStore, alloc: Allocator, up_to_sequence: u64, state: *ReplayRetirement) !void {
+        return self.truncateReplaySliceWithBounds(alloc, up_to_sequence, @splat(up_to_sequence), state);
+    }
+
+    fn truncateReplaySliceWithBounds(self: *DocStore, alloc: Allocator, up_to_sequence: u64, bounds: [9]u64, state: *ReplayRetirement) !void {
         if (up_to_sequence == 0) {
             state.runnable = false;
             return;
         }
         var lane = state.lane;
-        var clean_lanes = if (state.sweep_bound == up_to_sequence) state.clean_lanes else 0;
+        const same_bounds = state.sweep_bound == up_to_sequence and std.mem.eql(u64, &state.sweep_lane_bounds, &bounds);
+        var clean_lanes = if (same_bounds) state.clean_lanes else 0;
+        var canonical_after = if (same_bounds) state.canonical_after else 0;
+        var scan_incomplete = false;
         var deletes = std.ArrayListUnmanaged([]u8).empty;
         defer {
             for (deletes.items) |key| alloc.free(key);
@@ -2955,14 +2982,23 @@ pub const DocStore = struct {
                 defer cur.close();
                 const prefixes = txn.current_scan.?.vtable.get_prefix_into != null and cur.vtable.set_keys_only != null;
                 if (prefixes) cur.setKeysOnly();
-                const lower = internal_keys.replayRangeLower(ordinal, 0);
+                const from = if (ordinal == internal_keys.replay_all_kind and canonical_after != 0) canonical_after +| 1 else 0;
+                const lower = internal_keys.replayRangeLower(ordinal, from);
+                var examined: usize = 0;
                 const upper = internal_keys.replayRangeUpper(ordinal);
                 cur.setUpperBound(&upper);
                 var entry = try cur.seekAtOrAfter(&lower);
                 while (entry) |kv| : (entry = try cur.next()) {
                     if (std.mem.order(u8, kv.key, &upper) != .lt) break;
                     const sequence = internal_keys.parseReplayEntrySequence(kv.key, ordinal) orelse break;
-                    if (sequence > up_to_sequence) break;
+                    if (sequence > bounds[lane]) break;
+                    if (ordinal == internal_keys.replay_all_kind and examined == ReplayRetirement.max_keys) {
+                        scan_incomplete = true;
+                        break;
+                    }
+                    examined += 1;
+                    const previous_after = canonical_after;
+                    if (ordinal == internal_keys.replay_all_kind) canonical_after = sequence;
                     if (ordinal == internal_keys.replay_all_kind and txn.current_scan.?.vtable.get != null and
                         !try @import("db/derived/replay_reference.zig").canonicalMayRetireAfterLaneDeletes(&txn, sequence, deleted_lanes.get(sequence) orelse 0)) continue;
                     const chunk_codec = @import("db/derived/replay_chunks.zig");
@@ -2971,9 +3007,29 @@ pub const DocStore = struct {
                         try txn.current_scan.?.getPrefixInto(kv.key, &manifest_buffer)
                     else
                         kv.value;
+                    if (ordinal == internal_keys.replay_all_kind) {
+                        const mask = if (chunk_codec.isManifest(raw))
+                            (try chunk_codec.Manifest.decode(raw)).hints
+                        else if (change_journal_mod.looksLikeBinaryRecord(raw))
+                            try change_journal_mod.encodedRecordHintMask(raw)
+                        else
+                            // Legacy JSON needs its complete encoding to find
+                            // hints. Its generic consumers keep the uniform
+                            // minimum rather than adding payload reads here.
+                            @as(u8, 0);
+                        var safe = true;
+                        for (bounds[0..8], 0..) |bound, hint| {
+                            if ((mask == 0 or mask & (@as(u8, 1) << @intCast(hint)) != 0) and sequence > bound) safe = false;
+                        }
+                        if (!safe) continue;
+                    }
                     if (ordinal == internal_keys.replay_all_kind and chunk_codec.isManifest(raw)) {
                         const manifest = try chunk_codec.Manifest.decode(raw);
-                        if (deletes.items.len + manifest.count + 1 > ReplayRetirement.max_keys) break;
+                        if (deletes.items.len + manifest.count + 1 > ReplayRetirement.max_keys) {
+                            canonical_after = previous_after;
+                            scan_incomplete = true;
+                            break;
+                        }
                         for (manifest.retired_chunks..manifest.count) |chunk_ordinal| {
                             const chunk_key = chunk_codec.chunkKey(sequence, @intCast(chunk_ordinal));
                             const owned_chunk_key = try alloc.dupe(u8, &chunk_key);
@@ -2989,8 +3045,16 @@ pub const DocStore = struct {
                     const key = try alloc.dupe(u8, kv.key);
                     errdefer alloc.free(key);
                     try deletes.append(alloc, key);
-                    if (deletes.items.len == ReplayRetirement.max_keys) break;
+                    if (deletes.items.len == ReplayRetirement.max_keys) {
+                        if (ordinal == internal_keys.replay_all_kind) scan_incomplete = true;
+                        break;
+                    }
                 }
+            }
+            if (ordinal == internal_keys.replay_all_kind and !scan_incomplete) canonical_after = 0;
+            if (scan_incomplete) {
+                clean_lanes = 0;
+                break;
             }
             clean_lanes = if (before == deletes.items.len) clean_lanes + 1 else 0;
             lane = (lane + 1) % (replay_hints.len + 1);
@@ -3007,6 +3071,8 @@ pub const DocStore = struct {
         state.lane = lane;
         state.clean_lanes = clean_lanes;
         state.sweep_bound = up_to_sequence;
+        state.sweep_lane_bounds = bounds;
+        state.canonical_after = canonical_after;
         state.runnable = clean_lanes < replay_hints.len + 1;
         if (!state.runnable and up_to_sequence >= state.watermark) state.watermark = 0;
     }
@@ -6778,4 +6844,118 @@ test "docstore replay retirement atomically removes selected references and cano
     try std.testing.expect(completed);
     try std.testing.expectError(error.NotFound, store.get(a, &lane));
     try std.testing.expectError(error.NotFound, store.get(a, &canonical));
+}
+
+test "docstore replay retirement atomically separates source and output consumer cuts" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    const refs = @import("db/derived/replay_reference.zig");
+    const source = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1);
+    const output = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 2);
+    const producer = internal_keys.replayEntryKey(replayHintOrdinal(.enrichment), 1);
+    const source_index = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 1);
+    const output_index = internal_keys.replayEntryKey(replayHintOrdinal(.full_text), 2);
+    const raw_source = try change_journal_mod.encodeRecord(a, .{ .sequence = 1, .changed_doc_keys = &.{"source"}, .target_hints = &.{ .enrichment, .full_text } });
+    defer a.free(raw_source);
+    const raw_output = try change_journal_mod.encodeRecord(a, .{ .sequence = 2, .changed_doc_keys = &.{"output"}, .target_hints = &.{.full_text} });
+    defer a.free(raw_output);
+    {
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.put(&internal_keys.replay_meta_init_key, "1");
+        try write.put(&source, raw_source);
+        try write.put(&output, raw_output);
+        try write.put(&producer, &refs.encodeReference(1, .enrichment));
+        try write.put(&source_index, &refs.encodeReference(1, .full_text));
+        try write.put(&output_index, &refs.encodeReference(2, .full_text));
+        try write.commit();
+    }
+    var state: ReplayRetirement = .{ .watermark = 2, .runnable = true };
+    store.deferred_replay_retirement = &state;
+    defer store.deferred_replay_retirement = null;
+    store.bounded_replay_retirement = true;
+    var bounds: [9]u64 = @splat(2);
+    bounds[0] = 0;
+    bounds[1] = 1;
+    try store.truncateReplayByConsumerBounds(a, bounds);
+    try std.testing.expectError(error.NotFound, store.get(a, &source_index));
+    {
+        var captured = try store.beginReadTxn();
+        defer captured.abort();
+        _ = try captured.get(&source);
+        _ = try captured.get(&producer);
+        _ = try captured.get(&output);
+        _ = try captured.get(&output_index);
+    }
+    // Same maximum, different consumer cut: a prior clean sweep is no proof
+    // that the newly acknowledged output lane is physically gone.
+    bounds[1] = 2;
+    try store.truncateReplayByConsumerBounds(a, bounds);
+    try std.testing.expectError(error.NotFound, store.get(a, &output_index));
+    try std.testing.expectError(error.NotFound, store.get(a, &output));
+    {
+        var captured = try store.beginReadTxn();
+        defer captured.abort();
+        const raw = try captured.get(&producer);
+        const resolved = (try refs.resolve(a, &captured, 1, 0, raw)).?;
+        defer a.free(resolved);
+        var record = try change_journal_mod.decodeRecord(a, resolved);
+        defer record.deinit();
+        try std.testing.expectEqualStrings("source", record.record.changed_doc_keys[0]);
+    }
+    bounds[0] = 1;
+    try store.truncateReplayByConsumerBounds(a, bounds);
+    try std.testing.expectError(error.NotFound, store.get(a, &producer));
+    try std.testing.expectError(error.NotFound, store.get(a, &source));
+}
+
+test "docstore replay retirement atomically bounds scans past pinned source records" {
+    const a = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+    var store = try DocStore.open(a, path, .{});
+    defer store.close();
+    const refs = @import("db/derived/replay_reference.zig");
+    const last_source = ReplayRetirement.max_keys + 3;
+    const output_sequence = last_source + 1;
+    {
+        var write = try store.beginWriteBatch();
+        errdefer write.abort();
+        try write.put(&internal_keys.replay_meta_init_key, "1");
+        for (1..last_source + 1) |sequence| {
+            const raw = try change_journal_mod.encodeRecord(a, .{ .sequence = sequence, .changed_doc_keys = &.{"pinned"}, .target_hints = &.{.enrichment} });
+            defer a.free(raw);
+            try write.put(&internal_keys.replayEntryKey(internal_keys.replay_all_kind, sequence), raw);
+            try write.put(&internal_keys.replayEntryKey(0, sequence), &refs.encodeReference(sequence, .enrichment));
+        }
+        const raw = try change_journal_mod.encodeRecord(a, .{ .sequence = output_sequence, .changed_doc_keys = &.{"output"}, .target_hints = &.{.full_text} });
+        defer a.free(raw);
+        try write.put(&internal_keys.replayEntryKey(internal_keys.replay_all_kind, output_sequence), raw);
+        try write.put(&internal_keys.replayEntryKey(1, output_sequence), &refs.encodeReference(output_sequence, .full_text));
+        try write.commit();
+    }
+    var state: ReplayRetirement = .{ .watermark = output_sequence, .runnable = true };
+    store.deferred_replay_retirement = &state;
+    defer store.deferred_replay_retirement = null;
+    store.bounded_replay_retirement = true;
+    var bounds: [9]u64 = @splat(output_sequence);
+    bounds[0] = 0;
+    try store.truncateReplayByConsumerBounds(a, bounds);
+    try std.testing.expect(state.runnable);
+    try std.testing.expectEqual(@as(u64, ReplayRetirement.max_keys), state.canonical_after);
+    for (0..16) |_| {
+        if (!state.runnable) break;
+        try store.truncateReplayByConsumerBounds(a, bounds);
+    }
+    try std.testing.expect(!state.runnable);
+    try std.testing.expectError(error.NotFound, store.get(a, &internal_keys.replayEntryKey(internal_keys.replay_all_kind, output_sequence)));
+    var captured = try store.beginReadTxn();
+    defer captured.abort();
+    _ = try captured.get(&internal_keys.replayEntryKey(internal_keys.replay_all_kind, 1));
+    _ = try captured.get(&internal_keys.replayEntryKey(internal_keys.replay_all_kind, last_source));
 }

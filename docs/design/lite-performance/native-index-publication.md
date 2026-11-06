@@ -112,3 +112,23 @@ native range sources. Resident bytes reserve host capacity before allocation;
 a declined reservation selects bounded file staging. Decoded leases independently
 retain the immutable bytes and their resource owner after the runtime closes.
 Optional cache rejection refunds metadata before the normal decoding fallback.
+
+## Producer completion and committed-effect progress
+
+A producer's source watermark and an index's committed-effect watermark answer
+separate questions. A multi-document source record can produce several output
+publications before the producer completes that record. Each output has its own
+durable journal sequence. Index replay must consume those committed effects
+without waiting for the unfinished source record; otherwise finite output
+credits can form a circular wait. A synchronized visibility request first fences
+source completion, then captures and fences the resulting publication cut.
+Advancing an index watermark alone never proves future producer output complete.
+
+Native retirement uses a durable cut for each hint lane. Multiple indexes of the
+same kind contribute their minimum cut. Enrichment, resolution and promotion
+retain their own input lanes. Repair and graph-replacement readers retain all
+lanes, and failed catalog loads authorize no reclamation. A canonical payload
+can disappear only after every relevant consumer acknowledges it and every
+reference is physically deleted, including deletions in the same transaction.
+Legacy records without explicit hints retain the conservative uniform minimum.
+Continuation state becomes clean only for the exact set of cuts it examined.

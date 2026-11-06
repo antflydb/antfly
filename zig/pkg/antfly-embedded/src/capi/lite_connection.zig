@@ -9607,17 +9607,18 @@ test "capi native cooperative replay separates raw text from generated artifact 
             try db.batch(.{ .writes = writes[i .. i + 1], .sync_level = .write });
         }
         const target = db.core.nextDerivedSequence();
-        const generated_before = try db.core.loadAppliedSequence(a, "generated");
         _ = try db.runBackgroundTurnWithCancellation(.none, .replay);
         const produced = db.enrichment_runtime.?.stats().applied_sequence;
-        // The producer yields after its eight-document prefix. Raw text is
-        // already visible beyond it, while its artifact-backed sibling cannot
-        // seal the remaining source revisions.
+        // Raw primary text and committed artifact effects can advance while
+        // the producer still has requests outstanding. An artifact consumer's
+        // watermark does not claim those future requests are complete.
         try std.testing.expect(produced < target);
         try std.testing.expect(try db.core.loadAppliedSequence(a, "raw") >= target);
-        try std.testing.expect(try db.core.loadAppliedSequence(a, "generated") <= @max(generated_before, produced));
+        try std.testing.expectEqual(@as(u32, 32), db.core.index_manager.textIndex("raw").?.snapshot().liveDocCount());
+        try std.testing.expect(db.core.index_manager.textIndex("generated").?.snapshot().liveDocCount() <= 8);
         try db.runUntilIdle();
         try std.testing.expect(try db.core.loadAppliedSequence(a, "generated") >= target);
+        try std.testing.expectEqual(@as(u32, 32), db.core.index_manager.textIndex("generated").?.snapshot().liveDocCount());
         // Repeat across all three scheduling offsets and an overwrite, then
         // verify the full drain still completes both dependency classes.
         for (0..3) |_| {

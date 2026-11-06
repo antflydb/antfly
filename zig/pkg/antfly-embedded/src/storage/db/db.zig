@@ -32572,9 +32572,9 @@ pub const DB = struct {
         }
     }
 
-    /// Independent consumers can advance before a producer
-    /// starts inference or waits for output capacity. Only consumers of
-    /// generated artifacts inherit the producer's completed source prefix.
+    /// Index progress acknowledges committed effects. Producer completion is
+    /// a separate visibility fence: an output publication receives its own
+    /// replay sequence and must be consumed without waiting for future output.
     fn runBoundedDerivedDependencyStage(self: *DB, sequence: u64, generated: bool, options: ReplayDrainOptions) !void {
         if (sequence == 0) return;
         std.debug.assert(options.bounded_replay);
@@ -32608,11 +32608,11 @@ pub const DB = struct {
                     0 => try self.runBoundedDerivedDependencyStage(stable_target, false, options),
                     1 => try self.runEnrichmentUntilForDrain(stable_target, options),
                     2 => {
-                        // Generated artifacts may share a source revision with
-                        // a primary document. Never let their consumer seal a
-                        // revision whose producer has not completed it.
-                        const prefix = @min(stable_target, self.enrichment_runtime.?.stats().applied_sequence);
-                        try self.runBoundedDerivedDependencyStage(prefix, true, options);
+                        // A producer may need reclaimed output credits before
+                        // completing a multi-document source record. Consume
+                        // its already-committed effects independently; full
+                        // visibility waits fence source completion separately.
+                        try self.runBoundedDerivedDependencyStage(stable_target, true, options);
                     },
                     else => unreachable,
                 };
@@ -32870,7 +32870,8 @@ pub const DB = struct {
 
     /// The caller holds checked writer admission for this captured runtime.
     /// Commit output and its replay record together; downstream indexes consume
-    /// the completed producer prefix in their own bounded service turn.
+    /// committed effects in their own bounded service turn. Source completion
+    /// remains a separate fence for synchronized visibility.
     pub fn enqueuePreparedGeneratedBatch(self: *DB, derived_batch: enrichment_runtime_mod.GeneratedRecordBatch, promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion, deletes: []const []const u8, guards: []const enrichment_runtime_mod.GeneratedSourceGuard, fence: ?enrichment_runtime_mod.GeneratedWriteFence) !enrichment_runtime_mod.GeneratedRecordCommit {
         if (self.enrichment_append_context == null) try self.reconfigureEnrichmentRuntimePaused(.{ .enable_without_producers = true });
         return appendGeneratedBatchFromEnrichmentWithProjection(self.enrichment_append_context orelse return error.EnrichmentWaitCanceled, derived_batch, promotions, deletes, guards, fence, true);
@@ -34742,7 +34743,12 @@ pub const DB = struct {
         if (split_retirement) self.core.store.deferred_replay_retirement = &state.replay_retirement;
         if (phase == .retirement) {
             self.core.store.bounded_replay_retirement = true;
-            if (state.replay_retirement.watermark != 0 or state.replay_retirement.partial_pending) try truncateReplaySequenceAsync(self.async_context, state.replay_retirement.watermark);
+            // Output records may have no managed-index consumers. Discover
+            // their eligible hint lanes even while the producer's source
+            // watermark is zero and no executor callback has scheduled a cut.
+            if (self.core.store.runtime_store.capabilities().bounded_replay_admission or
+                state.replay_retirement.watermark != 0 or state.replay_retirement.partial_pending)
+                try truncateReplaySequenceAsync(self.async_context, state.replay_retirement.watermark);
             return state.replay_retirement.runnable;
         }
         if (phase == .artifacts or phase == .pressure_artifacts or phase == .index_storage) {
@@ -58373,14 +58379,55 @@ fn truncateReplaySequenceAsync(ctx_ptr: *anyopaque, sequence: u64) !void {
     const ctx: *AsyncContext = @ptrCast(@alignCast(ctx_ptr));
     if (ctx.repair_replay_mutex) |mutex| mutex.lockUncancelable(ctx.index_manager.checkpointIo());
     defer if (ctx.repair_replay_mutex) |mutex| mutex.unlock(ctx.index_manager.checkpointIo());
-    const effective = try clampReplayForNonIndexConsumers(ctx, sequence);
-    try ctx.store.truncateReplayUpTo(ctx.alloc, effective);
+    if (ctx.store.runtime_store.capabilities().bounded_replay_admission) {
+        try ctx.store.truncateReplayByConsumerBounds(ctx.alloc, try replayConsumerRetirementBounds(ctx, sequence));
+    } else {
+        const effective = try clampReplayForNonIndexConsumers(ctx, sequence);
+        try ctx.store.truncateReplayUpTo(ctx.alloc, effective);
+    }
     if (ctx.store.deferred_replay_retirement) |state| if (state.partial_pending) {
         // A checked refusal is not runnable debt: the next durable consumer
         // advancement will notify this lane again rather than busy-polling.
         _ = try retireConsumedReplayChunkPrefix(ctx);
         state.partial_pending = false;
     };
+}
+
+/// Hint lanes have independent consumers. A lagging producer retains its
+/// source references, not unrelated output publications. Graph replacement
+/// and repair readers inspect arbitrary records and therefore pin every lane.
+fn replayConsumerRetirementBounds(ctx: *AsyncContext, requested: u64) ![9]u64 {
+    if (ctx.index_manager.failedIndexLoadSummary().total != 0) return @splat(0);
+    var horizon = try ctx.store.latestReplaySequenceForOrdinal(internal_keys.replay_all_kind, requested);
+    horizon = try ctx.index_manager.clampReplayForGraphReplacementBuilds(ctx.store, horizon);
+    horizon = try clampReplayTruncationForRepairPins(ctx.alloc, ctx.index_repair_checkpoint, horizon);
+    var bounds: [9]u64 = @splat(horizon);
+    const managed = try ctx.index_manager.managedIndexes(ctx.alloc);
+    defer {
+        for (managed) |ref| ctx.alloc.free(@constCast(ref.name));
+        ctx.alloc.free(managed);
+    }
+    for (managed) |ref| {
+        const ordinal: usize = switch (ref.kind) {
+            .full_text => 1,
+            .dense_vector => 2,
+            .sparse_vector => 3,
+            .graph => 4,
+            .algebraic => 5,
+        };
+        bounds[ordinal] = @min(bounds[ordinal], try loadManagedAppliedSequenceContext(ctx.alloc, ctx.index_manager, ctx.store, ctx.applied_sequence_checkpoint_path, ref));
+    }
+    if (ctx.index_manager.hasGeneratedEnrichmentTargets())
+        bounds[0] = @min(bounds[0], try enrichment_state.loadAppliedSequence(ctx.alloc, ctx.store, enrichment_runtime_mod.scope_name));
+    if (ctx.resolution_runtime) |runtime|
+        bounds[6] = clampReplayTruncationForReplayStage(bounds[6], ctx.index_manager, runtime.stats());
+    if (ctx.promotion_runtime) |runtime|
+        bounds[7] = clampReplayTruncationForReplayStage(bounds[7], ctx.index_manager, runtime.stats());
+    if (ctx.index_manager.resolvers.items.len != 0) {
+        bounds[6] = @min(bounds[6], try enrichment_state.loadAppliedSequence(ctx.alloc, ctx.store, resolution_runtime_mod.scope_name));
+        bounds[7] = @min(bounds[7], try enrichment_state.loadAppliedSequence(ctx.alloc, ctx.store, promotion_runtime_mod.scope_name));
+    }
+    return bounds;
 }
 
 fn clampReplayForNonIndexConsumers(ctx: *AsyncContext, requested: u64) !u64 {
@@ -147613,15 +147660,33 @@ test "native projection progress and status share a failure atomic publication" 
 }
 
 test "background enrichment turn explicit native drain services consumers before its progress reserve fills" {
+    try testExplicitNativeDrainCredits(false, true);
+}
+
+test "background enrichment turn explicit native drain releases credits within a multi-document record" {
+    try testExplicitNativeDrainCredits(true, true);
+}
+
+test "background enrichment turn explicit native drain reclaims outputs without index consumers" {
+    try testExplicitNativeDrainCredits(true, false);
+}
+
+fn testExplicitNativeDrainCredits(comptime single_record: bool, comptime indexes: bool) !void {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const QueuedOutput = struct {
         database: *DB,
         file: *@import("../lite/native.zig").NativeFile,
         calls: usize = 0,
+        attempts: usize = 0,
+        largest_documents: usize = 0,
+        largest_artifacts: usize = 0,
         previous_after_bytes: u64 = 0,
         reclaimed_between_outputs: bool = false,
         fn commit(ptr: *anyopaque, batch: enrichment_runtime_mod.GeneratedRecordBatch, promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion, deletes: []const []const u8, guards: []const enrichment_runtime_mod.GeneratedSourceGuard, fence: ?enrichment_runtime_mod.GeneratedWriteFence) anyerror!enrichment_runtime_mod.GeneratedRecordCommit {
             const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.attempts += 1;
+            self.largest_documents = @max(self.largest_documents, batch.documents.len);
+            self.largest_artifacts = @max(self.largest_artifacts, @max(batch.changed_artifact_keys.len, batch.generated_enrichment_refs.len));
             const before = (try self.file.replayAdmission()).?;
             if (self.calls != 0 and before.bytes < self.previous_after_bytes) self.reclaimed_between_outputs = true;
             const result = try self.database.enqueuePreparedGeneratedBatch(batch, promotions, deletes, guards, fence);
@@ -147661,50 +147726,87 @@ test "background enrichment turn explicit native drain services consumers before
     try db.addEnrichment(.{ .name = "generated_asset_with_a_long_identifier_for_reproducing_bounded_native_replay_credit_starvation_during_explicit_drain", .kind = .asset, .field = "text", .producer_json = "{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"test-generator\"}}" });
     var config: enrichment_runtime_mod.Config = .{ .asset_producer = producer.interface() };
     try db.initOptionalEnrichmentRuntime(&config);
-    try db.addIndex(.{ .name = "raw", .kind = .full_text, .config_json = "{}" });
-    try db.addIndex(.{ .name = "generated", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"generated_asset_with_a_long_identifier_for_reproducing_bounded_native_replay_credit_starvation_during_explicit_drain\"}]}" });
-    try std.testing.expect(!try db.core.indexRequiresEnrichmentReplay("raw"));
-    try std.testing.expect(try db.core.indexRequiresEnrichmentReplay("generated"));
+    if (indexes) {
+        try db.addIndex(.{ .name = "raw", .kind = .full_text, .config_json = "{}" });
+        try db.addIndex(.{ .name = "generated", .kind = .full_text, .config_json = "{\"sources\":[{\"artifact\":\"generated_asset_with_a_long_identifier_for_reproducing_bounded_native_replay_credit_starvation_during_explicit_drain\"}]}" });
+        try std.testing.expect(!try db.core.indexRequiresEnrichmentReplay("raw"));
+        try std.testing.expect(try db.core.indexRequiresEnrichmentReplay("generated"));
+    }
     var output: QueuedOutput = .{ .database = &db, .file = &backend.native_docstore.?.file };
     db.enrichment_runtime.?.write_ctx = &output;
     db.enrichment_runtime.?.write_fn = QueuedOutput.commit;
     const padding: [2304]u8 = @splat('a');
     const value = try std.fmt.allocPrint(a, "{{\"text\":\"cooperative canary {s}\"}}", .{padding});
     defer a.free(value);
-    for (0..32) |i| {
-        var key: [32]u8 = undefined;
-        const name = try std.fmt.bufPrint(&key, "source-{d}", .{i});
-        try db.batch(.{ .writes = &.{.{ .key = name, .value = value }}, .sync_level = .write });
+    var keys: [32][32]u8 = undefined;
+    var writes: [32]types.BatchWrite = undefined;
+    for (&writes, &keys, 0..) |*write, *key, i| {
+        write.* = .{ .key = try std.fmt.bufPrint(key, "source-{d}", .{i}), .value = value };
+        if (!single_record) try db.batch(.{ .writes = write[0..1], .sync_level = .write });
     }
+    if (single_record) try db.batch(.{ .writes = &writes, .sync_level = .write });
+    if (!indexes) std.debug.print("no-index source: requests={d} generated={} progress={d}/{d}\n", .{ producer.successful_requests.load(.acquire), db.core.index_manager.hasGeneratedEnrichmentTargets(), db.enrichment_runtime.?.stats().applied_sequence, db.core.nextDerivedSequence() });
     try std.testing.expectEqual(@as(usize, 0), producer.successful_requests.load(.acquire));
     try std.testing.expect(db.enrichment_runtime.?.stats().applied_sequence < db.core.nextDerivedSequence());
     const file = &backend.native_docstore.?.file;
     var debt = (try file.replayAdmission()).?;
+    if (!indexes) std.debug.print("no-index source debt: bytes={d} records={d}\n", .{ debt.bytes, debt.records });
     try std.testing.expect(debt.bytes != 0);
-    debt.limits.bytes = debt.bytes + 1024;
-    debt.limits.records = debt.records;
+    debt.limits.bytes = debt.bytes + if (single_record)
+        readEnvU64("ANTFLY_TEST_NATIVE_DRAIN_EXTRA_BYTES", 4096)
+    else
+        @as(u64, 1024);
+    // Preserve enough slots for one publication: this case constrains bytes,
+    // rather than inventing a record cap below the engine's progress minimum.
+    debt.limits.records = @max(128, debt.records);
     const limits = debt.limits;
     try file.putDocument(lite.native.replay_admission.key, &debt.encode());
     // Match the C API explicit-drain consumer scope. This adds the existing
     // finite progress reserve, but does not make producer admission unbounded.
     file.replay_consumer_admission = true;
     defer file.replay_consumer_admission = false;
-    try db.runUntilIdle();
+    if (single_record) {
+        var pending = true;
+        for (0..256) |_| {
+            pending = try db.runExplicitReplayDrainTurn(&db.group_source_owner.state, 0);
+            if (!pending) break;
+            if (db.enrichment_runtime.?.stats().retrying)
+                try std.testing.io.sleep(.fromMilliseconds(25), .awake);
+        }
+        if (pending) {
+            const retained = (try file.replayAdmission()).?;
+            const progress = db.enrichment_runtime.?.stats();
+            std.debug.print("single-record replay did not settle: bytes={d} limit={d} producer={d}/{d} output_publications={d} attempts={d} max_docs={d} max_artifacts={d} provider_requests={d} retrying={}\n", .{ retained.bytes, limits.bytes, progress.applied_sequence, progress.target_sequence, output.calls, output.attempts, output.largest_documents, output.largest_artifacts, producer.successful_requests.load(.acquire), progress.retrying });
+        }
+        try std.testing.expect(!pending);
+    } else try db.runUntilIdle();
+    if (!indexes) std.debug.print("no-index settled: requests={d} publications={d} reclaimed={} progress={d}/{d} bytes={d}\n", .{ producer.successful_requests.load(.acquire), output.calls, output.reclaimed_between_outputs, db.enrichment_runtime.?.stats().applied_sequence, db.core.nextDerivedSequence(), (try file.replayAdmission()).?.bytes });
     try std.testing.expectEqual(@as(usize, 32), producer.successful_requests.load(.acquire));
-    try std.testing.expect(output.calls >= 4);
-    try std.testing.expect(output.reclaimed_between_outputs);
+    try std.testing.expect(output.calls >= if (single_record) @as(usize, 2) else @as(usize, 4));
+    if (indexes) try std.testing.expect(output.reclaimed_between_outputs);
     const target = db.core.nextDerivedSequence();
     try std.testing.expect(db.enrichment_runtime.?.stats().applied_sequence >= target);
-    try std.testing.expectEqual(@as(u32, 32), db.core.index_manager.textIndex("raw").?.snapshot().liveDocCount());
-    try std.testing.expectEqual(@as(u32, 32), db.core.index_manager.textIndex("generated").?.snapshot().liveDocCount());
+    if (indexes) {
+        try std.testing.expectEqual(@as(u32, 32), db.core.index_manager.textIndex("raw").?.snapshot().liveDocCount());
+        try std.testing.expectEqual(@as(u32, 32), db.core.index_manager.textIndex("generated").?.snapshot().liveDocCount());
+    }
     const after = (try file.replayAdmission()).?;
     try std.testing.expectEqual(limits.bytes, after.limits.bytes);
     try std.testing.expectEqual(limits.records, after.limits.records);
     try std.testing.expect(after.bytes < limits.bytes);
+    if (!indexes) {
+        try std.testing.expectEqual(@as(u64, 0), after.bytes);
+        const managed = try db.core.managedIndexes(a);
+        defer {
+            for (managed) |ref| a.free(@constCast(ref.name));
+            a.free(managed);
+        }
+        try std.testing.expectEqual(@as(usize, 0), managed.len);
+    }
     try std.testing.expect((try backend.check()).valid);
 }
 
-test "background enrichment turn fences artifact consumers at the producer prefix" {
+test "background enrichment turn consumes committed artifacts independently of unfinished production" {
     const QueuedOutput = struct {
         fn commit(ptr: *anyopaque, batch: enrichment_runtime_mod.GeneratedRecordBatch, promotions: []const enrichment_runtime_mod.GeneratedArtifactPromotion, deletes: []const []const u8, guards: []const enrichment_runtime_mod.GeneratedSourceGuard, fence: ?enrichment_runtime_mod.GeneratedWriteFence) anyerror!enrichment_runtime_mod.GeneratedRecordCommit {
             const database: *DB = @ptrCast(@alignCast(ptr));
@@ -147742,13 +147844,15 @@ test "background enrichment turn fences artifact consumers at the producer prefi
     // The bounded prefix must also tolerate a newer value for an early key.
     try db.batch(.{ .writes = &.{.{ .key = "source-0", .value = "{\"text\":\"latest producer canary\"}" }}, .sync_level = .write });
     const target = db.core.nextDerivedSequence();
-    const before = try db.core.loadAppliedSequence(alloc, "text");
     try std.testing.expect(try db.runBackgroundTurnWithCancellation(.none, .replay));
     const produced = db.enrichment_runtime.?.stats().applied_sequence;
     try std.testing.expect(produced > 0);
     try std.testing.expect(produced < target);
     try std.testing.expect(db.enrichment_runtime.?.stats().processed_requests <= 8);
-    try std.testing.expect(try db.core.loadAppliedSequence(alloc, "text") <= @max(before, produced));
+    // This watermark describes committed effects, not completion of future
+    // provider requests. The explicit visibility drain below must still wait
+    // for the source fence and then consume every resulting publication.
+    try std.testing.expect(try db.core.loadAppliedSequence(alloc, "text") >= produced);
     try db.runUntilIdle();
     try std.testing.expect(db.enrichment_runtime.?.stats().applied_sequence >= target);
     try std.testing.expect(db.enrichment_runtime.?.stats().processed_requests >= 32);
