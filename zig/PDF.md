@@ -1918,8 +1918,13 @@ indirect values. Unassigned ParentTree slots treat direct and indirect null
 equally; parent links still require real structure elements. Named property
 lookups at BDC remain logarithmic. Sparse scopes select names through a shared
 dictionary index; dense scopes reuse its sorted order in one pass.
-Named replacement strings retain their encoded bytes and decode only when
-selected. A bounded page-local cache shares each decoded string, including
+Named replacement strings decode only when selected. Direct dictionaries larger than 96 encoded bytes in
+indirect property tables retain source locations rather than their strings, so
+an oversized unselected replacement cannot exhaust a selected sibling's parsing
+allowance. Locations carry the source object identity and byte range, including
+inside encrypted or compressed objects, and remain valid after frame eviction.
+Tiny dictionaries use a bounded inline projection to avoid per-value resolver
+and cache overhead in dense tables. A bounded page-local cache shares each decoded string, including
 indirect values; overridden replacement values are never decoded or resolved.
 Indirect resource and property dictionaries are retained once per page. Form
 records borrow their raw strings, and property-name indexes are sorted once per
@@ -1947,7 +1952,22 @@ Cache entries reserve capacity before parsing. Successful projections and
 deterministic failures then commit without allocating; a saturated cache rejects
 a new entry before spending work on metadata it cannot retain. Property-name
 index caches also reserve capacity before allocating and sorting shared indexes,
-then commit without allocation.
+then commit without allocation. Their in-place introsort polls cancellation and
+charges comparison work without a second index-sized buffer; a heapsort
+fallback bounds worst-case work and smaller-partition recursion bounds stack
+space.
+Metadata resolution shares one decoded object-stream frame and validated offset
+index per page. Both count against the retained/live byte allowance; codec
+scratch has a separate per-decode cumulative allowance. Output ownership moves
+between accounting ledgers without copying or double-charging the shared
+backing allocator. Required reads evict unrelated frames, and large selected
+clones release a frame before competing with its decoded scratch value.
+Metadata scanning polls cancellation throughout tokens, strings, whitespace,
+comments, and skipped compound values. A page-local work allowance of 16 times
+the working-set byte limit (at least 1 MiB, at most 2 GiB) charges scanned bytes,
+token traversal, and property-index comparisons independently of allocations.
+Exhaustion is sticky; optional failures are memoized while cancellation and
+backing OOM remain retryable.
 Selected missing or malformed property dictionaries retain native glyph text and
 report incomplete ActualText, including when selected optional metadata exceeds
 a decode or allocation allowance. Actual allocator failures and cancellation

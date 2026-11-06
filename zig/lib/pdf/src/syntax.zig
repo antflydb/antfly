@@ -22,6 +22,32 @@ pub const ObjRef = struct {
     gen: u16,
 };
 
+// Source offsets survive object-stream eviction; no payload bytes are retained.
+pub const DeferredValue = struct {
+    reference: ObjRef,
+    start: usize,
+    end: usize,
+};
+
+pub const ScanControl = struct {
+    remaining_work: usize = std.math.maxInt(usize),
+    context: ?*const anyopaque = null,
+    is_cancelled_fn: ?*const fn (?*const anyopaque) bool = null,
+    until_poll: usize = 0,
+
+    pub fn spend(self: *@This(), work: usize) !void {
+        if (work >= self.until_poll or work > self.remaining_work) {
+            self.until_poll = 4096;
+            if (self.is_cancelled_fn) |check| if (check(self.context)) return error.Canceled;
+        } else self.until_poll -= work;
+        if (work > self.remaining_work) {
+            self.remaining_work = 0;
+            return error.PdfMetadataWorkLimit;
+        }
+        self.remaining_work -= work;
+    }
+};
+
 pub const DictEntry = struct {
     key: []u8,
     value: Object,
@@ -48,6 +74,7 @@ pub const Object = union(enum) {
         data_length: usize,
     },
     obj_ref: ObjRef,
+    deferred: DeferredValue,
     obj_def: struct {
         ptr: ObjRef,
         value: *Object,
@@ -114,6 +141,7 @@ pub const Object = union(enum) {
                 } };
             },
             .obj_ref => |value| .{ .obj_ref = value },
+            .deferred => |value| .{ .deferred = value },
             .obj_def => |def| blk: {
                 const boxed = try alloc.create(Object);
                 errdefer alloc.destroy(boxed);
@@ -241,6 +269,40 @@ pub const Scanner = struct {
     unread: std.ArrayList(Token) = .empty,
     max_object_depth: usize = std.math.maxInt(usize),
     object_depth: usize = 0,
+    source_ref: ?ObjRef = null,
+    allow_stream: bool = true,
+    control: ?*ScanControl = null,
+    last_checked_pos: usize = 0,
+
+    fn checkpoint(self: *Scanner) !void {
+        try self.checkpointUsing(self.control);
+    }
+
+    fn checkpointUsing(self: *Scanner, active: ?*ScanControl) !void {
+        if (active) |control| {
+            const work = (self.pos -| self.last_checked_pos) +| 1;
+            self.last_checked_pos = self.pos;
+            try control.spend(work);
+        }
+    }
+
+    fn findStringMarker(self: *Scanner) !?usize {
+        const bytes = self.bytes[self.pos..];
+        if (self.control) |control| {
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                const end = @min(bytes.len, offset + 4096);
+                if (std.mem.indexOfAny(u8, bytes[offset..end], "()\\")) |found| {
+                    try control.spend(found + 1);
+                    return offset + found;
+                }
+                try control.spend(end - offset);
+                offset = end;
+            }
+            return null;
+        }
+        return std.mem.indexOfAny(u8, bytes, "()\\");
+    }
 
     pub fn init(alloc: Allocator, bytes: []const u8) Scanner {
         return initWithOffset(alloc, bytes, 0);
@@ -266,7 +328,7 @@ pub const Scanner = struct {
 
     pub fn readObjectProjected(self: *Scanner, projection: Projection) anyerror!Object {
         if (projection != .full and self.unread.items.len == 0) {
-            self.skipSpaceAndComments();
+            try self.skipSpaceAndComments();
             if (self.peekByte()) |first| {
                 const compound = first == '[' or (first == '<' and self.pos + 1 < self.bytes.len and self.bytes[self.pos + 1] == '<');
                 const string = first == '(' or (first == '<' and !compound);
@@ -388,6 +450,11 @@ pub const Scanner = struct {
         return .{ .array = owned };
     }
 
+    fn nextIsDictionary(self: *Scanner) !bool {
+        try self.skipSpaceAndComments();
+        return self.pos + 1 < self.bytes.len and std.mem.eql(u8, self.bytes[self.pos..][0..2], "<<");
+    }
+
     fn readDictOrStream(self: *Scanner, projection: Projection) anyerror!Object {
         var entries = std.ArrayList(DictEntry).empty;
         defer {
@@ -410,7 +477,26 @@ pub const Scanner = struct {
             const key = try self.alloc.dupe(u8, tok.name);
             errdefer self.alloc.free(key);
 
-            const value: Object = if (selected.skip) blk: {
+            const value: Object = if (projection == .property_table and self.source_ref != null and self.unread.items.len == 0 and (try self.nextIsDictionary())) blk: {
+                try self.skipSpaceAndComments();
+                const start = self.base_offset + self.pos;
+                try self.skipObject(self.object_depth);
+                const end = self.base_offset + self.pos;
+                // Bound eager work per name. Tiny dictionaries avoid a second
+                // resolver/cache entry in dense tables; larger values retain
+                // only their source location, regardless of string size.
+                if (end - start <= 96) {
+                    var inline_scanner = Scanner.initWithOffset(self.alloc, self.bytes[start - self.base_offset .. end - self.base_offset], start);
+                    inline_scanner.source_ref = self.source_ref;
+                    inline_scanner.control = self.control;
+                    inline_scanner.allow_stream = false;
+                    inline_scanner.max_object_depth = self.max_object_depth;
+                    inline_scanner.object_depth = self.object_depth;
+                    defer inline_scanner.deinit();
+                    break :blk try inline_scanner.readObjectProjected(.property);
+                }
+                break :blk .{ .deferred = .{ .reference = self.source_ref.?, .start = start, .end = end } };
+            } else if (selected.skip) blk: {
                 try self.skipObject(self.object_depth);
                 break :blk .null;
             } else try self.readObjectProjected(selected.child);
@@ -429,6 +515,7 @@ pub const Scanner = struct {
             self.alloc.free(owned);
         }
 
+        if (!self.allow_stream) return .{ .dict = owned };
         var tok = try self.readToken();
         defer tok.deinit(self.alloc);
         if (tok != .keyword or !std.mem.eql(u8, tok.keyword, "stream")) {
@@ -476,11 +563,12 @@ pub const Scanner = struct {
     }
 
     fn readToken(self: *Scanner) anyerror!Token {
+        try self.checkpoint();
         if (self.unread.items.len > 0) {
             return self.unread.pop().?;
         }
 
-        self.skipSpaceAndComments();
+        try self.skipSpaceAndComments();
         if (self.pos >= self.bytes.len) return .eof;
 
         const c = self.readByte() orelse return .eof;
@@ -492,7 +580,7 @@ pub const Scanner = struct {
                         return .{ .keyword = try self.alloc.dupe(u8, "<<") };
                     }
                 }
-                if (!self.nextStartsHexString()) return .{ .keyword = try self.alloc.dupe(u8, "<") };
+                if (!(try self.nextStartsHexString())) return .{ .keyword = try self.alloc.dupe(u8, "<") };
                 return .{ .string = try self.readHexString() };
             },
             '(' => return .{ .string = try self.readLiteralString() },
@@ -533,6 +621,7 @@ pub const Scanner = struct {
     }
 
     fn skipObject(self: *Scanner, depth: usize) anyerror!void {
+        try self.checkpoint();
         if (depth >= self.max_object_depth) return error.PdfObjectNestingTooDeep;
         if (self.unread.items.len != 0) {
             // Normally a dictionary key consumes the final lookahead token.
@@ -541,13 +630,13 @@ pub const Scanner = struct {
             object.deinit(self.alloc);
             return;
         }
-        self.skipSpaceAndComments();
+        try self.skipSpaceAndComments();
         const first = self.readByte() orelse return error.UnexpectedEof;
         switch (first) {
             '(' => {
                 var nesting: usize = 1;
                 while (nesting != 0) {
-                    const offset = std.mem.indexOfAny(u8, self.bytes[self.pos..], "()\\") orelse {
+                    const offset = try self.findStringMarker() orelse {
                         self.pos = self.bytes.len;
                         return;
                     };
@@ -574,7 +663,7 @@ pub const Scanner = struct {
                 }
             },
             '[' => while (true) {
-                self.skipSpaceAndComments();
+                try self.skipSpaceAndComments();
                 if (self.peekByte() == ']') {
                     self.pos += 1;
                     break;
@@ -585,7 +674,7 @@ pub const Scanner = struct {
                 if (self.peekByte() == '<') {
                     self.pos += 1;
                     while (true) {
-                        self.skipSpaceAndComments();
+                        try self.skipSpaceAndComments();
                         if (self.pos + 1 < self.bytes.len and std.mem.eql(u8, self.bytes[self.pos..][0..2], ">>")) {
                             self.pos += 2;
                             break;
@@ -595,17 +684,18 @@ pub const Scanner = struct {
                         try self.skipObject(depth + 1);
                     }
                 } else {
-                    if (!self.nextStartsHexString()) return error.UnexpectedKeyword;
+                    if (!(try self.nextStartsHexString())) return error.UnexpectedKeyword;
                     while (true) {
-                        const hi = self.readSkippingSpace() orelse break;
+                        const hi = (try self.readSkippingSpace()) orelse break;
                         if (hi == '>' or unhex(hi) == null) break;
-                        const lo = self.readSkippingSpace() orelse break;
+                        const lo = (try self.readSkippingSpace()) orelse break;
                         if (lo == '>' or unhex(lo) == null) break;
                     }
                 }
             },
             '/' => {
                 while (self.pos < self.bytes.len) {
+                    try self.checkpoint();
                     const byte = self.readByte().?;
                     if (isSpace(byte) or isDelim(byte)) {
                         self.pos -= 1;
@@ -643,31 +733,41 @@ pub const Scanner = struct {
     }
 
     fn skipWord(self: *Scanner) ![]const u8 {
-        self.skipSpaceAndComments();
+        const active = self.control;
+        try self.skipSpaceAndComments();
         const start = self.pos;
-        while (self.pos < self.bytes.len and !isSpace(self.bytes[self.pos]) and !isDelim(self.bytes[self.pos])) self.pos += 1;
+        while (self.pos < self.bytes.len and !isSpace(self.bytes[self.pos]) and !isDelim(self.bytes[self.pos])) {
+            try self.checkpointUsing(active);
+            self.pos += 1;
+        }
         if (self.pos == start) return error.UnexpectedEof;
         return self.bytes[start..self.pos];
     }
 
-    fn skipSpaceAndComments(self: *Scanner) void {
+    fn skipSpaceAndComments(self: *Scanner) !void {
+        const active = self.control;
         while (self.pos < self.bytes.len) {
+            try self.checkpointUsing(active);
             const c = self.bytes[self.pos];
             if (isSpace(c)) {
                 self.pos += 1;
                 continue;
             }
             if (c == '%') {
-                while (self.pos < self.bytes.len and self.bytes[self.pos] != '\r' and self.bytes[self.pos] != '\n') : (self.pos += 1) {}
+                while (self.pos < self.bytes.len and self.bytes[self.pos] != '\r' and self.bytes[self.pos] != '\n') : (self.pos += 1) {
+                    try self.checkpointUsing(active);
+                }
                 continue;
             }
             break;
         }
     }
 
-    fn nextStartsHexString(self: *const Scanner) bool {
+    fn nextStartsHexString(self: *Scanner) !bool {
         var i = self.pos;
-        while (i < self.bytes.len and isSpace(self.bytes[i])) : (i += 1) {}
+        while (i < self.bytes.len and isSpace(self.bytes[i])) : (i += 1) {
+            if (self.control) |control| try control.spend(1);
+        }
         if (i >= self.bytes.len) return false;
         return self.bytes[i] == '>' or unhex(self.bytes[i]) != null;
     }
@@ -677,10 +777,10 @@ pub const Scanner = struct {
         defer out.deinit(self.alloc);
 
         while (true) {
-            const c = self.readSkippingSpace() orelse break;
+            const c = (try self.readSkippingSpace()) orelse break;
             if (c == '>') break;
             const hi = unhex(c) orelse break;
-            const c2 = self.readSkippingSpace() orelse {
+            const c2 = (try self.readSkippingSpace()) orelse {
                 try out.append(self.alloc, hi << 4);
                 break;
             };
@@ -698,10 +798,11 @@ pub const Scanner = struct {
     }
 
     fn readLiteralString(self: *Scanner) anyerror![]u8 {
+        const active = self.control;
         // Most literal strings need no escape or nesting processing. Allocate
         // their exact size once: geometric growth otherwise retains both old
         // and new buffers alongside a decoded object stream during relocation.
-        if (std.mem.indexOfAny(u8, self.bytes[self.pos..], "()\\")) |end| {
+        if (try self.findStringMarker()) |end| {
             if (self.bytes[self.pos + end] == ')') {
                 const result = try self.alloc.dupe(u8, self.bytes[self.pos .. self.pos + end]);
                 self.pos += end + 1;
@@ -713,6 +814,7 @@ pub const Scanner = struct {
 
         var depth: usize = 1;
         while (self.pos < self.bytes.len) {
+            try self.checkpointUsing(active);
             const c = self.readByte().?;
             switch (c) {
                 '(' => {
@@ -762,10 +864,12 @@ pub const Scanner = struct {
     }
 
     fn readName(self: *Scanner) anyerror![]u8 {
+        const active = self.control;
         var out = std.ArrayList(u8).empty;
         defer out.deinit(self.alloc);
 
         while (self.pos < self.bytes.len) {
+            try self.checkpointUsing(active);
             const c = self.readByte().?;
             if (isDelim(c) or isSpace(c)) {
                 self.unreadByte();
@@ -803,8 +907,12 @@ pub const Scanner = struct {
     }
 
     fn readKeywordToken(self: *Scanner) anyerror!Token {
+        const active = self.control;
         const start = self.pos;
-        while (self.pos < self.bytes.len and !isSpace(self.bytes[self.pos]) and !isDelim(self.bytes[self.pos])) self.pos += 1;
+        while (self.pos < self.bytes.len and !isSpace(self.bytes[self.pos]) and !isDelim(self.bytes[self.pos])) {
+            try self.checkpointUsing(active);
+            self.pos += 1;
+        }
         const text = self.bytes[start..self.pos];
         if (std.mem.eql(u8, text, "true")) return .{ .boolean = true };
         if (std.mem.eql(u8, text, "false")) return .{ .boolean = false };
@@ -812,8 +920,10 @@ pub const Scanner = struct {
         return .{ .keyword = try self.alloc.dupe(u8, text) };
     }
 
-    fn readSkippingSpace(self: *Scanner) ?u8 {
+    fn readSkippingSpace(self: *Scanner) !?u8 {
+        const active = self.control;
         while (self.pos < self.bytes.len) {
+            try self.checkpointUsing(active);
             const c = self.readByte().?;
             if (!isSpace(c)) return c;
         }
@@ -1441,5 +1551,73 @@ test "scanner inherited resource projections defer properties and discard unrela
             try std.testing.expectEqual(@as(i64, 2), tag.get("MCID").?.integer);
             try std.testing.expect(tag.get("Private") == null);
         }
+    }
+}
+
+test "scanner defers direct property dictionaries as source locations" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 55 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const input = try std.fmt.allocPrint(a, "<< /Unused << /ActualText (\\n{s}) >> /Tag << /ActualText (Label) >> /Indirect 9 0 R >>", .{padding});
+    defer a.free(input);
+    var storage: [8 * 1024]u8 = undefined;
+    var bounded = std.heap.FixedBufferAllocator.init(&storage);
+    var scanner = Scanner.initWithOffset(bounded.allocator(), input, 100);
+    scanner.source_ref = .{ .id = 7, .gen = 2 };
+    var control = ScanControl{};
+    scanner.control = &control;
+    defer scanner.deinit();
+    var object = try scanner.readObjectProjected(.property_table);
+    defer object.deinit(bounded.allocator());
+    try std.testing.expect(object.get("Unused").?.* == .deferred);
+    try std.testing.expectEqual(@as(u32, 9), object.get("Indirect").?.obj_ref.id);
+    const location = object.get("Unused").?.deferred;
+    try std.testing.expectEqualStrings("Label", object.get("Tag").?.get("ActualText").?.string);
+    try std.testing.expectEqual(@as(u32, 7), location.reference.id);
+    try std.testing.expectEqual(@as(u16, 2), location.reference.gen);
+    try std.testing.expect(std.mem.startsWith(u8, input[location.start - 100 .. location.end - 100], "<< /ActualText"));
+    try std.testing.expect(location.end - location.start > padding.len);
+    var copy = try object.clone(bounded.allocator());
+    defer copy.deinit(bounded.allocator());
+    try std.testing.expectEqual(location, copy.get("Unused").?.deferred);
+}
+
+test "scanner polls cancellation and bounds work throughout long tokens and skipped values" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 32 * 1024);
+    defer a.free(padding);
+    const Probe = struct {
+        calls: usize = 0,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.calls == 2;
+        }
+    };
+    inline for (.{ "({s})", "(\\n{s})", "/{s}", "<{s}>", "[{s}]", "%{s}\nnull", "{s}null", "{s}" }, 0..) |format, i| {
+        @memset(padding, if (i == 6) ' ' else if (i >= 4) '0' else 'A');
+        if (i == 4) for (padding, 0..) |*byte, j| {
+            byte.* = if (j % 2 == 0) '0' else ' ';
+        };
+        const value = try std.fmt.allocPrint(a, format, .{padding});
+        defer a.free(value);
+        const input = try std.fmt.allocPrint(a, "<< /Private {s} /ActualText (Label) >>", .{value});
+        defer a.free(input);
+        for ([_]Projection{ .full, .property }) |projection| {
+            var probe = Probe{};
+            var control = ScanControl{ .context = &probe, .is_cancelled_fn = Probe.cancelled };
+            var scanner = Scanner.init(a, input);
+            scanner.control = &control;
+            defer scanner.deinit();
+            try std.testing.expectError(error.Canceled, scanner.readObjectProjected(projection));
+            try std.testing.expectEqual(@as(usize, 2), probe.calls);
+            try std.testing.expect(scanner.pos < input.len / 2);
+        }
+        var control = ScanControl{ .remaining_work = 64 };
+        var scanner = Scanner.init(a, input);
+        scanner.control = &control;
+        defer scanner.deinit();
+        try std.testing.expectError(error.PdfMetadataWorkLimit, scanner.readObjectProjected(.property));
     }
 }
