@@ -128,7 +128,18 @@ const BoundModelSource = struct {
         if (kind == .onnx) {
             result.external_base_dir = try artifacts.constructionPath(external_base orelse std.fs.path.dirname(requested) orelse ".");
         } else {
-            if (manifest == null) result.owned_manifest = try manifest_mod.loadFromDir(result.allocator, requested);
+            if (manifest) |provided| {
+                if (kind == .directory) {
+                    if (provided.source_root != null) {
+                        try provided.verifyBoundRoot(proof.io, result.path);
+                    } else {
+                        // Hand-built manifests have no directory provenance.
+                        // Discover from the pinned root before native reuse.
+                        result.borrowed_manifest = null;
+                        result.owned_manifest = try manifest_mod.loadFromDir(result.allocator, result.path);
+                    }
+                }
+            } else result.owned_manifest = try manifest_mod.loadFromDir(result.allocator, if (kind == .directory) result.path else requested);
             if (kind == .gguf and !std.mem.eql(u8, result.view().manifest.?.gguf_path orelse return error.NoModelFileFound, result.path)) return error.ModelArtifactsChanging;
         }
         return result;
@@ -142,6 +153,10 @@ const BoundModelSource = struct {
             .gguf => try proof.artifacts().verifyPath(self.path),
             .directory => try proof.verifyManifest(self.view().manifest.?.*, backend),
         }
+    }
+    fn finish(self: *const BoundModelSource, proof: *ComponentConstruction) !void {
+        if (self.kind == .directory) try self.view().manifest.?.verifyBoundRoot(proof.io, self.path);
+        try proof.finish();
     }
     fn deinit(self: *BoundModelSource) void {
         if (self.owned_manifest) |*manifest| manifest.deinit();
@@ -7403,7 +7418,7 @@ pub const ModelManager = struct {
                         self,
                     );
                 }
-                try construction_proof.finish();
+                try bound.finish(&construction_proof);
                 return loaded.take();
             } else |err| {
                 rememberPreferredLoadError(&first_err, err);
@@ -11844,7 +11859,7 @@ fn loadSessionForPreferredBackendsWithArtifacts(
     manager: *ModelManager,
     preferred_backends: []const backends.BackendType,
     model_dir: []const u8,
-    man: manifest_mod.ModelManifest,
+    provided_man: manifest_mod.ModelManifest,
     source_session_manager: *const backends.SessionManager,
     control: ?InferenceExecutionControl,
     borrowed: ?*PublishedArtifacts,
@@ -11853,7 +11868,7 @@ fn loadSessionForPreferredBackendsWithArtifacts(
     var proof = try ComponentConstruction.init(
         manager.allocator,
         if (control) |active| active.io orelse source_session_manager.io orelse std.Options.debug_io else source_session_manager.io orelse std.Options.debug_io,
-        .{ .path = model_dir, .publication = man.managed_publication },
+        .{ .path = model_dir, .publication = provided_man.managed_publication },
         control,
         borrowed,
     );
@@ -11861,6 +11876,16 @@ fn loadSessionForPreferredBackendsWithArtifacts(
     if (proof.owned != null) proof.artifacts().verification_cache = &manager.verified_artifacts;
     const construction_root = try proof.artifacts().constructionPath(model_dir);
     defer proof.artifacts().allocator.free(construction_root);
+    // Normalize legacy/hand-built snapshots once, before route selection,
+    // preflight or admission. Every phase must use the constructor's metadata.
+    var discovered: ?manifest_mod.ModelManifest = null;
+    defer if (discovered) |*manifest| manifest.deinit();
+    if (provided_man.source_root == null and ModelSource.kindForPath(model_dir) == .directory) {
+        discovered = try manifest_mod.loadFromDir(manager.allocator, construction_root);
+        if (!std.meta.eql(discovered.?.managed_publication, provided_man.managed_publication)) return error.ModelArtifactsChanging;
+    }
+    const man = discovered orelse provided_man;
+    if (ModelSource.kindForPath(model_dir) == .directory) try man.verifyBoundRoot(proof.io, construction_root);
     var verified_onnx_path: ?[]const u8 = null;
     var device_order_scratch: backends.BackendOrderBuffer = undefined;
     const available_backends = try source_session_manager.executionBackendOrder(&device_order_scratch, preferred_backends, control);
@@ -12064,7 +12089,7 @@ fn loadSessionForPreferredBackendsWithArtifacts(
             // keeping the construction peak leased until preparation drains.
             try session_factory.prepareGlinerBoundaryResident(loaded.session, control);
             try session_factory.prepareLayaResident(loaded.session, control);
-            try proof.finish();
+            try bound.finish(&proof);
             if (loaded.resource_lease) |*lease| try lease.retain(resident_amounts);
             return loaded.take();
         } else |err| {
@@ -18673,4 +18698,109 @@ test "model selection bound sources unwind owned and borrowed metadata allocatio
     const onnx = try std.fs.path.join(a, &.{ root, "model.onnx" });
     defer a.free(onnx);
     try platform.allocator.checkAllAllocationFailures(a, boundSourceAllocationScenario, .{ root, onnx, ModelSource.Kind.onnx, null });
+}
+
+test "model selection rejects reused unmanaged manifests after directory alias switches" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "first", "second" }) |name| {
+        try tmp.dir.createDirPath(io, name);
+        var dir = try tmp.dir.openDir(io, name, .{});
+        defer dir.close(io);
+        try writeTinyHeadSafetensorsForModelManagerTest(dir, a, "model.safetensors");
+    }
+    try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const alias = try std.fs.path.join(a, &.{ root, "current" });
+    defer a.free(alias);
+    var manifest = try manifest_mod.loadFromDir(a, alias);
+    defer manifest.deinit();
+    var copy = try manifest.clone(a);
+    defer copy.deinit();
+    try std.testing.expectEqualStrings(manifest.source_root.?, copy.source_root.?);
+    var proof = try ComponentConstruction.init(a, io, .{ .path = alias, .publication = null }, null, null);
+    defer proof.deinit();
+    var bound = try BoundModelSource.init(&proof, alias, .directory, &manifest, null);
+    defer bound.deinit();
+    try tmp.dir.deleteFile(io, "current");
+    try tmp.dir.symLink(io, "second", "current", .{ .is_directory = true });
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    manager.admission_enabled = true;
+    try std.testing.expectError(error.ModelArtifactsChanging, manager.loadArtifactSession(alias, manifest));
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+    var fresh = try manifest_mod.loadFromDir(a, alias);
+    defer fresh.deinit();
+    try boundSourceAllocationScenario(a, alias, alias, .directory, &fresh);
+    // A replacement at the same canonical pathname is a new installation too.
+    try tmp.dir.deleteFile(io, "current");
+    try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
+    try tmp.dir.rename("first", tmp.dir, "old-first", io);
+    try tmp.dir.rename("second", tmp.dir, "first", io);
+    try std.testing.expectError(error.ModelArtifactsChanging, bound.finish(&proof));
+    try std.testing.expectError(error.ModelArtifactsChanging, manager.loadArtifactSession(alias, manifest));
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+}
+
+test "model selection companion ONNX sources preserve tensor context" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const names = [_][]const u8{ "vision_model.onnx", "audio_model.onnx", "text_projection.onnx", "visual_projection.onnx", "audio_projection.onnx" };
+    const prefixes = [_][]const u8{ "vision_model.weight", "audio_model.weight", "text_projection.weight", "visual_projection.weight", "audio_projection.weight" };
+    for ([_]bool{ false, true }) |managed_model| for (names, prefixes, 0..) |name, prefix, component_index| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var graph = ml.graph.Graph.init(a);
+        defer graph.deinit();
+        var builder = ml.graph.Builder.init(&graph);
+        const input = try builder.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+        const weight = try builder.parameter("weight", ml.graph.Shape.init(.f32, &.{4}));
+        try graph.markOutput(try builder.add(input, weight));
+        const values = [_]f32{ 1, 2, 3, 4 };
+        var exported = try onnx_graph.exportGraphWithExternalData(a, &graph, .{ .parameter_initializers = &.{.{ .name = "weight", .shape = ml.graph.Shape.init(.f32, &.{4}), .data = .{ .raw_bytes = std.mem.asBytes(&values) } }} }, "weights.data");
+        defer exported.deinit(a);
+        try tmp.dir.createDirPath(io, "blobs");
+        try tmp.dir.writeFile(io, .{ .sub_path = "blobs/graph", .data = exported.model_bytes });
+        try tmp.dir.symLink(io, "blobs/graph", name, .{});
+        try tmp.dir.writeFile(io, .{ .sub_path = "weights.data", .data = exported.external_data.?.bytes });
+        // A wrong base must not silently select valid but different weights.
+        try tmp.dir.writeFile(io, .{ .sub_path = "blobs/weights.data", .data = std.mem.asBytes(&[_]f32{ 10, 20, 30, 40 }) });
+        if (managed_model) try writeArtifactIdentityTestReceipt(tmp.dir, &.{ name, "weights.data", "blobs/weights.data" });
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        const alias = try std.fs.path.join(a, &.{ root, name });
+        defer a.free(alias);
+        var manifest = try manifest_mod.loadFromDir(a, root);
+        defer manifest.deinit();
+        try std.testing.expect(manifest.onnx_path == null);
+        const component_path = ([_]?[]const u8{ manifest.visual_model_path, manifest.audio_model_path, manifest.text_projection_path, manifest.visual_projection_path, manifest.audio_projection_path })[component_index].?;
+        var listing = try manifest_mod.loadListingFromDir(a, root);
+        defer listing.deinit();
+        const listing_path = ([_]?[]const u8{ listing.visual_model_path, listing.audio_model_path, listing.text_projection_path, listing.visual_projection_path, listing.audio_projection_path })[component_index].?;
+        try std.testing.expectEqualStrings(component_path, listing_path);
+        const access = try @import("../models/tensor_access.zig").openFromManifest(a, manifest);
+        defer access.deinit();
+        var record = try access.getRecord(a, prefix);
+        defer record.deinit();
+        try std.testing.expectEqualSlices(u8, std.mem.asBytes(&values), record.raw_bytes);
+        var sm = backends.SessionManager.initWithIo(a, io);
+        sm.preferred_backends = &.{.native};
+        sm.native_call_policy = .in_process;
+        var manager = ModelManager.init(a, sm);
+        defer manager.deinit();
+        manager.admission_enabled = true;
+        const selected = ResolvedModel{ .path = root, .publication = manifest.managed_publication };
+        var good = try manager.loadManagedSessionWithAdmission(alias, &.{.native}, null, null, selected, null);
+        defer good.deinit();
+        try expectBoundSourceOutput(good.session, false);
+        var component = try manager.loadManagedSessionWithAdmission(component_path, &.{.native}, null, null, selected, null);
+        defer component.deinit();
+        try expectBoundSourceOutput(component.session, false);
+    };
 }
