@@ -11731,9 +11731,9 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
     const compute = impl.shared_backend_ctx.ctx.metal_hosted.compute;
     const before = controller.snapshot();
     const sdk_before = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
-    // Exercise the real public cold metadata path before any ordinary call.
-    // Depending on constructor readiness, failure may precede specialization,
-    // immutable binding retention, or packed headers; no SDK payload may leak.
+    // Exercise real public input-wrapper allocation failure before the first
+    // ordinary call. Upload may already create a device tensor; rollback must
+    // retire it and preserve admission, rather than assert no SDK allocation.
     for (0..2) |fail_index| {
         var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
         const previous_allocator = compute.allocator;
@@ -11749,7 +11749,10 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
         } else |err| err;
         try std.testing.expectEqual(@as(anyerror, error.OutOfMemory), failure);
         try std.testing.expectEqualDeep(before, controller.snapshot());
-        try std.testing.expectEqual(sdk_before.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
+        const sdk_after = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+        try std.testing.expectEqual(sdk_before.device_owned_live_bytes, sdk_after.device_owned_live_bytes);
+        try std.testing.expectEqual(sdk_after.device_owned_buffers_created - sdk_before.device_owned_buffers_created, sdk_after.device_owned_buffers_released - sdk_before.device_owned_buffers_released);
+        try std.testing.expectEqual(sdk_after.device_owned_bytes_created - sdk_before.device_owned_bytes_created, sdk_after.device_owned_bytes_released - sdk_before.device_owned_bytes_released);
     }
     // Real constructor preparation can already make the first Source eligible.
     // Preserve its original selection; do not force a compatibility warmup.
