@@ -28,7 +28,6 @@ const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("../../backend_erased.zig");
-const docstore_mod = @import("../../docstore.zig");
 const lsm_backend = @import("../../lsm_backend.zig");
 const mem_backend = @import("../../mem_backend.zig");
 const artifact_projection_epoch = @import("../artifact_projection_epoch.zig");
@@ -903,8 +902,10 @@ test "projection checkpoint replacement revokes serving-certificate completion" 
         try txn.commit();
     }
     const Probe = struct {
-        fn current(store: *docstore_mod.DocStore) !u64 {
-            var read = try store.beginReadTxn();
+        fn current(store: anytype) !u64 {
+            var probe_runtime = try initRuntimeStore(std.testing.allocator, store);
+            defer probe_runtime.deinit();
+            var read = try probe_runtime.store.beginProbe();
             defer read.abort();
             return epoch.load(&read);
         }
