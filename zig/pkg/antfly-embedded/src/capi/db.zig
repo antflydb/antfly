@@ -5127,7 +5127,7 @@ pub fn antfly_db_batch(
     const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
     var prepared: ?Prepared = null;
     defer if (prepared) |*plan| plan.deinit();
-    if (owned.req.writes.len != 0) {
+    if (owned.req.writes.len != 0 or owned.req.deletes.len != 0) {
         const guard = enterHandle(handle_ptr, .read) orelse return capi.mapError(error.InvalidArgument);
         defer guard.leave();
         if (guard.entry_error) |code| {
@@ -5140,16 +5140,24 @@ pub fn antfly_db_batch(
     const Request = struct {
         owned: *StructBatchRequest,
         prepared: ?*Prepared,
+        handle_ptr: ?*anyopaque,
         fn prepare(raw: *anyopaque) !void {
             const request: *@This() = @ptrCast(@alignCast(raw));
-            if (request.prepared) |plan| try plan.prepareAttempt();
+            const plan = request.prepared orelse return;
+            try plan.prepareAttempt();
+            const guard = enterHandle(request.handle_ptr, .read) orelse return error.InvalidArgument;
+            defer guard.leave();
+            // Preparation is optional. Mutation admission below preserves the
+            // actual entry error and its retry/outcome classification.
+            if (guard.entry_error != null) return;
+            try plan.stageForegroundText(guard.handle.database());
         }
         fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
             const request: *@This() = @ptrCast(@alignCast(raw));
             try trackedBatchWithPreparedDocuments(handle.database(), request.owned.req, primary_committed, handle.selected_table_name, request.prepared);
         }
     };
-    var request: Request = .{ .owned = &owned, .prepared = if (prepared) |*plan| plan else null };
+    var request: Request = .{ .owned = &owned, .prepared = if (prepared) |*plan| plan else null, .handle_ptr = handle_ptr };
     return executeBatchWithReplayPreparation(handle_ptr, &request, Request.prepare, Request.apply);
 }
 
@@ -5197,7 +5205,7 @@ pub fn antfly_db_batch_json(
     const Prepared = @import("../storage/db/prepared_document_batch.zig").Plan;
     var prepared: ?Prepared = null;
     defer if (prepared) |*plan| plan.deinit();
-    if (owned.req.writes.len != 0) {
+    if (owned.req.writes.len != 0 or owned.req.deletes.len != 0) {
         // Capture only immutable catalog inputs under ordinary handle lifetime
         // admission. Parsing/mapping and graph-field extraction then proceed
         // without either process gate or native writer lease.
@@ -5211,16 +5219,24 @@ pub fn antfly_db_batch_json(
     const Request = struct {
         owned: *@TypeOf(owned),
         prepared: ?*Prepared,
+        handle_ptr: ?*anyopaque,
         fn prepare(raw: *anyopaque) !void {
             const request: *@This() = @ptrCast(@alignCast(raw));
-            if (request.prepared) |plan| try plan.prepareAttempt();
+            const plan = request.prepared orelse return;
+            try plan.prepareAttempt();
+            const guard = enterHandle(request.handle_ptr, .read) orelse return error.InvalidArgument;
+            defer guard.leave();
+            // Preparation is optional. Mutation admission below preserves the
+            // actual entry error and its retry/outcome classification.
+            if (guard.entry_error != null) return;
+            try plan.stageForegroundText(guard.handle.database());
         }
         fn apply(raw: *anyopaque, handle: *Handle, primary_committed: *bool) !void {
             const request: *@This() = @ptrCast(@alignCast(raw));
             try trackedBatchWithPreparedDocuments(handle.database(), request.owned.req, primary_committed, handle.selected_table_name, request.prepared);
         }
     };
-    var request: Request = .{ .owned = &owned, .prepared = if (prepared) |*plan| plan else null };
+    var request: Request = .{ .owned = &owned, .prepared = if (prepared) |*plan| plan else null, .handle_ptr = handle_ptr };
     const code = executeBatchWithReplayPreparation(handle_ptr, &request, Request.prepare, Request.apply);
     if (code != .ok) return code;
     out_buf.* = .{ .ptr = response.?.ptr, .len = response.?.len };

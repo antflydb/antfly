@@ -920,6 +920,7 @@ pub const ForegroundTextProjection = struct {
     selected_field: ?[]const u8,
     retain_empty: bool,
     source_options: mapper.TextProjectionOptions,
+    observed: []const mapper.ObservedFieldAnalyzer,
     stager: @import("../../immutable_artifact.zig").Stager,
 
     pub fn matches(self: ForegroundTextProjection, other: ForegroundTextProjection) bool {
@@ -931,6 +932,10 @@ pub const ForegroundTextProjection = struct {
         self.stager.deinit();
         self.projection.destroy();
         self.* = undefined;
+    }
+
+    pub fn prepareMetadata(self: *const ForegroundTextProjection, a: Allocator, observed: []const mapper.ObservedFieldAnalyzer) !?PreparedForegroundTextMetadata {
+        return PreparedForegroundTextMetadata.create(a, self, observed);
     }
 
     /// Document identities are deliberately absent from posting bytes. The
@@ -981,10 +986,215 @@ pub const ForegroundTextProjection = struct {
     }
 };
 
+/// Replacement analyzer claims and their in-memory postimage are allocated
+/// before admission. Publication owns the durable writes; activation only swaps
+/// owned arrays under the caller's catalog/analysis lifetime fences.
+pub const PreparedForegroundTextMetadata = struct {
+    const FieldAnalyzer = std.meta.Child(@FieldType(introducer_mod.TextAnalysisConfig, "field_analyzers"));
+    alloc: Allocator,
+    name: []u8,
+    generation: u64,
+    config_hash: u64,
+    descriptor: []u8,
+    expected: []u8,
+    encoded: []u8,
+    key: []u8,
+    observed: []mapper.ObservedFieldAnalyzer,
+    bindings: []FieldAnalyzer,
+    activated: bool = false,
+
+    fn freeBindings(a: Allocator, bindings: []const FieldAnalyzer) void {
+        for (bindings) |binding| {
+            a.free(binding.field_name);
+            a.free(binding.analyzer_name);
+        }
+        if (bindings.len != 0) a.free(bindings);
+    }
+
+    fn create(a: Allocator, config: *const ForegroundTextProjection, observed: []const mapper.ObservedFieldAnalyzer) !?PreparedForegroundTextMetadata {
+        var additions: std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer) = .empty;
+        defer additions.deinit(a);
+        for (observed) |item| {
+            if (!containsObservedFieldAnalyzer(config.observed, item) and !containsObservedFieldAnalyzer(additions.items, item)) try additions.append(a, item);
+        }
+        if (additions.items.len == 0) return null;
+        var claims: std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer) = .empty;
+        errdefer freeOwnedObservedFieldAnalyzers(a, &claims);
+        try appendOwnedObservedFieldAnalyzers(a, &claims, config.observed);
+        try appendOwnedObservedFieldAnalyzers(a, &claims, additions.items);
+        var bindings: std.ArrayListUnmanaged(FieldAnalyzer) = .empty;
+        errdefer {
+            for (bindings.items) |binding| {
+                a.free(binding.field_name);
+                a.free(binding.analyzer_name);
+            }
+            bindings.deinit(a);
+        }
+        for (config.projection.build.?.analysis.field_analyzers) |binding| {
+            const field_name = try a.dupe(u8, binding.field_name);
+            errdefer a.free(field_name);
+            const analyzer_name = try a.dupe(u8, binding.analyzer_name);
+            errdefer a.free(analyzer_name);
+            try bindings.append(a, .{ .field_name = field_name, .analyzer_name = analyzer_name });
+        }
+        for (additions.items) |item| {
+            const present = for (bindings.items) |binding| {
+                if (std.mem.eql(u8, binding.field_name, item.field_name) and std.mem.eql(u8, binding.analyzer_name, item.analyzer_name)) break true;
+            } else false;
+            if (present) continue;
+            const field_name = try a.dupe(u8, item.field_name);
+            errdefer a.free(field_name);
+            const analyzer_name = try a.dupe(u8, item.analyzer_name);
+            errdefer a.free(analyzer_name);
+            try bindings.append(a, .{ .field_name = field_name, .analyzer_name = analyzer_name });
+        }
+        const name = try a.dupe(u8, config.name);
+        errdefer a.free(name);
+        const descriptor = try a.dupe(u8, config.descriptor);
+        errdefer a.free(descriptor);
+        const expected = try serializeObservedTextFieldAnalyzers(a, config.observed);
+        errdefer a.free(expected);
+        const encoded = try serializeObservedTextFieldAnalyzers(a, claims.items);
+        errdefer a.free(encoded);
+        const key = try textFieldAnalyzersKey(a, config.name);
+        errdefer a.free(key);
+        const owned_claims = try claims.toOwnedSlice(a);
+        errdefer freeObservedTextFieldAnalyzers(a, owned_claims);
+        const owned_bindings = try bindings.toOwnedSlice(a);
+        return .{ .alloc = a, .name = name, .generation = config.generation, .config_hash = config.config_hash, .descriptor = descriptor, .expected = expected, .encoded = encoded, .key = key, .observed = owned_claims, .bindings = owned_bindings };
+    }
+
+    pub fn matches(self: *const PreparedForegroundTextMetadata, config: ForegroundTextProjection, a: Allocator) bool {
+        return self.alloc.ptr == a.ptr and self.alloc.vtable == a.vtable and self.generation == config.generation and self.config_hash == config.config_hash and
+            std.mem.eql(u8, self.name, config.name) and std.mem.eql(u8, self.descriptor, config.descriptor);
+    }
+
+    /// Called by an owned metadata overlay before writer admission. Preserve
+    /// the distinction between a missing claim and a failed/canceled read.
+    pub fn plan(self: *const PreparedForegroundTextMetadata, txn: anytype) !void {
+        const raw: ?[]const u8 = txn.get(self.key) catch |err| if (@as(anyerror, err) == error.NotFound) null else return err;
+        if (raw) |bytes| {
+            const actual = try deserializeObservedTextFieldAnalyzers(self.alloc, bytes);
+            defer freeObservedTextFieldAnalyzers(self.alloc, actual);
+            const canonical = try serializeObservedTextFieldAnalyzers(self.alloc, actual);
+            defer self.alloc.free(canonical);
+            if (!std.mem.eql(u8, canonical, self.expected)) return error.TextProjectionChanged;
+        } else if (!std.mem.eql(u8, self.expected, &emptyObservedPayload())) return error.TextProjectionChanged;
+        try txn.put(self.key, self.encoded);
+        for (self.bindings) |binding| {
+            if (binding.field_name.len == 0 or binding.analyzer_name.len == 0) continue;
+            const identity = algebraic_mod.lexical.DictionaryIdentity.analyzedText(self.name, binding.field_name, binding.analyzer_name);
+            switch (try algebraic_mod.lexical.claimRegistryOwnerTxn(self.alloc, txn, identity, self.name, .fst_postings, "ready")) {
+                .claimed, .already_owned => {},
+                .owned_by_other => return error.InvalidIndexConfig,
+            }
+        }
+    }
+
+    fn emptyObservedPayload() [12]u8 {
+        return .{ 'A', 'T', 'F', 'A', 3, 0, 0, 0, 0, 0, 0, 0 };
+    }
+
+    pub fn activateAssumeAnalysisLocked(self: *PreparedForegroundTextMetadata, manager: *IndexManager, entry: *IndexManager.TextIndex) void {
+        std.debug.assert(!self.activated and self.alloc.ptr == manager.alloc.ptr and self.alloc.vtable == manager.alloc.vtable);
+        std.debug.assert(std.mem.eql(u8, self.name, entry.config.name));
+        const old_observed = entry.observed_field_analyzers;
+        const old_bindings = entry.text_analysis.field_analyzers;
+        entry.observed_field_analyzers = self.observed;
+        entry.text_analysis.field_analyzers = self.bindings;
+        self.observed = &.{};
+        self.bindings = &.{};
+        self.activated = true;
+        manager.invalidateWritePlanSnapshot();
+        freeObservedTextFieldAnalyzers(manager.alloc, old_observed);
+        freeBindings(manager.alloc, old_bindings);
+    }
+
+    pub fn deinit(self: *PreparedForegroundTextMetadata) void {
+        const a = self.alloc;
+        freeObservedTextFieldAnalyzers(a, self.observed);
+        freeBindings(a, self.bindings);
+        a.free(self.key);
+        a.free(self.expected);
+        a.free(self.encoded);
+        a.free(self.descriptor);
+        a.free(self.name);
+        self.* = undefined;
+    }
+};
+
 /// Immutable full-text artifacts built before entering the per-index apply
 /// section. Native plans own their build dependencies; foreign providers keep
 /// the existing catalog/analysis read fence. Callers revalidate the captured
 /// publication context under lifecycle admission before publishing.
+/// Request-owned native publication. Only its short final guard borrows a
+/// mutable runtime; posting bytes and durable read witnesses survive refresh.
+pub const OwnedForegroundTextPublication = struct {
+    alloc: Allocator,
+    sequence: u64,
+    config: ForegroundTextProjection,
+    claims: ?PreparedForegroundTextMetadata,
+    root: @import("../../native_metadata_batch.zig").Prepared,
+    native: *persistent_mod.PersistentIndex.PreparedNativePublication,
+
+    pub fn deinit(self: *@This()) void {
+        const a = self.alloc;
+        self.native.deinit();
+        self.root.deinit();
+        if (self.claims) |*claims| claims.deinit();
+        a.destroy(self);
+    }
+
+    pub const Guard = struct {
+        manager: *IndexManager,
+        entry: *IndexManager.TextIndex,
+        pub fn release(self: *Guard) void {
+            self.entry.analysis_mutex.unlockExclusive();
+            self.entry.apply_mutex.unlock();
+            self.manager.catalog_mutex.unlockShared();
+            self.* = undefined;
+        }
+    };
+
+    /// Writer admission must never wait behind a replay lane which may itself
+    /// need the native writer. Contention declines this optional foreground
+    /// candidate; the canonical journal still owns the complete async effect.
+    pub fn bind(self: *@This(), manager: *IndexManager) !?Guard {
+        if (self.alloc.ptr != manager.alloc.ptr or self.alloc.vtable != manager.alloc.vtable) return null;
+        var current = try manager.acquireWritePlanSnapshot();
+        defer current.release();
+        const config = for (current.plan().foreground_text) |config| {
+            if (std.mem.eql(u8, config.name, self.config.name)) break config;
+        } else return null;
+        if (!self.config.matches(config)) return null;
+        if (!manager.catalog_mutex.tryLockShared()) return null;
+        var catalog_owned = true;
+        defer if (catalog_owned) manager.catalog_mutex.unlockShared();
+        const entry = manager.textIndexEntry(self.config.name) orelse return null;
+        if (!entry.apply_mutex.tryLock()) return null;
+        var apply_owned = true;
+        defer if (apply_owned) entry.apply_mutex.unlock();
+        if (!entry.analysis_mutex.tryLockExclusive()) return null;
+        var analysis_owned = true;
+        defer if (analysis_owned) entry.analysis_mutex.unlockExclusive();
+        if (current.generation() != manager.writePlanGeneration() or !manager.foregroundTextServiceableAssumeCatalogLocked(self.config.name)) return null;
+        self.native.bindTarget(&entry.persistent) catch |err| switch (err) {
+            error.EnrichmentWaitCanceled => return null,
+            else => return err,
+        };
+        catalog_owned = false;
+        apply_owned = false;
+        analysis_owned = false;
+        return .{ .manager = manager, .entry = entry };
+    }
+
+    pub fn activate(self: *@This(), guard: *const Guard) void {
+        std.debug.assert(self.native.activated);
+        guard.entry.recordCommittedDeletes(self.native.infos);
+        if (self.claims) |*claims| claims.activateAssumeAnalysisLocked(guard.manager, guard.entry);
+    }
+};
+
 pub const PreparedTextMapperPublication = struct {
     alloc: Allocator,
     segment_alloc: Allocator,
@@ -1009,6 +1219,14 @@ pub const PreparedTextMapperPublication = struct {
     }
 
     pub fn stage(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager) !void {
+        return self.stageWithIdentities(stager, false);
+    }
+
+    pub fn stageNative(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager) !void {
+        return self.stageWithIdentities(stager, true);
+    }
+
+    fn stageWithIdentities(self: *PreparedTextMapperPublication, stager: @import("../../immutable_artifact.zig").Stager, native_identities: bool) !void {
         if (self.staged.len != 0 or self.segments.len == 0) return;
         const staged = try self.alloc.alloc(persistent_mod.PreparedReplaySegment, self.segments.len);
         var initialized: usize = 0;
@@ -1017,7 +1235,7 @@ pub const PreparedTextMapperPublication = struct {
             self.alloc.free(staged);
         }
         for (self.segments, 0..) |*bytes, i| {
-            staged[i] = try persistent_mod.prepareReplaySegment(self.alloc, stager, bytes.*);
+            staged[i] = if (native_identities) try persistent_mod.prepareNativeTextSegment(self.alloc, stager, bytes.*) else try persistent_mod.prepareReplaySegment(self.alloc, stager, bytes.*);
             initialized += 1;
         }
         // Staging succeeds as a unit. On refusal, the caller still owns all
@@ -20732,7 +20950,8 @@ pub const IndexManager = struct {
         const source_options = try projection.ownValue(mapper.TextProjectionOptions, try self.textProjectionOptionsForSchema(a, schema == null and selected == null));
         // Configuration comparison is exact and independent of process-local
         // instance counters, so a same-catalog runtime refresh can adopt it.
-        const descriptor = try std.json.Stringify.valueAlloc(a, .{ .schema = schema_bytes, .analysis = build.analysis, .selected_field = selected, .source_options = source_options, .index_sort = build.options.index_sort }, .{});
+        const observed = try projection.ownValue(@TypeOf(entry.observed_field_analyzers), entry.observed_field_analyzers);
+        const descriptor = try std.json.Stringify.valueAlloc(a, .{ .schema = schema_bytes, .analysis = build.analysis, .observed = observed, .selected_field = selected, .source_options = source_options, .index_sort = build.options.index_sort }, .{});
         const name = try a.dupe(u8, entry.config.name);
         if (self.analysis_contributions_enabled) {
             @import("antfly_platform").sync.lockYielding(&self.analysis_contributions_mutex);
@@ -20746,7 +20965,7 @@ pub const IndexManager = struct {
             }
         }
         transferred = true;
-        return .{ .projection = projection, .name = name, .generation = entry.config.coverage_generation, .config_hash = types.indexConfigHash(entry.config), .descriptor = descriptor, .schema = schema, .selected_field = selected, .retain_empty = entry.coversPrimaryDocuments(), .source_options = source_options, .stager = stager };
+        return .{ .projection = projection, .name = name, .generation = entry.config.coverage_generation, .config_hash = types.indexConfigHash(entry.config), .descriptor = descriptor, .schema = schema, .selected_field = selected, .retain_empty = entry.coversPrimaryDocuments(), .source_options = source_options, .observed = observed, .stager = stager };
     }
 
     fn captureDetachedTextBuild(self: *IndexManager, entry: *TextIndex, projection: *OwnedTextMapperProjection) !void {
@@ -21755,6 +21974,97 @@ pub const IndexManager = struct {
             return;
         }
         return error.IndexNotFound;
+    }
+
+    fn foregroundTextServiceableAssumeCatalogLocked(self: *IndexManager, name: []const u8) bool {
+        if (self.repair_unavailable_indexes.get(name)) |slot| if (slot.retained()) return false;
+        if (!self.managed_admission_mutex.tryLock()) return false;
+        defer self.managed_admission_mutex.unlock();
+        return !self.managed_admission_indexes.contains(name);
+    }
+
+    /// Capture an exact native index replacement and root-metadata postimage.
+    /// Projection/tokenization has already completed without writer admission.
+    /// No mutable DB/index reference survives this function.
+    pub fn prepareOwnedForegroundTextPublication(
+        self: *IndexManager,
+        store: *docstore_mod.DocStore,
+        config: ForegroundTextProjection,
+        built: *PreparedTextMapperPublication,
+        delete_keys: []const []const u8,
+        previous_sequence: u64,
+    ) !?*OwnedForegroundTextPublication {
+        if (previous_sequence == std.math.maxInt(u64)) return null;
+        var current = try self.acquireWritePlanSnapshot();
+        defer current.release();
+        const selected = for (current.plan().foreground_text) |item| {
+            if (std.mem.eql(u8, item.name, config.name)) break item;
+        } else return null;
+        if (!config.matches(selected)) return null;
+        if (!self.catalog_mutex.tryLockShared()) return null;
+        defer self.catalog_mutex.unlockShared();
+        const entry = self.textIndexEntry(config.name) orelse return null;
+        if (!entry.apply_mutex.tryLock()) return null;
+        defer entry.apply_mutex.unlock();
+        if (!entry.analysis_mutex.tryLockShared()) return null;
+        defer entry.analysis_mutex.unlockShared();
+        if (current.generation() != self.writePlanGeneration() or !self.foregroundTextServiceableAssumeCatalogLocked(config.name)) return null;
+        var scope = (try store.runtime_store.nativePublicationScope(self.alloc)) orelse return null;
+        defer scope.deinit(self.alloc);
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const authority = try @import("../artifact_publication.zig").authority(&read);
+        const next_sequence = previous_sequence + 1;
+        const Planner = struct {
+            config: ForegroundTextProjection,
+            previous: u64,
+            admission_key: []const u8,
+            authority: ?@import("../artifact_publication.zig").Authority,
+            claims: ?*PreparedForegroundTextMetadata,
+            pub fn plan(planner: *const @This(), txn: anytype) !void {
+                const admission: ?[]const u8 = txn.get(planner.admission_key) catch |err| switch (@as(anyerror, err)) {
+                    error.NotFound => null,
+                    else => return err,
+                };
+                _ = admission orelse {
+                    try planner.planUnfenced(txn);
+                    return;
+                };
+                return error.ForegroundProjectionUnavailable;
+            }
+            fn planUnfenced(planner: *const @This(), txn: anytype) !void {
+                const checkpoint = try apply_state.loadProjectionMetadataTxn(txn, planner.config.name);
+                if (checkpoint) |value| {
+                    if (value.status != .clean or value.applied_sequence != planner.previous or value.generation != planner.config.generation or value.config_hash != planner.config.config_hash) return error.ForegroundProjectionUnavailable;
+                } else return error.ForegroundProjectionUnavailable;
+                if (!std.meta.eql(planner.authority, try @import("../artifact_publication.zig").authority(txn))) return error.EnrichmentSourceChanged;
+                if (planner.claims) |claims| try claims.plan(txn);
+                try apply_state.advanceProjectionMetadataTxn(txn, &.{.{ .index_name = planner.config.name, .sequence = planner.previous + 1, .generation = planner.config.generation, .config_hash = planner.config.config_hash }});
+            }
+        };
+        const result = try self.alloc.create(OwnedForegroundTextPublication);
+        errdefer self.alloc.destroy(result);
+        var claims = try config.prepareMetadata(self.alloc, built.observed_field_analyzers);
+        errdefer if (claims) |*owned| owned.deinit();
+        const admission_key = try internal_keys.managedIndexAdmissionKeyAlloc(self.alloc, config.name);
+        defer self.alloc.free(admission_key);
+        const planner: Planner = .{ .config = config, .previous = previous_sequence, .admission_key = admission_key, .authority = authority, .claims = if (claims) |*owned| owned else null };
+        var root = @import("../../native_metadata_batch.zig").prepare(self.alloc, scope, &read, &planner) catch |err| switch (err) {
+            error.ForegroundProjectionUnavailable, error.TextProjectionChanged => {
+                if (claims) |*owned| owned.deinit();
+                self.alloc.destroy(result);
+                return null;
+            },
+            else => return err,
+        };
+        errdefer root.deinit();
+        result.* = .{ .alloc = self.alloc, .sequence = next_sequence, .config = config, .claims = claims, .root = root, .native = undefined };
+        const metadata: persistent_mod.PersistentIndex.ReplayPublicationMetadata = .{
+            .participant = result.root.participant(),
+            .seal = if (authority) |selected_authority| if (self.artifact_projection_root != 0) .{ .root = self.artifact_projection_root, .namespace = selected_authority.namespace, .generation = config.generation, .config_hash = config.config_hash, .applied_sequence = next_sequence } else null else null,
+        };
+        result.native = try entry.persistent.prepareOwnedNativePublication(built.staged, delete_keys, null, metadata);
+        return result;
     }
 
     pub fn applyPreparedTextReplayPublication(
@@ -53619,4 +53929,99 @@ test "native text preparation declines detachment from a borrowed resource manag
     var prepared = try manager.preparePlannedTextMapperPublication(a, config.name, &context, &plan, 0, plan.input_end);
     defer prepared.deinit();
     try std.testing.expect(prepared.segments.len != 0);
+}
+
+test "foreground text metadata preparation releases every allocation failure and deduplicates dictionary bindings" {
+    const a = std.testing.allocator;
+    const projection = try OwnedTextMapperProjection.create(a, null);
+    defer projection.destroy();
+    const Owner = struct {
+        fn release(_: *anyopaque) void {}
+    };
+    projection.build = .{ .resources = .{ .ptr = projection, .allocator = a, .io = std.testing.io, .resource_manager = null, .retain_fn = Owner.release, .release_fn = Owner.release } };
+    const config: ForegroundTextProjection = .{ .projection = projection, .name = "text", .generation = 7, .config_hash = 11, .descriptor = "canonical-config", .schema = null, .selected_field = null, .retain_empty = true, .source_options = .{}, .observed = &.{}, .stager = undefined };
+    const observed = [_]mapper.ObservedFieldAnalyzer{
+        .{ .field_name = @constCast("body"), .analyzer_name = @constCast("standard") },
+        .{ .field_name = @constCast("body"), .analyzer_name = @constCast("standard") },
+        .{ .field_name = @constCast("body"), .analyzer_name = @constCast("standard"), .field_type = .keyword },
+    };
+    const Sweep = struct {
+        fn run(alloc: Allocator, captured: *const ForegroundTextProjection, claims: []const mapper.ObservedFieldAnalyzer) !void {
+            var prepared = (try captured.prepareMetadata(alloc, claims)).?;
+            defer prepared.deinit();
+            try std.testing.expect(prepared.matches(captured.*, alloc));
+            try std.testing.expectEqual(@as(usize, 2), prepared.observed.len);
+            try std.testing.expectEqual(@as(usize, 1), prepared.bindings.len);
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Sweep.run, .{ &config, &observed });
+}
+
+test "foreground text metadata joins primary publication and activates preallocated analyzer claims" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("../../lite/backend.zig");
+    const native_indexes = @import("../../lite/index_storage.zig");
+    const metadata_batches = @import("../../native_metadata_batch.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/foreground-text-metadata.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var backend = try backend_mod.Handle.createWithOptions(a, path, .{ .exclusive = true, .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer backend.deinit();
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    var store = try docstore_mod.DocStore.openRuntime(a, backend.native_runtime_store.?);
+    defer store.close();
+    var adapter = native_indexes.Store.init(a, backend.native_docstore.?);
+    var manager = try IndexManager.initWithOptions(a, "/foreground-meta", .{ .resource_manager = backend.owned_resource_manager.?, .text_lsm_storage = adapter.storage(), .generation_storage = adapter.storage() });
+    defer manager.deinit();
+    manager.setIo(std.testing.io);
+    manager.updateRange(.{ .start = "", .end = "" });
+    try std.testing.expect(try schema_mod.saveSchema(&store, a, .{ .version = 0, .default_type = "doc", .full_text_documents = &.{.{ .name = "doc", .open_dynamic_paths = &.{"body"} }} }));
+    try manager.addAllNoBackfill(&store, &.{.{ .name = "text", .kind = .full_text, .config_json = "{}" }});
+    var captured = try manager.acquireWritePlanSnapshot();
+    defer captured.release();
+    const config = &captured.plan().foreground_text[0];
+    const docs = [_]mapper.MapperDoc{.{ .key = "one", .value = "{\"body\":\"résumé 日本語\"}" }};
+    var projection = try config.project(a, &docs);
+    defer projection.deinit();
+    var built = (try projection.prepareDetached(a, 0, projection.input_end)).?;
+    defer built.deinit();
+    try std.testing.expect(built.observed_field_analyzers.len > 0);
+    const maybe_metadata = try config.prepareMetadata(a, built.observed_field_analyzers);
+    try std.testing.expect(maybe_metadata != null);
+    var metadata = maybe_metadata.?;
+    defer metadata.deinit();
+    const maybe_scope = try store.runtime_store.nativePublicationScope(a);
+    try std.testing.expect(maybe_scope != null);
+    var scope = maybe_scope.?;
+    defer scope.deinit(a);
+    var read = try store.beginReadTxn();
+    var read_live = true;
+    defer if (read_live) read.abort();
+    var batch = try metadata_batches.prepare(a, scope, &read, &metadata);
+    defer batch.deinit();
+    read.abort();
+    read_live = false;
+    const before = backend.native_docstore.?.file.activeCheckpoint().commit_sequence;
+    try store.putBatchWithPublications(std.testing.io, &.{.{ .key = "one", .value = docs[0].value }}, &.{}, null, .{}, null, batch.participant());
+    try std.testing.expectEqual(before + 1, backend.native_docstore.?.file.activeCheckpoint().commit_sequence);
+    const persisted = try loadObservedTextFieldAnalyzers(a, &store, "text");
+    defer freeObservedTextFieldAnalyzers(a, persisted);
+    try std.testing.expect(persisted.len > 0);
+    manager.catalog_mutex.lockShared();
+    {
+        defer manager.catalog_mutex.unlockShared();
+        const entry = manager.textIndexEntry("text").?;
+        entry.analysis_mutex.lockExclusive();
+        defer entry.analysis_mutex.unlockExclusive();
+        metadata.activateAssumeAnalysisLocked(&manager, entry);
+        try std.testing.expectEqual(persisted.len, entry.observed_field_analyzers.len);
+    }
+    var after = try manager.acquireWritePlanSnapshot();
+    defer after.release();
+    try std.testing.expect(!config.matches(after.plan().foreground_text[0]));
+    var repeated = try after.plan().foreground_text[0].prepareMetadata(a, built.observed_field_analyzers);
+    defer if (repeated) |*owned| owned.deinit();
+    try std.testing.expect(repeated == null);
+    try std.testing.expect((try backend.native_docstore.?.file.check()).valid);
 }

@@ -24,6 +24,9 @@ const types = @import("types.zig");
 const identity = @import("doc_identity.zig");
 const graph_fields = @import("graph_field_plan.zig");
 const Allocator = std.mem.Allocator;
+const persistent = @import("../persistent.zig");
+const native_publication = @import("../native_publication.zig");
+const docstore = @import("../docstore.zig");
 
 pub const Plan = struct {
     alloc: Allocator,
@@ -31,7 +34,14 @@ pub const Plan = struct {
     catalog: manager_mod.IndexManager.WritePlanSnapshotView,
     namespace: identity.Namespace,
     incarnation: u128,
+    schema: ?@import("schema_registry.zig").SchemaView = null,
     rows: std.StringHashMapUnmanaged(Entry) = .empty,
+    text: std.ArrayListUnmanaged(Text) = .empty,
+    text_delete_keys: []const []const u8 = &.{},
+    text_guards: []manager_mod.OwnedForegroundTextPublication.Guard = &.{},
+    text_candidates: []*persistent.PersistentIndex.PreparedNativePublication = &.{},
+    text_selected: []usize = &.{},
+    const Text = struct { config: manager_mod.ForegroundTextProjection, built: manager_mod.PreparedTextMapperPublication, publication: ?*manager_mod.OwnedForegroundTextPublication = null };
     const Entry = struct { value: []const u8, template: mapper.ExtractedWrite, extracted: ?mapper.ExtractedWrite = null };
 
     /// Called under the short catalog lifetime fence. No borrowed DB pointer
@@ -40,10 +50,12 @@ pub const Plan = struct {
         var schema = database.core.acquireSchemaView();
         defer if (schema) |*view| view.release();
         if (schema) |view| if (view.storageMode() == .relational) return null;
+        const catalog = try database.core.index_manager.acquireWritePlanSnapshot();
         return .{
             .alloc = a,
             .inputs = std.heap.ArenaAllocator.init(a),
-            .catalog = try database.core.index_manager.acquireWritePlanSnapshot(),
+            .catalog = catalog,
+            .schema = if (schema) |view| view.clone() else null,
             .namespace = database.core.identity_namespace,
             .incarnation = database.root_incarnation,
         };
@@ -55,8 +67,18 @@ pub const Plan = struct {
             if (entry.extracted) |*row| row.deinit(self.alloc);
             entry.template.deinit(self.alloc);
         }
+        for (self.text.items) |*item| {
+            if (item.publication) |publication| publication.deinit();
+            item.built.deinit();
+        }
+        self.text.deinit(self.alloc);
+        self.alloc.free(self.text_delete_keys);
+        self.alloc.free(self.text_guards);
+        self.alloc.free(self.text_candidates);
+        self.alloc.free(self.text_selected);
         self.rows.deinit(self.alloc);
         self.catalog.release();
+        if (self.schema) |*schema| schema.release();
         self.inputs.deinit();
         self.* = undefined;
     }
@@ -64,10 +86,14 @@ pub const Plan = struct {
     pub fn prepare(self: *Plan, request: types.BatchRequest) !void {
         // Preparation is optional acceleration, with explicit request-local
         // limits. Larger atomic batches retain the ordinary authoritative path.
-        if (request.writes.len > 8192) return;
+        if (request.writes.len > 8192 or request.deletes.len > 8192) return;
         var input_bytes: usize = 0;
         for (request.writes) |write| {
             input_bytes +|= write.key.len +| write.value.len;
+            if (input_bytes > 8 * 1024 * 1024) return;
+        }
+        for (request.deletes) |key| {
+            input_bytes +|= key.len;
             if (input_bytes > 8 * 1024 * 1024) return;
         }
         const a = self.alloc;
@@ -100,7 +126,152 @@ pub const Plan = struct {
             std.debug.assert(!entry.found_existing);
             entry.value_ptr.* = .{ .value = value, .template = row };
         }
+        try self.prepareForegroundText(request);
         try self.prepareAttempt();
+    }
+
+    fn prepareForegroundText(self: *Plan, request: types.BatchRequest) !void {
+        // A transform's final value depends on its validated primary read set.
+        // Until that owned read set is captured, only exact authored postimages
+        // can take this path. The canonical journal retains all other effects.
+        if (request.transforms.len != 0 or self.catalog.plan().foreground_text.len == 0 or (self.rows.count() == 0 and request.deletes.len == 0)) return;
+        const a = self.alloc;
+        var docs: std.ArrayListUnmanaged(mapper.MapperDoc) = .empty;
+        defer docs.deinit(a);
+        var delete_keys: std.ArrayListUnmanaged([]const u8) = .empty;
+        defer delete_keys.deinit(a);
+        var entries = self.rows.iterator();
+        while (entries.next()) |entry| {
+            const value = (try entry.value_ptr.template.logicalJson()) orelse return;
+            try docs.append(a, .{ .key = entry.key_ptr.*, .value = value, .root = entry.value_ptr.template.prepared_text_root });
+            try delete_keys.append(a, entry.key_ptr.*);
+        }
+        std.mem.sort(mapper.MapperDoc, docs.items, {}, struct {
+            fn less(_: void, left: mapper.MapperDoc, right: mapper.MapperDoc) bool {
+                return std.mem.order(u8, left.key, right.key) == .lt;
+            }
+        }.less);
+        for (request.deletes) |key| try delete_keys.append(a, try self.inputs.allocator().dupe(u8, key));
+        self.text_delete_keys = try delete_keys.toOwnedSlice(a);
+        const count = self.catalog.plan().foreground_text.len;
+        self.text_guards = try a.alloc(manager_mod.OwnedForegroundTextPublication.Guard, count);
+        self.text_candidates = try a.alloc(*persistent.PersistentIndex.PreparedNativePublication, count);
+        self.text_selected = try a.alloc(usize, count);
+        for (self.catalog.plan().foreground_text) |config| {
+            var projection = try config.project(a, docs.items);
+            defer projection.deinit();
+            var built = (try projection.prepareDetached(a, 0, projection.input_end)) orelse continue;
+            errdefer built.deinit();
+            try self.text.append(a, .{ .config = config, .built = built });
+        }
+    }
+
+    /// Called under a short current-runtime read/lifetime fence after posting
+    /// construction. This captures native aliases and exact metadata witnesses,
+    /// then releases every mutable index reference before writer admission.
+    pub fn stageForegroundText(self: *Plan, database: anytype) !void {
+        if (self.text.items.len == 0 or !try self.matches(database)) return;
+        const previous = database.core.store.lastReplaySequence(0);
+        var current = try database.core.index_manager.acquireWritePlanSnapshot();
+        defer current.release();
+        for (self.text.items) |*item| {
+            if (item.publication) |publication| publication.deinit();
+            item.publication = null;
+            const config = for (current.plan().foreground_text) |config| {
+                if (item.config.matches(config)) break config;
+            } else continue;
+            item.built.stageNative(config.stager) catch |err| switch (err) {
+                error.EnrichmentWaitCanceled, error.FileBusy => continue,
+                else => return err,
+            };
+            item.publication = database.core.index_manager.prepareOwnedForegroundTextPublication(database.core.store, item.config, &item.built, self.text_delete_keys, previous) catch |err| switch (err) {
+                error.EnrichmentWaitCanceled, error.FileBusy => null,
+                else => return err,
+            };
+        }
+    }
+
+    fn matchesEffects(self: *const Plan, request: types.BatchRequest) bool {
+        var count: usize = 0;
+        for (request.writes, 0..) |write, i| {
+            for (request.deletes) |key| {
+                if (std.mem.eql(u8, key, write.key)) break;
+            } else {
+                for (request.writes[i + 1 ..]) |later| {
+                    if (std.mem.eql(u8, later.key, write.key)) break;
+                } else {
+                    const expected = self.rows.get(write.key) orelse return false;
+                    if (!std.mem.eql(u8, expected.value, write.value)) return false;
+                    count += 1;
+                }
+            }
+        }
+        if (count != self.rows.count()) return false;
+        // Extra captured keys are replacement writes; every effective explicit
+        // delete must also be covered by this publication's deletion plan.
+        for (request.deletes) |key| {
+            for (self.text_delete_keys) |captured| {
+                if (std.mem.eql(u8, key, captured)) break;
+            } else return false;
+        }
+        for (self.text_delete_keys) |key| {
+            if (self.rows.contains(key)) continue;
+            for (request.deletes) |actual| {
+                if (std.mem.eql(u8, key, actual)) break;
+            } else return false;
+        }
+        return true;
+    }
+
+    /// Bind identities from this primary transaction's authoritative postimage.
+    /// One native commit publishes all eligible indexes and the primary batch.
+    /// Every bound handle is destroyed before releasing its live target fence.
+    pub fn commitForegroundText(self: *Plan, manager: *manager_mod.IndexManager, sequence: u64, request: types.BatchRequest, store: *docstore.DocStore, identity_writes: []const docstore.KVPair, primary: native_publication.Committer) !bool {
+        if (self.text.items.len == 0 or !self.matchesEffects(request)) return false;
+        var selected: usize = 0;
+        defer {
+            for (self.text_selected[0..selected], self.text_guards[0..selected]) |index, *guard| {
+                self.text.items[index].publication.?.deinit();
+                self.text.items[index].publication = null;
+                guard.release();
+            }
+        }
+        for (self.text.items, 0..) |*item, index| {
+            const publication = item.publication orelse continue;
+            if (publication.sequence != sequence) continue;
+            const guard = (try publication.bind(manager)) orelse continue;
+            self.text_selected[selected] = index;
+            self.text_guards[selected] = guard;
+            self.text_candidates[selected] = publication.native;
+            selected += 1;
+        }
+        if (selected == 0) return false;
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        const IdentityView = struct {
+            read: *@TypeOf(read),
+            writes: []const docstore.KVPair,
+            pub fn get(view: *@This(), key: []const u8) ![]const u8 {
+                var index = view.writes.len;
+                while (index != 0) {
+                    index -= 1;
+                    const write = view.writes[index];
+                    if (std.mem.eql(u8, write.key, key)) return write.value;
+                }
+                return view.read.get(key);
+            }
+        };
+        var identities: IdentityView = .{ .read = &read, .writes = identity_writes };
+        for (self.text_selected[0..selected]) |index| {
+            for (self.text.items[index].built.staged) |*segment| {
+                const ordinals = if (segment.ordinals) |*value| value else return error.InvalidDocIdentity;
+                for (ordinals.keys, ordinals.assigned) |key, *assigned| assigned.* = (try identity.lookupOrdinalTxn(self.alloc, &identities, key)) orelse return error.InvalidDocIdentity;
+                try ordinals.bind(ordinals.assigned);
+            }
+        }
+        try persistent.PersistentIndex.commitNativePublications(self.text_candidates[0..selected], primary);
+        for (self.text_selected[0..selected], self.text_guards[0..selected]) |index, *guard| self.text.items[index].publication.?.activate(guard);
+        return true;
     }
 
     /// Replenish mutable commit copies outside admission after a pre-commit
@@ -123,6 +294,11 @@ pub const Plan = struct {
         var schema = database.core.acquireSchemaView();
         defer if (schema) |*view| view.release();
         if (schema) |view| if (view.storageMode() == .relational) return false;
+        if ((self.schema == null) != (schema == null)) return false;
+        if (self.schema) |captured| {
+            const actual = schema.?;
+            if (captured.epoch != actual.epoch and !try @import("../schema.zig").schemasEqual(self.alloc, captured.tableSchema().*, actual.tableSchema().*)) return false;
+        }
         var current = try database.core.index_manager.acquireWritePlanSnapshot();
         defer current.release();
         const expected = self.catalog.plan().artifact_catalogs orelse return false;

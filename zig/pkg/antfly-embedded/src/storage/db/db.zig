@@ -78032,6 +78032,120 @@ test "db owned document preparation transfers effects and rejects changed identi
     try std.testing.expectError(error.TableNotFound, prepared.matches(&database));
 }
 
+test "db native foreground text shares the primary commit and binds authoritative document identities" {
+    try testNativeForegroundTextPrimary(false);
+}
+
+test "db native foreground text shares dynamic claims across multiple indexes in one primary commit" {
+    try testNativeForegroundTextPrimary(true);
+}
+
+fn testNativeForegroundTextPrimary(dynamic: bool) !void {
+    const a = std.testing.allocator;
+    const lite = @import("../lite/backend.zig");
+    const Prepared = @import("prepared_document_batch.zig").Plan;
+    var directory = try TestDirectory.init("native-foreground-primary-text");
+    defer directory.cleanup();
+    try std.Io.Dir.cwd().createDirPath(std.testing.io, directory.path());
+    const path = try std.fmt.allocPrint(a, "{s}/foreground.aflite", .{directory.path()});
+    defer a.free(path);
+    var host = try background_runtime_mod.BackendRuntimeHandle.init(a, .{ .backend = .manual, .borrowed_io = .{ .general = std.testing.io } });
+    defer host.deinit();
+    var backend = try lite.Handle.createWithOptions(a, path, .{ .exclusive = true, .externally_locked = true, .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer backend.deinit();
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    var options: OpenOptions = .{ .backend_runtime = host.ptr(), .executor = .{ .backend = .manual }, .start_index_workers = false, .start_optional_runtimes = false, .start_optional_runtime_workers = false, .start_independent_maintenance = false, .text_merge = .{ .enabled = false } };
+    try backend.configureDbOpenOptions(&options);
+    if (dynamic) {
+        var initial = try docstore_mod.DocStore.openRuntime(a, backend.native_runtime_store.?);
+        defer initial.close();
+        _ = try schema_mod.saveSchema(&initial, a, .{ .version = 0, .default_type = "doc", .full_text_documents = &.{.{ .name = "doc", .open_dynamic_paths = &.{"body"} }} });
+    }
+    var database = try DB.open(a, path, options);
+    defer database.close();
+    try database.addIndex(.{ .name = "text", .kind = .full_text, .config_json = "{}" });
+    if (dynamic) try database.addIndex(.{ .name = "second", .kind = .full_text, .config_json = "{}" });
+    for ([_][]const u8{ "{\"body\":\"alpha résumé 日本語\"}", "{\"body\":\"beta κόσμος\"}" }, 0..) |value, round| {
+        const request: types.BatchRequest = .{ .writes = &.{.{ .key = "one", .value = value }}, .sync_level = .write };
+        var prepared = (try Prepared.capture(a, &database)).?;
+        defer prepared.deinit();
+        try prepared.prepare(request);
+        try std.testing.expectEqual(@as(usize, if (dynamic) 2 else 1), prepared.text.items.len);
+        try prepared.stageForegroundText(&database);
+        if (prepared.text.items[0].publication == null) {
+            var probe = try database.core.store.beginReadTxn();
+            defer probe.abort();
+            std.debug.print("FOREGROUND_NOT_PREPARED round={d} tip={d} checkpoint={any} config_generation={d} config_hash={d}\n", .{ round, database.core.store.lastReplaySequence(0), try apply_state.loadProjectionMetadataTxn(&probe, "text"), prepared.text.items[0].config.generation, prepared.text.items[0].config.config_hash });
+            return error.ForegroundPublicationNotPrepared;
+        }
+        const before = backend.native_docstore.?.file.activeCheckpoint().commit_sequence;
+        var committed = false;
+        try database.batchTrackedWithPreparedDocuments(request, &committed, null, &prepared);
+        try std.testing.expect(committed);
+        for (prepared.text.items) |item| if (item.publication != null) return error.ForegroundPublicationNotConsumed;
+        try std.testing.expectEqual(before + 1, backend.native_docstore.?.file.activeCheckpoint().commit_sequence);
+        const entry = database.core.index_manager.textIndexEntry("text").?;
+        try std.testing.expectEqual(@as(u32, 1), entry.persistent.snapshot().liveDocCount());
+        var read = try database.core.store.beginReadTxn();
+        defer read.abort();
+        const ordinal = (try doc_identity.lookupOrdinalTxn(a, &read, "one")).?;
+        const current = entry.persistent.snapshot().segments[entry.persistent.snapshot().segments.len - 1];
+        try std.testing.expectEqual(@as(?u32, ordinal), try current.reader.docOrdinal(0));
+        if (dynamic) {
+            const other = database.core.index_manager.textIndexEntry("second").?;
+            try std.testing.expectEqual(@as(u32, 1), other.persistent.snapshot().liveDocCount());
+            const other_checkpoint = (try apply_state.loadProjectionMetadataTxn(&read, "second")).?;
+            try std.testing.expectEqual(database.core.nextDerivedSequence(), other_checkpoint.applied_sequence);
+            try std.testing.expect(entry.observed_field_analyzers.len > 0);
+            try std.testing.expect(other.observed_field_analyzers.len > 0);
+        }
+        const checkpoint = (try apply_state.loadProjectionMetadataTxn(&read, "text")).?;
+        try std.testing.expectEqual(database.core.nextDerivedSequence(), checkpoint.applied_sequence);
+        if (round == 1) {
+            var matches = try database.search(a, .{ .index_name = "text", .query = .{ .match = .{ .field = "body", .text = "alpha" } }, .limit = 10 });
+            defer matches.deinit();
+            try std.testing.expectEqual(@as(usize, 0), matches.hits.len);
+        }
+    }
+    // A failed predicate must leave both the primary and prepared indexes
+    // untouched, including their generation/progress records.
+    const refused: types.BatchRequest = .{ .writes = &.{.{ .key = "one", .value = "{\"body\":\"mustnotpublish\"}" }}, .predicates = &.{.{ .key = "one", .expected_version = 0 }}, .sync_level = .write };
+    var rejected = (try Prepared.capture(a, &database)).?;
+    defer rejected.deinit();
+    try rejected.prepare(refused);
+    try rejected.stageForegroundText(&database);
+    const before_refusal = backend.native_docstore.?.file.activeCheckpoint().commit_sequence;
+    var committed = false;
+    try std.testing.expectError(error.VersionConflict, database.batchTrackedWithPreparedDocuments(refused, &committed, null, &rejected));
+    try std.testing.expect(!committed);
+    try std.testing.expectEqual(before_refusal, backend.native_docstore.?.file.activeCheckpoint().commit_sequence);
+    const entry = database.core.index_manager.textIndexEntry("text").?;
+    try std.testing.expectEqual(@as(u32, 1), entry.persistent.snapshot().liveDocCount());
+    const deletion: types.BatchRequest = .{ .deletes = &.{"one"}, .sync_level = .write };
+    var deleting = (try Prepared.capture(a, &database)).?;
+    defer deleting.deinit();
+    try deleting.prepare(deletion);
+    try deleting.stageForegroundText(&database);
+    for (deleting.text.items) |item| if (item.publication == null) return error.ForegroundDeletionNotPrepared;
+    const before_deletion = backend.native_docstore.?.file.activeCheckpoint().commit_sequence;
+    committed = false;
+    try database.batchTrackedWithPreparedDocuments(deletion, &committed, null, &deleting);
+    try std.testing.expect(committed);
+    try std.testing.expectEqual(before_deletion + 1, backend.native_docstore.?.file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(@as(u32, 0), entry.persistent.snapshot().liveDocCount());
+    try std.testing.expect((try database.get(a, "one")) == null);
+    // A foreground postimage cannot cover an older canonical record which its
+    // index has not consumed. The prepared fast path must decline that gap.
+    try database.batch(.{ .writes = &.{.{ .key = "gap", .value = "{\"body\":\"pending\"}" }}, .sync_level = .write });
+    const later: types.BatchRequest = .{ .writes = &.{.{ .key = "later", .value = "{\"body\":\"later\"}" }}, .sync_level = .write };
+    var behind = (try Prepared.capture(a, &database)).?;
+    defer behind.deinit();
+    try behind.prepare(later);
+    try behind.stageForegroundText(&database);
+    for (behind.text.items) |item| if (item.publication != null) return error.ForegroundPublicationSkippedPendingSource;
+    try std.testing.expect((try backend.native_docstore.?.file.check()).valid);
+}
+
 test "db native chunk retirement waits for every text consumer across index replacement and vacuum" {
     if (builtin.os.tag != .linux and builtin.os.tag != .macos) return error.SkipZigTest;
     const a = std.testing.allocator;

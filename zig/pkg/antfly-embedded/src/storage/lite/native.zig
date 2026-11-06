@@ -23322,6 +23322,10 @@ test "lite logical byte accounting distinguishes control families and namespace 
     defer a.free(derived);
     derived[derived.len - 1] = keys.artifact_kind;
     const namespace = "\x02db/embedded/tables/2\x00";
+    const registry = "22:dictionary_registry:v1|4:text|59:4:text|4:body|13:analyzed_term|8:standard|4:term|8:analyzer";
+    const authored_registry_id = try keys.documentKeyAlloc(a, registry);
+    defer a.free(authored_registry_id);
+    try writer.putDocument(authored_registry_id, "u");
     try writer.putDocument(primary, "d");
     try writer.putDocument(relational, "r");
     try writer.putDocument("plain\x00\x00__txn_records__:authored-id", "p");
@@ -23335,6 +23339,7 @@ test "lite logical byte accounting distinguishes control families and namespace 
         &keys.outcome_receipt_prefix,
         &keys.identity_namespace_key,
         derived,
+        registry,
     }) |control| {
         try writer.putDocument(control, "c");
         const named = try std.mem.concat(a, u8, &.{ namespace, control });
@@ -23344,10 +23349,10 @@ test "lite logical byte accounting distinguishes control families and namespace 
     const report = try writer.check();
     try std.testing.expect(report.valid);
     const accounting = report.live_accounting.?;
-    try std.testing.expectEqual(@as(u64, 4), accounting.documents.records);
-    try std.testing.expectEqual(@as(u64, 12), accounting.control_documents.records);
-    try std.testing.expectEqual(@as(u64, 4), accounting.documents.value_bytes);
-    try std.testing.expectEqual(@as(u64, 12), accounting.control_documents.value_bytes);
+    try std.testing.expectEqual(@as(u64, 5), accounting.documents.records);
+    try std.testing.expectEqual(@as(u64, 14), accounting.control_documents.records);
+    try std.testing.expectEqual(@as(u64, 5), accounting.documents.value_bytes);
+    try std.testing.expectEqual(@as(u64, 14), accounting.control_documents.value_bytes);
     var bytes: u64 = 0;
     var records: u64 = 0;
     inline for (@typeInfo(LiveByteAccounting).@"struct".field_names) |field| {

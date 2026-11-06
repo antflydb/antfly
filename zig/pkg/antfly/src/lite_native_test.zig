@@ -23,6 +23,8 @@ test {
     _ = @import("antfly_local_sources").storage_lite_artifact_source;
     _ = @import("antfly_local_sources").storage_lite_index_storage;
     _ = @import("antfly_local_sources").storage_native_publication_value;
+    _ = @import("antfly_local_sources").storage_native_metadata_batch;
+    _ = @import("antfly_local_sources").storage_control_key;
     _ = @import("antfly_local_sources").storage_doc_ordinal_binding;
     _ = @import("antfly_local_sources").storage_lite_namespace_store;
     _ = @import("antfly_local_sources").storage_lite_native;

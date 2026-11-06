@@ -895,3 +895,7 @@ pub const storage_native_publication_value = @import("storage/native_publication
 pub const storage_lite_namespace_store = @import("storage/lite/namespace_store.zig");
 
 pub const storage_doc_ordinal_binding = @import("storage/doc_ordinal_binding.zig");
+
+pub const storage_native_metadata_batch = @import("storage/native_metadata_batch.zig");
+
+pub const storage_control_key = @import("storage/control_key.zig");

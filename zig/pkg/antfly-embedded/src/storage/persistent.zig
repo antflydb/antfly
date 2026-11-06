@@ -1618,8 +1618,9 @@ pub const PersistentIndex = struct {
         detached: ?*PreparedNativePublication,
     ) ![]index_mod.IndexWriter.DeleteInfo {
         if (metadata != null) {
-            const point = checkpoint orelse return error.InvalidDerivedApplyState;
-            if (!point.position.applied or point.position.next_item != point.position.total_items) return error.InvalidDerivedApplyState;
+            if (checkpoint) |point| {
+                if (!point.position.applied or point.position.next_item != point.position.total_items) return error.InvalidDerivedApplyState;
+            } else if (detached == null) return error.InvalidDerivedApplyState;
         }
         if (!self.main_store_owner.supportsAtomicNativePublication()) return error.Unsupported;
         const files = if (self.segment_files) |*value| value else return error.Unsupported;

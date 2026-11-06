@@ -3097,13 +3097,39 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             } else blk: {
                 if (durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null)
                     S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
-                try S.ownerField(self, "core").*.store.putBatchWithReplayAndParticipant(
-                    S.ownerField(self, "backend_runtime").*.io(),
-                    write_buffers.store_writes.items,
-                    write_buffers.delete_keys.items,
-                    replay_append,
-                    store_batch_options,
-                    if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
+                const ForegroundPrimary = struct {
+                    store: *docstore_mod.DocStore,
+                    io: ?std.Io,
+                    writes: []const docstore_mod.KVPair,
+                    deletes: []const []const u8,
+                    replay: ?docstore_mod.DocStore.ReplayAppend,
+                    options: backend_types.BatchOptions,
+                    authored: ?@import("../commit_participant.zig").Participant,
+                    fn commit(raw: *anyopaque, participant: @import("../native_publication.zig").Participant) !void {
+                        const primary: *@This() = @ptrCast(@alignCast(raw));
+                        try primary.store.putBatchWithPublications(primary.io, primary.writes, primary.deletes, primary.replay, primary.options, primary.authored, participant);
+                    }
+                };
+                var foreground_primary: ForegroundPrimary = .{
+                    .store = S.ownerField(self, "core").*.store,
+                    .io = S.ownerField(self, "backend_runtime").*.io(),
+                    .writes = write_buffers.store_writes.items,
+                    .deletes = write_buffers.delete_keys.items,
+                    .replay = replay_append,
+                    .options = store_batch_options,
+                    .authored = if (authored_acceptance.vectors.len != 0) authored_acceptance.participant() else null,
+                };
+                const foreground_committed = if (prepared_documents_current and append_derived_replay)
+                    try opts.prepared_documents.?.commitForegroundText(S.ownerField(self, "core").*.index_manager, sequence, effective_req, S.ownerField(self, "core").*.store, write_buffers.identity_writes.items, .{ .ptr = &foreground_primary, .commit_fn = ForegroundPrimary.commit })
+                else
+                    false;
+                if (!foreground_committed) try S.ownerField(self, "core").*.store.putBatchWithReplayAndParticipant(
+                    foreground_primary.io,
+                    foreground_primary.writes,
+                    foreground_primary.deletes,
+                    foreground_primary.replay,
+                    foreground_primary.options,
+                    foreground_primary.authored,
                 );
                 schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };

@@ -82,8 +82,9 @@ pub const Host = struct {
         try file.putIndexCatalogRecord(destination, bytes);
     }
 
-    fn metadataKey(self: *Host, allocator: std.mem.Allocator, scope: publication.Scope, key: []const u8) ![]u8 {
-        if (key.len < 2 or key[0] != 0 or key[1] != 0 or
+    fn metadataKey(self: *Host, allocator: std.mem.Allocator, scope: publication.Scope, key: []const u8, writable: bool) ![]u8 {
+        const permitted = @import("../control_key.zig").isScopedMetadata(key) or (!writable and @import("../internal_keys.zig").isControlRecordKey(key));
+        if (!permitted or
             (scope.prefix.len != 0 and scope.prefix[scope.prefix.len - 1] != 0)) return error.InvalidCommitMetadata;
         _ = try self.checkedFile(scope.inode);
         if (!std.mem.eql(u8, &self.file.header.reader_epoch_namespace, &scope.file_namespace)) return error.StaleArtifactConstruction;
@@ -92,14 +93,14 @@ pub const Host = struct {
 
     fn getMetadata(raw: *anyopaque, allocator: std.mem.Allocator, scope: publication.Scope, key: []const u8) ![]u8 {
         const self: *Host = @ptrCast(@alignCast(raw));
-        const full = try self.metadataKey(allocator, scope, key);
+        const full = try self.metadataKey(allocator, scope, key, false);
         defer allocator.free(full);
         return (try self.file.getDocumentAlloc(allocator, full)) orelse error.NotFound;
     }
 
     fn putMetadata(raw: *anyopaque, scope: publication.Scope, key: []const u8, value: []const u8) !void {
         const self: *Host = @ptrCast(@alignCast(raw));
-        const full = try self.metadataKey(self.allocator, scope, key);
+        const full = try self.metadataKey(self.allocator, scope, key, true);
         defer self.allocator.free(full);
         try self.file.putDocument(full, value);
     }

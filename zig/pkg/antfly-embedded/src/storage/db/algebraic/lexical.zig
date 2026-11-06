@@ -106,7 +106,10 @@ pub fn claimRegistryOwnerTxn(
     const key = try identity.registryKeyAlloc(alloc);
     defer alloc.free(key);
 
-    const existing_payload = txn.get(key) catch null;
+    const existing_payload: ?[]const u8 = txn.get(key) catch |err| switch (@as(anyerror, err)) {
+        error.NotFound => null,
+        else => return err,
+    };
     if (existing_payload) |payload| {
         var existing = try RegistryEntry.decodeAlloc(alloc, payload);
         defer existing.deinit(alloc);
@@ -660,4 +663,19 @@ test "lexical FST artifact supports exact prefix range and automaton traversal" 
     }
     try std.testing.expectEqual(@as(usize, 1), matched.len);
     try std.testing.expectEqualStrings("bronze", matched[0]);
+}
+
+test "dictionary registry claim propagates read failures without assigning a new owner" {
+    const Broken = struct {
+        writes: usize = 0,
+        pub fn get(_: *@This(), _: []const u8) ![]const u8 {
+            return error.OutOfMemory;
+        }
+        pub fn put(self: *@This(), _: []const u8, _: []const u8) !void {
+            self.writes += 1;
+        }
+    };
+    var broken: Broken = .{};
+    try std.testing.expectError(error.OutOfMemory, claimRegistryOwnerTxn(std.testing.allocator, &broken, DictionaryIdentity.analyzedText("text", "body", "standard"), "text", .fst_postings, "ready"));
+    try std.testing.expectEqual(@as(usize, 0), broken.writes);
 }
