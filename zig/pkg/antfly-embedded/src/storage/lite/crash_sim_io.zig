@@ -89,6 +89,32 @@ pub const CrashPlan = struct {
     power_loss: PowerLoss = .drop_unsynced,
 };
 
+/// Which overridden call a `IoFaultPlan` targets.
+pub const IoFaultKind = enum(u2) { write, sync, create };
+
+/// A single transient I/O failure, injected deterministically without any
+/// crash: `at_op`-th call of `kind` (0-based, counted independently per
+/// kind) returns `err` instead of reaching the real `Io`. Every call before
+/// and (unless `repeat`) after that one behaves completely normally --
+/// nothing here ever marks the shim `crashed`, so the scenario's own
+/// recovery/retry logic is exactly what has to clear the fault, not
+/// `applyPowerLoss`.
+pub const IoFaultPlan = struct {
+    at_op: u64,
+    kind: IoFaultKind,
+    /// `error.NoSpaceLeft` (a full disk) or `error.InputOutput` (a
+    /// transient read/write fault) are the two this models; both are valid
+    /// members of every error set the three injection sites return.
+    err: anyerror,
+    /// `false` (the default): fires exactly once, at `at_op`, then the
+    /// plan clears itself and every later call of `kind` succeeds
+    /// normally (a disk that was briefly full or glitched, then recovered).
+    /// `true`: fires at `at_op` and every call after it (a disk that stays
+    /// full/broken until the test explicitly clears the plan), useful for
+    /// proving a caller backs off instead of busy-looping.
+    repeat: bool = false,
+};
+
 const HandleEntry = struct {
     path: []u8,
 };
@@ -155,6 +181,24 @@ pub const SimIo = struct {
     /// must never corrupt durability bookkeeping" deterministically
     /// testable instead of relying on incidental machine load.
     sync_delay_ns: u64 = 0,
+
+    /// Error-injection, independent of any crash plan: unlike `crash_plan`,
+    /// firing this never marks `self.crashed` and never aborts the
+    /// scenario's own control flow -- the process keeps running, exactly as
+    /// it would after a real, transient `EIO`/`ENOSPC` that a disk recovers
+    /// from moments later. This is what makes "heavy machine load, disk
+    /// near full" reproducible on demand instead of incidental: the
+    /// `[uncrashed run]` crash-sweep pass that first surfaced
+    /// `IndexRebuilding`-forever (see crash_consistency_test.zig's "crash
+    /// sweep: full text synchronous visibility") needed exactly this -- an
+    /// ordinary write/sync failing once, with no crash at all, to prove the
+    /// owner reconciles and resumes instead of latching forever.
+    io_fault_plan: ?IoFaultPlan = null,
+    /// Per-kind count of matching calls observed so far, indexed by
+    /// `@intFromEnum(IoFaultKind)`. Counts every call of that kind,
+    /// including ones before the plan's `at_op` and (for a non-repeating
+    /// plan) ones after it fired once.
+    io_fault_op_counts: [3]u64 = @splat(0),
 
     /// Guards every field above. A scenario that opens a `db_mod.DB` can
     /// spawn a background maintenance task via `io.concurrent(...)`, which
@@ -230,6 +274,17 @@ pub const SimIo = struct {
     /// alone, never a fault.
     pub fn setSyncDelayNs(self: *SimIo, ns: u64) void {
         self.sync_delay_ns = ns;
+    }
+
+    /// Sets (or clears, with `null`) the deterministic I/O fault plan. See
+    /// `IoFaultPlan`. Also resets every kind's op counter to 0, so a test
+    /// that sets a plan always counts from a clean slate regardless of
+    /// what ran before (e.g. a scenario's earlier enumerate-only pass).
+    pub fn setIoFaultPlan(self: *SimIo, plan: ?IoFaultPlan) void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        self.io_fault_plan = plan;
+        self.io_fault_op_counts = @splat(0);
     }
 
     pub fn barrierCount(self: *const SimIo) u64 {
@@ -432,8 +487,27 @@ fn simDelayNs(self: *SimIo) u64 {
     return self.sync_delay_ns;
 }
 
+/// Returns the configured fault's error if this call is the `at_op`-th
+/// (0-based) call of `kind` since the plan was set, else `null`. Never
+/// touches `crash_plan`/`crashed`: this is a plain, recoverable failure the
+/// real `Io` could have produced on its own, not a crash.
+fn maybeInjectIoFault(self: *SimIo, kind: IoFaultKind) ?anyerror {
+    self.mutex.lock();
+    defer self.mutex.unlock();
+    const plan = self.io_fault_plan orelse return null;
+    if (plan.kind != kind) return null;
+    const slot = &self.io_fault_op_counts[@backingInt(kind)];
+    const count = slot.*;
+    slot.* += 1;
+    if (count < plan.at_op) return null;
+    if (count > plan.at_op and !plan.repeat) return null;
+    if (!plan.repeat) self.io_fault_plan = null;
+    return plan.err;
+}
+
 fn vtDirCreateFile(userdata: ?*anyopaque, dir: Dir, sub_path: []const u8, opts: Dir.CreateFileOptions) File.OpenError!File {
     const self = selfFrom(userdata);
+    if (maybeInjectIoFault(self, .create)) |err| return @errorCast(err);
     const delay_ns = simDelayNs(self);
     if (delay_ns != 0) std.Io.sleep(self.real, .fromNanoseconds(@intCast(delay_ns)), .awake) catch {};
     const file = try self.real.vtable.dirCreateFile(self.real.userdata, dir, sub_path, opts);
@@ -468,6 +542,7 @@ fn vtFileClose(userdata: ?*anyopaque, files: []const File) void {
 
 fn vtFileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
     const self = selfFrom(userdata);
+    if (maybeInjectIoFault(self, .sync)) |err| return @errorCast(err);
 
     self.mutex.lock();
     const path = self.allocator.dupe(u8, self.pathOf(file.handle)) catch {
@@ -539,6 +614,7 @@ fn vtFileSync(userdata: ?*anyopaque, file: File) File.SyncError!void {
 /// disk's write path, not just its fsync path.
 fn vtFileWritePositional(userdata: ?*anyopaque, file: File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) File.WritePositionalError!usize {
     const self = selfFrom(userdata);
+    if (maybeInjectIoFault(self, .write)) |err| return @errorCast(err);
     const delay_ns = simDelayNs(self);
     if (delay_ns != 0) std.Io.sleep(self.real, .fromNanoseconds(@intCast(delay_ns)), .awake) catch {};
     return self.real.vtable.fileWritePositional(self.real.userdata, file, header, data, splat, offset);
@@ -660,4 +736,58 @@ test "SimIo after-crash keeps the synced write durable" {
     try std.testing.expectEqualStrings("durable", &contents);
 
     try Dir.cwd().deleteFile(std.testing.io, path);
+}
+
+test "SimIo io fault plan injects one transient error without crashing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &buf);
+    const dir_path = buf[0..dir_len];
+    const path = try std.fmt.allocPrint(allocator, "{s}/sim-fault.bin", .{dir_path});
+    defer allocator.free(path);
+
+    const sim = try SimIo.init(allocator, std.testing.io);
+    defer sim.deinit();
+    // The second fileSync (index 1) fails once with NoSpaceLeft, modeling a
+    // disk that was briefly full. No crash plan is set: `sim.crashed` must
+    // stay false throughout, and the very next sync -- an ordinary retry,
+    // not a reopen -- must succeed.
+    sim.setIoFaultPlan(.{ .at_op = 1, .kind = .sync, .err = error.NoSpaceLeft });
+
+    var file = try Dir.cwd().createFile(sim.io(), path, .{ .read = true });
+    defer file.close(sim.io());
+    try file.writePositionalAll(sim.io(), "first", 0);
+    try file.sync(sim.io()); // sync #0: unaffected.
+    try file.writePositionalAll(sim.io(), "second", 5);
+    try std.testing.expectError(error.NoSpaceLeft, file.sync(sim.io())); // sync #1: fault fires.
+    try std.testing.expect(!sim.crashed);
+    try file.sync(sim.io()); // sync #2: the plan already cleared itself; retry succeeds.
+    try std.testing.expect(!sim.crashed);
+
+    try Dir.cwd().deleteFile(std.testing.io, path);
+}
+
+test "SimIo io fault plan can repeat until the test clears it" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const dir_len = try tmp.dir.realPath(std.testing.io, &buf);
+    const dir_path = buf[0..dir_len];
+    const path = try std.fmt.allocPrint(allocator, "{s}/sim-fault-repeat.bin", .{dir_path});
+    defer allocator.free(path);
+
+    const sim = try SimIo.init(allocator, std.testing.io);
+    defer sim.deinit();
+    sim.setIoFaultPlan(.{ .at_op = 0, .kind = .write, .err = error.InputOutput, .repeat = true });
+
+    var file = try Dir.cwd().createFile(sim.io(), path, .{ .read = true });
+    defer file.close(sim.io());
+    try std.testing.expectError(error.InputOutput, file.writePositionalAll(sim.io(), "a", 0));
+    try std.testing.expectError(error.InputOutput, file.writePositionalAll(sim.io(), "a", 0));
+    try std.testing.expect(!sim.crashed);
+    sim.setIoFaultPlan(null);
+    try file.writePositionalAll(sim.io(), "a", 0); // Recovers once the plan clears.
 }

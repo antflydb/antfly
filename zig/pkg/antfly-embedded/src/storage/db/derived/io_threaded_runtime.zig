@@ -1492,6 +1492,7 @@ fn closeWorkerCatchUpState(
 
 fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
     if (catch_up_policy.isRecoverableAdmissionError(err)) return true;
+    if (catch_up_policy.isTransientIoError(err)) return true;
     return switch (err) {
         // Structural reconciliation can retire the old HBC streaming session
         // after replay work completes but before this worker publishes it.
@@ -1508,6 +1509,7 @@ fn isRecoverablePublishError(worker: *const Worker, err: anyerror) bool {
 
 fn isRecoverableCatchUpError(worker: *const Worker, err: anyerror) bool {
     if (catch_up_policy.isRecoverableAdmissionError(err)) return true;
+    if (catch_up_policy.isTransientIoError(err)) return true;
     return switch (err) {
         error.ReplayDocumentNotVisible,
         error.PostingWalCaptureOwnershipConflict,

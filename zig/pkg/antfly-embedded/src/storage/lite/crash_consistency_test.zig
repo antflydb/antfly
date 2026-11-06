@@ -1079,6 +1079,80 @@ test "crash sweep: full text sync visibility discovery is not flaky under the sh
     }
 }
 
+// Deterministic regression test for the bug this file's "discovery is not
+// flaky under the shim" test above found by accident: a single transient
+// write/sync/create error during a `.full_text` commit -- no crash at all,
+// `sim.crashed` never becomes true -- must not leave `body_text`
+// `IndexRebuilding` forever. Before the fix (native.zig's
+// `NativeFile.reconcilePublicationUncertainty`, called from
+// `beginTransaction`; `catch_up_policy.isTransientIoError`, which keeps the
+// threaded derived worker retrying instead of latching `last_error_name`;
+// and `db.zig`'s `runUntilIdleWithReplayDrainOptions` draining a pending
+// managed-admission materialization) this reproduced exactly the trail
+// real heavy-load runs showed: `index catalog admission committed with
+// pending activation ... err=InputOutput`/`OutcomeUnknown`, then
+// `search()` never recovering from `IndexRebuilding`.
+//
+// Swept over every injection kind `crash_sim_io.zig` supports and a range
+// of op-indices rather than one hand-picked point, so the test does not
+// depend on knowing exactly which op a real disk hiccup happens to land
+// on -- matching this file's own `exhaustive` crash sweep's philosophy,
+// applied to I/O faults instead of crashes.
+test "crash sweep: full text recovers from one transient io fault with no crash" {
+    const allocator = std.testing.allocator;
+    const kinds = [_]sim_io.IoFaultKind{ .write, .sync, .create };
+    for (kinds) |kind| {
+        var at_op: u64 = 0;
+        while (at_op < 12) : (at_op += 1) {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            const path = try testAflitePath(allocator, tmp);
+            defer allocator.free(path);
+
+            const sim = try sim_io.SimIo.init(allocator, std.testing.io);
+            defer sim.deinit();
+
+            // Create the database and its full-text index, then commit the
+            // seed document, before arming the fault: this test is about
+            // recovering from a fault during the *second* write, not about
+            // surviving one during setup (crash_consistency_test's ordinary
+            // crash sweep for this scenario already covers every op,
+            // setup included).
+            var handle = try openDbWithIo(allocator, path, sim.io(), true);
+            errdefer handle.close();
+            try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+
+            sim.setIoFaultPlan(.{
+                .at_op = at_op,
+                .kind = kind,
+                .err = if (kind == .create) error.NoSpaceLeft else error.InputOutput,
+            });
+            handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text }) catch {
+                // The one-shot fault already fired and cleared itself
+                // (`IoFaultPlan.repeat` defaults to false): an ordinary
+                // application retry of the exact same write must now land
+                // cleanly, proving (a) the transient error surfaced as
+                // something retryable rather than wedging the owner.
+                try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+            };
+            handle.close();
+
+            // Reopen with a plain, unwrapped `std.Io` -- no `SimIo`, no
+            // fault -- and confirm the owner's own background catch-up
+            // resumes and the document becomes searchable without this
+            // reopen being the only possible recovery path: proving (b)
+            // the index never stays `IndexRebuilding` forever once the
+            // underlying I/O is healthy again.
+            var reopened = try openDbWithIo(allocator, path, std.testing.io, false);
+            defer reopened.close();
+            assertSearchable(&reopened, allocator, "body_text", "body", "ft-doc", "needle") catch |err| {
+                std.debug.print("io-fault regression failed kind={s} at_op={d}: {s}\n", .{ @tagName(kind), at_op, @errorName(err) });
+                return err;
+            };
+        }
+    }
+}
+
 fn reportFailures(report: *const SweepReport) !void {
     if (report.ok()) return;
     for (report.failures.items) |f| {
