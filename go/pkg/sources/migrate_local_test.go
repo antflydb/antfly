@@ -852,13 +852,13 @@ func TestMigrateLocalLiveGivesUpAfter409Budget(t *testing.T) {
 	require.Contains(t, err.Error(), "already in progress")
 }
 
-// TestMigrateLocalPreRepointMediaReferenceWorksUntilCleanup drives PUT and
+// TestMigrateLocalPreRepointMediaReferenceGoesStaleAtRepoint drives PUT and
 // POST separately (rather than through migrateRepoint) so it can fetch the
 // pre-repoint reference in the window between them: local bytes are never
 // deleted, and the pin itself is not pruned until the resync's cleanup runs,
 // so the old reference keeps resolving right up until that point -- not
 // gradually, and not because the bytes are still there (they always are).
-// TestMigrateLocalPreRepointMediaReferenceWorksUntilCleanup drives the PUT
+// TestMigrateLocalPreRepointMediaReferenceGoesStaleAtRepoint drives the PUT
 // (repoint) step directly, separately from any resync, to pin down exactly
 // when a reference issued before repointing stops working.
 //
@@ -871,7 +871,7 @@ func TestMigrateLocalLiveGivesUpAfter409Budget(t *testing.T) {
 // resync runs, so the fetch returns 410 "media_revoked" right after the PUT.
 // Local bytes are still never deleted; it is specifically the reference that
 // stops resolving, immediately, not gradually and not because of pruning.
-func TestMigrateLocalPreRepointMediaReferenceWorksUntilCleanup(t *testing.T) {
+func TestMigrateLocalPreRepointMediaReferenceGoesStaleAtRepoint(t *testing.T) {
 	_, service, root, _, backend := migrateLiveFixture(t)
 
 	job := startServiceJob(t, service)
