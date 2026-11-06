@@ -12851,7 +12851,9 @@ test "actual private Native stage quota callbacks can reenter the same model whi
     {
         const backend = stage.backend();
         const original = backend.vtable;
-        const copied = original.*;
+        var copied = original.*;
+        std.mem.doNotOptimizeAway(&copied);
+        try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(original));
         backend.vtable = &copied;
         defer backend.vtable = original;
         try std.testing.expectError(error.UnsupportedStageProvider, stage.admitPhaseScoped(.{ .host_scratch_bytes = 48 }, null));
@@ -14903,13 +14905,17 @@ test "CUDA actual complete Qwen host Session run cold-funds temporary state befo
 }
 
 test "eager GPT host context requires exact original session callback table" {
-    const copied = arch_vtable;
+    var copied = arch_vtable;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&arch_vtable));
     try std.testing.expect(eager_host_services.accepts(&arch_vtable));
     try std.testing.expect(!eager_host_services.accepts(&copied));
 }
 
 test "admitted inherited eager table refuses actual Session and RunPermit dispatch before invalid implementation metadata" {
-    const copied = arch_vtable;
+    var copied = arch_vtable;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&arch_vtable));
     var controller = runtime.tier.memory.AdmissionController{};
     const session = Session{ .ptr = @ptrFromInt(1), .vtable = &copied, .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
     try std.testing.expectError(error.UnsupportedRecurrentStateTarget, session.run(&.{}, std.testing.allocator));
@@ -14953,7 +14959,9 @@ test "generic Metal receiving constructor attests provider before casts and clas
     var session: Session = .{ .ptr = @ptrFromInt(1), .vtable = &forwarded, .model_lifetime = &model, .compute_backend_provider = .{ .ptr = &arch, .services = &archComputeServices } };
     try std.testing.expectError(error.Cancelled, constructMetalWorkspaceReceiver(session, std.testing.allocator, .{ .hard_cancellation = .{ .ptr = &probe, .arm_fn = Probe.arm, .disarm_fn = Probe.disarm } }));
     try std.testing.expectEqual(@as(usize, 1), probe.calls);
-    const copied_services = archComputeServices;
+    var copied_services = archComputeServices;
+    std.mem.doNotOptimizeAway(&copied_services);
+    try std.testing.expect(@intFromPtr(&copied_services) != @intFromPtr(&archComputeServices));
     session.compute_backend_provider.?.services = &copied_services;
     session.compute_backend_provider.?.ptr = @ptrFromInt(1);
     try std.testing.expectError(error.UnsupportedWorkspaceTarget, constructMetalWorkspaceReceiver(session, std.testing.allocator, null));
@@ -14972,7 +14980,9 @@ test "unadmitted canonical Metal receiving rejects inherited copied host table b
     var arch: ArchSession = undefined;
     arch.backend_type = .metal; // no SDK/provider/weights touched
     var model: Session.ModelLifetime = .{ .owner = &arch, .destroy_fn = Noop.destroy };
-    const copied = arch_vtable;
+    var copied = arch_vtable;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&arch_vtable));
     const session: Session = .{ .ptr = @ptrFromInt(1), .vtable = &copied, .model_lifetime = &model, .compute_backend_provider = .{ .ptr = &arch, .services = &archComputeServices } };
     try std.testing.expectError(error.UnsupportedRecurrentStateTarget, session.run(&.{}, std.testing.allocator));
     try std.testing.expectError(error.UnsupportedRecurrentStateTarget, session.runWithControl(&.{}, std.testing.allocator, .{ .native_call_policy = .in_process }));
@@ -15006,6 +15016,8 @@ test "Qwen lane capability uses actual provider before opaque forwarded metadata
     owner.arch_config = .{ .gpt = other };
     try std.testing.expectEqual(@as(?bool, false), qwenWorkspaceLanePolicy(forwarded));
     var copied = archComputeServices;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&archComputeServices));
     forwarded.compute_backend_provider.?.services = &copied;
     try std.testing.expectEqual(@as(?bool, null), qwenWorkspaceLanePolicy(forwarded));
 }
@@ -15063,6 +15075,8 @@ test "canonical host attempt marker is private to exact table provider and imple
     try std.testing.expectError(error.Cancelled, runCanonicalHostAttempt(session, &.{}, std.testing.allocator, .{ .check_fn = Noop.cancel }, null, null, &marker));
     try std.testing.expect(!marker);
     var copied_table = arch_vtable;
+    std.mem.doNotOptimizeAway(&copied_table);
+    try std.testing.expect(@intFromPtr(&copied_table) != @intFromPtr(&arch_vtable));
     session.ptr = @ptrFromInt(1);
     session.vtable = &copied_table;
     marker = true;
@@ -15111,6 +15125,8 @@ test "Gemma actual forwarded Model lane policy cannot be relabelled by copied me
     try std.testing.expectEqual(@as(?BackendType, .cuda), publishedModelBackend(session));
     try std.testing.expect(!pipeline.canEmbedOwned());
     var copied_table = arch_vtable;
+    std.mem.doNotOptimizeAway(&copied_table);
+    try std.testing.expect(@intFromPtr(&copied_table) != @intFromPtr(&arch_vtable));
     pipeline.session.vtable = &copied_table;
     pipeline.session.ptr = @ptrFromInt(16);
     try std.testing.expect(!pipeline.canEmbedOwned());
@@ -15143,6 +15159,8 @@ test "Gemma actual forwarded Model lane policy cannot be relabelled by copied me
     try std.testing.expectEqual(@as(?bool, null), gemmaWorkspaceLanePolicy(session));
     session.model_lifetime = &actual.model_lifetime;
     var copied = archComputeServices;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&archComputeServices));
     session.compute_backend_provider.?.services = &copied;
     try std.testing.expectEqual(@as(?bool, null), gemmaWorkspaceLanePolicy(session));
 }
@@ -16929,6 +16947,8 @@ test "Native operation source adapter rejects missing admitted owners and leaves
     arch.arch_config = .{ .gpt = .{ .family = .deepseek_v4 } };
     try std.testing.expect(!nativeWeightPreparationCandidate(session));
     var copied = arch_vtable;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&arch_vtable));
     session.vtable = &copied;
     session.ptr = @ptrFromInt(16);
     try std.testing.expect(!nativeWeightPreparationCandidate(session)); // no opaque ctx cast through copied table
@@ -17969,6 +17989,8 @@ test "Native default large resident Q8 Runtime preserves original dispatcher fal
 
 test "generic CUDA Gemma owned text geometry rejects copied callback table before opaque owner access" {
     var copied = arch_vtable;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&arch_vtable));
     const session: Session = .{ .ptr = @ptrFromInt(16), .vtable = &copied, .model_lifetime = @ptrFromInt(32) };
     try std.testing.expect(gemmaCudaOwnedTextWidth(session) == null);
 }

@@ -54,6 +54,8 @@ test "owned metadata sampling declines unsupported and copied actual Native tabl
     // implicit fallback acquisition of another provider's metadata scope.
     try std.testing.expect(snapshotOwned(backend, invalid) == null);
     var copied = backend.vtable.*;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(backend.vtable));
     var wrapped = backend.*;
     wrapped.vtable = &copied;
     wrapped.ptr = @ptrFromInt(0x1000);

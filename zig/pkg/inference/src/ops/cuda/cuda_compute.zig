@@ -43566,7 +43566,9 @@ test "CUDA selected projection routes preserve legacy outputs through eviction a
                     var no_allocation = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
                     var veto = request;
                     veto.allocator = no_allocation.allocator();
-                    const copied_table = cb.vtable.*;
+                    var copied_table = cb.vtable.*;
+                    std.mem.doNotOptimizeAway(&copied_table);
+                    try std.testing.expect(@intFromPtr(&copied_table) != @intFromPtr(cb.vtable));
                     veto.implementation.?.table = &copied_table;
                     try std.testing.expect((try prepareKernelRouteOp(&compute, veto)) == null);
                     try std.testing.expect(!no_allocation.has_induced_failure);
@@ -44263,6 +44265,8 @@ test "CUDA physical ownership accepts the scoped budget facade and rejects arbit
     try std.testing.expect(kernel_backend_impl.accepts(&vtable));
     try std.testing.expect(kernel_backend_impl.accepts(&scoped_run_budget_vtable));
     var copied = vtable;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&vtable));
     try std.testing.expect(!kernel_backend_impl.accepts(&copied));
 }
 
@@ -45099,7 +45103,9 @@ test "CUDA page COW declines copied providers and private float layouts before d
     var owner = CudaKvDeviceStorage{ .allocator = std.testing.allocator, .compute = undefined, .dtype = .f32 };
     const request = kv_storage_runtime.block_copy.Request{ .sequence = 1, .page_size = 2, .layers = 1, .items = &.{.{ .source = 0, .destination = 1, .prefix_tokens = 1, .table_index = 0 }} };
     try std.testing.expectError(error.SharedKvWriteUnsupported, CudaKvDeviceStorage.copySharedBlockPrefixes(&owner, &CudaKvDeviceStorage.hook_vtable, request));
-    const copied = CudaKvDeviceStorage.hook_vtable;
+    var copied = CudaKvDeviceStorage.hook_vtable;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&CudaKvDeviceStorage.hook_vtable));
     try std.testing.expectError(error.SharedKvWriteUnsupported, CudaKvDeviceStorage.copySharedBlockPrefixes(&owner, &copied, request));
 }
 
@@ -46277,7 +46283,9 @@ const ReusableForeignFixture = struct {
                 const source_amounts = source_domain.controller.snapshot();
                 const destination_amounts = destination_domain.controller.snapshot();
                 const actual_target = foreignTensorCopyTarget(&target_backend).?;
-                const denied_table = target_backend.vtable.*;
+                var denied_table = target_backend.vtable.*;
+                std.mem.doNotOptimizeAway(&denied_table);
+                try std.testing.expect(@intFromPtr(&denied_table) != @intFromPtr(target_backend.vtable));
                 const wrong_targets = [_]ForeignTensorCopyTarget{
                     .{ .context = null, .device = actual_target.device, .implementation_context = actual_target.implementation_context, .implementation_table = actual_target.implementation_table },
                     .{ .context = @ptrFromInt(16), .device = actual_target.device, .implementation_context = actual_target.implementation_context, .implementation_table = actual_target.implementation_table },
@@ -48676,6 +48684,8 @@ test "complete CUDA ModelProgram assigned routes capture F32 reduced and packed 
 
 test "complete CUDA payload service vetoes copied custom tables before any context or tensor cast" {
     var copied = vtable;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&vtable));
     copied.kernels = &kernel_backend_impl;
     const backend = ops.ComputeBackend{ .ptr = @ptrFromInt(8), .vtable = &copied };
     try std.testing.expect(@import("../../execution/cuda_owned_coverage.zig").services(backend) == null);
@@ -49021,6 +49031,8 @@ test "CUDA stage snapshots preserve actual F32 BF16 planes and reject copied tab
     defer compute.deinit();
     const cb = compute.computeBackend();
     var copied = cb.vtable.*;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(cb.vtable));
     const forged = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied };
     try std.testing.expectError(error.UnsupportedEmbeddingStage, CudaCompute.quiesceEmbeddingStage(&forged, &compute));
     try std.testing.expectError(error.UnsupportedEmbeddingStage, CudaCompute.escapeEmbeddingStage(&forged, @ptrFromInt(32), null));
@@ -49136,6 +49148,8 @@ test "CUDA stage input handoff keeps actual independent planes and copies actual
     try root.bf16_mirror.copyFromHost(&compute.ctx, std.mem.asBytes(&halves));
     try std.testing.expect(try CudaCompute.keepEmbeddingStageInput(&cb, &compute, input));
     var table = cb.vtable.*;
+    std.mem.doNotOptimizeAway(&table);
+    try std.testing.expect(@intFromPtr(&table) != @intFromPtr(cb.vtable));
     var forged = cb;
     forged.vtable = &table;
     try std.testing.expectError(error.UnsupportedEmbeddingStage, CudaCompute.keepEmbeddingStageInput(&forged, &compute, @ptrFromInt(8)));
@@ -51130,7 +51144,9 @@ test "captured graph funding rejects copied backend tables before invalid contex
     const key = [_]u64{ 1, 2 };
     var phase: Graph.GraphPhase = undefined;
     try phase.initInto(.{ .epoch = 1, .key = &key, .positions = &positions, .rows = 2, .hidden = 1024, .vocab = 8, .future_tokens = 16, .attention_layers = 1, .recurrent_layers = 1 });
-    const copied = vtable;
+    var copied = vtable;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&vtable));
     const backend = ops.ComputeBackend{ .ptr = @ptrFromInt(1), .vtable = &copied };
     try std.testing.expectError(error.UnsupportedReaderEpochBackend, CudaCompute.inspectCapturedGraphPhase(&backend, &phase, .{}));
     try std.testing.expectError(error.UnsupportedReaderEpochBackend, CudaCompute.bindCapturedGraphPhase(&backend, &phase, .{}));
@@ -51282,7 +51298,9 @@ test "captured graph prefunded nonempty program and learned workspace replay aft
 }
 
 test "CUDA KV typed mutation refuses copied hook table before invalid context cast" {
-    const copied = CudaKvDeviceStorage.hook_vtable;
+    var copied = CudaKvDeviceStorage.hook_vtable;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&CudaKvDeviceStorage.hook_vtable));
     try std.testing.expectError(error.UnsupportedReaderEpochBackend, CudaKvDeviceStorage.prepareMutationWithCleanup(@ptrFromInt(1), &copied, .{}));
 }
 
@@ -52218,7 +52236,9 @@ test "CUDA actual temporary recurrent producer reuses one cold peak only after c
 
 test "CUDA temporary recurrent cold target rejects copied table before invalid implementation context" {
     if (comptime !cuda_enabled) return error.SkipZigTest;
-    const copied = vtable;
+    var copied = vtable;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&vtable));
     const target = @import("../../backends/cold_compute_target.zig").Target{ .cuda = .{ .implementation_context = @ptrFromInt(1), .implementation_table = &copied, .primary_context = @ptrFromInt(2), .device = 0 } };
     try std.testing.expect((try CudaCompute.temporaryRecurrentTarget(target)) == null);
 }
@@ -52583,7 +52603,9 @@ test "CUDA reserved paged read rejects copied foreign hooks and invalid runtime 
     var foreign: CudaCompute = undefined;
     const attention = ops.AttentionContext{ .mode = .paged_decode, .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1, .kv_storage = &storage, .kv_cache = .{ .sequence_id = 1, .pool_id = 0, .logical_block_count = 1, .tail_tokens = 1, .logical_blocks = &.{0}, .kv_storage = &storage } };
     var paged = kv_storage_runtime.DevicePagedKvLayer{ .runtime = @ptrFromInt(1), .slot = 0, .format = cuda_kv_format_f16, .token_count = 1, .key_row_bytes = 64, .base_key_row_bytes = 64, .v_row_stride = 64, .page_size_tokens = 16, .position_offset = 0 };
-    const copied = CudaKvDeviceStorage.hook_vtable;
+    var copied = CudaKvDeviceStorage.hook_vtable;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&CudaKvDeviceStorage.hook_vtable));
     storage.device_write_hook = .{ .ctx = @ptrFromInt(1), .vtable = &copied };
     try std.testing.expectError(error.InvalidPagedKvState, gqaPagedAttentionWithCompressedDeviceKv(&expected, @ptrCast(&query), null, attention, paged, 1, 1, 1, 32));
     storage.device_write_hook = .{ .ctx = @ptrFromInt(2), .vtable = &CudaKvDeviceStorage.hook_vtable };
@@ -53565,6 +53587,8 @@ test "CUDA physical scope borrows exact live B and clears on end while refusing 
     const backend = ops.ComputeBackend{ .ptr = &compute, .vtable = &vtable };
     const storages = [_]?*ops.physical_storage.Lease{};
     var copied = vtable;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&vtable));
     const invalid = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied };
     try std.testing.expectError(error.UnsupportedPhysicalExecutionScope, physicalExecutionScopeWithCleanupOp(invalid.ptr, .{ .backend = invalid, .storages = &storages, .cleanup = &current }));
     try physicalExecutionScopeWithCleanupOp(&compute, .{ .backend = backend, .storages = &storages, .cleanup = &current });

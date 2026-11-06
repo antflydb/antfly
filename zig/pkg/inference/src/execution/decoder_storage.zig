@@ -708,7 +708,9 @@ test "decoder Native prefix cancellation preserves exact request metadata and re
     state.pool_id = original_pool.? + 1;
     try std.testing.expectEqual(@as(usize, 0), try attachPromptPrefix(&backend, &binding, &state, &PrefixFixture.model, &cache, PrefixFixture.request, &.{ 1, 2, 3, 9 }, null));
     state.pool_id = original_pool;
-    const copied_table = backend.vtable.*;
+    var copied_table = backend.vtable.*;
+    std.mem.doNotOptimizeAway(&copied_table);
+    try std.testing.expect(@intFromPtr(&copied_table) != @intFromPtr(backend.vtable));
     var forged = backend;
     forged.vtable = &copied_table;
     try std.testing.expect(NativePrefixBinding.init(&forged, &cache, &state, &metadata) == null);

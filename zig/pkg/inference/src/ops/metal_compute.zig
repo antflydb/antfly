@@ -54208,6 +54208,8 @@ const PreparedDenseRegionFixture = struct {
         const input_fact = route.Binding{ .tensor = .{ .value = values[0], .implementation = implementation } };
         try std.testing.expect(try functions.ownedPayloadServices.?.input(cb.ptr, input_fact, shape));
         var copied = cb.vtable.*;
+        std.mem.doNotOptimizeAway(&copied);
+        try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(cb.vtable));
         const foreign = route.Binding{ .tensor = .{ .value = @ptrFromInt(16), .implementation = .{ .context = cb.ptr, .table = &copied } } };
         try std.testing.expect(!try functions.ownedPayloadServices.?.input(cb.ptr, foreign, shape));
         const retained_source = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&x, &.{ 1, 64 }));
@@ -55256,6 +55258,8 @@ test "Metal provider operation leases exclude real calls and preserve sequential
     const actual = try operation.call(cb, outer.token(), ops.ComputeBackend.add, .{ &cb, input, input });
     defer cb.free(actual);
     var copied = cb.vtable.*;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(cb.vtable));
     var wrapped = cb;
     wrapped.vtable = &copied;
     try std.testing.expectError(error.BackendOperationChanged, operation.enter(wrapped, null, outer.token(), .managed));
@@ -55613,6 +55617,8 @@ test "Metal cleanup binding uses the exact owned engine and cannot replace a pri
     // A copied altered table cannot inherit target-specific binding authority.
     var altered = backend;
     var table = backend.vtable.*;
+    std.mem.doNotOptimizeAway(&table);
+    try std.testing.expect(@intFromPtr(&table) != @intFromPtr(backend.vtable));
     altered.vtable = &table;
     try std.testing.expect(!try altered.bindCleanupEpoch(&epoch));
 }
@@ -56312,7 +56318,9 @@ test "Metal dense promotion refuses cancellation and foreign B and preserves sou
     const values = [_]CT{value};
     const original = MetalCompute.toBuf(value).metal_tensor.?.device.?.ref;
     const refs = original.ref_count.load(.acquire);
-    const copied_table = backend.vtable.*;
+    var copied_table = backend.vtable.*;
+    std.mem.doNotOptimizeAway(&copied_table);
+    try std.testing.expect(@intFromPtr(&copied_table) != @intFromPtr(backend.vtable));
     var copied_backend = backend;
     copied_backend.vtable = &copied_table;
     try std.testing.expect((try copied_backend.detachDenseF32PhysicalPayload(&values, @ptrCast(&store), current)) == null);
@@ -56542,7 +56550,9 @@ test "Metal owned shared ingress requires actual managed authority and refuses p
 
 test "checked Metal stage transition and escape reject copied table before context or payload access" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
-    const copied = MetalCompute.vtable_impl;
+    var copied = MetalCompute.vtable_impl;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&MetalCompute.vtable_impl));
     const backend = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied };
     try std.testing.expect(!MetalCompute.acceptsEmbeddingStage(&backend));
     try std.testing.expectError(error.UnsupportedEmbeddingStage, MetalCompute.embeddingStageLeaseWithCleanup(&backend, false, .{}));
@@ -57298,6 +57308,8 @@ test "Metal owned metadata uses exact live Engine and independent nonblocking in
     try std.testing.expectError(error.BackendOperationChanged, operation.enter(backend, null, token, .metadata));
     // Full table must be accepted before the implementation pointer is cast.
     var copied = backend.vtable.*;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(backend.vtable));
     var wrapped = backend;
     wrapped.vtable = &copied;
     wrapped.ptr = @ptrFromInt(0x1000);
@@ -57382,6 +57394,8 @@ test "Qwen workspace cold role format inspection never prepares unpublished quan
 test "Qwen workspace receiving header rejects copied table before context or backend access" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     var copied = MetalCompute.vtable_impl;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&MetalCompute.vtable_impl));
     var cb: ops.ComputeBackend = .{ .ptr = @ptrFromInt(16), .vtable = &copied };
     const unusable: @import("../execution/invocation_context.zig").Context = undefined;
     try std.testing.expectError(error.UnsupportedWorkspaceReceiver, MetalCompute.bindWorkspaceInvocation(&cb, &unusable));
@@ -57974,6 +57988,8 @@ test "Metal raw bounded Main keeps original byte guard while generic existing re
     const context: Invocation.Context = .{ .cleanup = current, .workspace_uses = &uses };
     var no_roots: [0]*ownership.Root = .{};
     var copied = cb.vtable.*;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(cb.vtable));
     var foreign = cb;
     foreign.vtable = &copied;
     foreign.ptr = @ptrFromInt(16);
@@ -58057,6 +58073,8 @@ test "Metal owned cold catalog rejects copied receiver before pointer cast and m
     defer context.deinit(a);
     var backend = context.computeBackend();
     var copied = backend.vtable.*;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(backend.vtable));
     var wrapped = backend;
     wrapped.vtable = &copied;
     wrapped.ptr = @ptrFromInt(16);
@@ -58133,6 +58151,8 @@ test "reference host producer requires actual source allowance same live Engine 
     try std.testing.expectError(error.ForeignWorkspaceUse, phase.validateReferenceHostUse(@ptrCast(runtime), wrong_token));
     try std.testing.expectError(error.ForeignWorkspaceEndpoint, phase.validateReferenceHostUse(@ptrFromInt(1), current));
     var copied_table = backend.vtable.*;
+    std.mem.doNotOptimizeAway(&copied_table);
+    try std.testing.expect(@intFromPtr(&copied_table) != @intFromPtr(backend.vtable));
     phase.reference_implementation.?.table = &copied_table;
     try std.testing.expectError(error.BackendOperationChanged, phase.validateReferenceHostUse(@ptrCast(runtime), current));
     phase.reference_implementation.?.table = backend.vtable;
@@ -58205,6 +58225,8 @@ test "Metal Gemma RMS metadata measures same HashMap allocation and holds every 
 test "generic RMS metadata refuses copied tables missing and sealed current B before receiving pointer cast" {
     if (comptime !build_options.enable_metal) return error.SkipZigTest;
     var copied = MetalCompute.vtable_impl;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&MetalCompute.vtable_impl));
     const foreign: ops.ComputeBackend = .{ .ptr = @ptrFromInt(1), .vtable = &copied };
     try std.testing.expectError(error.UnsupportedEmbeddingStage, MetalCompute.prepareRmsMetadata(&foreign, 1, .{}));
     const canonical: ops.ComputeBackend = .{ .ptr = @ptrFromInt(1), .vtable = &MetalCompute.vtable_impl };
@@ -58286,6 +58308,8 @@ test "projection metadata exact capacity rejects duplicate widths and receiver a
     try std.testing.expectError(error.InvalidProjectionMetadataLayout, MetalCompute.projectionMetadataHostBytes(.{ .linear_entries = 1, .zero_widths = &.{ 2, 2 } }));
     try std.testing.expectError(error.InvalidProjectionMetadataLayout, MetalCompute.projectionMetadataHostBytes(.{ .linear_entries = 1, .zero_widths = &.{0} }));
     var copied = MetalCompute.vtable_impl;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&MetalCompute.vtable_impl));
     var cb: ops.ComputeBackend = .{ .ptr = @ptrFromInt(16), .vtable = &copied };
     try std.testing.expectError(error.UnsupportedEmbeddingStage, MetalCompute.prepareProjectionMetadata(&cb, request, .{}));
     cb.vtable = &MetalCompute.vtable_impl;
@@ -58369,6 +58393,8 @@ test "weight metadata rejects malformed inventory and missing actual cleanup bef
     invalid.vector_entries = invalid.entries + 1;
     try std.testing.expectError(error.InvalidWeightMetadataLayout, MetalCompute.weightMetadataHostBytes(invalid));
     var copied = MetalCompute.vtable_impl;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&MetalCompute.vtable_impl));
     var cb: ops.ComputeBackend = .{ .ptr = @ptrFromInt(16), .vtable = &copied };
     try std.testing.expectError(error.UnsupportedEmbeddingStage, MetalCompute.prepareWeightMetadata(&cb, request, .{}));
     cb.vtable = &MetalCompute.vtable_impl;

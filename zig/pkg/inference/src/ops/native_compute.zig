@@ -58788,6 +58788,8 @@ test "Native selected resident KBlock cold preparation uses original transaction
 
 test "Native selected resident preparation attests exact receiver before opaque pointer access" {
     var copied = vtable_impl;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&vtable_impl));
     const fake: ComputeBackend = .{ .ptr = @ptrFromInt(16), .vtable = &copied };
     try std.testing.expectError(error.UnsupportedNativeWeightPreparation, NativeCompute.snapshotResidentWeightPreparation(&fake, @ptrFromInt(16), "weight"));
     try std.testing.expectError(error.UnsupportedNativeWeightPreparation, NativeCompute.residentWeightCreditsNeedPreparation(&fake, @ptrFromInt(16)));
@@ -60018,6 +60020,8 @@ fn nativeF32MirrorColdCase(a: std.mem.Allocator, raw_first: bool, below: bool, g
     try std.testing.expectEqual(@as(usize, 0), data.canonical_panel_source_readers);
     try std.testing.expect(!compute.mirror_cache_receiving);
     var copied = cb.vtable.*;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(cb.vtable));
     var foreign = cb;
     foreign.vtable = &copied;
     foreign.ptr = @ptrFromInt(16);

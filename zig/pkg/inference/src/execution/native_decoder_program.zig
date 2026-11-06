@@ -1778,7 +1778,9 @@ test "native authored full query metadata checks missing answers and actual dtyp
         .{ .name = "model.layers.0.self_attn.k_norm.weight", .shape = null },
     };
     try Native.NativeCompute.validateAuthoredSourceQueries(&backend, &queries);
-    const inherited = Native.vtable_impl;
+    var inherited = Native.vtable_impl;
+    std.mem.doNotOptimizeAway(&inherited);
+    try std.testing.expect(@intFromPtr(&inherited) != @intFromPtr(&Native.vtable_impl));
     const fake = ops.ComputeBackend{ .ptr = @ptrFromInt(8), .vtable = &inherited };
     try std.testing.expectError(error.UnsupportedAuthoredNativeTarget, Native.NativeCompute.validateAuthoredSourceQueries(&fake, &queries));
     const tensor = &model.data.resident_weights.getPtr(name).?.tensor;
