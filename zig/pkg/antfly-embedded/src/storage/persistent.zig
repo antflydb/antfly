@@ -1273,6 +1273,7 @@ pub const PersistentIndex = struct {
     writer: index_mod.IndexWriter,
     main_store: backend_erased.NamespaceStore,
     main_store_owner: MainStoreOwner,
+    native_snapshot_identity: ?@import("native_publication.zig").NamespaceIdentity = null,
     segment_files: ?SegmentFileStore,
     retired_segment_file_deleter: ?*RetiredSegmentFileDeleter = null,
     retirement_reconcile_pending: bool = false,
@@ -1448,13 +1449,16 @@ pub const PersistentIndex = struct {
         return self.publishPreparedNativeLocked(segments, delete_keys, checkpoint, metadata, null);
     }
 
-    /// A prepared index replacement retains the caller's index-lifetime fence
-    /// and local storage serialization, but no native transaction, reader pin
-    /// or file writer admission. Acquire multiple indexes in catalog order.
-    /// Artifacts and metadata must outlive the handle. A caller can combine
-    /// several indexes and primary effects through commitNativePublications.
+    /// Borrowed preparations retain local storage serialization and the
+    /// caller's index lifetime. Owned preparations release both and can bind
+    /// to a freshly opened runtime with the exact same durable namespace.
+    /// Artifacts and metadata closures remain request-owned until deinit.
+    /// Bind multiple targets in catalog order before one native group commit.
     pub const PreparedNativePublication = struct {
-        index: *PersistentIndex,
+        index: ?*PersistentIndex,
+        alloc: Allocator,
+        resources: ?immutable_artifact.BuildResources = null,
+        runtime_detached: bool = false,
         namespace: @import("native_publication.zig").Prepared,
         snapshot: ?index_mod.IndexWriter.PreparedSegmentReplacement,
         replacements: []index_mod.ReplacementSegmentData,
@@ -1464,14 +1468,23 @@ pub const PersistentIndex = struct {
         activated: bool = false,
         staged: bool = false,
 
+        fn validate(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.namespace.participant.validate(view);
+            if (self.metadata) |joined| try joined.participant.validate(view);
+        }
+
         fn stage(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.activated or self.staged) return error.InvalidDerivedApplyState;
+            if (self.activated or self.staged or self.index == null) return error.InvalidDerivedApplyState;
             // A failed stage belongs to an aborted transaction. Recreate the
             // handle rather than attempting to bind the snapshot twice.
             self.staged = true;
             try self.namespace.participant.apply(view);
-            if (self.snapshot) |*candidate| try candidate.bind(&self.index.writer);
+            const index = self.index.?;
+            if (self.snapshot) |*candidate| {
+                if (self.runtime_detached) try candidate.bindNative(&index.writer, self.namespace.before.?, index.native_snapshot_identity) else try candidate.bind(&index.writer);
+            }
             for (self.segments) |segment| try segment.artifact.stageLink(view);
             if (self.snapshot) |*candidate| candidate.guardExternalVisibility();
             if (self.metadata) |joined| try joined.participant.apply(view);
@@ -1480,27 +1493,54 @@ pub const PersistentIndex = struct {
         fn activate(self: *@This()) void {
             std.debug.assert(self.staged and !self.activated);
             if (self.snapshot) |*candidate| candidate.publishRetainingExternalVisibility();
+            self.index.?.native_snapshot_identity = self.namespace.after;
             self.activated = true;
         }
 
+        /// Borrowed-mode callers release these with their originating index.
+        /// Owned-mode callers observe `infos` and let this handle free them.
         pub fn takeDeleteInfos(self: *@This()) []index_mod.IndexWriter.DeleteInfo {
-            std.debug.assert(self.activated);
+            std.debug.assert(self.activated and !self.runtime_detached);
             const result = self.infos;
             self.infos = &.{};
             return result;
         }
 
+        fn detachRuntime(self: *@This()) void {
+            std.debug.assert(!self.staged and !self.activated and !self.runtime_detached);
+            const index = self.index.?;
+            self.resources = index.writer.native_resources.?.retained();
+            self.index = null;
+            self.runtime_detached = true;
+            index.unlockStorage();
+        }
+
+        /// The caller fences this live target through commit and deinit. A
+        /// runtime refresh is safe; a changed index, inode or namespace is not.
+        pub fn bindTarget(self: *@This(), index: *PersistentIndex) !void {
+            if (!self.runtime_detached or self.index != null or self.staged or self.activated) return error.InvalidDerivedApplyState;
+            index.lockStorage();
+            errdefer index.unlockStorage();
+            const expected = self.namespace.before orelse return error.Unsupported;
+            const current = index.native_snapshot_identity orelse return error.EnrichmentWaitCanceled;
+            if (!expected.eql(current)) return error.EnrichmentWaitCanceled;
+            self.index = index;
+        }
+
         pub fn deinit(self: *@This()) void {
+            const a = self.alloc;
             const index = self.index;
+            var resources = self.resources;
             self.namespace.deinit();
             if (!self.activated) {
                 if (self.snapshot) |*candidate| candidate.abort();
-                for (self.replacements) |*replacement| replacement.data.deinit(index.alloc);
+                for (self.replacements) |*replacement| replacement.data.deinit(a);
             }
-            index.alloc.free(self.replacements);
-            index.freeDeleteInfos(self.infos);
-            index.unlockStorage();
-            index.alloc.destroy(self);
+            a.free(self.replacements);
+            index_mod.IndexWriter.freeDeleteInfos(a, self.infos);
+            if (index) |target| target.unlockStorage();
+            a.destroy(self);
+            if (resources) |*owner| owner.deinit();
         }
     };
 
@@ -1519,16 +1559,31 @@ pub const PersistentIndex = struct {
         return result;
     }
 
+    /// All mutable runtime references are released before returning. Binding
+    /// later needs only a live target with the same exact native namespace.
+    pub fn prepareOwnedNativePublication(self: *PersistentIndex, segments: []PreparedReplaySegment, delete_keys: []const []const u8, checkpoint: ?ReplayFragment.Checkpoint, metadata: ?ReplayPublicationMetadata) !*PreparedNativePublication {
+        if (self.writer.native_resources == null) return error.Unsupported;
+        const prepared = try self.prepareNativePublication(segments, delete_keys, checkpoint, metadata);
+        errdefer prepared.deinit();
+        if (prepared.namespace.before == null or prepared.namespace.after == null) return error.Unsupported;
+        prepared.detachRuntime();
+        return prepared;
+    }
+
     /// Exactly one host commit for all prepared indexes and its primary writes.
     /// Every allocation precedes this call. Host failure never activates a
     /// subset, and an uncertain result fences every potentially changed index.
     pub fn commitNativePublications(prepared: []const *PreparedNativePublication, primary: @import("native_publication.zig").Committer) !void {
         for (prepared, 0..) |candidate, i| {
-            if (candidate.staged or candidate.activated) return error.InvalidDerivedApplyState;
+            if (candidate.staged or candidate.activated or candidate.index == null) return error.InvalidDerivedApplyState;
             for (prepared[0..i]) |previous| if (previous.index == candidate.index) return error.InvalidDerivedApplyState;
         }
         const Group = struct {
             items: []const *PreparedNativePublication,
+            fn validate(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                for (self.items) |item| try PreparedNativePublication.validate(item, view);
+            }
             fn stage(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
                 const self: *@This() = @ptrCast(@alignCast(raw));
                 for (self.items) |item| try PreparedNativePublication.stage(item, view);
@@ -1539,10 +1594,10 @@ pub const PersistentIndex = struct {
         const parent_progress = backend_types.commit_progress;
         backend_types.commit_progress = &progress;
         defer backend_types.commit_progress = parent_progress;
-        primary.commit(.{ .ptr = &group, .stage = Group.stage }) catch |err| {
+        primary.commit(.{ .ptr = &group, .stage = Group.stage, .validate_fn = Group.validate }) catch |err| {
             if (progress.maybe_applied) {
                 if (parent_progress) |parent| parent.maybe_applied = true;
-                for (prepared) |item| if (item.index.segment_files) |files| files.storage.fenceUncertainPublication();
+                for (prepared) |item| if (item.index.?.segment_files) |files| files.storage.fenceUncertainPublication();
             }
             return err;
         };
@@ -1736,6 +1791,7 @@ pub const PersistentIndex = struct {
             txn.write = null;
             result.* = .{
                 .index = self,
+                .alloc = self.alloc,
                 .namespace = prepared_namespace,
                 .snapshot = publication,
                 .replacements = replacements,
@@ -1754,6 +1810,10 @@ pub const PersistentIndex = struct {
             snapshot_publication: ?*index_mod.IndexWriter.PreparedSegmentReplacement,
             target_writer: *index_mod.IndexWriter,
             guard_visibility: bool,
+            fn validate(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
+                const self_: *@This() = @ptrCast(@alignCast(raw));
+                if (self_.metadata) |joined| try joined.participant.validate(view);
+            }
             fn stage(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
                 if (self_.snapshot_publication) |prepared| try prepared.bind(self_.target_writer);
@@ -1771,7 +1831,7 @@ pub const PersistentIndex = struct {
             .target_writer = &self.writer,
             .guard_visibility = metadata != null,
         };
-        try self.commitPreparedPublicationWithParticipant(&txn, &uncertain, .{ .ptr = &participation, .stage = Participation.stage });
+        try self.commitPreparedPublicationWithParticipant(&txn, &uncertain, .{ .ptr = &participation, .stage = Participation.stage, .validate_fn = Participation.validate });
         if (publication) |*prepared| prepared.publish();
         published = true;
         return infos;
@@ -1818,6 +1878,7 @@ pub const PersistentIndex = struct {
     }
 
     const MainTxn = struct {
+        owner: ?*PersistentIndex = null,
         read: ?backend_erased.NamespaceReadTxn = null,
         write: ?backend_erased.NamespaceWriteTxn = null,
         retirement_cleanup_started: bool = false,
@@ -1858,7 +1919,10 @@ pub const PersistentIndex = struct {
 
         pub fn commitWithPublication(self: *MainTxn, participant: ?@import("native_publication.zig").Participant) !void {
             if (self.write) |*txn| {
-                if (participant) |value| try txn.commitWithPublication(value) else try txn.commit();
+                if (txn.vtable.commit_native_identity != null) {
+                    const identity = try txn.commitWithNativeIdentity(participant);
+                    if (self.owner) |owner| owner.native_snapshot_identity = identity;
+                } else if (participant) |value| try txn.commitWithPublication(value) else try txn.commit();
                 self.write = null;
                 return;
             }
@@ -1909,7 +1973,9 @@ pub const PersistentIndex = struct {
     }
 
     fn beginWriteMainTxn(self: *PersistentIndex) !MainTxn {
-        return try MainTxn.open(&self.main_store, false);
+        var txn = try MainTxn.open(&self.main_store, false);
+        txn.owner = self;
+        return txn;
     }
 
     fn backendCapabilities(_: *PersistentIndex) backend_types.Capabilities {
@@ -2152,14 +2218,23 @@ pub const PersistentIndex = struct {
 
         var writer = try index_mod.IndexWriter.init(alloc);
         errdefer writer.deinit();
+        if (cache_lifecycle) if (segment_files) |*files| {
+            if (try files.storage.acquireImmutableResources()) |owned| {
+                var resources = owned;
+                defer resources.deinit();
+                writer.setNativeResources(resources);
+            }
+        };
         var stale_active_ids = std.ArrayListUnmanaged(u64).empty;
         defer stale_active_ids.deinit(alloc);
 
         // Recovery: load existing segments from metadata plus immutable files.
         var committed_lsn: u64 = 0;
+        var native_snapshot_identity: ?@import("native_publication.zig").NamespaceIdentity = null;
         {
             var read_txn = try MainTxn.open(&opened_main.store, true);
             defer read_txn.abort();
+            if (read_txn.read) |*native| native_snapshot_identity = try native.nativeIdentity();
 
             // Read committed_lsn
             const lsn_bytes = read_txn.get(.meta, meta_committed_lsn) catch |err| switch (err) {
@@ -2318,6 +2393,7 @@ pub const PersistentIndex = struct {
             .io = opts.io,
             .alloc = alloc,
             .writer = writer,
+            .native_snapshot_identity = native_snapshot_identity,
             .main_store = opened_main.store,
             .main_store_owner = opened_main.owner,
             .deferred_retirement_maintenance = cache_lifecycle,
@@ -8886,4 +8962,120 @@ test "native foreground identity binding publishes once and survives reopen dele
     defer merged_reader.deinit();
     try std.testing.expectEqual(@as(?u32, 913), try merged_reader.docOrdinal(0));
     try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "owned native publication survives complete backend replacement and activates with its original accounting owner" {
+    try testOwnedPublicationRuntimeReplacement(false);
+}
+
+test "owned native publication retains large staged extents across complete backend replacement" {
+    try testOwnedPublicationRuntimeReplacement(true);
+}
+
+fn testOwnedPublicationRuntimeReplacement(large: bool) !void {
+    const a = std.testing.allocator;
+    const backend_mod = @import("lite/backend.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/owned-publication-runtime.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var backend = try backend_mod.Handle.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .exclusive = true, .externally_locked = true, .reclamation = .{ .enabled = false } });
+    var backend_live = true;
+    defer if (backend_live) backend.deinit();
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    const original_manager = backend.owned_resource_manager.?;
+    var adapter = lite_indexes.Store.init(a, backend.native_docstore.?);
+    var opts: PersistentIndexOptions = .{ .path = "/indexes/text", .io = std.testing.io, .main_backend = .lsm, .main_lsm_storage = adapter.storage(), .wal_backend = .lsm, .wal_storage = adapter.storage(), .main_no_sync = true, .wal_no_sync = true };
+    var index = try PersistentIndex.open(a, opts);
+    var index_live = true;
+    defer if (index_live) index.close();
+    const alpha = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(alpha);
+    const beta = if (large) large_segment: {
+        const small = try buildSimpleSegment(a, "doc:a", "beta");
+        defer a.free(small);
+        var reader = try segment_mod.SegmentReader.init(a, small);
+        defer reader.deinit();
+        const body = try a.alloc(u8, 1024 * 1024 + 12);
+        defer a.free(body);
+        @memcpy(body[0..10], "{\"noise\":\"");
+        var random = std.Random.DefaultPrng.init(17019);
+        random.random().bytes(body[10 .. body.len - 2]);
+        for (body[10 .. body.len - 2]) |*byte| byte.* = "0123456789abcdef"[byte.* & 15];
+        @memcpy(body[body.len - 2 ..], "\"}");
+        var builder = segment_mod.SegmentWriter.init(a);
+        defer builder.deinit();
+        try builder.addStoredDoc("doc:a", body);
+        try builder.addSection(try builder.addField("body"), .inverted_text, (try reader.getSection("body", .inverted_text)).?);
+        const built = try builder.build();
+        errdefer a.free(built);
+        try std.testing.expect(built.len > @import("lite/artifact_source.zig").OwnedBytes.maximum_length);
+        break :large_segment built;
+    } else try buildSimpleSegment(a, "doc:a", "beta");
+    defer a.free(beta);
+    try index.indexSegment(alpha);
+    const old = index.acquireSnapshot();
+    defer old.release();
+    var stager = (try index.acquireReplayStager(a)).?;
+    var stager_live = true;
+    defer if (stager_live) stager.deinit();
+    var staged = [_]PreparedReplaySegment{try prepareNativeTextSegment(a, stager, beta)};
+    defer staged[0].deinit();
+    const prepared = try index.prepareOwnedNativePublication(&staged, &.{"doc:a"}, null, null);
+    var prepared_live = true;
+    defer if (prepared_live) prepared.deinit();
+    try std.testing.expect(prepared.index == null);
+    try std.testing.expect(prepared.runtime_detached);
+    index.close();
+    index_live = false;
+    stager.deinit();
+    stager_live = false;
+    backend.deinit();
+    backend_live = false;
+    // Fixed native metadata can receive authoritative identities with no
+    // originating runtime, mutable index, primary Store or writer gate left.
+    try staged[0].ordinals.?.bind(&.{913});
+    backend = try backend_mod.Handle.open(a, path, .{ .io = std.testing.io, .no_sync = true, .externally_locked = true, .reclamation = .{ .enabled = false } });
+    backend_live = true;
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    try std.testing.expect(original_manager != backend.owned_resource_manager.?);
+    adapter = lite_indexes.Store.init(a, backend.native_docstore.?);
+    opts.main_lsm_storage = adapter.storage();
+    opts.wal_storage = adapter.storage();
+    index = try PersistentIndex.open(a, opts);
+    index_live = true;
+    {
+        var primary_store = try @import("docstore.zig").DocStore.openRuntime(a, backend.native_runtime_store.?);
+        defer primary_store.close();
+        const Primary = struct {
+            store: *@import("docstore.zig").DocStore,
+            fn commit(raw: *anyopaque, participant: @import("native_publication.zig").Participant) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                try self.store.putBatchWithPublications(std.testing.io, &.{.{ .key = "doc:a", .value = "beta" }}, &.{}, null, .{}, null, participant);
+            }
+        };
+        var primary: Primary = .{ .store = &primary_store };
+        const before = backend.native_docstore.?.file.activeCheckpoint().commit_sequence;
+        try prepared.bindTarget(&index);
+        try PersistentIndex.commitNativePublications(&.{prepared}, .{ .ptr = &primary, .commit_fn = Primary.commit });
+        try std.testing.expectEqual(before + 1, backend.native_docstore.?.file.activeCheckpoint().commit_sequence);
+        try std.testing.expectEqual(@as(usize, 1), prepared.infos.len);
+        prepared.deinit();
+        prepared_live = false;
+    }
+    try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, old, "alpha"));
+    try std.testing.expect(index.snapshot().native_resources.?.resource_manager.? == original_manager);
+    const retained = index.acquireSnapshot();
+    defer retained.release();
+    try std.testing.expect((try backend.native_docstore.?.file.check()).valid);
+    index.close();
+    index_live = false;
+    backend.deinit();
+    backend_live = false;
+    try std.testing.expectEqual(@as(?u32, 913), try retained.segments[retained.segments.len - 1].reader.docOrdinal(0));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, retained, "beta"));
+    _ = original_manager.sliceStats(.graph_predicate_cache);
 }

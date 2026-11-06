@@ -148,6 +148,7 @@ const State = struct {
     arena: std.heap.ArenaAllocator,
     snapshot: ?native.NativeFile = null,
     expected: ?[16]u8 = null,
+    next_generation: ?[16]u8 = null,
     inode: u64,
     file_namespace: [32]u8,
     writable: bool,
@@ -157,6 +158,11 @@ const State = struct {
     mutations: []native.CatalogMutation = &.{},
     fn a(self: *State) A {
         return self.arena.allocator();
+    }
+    fn identity(self: *const State, generation: ?[16]u8) publication.NamespaceIdentity {
+        var root: [32]u8 = undefined;
+        std.crypto.hash.Blake3.hash(self.backend.prefix, &root, .{});
+        return .{ .inode = self.inode, .file_namespace = self.file_namespace, .root = root, .generation = generation };
     }
     fn namespacePrefix(self: *State, ns: NS) ![]u8 {
         // Native records remain ordinary entries to generation manifests and
@@ -182,7 +188,11 @@ const State = struct {
         const data_root = self.backend.prefix[0 .. self.backend.prefix.len - "/.native-state/".len];
         const root = std.fs.path.dirname(data_root) orelse "";
         var host: Host = .{ .file = file, .allocator = self.a(), .index_prefix = root };
+        try self.validateView(host.view());
         try self.stageView(host.view());
+    }
+    fn validateView(self: *State, view: publication.View) !void {
+        if (self.participant) |participant| try participant.validate(view);
     }
     fn stageView(self: *State, view: publication.View) !void {
         // Mutation descriptors already reference these fixed buffers. Acquire
@@ -204,6 +214,10 @@ const State = struct {
         const self: *State = @ptrCast(@alignCast(raw));
         try self.stageView(view);
     }
+    fn validatePrepared(raw: *anyopaque, view: publication.View) !void {
+        const self: *State = @ptrCast(@alignCast(raw));
+        try self.validateView(view);
+    }
     fn releasePrepared(raw: *anyopaque) void {
         const self: *State = @ptrCast(@alignCast(raw));
         self.destroy();
@@ -218,6 +232,7 @@ const State = struct {
         @memcpy(generation[0..generation_magic.len], generation_magic);
         try self.backend.registry.io().randomSecure(generation[generation_magic.len..]);
         mutations[i] = .{ .key = self.backend.generation_key, .value = generation };
+        self.next_generation = generation[generation_magic.len..][0..16].*;
         self.mutations = mutations;
     }
 };
@@ -323,13 +338,24 @@ const Txn = struct {
         state.snapshot.?.close();
         state.snapshot = null;
         self.* = undefined;
-        return .{ .participant = .{ .ptr = state, .stage = State.stagePrepared }, .release_fn = State.releasePrepared };
+        return .{ .before = state.identity(state.expected), .after = state.identity(state.next_generation), .participant = .{ .ptr = state, .stage = State.stagePrepared, .validate_fn = State.validatePrepared }, .release_fn = State.releasePrepared };
     }
     pub fn commitWithPublication(self: *Txn, participant: publication.Participant) !void {
         self.state.participant = participant;
         try self.commit();
     }
+    pub fn nativeIdentity(self: *Txn) !publication.NamespaceIdentity {
+        if (self.state.snapshot == null) return error.TransactionClosed;
+        return self.state.identity(self.state.expected);
+    }
+    pub fn commitWithNativeIdentity(self: *Txn, participant: ?publication.Participant, out: *publication.NamespaceIdentity) !void {
+        self.state.participant = participant;
+        return self.commitImpl(out);
+    }
     pub fn commit(self: *Txn) !void {
+        return self.commitImpl(null);
+    }
+    fn commitImpl(self: *Txn, identity_out: ?*publication.NamespaceIdentity) !void {
         const state = self.state;
         if (!state.writable) return error.ReadOnly;
         if (state.snapshot == null) return error.TransactionClosed;
@@ -350,6 +376,7 @@ const Txn = struct {
                 return err;
             };
         }
+        if (identity_out) |out| out.* = state.identity(if (state.pending.count() != 0 or state.participant != null) state.next_generation else state.expected);
         state.destroy();
         self.* = undefined;
     }
@@ -763,4 +790,52 @@ test "native namespace binding allocation failures release parameter and cursor 
     value.deinit();
     value_live = false;
     try std.testing.expectEqual(@as(usize, 1), owner.references);
+}
+
+test "native namespace identity follows committed snapshots and prepared generation without consuming a live cursor" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-namespace-identity.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var owner = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer owner.close();
+    owner.maintenance_start_suppressed = true;
+    var backend = try Backend.open(a, &owner, "/indexes/identity", false);
+    defer backend.deinit();
+    var other = try Backend.open(a, &owner, "/indexes/other", false);
+    defer other.deinit();
+    var initial = try backend.beginRead();
+    defer initial.abort();
+    const before = (try initial.nativeIdentity()).?;
+    var other_read = try other.beginRead();
+    defer other_read.abort();
+    try std.testing.expect(!before.eql((try other_read.nativeIdentity()).?));
+    var write = try backend.beginWrite();
+    var write_live = true;
+    defer if (write_live) write.abort();
+    try write.put(.{}, "key", "value");
+    {
+        var cursor = try write.openCursor(.{});
+        defer cursor.close();
+        try std.testing.expectError(error.TransactionCursorActive, write.commitWithNativeIdentity(null));
+        try std.testing.expectEqualStrings("value", try write.get(.{}, "key"));
+    }
+    const committed = (try write.commitWithNativeIdentity(null)).?;
+    write_live = false;
+    try std.testing.expect(!before.eql(committed));
+    try std.testing.expect(before.eql((try initial.nativeIdentity()).?));
+    var after = try backend.beginRead();
+    defer after.abort();
+    try std.testing.expect(committed.eql((try after.nativeIdentity()).?));
+    var next = try backend.beginWrite();
+    var next_live = true;
+    defer if (next_live) next.abort();
+    try next.put(.{}, "key", "next");
+    var prepared = try next.prepareNativePublication();
+    next_live = false;
+    defer prepared.deinit();
+    try std.testing.expect(committed.eql(prepared.before.?));
+    try std.testing.expect(!prepared.before.?.eql(prepared.after.?));
+    try std.testing.expect(committed.eql((try after.nativeIdentity()).?));
 }

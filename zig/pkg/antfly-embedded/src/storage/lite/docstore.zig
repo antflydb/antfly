@@ -3660,11 +3660,10 @@ pub const Txn = struct {
             allocator: Allocator,
             fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
                 const context: *@This() = @ptrCast(@alignCast(ptr));
+                var host: @import("publication_host.zig").Host = .{ .file = file, .allocator = context.allocator, .index_prefix = "" };
+                if (context.publication) |participant| try participant.validate(host.view());
                 try file.putDocumentBatch(context.mutations);
-                if (context.publication) |participant| {
-                    var host: @import("publication_host.zig").Host = .{ .file = file, .allocator = context.allocator, .index_prefix = "" };
-                    try participant.apply(host.view());
-                }
+                if (context.publication) |participant| try participant.apply(host.view());
             }
         };
         var context = Commit{ .mutations = mutations, .publication = self.native_publication, .allocator = allocator };
@@ -12832,4 +12831,78 @@ test "lite seekable producer fallback bounds unrelated journal scans" {
         try std.testing.expect(window.fragment == null);
         completed = window.last_sequence;
     }
+}
+
+test "native publication validates preimages before primary writes and stages against their postimages" {
+    const a = std.testing.allocator;
+    const publication = @import("../native_publication.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-publication-phases.aflite");
+    defer a.free(path);
+    var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const selected = "\x00\x00__test__:preimage";
+    const joined_key = "\x00\x00__test__:joined";
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put(selected, "before");
+        try write.commit();
+    }
+    const Context = struct {
+        scope: publication.Scope,
+        expected: []const u8 = "stale",
+        validated: bool = false,
+        staged: bool = false,
+        fn validate(raw: *anyopaque, view: publication.View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const current = try view.getMetadata(std.testing.allocator, self.scope, selected);
+            defer std.testing.allocator.free(current);
+            if (!std.mem.eql(u8, current, self.expected)) return error.FileBusy;
+            self.validated = true;
+        }
+        fn stage(raw: *anyopaque, view: publication.View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!self.validated) return error.MissingNativePreimageValidation;
+            const current = try view.getMetadata(std.testing.allocator, self.scope, selected);
+            defer std.testing.allocator.free(current);
+            if (!std.mem.eql(u8, current, "after")) return error.MissingNativePrimaryPostimage;
+            try view.putMetadata(self.scope, joined_key, "committed");
+            self.staged = true;
+        }
+    };
+    var context: Context = .{ .scope = .{ .inode = (try store.file.file.stat(std.testing.io)).inode, .prefix = &.{}, .file_namespace = store.file.header.reader_epoch_namespace } };
+    const before = store.file.activeCheckpoint().commit_sequence;
+    {
+        var write = try store.beginWrite();
+        defer write.abort();
+        try write.put(selected, "after");
+        try write.setNativePublication(.{ .ptr = &context, .stage = Context.stage, .validate_fn = Context.validate });
+        try std.testing.expectError(error.FileBusy, write.commit());
+    }
+    try std.testing.expect(!context.validated and !context.staged);
+    try std.testing.expectEqual(before, store.file.activeCheckpoint().commit_sequence);
+    const unchanged = (try store.file.getDocumentAlloc(a, selected)).?;
+    defer a.free(unchanged);
+    try std.testing.expectEqualStrings("before", unchanged);
+    try std.testing.expect((try store.file.getDocumentAlloc(a, joined_key)) == null);
+    context.expected = "before";
+    {
+        var write = try store.beginWrite();
+        errdefer write.abort();
+        try write.put(selected, "after");
+        try write.setNativePublication(.{ .ptr = &context, .stage = Context.stage, .validate_fn = Context.validate });
+        try write.commit();
+    }
+    try std.testing.expect(context.validated and context.staged);
+    try std.testing.expectEqual(before + 1, store.file.activeCheckpoint().commit_sequence);
+    const after = (try store.file.getDocumentAlloc(a, selected)).?;
+    defer a.free(after);
+    const joined = (try store.file.getDocumentAlloc(a, joined_key)).?;
+    defer a.free(joined);
+    try std.testing.expectEqualStrings("after", after);
+    try std.testing.expectEqualStrings("committed", joined);
+    try std.testing.expect((try store.file.check()).valid);
 }

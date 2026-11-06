@@ -633,6 +633,7 @@ pub const Storage = struct {
         open_leased_immutable_source: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").Source = null,
         acquire_lease: ?*const fn (*anyopaque) anyerror!Lease = null,
         acquire_immutable_stager: ?*const fn (*anyopaque, Allocator) anyerror!?@import("../immutable_artifact.zig").Stager = null,
+        acquire_immutable_resources: ?*const fn (*anyopaque) anyerror!?@import("../immutable_artifact.zig").BuildResources = null,
         fence_uncertain_publication: ?*const fn (*anyopaque) void = null,
         create_dir_path: *const fn (*anyopaque, []const u8) anyerror!void,
         /// Directories are inferred from child files and have no independent
@@ -692,6 +693,13 @@ pub const Storage = struct {
         supports_host_path_generation_publication: bool = false,
         supports_native_path_locks: bool = false,
     };
+    /// Retain immutable decoder/accounting resources without requiring a
+    /// writable artifact capability. Read-only index snapshots use this too.
+    pub fn acquireImmutableResources(self: Storage) !?@import("../immutable_artifact.zig").BuildResources {
+        const acquire = self.vtable.acquire_immutable_resources orelse return null;
+        return try BoundaryAbi.call("acquire_immutable_resources", self.boundary_dispatch, acquire, .{self.ptr});
+    }
+
     pub fn acquireImmutableStager(self: Storage, alloc: Allocator) !?@import("../immutable_artifact.zig").Stager {
         const acquire = self.vtable.acquire_immutable_stager orelse return null;
         return try BoundaryAbi.call("acquire_immutable_stager", self.boundary_dispatch, acquire, .{ self.ptr, alloc });

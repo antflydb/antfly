@@ -62,6 +62,7 @@ pub const Store = struct {
         .private_scratch_directory = privateScratchDirectory,
         .create_dir_path = createDirPath,
         .acquire_immutable_stager = if (supports_native_artifact_leases) acquireImmutableStager else null,
+        .acquire_immutable_resources = acquireImmutableResources,
         .fence_uncertain_publication = fenceUncertainPublication,
         .virtual_directories = true,
         .read_file_alloc = readFileAlloc,
@@ -182,6 +183,7 @@ fn acquireReadSnapshot(ptr: *anyopaque) !StorageIo.Lease {
             value.open_immutable_source = null;
             value.open_leased_immutable_source = null;
             value.acquire_immutable_stager = null;
+            value.acquire_immutable_resources = null;
             value.fence_uncertain_publication = null;
             value.map_immutable_artifact = null;
             break :blk value;
@@ -426,6 +428,7 @@ fn appendPublication(raw: *anyopaque, path: []const u8, contents: []const u8, sy
             request.file = file;
             defer request.file = null;
             var host: @import("publication_host.zig").Host = .{ .file = file, .allocator = request.store.allocator, .index_prefix = request.store.namespace_prefix };
+            try request.participant.validate(host.view());
             try request.participant.apply(host.view());
             try file.appendIndexCatalogRecord(request.path, request.contents);
         }
@@ -453,13 +456,17 @@ const NativeArtifactStager = struct {
     }
     fn acquireBuildResources(raw: *anyopaque) !?immutable_artifact.BuildResources {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        const owner = self.registry.beginCallback() orelse return error.ReadOnly;
-        defer self.registry.endCallback();
+        return captureResources(self.registry);
+    }
+
+    fn captureResources(registry: *artifacts.Registry) !?immutable_artifact.BuildResources {
+        const owner = registry.beginCallback() orelse return error.ReadOnly;
+        defer registry.endCallback();
         // Keeping the registry alive retains a backend-owned manager after
         // close. It cannot extend an externally supplied manager's lifetime.
         if (owner.resource_manager != null and !owner.resource_manager_transfers_on_close) return null;
-        self.registry.retainOwner();
-        return .{ .native_metadata_revision = if (owner.file.header.indexed_reclamation) owner.file.header.indexed_revision else 3, .ptr = self.registry, .allocator = self.registry.allocator, .io = self.registry.io(), .resource_manager = owner.resource_manager, .release_fn = releaseBuildResources, .retain_fn = retainBuildResources };
+        registry.retainOwner();
+        return .{ .native_metadata_revision = if (owner.file.header.indexed_reclamation) owner.file.header.indexed_revision else 3, .ptr = registry, .allocator = registry.allocator, .io = registry.io(), .resource_manager = owner.resource_manager, .release_fn = releaseBuildResources, .retain_fn = retainBuildResources };
     }
 
     fn stage(raw: *anyopaque, bytes: []const u8) !immutable_artifact.Prepared {
@@ -659,6 +666,11 @@ const NativePreparedArtifact = struct {
         self.alloc.destroy(self);
     }
 };
+
+fn acquireImmutableResources(raw: *anyopaque) !?immutable_artifact.BuildResources {
+    const self: *Store = @ptrCast(@alignCast(raw));
+    return NativeArtifactStager.captureResources(try self.docs.artifactRegistry());
+}
 
 fn acquireImmutableStager(raw: *anyopaque, alloc: Allocator) !?immutable_artifact.Stager {
     const self: *Store = @ptrCast(@alignCast(raw));
@@ -4770,5 +4782,38 @@ test "native ordinal column keeps the actual source accounting owner after backe
     backend_live = false;
     try std.testing.expectEqual(@as(?u32, 47), try binding.ordinal(0));
     try std.testing.expectEqual(@as(?u32, 91), try binding.ordinal(1));
+    try std.testing.expect(manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes > 0);
+}
+
+test "native read only resources retain accounting without granting artifact staging" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "readonly-native-resources.aflite");
+    defer a.free(path);
+    {
+        var created = try backend_mod.Handle.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .exclusive = true, .reclamation = .{ .enabled = false } });
+        created.native_docstore.?.maintenance_start_suppressed = true;
+        created.deinit();
+    }
+    var backend = try backend_mod.Handle.open(a, path, .{ .io = std.testing.io, .read_only = true, .reclamation = .{ .enabled = false } });
+    var backend_live = true;
+    defer if (backend_live) backend.deinit();
+    var adapter = Store.init(a, backend.native_docstore.?);
+    const storage = adapter.storage();
+    try std.testing.expectError(error.ReadOnly, storage.acquireImmutableStager(a));
+    var resources = (try storage.acquireImmutableResources()).?;
+    defer resources.deinit();
+    const manager = resources.resource_manager.?;
+    backend.deinit();
+    backend_live = false;
+    var builder = try resources.createPublicationValue(8);
+    defer builder.deinit();
+    try builder.write(0, "snapshot");
+    try builder.seal();
+    var value = builder.value();
+    defer value.deinit();
+    try std.testing.expectEqualStrings("snapshot", try value.read());
     try std.testing.expect(manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes > 0);
 }

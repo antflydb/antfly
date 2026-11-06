@@ -57,6 +57,10 @@ pub const BuildResources = struct {
     resource_manager: ?*@import("resource_manager.zig").ResourceManager,
     release_fn: *const fn (*anyopaque) void,
     retain_fn: *const fn (*anyopaque) void,
+    pub fn retained(self: BuildResources) BuildResources {
+        self.retain_fn(self.ptr);
+        return self;
+    }
     pub fn valueOwner(self: BuildResources) @import("native_publication_value.zig").Owner {
         return .{ .ptr = self.ptr, .retain_fn = self.retain_fn, .release_fn = self.release_fn };
     }

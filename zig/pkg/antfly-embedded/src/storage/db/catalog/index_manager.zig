@@ -907,6 +907,80 @@ fn buildPreparedProjectedText(
     return .{ .alloc = alloc, .segment_alloc = segment_alloc, .segments = segments, .observed_field_analyzers = try observed.toOwnedSlice(alloc) };
 }
 
+/// Immutable foreground configuration shared by a catalog extraction epoch.
+/// It owns all schema, analyzer, IO and accounting state; no live index or DB
+/// is needed to project documents or build their immutable posting artifacts.
+pub const ForegroundTextProjection = struct {
+    projection: *OwnedTextMapperProjection,
+    name: []const u8,
+    generation: u64,
+    config_hash: u64,
+    descriptor: []const u8,
+    schema: ?schema_mod.TableSchema,
+    selected_field: ?[]const u8,
+    retain_empty: bool,
+    source_options: mapper.TextProjectionOptions,
+    stager: @import("../../immutable_artifact.zig").Stager,
+
+    pub fn matches(self: ForegroundTextProjection, other: ForegroundTextProjection) bool {
+        return self.generation == other.generation and self.config_hash == other.config_hash and
+            std.mem.eql(u8, self.name, other.name) and std.mem.eql(u8, self.descriptor, other.descriptor);
+    }
+
+    pub fn deinit(self: *ForegroundTextProjection) void {
+        self.stager.deinit();
+        self.projection.destroy();
+        self.* = undefined;
+    }
+
+    /// Document identities are deliberately absent from posting bytes. The
+    /// publisher binds authoritative ordinals after its primary read validation.
+    /// This projection can also be combined with sibling request deltas before
+    /// freezing segments, independently of request/RPC boundaries.
+    pub fn project(self: *const ForegroundTextProjection, alloc: Allocator, docs: []const mapper.MapperDoc) !TextPublicationPlan {
+        const captured = &self.projection.build.?;
+        const projection = try OwnedTextMapperProjection.create(alloc, captured.resources.resource_manager);
+        errdefer projection.destroy();
+        projection.build = .{ .resources = captured.resources.retained() };
+        const build = &projection.build.?;
+        const a = projection.arena.allocator();
+        build.analysis = try projection.ownValue(introducer_mod.TextAnalysisConfig, captured.analysis);
+        build.options = captured.options;
+        build.options.contribution_cache = null;
+        build.options.index_sort = try projection.ownValue(@TypeOf(captured.options.index_sort), captured.options.index_sort);
+        build.options.postings_run_directory = try a.dupe(u8, captured.options.postings_run_directory);
+        if (captured.options.contribution_cache) |cache| {
+            cache.retainOwner();
+            build.options.contribution_cache = cache;
+        }
+        projection.input_end = docs.len;
+        const inputs = try a.dupe(mapper.MapperDoc, docs);
+        for (inputs) |*doc| doc.doc_ordinal = null;
+        const source = try mapper.buildTextProjectionSourceBatchWithOptions(a, inputs, self.source_options);
+        var observed: std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer) = .empty;
+        var ends: std.ArrayListUnmanaged(usize) = .empty;
+        var builder = mapper.TextProjectionBatchBuilder.initWithSelectedField(a, build.analysis, self.schema, &observed, self.selected_field);
+        defer builder.deinit();
+        projection.observed_ends = try a.alloc(usize, docs.len + 1);
+        projection.observed_ends[0] = 0;
+        for (source.docs, 0..) |doc, i| {
+            const before = builder.text_docs.items.len;
+            try builder.appendSourceDocForIndex(doc, self.selected_field, self.retain_empty);
+            if (builder.text_docs.items.len - before > 1) return error.InvalidTextProjection;
+            if (builder.text_docs.items.len != before) try ends.append(a, i + 1);
+            projection.observed_ends[i + 1] = observed.items.len;
+        }
+        projection.docs = try a.dupe(introducer_mod.TextDocument, builder.text_docs.items);
+        projection.original_ends = try ends.toOwnedSlice(a);
+        projection.observed = observed.items;
+        try projection.ownConfiguration();
+        const chunks = try alloc.alloc(TextPublicationChunk, 1);
+        errdefer alloc.free(chunks);
+        chunks[0] = .{ .end = docs.len, .estimate = if (projection.docs.len == 0) .{} else try IndexManager.estimateProjectedTextPublication(a, projection.docs) };
+        return .{ .alloc = alloc, .chunks = chunks, .input_end = docs.len, .mapper_projection = projection };
+    }
+};
+
 /// Immutable full-text artifacts built before entering the per-index apply
 /// section. Native plans own their build dependencies; foreign providers keep
 /// the existing catalog/analysis read fence. Callers revalidate the captured
@@ -6185,6 +6259,7 @@ pub const IndexManager = struct {
         has_text_consumers: bool = false,
         text_requires_root: bool = true,
         text_fields: [][]u8 = &.{},
+        foreground_text: []ForegroundTextProjection = &.{},
         dense_fields: []DenseFieldWritePlan,
         sparse_fields: []SparseFieldWritePlan,
         graph_fields: []GraphFieldWritePlan,
@@ -6202,6 +6277,8 @@ pub const IndexManager = struct {
         chunk_dependents: [][]u32,
 
         pub fn deinit(self: *WritePlanSnapshot) void {
+            for (self.foreground_text) |*projection| projection.deinit();
+            if (self.foreground_text.len != 0) self.alloc.free(self.foreground_text);
             if (self.group_sources) |*plan| plan.deinit();
             if (self.completion_plan) |*plan| plan.deinit();
             if (self.artifact_catalogs) |*catalogs| catalogs.deinit(self.alloc);
@@ -6743,6 +6820,25 @@ pub const IndexManager = struct {
         errdefer alloc.free(catalog_resolvers);
         var completion_plan = try @import("../artifact_completion_plan.zig").Plan.init(alloc, .{ .indexes = catalog_indexes, .enrichments = catalog_enrichments, .resolvers = catalog_resolvers }, generated_templates);
         errdefer completion_plan.deinit();
+        var foreground: std.ArrayListUnmanaged(ForegroundTextProjection) = .empty;
+        errdefer {
+            for (foreground.items) |*projection| projection.deinit();
+            foreground.deinit(alloc);
+        }
+        for (self.text_indexes.items) |*entry| {
+            if (try self.captureForegroundTextProjectionAssumeCatalogLocked(alloc, entry)) |captured| {
+                var owned = captured;
+                foreground.append(alloc, captured) catch |err| {
+                    owned.deinit();
+                    return err;
+                };
+            }
+        }
+        const foreground_text = try foreground.toOwnedSlice(alloc);
+        errdefer {
+            for (foreground_text) |*projection| projection.deinit();
+            alloc.free(foreground_text);
+        }
         return .{
             .alloc = alloc,
             .generation = self.writePlanGeneration(),
@@ -6763,6 +6859,7 @@ pub const IndexManager = struct {
             .chunk_dependents = chunk_dependents,
             .text_requires_root = text_requires_root,
             .text_fields = try text_fields.toOwnedSlice(alloc),
+            .foreground_text = foreground_text,
         };
     }
 
@@ -8016,6 +8113,7 @@ pub const IndexManager = struct {
             entry.runtime_schema = runtime_schema_owned;
             entry.text_analysis = text_analysis;
             advanceTextProjectionRevisionAssumeAnalysisLocked(entry);
+            self.invalidateWritePlanSnapshot();
             runtime_schema_owned = null;
             text_analysis_owned = false;
 
@@ -20611,6 +20709,44 @@ pub const IndexManager = struct {
             try chunks.append(context.alloc, .{ .end = projection.input_end, .estimate = current });
         }
         return .{ .alloc = context.alloc, .chunks = try chunks.toOwnedSlice(context.alloc), .input_end = projection.input_end, .mapper_projection = projection };
+    }
+
+    fn captureForegroundTextProjectionAssumeCatalogLocked(self: *IndexManager, alloc: Allocator, entry: *TextIndex) !?ForegroundTextProjection {
+        // Expensive/generated text stays asynchronous. A base foreground
+        // watermark must never certify unseen implicit chunk/artifact effects.
+        if (entry.persistent.read_only or textEntryHasExplicitArtifactSources(entry) or try self.textIndexIsChunkBacked(alloc, entry.config.name)) return null;
+        entry.lockAnalysisShared();
+        defer entry.unlockAnalysisShared();
+        var stager = (try entry.persistent.acquireReplayStager(alloc)) orelse return null;
+        var transferred = false;
+        defer if (!transferred) stager.deinit();
+        const projection = try OwnedTextMapperProjection.create(alloc, self.resource_manager);
+        defer if (!transferred) projection.destroy();
+        try self.captureDetachedTextBuild(entry, projection);
+        const build = if (projection.build) |*value| value else return null;
+        if (build.resources.native_metadata_revision < 16) return null;
+        const a = projection.arena.allocator();
+        const schema_bytes: ?[]const u8 = if (entry.runtime_schema) |schema| try schema_mod.serializeSchema(a, schema) else null;
+        const schema: ?schema_mod.TableSchema = if (schema_bytes) |bytes| try schema_mod.deserializeSchema(a, bytes) else null;
+        const selected = try projection.ownValue(@TypeOf(entry.selected_field), entry.selected_field);
+        const source_options = try projection.ownValue(mapper.TextProjectionOptions, try self.textProjectionOptionsForSchema(a, schema == null and selected == null));
+        // Configuration comparison is exact and independent of process-local
+        // instance counters, so a same-catalog runtime refresh can adopt it.
+        const descriptor = try std.json.Stringify.valueAlloc(a, .{ .schema = schema_bytes, .analysis = build.analysis, .selected_field = selected, .source_options = source_options, .index_sort = build.options.index_sort }, .{});
+        const name = try a.dupe(u8, entry.config.name);
+        if (self.analysis_contributions_enabled) {
+            @import("antfly_platform").sync.lockYielding(&self.analysis_contributions_mutex);
+            defer self.analysis_contributions_mutex.unlock();
+            if (self.analysis_contributions == null) if (self.resource_manager) |manager| {
+                self.analysis_contributions = introducer_mod.AnalyzedContributionCache.create(manager) catch null;
+            };
+            if (self.analysis_contributions) |cache| {
+                cache.retainOwner();
+                build.options.contribution_cache = cache;
+            }
+        }
+        transferred = true;
+        return .{ .projection = projection, .name = name, .generation = entry.config.coverage_generation, .config_hash = types.indexConfigHash(entry.config), .descriptor = descriptor, .schema = schema, .selected_field = selected, .retain_empty = entry.coversPrimaryDocuments(), .source_options = source_options, .stager = stager };
     }
 
     fn captureDetachedTextBuild(self: *IndexManager, entry: *TextIndex, projection: *OwnedTextMapperProjection) !void {
@@ -36204,6 +36340,7 @@ fn mergeObservedTextFieldAnalyzers(
     const previous_analysis = entry.text_analysis.field_analyzers;
     entry.observed_field_analyzers = expanded_observed;
     entry.text_analysis.field_analyzers = expanded_analysis;
+    self.invalidateWritePlanSnapshot();
     observed_published = true;
     analysis_published = true;
     if (previous_observed.len > 0) self.alloc.free(previous_observed);
@@ -53387,6 +53524,12 @@ test "native text preparation builds from owned inputs after manager and backend
     const value = try std.fmt.allocPrint(a, "{{\"body\":\"résumé 日本語\",\"content\":\"{s}\"}}", .{content});
     defer a.free(value);
     const docs = [_]mapper.MapperDoc{ .{ .key = "one", .value = value }, .{ .key = "two", .value = value } };
+    var immutable = try manager.acquireWritePlanSnapshot();
+    defer immutable.release();
+    try std.testing.expectEqual(@as(usize, 1), immutable.plan().foreground_text.len);
+    var shared = try manager.acquireWritePlanSnapshot();
+    try std.testing.expectEqual(immutable.epoch, shared.epoch);
+    shared.release();
     var context = try manager.acquireTextPublicationContext(a, config.name);
     var context_live = true;
     defer if (context_live) context.deinit();
@@ -53420,6 +53563,23 @@ test "native text preparation builds from owned inputs after manager and backend
         try std.testing.expect((try iterator.next()) == null);
     }
     try std.testing.expectEqual(@as(usize, 2), count);
+    // Project unseen inputs after every mutable runtime has been destroyed.
+    const captured = &immutable.plan().foreground_text[0];
+    var foreground = try captured.project(a, &docs);
+    defer foreground.deinit();
+    var built = (try foreground.prepareDetached(a, 0, foreground.input_end)).?;
+    defer built.deinit();
+    var foreground_docs: usize = 0;
+    for (built.segments) |bytes| {
+        var reader = try segment_mod.SegmentReader.init(a, bytes);
+        defer reader.deinit();
+        foreground_docs += reader.doc_count;
+        try std.testing.expectEqual(@as(?u32, null), try reader.docOrdinal(0));
+        var field = (try reader.invertedIndexScoped(a, "body")).?;
+        defer field.deinit();
+        try std.testing.expect((try field.lookup("résumé 日本語")) != null);
+    }
+    try std.testing.expectEqual(@as(usize, 2), foreground_docs);
 }
 
 test "native text preparation declines detachment from a borrowed resource manager" {
@@ -53445,6 +53605,9 @@ test "native text preparation declines detachment from a borrowed resource manag
     manager.updateRange(.{ .start = "", .end = "" });
     const config: types.IndexConfig = .{ .name = "text", .kind = .full_text, .config_json = "{}" };
     try manager.addAllNoBackfill(&store, &.{config});
+    var immutable = try manager.acquireWritePlanSnapshot();
+    defer immutable.release();
+    try std.testing.expectEqual(@as(usize, 0), immutable.plan().foreground_text.len);
     var context = try manager.acquireTextPublicationContext(a, config.name);
     defer context.deinit();
     const docs = [_]mapper.MapperDoc{.{ .key = "one", .value = "{\"body\":\"résumé 日本語\"}" }};

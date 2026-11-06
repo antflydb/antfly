@@ -29,6 +29,19 @@ pub const Scope = struct {
     }
 };
 
+/// Pointer-free identity of a fully loaded native index snapshot. Physical
+/// cleanup preserves the semantic generation. The host still independently
+/// validates the full namespace path, inode and file namespace at publication.
+pub const NamespaceIdentity = struct {
+    inode: u64,
+    file_namespace: [32]u8,
+    root: [32]u8,
+    generation: ?[16]u8,
+    pub fn eql(self: NamespaceIdentity, other: NamespaceIdentity) bool {
+        return std.meta.eql(self, other);
+    }
+};
+
 /// Owned by a prepared namespace transaction until publication completes.
 /// All keys and values are prepared before writer admission; external extent
 /// references are forbidden here and use the artifact capability instead.
@@ -44,6 +57,8 @@ pub const NamespacePlan = struct {
 /// Consumes the originating transaction. No snapshots or runtime mutexes remain
 /// held. The owner must retain this handle until its participant has returned.
 pub const Prepared = struct {
+    before: ?NamespaceIdentity = null,
+    after: ?NamespaceIdentity = null,
     participant: Participant,
     release_fn: *const fn (*anyopaque) void,
     pub fn deinit(self: *Prepared) void {
@@ -93,8 +108,18 @@ pub const View = struct {
 pub const Participant = struct {
     ptr: *anyopaque,
     stage: *const fn (*anyopaque, View) anyerror!void,
+    validate_fn: ?*const fn (*anyopaque, View) anyerror!void = null,
     dispatch: Boundary.Dispatch = Boundary.local_dispatch,
-    const Boundary = abi.Boundary(struct { stage: *const fn (*anyopaque, View) anyerror!void });
+    const Boundary = abi.Boundary(struct {
+        stage: *const fn (*anyopaque, View) anyerror!void,
+        validate: *const fn (*anyopaque, View) anyerror!void,
+    });
+    /// Commit hosts invoke this before applying primary postimages. Stage then
+    /// sees those postimages in the same native transaction. Readset witnesses
+    /// therefore never conflict with their own primary mutations.
+    pub fn validate(self: Participant, view: View) !void {
+        if (self.validate_fn) |operation| try Boundary.call("validate", self.dispatch, operation, .{ self.ptr, view });
+    }
     pub fn apply(self: Participant, view: View) !void {
         return Boundary.call("stage", self.dispatch, self.stage, .{ self.ptr, view });
     }

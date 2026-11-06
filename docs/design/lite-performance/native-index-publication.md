@@ -385,3 +385,41 @@ reused from retired runtimes. Namespace cursor snapshots retain their own value
 references; overwriting a pending key cannot invalidate an existing cursor.
 The namespace's inode, file namespace and generation witness remains exact even
 when the value is bound later.
+
+### Preparation across runtime replacement
+
+`WritePlanSnapshot` now shares immutable foreground text configurations for its
+catalog epoch. They own schema, analyzer configuration, projection options and
+build resources. Document projection can produce an owned `TextPublicationPlan`
+without a live manager; segment construction follows separately, allowing a
+publisher to combine compatible request deltas before freezing posting segments.
+The configuration witness compares complete serialized semantics rather than
+process-local index counters. Schema refresh and newly observed analyzer claims
+invalidate this shared extraction epoch.
+
+`prepareOwnedNativePublication` releases both storage serialization and mutable
+runtime references. Its namespace mutations, replacement snapshot, deletion
+information and resource capability remain owned until activation or abort.
+After a runtime refresh, `bindTarget` accepts only the same inode, file namespace,
+index root and semantic namespace generation. The host independently validates
+that namespace before staging primary/index effects. Replacing a runtime does
+not make a changed namespace admissible.
+
+An independently retained snapshot accounting capability survives the original
+writer and backend. Rebinding a prepared snapshot never attaches its caches to
+an unretained replacement manager. Epoch assignment occurs at actual activation.
+The tests cover resident artifacts and large staged extents, complete backend
+replacement, one-checkpoint primary/index publication and snapshots retained
+after both backends have closed.
+
+Read-only snapshots acquire `Storage.acquireImmutableResources` independently of
+writable artifact staging. This retains their allocator/accounting lifetime
+without granting a mutation capability or requiring a writable sidecar directory.
+A borrowed external ResourceManager still cannot escape its caller's lifetime;
+providers decline detached ownership when they cannot retain that owner.
+
+Native participants have two transaction phases. The host validates owned read
+witnesses before applying primary postimages, then stages index and metadata
+changes against those postimages in the same transaction. Composite publishers
+forward both phases. This avoids a metadata witness conflicting with the
+request's own primary writes; a refusal rolls back the complete native group.

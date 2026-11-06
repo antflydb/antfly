@@ -86,6 +86,10 @@ fn ParentBox(comptime T: type) type {
         }
 
         fn commitWithPublication(self: *@This(), publication: ?@import("native_publication.zig").Participant) !void {
+            return self.commitWithPublicationAndIdentity(publication, null);
+        }
+
+        fn commitWithPublicationAndIdentity(self: *@This(), publication: ?@import("native_publication.zig").Participant, identity_out: ?*?@import("native_publication.zig").NamespaceIdentity) !void {
             platform.sync.lockYielding(&self.mutex);
             if (self.owner_closed or self.finalizing) {
                 self.mutex.unlock();
@@ -98,7 +102,20 @@ fn ParentBox(comptime T: type) type {
             self.finalizing = true;
             self.mutex.unlock();
 
-            const result = if (publication) |participant| blk: {
+            const result = if (identity_out) |out| blk: {
+                if (comptime T == NamespaceWriteTxn) {
+                    const identity = self.handle.commitWithNativeIdentity(publication) catch |err| break :blk @as(anyerror!void, err);
+                    out.* = identity;
+                    break :blk @as(anyerror!void, {});
+                }
+                if (comptime @hasDecl(T, "commitWithNativeIdentity")) {
+                    var identity: @import("native_publication.zig").NamespaceIdentity = undefined;
+                    self.handle.commitWithNativeIdentity(publication, &identity) catch |err| break :blk @as(anyerror!void, err);
+                    out.* = identity;
+                    break :blk @as(anyerror!void, {});
+                }
+                break :blk @as(anyerror!void, error.Unsupported);
+            } else if (publication) |participant| blk: {
                 if (comptime @hasDecl(T, "commitWithPublication")) break :blk self.handle.commitWithPublication(participant);
                 break :blk @as(anyerror!void, error.Unsupported);
             } else self.handle.commit();
@@ -795,6 +812,7 @@ pub const NamespaceReadTxn = struct {
 
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
+        native_identity: ?*const fn (*anyopaque) anyerror!?@import("native_publication.zig").NamespaceIdentity = null,
         get: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, backend_types.Namespace, []const []const u8, []?[]const u8) anyerror!void = null,
         open_cursor: ?*const fn (Allocator, *anyopaque, backend_types.Namespace) anyerror!Cursor = null,
@@ -804,6 +822,11 @@ pub const NamespaceReadTxn = struct {
     pub fn abort(self: *NamespaceReadTxn) void {
         self.vtable.abort(self.allocator, self.ptr);
         self.* = undefined;
+    }
+
+    pub fn nativeIdentity(self: *NamespaceReadTxn) !?@import("native_publication.zig").NamespaceIdentity {
+        const operation = self.vtable.native_identity orelse return null;
+        return try BoundaryAbi.call("native_identity", self.boundary_dispatch, operation, .{self.ptr});
     }
 
     pub fn get(self: *NamespaceReadTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
@@ -933,6 +956,7 @@ pub const NamespaceWriteTxn = struct {
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         commit: *const fn (Allocator, *anyopaque) anyerror!void,
+        commit_native_identity: ?*const fn (Allocator, *anyopaque, ?@import("native_publication.zig").Participant, *?@import("native_publication.zig").NamespaceIdentity) anyerror!void = null,
         commit_publication: ?*const fn (Allocator, *anyopaque, @import("native_publication.zig").Participant) anyerror!void = null,
         prepare_native_publication: ?*const fn (Allocator, *anyopaque) anyerror!@import("native_publication.zig").Prepared = null,
         get: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror![]const u8,
@@ -966,6 +990,17 @@ pub const NamespaceWriteTxn = struct {
         const prepared = try BoundaryAbi.call("prepare_native_publication", self.boundary_dispatch, operation, .{ self.allocator, self.ptr });
         self.* = undefined;
         return prepared;
+    }
+
+    pub fn commitWithNativeIdentity(self: *NamespaceWriteTxn, participant: ?@import("native_publication.zig").Participant) !?@import("native_publication.zig").NamespaceIdentity {
+        const operation = self.vtable.commit_native_identity orelse {
+            if (participant) |value| try self.commitWithPublication(value) else try self.commit();
+            return null;
+        };
+        var identity: ?@import("native_publication.zig").NamespaceIdentity = null;
+        try BoundaryAbi.call("commit_native_identity", self.boundary_dispatch, operation, .{ self.allocator, self.ptr, participant, &identity });
+        self.* = undefined;
+        return identity;
     }
 
     pub fn get(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
@@ -1920,6 +1955,10 @@ pub fn namespaceReadTxnFrom(
             unbox(ptr).requestAbort();
         }
 
+        fn nativeIdentity(ptr: *anyopaque) anyerror!?@import("native_publication.zig").NamespaceIdentity {
+            return try unbox(ptr).handle.nativeIdentity();
+        }
+
         fn get(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8) anyerror![]const u8 {
             return try unbox(ptr).handle.get(try mapNamespace(namespace), key);
         }
@@ -1952,6 +1991,7 @@ pub fn namespaceReadTxnFrom(
         .ptr = box_ptr,
         .vtable = &.{
             .abort = vt.abort,
+            .native_identity = if (@hasDecl(Handle, "nativeIdentity")) vt.nativeIdentity else null,
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
             .open_cursor = if (@hasDecl(Handle, "openCursor")) vt.openCursor else null,
@@ -2070,6 +2110,10 @@ pub fn namespaceWriteTxnFrom(
             try unbox(ptr).commit();
         }
 
+        fn commitNativeIdentity(_: Allocator, ptr: *anyopaque, participant: ?@import("native_publication.zig").Participant, out: *?@import("native_publication.zig").NamespaceIdentity) anyerror!void {
+            return unbox(ptr).commitWithPublicationAndIdentity(participant, out);
+        }
+
         fn commitPublication(_: Allocator, ptr: *anyopaque, participant: @import("native_publication.zig").Participant) anyerror!void {
             try unbox(ptr).commitWithPublication(participant);
         }
@@ -2118,6 +2162,7 @@ pub fn namespaceWriteTxnFrom(
         .vtable = &.{
             .abort = vt.abort,
             .commit = vt.commit,
+            .commit_native_identity = if (@hasDecl(Handle, "commitWithNativeIdentity")) vt.commitNativeIdentity else null,
             .commit_publication = if (@hasDecl(Handle, "commitWithPublication")) vt.commitPublication else null,
             .prepare_native_publication = if (@hasDecl(Handle, "prepareNativePublication")) vt.prepareNativePublication else null,
             .get = vt.get,

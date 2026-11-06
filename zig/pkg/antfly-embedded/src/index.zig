@@ -1484,6 +1484,9 @@ test "graph predicate cache declines unmanaged and soft-pressure admission" {
 /// Snapshots obtained via `snapshot()` are borrowed (no ref change) and must
 /// not outlive the next write operation.
 pub const IndexSnapshot = struct {
+    /// Cached navigation and predicates must retain their accounting owner
+    /// even when all sources came from a retired runtime's resident pool.
+    native_resources: ?@import("storage/immutable_artifact.zig").BuildResources = null,
     alloc: Allocator,
     ref_count: u32,
     epoch: u64,
@@ -1879,6 +1882,7 @@ pub const IndexSnapshot = struct {
     fn freeFinal(self: *IndexSnapshot) void {
         self.quiesceOwnedSources();
         const alloc = self.alloc;
+        var native_resources = self.native_resources;
         self.graph_predicates.deinit(alloc);
         self.binding_flights.deinit(alloc);
         var entries = self.bound_segments.valueIterator();
@@ -1923,6 +1927,7 @@ pub const IndexSnapshot = struct {
         if (self.scoring_owner) |owner| owner.release();
         const backing = if (self.binding_allocator) |locked| locked.backing else alloc;
         backing.destroy(self);
+        if (native_resources) |*resources| resources.deinit();
     }
 
     pub fn bm25BoundTable(
@@ -2740,6 +2745,7 @@ pub const IndexWriter = struct {
     next_epoch: u64,
     retired_segment_cleanup: ?RetiredSegmentCleanup = null,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    native_resources: ?@import("storage/immutable_artifact.zig").BuildResources = null,
     mapped_residency_mu: std.atomic.Mutex,
     mapped_residency_next_check_ns: @import("antfly_platform").atomic.Value(u64),
     mapped_residency_evictions: u64,
@@ -2772,6 +2778,9 @@ pub const IndexWriter = struct {
             for (base.segments, revisions) |segment, *revision| revision.* = segment.shared.deletion_revision.load(.acquire);
             self.detached_revisions = revisions;
             self.detached_base = base.retain();
+            if (self.snapshot.native_resources == null) if (writer.native_resources) |resources| {
+                self.snapshot.native_resources = resources.retained();
+            };
             self.writer = null;
             writer.mu.unlock();
         }
@@ -2786,6 +2795,23 @@ pub const IndexWriter = struct {
                 writer.mu.unlock();
                 return error.EnrichmentWaitCanceled;
             }
+            for (self.detached_base.?.segments, self.detached_revisions) |segment, revision| {
+                if (segment.shared.deletion_revision.load(.acquire) != revision) {
+                    writer.mu.unlock();
+                    return error.EnrichmentWaitCanceled;
+                }
+            }
+            self.writer = writer;
+        }
+
+        /// Rebind across a runtime refresh only when both runtimes describe
+        /// the same durable native namespace. The native host independently
+        /// validates that witness before committing any primary/index effects.
+        pub fn bindNative(self: *PreparedSegmentReplacement, writer: *IndexWriter, prepared_identity: @import("storage/native_publication.zig").NamespaceIdentity, target_identity: ?@import("storage/native_publication.zig").NamespaceIdentity) !void {
+            const current_identity = target_identity orelse return error.EnrichmentWaitCanceled;
+            if (!prepared_identity.eql(current_identity)) return error.EnrichmentWaitCanceled;
+            std.debug.assert(self.active and self.writer == null);
+            writer.lockMutex();
             for (self.detached_base.?.segments, self.detached_revisions) |segment, revision| {
                 if (segment.shared.deletion_revision.load(.acquire) != revision) {
                     writer.mu.unlock();
@@ -2842,6 +2868,7 @@ pub const IndexWriter = struct {
             if (self.retired.len > 0) self.staging_alloc.free(self.retired);
 
             writer.next_segment_id = @max(writer.next_segment_id, self.next_segment_id);
+            self.snapshot.epoch = writer.next_epoch;
             writer.next_epoch += 1;
             writer.publishSnapshot(self.snapshot);
             if (!retain_external_visibility) self.releaseExternalVisibility();
@@ -2858,6 +2885,7 @@ pub const IndexWriter = struct {
             if (!self.active) return;
             self.releaseExternalVisibility();
             const alloc = self.snapshot.alloc;
+            var native_resources = self.snapshot.native_resources;
             for (self.snapshot.segments[self.carried_count..]) |*seg| {
                 SegmentEntry.destroyShared(alloc, seg.shared);
                 seg.reader.deinit();
@@ -2873,6 +2901,7 @@ pub const IndexWriter = struct {
             if (self.detached_base) |base| base.release();
             self.detached_base = null;
             self.active = false;
+            if (native_resources) |*resources| resources.deinit();
         }
     };
 
@@ -2891,7 +2920,10 @@ pub const IndexWriter = struct {
     /// Publish a new snapshot. Must be the only way `current` is replaced.
     fn publishSnapshot(self: *IndexWriter, new_snap: *IndexSnapshot) void {
         self.lockMappedResidencyMutex();
-        new_snap.graph_predicates.attachManager(self.resource_manager);
+        if (new_snap.native_resources == null) if (self.native_resources) |resources| {
+            new_snap.native_resources = resources.retained();
+        };
+        new_snap.graph_predicates.attachManager(if (new_snap.native_resources) |resources| resources.resource_manager else self.resource_manager);
         self.mapped_residency_mu.unlock();
         self.lockSnapshotMutex();
         @atomicStore(*IndexSnapshot, &self.current, new_snap, .release);
@@ -3173,6 +3205,15 @@ pub const IndexWriter = struct {
         self.retired_segment_cleanup = cleanup;
     }
 
+    /// Called while the writer is unpublished or under its serialization.
+    /// Existing snapshots keep their own owner when this writer is retired.
+    pub fn setNativeResources(self: *IndexWriter, resources: @import("storage/immutable_artifact.zig").BuildResources) void {
+        const retained = resources.retained();
+        if (self.native_resources) |*previous| previous.deinit();
+        self.native_resources = retained;
+        if (self.current.native_resources == null) self.current.native_resources = resources.retained();
+    }
+
     pub fn deinit(self: *IndexWriter) void {
         self.lockMappedResidencyMutex();
         self.resource_manager = null;
@@ -3184,6 +3225,8 @@ pub const IndexWriter = struct {
         // never deletes persisted segment files).
         const snap = @atomicLoad(*IndexSnapshot, &self.current, .acquire);
         snap.release();
+        if (self.native_resources) |*resources| resources.deinit();
+        self.native_resources = null;
     }
 
     /// Get the current snapshot (lock-free read, no ref change).
@@ -6589,4 +6632,60 @@ test "group activation retains every external fence until all snapshots are inst
     first.mu.unlock();
     try std.testing.expect(second.mu.tryLock());
     second.mu.unlock();
+}
+
+test "native detached publication rebinds exact namespaces after writer shutdown and retains accounting" {
+    const a = std.testing.allocator;
+    const Lease = struct {
+        references: usize = 1,
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references -= 1;
+        }
+        fn resources(self: *@This()) @import("storage/immutable_artifact.zig").BuildResources {
+            return .{ .ptr = self, .allocator = std.testing.allocator, .io = std.testing.io, .resource_manager = null, .retain_fn = retain, .release_fn = release };
+        }
+    };
+    var old_owner: Lease = .{};
+    var new_owner: Lease = .{};
+    defer std.debug.assert(old_owner.references == 1 and new_owner.references == 1);
+    var writer = try IndexWriter.init(a);
+    var writer_live = true;
+    defer if (writer_live) writer.deinit();
+    writer.setNativeResources(old_owner.resources());
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "old", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} }});
+    defer a.free(bytes);
+    try writer.addSegment(bytes);
+    var prepared = try writer.prepareSegmentsManyData(&.{1}, &.{});
+    defer prepared.abort();
+    try prepared.detach();
+    writer.deinit();
+    writer_live = false;
+    var replacement = try IndexWriter.init(a);
+    var replacement_live = true;
+    defer if (replacement_live) replacement.deinit();
+    replacement.setNativeResources(new_owner.resources());
+    try replacement.addSegment(bytes);
+    try std.testing.expect(prepared.detached_base.? != replacement.current);
+    const identity: @import("storage/native_publication.zig").NamespaceIdentity = .{ .inode = 17, .file_namespace = @splat(3), .root = @splat(7), .generation = @splat(11) };
+    var changed = identity;
+    changed.generation = @splat(12);
+    try std.testing.expectError(error.EnrichmentWaitCanceled, prepared.bindNative(&replacement, identity, changed));
+    try std.testing.expect(replacement.mu.tryLock());
+    replacement.mu.unlock();
+    try prepared.bindNative(&replacement, identity, identity);
+    prepared.guardExternalVisibility();
+    prepared.publish();
+    const retained = replacement.acquireSnapshot();
+    defer retained.release();
+    try std.testing.expectEqual(@as(usize, 0), retained.segments.len);
+    try std.testing.expectEqual(@as(*anyopaque, &old_owner), retained.native_resources.?.ptr);
+    replacement.deinit();
+    replacement_live = false;
+    try std.testing.expect(old_owner.references > 1);
+    try std.testing.expectEqual(@as(usize, 1), new_owner.references);
 }
