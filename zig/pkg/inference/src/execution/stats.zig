@@ -36,6 +36,9 @@ pub const PhysicalReplayDecision = enum {
 };
 
 pub const ExecutionStats = struct {
+    /// Last successfully finished Frame's cold admission coverage metadata.
+    /// Compatibility reasons do not mean the numerical path fell back.
+    prepared_payload_coverage: ?@import("owned_coverage.zig").Coverage = null,
     /// Actual owned spans for this prepared program, including published values.
     /// Lifetime peaks are not per-request peaks or total model/device residency.
     planned_storage: ?@import("storage_accounting.zig").Snapshot = null,
@@ -193,6 +196,9 @@ pub const ExecutionStats = struct {
     runtime_prepare_slot_calls: u64 = 0,
     runtime_prepare_slot_cache_hits: u64 = 0,
     runtime_region_fallbacks: u64 = 0,
+    /// True only after the actual instrumented Metal region/frame planner
+    /// produces these existing counters; false does not imply observed zero.
+    metal_region_policy_observed: bool = false,
     runtime_frame_candidates: u64 = 0,
     runtime_frame_eligible: u64 = 0,
     runtime_frame_metadata_ready: u64 = 0,

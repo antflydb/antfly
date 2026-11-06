@@ -941,6 +941,7 @@ pub const Call = struct {
         defer if (!already_ran and self.ran) {
             const frame = maybe_frame.?;
             observation.nativeProgramBank(.{
+                .prepared_payload_coverage = frame.pool.payload_coverage,
                 .frame_allocations = frame.stats.allocations,
                 .frame_requested_allocation_bytes = frame.stats.allocated_bytes,
                 .frame_reuse_accesses = frame.stats.reused_allocations,
@@ -2189,6 +2190,10 @@ test "Native actual complete Call success refusal and cancellation publish copie
     try std.testing.expect(entries > 0 and returned > 0 and errors > 0);
     try std.testing.expect(report.native_definition_templates == null);
     const bank = report.authored_native_program_bank orelse return error.MissingNativeProgramBank;
+    const admission_coverage = report.payload_admission_coverage orelse return error.MissingNativePreparedCoverage;
+    try std.testing.expectEqual(.latest_entered_native_call_prepared_metadata, admission_coverage.scope);
+    try std.testing.expect(admission_coverage.value == .complete);
+    try std.testing.expectEqualDeep(bank.prepared_payload_coverage.?, admission_coverage.value);
     const owned = bank.owned_ledger orelse return error.MissingNativeProgramLedger;
     try std.testing.expect(owned.total.leases_created > 0 and owned.total.requested_peak_bytes > 0);
     try std.testing.expect(owned.total.requested_live_bytes > 0);

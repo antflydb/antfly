@@ -84,6 +84,10 @@ pub const Report = struct {
     specializations: ?Specializations = null,
     actual_interpreter_fallback_dispatches: ?u64 = null,
     program_route_decision: ?[]const u8 = null,
+    /// Prepared admission coverage from an actual Frame/entered Native Call.
+    /// A compatibility reason is not a numerical fallback or a quota grant.
+    payload_admission_coverage: ?PayloadAdmissionCoverage = null,
+    metal_region_policy: ?MetalRegionPolicy = null,
     owned_program_fallbacks: ?ProgramFallbacks = null,
     program_output_copies: ?ProgramOutputCopies = null,
     fallback_detail_scope: enum { invocation_errors_and_corresponding_program_only } = .invocation_errors_and_corresponding_program_only,
@@ -143,6 +147,8 @@ pub const Report = struct {
         }
         if (value.runtime.device_owners) |owners| report.retained_device_owner_count = owners.owners;
         if (value.execution) |program| {
+            if (program.prepared_payload_coverage) |coverage| report.payload_admission_coverage = .{ .scope = .corresponding_program_last_finished_frame_prepared_metadata, .value = coverage };
+            if (program.metal_region_policy_observed) report.metal_region_policy = MetalRegionPolicy.init(program);
             report.owned_program_fallbacks = ProgramFallbacks.init(program);
             report.program_output_copies = .{ .total_owned = program.graph_output_owned_copies, .planned_literal = program.planned_literal_output_copies, .opaque_metal_graph_output = program.opaque_graph_output_copies };
             report.program_storage_scope = @tagName(value.execution_scope);
@@ -166,6 +172,7 @@ pub const Report = struct {
         // An execution publication retains its original precedence. The
         // Native sample remains separately visible if both producers exist.
         if (value.execution == null) if (report.authored_native_program_bank) |bank| {
+            if (bank.prepared_payload_coverage) |coverage| report.payload_admission_coverage = .{ .scope = .latest_entered_native_call_prepared_metadata, .value = coverage };
             report.program_storage_reuse_hits = bank.frame_reuse_accesses;
             report.program_storage_allocations = bank.frame_allocations;
             report.program_storage_requested_allocation_bytes = bank.frame_requested_allocation_bytes;
@@ -193,6 +200,63 @@ pub const ProgramOutputCopies = struct {
     total_owned: u64,
     planned_literal: u64,
     opaque_metal_graph_output: u64,
+};
+
+/// Inline value only; copied coverage never borrows a Pool or graph and never
+/// substitutes for the actual current admission/source capability check.
+pub const PayloadAdmissionCoverage = struct {
+    scope: enum { corresponding_program_last_finished_frame_prepared_metadata, latest_entered_native_call_prepared_metadata },
+    value: @import("owned_coverage.zig").Coverage,
+};
+
+/// Existing instrumented planner/dispatch counters from the corresponding
+/// program. Null until the real Metal planner runs, even on a Metal backend.
+/// Broad optional-region declines retain their original aggregate meaning;
+/// no missing internal reason is inferred from an attempted callback.
+pub const MetalRegionPolicy = struct {
+    scope: enum { corresponding_program_instrumented_metal_region_planner } = .corresponding_program_instrumented_metal_region_planner,
+    active_regions: u64,
+    covered_nodes: u64,
+    elided_nodes: u64,
+    pre_skipped_nodes: u64,
+    external_consumer_pre_skip_declines: u64,
+    optional_region_preparation_declines: u64,
+    graph_pattern_fallbacks: u64,
+    frame_candidates: u64,
+    frame_eligible: u64,
+    frame_metadata_ready: u64,
+    no_regions: u64,
+    missing_qkv: u64,
+    missing_attention: u64,
+    missing_ffn: u64,
+    missing_ple: u64,
+    single_row: u64,
+    non_layer_order: u64,
+    shape_mismatch: u64,
+    missing_model_metadata: u64,
+    pub fn init(program: @import("stats.zig").ExecutionStats) MetalRegionPolicy {
+        return .{
+            .active_regions = program.runtime_region_plan_active_regions,
+            .covered_nodes = program.runtime_region_plan_covered_nodes,
+            .elided_nodes = program.runtime_region_plan_elided_nodes,
+            .pre_skipped_nodes = program.runtime_region_pre_skipped_nodes,
+            .external_consumer_pre_skip_declines = program.runtime_region_pre_skip_declined_external_consumers,
+            .optional_region_preparation_declines = program.runtime_region_fallbacks,
+            .graph_pattern_fallbacks = program.graph_region_fallbacks,
+            .frame_candidates = program.runtime_frame_candidates,
+            .frame_eligible = program.runtime_frame_eligible,
+            .frame_metadata_ready = program.runtime_frame_metadata_ready,
+            .no_regions = program.runtime_frame_ineligible_no_regions,
+            .missing_qkv = program.runtime_frame_ineligible_missing_qkv,
+            .missing_attention = program.runtime_frame_ineligible_missing_attention,
+            .missing_ffn = program.runtime_frame_ineligible_missing_ffn,
+            .missing_ple = program.runtime_frame_ineligible_missing_ple,
+            .single_row = program.runtime_frame_ineligible_single_row,
+            .non_layer_order = program.runtime_frame_ineligible_non_layer_order,
+            .shape_mismatch = program.runtime_frame_ineligible_shape_mismatch,
+            .missing_model_metadata = program.runtime_frame_ineligible_missing_model_metadata,
+        };
+    }
 };
 
 /// Actual owned reason counters already produced by execution. Region/private
@@ -298,4 +362,28 @@ test "uniform Native Call bank report preserves unavailable classes and executio
     source.configure(false);
     try std.testing.expect(source.snapshot() == null);
     try std.testing.expectEqualDeep(bank, unavailable.authored_native_program_bank.?);
+}
+
+test "coverage publication preserves absence and corresponding program precedence without inventing quota" {
+    const std = @import("std");
+    const D = @import("diagnostics.zig");
+    var diagnostics = D.Diagnostics{};
+    diagnostics.configure(true);
+    diagnostics.publish(.{ .context_backend = .metal, .execution = .{} });
+    const unavailable = diagnostics.snapshot().?.report.?;
+    try std.testing.expect(unavailable.payload_admission_coverage == null);
+    try std.testing.expect(unavailable.metal_region_policy == null);
+    const bank = @import("runtime_observation.zig").NativeProgramBank{ .prepared_payload_coverage = .{ .complete = .{ .epoch = 19 } }, .frame_allocations = 0, .frame_requested_allocation_bytes = 0, .frame_reuse_accesses = 0, .owned_ledger = null };
+    diagnostics.publish(.{ .execution = .{ .prepared_payload_coverage = .{ .compatibility = .alias } }, .runtime = .{ .authored_native_program_bank = bank } });
+    const program = diagnostics.snapshot().?.report.?;
+    try std.testing.expectEqual(.corresponding_program_last_finished_frame_prepared_metadata, program.payload_admission_coverage.?.scope);
+    try std.testing.expectEqual(@import("owned_coverage.zig").Reason.alias, program.payload_admission_coverage.?.value.compatibility);
+    diagnostics.publish(.{ .execution = .{}, .runtime = .{ .authored_native_program_bank = bank } });
+    try std.testing.expect(diagnostics.snapshot().?.report.?.payload_admission_coverage == null);
+    diagnostics.publish(.{ .runtime = .{ .authored_native_program_bank = bank } });
+    const native = diagnostics.snapshot().?.report.?;
+    diagnostics.configure(false);
+    try std.testing.expectEqual(.latest_entered_native_call_prepared_metadata, native.payload_admission_coverage.?.scope);
+    try std.testing.expectEqual(@as(u64, 19), native.payload_admission_coverage.?.value.complete.epoch);
+    try std.testing.expectEqual(@import("owned_coverage.zig").Reason.alias, program.payload_admission_coverage.?.value.compatibility);
 }

@@ -5375,6 +5375,7 @@ fn analyzeRuntimeFrameEligibility(graph: ?*const Graph, plan: RuntimeRegionPlan)
 }
 
 fn recordRuntimeFrameEligibilityStats(stats: *PartitionExecutor.ExecutionStats, eligibility: RuntimeFrameEligibility) void {
+    stats.metal_region_policy_observed = true;
     if (eligibility.reason != .no_regions) stats.runtime_frame_candidates += 1;
     if (eligibility.eligible()) {
         stats.runtime_frame_eligible += 1;
@@ -20048,6 +20049,15 @@ test "metal partition executor runtime frame eligibility recognizes layer triple
 
     var stats: PartitionExecutor.ExecutionStats = .{};
     recordRuntimeFrameEligibilityStats(&stats, eligibility);
+    try std.testing.expect(stats.metal_region_policy_observed);
+    var diagnostics = @import("../execution/diagnostics.zig").Diagnostics{};
+    diagnostics.configure(true);
+    diagnostics.publish(.{ .execution = stats });
+    const retained_policy = diagnostics.snapshot().?.report.?.metal_region_policy orelse return error.MissingActualRegionPolicy;
+    diagnostics.configure(false);
+    try std.testing.expectEqual(.corresponding_program_instrumented_metal_region_planner, retained_policy.scope);
+    try std.testing.expectEqual(@as(u64, 1), retained_policy.missing_model_metadata);
+    try std.testing.expectEqual(@as(u64, 0), retained_policy.missing_qkv);
     try std.testing.expectEqual(@as(u64, 1), stats.runtime_frame_candidates);
     try std.testing.expectEqual(@as(u64, 0), stats.runtime_frame_eligible);
     try std.testing.expectEqual(@as(u64, 1), stats.runtime_frame_ineligible_missing_model_metadata);

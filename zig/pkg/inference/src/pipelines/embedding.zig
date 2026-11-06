@@ -4616,8 +4616,6 @@ pub const EmbeddingPipeline = struct {
 
     const residentMaskedMeanPool = sequence_pool.maskedMean;
 
-    const residentLastTokenPool = sequence_pool.last;
-
     fn resident2DToEmbeddings(
         self: *EmbeddingPipeline,
         outputs: *session_mod.ResidentOutputs,

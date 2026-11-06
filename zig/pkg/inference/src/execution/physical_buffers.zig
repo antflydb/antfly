@@ -36,6 +36,9 @@ pub const SharedLiteralStore = @import("immutable_literals.zig").SharedLiteralSt
 const ReplayDecision = @import("stats.zig").PhysicalReplayDecision;
 
 pub const Stats = struct {
+    /// Cold prepared admission metadata of the actual successfully finished
+    /// Frame; neither GPU completion nor newly granted ownership/quota.
+    prepared_payload_coverage: ?@import("owned_coverage.zig").Coverage = null,
     storage_usage: ?accounting.Snapshot = null,
     replay_decision: ReplayDecision = .not_requested,
     dispatches: u64 = 0,
@@ -1954,9 +1957,10 @@ pub const Frame = struct {
             self.retired = true;
             return err;
         };
-        if (self.collect_storage_stats) if (self.pool.accounting) |ledger| {
-            self.stats.storage_usage = ledger.snapshot();
-        };
+        if (self.collect_storage_stats) {
+            self.stats.prepared_payload_coverage = self.pool.payload_coverage;
+            if (self.pool.accounting) |ledger| self.stats.storage_usage = ledger.snapshot();
+        }
         return self.stats;
     }
 

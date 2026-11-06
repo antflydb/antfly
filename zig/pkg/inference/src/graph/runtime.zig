@@ -342,6 +342,7 @@ pub const Runtime = struct {
     }
 
     fn addPhysicalStats(stats: *partition_mod.PartitionExecutor.ExecutionStats, physical: @import("../execution/physical_buffers.zig").Stats) void {
+        stats.prepared_payload_coverage = physical.prepared_payload_coverage;
         stats.planned_storage = physical.storage_usage;
         stats.physical_replay = physical.replay_decision;
         stats.assigned_kernel_dispatches += physical.dispatches;
@@ -1634,4 +1635,58 @@ test "pure physical layout gives fresh pools independent storage and rechecks ac
 test "pure physical layout and fresh pool metadata unwind every allocation failure" {
     if (comptime !build_options.enable_native) return error.SkipZigTest;
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, PhysicalLayoutFixture.check, .{});
+}
+
+fn recordedNativePayloadCoverage(prepared: bool) !@import("../execution/invocation_report.zig").Report {
+    const a = std.testing.allocator;
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = Builder.init(&graph);
+    const input_node = try builder.parameter("coverage.x", Shape.init(.f32, &.{4}));
+    try graph.markOutput(try builder.neg(input_node));
+    var program = try @import("../execution/program.zig").ModelProgram.init(a, &graph, &.{.{ .name = "coverage.x", .node_id = input_node, .kind = .input }});
+    defer program.deinit();
+    var executable = try @import("../execution/executable.zig").prepare(a, &program, &backend, .partitioned);
+    defer executable.deinit();
+    executable.configureExecutionDiagnostics(true);
+    const input = program.id_map[input_node];
+    const routes = if (prepared)
+        (try executable.runtime.physical_pool.?.prepareRoutes(&.{.{ .node_id = input, .value = .{ .imported_host = .{ .logical = program.graph.node(input).output_shape, .target = .native, .owned_ingress = true } } }})) orelse return error.MissingPreparedCoverageRoute
+    else
+        null;
+    defer if (routes) |owner| owner.release();
+    var host_tensor = try @import("../backends/tensor.zig").Tensor.initFloat32(a, "coverage.x", &.{4}, &.{ 1, -2, 3, -4 });
+    defer host_tensor.deinit();
+    const raw = try backend.fromFloat32Shape(&.{ 1, -2, 3, -4 }, &.{4});
+    defer backend.free(raw);
+    const host_inputs = [_]@import("../execution/host_ingress.zig").Input{.{ .node_id = input, .value = &host_tensor }};
+    const runtime_inputs = [_]interpreter.RuntimeInput{.{ .node_id = input, .value = raw, .source_backend = &backend }};
+    var result = try executable.run(a, .{ .prepared_routes = routes, .host_inputs = if (prepared) &host_inputs else null, .runtime_inputs = if (prepared) null else &runtime_inputs, .collect_partition_stats = true });
+    defer result.deinit(&executable.runtime);
+    const values = try backend.toFloat32(result.outputs[0], a);
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ -1, 2, -3, 4 }, values);
+    const report = executable.diagnostics.snapshot().?.report.?;
+    const coverage = report.payload_admission_coverage orelse return error.MissingFinishedFrameCoverage;
+    try std.testing.expectEqual(.corresponding_program_last_finished_frame_prepared_metadata, coverage.scope);
+    try std.testing.expectEqualDeep(result.stats.prepared_payload_coverage.?, coverage.value);
+    if (prepared) {
+        try std.testing.expect(coverage.value == .complete);
+        try std.testing.expectEqual(routes.?.pool.selection.?.epoch, coverage.value.complete.epoch);
+    } else try std.testing.expectEqual(@import("../execution/owned_coverage.zig").Reason.no_selected_routes, coverage.value.compatibility);
+    try std.testing.expect(report.metal_region_policy == null);
+    return report;
+}
+
+test "actual Native executable publishes owned admission coverage metadata after all program owners retire" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    for ([_]bool{ false, true }) |prepared| {
+        const retained = try recordedNativePayloadCoverage(prepared);
+        // The actual Frame/Pool/Executable/backend/graph are already gone.
+        const value = retained.payload_admission_coverage.?.value;
+        if (prepared) try std.testing.expect(value == .complete) else try std.testing.expectEqual(@import("../execution/owned_coverage.zig").Reason.no_selected_routes, value.compatibility);
+    }
 }

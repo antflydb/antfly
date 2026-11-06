@@ -882,6 +882,9 @@ pub const NativePrograms = struct {
 /// peaks. Model weights, KV, Call host output, metadata and vendor heaps are
 /// outside this ledger. Unknown backing bytes stay null.
 pub const NativeProgramBank = struct {
+    /// Copied only from the actual entered Call, sampled before close.
+    /// It describes prepared admission policy, not numerical success.
+    prepared_payload_coverage: ?@import("owned_coverage.zig").Coverage = null,
     scope: enum { latest_entered_call_acquire_prepare_run_before_close } = .latest_entered_call_acquire_prepare_run_before_close,
     ledger_scope: enum { prepared_owner_lease_lifetime_sampled_before_call_close } = .prepared_owner_lease_lifetime_sampled_before_call_close,
     coverage: enum { program_owned_leases_excluding_model_kv_host_output_metadata_vendor } = .program_owned_leases_excluding_model_kv_host_output_metadata_vendor,

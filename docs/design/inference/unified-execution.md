@@ -304,6 +304,11 @@ preparation API do not by themselves complete these remaining requirements:
   known fallback producers, and registered host/device allocation owners. Batch
   participants and pending outcomes survive model retirement. Registered owner
   intervals can include concurrent activity; lifetime peaks are labelled as such.
+  Successful frames and entered Native calls copy their prepared payload admission
+  coverage into the report, including the existing compatibility reason. This
+  describes prepared accounting rather than a numerical fallback or quota grant.
+  Instrumented Metal region-policy counters remain absent until their actual
+  planner runs.
   Unobserved fallback reasons and opaque vendor/private allocation domains remain
   unavailable. These scoped observations do not claim a whole-backend census or
   an exclusive invocation memory peak.
