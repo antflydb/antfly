@@ -12038,7 +12038,7 @@ test "managed Imported Metal packed QKV cold service owns direct tiled roots out
 test "direct Imported component floors use file classification and preserve explicit hard caps" {
     const a = std.testing.allocator;
     var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
-    var manager = ModelManager.init(failing.allocator(), .{ .allocator = failing.allocator() });
+    var manager = ModelManager.init(failing.allocator(), .{ .allocator = failing.allocator(), .preferred_backends = &.{.metal} });
     defer manager.deinit();
     const memory = runtime.tier.memory;
     const backend = backends.BackendRuntime{ .backend = .metal };

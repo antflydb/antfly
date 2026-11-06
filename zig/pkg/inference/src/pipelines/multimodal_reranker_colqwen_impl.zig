@@ -1003,11 +1003,14 @@ const ResidentDocumentFixture = struct {
             defer observed_resident.deinit();
             for (observed_host.hidden_states, observed_resident.hidden_states) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
             if (reference.hidden_size == 3) {
-                // Original host tail exports all hidden rows and the three
-                // bias values, then uploads hidden rows to the SAME linear.
-                // Prompt staging and final requested-vector exports are shared.
-                const hidden_bytes: u64 = prepared.input_ids.len * config().hidden_size * @sizeOf(f32);
-                const bias_bytes: u64 = reference.hidden_size * @sizeOf(f32);
+                // This zero-layer Metal fixture follows the actual rank-two
+                // input storage: ordinary host inputs keep norm/linear on the
+                // host, while the existing upload policy yields device rows.
+                // Its cached bias remains host-backed in either configuration.
+                // CUDA always downloads the bias as well as the hidden packet.
+                const device_rows = cb.kind() == .cuda or @import("../ops/metal_compute.zig").MetalCompute.debugHasDeviceTensor(cb, first);
+                const hidden_bytes: u64 = if (device_rows) prepared.input_ids.len * config().hidden_size * @sizeOf(f32) else 0;
+                const bias_bytes: u64 = if (cb.kind() == .cuda) reference.hidden_size * @sizeOf(f32) else 0;
                 try std.testing.expectEqual(resident_audit.upload_bytes + hidden_bytes, host_audit.upload_bytes);
                 try std.testing.expectEqual(resident_audit.download_bytes + hidden_bytes + bias_bytes, host_audit.download_bytes);
             } else {
