@@ -24,6 +24,18 @@ const CT = ops.CT;
 /// Request-private owning projection. The fact alone is backend-free; the CT
 /// must remain private to this actual receiving backend, including names whose
 /// parameter nodes the optimizer eliminated.
+const TensorDesc = @import("../graph/backend_contracts.zig").TensorDesc;
+
+/// Pure layout metadata; no receiving backend pointer or payload authority.
+fn nativePackedTensorDesc(shape: ml.graph.Shape, kind: @import("../gguf/tensor_types.zig").KnownTensorType) ?TensorDesc {
+    const contracts = @import("../graph/backend_contracts.zig");
+    const format = contracts.quantFormatFromGgufTensorType(.{ .known = kind }) orelse return null;
+    var descriptor = TensorDesc.packedQuant(shape, format);
+    descriptor.current_backend = .native;
+    descriptor.resident_backend = .native;
+    return descriptor;
+}
+
 const ParameterQuery = struct { node: ml.graph.NodeId, query: ?usize };
 const StaticStep = union(enum) { single: ml.graph.NodeId, pair: u32 };
 const PairGroup = struct { first: ml.graph.NodeId, second: ml.graph.NodeId, activation: ml.graph.NodeId, weights: [2]ml.graph.NodeId };
@@ -68,6 +80,9 @@ pub const Template = struct {
     /// lookup when graph parameter spelling differs from the query transcript.
     parameter_queries: []ParameterQuery,
     has_unmatched_parameters: bool,
+    /// Optional layout prototype, independent of backend/payload handles.
+    /// Null retains the original current-derived descriptor path for adapters.
+    tensor_descriptors: ?[]?TensorDesc,
     descriptors: []?ops.kernel_descriptor.Descriptor,
     authored_descriptors: []?ops.kernel_descriptor.Descriptor,
     steps: []StaticStep,
@@ -90,6 +105,7 @@ pub const Template = struct {
         for (self.queries) |query| allocator.free(query.name);
         allocator.free(self.queries);
         allocator.free(self.parameter_queries);
+        if (self.tensor_descriptors) |descriptors| allocator.free(descriptors);
         allocator.free(self.descriptors);
         allocator.free(self.authored_descriptors);
         allocator.free(self.steps);
@@ -231,6 +247,23 @@ pub const Template = struct {
             parameter_index += 1;
             has_unmatched_parameters = has_unmatched_parameters or selected == null;
         }
+        const tensor_descriptors: ?[]?TensorDesc = if (has_unmatched_parameters) null else blk: {
+            const prototype = try allocator.alloc(?TensorDesc, artifact.graph.nodeCount());
+            @memset(prototype, null);
+            for (parameter_queries) |parameter| {
+                const query = queries[parameter.query.?];
+                if (query.quantized) |quantized| {
+                    prototype[parameter.node] = nativePackedTensorDesc(query.shape.?, quantized.kind) orelse {
+                        // Preserve the original unsupported-format error site
+                        // after this receiving Program acquires its witnesses.
+                        allocator.free(prototype);
+                        break :blk null;
+                    };
+                }
+            }
+            break :blk prototype;
+        };
+        errdefer if (tensor_descriptors) |prototype| allocator.free(prototype);
         var steps: std.ArrayList(ml.graph.NodeId) = .empty;
         defer steps.deinit(allocator);
         for (artifact.graph.nodes.items, 0..) |node, index| {
@@ -282,7 +315,7 @@ pub const Template = struct {
                 break;
             }
         };
-        self.* = .{ .allocator = allocator, .artifact = artifact, .queries = queries, .parameter_queries = parameter_queries, .has_unmatched_parameters = has_unmatched_parameters, .descriptors = descriptors, .authored_descriptors = authored, .steps = ordered, .pairs = pairs, .input = token_input, .config_hash = context.gpt_config.fingerprint(), .reduction_policy = if (has_resident_quantized) .native_original_resident_quantized_v2 else if (pairs.len != 0) .native_original_kblock_pair_v1 else if (quantized_source) .native_original_kblock_single_v1 else .native_original_dense_v1, .use_blas = Native.useBlas() };
+        self.* = .{ .allocator = allocator, .artifact = artifact, .queries = queries, .parameter_queries = parameter_queries, .has_unmatched_parameters = has_unmatched_parameters, .tensor_descriptors = tensor_descriptors, .descriptors = descriptors, .authored_descriptors = authored, .steps = ordered, .pairs = pairs, .input = token_input, .config_hash = context.gpt_config.fingerprint(), .reduction_policy = if (has_resident_quantized) .native_original_resident_quantized_v2 else if (pairs.len != 0) .native_original_kblock_pair_v1 else if (quantized_source) .native_original_kblock_single_v1 else .native_original_dense_v1, .use_blas = Native.useBlas() };
         return self;
     }
 };
@@ -449,12 +482,13 @@ pub const Program = struct {
         // Only unmatched adapter spellings need the original independent table.
         self.weight_planes = try allocator.alloc(@import("storage_ownership.zig").Plane, if (template.has_unmatched_parameters) self.graph.nodeCount() else 0);
         errdefer allocator.free(self.weight_planes);
-        var bindings: std.ArrayList(route.InputBinding) = .empty;
-        defer bindings.deinit(allocator);
-        const descriptors = try allocator.alloc(?@import("../graph/backend_contracts.zig").TensorDesc, self.graph.nodeCount());
-        defer allocator.free(descriptors);
-        @memset(descriptors, null);
-        for (template.parameter_queries) |parameter| {
+        const bindings = try allocator.alloc(route.InputBinding, template.parameter_queries.len);
+        defer allocator.free(bindings);
+        const owned_descriptors: ?[]?TensorDesc = if (template.tensor_descriptors != null) null else try allocator.alloc(?TensorDesc, self.graph.nodeCount());
+        defer if (owned_descriptors) |owned| allocator.free(owned);
+        if (owned_descriptors) |owned| @memset(owned, null);
+        const descriptors: []const ?TensorDesc = template.tensor_descriptors orelse owned_descriptors.?;
+        for (template.parameter_queries, bindings) |parameter, *binding| {
             const index = parameter.node;
             const node = self.graph.node(index);
             const name = self.graph.parameterName(node);
@@ -468,19 +502,14 @@ pub const Program = struct {
             const value = if (query) |entry| entry.witness orelse return error.IncompleteNativeProgram else try context.graphWeight(name);
             self.weights[index] = value;
             if (answer.quantized) |quantized_source| {
-                const contracts = @import("../graph/backend_contracts.zig");
-                const format = contracts.quantFormatFromGgufTensorType(.{ .known = quantized_source.kind }) orelse return error.UnsupportedAuthoredWeight;
-                var packed_descriptor = contracts.TensorDesc.packedQuant(actual, format);
-                packed_descriptor.current_backend = .native;
-                packed_descriptor.resident_backend = .native;
-                descriptors[index] = packed_descriptor;
-                try bindings.append(allocator, .{ .node_id = @intCast(index), .value = .{ .tensor = .{ .value = value, .implementation = .{ .context = self.backend.ptr, .table = self.backend.vtable } } } });
+                if (owned_descriptors) |current| current[index] = nativePackedTensorDesc(actual, quantized_source.kind) orelse return error.UnsupportedAuthoredWeight;
+                binding.* = .{ .node_id = @intCast(index), .value = .{ .tensor = .{ .value = value, .implementation = .{ .context = self.backend.ptr, .table = self.backend.vtable } } } };
             } else {
                 const planes: []const @import("storage_ownership.zig").Plane = if (query) |entry| &entry.plane else blk: {
                     self.weight_planes[index] = try Native.NativeCompute.authoredResidentF32Plane(&self.backend, name, value);
                     break :blk self.weight_planes[index..][0..1];
                 };
-                try bindings.append(allocator, .{ .node_id = @intCast(index), .value = .{ .resident = .{ .logical = actual, .implementation = .{ .context = self.backend.ptr, .table = self.backend.vtable }, .planes = planes } } });
+                binding.* = .{ .node_id = @intCast(index), .value = .{ .resident = .{ .logical = actual, .implementation = .{ .context = self.backend.ptr, .table = self.backend.vtable }, .planes = planes } } };
             }
         }
         self.bindings = try allocator.alloc(route.InputBinding, 1);
@@ -523,7 +552,7 @@ pub const Program = struct {
             const activation = pool.plan.slotForNode(pair.activation) orelse return error.IncompleteNativeProgram;
             if (first.kind != .allocation or second.kind != .allocation or first.allocation == second.allocation or first.allocation == activation.allocation or second.allocation == activation.allocation) return error.UnsupportedAuthoredWeight;
         }
-        try pool.configureRoutes(bindings.items);
+        try pool.configureRoutes(bindings);
         self.selected = (try pool.prepareRoutesWithPolicy(self.bindings, .compatibility_regions)) orelse return error.MissingPreparedKernelRoute;
         errdefer self.selected.release();
         if (self.selected.pool.payload_coverage != .complete or self.selected.pool.regions.len != 0) return error.IncompleteNativeProgram;
@@ -1811,6 +1840,14 @@ test "native Definition template shares only immutable graph and descriptors acr
         }
         try std.testing.expect(reused > 0);
         try std.testing.expect(!program.template.has_unmatched_parameters);
+        try std.testing.expect(program.template.tensor_descriptors != null);
+        try std.testing.expectEqual(program.graph.nodeCount(), program.template.tensor_descriptors.?.len);
+        for (program.template.parameter_queries) |parameter| {
+            const fact = program.template.queries[parameter.query.?];
+            if (fact.quantized) |quantized| {
+                try std.testing.expect(std.meta.eql(nativePackedTensorDesc(fact.shape.?, quantized.kind), program.template.tensor_descriptors.?[parameter.node]));
+            } else try std.testing.expect(program.template.tensor_descriptors.?[parameter.node] == null);
+        }
         try std.testing.expectEqual(@as(usize, 0), program.weight_planes.len);
     }
     try std.testing.expect(first.selected.pool != second.selected.pool);
@@ -2364,6 +2401,8 @@ test "native Definition parameter links preserve original independent lookup whe
     const weight_node = template.parameter_queries[node_index].node;
     template.parameter_queries[node_index].query = null;
     template.has_unmatched_parameters = true;
+    if (template.tensor_descriptors) |descriptors| a.free(descriptors);
+    template.tensor_descriptors = null;
     const program = (try Program.tryCreateWithTemplate(a, &context, &slot)) orelse return error.MissingAuthoredNativeProgram;
     defer program.destroyWithCleanup(.{ .outside_execution = true });
     try std.testing.expect(program.template == template);
