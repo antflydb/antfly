@@ -4737,7 +4737,16 @@ pub const ModelManager = struct {
         }
     };
 
+    fn verifyArtifactPublication(self: *ModelManager, model_dir: []const u8, man: *const manifest_mod.ModelManifest) !void {
+        const io = self.session_manager.io orelse std.Options.debug_io;
+        if (!std.meta.eql(man.managed_publication, try managed_receipt.publicationGeneration(self.allocator, io, model_dir))) return error.ModelArtifactsChanging;
+    }
+
     pub fn loadGenerationTokenizerAssets(self: *ModelManager, model_dir: []const u8, man: *const manifest_mod.ModelManifest) !TokenizerAssets {
+        const io = self.session_manager.io orelse std.Options.debug_io;
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
+        defer publication_lease.deinit(io);
+        try self.verifyArtifactPublication(model_dir, man);
         try self.ensureResourceOwnerReady();
         const kind = if (shouldPreferSentencePieceOverride(man.*, model_dir, self.allocator))
             manifest_mod.TokenizerType.sentencepiece
@@ -4771,6 +4780,7 @@ pub const ModelManager = struct {
             ct.* = try generation.ChatTemplate.init(self.allocator, source, man.bos_token, man.eos_token, man.unk_token, man.pad_token);
             assets.chat_tmpl = ct;
         }
+        try self.verifyArtifactPublication(model_dir, man);
         if (lease) |*active| try active.retain(plan.resident);
         assets.lease = lease;
         return assets;
@@ -4779,6 +4789,10 @@ pub const ModelManager = struct {
     /// Load only the admitted backend session. Artifact callers already own
     /// tokenizer assets and must not parse or retain a second tokenizer.
     pub fn loadArtifactSession(self: *ModelManager, model_dir: []const u8, man: manifest_mod.ModelManifest) !ArtifactSession {
+        const io = self.session_manager.io orelse std.Options.debug_io;
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, model_dir);
+        defer publication_lease.deinit(io);
+        try self.verifyArtifactPublication(model_dir, &man);
         var managed = try loadSessionForPreferredBackends(self, &.{.native}, model_dir, man, &self.session_manager, null);
         var result = ArtifactSession{ .allocator = self.allocator, .managed = managed.take(), .session = managed.session };
         errdefer result.deinit();
@@ -4795,6 +4809,7 @@ pub const ModelManager = struct {
             result.shared_prefetch = state;
             try session_factory.attachSharedPrefetchState(result.session, state);
         }
+        try self.verifyArtifactPublication(model_dir, &man);
         return result;
     }
 
@@ -16438,6 +16453,8 @@ test "model selection lazy optional component retains primary publication" {
     const receipt_a = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "gguf", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{.{ .path = "model.gguf", .size = size }} }, .{});
     defer a.free(receipt_a);
     try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt_a });
+    var original_manifest = try manifest_mod.loadFromDir(a, root);
+    defer original_manifest.deinit();
     const publication_a = try managed_receipt.publicationGeneration(a, io, root);
     var sm = backends.SessionManager.initWithIo(a, io);
     sm.preferred_backends = &.{.native};
@@ -16474,6 +16491,16 @@ test "model selection lazy optional component retains primary publication" {
     @memset(receipt_b[pin..][0..40], 'b');
     try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt_b });
     try std.testing.expect(!std.meta.eql(publication_a, try managed_receipt.publicationGeneration(a, io, root)));
+    if (manager.loadArtifactSession(root, original_manifest)) |loaded| {
+        var unexpected = loaded;
+        unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| try std.testing.expectEqual(error.ModelArtifactsChanging, err);
+    if (manager.loadGenerationTokenizerAssets(root, &original_manifest)) |loaded| {
+        var unexpected = loaded;
+        unexpected.deinit();
+        return error.TestExpectedError;
+    } else |err| try std.testing.expectEqual(error.ModelArtifactsChanging, err);
     // Already materialized A remains safe for the request that owns A.
     try std.testing.expect(!try model.ensureOptionalSessionWithControl(.text_projection, &existing, &existing_lease, root, control));
     try std.testing.expect(existing.?.ptr == previous_session);
