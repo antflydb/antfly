@@ -403,7 +403,7 @@ fn executeModelForwardViaDefinition(
             defer allocator.free(package);
             break :found try pjrt_artifact_executor_mod.createAdmittedModelExecutorFromPackageManifestPath(allocator, io, package, shape.seq_len, shape.query_seq_len, shape.attention_mode, graph, context.cb, policy, plugin);
         } else found: {
-            var prefill = (compiled_artifact.findUniqueMatchingArtifactPath(allocator, io, directory, .{ .backend = "xla", .model_dir = model_dir, .kind = "pjrt_executable", .artifact_role = compiled_artifact.artifact_role_prefill, .seq_len = shape.seq_len, .query_seq_len = shape.query_seq_len, .attention_mode = shape.attention_mode, .require_pjrt_memory_plan = true }) catch |err| switch (err) {
+            var prefill = (compiled_artifact.findManagedPjrtPrefill(allocator, io, directory, "xla", model_dir, shape.seq_len, shape.query_seq_len, shape.attention_mode) catch |err| switch (err) {
                 error.FileNotFound => null,
                 else => return err,
             }) orelse return error.PjrtLoadOnlyArtifactsRequired;

@@ -661,22 +661,7 @@ fn findMatchingFullModelArtifact(
     query_seq_len: usize,
     attention_mode: []const u8,
 ) !?compiled_artifact.LocatedArtifact {
-    if (std.mem.eql(u8, backend, "xla")) {
-        const xla_kinds = [_][]const u8{"pjrt_executable"};
-        for (xla_kinds) |kind| {
-            if (try compiled_artifact.findMatchingArtifactPath(allocator, io, search_dir, .{
-                .require_pjrt_memory_plan = true,
-                .backend = backend,
-                .kind = kind,
-                .model_dir = model_dir,
-                .seq_len = seq_len,
-                .query_seq_len = query_seq_len,
-                .attention_mode = attention_mode,
-            })) |found| return found;
-        }
-        return null;
-    }
-    return null;
+    return compiled_artifact.findManagedPjrtPrefill(allocator, io, search_dir, backend, model_dir, seq_len, query_seq_len, attention_mode);
 }
 
 fn resolvePackagePrefillManifestPath(
@@ -2752,9 +2737,14 @@ fn admittedPjrtPackageScenario(a: std.mem.Allocator, root: []const u8, prefill: 
         var prefill_only_owner = prefill_only.modelExecutor();
         defer prefill_only_owner.deinit();
         try std.testing.expectEqual(@as(usize, 0), prefill_only.decode_variants.len);
+        var prefill_runtime = try prefill_only_owner.createRuntime(a);
+        defer prefill_runtime.deinit();
+        try std.testing.expect(!prefill_runtime.capabilities().supports_decode);
+        try std.testing.expectError(error.UnsupportedDecode, prefill_runtime.decode(a, .{ .token_id = 0, .position = 16 }));
     }
     var retained_runtime = try owned.createRuntime(a);
     defer retained_runtime.deinit();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, owned.createRuntime(a));
     owned.deinit();
     owns_executor = false;
     try std.testing.expect(executor.graph != &graph);
@@ -2918,6 +2908,7 @@ test "run-artifact managed decode runtime survives executor graph and manager te
     };
     var outputs = [_]u32{ 0, 1, 2 };
     var output_bindings = [_]compiled_artifact.PjrtOutputBindingMeta{
+        .{ .kind = compiled_artifact.pjrt_binding_graph_node, .node_id = 0 },
         .{ .kind = compiled_artifact.pjrt_binding_present_key, .node_id = 1, .layer_index = 0, .name = "present.0.key" },
         .{ .kind = compiled_artifact.pjrt_binding_present_value, .node_id = 2, .layer_index = 0, .name = "present.0.value" },
     };
@@ -2949,9 +2940,9 @@ test "run-artifact managed decode runtime survives executor graph and manager te
     var manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
     var manager_live = true;
     defer if (manager_live) manager.deinit();
-    const policy = model_manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 128 * 1024 * 1024 } };
+    const policy = model_manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 128 * 1024 * 1024, .kv_limit_bytes = 48 } };
     try policy.configure(&manager);
-    const context = pjrt_admission.Context{ .allocator = a, .manager = &manager, .policy = policy };
+    var context = pjrt_admission.Context{ .allocator = a, .manager = &manager, .policy = policy, .runtime_capacity = 4, .decode_steps_limit = 1 };
     var graph = ml.graph.Graph.init(a);
     var graph_live = true;
     defer if (graph_live) graph.deinit();
@@ -2959,10 +2950,45 @@ test "run-artifact managed decode runtime survives executor graph and manager te
     const parameter = try builder.parameter("input_ids", ml.graph.Shape.init(.i64, &.{16}));
     try graph.markOutput(parameter);
     var backend: ops.ComputeBackend = undefined; // semantic ABI needs no host weights
-    const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifestPaths(a, std.testing.io, prefill, &.{decode}, &graph, &backend, &context, plugin);
+
+    // Capacity must be backed before client creation, not added after buffers
+    // already exist. Four runtimes require 64 KV bytes under this 48-byte cap.
+    try std.testing.expectError(error.ResourceLimitExceeded, graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifestPaths(a, std.testing.io, prefill, &.{decode}, &graph, &backend, &context, plugin));
+    try std.testing.expectEqual(@as(usize, 0), count(0));
+    context.runtime_capacity = 3;
+    try std.testing.expectError(error.PjrtLoadOnlyArtifactsRequired, graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifestPaths(a, std.testing.io, prefill, &.{}, &graph, &backend, &context, plugin));
+    context.decode_steps_limit = 2;
+    try std.testing.expectError(error.PjrtLoadOnlyArtifactsRequired, graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifestPaths(a, std.testing.io, prefill, &.{decode}, &graph, &backend, &context, plugin));
+    context.decode_steps_limit = 1;
+    var gap_manifest = try compiled_artifact.readManifest(a, std.testing.io, decode);
+    defer gap_manifest.deinit();
+    gap_manifest.value.seq_len = 18;
+    try compiled_artifact.writeManifest(a, std.testing.io, decode, gap_manifest.value);
+    try std.testing.expectError(error.ArtifactShapeMismatch, graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifestPaths(a, std.testing.io, prefill, &.{decode}, &graph, &backend, &context, plugin));
+    gap_manifest.value.seq_len = 17;
+    try compiled_artifact.writeManifest(a, std.testing.io, decode, gap_manifest.value);
+    try std.testing.expectEqual(@as(usize, 0), count(0));
+
+    const package_path = try std.fs.path.join(a, &.{ root, "model.antfly-inference-package.json" });
+    defer a.free(package_path);
+    var prefill_manifest = try compiled_artifact.readManifest(a, std.testing.io, prefill);
+    defer prefill_manifest.deinit();
+    const package_entries = [_]compiled_artifact.PackageArtifactEntry{
+        .{ .manifest_path = prefill, .artifact_path = prefill_manifest.value.artifact_path, .artifact_role = "prefill", .seq_len = 16, .query_seq_len = 16, .attention_mode = "paged_prefill" },
+        .{ .manifest_path = decode, .artifact_path = gap_manifest.value.artifact_path, .artifact_role = "decode", .seq_len = 17, .query_seq_len = 1, .attention_mode = "paged_decode" },
+    };
+    var package = compiled_artifact.PackageManifest{ .backend = "xla", .model_dir = root, .kind = "pjrt_executable", .artifacts = package_entries[0..1] };
+    try compiled_artifact.writePackageManifest(a, std.testing.io, package_path, package);
+    try std.testing.expectError(error.PjrtLoadOnlyArtifactsRequired, graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromPackageManifestPath(a, std.testing.io, package_path, 16, 16, "paged_prefill", &graph, &backend, &context, plugin));
+    try std.testing.expectEqual(@as(usize, 0), count(0));
+    package.artifacts = &package_entries;
+    try compiled_artifact.writePackageManifest(a, std.testing.io, package_path, package);
+    const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromPackageManifestPath(a, std.testing.io, package_path, 16, 16, "paged_prefill", &graph, &backend, &context, plugin);
     var owned = executor.modelExecutor();
     var executor_live = true;
     defer if (executor_live) owned.deinit();
+    var failing_runtime_allocator = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    try std.testing.expectError(error.OutOfMemory, owned.createRuntime(failing_runtime_allocator.allocator()));
     var run = try owned.createRuntime(a);
     var runtime_live = true;
     defer if (runtime_live) run.deinit();
@@ -2970,6 +2996,28 @@ test "run-artifact managed decode runtime survives executor graph and manager te
     var first = try run.prefill(a, .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill });
     defer first.deinit(a);
     try std.testing.expectEqualSlices(f32, &.{ 0, 1 }, try first.hostLogits(a));
+    {
+        const admitted_before = manager.currentAdmissionAmounts();
+        try std.testing.expectEqual(@as(usize, 48), admitted_before.host_kv_bytes);
+        var other = try owned.createRuntime(a);
+        var other_live = true;
+        defer if (other_live) other.deinit();
+        var third = try owned.createRuntime(a);
+        defer third.deinit();
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, owned.createRuntime(a));
+        var other_output = try other.prefill(a, .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill });
+        defer other_output.deinit(a);
+        var third_output = try third.prefill(a, .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill });
+        defer third_output.deinit(a);
+        try std.testing.expectEqual(@as(usize, 6), count(8) - count(9));
+        try std.testing.expect((count(8) - count(9)) * 4 <= admitted_before.host_kv_bytes);
+        try std.testing.expectEqualDeep(admitted_before, manager.currentAdmissionAmounts());
+        other.deinit();
+        other_live = false;
+        var reused = try owned.createRuntime(a);
+        reused.deinit();
+    }
+
     owned.deinit();
     executor_live = false;
     graph.deinit();
@@ -2982,8 +3030,33 @@ test "run-artifact managed decode runtime survives executor graph and manager te
     try std.testing.expectEqualSlices(f32, &.{ 1, 0 }, try second.hostLogits(a));
     run.deinit();
     runtime_live = false;
-    try std.testing.expectEqual(@as(usize, 2), count(10));
+    try std.testing.expectEqual(@as(usize, 4), count(10));
     try std.testing.expectEqual(count(1), count(2));
     try std.testing.expectEqual(count(3), count(4));
     try std.testing.expectEqual(count(8), count(9));
+}
+
+test "run-artifact runtime capacity scales execution memory and shares CPU CUDA code" {
+    var artifact = testPjrtManifest("unused.exec");
+    artifact.pjrt_memory_plan = .{ .platform = .cpu, .artifact_sha256 = @splat(0), .plugin_sha256 = @splat(0), .memory = .{ .code = 64, .arguments = 4096, .outputs = 8, .temporary = 128 } };
+    inline for (.{ .cpu, .cuda }) |platform_kind| {
+        artifact.pjrt_memory_plan.?.platform = platform_kind;
+        const one = try pjrt_admission.Package.planExecution(&.{ artifact, artifact }, 1024, 1);
+        const three = try pjrt_admission.Package.planExecution(&.{ artifact, artifact }, 1024, 3);
+        try std.testing.expectEqual(one.cpu, three.cpu);
+        if (platform_kind == .cpu) {
+            try std.testing.expectEqual(@as(usize, 1024 + 2 * 64 + 3 * 4096), three.amounts.host_weight_bytes);
+            try std.testing.expectEqual(3 * one.amounts.host_scratch_bytes, three.amounts.host_scratch_bytes);
+            try std.testing.expectEqual(@as(usize, 0), three.external_code);
+        } else {
+            try std.testing.expectEqual(@as(usize, 1024), three.amounts.host_weight_bytes);
+            try std.testing.expectEqual(3 * one.amounts.backend_scratch_bytes, three.amounts.backend_scratch_bytes);
+            try std.testing.expectEqual(@as(usize, 2 * 64), three.external_code);
+            // Allocator rounding is additional to the independently leased
+            // runtime buffers; generated code never consumes their pool cap.
+            try std.testing.expect(three.amounts.backendTotalBytes() - three.external_code >= 3 * (4096 + 8 + 128));
+        }
+    }
+    try std.testing.expectError(error.ResourceLimitExceeded, pjrt_admission.Package.planExecution(&.{artifact}, 0, 0));
+    try std.testing.expectError(error.Overflow, pjrt_admission.Package.planExecution(&.{artifact}, 0, std.math.maxInt(usize)));
 }

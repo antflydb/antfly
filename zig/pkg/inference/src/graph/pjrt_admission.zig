@@ -24,6 +24,9 @@ pub const Context = struct {
     manager: *model_manager_mod.ModelManager,
     policy: ?model_manager_mod.ModelLoadPolicy = null,
     decode_steps_limit: ?usize = null,
+    /// Reserve independent execution envelopes before fixing the CUDA pool.
+    /// Runtime creation borrows one slot until that runtime releases its KV.
+    runtime_capacity: usize = 1,
 };
 
 fn artifactShapeBytes(shape: []const i64, element_bytes: usize) !usize {
@@ -315,6 +318,28 @@ pub const Package = struct {
     staging: runtime.tier.memory.AdmissionLease,
     device: ArtifactDeviceAdmission,
     client: @import("pjrt").pjrt.Client,
+    runtime_capacity: usize,
+    available_runtimes: std.atomic.Value(usize),
+
+    pub const RuntimeLease = struct {
+        owner: *Package,
+
+        pub fn release(self: *@This()) void {
+            const previous = self.owner.available_runtimes.fetchAdd(1, .release);
+            std.debug.assert(previous < self.owner.runtime_capacity);
+            self.* = undefined;
+        }
+    };
+
+    /// These slots are backed by independent KV, arguments, transfer staging,
+    /// and workspace reservations. Executable residency is shared once.
+    pub fn acquireRuntime(self: *@This()) !RuntimeLease {
+        var available = self.available_runtimes.load(.acquire);
+        while (available != 0) {
+            available = self.available_runtimes.cmpxchgWeak(available, available - 1, .acq_rel, .acquire) orelse return .{ .owner = self };
+        }
+        return error.ResourceTemporarilyUnavailable;
+    }
 
     fn readVerified(a: std.mem.Allocator, artifact: compiled_artifact.Manifest, size: usize) ![]u8 {
         const bytes = try @import("../util/c_file.zig").readFileMax(a, artifact.artifact_path, size);
@@ -326,22 +351,23 @@ pub const Package = struct {
         return bytes;
     }
 
-    pub fn init(context: *const Context, artifacts: []const compiled_artifact.Manifest, plugin: [:0]const u8, metadata_bytes: usize) !*@This() {
+    pub const ExecutionPlan = struct {
+        cpu: bool,
+        amounts: runtime.tier.memory.AdmissionAmounts,
+        external_code: usize,
+    };
+
+    /// Each slot owns a complete execution envelope; all slots share immutable
+    /// executable residency and metadata. This also sizes CUDA's fixed pool.
+    pub fn planExecution(artifacts: []const compiled_artifact.Manifest, metadata_bytes: usize, runtime_capacity: usize) !ExecutionPlan {
         if (artifacts.len == 0) return error.MissingArtifactMetadata;
-        const a = platform.allocator.reclaimingScratch(context.allocator);
-        const lifetime = try context.manager.retainResourceLifetime();
-        errdefer lifetime.deinit();
+        if (runtime_capacity == 0) return error.ResourceLimitExceeded;
         const first = try ArtifactDeviceAdmission.plan(artifacts[0]);
-        const sizes = try a.alloc(usize, artifacts.len);
-        errdefer a.free(sizes);
         var amounts: runtime.tier.memory.AdmissionAmounts = .{};
         var host_code: usize = 0;
         var backend_code: usize = 0;
         var external_code: usize = 0;
-        var encoded: usize = 0;
-        var largest_encoded: usize = 0;
-        const c_file = @import("../util/c_file.zig");
-        for (artifacts, 0..) |artifact, i| {
+        for (artifacts) |artifact| {
             const profile = try ArtifactDeviceAdmission.plan(artifact);
             if (profile.platform != first.platform or !std.mem.eql(u8, &profile.plugin_sha256, &first.plugin_sha256)) return error.InvalidArtifact;
             const one = try ArtifactDeviceAdmission.executionAmounts(artifact, profile.memory, first.platform == .cpu);
@@ -357,14 +383,35 @@ pub const Package = struct {
             amounts.backend_kv_bytes = @max(amounts.backend_kv_bytes, one.backend_kv_bytes);
             amounts.host_scratch_bytes = @max(amounts.host_scratch_bytes, one.host_scratch_bytes);
             amounts.backend_scratch_bytes = @max(amounts.backend_scratch_bytes, one.backend_scratch_bytes);
-            sizes[i] = std.math.cast(usize, try c_file.fileSize(a, artifact.artifact_path)) orelse return error.ResourceLimitExceeded;
-            encoded = try std.math.add(usize, encoded, sizes[i]);
-            largest_encoded = @max(largest_encoded, sizes[i]);
+        }
+        inline for (@typeInfo(runtime.tier.memory.AdmissionAmounts).@"struct".field_names) |field| {
+            @field(amounts, field) = try std.math.mul(usize, @field(amounts, field), runtime_capacity);
         }
         amounts.host_weight_bytes = try std.math.add(usize, amounts.host_weight_bytes, try std.math.add(usize, host_code, metadata_bytes));
         amounts.backend_weight_bytes = try std.math.add(usize, amounts.backend_weight_bytes, backend_code);
         if (first.platform == .cuda) try ArtifactDeviceAdmission.addCudaHeadroom(&amounts);
-        var device = try ArtifactDeviceAdmission.initAmounts(context, first.platform == .cpu, amounts, external_code);
+        return .{ .cpu = first.platform == .cpu, .amounts = amounts, .external_code = external_code };
+    }
+
+    pub fn init(context: *const Context, artifacts: []const compiled_artifact.Manifest, plugin: [:0]const u8, metadata_bytes: usize) !*@This() {
+        if (artifacts.len == 0) return error.MissingArtifactMetadata;
+        if (context.runtime_capacity == 0) return error.ResourceLimitExceeded;
+        const a = platform.allocator.reclaimingScratch(context.allocator);
+        const lifetime = try context.manager.retainResourceLifetime();
+        errdefer lifetime.deinit();
+        const first = try ArtifactDeviceAdmission.plan(artifacts[0]);
+        const sizes = try a.alloc(usize, artifacts.len);
+        errdefer a.free(sizes);
+        const execution = try planExecution(artifacts, metadata_bytes, context.runtime_capacity);
+        var encoded: usize = 0;
+        var largest_encoded: usize = 0;
+        const c_file = @import("../util/c_file.zig");
+        for (artifacts, 0..) |artifact, i| {
+            sizes[i] = std.math.cast(usize, try c_file.fileSize(a, artifact.artifact_path)) orelse return error.ResourceLimitExceeded;
+            encoded = try std.math.add(usize, encoded, sizes[i]);
+            largest_encoded = @max(largest_encoded, sizes[i]);
+        }
+        var device = try ArtifactDeviceAdmission.initAmounts(context, execution.cpu, execution.amounts, execution.external_code);
         errdefer device.deinit();
         const peak = try std.math.add(usize, try std.math.add(usize, encoded, largest_encoded), 64 * 1024);
         var staging = try context.manager.acquireRunResourceAmounts(.cpu, ArtifactDeviceAdmission.limitsFor(context, true), .{ .host_weight_bytes = peak });
@@ -375,7 +422,7 @@ pub const Package = struct {
         try staging.retain(.{ .host_weight_bytes = try std.math.add(usize, encoded, largest_encoded) });
         const owner = try a.create(@This());
         errdefer a.destroy(owner);
-        owner.* = .{ .allocator = a, .lifetime = lifetime, .prefill_bytes = prefill, .encoded_sizes = sizes, .encoded_total = encoded, .metadata_bytes = metadata_bytes, .staging = staging, .device = device, .client = try @import("pjrt").pjrt.Client.initWithMemoryPolicy(plugin, if (device.cpu) .cpu else .{ .cuda = .{ .capacity_bytes = device.pool_bytes, .device_bytes = device.device_bytes } }) };
+        owner.* = .{ .allocator = a, .lifetime = lifetime, .prefill_bytes = prefill, .encoded_sizes = sizes, .encoded_total = encoded, .metadata_bytes = metadata_bytes, .runtime_capacity = context.runtime_capacity, .available_runtimes = .init(context.runtime_capacity), .staging = staging, .device = device, .client = try @import("pjrt").pjrt.Client.initWithMemoryPolicy(plugin, if (device.cpu) .cpu else .{ .cuda = .{ .capacity_bytes = device.pool_bytes, .device_bytes = device.device_bytes } }) };
         errdefer owner.client.deinit();
         const cpu = try owner.client.isCpu();
         if (cpu != device.cpu or (!cpu and !std.ascii.eqlIgnoreCase(try owner.client.platformName(), "cuda"))) return error.InvalidArtifact;
@@ -401,6 +448,7 @@ pub const Package = struct {
     }
 
     pub fn deinit(self: *@This()) void {
+        std.debug.assert(self.available_runtimes.load(.acquire) == self.runtime_capacity);
         self.client.deinit();
         self.allocator.free(self.prefill_bytes);
         self.allocator.free(self.encoded_sizes);

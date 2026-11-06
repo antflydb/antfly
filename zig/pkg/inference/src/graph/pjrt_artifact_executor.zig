@@ -235,6 +235,9 @@ pub fn createAdmittedModelExecutorFromManifestPaths(
     plugin: [:0]const u8,
 ) !*pjrt_executor.PjrtModelExecutor {
     const selected_decode_paths = decode_paths[0..@min(decode_paths.len, policy.decode_steps_limit orelse decode_paths.len)];
+    if (policy.decode_steps_limit) |required| {
+        if (selected_decode_paths.len != required) return error.PjrtLoadOnlyArtifactsRequired;
+    }
     const manifests = try allocator.alloc(std.json.Parsed(compiled_artifact.Manifest), selected_decode_paths.len + 1);
     defer allocator.free(manifests);
     var initialized: usize = 0;

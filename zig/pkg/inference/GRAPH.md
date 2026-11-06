@@ -438,6 +438,22 @@ memory pressure; admission does not reduce it to a different artifact bucket.
 The native graph keeps KV page geometry without allocating duplicate CPU KV
 storage: the managed executable owns and admits that storage.
 
+Managed requests verify complete contiguous decode coverage before constructing
+the provider. A prefill-only executable never doubles as a decode executable,
+even for a one-token prompt. Standalone lookup prefers profiled embedded
+parameters, then profiled external inputs, and rejects duplicate matches within
+the selected mode.
+
+Managed packages reserve `Context.runtime_capacity` independent execution slots
+(default one) before client construction. Each slot includes its own arguments,
+KV, scratch, and host transfer envelope; code, graph metadata, and serialized
+provider copies are charged once. Runtime creation borrows a slot atomically and
+returns temporary-unavailability when all slots are occupied. Destruction frees
+retained KV before returning the slot; failed runtime allocation returns it too.
+Capacity cannot grow beyond CUDA's already admitted fixed pool. Callers needing
+concurrent runtimes set the capacity when loading the executor, allowing full
+workspace concurrency without duplicating immutable executable residency.
+
 Managed CLI XLA generation defaults to whole-model load-only execution. Inline
 compilation, explicit partitioned generation, and speculative/multimodal XLA
 routes have no bounded compiler contract and return an unsupported-feature error;

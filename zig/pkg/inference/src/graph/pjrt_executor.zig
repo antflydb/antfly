@@ -805,6 +805,8 @@ pub const PjrtModelExecutor = struct {
 
     fn createRuntime(ctx: *anyopaque, allocator: Allocator) !model_runtime.ModelRuntime {
         const self: *PjrtModelExecutor = @ptrCast(@alignCast(ctx));
+        var execution_lease = if (self.artifact_owner) |owner| try owner.acquireRuntime() else null;
+        errdefer if (execution_lease) |*lease| lease.release();
         const runtime_ctx = try allocator.create(PjrtModelRuntime);
         runtime_ctx.* = .{
             .allocator = allocator,
@@ -813,6 +815,7 @@ pub const PjrtModelExecutor = struct {
             .host_backend = self.host_backend,
             .input_materialization = self.input_materialization,
             .retained_buffers = PjrtRetainedBufferCache.init(allocator),
+            .execution_lease = execution_lease,
             .semantic_input_bindings = self.semantic_input_bindings,
             .semantic_output_bindings = self.semantic_output_bindings,
             .decode_variants = self.decode_variants,
@@ -850,6 +853,7 @@ pub fn deinitModelExecutorPtr(ctx: *anyopaque) void {
 }
 
 const PjrtModelRuntime = struct {
+    execution_lease: ?@import("pjrt_admission.zig").Package.RuntimeLease = null,
     artifact_executor_owner: ?*PjrtModelExecutor = null,
     allocator: Allocator,
     graph: *const Graph,
@@ -885,7 +889,9 @@ const PjrtModelRuntime = struct {
                 .interruption = .uninterruptible,
             };
         }
-        return runtimeCapabilitiesForInputMaterialization(self.input_materialization);
+        var result = runtimeCapabilitiesForInputMaterialization(self.input_materialization);
+        if (self.artifact_executor_owner != null) result.supports_decode = false;
+        return result;
     }
 
     fn prefill(
@@ -903,8 +909,11 @@ const PjrtModelRuntime = struct {
         request: model_runtime.DecodeRequest,
     ) !model_runtime.ModelOutput {
         const self: *PjrtModelRuntime = @ptrCast(@alignCast(ctx));
+        // A managed prefill executable is not a decode ABI, even when its
+        // input happens to contain one token. Never discard history silently.
+        if (self.artifact_executor_owner != null and self.decode_variants.len == 0) return error.UnsupportedDecode;
         const ids = [_]i64{request.token_id};
-        const seq_len = request.position + 1;
+        const seq_len = try std.math.add(usize, request.position, 1);
         const phase = if (self.decode_variants.len > 0)
             self.decodePhaseForSeqLen(seq_len) orelse return error.UnsupportedShape
         else
@@ -1057,6 +1066,7 @@ const PjrtModelRuntime = struct {
         if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelRuntime deinit begin", .{});
         self.retained_buffers.deinit();
         if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelRuntime retained buffers deinit complete", .{});
+        if (self.execution_lease) |*lease| lease.release();
         if (self.artifact_executor_owner) |owner| PjrtModelExecutor.deinit(owner);
         allocator.destroy(self);
         if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelRuntime deinit complete", .{});

@@ -862,3 +862,50 @@ pub fn findManagedPjrtPackage(allocator: std.mem.Allocator, io: std.Io, director
     }
     return null;
 }
+
+/// Managed standalone lookup uses the same parameter-mode preference as
+/// package lookup. Duplicate artifacts within one mode remain an error.
+pub fn findManagedPjrtPrefill(allocator: std.mem.Allocator, io: std.Io, directory: []const u8, backend: []const u8, model_dir: []const u8, seq_len: usize, query_seq_len: usize, attention_mode: []const u8) !?LocatedArtifact {
+    if (!std.mem.eql(u8, backend, "xla")) return null;
+    for ([_][]const u8{ pjrt_parameter_mode_embedded, pjrt_parameter_mode_inputs }) |mode| {
+        if (try findUniqueMatchingArtifactPath(allocator, io, directory, .{ .backend = backend, .model_dir = model_dir, .kind = "pjrt_executable", .artifact_role = artifact_role_prefill, .seq_len = seq_len, .query_seq_len = query_seq_len, .attention_mode = attention_mode, .pjrt_parameter_mode = mode, .require_pjrt_memory_plan = true })) |found| return found;
+    }
+    return null;
+}
+
+test "managed PJRT standalone lookup prefers embedded then inputs and rejects duplicates within a mode" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var artifact = Manifest{ .kind = "pjrt_executable", .backend = "xla", .model_dir = root, .artifact_path = "model.exec", .prompt_tokens = 1, .seq_len = 1, .query_seq_len = 1, .attention_mode = "paged_prefill", .raw_prompt = true, .chat_template_applied = false, .pjrt_memory_plan = .{ .platform = .cpu, .artifact_sha256 = @splat(0), .plugin_sha256 = @splat(0), .memory = .{} } };
+    const embedded = try std.fs.path.join(a, &.{ root, "embedded.inference.json" });
+    defer a.free(embedded);
+    const inputs = try std.fs.path.join(a, &.{ root, "inputs.inference.json" });
+    defer a.free(inputs);
+    const duplicate = try std.fs.path.join(a, &.{ root, "duplicate.inference.json" });
+    defer a.free(duplicate);
+    try writeManifest(a, io, embedded, artifact);
+    artifact.pjrt_parameter_mode = pjrt_parameter_mode_inputs;
+    try writeManifest(a, io, inputs, artifact);
+    {
+        var found = (try findManagedPjrtPrefill(a, io, root, "xla", root, 1, 1, "paged_prefill")).?;
+        defer found.deinit(a);
+        try std.testing.expectEqualStrings(embedded, found.manifest_path);
+    }
+    // A legacy embedded artifact must not hide a usable profiled inputs file.
+    artifact.pjrt_parameter_mode = pjrt_parameter_mode_embedded;
+    artifact.pjrt_memory_plan = null;
+    try writeManifest(a, io, embedded, artifact);
+    {
+        var found = (try findManagedPjrtPrefill(a, io, root, "xla", root, 1, 1, "paged_prefill")).?;
+        defer found.deinit(a);
+        try std.testing.expectEqualStrings(inputs, found.manifest_path);
+    }
+    var profiled = try readManifest(a, io, inputs);
+    defer profiled.deinit();
+    try writeManifest(a, io, duplicate, profiled.value);
+    try std.testing.expectError(error.AmbiguousCompiledArtifact, findManagedPjrtPrefill(a, io, root, "xla", root, 1, 1, "paged_prefill"));
+}
