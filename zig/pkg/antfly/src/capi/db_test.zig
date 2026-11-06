@@ -7813,7 +7813,11 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
             var held = true;
             defer if (held) lease.release();
             var reader = try lease.documentRows(budget.allocator(), 1);
-            defer reader.deinit();
+            var reader_live = true;
+            defer if (reader_live) reader.deinit();
+            // The pinned privacy-policy owner lives with the reader, while
+            // body/projection scratch must return to this baseline per page.
+            const reader_retained = budget.live;
             const file = if (handle) |owner| &owner.owned_lite_backend.?.native_docstore.?.read_generation.?.file else null;
             if (file) |native_file| native_file.page_cache_enabled.store(false, .monotonic);
             var ranked = (try lease.search(a, .{ .full_text = .{ .match_all = {} }, .limit = 2, .include_stored = false })).result;
@@ -7866,7 +7870,7 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
             const deleted_projection = try reader.lookupProjectedBatch(&.{"b"}, &.{"body"}, 256 * 1024);
             try std.testing.expectEqualStrings("\"beta\"", deleted_projection.values[0].fields[0].value);
             reader.releasePage();
-            try std.testing.expectEqual(@as(usize, 0), budget.live);
+            try std.testing.expectEqual(reader_retained, budget.live);
             const legacy = try reader.lookupProjectedBatch(&.{"legacy"}, &.{"body"}, 256 * 1024);
             try std.testing.expectEqualSlices(u8, document, legacy.values[0].bytes);
             reader.releasePage();
@@ -7878,10 +7882,10 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
             // retire on every lookup rather than accumulating across the result set.
             try std.testing.expect(budget.peak < 8 * 1024 * 1024);
             reader.releasePage();
-            try std.testing.expectEqual(@as(usize, 0), budget.live);
+            try std.testing.expectEqual(reader_retained, budget.live);
             try std.testing.expectEqualSlices(u8, second, try reader.lookup("b"));
             reader.releasePage();
-            try std.testing.expectEqual(@as(usize, 0), budget.live);
+            try std.testing.expectEqual(reader_retained, budget.live);
             budget.limit = 0;
             try std.testing.expectError(error.OutOfMemory, reader.lookupBatch(&.{ "b", "a", "b" }, 4 * 1024 * 1024));
             budget.limit = 8 * 1024 * 1024;
@@ -7892,7 +7896,7 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
             try std.testing.expectEqualSlices(u8, document, batch.values[1].?);
             try std.testing.expectEqualSlices(u8, second, batch.values[2].?);
             reader.releasePage();
-            try std.testing.expectEqual(@as(usize, 0), budget.live);
+            try std.testing.expectEqual(reader_retained, budget.live);
             const isolated = try reader.lookupBatch(&.{ "a", "b" }, 1);
             try std.testing.expectEqual(@as(usize, 1), isolated.consumed);
             try std.testing.expectEqualSlices(u8, document, isolated.values[0].?);
@@ -7902,7 +7906,7 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
             try std.testing.expectEqual(@as(usize, 1), suffix.consumed);
             try std.testing.expectEqualSlices(u8, second, suffix.values[0].?);
             reader.releasePage();
-            try std.testing.expectEqual(@as(usize, 0), budget.live);
+            try std.testing.expectEqual(reader_retained, budget.live);
             try std.testing.expectError(error.InvalidBatch, reader.lookupBatch(&.{ "a", "b" }, 0));
             reader.releasePage();
             const point_before = if (file) |native_file| native_file.test_page_reads.load(.monotonic) else 0;
@@ -7916,7 +7920,7 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
             const batch_reads = if (file) |native_file| native_file.test_page_reads.load(.monotonic) - batch_before else 0;
             if (file != null) std.debug.print("document hydration 64 small keys: point pages {d}, bounded batch pages incl proofs {d}\n", .{ point_reads, batch_reads });
             reader.releasePage();
-            try std.testing.expectEqual(@as(usize, 0), budget.live);
+            try std.testing.expectEqual(reader_retained, budget.live);
             const legacy_revision = blk: {
                 var txn = try database.core.store.beginReadTxn();
                 defer txn.abort();
@@ -7938,9 +7942,15 @@ test "capi SQL document ranked hydration pins old primary bytes and retires each
             var migrated_lease = try database.beginQueryReadLease();
             defer migrated_lease.release();
             var migrated = try migrated_lease.documentRows(budget.allocator(), 1);
-            defer migrated.deinit();
+            var migrated_live = true;
+            defer if (migrated_live) migrated.deinit();
             const migrated_value = try migrated.lookupProjectedBatch(&.{"legacy"}, &.{"body"}, 256 * 1024);
             try std.testing.expectEqualStrings("\"alpha\"", migrated_value.values[0].fields[0].value);
+            migrated.deinit();
+            migrated_live = false;
+            reader.deinit();
+            reader_live = false;
+            try std.testing.expectEqual(@as(usize, 0), budget.live);
             std.debug.print("document ranked hydration lite={any}: scoped peak {d} bytes across snapshot and bounded batch reads\n", .{ is_lite, budget.peak });
         }
     };

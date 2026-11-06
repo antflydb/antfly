@@ -138,3 +138,16 @@ fragment cursor fields. Its decoder accepts the earlier `ESQ2` header and both
 unreleased `ESQ3` layouts using exact lengths and bounded slot counts. Empty-key
 and fragment cursors cannot be claimed simultaneously. This preserves main's
 opaque empty-document IDs together with authenticated seekable discovery.
+
+## Immutable inputs across admission yields
+
+A changed foreground tip can refuse artifact publication after source replay
+completed successfully. That refusal invalidates mutable actors and captured
+publication authority. It does not invalidate immutable bytes protected by a
+live durable value lease. Before closing the refused runtime, preserve its
+immutable inputs under the existing file-wide entry, byte, range and time bounds.
+No primary epoch or mutable DB state is retained by this handoff. Exact current
+path/inode/value identity is checked again before any pooled source is reused.
+An uncertain outcome on either the detached or serving owner clears the handoff.
+Shutdown does not extend it. Source and decoded-lease resource owners continue
+to outlive any retained readers independently of the closed runtime.

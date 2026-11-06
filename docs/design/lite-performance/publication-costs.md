@@ -69,6 +69,22 @@ passed. Fixtures were closed and deleted. These are operation counts across
 Debug and optimized builds; background scheduling can vary. This receipt does
 not establish a throughput improvement or complete qualification.
 
+The integrated atomic publisher's [Debug receipt](commit-io-v64-debug.json)
+reduces calling-thread syncs further: two per primary-only write and 6.25 per
+indexed write. That reduction does not establish a total-work improvement.
+Across all threads, the indexed case still performed 4,802 syncs and wrote about
+68 MB for 128 updates. A separate all-thread stack trace attributed 2,522 of
+3,500 syncs to 1,261 durable artifact-lease acquisitions while maintenance
+reopened indexes. Scheduling changes the background totals, so all-thread
+counts remain part of the acceptance criteria.
+
+Cache diagnostics identified an important lifetime boundary: expected
+artifact-publication admission yields discarded the mutable maintenance
+runtime and also skipped immutable-source preservation. The exact leased
+inputs can remain useful even when that runtime loses publication authority.
+The bounded immutable handoff must survive those expected yields, while a
+later open still checks its current inode and immutable value identity.
+
 ## Required publication shape
 
 One prepared index publication should own immutable artifacts, exact source and
@@ -91,9 +107,11 @@ second commit for each fragment. Consolidating them requires preserving the
 readiness witnesses that currently consume persisted status and projection
 metadata. Unchanged observability state can be coalesced independently.
 
-Native commits currently have three durability barriers. Reducing those barriers
-requires a proven crash-recovery protocol, rather than removing sync calls. A
-pager/WAL prototype is a separate foundation decision after unnecessary logical
+Revision-11 authenticated checkpoints use two durability barriers when the new
+checkpoint is unambiguously newer than the retained checkpoint. The data barrier
+remains before checkpoint publication, and the selector shares the final barrier.
+Legacy or ambiguous histories retain the three-barrier protocol. A pager/WAL
+redesign remains a separate foundation decision after unnecessary logical
 publications and copy-on-write amplification have been measured independently.
 
 ## Completion criteria

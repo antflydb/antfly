@@ -1,0 +1,153 @@
+{
+  "source_commit": "bbae3baaa282b906f0648aa1da20979a8bf67aee",
+  "library_sha256": "5e83e1b340f1dd65bef52be659a68f0d9a6048a98087841b6d3037c74de759c6",
+  "shim_sha256": "5922fac595545f87d8a41b99b5f9da5878a9ca5b53ba88214b6bfa1db8c93406",
+  "script_sha256": "04281406682a4035a078cfaa53945bc757cc46f89c6bd2d800ceb4f4abb094f2",
+  "counter_source_sha256": "f79fade832344d80563ae9ef547a840b5218c49fee422374dcb536f2d587ff0a",
+  "scope": "Synthetic operation counts, not elapsed performance qualification; reset_thread identifies execution thread, not semantic request ownership.",
+  "status": "passed",
+  "cases": [
+    {
+      "engine": "antfly",
+      "indexed": false,
+      "writes": 128,
+      "local_diagnostic_not_performance_qualification": true,
+      "after_mutations": {
+        "reset_thread": {
+          "main": {
+            "fsync_calls": 256,
+            "write_calls": 1586,
+            "write_bytes": 5692544,
+            "read_calls": 5582,
+            "read_bytes": 22863872,
+            "fsync_ns": 16195000
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 246,
+            "write_bytes": 15744,
+            "read_calls": 758,
+            "read_bytes": 24256,
+            "fsync_ns": 0
+          }
+        },
+        "other_threads": {
+          "main": {
+            "fsync_calls": 218,
+            "write_calls": 878,
+            "write_bytes": 2433925,
+            "read_calls": 4328,
+            "read_bytes": 17727488,
+            "fsync_ns": 8734000
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 193,
+            "write_bytes": 12352,
+            "read_calls": 632,
+            "read_bytes": 18704,
+            "fsync_ns": 0
+          }
+        }
+      },
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": false,
+        "integrity_passed": true,
+        "seconds": 0.10062425000069197
+      },
+      "cleanup": {
+        "removed_bytes": 1085440
+      }
+    },
+    {
+      "engine": "antfly",
+      "indexed": true,
+      "writes": 128,
+      "local_diagnostic_not_performance_qualification": true,
+      "after_mutations": {
+        "reset_thread": {
+          "main": {
+            "fsync_calls": 800,
+            "write_calls": 4949,
+            "write_bytes": 17452304,
+            "read_calls": 10347,
+            "read_bytes": 43028480,
+            "fsync_ns": 49103000
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 529,
+            "write_bytes": 33856,
+            "read_calls": 1585,
+            "read_bytes": 59424,
+            "fsync_ns": 0
+          }
+        },
+        "other_threads": {
+          "main": {
+            "fsync_calls": 4002,
+            "write_calls": 17886,
+            "write_bytes": 50284508,
+            "read_calls": 13909,
+            "read_bytes": 57393152,
+            "fsync_ns": 194224000
+          },
+          "wal": {
+            "fsync_calls": 0,
+            "write_calls": 0,
+            "write_bytes": 0,
+            "read_calls": 0,
+            "read_bytes": 0,
+            "fsync_ns": 0
+          },
+          "auxiliary": {
+            "fsync_calls": 0,
+            "write_calls": 1984,
+            "write_bytes": 275439,
+            "read_calls": 6172,
+            "read_bytes": 636521,
+            "fsync_ns": 0
+          }
+        }
+      },
+      "verification": {
+        "every_latest_value_checked": true,
+        "primary_rows_checked": 128,
+        "expected_rows": 128,
+        "latest_and_overwritten_tokens_checked": true,
+        "integrity_passed": true,
+        "seconds": 0.24243304199990234
+      },
+      "cleanup": {
+        "removed_bytes": 2392064
+      }
+    }
+  ]
+}

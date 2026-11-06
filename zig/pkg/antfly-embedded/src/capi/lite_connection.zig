@@ -235,6 +235,7 @@ const TextRuntimeCacheDiagnostics = struct {
     not_retained_index_inputs: u64 = 0,
     not_retained_storage_error: u64 = 0,
     retained_storage_yield: u64 = 0,
+    immutable_yield_handoffs: u64 = 0,
     blocked_manual: u64 = 0,
     blocked_enrichment: u64 = 0,
     blocked_queries: u64 = 0,
@@ -2349,6 +2350,10 @@ pub const Owner = struct {
         // allocation or resource refusal must not alter a committed outcome.
         self.clearImmutableTextHandoff();
         if (self.stopping.load(.acquire)) return;
+        if (needsOutcomeReconciliation(root)) {
+            self.immutable_sources.clear();
+            return;
+        }
         if (self.current) |current| if (needsOutcomeReconciliation(current)) {
             self.immutable_sources.clear();
             return;
@@ -3517,12 +3522,20 @@ pub const Owner = struct {
             // Provider/query actors and their primary observations still end
             // here. Bounded immutable readers may bridge a later primary batch
             // even when this turn caught up. TTL and byte caps bound retention.
-            if (maintenance_error == null) {
-                // An artifact continuation may outlive the successful source
-                // turn. Its final teardown must preserve immutable ranges too;
-                // exact pooled identities authorize the next open independently.
+            const immutable_yield = if (maintenance_error) |err| switch (err) {
+                error.EnrichmentWaitCanceled, error.EnrichmentSourceChanged, error.FileBusy, error.WouldBlock => true,
+                else => false,
+            } else false;
+            if (maintenance_error == null or immutable_yield) {
+                // A changed tip invalidates mutable publication authority, not
+                // the bytes protected by existing immutable value leases. Keep
+                // the bounded handoff across expected admission yields too;
+                // each later open validates its exact inode/root identity.
+                // Uncertain publication outcomes still clear this handoff.
                 self.gate.mutex.lockUncancelable(io);
                 self.preserveImmutableTextHandoff(root, database);
+                if (immutable_yield and (self.immutable_sources.count != 0 or self.immutable_text_handoff != null))
+                    self.publication_stats.text_runtime_cache.immutable_yield_handoffs +|= 1;
                 self.gate.mutex.unlock(io);
             }
             // End the input fences before reclamation. Keeping them in an
@@ -7662,6 +7675,84 @@ test "capi native allocator proof issue1431 physical maintenance releases detach
     try std.testing.expect(probe.calls != 0);
     try std.testing.expect(probe.captured);
     if (probe.failure) |err| return err;
+}
+
+test "capi native artifact yields preserve exact immutable leases across runtime teardown" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    for ([_]anyerror{ error.EnrichmentWaitCanceled, error.EnrichmentSourceChanged }) |yield_error| {
+        var fixture = try AdmissionFollowupFixture.init("artifact-yield-handoff", 5000, .batch);
+        defer fixture.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+        const owner = fixture.connection.owner;
+        {
+            var lease = try fixture.connection.acquire();
+            defer {
+                lease.close();
+                fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            }
+            const live = try owner.refresh();
+            try live.owned_lite_backend.?.native_docstore.?.file.putIndexCatalogRecord("/yield-input", "protected immutable bytes");
+        }
+        const Source = @import("../segment_source.zig").Source;
+        const Probe = struct {
+            yield_error: anyerror,
+            source: ?Source = null,
+            calls: usize = 0,
+            failure: ?anyerror = null,
+            fn capture(ptr: *anyopaque, root: *h.Handle) void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                if (root.maintenance_publication == null or self.source != null) return;
+                self.source = root.owned_lite_backend.?.native_docstore.?.openArtifactSource("/yield-input") catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                @import("../storage/db/catalog/index_manager.zig").test_before_text_merge_step = .{ .manager = root.db.core.index_manager, .ptr = self, .notify = merge };
+            }
+            fn merge(ptr: *anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(ptr));
+                self.calls += 1;
+                return self.yield_error;
+            }
+        };
+        var probe: Probe = .{ .yield_error = yield_error };
+        defer if (probe.source) |*source| source.close();
+        defer @import("../storage/db/catalog/index_manager.zig").test_before_text_merge_step = null;
+        owner.test_after_capture = .{ .ptr = &probe, .notify = Probe.capture };
+        defer owner.test_after_capture = null;
+        for (0..8) |_| {
+            _ = try owner.maintenanceTurnForTest();
+            if (probe.calls != 0 or probe.failure != null) break;
+        }
+        if (probe.failure) |err| return err;
+        try std.testing.expect(probe.calls != 0);
+        try std.testing.expect(owner.maintenance_snapshot != null and !owner.maintenance_snapshot.?.db_live);
+        try std.testing.expect(owner.immutable_sources.count != 0);
+        try std.testing.expectEqual(@as(u64, 1), owner.publication_stats.text_runtime_cache.immutable_yield_handoffs);
+        const original_ptr = probe.source.?.ranges.ptr;
+        probe.source.?.close();
+        probe.source = null;
+        owner.test_after_capture = null;
+        @import("../storage/db/catalog/index_manager.zig").test_before_text_merge_step = null;
+        var lease = try fixture.connection.acquire();
+        defer {
+            lease.close();
+            fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        }
+        const live = try owner.refresh();
+        const replacement = try owner.refreshMaintenanceSnapshot(live, .source);
+        var reused = try replacement.owned_lite_backend.?.native_docstore.?.openArtifactSource("/yield-input");
+        defer reused.close();
+        try std.testing.expectEqual(original_ptr, reused.ranges.ptr);
+        var bytes: [25]u8 = undefined;
+        try reused.readInto(0, &bytes);
+        try std.testing.expectEqualStrings("protected immutable bytes", &bytes);
+        // An uncertain commit must invalidate even immutable handoffs.
+        replacement.sql_decision_uncertain = true;
+        owner.preserveImmutableTextHandoff(replacement, &replacement.db);
+        replacement.sql_decision_uncertain = false;
+        try std.testing.expectEqual(@as(usize, 0), owner.immutable_sources.count);
+        try std.testing.expect(owner.immutable_text_handoff == null);
+    }
 }
 
 test "capi native artifact maintenance releases primary history before merging" {
