@@ -11408,11 +11408,37 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return bound;
     }
 
+    /// Ordinary owned host results (including the original dense linear
+    /// fallback) have real F32 storage even when no MetalTensor was needed.
+    /// Borrowed model, opaque and transformed representations remain unknown.
+    fn ownedHostStorageOwnership(buffer: *const Buf, visitor: @import("../execution/storage_ownership.zig").Visitor) !@import("../execution/storage_ownership.zig").Coverage {
+        const ownership = @import("../execution/storage_ownership.zig");
+        if (!buffer.owned or buffer.data.len == 0 or buffer.shared_data_refcount == null or buffer.shared_data_refcount.?.* == 0 or
+            buffer.persistent_model or buffer.boundary_immutable_f32 or buffer.immutable_cached_source or buffer.weight_handle_name != null or buffer.weight_handle_refs != 0 or buffer.weight_handle_compute_owned or buffer.lazy_entry != null or buffer.owns_lazy_pin or
+            buffer.lazy_multiply != null or bufHasAnyQuantizedStorage(buffer) or buffer.native_dense_bytes != null or buffer.native_dense_dtype != null or buffer.native_dense_bytes_owned or buffer.native_dense_mmap_source_bytes != null or buffer.native_dense_host_cache != null or
+            buffer.integer_storage or buffer.integer_bounds != null or buffer.resident_index_bounds != null or buffer.resident_index_storage != null or buffer.resident_owner != null or
+            hasHostView(buffer) or buffer.logical_view_strides != null or buffer.view_base_offset != 0 or buffer.materialized_view_cache != null or buffer.shared_view_index_refcount != null)
+            return .unknown;
+        const dimensions = buffer.logical_shape orelse return .unknown;
+        if (dimensions.len == 0 or dimensions.len > 8) return .unknown;
+        const shape = @import("ml").graph.Shape.init(.f32, dimensions);
+        const count = shape.numElements() orelse return .unknown;
+        if (count <= 0 or std.math.cast(usize, count) != buffer.data.len) return .unknown;
+        const bytes = try std.math.mul(usize, buffer.data.len, @sizeOf(f32));
+        const identity = ownership.Identity{ .kind = .host, .base = @intFromPtr(buffer.data.ptr) };
+        var descriptor = @import("../graph/backend_contracts.zig").TensorDesc.init(shape, .host_f32);
+        descriptor.current_backend = .metal;
+        descriptor.resident_backend = .native;
+        try visitor.emit(.{ .backing = .{ .identity = identity, .domain = .host, .requested_bytes = bytes, .backing_bytes = bytes, .access = .writable, .ownership = .allocation } });
+        try visitor.emit(.{ .plane = .{ .descriptor = descriptor, .role = .primary, .backing = identity, .byte_offset = 0, .base_alignment = @alignOf(f32), .logical_bytes = bytes, .readable_bytes = bytes } });
+        return .complete;
+    }
+
     fn storageOwnershipOp(_: *anyopaque, tensor: CT, visitor: @import("../execution/storage_ownership.zig").Visitor) anyerror!@import("../execution/storage_ownership.zig").Coverage {
         const ownership = @import("../execution/storage_ownership.zig");
         const buffer = toBuf(tensor);
         if (buffer.lazy_multiply != null or bufHasAnyQuantizedStorage(buffer) or buffer.native_dense_bytes != null) return .unknown;
-        const physical = if (buffer.metal_tensor) |*value| value else return .unknown;
+        const physical = if (buffer.metal_tensor) |*value| value else return ownedHostStorageOwnership(buffer, visitor);
         const Adapter = struct {
             buffer: *const Buf,
             visitor: ownership.Visitor,
@@ -59221,4 +59247,71 @@ test "Metal literal construction staged metadata all OOM preserves exact owners 
         }
     };
     try std.testing.checkAllAllocationFailures(a, Case.run, .{ backend, initializer });
+}
+
+test "Metal ordinary host linear fallback owns complete readable F32 rows without model or view inference" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    const helper = @import("media_residency_test.zig");
+    const Case = struct {
+        fn run(cb: ops.ComputeBackend, _: ops.ComputeBackend) !void {
+            const a = std.testing.allocator;
+            // The original host ingress callback deliberately creates host
+            // packets without changing any process upload/runtime policy.
+            const input = try MetalCompute.fromFloat32Op(cb.ptr, &.{ 1, 2, 3, 4 });
+            defer cb.free(input);
+            const weight = try MetalCompute.fromFloat32Op(cb.ptr, &.{ 1, 0, 0, 1 });
+            defer cb.free(weight);
+            const bias = try MetalCompute.fromFloat32Op(cb.ptr, &.{ 0.25, -0.5 });
+            defer cb.free(bias);
+            const output = try cb.linear(input, weight, bias, 2, 2, 2);
+            defer cb.free(output);
+            try std.testing.expect(MetalCompute.toBuf(output).metal_tensor == null);
+            const Rows = @import("../execution/decoder_prefill.zig").EmbeddingRows;
+            try std.testing.expect(try Rows.supportsSource(&cb, output, 2, 2));
+            var rows = (try Rows.initPartitioned(&cb, a, 2, 2, &.{ .{ .offset = 0, .rows = 1 }, .{ .offset = 1, .rows = 1 } })) orelse return error.ExpectedRowDestination;
+            defer rows.deinit();
+            try rows.fill(1, output, 2, 1);
+            try rows.fill(0, output, 2, 0);
+            const result = try rows.take();
+            defer cb.free(result);
+            const values = try cb.toFloat32(result, a);
+            defer a.free(values);
+            try std.testing.expectEqualSlices(f32, &.{ 1.25, 1.5, 3.25, 3.5 }, values);
+            const original = MetalCompute.toBuf(output).*;
+            var denied = original;
+            denied.owned = false;
+            try std.testing.expect(!try Rows.supportsSource(&cb, @ptrCast(&denied), 2, 2));
+            denied = original;
+            denied.shared_data_refcount = null;
+            try std.testing.expect(!try Rows.supportsSource(&cb, @ptrCast(&denied), 2, 2));
+            denied = original;
+            denied.persistent_model = true;
+            try std.testing.expect(!try Rows.supportsSource(&cb, @ptrCast(&denied), 2, 2));
+            denied = original;
+            denied.weight_handle_name = "borrowed.model";
+            try std.testing.expect(!try Rows.supportsSource(&cb, @ptrCast(&denied), 2, 2));
+            denied = original;
+            denied.view_base_offset = 1;
+            try std.testing.expect(!try Rows.supportsSource(&cb, @ptrCast(&denied), 2, 2));
+            denied = original;
+            denied.logical_shape = @constCast(&[_]i64{ 1, 3 });
+            try std.testing.expect(!try Rows.supportsSource(&cb, @ptrCast(&denied), 2, 2));
+            denied = original;
+            denied.integer_storage = true;
+            try std.testing.expect(!try Rows.supportsSource(&cb, @ptrCast(&denied), 2, 2));
+            denied = original;
+            denied.quantized_storage = @ptrFromInt(16); // inspected only as an opaque sidecar tag
+            try std.testing.expect(!try Rows.supportsSource(&cb, @ptrCast(&denied), 2, 2));
+            denied = original;
+            denied.native_dense_bytes = &.{0};
+            try std.testing.expect(!try Rows.supportsSource(&cb, @ptrCast(&denied), 2, 2));
+            denied = original;
+            denied.logical_view_strides = @constCast(&[_]usize{ 1, 2 });
+            try std.testing.expect(!try Rows.supportsSource(&cb, @ptrCast(&denied), 2, 2));
+            denied = original;
+            denied.weight_handle_compute_owned = true;
+            try std.testing.expect(!try Rows.supportsSource(&cb, @ptrCast(&denied), 2, 2));
+        }
+    };
+    try helper.onMetal(helper.noWeights, Case.run);
 }

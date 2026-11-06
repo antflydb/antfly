@@ -18918,6 +18918,15 @@ test "Native Whisper preserves unknown arena and bounded allocator compatibility
     try std.testing.expect(bound.denied and bound.live == 0);
 }
 
+// The cold constructor has ended its construction scope. Its admitted banks
+// still require an actual caller-owned cleanup Epoch at physical destruction;
+// outside execution is an ordering fact, not a replacement for that boundary.
+fn destroyColdWhisperFixture(cold: *ColdNativeWhisper) void {
+    var cleanup = ReceiverCleanup.beginStandalone() catch platform.inference_process_supervisor.restartWorker();
+    defer cleanup.finish();
+    cold.destroy(.{ .boundary = cleanup.boundary() });
+}
+
 fn nativeWhisperSharedDefinitionCase(a: std.mem.Allocator) !void {
     if (comptime !build_options.enable_native) return error.SkipZigTest;
     const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
@@ -18939,13 +18948,13 @@ fn nativeWhisperSharedDefinitionCase(a: std.mem.Allocator) !void {
     defer if (first_base_open) base_first.deinit();
     const first = (try prepareColdNativeWhisper(session, a, null, config, geometry, &base_first, .{ .host = &hidden })) orelse return error.MissingFirstColdWhisper;
     var first_open = true;
-    defer if (first_open) first.destroy(.{ .outside_execution = true });
+    defer if (first_open) destroyColdWhisperFixture(first);
     var base_second = try incrementalBasePermit(session, config, geometry, false, false);
     var second_base_open = true;
     defer if (second_base_open) base_second.deinit();
     const second = (try prepareColdNativeWhisper(session, a, null, config, geometry, &base_second, .{ .host = &hidden })) orelse return error.MissingSecondColdWhisper;
     var second_open = true;
-    defer if (second_open) second.destroy(.{ .outside_execution = true });
+    defer if (second_open) destroyColdWhisperFixture(second);
     const one = first.program.?.schedule;
     const two = second.program.?.schedule;
     const definition = one.definition;
@@ -18972,9 +18981,9 @@ fn nativeWhisperSharedDefinitionCase(a: std.mem.Allocator) !void {
     const pinned_count = definition.references.load(.acquire);
     try std.testing.expect(arch.whisper_definitions.takeUnpinned() == null);
     try std.testing.expectEqual(pinned_count, definition.references.load(.acquire));
-    first.destroy(.{ .outside_execution = true });
+    destroyColdWhisperFixture(first);
     first_open = false;
-    second.destroy(.{ .outside_execution = true });
+    destroyColdWhisperFixture(second);
     second_open = false;
     base_first.deinit();
     first_base_open = false;
