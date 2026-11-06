@@ -1002,6 +1002,16 @@ pub const Batch = struct {
         set_replay_opaque: ?*const fn (*anyopaque, u64, []const u8) anyerror!void = null,
         set_commit_participant: ?*const fn (*anyopaque, @import("commit_participant.zig").Participant) anyerror!void = null,
         contains_many_sorted: ?*const fn (*anyopaque, []const []const u8, []bool) anyerror!void = null,
+        /// WS4 phase 2: optional second write surface into this handle's
+        /// index-catalog root (a catalog root separate from the primary
+        /// `get`/`put` keyspace above), applied in the SAME native
+        /// transaction as whatever else this `Batch` stages -- see
+        /// `native_catalog_backend.zig`'s `Mutation` and
+        /// `lite/native.zig`'s `putIndexCatalogBatch`. Only Lite's concrete
+        /// `Txn` handle implements this; every other backend leaves it
+        /// `null` (no `.native_catalog`-backed `PersistentIndex` exists on
+        /// those backends, so this is never called there).
+        put_index_catalog: ?*const fn (*anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -1146,6 +1156,15 @@ pub const Batch = struct {
     pub fn setCommitParticipant(self: *Batch, participant: @import("commit_participant.zig").Participant) !void {
         const attach = self.vtable.set_commit_participant orelse return error.Unsupported;
         try BoundaryAbi.call("set_commit_participant", self.boundary_dispatch, attach, .{ self.ptr, participant });
+    }
+
+    /// WS4 phase 2: stage mutations into this handle's index-catalog root
+    /// (see `VTable.put_index_catalog`), to be applied in the same native
+    /// transaction as this `Batch`'s own primary-keyspace writes once it
+    /// commits. `error.Unsupported` on every backend but Lite.
+    pub fn putIndexCatalogBatch(self: *Batch, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) !void {
+        const put_index_catalog = self.vtable.put_index_catalog orelse return error.Unsupported;
+        try BoundaryAbi.call("put_index_catalog", self.boundary_dispatch, put_index_catalog, .{ self.ptr, scope, mutations });
     }
 };
 
@@ -2267,6 +2286,10 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
         pub fn setCommitParticipant(ptr: *anyopaque, participant: @import("commit_participant.zig").Participant) anyerror!void {
             return unbox(ptr).handle.setCommitParticipant(participant);
         }
+
+        pub fn putIndexCatalogBatch(ptr: *anyopaque, scope: []const u8, mutations: []const @import("native_catalog_backend.zig").Mutation) anyerror!void {
+            return unbox(ptr).handle.putIndexCatalogBatch(scope, mutations);
+        }
     };
 
     return .{
@@ -2286,6 +2309,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             .set_replay_opaque = if (@hasDecl(Handle, "setReplayOpaque")) vt.setReplayOpaque else null,
             .set_commit_participant = if (@hasDecl(Handle, "setCommitParticipant")) vt.setCommitParticipant else null,
             .contains_many_sorted = if (@hasDecl(Handle, "containsManySorted")) vt.containsManySorted else null,
+            .put_index_catalog = if (@hasDecl(Handle, "putIndexCatalogBatch")) vt.putIndexCatalogBatch else null,
         },
     };
 }
