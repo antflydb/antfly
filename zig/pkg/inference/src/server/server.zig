@@ -25234,14 +25234,14 @@ pub const Node = struct {
             return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" });
         // Keep unsupported transformations on ordinary routing. A partial
         // estimate must never claim to describe the eventual rendered prompt.
-        if (body.messages.len == 0 or generateRequestHasNonTextContentParts(body) or body.tools != null or body.tool_choice != null or body.context_management != null or body.response_format != null or body.draft_model != null or body.kv_cache != null)
+        if (body.messages.len == 0 or generateRequestHasNonTextContentParts(body) or body.tools != null or body.tool_choice != null or body.context_management != null or body.response_format != null or body.grammar != null or body.draft_model != null or body.kv_cache != null)
             return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" });
         if (try self.acquireSlotUnits(ctx, 1)) |response| return response;
         defer self.releaseSlotUnits(1);
         const path = self.resolveRequestModelPath(ctx.allocator, ctx.io, body.model, "generators") catch |err| return requestModelResolutionError(ctx, err);
         defer ctx.allocator.free(path);
         if (try rejectDisallowedModel(self, ctx, path)) |response| return response;
-        var handle = (try self.model_manager.acquireCachedFromDir(path)) orelse return ctx.status(409).json(.{ .@"error" = "MODEL_NOT_LOADED" });
+        var handle = (try self.model_manager.acquireCachedObservationFromDir(path)) orelse return ctx.status(409).json(.{ .@"error" = "MODEL_NOT_LOADED" });
         defer handle.release();
         const model = handle.get();
         if (!model.session.executionCapabilities().cooperative_steps) return ctx.status(422).json(.{ .@"error" = "PLACEMENT_UNAVAILABLE" });
@@ -50199,4 +50199,29 @@ test "generation placement empty request cannot activate model or reserve KV" {
     defer response.deinit();
     try std.testing.expectEqual(@as(u16, 400), response.status.code);
     try std.testing.expectEqual(InferenceHttpRouteAdmission.inference, inferenceHttpRouteAdmission("POST", "/_placement/generate"));
+}
+
+test "generation placement rejects grammar before model resolution" {
+    var node = try Node.init(std.testing.allocator, .{});
+    defer node.deinit();
+    for ([_][]const u8{
+        \\{"model":"missing","messages":[{"role":"user","content":"hello"}],"grammar":"json"}
+        ,
+        \\{"model":"missing","messages":[{"role":"user","content":"hello"}],"grammar":"root ::= \"ok\""}
+        ,
+        \\{"model":"missing","messages":[{"role":"user","content":"hello"}],"grammar":""}
+        ,
+    }) |body| {
+        var request = try httpx.Request.init(std.testing.allocator, .POST, "/ai/v1/_placement/generate");
+        defer request.deinit();
+        request.body = body;
+        var ctx = httpx.Context.init(std.testing.allocator, std.testing.io, &request);
+        defer ctx.deinit();
+        var response = try node.estimateGeneratePlacement(&ctx);
+        defer response.deinit();
+        try std.testing.expectEqual(@as(u16, 422), response.status.code);
+        try std.testing.expectEqualStrings("{\"error\":\"PLACEMENT_UNAVAILABLE\"}", response.body.?);
+        try std.testing.expectEqual(@as(usize, 0), node.model_manager.loaded.count());
+        try std.testing.expectEqual(@as(usize, 0), node.model_manager.in_flight_loads.count());
+    }
 }

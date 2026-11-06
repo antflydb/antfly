@@ -244,8 +244,9 @@ cache reuse, queued work and active scheduler context. Probing never loads a
 model, attaches KV, or refreshes cache residency. Colony combines these estimates
 with locally reserved work to prefer useful cache locality without routing every
 request into a busy replica. Probes have a bounded candidate count and timeout;
-unsupported requests, mixed worker versions or incomplete evidence retain
-ordinary routing. Pool, namespace, capability and admission rules still apply.
+unsupported requests (including grammar-constrained generation), mixed worker
+versions or incomplete evidence retain ordinary routing. Pool, namespace,
+capability and admission rules still apply.
 This protocol performs no KV transfer between workers.
 
 Compatible EmbeddingGemma 2 CUDA text requests also combine automatically under
