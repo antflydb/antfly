@@ -2307,6 +2307,11 @@ fn enrichmentErrorDisposition(err: anyerror) EnrichmentErrorDisposition {
         error.InvalidDerivedCoverageOutcome,
         => .fatal_worker,
 
+        error.InvalidPrivacySpan,
+        error.InvalidPrivacyReceipt,
+        error.InvalidPrivacyFieldType,
+        error.InvalidPrivacyCategory,
+        error.PrivacyWindowLimitExceeded,
         error.RequiredMediaOutputFailed,
         error.DocumentModelRevisionMismatch,
         error.DocumentBudgetExhausted,
@@ -2996,6 +3001,25 @@ const ScopedReplay = struct {
         _ = std.base64.standard.Encoder.encode(encoded, key);
         return encoded;
     }
+    /// Dependency priming precedes ordinary document replay. Consult the same
+    /// source/incarnation/definition-bound tickets before invoking a root.
+    /// Healthy roots do one indexed lookup and no additional primary read.
+    fn rootDelayed(self: *@This(), runtime: *EnrichmentRuntime, group: enrichment_worker.PendingDocumentGroup, templates: []const enrichment_types.GeneratedEnrichmentRequest, root: enrichment_types.GeneratedEnrichmentRequest) !bool {
+        const logical = logicalRequestFingerprint(root);
+        const io = concurrencyIo(runtime);
+        self.mutex.lockUncancelable(io);
+        const present = self.state.hasLogical(runtime.alloc, logical) catch |err| {
+            self.mutex.unlock(io);
+            return err;
+        };
+        self.mutex.unlock(io);
+        if (!present) return false;
+        const planned = try prepareDocumentRequests(runtime, group, templates);
+        defer runtime.alloc.free(planned);
+        const delayed = try self.prepareDocument(runtime, group, planned);
+        defer runtime.alloc.free(delayed);
+        return std.mem.indexOfScalar(u64, delayed, logical) != null;
+    }
     fn prepareDocument(self: *@This(), runtime: *EnrichmentRuntime, group: enrichment_worker.PendingDocumentGroup, planned: []const enrichment_types.GeneratedEnrichmentRequest) ![]u64 {
         const key = try documentKey(runtime.alloc, group.doc_key);
         defer runtime.alloc.free(key);
@@ -3200,7 +3224,7 @@ const ScopedReplay = struct {
         const pending = self.state.tickets.items.len != 0;
         const scanned = self.state.scanned_sequence;
         const full = self.state.tickets.items.len >= scoped_retries.max_documents;
-        const has_tail = self.state.scan_document.len != 0;
+        const has_tail = self.state.hasScanDocument();
         const deadline = self.state.deadline();
         self.mutex.unlock(scheduler_io);
         const io = lockRuntime(runtime);
@@ -4087,7 +4111,7 @@ fn restoreScopedRetryCache(runtime: anytype) !void {
         runtime.next_retry_at_ms = 0;
     }
     runtime.scoped_retry_full = state.tickets.items.len >= scoped_retries.max_documents;
-    runtime.scoped_retry_has_tail = state.scan_document.len != 0;
+    runtime.scoped_retry_has_tail = state.hasScanDocument();
     runtime.scoped_retry_wait = runtime.scoped_retry_pending and runtime.retry_failure_fingerprint == 0 and runtime.consecutive_retry_count == 0;
     if (runtime.scoped_retry_wait) {
         runtime.retrying = true;
@@ -6045,7 +6069,8 @@ fn getOrCreateRequestChunksWithProbe(runtime: *EnrichmentRuntime, request: enric
         const upstream = runtime.index_manager.getEnrichment(.asset, request.upstream_artifact_name) orelse return error.InvalidEnrichmentConfig;
         var producer = try asset_producer_mod.parseProducerConfig(runtime.alloc, upstream.producer_json);
         defer producer.deinit(runtime.alloc);
-        if (producer.type != .media_output or !std.mem.eql(u8, request.source_field, "text") or request.source_template.len != 0) return error.InvalidEnrichmentConfig;
+        const privacy_source = @import("../../../privacy/document.zig").isProtectedArtifactName(upstream.name) or @import("../../../privacy/document.zig").consumerPolicyVersion(upstream.name) != null;
+        if (!privacy_source and (producer.type != .media_output or !std.mem.eql(u8, request.source_field, "text") or request.source_template.len != 0)) return error.InvalidEnrichmentConfig;
         const key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", upstream.name);
         defer runtime.alloc.free(key);
         upstream_raw = try storeGetOptionalAllocWithRetry(runtime, key);
@@ -6093,6 +6118,37 @@ fn getOrCreateRequestChunksWithProbe(runtime: *EnrichmentRuntime, request: enric
 
     if (request.upstream_artifact_name.len != 0 and upstream_raw == null) return error.ArtifactPublicationPending;
     if (upstream_raw) |bytes| {
+        const privacy = @import("../../../privacy/document.zig");
+        if (privacy.isProtectedArtifactName(request.upstream_artifact_name) or privacy.consumerPolicyVersion(request.upstream_artifact_name) != null) {
+            // Local chunk publication must bind the captured primary input to
+            // a current sanitized upstream, rather than stamp stale bytes
+            // with the digest of a newer primary write.
+            var read = try runtime.store.beginProbe();
+            defer read.abort();
+            if (try ordered_publication.authority(&read) == null) {
+                const root_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", request.upstream_artifact_name);
+                defer runtime.alloc.free(root_key);
+                const version = privacy.consumerPolicyVersion(request.upstream_artifact_name) orelse request.upstream_artifact_name[privacy.protected_artifact_prefix.len..][0..64].*;
+                try @import("../../../privacy/local_publication.zig").require(runtime.alloc, &read, root_key, version, raw.?, bytes);
+            }
+            const sanitized = if (privacy.isProtectedArtifactName(request.upstream_artifact_name))
+                try @import("../../../privacy/consumer.zig").document(runtime.alloc, bytes)
+            else
+                try runtime.alloc.dupe(u8, bytes);
+            defer runtime.alloc.free(sanitized);
+            const text = if (request.source_field.len == 0 and request.source_template.len == 0) try runtime.alloc.dupe(u8, sanitized) else try extractSourceText(runtime.alloc, runtime.config, sanitized, request);
+            defer if (text) |value| runtime.alloc.free(value);
+            const chunks = if (text) |value|
+                if (request.chunker_json.len > 0)
+                    try chunker_mod.chunkTextWithConfigJsonAndProvider(runtime.alloc, value, request.chunker_json, runtime.config.chunk_provider)
+                else
+                    try chunker_mod.chunkText(runtime.alloc, value, request.chunk_size, request.chunk_overlap)
+            else
+                try runtime.alloc.alloc(chunker_mod.Chunk, 0);
+            errdefer chunker_mod.freeChunks(runtime.alloc, chunks);
+            try cache.append(runtime.alloc, .{ .key = cache_key, .chunks = chunks, .source_record_digest = source_digest });
+            return .{ .chunks = chunks, .source_record_digest = source_digest };
+        }
         var asset = try std.json.parseFromSlice(struct { text: []const u8 }, runtime.alloc, bytes, .{ .ignore_unknown_fields = true });
         defer asset.deinit();
         const chunks = if (request.chunker_json.len > 0)
@@ -9970,7 +10026,7 @@ fn runForegroundCatchUpPassOwned(
     // No new window is admitted while every durable scheduling slot is in use.
     // One slot is reserved per document before any external invocation begins.
     const replay_window: @import("../derived/replay_source.zig").Source.EnrichmentWindow = if (available_documents != 0)
-        try runtime.replay_source.collectEnrichmentDocumentGroupsWindow(runtime.alloc, scheduler.state.scanned_sequence -| @as(u64, if (scheduler.state.scan_document.len != 0) 1 else 0), .{
+        try runtime.replay_source.collectEnrichmentDocumentGroupsWindow(runtime.alloc, scheduler.state.scanned_sequence -| @as(u64, if (scheduler.state.hasScanDocument()) 1 else 0), .{
             .max_records = 4096,
             .max_document_groups = available_documents,
             .max_input_bytes = 4 * 1024 * 1024,
@@ -9981,7 +10037,7 @@ fn runForegroundCatchUpPassOwned(
     const scan_key = try scheduler.state.scanDocumentAlloc(runtime.alloc);
     defer runtime.alloc.free(scan_key);
     var start: usize = 0;
-    if (scan_key.len != 0) while (start < replay_window.groups.len) : (start += 1) {
+    if (scheduler.state.hasScanDocument()) while (start < replay_window.groups.len) : (start += 1) {
         const group = replay_window.groups[start];
         if (group.sequence > scheduler.state.scanned_sequence or
             (group.sequence == scheduler.state.scanned_sequence and std.mem.order(u8, group.doc_key, scan_key) == .gt)) break;
@@ -14589,6 +14645,17 @@ fn scheduleScannerRetry(runtime: *EnrichmentRuntime, request: enrichment_types.G
     return try scope.shouldYield(runtime, err);
 }
 
+fn prepareDocumentRequests(runtime: *EnrichmentRuntime, pending: enrichment_worker.PendingDocumentGroup, templates: []const enrichment_types.GeneratedEnrichmentRequest) ![]enrichment_types.GeneratedEnrichmentRequest {
+    const planned = try runtime.alloc.dupe(enrichment_types.GeneratedEnrichmentRequest, templates);
+    errdefer runtime.alloc.free(planned);
+    for (planned) |*request| {
+        request.sequence = pending.sequence;
+        if (request.kind != .dense_embedding and request.kind != .sparse_embedding) continue;
+        request.reprocess_generation = try embeddingReprocessGeneration(runtime, request.doc_key, requestEmbeddingName(request.*), request.producer_json);
+    }
+    return planned;
+}
+
 fn processPendingDocumentGroup(
     runtime: *EnrichmentRuntime,
     pending: enrichment_worker.PendingDocumentGroup,
@@ -14605,13 +14672,8 @@ fn processPendingDocumentGroup(
     try guard.check();
     try servicePendingArtifactUnitJobs(runtime, pending.doc_key, guard);
     const templates = try getOrCreatePlannedRequests(runtime, pending.doc_key, request_plan_cache);
-    const planned = try runtime.alloc.dupe(enrichment_types.GeneratedEnrichmentRequest, templates);
+    const planned = try prepareDocumentRequests(runtime, pending, templates);
     defer runtime.alloc.free(planned);
-    for (planned) |*request| {
-        request.sequence = pending.sequence;
-        if (request.kind != .dense_embedding and request.kind != .sparse_embedding) continue;
-        request.reprocess_generation = try embeddingReprocessGeneration(runtime, request.doc_key, requestEmbeddingName(request.*), request.producer_json);
-    }
     const delayed_requests = if (runtime.retry_scheduler) |scheduler|
         try scheduler.prepareDocument(runtime, pending, planned)
     else
@@ -15225,6 +15287,83 @@ fn dispatchDeferredGeneratedWork(
 /// timeout/cancellation or a scan-time error here can still leave an earlier
 /// quantum's dispatched lane running in the background, and it must be
 /// awaited, never abandoned.
+/// Prepare policy roots across the bounded replay page before traversing
+/// their consumers. A per-document dependency must not force serial detector
+/// calls or let a missing upstream settle a downstream vector as skipped.
+fn flushPrimedPrivacyRoots(runtime: *EnrichmentRuntime, roots: []const enrichment_types.GeneratedEnrichmentRequest, window: *GeneratedReplayWindow) !void {
+    var scope = FailureScope{};
+    const failure: ?anyerror = if (processDeferredAssets(runtime, roots, window, &scope, null)) |_| null else |err| err;
+    try scope.publish(runtime, window, failure == null);
+    if (failure) |err| {
+        // A durably parked provider failure must not hold successful roots or
+        // their consumers behind its retry clock. Ordinary replay reloads the
+        // tickets after priming and skips precisely the delayed dependency.
+        if (runtime.retry_scheduler != null and scope.first_scheduled_fingerprint != 0 and
+            !scope.publication_failed and !isEnrichmentControlError(err) and
+            enrichmentErrorDisposition(err) == .retryable_request) return;
+        return scope.scannerFailure(runtime, err);
+    }
+}
+
+fn primePrivacyRoots(runtime: *EnrichmentRuntime, pending: []const enrichment_worker.PendingDocumentGroup, plans: *std.ArrayListUnmanaged(RequestPlanCacheEntry), guard: ForegroundCatchUpGuard) !bool {
+    var roots: std.ArrayListUnmanaged(enrichment_types.GeneratedEnrichmentRequest) = .empty;
+    defer roots.deinit(runtime.alloc);
+    var window = GeneratedReplayWindow{ .alloc = runtime.alloc };
+    defer window.deinit();
+    var primed = false;
+    for (pending) |group| {
+        try guard.check();
+        const requests = try getOrCreatePlannedRequests(runtime, group.doc_key, plans);
+        for (requests, 0..) |root_template, request_index| {
+            if (root_template.kind != .asset or !@import("../../../privacy/document.zig").isArtifactName(requestArtifactName(root_template))) continue;
+            // Independent roots use the ordinary asset lane and its durable
+            // replay checkpoints. Priming them would repeatedly traverse the
+            // entire replay window before that lane can advance its cursor.
+            if (!assetHasConsumer(root_template, requests[request_index + 1 ..])) continue;
+            primed = true;
+            var request = root_template;
+            request.sequence = group.sequence;
+            if (runtime.retry_scheduler) |scheduler| if (try scheduler.rootDelayed(runtime, group, requests, request)) continue;
+            if (try skipPersistedRequestFailure(runtime, &window, request)) continue;
+            try roots.append(runtime.alloc, request);
+            if (roots.items.len == 8) {
+                try flushPrimedPrivacyRoots(runtime, roots.items, &window);
+                roots.clearRetainingCapacity();
+            }
+        }
+    }
+    if (roots.items.len == 0) return primed;
+    try flushPrimedPrivacyRoots(runtime, roots.items, &window);
+    return primed;
+}
+
+test "privacy independent roots preserve the bounded asset replay lane" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    // Only allocation is initialized: independent roots must never access
+    // storage or publish during the dependency-priming pass.
+    var runtime: EnrichmentRuntime = undefined;
+    runtime.alloc = a;
+    var plans: std.ArrayListUnmanaged(RequestPlanCacheEntry) = .empty;
+    var pending: std.ArrayListUnmanaged(enrichment_worker.PendingDocumentGroup) = .empty;
+    for (0..237) |index| {
+        const key = try std.fmt.allocPrint(a, "doc-{d}", .{index});
+        const requests = try a.alloc(enrichment_types.GeneratedEnrichmentRequest, 1);
+        requests[0] = .{ .kind = .asset, .index_name = "", .artifact_name = "_privacy_document", .doc_key = key, .source_field = "__antfly_privacy_source" };
+        try plans.append(a, .{ .doc_key = key, .requests = requests });
+        try pending.append(a, .{ .sequence = @intCast(index + 1), .doc_key = key });
+    }
+    try std.testing.expect(!try primePrivacyRoots(&runtime, pending.items, &plans, .{}));
+    var consumer = plans.items[0].requests[0];
+    consumer.upstream_artifact_name = "_privacy_document";
+    try std.testing.expect(assetHasConsumer(plans.items[0].requests[0], &.{consumer}));
+    consumer.upstream_artifact_name = "";
+    consumer.kind = .chunk_text;
+    consumer.input_kind = .materialized_chunks;
+    try std.testing.expect(assetHasConsumer(plans.items[0].requests[0], &.{consumer}));
+}
+
 fn runGeneratedCatchUpQuanta(
     runtime: *EnrichmentRuntime,
     pending: []const enrichment_worker.PendingDocumentGroup,
@@ -15255,12 +15394,21 @@ fn runGeneratedCatchUpQuanta(
     const max_preparation_items = generatedPreparationWindowItems();
     const max_source_bytes = generatedPreparationSourceBytes();
 
+    var primed_through: usize = 0;
+    var primed_dependencies = false;
     var max_seen = runtime.applied_sequence;
     var last_processed: ?enrichment_worker.PendingDocumentGroup = null;
-    for (pending) |group| {
+    for (pending, 0..) |group, group_index| {
         try guard.check();
         max_seen = @max(max_seen, group.sequence);
         if (replayCursorsCoverGroup(replay_cursor_assets, replay_cursor_dense, runtime.applied_sequence, group)) continue;
+        if (group_index >= primed_through) {
+            // Prime only the next physical detector cohort. Acknowledged
+            // earlier cohorts can checkpoint even when a later root waits
+            // for ordered publication; retries honor both stream cursors.
+            primed_through = @min(pending.len, group_index + 8);
+            primed_dependencies = try primePrivacyRoots(runtime, pending[group_index..primed_through], &request_plan_cache, guard);
+        }
         if (prepared_sources == null) {
             const owned = try runtime.alloc.create(PreparedDocumentSourceCache);
             owned.* = PreparedDocumentSourceCache.init(runtime);
@@ -15280,7 +15428,7 @@ fn runGeneratedCatchUpQuanta(
             deferred_chunked_dense.items.len,
             deferred_assets.items.len,
             max_preparation_items,
-        )) {
+        ) or (primed_dependencies and group_index + 1 == primed_through)) {
             // Cursor checkpoints are saved per-lane inside dispatch as each
             // stream durably publishes.
             try dispatchDeferredGeneratedWork(pipeline, &chunk_cache, &request_plan_cache, &deferred_plain_dense, &deferred_chunked_dense, &deferred_assets, &window, runtime.applied_sequence, group, &prepared_sources);
@@ -15421,6 +15569,43 @@ fn processAsset(
     };
     var source_text_owned = true;
     defer if (source_text_owned) runtime.alloc.free(@constCast(source_text));
+    if (consumes_upstream and context == null) {
+        const privacy = @import("../../../privacy/document.zig");
+        const root = privacy.isProtectedArtifactName(request.upstream_artifact_name);
+        const version = if (root) @as(?[64]u8, request.upstream_artifact_name[privacy.protected_artifact_prefix.len..][0..64].*) else privacy.consumerPolicyVersion(request.upstream_artifact_name);
+        if (version) |expected| {
+            var read = try runtime.store.beginProbe();
+            defer read.abort();
+            const upstream_key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", request.upstream_artifact_name);
+            defer runtime.alloc.free(upstream_key);
+            try @import("../../../privacy/local_publication.zig").require(runtime.alloc, &read, upstream_key, expected, raw, source_text);
+        }
+    }
+    if (consumes_upstream and @import("../../../privacy/document.zig").isProtectedArtifactName(request.upstream_artifact_name)) {
+        const sanitized = try @import("../../../privacy/consumer.zig").document(runtime.alloc, source_text);
+        runtime.alloc.free(@constCast(source_text));
+        source_text = sanitized;
+    }
+    if (consumes_upstream and (request.source_field.len != 0 or request.source_template.len != 0)) {
+        const selected = try extractAssetSourceValue(runtime.alloc, runtime.config, source_text, request);
+        runtime.alloc.free(@constCast(source_text));
+        source_text_owned = false;
+        // Missing selected fields use the same explicit no-output transition
+        // as a missing upstream, so stale outputs cannot remain searchable.
+        if (selected == null) {
+            if (context) |*value| return enqueueAssetProducerOutput(runtime, request, value, key, null);
+            const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
+            defer runtime.alloc.free(state_key);
+            try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
+            try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, key);
+            try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
+            try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .skipped);
+            return;
+        }
+        source_text = selected.?;
+        source_text_owned = true;
+    }
+
     if (consumes_upstream and request.group_artifact_name.len > 0 and std.mem.eql(u8, request.upstream_artifact_name, request.group_artifact_name)) {
         const wrapper = try std.json.parseFromSlice(std.json.Value, runtime.alloc, source_text, .{});
         defer wrapper.deinit();
@@ -15549,15 +15734,27 @@ fn processAsset(
         const existing = try storeGetOptionalAllocWithRetry(runtime, key);
         if (existing) |value| {
             defer runtime.alloc.free(value);
-            try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
-            try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
-            // The artifact exists and matches its skip state: produced
-            // coverage, so an idempotent replay converges the summary.
-            try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
-            return;
+            if (try reusablePrivateAsset(runtime, artifact_name, key, source_text, raw, producer_cfg.config_json, value)) {
+                try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
+                try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
+                // Private outputs also require their destination-owned witness.
+                // A restored skip state cannot certify imported artifact bytes.
+                try queueArtifactCoverageOutcomeForRequest(runtime, window, request, .produced);
+                return;
+            }
         }
     }
 
+    if (@import("../../../privacy/document.zig").isArtifactName(artifact_name)) {
+        const privacy = @import("../../../privacy/document.zig");
+        if (try storeGetOptionalAllocWithRetry(runtime, privacy.execution_key)) |override| {
+            defer runtime.alloc.free(override);
+            if (try privacy.withExecutionOverride(runtime.alloc, producer_cfg.config_json, override)) |updated| {
+                runtime.alloc.free(producer_cfg.config_json);
+                producer_cfg.config_json = updated;
+            }
+        }
+    }
     const config_json = producer_cfg.config_json;
     producer_cfg.config_json = "";
     var config_json_owned = true;
@@ -15816,6 +16013,14 @@ fn assetProducerRetainedBytes(item: AssetProducerBatchItem) usize {
     return bytes;
 }
 
+fn assetHasConsumer(request: enrichment_types.GeneratedEnrichmentRequest, remaining: []const enrichment_types.GeneratedEnrichmentRequest) bool {
+    const name = requestArtifactName(request);
+    return for (remaining) |consumer| {
+        if (std.mem.eql(u8, consumer.upstream_artifact_name, name) or
+            (consumer.input_kind != .document and std.mem.eql(u8, consumer.artifact_name, name))) break true;
+    } else false;
+}
+
 /// Publish nonleaf producers in dependency order. Only leaves enter the
 /// provider grouping lane, where reordering across documents is safe.
 fn processPlannedAsset(
@@ -15826,11 +16031,7 @@ fn processPlannedAsset(
     prepared_sources: *PreparedDocumentSourceCache,
     window: *GeneratedReplayWindow,
 ) !bool {
-    const name = requestArtifactName(request);
-    const has_consumer = for (remaining) |consumer| {
-        if (std.mem.eql(u8, consumer.upstream_artifact_name, name) or
-            (consumer.input_kind != .document and std.mem.eql(u8, consumer.artifact_name, name))) break true;
-    } else false;
+    const has_consumer = assetHasConsumer(request, remaining);
     if (!has_consumer) {
         try processAssetOrDefer(runtime, request, deferred, prepared_sources, window);
         return true;
@@ -15998,6 +16199,27 @@ fn flushAssetProducerBatch(
     if (deferred_retry_error) |err| return err;
 }
 
+fn recordAssetProducerFailure(runtime: *EnrichmentRuntime, window: *GeneratedReplayWindow, item: AssetProducerBatchItem, err: anyerror, attempt: u64) !void {
+    try recordIsolatedRequestErrorFor(runtime, window, item.request, err, attempt);
+    if (!@import("../../../privacy/document.zig").isArtifactName(item.request.artifact_name)) return;
+    const parsed = try std.json.parseFromSlice(std.json.Value, runtime.alloc, item.config_json, .{});
+    defer parsed.deinit();
+    const policy_value = parsed.value.object.get(@import("../../../privacy/document.zig").config_key) orelse return error.InvalidPrivacyProducer;
+    const policy = try std.json.parseFromValue(@import("../../../privacy/contract.zig").Policy, runtime.alloc, policy_value, .{});
+    defer policy.deinit();
+    const marker = try std.json.Stringify.valueAlloc(runtime.alloc, .{ .privacy_failure = .{
+        .sequence = item.request.sequence,
+        .policy_version = (try policy.value.identity(runtime.alloc))[0..],
+        .source_fingerprint = @import("../../../privacy/contract.zig").fingerprint(item.source_text)[0..],
+        .error_code = @errorName(err),
+    } }, .{});
+    defer runtime.alloc.free(marker);
+    // Asset skip-state is local recovery metadata, never a serving witness.
+    // A JSON failure marker cannot match its successful 32-byte skip digest;
+    // explicit retry/new source work therefore cannot reuse a failed result.
+    try storePutPrivateBatchWithRetry(runtime, &runtime.store, &.{.{ .key = item.state_key, .value = marker }}, &.{});
+}
+
 fn flushAssetProducerBatchItems(
     runtime: *EnrichmentRuntime,
     items: []AssetProducerBatchItem,
@@ -16061,7 +16283,7 @@ fn flushAssetProducerBatchItems(
                         retry_error = failure.cause;
                         scope.deferRetry(failure.cause);
                     }
-                } else try recordIsolatedRequestErrorFor(runtime, window, item.request, failure.cause, scope.attemptNumber(runtime));
+                } else try recordAssetProducerFailure(runtime, window, item.*, failure.cause, scope.attemptNumber(runtime));
             },
             .value => |output| {
                 applyAssetProducerBatchOutput(runtime, item, output, window) catch |err| {
@@ -16075,7 +16297,7 @@ fn flushAssetProducerBatchItems(
                             retry_error = err;
                             scope.deferRetry(err);
                         }
-                    } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, scope.attemptNumber(runtime));
+                    } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime));
                     continue;
                 };
                 runtime.alloc.free(output);
@@ -16139,7 +16361,7 @@ fn flushIndexDocumentBatch(runtime: *EnrichmentRuntime, producer: asset_producer
                         retry_error = err;
                         scope.deferRetry(err);
                     }
-                } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, scope.attemptNumber(runtime));
+                } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime));
                 continue;
             };
             applyAssetProducerBatchOutput(runtime, item, bytes, window) catch |err| {
@@ -16153,7 +16375,7 @@ fn flushIndexDocumentBatch(runtime: *EnrichmentRuntime, producer: asset_producer
                         retry_error = err;
                         scope.deferRetry(err);
                     }
-                } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, scope.attemptNumber(runtime));
+                } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime));
             };
         }
         offset += count;
@@ -16180,7 +16402,7 @@ fn flushAssetProducerBatchSequential(
                     retry_error = err;
                     scope.deferRetry(err);
                 }
-            } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, scope.attemptNumber(runtime));
+            } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime));
             continue;
         };
         defer runtime.alloc.free(produced);
@@ -16195,7 +16417,7 @@ fn flushAssetProducerBatchSequential(
                     retry_error = err;
                     scope.deferRetry(err);
                 }
-            } else try recordIsolatedRequestErrorFor(runtime, window, item.request, err, scope.attemptNumber(runtime));
+            } else try recordAssetProducerFailure(runtime, window, item.*, err, scope.attemptNumber(runtime));
         };
     }
     if (retry_error) |err| return err;
@@ -17104,12 +17326,40 @@ fn applyAssetProducerBatchOutput(
     produced: []const u8,
     window: *GeneratedReplayWindow,
 ) !void {
-    if (item.producer_context) |*value| return enqueueAssetProducerOutput(runtime, item.request, value, item.artifact_key, produced);
-    const writes = [_]KVPair{
-        .{ .key = item.artifact_key, .value = produced },
+    const privacy_output = try @import("../../../privacy/materialize.zig").output(runtime.alloc, item.source_text, item.request.producer_json, produced);
+    defer if (privacy_output) |value| runtime.alloc.free(value);
+    const validated = privacy_output orelse produced;
+    if (item.producer_context) |*value| return enqueueAssetProducerOutput(runtime, item.request, value, item.artifact_key, validated);
+    var writes: std.ArrayListUnmanaged(KVPair) = .empty;
+    defer writes.deinit(runtime.alloc);
+    try writes.appendSlice(runtime.alloc, &.{
+        .{ .key = item.artifact_key, .value = validated },
         .{ .key = item.state_key, .value = item.state_value },
-    };
-    try storePutBatch(runtime, &writes, &.{});
+    });
+    var witness_key: ?[]u8 = null;
+    defer if (witness_key) |value| runtime.alloc.free(value);
+    var witness: [192]u8 = undefined;
+    const private_consumer_version = @import("../../../privacy/document.zig").consumerPolicyVersion(requestArtifactName(item.request));
+    if (@import("../../../privacy/document.zig").isArtifactName(requestArtifactName(item.request)) or private_consumer_version != null) {
+        // Legacy/local producers have no ordered authority. A replicated
+        // owner must never fall back to a locally minted serving witness.
+        var read = try runtime.store.beginProbe();
+        defer read.abort();
+        if (try @import("../../source_authority.zig").maintenanceMode(&read) != .local) return error.ArtifactPublicationPending;
+        const privacy = @import("../../../privacy/document.zig");
+        const version = private_consumer_version orelse blk: {
+            var tree = try std.json.parseFromSlice(std.json.Value, runtime.alloc, item.config_json, .{});
+            defer tree.deinit();
+            var policy = try std.json.parseFromValue(privacy.contract.Policy, runtime.alloc, tree.value.object.get(privacy.config_key).?, .{});
+            defer policy.deinit();
+            break :blk try policy.value.identity(runtime.alloc);
+        };
+        const local = @import("../../../privacy/local_publication.zig");
+        witness_key = try local.key(runtime.alloc, item.artifact_key);
+        witness = local.encode(version, if (private_consumer_version != null) item.raw_doc else item.source_text, validated);
+        try writes.append(runtime.alloc, .{ .key = witness_key.?, .value = &witness });
+    }
+    try storePutBatch(runtime, writes.items, &.{});
     try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, item.artifact_key);
 
     const artifact_name = requestArtifactName(item.request);
@@ -17118,9 +17368,9 @@ fn applyAssetProducerBatchOutput(
         for (text_indexes) |name| runtime.alloc.free(name);
         runtime.alloc.free(text_indexes);
     }
-    try appendInlineFullTextDocumentToWindow(runtime, window, item.artifact_key, produced, text_indexes);
-    try materializeGraphAssetForRuntime(runtime, item.request, produced, item.raw_doc, window);
-    recordArtifactBytes(runtime, .asset, produced.len);
+    try appendInlineFullTextDocumentToWindow(runtime, window, item.artifact_key, validated, text_indexes);
+    try materializeGraphAssetForRuntime(runtime, item.request, validated, item.raw_doc, window);
+    recordArtifactBytes(runtime, .asset, validated.len);
     try queueArtifactCoverageOutcomeForRequest(runtime, window, item.request, .produced);
     try retireIndexDocumentCheckpoint(runtime, item.request, null);
 }
@@ -28073,9 +28323,12 @@ fn processOrderedChunkVectorRequest(
 
 /// Accepted streams advance through the reserved publication control lane.
 /// No local write/queue acknowledgement can replace the ordered census page.
-/// False requests materialization; true still means replay must remain pending
-/// until upstream closure and obligation discharge have been certified.
-fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, limits: @import("../artifact_stream_census.zig").Limits) !bool {
+/// Materialization and queued census pages keep replay pending. A current
+/// owner-accepted stream closure releases this request; document and physical
+/// projection obligations retain their independent completion witnesses.
+const OrderedChunkVectorProgress = enum { materialize, pending, complete };
+
+fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, request: enrichment_types.GeneratedEnrichmentRequest, limits: @import("../artifact_stream_census.zig").Limits) !OrderedChunkVectorProgress {
     const progress = @import("../artifact_stream_progress.zig");
     var encoded: ?[]u8 = null;
     defer if (encoded) |bytes| alloc.free(bytes);
@@ -28085,7 +28338,7 @@ fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, 
         defer if (runtime.coverage_apply_mutex) |mutex| mutex.unlockShared();
         var read = try runtime.store.beginRead();
         defer read.abort();
-        if (try ordered_publication.authority(&read) == null) return false;
+        if (try ordered_publication.authority(&read) == null) return .materialize;
         try @import("../artifact_reprocess_intent.zig").requireEmbeddingGeneration(alloc, &read, request.doc_key, requestEmbeddingName(request), request.producer_json, request.reprocess_generation);
         if (runtime.config.root_incarnation == 0) return error.DurableRootIncarnationUnavailable;
         const fence = try requiredRuntimeStoreWriteFence(runtime);
@@ -28094,9 +28347,19 @@ fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, 
         defer plan.release();
         var borrowed: @import("../artifact_chunk_cursor.zig").BorrowedRead = .{ .read = &read };
         var prepared = (progress.prepare(alloc, &borrowed, runtime.config.root_incarnation, request, plan.plan(), limits, null) catch |err| switch (err) {
-            error.ArtifactPublicationPending => return false,
+            error.ArtifactPublicationPending => return .materialize,
             else => return err,
-        }) orelse return true;
+        }) orelse {
+            // Enumeration is not enough: advance replay only after the owner
+            // accepted a closed stream with current causal inputs. This does
+            // not discharge the independent document or projection obligations.
+            var closure = progress.prepareClosure(alloc, &borrowed, runtime.config.root_incarnation, request, plan.plan()) catch |err| switch (err) {
+                error.ArtifactPublicationPending => return .pending,
+                else => return err,
+            };
+            defer closure.deinit();
+            return .complete;
+        };
         defer prepared.deinit();
         const command = try progress.commandFor(&prepared, request, plan.plan(), limits);
         namespace = command.namespace;
@@ -28106,7 +28369,7 @@ fn driveOrderedChunkVectorCensus(runtime: *EnrichmentRuntime, alloc: Allocator, 
     // touching the dispatcher. Queue refusal leaves durable progress unchanged.
     const dispatcher = runtime.artifact_publication_dispatcher orelse return error.ArtifactCatalogDrift;
     try dispatcher.submit(namespace, encoded.?);
-    return true;
+    return .pending;
 }
 
 // Bind newly embedded retained text to the actual provider generation, so a
@@ -28150,7 +28413,11 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
             };
         }
     }
-    if (!verify_text_generation and try driveOrderedChunkVectorCensus(runtime, alloc, request, .{})) return error.ArtifactPublicationPending;
+    if (!verify_text_generation) switch (try driveOrderedChunkVectorCensus(runtime, alloc, request, .{})) {
+        .complete => return true,
+        .pending => return error.ArtifactPublicationPending,
+        .materialize => {},
+    };
     const publication = @import("../artifact_chunk_vector_publication.zig");
     const logical = @import("../artifact_chunk_cursor.zig");
     const Candidates = @import("../artifact_chunk_vector_cursor.zig").Cursor(logical.BorrowedRead);
@@ -28417,7 +28684,9 @@ fn processOrderedChunkVectorWithAllocator(runtime: *EnrichmentRuntime, alloc: Al
     // An independent text consumer can outlive the parent's model recipe.
     // Verify every accepted vector against its current provider generation
     // before permitting the census driver to certify these proofs.
-    if (verify_text_generation and !publishing) _ = try driveOrderedChunkVectorCensus(runtime, alloc, request, .{});
+    if (verify_text_generation and !publishing) {
+        if (try driveOrderedChunkVectorCensus(runtime, alloc, request, .{}) == .complete) return true;
+    }
     // Enumerating members is not an exact-input stream-completion certificate.
     // Keep replay/obligations pending until the ordered reconciliation driver
     // certifies this stream, including a stable empty generation.
@@ -30388,7 +30657,7 @@ fn processOrderedChunkText(runtime: *EnrichmentRuntime, request: enrichment_type
             const upstream = runtime.index_manager.getEnrichment(.asset, request.upstream_artifact_name) orelse return error.InvalidEnrichmentConfig;
             var producer = try asset_producer_mod.parseProducerConfig(runtime.alloc, upstream.producer_json);
             defer producer.deinit(runtime.alloc);
-            if (producer.type != .media_output) return error.OnlineMergeArtifactTailsUnsupported;
+            if (producer.type != .media_output and !@import("../../../privacy/document.zig").isProtectedArtifactName(upstream.name) and @import("../../../privacy/document.zig").consumerPolicyVersion(upstream.name) == null) return error.OnlineMergeArtifactTailsUnsupported;
         }
         var plan = try runtime.index_manager.acquireWritePlanSnapshot();
         defer plan.release();
@@ -30646,7 +30915,8 @@ fn processChunkText(
     };
     if (ordered) return;
 
-    const chunks = (try getOrCreateRequestChunksWithProbe(runtime, request, chunk_cache, null, prepared_sources)).chunks;
+    const chunk_source = try getOrCreateRequestChunksWithProbe(runtime, request, chunk_cache, null, prepared_sources);
+    const chunks = chunk_source.chunks;
 
     const artifact_name = requestArtifactName(request);
     const include_default_full_text = request.full_text_index or
@@ -30705,12 +30975,28 @@ fn processChunkText(
     }
 
     if (persist_chunks) {
-        const writes = try runtime.alloc.alloc(KVPair, chunks.len);
-        defer runtime.alloc.free(writes);
-        for (prepared_chunks.?.mutations, writes) |row, *write| write.* = .{ .key = row.key, .value = row.value.? };
-
-        try storePutBatchWithRetry(runtime, writes, &.{});
-        for (writes) |write| {
+        var writes: std.ArrayListUnmanaged(KVPair) = .empty;
+        defer writes.deinit(runtime.alloc);
+        var witness_keys: std.ArrayListUnmanaged([]u8) = .empty;
+        defer {
+            for (witness_keys.items) |key| runtime.alloc.free(key);
+            witness_keys.deinit(runtime.alloc);
+        }
+        const witnesses = try runtime.alloc.alloc([192]u8, chunks.len);
+        defer runtime.alloc.free(witnesses);
+        const version = @import("../../../privacy/document.zig").consumerPolicyVersion(artifact_name);
+        for (prepared_chunks.?.mutations, 0..) |row, i| {
+            try writes.append(runtime.alloc, .{ .key = row.key, .value = row.value.? });
+            if (version) |policy_version| {
+                const local = @import("../../../privacy/local_publication.zig");
+                const key = try local.key(runtime.alloc, row.key);
+                try witness_keys.append(runtime.alloc, key);
+                witnesses[i] = local.encodeDigest(policy_version, chunk_source.source_record_digest orelse return error.EnrichmentSourceChanged, row.value.?);
+                try writes.append(runtime.alloc, .{ .key = key, .value = &witnesses[i] });
+            }
+        }
+        try storePutBatchWithRetry(runtime, writes.items, &.{});
+        for (prepared_chunks.?.mutations) |write| {
             try appendUniqueIndexedRuntimeKey(runtime.alloc, &window.changed_artifact_keys, &window.changed_artifact_key_index, write.key);
         }
     }
@@ -32744,6 +33030,34 @@ fn shouldSkipAssetArtifact(runtime: *EnrichmentRuntime, artifact_key: []const u8
         return true;
     }
     return false;
+}
+
+/// Native restore retains artifact bodies and producer skip state, but never
+/// imports standalone publication authority. Missing/stale witnesses require
+/// ordinary producer execution and its atomic output/witness commit.
+fn reusablePrivateAsset(runtime: *EnrichmentRuntime, name: []const u8, artifact: []const u8, source: []const u8, primary: []const u8, config_json: []const u8, output: []const u8) !bool {
+    const privacy = @import("../../../privacy/document.zig");
+    const consumer_version = privacy.consumerPolicyVersion(name);
+    if (!privacy.isArtifactName(name) and consumer_version == null) return true;
+    var arena = std.heap.ArenaAllocator.init(runtime.alloc);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const version = consumer_version orelse if (privacy.isProtectedArtifactName(name)) name[privacy.protected_artifact_prefix.len..][0..64].* else resolved: {
+        const tree = try std.json.parseFromSliceLeaky(std.json.Value, a, config_json, .{});
+        if (tree != .object) return error.InvalidPrivacyProducer;
+        const policy = try std.json.parseFromValueLeaky(privacy.contract.Policy, a, tree.object.get(privacy.config_key) orelse return error.InvalidPrivacyProducer, .{});
+        break :resolved try policy.identity(a);
+    };
+    var read = try runtime.store.beginProbe();
+    defer read.abort();
+    if (try @import("../../source_authority.zig").maintenanceMode(&read) != .local or try ordered_publication.authority(&read) != null) return false;
+    const current = read.get(artifact) catch |err| if (err == error.NotFound) return false else return err;
+    if (!std.mem.eql(u8, current, output)) return false;
+    @import("../../../privacy/local_publication.zig").require(a, &read, artifact, version, if (consumer_version != null) primary else source, output) catch |err| switch (err) {
+        error.PrivacyPublicationPending, error.PrivacyStale => return false,
+        else => return err,
+    };
+    return true;
 }
 
 fn shouldSkipAssetProducer(runtime: *EnrichmentRuntime, state_key: []const u8, expected_state: []const u8) !bool {
@@ -38857,7 +39171,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
                     break :blk (try stream_progress.prepare(alloc, &snapshot, db.root_incarnation, vector_request, plan.plan(), .{ .visits = 1 }, null)) orelse break;
                 };
                 defer prepared.deinit();
-                try std.testing.expect(try driveOrderedChunkVectorCensus(runtime, alloc, vector_request, .{ .visits = 1 }));
+                try std.testing.expectEqual(OrderedChunkVectorProgress.pending, try driveOrderedChunkVectorCensus(runtime, alloc, vector_request, .{ .visits = 1 }));
                 {
                     var queued = try @import("../artifact_publication_transport_codec.zig").decodeBorrowed(alloc, progress_harness.encoded.?);
                     defer queued.deinit();
@@ -38911,7 +39225,7 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
             }
             try std.testing.expect(committed_pages != 0);
             try std.testing.expectEqual(committed_pages, progress_harness.calls);
-            try std.testing.expect(try driveOrderedChunkVectorCensus(runtime, alloc, vector_request, .{ .visits = 1 }));
+            try std.testing.expectEqual(OrderedChunkVectorProgress.complete, try driveOrderedChunkVectorCensus(runtime, alloc, vector_request, .{ .visits = 1 }));
             try std.testing.expectEqual(committed_pages, progress_harness.calls);
         }
         {
@@ -38974,8 +39288,15 @@ fn testOrderedChunkVectorCallback(dense: bool) !void {
             try std.testing.expect((try stream_progress.load(&snapshot, db.root_incarnation, vector_request, plan.plan())).?.closed);
             try std.testing.expect((try ordered_publication.rejected(&snapshot, live_command)) == null);
             const calls = harness.calls;
-            try std.testing.expectError(error.ArtifactPublicationPending, harness.process(runtime, vector_request, &window, dense));
+            // A current owner-accepted stream closes this replay request. The
+            // document's independent obligations remain in their registry.
+            const pending_work = (try @import("../artifact_producer_obligations.zig").load(&snapshot)).?.pending_documents;
+            try std.testing.expect(pending_work != 0);
+            try harness.process(runtime, vector_request, &window, dense);
             try std.testing.expectEqual(calls, harness.calls);
+            var after = try db.core.store.beginReadTxn();
+            defer after.abort();
+            try std.testing.expectEqual(pending_work, (try @import("../artifact_producer_obligations.zig").load(&after)).?.pending_documents);
         }
     }
     try std.testing.expectEqual(@as(usize, 0), window.sparse_embeddings.items.len);

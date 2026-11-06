@@ -1415,3 +1415,105 @@ def test_memory_evaluation_pages_and_indexed_candidates_with_admin_key(storage_e
             time.sleep(0.1)
     finally:
         server.stop()
+
+
+@pytest.mark.e2e_resource("antfly_process")
+@pytest.mark.parametrize("fixture_name", ["auth_api", "stateful_auth_api"])
+def test_privacy_scoped_routes_and_permissions(request, fixture_name):
+    """Every privacy operation selects and authorizes the explicit table scope."""
+    api = request.getfixturevalue(fixture_name)
+    admin = _basic_auth("admin", AUTH_BOOTSTRAP_PASSWORD)
+    api.s.headers["Authorization"] = admin
+    api.post("/databases/privacy_tenant", {})
+    api.post("/databases/privacy_tenant/namespaces/serving", {})
+    scoped = "/databases/privacy_tenant/namespaces/serving/tables/notes"
+    literal = "/tables/notes"
+    policy = {"mode": "monitor", "fields": ["absent"]}
+    for path in (literal, scoped):
+        api.post(path, {"num_shards": 1})
+        api.post(
+            path + "/batch",
+            {"inserts": {"doc": {"value": path}}, "sync_level": "full_index"},
+        )
+    api.post(
+        "/auth/v1/users/privacy_curator",
+        {
+            "password": "curator",
+            "initial_policies": [
+                {
+                    "table_target": {
+                        "database": "privacy_tenant",
+                        "namespace": "serving",
+                        "table": "notes",
+                    },
+                    "resource_type": "table",
+                    "type": "admin",
+                }
+            ],
+        },
+    )
+    api.post(
+        "/auth/v1/users/privacy_reader",
+        {
+            "password": "reader",
+            "initial_policies": [
+                {
+                    "table_target": {
+                        "database": "privacy_tenant",
+                        "namespace": "serving",
+                        "table": "notes",
+                    },
+                    "resource_type": "table",
+                    "type": "read",
+                }
+            ],
+        },
+    )
+    path = scoped + "/privacy"
+    api.s.headers["Authorization"] = _basic_auth("privacy_curator", "curator")
+    assert not api.get(path)["configured"]
+    preview_body = {"policy": policy, "sample": {"keys": ["doc"]}}
+    preview = api.post(path + "/preview", preview_body)
+    assert preview["documents"][0]["fields"][0]["findings"] == []
+    saved = api.put(path, policy)
+    scan = api.post(path + "/scans", {"limit": 1})
+    assert api.get(path + "/scans/" + scan["scan_id"])["scan_id"] == scan["scan_id"]
+    assert api.get(path + "/findings")["findings"] == []
+    assert api.post(path + "/findings", {"limit": 1})["findings"] == []
+    operations = [
+        ("GET", "", None),
+        ("PUT", "", policy),
+        ("POST", "/preview", preview_body),
+        ("POST", "/scans", {}),
+        ("GET", "/scans/" + scan["scan_id"], None),
+        ("GET", "/findings", None),
+        ("POST", "/findings", {"limit": 1}),
+    ]
+    # A table read grant cannot inspect policies/findings; the scoped admin
+    # grant cannot administer an identically named default.public table.
+    for auth, base in (
+        (_basic_auth("privacy_reader", "reader"), path),
+        (_basic_auth("privacy_curator", "curator"), literal + "/privacy"),
+    ):
+        api.s.headers["Authorization"] = auth
+        for method, suffix, body in operations:
+            response = api.s.request(
+                method, api.url + base + suffix, json=body, timeout=30
+            )
+            assert response.status_code == 403, (method, base + suffix, response.text)
+    api.s.headers["Authorization"] = admin
+    assert not api.get(literal + "/privacy")["configured"]
+    assert api.get(path)["policy_version"] == saved["policy_version"]
+    # The public lifecycle remains terminal across A -> B -> A, even if the
+    # background worker completed the job before either replacement.
+    for replacement in ({**policy, "replacement": "mask"}, policy):
+        before = api.get(path)
+        response = api.s.put(
+            api.url + path,
+            json=replacement,
+            headers={"If-Match": before["etag"]},
+            timeout=30,
+        )
+        assert response.status_code == 202, response.text
+        assert api.get(path + "/scans/" + saved["scan_id"])["phase"] == "superseded"
+    assert api.get(path)["policy_version"] == saved["policy_version"]

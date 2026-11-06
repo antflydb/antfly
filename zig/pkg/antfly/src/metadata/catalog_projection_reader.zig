@@ -81,10 +81,12 @@ pub const CatalogProjectionReader = struct {
         ranges: []metadata_table_manager.RangeRecord = &.{},
         index: metadata_api.CatalogProjectionIndex = .{},
         table_name_indexes: std.StringHashMapUnmanaged(usize) = .empty,
+        privacy_policy_versions: []?[64]u8 = &.{},
         table_range_spans: std.AutoHashMapUnmanaged(u64, RangeSpan) = .empty,
 
         pub fn deinit(self: *Snapshot, alloc: std.mem.Allocator) void {
             self.table_name_indexes.deinit(alloc);
+            alloc.free(self.privacy_policy_versions);
             self.table_range_spans.deinit(alloc);
             self.index.deinit(alloc);
             freeTables(alloc, self.tables);
@@ -459,6 +461,18 @@ pub const CatalogProjectionReader = struct {
     /// Clone only one table and its ranges from the shared immutable cache.
     /// Indexed lookup is constant-time and allocation/copy cost scales with
     /// the selected table rather than total tenant count.
+    pub fn privacyPolicyBinding(self: *CatalogProjectionReader, alloc: std.mem.Allocator, metadata_group_id: u64, source: Source, table_name: []const u8, deadline_ns: ?u64) !metadata_api.PrivacyPolicyBinding {
+        var lease = try self.snapshotLease(alloc, metadata_group_id, source, deadline_ns);
+        defer lease.deinit();
+        const snapshot = lease.snapshot();
+        const version = if (snapshot.table_name_indexes.get(table_name)) |index|
+            snapshot.privacy_policy_versions[index] orelse return error.InvalidPrivacyCatalog
+        else
+            @as([64]u8, @splat(0));
+        try ensureBeforeDeadline(deadline_ns);
+        return .{ .metadata_group_id = metadata_group_id, .metadata_incarnation = snapshot.metadata_incarnation, .catalog_revision = snapshot.catalog_revision, .policy_version = version };
+    }
+
     pub fn tableRoutingSnapshot(
         self: *CatalogProjectionReader,
         alloc: std.mem.Allocator,
@@ -640,8 +654,13 @@ pub const CatalogProjectionReader = struct {
         );
         try snapshot.table_name_indexes.ensureTotalCapacity(alloc, @intCast(snapshot.tables.len));
         try snapshot.table_range_spans.ensureTotalCapacity(alloc, @intCast(snapshot.tables.len));
+        snapshot.privacy_policy_versions = try alloc.alloc(?[64]u8, snapshot.tables.len);
         for (snapshot.tables, 0..) |table, index| {
             if (index % 64 == 0) try ensureBeforeDeadline(deadline_ns);
+            snapshot.privacy_policy_versions[index] = @import("antfly_local_sources").privacy_catalog.policyBinding(alloc, table.indexes_json) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => null, // A malformed policy fails only this table's fence.
+            };
             if (snapshot.table_name_indexes.contains(table.name)) return error.InvalidCatalogProjection;
             snapshot.table_name_indexes.putAssumeCapacity(table.name, index);
         }
@@ -1399,4 +1418,73 @@ test "catalog retained WAL replay preserves durable metadata while applied water
     }
     try std.testing.expectEqual(@as(u64, 5), wal.appliedIndex());
     try std.testing.expectEqual(@as(u64, 5), node.status().applied_index);
+}
+
+test "privacy compact bindings exclude retained job bytes and refresh at semantic publication" {
+    const a = std.testing.allocator;
+    var fixtures = std.heap.ArenaAllocator.init(a);
+    defer fixtures.deinit();
+    const f = fixtures.allocator();
+    const catalog = @import("antfly_local_sources").privacy_catalog;
+    var resource = try catalog.next(f, null, .{ .mode = .redact_for_search_and_ai, .fields = &.{"body"} }, null);
+    const key = try f.alloc(u8, 900 * 1024);
+    @memset(key, 'k');
+    const raw = try std.json.Stringify.valueAlloc(f, .{ .key = key, .error_code = "Failed" }, .{});
+    const failure = try std.json.parseFromSliceLeaky(std.json.Value, f, raw, .{});
+    var details: std.json.Value = .{ .array = std.array_list.Managed(std.json.Value).init(f) };
+    try details.array.append(failure);
+    for (0..16) |_| _ = try catalog.startScan(f, &resource, "", "", 100);
+    for (@constCast(resource.scans)) |*scan| {
+        scan.phase = .failed;
+        scan.failures = details;
+        scan.failed = 1;
+    }
+    const Fixture = struct {
+        indexes: []const u8,
+        epoch_value: u64 = 1,
+        captures: usize = 0,
+        fn listen(_: *anyopaque) !void {}
+        fn epoch(ptr: *anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.epoch_value;
+        }
+        fn capture(ptr: *anyopaque, alloc: std.mem.Allocator, _: u64, _: ?u64) !metadata_storage.CatalogProjectionSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.captures += 1;
+            const tables = try alloc.alloc(metadata_table_manager.TableRecord, 2);
+            errdefer alloc.free(tables);
+            tables[0] = try metadata_table_manager.cloneTable(alloc, .{ .table_id = 7, .name = "docs", .schema_json = "{}", .indexes_json = self.indexes });
+            errdefer metadata_table_manager.freeTable(alloc, tables[0]);
+            tables[1] = try metadata_table_manager.cloneTable(alloc, .{ .table_id = 8, .name = "bad", .schema_json = "{}", .indexes_json = "{\"_privacy\":{}}" });
+            return .{ .metadata_incarnation = @splat('1'), .catalog_revision = self.epoch_value, .tables = tables, .ranges = &.{} };
+        }
+    };
+    var fixture = Fixture{ .indexes = try catalog.install(f, "{}", resource) };
+    const source: CatalogProjectionReader.Source = .{ .ptr = &fixture, .vtable = &.{ .ensure_listener_registered = Fixture.listen, .catalog_epoch = Fixture.epoch, .capture_projection = Fixture.capture } };
+    var reader: CatalogProjectionReader = .{};
+    defer reader.deinit(a);
+    const first = try reader.privacyPolicyBinding(a, 9, source, "docs", null);
+    try std.testing.expectEqual(resource.policy_version, first.policy_version);
+    try std.testing.expectEqual(@as(u64, 1), first.catalog_revision);
+    var budget = @import("antfly_inference_work").BoundedInvocationAllocator.init(a, 0);
+    for (0..100) |_| {
+        const result = try reader.privacyPolicyBinding(budget.allocator(), 9, source, "docs", null);
+        try std.testing.expectEqual(first.policy_version, result.policy_version);
+    }
+    try std.testing.expectEqual(@as(usize, 0), budget.peak_live_bytes);
+    try std.testing.expectEqual(@as(usize, 1), fixture.captures);
+    try std.testing.expectError(error.InvalidPrivacyCatalog, reader.privacyPolicyBinding(a, 9, source, "bad", null));
+    const missing = try reader.privacyPolicyBinding(budget.allocator(), 9, source, "missing", null);
+    try std.testing.expect(std.mem.allEqual(u8, &missing.policy_version, 0));
+    std.debug.print("\nPrivacy compact binding catalog_bytes={} warm_capture_peak_bytes={} reads=100\n", .{ fixture.indexes.len, budget.peak_live_bytes });
+    // A semantic replacement must invalidate the cached binding, while a bad
+    // neighbor table cannot poison the healthy table's metadata generation.
+    const monitor = try catalog.next(f, resource, .{ .mode = .monitor, .fields = &.{"body"} }, try catalog.etag(f, resource));
+    fixture.indexes = try catalog.install(f, fixture.indexes, monitor);
+    fixture.epoch_value += 1;
+    const replaced = try reader.privacyPolicyBinding(a, 9, source, "docs", null);
+    try std.testing.expect(std.mem.allEqual(u8, &replaced.policy_version, 0));
+    try std.testing.expectEqual(@as(u64, 2), replaced.catalog_revision);
+    try std.testing.expectEqual(@as(usize, 2), fixture.captures);
+    try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, reader.privacyPolicyBinding(a, 9, source, "docs", 1));
 }

@@ -4058,7 +4058,7 @@ fn requireGlinerSpecialtyRequest(profile: gliner_specialty.Profile, request: *co
             }
         }
         if (!has_text) return error.InvalidExtractionRequest;
-        if (item.options.long_document.mode == .window) return error.UnsupportedGlinerSpanLongDocument;
+        if (profile == .gliguard and item.options.long_document.mode == .window) return error.UnsupportedGlinerSpanLongDocument;
         if (schema.relations.len != 0 or schema.entity_attributes.len != 0 or schema.structures.len != 0 or schema.joint_ie != null)
             return error.UnsupportedGlinerSpanV2Task;
         switch (profile) {
@@ -12166,9 +12166,9 @@ pub const Node = struct {
             try requireGlinerSpecialtyRequest(profile, request);
             options.modern_span_extraction = false;
             options.specialty_profile = profile;
-            options.span_extraction_profile = if (profile == .pii) .{ .omitted_overlap = .legacy_greedy } else null;
+            options.span_extraction_profile = if (profile == .pii) .{ .omitted_overlap = .legacy_greedy, .allow_long_documents = true } else null;
             options.max_prompt_tokens = 0;
-            options.max_sequences_per_item = 1;
+            options.max_sequences_per_item = if (profile == .pii) 64 else 1;
         }
         try span_v2_executor.preflight(request, options);
         failure.* = .{ .stage = "model" };
@@ -12279,7 +12279,7 @@ pub const Node = struct {
         for (request_plan.items) |item| prepared_sequences += item.batches.len;
         if (qualified_identity) |identity|
             try gliner_decide_qualification.requireRequestIdentity(identity, qualified_backend, request.items.len, prepared_sequences, longest);
-        if (specialty_candidate != null and (longest > 512 or prepared_sequences != request.items.len))
+        if (specialty_candidate != null and (longest > 512 or (specialty_candidate == .gliguard and prepared_sequences != request.items.len)))
             return error.UnsupportedGlinerDecisionGeometry;
         try validateTextExecutorInvocation(executor_contract, texts.len, texts, 0, longest, max_labels, 0);
         // The authenticated FP32 and Q8 CUDA Decide artifacts declare independent padded
@@ -12293,7 +12293,7 @@ pub const Node = struct {
         }
         const span_geometry: ?span_v2_executor.SpanExtractionGeometry = if (specialty_candidate == .pii) geometry: {
             var shape = try span_v2_executor.maxSpanExtractionGeometry(request, &request_plan, options.span_extraction_profile.?);
-            shape.batch_items = span_v2_executor.extractionBatchItems(request, &request_plan, options);
+            shape.batch_items = span_v2_executor.physicalSpanBatchItems(request, &request_plan, options);
             break :geometry shape;
         } else null;
         const additional_host_bytes = if (span_geometry) |geometry|

@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const byte_copy = @import("../../common/byte_copy.zig");
 const Allocator = std.mem.Allocator;
 const backend_adapter = @import("../backend_adapter.zig");
 const backend_types = @import("../backend_types.zig");
@@ -466,7 +467,7 @@ pub const State = struct {
 
         for (0..self.entryCount()) |i| {
             const entry = self.entryAt(i);
-            if (std.mem.order(u8, entry.key, split_key) == .lt) {
+            if (byte_copy.orderBytes(entry.key, split_key) == .lt) {
                 left.entries.appendAssumeCapacity(try cloneEntry(allocator, entry));
             } else {
                 right.entries.appendAssumeCapacity(try cloneEntry(allocator, entry));
@@ -596,8 +597,8 @@ pub const ActiveMemTable = struct {
         for (0..self.entryCount()) |entry_index| {
             const entry = self.entryAt(entry_index);
             if (compareNamespace(namespaceOf(entry), namespace) != .eq) continue;
-            if (std.mem.order(u8, entry.key, lower) == .lt) continue;
-            if (std.mem.order(u8, entry.key, upper) != .lt) continue;
+            if (byte_copy.orderBytes(entry.key, lower) == .lt) continue;
+            if (byte_copy.orderBytes(entry.key, upper) != .lt) continue;
             selected += 1;
         }
 
@@ -609,8 +610,8 @@ pub const ActiveMemTable = struct {
         for (0..self.entryCount()) |entry_index| {
             const entry = self.entryAt(entry_index);
             if (compareNamespace(namespaceOf(entry), namespace) != .eq) continue;
-            if (std.mem.order(u8, entry.key, lower) == .lt) continue;
-            if (std.mem.order(u8, entry.key, upper) != .lt) continue;
+            if (byte_copy.orderBytes(entry.key, lower) == .lt) continue;
+            if (byte_copy.orderBytes(entry.key, upper) != .lt) continue;
             out.entries.appendAssumeCapacity(try initArenaEntry(
                 arena_allocator,
                 namespaceOf(entry),
@@ -923,13 +924,13 @@ pub fn compareNamespace(a: backend_types.Namespace, b: backend_types.Namespace) 
     if (a.name == null and b.name == null) return .eq;
     if (a.name == null) return .lt;
     if (b.name == null) return .gt;
-    return std.mem.order(u8, a.name.?, b.name.?);
+    return byte_copy.orderBytes(a.name.?, b.name.?);
 }
 
 pub fn compareEntryTo(entry: OwnedEntry, namespace: backend_types.Namespace, key: []const u8) std.math.Order {
     const namespace_order = compareNamespace(namespaceOf(entry), namespace);
     if (namespace_order != .eq) return namespace_order;
-    return std.mem.order(u8, entry.key, key);
+    return byte_copy.orderBytes(entry.key, key);
 }
 
 pub fn applyState(target: *State, allocator: Allocator, source: anytype) !void {
@@ -944,7 +945,7 @@ pub fn sortStateEntries(state: *State) void {
         fn lessThan(_: void, a: OwnedEntry, b: OwnedEntry) bool {
             const namespace_order = compareNamespace(namespaceOf(a), namespaceOf(b));
             if (namespace_order != .eq) return namespace_order == .lt;
-            return std.mem.order(u8, a.key, b.key) == .lt;
+            return byte_copy.orderBytes(a.key, b.key) == .lt;
         }
     }.lessThan);
 }

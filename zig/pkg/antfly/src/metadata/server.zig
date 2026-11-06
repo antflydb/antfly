@@ -334,6 +334,7 @@ pub const MetadataServer = struct {
                 };
             }
             api_server_cfg.restore_owner_progress_generation = &svc.restore_owner_progress_generation;
+            api_server_cfg.privacy_scan_coordinator = true;
             api_server_cfg.configureRemoteCatalogPublicationAuthority();
             // Restore-owner and durable-session RPCs share the same owned
             // data-bearing routes and transport as ordinary hosted reads and
@@ -698,6 +699,7 @@ fn metadataAdminHttpxConfig(
         .host = cfg.bind_host,
         .port = cfg.bind_port,
         .max_body_size = cfg.max_request_bytes,
+        .max_route_body_size = @max(cfg.max_request_bytes, @import("antfly_public_limits").max_route_body_bytes),
         .header_read_timeout_ms = cfg.header_read_timeout_ms,
         .body_read_timeout_ms = cfg.body_read_timeout_ms,
         .response_write_timeout_ms = cfg.header_read_timeout_ms,
@@ -2165,7 +2167,7 @@ fn metadataJobStateCas(ptr: *anyopaque, key: []const u8, expected: ?[]const u8, 
     }
     _ = try svc.proposeTransitionCommandAndWaitAppliedInTerm(.{ .compare_and_set_job_state = .{ .key = key, .expected_hash = expected orelse "", .value = value } }, term);
     const store = svc.projectedStore() orelse return error.MissingMetadataStore;
-    const current = (try store.getJobState(svc.alloc, svc.metadata_group_id, key)) orelse return false;
+    const current = (try store.getJobState(svc.alloc, svc.metadata_group_id, key)) orelse return std.mem.startsWith(u8, key, "privacy/") and std.mem.eql(u8, value, "\x00");
     defer svc.alloc.free(current);
     return std.mem.eql(u8, current, value);
 }

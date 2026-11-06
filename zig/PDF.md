@@ -1918,24 +1918,57 @@ indirect values. Unassigned ParentTree slots treat direct and indirect null
 equally; parent links still require real structure elements. Named property
 lookups at BDC remain logarithmic. Sparse scopes select names through a shared
 dictionary index; dense scopes reuse its sorted order in one pass.
-Named replacement strings retain their encoded bytes and decode only when
-selected. A bounded page-local cache shares each decoded string, including
+Named replacement strings decode only when selected. Direct dictionaries larger than 96 encoded bytes in
+indirect property tables retain source locations rather than their strings, so
+an oversized unselected replacement cannot exhaust a selected sibling's parsing
+allowance. Locations carry the source object identity and byte range, including
+inside encrypted or compressed objects, and remain valid after frame eviction.
+Tiny dictionaries use a bounded inline projection to avoid per-value resolver
+and cache overhead in dense tables. A bounded page-local cache shares each decoded string, including
 indirect values; overridden replacement values are never decoded or resolved.
 Indirect resource and property dictionaries are retained once per page. Form
 records borrow their raw strings, and property-name indexes are sorted once per
 dictionary. Repeated Form scopes cannot multiply a shared replacement's storage.
 The resource cache retains recognized resource fields and only MCID/ActualText
-from property dictionaries. Unknown payloads are released with temporary parsing
-storage rather than accumulating in the cache. Temporary per-object parsing and
-retained metadata share one live-byte ceiling, with separate cumulative-allocation
-allowances. Required fields from indirect resources retain only a small source
+from property dictionaries. Metadata parsing skips unknown values without allocating
+their strings or object graphs, while preserving token validation and depth limits.
+Temporary per-object parsing and retained metadata share one live-byte ceiling,
+with separate cumulative-allocation allowances. Required fields from indirect resources retain only a small source
 reference for Properties; the optional table is projected on first selected use.
-Inherited resource references preserve this behavior. Direct table retention that
+Inherited direct resources retain their parent reference as a source locator,
+so their Properties values are also deferred until selected. Only Parent and
+Resources fields are parsed during resource inheritance; unrelated parent data
+is skipped. Inheritance traversal is depth-bounded. Direct table retention that
 exceeds its allowance becomes an invalid optional value, diagnosed only if used.
 Indirect property tables and dictionaries are resolved only when a selected
 scope needs them; overridden scopes do not read their object streams.
-The syntax scanner transfers owned string/name tokens into objects, avoiding a
-second full payload allocation while an object stream remains decoded.
+Fonts, graphics states, and color spaces share the projected resource root.
+The syntax scanner transfers owned tokens through lookahead and into objects,
+avoiding a second full payload allocation while an object stream remains decoded.
+Compressed object headers validate increasing offsets and parse integer pairs
+without object lookahead. Each object scanner is bounded by the next offset,
+so lookahead cannot materialize an adjacent object's payload.
+Cache entries reserve capacity before parsing. Successful projections and
+deterministic failures then commit without allocating; a saturated cache rejects
+a new entry before spending work on metadata it cannot retain. Property-name
+index caches also reserve capacity before allocating and sorting shared indexes,
+then commit without allocation. Their in-place introsort polls cancellation and
+charges comparison work without a second index-sized buffer; a heapsort
+fallback bounds worst-case work and smaller-partition recursion bounds stack
+space.
+Metadata resolution shares one decoded object-stream frame and validated offset
+index per page. Both count against the retained/live byte allowance; codec
+scratch has a separate per-decode cumulative allowance. Decoded frames and
+projected object graphs move between accounting ledgers without copying or
+double-charging the shared backing allocator. Required reads evict unrelated
+frames; retained-budget pressure may also evict a frame before adopting a
+selected value.
+Metadata scanning polls cancellation throughout tokens, strings, whitespace,
+comments, and skipped compound values. A page-local work allowance of 16 times
+the working-set byte limit (at least 1 MiB, at most 2 GiB) charges scanned bytes,
+token traversal, and property-index comparisons independently of allocations.
+Exhaustion is sticky; optional failures are memoized while cancellation and
+backing OOM remain retryable.
 Selected missing or malformed property dictionaries retain native glyph text and
 report incomplete ActualText, including when selected optional metadata exceeds
 a decode or allocation allowance. Actual allocator failures and cancellation

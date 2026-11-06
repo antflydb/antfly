@@ -39,6 +39,8 @@ pub fn groupRoot(configs: anytype, name: []const u8) ?[]const u8 {
 /// Template paths are interpreted separately by the template engine.
 pub fn sourceFieldValue(root: std.json.Value, field: []const u8, grouped: bool) std.json.Value {
     if (root != .object) return .null;
+    if (std.mem.eql(u8, field, @import("../../../privacy/document.zig").state_field)) return .null;
+    if (std.mem.eql(u8, field, @import("../../../privacy/document.zig").source_field)) return root;
     if (grouped and std.mem.eql(u8, field, grouped_source_field)) {
         const unit = root.object.get("_group_unit") orelse return .null;
         if (unit != .object) return .null;

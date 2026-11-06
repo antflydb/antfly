@@ -167,7 +167,7 @@ pub fn clearReplayCursor(store: anytype, scope: []const u8) !void {
 }
 
 fn encodeReplayCursor(alloc: Allocator, cursor: ReplayCursor) ![]u8 {
-    if (cursor.doc_key.len == 0 or cursor.doc_key.len > std.math.maxInt(u32))
+    if (cursor.doc_key.len > std.math.maxInt(u32))
         return error.InvalidEnrichmentState;
     const body_len = replay_cursor_magic.len + 4 + 8 + 8 + 4 + cursor.doc_key.len;
     const raw = try alloc.alloc(u8, body_len + 4);
@@ -196,7 +196,7 @@ fn decodeReplayCursor(alloc: Allocator, raw: []const u8) !ReplayCursor {
     const base_applied_sequence = readCheckpointInt(raw, &pos, u64);
     const sequence = readCheckpointInt(raw, &pos, u64);
     const key_len: usize = readCheckpointInt(raw, &pos, u32);
-    if (key_len == 0 or key_len != body_len - pos) return error.InvalidEnrichmentState;
+    if (key_len != body_len - pos) return error.InvalidEnrichmentState;
     return .{
         .base_applied_sequence = base_applied_sequence,
         .sequence = sequence,
@@ -894,4 +894,14 @@ test "durable enrichment scoped retry persists incremental records and migrates 
     defer reused.deinit(a);
     try std.testing.expectEqual(@as(u64, 9_000_000), reused.deadline());
     try std.testing.expectEqual(@as(u32, 1), reused.prior(19).failures);
+}
+
+test "privacy replay cursor preserves an empty document identifier" {
+    const a = std.testing.allocator;
+    const raw = try encodeReplayCursor(a, .{ .base_applied_sequence = 1, .sequence = 2, .doc_key = @constCast("") });
+    defer a.free(raw);
+    var decoded = try decodeReplayCursor(a, raw);
+    defer decoded.deinit(a);
+    try std.testing.expectEqualStrings("", decoded.doc_key);
+    try std.testing.expectEqual(@as(u64, 2), decoded.sequence);
 }

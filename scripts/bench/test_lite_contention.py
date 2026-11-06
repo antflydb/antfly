@@ -231,7 +231,9 @@ class ContentionReportTests(unittest.TestCase):
         self.assertEqual(len(result["thread_max_progress_gap_seconds"]), 3)
         # One handle for diagnostics plus one per writer thread.
         self.assertEqual(len(opened), 4)
-        self.assertEqual(sum(result["thread_successful_calls"]), len(result["success_latency_ns"]))
+        self.assertEqual(
+            sum(result["thread_successful_calls"]), len(result["success_latency_ns"])
+        )
         prefixes = {key.rsplit("-", 1)[0] for key in database.keys}
         self.assertEqual(prefixes, {"worker-2-t0", "worker-2-t1", "worker-2-t2"})
         written = {write["key"] for write in result["latest_churn_writes"]}
@@ -312,7 +314,9 @@ class ContentionReportTests(unittest.TestCase):
             patch.object(bench, "sdk", return_value=api),
             patch.object(bench, "measurement_stats", return_value=zero),
         ):
-            bench.native_worker(config, 1, ready, SimpleNamespace(wait=lambda _: True), results)
+            bench.native_worker(
+                config, 1, ready, SimpleNamespace(wait=lambda _: True), results
+            )
         result = results.get_nowait()
         self.assertEqual(result["status"], "ok")
         for payload in database.payloads:
@@ -491,16 +495,19 @@ class ContentionReportTests(unittest.TestCase):
         with patch.object(bench, "sdk", side_effect=OSError("library missing")):
             with self.assertRaises(OSError):
                 bench.status_reader(
-                    {"library": "x", "status_interval": 1, "database": "d", "timeout_ms": 5000},
+                    {
+                        "library": "x",
+                        "status_interval": 1,
+                        "database": "d",
+                        "timeout_ms": 5000,
+                    },
                     stop,
                     results,
                 )
         result = results.get_nowait()
         self.assertEqual(result["reads"], 0)
         self.assertIn("library missing", result["startup_error"])
-        self.assertEqual(
-            bench.status_reader_problem(result, 1), "status_reader_failed"
-        )
+        self.assertEqual(bench.status_reader_problem(result, 1), "status_reader_failed")
 
     def test_status_reader_problem_requires_successful_reads_and_clean_exit(self):
         clean = {"reads": 3, "errors": 0, "startup_error": None}
@@ -508,10 +515,12 @@ class ContentionReportTests(unittest.TestCase):
         self.assertEqual(bench.status_reader_problem(None, 0), "status_reader_failed")
         self.assertEqual(bench.status_reader_problem(clean, -9), "status_reader_failed")
         self.assertEqual(
-            bench.status_reader_problem({**clean, "reads": 0}, 0), "status_reader_failed"
+            bench.status_reader_problem({**clean, "reads": 0}, 0),
+            "status_reader_failed",
         )
         self.assertEqual(
-            bench.status_reader_problem({**clean, "errors": 2}, 0), "status_reader_errors"
+            bench.status_reader_problem({**clean, "errors": 2}, 0),
+            "status_reader_errors",
         )
 
 
@@ -540,8 +549,14 @@ class LeaseAndFairnessTests(unittest.TestCase):
             hold_max_ns=max(holds, default=0),
         )
         empty = dict.fromkeys(bench.LEASE_COUNTERS, 0)
-        empty.update(wait_log2_ns=[0] * 64, hold_log2_ns=[0] * 64, wait_max_ns=0, hold_max_ns=0)
-        return {"foreground_lease": group, "maintenance_lease": empty, "gate_wait_ns": 7}
+        empty.update(
+            wait_log2_ns=[0] * 64, hold_log2_ns=[0] * 64, wait_max_ns=0, hold_max_ns=0
+        )
+        return {
+            "foreground_lease": group,
+            "maintenance_lease": empty,
+            "gate_wait_ns": 7,
+        }
 
     def test_lease_delta_is_none_for_a_library_without_lease_timing(self):
         self.assertIsNone(bench.lease_delta({}, {"maintenance_rounds": 1}))
@@ -549,14 +564,24 @@ class LeaseAndFairnessTests(unittest.TestCase):
     def test_lease_summary_reports_per_worker_tails_and_busy(self):
         zero = self.lease_snapshot(0, [], [])
         workers = [
-            {"lease": bench.lease_delta(zero, self.lease_snapshot(2, [1000, 3000], [500, 700]))},
-            {"lease": bench.lease_delta(zero, self.lease_snapshot(1, [1 << 30], [900], busy=3))},
+            {
+                "lease": bench.lease_delta(
+                    zero, self.lease_snapshot(2, [1000, 3000], [500, 700])
+                )
+            },
+            {
+                "lease": bench.lease_delta(
+                    zero, self.lease_snapshot(1, [1 << 30], [900], busy=3)
+                )
+            },
         ]
         summary = bench.lease_summary(workers)
         fg = summary["foreground_lease"]
         self.assertEqual(fg["acquisitions"], 3)
         self.assertEqual(fg["per_worker_busy"], [0, 3])
-        self.assertEqual(fg["per_worker_wait_p99_upper_ns"], [(1 << 12) - 1, (1 << 31) - 1])
+        self.assertEqual(
+            fg["per_worker_wait_p99_upper_ns"], [(1 << 12) - 1, (1 << 31) - 1]
+        )
         self.assertEqual(fg["wait_p99_upper_ns"], (1 << 31) - 1)
         self.assertEqual(summary["gate_wait_ns"], 0)
 
