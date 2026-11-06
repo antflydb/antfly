@@ -1803,12 +1803,23 @@ pub fn reembedDenseDocuments(
     }
     var slots: std.ArrayList(usize) = .empty;
     defer slots.deinit(alloc);
+    var chunk_cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
+    defer freeWorkerChunkCache(runtime.alloc, &chunk_cache);
     for (requests, 0..) |request, i| {
-        const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
-        defer runtime.alloc.free(doc_store_key);
         // Page-image inputs embed rendered pages, not the document source;
         // such indexes must keep their vectors.
         if (request.embedding_input == .pdf_page_images) return error.ReembedUnsupportedInput;
+        if (request.input_kind != .document) {
+            const text = (try reembedChunkTextAlloc(runtime, request, &chunk_cache)) orelse continue;
+            texts.append(alloc, text) catch |err| {
+                runtime.alloc.free(text);
+                return err;
+            };
+            try slots.append(alloc, i);
+            continue;
+        }
+        const doc_store_key = try documentSourceStoreKeyAlloc(runtime, request.doc_key);
+        defer runtime.alloc.free(doc_store_key);
         const raw = (try storeGetOptionalDocumentAllocWithRetry(runtime, doc_store_key)) orelse continue;
         defer runtime.alloc.free(raw);
         var prepared = try prepareDenseSourceInput(runtime.alloc, runtime.config, dense_embedder, raw, request);
@@ -1838,6 +1849,34 @@ pub fn reembedDenseDocuments(
         @memcpy(out[slot * dims ..][0..dims], vector);
         found[slot] = true;
     }
+}
+
+/// Text of one chunk for re-embedding. `request.doc_key` is the chunk's key;
+/// its parent document is re-chunked exactly as the producer chunks it, and
+/// the text is embedded raw, as the producer embeds chunk text. Returns null
+/// when the document or the chunk is gone (for example, after an edit the
+/// graph has not caught up with). Chunks carrying model metadata (media
+/// windows, model outputs) and stored chunk inputs are not supported.
+fn reembedChunkTextAlloc(
+    runtime: *EnrichmentRuntime,
+    request: enrichment_types.GeneratedEnrichmentRequest,
+    chunk_cache: *std.ArrayListUnmanaged(WorkerChunkCacheEntry),
+) !?[]u8 {
+    if (request.input_kind != .inline_chunks) return error.ReembedUnsupportedInput;
+    const parent = (try internal_keys.decodeDocumentComponentAlloc(runtime.alloc, request.doc_key)) orelse return null;
+    defer runtime.alloc.free(parent);
+    var parent_request = request;
+    parent_request.doc_key = parent;
+    var source_set = try chunkEmbeddingSourceSetForRequest(runtime, parent_request, requestArtifactName(request), chunk_cache);
+    defer source_set.deinit(runtime.alloc);
+    for (source_set.sources) |*source| {
+        if (!std.mem.eql(u8, source.key, request.doc_key)) continue;
+        if (source.metadata != null) return error.ReembedUnsupportedInput;
+        const text = source.text;
+        source.text = source.text[0..0]; // The caller owns it now.
+        return text;
+    }
+    return null;
 }
 
 pub fn embedDensePartsTracked(
@@ -5913,6 +5952,118 @@ test "enrichment worker chunk cache keys preserve embedded separators" {
     defer alloc.free(right);
 
     try std.testing.expect(!std.mem.eql(u8, left, right));
+}
+
+test "transient leann re-embeds one chunk from its re-chunked parent like the producer" {
+    const alloc = std.testing.allocator;
+    const Probe = struct {
+        batch_calls: usize = 0,
+        texts: std.ArrayListUnmanaged([]u8) = .empty,
+
+        fn embedDense(_: *anyopaque, a: Allocator, _: []const u8, _: []const u8, dims: u32) ![]f32 {
+            const v = try a.alloc(f32, dims);
+            @memset(v, 1);
+            return v;
+        }
+
+        fn embedDenseBatch(raw: *anyopaque, a: Allocator, _: []const u8, texts: []const []const u8, dims: u32) ![]const []const f32 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.batch_calls += 1;
+            const out = try a.alloc([]const f32, texts.len);
+            for (out, texts) |*v, text| {
+                try self.texts.append(std.testing.allocator, try std.testing.allocator.dupe(u8, text));
+                const vec = try a.alloc(f32, dims);
+                @memset(vec, @floatFromInt(text.len));
+                v.* = vec;
+            }
+            return out;
+        }
+
+        fn interface(self: *@This()) embedder_mod.DenseEmbedder {
+            return .{ .ptr = self, .dense_embed_fn = embedDense, .dense_embed_batch_fn = embedDenseBatch, .deinit_fn = null };
+        }
+    };
+    var probe = Probe{};
+    defer {
+        for (probe.texts.items) |text| alloc.free(text);
+        probe.texts.deinit(alloc);
+    }
+
+    var backend = mem_backend.Backend.init(alloc, .{});
+    defer backend.close();
+    var store = try backend.runtimeStore(alloc, .{ .name = "docs" });
+    defer store.deinit();
+    var erased_store = try backend_erased.storeFrom(alloc, store);
+    defer erased_store.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const index_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/leann-chunk-reembed", .{tmp.sub_path});
+    var index_manager = try index_manager_mod.IndexManager.init(alloc, index_path);
+    defer index_manager.deinit();
+    var runtime = EnrichmentRuntime{
+        .alloc = alloc,
+        .io_impl = null,
+        .store = erased_store,
+        .owns_store = false,
+        .change_journal = undefined,
+        .replay_source = undefined,
+        .index_manager = &index_manager,
+        .write_ctx = undefined,
+        .write_fn = undefined,
+        .failure_ctx = undefined,
+        .failure_fn = undefined,
+        .notify_ctx = undefined,
+        .notify_fn = undefined,
+        .config = .{ .dense_embedder = probe.interface() },
+        .ownership = undefined,
+    };
+    defer clearIndexEmbeddingActivity(&runtime);
+
+    const doc_key = try documentSourceStoreKeyAlloc(&runtime, "doc:a");
+    defer alloc.free(doc_key);
+    try storePutWithRetry(&runtime, doc_key, "{\"body\":\"one two three four five six seven eight nine ten eleven twelve thirteen fourteen fifteen sixteen\"}");
+
+    const document_request: enrichment_types.GeneratedEnrichmentRequest = .{
+        .kind = .dense_embedding,
+        .index_name = "leann_idx",
+        .artifact_name = "leann_idx_chunks",
+        .embedding_name = "leann_idx",
+        .input_kind = .inline_chunks,
+        .doc_key = "doc:a",
+        .source_field = "body",
+        .expected_dims = 2,
+        .chunk_size = 4,
+        .chunk_overlap = 0,
+    };
+    // What the producer embeds for this document.
+    var cache = std.ArrayListUnmanaged(WorkerChunkCacheEntry).empty;
+    defer freeWorkerChunkCache(alloc, &cache);
+    var produced = try chunkEmbeddingSourceSetForRequest(&runtime, document_request, "leann_idx_chunks", &cache);
+    defer produced.deinit(alloc);
+    try std.testing.expect(produced.sources.len >= 2);
+    const wanted = produced.sources[1];
+
+    const missing_key = try internal_keys.chunkArtifactKeyAlloc(alloc, "doc:a", "leann_idx_chunks", 9999);
+    defer alloc.free(missing_key);
+    var requests = [_]enrichment_types.GeneratedEnrichmentRequest{ document_request, document_request };
+    requests[0].doc_key = wanted.key;
+    requests[1].doc_key = missing_key;
+    var out: [4]f32 = undefined;
+    var found = [_]bool{ false, false };
+    try reembedDenseDocuments(&runtime, alloc, &requests, 2, &out, &found);
+
+    // The chunk's own text, in one batched call; an unknown chunk is not found.
+    try std.testing.expect(found[0]);
+    try std.testing.expect(!found[1]);
+    try std.testing.expectEqual(@as(usize, 1), probe.batch_calls);
+    try std.testing.expectEqual(@as(usize, 1), probe.texts.items.len);
+    try std.testing.expectEqualStrings(wanted.text, probe.texts.items[0]);
+    try std.testing.expectEqual(@as(f32, @floatFromInt(wanted.text.len)), out[0]);
+
+    // Stored-chunk inputs are not re-chunked from the document.
+    requests[0].input_kind = .materialized_chunks;
+    try std.testing.expectError(error.ReembedUnsupportedInput, reembedDenseDocuments(&runtime, alloc, requests[0..1], 2, out[0..2], found[0..1]));
 }
 
 test "empty chunk sources retain their own document revisions" {

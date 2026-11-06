@@ -8845,6 +8845,21 @@ pub const IndexManager = struct {
         _ = try self.elideLeannVectorsTxn(txn, index_name, entries);
     }
 
+    /// Whether a local transient LEANN index has covered vectors waiting to
+    /// become stubs, so callers can skip the exclusive apply lock that
+    /// `elideLocalLeannVectors` needs. Call with the apply lock held (shared
+    /// is enough).
+    pub fn localLeannElisionPending(self: *IndexManager) bool {
+        if (self.leann_replication) return false;
+        for (self.dense_indexes.items) |*entry| {
+            if (!entry.leann_transient) continue;
+            const leann_store = entry.index.leann orelse continue;
+            if (leann_store.isReplicated()) continue;
+            if (leann_store.pendingElideCount() > 0) return true;
+        }
+        return false;
+    }
+
     /// Local (unreplicated) transient LEANN indexes: replaces stored vectors
     /// their synced graphs cover by stubs. Call after `syncAll` while holding
     /// the DB apply lock.
@@ -32943,10 +32958,16 @@ pub const IndexManager = struct {
             .embedding_name = embedding_name,
             .embedding_input = chunk_cfg.embedding_input,
             .input_kind = embeddingInputKind(self, generator),
+            // For chunked indexes this is a chunk key; the runtime re-chunks
+            // its parent document with the settings below.
             .doc_key = doc_key,
             .source_field = chunk_cfg.source_field,
             .source_template = chunk_cfg.source_template,
             .expected_dims = entry.dims,
+            .chunk_size = chunk_cfg.chunk_size,
+            .chunk_overlap = chunk_cfg.chunk_overlap,
+            .chunker_json = chunk_cfg.chunker_json,
+            .full_text_index = chunk_cfg.full_text_index,
             .producer_json = embedding_cfg.producer_json,
             .execution_json = chunk_cfg.embedding_execution_json,
         };

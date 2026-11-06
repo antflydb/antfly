@@ -3205,10 +3205,11 @@ pub fn translateEmbeddingsIndexConfigJsonWithOptions(
     try out.appendSlice(alloc, ",\"metric\":");
     try appendJsonString(alloc, &out, metric);
     // Transient vector storage re-embeds candidates from the document's own
-    // field or template, so it needs the index's embedder and one vector per
-    // document: no external vectors, chunking, or artifacts from other
-    // enrichments.
-    if (leann_algorithm) try appendLeannIndexConfig(alloc, &out, root, !external and !artifact_backed and chunker_json == null and embedder_json != null);
+    // field or template (re-chunked the way the producer chunks it), so it
+    // needs the index's embedder: no external vectors, artifacts from other
+    // enrichments, or chunkers whose vectors come from media or model output.
+    const reembeddable_chunks = if (root.get("chunker")) |chunker| textOnlyChunker(chunker) else true;
+    if (leann_algorithm) try appendLeannIndexConfig(alloc, &out, root, !external and !artifact_backed and reembeddable_chunks and embedder_json != null);
     if (artifact_sources.len > 0) {
         try appendArtifactIndexSources(alloc, &out, artifact_sources);
     } else {
@@ -3269,6 +3270,26 @@ fn denseAlgorithmIsLeann(root: std.json.ObjectMap) !bool {
     } else false;
     if (root.get("leann") != null and !leann) return error.InvalidCreateTableRequest;
     return leann;
+}
+
+/// Whether a chunker's vectors can be reproduced from chunk text alone:
+/// fixed text chunking, with no audio windows, media policy, model outputs
+/// or chunk embedding targets (those embed media parts or carry vectors the
+/// re-embedder cannot recompute).
+fn textOnlyChunker(chunker: std.json.Value) bool {
+    if (chunker != .object) return false;
+    for ([_][]const u8{ "audio", "policy", "outputs", "embedding" }) |key| {
+        if (chunker.object.get(key)) |value| if (value != .null) return false;
+    }
+    if (chunker.object.get("model")) |model| {
+        if (model != .string) return false;
+        const fixed = [_][]const u8{ "fixed", "fixed_bert", "fixed_bpe", "fixed-bert-tokenizer" };
+        for (fixed) |name| {
+            if (std.mem.eql(u8, model.string, name)) return true;
+        }
+        return false;
+    }
+    return true;
 }
 
 /// Mirrors `leann.Config.default_rabitq_bits` (this module does not depend on
@@ -3379,6 +3400,18 @@ test "managed embedder translates leann algorithm into dense config" {
             ,
             "\"vector_storage\":\"persistent\"",
         },
+        // Text chunks are re-chunked and re-embedded like whole documents.
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"chunker":{"provider":"antfly","model":"fixed","text":{"target_tokens":64}},"algorithm":"leann"}
+            ,
+            "\"vector_storage\":\"transient\"",
+        },
+        // Audio windows embed media parts, which re-embedding cannot redo.
+        .{
+            \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"chunker":{"provider":"antfly","audio":{"window_duration_ms":30000}},"algorithm":"leann"}
+            ,
+            "\"vector_storage\":\"persistent\"",
+        },
     }) |case| {
         var p = try std.json.parseFromSlice(std.json.Value, alloc, case[0], .{});
         defer p.deinit();
@@ -3430,6 +3463,8 @@ test "managed embedder translates leann algorithm into dense config" {
         \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"quantizer":"pq","vector_storage":"transient"}}
         ,
         \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"algorithm":"leann","leann":{"vector_storage":"sometimes"}}
+        ,
+        \\{"field":"body","dimension":3,"embedder":{"provider":"antfly","model":"antflydb/test"},"chunker":{"provider":"antfly","audio":{"window_duration_ms":30000}},"algorithm":"leann","leann":{"vector_storage":"transient"}}
         ,
     }) |bad| {
         var p = try std.json.parseFromSlice(std.json.Value, alloc, bad, .{});
