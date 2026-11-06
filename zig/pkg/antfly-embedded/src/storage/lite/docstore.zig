@@ -2028,7 +2028,8 @@ pub const Store = struct {
     pub fn getCatalogRecordAlloc(self: *Store, a: Allocator, key: []const u8) !?[]u8 {
         lockStore(self);
         defer self.mutex.unlock();
-        if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+        if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+        if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
         return self.file.getCatalogRecordAlloc(a, key);
     }
 
@@ -2224,7 +2225,8 @@ pub const Store = struct {
             const previous_cancel = self.file.allocator_cancel_token;
             self.file.allocator_cancel_token = cancel;
             defer self.file.allocator_cancel_token = previous_cancel;
-            if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+            if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+            if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
             _ = try artifact_source.cleanupOrphans(&self.file, &self.artifact_cleanup_cursor);
             try self.artifact_marker_sweep.run(&self.file);
             if (try self.file.retirementNeedsService()) {
@@ -2262,7 +2264,8 @@ pub const Store = struct {
             self.maintenance_policy.retirement_bytes = self.file.retirement_activity_bytes;
             const retry_due = self.maintenance_policy.rewriteRetryDue(std.Io.Clock.awake.now(self.file.runtime()).nanoseconds);
             if (!force and !self.maintenance_policy.due(size) and !retry_due) return;
-            if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+            if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+            if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
             assessed_checkpoint = self.file.activeCheckpoint();
             assessed_size = size;
             assessed_indexed = self.file.header.indexed_reclamation or self.file.vacuum_target_indexed;
@@ -2562,7 +2565,8 @@ pub const Store = struct {
         var snapshot, const size = blk: {
             lockStore(self);
             defer self.mutex.unlock();
-            if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+            if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+            if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
             var file = try native.NativeFile.openWithIo(self.allocator, self.file.runtime(), self.file.path, .{ .read_only = true, .resource_manager = self.resource_manager });
             errdefer file.close();
             file.page_cache_policy = .metadata_only;
@@ -2601,7 +2605,8 @@ pub const Store = struct {
                 std.log.warn("lite vacuum refused: another maintenance cycle owns the workspace", .{});
                 return error.FileBusy;
             }
-            if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+            if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+            if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
             var snapshot = try self.file.captureFullReadSnapshot();
             snapshot.page_cache_policy = .metadata_only;
             snapshot.vacuum_target_indexed = self.file.vacuum_target_indexed;
@@ -2717,7 +2722,8 @@ pub const Store = struct {
                     if (!self.file.no_sync) try image.prepared.file.sync(io);
                 }
                 if (capture.count == 0) {
-                    if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+                    if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+                    if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
                     image.report.before_size = (try self.file.file.stat(io)).size;
                     image.report.reclaimed_bytes = image.report.before_size -| image.report.after_size;
                     image.prepared.no_sync = self.file.no_sync;
@@ -2825,7 +2831,8 @@ pub const Store = struct {
         lockStore(self);
         defer self.mutex.unlock();
         if (self.generation_workspace_active or self.maintenance_running or self.file.change_capture != null) return error.FileBusy;
-        if (self.file.checkpoint_publication_uncertain or self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+        if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+        if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
         const status = try self.reclamationStatusAssumeLocked();
         var options = self.maintenance_policy.options;
         const minimum = native.NativeFile.minimumOwnerStorageBytes(options.page_reuse);
@@ -2870,7 +2877,8 @@ pub const Store = struct {
         // Portable archives omit secrets. Check at publication while reserving
         // the writer slot so a secret committed during preparation cannot be lost.
         if (self.file.change_capture != null) return error.FileBusy;
-        if (self.secret_store_uncertain or self.file.checkpoint_publication_uncertain) return error.OutcomeReconciliationRequired;
+        if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+        if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
         if (try self.file.hasSecretState()) return error.LiteImportTargetNotEmpty;
         const old_bytes = (try self.file.file.stat(io)).size;
         try self.admitPreparedGenerationAssumeLocked(&prepared.file, old_bytes);
@@ -3112,7 +3120,8 @@ pub const Store = struct {
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStore(self);
         defer self.mutex.unlock();
-        if (self.secret_store_uncertain or self.file.checkpoint_publication_uncertain) return error.OutcomeReconciliationRequired;
+        if (self.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+        if (self.file.checkpoint_publication_uncertain) try self.file.reconcilePublicationUncertainty();
         try self.file.sync();
     }
 
@@ -3572,8 +3581,29 @@ pub const Txn = struct {
             store.read_mutex.lockUncancelable(io);
         }
         defer store.read_mutex.unlock(io);
-        // Refused, not unknown: the read never ran. Reopen to reconcile.
-        if (store.read_outcome_unknown) return error.OutcomeReconciliationRequired;
+        // A prior publish may have left durability unknown. Try to resolve
+        // it in-process (re-reads the on-disk slot the failed publish
+        // targeted; see `NativeFile.reconcilePublicationUncertainty`)
+        // before refusing the read outright -- that call's own
+        // `notifyPublication` keeps `read_outcome_unknown` in sync via the
+        // same `observeReadCheckpoint` callback an ordinary successful
+        // publish already notifies. Only a secret-store uncertainty (no
+        // in-process reconciliation exists for that yet) or a disk that is
+        // still failing falls through to the original refusal.
+        //
+        // `reconcilePublicationUncertainty` must run with `read_mutex`
+        // released: its own success path calls `notifyPublication`, which
+        // invokes this same `Store`'s `observeReadCheckpoint` observer --
+        // and that locks `read_mutex` too. Held across the call, that is an
+        // immediate self-deadlock on this non-reentrant mutex (caught by a
+        // hung regression run; see this file's test of the same name).
+        if (store.read_outcome_unknown) {
+            if (store.secret_store_uncertain) return error.OutcomeReconciliationRequired;
+            store.read_mutex.unlock(io);
+            const reconciled = store.file.reconcilePublicationUncertainty();
+            store.read_mutex.lockUncancelable(io);
+            try reconciled;
+        }
         const checkpoint = store.read_generation.?.checkpoint;
         // Nested reads borrow the current writer's publication lease. Taking
         // another inode lock here would conflict with its page allocator's

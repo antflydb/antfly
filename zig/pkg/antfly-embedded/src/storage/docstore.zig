@@ -694,6 +694,22 @@ pub const DocStore = struct {
                 try self.artifact_footprint.stage(self);
                 try self.document_revisions.stage(self);
             }
+            // From here on, a failure (including `write.commit()` itself)
+            // must still release what staging above captured -- these three
+            // own real allocations (in particular `document_revisions`'s
+            // hash map), not just flags, and the success path below is the
+            // only other place that frees them. Without this, a commit that
+            // fails after staging (a transient write/sync error surfacing
+            // through `write.commit()`, in particular -- see native.zig's
+            // `reconcilePublicationUncertainty` and the derived-worker
+            // retry classification in catch_up_policy.zig, both of which
+            // make that failure far more commonly observed than before)
+            // leaks every one of them.
+            errdefer {
+                self.retained.deinit(self.alloc);
+                self.artifact_inputs.deinit(self.alloc);
+                self.document_revisions.deinit(self.alloc);
+            }
             const reader_owner = self.portable_import_reader_owner;
             const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             const source_owner = self.columnar_owner;
@@ -1239,6 +1255,18 @@ pub const DocStore = struct {
                 self.ticket.wait() catch |err| {
                     self.batch.retained.poisoned = true;
                     if (self.source_owner) |owner| owner.committed_replay_next_cached.store(0, .release);
+                    // `commitStaged` already staged these three (that is
+                    // what makes `source_certificates`/the payload session
+                    // above valid to reference); a ticket that never durably
+                    // lands (a transient write/sync error, in particular --
+                    // see `reconcilePublicationUncertainty` and
+                    // `catch_up_policy.isTransientIoError`, which together
+                    // make this far more commonly observed than before)
+                    // must still release them, the same as `Txn.commit`'s
+                    // own `errdefer` does for the non-staged commit path.
+                    self.batch.retained.deinit(self.batch.alloc);
+                    self.batch.artifact_inputs.deinit(self.batch.alloc);
+                    self.batch.document_revisions.deinit(self.batch.alloc);
                     return err;
                 };
                 if (self.payload_session) |session| {
@@ -1268,6 +1296,17 @@ pub const DocStore = struct {
                 try self.artifact_inputs.stage(self.asTxn(), self.retained.staged);
                 try self.artifact_footprint.stage(self.asTxn());
                 try self.document_revisions.stage(self.asTxn());
+            }
+            // Mirrors `Txn.commit`'s own post-stage `errdefer`: once staged,
+            // these three must be released on any failure from here on
+            // (the payload session's own staging calls below, or the
+            // runtime's `commitStaged()` itself), not only on the success
+            // path a few lines down -- `StagedBatch.wait` covers the
+            // window after a `StagedBatch` is actually returned.
+            errdefer {
+                self.retained.deinit(self.alloc);
+                self.artifact_inputs.deinit(self.alloc);
+                self.document_revisions.deinit(self.alloc);
             }
             const bump_columnar_revision = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             const source_owner = self.columnar_owner;

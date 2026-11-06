@@ -5047,6 +5047,15 @@ pub const NativeFile = struct {
     // An error after slot publication may leave disk ahead of header. Do not
     // elide a subsequent write based on the old in-memory checkpoint then.
     checkpoint_publication_uncertain: bool = false,
+    /// The checkpoint `publishCheckpoint` was writing into `uncertain_slot`
+    /// when the I/O that set `checkpoint_publication_uncertain` failed.
+    /// `reconcilePublicationUncertainty` compares this against what is
+    /// actually on disk to resolve the latch in-process, without a
+    /// close+reopen. Both are set together, immediately before the risky
+    /// write, and cleared together whenever the latch clears (on success in
+    /// `publishCheckpoint`, or by reconciliation).
+    uncertain_checkpoint: ?CheckpointSlot = null,
+    uncertain_slot: ?u8 = null,
     /// Owner admission budget. Reuse remains permitted at the file-size cap.
     /// Null means unlimited; the owner subtracts retired/workspace capacity.
     max_file_bytes: ?u64 = null,
@@ -12146,14 +12155,76 @@ pub const NativeFile = struct {
         return self.activeCheckpoint();
     }
 
+    /// Resolves a `checkpoint_publication_uncertain` latch in-process, without
+    /// a close+reopen, by re-reading the on-disk slot the failed publish
+    /// targeted (`uncertain_slot`) and comparing it against the checkpoint
+    /// that was in flight (`uncertain_checkpoint`).
+    ///
+    /// Two outcomes, both of which clear the latch:
+    ///   - The slot matches (same commit_sequence, structurally valid, and
+    ///     -- if it carries a manifest -- that manifest verifies): the write
+    ///     actually landed before the error fired (a transient fault after
+    ///     the bytes reached disk, e.g. a dropped fsync acknowledgment, or a
+    ///     retry at the OS level this process never observed). Adopt it as
+    ///     the active checkpoint exactly as a successful `publishCheckpoint`
+    ///     would have.
+    ///   - The slot does not match (absent, torn, stale, or still the
+    ///     previous generation): the write never durably landed. The
+    ///     previous checkpoint -- never touched by the failed attempt -- is
+    ///     still the active, durable one, so nothing adopts; the caller's
+    ///     lost commit simply needs to be retried from scratch (which is
+    ///     always safe here: nothing claimed that commit succeeded).
+    ///
+    /// Returns `error.OutcomeReconciliationRequired` only when the disk
+    /// itself cannot be read right now (I/O has not yet recovered) or no
+    /// in-flight checkpoint was recorded -- the same error every caller
+    /// already surfaces today, so adding this call changes nothing about
+    /// their behavior on a persistent fault.
+    pub fn reconcilePublicationUncertainty(self: *NativeFile) !void {
+        if (!self.checkpoint_publication_uncertain) return;
+        const slot_index = self.uncertain_slot orelse return error.OutcomeReconciliationRequired;
+        const proposed = self.uncertain_checkpoint orelse return error.OutcomeReconciliationRequired;
+        const io = self.runtimeIo();
+        const file_size = self.file.length(io) catch return error.OutcomeReconciliationRequired;
+        const on_disk = loadCheckpointSlot(self.file, io, self.header.page_size, file_size, slot_index);
+        if (on_disk.commit_sequence == proposed.commit_sequence and
+            validCheckpointSlot(on_disk) and
+            verifyManifest(self.file, io, on_disk, self.header.page_size))
+        {
+            // The write landed. Adopt it exactly as the successful tail of
+            // `publishCheckpoint` would have.
+            self.header.checkpoints[slot_index] = on_disk;
+            self.header.active_checkpoint = slot_index;
+            self.last_synced_header = self.header;
+        }
+        // Else: the previous checkpoint is still active in `self.header`
+        // (the failed attempt never overwrote it in memory) and still
+        // durable on disk (the failed attempt never overwrote it there
+        // either, by construction -- `publishCheckpoint` always targets the
+        // *other* slot). The lost commit is simply redone by its caller.
+        self.checkpoint_publication_uncertain = false;
+        self.uncertain_checkpoint = null;
+        self.uncertain_slot = null;
+        // `publishCheckpoint`'s own `defer self.notifyPublication()` is the
+        // only thing that normally keeps a caching observer (docstore's
+        // `read_outcome_unknown`, in particular) in sync with this flag;
+        // reconciling outside that function must fire the same observer
+        // itself, or a read path gated on the observer's stale `true` would
+        // keep refusing forever even though the write path above is clear.
+        self.notifyPublication();
+    }
+
     /// The caller serializes writers and checkpoint acquisition throughout a
     /// transaction. Intermediate roots are private; existing pinned readers
     /// continue reading immutable pages from their own checkpoint.
     pub fn beginTransaction(self: *NativeFile) !void {
         if (self.read_only) return error.ReadOnly;
         if (self.transaction_header != null) return error.TransactionAlreadyActive;
-        // A new transaction never ran: it is refused, not of unknown outcome.
-        if (self.checkpoint_publication_uncertain) return error.OutcomeReconciliationRequired;
+        // A previous commit's durability is unknown. Try to resolve it from
+        // disk in-process before refusing this one; see
+        // `reconcilePublicationUncertainty`. Only a disk that is still
+        // failing (or an inconsistent latch) falls through to the refusal.
+        if (self.checkpoint_publication_uncertain) try self.reconcilePublicationUncertainty();
         self.transaction_header = self.header;
         self.artifact_lease_transaction = false;
         self.allocator_certificate_staged = false;
@@ -12509,6 +12580,11 @@ pub const NativeFile = struct {
 
         const io = self.runtimeIo();
         self.checkpoint_publication_uncertain = true;
+        // Ground truth for `reconcilePublicationUncertainty`: which slot and
+        // which proposed checkpoint were in flight when the latch set. Both
+        // clear together with the latch, below and in that method.
+        self.uncertain_checkpoint = checkpoint;
+        self.uncertain_slot = next_slot;
         // From here until the flag clears, a failure leaves the commit's
         // durability unknown: report exactly that, not a raw I/O error a
         // caller might retry as if nothing had been written.
@@ -12530,6 +12606,8 @@ pub const NativeFile = struct {
         self.header.checkpoints[next_slot] = checkpoint;
         self.header.active_checkpoint = next_slot;
         self.checkpoint_publication_uncertain = false;
+        self.uncertain_checkpoint = null;
+        self.uncertain_slot = null;
         wal_trace.recordCommit();
         // This checkpoint is now the last durable one, whether it ended up
         // presynced (manifest rejected or never attempted) or not: either

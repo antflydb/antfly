@@ -62,6 +62,7 @@ pub const RecoverableRetryStats = struct {
     replay_document_not_visible: u64 = 0,
     artifact_repair_required: u64 = 0,
     not_found: u64 = 0,
+    transient_io: u64 = 0,
 };
 
 pub const RecoverableRetryCounters = struct {
@@ -71,6 +72,7 @@ pub const RecoverableRetryCounters = struct {
     replay_document_not_visible: @import("antfly_platform").atomic.Value(u64) = .init(0),
     artifact_repair_required: @import("antfly_platform").atomic.Value(u64) = .init(0),
     not_found: @import("antfly_platform").atomic.Value(u64) = .init(0),
+    transient_io: @import("antfly_platform").atomic.Value(u64) = .init(0),
 
     pub fn record(self: *@This(), err: anyerror) void {
         _ = self.total.fetchAdd(1, .monotonic);
@@ -89,6 +91,12 @@ pub const RecoverableRetryCounters = struct {
             error.ReplayDocumentNotVisible => _ = self.replay_document_not_visible.fetchAdd(1, .monotonic),
             error.ArtifactRepairRequired => _ = self.artifact_repair_required.fetchAdd(1, .monotonic),
             error.NotFound => _ = self.not_found.fetchAdd(1, .monotonic),
+            error.InputOutput,
+            error.NoSpaceLeft,
+            error.DiskQuota,
+            error.OutcomeUnknown,
+            error.OutcomeReconciliationRequired,
+            => _ = self.transient_io.fetchAdd(1, .monotonic),
             else => {},
         }
     }
@@ -101,6 +109,7 @@ pub const RecoverableRetryCounters = struct {
             .replay_document_not_visible = self.replay_document_not_visible.load(.monotonic),
             .artifact_repair_required = self.artifact_repair_required.load(.monotonic),
             .not_found = self.not_found.load(.monotonic),
+            .transient_io = self.transient_io.load(.monotonic),
         };
     }
 };
@@ -122,6 +131,27 @@ pub fn isRecoverableAdmissionError(err: anyerror) bool {
         error.TextMergeBackpressureTimeout,
         error.TextMergeBackpressureUnavailable,
         error.TextMergeRuntimeShutdown,
+        => true,
+        else => false,
+    };
+}
+
+/// A transient write/sync/publish I/O failure (a disk momentarily full or
+/// erroring, or a checkpoint publish left with an unknown outcome by one).
+/// None of these invalidate the replay record being applied: the owner
+/// either reconciles the uncertain publication in-process on its next
+/// attempt (`NativeFile.reconcilePublicationUncertainty`, reached through
+/// `beginTransaction`) or simply redoes a commit that never durably landed.
+/// Backing off and retrying -- never poisoning the worker's `last_error_name`
+/// latch -- is what lets catch-up resume once the underlying I/O recovers
+/// instead of leaving an index in `IndexRebuilding` forever.
+pub fn isTransientIoError(err: anyerror) bool {
+    return switch (err) {
+        error.InputOutput,
+        error.NoSpaceLeft,
+        error.DiskQuota,
+        error.OutcomeUnknown,
+        error.OutcomeReconciliationRequired,
         => true,
         else => false,
     };

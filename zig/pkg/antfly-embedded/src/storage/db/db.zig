@@ -33807,6 +33807,20 @@ pub const DB = struct {
 
     fn runUntilIdleWithReplayDrainOptions(self: *DB, options: ReplayDrainOptions) !void {
         _ = try self.retryPortableRuntimeActivationIfNeeded();
+        // A managed-admission materialization can be left pending by
+        // `recoverCommittedIndexAdmission` when an index's activation commit
+        // hit a transient error (OutcomeUnknown/OutcomeReconciliationRequired/
+        // a real write or sync failure): that path logs the failure and
+        // leaves the demand recorded (`managed_admission_owner.Owner.request`
+        // is never un-requested by a failed pass) for a later retry, but
+        // until now the only caller that ever retried it was the
+        // `indexRepairIntentSummary` status query -- never an idle drain.
+        // Retry it here too so draining to idle (the recovery recipe every
+        // caller, including this process's own crash-consistency sweep,
+        // already uses to wait out background catch-up) is itself able to
+        // resolve a stuck activation once the underlying I/O recovers,
+        // instead of leaving the affected index `IndexRebuilding` forever.
+        if (self.managedAdmissionMaterializationPending()) try self.drainManagedIndexAdmissions(self.alloc);
         // Manual owners need synchronous resolver drivers both during shadow
         // construction and after a crash between activation and promotion.
         // Creating these drivers does not start background workers.
