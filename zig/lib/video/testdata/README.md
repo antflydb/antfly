@@ -46,6 +46,9 @@ quantized bicubic coefficients. They qualify that preparation contract; model
 geometry, official decoder color conversion, vision tokens, and embeddings still
 need end-to-end processor/model qualification after PR #1014 is integrated.
 
+`av1-mp4.mp4` and `hevc-mp4.mp4` are copies of `av1.mp4` and `hevc-hvc1.mp4` from
+`zig/pkg/inference/src/testdata/video/codecs`, whose README records their provenance.
+
 ## Scheduling fixtures
 
 `schedule-closed.mp4` and `schedule-open.mp4` are original Apache-2.0 testsrc2
