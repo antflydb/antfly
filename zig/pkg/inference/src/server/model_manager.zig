@@ -111,6 +111,78 @@ const ComponentConstruction = struct {
     }
 };
 
+/// Keep supplied execution metadata borrowed while owning only rebound paths.
+/// Provenance-free callers select artifacts explicitly; discovering defaults
+/// would change the model. Ordinary snapshots need no path copies or parsing.
+const BoundDirectoryManifest = struct {
+    allocator: std.mem.Allocator,
+    manifest: manifest_mod.ModelManifest,
+    owns_manifest: bool = false,
+    owned_paths: std.ArrayListUnmanaged([]u8) = .empty,
+
+    fn init(proof: *ComponentConstruction, physical_root: []const u8, requested_root: []const u8, provided: ?*const manifest_mod.ModelManifest) !BoundDirectoryManifest {
+        const a = proof.artifacts().allocator;
+        if (provided == null) return .{ .allocator = a, .manifest = try manifest_mod.loadFromDirectorySource(a, physical_root, requested_root), .owns_manifest = true };
+        var result = BoundDirectoryManifest{ .allocator = a, .manifest = provided.?.* };
+        result.manifest.allocator = a;
+        errdefer result.deinit();
+        if (result.manifest.source_root != null) {
+            try result.manifest.verifyBoundRoot(proof.io, physical_root);
+            return result;
+        }
+        const stat = try std.Io.Dir.cwd().statFile(proof.io, physical_root, .{});
+        if (stat.kind != .directory) return error.NotDir;
+        result.manifest.source_root = try result.own(try a.dupe(u8, physical_root));
+        result.manifest.source_root_inode = stat.inode;
+        // Capture the primary's logical directory before binding its leaf.
+        if (provided.?.onnx_logical_path orelse provided.?.onnx_path) |logical| {
+            result.manifest.onnx_logical_path = try result.own(try logicalFilePath(proof, logical));
+        }
+        inline for (@typeInfo(manifest_mod.ModelManifest).@"struct".field_names) |field| {
+            if (comptime std.mem.endsWith(u8, field, "_path") and
+                !std.mem.eql(u8, field, "onnx_logical_path") and
+                @TypeOf(@field(result.manifest, field)) == ?[]const u8)
+            {
+                if (@field(result.manifest, field)) |path| {
+                    const physical = try proof.artifacts().constructionPath(path);
+                    const companion = comptime std.mem.eql(u8, field, "visual_model_path") or
+                        std.mem.eql(u8, field, "audio_model_path") or
+                        std.mem.eql(u8, field, "text_projection_path") or
+                        std.mem.eql(u8, field, "visual_projection_path") or
+                        std.mem.eql(u8, field, "audio_projection_path");
+                    if (companion and ModelSource.kindForPath(path) != .directory) {
+                        defer a.free(physical);
+                        @field(result.manifest, field) = try result.own(try logicalFilePath(proof, path));
+                    } else @field(result.manifest, field) = try result.own(physical);
+                }
+            }
+        }
+        try result.manifest.verifyBoundRoot(proof.io, physical_root);
+        return result;
+    }
+
+    fn logicalFilePath(proof: *ComponentConstruction, path: []const u8) ![]u8 {
+        const a = proof.artifacts().allocator;
+        const parent = try proof.artifacts().constructionPath(std.fs.path.dirname(path) orelse ".");
+        defer a.free(parent);
+        return std.fs.path.join(a, &.{ parent, std.fs.path.basename(path) });
+    }
+
+    fn own(self: *BoundDirectoryManifest, path: []u8) ![]u8 {
+        self.owned_paths.append(self.allocator, path) catch |err| {
+            self.allocator.free(path);
+            return err;
+        };
+        return path;
+    }
+
+    fn deinit(self: *BoundDirectoryManifest) void {
+        if (self.owns_manifest) self.manifest.deinit();
+        for (self.owned_paths.items) |path| self.allocator.free(path);
+        self.owned_paths.deinit(self.allocator);
+    }
+};
+
 /// Acquisition-owned storage for the borrowed backend source descriptor.
 const BoundModelSource = struct {
     allocator: std.mem.Allocator,
@@ -120,6 +192,7 @@ const BoundModelSource = struct {
     external_base_dir: ?[]u8 = null,
     owned_manifest: ?manifest_mod.ModelManifest = null,
     borrowed_manifest: ?*const manifest_mod.ModelManifest = null,
+    directory_manifest: ?BoundDirectoryManifest = null,
 
     fn init(proof: *ComponentConstruction, requested: []const u8, kind: ModelSource.Kind, manifest: ?*const manifest_mod.ModelManifest, external_base: ?[]const u8) !BoundModelSource {
         const artifacts = proof.artifacts();
@@ -128,24 +201,16 @@ const BoundModelSource = struct {
         if (kind == .onnx) {
             result.external_base_dir = try artifacts.constructionPath(external_base orelse std.fs.path.dirname(requested) orelse ".");
         } else {
-            if (manifest) |provided| {
-                if (kind == .directory) {
-                    if (provided.source_root != null) {
-                        try provided.verifyBoundRoot(proof.io, result.path);
-                    } else {
-                        // Hand-built manifests have no directory provenance.
-                        // Discover from the pinned root before native reuse.
-                        result.borrowed_manifest = null;
-                        result.owned_manifest = try manifest_mod.loadFromDir(result.allocator, result.path);
-                    }
-                }
-            } else result.owned_manifest = try manifest_mod.loadFromDir(result.allocator, if (kind == .directory) result.path else requested);
+            if (kind == .directory) {
+                result.borrowed_manifest = null;
+                result.directory_manifest = try BoundDirectoryManifest.init(proof, result.path, requested, manifest);
+            } else if (manifest == null) result.owned_manifest = try manifest_mod.loadFromDir(result.allocator, requested);
             if (kind == .gguf and !std.mem.eql(u8, result.view().manifest.?.gguf_path orelse return error.NoModelFileFound, result.path)) return error.ModelArtifactsChanging;
         }
         return result;
     }
     fn view(self: *const BoundModelSource) ModelSource {
-        return .{ .path = self.path, .kind = self.kind, .logical_path = self.logical_path, .external_base_dir = self.external_base_dir, .manifest = self.borrowed_manifest orelse if (self.owned_manifest) |*manifest| manifest else null };
+        return .{ .path = self.path, .kind = self.kind, .logical_path = self.logical_path, .external_base_dir = self.external_base_dir, .manifest = if (self.directory_manifest) |*directory| &directory.manifest else self.borrowed_manifest orelse if (self.owned_manifest) |*manifest| manifest else null };
     }
     fn verify(self: *const BoundModelSource, proof: *ComponentConstruction, backend: backends.BackendType) !void {
         switch (self.kind) {
@@ -159,6 +224,7 @@ const BoundModelSource = struct {
         try proof.finish();
     }
     fn deinit(self: *BoundModelSource) void {
+        if (self.directory_manifest) |*directory| directory.deinit();
         if (self.owned_manifest) |*manifest| manifest.deinit();
         if (self.external_base_dir) |path| self.allocator.free(path);
         self.allocator.free(self.path);
@@ -11876,16 +11942,14 @@ fn loadSessionForPreferredBackendsWithArtifacts(
     if (proof.owned != null) proof.artifacts().verification_cache = &manager.verified_artifacts;
     const construction_root = try proof.artifacts().constructionPath(model_dir);
     defer proof.artifacts().allocator.free(construction_root);
-    // Normalize legacy/hand-built snapshots once, before route selection,
-    // preflight or admission. Every phase must use the constructor's metadata.
-    var discovered: ?manifest_mod.ModelManifest = null;
-    defer if (discovered) |*manifest| manifest.deinit();
-    if (provided_man.source_root == null and ModelSource.kindForPath(model_dir) == .directory) {
-        discovered = try manifest_mod.loadFromDir(manager.allocator, construction_root);
-        if (!std.meta.eql(discovered.?.managed_publication, provided_man.managed_publication)) return error.ModelArtifactsChanging;
-    }
-    const man = discovered orelse provided_man;
-    if (ModelSource.kindForPath(model_dir) == .directory) try man.verifyBoundRoot(proof.io, construction_root);
+    // Bind explicit selections once, before any backend policy or admission.
+    // Every phase sees the same metadata; legacy callers never rediscover defaults.
+    var directory_manifest: ?BoundDirectoryManifest = if (ModelSource.kindForPath(model_dir) == .directory)
+        try BoundDirectoryManifest.init(&proof, construction_root, model_dir, &provided_man)
+    else
+        null;
+    defer if (directory_manifest) |*directory| directory.deinit();
+    const man = if (directory_manifest) |*directory| directory.manifest else provided_man;
     var verified_onnx_path: ?[]const u8 = null;
     var device_order_scratch: backends.BackendOrderBuffer = undefined;
     const available_backends = try source_session_manager.executionBackendOrder(&device_order_scratch, preferred_backends, control);
@@ -18674,6 +18738,13 @@ fn boundSourceAllocationScenario(a: std.mem.Allocator, owner: []const u8, reques
     defer source.deinit();
     try std.testing.expectEqual(kind, source.view().kind);
     if (kind == .onnx) try std.testing.expect(source.external_base_dir != null) else try std.testing.expect(source.view().manifest != null);
+    if (manifest) |provided| if (source.view().manifest) |bound| {
+        try std.testing.expectEqual(provided.model_type, bound.model_type);
+        try std.testing.expectEqualStrings(provided.config_model_arch, bound.config_model_arch);
+        if (provided.audio_model_path) |path| {
+            if (ModelSource.kindForPath(path) != .directory) try std.testing.expectEqual(ModelSource.kindForPath(path), ModelSource.kindForPath(bound.audio_model_path.?));
+        }
+    };
 }
 
 test "model selection bound sources unwind owned and borrowed metadata allocation failures" {
@@ -18698,6 +18769,10 @@ test "model selection bound sources unwind owned and borrowed metadata allocatio
     const onnx = try std.fs.path.join(a, &.{ root, "model.onnx" });
     defer a.free(onnx);
     try platform.allocator.checkAllAllocationFailures(a, boundSourceAllocationScenario, .{ root, onnx, ModelSource.Kind.onnx, null });
+    const legacy = manifest_mod.ModelManifest{ .allocator = a, .model_type = .reranker, .gguf_path = alias, .onnx_path = onnx, .visual_model_path = onnx, .audio_model_path = alias };
+    try platform.allocator.checkAllAllocationFailures(a, boundSourceAllocationScenario, .{ root, root, ModelSource.Kind.directory, &legacy });
+    try std.testing.expect(legacy.source_root == null);
+    try std.testing.expectEqualStrings(alias, legacy.gguf_path.?);
 }
 
 test "model selection rejects reused unmanaged manifests after directory alias switches" {
@@ -18803,4 +18878,106 @@ test "model selection companion ONNX sources preserve tensor context" {
         defer component.deinit();
         try expectBoundSourceOutput(component.session, false);
     };
+}
+
+test "model selection native directory binding preserves logical task hints" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |managed_model| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        try tmp.dir.createDirPath(io, "blob");
+        try tmp.dir.createDirPath(io, "rerankers");
+        var dir = try tmp.dir.openDir(io, "blob", .{});
+        defer dir.close(io);
+        try writeCancellationTestModel(dir, a);
+        if (managed_model) try writeArtifactIdentityTestReceipt(dir, &.{ "model.gguf", "config.json", "tokenizer.json" });
+        try tmp.dir.symLink(io, "../blob", "rerankers/model", .{ .is_directory = true });
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        const alias = try std.fs.path.join(a, &.{ root, "rerankers/model" });
+        defer a.free(alias);
+        var direct = try manifest_mod.loadFromDir(a, alias);
+        defer direct.deinit();
+        try std.testing.expectEqual(manifest_mod.ModelType.reranker, direct.model_type);
+        var proof = try ComponentConstruction.init(a, io, .{ .path = alias, .publication = direct.managed_publication }, null, null);
+        defer proof.deinit();
+        var bound = try BoundModelSource.init(&proof, alias, .directory, null, null);
+        defer bound.deinit();
+        try std.testing.expectEqual(manifest_mod.ModelType.reranker, bound.view().manifest.?.model_type);
+        var sm = backends.SessionManager.initWithIo(a, io);
+        sm.preferred_backends = &.{.native};
+        sm.native_call_policy = .in_process;
+        const original = try sm.loadModel(alias);
+        defer original.close();
+        try std.testing.expectEqualStrings("logits", original.outputInfo()[0].name);
+        var manager = ModelManager.init(a, sm);
+        defer manager.deinit();
+        var loaded = try manager.loadManagedSessionWithAdmission(alias, &.{.native}, null, null, .{ .path = alias, .publication = direct.managed_publication }, null);
+        defer loaded.deinit();
+        try std.testing.expectEqualStrings("logits", loaded.session.outputInfo()[0].name);
+    }
+}
+
+test "model selection explicit legacy graph selection never rediscovers defaults" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |managed_model| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        var graph = ml.graph.Graph.init(a);
+        defer graph.deinit();
+        var builder = ml.graph.Builder.init(&graph);
+        const input_node = try builder.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+        try graph.markOutput(input_node);
+        const bytes = try onnx_graph.exportGraph(a, &graph, .{});
+        defer a.free(bytes);
+        try tmp.dir.createDirPath(io, "blobs");
+        try tmp.dir.writeFile(io, .{ .sub_path = "blobs/graph", .data = bytes });
+        try tmp.dir.symLink(io, "blobs/graph", "custom.onnx", .{});
+        const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+        defer a.free(root);
+        const path = try std.fs.path.join(a, &.{ root, "custom.onnx" });
+        defer a.free(path);
+        var sm = backends.SessionManager.initWithIo(a, io);
+        sm.preferred_backends = &.{.native};
+        sm.native_call_policy = .in_process;
+        var manager = ModelManager.init(a, sm);
+        defer manager.deinit();
+        manager.admission_enabled = true;
+        var supplied = manifest_mod.ModelManifest{ .allocator = a, .onnx_path = path };
+        for ([_]bool{ false, true }) |with_default| {
+            if (with_default) {
+                var other = ml.graph.Graph.init(a);
+                defer other.deinit();
+                var other_builder = ml.graph.Builder.init(&other);
+                const x = try other_builder.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+                try other.markOutput(try other_builder.add(x, x));
+                const other_bytes = try onnx_graph.exportGraph(a, &other, .{});
+                defer a.free(other_bytes);
+                try tmp.dir.writeFile(io, .{ .sub_path = "model.onnx", .data = other_bytes });
+            }
+            if (managed_model) try writeArtifactIdentityTestReceipt(tmp.dir, if (with_default) &.{ "custom.onnx", "model.onnx" } else &.{"custom.onnx"});
+            supplied.managed_publication = try managed_receipt.publicationGeneration(a, io, root);
+            var loaded = try manager.loadArtifactSession(root, supplied);
+            defer loaded.deinit();
+            var input = try backends.Tensor.initFloat32(a, "input", &.{4}, &.{ 1, 2, 3, 4 });
+            defer input.deinit();
+            const output = try loaded.session.run(&.{input}, a);
+            defer {
+                for (output) |*tensor| tensor.deinit();
+                a.free(output);
+            }
+            try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, output[0].asFloat32());
+            try std.testing.expect(supplied.source_root == null);
+            try std.testing.expectEqualStrings(path, supplied.onnx_path.?);
+        }
+        if (managed_model) {
+            // An authenticated default cannot replace an unpublished selection.
+            try writeArtifactIdentityTestReceipt(tmp.dir, &.{"model.onnx"});
+            supplied.managed_publication = try managed_receipt.publicationGeneration(a, io, root);
+            try std.testing.expectError(error.InvalidManagedDownload, manager.loadArtifactSession(root, supplied));
+        }
+        try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, manager.currentAdmissionAmounts());
+    }
 }

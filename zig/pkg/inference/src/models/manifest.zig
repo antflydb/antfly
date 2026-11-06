@@ -1339,6 +1339,16 @@ pub fn loadFromDir(allocator: std.mem.Allocator, model_dir_path: []const u8) !Mo
     return loadFromCatalog(allocator, &catalog);
 }
 
+/// Discover a directory source with physical IO and logical task hints kept
+/// separate. The requested alias is checked before publishing the snapshot,
+/// but is never reopened for metadata or weight discovery.
+pub fn loadFromDirectorySource(allocator: std.mem.Allocator, physical_dir: []const u8, requested_dir: []const u8) !ModelManifest {
+    var catalog = try ArtifactCatalog.initPublished(allocator, physical_dir);
+    defer catalog.deinit();
+    catalog.model_dir_path = requested_dir;
+    return loadFromCatalog(allocator, &catalog);
+}
+
 /// Parse execution/admission metadata under the same construction fence as
 /// weights. A receipt captured before a rename cannot authenticate sidecars
 /// reopened from the replacement installation.
