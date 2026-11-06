@@ -1719,6 +1719,11 @@ pub fn freeOwnerSchemaBeforeIndexLoad(alloc: std.mem.Allocator, prepared: ?db_mo
 pub const InferenceDefaults = struct {
     api_url: ?[]const u8 = null,
     api_key: ?[]const u8 = null,
+    /// Node secret store that resolves `api_key` (and index-scoped secret
+    /// references) on paths that take no explicit store, such as owner
+    /// reconciliation. Without it a `${secret:...}` reference would fall back
+    /// to an environment lookup instead of the configured file store.
+    secret_store: ?*common_secrets.FileStore = null,
 };
 
 pub fn configureStorageKernelOwnerDb(
@@ -2000,7 +2005,7 @@ pub fn reconcileStorageKernelOwnerDb(
         inference.api_url,
         inference.api_key,
         table_name,
-        null,
+        inference.secret_store,
         null,
     );
     const provisioned = if (indexes_json.len > 0) blk: {

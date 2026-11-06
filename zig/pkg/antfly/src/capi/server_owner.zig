@@ -183,7 +183,7 @@ pub const StorageOwnerContext = struct {
     }
 
     pub fn inferenceDefaults(self: *const StorageOwnerContext) local_write.InferenceDefaults {
-        return .{ .api_url = self.inference_api_url, .api_key = self.inference_api_key };
+        return .{ .api_url = self.inference_api_url, .api_key = self.inference_api_key, .secret_store = self.secret_store };
     }
 
     fn clearInferenceDefaults(self: *StorageOwnerContext) void {
