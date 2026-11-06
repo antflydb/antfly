@@ -632,6 +632,8 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         .{ .sql = "SELECT l.id, r.id FROM l RIGHT JOIN r ON l.id=r.id AND l.id>1 ORDER BY l.id NULLS LAST, r.id NULLS LAST" },
         .{ .sql = "SELECT count(*) AS n FROM l LEFT JOIN r ON l.id=r.id" },
         .{ .sql = "SELECT count(*) AS n FROM l JOIN r ON l.id=r.id" },
+        .{ .sql = "SELECT count(*), sum(c.id), min(b.id), max(c.id) FROM l a JOIN r b ON a.id=b.id JOIN l c ON b.id=c.id", .wide_payload = true },
+        .{ .sql = "SELECT b.id, count(*), sum(c.id) FROM l a JOIN r b ON a.id=b.id JOIN l c ON b.id=c.id GROUP BY b.id ORDER BY b.id", .wide_payload = true },
         .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id>$1 ORDER BY l.id NULLS LAST, r.id NULLS LAST", .parameters = &.{.{ .integer = 5 }} },
         .{ .sql = "SELECT l.id, r.id FROM l JOIN r ON l.id=r.id AND NOT is_missing(r.id) ORDER BY l.id, r.id" },
         .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id = ANY($1::bigint[]) ORDER BY l.id NULLS LAST, r.id NULLS LAST", .parameters = &.{.{ .string = "[-2:0]={1,6,NULL}" }} },
@@ -720,6 +722,7 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         }
         try std.testing.expect(ReadGuard.reads > 0);
         try std.testing.expect(backend.captures >= 2);
+        const scanned_before_cancel = backend.scanned;
         var canceled: bool = true;
         distributed.distributed_context.cancellation = .{ .ptr = &canceled, .is_cancelled_fn = struct {
             fn check(raw: *const anyopaque) bool {
@@ -727,7 +730,7 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
             }
         }.check };
         try std.testing.expectError(error.Canceled, local.sql_runtime.execute(a, distributed, &compiled, query_case.parameters, execution_limits));
-        try std.testing.expectEqual(@as(usize, 0), backend.scanned);
+        try std.testing.expectEqual(scanned_before_cancel, backend.scanned);
     };
 }
 

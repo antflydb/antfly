@@ -457,8 +457,17 @@ form until a scalar consumer demands it. Retaining operators copy into their own
 stores before advancing; cursor close retires lazy caches before block metadata.
 Result manifests, source cancellation and allocation failures use the same bounded
 ownership path. An allocation regression compares this transfer against the
-former eager scalar-row cloning pattern for wide JSON results.
+former scalar decoder and eager row-cloning loop for wide JSON results. Three
+trials alternate execution order and report latency and peak tracked allocations
+for the bridge plus its retaining destination; fixture setup and external
+object-store allocations are outside that accounting. Timing is diagnostic,
+while ownership, pull allocations, and peak-memory improvements are asserted.
 
 Local join-aggregate reduction declines distributed cursors, whose join has
 already executed remotely. COUNT and grouped aggregates consume their result
 batches through the ordinary aggregate path without inspecting local children.
+
+Local aggregate reduction may sample a child that is itself a distributed join.
+Both scalar and batch consumers replay that borrowed sample before pulling the
+remote producer again, even when the sample declines reduction. Failed replay
+allocations leave the sample position unchanged.

@@ -319,15 +319,37 @@ const ResultFixture = struct {
         saved.deinit(a);
         return .{ .key = key, .hash = hash, .bytes = bytes.len, .rows = page.rows };
     }
-    /// Match the former bridge's eager scalar-row materialization for comparison.
-    fn cloned(a: A, batch: Batch) !Batch {
-        const rows = try a.alloc([]const Datum, batch.len());
-        for (rows, 0..) |*row, index| {
-            const cells = try a.alloc(Datum, batch.width());
-            for (cells, 0..) |*cell, column| cell.* = try local.sql_operators.cloneDatum(a, try batch.cell(a, index, column));
-            row.* = cells;
+    /// Preserve the pre-typed bridge's scalar decoder and eager clone loop as
+    /// an executable baseline. This fixture only consumes direct result pages.
+    fn legacyNext(owner: *Owner, a: A, maximum: usize) !Batch {
+        var rows: std.ArrayList([]const Datum) = .empty;
+        while (rows.items.len < maximum) {
+            try owner.service.context.ensureActive();
+            if (owner.block) |*block| {
+                if (owner.row < block.view().count()) {
+                    const cells = try a.alloc(Datum, block.view().width());
+                    for (cells, 0..) |*cell, column| cell.* = try local.sql_operators.cloneDatum(a, try block.view().cell(owner.row, column));
+                    try rows.append(a, cells);
+                    owner.row += 1;
+                    continue;
+                }
+                block.deinit();
+                owner.block = null;
+            }
+            if (owner.data) |*data| {
+                if (try data.nextBlock(&owner.block_arena, exchange.max_object_bytes)) |encoded| {
+                    owner.block = .{ .borrowed = .{ .a = owner.a, .arena = .init(owner.a), .encoded = encoded } };
+                    owner.row = 0;
+                    continue;
+                }
+                owner.data = null;
+            }
+            if (owner.page == owner.pages.len) break;
+            _ = owner.decode.reset(.free_all);
+            owner.data = try owner.service.exchange_store.read(owner.decode.allocator(), owner.pages[owner.page], 0, exchange.max_object_bytes);
+            owner.page += 1;
         }
-        return .{ .rows = rows };
+        return .{ .rows = rows.items };
     }
 };
 
@@ -457,33 +479,44 @@ test "distributed SQL result bridge forwards wide JSON with bounded pull allocat
     for (rows, 0..) |*row, index| row.* = .{ .values = &.{scalar.Datum.json(json)}, .keys = &.{}, .ordinal = index };
     const output = try objects.put(sa, @splat('a'), 1000000, &.{rows}, 16 << 20);
     var pull_bytes: [2]usize = undefined;
-    var elapsed_ns: [2]u64 = undefined;
-    for ([_]bool{ true, false }, 0..) |clone_rows, mode| {
-        const owner = try ResultFixture.open(a, objects, &.{output}, &.{});
+    var peak_bytes: [2][3]usize = undefined;
+    var elapsed_ns: [2][3]u64 = undefined;
+    // Alternate ordering to avoid always warming the object-store/cache path
+    // for the typed run. Timing is diagnostic; correctness/bytes are asserted.
+    for (0..3) |trial| for (0..2) |turn| {
+        const mode = if (trial % 2 == 0) turn else 1 - turn;
+        var budget: local.sql_memory_budget = .{ .backing = a, .limit = std.math.maxInt(usize) };
+        const measured = budget.allocator();
+        const owner = try ResultFixture.open(measured, objects, &.{output}, &.{});
         var closed = false;
         defer if (!closed) Owner.close(owner);
-        var counted = std.testing.FailingAllocator.init(a, .{});
+        var counted = std.testing.FailingAllocator.init(measured, .{});
         var pull = std.heap.ArenaAllocator.init(counted.allocator());
         defer pull.deinit();
-        var destination = local.sql_typed_store.Store.init(a);
+        var destination = local.sql_typed_store.Store.init(measured);
         defer destination.deinit();
         const started = @import("antfly_platform").time.monotonicNs();
         while (true) {
             _ = pull.reset(.free_all);
-            var batch = try Owner.next(owner, pull.allocator(), 256);
+            const batch = if (mode == 0) try ResultFixture.legacyNext(owner, pull.allocator(), 256) else try Owner.next(owner, pull.allocator(), 256);
             if (batch.len() == 0) break;
-            if (clone_rows) batch = try ResultFixture.cloned(pull.allocator(), batch);
             try destination.appendBatch(batch);
         }
-        elapsed_ns[mode] = @import("antfly_platform").time.monotonicNs() - started;
+        elapsed_ns[mode][trial] = @import("antfly_platform").time.monotonicNs() - started;
         Owner.close(owner);
         closed = true;
         try std.testing.expectEqual(@as(usize, 512), destination.len);
         const retained = try destination.cell(sa, 511, 0);
         try std.testing.expectEqualStrings(text, retained.value.object.get("payload").?.string);
-        pull_bytes[mode] = counted.allocated_bytes;
-    }
-    std.debug.print("result bridge rows=512 payload=16384 cloned_pull_bytes={d} typed_pull_bytes={d} cloned_ns={d} typed_ns={d}\n", .{ pull_bytes[0], pull_bytes[1], elapsed_ns[0], elapsed_ns[1] });
+        if (trial == 0) {
+            pull_bytes[mode] = counted.allocated_bytes;
+        } else {
+            try std.testing.expectEqual(pull_bytes[mode], counted.allocated_bytes);
+        }
+        peak_bytes[mode][trial] = budget.peak;
+    };
+    std.debug.print("result bridge rows=512 payload=16384 legacy_pull_bytes={d} typed_pull_bytes={d} legacy_peak_bytes={any} typed_peak_bytes={any} legacy_ns={any} typed_ns={any}\n", .{ pull_bytes[0], pull_bytes[1], peak_bytes[0], peak_bytes[1], elapsed_ns[0], elapsed_ns[1] });
+    for (peak_bytes[0], peak_bytes[1]) |legacy, typed| try std.testing.expect(typed < legacy);
     try std.testing.expect(pull_bytes[0] > 8 * 1024 * 1024);
     try std.testing.expect(pull_bytes[1] < 16 * 1024);
 }
