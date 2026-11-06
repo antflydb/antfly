@@ -665,7 +665,6 @@ pub const OpenOptions = struct {
     start_optional_runtime_workers: bool = true,
     /// Managed caches install distributed callbacks before activating replay.
     start_resolver_workers: bool = true,
-    external_derived_checkpoints: bool = true,
     /// Optional durable namespace for replica-local index repair state.
     /// Externally owned roots use this to keep crash-resume intent and replay
     /// pins inside the same atomic storage generation as their indexes.
@@ -4016,7 +4015,6 @@ pub const DB = struct {
                 opts.identity_namespace,
                 false,
                 if (opts.prefer_existing_identity_namespace) .use_existing else .reject,
-                opts.external_derived_checkpoints,
                 opts.index_repair_checkpoint_storage,
                 opts.lsm_root_generation,
                 openModeRequiresReadOnlyBackends(opts.open_mode),
@@ -116317,7 +116315,6 @@ test "db dense artifact rebuild persists state through external index storage" {
         },
         .physical_root_mode = .external_backend,
         .index_base_path = index_base_path,
-        .external_derived_checkpoints = false,
         .start_index_workers = false,
         .start_optional_runtimes = false,
         .ttl_cleanup = .{ .enabled = false },

@@ -735,7 +735,6 @@ fn openDbWithIo(allocator: Allocator, path: []const u8, io: std.Io, create: bool
     const identity = connection.identityOpenOptions(create);
     var db_opts = db_mod.OpenOptions{
         .open_mode = .writer,
-        .external_derived_checkpoints = false,
         .identity_namespace = identity.identity_namespace,
         .prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace,
     };

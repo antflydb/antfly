@@ -99,7 +99,6 @@ pub const Connection = struct {
                 defer a.free(namespace);
                 var options: db_mod.OpenOptions = .{
                     .open_mode = .writer,
-                    .external_derived_checkpoints = false,
                     .identity_namespace = .{ .table_id = table.id, .shard_id = table.id, .range_id = table.id },
                     .prefer_existing_identity_namespace = false,
                     .online_source_authority = .native,
@@ -196,7 +195,6 @@ fn openWithBackend(
     const identity = identityOpenOptions(create);
     var opts = db_mod.OpenOptions{
         .open_mode = open_mode,
-        .external_derived_checkpoints = false,
         .identity_namespace = identity.identity_namespace,
         .prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace,
     };
@@ -292,7 +290,6 @@ test "lite connection adopts a legacy file whose first write persisted the defau
         defer lite_backend.deinit();
         var opts = db_mod.OpenOptions{
             .open_mode = .writer,
-            .external_derived_checkpoints = false,
             .identity_namespace = null,
         };
         try lite_backend.configureDbOpenOptions(&opts);

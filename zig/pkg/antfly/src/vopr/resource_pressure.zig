@@ -257,7 +257,6 @@ pub const Scenario = struct {
                 .executor = .{ .backend = .manual },
                 .backend_runtime = &runtime,
                 .resource_manager = &self.resources,
-                .external_derived_checkpoints = false,
                 .ttl_cleanup = .{ .enabled = false },
                 .transaction_recovery = .{ .enabled = false },
                 .text_merge = .{ .enabled = false },

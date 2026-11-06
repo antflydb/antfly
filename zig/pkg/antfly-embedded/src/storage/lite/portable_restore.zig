@@ -171,7 +171,7 @@ pub fn importPreparedIntoLiteDb(
     });
     var staged_backend_owned = true;
     errdefer if (staged_backend_owned) staged_backend.deinit();
-    var staged_opts = db_mod.OpenOptions{ .identity_namespace = root_identity, .prefer_existing_identity_namespace = false, .external_derived_checkpoints = false };
+    var staged_opts = db_mod.OpenOptions{ .identity_namespace = root_identity, .prefer_existing_identity_namespace = false };
     try staged_backend.configureDbOpenOptions(&staged_opts);
     var prepared = LiteDb{ .db = try db_mod.DB.open(allocator, tmp_path, staged_opts), .backend = staged_backend, .open_mode = .writer };
     staged_backend_owned = false;

@@ -3101,7 +3101,6 @@ pub fn openLiteHandleAllocWithSharedInference(
 
     var opts = db_mod.OpenOptions{
         .open_mode = resolved.open_mode,
-        .external_derived_checkpoints = false,
         .backend_runtime = if (owned_runtime) |runtime| runtime.runtime else backend_runtime,
         .online_source_authority = .native,
     };
@@ -3205,9 +3204,9 @@ pub fn openLiteHandleAllocWithSharedInference(
 }
 
 pub fn dbOpenOptionsFromResolved(resolved: LiteResolvedOpenOptions, lite: bool) db_mod.OpenOptions {
+    _ = lite;
     var opts = db_mod.OpenOptions{
         .open_mode = resolved.open_mode,
-        .external_derived_checkpoints = !lite,
         .online_source_authority = .native,
     };
     if (resolved.map_size) |map_size| opts.map_size = map_size;
@@ -3912,7 +3911,7 @@ pub fn restorePortableBackupToDirectory(
     var staged = try transition.beginStaging();
     defer staged.deinit();
     {
-        var db = try db_mod.DB.open(alloc, staged.path(), .{ .staged_generation = &staged, .identity_namespace = try @import("database_backup.zig").rootIdentity(alloc, backup), .external_derived_checkpoints = false });
+        var db = try db_mod.DB.open(alloc, staged.path(), .{ .staged_generation = &staged, .identity_namespace = try @import("database_backup.zig").rootIdentity(alloc, backup) });
         defer db.close();
         try @import("database_backup.zig").populate(alloc, &db, null, staged.path(), backup);
     }
@@ -3986,7 +3985,6 @@ pub fn restorePortableSourceToLiteFile(
 
         var opts = db_mod.OpenOptions{
             .open_mode = .writer,
-            .external_derived_checkpoints = false,
             .backend_runtime = backend_runtime,
             .identity_namespace = try @import("database_backup.zig").rootIdentity(alloc, context),
             .prefer_existing_identity_namespace = false,

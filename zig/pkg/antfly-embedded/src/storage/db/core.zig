@@ -2998,16 +2998,10 @@ pub fn openCoreResourcesFromPrimaryStore(
     configured_identity_namespace: ?doc_identity.Namespace,
     persist_identity_namespace_if_missing: bool,
     identity_namespace_mismatch_policy: doc_identity.NamespaceMismatchPolicy,
-    external_derived_checkpoints: bool,
     index_repair_checkpoint_storage: ?lsm_backend_mod.Storage,
     root_generation: u64,
     read_only: bool,
 ) !OpenedCoreResources {
-    // Progress v2 lives in the primary KV store for every backend kind; there
-    // is no longer an external checkpoint-sidecar file this flag could ask
-    // for. The parameter stays (callers still pass it) pending a broader
-    // signature cleanup.
-    _ = external_derived_checkpoints;
     var owned_path: ?[]u8 = null;
     var owned_index_repair_checkpoint: ?IndexRepairCheckpoint = null;
     var owned_store: ?*docstore_mod.DocStore = null;

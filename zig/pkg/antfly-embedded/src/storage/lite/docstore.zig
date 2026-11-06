@@ -2942,6 +2942,20 @@ pub const Store = struct {
         return self.submitScopedMutation(context, apply, durable, false, false);
     }
 
+    /// WS7/WS5 interim ride-along commit, one named helper so every caller
+    /// (owner-turn retirement, reclamation, catch-up/status) goes through
+    /// a single place: WS2's upcoming `Store.stageRideAlong` ticketed
+    /// group-commit queue replaces this body, not its callers. Never closes
+    /// a group and never forces a sync on its own (design doc §3.2a); it
+    /// becomes durable for free the next time any grouped member -- most
+    /// commonly a concurrent foreground write -- commits with durable=true,
+    /// or at this owner's own idle-flush/close/lease-handoff barriers.
+    /// Crash invariant: whatever this writes may be lost and redone; it must
+    /// never be the only record of acknowledged work or a released credit.
+    pub fn commitRideAlong(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
+        return self.submitMutationWithDurability(context, apply, false);
+    }
+
     /// Immutable source aliases are read-path metadata, not authored writes.
     /// Only groups containing exclusively these aliases may defer reuse proof.
     pub fn submitArtifactLeaseMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
@@ -3141,13 +3155,15 @@ pub const Store = struct {
     }
 
     pub fn beginBatchWithOptions(self: *Store, options: backend_types.BatchOptions) !Txn {
-        _ = options;
-        return try self.beginBatch();
+        var txn = try self.beginBatch();
+        txn.ride_along = options.durability == .ride_along;
+        return txn;
     }
 
     pub fn beginBatchWithOptionsYielding(self: *Store, options: backend_types.BatchOptions) !Txn {
-        _ = options;
-        return try self.beginBatchYielding();
+        var txn = try self.beginBatchYielding();
+        txn.ride_along = options.durability == .ride_along;
+        return txn;
     }
 
     pub fn lastReplaySequence(self: *Store, fallback_last: u64) u64 {
@@ -3229,9 +3245,15 @@ pub const Store = struct {
     /// path-lease holder or the Raft leader) -- `is_owner` is not derived
     /// here, it is asserted, so a caller cannot mistake a skipped turn for a
     /// completed one.
+    ///
+    /// Commits non-durably (WS7/§3.2a's commitRideAlong): retirement is
+    /// always safe to lose and redo from the durable progress watermark, so
+    /// it must never force its own fsync. It becomes durable for free on
+    /// the next foreground group, or at this owner's own idle-flush/close
+    /// barrier.
     pub fn serviceRetirement(self: *Store, is_owner: bool, budget: replay_chunks.RetirementBudget) !replay_chunks.RetirementStats {
         if (!is_owner) return error.RetirementRequiresOwner;
-        return try retireReplaySlice(self, "", false, self.retirement_queue.requested(), budget);
+        return try retireReplaySlice(self, "", false, self.retirement_queue.requested(), budget, false);
     }
 };
 
@@ -3256,8 +3278,9 @@ const RuntimeStore = struct {
     }
 
     pub fn beginBatchWithOptions(self: *RuntimeStore, options: backend_types.BatchOptions) !Txn {
-        _ = options;
-        return try Txn.openWriteYieldingWithPrefix(self.store, self.prefix);
+        var txn = try Txn.openWriteYieldingWithPrefix(self.store, self.prefix);
+        txn.ride_along = options.durability == .ride_along;
+        return txn;
     }
 
     pub fn lastReplaySequence(self: *RuntimeStore, fallback_last: u64) u64 {
@@ -3335,6 +3358,12 @@ pub const Txn = struct {
     read_generation: ?*ReadGeneration = null,
     read_pin: ?*ReadPin = null,
     checkpoint: native.CheckpointSlot = .{},
+    /// Set by beginBatchWithOptions() from BatchOptions.durability ==
+    /// .ride_along. commit() reads this to pick commitWithDurability's
+    /// argument, so callers that go through the generic backend_adapter
+    /// Store interface (a bare `try txn.commit()`, no durability
+    /// parameter available there) still get ride-along semantics.
+    ride_along: bool = false,
 
     pub fn decodedResultsNamespace(self: *const Txn) []const u8 {
         return self.prefix;
@@ -3463,6 +3492,17 @@ pub const Txn = struct {
     }
 
     pub fn commit(self: *Txn) !void {
+        return self.commitWithDurability(!self.ride_along);
+    }
+
+    /// WS7/WS5: `durable = false` submits through Store.commitRideAlong
+    /// instead of Store.submitMutation, so this transaction never forces its
+    /// own fsync -- it becomes durable only when a later durable commit's
+    /// checkpoint happens to cover it (design doc §3.2a). Only owner-turn
+    /// background work (retirement, reclamation, catch-up/status) may pass
+    /// false; every foreground/acknowledgement caller must keep `commit()`'s
+    /// default of true, or an acknowledged write could be lost on crash.
+    pub fn commitWithDurability(self: *Txn, durable: bool) !void {
         if (self.read_only) return error.ReadOnly;
         const store = self.store orelse return error.ReadOnly;
         // Metadata probes may use a write transaction without staging changes.
@@ -3499,7 +3539,11 @@ pub const Txn = struct {
         }
         const wal_trace_scope = wal_trace.scope(.primary_commit);
         defer wal_trace_scope.end();
-        try store.submitMutation(&context, Commit.apply);
+        if (durable) {
+            try store.submitMutation(&context, Commit.apply);
+        } else {
+            try store.commitRideAlong(&context, Commit.apply);
+        }
         self.releaseGenerationReadLock();
         if (self.writer_reserved) {
             store.releaseWriterSlot();
@@ -4977,6 +5021,7 @@ fn retireReplaySlice(
     yielding: bool,
     up_to_sequence: u64,
     budget: replay_chunks.RetirementBudget,
+    durable: bool,
 ) !replay_chunks.RetirementStats {
     var stats = replay_chunks.RetirementStats{ .done = true, .no_op = true };
     if (up_to_sequence == 0) return stats;
@@ -5050,7 +5095,7 @@ fn retireReplaySlice(
     ledger = ledger.released(freed_bytes, freed_records);
     try storeJournalCreditLedger(&write, ledger);
 
-    try write.commit();
+    try write.commitWithDurability(durable);
     committed = true;
 
     stats.retired_through = if (max_retired_exclusive == 0) 0 else max_retired_exclusive - 1;
@@ -5063,7 +5108,11 @@ fn retireReplaySlice(
 /// catches up to `up_to_sequence` or there is nothing left to do.
 fn drainRetireReplaySlice(store: *Store, prefix: []const u8, yielding: bool, up_to_sequence: u64) !void {
     while (true) {
-        const stats = try retireReplaySlice(store, prefix, yielding, up_to_sequence, default_retirement_budget);
+        // Durable: callers of this back-compat path (direct tests,
+        // shard-transfer donor/receiver) expect the drain itself to be the
+        // durability barrier, unlike serviceRetirement's owner-turn
+        // ride-along commits.
+        const stats = try retireReplaySlice(store, prefix, yielding, up_to_sequence, default_retirement_budget, true);
         if (stats.done) return;
     }
 }

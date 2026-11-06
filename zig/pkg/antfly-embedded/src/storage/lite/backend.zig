@@ -276,7 +276,6 @@ pub const Handle = struct {
                 opts.index_backends.sparse_lsm_storage = storage;
                 opts.index_backends.graph_lsm_storage = storage;
                 opts.index_repair_checkpoint_storage = storage;
-                opts.external_derived_checkpoints = false;
                 opts.physical_root_mode = .external_backend;
             },
             .native_single_file => {
@@ -306,7 +305,6 @@ pub const Handle = struct {
                 opts.index_repair_checkpoint_storage = storage;
                 opts.index_base_path = native_index_base_path;
                 opts.index_open_parallelism = 1;
-                opts.external_derived_checkpoints = false;
                 opts.physical_root_mode = .external_backend;
                 opts.external_root_incarnation = try self.durableRootIncarnationLocked("root");
             },
@@ -380,7 +378,6 @@ pub const Handle = struct {
         opts.index_repair_checkpoint_storage = storage;
         opts.index_base_path = runtime.index_base_path;
         opts.index_open_parallelism = 1;
-        opts.external_derived_checkpoints = false;
         opts.physical_root_mode = .external_backend;
         opts.external_root_incarnation = try self.durableRootIncarnationLocked(canonical_namespace);
     }
@@ -1173,7 +1170,6 @@ test "lite backend native engine creates and checks aflite file" {
     try std.testing.expect(db_opts.index_backends.graph_lsm_storage != null);
     try std.testing.expectEqualStrings(native_index_base_path, db_opts.index_base_path.?);
     try std.testing.expectEqual(@as(?usize, 1), db_opts.index_open_parallelism);
-    try std.testing.expect(!db_opts.external_derived_checkpoints);
     try std.testing.expectEqual(
         db_mod.OpenOptions.PhysicalRootMode.external_backend,
         db_opts.physical_root_mode,
