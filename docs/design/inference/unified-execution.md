@@ -273,6 +273,11 @@ preparation API do not by themselves complete these remaining requirements:
   consumes the prepared views. Cross K/V projections write directly into the
   original KV slabs, and self attention receives actual live prefixes without
   allocating slice headers. The initial causal prompt retains eager execution.
+  Managed decoders share immutable graph, descriptor, liveness and layout facts
+  through a bounded Model cache; weights, KV, Frames and execution epochs stay
+  private. Shared metadata retains its admission Domain, with final quota refunds
+  deferred through the actual retirement boundary outside execution. Retained
+  shared metadata and pending mandatory KV remain in the full request fit.
   Cold metadata has independently admitted storage, physical banks have exact
   additional declarations, and the old request envelope remains intact. Source
   stamps revalidate under the Model gate; construction capabilities are consumed

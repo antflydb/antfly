@@ -1397,6 +1397,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return metal_runtime.antfly_metal_validate_prepared_bindings(provider.raw_decode_runtime, checked, stamps.ptr, stamps.len) == 1;
     }
 
+    /// Existing ordinary linear returns owned dense F32 and row copies keep
+    /// exact SDK source roots through their actual command-buffer completion.
+    /// Metadata/tape capture is a different producer contract, not certified.
+    pub fn ordinaryF32RowProducerAvailable(cb: *const ops.ComputeBackend) !bool {
+        if (!kernel_backend_impl.accepts(cb.vtable)) return false;
+        _ = preparedBackendIdentity(cb) orelse return false;
+        const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
+        return self.audio_capture == null and !self.ownsMetadataIndex();
+    }
+
     pub fn preparedBackendIdentity(cb: *const ops.ComputeBackend) ?PreparedBackendIdentity {
         if (cb.kind() != .metal or !kernel_backend_impl.accepts(cb.vtable)) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));

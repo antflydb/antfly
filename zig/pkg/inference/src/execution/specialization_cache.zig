@@ -109,3 +109,51 @@ test "specialization ownership preserves LRU victims and allocation failure atom
     try std.testing.expectError(error.OutOfMemory, empty.reserve(failing.allocator()));
     try std.testing.expectEqual(@as(usize, 0), empty.entries.items.len);
 }
+
+/// One bounded immutable specialization. A borrowed entry is never evicted;
+/// callers retire detached values outside this metadata-only mutex.
+pub fn PinnedSlot(comptime Value: type, comptime Key: type, comptime keyOf: fn (Value) Key, comptime equal: fn (Key, Key) bool, comptime retain: fn (Value) Value, comptime pinned: fn (Value) bool) type {
+    return struct {
+        mutex: std.atomic.Mutex = .unlocked,
+        value: ?Value = null,
+        stats: Stats = .{},
+        pub fn acquire(self: *@This(), key: Key) ?Value {
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.value) |value| if (equal(keyOf(value), key)) {
+                self.stats.hits +%= 1;
+                return retain(value);
+            };
+            self.stats.misses +%= 1;
+            return null;
+        }
+        pub fn publish(self: *@This(), value: Value) ?Value {
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.value) |old| {
+                if (equal(keyOf(old), keyOf(value)) or pinned(old)) return null;
+            }
+            const old = self.value;
+            self.value = retain(value);
+            self.stats.builds +%= 1;
+            if (old != null) self.stats.evictions +%= 1;
+            return old;
+        }
+        pub fn takeUnpinned(self: *@This()) ?Value {
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            const old = self.value orelse return null;
+            if (pinned(old)) return null;
+            self.value = null;
+            self.stats.evictions +%= 1;
+            return old;
+        }
+        pub fn take(self: *@This()) ?Value {
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            defer self.mutex.unlock();
+            const old = self.value;
+            self.value = null;
+            return old;
+        }
+    };
+}

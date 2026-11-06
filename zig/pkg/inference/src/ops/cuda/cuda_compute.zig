@@ -4096,6 +4096,16 @@ pub const CudaCompute = struct {
         }
     }
 
+    /// Ordinary F32 projection outputs use the same tracked stream and
+    /// temporary-buffer retirement as existing borrowed row-copy callers.
+    /// Capture requires its separate pinned-root owner and remains unchanged.
+    pub fn ordinaryF32RowProducerAvailable(cb: *const ops.ComputeBackend) !bool {
+        if (!acceptsPhysicalImplementation(cb.vtable)) return false;
+        const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));
+        if (self.capability_profile == .embedding_gemma2 or self.debug_cuda_graph_capture_active) return false;
+        return !try self.ctx.streamCaptureActive();
+    }
+
     pub fn inspectCapturedGraphPhase(cb: *const ops.ComputeBackend, phase: *@import("lighton_decode_graph.zig").GraphPhase, current: CacheCleanup) !GraphPhaseDecision {
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.UnsupportedReaderEpochBackend;
         const self: *CudaCompute = @ptrCast(@alignCast(cb.ptr));

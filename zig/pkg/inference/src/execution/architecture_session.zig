@@ -2784,6 +2784,9 @@ const ArchSession = struct {
     /// Tree-packed Laya trunk keys and values, created on first packed run.
     laya_trunk_cache: ?*@import("../architectures/laya_trunk_cache.zig").Cache = null,
     laya_trunk_cache_lock: std.atomic.Mutex = .unlocked,
+    whisper_definitions: @import("dense_decoder_schedule.zig").DefinitionSlot = .{},
+    whisper_definition_retirement_mutex: std.atomic.Mutex = .unlocked,
+    retired_whisper_definitions: ?*@import("dense_decoder_schedule.zig").Definition = null,
 };
 
 const GlinerDecisionIdentityHandoff = struct {
@@ -5084,9 +5087,10 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     // vector, encoder/self masks) is now exclusively charged by metadata AA.
     // Keep the actual KV payload in its original class and ALL old base floors.
     kv_only.host_scratch_bytes = try std.math.sub(usize, kv_only.host_scratch_bytes, geometry.known_metadata_bytes);
-    try metadata.validateAdditional(kv_only);
-    self.cache_permit = try incrementalCachePermitForAmounts(session, base, kv_only);
-    if (self.cache_permit) |*cache| try metadata.setHeldPermits(&.{ base, cache });
+    // The complete real KV recipe remains a denial floor during metadata/source
+    // preparation, before any partial KV lease can misclassify a known cache
+    // footprint as independent contention.
+    if (session.run_admission != null) try metadata.setPendingAdditional(kv_only);
     self.encoder = switch (encoder) {
         .resident => |value| value,
         .host => |values| block: {
@@ -5098,7 +5102,35 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     };
     self.weights = try whisper_arch.PreparedDecoderWeights.initWithSource(cb, metadata.allocator(), config, true, .{ .expected_data = data, .domain = domain });
     try NativeCompute.stampHeldF32WeightSources(cb, data, self.weights.?.fetcher.handles.items);
-    self.program = (try whisper_arch.PreparedSingleToken.init(cb, data, metadata.allocator(), config, self.encoder.?, geometry.encoder_rows, &self.weights.?)) orelse return false;
+    const schedule = @import("dense_decoder_schedule.zig");
+    const arch: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    var preparation = schedule.Preparation{ .key = @splat(0) };
+    defer preparation.deinit(current);
+    // Only independently admitted managed metadata can enter the Model cache.
+    // Raw/no-Domain callers retain their original request-owned preparation.
+    if (domain != null and schedule.sharedBackingSupported(arch.allocator)) {
+        preparation.key = try whisper_arch.PreparedSingleToken.definitionKey(cb, data, config, geometry.encoder_rows, &self.weights.?);
+        preparation.cached = arch.whisper_definitions.acquire(preparation.key);
+        if (preparation.cached) |value| if (value.shared.?.domain.owner != domain.?.owner or value.shared.?.domain.controller() != domain.?.controller()) {
+            value.release(current);
+            preparation.cached = null;
+        };
+        if (preparation.cached) |definition| {
+            try metadata.setSharedMetadataFloor(definition.shared.?.admittedAmounts());
+        } else preparation.shared = try @import("cold_metadata.zig").Shared.create(arch.allocator, metadata);
+    }
+    self.cache_permit = try incrementalCachePermitForAmounts(session, base, kv_only);
+    if (session.run_admission != null) {
+        if (self.cache_permit) |*cache| try metadata.setHeldPermitsReplacingPending(&.{ base, cache }) else try metadata.setHeldPermitsReplacingPending(&.{base});
+    }
+    self.program = (whisper_arch.PreparedSingleToken.init(cb, data, metadata.allocator(), config, self.encoder.?, geometry.encoder_rows, &self.weights.?, &preparation) catch |err| {
+        if (err == error.OutOfMemory) if (preparation.shared) |shared| return shared.admissionError() orelse err;
+        return err;
+    }) orelse return false;
+    const definition = self.program.?.schedule.definition;
+    if (preparation.cached == null) if (definition.shared) |shared| {
+        try shared.sealBeforeExecution();
+    };
     try self.program.?.schedule.setHostWorkspaceAllocator(allocator);
     var requirements = @import("prepared_storage_admission.zig").Builder{ .allocator = metadata.allocator() };
     defer requirements.deinit();
@@ -5124,6 +5156,11 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
     // Construction C owns no numerical work. It ends before the real receiver
     // binds a fresh B to this already materialized Frame under its Model gate.
     try metadata.sealBeforeExecution();
+    if (preparation.cached == null and definition.shared != null) {
+        // Successful complete cold publication only. Never leave newly charged
+        // metadata cached when optional bank/Frame preparation declines.
+        if (arch.whisper_definitions.publish(definition)) |old| old.release(.{ .outside_execution = true });
+    }
     return true;
 }
 
@@ -6564,7 +6601,19 @@ pub fn reclaimOneHostCacheEntryForSession(session: Session) usize {
         .native => native: {
             const weight_bytes = native_mod.reclaimOneHostCacheEntryDeferringCredit(&self.backend_data.native);
             if (weight_bytes != 0) break :native weight_bytes; // original priority
-            break :native if (self.laya_trunk_cache) |cache| cache.reclaimOneDeferringPhysical() else 0;
+            if (self.laya_trunk_cache) |cache| {
+                const bytes = cache.reclaimOneDeferringPhysical();
+                if (bytes != 0) break :native bytes;
+            }
+            // A cache-held Definition is reclaimable only with no decoder
+            // borrowers. Detach metadata here; callbacks run solely in the
+            // existing explicit outside-execution settlement service below.
+            platform.sync.lockYielding(&self.whisper_definition_retirement_mutex);
+            defer self.whisper_definition_retirement_mutex.unlock();
+            const definition = self.whisper_definitions.takeUnpinned() orelse break :native 0;
+            definition.retired_next = self.retired_whisper_definitions;
+            self.retired_whisper_definitions = definition;
+            break :native definition.shared.?.admittedAmounts().hostTotalBytes();
         },
         .pjrt => native_mod.reclaimOneHostCacheEntryDeferringCredit(&self.backend_data.pjrt.native),
         .metal, .cuda, .wasm => 0,
@@ -6577,7 +6626,13 @@ pub fn reclaimOneHostCacheEntryForSession(session: Session) usize {
 pub fn hostCacheCreditSettlementPendingForSession(session: Session) bool {
     if (session.vtable != &arch_vtable) return false;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    if (self.backend_type == .native) if (self.laya_trunk_cache) |cache| if (cache.retirementPending()) return true;
+    if (self.backend_type == .native) {
+        platform.sync.lockYielding(&self.whisper_definition_retirement_mutex);
+        const pending = self.retired_whisper_definitions != null;
+        self.whisper_definition_retirement_mutex.unlock();
+        if (pending) return true;
+        if (self.laya_trunk_cache) |cache| if (cache.retirementPending()) return true;
+    }
     const data: ?*native_mod.WeightStore = switch (self.backend_type) {
         .native => &self.backend_data.native,
         .pjrt => &self.backend_data.pjrt.native,
@@ -6595,11 +6650,22 @@ pub fn flushHostCacheReleasesOutsideExecutionForSession(session: Session) !bool 
         else => null,
     };
     var released = false;
+    if (self.backend_type == .native) {
+        platform.sync.lockYielding(&self.whisper_definition_retirement_mutex);
+        var definitions = self.retired_whisper_definitions;
+        self.retired_whisper_definitions = null;
+        self.whisper_definition_retirement_mutex.unlock();
+        while (definitions) |definition| {
+            definitions = definition.retired_next;
+            definition.release(.{ .outside_execution = true });
+            released = true;
+        }
+    }
     if (data) |actual| if (actual.tier_cache) |*cache| {
         const before = cache.admissionAmounts();
         cache.flushReleasedOutsideExecution() catch {};
         const after = cache.admissionAmounts();
-        released = after.host_weight_bytes < before.host_weight_bytes or after.backend_weight_bytes < before.backend_weight_bytes;
+        released = released or after.host_weight_bytes < before.host_weight_bytes or after.backend_weight_bytes < before.backend_weight_bytes;
     };
     if (self.backend_type == .native) if (self.laya_trunk_cache) |cache| {
         const pending = cache.retirementPending();
@@ -8543,6 +8609,11 @@ fn archCloseWithCleanup(ptr: *anyopaque, current: @import("cleanup_context.zig")
     if (self.video_coefficient_permit) |*permit| permit.deinit();
     if (self.video_coefficient_device_permit) |*permit| permit.deinit();
     if (self.generation_workspace) |*workspace| workspace.borrowed.deinit();
+    if (self.whisper_definitions.take()) |definition| definition.release(current);
+    while (self.retired_whisper_definitions) |definition| {
+        self.retired_whisper_definitions = definition.retired_next;
+        definition.release(current);
+    }
     if (self.laya_trunk_cache) |cache| {
         cache.deinitWithCleanup(current) catch platform.inference_process_supervisor.restartWorker();
         self.allocator.destroy(cache);
@@ -18585,7 +18656,8 @@ fn nativeWhisperAssignedSourceCase(a: std.mem.Allocator, admitted: bool) !void {
         try std.testing.expect(value.controller.snapshot().host_kv_bytes > 0);
         try std.testing.expect(value.controller.snapshot().host_scratch_bytes > 0);
         try std.testing.expectEqual(@as(usize, 0), decoder.cache_permit.?.lease.?.amounts.host_scratch_bytes);
-        const expected = try (try (try decoder.base_permit.?.lease.?.amounts.merge(decoder.cache_permit.?.lease.?.amounts)).merge(try program.schedule.selected.storageRequirement())).merge(decoder.cold_metadata.?.admittedAmounts());
+        const private_expected = try (try (try decoder.base_permit.?.lease.?.amounts.merge(decoder.cache_permit.?.lease.?.amounts)).merge(try program.schedule.selected.storageRequirement())).merge(decoder.cold_metadata.?.admittedAmounts());
+        const expected = if (program.schedule.definition.shared) |shared| try private_expected.merge(shared.admittedAmounts()) else private_expected;
         try std.testing.expectEqualDeep(expected, value.controller.snapshot());
     }
     try std.testing.expect(frame.scope_cleanup.boundary.? == &program.schedule.numerical_epoch.?);
@@ -18844,4 +18916,186 @@ test "Native Whisper preserves unknown arena and bounded allocator compatibility
     var bound = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = 1 };
     try std.testing.expectError(error.OutOfMemory, whisperNativeDecoder(session, bound.allocator(), null, &hidden, 2));
     try std.testing.expect(bound.denied and bound.live == 0);
+}
+
+fn nativeWhisperSharedDefinitionCase(a: std.mem.Allocator) !void {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const domain = try Domain.create();
+    defer domain.release();
+    defer std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot()) catch @panic("shared Whisper metadata quota leaked");
+    var session = try IncrementalFixture.session(std.testing.allocator);
+    var session_open = true;
+    defer if (session_open) session.close();
+    try session.installOwnedExecutionGate(std.testing.allocator);
+    session.model_lifetime.?.admission_domain = domain.pin();
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 128 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    const arch: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    const config = arch.arch_config.whisper;
+    const geometry = try whisper_arch.CacheGeometry.init(config, 2);
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    var base_first = try incrementalBasePermit(session, config, geometry, false, false);
+    var first_base_open = true;
+    defer if (first_base_open) base_first.deinit();
+    const first = (try prepareColdNativeWhisper(session, a, null, config, geometry, &base_first, .{ .host = &hidden })) orelse return error.MissingFirstColdWhisper;
+    var first_open = true;
+    defer if (first_open) first.destroy(.{ .outside_execution = true });
+    var base_second = try incrementalBasePermit(session, config, geometry, false, false);
+    var second_base_open = true;
+    defer if (second_base_open) base_second.deinit();
+    const second = (try prepareColdNativeWhisper(session, a, null, config, geometry, &base_second, .{ .host = &hidden })) orelse return error.MissingSecondColdWhisper;
+    var second_open = true;
+    defer if (second_open) second.destroy(.{ .outside_execution = true });
+    const one = first.program.?.schedule;
+    const two = second.program.?.schedule;
+    const definition = one.definition;
+    try std.testing.expect(definition == two.definition and definition.shared != null);
+    try std.testing.expect(one.graph.nodes.items.ptr == two.graph.nodes.items.ptr);
+    try std.testing.expect(one.descriptors.ptr == two.descriptors.ptr and one.steps.ptr == two.steps.ptr);
+    try std.testing.expect(one.values.ptr != two.values.ptr and one.bindings.ptr != two.bindings.ptr and one.planes.ptr != two.planes.ptr);
+    try std.testing.expect(one.root != two.root and one.selected != two.selected and one.frame.? != two.frame.?);
+    try std.testing.expect(one.backend.ptr != two.backend.ptr);
+    try std.testing.expect(first.weights.?.fetcher.handles.items.ptr != second.weights.?.fetcher.handles.items.ptr);
+    try std.testing.expect(first.program.?.self_slabs[0].k != second.program.?.self_slabs[0].k);
+    try std.testing.expect(first.program.?.self_slabs[0].cross_k != second.program.?.self_slabs[0].cross_k);
+    try std.testing.expect(one.numerical_epoch == null and two.numerical_epoch == null);
+    const shared_amounts = definition.shared.?.admittedAmounts();
+    try std.testing.expect(shared_amounts.host_scratch_bytes > 0);
+    const expected = try (try (try (try base_first.lease.?.amounts.merge(base_second.lease.?.amounts)).merge(first.metadata.admittedAmounts())).merge(second.metadata.admittedAmounts())).merge(shared_amounts);
+    // Physical banks retain independent declared leases after permit partition.
+    const with_first = try expected.merge(try one.selected.storageRequirement());
+    const with_second = try with_first.merge(try two.selected.storageRequirement());
+    const with_kv_first = try with_second.merge(first.cache_permit.?.lease.?.amounts);
+    const full = try with_kv_first.merge(second.cache_permit.?.lease.?.amounts);
+    try std.testing.expectEqualDeep(full, domain.controller.snapshot());
+    // Reclamation cannot detach a borrowed Definition or touch its live graph.
+    const pinned_count = definition.references.load(.acquire);
+    try std.testing.expect(arch.whisper_definitions.takeUnpinned() == null);
+    try std.testing.expectEqual(pinned_count, definition.references.load(.acquire));
+    first.destroy(.{ .outside_execution = true });
+    first_open = false;
+    second.destroy(.{ .outside_execution = true });
+    second_open = false;
+    base_first.deinit();
+    first_base_open = false;
+    base_second.deinit();
+    second_base_open = false;
+    try std.testing.expectEqualDeep(shared_amounts, domain.controller.snapshot());
+    const reclaimed = reclaimOneHostCacheEntryForSession(session);
+    try std.testing.expectEqual(shared_amounts.hostTotalBytes(), reclaimed);
+    try std.testing.expect(hostCacheCreditSettlementPendingForSession(session));
+    try std.testing.expectEqualDeep(shared_amounts, domain.controller.snapshot());
+    try std.testing.expect(try flushHostCacheReleasesOutsideExecutionForSession(session));
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+
+    // Real public decoders reuse the same schema but enter independent actual
+    // numerical epochs, and their host publications survive both cache eviction
+    // and final Model release.
+    var decoder = (try whisperNativeDecoder(session, a, null, &hidden, 2)).?;
+    var decoder_open = true;
+    defer if (decoder_open) decoder.deinit();
+    const public_definition = decoder.cache.native_program.?.schedule.definition;
+    try std.testing.expect(public_definition.shared != null);
+    const first_result = try decoder.step(&.{ 0, 1 });
+    defer a.free(first_result);
+    const held = try a.dupe(f32, first_result);
+    defer a.free(held);
+    const next = try decoder.step(&.{2});
+    defer a.free(next);
+    decoder.deinit();
+    decoder_open = false;
+    var repeated = (try whisperNativeDecoder(session, a, null, &hidden, 2)).?;
+    var repeated_open = true;
+    defer if (repeated_open) repeated.deinit();
+    try std.testing.expect(repeated.cache.native_program.?.schedule.definition == public_definition);
+    const repeated_result = try repeated.step(&.{ 0, 1 });
+    defer a.free(repeated_result);
+    try std.testing.expectEqualSlices(f32, held, repeated_result);
+    repeated.deinit();
+    repeated_open = false;
+    // A changed encoder length is a different exact schema; no live borrowers
+    // remain, so the single bounded slot can evict its old Definition.
+    const wider_hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3, 0.1, 0.2, 0.3, 0.4 };
+    var changed = (try whisperNativeDecoder(session, a, null, &wider_hidden, 3)).?;
+    var changed_open = true;
+    defer if (changed_open) changed.deinit();
+    try std.testing.expect(changed.cache.native_program.?.schedule.definition != public_definition);
+    try std.testing.expect(arch.whisper_definitions.stats.evictions > 0);
+    try std.testing.expectEqualSlices(f32, held, first_result);
+    const changed_result = try changed.step(&.{ 0, 1 });
+    defer a.free(changed_result);
+    session.close();
+    session_open = false;
+    const changed_next = try changed.step(&.{2});
+    defer a.free(changed_next);
+    changed.deinit();
+    changed_open = false;
+    try std.testing.expectEqualSlices(f32, held, first_result);
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "actual admitted Native Whisper Definitions share only immutable schemas across private cold and public decoders" {
+    try nativeWhisperSharedDefinitionCase(std.testing.allocator);
+}
+
+test "Native Whisper shared Definition publication cold hits eviction and Model close unwind request allocation failures" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, nativeWhisperSharedDefinitionCase, .{});
+}
+
+// A request may use a short-lived allocator decorator, while the real Model
+// owns a stable allocator and therefore a safely independent shared cache.
+fn nativeWhisperStableModelPrivateRequestCase(a: std.mem.Allocator) !void {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const domain = try Domain.create();
+    defer domain.release();
+    var session = try IncrementalFixture.session(a);
+    defer session.close();
+    try session.installOwnedExecutionGate(a);
+    session.model_lifetime.?.admission_domain = domain.pin();
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 128 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    {
+        var decorator = std.testing.FailingAllocator.init(a, .{});
+        var decoder = (try whisperNativeDecoder(session, decorator.allocator(), null, &hidden, 2)).?;
+        var open = true;
+        defer if (open) decoder.deinit();
+        try std.testing.expect(decoder.cache.native_program.?.schedule.definition.shared != null);
+        const result = try decoder.step(&.{ 0, 1 });
+        defer decorator.allocator().free(result);
+        decoder.deinit();
+        open = false;
+    }
+    // The request decorator's scope has ended before this cache-hit request
+    // and final Model close. Shared chunks never call its allocator context.
+    var repeated = (try whisperNativeDecoder(session, a, null, &hidden, 2)).?;
+    defer repeated.deinit();
+    try std.testing.expect(repeated.cache.native_program.?.schedule.definition.shared != null);
+    const again = try repeated.step(&.{ 0, 1 });
+    defer a.free(again);
+}
+
+test "Native Whisper shared cache uses only stable Model backing and retains private test allocator compatibility" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    try nativeWhisperStableModelPrivateRequestCase(std.testing.allocator);
+    const a = std.testing.allocator;
+    var decorator = std.testing.FailingAllocator.init(a, .{});
+    try std.testing.expect(@import("dense_decoder_schedule.zig").preparationBackingSupported(decorator.allocator()));
+    try std.testing.expect(!@import("dense_decoder_schedule.zig").sharedBackingSupported(decorator.allocator()));
+    const Domain = @import("../runtime/tier/admission_domain.zig").Domain;
+    const domain = try Domain.create();
+    defer domain.release();
+    var session = try IncrementalFixture.session(decorator.allocator());
+    defer session.close();
+    try session.installOwnedExecutionGate(decorator.allocator());
+    session.model_lifetime.?.admission_domain = domain.pin();
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 128 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    var decoder = (try whisperNativeDecoder(session, decorator.allocator(), null, &hidden, 2)).?;
+    defer decoder.deinit();
+    try std.testing.expect(decoder.cache.native_program != null);
+    try std.testing.expect(decoder.cache.native_program.?.schedule.definition.shared == null);
+    const actual = try decoder.step(&.{ 0, 1 });
+    defer decorator.allocator().free(actual);
 }

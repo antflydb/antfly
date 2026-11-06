@@ -1,7 +1,8 @@
 // Copyright 2026 Antfly, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-//! One request's authored dense decoder schedule. The graph owns liveness only:
+//! Shared immutable dense decoder Definitions and request-private schedules.
+//! The authored graph owns liveness only:
 //! no optimizer or second numerical forward changes the architecture's calls.
 //! Persistent Native headers are borrowed by the eager semantic dispatcher;
 //! the single owned Frame stays entered until decoder teardown.
@@ -36,7 +37,102 @@ pub fn preparationBackingSupported(a: std.mem.Allocator) bool {
     return false;
 }
 
+/// Shared final destruction may follow Model.close at a real B boundary.
+/// Only allocator contexts that outlive BOTH boundaries can back this cache.
+pub fn sharedBackingSupported(a: std.mem.Allocator) bool {
+    if (@import("program.zig").processMetadataAllocator(a)) return true;
+    if (comptime @import("builtin").is_test) {
+        const testing = std.testing.allocator;
+        return a.ptr == testing.ptr and a.vtable == testing.vtable;
+    }
+    return false;
+}
+
+pub const Definition = struct {
+    allocator: std.mem.Allocator,
+    references: std.atomic.Value(usize) = .init(1),
+    key: [32]u8,
+    retired_next: ?*Definition = null,
+    shared: ?*@import("cold_metadata.zig").Shared,
+    graph: ml.graph.Graph,
+    descriptors: []?ops.kernel_descriptor.Descriptor,
+    steps: []Node,
+    analysis: @import("../graph/interpreter.zig").CachedAnalysis,
+    layout: @import("../graph/runtime.zig").PhysicalLayout,
+
+    fn keyOf(self: *Definition) [32]u8 {
+        return self.key;
+    }
+    fn equal(a: [32]u8, b: [32]u8) bool {
+        return std.mem.eql(u8, &a, &b);
+    }
+    pub fn retain(self: *Definition) *Definition {
+        const old = self.references.fetchAdd(1, .monotonic);
+        std.debug.assert(old != 0 and old != std.math.maxInt(usize));
+        return self;
+    }
+    fn pinned(self: *Definition) bool {
+        return self.references.load(.acquire) > 1;
+    }
+    fn destroy(raw: *anyopaque) void {
+        const self: *Definition = @ptrCast(@alignCast(raw));
+        self.layout.deinit();
+        self.analysis.deinit(self.allocator);
+        self.allocator.free(self.steps);
+        self.allocator.free(self.descriptors);
+        self.graph.deinit();
+        self.allocator.destroy(self);
+    }
+    pub fn release(self: *Definition, current: Cleanup) void {
+        const old = self.references.fetchSub(1, .acq_rel);
+        std.debug.assert(old != 0);
+        if (old != 1) return;
+        if (self.shared) |owner| owner.releaseWithCleanup(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker() else destroy(self);
+    }
+    fn create(builder: *Builder) !*Definition {
+        const a = builder.graph.allocator;
+        const self = try a.create(Definition);
+        errdefer a.destroy(self);
+        var graph = builder.graph;
+        builder.graph = ml.graph.Graph.init(a);
+        errdefer graph.deinit();
+        const descriptors = try builder.descriptors.toOwnedSlice(a);
+        errdefer a.free(descriptors);
+        const steps = try builder.steps.toOwnedSlice(a);
+        errdefer a.free(steps);
+        var analysis = try @import("../graph/interpreter.zig").CachedAnalysis.compute(a, &graph);
+        errdefer analysis.deinit(a);
+        var layout = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &graph, &.{&builder.backend}, .{}, true);
+        errdefer layout.deinit();
+        self.* = .{ .allocator = a, .key = if (builder.preparation) |preparation| preparation.key else @splat(0), .shared = if (builder.preparation) |preparation| preparation.shared else null, .graph = graph, .descriptors = descriptors, .steps = steps, .analysis = analysis, .layout = layout };
+        // No fallible work follows transfer of the finalizer. Publication is
+        // sealed separately by the caller after successful private preparation.
+        if (self.shared) |owner| {
+            try owner.setFinalizer(self, destroy);
+            builder.preparation.?.shared = null;
+        }
+        // All immutable lists have moved. The emptied builder no longer
+        // borrows an allocator context that Definition error cleanup can retire.
+        builder.graph = ml.graph.Graph.init(builder.allocator);
+        return self;
+    }
+};
+pub const DefinitionSlot = @import("specialization_cache.zig").PinnedSlot(*Definition, [32]u8, Definition.keyOf, Definition.equal, Definition.retain, Definition.pinned);
+pub const Preparation = struct {
+    key: [32]u8,
+    cached: ?*Definition = null,
+    shared: ?*@import("cold_metadata.zig").Shared = null,
+    pub fn deinit(self: *Preparation, current: Cleanup) void {
+        if (self.cached) |value| value.release(current);
+        if (self.shared) |owner| owner.releaseWithCleanup(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        self.* = undefined;
+    }
+};
+
 pub const Builder = struct {
+    allocator: std.mem.Allocator,
+    preparation: ?*Preparation = null,
+    replay_cursor: usize = 0,
     graph: ml.graph.Graph,
     descriptors: std.ArrayList(?ops.kernel_descriptor.Descriptor) = .empty,
     values: std.ArrayList(?CT) = .empty,
@@ -47,36 +143,61 @@ pub const Builder = struct {
     backend: ops.ComputeBackend,
 
     pub fn init(a: std.mem.Allocator, cb: *const ops.ComputeBackend) Builder {
-        return .{ .graph = .init(a), .backend = cb.withoutSynchronousBorrows() };
+        return initPrepared(a, cb, null);
+    }
+    pub fn initPrepared(a: std.mem.Allocator, cb: *const ops.ComputeBackend, preparation: ?*Preparation) Builder {
+        const graph_allocator = if (preparation) |value| if (value.shared) |owner| owner.allocator() else a else a;
+        return .{ .allocator = a, .preparation = preparation, .graph = if (preparation) |value| if (value.cached) |definition| definition.graph else .init(graph_allocator) else .init(graph_allocator), .backend = cb.withoutSynchronousBorrows() };
+    }
+    fn cached(self: *const Builder) ?*Definition {
+        return if (self.preparation) |value| value.cached else null;
+    }
+    fn replay(self: *Builder, shape: Shape, inputs: []const Node, descriptor: ?ops.kernel_descriptor.Descriptor) !?Node {
+        const definition = self.cached() orelse return null;
+        if (self.replay_cursor >= definition.graph.nodeCount()) return error.DenseDefinitionChanged;
+        const id: Node = @intCast(self.replay_cursor);
+        const node = definition.graph.node(id);
+        if (!node.output_shape.eq(shape) or !std.mem.eql(Node, node.getInputs(), inputs)) return error.DenseDefinitionChanged;
+        const stored = definition.descriptors[id];
+        if (descriptor) |expected| {
+            const actual = stored orelse return error.DenseDefinitionChanged;
+            if (actual.input_count != expected.input_count or !actual.output_shape.eq(expected.output_shape) or !std.meta.eql(actual.operation, expected.operation)) return error.DenseDefinitionChanged;
+            for (actual.input_shapes[0..actual.input_count], expected.input_shapes[0..expected.input_count]) |a, b| if (!a.eq(b)) return error.DenseDefinitionChanged;
+        } else if (stored != null or node.op != .parameter) return error.DenseDefinitionChanged;
+        self.replay_cursor += 1;
+        return id;
     }
     pub fn deinit(self: *Builder) void {
-        const a = self.graph.allocator;
-        self.descriptors.deinit(a);
+        const a = self.allocator;
+        self.descriptors.deinit(self.graph.allocator);
         self.values.deinit(a);
         self.bindings.deinit(a);
         self.immutable_resident.deinit(a);
-        self.steps.deinit(a);
+        self.steps.deinit(self.graph.allocator);
         for (self.planes.items) |plane| a.destroy(plane);
         self.planes.deinit(a);
-        self.graph.deinit();
+        if (self.cached() == null) self.graph.deinit();
     }
     pub fn parameter(self: *Builder, shape: Shape, value: CT) !Node {
         return self.parameterWithPlane(shape, value, try residentPlane(&self.backend, value));
     }
     fn parameterWithPlane(self: *Builder, shape: Shape, value: CT, observed: @import("storage_ownership.zig").Plane) !Node {
-        var b = ml.graph.Builder.init(&self.graph);
-        var name: [40]u8 = undefined;
-        const id = try b.parameter(try std.fmt.bufPrint(&name, "dense.input.{d}", .{self.graph.nodeCount()}), shape);
-        try self.descriptors.append(self.graph.allocator, null);
-        try self.values.append(self.graph.allocator, value);
+        const reused = try self.replay(shape, &.{}, null);
+        const id = reused orelse fresh: {
+            var b = ml.graph.Builder.init(&self.graph);
+            var name: [40]u8 = undefined;
+            break :fresh try b.parameter(try std.fmt.bufPrint(&name, "dense.input.{d}", .{self.graph.nodeCount()}), shape);
+        };
+        if (reused == null) try self.descriptors.append(self.graph.allocator, null);
+        try self.values.append(self.allocator, value);
         const binding: route.Binding = block: {
-            const plane = try self.graph.allocator.create(@import("storage_ownership.zig").Plane);
-            errdefer self.graph.allocator.destroy(plane);
+            const plane = try self.allocator.create(@import("storage_ownership.zig").Plane);
+            errdefer self.allocator.destroy(plane);
             plane.* = observed;
-            try self.planes.append(self.graph.allocator, plane);
+            try self.planes.append(self.allocator, plane);
             break :block .{ .resident = .{ .logical = shape, .planes = @as([*]const @import("storage_ownership.zig").Plane, @ptrCast(plane))[0..1], .implementation = .{ .context = self.backend.ptr, .table = self.backend.vtable } } };
         };
-        try self.bindings.append(self.graph.allocator, .{ .node_id = id, .value = binding });
+        try self.bindings.append(self.allocator, .{ .node_id = id, .value = binding });
         return id;
     }
     /// An actual typed held-source proof, not a partial generic storage report.
@@ -86,36 +207,54 @@ pub const Builder = struct {
         const node = try self.parameterWithPlane(plane.descriptor.shape, value, plane);
         const binding = self.bindings.pop().?;
         std.debug.assert(binding.node_id == node and binding.value == .resident);
-        try self.immutable_resident.append(self.graph.allocator, binding);
+        try self.immutable_resident.append(self.allocator, binding);
         return node;
     }
     pub fn hostParameter(self: *Builder, shape: Shape) !Node {
-        var b = ml.graph.Builder.init(&self.graph);
-        var name: [40]u8 = undefined;
-        const id = try b.parameter(try std.fmt.bufPrint(&name, "dense.host.{d}", .{self.graph.nodeCount()}), shape);
-        try self.descriptors.append(self.graph.allocator, null);
-        try self.values.append(self.graph.allocator, null);
-        try self.bindings.append(self.graph.allocator, .{ .node_id = id, .value = .{ .imported_host = .{ .logical = shape, .target = .native, .owned_ingress = true, .borrowable_host = false } } });
+        const reused = try self.replay(shape, &.{}, null);
+        const id = reused orelse fresh: {
+            var b = ml.graph.Builder.init(&self.graph);
+            var name: [40]u8 = undefined;
+            break :fresh try b.parameter(try std.fmt.bufPrint(&name, "dense.host.{d}", .{self.graph.nodeCount()}), shape);
+        };
+        if (reused == null) try self.descriptors.append(self.graph.allocator, null);
+        try self.values.append(self.allocator, null);
+        try self.bindings.append(self.allocator, .{ .node_id = id, .value = .{ .imported_host = .{ .logical = shape, .target = .native, .owned_ingress = true, .borrowable_host = false } } });
         return id;
     }
     pub fn gather(self: *Builder, weight: Node, indices: Node, width: usize) !Node {
-        var b = ml.graph.Builder.init(&self.graph);
-        const id = try b.gather(weight, indices, Shape.init(.f32, &.{ 1, @intCast(width) }));
-        try self.descriptors.append(self.graph.allocator, ops.kernel_descriptor.lower(&self.graph, id) orelse return error.UnsupportedDenseSchedule);
-        try self.values.append(self.graph.allocator, null);
-        try self.steps.append(self.graph.allocator, id);
+        const shape = Shape.init(.f32, &.{ 1, @intCast(width) });
+        const id = if (self.cached()) |definition| reuse: {
+            if (self.replay_cursor >= definition.graph.nodeCount()) return error.DenseDefinitionChanged;
+            const id: Node = @intCast(self.replay_cursor);
+            const descriptor = definition.descriptors[id] orelse return error.DenseDefinitionChanged;
+            if (descriptor.operation != .gather) return error.DenseDefinitionChanged;
+            break :reuse (try self.replay(shape, &.{ weight, indices }, descriptor)).?;
+        } else fresh: {
+            var b = ml.graph.Builder.init(&self.graph);
+            const id = try b.gather(weight, indices, shape);
+            try self.descriptors.append(self.graph.allocator, ops.kernel_descriptor.lower(&self.graph, id) orelse return error.UnsupportedDenseSchedule);
+            break :fresh id;
+        };
+        try self.values.append(self.allocator, null);
+        if (self.cached() == null) try self.steps.append(self.graph.allocator, id);
         return id;
     }
     pub fn operation(self: *Builder, op: ml.graph.OpCode, inputs: []const Node, descriptor: ops.kernel_descriptor.Descriptor) !Node {
+        const reused = try self.replay(descriptor.output_shape, inputs, descriptor);
         var node = ml.graph.Node{ .op = op, .output_shape = descriptor.output_shape, .num_inputs = @intCast(inputs.len) };
         @memcpy(node.inputs[0..inputs.len], inputs);
-        const id = try self.graph.addNode(node);
-        try self.descriptors.append(self.graph.allocator, descriptor);
-        try self.values.append(self.graph.allocator, null);
-        try self.steps.append(self.graph.allocator, id);
+        const id = reused orelse try self.graph.addNode(node);
+        if (reused == null) try self.descriptors.append(self.graph.allocator, descriptor);
+        try self.values.append(self.allocator, null);
+        if (self.cached() == null) try self.steps.append(self.graph.allocator, id);
         return id;
     }
     pub fn output(self: *Builder, id: Node) !void {
+        if (self.cached() != null) {
+            for (self.graph.outputs.items) |root| if (root == id) return;
+            return error.DenseDefinitionChanged;
+        }
         try self.graph.markOutput(id);
     }
     pub fn logicalShape(self: *const Builder, id: Node) Shape {
@@ -174,6 +313,7 @@ pub fn projectionDescriptor(cb: *const ops.ComputeBackend, expected_data: *const
 pub const Schedule = struct {
     allocator: std.mem.Allocator,
     backend: ops.ComputeBackend,
+    definition: *Definition,
     graph: ml.graph.Graph,
     descriptors: []?ops.kernel_descriptor.Descriptor,
     values: []?CT,
@@ -191,20 +331,23 @@ pub const Schedule = struct {
     /// Creates only metadata. All actual physical banks are funded separately
     /// before enter, without using the architecture's compatibility allowance.
     pub fn create(builder: *Builder) !*Schedule {
-        const a = builder.graph.allocator;
+        const a = builder.allocator;
         const self = try a.create(Schedule);
         errdefer a.destroy(self);
         self.allocator = a;
         self.backend = builder.backend;
-        self.graph = builder.graph;
-        builder.graph = ml.graph.Graph.init(a);
-        errdefer self.graph.deinit();
-        self.descriptors = try builder.descriptors.toOwnedSlice(a);
-        errdefer a.free(self.descriptors);
+        const definition = if (builder.cached()) |value| block: {
+            if (builder.replay_cursor != value.graph.nodeCount()) return error.DenseDefinitionChanged;
+            break :block value.retain();
+        } else try Definition.create(builder);
+        errdefer definition.release(.{ .outside_execution = true });
+        self.definition = definition;
+        self.graph = definition.graph;
+        self.descriptors = definition.descriptors;
+        self.steps = definition.steps;
+        self.analysis = definition.analysis;
         self.values = try builder.values.toOwnedSlice(a);
         errdefer a.free(self.values);
-        self.steps = try builder.steps.toOwnedSlice(a);
-        errdefer a.free(self.steps);
         self.planes = try builder.planes.toOwnedSlice(a);
         errdefer {
             for (self.planes) |plane| a.destroy(plane);
@@ -212,11 +355,14 @@ pub const Schedule = struct {
         }
         self.bindings = try builder.bindings.toOwnedSlice(a);
         errdefer a.free(self.bindings);
-        self.analysis = try @import("../graph/interpreter.zig").CachedAnalysis.compute(a, &self.graph);
-        errdefer self.analysis.deinit(a);
-        var layout = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &self.graph, &.{&self.backend}, .{}, false);
-        defer layout.deinit();
-        self.root = (try layout.createPool(a, &self.graph, &.{&self.backend}, self.descriptors)) orelse return error.UnsupportedDenseSchedule;
+        self.root = (definition.layout.createPool(a, &self.graph, &.{&self.backend}, self.descriptors) catch |err| switch (err) {
+            error.PhysicalOutputLayoutChanged => fallback: {
+                var fresh = try @import("../graph/runtime.zig").PhysicalLayout.create(a, &self.graph, &.{&self.backend}, .{}, false);
+                defer fresh.deinit();
+                break :fallback try fresh.createPool(a, &self.graph, &.{&self.backend}, self.descriptors);
+            },
+            else => return err,
+        }) orelse return error.UnsupportedDenseSchedule;
         errdefer self.root.deinit();
         self.root.coverage_graph = &self.graph;
         self.root.coverage_reachable = self.analysis.reachable;
@@ -298,14 +444,12 @@ pub const Schedule = struct {
         if (self.numerical_epoch) |*epoch| epoch.release();
         self.numerical_epoch = null;
         self.borrowed.deinit(self.allocator);
-        self.analysis.deinit(self.allocator);
         self.allocator.free(self.bindings);
         for (self.planes) |plane| self.allocator.destroy(plane);
         self.allocator.free(self.planes);
-        self.allocator.free(self.steps);
         self.allocator.free(self.values);
-        self.allocator.free(self.descriptors);
-        self.graph.deinit();
+        const definition = self.definition;
         self.allocator.destroy(self);
+        definition.release(current);
     }
 };

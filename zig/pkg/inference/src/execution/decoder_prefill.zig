@@ -31,6 +31,10 @@ pub const EmbeddingRows = struct {
     width: usize,
     namespace: @import("../execution/storage_ownership.zig").Identity,
     written: usize = 0,
+    partitions: []Partition = &.{},
+
+    pub const Span = struct { offset: usize, rows: usize };
+    const Partition = struct { span: Span, filled: bool = false };
 
     /// The actual accepted storage owner attests the physical readable plane.
     /// A logical F32 dtype alone can also describe packed/opaque model storage,
@@ -116,14 +120,53 @@ pub const EmbeddingRows = struct {
         };
         return .{ .backend = backend, .allocator = allocator, .tensor = tensor, .rows = rows, .width = width, .namespace = namespace };
     }
+    /// Cold disjoint full coverage. Sources may arrive in another order, but
+    /// no caller can publish an uninitialized gap or fill one span twice.
+    pub fn initPartitioned(backend: *const ComputeBackend, allocator: std.mem.Allocator, rows: usize, width: usize, spans: []const Span) !?EmbeddingRows {
+        var end: usize = 0;
+        for (spans) |span| {
+            if (span.rows == 0 or span.offset != end) return error.InvalidEmbeddingAssembly;
+            end = try std.math.add(usize, end, span.rows);
+            if (end > rows) return error.InvalidEmbeddingAssembly;
+        }
+        if (spans.len == 0 or end != rows) return error.IncompleteEmbeddingAssembly;
+        var result = (try init(backend, allocator, rows, width)) orelse return null;
+        errdefer result.deinit();
+        result.partitions = try allocator.alloc(Partition, spans.len);
+        for (result.partitions, spans) |*target, span| target.* = .{ .span = span };
+        return result;
+    }
+    pub fn spanCount(self: *const @This()) usize {
+        return self.partitions.len;
+    }
+    pub fn spanAt(self: *const @This(), index: usize) Span {
+        return self.partitions[index].span;
+    }
+    pub fn fill(self: *@This(), index: usize, source: ops.CT, source_rows: usize, start: usize) !void {
+        if (index >= self.partitions.len or self.partitions[index].filled) return error.InvalidEmbeddingAssembly;
+        const target = self.partitions[index].span;
+        if (start > source_rows or target.rows > source_rows - start or !try self.acceptsSource(source, source_rows)) return error.InvalidEmbeddingAssembly;
+        self.copyAt(target.offset, source, start, target.rows) catch |err| switch (err) {
+            error.UnsupportedBackendOp => return error.InvalidEmbeddingAssembly,
+            else => return err,
+        };
+        self.partitions[index].filled = true;
+        self.written += target.rows;
+    }
     pub fn deinit(self: *@This()) void {
         if (self.tensor) |tensor| self.backend.free(tensor);
         self.tensor = null;
+        self.allocator.free(self.partitions);
+        self.partitions = &.{};
+    }
+    fn copyAt(self: *@This(), offset: usize, source: ops.CT, start: usize, count: usize) !void {
+        const destination = self.tensor orelse return error.InvalidEmbeddingAssembly;
+        if (offset > self.rows or count > self.rows - offset) return error.InvalidEmbeddingAssembly;
+        if (!try self.backend.copyRows2D(self.allocator, destination, offset, source, start, count, self.width)) return error.UnsupportedBackendOp;
     }
     pub fn append(self: *@This(), source: ops.CT, start: usize, count: usize) !void {
-        const destination = self.tensor orelse return error.InvalidEmbeddingAssembly;
-        if (count > self.rows - self.written) return error.InvalidEmbeddingAssembly;
-        if (!try self.backend.copyRows2D(self.allocator, destination, self.written, source, start, count, self.width)) return error.UnsupportedBackendOp;
+        if (self.partitions.len != 0 or count > self.rows - self.written) return error.InvalidEmbeddingAssembly;
+        try self.copyAt(self.written, source, start, count);
         // An error after submission never selects a host replay.
         self.written += count;
     }

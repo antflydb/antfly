@@ -994,7 +994,38 @@ pub const PreparedSingleToken = struct {
         }
     };
 
-    pub fn init(cb: *const ComputeBackend, source_data: *const anyopaque, a: std.mem.Allocator, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights) !?PreparedSingleToken {
+    /// Value-only key: every config field, encoder length, actual ordered
+    /// source shapes and optional-bias topology. No handle, source or provider
+    /// identity crosses into the immutable Definition.
+    pub fn definitionKey(cb: *const ComputeBackend, source_data: *const anyopaque, config: Config, rows: usize, weights: *const PreparedDecoderWeights) ![32]u8 {
+        var hash = std.crypto.hash.sha2.Sha256.init(.{});
+        inline for (@typeInfo(Config).@"struct".field_names) |name| {
+            const value = @field(config, name);
+            hash.update(std.mem.asBytes(&value));
+        }
+        hash.update(std.mem.asBytes(&rows));
+        const count = weights.fetcher.handles.items.len;
+        hash.update(std.mem.asBytes(&count));
+        for (weights.fetcher.handles.items) |value| {
+            const shape = (try @import("../ops/native_compute.zig").NativeCompute.heldF32WeightPrimary(cb, source_data, value)).descriptor.shape;
+            const rank = shape.rank();
+            hash.update(std.mem.asBytes(&rank));
+            hash.update(std.mem.sliceAsBytes(shape.dims[0..rank]));
+        }
+        for (weights.weights.layers) |layer| inline for (@typeInfo(LayerWeights).@"struct".field_names) |name| {
+            if (comptime @TypeOf(@field(layer, name)) == Linear) {
+                const present: u8 = @intFromBool(@field(layer, name).b != null);
+                hash.update(&.{present});
+            }
+        };
+        if (weights.cross) |crosses| for (crosses) |cross| {
+            const bits = [_]u8{ @intFromBool(cross.k.b != null), @intFromBool(cross.v.b != null) };
+            hash.update(&bits);
+        };
+        return hash.finalResult();
+    }
+
+    pub fn init(cb: *const ComputeBackend, source_data: *const anyopaque, a: std.mem.Allocator, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights, preparation: ?*schedule_mod.Preparation) !?PreparedSingleToken {
         const Native = @import("../ops/native_compute.zig");
         if (cb.vtable != &Native.vtable_impl or cb.vtable.addLayerNormSum != null or weights.cross == null or weights.weights.layers.len != config.decoder_layers or weights.cross.?.len != config.decoder_layers) return null;
         for (weights.weights.layers) |w| if (w.qkv_slots != null) return null;
@@ -1027,7 +1058,7 @@ pub const PreparedSingleToken = struct {
             slab.* = .{ .k = k, .v = v, .cross_k = cross_k, .cross_v = cross_v };
             built += 1;
         }
-        var b = schedule_mod.Builder.init(a, cb);
+        var b = schedule_mod.Builder.initPrepared(a, cb, preparation);
         defer b.deinit();
         const author = Author{ .b = &b, .cb = cb, .source_data = source_data };
         for (weights.cross.?, slabs) |cross, slab| {

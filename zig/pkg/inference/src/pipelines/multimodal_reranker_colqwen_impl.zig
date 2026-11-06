@@ -275,37 +275,11 @@ pub fn scoreDocument(
     var prepared_doc = try prepareDocumentPrompt(allocator, tok, prompt_cfg, gpt_cfg, prepared_images.items, document_text, max_length, add_bos_token);
     defer prepared_doc.deinit();
 
-    var image_embeddings = std.ArrayListUnmanaged([]f32).empty;
-    var native_image_embeddings = std.ArrayListUnmanaged(NativeImageEmbedding).empty;
-    defer {
-        for (image_embeddings.items) |emb| allocator.free(emb);
-        image_embeddings.deinit(allocator);
-        for (native_image_embeddings.items) |emb| cb.free(emb.tensor);
-        native_image_embeddings.deinit(allocator);
-    }
-    if (vision_session == null) {
-        try native_image_embeddings.ensureTotalCapacityPrecise(allocator, prepared_images.items.len);
-        for (prepared_images.items, 0..) |prepared, index| {
-            if (execution_control) |control|
-                try control.update(.executing, @intCast(index), @intCast(prepared_images.items.len));
-            native_image_embeddings.appendAssumeCapacity(.{
-                .tensor = try qwen2vl_vision.encodePreparedImageTokensTensor(cb, allocator, gpt_cfg, prep_cfg, prepared),
-                .token_count = prepared.image_token_count,
-            });
-        }
-    } else {
-        try image_embeddings.ensureTotalCapacityPrecise(allocator, prepared_images.items.len);
-        for (prepared_images.items, 0..) |prepared, index| {
-            if (execution_control) |control|
-                try control.update(.executing, @intCast(index), @intCast(prepared_images.items.len));
-            image_embeddings.appendAssumeCapacity(try encodeImageTokens(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared, execution_control));
-        }
-    }
-
     var doc_encoded = if (vision_session == null)
-        try encodeDocumentFromPreparedNative(cb, allocator, gpt_cfg, prepared_doc, native_image_embeddings.items)
+        (try encodeDocumentStreamingNative(cb, allocator, gpt_cfg, prep_cfg, prepared_doc, prepared_images.items, execution_control)) orelse
+            try encodePreparedDocumentCompatibility(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared_doc, prepared_images.items, execution_control)
     else
-        try encodeDocumentFromPrepared(cb, allocator, gpt_cfg, prepared_doc, image_embeddings.items);
+        try encodePreparedDocumentCompatibility(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared_doc, prepared_images.items, execution_control);
     defer doc_encoded.deinit();
 
     return reranking.lateInteractionScore(
@@ -318,6 +292,156 @@ pub fn scoreDocument(
         query.hidden_size,
         tok.specialTokens(),
     );
+}
+
+// Compatibility is selected before the first vision producer. Submitted image
+// or row-copy errors never re-enter this path.
+fn encodePreparedDocumentCompatibility(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    vision_session: ?backends.Session,
+    gpt_cfg: gpt_mod.Config,
+    prep_cfg: qwen2vl.PreprocessorConfig,
+    prepared_doc: qwen2vl.PreparedTextInput,
+    prepared_images: []const qwen2vl.PreparedImage,
+    execution_control: ?InferenceExecutionControl,
+) !EncodedSequence {
+    var image_embeddings = std.ArrayListUnmanaged([]f32).empty;
+    var native_image_embeddings = std.ArrayListUnmanaged(NativeImageEmbedding).empty;
+    defer {
+        for (image_embeddings.items) |emb| allocator.free(emb);
+        image_embeddings.deinit(allocator);
+        for (native_image_embeddings.items) |emb| cb.free(emb.tensor);
+        native_image_embeddings.deinit(allocator);
+    }
+    if (vision_session == null) {
+        try native_image_embeddings.ensureTotalCapacityPrecise(allocator, prepared_images.len);
+        for (prepared_images, 0..) |prepared, index| {
+            if (execution_control) |control|
+                try control.update(.executing, @intCast(index), @intCast(prepared_images.len));
+            native_image_embeddings.appendAssumeCapacity(.{
+                .tensor = try qwen2vl_vision.encodePreparedImageTokensTensor(cb, allocator, gpt_cfg, prep_cfg, prepared),
+                .token_count = prepared.image_token_count,
+            });
+        }
+    } else {
+        try image_embeddings.ensureTotalCapacityPrecise(allocator, prepared_images.len);
+        for (prepared_images, 0..) |prepared, index| {
+            if (execution_control) |control|
+                try control.update(.executing, @intCast(index), @intCast(prepared_images.len));
+            image_embeddings.appendAssumeCapacity(try encodeImageTokens(cb, allocator, vision_session, gpt_cfg, prep_cfg, prepared, execution_control));
+        }
+    }
+
+    return if (vision_session == null)
+        try encodeDocumentFromPreparedNative(cb, allocator, gpt_cfg, prepared_doc, native_image_embeddings.items)
+    else
+        try encodeDocumentFromPrepared(cb, allocator, gpt_cfg, prepared_doc, image_embeddings.items);
+}
+
+/// The partition owns every prompt row before producing an image. Images are
+/// produced in their original order and retired after the existing borrowed
+/// row-copy call; text embeddings are still produced only after every image.
+fn encodeDocumentStreamingNative(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    cfg: gpt_mod.Config,
+    prep_cfg: qwen2vl.PreprocessorConfig,
+    prepared: qwen2vl.PreparedTextInput,
+    images: []const qwen2vl.PreparedImage,
+    execution_control: ?InferenceExecutionControl,
+) !?EncodedSequence {
+    var producer = NativeVisionProducer{ .cb = cb, .allocator = allocator, .cfg = cfg, .prep_cfg = prep_cfg, .images = images, .control = execution_control };
+    return encodeDocumentStreamingProducer(cb, allocator, cfg, prep_cfg, prepared, images, &producer, execution_control);
+}
+
+const NativeVisionProducer = struct {
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    cfg: gpt_mod.Config,
+    prep_cfg: qwen2vl.PreprocessorConfig,
+    images: []const qwen2vl.PreparedImage,
+    control: ?InferenceExecutionControl,
+    fn produce(self: *@This(), index: usize) !CT {
+        if (self.control) |control| try control.update(.executing, @intCast(index), @intCast(self.images.len));
+        return qwen2vl_vision.encodePreparedImageTokensTensor(self.cb, self.allocator, self.cfg, self.prep_cfg, self.images[index]);
+    }
+    fn release(self: *@This(), tensor: CT) void {
+        self.cb.free(tensor);
+    }
+};
+
+fn encodeDocumentStreamingProducer(
+    cb: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    cfg: gpt_mod.Config,
+    prep_cfg: qwen2vl.PreprocessorConfig,
+    prepared: qwen2vl.PreparedTextInput,
+    images: []const qwen2vl.PreparedImage,
+    producer: anytype,
+    execution_control: ?InferenceExecutionControl,
+) !?EncodedSequence {
+    if (execution_control) |control| try control.check();
+    if (!std.math.approxEqAbs(f32, cfg.tokenEmbeddingScale(), 1.0, 1e-6)) return null;
+    if (images.len == 0 or prepared.input_ids.len == 0) return error.ImagePlaceholderCountMismatch;
+    const width: usize = @intCast(cfg.hidden_size);
+    // These are canonical producer facts, inspected for ALL images before any
+    // numerical callback. Actual destination/source namespace is still checked
+    // by the common row owner, not inferred from backend kind.
+    for (images) |image| {
+        const layout = (try qwen2vl_vision.streamingOutputLayout(cb, cfg, prep_cfg, image)) orelse return null;
+        if (layout.width != width or layout.rows != image.image_token_count) return error.ImageProjectionSizeMismatch;
+    }
+    var spans = std.ArrayListUnmanaged(decoder_prefill.EmbeddingRows.Span).empty;
+    defer spans.deinit(allocator);
+    var image_index: usize = 0;
+    var offset: usize = 0;
+    while (offset < prepared.input_ids.len) {
+        const image_span = prepared.input_ids[offset] == cfg.image_token_index;
+        const start = offset;
+        while (offset < prepared.input_ids.len and (prepared.input_ids[offset] == cfg.image_token_index) == image_span) : (offset += 1) {}
+        const rows = offset - start;
+        if (image_span) {
+            if (image_index >= images.len or rows > images[image_index].image_token_count) return error.ImagePlaceholderCountMismatch;
+            image_index += 1;
+        }
+        try spans.append(allocator, .{ .offset = start, .rows = rows });
+    }
+    if (image_index != images.len) return error.ImagePlaceholderCountMismatch;
+    // Tokenization may have cancelled since its last progress checkpoint.
+    // Check before the first destination SDK allocation, not only at produce.
+    if (execution_control) |control| try control.check();
+    var assembly = (try decoder_prefill.EmbeddingRows.initPartitioned(cb, allocator, prepared.input_ids.len, width, spans.items)) orelse return null;
+    defer assembly.deinit();
+    spans.deinit(allocator);
+    spans = .empty;
+    image_index = 0;
+    for (0..assembly.spanCount()) |index| {
+        const span = assembly.spanAt(index);
+        if (prepared.input_ids[span.offset] != cfg.image_token_index) continue;
+        const image = images[image_index];
+        const tensor = try producer.produce(image_index);
+        defer producer.release(tensor);
+        try assembly.fill(index, tensor, image.image_token_count, 0);
+        image_index += 1;
+    }
+    // Preserve the original weight lookup and text producer order after images.
+    const embed_w = try getEmbeddingWeight(cb, cfg);
+    defer cb.free(embed_w);
+    for (0..assembly.spanCount()) |index| {
+        const span = assembly.spanAt(index);
+        if (prepared.input_ids[span.offset] == cfg.image_token_index) continue;
+        const tensor = try embedTextChunk(cb, allocator, embed_w, prepared.input_ids[span.offset..][0..span.rows], width);
+        defer cb.free(tensor);
+        try assembly.fill(index, tensor, span.rows, 0);
+    }
+    return try finishNativeDocumentRows(cb, allocator, cfg, prepared, try assembly.take());
+}
+
+fn finishNativeDocumentRows(cb: *const ComputeBackend, allocator: std.mem.Allocator, cfg: gpt_mod.Config, prepared: qwen2vl.PreparedTextInput, input: CT) !EncodedSequence {
+    var hidden = try decoder_prefill.ResidentHiddenRows.fromEmbeddings(cb, allocator, cfg, input, prepared.input_ids.len);
+    defer hidden.deinit();
+    return finishEncodedSequence(allocator, prepared, try applyResidentRetrievalProjection(cb, allocator, &hidden));
 }
 
 pub fn prepareDocumentPrompt(
@@ -663,10 +787,7 @@ pub fn encodeDocumentFromPreparedNative(
 
     const input_embeddings = if (resident) |*assembly| try assembly.take() else current orelse return error.ImagePlaceholderCountMismatch;
     current = null;
-    var hidden = try decoder_prefill.ResidentHiddenRows.fromEmbeddings(cb, allocator, gpt_cfg, input_embeddings, prepared_doc.input_ids.len);
-    defer hidden.deinit();
-    const projected = try applyResidentRetrievalProjection(cb, allocator, &hidden);
-    return finishEncodedSequence(allocator, prepared_doc, projected);
+    return finishNativeDocumentRows(cb, allocator, gpt_cfg, prepared_doc, input_embeddings);
 }
 
 fn embedTextChunk(
@@ -1241,4 +1362,184 @@ test "Native ColQwen document producers preserve actual imported and native owne
     if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
     try DocumentProducerOomFixture.run(std.testing.allocator);
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, DocumentProducerOomFixture.run, .{});
+}
+
+const StreamingDocumentFixture = struct {
+    const helper = ResidentDocumentFixture.helper;
+    const native = ResidentDocumentFixture.native;
+    fn config() gpt_mod.Config {
+        var cfg = ResidentDocumentFixture.config();
+        cfg.vision_embed_dim = 4;
+        cfg.vision_num_hidden_layers = 1;
+        cfg.vision_num_attention_heads = 1;
+        cfg.vision_intermediate_size = 4;
+        return cfg;
+    }
+    const prep = qwen2vl.PreprocessorConfig{ .min_pixels = 16, .max_pixels = 16, .patch_size = 2, .merge_size = 1, .temporal_patch_size = 1 };
+    fn populate(store: *native.WeightStore) !void {
+        try ResidentDocumentFixture.populateProjection(store);
+        try helper.putWeight(store, "visual.patch_embed.proj.weight", &.{ 4, 12 }, null);
+        inline for (.{ "norm1", "norm2" }) |norm| {
+            try helper.putWeight(store, "visual.blocks.0." ++ norm ++ ".weight", &.{4}, 1);
+            try helper.putWeight(store, "visual.blocks.0." ++ norm ++ ".bias", &.{4}, 0);
+        }
+        try helper.putWeight(store, "visual.blocks.0.attn.qkv.weight", &.{ 12, 4 }, null);
+        try helper.putWeight(store, "visual.blocks.0.attn.qkv.bias", &.{12}, null);
+        try helper.putWeight(store, "visual.blocks.0.attn.proj.weight", &.{ 4, 4 }, null);
+        try helper.putWeight(store, "visual.blocks.0.attn.proj.bias", &.{4}, null);
+        inline for (.{ "linear_fc1", "linear_fc2" }) |layer| {
+            try helper.putWeight(store, "visual.blocks.0.mlp." ++ layer ++ ".weight", &.{ 4, 4 }, null);
+            try helper.putWeight(store, "visual.blocks.0.mlp." ++ layer ++ ".bias", &.{4}, null);
+            try helper.putWeight(store, "visual.merger." ++ layer ++ ".weight", &.{ 4, 4 }, null);
+            try helper.putWeight(store, "visual.merger." ++ layer ++ ".bias", &.{4}, null);
+        }
+        try helper.putWeight(store, "visual.merger.norm.weight", &.{4}, 1);
+        try helper.putWeight(store, "visual.merger.norm.bias", &.{4}, 0);
+    }
+    const ObservedProducer = struct {
+        original: NativeVisionProducer,
+        produced: usize = 0,
+        released: usize = 0,
+        live: usize = 0,
+        max_live: usize = 0,
+        fn produce(self: *@This(), index: usize) !CT {
+            try std.testing.expectEqual(self.produced, index);
+            try std.testing.expectEqual(@as(usize, 0), self.live);
+            const tensor = try self.original.produce(index);
+            self.produced += 1;
+            self.live += 1;
+            self.max_live = @max(self.max_live, self.live);
+            return tensor;
+        }
+        fn release(self: *@This(), tensor: CT) void {
+            self.original.release(tensor);
+            self.live -= 1;
+            self.released += 1;
+        }
+    };
+    fn exercise(cb: *const ComputeBackend, reference: *const ComputeBackend, a: std.mem.Allocator) !void {
+        var first = try qwen2vl.prepareImage(a, &DocumentProducerOomFixture.png_1x1, prep);
+        defer first.deinit();
+        var second = try qwen2vl.prepareImage(a, &DocumentProducerOomFixture.png_1x1, prep);
+        defer second.deinit();
+        // Distinct real pixels, while retaining the original preprocessor's
+        // dimensions/grid and actual original vision encoder for both images.
+        for (second.pixel_values) |*value| value.* *= 0.5;
+        const images = [_]qwen2vl.PreparedImage{ first, second };
+        var ids = [_]i32{ 1, 7, 7, 2, 7, 3 };
+        var mask = [_]i32{ 1, 1, 1, 1, 1, 1 };
+        const prepared = qwen2vl.PreparedTextInput{ .allocator = a, .input_ids = &ids, .attention_mask = &mask };
+        const cfg = config();
+        var producer = ObservedProducer{ .original = .{ .cb = cb, .allocator = a, .cfg = cfg, .prep_cfg = prep, .images = &images, .control = null } };
+        var streamed = (try encodeDocumentStreamingProducer(cb, a, cfg, prep, prepared, &images, &producer, null)) orelse return error.ExpectedStreamingDocument;
+        defer streamed.deinit();
+        try std.testing.expectEqual(@as(usize, 2), producer.produced);
+        try std.testing.expectEqual(@as(usize, 2), producer.released);
+        try std.testing.expectEqual(@as(usize, 0), producer.live);
+        try std.testing.expectEqual(@as(usize, 1), producer.max_live);
+        const held = try a.dupe(f32, streamed.hidden_states);
+        defer a.free(held);
+        // Independent original produce-all/assembly path, not another invocation
+        // of the streaming helper. Partial runs consume 2/4 and 1/4 image rows.
+        const one = try qwen2vl_vision.encodePreparedImageTokensTensor(reference, a, cfg, prep, first);
+        defer reference.free(one);
+        const two = try qwen2vl_vision.encodePreparedImageTokensTensor(reference, a, cfg, prep, second);
+        defer reference.free(two);
+        var expected = try encodeDocumentFromPreparedNative(reference, a, cfg, prepared, &.{ .{ .tensor = one, .token_count = first.image_token_count }, .{ .tensor = two, .token_count = second.image_token_count } });
+        defer expected.deinit();
+        try std.testing.expectEqualSlices(i32, expected.input_ids, streamed.input_ids);
+        try std.testing.expectEqual(expected.hidden_size, streamed.hidden_size);
+        for (expected.hidden_states, streamed.hidden_states) |gold, actual| try std.testing.expectApproxEqAbs(gold, actual, 2e-4);
+        try std.testing.expectEqualSlices(f32, held, streamed.hidden_states);
+        // Exercise the installed public scoreDocument consumer with genuine PNG
+        // preparation/tokenization and actual vision producers as well.
+        var token = DocumentPromptTestTokenizer.make();
+        var token_table = token.vtable.*;
+        token_table.encode = DocumentProducerOomFixture.encode;
+        token.vtable = &token_table;
+        const query = EncodedSequence{ .allocator = a, .input_ids = @constCast(&[_]i32{1}), .attention_mask = @constCast(&[_]i32{1}), .hidden_states = @constCast(&[_]f32{ 1, 2, 3 }), .hidden_size = 3 };
+        const score = try scoreDocument(cb, a, null, token, .{}, cfg, prep, query, "document", &.{ &DocumentProducerOomFixture.png_1x1, &DocumentProducerOomFixture.png_1x1 }, 12, false, null);
+        try std.testing.expect(std.math.isFinite(score));
+        try std.testing.expectEqualSlices(f32, held, streamed.hidden_states);
+        // Partition completion prevents publishing the uninitialized text gap;
+        // repeated spans, overlap and malformed cold layouts cannot write it.
+        const row = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4 }, &.{ 1, 4 });
+        defer cb.free(row);
+        var partition = (try decoder_prefill.EmbeddingRows.initPartitioned(cb, a, 3, 4, &.{ .{ .offset = 0, .rows = 1 }, .{ .offset = 1, .rows = 1 }, .{ .offset = 2, .rows = 1 } })) orelse return error.ExpectedStreamingDocument;
+        defer partition.deinit();
+        try partition.fill(2, row, 1, 0);
+        try std.testing.expectError(error.IncompleteEmbeddingAssembly, partition.take());
+        try std.testing.expectError(error.InvalidEmbeddingAssembly, partition.fill(2, row, 1, 0));
+        try partition.fill(0, row, 1, 0);
+        try partition.fill(1, row, 1, 0);
+        const full = try partition.take();
+        defer cb.free(full);
+        const values = try cb.toFloat32(full, a);
+        defer a.free(values);
+        try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4, 1, 2, 3, 4, 1, 2, 3, 4 }, values);
+        try std.testing.expectError(error.InvalidEmbeddingAssembly, decoder_prefill.EmbeddingRows.initPartitioned(cb, a, 3, 4, &.{ .{ .offset = 0, .rows = 2 }, .{ .offset = 1, .rows = 2 } }));
+        // A copied provider table is rejected before dereferencing its forged
+        // context and before invoking even the first real image producer.
+        var copied_table = cb.vtable.*;
+        std.mem.doNotOptimizeAway(&copied_table);
+        var foreign = cb.*;
+        foreign.vtable = &copied_table;
+        foreign.ptr = @ptrFromInt(16);
+        var denied = ObservedProducer{ .original = producer.original };
+        try std.testing.expect((try encodeDocumentStreamingProducer(&foreign, a, cfg, prep, prepared, &images, &denied, null)) == null);
+        try std.testing.expectEqual(@as(usize, 0), denied.produced);
+        const Cancel = struct {
+            calls: usize = 0,
+            fn check(raw: ?*anyopaque) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw.?));
+                self.calls += 1;
+                if (self.calls == 2) return error.Cancelled;
+            }
+        };
+        var cancellation = Cancel{};
+        var cancelled = ObservedProducer{ .original = producer.original };
+        cancelled.original.control = .{ .ptr = &cancellation, .check_fn = Cancel.check };
+        if (encodeDocumentStreamingProducer(cb, a, cfg, prep, prepared, &images, &cancelled, null)) |result| {
+            if (result) |value| {
+                var unexpected = value;
+                unexpected.deinit();
+            }
+            return error.ExpectedCancellation;
+        } else |err| switch (err) {
+            error.Cancelled => {},
+            else => return err,
+        }
+        try std.testing.expectEqual(@as(usize, 1), cancelled.produced);
+        try std.testing.expectEqual(@as(usize, 1), cancelled.released);
+        try std.testing.expectEqual(@as(usize, 0), cancelled.live);
+        try std.testing.expectEqualSlices(f32, held, streamed.hidden_states);
+    }
+    fn check(cb: ComputeBackend, reference: ComputeBackend) !void {
+        try exercise(&cb, &reference, std.testing.allocator);
+    }
+    fn oom(a: std.mem.Allocator) !void {
+        var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+        defer weights.deinitOwned();
+        try populate(&weights);
+        var compute = native.NativeCompute.init(a, &weights, null);
+        defer compute.deinit();
+        const cb = compute.computeBackend();
+        try exercise(&cb, &cb, a);
+    }
+};
+
+test "Native ColQwen streams two actual image producers with partial spans and retained output" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try StreamingDocumentFixture.helper.onNative(StreamingDocumentFixture.populate, StreamingDocumentFixture.check);
+}
+test "Metal ColQwen streams two actual image producers with original Native oracle" {
+    try StreamingDocumentFixture.helper.onMetal(StreamingDocumentFixture.populate, StreamingDocumentFixture.check);
+}
+test "CUDA ColQwen streams two actual image producers with original Native oracle" {
+    try StreamingDocumentFixture.helper.onCuda(StreamingDocumentFixture.populate, StreamingDocumentFixture.check);
+}
+test "Native ColQwen streaming producer and assembly full allocation failure cleanup" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try StreamingDocumentFixture.oom(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, StreamingDocumentFixture.oom, .{});
 }
