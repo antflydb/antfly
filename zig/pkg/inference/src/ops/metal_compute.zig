@@ -11962,9 +11962,9 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!acceptsPhysicalImplementation(cb.vtable)) return error.ForeignPreparedProjectionBackend;
         const self: *MetalCompute = @ptrCast(@alignCast(cb.ptr));
         if (!DenseProjectionProfile.noFrame(self) or !DenseProjectionRegion.hasProjectionHead(graph, false) or currentEngineOperation(self) != null) return null;
-        if (graph.outputs.items.len != request.count) return error.PreparedProjectionSourceChanged;
-        for (graph.outputs.items, 0..) |node, index| {
-            const descriptor = ops.kernel_descriptor.lower(graph, node) orelse return error.PreparedProjectionSourceChanged;
+        const semantic = ops.kernel_descriptor.projectionHead(graph) orelse return error.PreparedProjectionSourceChanged;
+        if (semantic.count != request.count) return error.PreparedProjectionSourceChanged;
+        for (semantic.linears[0..semantic.count], 0..) |descriptor, index| {
             if (descriptor.operation.linear.in_dim != request.width or descriptor.operation.linear.out_dim != request.widths[index]) return error.PreparedProjectionSourceChanged;
         }
         const pack = blk: {
@@ -12045,7 +12045,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         allocator: std.mem.Allocator,
         compute: *MetalCompute,
         count: usize,
-        nodes: [3]ml.graph.NodeId,
+        nodes: [6]ml.graph.NodeId,
         inputs: [4]ml.graph.NodeId,
         outputs: [3]region.Output,
         linears: [3]route.Owned,
@@ -12061,30 +12061,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             return hasProjectionHead(graph, true);
         }
         fn hasProjectionHead(graph: *const ml.graph.Graph, row_one: bool) bool {
-            // The initial synchronous profile is a complete projection head,
-            // never a promise to disable profitable framing on a mixed graph.
-            if (graph.outputs.items.len < 2 or graph.outputs.items.len > 3) return false;
-            var common: ?ml.graph.NodeId = null;
-            var dimensions: [3]usize = undefined;
-            var width: usize = 0;
-            var rows: usize = 0;
-            for (graph.outputs.items, 0..) |node, index| {
-                const descriptor = ops.kernel_descriptor.lower(graph, node) orelse return false;
-                if (descriptor.operation != .linear or descriptor.operation.linear.bias or !supportsAssignedDescriptor(&descriptor) or
-                    (row_one and descriptor.operation.linear.rows != 1) or (!row_one and descriptor.operation.linear.rows <= 1)) return false;
-                const current = graph.node(node);
-                if (graph.node(current.inputs[0]).op != .parameter or graph.node(current.inputs[1]).op != .parameter) return false;
-                if (common) |input| {
-                    if (input != current.inputs[0] or width != descriptor.operation.linear.in_dim or rows != descriptor.operation.linear.rows) return false;
-                } else {
-                    common = current.inputs[0];
-                    width = descriptor.operation.linear.in_dim;
-                    rows = descriptor.operation.linear.rows;
-                }
-                for (graph.outputs.items[0..index]) |prior| if (graph.node(prior).inputs[1] == current.inputs[1]) return false;
-                dimensions[index] = descriptor.operation.linear.out_dim;
-            }
-            return if (graph.outputs.items.len == 2) dimensions[0] == dimensions[1] else dimensions[1] == dimensions[2];
+            const head = ops.kernel_descriptor.projectionHead(graph) orelse return false;
+            return if (row_one) head.form == .independent and head.linears[0].operation.linear.rows == 1 else head.linears[0].operation.linear.rows > 1;
         }
         fn slotsSupported(self: *@This()) bool {
             for (self.linears[0..self.count], 0..) |linear, index| {
@@ -12236,31 +12214,85 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const table: region.SelectionDependency.VTable = .{ .matches = matches, .validate = validate, .deinit = @This().deinit };
     };
+    fn prepareSemanticProjectionRegions(self: *MetalCompute, request: @import("../execution/region_route.zig").Prepare) !?@import("../execution/region_route.zig").OwnedList {
+        const region = @import("../execution/region_route.zig");
+        const route = @import("../execution/kernel_route.zig");
+        const semantic = ops.kernel_descriptor.projectionHead(request.graph) orelse return null;
+        if (semantic.linears[0].operation.linear.rows <= 1) return null;
+        const profile = self.packed_projection_profile orelse return null;
+        if (profile.program != request.graph or profile.packed_owner == null) return null;
+        const expected = profile.packed_request orelse return null;
+        if (expected.count != semantic.count) return error.PreparedProjectionSourceChanged;
+        if (request.node_facts.len != request.graph.nodeCount() or request.reachable.len != request.graph.nodeCount()) return error.InvalidRegionOrder;
+        const positions = try request.allocator.alloc(u32, request.graph.nodeCount());
+        defer request.allocator.free(positions);
+        @memset(positions, std.math.maxInt(u32));
+        for (request.node_order, 0..) |node, position| {
+            if (node >= positions.len or positions[node] != std.math.maxInt(u32)) return error.InvalidRegionOrder;
+            positions[node] = std.math.cast(u32, position) orelse return error.InvalidRegionOrder;
+        }
+        // The semantic head may contain concatenated weights and paired-output
+        // markers. Cover those real nodes once, ordered by the actual plan.
+        var covered: [6]ml.graph.NodeId = undefined;
+        var covered_count: usize = 0;
+        for (request.partition_nodes) |node| {
+            if (!request.reachable[node] or request.graph.node(node).op == .parameter) continue;
+            if (std.mem.indexOfScalar(ml.graph.NodeId, semantic.covered[0..semantic.covered_count], node) == null or covered_count == covered.len) return null;
+            covered[covered_count] = node;
+            covered_count += 1;
+        }
+        if (covered_count != semantic.covered_count) return null;
+        for (covered[0..covered_count], 0..) |node, index| {
+            if (positions[node] == std.math.maxInt(u32) or (index != 0 and positions[covered[index - 1]] >= positions[node])) return error.InvalidRegionOrder;
+        }
+        const entry = covered[0];
+        if (positions[semantic.input] >= positions[entry]) return null;
+        const table: *const ops.ComputeBackend.VTable = @ptrCast(@alignCast(request.implementation.table));
+        const owner = try request.allocator.create(DenseProjectionRegion);
+        owner.* = .{ .allocator = request.allocator, .compute = self, .count = 0, .nodes = undefined, .inputs = undefined, .outputs = undefined, .linears = undefined };
+        var transferred = false;
+        defer if (!transferred) DenseProjectionRegion.deinit(owner);
+        @memcpy(owner.nodes[0..covered_count], covered[0..covered_count]);
+        owner.inputs[0] = semantic.input;
+        var actual = expected;
+        actual.widths = @splat(0);
+        actual.slots = @splat(0);
+        actual.generations = @splat(0);
+        actual.declarations = @splat(0);
+        for (semantic.linears[0..semantic.count], 0..) |descriptor, index| {
+            const weight = semantic.weights[index];
+            if (request.node_facts[weight] != .tensor) return null;
+            const facts = [_]route.Binding{ request.node_facts[semantic.input], request.node_facts[weight] };
+            const bytes = try std.math.mul(usize, descriptor.elements(), @sizeOf(f32));
+            const output_node = semantic.outputs[index];
+            const output = route.OutputSlot{ .allocation = 0, .node = output_node, .epoch = 0, .logical = descriptor.output_shape, .writable_bytes = bytes };
+            owner.linears[index] = (try PreparedDenseLinear.prepareRegion(self, .{ .allocator = request.allocator, .implementation = request.implementation, .descriptor = &descriptor, .inputs = &facts, .output = output }, table)) orelse return null;
+            owner.count += 1;
+            owner.inputs[index + 1] = weight;
+            owner.outputs[index] = .{ .node = output_node, .logical = descriptor.output_shape, .bytes = bytes };
+            const prepared: *PreparedDenseLinear = @ptrCast(@alignCast(owner.linears[index].context));
+            actual.widths[index] = descriptor.operation.linear.out_dim;
+            actual.slots[index] = prepared.slot;
+            actual.generations[index] = metal_runtime.antfly_metal_prepared_binding_generation(self.provider_impl.raw_decode_runtime, .linear, prepared.slot);
+            actual.declarations[index] = self.provider_impl.privateSlotDeclaration(.linear, prepared.slot);
+        }
+        if (!owner.slotsSupported() or !std.meta.eql(actual, expected)) return null;
+        owner.packed_request = expected;
+        owner.scratch_bytes = try (try expected.layout()).outputBytes(semantic.linears[0].operation.linear.rows);
+        const items = try request.allocator.alloc(region.Owned, 1);
+        items[0] = .{ .context = owner, .implementation = request.implementation, .key = entry, .policy_key = 2, .covered_nodes = owner.nodes[0..covered_count], .input_nodes = owner.inputs[0 .. owner.count + 1], .entry_node = entry, .requirements = .{ .outputs = owner.outputs[0..owner.count], .dispatch_workspace = .{ .byte_size = owner.scratch_bytes }, .uncovered = .{} }, .vtable = &DenseProjectionRegion.table };
+        transferred = true;
+        return .{ .allocator = request.allocator, .items = items };
+    }
+
     fn prepareDenseProjectionRegions(ctx: *anyopaque, request: @import("../execution/region_route.zig").Prepare) !?@import("../execution/region_route.zig").OwnedList {
         const region = @import("../execution/region_route.zig");
         const route = @import("../execution/kernel_route.zig");
         if (comptime !build_options.enable_metal) return null;
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (request.implementation.context != ctx or !acceptsPhysicalImplementation(request.implementation.table) or (request.policy_key != 1 and request.policy_key != 2) or request.execution_profile != .synchronous or !self.projectionScopeValid()) return null;
-        if (request.policy_key == 2) {
-            const profile = self.packed_projection_profile orelse return null;
-            if (profile.program != request.graph or profile.packed_owner == null or !DenseProjectionRegion.hasProjectionHead(request.graph, false)) return null;
-        }
-        var packed_nodes: [3]ml.graph.NodeId = undefined;
-        var partition_nodes = request.partition_nodes;
-        if (request.policy_key == 2) {
-            var count: usize = 0;
-            for (request.partition_nodes) |node| {
-                if (!request.reachable[node] or request.graph.node(node).op == .parameter) continue;
-                if (count == packed_nodes.len or DenseProjectionRegion.candidate(request.graph, node) == null or
-                    std.mem.indexOfScalar(ml.graph.NodeId, request.graph.outputs.items, node) == null) return null;
-                for (packed_nodes[0..count]) |previous| if (previous == node) return error.InvalidRegionOrder;
-                packed_nodes[count] = node;
-                count += 1;
-            }
-            if (count != request.graph.outputs.items.len) return null;
-            partition_nodes = packed_nodes[0..count];
-        }
+        if (request.policy_key == 2) return prepareSemanticProjectionRegions(self, request);
+        const partition_nodes = request.partition_nodes;
         const table: *const ops.ComputeBackend.VTable = @ptrCast(@alignCast(request.implementation.table));
         const positions = try request.allocator.alloc(u32, request.graph.nodeCount());
         defer request.allocator.free(positions);
@@ -12291,7 +12323,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 cursor += 1;
                 continue;
             };
-            if ((request.policy_key == 1 and first.operation.linear.rows != 1) or (request.policy_key == 2 and first.operation.linear.rows <= 1)) {
+            if (first.operation.linear.rows != 1) {
                 cursor += 1;
                 continue;
             }
@@ -12325,10 +12357,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
                 if (source >= positions.len) {
                     ready = false;
                 } else if (positions[source] >= entry_position) {
-                    // A retained concrete model parameter already exists before
-                    // execution; skipping its later metadata-only schedule node
-                    // introduces no producer/transfer and borrows no future CT.
-                    if (request.policy_key != 2 or request.graph.node(source).op != .parameter or request.node_facts[source] != .tensor) ready = false;
+                    ready = false;
                 }
             };
             for (partition_nodes[cursor..][0..count], 0..) |node, index| {
@@ -12361,30 +12390,6 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (owner.count != count or !owner.slotsSupported()) {
                 cursor += 1;
                 continue;
-            }
-            if (request.policy_key == 2) {
-                const profile = self.packed_projection_profile orelse return error.RegionExecutionProfileChanged;
-                const expected = profile.packed_request orelse return error.RegionExecutionProfileChanged;
-                var actual = expected;
-                actual.count = @intCast(count);
-                actual.width = first.operation.linear.in_dim;
-                actual.widths = @splat(0);
-                actual.slots = @splat(0);
-                actual.generations = @splat(0);
-                actual.declarations = @splat(0);
-                for (owner.linears[0..count], 0..) |linear, index| {
-                    const source: *PreparedDenseLinear = @ptrCast(@alignCast(linear.context));
-                    actual.widths[index] = source.descriptor.operation.linear.out_dim;
-                    actual.slots[index] = source.slot;
-                    actual.generations[index] = metal_runtime.antfly_metal_prepared_binding_generation(self.provider_impl.raw_decode_runtime, .linear, source.slot);
-                    actual.declarations[index] = self.provider_impl.privateSlotDeclaration(.linear, source.slot);
-                }
-                if (!std.meta.eql(actual, expected)) {
-                    cursor += 1;
-                    continue;
-                }
-                owner.packed_request = expected;
-                owner.scratch_bytes = try (try expected.layout()).outputBytes(first.operation.linear.rows);
             }
             // Slices point into their stable heap owner, never this call frame.
             try result.append(request.allocator, .{ .context = owner, .implementation = request.implementation, .key = first_node, .policy_key = request.policy_key, .covered_nodes = owner.nodes[0..count], .input_nodes = owner.inputs[0 .. count + 1], .entry_node = first_node, .requirements = .{ .outputs = owner.outputs[0..count], .dispatch_workspace = .{ .byte_size = owner.scratch_bytes }, .uncovered = .{} }, .vtable = &DenseProjectionRegion.table });
@@ -12440,14 +12445,14 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (node >= pool.plan.node_positions.len or pool.plan.node_positions[node] == std.math.maxInt(u32)) return null;
             if (index != 0 and pool.plan.node_positions[graph.outputs.items[index - 1]] >= pool.plan.node_positions[node]) return null;
         }
-        const count = graph.outputs.items.len;
+        const semantic = ops.kernel_descriptor.projectionHead(graph) orelse return null;
+        const count = semantic.count;
         if (count == 3 and platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED")) return null;
         var request = ProjectionPack.Request{ .count = @intCast(count), .slots = @splat(0), .generations = @splat(0), .declarations = @splat(0), .width = 0, .widths = @splat(0) };
-        for (graph.outputs.items, 0..) |node, index| {
-            const descriptor = ops.kernel_descriptor.lower(graph, node) orelse return null;
+        for (semantic.linears[0..count], 0..) |descriptor, index| {
             const linear = descriptor.operation.linear;
-            if (linear.rows <= 1 or linear.rows > std.math.maxInt(u32) or linear.in_dim > std.math.maxInt(u32) or linear.out_dim > std.math.maxInt(u32)) return null;
-            const source = immutable.originalTensor(graph.node(node).inputs[1]) orelse return null;
+            if (linear.rows <= 1) return null;
+            const source = immutable.originalTensor(semantic.weights[index]) orelse return null;
             if (source.implementation.context != cb.ptr or !acceptsPhysicalImplementation(source.implementation.table)) return null;
             const key = self.assignedDenseLinearKey(linear, source.value, null) orelse return null;
             const slot = self.assignedDenseLinearSlot(key) orelse return null;

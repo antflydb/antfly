@@ -13246,44 +13246,38 @@ fn matchGroupedLinearQkvSlicePatternAt(
     skipped_nodes: []const bool,
 ) ?GroupedLinearQkvSlicePattern {
     const linear_id = node_ids[node_pos];
-    const linear = graph.node(linear_id);
-    const attrs = switch (linear.op) {
-        .fused_linear_no_bias => |linear_attrs| linear_attrs,
-        else => return null,
+    const Selection = struct {
+        graph: *const Graph,
+        values: []?CT,
+        node_ids: []const NodeId,
+        start: usize,
+        reachable: []const bool,
+        skipped: []const bool,
+        fn find(raw: *anyopaque, linear: NodeId, start: usize, limit: usize) ?NodeId {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return findLinearSliceCandidate(self.graph, self.values, self.node_ids, self.start, self.reachable, self.skipped, linear, start, limit);
+        }
     };
-    const rows = shapeDimUsize(linear.output_shape, 0) orelse return null;
-    const total_out_dim = shapeDimUsize(linear.output_shape, 1) orelse return null;
-    if (rows == 0 or attrs.in_dim == 0 or total_out_dim == 0) return null;
-    const inputs = linear.getInputs();
-    if (inputs.len < 2) return null;
-
-    var leaves: [3]NodeId = undefined;
-    if (!collectThreeRowConcatLeaves(graph, inputs[1], &leaves)) return null;
-    const q_rows = shapeDimUsize(graph.node(leaves[0]).output_shape, 0) orelse return null;
-    const k_rows = shapeDimUsize(graph.node(leaves[1]).output_shape, 0) orelse return null;
-    const v_rows = shapeDimUsize(graph.node(leaves[2]).output_shape, 0) orelse return null;
-    const q_cols = shapeDimUsize(graph.node(leaves[0]).output_shape, 1) orelse return null;
-    const k_cols = shapeDimUsize(graph.node(leaves[1]).output_shape, 1) orelse return null;
-    const v_cols = shapeDimUsize(graph.node(leaves[2]).output_shape, 1) orelse return null;
-    if (q_cols != attrs.in_dim or k_cols != attrs.in_dim or v_cols != attrs.in_dim) return null;
-    if (k_rows != v_rows or total_out_dim != q_rows + k_rows + v_rows) return null;
-
-    const q_slice = findLinearSliceCandidate(graph, values, node_ids, node_pos + 1, reachable, skipped_nodes, linear_id, 0, q_rows) orelse return null;
-    const k_slice = findLinearSliceCandidate(graph, values, node_ids, node_pos + 1, reachable, skipped_nodes, linear_id, q_rows, q_rows + k_rows) orelse return null;
-    const v_slice = findLinearSliceCandidate(graph, values, node_ids, node_pos + 1, reachable, skipped_nodes, linear_id, q_rows + k_rows, q_rows + k_rows + v_rows) orelse return null;
+    var selection = Selection{ .graph = graph, .values = values, .node_ids = node_ids, .start = node_pos + 1, .reachable = reachable, .skipped = skipped_nodes };
+    const head = @import("../ops/kernel_descriptor.zig").groupedProjectionHeadWithSelection(graph, linear_id, .{ .context = &selection, .find = Selection.find }) orelse return null;
+    const dimensions = head.linears[0].operation.linear;
+    const q_rows = dimensions.out_dim;
+    const k_rows = head.linears[1].operation.linear.out_dim;
+    const q_slice = head.outputs[0];
+    const k_slice = head.outputs[1];
+    const v_slice = head.outputs[2];
     if (!hasOnlyExpectedUses(graph, reachable, skipped_nodes, linear_id, &.{ q_slice, k_slice, v_slice })) return null;
-
     return .{
         .linear_id = linear_id,
         .q_slice_id = q_slice,
         .k_slice_id = k_slice,
         .v_slice_id = v_slice,
-        .input_id = inputs[0],
-        .q_weight_id = leaves[0],
-        .k_weight_id = leaves[1],
-        .v_weight_id = leaves[2],
-        .rows = rows,
-        .in_dim = attrs.in_dim,
+        .input_id = head.input,
+        .q_weight_id = head.weights[0],
+        .k_weight_id = head.weights[1],
+        .v_weight_id = head.weights[2],
+        .rows = dimensions.rows,
+        .in_dim = dimensions.in_dim,
         .q_out_dim = q_rows,
         .kv_out_dim = k_rows,
     };
@@ -13361,31 +13355,6 @@ fn findNodePos(node_ids: []const NodeId, needle: NodeId) ?usize {
         if (node_id == needle) return pos;
     }
     return null;
-}
-
-fn collectThreeRowConcatLeaves(graph: *const Graph, root_id: NodeId, out: *[3]NodeId) bool {
-    var count: usize = 0;
-    collectRowConcatLeaves(graph, root_id, out, &count) catch return false;
-    return count == 3;
-}
-
-fn collectRowConcatLeaves(graph: *const Graph, node_id: NodeId, out: *[3]NodeId, count: *usize) !void {
-    const node = graph.node(node_id);
-    switch (node.op) {
-        .concat_prim => |attrs| {
-            if (attrs.axis != 0) return error.UnsupportedShape;
-            const inputs = node.getInputs();
-            if (inputs.len < 2) return error.UnsupportedShape;
-            try collectRowConcatLeaves(graph, inputs[0], out, count);
-            try collectRowConcatLeaves(graph, inputs[1], out, count);
-        },
-        .parameter => {
-            if (count.* >= out.len) return error.UnsupportedShape;
-            out[count.*] = node_id;
-            count.* += 1;
-        },
-        else => return error.UnsupportedShape,
-    }
 }
 
 fn findLinearSliceCandidate(
@@ -22939,4 +22908,40 @@ fn executeSynchronousPhysicalRegions(allocator: std.mem.Allocator, graph: *const
     }
     _ = allocator;
     return true;
+}
+
+test "shared grouped projection matcher preserves rank one legacy activation and unreachable slice selection" {
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const input = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{4}));
+    const q = try builder.parameter("q", ml.graph.Shape.init(.f32, &.{ 2, 4 }));
+    const k = try builder.parameter("k", ml.graph.Shape.init(.f32, &.{ 2, 4 }));
+    const v = try builder.parameter("v", ml.graph.Shape.init(.f32, &.{ 2, 4 }));
+    const qk = try builder.concat(q, k, 0);
+    const qkv = try builder.concat(qk, v, 0);
+    const linear = try builder.linearNoBias(input, qkv, 1, 4, 6);
+    for (0..3) |index| try graph.markOutput(try builder.sliceLastDim(linear, @intCast(index * 2), @intCast((index + 1) * 2)));
+    const extra = try builder.sliceLastDim(linear, 0, 2);
+    const values = try a.alloc(?CT, graph.nodeCount());
+    defer a.free(values);
+    @memset(values, null);
+    const node_ids = try a.alloc(NodeId, graph.nodeCount());
+    defer a.free(node_ids);
+    for (node_ids, 0..) |*node, id| node.* = @intCast(id);
+    const reachable = try a.alloc(bool, graph.nodeCount());
+    defer a.free(reachable);
+    @memset(reachable, true);
+    reachable[extra] = false;
+    const skipped = try a.alloc(bool, graph.nodeCount());
+    defer a.free(skipped);
+    @memset(skipped, false);
+    const original = matchGroupedLinearQkvSlicePatternAt(&graph, values, node_ids, linear, reachable, skipped) orelse return error.MissingLegacyGroupedProjection;
+    try std.testing.expectEqual(input, original.input_id);
+    try std.testing.expectEqual(@as(usize, 1), original.rows);
+    try std.testing.expectEqual(q, original.q_weight_id);
+    try std.testing.expectEqual(k, original.k_weight_id);
+    try std.testing.expectEqual(v, original.v_weight_id);
+    try std.testing.expect(@import("../ops/kernel_descriptor.zig").projectionHead(&graph) == null);
 }

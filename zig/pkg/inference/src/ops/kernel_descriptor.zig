@@ -167,6 +167,162 @@ pub const PagedAttention = struct {
 
 pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, linear: Linear, norm: Norm, softmax: Softmax, rope: Rope, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather, paged_attention: PagedAttention };
 
+/// Value-only semantics for original independent, fused-pair, and grouped QKV
+/// projection heads. It never owns a CT, prepared slot, or execution policy.
+pub const ProjectionHead = struct {
+    form: enum { independent, pair, grouped_qkv },
+    count: u8,
+    input: ml.graph.NodeId,
+    weights: [3]ml.graph.NodeId = @splat(ml.graph.null_node),
+    outputs: [3]ml.graph.NodeId = @splat(ml.graph.null_node),
+    covered: [6]ml.graph.NodeId = @splat(ml.graph.null_node),
+    covered_count: u8 = 0,
+    entry: ml.graph.NodeId,
+    linears: [3]Descriptor = undefined,
+
+    fn append(self: *@This(), node: ml.graph.NodeId) bool {
+        if (std.mem.indexOfScalar(ml.graph.NodeId, self.covered[0..self.covered_count], node) != null) return true;
+        if (self.covered_count == self.covered.len) return false;
+        self.covered[self.covered_count] = node;
+        self.covered_count += 1;
+        return true;
+    }
+    fn source(self: *@This(), graph: *const ml.graph.Graph, index: usize, weight: ml.graph.NodeId, output: ml.graph.NodeId, rows: usize, width: usize, columns: usize, strict_shapes: bool) bool {
+        const input_shape = graph.node(self.input).output_shape;
+        const weight_shape = graph.node(weight).output_shape;
+        const output_shape = graph.node(output).output_shape;
+        // Legacy grouped execution flattens its activation using explicit
+        // rows/in_dim. Preserve that broader structural contract; only a
+        // complete assigned head requires exact rank-two physical geometry.
+        if (weight_shape.rank() < 2 or weight_shape.dim(0) != columns or weight_shape.dim(1) != width or graph.node(weight).op != .parameter) return false;
+        if (strict_shapes and (input_shape.rank() != 2 or weight_shape.rank() != 2 or output_shape.rank() != 2 or
+            input_shape.dim(0) != rows or input_shape.dim(1) != width or output_shape.dim(0) != rows or output_shape.dim(1) != columns)) return false;
+        const geometry = Linear.init(rows, width, columns, false) catch return false;
+        if (rows == 0 or width == 0 or columns == 0) return false;
+        self.weights[index] = weight;
+        self.outputs[index] = output;
+        self.linears[index] = .{ .operation = .{ .linear = geometry }, .output_shape = output_shape, .input_shapes = .{ input_shape, weight_shape, undefined }, .input_count = 2 };
+        return true;
+    }
+};
+
+fn projectionConcatLeaves(graph: *const ml.graph.Graph, node: ml.graph.NodeId, result: *ProjectionHead, leaves: *[3]ml.graph.NodeId, count: *usize) bool {
+    const current = graph.node(node);
+    if (current.op == .parameter) {
+        if (count.* == leaves.len) return false;
+        leaves[count.*] = node;
+        count.* += 1;
+        return true;
+    }
+    if (current.op != .concat_prim or current.op.concat_prim.axis != 0 or current.getInputs().len != 2 or
+        std.mem.indexOfScalar(ml.graph.NodeId, result.covered[0..result.covered_count], node) != null or !result.append(node)) return false;
+    return projectionConcatLeaves(graph, current.inputs[0], result, leaves, count) and projectionConcatLeaves(graph, current.inputs[1], result, leaves, count);
+}
+
+/// Structural authority shared with the original grouped-QKV compatibility
+/// matcher. Execution values, liveness, scheduling and backend policy remain
+/// obligations of the receiving owner.
+pub const ProjectionSliceSelection = struct {
+    context: *anyopaque,
+    find: *const fn (*anyopaque, ml.graph.NodeId, usize, usize) ?ml.graph.NodeId,
+};
+
+pub fn groupedProjectionHead(graph: *const ml.graph.Graph, linear_id: ml.graph.NodeId) ?ProjectionHead {
+    return groupedProjectionHeadWithSelection(graph, linear_id, null);
+}
+
+pub fn groupedProjectionHeadWithSelection(graph: *const ml.graph.Graph, linear_id: ml.graph.NodeId, selection: ?ProjectionSliceSelection) ?ProjectionHead {
+    if (linear_id >= graph.nodeCount()) return null;
+    const linear = graph.node(linear_id);
+    if (linear.op != .fused_linear_no_bias or linear.getInputs().len != 2) return null;
+    const attrs = linear.op.fused_linear_no_bias;
+    if (linear.output_shape.rank() != 2) return null;
+    const rows = std.math.cast(usize, linear.output_shape.dim(0)) orelse return null;
+    const total = std.math.cast(usize, linear.output_shape.dim(1)) orelse return null;
+    if (rows == 0 or total == 0) return null;
+    var result = ProjectionHead{ .form = .grouped_qkv, .count = 3, .input = linear.inputs[0], .entry = linear_id };
+    var leaves: [3]ml.graph.NodeId = undefined;
+    var count: usize = 0;
+    if (!projectionConcatLeaves(graph, linear.inputs[1], &result, &leaves, &count) or count != 3) return null;
+    if (!result.append(linear_id)) return null;
+    var cursor: usize = 0;
+    for (leaves, 0..) |weight, index| {
+        const shape = graph.node(weight).output_shape;
+        if (shape.rank() < 2 or shape.dim(0) <= 0) return null;
+        const columns = std.math.cast(usize, shape.dim(0)) orelse return null;
+        const end = std.math.add(usize, cursor, columns) catch return null;
+        var found: ?ml.graph.NodeId = if (selection) |chosen| chosen.find(chosen.context, linear_id, cursor, end) else null;
+        if (selection == null) for (graph.nodes.items, 0..) |node, id| {
+            if (node.op != .slice or node.getInputs().len != 1 or node.inputs[0] != linear_id) continue;
+            const slice = node.op.slice;
+            if (slice.num_axes != 2 or slice.starts[0] != 0 or slice.limits[0] != rows or slice.strides[0] != 1 or slice.strides[1] != 1 or
+                slice.starts[1] != cursor or slice.limits[1] != end) continue;
+            if (found != null) return null;
+            found = @intCast(id);
+        };
+        const output = found orelse return null;
+        if (!result.source(graph, index, weight, output, rows, attrs.in_dim, columns, selection == null) or !result.append(output)) return null;
+        cursor = end;
+    }
+    if (cursor != total or result.linears[1].operation.linear.out_dim != result.linears[2].operation.linear.out_dim) return null;
+    return result;
+}
+
+/// Complete parameter-fed projection head only. Mixed graphs keep their
+/// original executor and schedule; no reachability/placement is guessed here.
+pub fn projectionHead(graph: *const ml.graph.Graph) ?ProjectionHead {
+    const outputs = graph.outputs.items;
+    if (outputs.len != 2 and outputs.len != 3) return null;
+    var result: ?ProjectionHead = null;
+    if (outputs.len == 2) {
+        const pair_id = outputs[0];
+        const pair = graph.node(pair_id);
+        const second = graph.node(outputs[1]);
+        if (pair.op == .fused_linear_no_bias_pair and pair.getInputs().len == 3 and second.op == .fused_to_float32 and second.getInputs().len == 1 and second.inputs[0] == pair_id) {
+            const attrs = pair.op.fused_linear_no_bias_pair;
+            var head = ProjectionHead{ .form = .pair, .count = 2, .input = pair.inputs[0], .entry = pair_id };
+            if (!head.source(graph, 0, pair.inputs[1], outputs[0], attrs.rows, attrs.in_dim, attrs.out_dim, true) or
+                !head.source(graph, 1, pair.inputs[2], outputs[1], attrs.rows, attrs.in_dim, attrs.out_dim, true) or !head.append(pair_id) or !head.append(outputs[1])) return null;
+            result = head;
+        }
+    } else {
+        const first = graph.node(outputs[0]);
+        if (first.op == .slice and first.getInputs().len == 1) {
+            const head = groupedProjectionHead(graph, first.inputs[0]) orelse return null;
+            if (!std.mem.eql(ml.graph.NodeId, outputs, head.outputs[0..3])) return null;
+            result = head;
+        }
+    }
+    if (result == null) {
+        var head = ProjectionHead{ .form = .independent, .count = @intCast(outputs.len), .input = ml.graph.null_node, .entry = outputs[0] };
+        for (outputs, 0..) |output, index| {
+            const node = graph.node(output);
+            const descriptor = lower(graph, output) orelse return null;
+            if (descriptor.operation != .linear or descriptor.operation.linear.bias or node.getInputs().len != 2) return null;
+            if (index == 0) head.input = node.inputs[0] else if (node.inputs[0] != head.input) return null;
+            const dims = descriptor.operation.linear;
+            if (!head.source(graph, index, node.inputs[1], output, dims.rows, dims.in_dim, dims.out_dim, true) or !head.append(output)) return null;
+        }
+        result = head;
+    }
+    const head = result.?;
+    if (graph.node(head.input).op != .parameter) return null;
+    for (head.linears[0..head.count], 0..) |linear, index| {
+        if (linear.output_shape.dtype != .f32 or linear.input_shapes[0].dtype != .f32 or linear.input_shapes[1].dtype != .f32) return null;
+        for (head.weights[0..index]) |prior| if (prior == head.weights[index]) return null;
+    }
+    for (head.linears[1..head.count]) |linear| {
+        if (linear.operation.linear.rows != head.linears[0].operation.linear.rows or linear.operation.linear.in_dim != head.linears[0].operation.linear.in_dim) return null;
+    }
+    if (head.count == 2 and head.linears[0].operation.linear.out_dim != head.linears[1].operation.linear.out_dim) return null;
+    if (head.count == 3 and head.linears[1].operation.linear.out_dim != head.linears[2].operation.linear.out_dim) return null;
+    for (graph.nodes.items, 0..) |node, id| {
+        if (node.op == .parameter) continue;
+        if (std.mem.indexOfScalar(ml.graph.NodeId, head.covered[0..head.covered_count], @intCast(id)) == null) return null;
+    }
+    return head;
+}
+
 pub const Descriptor = struct {
     operation: Operation,
     output_shape: ml.graph.Shape,
@@ -451,4 +607,52 @@ test "ordinary RoPE descriptors lower logical batch positions and reject invalid
     graph.nodeMut(id).inputs[1] = input;
     graph.nodeMut(id).inputs[2] = input;
     try std.testing.expect(lower(&graph, id) == null);
+}
+
+test "semantic projection heads retain optimizer pair and grouped QKV source output identities" {
+    const a = std.testing.allocator;
+    inline for (.{ @as(usize, 2), @as(usize, 3) }) |count| {
+        var graph = ml.graph.Graph.init(a);
+        defer graph.deinit();
+        var builder = ml.graph.Builder.init(&graph);
+        const rows = if (count == 2) 3 else 128;
+        const width = if (count == 2) 64 else 128;
+        const input = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, width }));
+        for (([_][]const u8{ "q", "k", "v" })[0..count]) |name| {
+            const weight = try builder.parameter(name, ml.graph.Shape.init(.f32, &.{ width, width }));
+            try graph.markOutput(try builder.linearNoBias(input, weight, rows, width, width));
+        }
+        var optimized = try ml.graph.passes.pipeline.Pipeline.default.run(a, &graph);
+        defer optimized.deinit();
+        const head = projectionHead(&optimized.graph) orelse return error.MissingSemanticProjectionHead;
+        try std.testing.expectEqual(@as(u8, count), head.count);
+        try std.testing.expect(head.form == (if (count == 2) .pair else .grouped_qkv));
+        try std.testing.expectEqual(@as(u8, if (count == 2) 2 else 6), head.covered_count);
+        try std.testing.expectEqualSlices(ml.graph.NodeId, optimized.graph.outputs.items, head.outputs[0..count]);
+        for (head.weights[0..count], head.linears[0..count]) |weight, descriptor| {
+            try std.testing.expect(optimized.graph.node(weight).op == .parameter);
+            try std.testing.expectEqual(@as(u32, rows), descriptor.operation.linear.rows);
+            try std.testing.expectEqual(@as(u32, width), descriptor.operation.linear.in_dim);
+            try std.testing.expectEqual(@as(u32, width), descriptor.operation.linear.out_dim);
+        }
+        // Swapping graph outputs changes public semantics, so the optimized
+        // marker/slice form cannot silently reinterpret its projection order.
+        std.mem.swap(ml.graph.NodeId, &optimized.graph.outputs.items[0], &optimized.graph.outputs.items[1]);
+        try std.testing.expect(projectionHead(&optimized.graph) == null);
+        std.mem.swap(ml.graph.NodeId, &optimized.graph.outputs.items[0], &optimized.graph.outputs.items[1]);
+        try std.testing.expect(projectionHead(&optimized.graph) != null);
+        if (count == 3) {
+            const first_slice = optimized.graph.node(head.outputs[0]);
+            const linear = first_slice.inputs[0];
+            const saved = optimized.graph.nodes.items[head.outputs[1]].op.slice.strides[1];
+            optimized.graph.nodes.items[head.outputs[1]].op.slice.strides[1] = 2;
+            try std.testing.expect(projectionHead(&optimized.graph) == null);
+            optimized.graph.nodes.items[head.outputs[1]].op.slice.strides[1] = saved;
+            // Broader compatibility receives its own exact scheduling/liveness
+            // selection. Reduced dtype does not shrink the old structural path.
+            for (optimized.graph.nodes.items) |*node| node.output_shape.dtype = .f16;
+            try std.testing.expect(groupedProjectionHead(&optimized.graph, linear) != null);
+            try std.testing.expect(projectionHead(&optimized.graph) == null);
+        }
+    }
 }

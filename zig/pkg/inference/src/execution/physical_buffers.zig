@@ -300,7 +300,17 @@ pub const Pool = struct {
         for (backends, owned_backends) |backend, *owned| owned.* = backend.withoutSynchronousBorrows();
         const literal_store = try SharedLiteralStore.create(allocator, graph, plan, owned_backends);
         errdefer if (literal_store) |store| store.release();
-        if (count == 0 and literal_store == null) {
+        // A complete semantic head can have only fused region operations and
+        // no individually assigned primitive. Keep its physical output plan
+        // available to the real region provider; this grants no kernel or
+        // complete-payload coverage before exact runtime region selection.
+        const region_only = count == 0 and literal_store == null and kernels.projectionHead(graph) != null and blk: {
+            for (owned_backends) |backend| if (backend.vtable.kernels) |functions| {
+                if (functions.accepts(backend.vtable) and functions.prepareRegionRoutes != null) break :blk true;
+            };
+            break :blk false;
+        };
+        if (count == 0 and literal_store == null and !region_only) {
             allocator.free(prepared);
             allocator.free(transfers);
             allocator.free(owned_backends);

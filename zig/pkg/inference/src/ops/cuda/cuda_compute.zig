@@ -43315,7 +43315,7 @@ fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../../execution/kerne
         // RMS auxiliary mirrors depend on live environment/provider readiness.
         // Preserve their per-invocation policy checks even with dense inputs.
         if (request.descriptor.operation == .norm and request.descriptor.operation.norm.kind == .rms) {
-            var selected = (try @import("../../execution/assigned_kernel_route.zig").prepare(.{ .ptr = self, .vtable = table }, request, directCudaRouteSupported)) orelse return null;
+            var selected = (try @import("../../execution/assigned_kernel_route.zig").prepare(.{ .ptr = self, .vtable = table }, request, rmsCudaRouteSupported)) orelse return null;
             // This canonical producer writes dense F32 into its assigned slot
             // and attaches only its declared mirrors. Its model gamma remains
             // live invocation-validated; it grants no source payload credit.
@@ -43361,6 +43361,10 @@ fn primitiveCudaDotRouteSupported(ctx: *anyopaque, descriptor: *const ops.kernel
     for (0..rank - 2) |axis| if (descriptor.output_shape.dim(@intCast(axis)) != descriptor.input_shapes[0].dim(@intCast(axis))) return false;
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     return self.training_blas == null and !self.resident_training_cache and self.kernels.primitive_batched_dot_f32 != null;
+}
+
+fn rmsCudaRouteSupported(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
+    return descriptor.operation == .norm and descriptor.operation.norm.kind == .rms and directCudaRouteSupported(ctx, descriptor);
 }
 
 fn directCudaRouteSupported(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
@@ -48272,6 +48276,12 @@ fn ownedPayloadRoute(ctx: *anyopaque, owned: *const @import("../../execution/ker
         // Dynamic validation protects the original nontraining schedule; it
         // does not imply hidden output or temporary ownership for this family.
         return owned.output_plane_metadata == .assigned_dense and required.workspace.byte_size == 0 and required.workspace.host_byte_size == 0 and required.probe_workspace.byte_size == 0 and required.probe_workspace.host_byte_size == 0 and required.auxiliaries.count == 0;
+    }
+    if (direct.belongsToProgram(owned, backend, rmsCudaRouteSupported)) {
+        // The actual RMS producer keeps live gamma/auxiliary-policy validation.
+        // Its assigned primary and declared mirror are independently checked by
+        // device coverage; invocation validation does not imply hidden storage.
+        return owned.output_plane_metadata == .assigned_dense and required.workspace.byte_size == 0 and required.workspace.host_byte_size == 0 and required.probe_workspace.byte_size == 0 and required.probe_workspace.host_byte_size == 0;
     }
     if (owned.validation_scope != .prepared_program) return false;
     return direct.belongsTo(owned, backend);

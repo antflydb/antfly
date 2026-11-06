@@ -11761,40 +11761,22 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
         defer original.deinit();
         const first_stats = session.executionDiagnostics().?.execution.?;
         try std.testing.expect(first_stats.runtime_region_plan_dispatches <= 1);
-        try std.testing.expectEqual(first_stats.runtime_region_plan_dispatches * count, first_stats.runtime_region_plan_covered_nodes);
+        // The existing grouped compiler may cover four QKV nodes on a cold
+        // call; the assigned semantic head below must cover all six instead.
+        try std.testing.expect(first_stats.runtime_region_plan_covered_nodes <= (if (count == 2) @as(u64, 2) else 6));
+        if (first_stats.runtime_region_plan_dispatches == 0) try std.testing.expectEqual(@as(u64, 0), first_stats.runtime_region_plan_covered_nodes);
         for (original.outputs, 0..) |output, index| {
             const actual = try original.backend.toFloat32(output, a);
             defer a.free(actual);
             for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)), got, 0.0001);
         }
     }
-    // Dynamic Imported roots deliberately own interpreter metadata only.
-    // Inspect and retain the exact actual concrete specialization selected by
-    // the public call, rather than assuming its physical pool lives on root.
-    var target = impl;
-    platform.sync.lockYielding(&impl.specialization_mutex);
-    var target_locked = true;
-    defer if (target_locked) impl.specialization_mutex.unlock();
-    try std.testing.expectEqual(@import("../execution/executable.zig").runtime_module.Strategy.partitioned, impl.requested_strategy);
-    if (impl.executable.runtime.physical_pool == null) {
-        try std.testing.expect(impl.source_path != null);
-        const expected_key = [_]i64{ 2, rows, width };
-        var matches: usize = 0;
-        for (impl.specializations.entries.items) |entry| {
-            if (!std.mem.eql(i64, entry.shapes, &expected_key)) continue;
-            target = entry.session;
-            matches += 1;
-        }
-        try std.testing.expectEqual(@as(usize, 1), matches);
-        try std.testing.expect(target != impl);
-    }
-    try std.testing.expect(target.shared_backend_ctx == impl.shared_backend_ctx);
-    try std.testing.expect(target.cb.ptr == impl.cb.ptr and target.cb.vtable == impl.cb.vtable);
-    _ = target.model_lifetime.retain();
-    var target_retained = true;
-    defer if (target_retained) target.model_lifetime.release();
-    impl.specialization_mutex.unlock();
-    target_locked = false;
+    // This fixture exports fixed shapes. The optimized fused semantic head
+    // must retain a region-capable physical plan on this actual root.
+    const target = impl;
+    try std.testing.expectEqual(@import("../execution/executable.zig").runtime_module.Strategy.partitioned, target.requested_strategy);
+    try std.testing.expect(target.source_path == null);
+    try std.testing.expect(target.executable.runtime.physical_pool != null);
     const request = blk: {
         var metadata = try @import("../execution/backend_operation.zig").enter(target.cb, target.executable.graph, null, .metadata);
         defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
@@ -11808,7 +11790,8 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
     defer if (held_open) held.deinit();
     const stats = session.executionDiagnostics().?.execution.?;
     try std.testing.expectEqual(@as(u64, 1), stats.runtime_region_plan_dispatches);
-    try std.testing.expectEqual(@as(u64, count), stats.runtime_region_plan_covered_nodes);
+    try std.testing.expectEqual(if (count == 2) @as(u64, 2) else 6, stats.runtime_region_plan_covered_nodes);
+    try std.testing.expect(compute.packed_projection_entries != null);
     try std.testing.expect(!metal.hasActiveFrame(compute.provider_impl.raw_decode_runtime) and !metal.hasSubmittedFrame(compute.provider_impl.raw_decode_runtime));
     const after = controller.snapshot();
     try std.testing.expect(after.backend_weight_bytes > before.backend_weight_bytes);
@@ -11947,10 +11930,6 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
     try std.testing.expectEqual(first_snapshot.identity, second_snapshot.identity);
     try std.testing.expectEqualDeep(first_snapshot.amounts, second_snapshot.amounts);
     const first_runtime = handle.get().runtime_id;
-    // Drop only this test's inspection pin while the actual root/cache still
-    // owns its target. Subsequent close accounting observes real owners only.
-    target.model_lifetime.release();
-    target_retained = false;
     handle.release();
     handle_open = false;
     try std.testing.expectEqual(UnloadRuntimeResult.unloaded, manager.unloadRuntime(first_runtime));
