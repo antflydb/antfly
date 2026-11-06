@@ -395,3 +395,60 @@ test "privacy compact binding HTTP reads bound replies and reject malformed or u
     try std.testing.expectError(error.CatalogRoutingSnapshotTimeout, client.fetchPrivacyPolicyBinding("http://metadata", "docs", .{ .deadline_ns = 1 }));
     try std.testing.expectEqual(calls, fake.calls);
 }
+
+test "privacy metadata reply ownership failures retain outcome and never replay delivery" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        fail: *std.testing.FailingAllocator,
+        fail_after: usize,
+        status: u16,
+        unknown: bool,
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, _: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            // The transport owns these allocations independently of the
+            // metadata client's caller arena. Arm failures only after reply.
+            const parent = std.testing.allocator;
+            const headers = try parent.alloc(http.Header, if (self.unknown) 2 else 1);
+            headers[0] = .{ .name = try parent.dupe(u8, "ETag"), .value = try parent.dupe(u8, "accepted") };
+            if (self.unknown) headers[1] = .{ .name = try parent.dupe(u8, "X-Antfly-Raft-Mutation-Outcome"), .value = try parent.dupe(u8, "unknown-v1") };
+            const response = http.HttpResponse{ .owner_allocator = parent, .status = self.status, .headers = headers, .body = try parent.dupe(u8, "{}") };
+            self.fail.fail_index = self.fail.alloc_index + self.fail_after;
+            return response;
+        }
+    };
+    for ([_]u16{ 202, 409, 503, 412 }) |status| for ([_]bool{ false, true }) |scan| for (0..2) |index| {
+        var fail = std.testing.FailingAllocator.init(a, .{});
+        var fake = Fake{ .fail = &fail, .fail_after = index, .status = status, .unknown = status == 409 or status == 503 };
+        var client = @import("../metadata/http_client.zig").MetadataHttpClient.init(fail.allocator(), .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+        try std.testing.expectError(if (status == 412) error.OutOfMemory else error.MetadataMutationOutcomeUnknown, client.forwardPrivacyMutation("http://metadata", "docs", "{}", null, scan, .{}));
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    };
+}
+
+test "privacy reply transport failures distinguish unsent requests from possible admission" {
+    const a = std.testing.allocator;
+    const Fake = struct {
+        state: http.RequestDeliveryTracker.State,
+        failure: anyerror,
+        calls: usize = 0,
+        fn execute(raw: *anyopaque, _: std.mem.Allocator, req: http.HttpRequest) !http.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            const delivery = req.delivery_tracker orelse return error.MissingDeliveryTracker;
+            switch (self.state) {
+                .not_sent => delivery.markNotSent(),
+                .may_have_been_sent => delivery.markMayHaveBeenSent(),
+                .unknown => {},
+            }
+            return self.failure;
+        }
+    };
+    for ([_]http.RequestDeliveryTracker.State{ .not_sent, .may_have_been_sent, .unknown }) |state| for ([_]anyerror{ error.OutOfMemory, error.Canceled, error.InvalidResponse }) |failure| for ([_]bool{ false, true }) |scan| {
+        var fake = Fake{ .state = state, .failure = failure };
+        var client = @import("../metadata/http_client.zig").MetadataHttpClient.init(a, .{ .ptr = &fake, .vtable = &.{ .execute = Fake.execute } });
+        try std.testing.expectError(if (state == .not_sent) failure else error.MetadataMutationOutcomeUnknown, client.forwardPrivacyMutation("http://metadata", "docs", "{}", null, scan, .{}));
+        try std.testing.expectEqual(@as(usize, 1), fake.calls);
+    };
+}

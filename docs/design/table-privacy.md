@@ -4,7 +4,7 @@ Implements the table-scoped **Privacy** design in
 [issue #1401](https://github.com/antflydb/antfly/issues/1401). The user-facing
 contract and examples are in [Table privacy](../reference/table-privacy.md).
 The branch starts at `f2b3baaee1cb508005451843c17fa07f2e069d4b`.
-Main is merged through `6c0b004e95ad947587cbc4bbb60f4812fb714b28`; privacy uses metadata protocol version 82.
+Main is merged through `93d85e2b476069cc5976e92cb1a7b3abd4a8f406`; privacy uses metadata protocol version 82.
 
 ## Policy and user experience
 
@@ -19,6 +19,10 @@ definitions, sensitivity and per-category thresholds, replacement style,
 artifact-compatible producer configuration, explicit sample keys, UTF-8 span
 highlights, external-processing disclosure, and false-positive threshold tuning.
 Protective saves require a fresh preview and an availability acknowledgment.
+Policy adoption is independent of scan-status availability. Policy and scan
+polling run separately, with one outstanding request per poller, cancellation
+on scope changes, and automatic recovery of scan errors. An accepted save
+adopts its reply without an additional policy GET.
 The editor pins the ETag of its loaded policy. Status polling never advances
 that save precondition; explicit reload adopts a concurrent policy and clears
 the previous preview/availability acknowledgment. Coverage and findings
@@ -216,6 +220,13 @@ never reused. Snapshot recovery includes chunks, manifests and deletion progress
 Protocol version 80 is required on metadata and data nodes. Data coordinators
 forward policy and scan mutations to the metadata owner, preserving preconditions,
 request controls and ambiguous outcomes without replaying scan admission.
+Forwarded mutations retain accepted or ambiguous outcomes across transport
+reply failures, owned body/ETag copies, data-node handoff and processing
+disclosure updates. A shared observation boundary converts post-acceptance
+failures into `MetadataMutationOutcomeUnknown`; definite rejection retains its
+error identity. Request delivery telemetry distinguishes unsent failures from
+response-less failures that may follow admission. These guards add no RPCs,
+response copies or replay loops.
 The compiled metadata registrar exposes exactly the two authenticated privacy
 control routes. They opt into the public 64 MiB request allowance through a
 separate route ceiling in the HTTP parser; ordinary metadata routes retain their

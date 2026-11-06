@@ -107,4 +107,97 @@ describe("privacy policy editor concurrency", () => {
       { ifMatch: '"two"' }
     );
   });
+
+  it("adopts policy and ETag even when the initial scan request fails", async () => {
+    api.privacy.get.mockResolvedValue(resource('"loaded"', ["subject"]));
+    api.privacy.getScan
+      .mockRejectedValueOnce(new Error("Scan temporarily unavailable"))
+      .mockResolvedValue({ data: { scan_id: "scan", phase: "running" } });
+    await act(async () => render(<TablePrivacyPanel tableName="customers" />));
+    expect(screen.getByLabelText("Fields (comma separated)").getAttribute("value")).toBe("subject");
+    expect(screen.getByText(/Scan status is unavailable/)).toBeTruthy();
+    fireEvent.change(screen.getByLabelText("Fields (comma separated)"), {
+      target: { value: "edited" },
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(2500));
+    expect(screen.queryByText(/Scan status is unavailable/)).toBeNull();
+    expect(screen.getByLabelText("Fields (comma separated)").getAttribute("value")).toBe("edited");
+    api.privacy.put.mockRejectedValue(new Error("record request"));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Save policy" })));
+    expect(api.privacy.put).toHaveBeenCalledWith(
+      "customers",
+      expect.objectContaining({ fields: ["edited"] }),
+      { ifMatch: '"loaded"' }
+    );
+  });
+
+  it("reloads the policy and ETag independently of unavailable progress", async () => {
+    api.privacy.getScan.mockRejectedValue(new Error("Scan unavailable"));
+    await act(async () => render(<TablePrivacyPanel tableName="customers" />));
+    api.privacy.get.mockResolvedValue(resource('"two"', ["description"]));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Reload policy" })));
+    expect(screen.getByLabelText("Fields (comma separated)").getAttribute("value")).toBe(
+      "description"
+    );
+    api.privacy.put.mockRejectedValue(new Error("record request"));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Save policy" })));
+    expect(api.privacy.put).toHaveBeenCalledWith(
+      "customers",
+      expect.objectContaining({ fields: ["description"] }),
+      { ifMatch: '"two"' }
+    );
+  });
+
+  it("keeps accepted saves visible without another policy read or available progress", async () => {
+    api.privacy.getScan.mockRejectedValue(new Error("Scan unavailable"));
+    await act(async () => render(<TablePrivacyPanel tableName="customers" />));
+    api.privacy.put.mockResolvedValue(resource('"saved"'));
+    api.privacy.get.mockRejectedValue(new Error("Policy read unavailable"));
+    const reads = api.privacy.get.mock.calls.length;
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Save policy" })));
+    expect(screen.getByText(/Policy accepted/)).toBeTruthy();
+    expect(screen.queryByText("Policy read unavailable")).toBeNull();
+    expect(api.privacy.get).toHaveBeenCalledTimes(reads);
+    api.privacy.put.mockRejectedValue(new Error("record request"));
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Save policy" })));
+    expect(api.privacy.put).toHaveBeenLastCalledWith("customers", expect.anything(), {
+      ifMatch: '"saved"',
+    });
+  });
+
+  it("does not overlap slow progress requests and cancels on unmount", async () => {
+    let complete: (result: { data: { scan_id: string; phase: string } }) => void = () => {};
+    api.privacy.getScan.mockImplementationOnce(
+      () =>
+        new Promise((resolve) => {
+          complete = resolve;
+        })
+    );
+    let view: ReturnType<typeof render> | undefined;
+    await act(async () => {
+      view = render(<TablePrivacyPanel tableName="customers" />);
+    });
+    await act(async () => vi.advanceTimersByTimeAsync(10000));
+    expect(api.privacy.getScan).toHaveBeenCalledTimes(1);
+    expect(api.privacy.get.mock.calls.length).toBeGreaterThan(1);
+    await act(async () => complete({ data: { scan_id: "scan", phase: "running" } }));
+    await act(async () => vi.advanceTimersByTimeAsync(2500));
+    expect(api.privacy.getScan).toHaveBeenCalledTimes(2);
+    const signal = api.privacy.getScan.mock.calls[1][2] as AbortSignal;
+    view?.unmount();
+    expect(signal.aborted).toBe(true);
+    await act(async () => vi.advanceTimersByTimeAsync(10000));
+    expect(api.privacy.getScan).toHaveBeenCalledTimes(2);
+  });
+
+  it("retries progress immediately when Refresh is clicked", async () => {
+    api.privacy.getScan
+      .mockRejectedValueOnce(new Error("Scan unavailable"))
+      .mockResolvedValue({ data: { scan_id: "scan", phase: "running" } });
+    await act(async () => render(<TablePrivacyPanel tableName="customers" />));
+    expect(screen.getByText(/Scan status is unavailable/)).toBeTruthy();
+    await act(async () => fireEvent.click(screen.getByRole("button", { name: "Refresh" })));
+    expect(api.privacy.getScan).toHaveBeenCalledTimes(2);
+    expect(screen.queryByText(/Scan status is unavailable/)).toBeNull();
+  });
 });

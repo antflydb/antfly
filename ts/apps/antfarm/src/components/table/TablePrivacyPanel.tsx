@@ -64,6 +64,8 @@ export function TablePrivacyPanel({ tableName }: { tableName: string }) {
   const [preview, setPreview] = useState<PrivacyPreview>();
   const [previewPolicy, setPreviewPolicy] = useState("");
   const [scan, setScan] = useState<PrivacyScan>();
+  const [scanError, setScanError] = useState<string>();
+  const [scanRefresh, setScanRefresh] = useState(0);
   const [findings, setFindings] = useState<PrivacyFindingsPage>();
   const [document, setDocument] = useState("");
   const [findingField, setFindingField] = useState("");
@@ -84,11 +86,7 @@ export function TablePrivacyPanel({ tableName }: { tableName: string }) {
   const refresh = useCallback(
     async (signal?: AbortSignal) => {
       const result = await api.privacy.get(tableName, signal);
-      setStatus(result.data);
-      if (result.data.scan_id && result.data.configured) {
-        const progress = await api.privacy.getScan(tableName, result.data.scan_id, signal);
-        setScan(progress.data);
-      }
+      if (!signal?.aborted) setStatus(result.data);
       return result;
     },
     [api, tableName]
@@ -102,35 +100,66 @@ export function TablePrivacyPanel({ tableName }: { tableName: string }) {
         setPreview(undefined);
         setPreviewPolicy("");
         setImpactAccepted(false);
-        if (data.policy) {
-          setPolicy(data.policy);
-          setProducer(data.policy.producer ? JSON.stringify(data.policy.producer, null, 2) : "");
-          setCategories(
-            data.policy.categories ? JSON.stringify(data.policy.categories, null, 2) : ""
-          );
-        }
+        setPolicy(data.policy ?? initial);
+        setProducer(data.policy?.producer ? JSON.stringify(data.policy.producer, null, 2) : "");
+        setCategories(
+          data.policy?.categories ? JSON.stringify(data.policy.categories, null, 2) : ""
+        );
       })
       .catch((reason) => {
         if (!controller.signal.aborted) setError(String(reason.message ?? reason));
       });
     return () => controller.abort();
   }, [refresh]);
+  const statusPollInterval =
+    !scan || ["queued", "running", "processing"].includes(scan.phase) ? 2500 : 10000;
   useEffect(() => {
     if (!status?.configured) return;
     const controller = new AbortController();
-    const timer = setInterval(
-      () => {
-        refresh(controller.signal).catch((reason) => {
-          if (!controller.signal.aborted) setError(String(reason.message ?? reason));
-        });
-      },
-      !scan || ["queued", "running", "processing"].includes(scan.phase) ? 2500 : 10000
-    );
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        await refresh(controller.signal);
+      } catch (reason) {
+        if (!controller.signal.aborted)
+          setError(reason instanceof Error ? reason.message : String(reason));
+      }
+      if (!controller.signal.aborted) timer = setTimeout(poll, statusPollInterval);
+    };
+    timer = setTimeout(poll, statusPollInterval);
     return () => {
-      clearInterval(timer);
+      clearTimeout(timer);
       controller.abort();
     };
-  }, [scan?.phase, refresh, status?.configured]);
+  }, [statusPollInterval, refresh, status?.configured]);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: scanRefresh cancels and restarts progress polling on an explicit refresh.
+  useEffect(() => {
+    const scanId = status?.configured ? status.scan_id : undefined;
+    setScanError(undefined);
+    setScan((current) => (current?.scan_id === scanId ? current : undefined));
+    if (!scanId) return;
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let phase: PrivacyScan["phase"] = "queued";
+    const poll = async () => {
+      try {
+        const result = await api.privacy.getScan(tableName, scanId, controller.signal);
+        if (controller.signal.aborted) return;
+        phase = result.data.phase;
+        setScan(result.data);
+        setScanError(undefined);
+      } catch (reason) {
+        if (controller.signal.aborted) return;
+        setScanError(reason instanceof Error ? reason.message : String(reason));
+      }
+      timer = setTimeout(poll, ["queued", "running", "processing"].includes(phase) ? 2500 : 10000);
+    };
+    void poll();
+    return () => {
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [api, tableName, status?.configured, status?.scan_id, scanRefresh]);
   const run = async (operation: () => Promise<void>) => {
     setBusy(true);
     setError(undefined);
@@ -184,7 +213,6 @@ export function TablePrivacyPanel({ tableName }: { tableName: string }) {
       setMessage(
         "Policy accepted. Existing documents are being scanned; new writes use this policy."
       );
-      await refresh();
     });
   const reviewFalsePositive = (category: string) =>
     run(async () => {
@@ -211,6 +239,7 @@ export function TablePrivacyPanel({ tableName }: { tableName: string }) {
     run(async () => {
       const result = await api.privacy.startScan(tableName);
       setScan(result.data);
+      setStatus((current) => (current ? { ...current, scan_id: result.data.scan_id } : current));
       setMessage("Rescan queued. Progress and cursors are saved durably.");
     });
   const loadFindings = (cursor?: string) =>
@@ -228,6 +257,13 @@ export function TablePrivacyPanel({ tableName }: { tableName: string }) {
 
   return (
     <div className="flex flex-col gap-4">
+      {scanError && (
+        <Alert>
+          <AlertDescription>
+            Scan status is unavailable: {scanError}. Retrying automatically.
+          </AlertDescription>
+        </Alert>
+      )}
       {error && (
         <Alert variant="destructive">
           <AlertDescription>{error}</AlertDescription>
@@ -590,6 +626,7 @@ export function TablePrivacyPanel({ tableName }: { tableName: string }) {
               disabled={busy}
               onClick={() =>
                 run(async () => {
+                  setScanRefresh((current) => current + 1);
                   await refresh();
                 })
               }

@@ -845,6 +845,12 @@ test "native Linux ARM64 CPU Debug API claim covers its measured peak" {
             6 => fallback.target.cpu.features.removeFeature(@backingInt(std.Target.aarch64.Feature.neon)),
             else => unreachable,
         }
-        try std.testing.expectEqual(12 * gib, runtimeCompileMaxRss(.api_kernel, fallback));
+        // Other native GNU Debug profiles retain main's measured CUDA
+        // reservation; this CPU qualification must not lower that floor.
+        const expected_gib: usize = switch (i) {
+            0, 1, 2, 6 => 18,
+            else => 12,
+        };
+        try std.testing.expectEqual(expected_gib * gib, runtimeCompileMaxRss(.api_kernel, fallback));
     }
 }

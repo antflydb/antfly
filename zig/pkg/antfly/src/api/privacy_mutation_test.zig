@@ -26,6 +26,18 @@ const Server = struct {
         installed: ?metadata.TableRecord = null,
         loads: usize = 0,
         rejection: ?anyerror = null,
+        forwarded: ?*Forwarded = null,
+        pub fn forwardPrivacyMutation(self: *@This(), out: A, _: []const u8, _: []const u8, _: ?[]const u8, scan: bool, _: local.api_operation.RequestContext) !?privacy.Response {
+            const reply = self.forwarded orelse return null;
+            reply.calls += 1;
+            const raw = if (scan) "{\"phase\":\"queued\"}" else "{\"external_processing\":true,\"resolved_producer\":{\"type\":\"extractor\",\"config\":{\"provider\":\"antfly\",\"model\":\"x\"},\"revision\":\"v1\"}}";
+            var response = privacy.Response{ .response = .{ .status = 202, .json = true, .body = try self.a.dupe(u8, raw) } };
+            defer response.deinit(self.a);
+            response.etag = try self.a.dupe(u8, "accepted");
+            self.committed = true;
+            reply.fail.fail_index = reply.fail.alloc_index + reply.fail_after;
+            return try response.cloneMutation(out);
+        }
         pub fn privacyAuthorityTerm(_: *@This()) !?u64 {
             return 1;
         }
@@ -116,4 +128,54 @@ test "privacy rejected policy admission releases its prepared acceptance" {
     try std.testing.expectEqual(@as(u16, 503), response.response.status);
     try std.testing.expectEqual(@as(?u32, 1), response.response.retry_after_seconds);
     try std.testing.expect(response.etag == null);
+}
+
+const Forwarded = struct { fail: *std.testing.FailingAllocator, fail_after: usize, calls: usize = 0 };
+
+test "privacy forwarded policy and scan acceptance survive every reply observation allocation failure" {
+    const a = std.testing.allocator;
+    for ([_]privacy.Action{ .put, .start_scan }) |action| {
+        var failures: usize = 0;
+        for (0..256) |index| {
+            var fail = std.testing.FailingAllocator.init(a, .{});
+            var vtable = fail.allocator().vtable.*;
+            // One failed allocation must not prevent the fallback error reply.
+            // This exercises the outcome boundary, not an exhausted process.
+            vtable.alloc = struct {
+                fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+                    const f: *std.testing.FailingAllocator = @ptrCast(@alignCast(ctx));
+                    const result = f.allocator().rawAlloc(len, alignment, ra);
+                    if (result == null) f.fail_index = std.math.maxInt(usize);
+                    return result;
+                }
+            }.alloc;
+            const out = A{ .ptr = &fail, .vtable = &vtable };
+            var forwarded = Forwarded{ .fail = &fail, .fail_after = index };
+            var server = Server{ .source = .{ .a = a, .forwarded = &forwarded } };
+            var response = try privacy.handle(&server, out, "docs", action, .{ .body = body }, .{});
+            defer response.deinit(out);
+            try std.testing.expect(server.source.committed);
+            try std.testing.expectEqual(@as(usize, 1), forwarded.calls);
+            try std.testing.expectEqual(@as(usize, 0), server.source.loads);
+            if (fail.has_induced_failure) {
+                failures += 1;
+                try std.testing.expectEqual(@as(u16, 409), response.response.status);
+                try std.testing.expect(response.response.metadata_mutation_outcome == .unknown);
+                try std.testing.expect(response.etag == null);
+                var value = try std.json.parseFromSlice(struct { code: []const u8 }, a, response.response.body, .{ .ignore_unknown_fields = true });
+                defer value.deinit();
+                try std.testing.expectEqualStrings("privacy_mutation_outcome_unknown", value.value.code);
+            } else {
+                try std.testing.expectEqual(@as(u16, 202), response.response.status);
+                try std.testing.expectEqualStrings("accepted", response.etag.?);
+                if (action == .put) {
+                    var value = try std.json.parseFromSlice(struct { external_processing: bool }, a, response.response.body, .{ .ignore_unknown_fields = true });
+                    defer value.deinit();
+                    try std.testing.expect(!value.value.external_processing);
+                }
+                break;
+            }
+        } else return error.MissingSuccessfulReply;
+        if (action == .put) try std.testing.expect(failures > 2) else try std.testing.expectEqual(@as(usize, 2), failures);
+    }
 }

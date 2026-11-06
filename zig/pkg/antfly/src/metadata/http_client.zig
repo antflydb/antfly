@@ -1527,19 +1527,29 @@ pub const MetadataHttpClient = struct {
             .{ .name = @import("antfly_public_limits").Execution.timeout_header, .value = budget_header },
             .{ .name = "If-Match", .value = if_match orelse "" },
         };
-        var response = self.executeWithRetryPolicy(.{ .method = if (scan) .POST else .PUT, .uri = uri, .body = body, .content_type = "application/json", .headers = if (if_match != null) &headers else headers[0..1], .timeout_ms = timeout, .cancellation = &signal }, if (request.deadline_ns) |deadline| .{ .deadline_ns = deadline, .cancellation = &signal } else null, .at_most_once) catch |err| switch (err) {
+        var delivery: http_common.RequestDeliveryTracker = .{};
+        delivery.markNotSent();
+        var response = self.executeWithRetryPolicy(.{ .method = if (scan) .POST else .PUT, .uri = uri, .body = body, .content_type = "application/json", .headers = if (if_match != null) &headers else headers[0..1], .timeout_ms = timeout, .cancellation = &signal, .delivery_tracker = &delivery }, if (request.deadline_ns) |deadline| .{ .deadline_ns = deadline, .cancellation = &signal } else null, .at_most_once) catch |err| switch (err) {
             error.ReallocationOutcomeUnknown => return error.MetadataMutationOutcomeUnknown,
-            else => return err,
+            // These outcomes prove non-admission independently of the
+            // executor's send telemetry. Preserve established failover rules.
+            error.NotLeader, error.RaftMutationRequestNotSent, error.ConnectionRefused => return err,
+            // Allocation, cancellation or decoding can fail while receiving an
+            // already-applied reply. Only explicit not-sent proof is replayable.
+            else => return if (delivery.load() == .not_sent) err else error.MetadataMutationOutcomeUnknown,
         };
         defer response.deinit(self.alloc);
-        var result: @import("../api/privacy.zig").Response = .{ .response = .{ .status = response.status, .body = try self.alloc.dupe(u8, response.body), .json = true } };
+        // Decode the scalar outcome before allocating any reply storage. All
+        // subsequent response observations share the same ambiguity boundary.
+        const outcome: ?@import("../api/public_table_http.zig").MetadataMutationOutcome = if (responseHasHeaderValueAnyStatus(response, routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown)) .unknown else null;
+        return self.ownPrivacyMutationResponse(response, outcome) catch |err|
+            return @import("../api/privacy.zig").mutationObservationError(response.status, outcome, err);
+    }
+
+    fn ownPrivacyMutationResponse(self: *MetadataHttpClient, response: http_common.HttpResponse, outcome: ?@import("../api/public_table_http.zig").MetadataMutationOutcome) !@import("../api/privacy.zig").Response {
+        var result: @import("../api/privacy.zig").Response = .{ .response = .{ .status = response.status, .body = try self.alloc.dupe(u8, response.body), .json = true, .metadata_mutation_outcome = outcome } };
         errdefer result.deinit(self.alloc);
         result.etag = if (responseHeader(response, "ETag")) |etag| try self.alloc.dupe(u8, etag) else null;
-        // Outcome markers are meaningful on 409 as well as 503. Do not use
-        // the leader-retry helper, which intentionally matches only 503.
-        if (responseHasHeaderValueAnyStatus(response, routes.Routes.raft_mutation_outcome_header, routes.Routes.raft_mutation_outcome_unknown)) {
-            result.response.metadata_mutation_outcome = .unknown;
-        }
         if (responseHeader(response, "Retry-After")) |value| {
             result.response.retry_after_seconds = std.fmt.parseUnsigned(u32, std.mem.trim(u8, value, " \t\r\n"), 10) catch null;
         }

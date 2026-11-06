@@ -53,11 +53,25 @@ pub const Response = struct {
         return result;
     }
 
+    /// Copy a mutation reply without losing a possibly committed outcome if
+    /// the caller allocator cannot accept either owned buffer.
+    pub fn cloneMutation(self: Response, a: A) !Response {
+        return self.clone(a) catch |err| return mutationObservationError(self.response.status, self.response.metadata_mutation_outcome, err);
+    }
+
     pub fn deinit(self: *Response, a: A) void {
         self.response.deinit(a);
         if (self.etag) |tag| a.free(tag);
     }
 };
+/// After an accepted or explicitly ambiguous reply, losing an observation
+/// cannot prove non-application. Reuse this boundary at every forwarding
+/// handoff; pre-admission/definite rejection errors retain their identity.
+pub fn mutationObservationError(status: u16, outcome: ?http.MetadataMutationOutcome, err: anyerror) anyerror {
+    if ((status >= 200 and status < 300) or outcome == .unknown) return error.MetadataMutationOutcomeUnknown;
+    return err;
+}
+
 test "privacy response cloning preserves ownership and forwarding metadata on allocation failure" {
     const a = std.testing.allocator;
     var source: Response = .{ .response = .{
@@ -90,6 +104,27 @@ test "privacy response cloning preserves ownership and forwarding metadata on al
     var no_tag = source;
     no_tag.etag = null;
     try std.testing.checkAllAllocationFailures(a, Check.run, .{no_tag});
+}
+
+test "privacy mutation reply cloning preserves acceptance and ambiguous outcomes on every buffer failure" {
+    const a = std.testing.allocator;
+    const Case = struct { status: u16, outcome: ?http.MetadataMutationOutcome = null, ambiguous: bool };
+    for ([_]Case{
+        .{ .status = 202, .ambiguous = true },
+        .{ .status = 409, .outcome = .unknown, .ambiguous = true },
+        .{ .status = 503, .outcome = .unknown, .ambiguous = true },
+        .{ .status = 412, .ambiguous = false },
+        .{ .status = 503, .ambiguous = false },
+    }) |case| {
+        var response = Response{ .response = .{ .status = case.status, .body = try a.dupe(u8, "upstream"), .metadata_mutation_outcome = case.outcome }, .etag = try a.dupe(u8, "tag") };
+        defer response.deinit(a);
+        for (0..2) |index| {
+            var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+            try std.testing.expectError(if (case.ambiguous) error.MetadataMutationOutcomeUnknown else error.OutOfMemory, response.cloneMutation(fail.allocator()));
+            try std.testing.expectEqualStrings("upstream", response.response.body);
+            try std.testing.expectEqualStrings("tag", response.etag.?);
+        }
+    }
 }
 
 fn json(a: A, status: u16, value: anytype) !Response {
@@ -432,7 +467,8 @@ fn executeAttempt(server: anytype, a: A, out: A, table: []const u8, action: Acti
         if (action == .put or action == .start_scan) if (try server.source.forwardPrivacyMutation(out, table, args.body, args.if_match, action == .start_scan, request)) |response| {
             var owned = response;
             errdefer owned.deinit(out);
-            try localizeProcessingDisclosure(server, out, &owned);
+            localizeProcessingDisclosure(server, out, &owned) catch |err|
+                return mutationObservationError(owned.response.status, owned.response.metadata_mutation_outcome, err);
             return owned;
         };
     }

@@ -28312,7 +28312,7 @@ const RemoteMetadataSource = struct {
             fn call(_: *RemoteMetadataSource, client: *antfly.metadata_http_client.MetadataHttpClient, base_uri: []const u8, _: antfly.public_api.raft_mutation_forwarding.Context, ctx: anytype) !@import("../api/privacy.zig").Response {
                 var result = try client.forwardPrivacyMutation(base_uri, ctx.table, ctx.body, ctx.if_match, ctx.scan, ctx.request);
                 defer result.deinit(client.alloc);
-                return result.clone(ctx.a);
+                return result.cloneMutation(ctx.a);
             }
         }.call, .{ .a = a, .table = table, .body = body, .if_match = if_match, .scan = scan, .request = request }, request);
     }
