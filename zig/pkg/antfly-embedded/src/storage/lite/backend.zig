@@ -302,12 +302,19 @@ pub const Handle = struct {
                 // themselves) is a native-catalog view, not an embedded LSM
                 // instance stored through the virtual filesystem below: see
                 // storage/native_catalog_backend.zig and
-                // lite/native_catalog_sink.zig. Dense/sparse/graph indexes
-                // are unaffected and stay on `.lsm`.
+                // lite/native_catalog_sink.zig. Sparse's own postings/chunk
+                // metadata is the same native-catalog view (see
+                // sparse/sparse.zig's `.native_catalog` `SparseBackend`).
+                // Dense and graph indexes are unaffected and stay on `.lsm`
+                // (see the design doc's WS4-for-vectors open risk: dense's
+                // storage owner is switched on exhaustively at ~20 sites in
+                // hbc_adapter.zig, each needing its own review before this
+                // can safely follow sparse's lead).
                 opts.index_backends.text_main_backend = .native_catalog;
                 opts.index_backends.text_main_native_catalog_sink = self.native_catalog_sink.?.sink();
                 opts.index_backends.dense_storage_backend = .lsm;
-                opts.index_backends.sparse_backend = .lsm;
+                opts.index_backends.sparse_backend = .native_catalog;
+                opts.index_backends.sparse_main_native_catalog_sink = self.native_catalog_sink.?.sink();
                 opts.index_backends.graph_reverse_backend = .lsm;
                 opts.index_backends.text_lsm_storage = storage;
                 opts.index_backends.dense_lsm_storage = storage;
@@ -386,7 +393,8 @@ pub const Handle = struct {
         opts.index_backends.text_main_backend = .native_catalog;
         opts.index_backends.text_main_native_catalog_sink = self.native_catalog_sink.?.sink();
         opts.index_backends.dense_storage_backend = .lsm;
-        opts.index_backends.sparse_backend = .lsm;
+        opts.index_backends.sparse_backend = .native_catalog;
+        opts.index_backends.sparse_main_native_catalog_sink = self.native_catalog_sink.?.sink();
         opts.index_backends.graph_reverse_backend = .lsm;
         opts.index_backends.text_lsm_storage = storage;
         opts.index_backends.dense_lsm_storage = storage;
