@@ -55605,7 +55605,8 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
             });
         } else try abortReplayCaptureContext(&replay_ctx, index_ref);
     }
-    try saveAppliedSequencesBatchContext(ctx, updates.items);
+    // Background replay catch-up (apply_state.contributeProgressDeferred).
+    try saveAppliedSequencesBatchContext(ctx, updates.items, true);
     try truncateReplayJournalIfSafeContext(ctx);
 }
 
@@ -55720,6 +55721,7 @@ fn saveAppliedSequencesBatchLockedContext(
     ctx: *const BatchExecutionContext,
     enriched_updates: []const apply_state.AppliedSequenceUpdate,
     async_ctx: ?*AsyncContext,
+    deferred: bool,
 ) !void {
     var generic_updates = std.ArrayListUnmanaged(apply_state.AppliedSequenceUpdate).empty;
     defer generic_updates.deinit(ctx.alloc);
@@ -55766,6 +55768,9 @@ fn saveAppliedSequencesBatchLockedContext(
                 false,
                 if (closing_status_force) enriched_updates else &.{},
                 closing_status_force,
+                // A close drain has no later commit to ride along on, so it
+                // must flush durably regardless of what the caller asked for.
+                deferred and !closing_status_force,
             );
         }
         return;
@@ -55797,12 +55802,13 @@ fn saveAppliedSequencesBatchLockedContext(
             true,
             if (closing_status_force) enriched_updates else generic_updates.items,
             closing_status_force,
+            deferred and !closing_status_force,
         );
         return;
     }
     try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
     try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
-    try publishManagedProgress(ctx.alloc, ctx.store, ctx.index_manager, generic_updates.items, true, generic_updates.items, false);
+    try publishManagedProgress(ctx.alloc, ctx.store, ctx.index_manager, generic_updates.items, true, generic_updates.items, false, deferred);
 }
 
 const appliedSequenceUpdatesWithConfigHashes = local_mutation.appliedSequenceUpdatesWithConfigHashes;
@@ -55885,6 +55891,19 @@ pub fn resetStatusPersistCountForTest() void {
 /// sequence/identity: there is no separate legacy checkpoint commit left to
 /// keep in sync, so this call *is* the one docstore-side commit for the
 /// flush pass that reaches it.
+///
+/// `deferred` selects which of `apply_state.contributeProgress`/
+/// `contributeProgressDeferred` carries that commit: `true` for a
+/// background/catch-up flush pass, `false` for a synchronous-ack caller.
+/// See `contributeProgressDeferred`'s doc comment for exactly what that
+/// buys today (avoiding an extra memtable flush under `defer_commit_flush`,
+/// not an elided fsync — the WAL still syncs on every commit regardless of
+/// this flag, which is why it is safe: the physical effects this progress
+/// reports are already durable, so losing the record to any failure before
+/// it is itself durable just makes the consumer replay back to its last
+/// durable watermark, never observe progress ahead of effects) and why
+/// making it also skip the fsync is a separate, larger change this does
+/// not attempt.
 fn publishManagedProgress(
     alloc: Allocator,
     store: *docstore_mod.DocStore,
@@ -55893,6 +55912,7 @@ fn publishManagedProgress(
     lsm_wal_checkpointed: bool,
     status_targets: []const apply_state.AppliedSequenceUpdate,
     force_status: bool,
+    deferred: bool,
 ) !void {
     if (updates.len == 0 and status_targets.len == 0) return;
 
@@ -55933,7 +55953,11 @@ fn publishManagedProgress(
     }
 
     if (progress.len == 0 and status_writes.items.len == 0) return;
-    try apply_state.contributeProgress(alloc, store, progress, status_writes.items);
+    if (deferred) {
+        try apply_state.contributeProgressDeferred(alloc, store, progress, status_writes.items);
+    } else {
+        try apply_state.contributeProgress(alloc, store, progress, status_writes.items);
+    }
     if (status_writes.items.len > 0) {
         index_manager.markStatusPersisted(now_ns);
         _ = status_persist_count.fetchAdd(1, .monotonic);
@@ -61632,6 +61656,11 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
         false,
         &.{.{ .index_name = index_name, .sequence = applied_sequence }},
         true,
+        // Reached from both synchronous and background catch-up callers
+        // (this finalizer is shared by saveAppliedSequencesBatchLockedContext
+        // and the dense flush passes below); a completed lifecycle marker
+        // is durable rather than guessing.
+        false,
     ) catch |err| {
         std.log.warn("dense status snapshot persistence deferred index={s} sequence={} err={s}", .{
             index_name,
@@ -61845,6 +61874,10 @@ fn flushFinishedDenseAppliedSequenceLocked(
             !hbc_authoritative,
             if (!hbc_authoritative or closing_status_force) enriched_updates else &.{},
             closing_status_force,
+            // Background dense catch-up finish (finishDerivedCatchUpSessionAsync
+            // is this function's only caller): defer, except a close drain,
+            // which has no later commit to pick this up.
+            !closing_status_force,
         );
         status_snapshot_ns +|= elapsedSince(status_started);
         break :blk elapsedSince(save_start_ns);
@@ -61950,6 +61983,13 @@ fn flushPendingAppliedSequencesLocked(
             generic_updates.items.len > 0,
             enriched_updates,
             closing_status_force,
+            // `force == false` is the coalescer's opportunistic background
+            // flush -- no synchronous caller is waiting on it (the only
+            // caller for that case, persistAppliedSequenceAsync, tries the
+            // lock and skips entirely rather than block). `force == true`
+            // means a synchronous caller needs this watermark visible now,
+            // or this is the close drain; both must flush durably.
+            !force and !closing_status_force,
         );
         status_snapshot_ns +|= elapsedSince(status_started);
         break :blk elapsedSince(save_start_ns);

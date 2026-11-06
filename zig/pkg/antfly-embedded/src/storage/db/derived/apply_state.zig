@@ -310,19 +310,59 @@ pub fn contributeProgressTxn(txn: anytype, progress: Progress) !void {
 
 /// The one authoritative progress commit for a publication: every consumer
 /// it touches, plus any status snapshot the caller chooses to piggyback,
-/// lands in exactly one `txn.commit()`. Call this once per publication,
-/// not once per consumer — batch every `Progress` value touched by that
-/// publication into one call so `progressCommitCount()` advances by exactly
-/// one regardless of how many consumers were updated.
+/// lands in exactly one commit. Call this once per publication, not once
+/// per consumer — batch every `Progress` value touched by that publication
+/// into one call so `progressCommitCount()` advances by exactly one
+/// regardless of how many consumers were updated.
+///
+/// Committed with ordinary (non-deferred) `BatchOptions{}`: this is the
+/// entry point for progress written as part of a synchronous ack. Background/
+/// catch-up flush passes should call `contributeProgressDeferred` instead.
 pub fn contributeProgress(alloc: Allocator, store: anytype, updates: []const Progress, status_writes: []const StatusWrite) !void {
+    return contributeProgressWithOptions(alloc, store, updates, status_writes, .{});
+}
+
+/// Same record, same one-commit-per-publication contract as
+/// `contributeProgress`, but committed with `defer_commit_flush = true`.
+///
+/// IMPORTANT: as of this writing `defer_commit_flush` only defers the
+/// in-memory table's flush to an immutable/on-disk run (a write-
+/// amplification knob); it does not defer this backend's WAL fsync. A
+/// deferred progress commit is therefore exactly as durable as an ordinary
+/// one today — this call's only present effect is letting a burst of
+/// background progress commits avoid forcing extra memtable flushes. An
+/// earlier version of this change also tried to make `defer_commit_flush`
+/// skip the WAL fsync itself; that broke "lsm backend simulation post-commit
+/// wal checkpoint fault is acknowledged and replayable" in
+/// lsm_backend_sim_test.zig, which asserts that an existing
+/// `defer_commit_flush = true` bulk-ingest commit survives a crash+reopen —
+/// proof that every other caller of this flag (TTL cleanup, bulk ingest,
+/// hbc_adapter) already depends on it never weakening WAL durability. Making
+/// a background progress commit's fsync actually ride along on a later
+/// commit would need a new, separate signal threaded through
+/// `Backend.appendWalForMutable`/`appendWalForState` down to the
+/// `wal_sync_on_commit` decision in `appendWalWithPreparation` — a change to
+/// the core commit path shared by every LSM-backed write in the system, not
+/// attempted here.
+///
+/// This is nonetheless the one seam background/catch-up flush passes call
+/// through today, so that a real fsync-eliding mechanism — WS2's
+/// `stageRideAlong`, or the WAL-sync signal above — has exactly one call
+/// site to take over, instead of every background call site needing to
+/// change again later.
+pub fn contributeProgressDeferred(alloc: Allocator, store: anytype, updates: []const Progress, status_writes: []const StatusWrite) !void {
+    return contributeProgressWithOptions(alloc, store, updates, status_writes, .{ .defer_commit_flush = true });
+}
+
+fn contributeProgressWithOptions(alloc: Allocator, store: anytype, updates: []const Progress, status_writes: []const StatusWrite, options: backend_erased.types.BatchOptions) !void {
     if (updates.len == 0 and status_writes.len == 0) return;
     var runtime = try initRuntimeStore(alloc, store);
     defer runtime.deinit();
-    var txn = try runtime.store.beginWrite();
-    errdefer txn.abort();
-    for (updates) |progress| try contributeProgressTxn(&txn, progress);
-    for (status_writes) |write| try txn.put(write.key, write.value);
-    try txn.commit();
+    var batch = try runtime.store.beginBatchWithOptions(options);
+    errdefer batch.abort();
+    for (updates) |progress| try contributeProgressTxn(&batch, progress);
+    for (status_writes) |write| try batch.put(write.key, write.value);
+    try batch.commit();
     _ = progress_commit_count.fetchAdd(1, .monotonic);
 }
 
@@ -815,6 +855,53 @@ test "derived apply state works with lsm backend store" {
     try std.testing.expectEqual(@as(u64, 0), try loadAppliedSequence(std.testing.allocator, runtime, "idx"));
     try saveAppliedSequence(runtime, "idx", 31);
     try std.testing.expectEqual(@as(u64, 31), try loadAppliedSequence(std.testing.allocator, runtime, "idx"));
+}
+
+test "contributeProgressDeferred writes the same durable record as contributeProgress" {
+    // contributeProgressDeferred exists as the one call site a future
+    // fsync-eliding mechanism (WS2's stageRideAlong, or a new WAL-sync
+    // signal; see the doc comment above) can take over without touching
+    // every background caller again. It is NOT currently cheaper in terms
+    // of fsyncs -- see that comment for why repurposing the existing
+    // `defer_commit_flush` flag to also skip WAL fsync is unsafe (it would
+    // regress durability for every other caller of that flag: TTL cleanup,
+    // bulk ingest, hbc_adapter). What it must still get right today is
+    // ordinary correctness: a durable, independently readable record, one
+    // commit per call, identical in shape to contributeProgress's.
+    var backend = mem_backend.Backend.init(std.testing.allocator, .{});
+    defer backend.close();
+    var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
+    defer runtime.deinit();
+
+    resetProgressCommitCountForTest();
+    const background_passes = 5;
+    for (0..background_passes) |i| {
+        try contributeProgressDeferred(std.testing.allocator, runtime, &.{
+            .{ .consumer = "bg_index", .sequence = i + 1 },
+        }, &.{});
+    }
+    try std.testing.expectEqual(@as(u64, background_passes), progressCommitCount());
+    try std.testing.expectEqual(
+        @as(u64, background_passes),
+        (try loadProgress(std.testing.allocator, runtime, "bg_index")).?.applied_sequence,
+    );
+
+    try contributeProgress(std.testing.allocator, runtime, &.{
+        .{ .consumer = "fg_index", .sequence = 1 },
+    }, &.{});
+    try std.testing.expectEqual(@as(u64, background_passes + 1), progressCommitCount());
+    try std.testing.expectEqual(
+        @as(u64, 1),
+        (try loadProgress(std.testing.allocator, runtime, "fg_index")).?.applied_sequence,
+    );
+    // Deferred or not, both consumers' records survive and are independently
+    // readable -- a crashed/lost deferred commit is a correctness concern
+    // for the caller's replay bookkeeping (see contributeProgressDeferred's
+    // doc comment), never for what actually got written here.
+    try std.testing.expectEqual(
+        @as(u64, background_passes),
+        (try loadProgress(std.testing.allocator, runtime, "bg_index")).?.applied_sequence,
+    );
 }
 
 test "partial replay cursor round-trips per index and is independent of applied progress" {

@@ -5046,9 +5046,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             return ticket;
         }
 
+        /// `deferred_progress` is forwarded to `saveAppliedSequencesBatchLockedContext`'s
+        /// progress commit: `true` for a background/catch-up flush pass (for
+        /// example replay catch-up), `false` for a synchronous-ack caller.
+        /// See `apply_state.contributeProgressDeferred`'s doc comment for
+        /// exactly what `true` buys today.
         pub fn saveAppliedSequencesBatchContext(
             ctx: *const BatchExecutionContext,
             updates: []const apply_state.AppliedSequenceUpdate,
+            deferred_progress: bool,
         ) !void {
             if (updates.len == 0) return;
             const enriched_updates = try appliedSequenceUpdatesWithConfigHashes(ctx.alloc, ctx.index_manager, updates);
@@ -5059,9 +5065,9 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                     &async_ctx.stats.applied_sequence_mutex,
                 );
                 defer seq_lock.unlock();
-                return try saveAppliedSequencesBatchLockedContext(ctx, enriched_updates, async_ctx);
+                return try saveAppliedSequencesBatchLockedContext(ctx, enriched_updates, async_ctx, deferred_progress);
             }
-            return try saveAppliedSequencesBatchLockedContext(ctx, enriched_updates, null);
+            return try saveAppliedSequencesBatchLockedContext(ctx, enriched_updates, null, deferred_progress);
         }
 
         pub fn shouldAppendSplitDelta(self: anytype) bool {
