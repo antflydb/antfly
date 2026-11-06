@@ -1228,6 +1228,8 @@ pub const PersistentIndex = struct {
 
         pub fn commit(self: *MainTxn) !void {
             if (self.write) |*txn| {
+                const wal_trace_scope = wal_trace.scope(.main_txn_commit);
+                defer wal_trace_scope.end();
                 try txn.commit();
                 self.write = null;
                 return;

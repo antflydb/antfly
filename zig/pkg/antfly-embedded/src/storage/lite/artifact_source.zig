@@ -22,6 +22,7 @@ const native = @import("native.zig");
 const docs = @import("docstore.zig");
 const Source = @import("../../segment_source.zig").Source;
 const limits = @import("antfly_runtime_fs").threaded_io_limits;
+const wal_trace = @import("../write_amplification_trace.zig");
 const Allocator = std.mem.Allocator;
 
 const key_prefix = native.NativeFile.artifact_lease_key_prefix;
@@ -350,7 +351,11 @@ pub const Registry = struct {
         if (reader_fenced) {
             capture.checkpoint = reader.activeCheckpoint();
             capture.value = try reader.openIndexValue(a, key, capture.checkpoint);
-        } else try owner.submitArtifactLeaseMutation(&capture, Capture.apply);
+        } else {
+            const wal_trace_scope = wal_trace.scope(.artifact_lease);
+            defer wal_trace_scope.end();
+            try owner.submitArtifactLeaseMutation(&capture, Capture.apply);
+        }
         const captured_inode = (try reader.file.stat(reader.runtime())).inode;
         state.* = .{
             .registry = self,
