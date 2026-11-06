@@ -759,6 +759,66 @@ test "lite reclamation shrinking observes partially live packed records" {
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
+// §3.2a/§3.6: a background reclamation pass must never pay for its own
+// fsync. This drives maintainOnceWithCancel's ordinary (non-pressure) small
+// reclamation several times over real retirement debt and confirms none of
+// those passes increments native.zig's real syscall-level sync counter
+// (test_sync_calls, bumped only inside syncIfRequired's actual fsync/
+// syncData call -- unlike the diagnostic wal_trace counters the capi and
+// WS0-harness tests use, this one is driven straight off the leaf IO, so it
+// cannot be fooled by anything upstream of the actual syscall). The
+// following foreground write must still sync normally: ride-along work
+// rides on that commit instead of being stuck permanently undurable.
+test "lite reclamation ride-along passes force no sync before the next durable write" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "reclaim-ride-along-sync.aflite");
+    defer a.free(path);
+    // no_sync=false: this test specifically measures real fsync calls, so
+    // (unlike most reclamation tests here) it must not skip them.
+    var store = try Store.createWithOptions(a, path, .{
+        .io = std.testing.io,
+        .no_sync = false,
+        .reclamation = .{ .minimum_reclaim_bytes = 1024 * 1024 * 1024, .assessment_bytes = 1024 * 1024 * 1024 },
+    });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+
+    const value = try a.alloc(u8, 64 * 1024);
+    defer a.free(value);
+    @memset(value, 'v');
+
+    // Real retirement debt: eight durable overwrites of the same large
+    // document retire seven superseded copies.
+    for (0..8) |_| {
+        var write = try store.beginWrite();
+        try write.put("doc", value);
+        try write.commit();
+    }
+    try std.testing.expect(try store.file.retirementNeedsService());
+    const before = store.file.test_sync_calls.load(.monotonic);
+
+    // N background reclamation ride-alongs over that debt: zero additional
+    // syncs, even though real work (freeing pages) happens.
+    for (0..5) |_| try store.maintainOnce(false);
+    try std.testing.expectEqual(before, store.file.test_sync_calls.load(.monotonic));
+
+    // The next foreground write is still an ordinary durable commit and
+    // still syncs -- the accumulated ride-along work becomes durable for
+    // free on this commit's checkpoint, not stuck undurable forever.
+    var final_write = try store.beginWrite();
+    try final_write.put("final", "value");
+    try final_write.commit();
+    try std.testing.expect(store.file.test_sync_calls.load(.monotonic) > before);
+    try std.testing.expect((try store.checkWithCancel(null)).valid);
+
+    var read = try store.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualSlices(u8, value, try read.get("doc"));
+    try std.testing.expectEqualStrings("value", try read.get("final"));
+}
+
 test "startMaintenanceAssumeLocked skips the ledger-rebase check once the cheap byte threshold alone forces a start" {
     const a = std.testing.allocator;
 
