@@ -1016,6 +1016,18 @@ pub const BatchVisibilityCompletion = struct {
     }
 };
 
+/// WS3: lets a capi caller drop its own connection-level locks (the path
+/// gate's lease and the per-connection call-serializing mutex) across the
+/// primary write's durability wait, not just the DB apply lock. Invoked
+/// exactly once, from `mutation_commit.zig`'s `batchInternalPreparedOwned`,
+/// right after the apply lock releases and before the ticket is waited on;
+/// never invoked when there is no ticket to shield (the transaction-
+/// resolution commit path, which does not stage through this hook).
+pub const WriterLaneReleaseHook = struct {
+    ptr: *anyopaque,
+    release: *const fn (ptr: *anyopaque) void,
+};
+
 pub const BatchExecutionOptions = struct {
     resolver_review_command: ?*const @import("resolver_review.zig").Command = null,
     group_source_command: ?*const @import("group_source_contract.zig").Command = null,
@@ -1064,6 +1076,8 @@ pub const BatchExecutionOptions = struct {
     /// Borrowed by this synchronous call and consumed only after primary
     /// durability, while waiting for requested derived visibility.
     visibility_cancellation: types.CancellationToken = .none,
+    /// WS3 in-process writer lane; see `WriterLaneReleaseHook`.
+    writer_lane_release_before_wait: ?WriterLaneReleaseHook = null,
 };
 
 pub const OrderedApplyReceipt = types.OrderedApplyReceipt;

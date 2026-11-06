@@ -3181,14 +3181,31 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 split_shadow_ticket = reserveSplitShadowApplyTicket(self);
             }
             unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
+            // WS3: drop the capi connection-level locks (path lease, per-
+            // connection call mutex) too, before paying for the fsync -- the
+            // apply lock release above already let another thread start its
+            // own staging; this lets it finish entering (admission, refresh)
+            // while this call's ticket is still pending. Only called when a
+            // ticket is actually outstanding: the transaction-resolution
+            // commit path above never populates `primary_ticket`.
+            if (primary_ticket != null) {
+                if (opts.writer_lane_release_before_wait) |hook| hook.release(hook.ptr);
+            }
             // WS3: wait for the primary write's durability only now, with the
             // apply lock (and, above `batchInternalPreparedOwned`, the capi
             // connection gate) already released, so this call's fsync can
             // share a group with whatever other writers staged while this
             // one ran its own apply-lock-protected bookkeeping above.
-            if (primary_ticket) |*ticket| {
-                try ticket.wait();
+            if (primary_ticket) |ticket| {
+                // Clear before waiting, not after: `wait` must run at most
+                // once. If it fails, the `errdefer` registered above this
+                // would otherwise see `primary_ticket` still set and call
+                // `wait` on it a second time -- a use-after-free, since
+                // `wait` frees the ticket's owned heap state unconditionally
+                // the first time (success or failure).
                 primary_ticket = null;
+                var owned_ticket = ticket;
+                try owned_ticket.wait();
             }
             snapshot_mutation.release();
             if (split_shadow_ticket) |ticket| {
