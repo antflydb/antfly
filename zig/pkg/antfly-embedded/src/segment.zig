@@ -6905,7 +6905,9 @@ test "segment roundtrip" {
 
     try std.testing.expectEqual(@as(u32, 2), reader.doc_count);
     try std.testing.expectEqual(@as(u16, 2), reader.num_fields);
-    try std.testing.expectEqualStrings("content", reader.fields[0].name);
+    try std.testing.expect(reader.fields_sorted);
+    const content = findSegmentField(SegmentReader.FieldInfo, reader.fields, reader.fields_sorted, "content") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("content", content.name);
 
     // Read inverted index
     var inv_reader = (try reader.invertedIndex("content")) orelse return error.TestExpectedEqual;
@@ -6979,7 +6981,10 @@ test "segment readers lazily reject section corruption and memoize failure" {
     const corrupted = try alloc.dupe(u8, encoded);
     defer alloc.free(corrupted);
     var original_reader = try SegmentReader.init(alloc, corrupted);
-    const section_offset: usize = @intCast(original_reader.fields[0].sections[0].offset);
+    const content = findSegmentField(SegmentReader.FieldInfo, original_reader.fields, original_reader.fields_sorted, "content") orelse return error.TestExpectedEqual;
+    const section_offset: usize = for (content.sections) |section| {
+        if (section.section_type == .inverted_text) break @intCast(section.offset);
+    } else return error.TestExpectedEqual;
     original_reader.deinit();
     corrupted[section_offset] ^= 0x40;
 

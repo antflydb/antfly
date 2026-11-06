@@ -5820,12 +5820,16 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configureRuntimeContracts(storage_vopr_runtime_test_mod);
-    storage_vopr_runtime_test_mod.addImport("antfly_platform", platform_mod);
-    storage_vopr_runtime_test_mod.addImport("antfly_hash", hash_mod);
-    storage_vopr_runtime_test_mod.addImport("antfly_pdf", pdf_mod);
+    @import("../../../build_support/embedded/source_owner.zig").attach(storage_vopr_runtime_test_mod);
+    const storage_runtime_test_imports = @import("../../../build_support/antfly/test_support.zig").Imports{
+        .runtime = antfly_imports,
+        .vopr = vopr_mod,
+        .lmdb_engine = lmdb_engine_mod,
+    };
+    storage_runtime_test_imports.configure(b, storage_vopr_runtime_test_mod, true, true);
     const storage_vopr_runtime_tests = b.addTest(.{
         .root_module = storage_vopr_runtime_test_mod,
+        .filters = &.{ "storage_sim_runtime_root.test_", "storage.sim_runtime.", "storage.background_runtime." },
     });
     const run_storage_vopr_runtime_tests = b.addRunArtifact(storage_vopr_runtime_tests);
     const storage_vopr_runtime_test_step = b.step("storage-vopr-runtime-test", "Run storage VOPR runtime and modeled-device tests");

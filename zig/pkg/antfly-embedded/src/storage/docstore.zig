@@ -5547,7 +5547,11 @@ test "docstore replay retirement defers source work and bounds fair cleanup acro
     const boundary = internal_keys.replayEntryKey(internal_keys.replay_all_kind, 301 + ReplayRetirement.max_keys);
     const value = try store.get(alloc, &boundary);
     alloc.free(value);
-    try std.testing.expect(state.lane == 0);
+    // A full canonical batch resumes at its exact last inspected sequence;
+    // it cannot claim the remainder of this lane clean by rotating past it.
+    try std.testing.expect(state.runnable);
+    try std.testing.expectEqual(replay_hints.len, state.lane);
+    try std.testing.expectEqual(@as(u64, 300 + ReplayRetirement.max_keys), state.canonical_after);
     for (0..(replay_hints.len + 1) * 5) |_| try store.truncateReplayUpTo(alloc, cutoff);
     try std.testing.expectEqual(@as(u64, 0), state.watermark);
     for (hints) |hint| {
