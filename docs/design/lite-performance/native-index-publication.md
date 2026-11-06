@@ -106,3 +106,9 @@ replacement would prevent idle finalization from ever servicing it. Background
 scheduling retains blocked resolver debt for a later wake; explicit drains finish
 after runnable consumers settle and leave the blocked outcome visible. The
 configured stuck-index diagnostic is checked between explicit rounds as well.
+
+Memory-backed artifacts use the same resource-accounted decoded-lease contract as
+native range sources. Resident bytes reserve host capacity before allocation;
+a declined reservation selects bounded file staging. Decoded leases independently
+retain the immutable bytes and their resource owner after the runtime closes.
+Optional cache rejection refunds metadata before the normal decoding fallback.

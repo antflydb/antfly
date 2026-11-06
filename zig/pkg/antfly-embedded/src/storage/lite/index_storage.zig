@@ -462,7 +462,14 @@ const NativeArtifactStager = struct {
     fn stage(raw: *anyopaque, bytes: []const u8) !immutable_artifact.Prepared {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (bytes.len == 0) return error.InvalidArtifactConstructionState;
-        if (bytes.len <= 256 * 1024) return InlinePreparedArtifact.create(self, bytes);
+        if (bytes.len <= 256 * 1024) {
+            if (InlinePreparedArtifact.create(self, bytes)) |prepared| return prepared else |err| switch (err) {
+                // Inline residency is optional. Fall back to bounded native
+                // construction when the resource owner cannot retain it.
+                error.ResourceBudgetExceeded, error.OutOfMemory => {},
+                else => return err,
+            }
+        }
         const pending = try self.alloc.create(NativePreparedArtifact);
         errdefer self.alloc.destroy(pending);
         const prefix = try self.alloc.dupe(u8, self.prefix);
@@ -505,11 +512,21 @@ const InlinePreparedArtifact = struct {
     const vtable: immutable_artifact.Prepared.VTable = .{ .link = link, .prepare_link = prepareLink, .stage_link = stageLink, .deinit = deinit };
 
     const Bytes = struct {
+        const source_mod = @import("../../segment_source.zig");
+        const resources = @import("../resource_manager.zig");
+        const DecodeCache = source_mod.ImmutableDecodeCache;
+        const decode_limit = 1024 * 1024;
         alloc: Allocator,
         data: []u8,
         registry: *artifacts.Registry,
         identity: [32]u8,
+        resource_manager: ?*resources.ResourceManager,
+        residency: ?resources.Reservation,
         references: std.atomic.Value(usize) = .init(1),
+        cache_mutex: std.atomic.Mutex = .unlocked,
+        decoded_cache: ?*DecodeCache = null,
+        decoded_users: usize = 0,
+
         fn source(self: *@This()) SegmentSource {
             return .{ .ranges = .{
                 .ptr = self,
@@ -518,9 +535,12 @@ const InlinePreparedArtifact = struct {
                 .close = close,
                 .retain_owned = retain,
                 .retained_bytes = retained,
-                .retention_overhead_bytes = @sizeOf(@This()) + self.data.len,
+                .retention_overhead_bytes = @sizeOf(@This()) + self.data.len + decode_limit + DecodeCache.metadata_overhead,
                 .retention_artifact_only = true,
                 .immutable_identity = self.identity,
+                .resource_manager = self.resource_manager,
+                .acquire_decoded = acquireDecoded,
+                .lookup_decoded = lookupDecoded,
             } };
         }
         fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
@@ -535,11 +555,71 @@ const InlinePreparedArtifact = struct {
         }
         fn retained(raw: *anyopaque) usize {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            return self.data.len;
+            platform_sync.lockYielding(&self.cache_mutex);
+            defer self.cache_mutex.unlock();
+            return self.data.len + if (self.decoded_cache) |cache| cache.retainedBytes() else @as(usize, 0);
+        }
+        fn pinDecoded(self: *@This()) void {
+            _ = self.references.fetchAdd(1, .monotonic);
+            platform_sync.lockYielding(&self.cache_mutex);
+            self.decoded_users += 1;
+            self.cache_mutex.unlock();
+        }
+        fn releaseDecodedPin(self: *@This()) void {
+            platform_sync.lockYielding(&self.cache_mutex);
+            std.debug.assert(self.decoded_users != 0);
+            self.decoded_users -= 1;
+            self.cache_mutex.unlock();
+            close(self);
+        }
+        fn discardDeclinedDecode(self: *@This()) void {
+            platform_sync.lockYielding(&self.cache_mutex);
+            defer self.cache_mutex.unlock();
+            // Another loader or returned lease owns its independent pin. A
+            // sole declined attempt refunds optional metadata before fallback.
+            if (self.decoded_users != 1) return;
+            if (self.decoded_cache) |cache| cache.deinit();
+            self.decoded_cache = null;
+        }
+        fn releaseDecoded(raw: *anyopaque, item: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            (DecodeCache.Lease{ .cache = self.decoded_cache.?, .entry = @ptrCast(@alignCast(item)) }).release();
+            self.releaseDecodedPin();
+        }
+        fn lookupDecoded(raw: *anyopaque, key: source_mod.DecodeKey) !?source_mod.Decoded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pinDecoded();
+            var transferred = false;
+            defer if (!transferred) self.releaseDecodedPin();
+            platform_sync.lockYielding(&self.cache_mutex);
+            const cache = self.decoded_cache;
+            self.cache_mutex.unlock();
+            const lease = (cache orelse return null).lookup(key) orelse return null;
+            transferred = true;
+            return .{ .value = lease.entry.value.?, .owner = self, .item = lease.entry, .release_fn = releaseDecoded, .retained_bytes = lease.entry.arena.queryCapacity() };
+        }
+        fn acquireDecoded(raw: *anyopaque, request: source_mod.DecodeRequest) !?source_mod.Decoded {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.pinDecoded();
+            var transferred = false;
+            defer if (!transferred) self.releaseDecodedPin();
+            platform_sync.lockYielding(&self.cache_mutex);
+            if (self.decoded_cache == null) self.decoded_cache = DecodeCache.create(self.alloc, self.resource_manager, decode_limit) catch null;
+            const cache = self.decoded_cache;
+            self.cache_mutex.unlock();
+            const lease = (try (cache orelse return null).acquire(request)) orelse {
+                self.discardDeclinedDecode();
+                return null;
+            };
+            transferred = true;
+            return .{ .value = lease.entry.value.?, .owner = self, .item = lease.entry, .release_fn = releaseDecoded, .retained_bytes = lease.entry.arena.queryCapacity() };
         }
         fn close(raw: *anyopaque) void {
             const self: *@This() = @ptrCast(@alignCast(raw));
             if (self.references.fetchSub(1, .acq_rel) != 1) return;
+            std.debug.assert(self.decoded_users == 0);
+            if (self.decoded_cache) |cache| cache.deinit();
+            if (self.residency) |*credit| credit.release();
             const alloc = self.alloc;
             const registry = self.registry;
             alloc.free(self.data);
@@ -557,6 +637,11 @@ const InlinePreparedArtifact = struct {
         // Stager descriptors may belong to request scratch. Published source
         // bytes must instead use the independently retained provider owner.
         const backing_alloc = stager.registry.allocator;
+        var residency: ?Bytes.resources.Reservation = if (owner.resource_manager) |manager|
+            try manager.reserveWithoutReclaim(.lite_native_page_cache, @sizeOf(Bytes) + bytes.len)
+        else
+            null;
+        errdefer if (residency) |*credit| credit.release();
         const backing = try backing_alloc.create(Bytes);
         errdefer backing_alloc.destroy(backing);
         const prefix = try stager.alloc.dupe(u8, stager.prefix);
@@ -564,7 +649,7 @@ const InlinePreparedArtifact = struct {
         const data = try backing_alloc.dupe(u8, bytes);
         var identity: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(data, &identity, .{});
-        backing.* = .{ .alloc = backing_alloc, .data = data, .registry = stager.registry, .identity = identity };
+        backing.* = .{ .alloc = backing_alloc, .data = data, .registry = stager.registry, .identity = identity, .resource_manager = owner.resource_manager, .residency = residency };
         stager.registry.retainOwner(); // Backing bytes may outlive the prepared publication.
         stager.registry.retainOwner(); // Publication callbacks own a separate reference.
         state.* = .{ .alloc = stager.alloc, .registry = stager.registry, .prefix = prefix, .inode = inode, .bytes = backing };
