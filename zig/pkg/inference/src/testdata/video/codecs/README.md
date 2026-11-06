@@ -56,3 +56,6 @@ clip's `hvcC` payload.
 
 `hevc-sar-nopasp.mp4` is a 64x64 x265 clip with `setsar=2/1` and its `pasp` box renamed
 to `free`, so its 2:1 pixel aspect is only in the SPS.
+
+`hevc-sar-pasp-square.mp4` is the same clip with its `pasp` box rewritten to 1:1, so the
+container's explicit square pixels conflict with the stream's 2:1 SAR.

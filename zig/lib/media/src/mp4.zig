@@ -46,6 +46,8 @@ pub const Track = struct {
     codec_config: []const u8 = &.{},
     nal_length_bytes: u3,
     pixel_aspect: struct { horizontal: u32 = 1, vertical: u32 = 1 } = .{},
+    /// A pasp box was present. An explicit 1:1 differs from having no declaration.
+    pixel_aspect_declared: bool = false,
     /// Raw colr payload; downstream preparation must qualify its color policy.
     color_info: []const u8 = &.{},
     edit: timeline.Edit = .{},
@@ -389,6 +391,7 @@ const Parser = struct {
                 var configuration: ?[]const u8 = null;
                 var color: []const u8 = &.{};
                 var horizontal: u32 = 1;
+                var aspect_declared = false;
                 var vertical: u32 = 1;
                 while (child < b.payload.len) {
                     const c = try self.box(b.payload, child);
@@ -411,6 +414,7 @@ const Parser = struct {
                         horizontal = u32be(c.payload[0..4]);
                         vertical = u32be(c.payload[4..8]);
                         if (horizontal == 0 or vertical == 0) return error.MalformedMedia;
+                        aspect_declared = true;
                     }
                     child = c.end;
                 }
@@ -434,7 +438,7 @@ const Parser = struct {
                     .mjpeg => {},
                 }
                 if (nal_len == 3) return error.MalformedMedia;
-                t.track = .{ .inband_parameter_sets = b.typ == tag("avc3") or b.typ == tag("hev1"), .codec = codec, .id = 0, .timescale = 0, .width = width, .height = height, .avcc = if (codec == .avc) config else &.{}, .codec_config = if (codec == .hevc or codec == .av1) config else &.{}, .nal_length_bytes = nal_len, .pixel_aspect = .{ .horizontal = horizontal, .vertical = vertical }, .color_info = color, .display_matrix = @splat(0) };
+                t.track = .{ .inband_parameter_sets = b.typ == tag("avc3") or b.typ == tag("hev1"), .codec = codec, .id = 0, .timescale = 0, .width = width, .height = height, .avcc = if (codec == .avc) config else &.{}, .codec_config = if (codec == .hevc or codec == .av1) config else &.{}, .nal_length_bytes = nal_len, .pixel_aspect = .{ .horizontal = horizontal, .vertical = vertical }, .pixel_aspect_declared = aspect_declared, .color_info = color, .display_matrix = @splat(0) };
             }
             cursor = b.end;
         }

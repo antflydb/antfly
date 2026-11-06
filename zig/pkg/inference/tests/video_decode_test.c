@@ -158,6 +158,12 @@ int main(void) {
     assert(sequence(&d, &f) == 4);
     fake_destroy(d.decoder); release_budget(&d);
 
+    // A declared container aspect wins over a conflicting bitstream ratio.
+    d = decoder(); f = format(); d.aspect_declared = 1;
+    f.display_aspect_ratio.x = 16; f.display_aspect_ratio.y = 9;
+    assert(sequence(&d, &f) == 4);
+    fake_destroy(d.decoder); release_budget(&d);
+
     // Same-geometry clips may reuse surfaces only when their codecs match.
     const cudaVideoCodec codecs[] = {
         cudaVideoCodec_H264, cudaVideoCodec_HEVC, cudaVideoCodec_AV1, cudaVideoCodec_H264

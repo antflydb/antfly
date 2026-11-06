@@ -103,8 +103,9 @@ pub const Reservation = struct {
 pub fn reservation(a: std.mem.Allocator, bytes: []const u8) Reservation {
     if (@import("builtin").os.tag != .macos) return .{};
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-reservation" };
-    var reader = media.mp4.Reader.init(a, &source, video.mp4_coded.limits) catch return .{};
-    defer reader.deinit();
+    var input = embedding_video.PacketInput.init(a, &source, bytes) catch return .{};
+    defer input.deinit();
+    const reader = &input.reader;
     if (reader.track.codec != .hevc or !video.apple_hevc.hasParameterSets(reader.track.codec_config)) return .{};
     const surfaces = video.apple_hevc.surfaceBytes(reader.track) catch return .{};
     if (surfaces > video.apple_hevc.max_surface_bytes) return .{};
@@ -480,6 +481,24 @@ test "gemma4 video surface reservations honor an explicit scratch cap and releas
     permit.deinit();
     try std.testing.expectEqual(@as(usize, 0), automatic.backend_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 2048), automatic.limits.scratch_limit_bytes);
+}
+
+test "gemma4 video decodes in-band HEVC parameter sets through VideoToolbox" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/codecs/hevc-hev1-inband.mp4");
+    try std.testing.expect(reservation(a, bytes).surface_bytes != 0);
+    const Count = struct {
+        frames: usize = 0,
+        fn accept(raw: *anyopaque, _: usize, _: video.preparation.BorrowedFrame, _: video.preparation.Options, _: media.source.Control) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.frames += 1;
+        }
+    };
+    var count: Count = .{};
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes, .device_bytes = video.apple_hevc.max_surface_bytes } };
+    try embedding_video.observeConfigured(a, bytes, null, .{}, .{ .observer = .{ .context = &count, .accept = Count.accept }, .sampling = sampling, .pool = &pool });
+    try std.testing.expect(count.frames != 0);
 }
 
 test "gemma4 video names the missing HEVC route instead of calling the clip corrupt" {

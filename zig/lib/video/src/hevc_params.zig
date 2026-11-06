@@ -102,13 +102,15 @@ pub const ShortTermRefPicSet = struct {
 };
 
 /// Parses st_ref_pic_set(stRpsIdx); `sets[0..st_rps_idx]` must already be
-/// populated when inter-RPS prediction (clause 7.4.8) is used.
-pub fn parseShortTermRefPicSet(bits: *Bits, sets: []const ShortTermRefPicSet, st_rps_idx: usize) !ShortTermRefPicSet {
+/// populated when inter-RPS prediction (clause 7.4.8) is used. `num_sets` is the
+/// SPS's num_short_term_ref_pic_sets: only a slice header's own set, whose index
+/// equals that count, signals delta_idx_minus1 (clause 7.3.7).
+pub fn parseShortTermRefPicSet(bits: *Bits, sets: []const ShortTermRefPicSet, st_rps_idx: usize, num_sets: usize) !ShortTermRefPicSet {
     var inter_pred = false;
     if (st_rps_idx != 0) inter_pred = try bits.flag();
     if (inter_pred) {
         var delta_idx: usize = 1;
-        if (st_rps_idx == sets.len) delta_idx = try bits.ueBounded(std.math.maxInt(u32) - 1) + 1;
+        if (st_rps_idx == num_sets) delta_idx = try bits.ueBounded(std.math.maxInt(u32) - 1) + 1;
         if (delta_idx == 0 or delta_idx > st_rps_idx) return error.MalformedVideoConfig;
         const ref_idx = st_rps_idx - delta_idx;
         const sign = try bits.flag();
@@ -402,7 +404,7 @@ pub fn parseSps(bits: *Bits) !Sps {
     const num_short_term_ref_pic_sets = try bits.ue();
     if (num_short_term_ref_pic_sets > max_short_term_rps) return error.ResourceLimitExceeded;
     var short_term_ref_pic_sets: [max_short_term_rps]ShortTermRefPicSet = @splat(.{});
-    for (0..num_short_term_ref_pic_sets) |i| short_term_ref_pic_sets[i] = try parseShortTermRefPicSet(bits, short_term_ref_pic_sets[0..i], i);
+    for (0..num_short_term_ref_pic_sets) |i| short_term_ref_pic_sets[i] = try parseShortTermRefPicSet(bits, short_term_ref_pic_sets[0..i], i, num_short_term_ref_pic_sets);
     const long_term_ref_pics_present = try bits.flag();
     var num_long_term_ref_pics: u8 = 0;
     var lt_ref_pic_poc_lsb: [max_rps_entries]u32 = @splat(0);

@@ -59,6 +59,46 @@ pub fn parse(a: std.mem.Allocator, config: []const u8) !?Signal {
     return null;
 }
 
+/// `hev1` clips may carry parameter sets only in their samples. A record built from
+/// the first sample lets routes that need them up front treat the clip like any
+/// other. Caller owns the result; null when the record has sets or the sample has none.
+pub fn fromInband(a: std.mem.Allocator, config: []const u8, sample: []const u8, length_bytes: u3) !?[]u8 {
+    if (config.len < 23) return error.MalformedVideoConfig;
+    if (config[22] != 0) return null;
+    var units: [3]std.ArrayList([]const u8) = @splat(.empty);
+    defer for (&units) |*list| list.deinit(a);
+    var cursor: usize = 0;
+    while (cursor < sample.len) {
+        if (sample.len - cursor < length_bytes) return error.MalformedVideoConfig;
+        var size: usize = 0;
+        for (sample[cursor..][0..length_bytes]) |byte| size = (size << 8) | byte;
+        cursor += length_bytes;
+        if (size < 2 or size > sample.len - cursor) return error.MalformedVideoConfig;
+        const unit = sample[cursor..][0..size];
+        cursor += size;
+        const kind = (unit[0] >> 1) & 0x3f;
+        if (kind < 32) break;
+        if (kind <= 34) try units[kind - 32].append(a, unit);
+    }
+    if (units[1].items.len == 0 or units[2].items.len == 0) return null;
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    try out.appendSlice(a, config[0..22]);
+    var arrays: u8 = 0;
+    for (&units) |*list| arrays += @intFromBool(list.items.len != 0);
+    try out.append(a, arrays);
+    for (&units, 32..) |*list, kind| {
+        if (list.items.len == 0) continue;
+        try out.append(a, @intCast(kind));
+        try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(u16, @intCast(list.items.len))));
+        for (list.items) |unit| {
+            try out.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(u16, std.math.cast(u16, unit.len) orelse return error.MalformedVideoConfig)));
+            try out.appendSlice(a, unit);
+        }
+    }
+    return try out.toOwnedSlice(a);
+}
+
 /// The container's color declaration when present, which must agree with the stream.
 pub fn fullRange(signal: ?Signal, color_info: []const u8) !bool {
     const nclx = color_info.len >= 11 and std.mem.eql(u8, color_info[0..4], "nclx");
@@ -183,4 +223,49 @@ test "An SPS depth of 0xfffffffe is refused" {
     var bits = try bits_mod.Bits.init(a, payload);
     defer bits.deinit();
     try std.testing.expectError(error.MalformedVideoPacket, params.parseSps(&bits));
+}
+
+test "SPS predicted reference sets read delta_idx only in a slice header" {
+    const a = std.testing.allocator;
+    // inter_ref_pic_set_prediction_flag=1, delta_rps_sign=0, abs_delta_rps_minus1=ue(0),
+    // used_by_curr_pic_flag=1 for the one candidate, then the RBSP stop bit.
+    const sets = [_]params.ShortTermRefPicSet{.{}};
+    var bits = try bits_mod.Bits.init(a, &.{0b1_0_1_1_1_000});
+    defer bits.deinit();
+    const inside_sps = try params.parseShortTermRefPicSet(&bits, &sets, 1, 2);
+    try std.testing.expectEqual(@as(usize, 1), inside_sps.numDeltaPocs());
+    try std.testing.expectEqual(@as(usize, 4), bits.position);
+    // The same index in a slice header (index == count) also has delta_idx_minus1=ue(0).
+    var slice = try bits_mod.Bits.init(a, &.{0b1_1_0_1_1_1_00});
+    defer slice.deinit();
+    const in_slice = try params.parseShortTermRefPicSet(&slice, &sets, 1, 1);
+    try std.testing.expectEqual(@as(usize, 1), in_slice.numDeltaPocs());
+    try std.testing.expectEqual(@as(usize, 5), slice.position);
+}
+
+test "A record built from in-band parameter sets parses like an out-of-band one" {
+    const a = std.testing.allocator;
+    const full = @embedFile("../testdata/hevc-hlg-config.bin");
+    var empty: [23]u8 = undefined;
+    @memcpy(empty[0..22], full[0..22]);
+    empty[22] = 0;
+    try std.testing.expect((try fromInband(a, full, "", 4)) == null);
+    var sample: std.ArrayList(u8) = .empty;
+    defer sample.deinit(a);
+    const record = try nal.parseConfigurationRecord(full);
+    var arrays = record.arrays();
+    while (try arrays.next()) |array| {
+        var nals = array.nals;
+        while (try nals.next()) |unit| {
+            try sample.appendSlice(a, &std.mem.toBytes(std.mem.nativeToBig(u32, @intCast(unit.len))));
+            try sample.appendSlice(a, unit);
+        }
+    }
+    try sample.appendSlice(a, &[_]u8{ 0, 0, 0, 3, 19 << 1, 1, 0 });
+    const built = (try fromInband(a, &empty, sample.items, 4)).?;
+    defer a.free(built);
+    try std.testing.expectEqual(@as(?u8, 18), (try parse(a, built)).?.transfer);
+    // Only VPS, SPS and PPS are kept; a sample with no SPS yields nothing.
+    try std.testing.expect((try fromInband(a, &empty, &.{ 0, 0, 0, 3, 19 << 1, 1, 0 }, 4)) == null);
+    try std.testing.expectError(error.MalformedVideoConfig, fromInband(a, &empty, &.{ 0, 0, 0, 9, 32 << 1 }, 4));
 }

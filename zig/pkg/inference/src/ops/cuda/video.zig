@@ -29,7 +29,7 @@ const Callback = *const fn (*anyopaque, u64, u32, u32, u32, i64, u32, u32, u32, 
 extern fn antfly_nvdec_open(*?*anyopaque, ?*anyopaque, *anyopaque, Callback) c_int;
 extern fn antfly_nvdec_packet(*anyopaque, ?[*]const u8, u32, i64, c_int) c_int;
 extern fn antfly_nvdec_close(*anyopaque) void;
-extern fn antfly_nvdec_begin(*anyopaque, ?*anyopaque, *anyopaque, Callback, u32, u32, c_int, c_int, c_int, c_int, c_int, u32, u32) c_int;
+extern fn antfly_nvdec_begin(*anyopaque, ?*anyopaque, *anyopaque, Callback, u32, u32, c_int, c_int, c_int, c_int, c_int, u32, u32, c_int) c_int;
 extern fn antfly_nvdec_finish(*anyopaque) void;
 
 extern fn antfly_nvdec_set_budget(*anyopaque, *anyopaque, *const fn (*anyopaque, u32, u32, u32, u32) callconv(.c) c_int, *const fn (*anyopaque) callconv(.c) void) void;
@@ -251,11 +251,11 @@ fn validateTrack(track: anytype) !void {
     _ = try containerColor(track.color_info);
 }
 
-/// In lowest terms. A stream's SAR applies when the container declares none.
+/// In lowest terms. A container pasp wins; a stream's SAR applies without one.
 fn displayAspect(a: std.mem.Allocator, track: media.mp4.Track) !PixelAspect {
     var horizontal = track.pixel_aspect.horizontal;
     var vertical = track.pixel_aspect.vertical;
-    if (horizontal == vertical and track.codec == .hevc) {
+    if (!track.pixel_aspect_declared and track.codec == .hevc) {
         if (try @import("antfly_video").hevc_config.parse(a, track.codec_config)) |signal| {
             horizontal = signal.sar.horizontal;
             vertical = signal.sar.vertical;
@@ -433,7 +433,7 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
         .av1 => 11,
         .mjpeg => return error.UnsupportedVideoFormat,
     };
-    try state.checkStatus(antfly_nvdec_begin(decoder.?, ctx.stream, &state, DecodeState.callback, track.width, track.height, codec, color.matrix, color.range, color.transfer, color.primaries, state.sar.horizontal, state.sar.vertical));
+    try state.checkStatus(antfly_nvdec_begin(decoder.?, ctx.stream, &state, DecodeState.callback, track.width, track.height, codec, color.matrix, color.range, color.transfer, color.primaries, state.sar.horizontal, state.sar.vertical, @intFromBool(track.pixel_aspect_declared)));
     var annex: std.ArrayList(u8) = .empty;
     defer annex.deinit(allocator);
     switch (track.codec) {

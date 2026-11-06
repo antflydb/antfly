@@ -792,12 +792,13 @@ fn policyLayout(track: media.mp4.Track, display: video.display.Layout, width: u3
     return .{ .width = g.width, .height = g.height, .presentation_width = display.width, .presentation_height = display.height, .matrix = matrix, .rotation = display.rotation, .tone_mapping = tone, .torchvision = true, .rgb_rounding = if (matrix == .gbr_identity) .gbr_reference else if (width % 16 == 0) .q13_components else .q16_luma };
 }
 
-/// The bitstream's color and aspect apply where the container says nothing, and
-/// policySignal refuses a declaration that conflicts with them.
+/// The bitstream's color and aspect apply where the container says nothing. A
+/// container pasp wins over the stream's SAR, as in other players, and policySignal
+/// refuses color that conflicts.
 fn hevcPolicy(a: std.mem.Allocator, track: media.mp4.Track, width: u32, height: u32) !video.preparation.Options {
     const signal = (try video.hevc_config.parse(a, track.codec_config)) orelse return policy(track, width, height);
     var effective = track;
-    if (track.pixel_aspect.horizontal == track.pixel_aspect.vertical) effective.pixel_aspect = .{ .horizontal = signal.sar.horizontal, .vertical = signal.sar.vertical };
+    if (!track.pixel_aspect_declared) effective.pixel_aspect = .{ .horizontal = signal.sar.horizontal, .vertical = signal.sar.vertical };
     return policySignal(effective, width, height, .{ .primaries = signal.primaries, .transfer = signal.transfer, .matrix = signal.matrix });
 }
 
@@ -832,6 +833,9 @@ fn openWebmLane(a: std.mem.Allocator, source: *media.source.Source, bytes: []con
 pub const PacketInput = struct {
     reader: media.mp4.Reader,
     snapshot: ?*media.stream.Snapshot = null,
+    /// Stays valid for copies of `reader`, which borrow it through their track.
+    inband_config: ?[]u8 = null,
+    allocator: ?std.mem.Allocator = null,
     pub fn init(a: std.mem.Allocator, source: *media.source.Source, bytes: []const u8) !PacketInput {
         if (media.transport_stream.isTransportStream(bytes)) {
             const normalized = try video.transport_avc.Reader.init(a, source.identity, bytes, .{}, .{
@@ -840,9 +844,22 @@ pub const PacketInput = struct {
             });
             return .{ .reader = normalized.reader, .snapshot = normalized.snapshot };
         }
-        return .{ .reader = try media.mp4.Reader.init(a, source, video.mp4_coded.limits) };
+        var input = PacketInput{ .reader = try media.mp4.Reader.init(a, source, video.mp4_coded.limits), .allocator = a };
+        errdefer input.deinit();
+        if (input.reader.track.codec == .hevc and input.reader.track.inband_parameter_sets and input.reader.packets.len != 0) {
+            var first = try input.reader.readPacket(0);
+            defer first.deinit();
+            // A malformed sample is the decoder's to report.
+            input.inband_config = video.hevc_config.fromInband(a, input.reader.track.codec_config, first.bytes, input.reader.track.nal_length_bytes) catch |err| switch (err) {
+                error.OutOfMemory => return err,
+                else => null,
+            };
+            if (input.inband_config) |config| input.reader.track.codec_config = config;
+        }
+        return input;
     }
     pub fn deinit(self: *PacketInput) void {
+        if (self.inband_config) |config| self.allocator.?.free(config);
         self.reader.deinit();
         if (self.snapshot) |snapshot| snapshot.deinit();
     }
@@ -957,6 +974,16 @@ test "HEVC output planning and preparation share the bitstream's aspect" {
     const expected = (try video.preparation.geometry(reader.track.width, reader.track.height, preparation)).values() * @sizeOf(f32);
     const planned = try selectionOutputBytes(a, &.{0}, &reader, null, null, null);
     try std.testing.expectEqual(expected, planned.bytes);
+}
+
+test "An explicit square pasp wins over a stream's SAR" {
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../testdata/video/codecs/hevc-sar-pasp-square.mp4") }, .identity = "square" };
+    var reader = try media.mp4.Reader.init(a, &source, video.mp4_coded.limits);
+    defer reader.deinit();
+    try std.testing.expect(reader.track.pixel_aspect_declared);
+    try std.testing.expectEqual((try policy(reader.track, 64, 64)).presentation_width, (try hevcPolicy(a, reader.track, 64, 64)).presentation_width);
+    try std.testing.expectEqual(@as(u32, 64), (try hevcPolicy(a, reader.track, 64, 64)).presentation_width);
 }
 
 test "embeddinggemma2 video contract pixels follow the first decodable track on both routes" {
