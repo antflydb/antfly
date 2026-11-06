@@ -483,7 +483,18 @@ pub fn next(a: A, before: ?Resource, policy: contract.Policy, if_match: ?[]const
         defer a.free(raw);
         break :scan contract.fingerprint(raw);
     };
-    return .{ .checkpoint_encoding = if (before) |prior| prior.checkpoint_encoding else 0, .coverage = if (!changed) before.?.coverage else .{}, .policy = policy, .artifact_name = if (policy.mode == .redact_for_search_and_ai) try projection.protectedArtifactName(a, version) else projection.artifact_name, .policy_version = version, .resource_version = if (before) |prior| try std.math.add(u64, prior.resource_version, 1) else 1, .generation = generation, .scan_id = scan_id, .scan_sequence = if (before) |prior| prior.scan_sequence else 0, .scans = if (before) |prior| prior.scans else &.{}, .unprotected_indexes_json = if (before) |prior| prior.unprotected_indexes_json else "" };
+    // Job lifecycle belongs to this admitted generation, even when a later
+    // policy reuses an earlier semantic identity. Retire history in the same
+    // metadata CAS as the policy; never depend on a worker observing the gap.
+    // Copy only the bounded job headers and leave the prior resource immutable.
+    var scans: []const Scan = if (before) |prior| prior.scans else &.{};
+    if (changed and scans.len != 0) {
+        const retired = try a.dupe(Scan, scans);
+        for (retired) |*scan| scan.phase = .superseded;
+        scans = retired;
+    }
+    errdefer if (changed and scans.len != 0) a.free(scans);
+    return .{ .checkpoint_encoding = if (before) |prior| prior.checkpoint_encoding else 0, .coverage = if (!changed) before.?.coverage else .{}, .policy = policy, .artifact_name = if (policy.mode == .redact_for_search_and_ai) try projection.protectedArtifactName(a, version) else projection.artifact_name, .policy_version = version, .resource_version = if (before) |prior| try std.math.add(u64, prior.resource_version, 1) else 1, .generation = generation, .scan_id = scan_id, .scan_sequence = if (before) |prior| prior.scan_sequence else 0, .scans = scans, .unprotected_indexes_json = if (before) |prior| prior.unprotected_indexes_json else "" };
 }
 
 /// Preserve ordinary catalog entries and replace exactly the managed producer.
@@ -941,6 +952,61 @@ test "privacy scan retention preserves active jobs and admits the sixteenth scan
     resource = try next(a, resource, policy, try etag(a, resource));
     _ = try startScan(a, &resource, "", "", 100);
     try std.testing.expectEqual(@as(usize, 16), resource.scans.len);
+}
+
+test "privacy scan supersession is durable across policy reuse and tuning" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const policy = contract.Policy{ .mode = .monitor, .fields = &.{"body"} };
+    var first = try next(a, null, policy, null);
+    const phases = std.meta.tags(@FieldType(Scan, "phase"));
+    for (phases) |_| _ = try startScan(a, &first, "", "", 100);
+    const jobs = try a.dupe(Scan, first.scans);
+    for (jobs, phases) |*job, phase| job.phase = phase;
+    first.scans = jobs;
+    var tuned_policy = policy;
+    tuned_policy.execution.batch_items = 1;
+    const tuned = try next(a, first, tuned_policy, try etag(a, first));
+    try std.testing.expectEqual(first.generation, tuned.generation);
+    for (tuned.scans, phases) |job, phase| try std.testing.expectEqual(phase, job.phase);
+    var other = policy;
+    other.replacement = .mask;
+    const second = try next(a, tuned, other, try etag(a, tuned));
+    // A losing CAS must not have mutated the caller's snapshot.
+    for (first.scans, phases) |job, phase| try std.testing.expectEqual(phase, job.phase);
+    for (second.scans) |job| try std.testing.expectEqual(.superseded, job.phase);
+    // Serialize and reload the intermediate policy before restoring A: no
+    // worker, process-local flag, or observing client is needed to retire jobs.
+    const encoded = try replaceResource(a, "{}", second);
+    const root = try std.json.parseFromSlice(std.json.Value, a, encoded, .{});
+    var stored = (try current(a, root.value)).?;
+    defer stored.deinit();
+    var restored = try next(a, stored.value, policy, try etag(a, stored.value));
+    try std.testing.expectEqual(first.policy_version, restored.policy_version);
+    try std.testing.expectEqual(first.generation + 2, restored.generation);
+    for (restored.scans) |job| try std.testing.expectEqual(.superseded, job.phase);
+    const fresh = try startScan(a, &restored, "", "", 100);
+    try std.testing.expectEqual(.queued, fresh.phase);
+    for (first.scans) |job| try std.testing.expect(!std.mem.eql(u8, &job.scan_id, &fresh.scan_id));
+}
+
+test "privacy restored policy admits a full queue without obsolete job backpressure" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const policy = contract.Policy{ .mode = .monitor, .fields = &.{"body"} };
+    var resource = try next(a, null, policy, null);
+    for (0..16) |_| _ = try startScan(a, &resource, "", "", 100);
+    var other = policy;
+    other.replacement = .mask;
+    resource = try next(a, resource, other, try etag(a, resource));
+    _ = try startScan(a, &resource, "", "", 100);
+    resource = try next(a, resource, policy, try etag(a, resource));
+    for (0..16) |_| _ = try startScan(a, &resource, "", "", 100);
+    try std.testing.expectEqual(@as(usize, 16), resource.scans.len);
+    for (resource.scans) |job| try std.testing.expectEqual(.queued, job.phase);
+    try std.testing.expectError(error.PrivacyScanLimitExceeded, startScan(a, &resource, "", "", 100));
 }
 
 test "privacy executable catalog is invariant to equivalent authored ordering" {

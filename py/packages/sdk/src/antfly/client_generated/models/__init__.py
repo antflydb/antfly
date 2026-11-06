@@ -699,6 +699,14 @@ from .geo_shape_query import GeoShapeQuery
 from .get_current_user_response_200 import GetCurrentUserResponse200
 from .get_current_user_response_200_metadata_type_0 import GetCurrentUserResponse200MetadataType0
 from .get_document_artifact_manifest_detail import GetDocumentArtifactManifestDetail
+from .get_namespace_table_privacy_response_403 import GetNamespaceTablePrivacyResponse403
+from .get_namespace_table_privacy_response_412 import GetNamespaceTablePrivacyResponse412
+from .get_namespace_table_privacy_response_422 import GetNamespaceTablePrivacyResponse422
+from .get_namespace_table_privacy_response_428 import GetNamespaceTablePrivacyResponse428
+from .get_namespace_table_privacy_scan_response_403 import GetNamespaceTablePrivacyScanResponse403
+from .get_namespace_table_privacy_scan_response_412 import GetNamespaceTablePrivacyScanResponse412
+from .get_namespace_table_privacy_scan_response_422 import GetNamespaceTablePrivacyScanResponse422
+from .get_namespace_table_privacy_scan_response_428 import GetNamespaceTablePrivacyScanResponse428
 from .get_table_privacy_response_403 import GetTablePrivacyResponse403
 from .get_table_privacy_response_412 import GetTablePrivacyResponse412
 from .get_table_privacy_response_422 import GetTablePrivacyResponse422
@@ -1253,6 +1261,10 @@ from .linkup_search_config_output_type import LinkupSearchConfigOutputType
 from .linkup_search_config_provider import LinkupSearchConfigProvider
 from .list_chat_gpt_models_response_200 import ListChatGPTModelsResponse200
 from .list_document_artifact_manifests_detail import ListDocumentArtifactManifestsDetail
+from .list_namespace_table_privacy_findings_response_403 import ListNamespaceTablePrivacyFindingsResponse403
+from .list_namespace_table_privacy_findings_response_412 import ListNamespaceTablePrivacyFindingsResponse412
+from .list_namespace_table_privacy_findings_response_422 import ListNamespaceTablePrivacyFindingsResponse422
+from .list_namespace_table_privacy_findings_response_428 import ListNamespaceTablePrivacyFindingsResponse428
 from .list_restore_jobs_phase import ListRestoreJobsPhase
 from .list_restore_jobs_scope import ListRestoreJobsScope
 from .list_table_privacy_findings_response_403 import ListTablePrivacyFindingsResponse403
@@ -1991,6 +2003,10 @@ from .predicate_decision_question import PredicateDecisionQuestion
 from .predicate_decision_question_type import PredicateDecisionQuestionType
 from .prefix_query import PrefixQuery
 from .prepare_native_kv_checkpoint_x_antfly_kv_encoding import PrepareNativeKvCheckpointXAntflyKVEncoding
+from .preview_namespace_table_privacy_response_403 import PreviewNamespaceTablePrivacyResponse403
+from .preview_namespace_table_privacy_response_412 import PreviewNamespaceTablePrivacyResponse412
+from .preview_namespace_table_privacy_response_422 import PreviewNamespaceTablePrivacyResponse422
+from .preview_namespace_table_privacy_response_428 import PreviewNamespaceTablePrivacyResponse428
 from .preview_table_privacy_response_403 import PreviewTablePrivacyResponse403
 from .preview_table_privacy_response_412 import PreviewTablePrivacyResponse412
 from .preview_table_privacy_response_422 import PreviewTablePrivacyResponse422
@@ -2074,6 +2090,10 @@ from .provenance_origin_trace_type_0_kind import ProvenanceOriginTraceType0Kind
 from .prune_stats import PruneStats
 from .pruner import Pruner
 from .put_artifact_enrichment_response_201 import PutArtifactEnrichmentResponse201
+from .put_namespace_table_privacy_response_403 import PutNamespaceTablePrivacyResponse403
+from .put_namespace_table_privacy_response_412 import PutNamespaceTablePrivacyResponse412
+from .put_namespace_table_privacy_response_422 import PutNamespaceTablePrivacyResponse422
+from .put_namespace_table_privacy_response_428 import PutNamespaceTablePrivacyResponse428
 from .put_table_privacy_response_403 import PutTablePrivacyResponse403
 from .put_table_privacy_response_412 import PutTablePrivacyResponse412
 from .put_table_privacy_response_422 import PutTablePrivacyResponse422
@@ -2121,6 +2141,10 @@ from .query_hit_source import QueryHitSource
 from .query_hits import QueryHits
 from .query_hits_total import QueryHitsTotal
 from .query_hits_total_relation import QueryHitsTotalRelation
+from .query_namespace_table_privacy_findings_response_403 import QueryNamespaceTablePrivacyFindingsResponse403
+from .query_namespace_table_privacy_findings_response_412 import QueryNamespaceTablePrivacyFindingsResponse412
+from .query_namespace_table_privacy_findings_response_422 import QueryNamespaceTablePrivacyFindingsResponse422
+from .query_namespace_table_privacy_findings_response_428 import QueryNamespaceTablePrivacyFindingsResponse428
 from .query_profile import QueryProfile
 from .query_profile_value_verification import QueryProfileValueVerification
 from .query_profile_value_verification_plans_item import QueryProfileValueVerificationPlansItem
@@ -2409,6 +2433,11 @@ from .sse_step_progress import SSEStepProgress
 from .sse_step_started import SSEStepStarted
 from .sse_tool_mode import SSEToolMode
 from .sse_tool_mode_mode import SSEToolModeMode
+from .start_namespace_table_privacy_scan_response_403 import StartNamespaceTablePrivacyScanResponse403
+from .start_namespace_table_privacy_scan_response_409 import StartNamespaceTablePrivacyScanResponse409
+from .start_namespace_table_privacy_scan_response_412 import StartNamespaceTablePrivacyScanResponse412
+from .start_namespace_table_privacy_scan_response_422 import StartNamespaceTablePrivacyScanResponse422
+from .start_namespace_table_privacy_scan_response_428 import StartNamespaceTablePrivacyScanResponse428
 from .start_table_privacy_scan_response_403 import StartTablePrivacyScanResponse403
 from .start_table_privacy_scan_response_409 import StartTablePrivacyScanResponse409
 from .start_table_privacy_scan_response_412 import StartTablePrivacyScanResponse412
@@ -3294,6 +3323,14 @@ __all__ = (
     "GetCurrentUserResponse200",
     "GetCurrentUserResponse200MetadataType0",
     "GetDocumentArtifactManifestDetail",
+    "GetNamespaceTablePrivacyResponse403",
+    "GetNamespaceTablePrivacyResponse412",
+    "GetNamespaceTablePrivacyResponse422",
+    "GetNamespaceTablePrivacyResponse428",
+    "GetNamespaceTablePrivacyScanResponse403",
+    "GetNamespaceTablePrivacyScanResponse412",
+    "GetNamespaceTablePrivacyScanResponse422",
+    "GetNamespaceTablePrivacyScanResponse428",
     "GetTablePrivacyResponse403",
     "GetTablePrivacyResponse412",
     "GetTablePrivacyResponse422",
@@ -3848,6 +3885,10 @@ __all__ = (
     "LinkupSearchConfigProvider",
     "ListChatGPTModelsResponse200",
     "ListDocumentArtifactManifestsDetail",
+    "ListNamespaceTablePrivacyFindingsResponse403",
+    "ListNamespaceTablePrivacyFindingsResponse412",
+    "ListNamespaceTablePrivacyFindingsResponse422",
+    "ListNamespaceTablePrivacyFindingsResponse428",
     "ListRestoreJobsPhase",
     "ListRestoreJobsScope",
     "ListTablePrivacyFindingsResponse403",
@@ -4372,6 +4413,10 @@ __all__ = (
     "PredicateDecisionQuestionType",
     "PrefixQuery",
     "PrepareNativeKvCheckpointXAntflyKVEncoding",
+    "PreviewNamespaceTablePrivacyResponse403",
+    "PreviewNamespaceTablePrivacyResponse412",
+    "PreviewNamespaceTablePrivacyResponse422",
+    "PreviewNamespaceTablePrivacyResponse428",
     "PreviewTablePrivacyResponse403",
     "PreviewTablePrivacyResponse412",
     "PreviewTablePrivacyResponse422",
@@ -4453,6 +4498,10 @@ __all__ = (
     "Pruner",
     "PruneStats",
     "PutArtifactEnrichmentResponse201",
+    "PutNamespaceTablePrivacyResponse403",
+    "PutNamespaceTablePrivacyResponse412",
+    "PutNamespaceTablePrivacyResponse422",
+    "PutNamespaceTablePrivacyResponse428",
     "PutTablePrivacyResponse403",
     "PutTablePrivacyResponse412",
     "PutTablePrivacyResponse422",
@@ -4500,6 +4549,10 @@ __all__ = (
     "QueryHitSource",
     "QueryHitsTotal",
     "QueryHitsTotalRelation",
+    "QueryNamespaceTablePrivacyFindingsResponse403",
+    "QueryNamespaceTablePrivacyFindingsResponse412",
+    "QueryNamespaceTablePrivacyFindingsResponse422",
+    "QueryNamespaceTablePrivacyFindingsResponse428",
     "QueryProfile",
     "QueryProfileValueVerification",
     "QueryProfileValueVerificationPlansItem",
@@ -4788,6 +4841,11 @@ __all__ = (
     "SSEStepStarted",
     "SSEToolMode",
     "SSEToolModeMode",
+    "StartNamespaceTablePrivacyScanResponse403",
+    "StartNamespaceTablePrivacyScanResponse409",
+    "StartNamespaceTablePrivacyScanResponse412",
+    "StartNamespaceTablePrivacyScanResponse422",
+    "StartNamespaceTablePrivacyScanResponse428",
     "StartTablePrivacyScanResponse403",
     "StartTablePrivacyScanResponse409",
     "StartTablePrivacyScanResponse412",

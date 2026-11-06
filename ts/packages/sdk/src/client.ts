@@ -574,6 +574,9 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
+/** A literal table name uses default.public; scoped names are explicit. */
+export type PrivacyTableTarget = string | components["schemas"]["CatalogTableTarget"];
+
 export class AntflyClient {
   private client: Client<paths>;
   private memoryTransport?: Client<MemoryPaths>;
@@ -754,7 +757,7 @@ export class AntflyClient {
 
   /** Table-scoped privacy administration, sharing this client's authentication. */
   readonly privacy = {
-    get: (table: string, signal?: AbortSignal) =>
+    get: (table: PrivacyTableTarget, signal?: AbortSignal) =>
       this.privacyRequest<components["schemas"]["PrivacyStatus"]>(
         table,
         "",
@@ -764,7 +767,7 @@ export class AntflyClient {
         signal
       ),
     put: (
-      table: string,
+      table: PrivacyTableTarget,
       policy: components["schemas"]["PrivacyPolicy"],
       options?: { ifMatch?: string; signal?: AbortSignal }
     ) =>
@@ -777,7 +780,7 @@ export class AntflyClient {
         options?.signal
       ),
     preview: (
-      table: string,
+      table: PrivacyTableTarget,
       request: components["schemas"]["PrivacyPreviewRequest"],
       signal?: AbortSignal
     ) =>
@@ -790,7 +793,7 @@ export class AntflyClient {
         signal
       ),
     startScan: (
-      table: string,
+      table: PrivacyTableTarget,
       request: components["schemas"]["PrivacyScanRequest"] = {},
       signal?: AbortSignal
     ) =>
@@ -802,7 +805,7 @@ export class AntflyClient {
         undefined,
         signal
       ),
-    getScan: (table: string, scan: string, signal?: AbortSignal) =>
+    getScan: (table: PrivacyTableTarget, scan: string, signal?: AbortSignal) =>
       this.privacyRequest<components["schemas"]["PrivacyScan"]>(
         table,
         `/scans/${encodeURIComponent(scan)}`,
@@ -812,7 +815,7 @@ export class AntflyClient {
         signal
       ),
     findings: (
-      table: string,
+      table: PrivacyTableTarget,
       options?: {
         cursor?: string;
         document?: string;
@@ -836,34 +839,35 @@ export class AntflyClient {
   };
 
   private async privacyRequest<T>(
-    table: string,
+    table: PrivacyTableTarget,
     suffix: string,
     method: "GET" | "POST" | "PUT",
     body?: unknown,
     ifMatch?: string,
     signal?: AbortSignal
   ): Promise<{ data: T; etag?: string }> {
-    const response = await fetch(
-      this.url(`/db/v1/tables/${encodeURIComponent(table)}/privacy${suffix}`),
-      {
-        method,
-        headers: this.requestHeaders(ifMatch === undefined ? undefined : { "If-Match": ifMatch }),
-        ...(body === undefined
-          ? {}
-          : {
-              body: encodeBoundedJSON(
-                body,
-                suffix === "/findings"
-                  ? MAX_PRIVACY_FINDINGS_REQUEST_BYTES
-                  : DEFAULT_WRITE_MAX_REQUEST_BYTES,
-                false
-              ),
-            }),
-        signal,
-        credentials: "same-origin",
-        redirect: "error",
-      }
-    );
+    const tablePath =
+      typeof table === "string"
+        ? `/tables/${encodeURIComponent(table)}`
+        : `/databases/${encodeURIComponent(table.database ?? "default")}/namespaces/${encodeURIComponent(table.namespace ?? "public")}/tables/${encodeURIComponent(table.table)}`;
+    const response = await fetch(this.url(`/db/v1${tablePath}/privacy${suffix}`), {
+      method,
+      headers: this.requestHeaders(ifMatch === undefined ? undefined : { "If-Match": ifMatch }),
+      ...(body === undefined
+        ? {}
+        : {
+            body: encodeBoundedJSON(
+              body,
+              suffix === "/findings"
+                ? MAX_PRIVACY_FINDINGS_REQUEST_BYTES
+                : DEFAULT_WRITE_MAX_REQUEST_BYTES,
+              false
+            ),
+          }),
+      signal,
+      credentials: "same-origin",
+      redirect: "error",
+    });
     const result = await readLimitedResponseText(
       response,
       response.ok

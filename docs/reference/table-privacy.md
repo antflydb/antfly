@@ -47,6 +47,9 @@ Poll `GET /tables/customers/privacy/scans/{scan_id}`. Jobs progress through
 `queued`, `running`, and `processing`; processing verifies current receipts and
 consumer publication before `succeeded`. Failed jobs expose bounded document
 IDs and error codes. A semantic policy replacement supersedes earlier jobs.
+Supersession is committed atomically with replacement and remains terminal if a
+later policy reuses the same semantic version. Execution-only tuning preserves
+jobs and their progress.
 
 ```http
 GET /tables/customers/privacy/findings?field=body&category=email&limit=100
@@ -256,3 +259,26 @@ current source receipts and authoritative publication, independently of census
 progress. Private artifacts without destination publication are regenerated, so
 the configured producer may need to run again. Metadata recovery and hot-standby replication retain their own
 resumable job state; this reset applies to table backup restore.
+
+Privacy operations also support explicit database and namespace scope:
+`/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy`
+and the same `/preview`, `/findings`, `/scans`, and `/scans/{scanId}` suffixes.
+All require administration permission on that scoped table. A plain table name
+always selects `default.public`; dots and escaped slashes never infer scope.
+
+The TypeScript privacy client accepts either a literal name or an explicit target
+for each operation. The target uses the shared `CatalogTableTarget` contract,
+with database `default` and namespace `public` when omitted. For example:
+
+```typescript
+const target = { database: "tenant", namespace: "serving", table: "notes" };
+const current = await client.privacy.get(target);
+await client.privacy.put(target, policy, { ifMatch: current.etag });
+```
+
+Generated Go, Python, and Rust clients expose the corresponding
+`getNamespaceTablePrivacy`, `putNamespaceTablePrivacy`,
+`previewNamespaceTablePrivacy`, `startNamespaceTablePrivacyScan`,
+`getNamespaceTablePrivacyScan`, `listNamespaceTablePrivacyFindings`, and
+`queryNamespaceTablePrivacyFindings` operations (using each language's naming
+convention).

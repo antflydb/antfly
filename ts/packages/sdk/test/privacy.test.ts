@@ -36,6 +36,44 @@ describe("table privacy", () => {
     expect(calls[0].signal.aborted).toBe(true);
   });
 
+  it("addresses scoped tables for every privacy operation without changing literal names", async () => {
+    const calls: Request[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: string, init: RequestInit) => {
+        calls.push(new Request(input, init));
+        return Response.json({}, { headers: { ETag: '"scoped"' } });
+      })
+    );
+    const client = new AntflyClient({ baseUrl: "https://antfly.test" });
+    const target = { database: "tenant one", namespace: "serving", table: "notes/a" };
+    const policy = { mode: "monitor" as const, fields: ["body"] };
+    await client.privacy.get(target);
+    await client.privacy.put(target, policy, { ifMatch: '"old"' });
+    await client.privacy.preview(target, { policy, sample: { keys: ["doc"] } });
+    await client.privacy.startScan(target);
+    await client.privacy.getScan(target, "scan/a");
+    await client.privacy.findings(target, { cursor: "opaque+/=", limit: 1 });
+    const base =
+      "https://antfly.test/db/v1/databases/tenant%20one/namespaces/serving/tables/notes%2Fa/privacy";
+    expect(calls.map((call) => [call.method, call.url])).toEqual([
+      ["GET", base],
+      ["PUT", base],
+      ["POST", base + "/preview"],
+      ["POST", base + "/scans"],
+      ["GET", base + "/scans/scan%2Fa"],
+      ["POST", base + "/findings"],
+    ]);
+    expect(calls[1].headers.get("If-Match")).toBe('"old"');
+    expect(await calls[5].json()).toEqual({ cursor: "opaque+/=", limit: 1 });
+    await client.privacy.get("tenant.serving.notes/a");
+    expect(calls[6].url).toBe("https://antfly.test/db/v1/tables/tenant.serving.notes%2Fa/privacy");
+    await client.privacy.get({ table: "notes/a" });
+    expect(calls[7].url).toBe(
+      "https://antfly.test/db/v1/databases/default/namespaces/public/tables/notes%2Fa/privacy"
+    );
+  });
+
   it("carries large opaque findings cursors and filters in the body", async () => {
     const fetch = vi.fn(async (_input: string, _init?: RequestInit) =>
       Response.json({ findings: [], policy_version: "v" })

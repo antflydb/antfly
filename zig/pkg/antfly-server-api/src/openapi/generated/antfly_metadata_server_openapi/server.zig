@@ -550,6 +550,85 @@ pub fn parseRetryNamespaceIndexBody(allocator: std.mem.Allocator, body: []const 
     return std.json.parseFromSlice(antfly_indexes_openapi.IndexMaintenanceRequest, allocator, body, .{ .ignore_unknown_fields = true });
 }
 
+/// Read table privacy policy and coverage
+pub const GetNamespaceTablePrivacyPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Apply table privacy policy
+pub const PutNamespaceTablePrivacyPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for putNamespaceTablePrivacy.
+pub fn parsePutNamespaceTablePrivacyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyPolicy) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyPolicy, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// List current privacy findings
+pub const ListNamespaceTablePrivacyFindingsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+pub const ListNamespaceTablePrivacyFindingsParams = struct {
+    cursor: ?[]const u8 = null,
+    document: ?[]const u8 = null,
+    field: ?[]const u8 = null,
+    category: ?[]const u8 = null,
+    policy_version: ?[]const u8 = null,
+    limit: ?[]const u8 = null,
+};
+
+/// List current privacy findings with body filters
+pub const QueryNamespaceTablePrivacyFindingsPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for queryNamespaceTablePrivacyFindings.
+pub fn parseQueryNamespaceTablePrivacyFindingsBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyFindingsRequest) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyFindingsRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Inspect a bounded sample without saving the policy
+pub const PreviewNamespaceTablePrivacyPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for previewNamespaceTablePrivacy.
+pub fn parsePreviewNamespaceTablePrivacyBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyPreviewRequest) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyPreviewRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Start a durable privacy rescan
+pub const StartNamespaceTablePrivacyScanPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+};
+
+/// Parse the JSON request body for startNamespaceTablePrivacyScan.
+pub fn parseStartNamespaceTablePrivacyScanBody(allocator: std.mem.Allocator, body: []const u8) !std.json.Parsed(antfly_privacy_openapi.PrivacyScanRequest) {
+    return std.json.parseFromSlice(antfly_privacy_openapi.PrivacyScanRequest, allocator, body, .{ .ignore_unknown_fields = true });
+}
+
+/// Read privacy scan progress
+pub const GetNamespaceTablePrivacyScanPathParams = struct {
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+    scan_id: []const u8,
+};
+
 /// Query an explicit namespace table
 pub const QueryNamespaceTablePathParams = struct {
     /// Database name
@@ -2056,6 +2135,13 @@ pub const routes = [_]Route{
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}:{action}", .operation_id = "executeNamespaceTableGraphMetricAction", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/repair", .operation_id = "repairNamespaceIndex", .request_body = .buffered, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}/retry", .operation_id = "retryNamespaceIndex", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy", .operation_id = "getNamespaceTablePrivacy", .request_body = .none, .streaming_response = false },
+    .{ .method = "PUT", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy", .operation_id = "putNamespaceTablePrivacy", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/findings", .operation_id = "listNamespaceTablePrivacyFindings", .request_body = .none, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/findings", .operation_id = "queryNamespaceTablePrivacyFindings", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/preview", .operation_id = "previewNamespaceTablePrivacy", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/scans", .operation_id = "startNamespaceTablePrivacyScan", .request_body = .buffered, .streaming_response = false },
+    .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/scans/{scanId}", .operation_id = "getNamespaceTablePrivacyScan", .request_body = .none, .streaming_response = false },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query", .operation_id = "queryNamespaceTable", .request_body = .buffered, .streaming_response = true },
     .{ .method = "POST", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rename", .operation_id = "renameNamespaceTable", .request_body = .buffered, .streaming_response = false },
     .{ .method = "GET", .path = "/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/resolvers", .operation_id = "namespaceListResolvers", .request_body = .none, .streaming_response = false },
@@ -2281,6 +2367,13 @@ pub fn ServerRouter(comptime Impl: type) type {
         if (!@hasDecl(Impl, "executeNamespaceTableGraphMetricAction")) @compileError("ServerRouter: Impl missing required method 'executeNamespaceTableGraphMetricAction'");
         if (!@hasDecl(Impl, "repairNamespaceIndex")) @compileError("ServerRouter: Impl missing required method 'repairNamespaceIndex'");
         if (!@hasDecl(Impl, "retryNamespaceIndex")) @compileError("ServerRouter: Impl missing required method 'retryNamespaceIndex'");
+        if (!@hasDecl(Impl, "getNamespaceTablePrivacy")) @compileError("ServerRouter: Impl missing required method 'getNamespaceTablePrivacy'");
+        if (!@hasDecl(Impl, "putNamespaceTablePrivacy")) @compileError("ServerRouter: Impl missing required method 'putNamespaceTablePrivacy'");
+        if (!@hasDecl(Impl, "listNamespaceTablePrivacyFindings")) @compileError("ServerRouter: Impl missing required method 'listNamespaceTablePrivacyFindings'");
+        if (!@hasDecl(Impl, "queryNamespaceTablePrivacyFindings")) @compileError("ServerRouter: Impl missing required method 'queryNamespaceTablePrivacyFindings'");
+        if (!@hasDecl(Impl, "previewNamespaceTablePrivacy")) @compileError("ServerRouter: Impl missing required method 'previewNamespaceTablePrivacy'");
+        if (!@hasDecl(Impl, "startNamespaceTablePrivacyScan")) @compileError("ServerRouter: Impl missing required method 'startNamespaceTablePrivacyScan'");
+        if (!@hasDecl(Impl, "getNamespaceTablePrivacyScan")) @compileError("ServerRouter: Impl missing required method 'getNamespaceTablePrivacyScan'");
         if (!@hasDecl(Impl, "queryNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'queryNamespaceTable'");
         if (!@hasDecl(Impl, "renameNamespaceTable")) @compileError("ServerRouter: Impl missing required method 'renameNamespaceTable'");
         if (!@hasDecl(Impl, "namespaceListResolvers")) @compileError("ServerRouter: Impl missing required method 'namespaceListResolvers'");
@@ -2504,6 +2597,13 @@ pub fn ServerRouter(comptime Impl: type) type {
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName/graph-metrics/:metricName::action", httpx.Handler.bind(self.impl, executeNamespaceTableGraphMetricAction));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName/repair", httpx.Handler.bind(self.impl, repairNamespaceIndex));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/indexes/:indexName/retry", httpx.Handler.bind(self.impl, retryNamespaceIndex));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/privacy", httpx.Handler.bind(self.impl, getNamespaceTablePrivacy));
+            try server.put("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/privacy", httpx.Handler.bind(self.impl, putNamespaceTablePrivacy));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/privacy/findings", httpx.Handler.bind(self.impl, listNamespaceTablePrivacyFindings));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/privacy/findings", httpx.Handler.bind(self.impl, queryNamespaceTablePrivacyFindings));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/privacy/preview", httpx.Handler.bind(self.impl, previewNamespaceTablePrivacy));
+            try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/privacy/scans", httpx.Handler.bind(self.impl, startNamespaceTablePrivacyScan));
+            try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/privacy/scans/:scanId", httpx.Handler.bind(self.impl, getNamespaceTablePrivacyScan));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/query", httpx.Handler.bind(self.impl, queryNamespaceTable));
             try server.post("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/rename", httpx.Handler.bind(self.impl, renameNamespaceTable));
             try server.get("/databases/:databaseName/namespaces/:namespaceName/tables/:tableName/resolvers", httpx.Handler.bind(self.impl, namespaceListResolvers));
@@ -3152,6 +3252,78 @@ pub fn ServerRouter(comptime Impl: type) type {
             const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
             const index_name = ctx.param("indexName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: indexName" });
             return impl.retryNamespaceIndex(ctx, database_name, namespace_name, table_name, index_name);
+        }
+
+        /// Read table privacy policy and coverage
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy
+        fn getNamespaceTablePrivacy(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.getNamespaceTablePrivacy(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// Apply table privacy policy
+        /// PUT /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy
+        fn putNamespaceTablePrivacy(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.putNamespaceTablePrivacy(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// List current privacy findings
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/findings
+        fn listNamespaceTablePrivacyFindings(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const query_params = ListNamespaceTablePrivacyFindingsParams{
+                .cursor = try ctx.queryDecoded("cursor"),
+                .document = try ctx.queryDecoded("document"),
+                .field = try ctx.queryDecoded("field"),
+                .category = try ctx.queryDecoded("category"),
+                .policy_version = try ctx.queryDecoded("policy_version"),
+                .limit = try ctx.queryDecoded("limit"),
+            };
+            return impl.listNamespaceTablePrivacyFindings(ctx, database_name, namespace_name, table_name, query_params);
+        }
+
+        /// List current privacy findings with body filters
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/findings
+        fn queryNamespaceTablePrivacyFindings(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.queryNamespaceTablePrivacyFindings(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// Inspect a bounded sample without saving the policy
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/preview
+        fn previewNamespaceTablePrivacy(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.previewNamespaceTablePrivacy(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// Start a durable privacy rescan
+        /// POST /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/scans
+        fn startNamespaceTablePrivacyScan(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            return impl.startNamespaceTablePrivacyScan(ctx, database_name, namespace_name, table_name);
+        }
+
+        /// Read privacy scan progress
+        /// GET /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/privacy/scans/{scanId}
+        fn getNamespaceTablePrivacyScan(impl: *Impl, ctx: *httpx.Context) anyerror!httpx.Response {
+            const database_name = ctx.param("databaseName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: databaseName" });
+            const namespace_name = ctx.param("namespaceName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: namespaceName" });
+            const table_name = ctx.param("tableName") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: tableName" });
+            const scan_id = ctx.param("scanId") orelse return ctx.status(400).json(.{ .@"error" = "missing_path_param", .message = "Missing path parameter: scanId" });
+            return impl.getNamespaceTablePrivacyScan(ctx, database_name, namespace_name, table_name, scan_id);
         }
 
         /// Query an explicit namespace table
@@ -4475,6 +4647,13 @@ pub fn ServerRouter(comptime Impl: type) type {
 //   fn executeNamespaceTableGraphMetricAction(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8, metric_name: []const u8, action: []const u8) !httpx.Response
 //   fn repairNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
 //   fn retryNamespaceIndex(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, index_name: []const u8) !httpx.Response
+//   fn getNamespaceTablePrivacy(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn putNamespaceTablePrivacy(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn listNamespaceTablePrivacyFindings(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, params: ListNamespaceTablePrivacyFindingsParams) !httpx.Response
+//   fn queryNamespaceTablePrivacyFindings(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn previewNamespaceTablePrivacy(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn startNamespaceTablePrivacyScan(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
+//   fn getNamespaceTablePrivacyScan(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, scan_id: []const u8) !httpx.Response
 //   fn queryNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn renameNamespaceTable(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response
 //   fn namespaceListResolvers(self: *Impl, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response

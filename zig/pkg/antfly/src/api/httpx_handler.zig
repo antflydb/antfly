@@ -10622,6 +10622,48 @@ pub const AntflyApiHandler = struct {
         return respondOwnedApiResponse(ctx, &result.response);
     }
 
+    pub fn getNamespaceTablePrivacy(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.privacyRequest(ctx, table_name, .get, "");
+    }
+
+    pub fn putNamespaceTablePrivacy(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.privacyRequest(ctx, table_name, .put, "");
+    }
+
+    pub fn previewNamespaceTablePrivacy(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.privacyRequest(ctx, table_name, .preview, "");
+    }
+
+    pub fn startNamespaceTablePrivacyScan(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.privacyRequest(ctx, table_name, .start_scan, "");
+    }
+
+    pub fn getNamespaceTablePrivacyScan(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, scan_id: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.privacyRequest(ctx, table_name, .get_scan, scan_id);
+    }
+
+    pub fn listNamespaceTablePrivacyFindings(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8, _: anytype) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.privacyRequest(ctx, table_name, .findings, "");
+    }
+
+    pub fn queryNamespaceTablePrivacyFindings(self: *AntflyApiHandler, ctx: *httpx.Context, database_name: []const u8, namespace_name: []const u8, table_name: []const u8) !httpx.Response {
+        _ = database_name;
+        _ = namespace_name;
+        return self.privacyRequest(ctx, table_name, .findings, "");
+    }
+
     pub fn getTablePrivacy(self: *AntflyApiHandler, ctx: *httpx.Context, table_name: []const u8) !httpx.Response {
         return self.privacyRequest(ctx, table_name, .get, "");
     }

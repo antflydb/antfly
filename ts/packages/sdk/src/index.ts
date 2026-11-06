@@ -43,6 +43,7 @@ export {
   type IndexMutationTemporarilyUnavailableCode,
   IndexMutationTemporarilyUnavailableError,
   type IndexOperations,
+  type PrivacyTableTarget,
   QUERY_TEMPORARILY_UNAVAILABLE_CODES,
   type QueryExecutionOptions,
   type QueryTemporarilyUnavailableCode,

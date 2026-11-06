@@ -29,13 +29,7 @@ pub fn publicPostBodyLimit(path: []const u8) ?usize {
 /// Metadata's ordinary listener cap is smaller than document admission. Keep
 /// privacy control parity with the public API without widening other routes.
 pub fn privacyMutationBodyLimit(raw_path: []const u8) ?usize {
-    const path = if (std.mem.startsWith(u8, raw_path, "/db/v1/")) raw_path[6..] else raw_path;
-    const prefix = if (std.mem.startsWith(u8, path, "/internal/v1/tables/")) "/internal/v1/tables/" else "/tables/";
-    if (!std.mem.startsWith(u8, path, prefix)) return null;
-    const suffix = if (std.mem.endsWith(u8, path, "/privacy/scans")) "/privacy/scans" else "/privacy";
-    if (!std.mem.endsWith(u8, path, suffix) or path.len <= prefix.len + suffix.len) return null;
-    const table = path[prefix.len .. path.len - suffix.len];
-    if (std.mem.indexOfScalar(u8, table, '/') != null) return null;
+    if (!privacyPath(raw_path, "/privacy", true) and !privacyPath(raw_path, "/privacy/scans", true)) return null;
     return @import("antfly_public_limits").max_request_body_bytes;
 }
 
@@ -85,11 +79,38 @@ pub fn isInternalDocumentReadPath(path: []const u8) bool {
 }
 
 pub fn isPrivacyFindingsPath(path: []const u8) bool {
-    const relative = if (std.mem.startsWith(u8, path, "/db/v1/")) path[6..] else path;
-    const prefix = "/tables/";
-    const suffix = "/privacy/findings";
-    if (!std.mem.startsWith(u8, relative, prefix) or !std.mem.endsWith(u8, relative, suffix) or relative.len <= prefix.len + suffix.len) return false;
-    return std.mem.indexOfScalar(u8, relative[prefix.len .. relative.len - suffix.len], '/') == null;
+    return privacyPath(path, "/privacy/findings", false);
+}
+
+// Match both public table address forms without allocation or percent decoding.
+// Encoded slashes remain one name component; extra/empty segments never match.
+fn privacyPath(raw: []const u8, suffix: []const u8, internal: bool) bool {
+    const path = if (std.mem.startsWith(u8, raw, "/db/v1/")) raw[6..] else if (internal and std.mem.startsWith(u8, raw, "/internal/v1/")) raw[12..] else raw;
+    if (!std.mem.endsWith(u8, path, suffix)) return false;
+    var parts = std.mem.splitScalar(u8, path[0 .. path.len - suffix.len], '/');
+    if (!std.mem.eql(u8, parts.next() orelse return false, "")) return false;
+    const kind = parts.next() orelse return false;
+    if (std.mem.eql(u8, kind, "databases")) {
+        if ((parts.next() orelse return false).len == 0) return false;
+        if (!std.mem.eql(u8, parts.next() orelse return false, "namespaces")) return false;
+        if ((parts.next() orelse return false).len == 0) return false;
+        if (!std.mem.eql(u8, parts.next() orelse return false, "tables")) return false;
+    } else if (!std.mem.eql(u8, kind, "tables")) return false;
+    return (parts.next() orelse return false).len != 0 and parts.next() == null;
+}
+
+test "scoped privacy body admission preserves mutation and findings budgets" {
+    const limits = @import("antfly_public_limits");
+    for ([_][]const u8{ "/db/v1/databases/:databaseName/namespaces/:namespaceName/tables/:tableName", "/databases/d%2Fb/namespaces/n%20s/tables/t%2F1" }) |base| {
+        var buffer: [256]u8 = undefined;
+        try std.testing.expectEqual(@as(?usize, limits.max_request_body_bytes), privacyMutationBodyLimit(try std.fmt.bufPrint(&buffer, "{s}/privacy", .{base})));
+        try std.testing.expectEqual(@as(?usize, limits.max_request_body_bytes), publicPostBodyLimit(try std.fmt.bufPrint(&buffer, "{s}/privacy/scans", .{base})));
+        try std.testing.expectEqual(@as(?usize, limits.max_privacy_findings_body_bytes), publicPostBodyLimit(try std.fmt.bufPrint(&buffer, "{s}/privacy/findings", .{base})));
+        try std.testing.expect(publicPostBodyLimit(try std.fmt.bufPrint(&buffer, "{s}/privacy/preview", .{base})) == null);
+    }
+    for ([_][]const u8{ "/databases//namespaces/n/tables/t/privacy", "/databases/d/namespaces//tables/t/privacy", "/databases/d/namespaces/n/tables//privacy", "/databases/d/namespaces/n/tables/t/extra/privacy", "/databases/d/tables/t/privacy" }) |path| {
+        try std.testing.expect(privacyMutationBodyLimit(path) == null);
+    }
 }
 
 test "privacy findings body admission covers cursor and filters without enlarging other routes" {
