@@ -1028,6 +1028,77 @@ test "video CUDA preprocessing matches CPU RGB resize and planar patches" {
     };
 }
 
+test "video CUDA kernels follow the portable HDR policy and quarter turns" {
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const tone = @import("antfly_video").tone;
+    var compute = try cuda.CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var preprocess = try Preprocessor.init(a, &compute.ctx);
+    defer preprocess.deinit();
+    const width = 8;
+    const height = 8;
+    const pitch = 16;
+    // MSB-aligned 10-bit samples across the code range, luma then interleaved chroma.
+    var surface: [pitch * height * 3 / 2]u8 = undefined;
+    const samples = std.mem.bytesAsSlice(u16, @as([]align(1) u8, &surface));
+    for (samples, 0..) |*sample, i| sample.* = @intCast(@as(u32, 64 + (i * 61) % 877) << 6);
+    var buffer = try @import("buffer.zig").DeviceBuffer.alloc(&compute.ctx, surface.len);
+    defer buffer.free(&compute.ctx);
+    try buffer.copyFromHost(&compute.ctx, &surface);
+    const mean = [3]f32{ 0, 0, 0 };
+    const unit = [3]f32{ 1, 1, 1 };
+    const sample = struct {
+        fn at(bytes: []const u8, offset: usize) f64 {
+            return @as(f64, @floatFromInt(std.mem.readInt(u16, bytes[offset..][0..2], .little) >> 6)) * 0.25;
+        }
+    }.at;
+    const encoded = struct {
+        fn rgb(bytes: []const u8, x: usize, y: usize) [3]f64 {
+            const kr = 0.2627;
+            const kb = 0.0593;
+            const uv = pitch * height + (y / 2) * pitch + (x / 2) * 4;
+            const yy = (sample(bytes, y * pitch + x * 2) - 16) * (255.0 / 219.0);
+            const u = (sample(bytes, uv) - 128) * (255.0 / 224.0);
+            const v = (sample(bytes, uv + 2) - 128) * (255.0 / 224.0);
+            const kg = 1 - kr - kb;
+            return .{
+                std.math.clamp(yy + 2 * (1 - kr) * v, 0, 255),
+                std.math.clamp(yy - 2 * kb * (1 - kb) / kg * u - 2 * kr * (1 - kr) / kg * v, 0, 255),
+                std.math.clamp(yy + 2 * (1 - kb) * u, 0, 255),
+            };
+        }
+    }.rgb;
+    for ([_]struct { code: u32, policy: tone.Policy }{ .{ .code = 1, .policy = .pq_reinhard_100 }, .{ .code = 2, .policy = .hlg_reinhard_100 } }) |case| {
+        for ([_]u32{ 0, 1, 2, 3 }) |rotation| {
+            const output = try preprocess.patches(&cb, .{ .device = buffer.ptr, .pitch = pitch, .width = width, .height = height, .timestamp_us = 0, .matrix = 9, .full_range = 0, .high_depth = 1, .tone = case.code, .rotation = rotation }, width, height, 2, mean, unit);
+            defer cb.free(output);
+            const actual = try cb.toFloat32(output, a);
+            defer a.free(actual);
+            for (0..height / 2) |gy| for (0..width / 2) |gx| for (0..3) |c| for (0..2) |py| for (0..2) |px| {
+                const dx = gx * 2 + px;
+                const dy = gy * 2 + py;
+                const x = switch (rotation) {
+                    1 => dy,
+                    2 => width - 1 - dx,
+                    3 => width - 1 - dy,
+                    else => dx,
+                };
+                const y = switch (rotation) {
+                    1 => height - 1 - dx,
+                    2 => height - 1 - dy,
+                    3 => dx,
+                    else => dy,
+                };
+                const index = (((gy * (width / 2) + gx) * 3 + c) * 2 + py) * 2 + px;
+                const expected = tone.render64(encoded(&surface, x, y), true, case.policy)[c];
+                try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(expected)) / 255, actual[index], 1.5 / 255.0);
+            };
+        }
+    }
+}
+
 test "NVDEC decodes Main 10 HDR and rotated HEVC with its display metadata" {
     if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
     const a = std.testing.allocator;
