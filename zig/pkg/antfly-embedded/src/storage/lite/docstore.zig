@@ -6778,7 +6778,13 @@ test "lite replay cleanup propagates record corruption without deleting a partia
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
-fn expectLedgerMatchesScanForTest(store: *Store) !void {
+/// WS5 invariant, reusable from other test files: the durable journal
+/// credit ledger must always equal a fresh scan over every replay lane
+/// (the all-kind lane plus every hinted lane). There is no other
+/// bookkeeping path (see `internal_keys.JournalCreditLedger`'s doc
+/// comment), so any divergence is a real leak or double-release, not a
+/// benign timing difference.
+pub fn expectLedgerMatchesScanForTest(store: *Store) !void {
     const Collector = struct {
         bytes: u64 = 0,
         records: u64 = 0,
