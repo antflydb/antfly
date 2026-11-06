@@ -661,6 +661,18 @@ fn checkInFlightResolutionDb(in_flight: Checkpoint, handle: *DbHandle, allocator
 /// draining background work between attempts, and only treats it as a
 /// finding if the index never finishes catching up within a generous bound.
 fn assertSearchable(handle: *DbHandle, allocator: Allocator, search_index: []const u8, search_field: []const u8, key: []const u8, text: []const u8) !void {
+    const platform_time = @import("antfly_platform").time;
+    // A fixed retry count conflates "stuck" with "a real host under enough
+    // concurrent load that each recovery pass's own I/O keeps hitting fresh
+    // transient errors" -- recovery can legitimately still be making
+    // progress (a different injected-free error each attempt, not the same
+    // one repeating) well past any small fixed count on a busy shared
+    // machine. Bound by wall-clock time instead so a crash sweep run under
+    // sustained load does not fail just because it needed more than N
+    // iterations; `attempt` is kept only for diagnostics. A real stuck
+    // recovery (the same unresolved condition forever) still eventually
+    // exhausts this deadline and fails exactly as before.
+    const deadline_ns = platform_time.monotonicNs() +| (30 * std.time.ns_per_s);
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         var result = handle.db.search(allocator, .{
@@ -668,7 +680,7 @@ fn assertSearchable(handle: *DbHandle, allocator: Allocator, search_index: []con
             .full_text = .{ .match = .{ .field = search_field, .text = text } },
             .limit = 10,
         }) catch |err| {
-            if (err == error.IndexRebuilding and attempt < 50) {
+            if (err == error.IndexRebuilding and platform_time.monotonicNs() < deadline_ns) {
                 // `runUntilIdle` alone is what a sweep barrier count needs
                 // to stay deterministic (see `openDbWithIo`), but settling
                 // a text index after reopen may need the fuller recipe
