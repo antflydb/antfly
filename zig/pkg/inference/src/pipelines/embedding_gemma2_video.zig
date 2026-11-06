@@ -943,6 +943,22 @@ test "embeddinggemma2 video contract pixel inspection admits CUDA MP4 codecs wit
     }
 }
 
+test "HEVC output planning and preparation share the bitstream's aspect" {
+    const a = std.testing.allocator;
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = @embedFile("../testdata/video/codecs/hevc-sar-nopasp.mp4") }, .identity = "sar" };
+    var reader = try media.mp4.Reader.init(a, &source, video.mp4_coded.limits);
+    defer reader.deinit();
+    try std.testing.expectEqual(reader.track.pixel_aspect.horizontal, reader.track.pixel_aspect.vertical);
+    const stream = try hevcPolicy(a, reader.track, reader.track.width, reader.track.height);
+    const container = try policy(reader.track, reader.track.width, reader.track.height);
+    try std.testing.expect(stream.width != container.width);
+    var preparation = stream;
+    preparation.rgb_rounding = .q13_reconstructed;
+    const expected = (try video.preparation.geometry(reader.track.width, reader.track.height, preparation)).values() * @sizeOf(f32);
+    const planned = try selectionOutputBytes(a, &.{0}, &reader, null, null, null);
+    try std.testing.expectEqual(expected, planned.bytes);
+}
+
 test "embeddinggemma2 video contract pixels follow the first decodable track on both routes" {
     const bytes = @embedFile("../testdata/video/codecs/hevc-avc-tracks.mp4");
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
@@ -1046,7 +1062,7 @@ fn selectionOutputBytes(a: std.mem.Allocator, selected: []const usize, reader: ?
             const height: u32 = @intCast(if (cfg) |c| c.height else track.height);
             source_width = width;
             source_height = height;
-            preparation = if (cfg) |c| try policySignal(track, width, height, c.color) else try policy(track, width, height);
+            preparation = if (cfg) |c| try policySignal(track, width, height, c.color) else if (track.codec == .hevc) try hevcPolicy(a, track, width, height) else try policy(track, width, height);
             // Portable decode can reconstruct full chroma even when container
             // colour signalling alone does not specify its rounding policy.
             if (preparation.tone_mapping == .none) preparation.rgb_rounding = .q13_reconstructed;
@@ -1228,7 +1244,9 @@ pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sa
 }
 fn inspectPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, control: Control, sampling: Sampling, metal: bool, selection: ?*const ReaderSelection) !Plan {
     // AVC combines VUI and container declarations in parameterSession below.
-    if (reader.track.codec != .avc) _ = try policy(reader.track, reader.track.width, reader.track.height);
+    if (reader.track.codec == .hevc) {
+        _ = try hevcPolicy(a, reader.track, reader.track.width, reader.track.height);
+    } else if (reader.track.codec != .avc) _ = try policy(reader.track, reader.track.width, reader.track.height);
     const selected = try selectReader(a, reader, sampling, reader.input.control, selection);
     defer a.free(selected);
     const configurations = try parameterSession(a, reader);

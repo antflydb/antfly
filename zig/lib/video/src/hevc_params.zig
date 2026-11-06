@@ -108,11 +108,11 @@ pub fn parseShortTermRefPicSet(bits: *Bits, sets: []const ShortTermRefPicSet, st
     if (st_rps_idx != 0) inter_pred = try bits.flag();
     if (inter_pred) {
         var delta_idx: usize = 1;
-        if (st_rps_idx == sets.len) delta_idx = try bits.ue() + 1;
+        if (st_rps_idx == sets.len) delta_idx = try bits.ueBounded(std.math.maxInt(u32) - 1) + 1;
         if (delta_idx == 0 or delta_idx > st_rps_idx) return error.MalformedVideoConfig;
         const ref_idx = st_rps_idx - delta_idx;
         const sign = try bits.flag();
-        const abs_delta = try bits.ue() + 1;
+        const abs_delta = try bits.ueBounded(std.math.maxInt(u32) - 1) + 1;
         if (abs_delta > max_delta_poc) return error.MalformedVideoPacket;
         const delta_rps: i32 = (if (sign) @as(i32, -1) else 1) * @as(i32, @intCast(abs_delta));
         const ref = sets[ref_idx];
@@ -188,7 +188,7 @@ pub fn parseShortTermRefPicSet(bits: *Bits, sets: []const ShortTermRefPicSet, st
     var result = ShortTermRefPicSet{ .negative_count = @intCast(num_negative), .positive_count = @intCast(num_positive) };
     var prev: i32 = 0;
     for (0..num_negative) |i| {
-        const delta = try bits.ue() + 1;
+        const delta = try bits.ueBounded(std.math.maxInt(u32) - 1) + 1;
         if (delta > max_delta_poc) return error.MalformedVideoPacket;
         prev -= @intCast(delta);
         result.delta_poc[i] = prev;
@@ -196,7 +196,7 @@ pub fn parseShortTermRefPicSet(bits: *Bits, sets: []const ShortTermRefPicSet, st
     }
     prev = 0;
     for (0..num_positive) |i| {
-        const delta = try bits.ue() + 1;
+        const delta = try bits.ueBounded(std.math.maxInt(u32) - 1) + 1;
         if (delta > max_delta_poc) return error.MalformedVideoPacket;
         prev += @intCast(delta);
         result.delta_poc[num_negative + i] = prev;
@@ -227,7 +227,7 @@ pub fn parseScalingListData(bits: *Bits) !ScalingListData {
         while (matrix_id < 6) : (matrix_id += step) {
             const predicted = !try bits.flag(); // scaling_list_pred_mode_flag
             if (predicted) {
-                const delta = try bits.ue();
+                const delta = try bits.ueBounded(5);
                 if (delta * step > matrix_id) return error.MalformedVideoConfig;
                 data.entries[size_id][matrix_id] = if (delta == 0) .default else .{ .predicted_from = @intCast(matrix_id - delta * step) };
                 continue;
@@ -350,27 +350,29 @@ pub fn parseSps(bits: *Bits) !Sps {
         conf_win_right = try bits.ue();
         conf_win_top = try bits.ue();
         conf_win_bottom = try bits.ue();
+        // Display size subtracts these, so they can't exceed the picture they crop.
+        if (conf_win_left > width or conf_win_right > width - conf_win_left or conf_win_top > height or conf_win_bottom > height - conf_win_top) return error.MalformedVideoConfig;
     }
-    const bit_depth_luma = try bits.ue() + 8;
-    const bit_depth_chroma = try bits.ue() + 8;
+    const bit_depth_luma = try bits.ueBounded(std.math.maxInt(u32) - 8) + 8;
+    const bit_depth_chroma = try bits.ueBounded(std.math.maxInt(u32) - 8) + 8;
     if ((bit_depth_luma != 8 and bit_depth_luma != 10) or bit_depth_luma != bit_depth_chroma) return error.UnsupportedVideoProfile;
-    const log2_max_poc_lsb = try bits.ue() + 4;
+    const log2_max_poc_lsb = try bits.ueBounded(std.math.maxInt(u32) - 4) + 4;
     if (log2_max_poc_lsb > 16) return error.UnsupportedVideoProfile;
     const sub_layer_ordering_present = try bits.flag();
     var max_dec_pic_buffering: u8 = 0;
     var max_num_reorder_pics: u8 = 0;
     const first_layer: usize = if (sub_layer_ordering_present) 0 else max_sub_layers_minus1;
     for (first_layer..@as(usize, max_sub_layers_minus1) + 1) |_| {
-        const buffering = try bits.ue() + 1;
+        const buffering = try bits.ueBounded(std.math.maxInt(u32) - 1) + 1;
         const reorder = try bits.ue();
         _ = try bits.ue(); // sps_max_latency_increase_plus1
         if (buffering > 16 or reorder > 16) return error.UnsupportedVideoProfile;
         max_dec_pic_buffering = @intCast(buffering);
         max_num_reorder_pics = @intCast(reorder);
     }
-    const log2_min_luma_cb = try bits.ue() + 3;
+    const log2_min_luma_cb = try bits.ueBounded(std.math.maxInt(u32) - 3) + 3;
     const log2_diff_cb = try bits.ue();
-    const log2_min_tb = try bits.ue() + 2;
+    const log2_min_tb = try bits.ueBounded(std.math.maxInt(u32) - 2) + 2;
     const log2_diff_tb = try bits.ue();
     const max_hierarchy_inter = try bits.ue();
     const max_hierarchy_intra = try bits.ue();
@@ -563,7 +565,7 @@ fn skipHrdParametersFull(bits: *Bits, common_inf_present: bool, max_sub_layers_m
         var low_delay = false;
         if (fixed_pic_rate_within_cvs) _ = try bits.ue() else low_delay = try bits.flag();
         var cpb_cnt: usize = 1;
-        if (!low_delay) cpb_cnt = try bits.ue() + 1;
+        if (!low_delay) cpb_cnt = try bits.ueBounded(std.math.maxInt(u32) - 1) + 1;
         if (cpb_cnt > 32) return error.UnsupportedVideoProfile;
         if (nal_hrd) for (0..cpb_cnt) |_| {
             _ = try bits.ue();
@@ -642,10 +644,10 @@ pub fn parsePps(bits: *Bits) !Pps {
     const num_extra_slice_header_bits: u3 = @intCast(try bits.read(3));
     const sign_data_hiding_enabled = try bits.flag();
     const cabac_init_present = try bits.flag();
-    const num_ref_idx_l0 = try bits.ue() + 1;
-    const num_ref_idx_l1 = try bits.ue() + 1;
+    const num_ref_idx_l0 = try bits.ueBounded(std.math.maxInt(u32) - 1) + 1;
+    const num_ref_idx_l1 = try bits.ueBounded(std.math.maxInt(u32) - 1) + 1;
     if (num_ref_idx_l0 > 16 or num_ref_idx_l1 > 16) return error.UnsupportedVideoProfile;
-    const init_qp = try bits.se() + 26;
+    const init_qp = try bits.seBounded(-1024, 1024) + 26;
     const constrained_intra_pred = try bits.flag();
     const transform_skip_enabled = try bits.flag();
     const cu_qp_delta_enabled = try bits.flag();
@@ -667,8 +669,8 @@ pub fn parsePps(bits: *Bits) !Pps {
         if (tiles.columns > 32 or tiles.rows > 32) return error.ResourceLimitExceeded;
         tiles.uniform_spacing = try bits.flag();
         if (!tiles.uniform_spacing) {
-            for (0..tiles.columns - 1) |i| tiles.column_width[i] = try bits.ue() + 1;
-            for (0..tiles.rows - 1) |i| tiles.row_height[i] = try bits.ue() + 1;
+            for (0..tiles.columns - 1) |i| tiles.column_width[i] = try bits.ueBounded(std.math.maxInt(u32) - 1) + 1;
+            for (0..tiles.rows - 1) |i| tiles.row_height[i] = try bits.ueBounded(std.math.maxInt(u32) - 1) + 1;
         }
         tiles.loop_filter_across_tiles = try bits.flag();
     }
@@ -690,7 +692,7 @@ pub fn parsePps(bits: *Bits) !Pps {
     var scaling_list = ScalingListData{};
     if (scaling_list_data_present) scaling_list = try parseScalingListData(bits);
     const lists_modification_present = try bits.flag();
-    const log2_parallel_merge_level = try bits.ue() + 2;
+    const log2_parallel_merge_level = try bits.ueBounded(std.math.maxInt(u32) - 2) + 2;
     if (log2_parallel_merge_level > 10) return error.UnsupportedVideoProfile;
     const slice_segment_header_extension_present = try bits.flag();
     if (try bits.flag()) { // pps_extension_present_flag

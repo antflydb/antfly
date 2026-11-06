@@ -53,3 +53,6 @@ the display matrix. They aren't in `receipt.json`, because no reference hash app
 `hevc-hlg-nocolr.mp4` is `hevc-hlg.mp4` with its `colr` box renamed to `free`, so the
 HDR signal is only in the SPS. `lib/video/testdata/hevc-hlg-config.bin` is that
 clip's `hvcC` payload.
+
+`hevc-sar-nopasp.mp4` is a 64x64 x265 clip with `setsar=2/1` and its `pasp` box renamed
+to `free`, so its 2:1 pixel aspect is only in the SPS.

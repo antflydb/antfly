@@ -43,15 +43,19 @@ pub const Admission = struct {
     session: ?Session = null,
     explicit_scratch_limit: usize = 0,
 
-    fn acquire(self: Admission, additional_shared: bool) !Permit {
-        var permit: Permit = .{};
+    fn acquire(self: Admission, additional_shared: bool, reserved: Reservation) !Permit {
+        var permit: Permit = .{ .reservation = reserved };
         errdefer permit.deinit();
         if (self.run_budget) |budget| {
             permit.budget = budget;
             permit.previous_scratch_limit = budget.limits.scratch_limit_bytes;
-            if (budget.limits.scratch_limit_bytes != 0) budget.limits = try memory.withAutomaticScratchFloor(budget.limits, self.explicit_scratch_limit, budget.scratchTotalBytes(), portable_host_bytes);
-            try budget.reserveEstimate(hostEstimate());
-            permit.reserved = true;
+            if (budget.limits.scratch_limit_bytes != 0) budget.limits = try memory.withAutomaticScratchFloor(budget.limits, self.explicit_scratch_limit, budget.scratchTotalBytes(), reserved.host_bytes +| reserved.surface_bytes);
+            try budget.reserveEstimate(scratchEstimate(reserved.host_bytes, .host));
+            permit.reserved_host = true;
+            if (reserved.surface_bytes != 0) {
+                try budget.reserveEstimate(scratchEstimate(reserved.surface_bytes, .backend));
+                permit.reserved_surfaces = true;
+            }
         }
         // Non-CUDA serving requests already reserve portable host memory during
         // generation admission. CUDA acquires it only after a decoder rejection.
@@ -65,21 +69,46 @@ pub const Admission = struct {
 const Permit = struct {
     budget: ?*memory.RunBudget = null,
     previous_scratch_limit: usize = 0,
-    reserved: bool = false,
+    reservation: Reservation = .{},
+    reserved_host: bool = false,
+    reserved_surfaces: bool = false,
     shared: ?@import("../backends/session.zig").RunPermit = null,
 
     fn deinit(self: *Permit) void {
         if (self.shared) |*held| held.deinit();
         if (self.budget) |budget| {
-            if (self.reserved) budget.releaseEstimate(hostEstimate());
+            if (self.reserved_host) budget.releaseEstimate(scratchEstimate(self.reservation.host_bytes, .host));
+            if (self.reserved_surfaces) budget.releaseEstimate(scratchEstimate(self.reservation.surface_bytes, .backend));
             budget.limits.scratch_limit_bytes = self.previous_scratch_limit;
         }
         self.* = .{};
     }
 };
 
-fn hostEstimate() memory.Estimate {
-    return .{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = portable_host_bytes, .scratch_tier = .host };
+fn scratchEstimate(bytes: usize, tier: memory.ResidencyTier) memory.Estimate {
+    return .{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = bytes, .scratch_tier = tier };
+}
+
+/// Host indexing plus the prepared and displayed frames, without a portable decoder.
+const apple_hevc_host_bytes: usize = 64 * 1024 * 1024 + portable_frame_bytes;
+
+pub const Reservation = struct {
+    host_bytes: usize = portable_host_bytes,
+    /// VideoToolbox surfaces, which cache hits and portable budgets don't cover.
+    surface_bytes: usize = 0,
+};
+
+/// What this clip's route will hold on a host without NVDEC. Unreadable clips keep
+/// the portable reservation; decoding reports what's wrong with them.
+pub fn reservation(a: std.mem.Allocator, bytes: []const u8) Reservation {
+    if (@import("builtin").os.tag != .macos) return .{};
+    var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-reservation" };
+    var reader = media.mp4.Reader.init(a, &source, video.mp4_coded.limits) catch return .{};
+    defer reader.deinit();
+    if (reader.track.codec != .hevc or !video.apple_hevc.hasParameterSets(reader.track.codec_config)) return .{};
+    const surfaces = video.apple_hevc.surfaceBytes(reader.track) catch return .{};
+    if (surfaces > video.apple_hevc.max_surface_bytes) return .{};
+    return .{ .host_bytes = apple_hevc_host_bytes, .surface_bytes = std.math.cast(usize, surfaces) orelse return .{} };
 }
 
 pub fn encode(cb: *const ComputeBackend, admission: Admission, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
@@ -93,11 +122,11 @@ pub fn encode(cb: *const ComputeBackend, admission: Admission, a: std.mem.Alloca
             if (err != error.NvdecUnavailable and inputError(err) != error.InvalidVideoInput) return err;
             std.log.info("gemma4 video falling back to portable decoding: {s}", .{@errorName(err)});
         }
-        var permit = try admission.acquire(true);
+        var permit = try admission.acquire(true, .{});
         defer permit.deinit();
         return encodePortable(cb, a, projector, bytes);
     }
-    var permit = try admission.acquire(false);
+    var permit = try admission.acquire(false, reservation(a, bytes));
     defer permit.deinit();
     return encodePortable(cb, a, projector, bytes);
 }
@@ -146,7 +175,7 @@ test "gemma4 video portable admission enforces CLI host combined and scratch lim
     for (cases) |limits| {
         var budget = memory.RunBudget.init(limits);
         const admission = Admission{ .run_budget = &budget, .session = session, .explicit_scratch_limit = limits.scratch_limit_bytes };
-        try std.testing.expectError(error.MemoryBudgetExceeded, admission.acquire(true));
+        try std.testing.expectError(error.MemoryBudgetExceeded, admission.acquire(true, .{}));
         try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
         try std.testing.expectEqual(limits, budget.limits);
     }
@@ -165,7 +194,7 @@ test "gemma4 video portable admission refunds both owners and restores automatic
     try budget.reserveEstimate(base);
     const Probe = struct {
         fn decode(admission: Admission) !void {
-            var permit = try admission.acquire(true);
+            var permit = try admission.acquire(true, .{});
             defer permit.deinit();
             try std.testing.expectEqual(portable_host_bytes, admission.run_budget.?.host_scratch_bytes);
             try std.testing.expectEqual(portable_host_bytes, admission.session.?.run_admission.?.controller.snapshot().host_scratch_bytes);
@@ -191,11 +220,11 @@ test "gemma4 video portable admission rolls back local capacity on shared denial
     defer existing.deinit();
     var budget = memory.RunBudget.init(.{ .scratch_limit_bytes = 1024 });
     const admission = Admission{ .run_budget = &budget, .session = session };
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, admission.acquire(true));
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, admission.acquire(true, .{}));
     try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 1024), budget.limits.scratch_limit_bytes);
     // Non-CUDA serving admission already holds the shared host reservation.
-    var permit = try admission.acquire(false);
+    var permit = try admission.acquire(false, .{});
     try std.testing.expectEqual(portable_host_bytes, budget.host_scratch_bytes);
     try std.testing.expectEqual(portable_host_bytes, controller.snapshot().host_scratch_bytes);
     permit.deinit();
@@ -407,6 +436,50 @@ test "gemma4 video decodes HEVC in MP4 at FFmpeg's timestamps" {
     try embedding_video.observeConfigured(a, bytes, null, .{}, .{ .observer = .{ .context = &count, .accept = Count.accept }, .sampling = sampling, .pool = &pool });
     try std.testing.expectEqual(timestamps.len, count.frames);
     try std.testing.expectEqual(@as(u32, 192), count.width);
+}
+
+test "gemma4 video reserves VideoToolbox surfaces for HEVC, not a portable pool" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/codecs/hevc-10bit.mp4");
+    const reserved = reservation(a, bytes);
+    try std.testing.expectEqual(apple_hevc_host_bytes, reserved.host_bytes);
+    try std.testing.expect(reserved.surface_bytes != 0);
+    const generation = @import("generation.zig");
+    const messages = [_]generation.Message{.{ .role = "user", .content = "describe", .video_bytes = bytes }};
+    const admitted = try generation.nativeGenerationMediaAdmissionForBackend(a, "", &messages, .{ .family = .gemma }, .generic);
+    try std.testing.expectEqual(reserved.host_bytes, admitted.host_scratch_bytes);
+    try std.testing.expectEqual(reserved.surface_bytes, admitted.backend_scratch_bytes);
+    // Surfaces at 4K Main 10 are the case the portable budget undercounted.
+    var track = media.mp4.Track{ .id = 1, .timescale = 1000, .width = 3840, .height = 2160, .avcc = &.{}, .nal_length_bytes = 4, .display_matrix = .{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 } };
+    var config = @as([23]u8, @splat(0));
+    config[0] = 1;
+    config[16] = 1;
+    config[17] = 2;
+    config[18] = 2;
+    track.codec_config = &config;
+    try std.testing.expect(try video.apple_hevc.surfaceBytes(track) > portable_host_bytes);
+    // Other codecs and unreadable clips keep the portable reservation.
+    try std.testing.expectEqual(@as(usize, 0), reservation(a, @embedFile("../testdata/video/codecs/av1.mp4")).surface_bytes);
+    try std.testing.expectEqual(portable_host_bytes, reservation(a, "not a video").host_bytes);
+}
+
+test "gemma4 video surface reservations honor an explicit scratch cap and release cleanly" {
+    const reserved = Reservation{ .host_bytes = 1024, .surface_bytes = 4096 };
+    var capped = memory.RunBudget.init(.{ .scratch_limit_bytes = 2048 });
+    const refused = Admission{ .run_budget = &capped, .explicit_scratch_limit = 2048 };
+    try std.testing.expectError(error.MemoryBudgetExceeded, refused.acquire(false, reserved));
+    try std.testing.expectEqual(@as(usize, 0), capped.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), capped.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 2048), capped.limits.scratch_limit_bytes);
+    var automatic = memory.RunBudget.init(.{ .scratch_limit_bytes = 2048 });
+    const grows = Admission{ .run_budget = &automatic };
+    var permit = try grows.acquire(false, reserved);
+    try std.testing.expectEqual(@as(usize, 1024), automatic.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 4096), automatic.backend_scratch_bytes);
+    permit.deinit();
+    try std.testing.expectEqual(@as(usize, 0), automatic.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 2048), automatic.limits.scratch_limit_bytes);
 }
 
 test "gemma4 video names the missing HEVC route instead of calling the clip corrupt" {

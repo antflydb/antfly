@@ -89,3 +89,98 @@ test "A record without parameter sets carries no signal" {
     config[21] = 3;
     try std.testing.expect((try parse(std.testing.allocator, &config)) == null);
 }
+
+/// Writes `bits` of `source` from `start`, into a byte buffer being built.
+const BitWriter = struct {
+    bytes: []u8,
+    position: usize = 0,
+    fn put(self: *BitWriter, bit: u1) void {
+        const byte = self.position / 8;
+        const mask = @as(u8, 0x80) >> @intCast(self.position % 8);
+        if (bit == 1) self.bytes[byte] |= mask else self.bytes[byte] &= ~mask;
+        self.position += 1;
+    }
+};
+
+/// A NAL payload can't hold a long run of zeros without emulation prevention.
+fn escaped(a: std.mem.Allocator, raw: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    var zeros: usize = 0;
+    for (raw) |byte| {
+        if (zeros == 2 and byte <= 3) {
+            try out.append(a, 3);
+            zeros = 0;
+        }
+        try out.append(a, byte);
+        zeros = if (byte == 0) zeros + 1 else 0;
+    }
+    return out.toOwnedSlice(a);
+}
+
+test "A huge Exp-Golomb value anywhere in real parameter sets is an error, not a panic" {
+    const a = std.testing.allocator;
+    const record = try nal.parseConfigurationRecord(@embedFile("../testdata/hevc-hlg-config.bin"));
+    var sets: [2][]const u8 = undefined;
+    var arrays = record.arrays();
+    while (try arrays.next()) |array| {
+        var nals = array.nals;
+        const unit = (try nals.next()) orelse continue;
+        if (array.nal_unit_type == 33) sets[0] = (try nal.parseHeader(unit)).rbsp;
+        if (array.nal_unit_type == 34) sets[1] = (try nal.parseHeader(unit)).rbsp;
+    }
+    const buffer = try a.alloc(u8, @max(sets[0].len, sets[1].len) + 16);
+    defer a.free(buffer);
+    for (sets, 0..) |set, kind| {
+        for (0..set.len * 8) |offset| {
+            // Leading zeros then 32 one bits: the largest value ue(v) can return.
+            var writer = BitWriter{ .bytes = buffer };
+            for (0..offset) |bit| writer.put(@intCast((set[bit / 8] >> @intCast(7 - bit % 8)) & 1));
+            for (0..31) |_| writer.put(0);
+            for (0..32) |_| writer.put(1);
+            for (offset..set.len * 8) |bit| writer.put(@intCast((set[bit / 8] >> @intCast(7 - bit % 8)) & 1));
+            const payload = try escaped(a, buffer[0 .. (writer.position + 7) / 8]);
+            defer a.free(payload);
+            var bits = bits_mod.Bits.init(a, payload) catch continue;
+            defer bits.deinit();
+            if (kind == 0) {
+                _ = params.parseSps(&bits) catch continue;
+            } else {
+                _ = params.parsePps(&bits) catch continue;
+            }
+        }
+    }
+}
+
+test "An SPS depth of 0xfffffffe is refused" {
+    const a = std.testing.allocator;
+    var bytes = @as([64]u8, @splat(0));
+    var writer = BitWriter{ .bytes = &bytes };
+    const ue = struct {
+        fn put(w: *BitWriter, value: u64) void {
+            const coded = value + 1;
+            const width: u7 = @intCast(64 - @clz(coded));
+            for (0..width - 1) |_| w.put(0);
+            var bit: u7 = width;
+            while (bit != 0) {
+                bit -= 1;
+                w.put(@intCast((coded >> @intCast(bit)) & 1));
+            }
+        }
+    }.put;
+    for (0..4) |_| writer.put(0); // sps_video_parameter_set_id
+    for (0..3) |_| writer.put(0); // sps_max_sub_layers_minus1
+    writer.put(1); // sps_temporal_id_nesting_flag
+    for (0..96) |_| writer.put(0); // profile_tier_level, general fields and level
+    ue(&writer, 0); // sps_seq_parameter_set_id
+    ue(&writer, 1); // chroma_format_idc
+    ue(&writer, 64); // pic_width
+    ue(&writer, 64); // pic_height
+    writer.put(0); // conformance_window_flag
+    ue(&writer, 0xfffffffe); // bit_depth_luma_minus8
+    const payload = try escaped(a, bytes[0 .. (writer.position + 7) / 8]);
+    defer a.free(payload);
+    var bits = try bits_mod.Bits.init(a, payload);
+    defer bits.deinit();
+    try std.testing.expectError(error.MalformedVideoPacket, params.parseSps(&bits));
+}
