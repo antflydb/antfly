@@ -56082,7 +56082,15 @@ fn quantizedSingleRecipe(self: *NativeCompute, tensor: CT, descriptor: *const op
     return quantizedSingleRecipeWithPlan(self, tensor, descriptor, null);
 }
 fn quantizedSingleRecipeWithPlan(self: *NativeCompute, tensor: CT, descriptor: *const ops.kernel_descriptor.Descriptor, frozen_plan: ?ops.OperatorPlan) !?QuantizedSingleRecipe {
-    if (descriptor.operation != .linear or !nativeResidentDenseLinearRouteSupported(self, descriptor)) return null;
+    return quantizedSingleRecipeForGeometry(self, tensor, descriptor, frozen_plan, false);
+}
+
+fn quantizedSingleRecipeForGeometry(self: *NativeCompute, tensor: CT, descriptor: *const ops.kernel_descriptor.Descriptor, frozen_plan: ?ops.OperatorPlan, comptime validated_linear_geometry: bool) !?QuantizedSingleRecipe {
+    if (comptime validated_linear_geometry) {
+        // Only a private route's factory-validated copied descriptor reaches
+        // this specialization. Mutable backend policy remains a live guard.
+        if (!nativeResidentDenseLinearPolicySupported(self)) return null;
+    } else if (descriptor.operation != .linear or !nativeResidentDenseLinearRouteSupported(self, descriptor)) return null;
     const linear = descriptor.operation.linear;
     if (linear.rows != 1 or linear.bias or self.quantized_activation_policy != .automatic) return null;
     ResidentWeightPreparation.lock(self.data);
@@ -56145,13 +56153,18 @@ const QuantizedSingleRoute = struct {
     fn sameSlot(self: *const @This(), slot: @import("../execution/kernel_route.zig").OutputSlot) bool {
         return slot.allocation == self.slot.allocation and slot.node == self.slot.node and slot.epoch == self.slot.epoch and slot.logical.eq(self.slot.logical);
     }
+    fn currentRecipe(self: *const @This(), weight: CT) !?QuantizedSingleRecipe {
+        const compute: *NativeCompute = @ptrCast(@alignCast(self.backend.ptr));
+        // Factory selection performed the complete generic shape check before
+        // copying descriptor. Never substitute an incoming descriptor here.
+        return quantizedSingleRecipeForGeometry(compute, weight, &self.descriptor, self.recipe.operator_plan, true);
+    }
     fn matches(raw: *anyopaque, request: @import("../execution/kernel_route.zig").Validate) bool {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (!self.sameSlot(request.output) or request.inputs.len != 2) return false;
         if (!@import("../execution/assigned_kernel_route.zig").bindingDense(self.backend, request.inputs[0], self.descriptor.input_shapes[0])) return false;
         const weight = self.tensor(request.inputs[1]) orelse return false;
-        const compute: *NativeCompute = @ptrCast(@alignCast(self.backend.ptr));
-        const actual = (quantizedSingleRecipeWithPlan(compute, weight, &self.descriptor, self.recipe.operator_plan) catch return false) orelse return false;
+        const actual = (self.currentRecipe(weight) catch return false) orelse return false;
         return std.meta.eql(actual, self.recipe);
     }
     fn validate(raw: *anyopaque, request: @import("../execution/kernel_route.zig").Validate) !void {
@@ -56163,8 +56176,7 @@ const QuantizedSingleRoute = struct {
     }
     fn validateInvocation(self: *const @This(), invocation: ops.kernel_descriptor.Invocation) !void {
         if (!std.meta.eql(self.descriptor, invocation.descriptor.*) or invocation.inputs.len != 2) return error.PreparedKernelBindingChanged;
-        const compute: *NativeCompute = @ptrCast(@alignCast(self.backend.ptr));
-        const actual = (try quantizedSingleRecipeWithPlan(compute, invocation.inputs[1], invocation.descriptor, self.recipe.operator_plan)) orelse return error.PreparedKernelBindingChanged;
+        const actual = (try self.currentRecipe(invocation.inputs[1])) orelse return error.PreparedKernelBindingChanged;
         if (!std.meta.eql(actual, self.recipe)) return error.PreparedKernelBindingChanged;
         if (invocation.operatorPlan()) |supplied| if (!std.meta.eql(supplied, self.recipe.operator_plan)) return error.PreparedKernelBindingChanged;
         const output_ct = invocation.output orelse return;
@@ -56420,9 +56432,13 @@ fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../execution/kernel_r
     return .{ .context = selected, .implementation = .{ .context = self, .table = implementation.table, .policy_epoch = @intFromBool(use_blas) | (@as(u64, @intFromBool(self.cache_embeddinggemma2_bf16_weights)) << 1) }, .key = hasher.final(), .requirements = .{ .primary_bytes = try std.math.mul(usize, descriptor.elements(), 4), .profile = @backingInt(family), .workspace = .{ .host_byte_size = workspace.byte_size }, .host_alignment = SourceLinearWorkspacePlan.alignment }, .vtable = &NativeSourceRoute.vtable };
 }
 
+fn nativeResidentDenseLinearPolicySupported(self: *const NativeCompute) bool {
+    return !self.cache_embeddinggemma2_bf16_weights;
+}
+
 fn nativeResidentDenseLinearRouteSupported(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
     const self: *NativeCompute = @ptrCast(@alignCast(ctx));
-    if (descriptor.operation != .linear or self.cache_embeddinggemma2_bf16_weights) return false;
+    if (descriptor.operation != .linear or !nativeResidentDenseLinearPolicySupported(self)) return false;
     const linear = descriptor.operation.linear;
     if (linear.rows == 0 or linear.in_dim == 0 or linear.out_dim == 0 or descriptor.input_count != @as(u8, if (linear.bias) 3 else 2)) return false;
     if (!descriptor.output_shape.eq(@import("ml").graph.Shape.init(.f32, &.{ linear.rows, linear.out_dim })) or !descriptor.input_shapes[0].eq(@import("ml").graph.Shape.init(.f32, &.{ linear.rows, linear.in_dim })) or !descriptor.input_shapes[1].eq(@import("ml").graph.Shape.init(.f32, &.{ linear.out_dim, linear.in_dim }))) return false;
@@ -58721,6 +58737,48 @@ fn nativeResidentColdPreparationOomCase(a: std.mem.Allocator) !void {
     try std.testing.expectEqual(prepared_bytes, data.tier_cache.?.host_bytes);
     try std.testing.expect(prepared_bytes != 0);
     try std.testing.expect((try NativeCompute.snapshotResidentWeightPreparation(&cb, &data, key)) == null);
+
+    // The private receiving route reuses only copied static geometry. Its
+    // actual source and every mutable policy still cross the original guard.
+    const weight = try getWeight(&compute, key);
+    defer freeTensor(&compute, weight);
+    const input = try cb.fromFloat32Shape(&@as([32]f32, @splat(1)), &.{ 1, 32 });
+    defer cb.free(input);
+    const ml = @import("ml");
+    const route = @import("../execution/kernel_route.zig");
+    const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .linear = .{ .rows = 1, .in_dim = 32, .out_dim = 4, .bias = false } }, .output_shape = ml.graph.Shape.init(.f32, &.{ 1, 4 }), .input_shapes = .{ ml.graph.Shape.init(.f32, &.{ 1, 32 }), ml.graph.Shape.init(.f32, &.{ 4, 32 }), .{} }, .input_count = 2 };
+    const facts = [_]route.Binding{ .{ .imported_host = .{ .logical = descriptor.input_shapes[0], .target = .native } }, .{ .tensor = .{ .value = weight, .implementation = .{ .context = cb.ptr, .table = cb.vtable } } } };
+    const slot = route.OutputSlot{ .node = 3, .allocation = 5, .epoch = 7, .logical = descriptor.output_shape, .writable_bytes = 16 };
+    var selected = (try prepareQuantizedSingleRoute(&compute, cb, .{ .allocator = a, .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .descriptor = &descriptor, .inputs = &facts, .output = slot })) orelse return error.MissingPreparedKernelRoute;
+    defer selected.deinit();
+    const owner: *const QuantizedSingleRoute = @ptrCast(@alignCast(selected.context));
+    const current = route.Validate{ .inputs = &facts, .output = slot };
+    const invocation = ops.kernel_descriptor.Invocation{ .descriptor = &descriptor, .inputs = &.{ input, weight } };
+    try selected.validate(current);
+    try owner.validateInvocation(invocation);
+    const generic = (try quantizedSingleRecipeWithPlan(&compute, weight, &descriptor, owner.recipe.operator_plan)) orelse return error.MissingPreparedKernelRoute;
+    try std.testing.expect(std.meta.eql(generic, (try owner.currentRecipe(weight)).?));
+    var changed = descriptor;
+    changed.output_shape = ml.graph.Shape.init(.f32, &.{ 1, 5 });
+    try std.testing.expect((try quantizedSingleRecipeWithPlan(&compute, weight, &changed, owner.recipe.operator_plan)) == null);
+    var changed_invocation = invocation;
+    changed_invocation.descriptor = &changed;
+    try std.testing.expectError(error.PreparedKernelBindingChanged, owner.validateInvocation(changed_invocation));
+    changed = descriptor;
+    changed.input_shapes[0].dtype = .bf16;
+    try std.testing.expect((try quantizedSingleRecipeWithPlan(&compute, weight, &changed, owner.recipe.operator_plan)) == null);
+    compute.cache_embeddinggemma2_bf16_weights = true;
+    defer compute.cache_embeddinggemma2_bf16_weights = false;
+    try std.testing.expectError(error.PreparedKernelBindingChanged, selected.validate(current));
+    try std.testing.expectError(error.PreparedKernelBindingChanged, owner.validateInvocation(invocation));
+    compute.cache_embeddinggemma2_bf16_weights = false;
+    compute.quantized_activation_policy = .strict_f32;
+    defer compute.quantized_activation_policy = .automatic;
+    try std.testing.expectError(error.PreparedKernelBindingChanged, selected.validate(current));
+    try std.testing.expectError(error.PreparedKernelBindingChanged, owner.validateInvocation(invocation));
+    compute.quantized_activation_policy = .automatic;
+    try selected.validate(current);
+    try owner.validateInvocation(invocation);
 }
 
 test "Native selected resident KBlock cold preparation uses original transactional body and unwinds all allocation failures" {

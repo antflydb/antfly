@@ -2886,7 +2886,7 @@ pub fn qwenWorkspaceLanePolicy(session: Session) ?bool {
 
 /// Lane order is an immutable ACTUAL model fact, including value-copy
 /// forwarding headers retaining the original published provider/Model owner.
-pub fn gemmaWorkspaceLanePolicy(session: Session) ?bool {
+fn publishedArchitectureOwner(session: Session) ?*const ArchSession {
     const owner: *const ArchSession = actual: {
         if (session.compute_backend_provider) |provider| {
             if (session.model_lifetime) |model| {
@@ -2900,10 +2900,45 @@ pub fn gemmaWorkspaceLanePolicy(session: Session) ?bool {
             }
         }
         if (session.vtable != &arch_vtable) return null;
+        if (session.model_lifetime) |model| {
+            if (model.destroy_fn != archClose or model.quiesce_fn != archQuiesce or model.owner != session.ptr) return null;
+        }
         break :actual @ptrCast(@alignCast(session.ptr));
     };
     if (session.model_lifetime) |model| if (&owner.model_lifetime != model) return null;
+    return owner;
+}
+
+pub fn gemmaWorkspaceLanePolicy(session: Session) ?bool {
+    const owner = publishedArchitectureOwner(session) orelse return null;
     return owner.arch_config == .embedding_gemma2;
+}
+
+/// Immutable actual-model backend, retaining forwarded provider authority.
+/// No public callback or transient wrapper implementation is dereferenced.
+/// This is metadata only; it never certifies a public output callback.
+pub fn publishedModelBackend(session: Session) ?BackendType {
+    // Full endpoint identity precedes opaque Model access. Forwarders retain
+    // the original typed provider; a copied public table alone grants nothing.
+    const original_provider = if (session.compute_backend_provider) |provider| provider.services == &archComputeServices else false;
+    if (session.vtable != &arch_vtable and !original_provider) return null;
+    const model = session.model_lifetime orelse return null;
+    if (model.destroy_fn != archClose or model.quiesce_fn != archQuiesce) return null;
+    // The canonical public table will dispatch with THIS receiver. A valid
+    // provider may forward metadata for a custom wrapper, but cannot repair
+    // an unrelated receiver paired with our own direct callbacks.
+    if (session.vtable == &arch_vtable and model.owner != session.ptr) return null;
+    const owner = publishedArchitectureOwner(session) orelse return null;
+    return owner.backend_type;
+}
+
+/// Reject inconsistent headers only for this owner's recognized endpoint or
+/// typed provider. Unknown custom/imported owners retain their own contract;
+/// a null architecture query must not turn a known invalid owner into one.
+pub fn hasInvalidPublishedModelHeader(session: Session) bool {
+    const original_provider = if (session.compute_backend_provider) |provider| provider.services == &archComputeServices else false;
+    if (session.vtable != &arch_vtable and !original_provider) return false;
+    return publishedModelBackend(session) == null;
 }
 
 /// Exact resident callback/config geometry for the generic public CUDA text
@@ -14992,7 +15027,7 @@ test "Gemma actual forwarded Model lane policy cannot be relabelled by copied me
             return error.UnexpectedGemmaLaneMath;
         }
         fn info(_: *anyopaque) []const @import("../backends/tensor.zig").TensorInfo {
-            return &.{};
+            return &.{.{ .name = "embeddings", .dtype = .f32, .shape = &.{ 1, 768 } }};
         }
         fn backend(_: *anyopaque) BackendType {
             return .metal;
@@ -15001,11 +15036,58 @@ test "Gemma actual forwarded Model lane policy cannot be relabelled by copied me
         const table: Session.VTable = .{ .run = run, .inputInfo = info, .outputInfo = info, .backend = backend, .close = close };
     };
     var actual: ArchSession = undefined;
+    actual.backend_type = .metal;
     actual.arch_config = .{ .embedding_gemma2 = undefined }; // no payload field read by immutable classification
     actual.model_lifetime = .{ .owner = &actual, .destroy_fn = archClose, .quiesce_fn = archQuiesce };
     var marker: u8 = 0;
-    var session: Session = .{ .ptr = &marker, .vtable = &Probe.table, .model_lifetime = &actual.model_lifetime, .compute_backend_provider = .{ .ptr = &actual, .services = &archComputeServices } };
+    var session: Session = .{ .ptr = &marker, .vtable = &Probe.table, .model_lifetime = &actual.model_lifetime, .compute_backend_provider = .{ .ptr = &actual, .services = &archComputeServices }, .model_contract = .{ .task = .generic, .resolved = true } };
     try std.testing.expectEqual(@as(?bool, true), gemmaWorkspaceLanePolicy(session));
+    try std.testing.expectEqual(@as(?BackendType, .metal), publishedModelBackend(session));
+    try std.testing.expect(!hasInvalidPublishedModelHeader(session));
+    const unrelated = Session{ .ptr = @ptrFromInt(16), .vtable = &Probe.table };
+    try std.testing.expect(!hasInvalidPublishedModelHeader(unrelated));
+    // Forwarding the retaining Model/provider keeps its real Metal eligibility
+    // even though the wrapper implementation and callback table are different.
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    actual.model_lifetime.admission_domain = domain.pin();
+    defer actual.model_lifetime.admission_domain.?.release();
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    var pipeline = @import("../pipelines/embedding.zig").EmbeddingPipeline.init(std.testing.allocator, session, undefined, .{ .resident_text_encoder = true, .normalize = true, .pooling = .mean, .embedding_gemma2_dimensions = 768 });
+    try std.testing.expect(pipeline.canEmbedOwned());
+    // An actual CUDA Model cannot be relabelled by the wrapper's Metal hint.
+    // Its generic owned entry requires the existing exact callback geometry.
+    actual.backend_type = .cuda;
+    try std.testing.expectEqual(@as(?BackendType, .cuda), publishedModelBackend(session));
+    try std.testing.expect(!pipeline.canEmbedOwned());
+    var copied_table = arch_vtable;
+    pipeline.session.vtable = &copied_table;
+    pipeline.session.ptr = @ptrFromInt(16);
+    try std.testing.expect(!pipeline.canEmbedOwned());
+    try std.testing.expectError(error.UnsupportedOwnedEmbeddingEntry, pipeline.embedOwned(&.{"must not tokenize or dispatch"}, .{ .outside_execution = true }));
+    // The canonical table does not grant authority to inspect a missing or
+    // unrelated receiver. Owned eligibility refuses before ANY callback/cast.
+    pipeline.session.vtable = &arch_vtable;
+    // Even an unchanged genuine provider cannot authorize our canonical
+    // callbacks on a different public receiver. All backend kinds refuse.
+    inline for (.{ BackendType.native, BackendType.metal, BackendType.cuda }) |kind| {
+        actual.backend_type = kind;
+        try std.testing.expect(publishedModelBackend(pipeline.session) == null);
+        try std.testing.expect(hasInvalidPublishedModelHeader(pipeline.session));
+        try std.testing.expect(!pipeline.canEmbedOwned());
+    }
+    pipeline.session.compute_backend_provider = null;
+    try std.testing.expect(publishedModelBackend(pipeline.session) == null);
+    try std.testing.expectEqual(@as(?bool, null), gemmaWorkspaceLanePolicy(pipeline.session));
+    try std.testing.expect(hasInvalidPublishedModelHeader(pipeline.session));
+    try std.testing.expect(!pipeline.canEmbedOwned());
+    var lane: @import("../execution_control.zig").ExecutionLane = .{};
+    pipeline.execution_lane = &lane;
+    try std.testing.expect(!pipeline.canEmbedOwned());
+    pipeline.session.model_lifetime = null;
+    try std.testing.expect(publishedModelBackend(pipeline.session) == null);
+    try std.testing.expect(!pipeline.canEmbedOwned());
+    try std.testing.expectError(error.UnsupportedOwnedEmbeddingEntry, pipeline.embedOwned(&.{"must not tokenize or dispatch"}, .{ .outside_execution = true }));
     var wrong = actual.model_lifetime;
     session.model_lifetime = &wrong;
     try std.testing.expectEqual(@as(?bool, null), gemmaWorkspaceLanePolicy(session));

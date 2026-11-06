@@ -413,8 +413,14 @@ pub const EmbeddingPipeline = struct {
     /// Cold eligibility only; a decline means no encoder was attempted.
     /// Unknown lane/workspace geometries keep their separately-owned adapter.
     pub fn canEmbedOwned(self: *const EmbeddingPipeline) bool {
+        // A published owning entry needs the primary retaining Model before
+        // resolving any provider, architecture policy or public callback.
+        if (self.session.model_lifetime == null or @import("../execution/architecture_session.zig").hasInvalidPublishedModelHeader(self.session)) return false;
         if ((self.execution_lane != null and !self.usesLateWorkspaceLaneProtocol()) or self.execution_lane_held or self.execution_gate_held or self.gemma_workspace != null) return false;
-        if (session_factory.getEmbeddingGemma2Config(self.session) != null and !self.gemmaOwnedTextEligible()) return false;
+        // Classify the retained Model through its typed provider, not an
+        // optional config getter hidden by a copied/forwarded public table.
+        // Losing that getter must never authorize the generic owned route.
+        if (self.usesGemmaWorkspaceLaneProtocol() and !self.gemmaOwnedTextEligible()) return false;
         const source = self.textEncodingSession();
         const policy = source.run_admission orelse return false;
         const model = source.model_lifetime orelse return false;
@@ -908,7 +914,8 @@ pub const EmbeddingPipeline = struct {
         return result;
     }
     fn gemmaOwnedTextEligible(self: *const EmbeddingPipeline) bool {
-        const selected = switch (self.session.backend()) {
+        const backend = @import("../execution/architecture_session.zig").publishedModelBackend(self.session) orelse return false;
+        const selected = switch (backend) {
             .native, .metal => true,
             .cuda => if (@import("../execution/architecture_session.zig").gemmaCudaOwnedTextWidth(self.session)) |width| self.config.embedding_gemma2_dimensions <= width else false,
             else => false,
@@ -918,7 +925,7 @@ pub const EmbeddingPipeline = struct {
             // Canonical CUDA already returns its original normalized 768-F32
             // head for either pipeline option. normalize=false only suppresses
             // the later prefix L2; it changes no encoder/source/kernel path.
-            self.residentTextEncoderEnabled() and (self.config.normalize or self.session.backend() == .cuda) and self.config.pooling == .mean and
+            self.residentTextEncoderEnabled() and (self.config.normalize or backend == .cuda) and self.config.pooling == .mean and
             self.text_projection == null;
     }
     fn embedGemma2TextsOwned(self: *EmbeddingPipeline, texts: []const []const u8) !session_mod.OwnedHostVectors {

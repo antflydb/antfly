@@ -18,7 +18,8 @@
 //! boundaries; dispatch admission and compute policy stay with the caller.
 const std = @import("std");
 const cpu = @import("quant_kernel_cpu_source.zig");
-const Pipeline = struct { name: []const u8, allocator: []const u8, allocation_len: []const u8, indent: usize, else_branch: bool, quantified: bool, compute: []const u8 };
+const Consumer = enum { inline_quantization, prepared_pair, prepared_single };
+const Pipeline = struct { name: []const u8, allocator: []const u8, allocation_len: []const u8, indent: usize, else_branch: bool, quantified: bool, consumer: Consumer = .inline_quantization, assigned_workspace: bool = false, compute: []const u8 = "" };
 pub const owners = .{ Owner(0), Owner(1), Owner(2), Owner(3), Owner(4), Owner(5), Owner(6), Owner(7) };
 fn Owner(comptime index: usize) type {
     return struct {
@@ -29,6 +30,11 @@ fn Owner(comptime index: usize) type {
         pub fn render(allocator: std.mem.Allocator) ![]u8 {
             var out = cpu.Emitter{ .allocator = allocator };
             defer out.bytes.deinit(allocator);
+            if (pipeline.assigned_workspace) {
+                try out.raw("if (activation_workspace) |q_input| {\nif (q_input.len != q_input_len) return error.InvalidAssignedHostWorkspace;\n");
+                try emitConsumer(&out, pipeline, true);
+                try out.raw("} else ");
+            }
             try out.raw("if (q_input_len <= q8_k_activation_stack_max_bytes) {\n");
             for ([_]bool{ true, false }) |stack| {
                 if (stack) {
@@ -39,12 +45,14 @@ fn Owner(comptime index: usize) type {
                     try out.add("const q_input = try {s}.alloc(u8, {s});\ndefer {s}.free(q_input);\n", .{ pipeline.allocator, pipeline.allocation_len, pipeline.allocator });
                     if (pipeline.quantified) try out.raw("noteNativeQuantPhase(.q8k_activation_alloc, alloc_start);\n");
                 }
-                if (pipeline.quantified) try out.raw("const quant_start = nativeQuantPhaseStart();\n");
-                if (stack and !pipeline.else_branch) try out.raw("if (rows == 1) {\nquantizeQ8_KActivationRows(input, q_input, rows, in_dim, row_blocks);\n} else {\n");
-                try out.raw("try quantizeQ8_KActivationRowsDispatch(io, input, q_input, rows, in_dim, row_blocks);\n");
-                if (stack and !pipeline.else_branch) try out.raw("}\n");
-                if (pipeline.quantified) try out.raw("noteNativeQuantPhase(.q8k_activation_quant, quant_start);\n");
-                try out.raw(pipeline.compute);
+                if (pipeline.consumer == .inline_quantization) {
+                    if (pipeline.quantified) try out.raw("const quant_start = nativeQuantPhaseStart();\n");
+                    if (stack and !pipeline.else_branch) try out.raw("if (rows == 1) {\nquantizeQ8_KActivationRows(input, q_input, rows, in_dim, row_blocks);\n} else {\n");
+                    try out.raw("try quantizeQ8_KActivationRowsDispatch(io, input, q_input, rows, in_dim, row_blocks);\n");
+                    if (stack and !pipeline.else_branch) try out.raw("}\n");
+                    if (pipeline.quantified) try out.raw("noteNativeQuantPhase(.q8k_activation_quant, quant_start);\n");
+                }
+                try emitConsumer(&out, pipeline, stack);
                 if (stack and !pipeline.else_branch) try out.raw("return;\n");
             }
             if (pipeline.else_branch) try out.raw("}\n");
@@ -52,12 +60,18 @@ fn Owner(comptime index: usize) type {
         }
     };
 }
+/// Preserve the existing numerical helper and its original packing schedule;
+/// only lexical assigned/stack/heap ownership is emitted by this renderer.
+fn emitConsumer(out: *cpu.Emitter, pipeline: Pipeline, stack: bool) !void {
+    switch (pipeline.consumer) {
+        .inline_quantization => try out.raw(pipeline.compute),
+        .prepared_pair => try out.raw("try runPreparedKBlockPairActivation(io, input, q_input, storage_a, storage_b, output_a, output_b, rows, in_dim, out_dim, known);\n"),
+        .prepared_single => try out.add("try runPreparedKBlockSingleActivation(io, input, q_input, prepared_blocks, panel_blocks, panel8_blocks, panel16_blocks, bias, output, rows, in_dim, out_dim, known, {s});\n", .{if (stack) "false" else "true"}),
+    }
+}
+
 const pipelines = [_]Pipeline{
-    .{ .name = "linearNoBiasQuantizedPair pipeline 1", .allocator = "allocator", .allocation_len = "q_input_len", .else_branch = true, .quantified = true, .indent = 16, .compute =
-    \\const compute_start = nativeQuantPhaseStart();
-    \\try linearKPreparedQ8KActivationPairDispatch(false, io, q_input, storage_a.preparedBytes(.row_major_blocks).?, storage_a.preparedBytes(.panel4), storage_a.preparedBytes(.panel8), storage_a.preparedBytes(.panel16), output_a, storage_b.preparedBytes(.row_major_blocks).?, storage_b.preparedBytes(.panel4), storage_b.preparedBytes(.panel8), storage_b.preparedBytes(.panel16), output_b, rows, in_dim, out_dim, known);
-    \\noteNativeQuantPhase(.q4q5_q8k_pair_compute, compute_start);
-    },
+    .{ .name = "linearNoBiasQuantizedPair pipeline 1", .allocator = "allocator", .allocation_len = "q_input_len", .else_branch = true, .quantified = true, .indent = 16, .consumer = .prepared_pair, .assigned_workspace = true },
     .{ .name = "linearNoBiasQuantizedPair pipeline 2", .allocator = "allocator", .allocation_len = "q_input_len", .else_branch = true, .quantified = true, .indent = 16, .compute =
     \\try linearKPreparedQ8KActivationPairDispatch(true, io, q_input, storage_a.preparedBytes(.row_major_blocks).?, storage_a.preparedBytes(.panel4), storage_a.preparedBytes(.panel8), panel16_a, output_a, storage_b.preparedBytes(.row_major_blocks).?, storage_b.preparedBytes(.panel4), storage_b.preparedBytes(.panel8), panel16_b, output_b, rows, in_dim, out_dim, null);
     },
@@ -85,11 +99,7 @@ const pipelines = [_]Pipeline{
     .{ .name = "linearNoBiasQ6KPreparedQ8KActivation pipeline 1", .allocator = "allocator", .allocation_len = "rows * row_blocks * q8_block_size", .else_branch = false, .quantified = true, .indent = 4, .compute =
     \\try linearQ6KPreparedQ8KActivationDispatch(io, q_input, prepared_blocks, panel_blocks, panel8_blocks, panel16_blocks, output, rows, in_dim, out_dim);
     },
-    .{ .name = "linearNoBiasQ4Q5KPreparedQ8KActivation pipeline 1", .allocator = "allocator", .allocation_len = "rows * row_blocks * q8_block_size", .else_branch = false, .quantified = true, .indent = 4, .compute =
-    \\const compute_start = nativeQuantPhaseStart();
-    \\try linearQ4Q5KPreparedQ8KActivationDispatch(io, q_input, prepared_blocks, panel_blocks, panel8_blocks, panel16_blocks, bias, output, rows, in_dim, out_dim, known);
-    \\noteNativeQuantPhase(.q4q5_q8k_compute, compute_start);
-    },
+    .{ .name = "linearNoBiasQ4Q5KPreparedQ8KActivation pipeline 1", .allocator = "allocator", .allocation_len = "rows * row_blocks * q8_block_size", .else_branch = false, .quantified = true, .indent = 4, .consumer = .prepared_single },
 };
 
 test "activation pipelines retain allocation scope and exactly one free" {
@@ -97,6 +107,20 @@ test "activation pipelines retain allocation scope and exactly one free" {
         const source = try O.render(std.testing.allocator);
         defer std.testing.allocator.free(source);
         try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "defer "));
-        try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "try quantizeQ8_KActivationRowsDispatch("));
+        try std.testing.expectEqual(@as(usize, if (O.pipeline.consumer == .inline_quantization) 2 else 0), std.mem.count(u8, source, "try quantizeQ8_KActivationRowsDispatch("));
+        switch (O.pipeline.consumer) {
+            .inline_quantization => {},
+            .prepared_pair => {
+                try std.testing.expect(O.pipeline.assigned_workspace);
+                try std.testing.expectEqual(@as(usize, 3), std.mem.count(u8, source, "try runPreparedKBlockPairActivation("));
+                try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "if (q_input.len != q_input_len) return error.InvalidAssignedHostWorkspace;"));
+            },
+            .prepared_single => {
+                try std.testing.expect(!O.pipeline.assigned_workspace);
+                try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, source, "try runPreparedKBlockSingleActivation("));
+                try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "known, false);"));
+                try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, source, "known, true);"));
+            },
+        }
     }
 }

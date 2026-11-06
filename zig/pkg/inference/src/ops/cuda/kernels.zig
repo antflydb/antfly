@@ -22129,7 +22129,10 @@ test "CUDA primitive index traversal rejects overflowing legacy coordinates befo
 
 test "CUDA shared Q4K triple launcher preserves ordinary and tiled native outputs" {
     if (!build_options.enable_cuda) return error.SkipZigTest;
-    try smokeQ4_K(std.testing.allocator);
+    smokeQ4_K(std.testing.allocator) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
 }
 
 test "CUDA Q8 row column and tensor core tiles cover every output and guard" {

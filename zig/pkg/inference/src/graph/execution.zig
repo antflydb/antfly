@@ -991,7 +991,9 @@ test "cached decoder graph preparation reuses native and Metal executables acros
                 }
                 prepared.diagnostics.configure(true);
             } else if (kind == .native) {
-                const stats = prepared.diagnostics.snapshot().?.execution;
+                const snapshot = prepared.diagnostics.snapshot().?;
+                try std.testing.expect(snapshot.execution != null);
+                const stats = snapshot.execution.?;
                 try std.testing.expectEqual(@as(u64, 0), stats.physical_storage_allocations);
                 try std.testing.expect(stats.physical_storage_reuses > 0);
             }

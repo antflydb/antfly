@@ -24,9 +24,10 @@ const CT = ops.CT;
 /// Request-private owning projection. The fact alone is backend-free; the CT
 /// must remain private to this actual receiving backend, including names whose
 /// parameter nodes the optimizer eliminated.
+const ParameterQuery = struct { node: ml.graph.NodeId, query: ?usize };
 const StaticStep = union(enum) { single: ml.graph.NodeId, pair: u32 };
 const PairGroup = struct { first: ml.graph.NodeId, second: ml.graph.NodeId, activation: ml.graph.NodeId, weights: [2]ml.graph.NodeId };
-const SourceQuery = struct { fact: Native.AuthoredSourceQuery, witness: ?CT = null, physical: ?Native.AuthoredQuantizedIdentity = null };
+const SourceQuery = struct { fact: Native.AuthoredSourceQuery, witness: ?CT = null, physical: ?Native.AuthoredQuantizedIdentity = null, plane: [1]@import("storage_ownership.zig").Plane = undefined };
 
 /// Selected original-forward semantics with a fully authored Native lowering.
 /// Keep this independent of Metal's Qwen prefill selector. These two semantic
@@ -63,6 +64,10 @@ pub const Template = struct {
     references: std.atomic.Value(usize) = .init(1),
     artifact: @import("program.zig").ModelProgram,
     queries: []Native.AuthoredSourceQuery,
+    /// Backend-free links only. A null entry preserves the original adapter
+    /// lookup when graph parameter spelling differs from the query transcript.
+    parameter_queries: []ParameterQuery,
+    has_unmatched_parameters: bool,
     descriptors: []?ops.kernel_descriptor.Descriptor,
     authored_descriptors: []?ops.kernel_descriptor.Descriptor,
     steps: []StaticStep,
@@ -84,6 +89,7 @@ pub const Template = struct {
         const allocator = self.allocator;
         for (self.queries) |query| allocator.free(query.name);
         allocator.free(self.queries);
+        allocator.free(self.parameter_queries);
         allocator.free(self.descriptors);
         allocator.free(self.authored_descriptors);
         allocator.free(self.steps);
@@ -201,6 +207,30 @@ pub const Template = struct {
         // combine original independent GEMMs or change their reduction order.
         var artifact = try @import("program.zig").ModelProgram.takeOptimized(graph, token_input);
         errdefer artifact.deinit();
+        var parameter_count: usize = 0;
+        for (artifact.graph.nodes.items, 0..) |node, index| {
+            if (artifact.analysis.reachable[index] and node.op == .parameter and index != token_input) parameter_count += 1;
+        }
+        const parameter_queries = try allocator.alloc(ParameterQuery, parameter_count);
+        errdefer allocator.free(parameter_queries);
+        var parameter_index: usize = 0;
+        var has_unmatched_parameters = false;
+        // Preserve original graph order. Resolver.note already keeps a compact
+        // query transcript; link it once here without a second runtime map.
+        for (artifact.graph.nodes.items, 0..) |node, index| {
+            if (!artifact.analysis.reachable[index] or node.op != .parameter or index == token_input) continue;
+            var selected: ?usize = null;
+            const name = artifact.graph.parameterName(artifact.graph.node(@intCast(index)));
+            for (queries, 0..) |query, query_index| {
+                if (query.shape != null and std.mem.eql(u8, query.name, name)) {
+                    selected = query_index;
+                    break;
+                }
+            }
+            parameter_queries[parameter_index] = .{ .node = @intCast(index), .query = selected };
+            parameter_index += 1;
+            has_unmatched_parameters = has_unmatched_parameters or selected == null;
+        }
         var steps: std.ArrayList(ml.graph.NodeId) = .empty;
         defer steps.deinit(allocator);
         for (artifact.graph.nodes.items, 0..) |node, index| {
@@ -252,7 +282,7 @@ pub const Template = struct {
                 break;
             }
         };
-        self.* = .{ .allocator = allocator, .artifact = artifact, .queries = queries, .descriptors = descriptors, .authored_descriptors = authored, .steps = ordered, .pairs = pairs, .input = token_input, .config_hash = context.gpt_config.fingerprint(), .reduction_policy = if (has_resident_quantized) .native_original_resident_quantized_v2 else if (pairs.len != 0) .native_original_kblock_pair_v1 else if (quantized_source) .native_original_kblock_single_v1 else .native_original_dense_v1, .use_blas = Native.useBlas() };
+        self.* = .{ .allocator = allocator, .artifact = artifact, .queries = queries, .parameter_queries = parameter_queries, .has_unmatched_parameters = has_unmatched_parameters, .descriptors = descriptors, .authored_descriptors = authored, .steps = ordered, .pairs = pairs, .input = token_input, .config_hash = context.gpt_config.fingerprint(), .reduction_policy = if (has_resident_quantized) .native_original_resident_quantized_v2 else if (pairs.len != 0) .native_original_kblock_pair_v1 else if (quantized_source) .native_original_kblock_single_v1 else .native_original_dense_v1, .use_blas = Native.useBlas() };
         return self;
     }
 };
@@ -320,6 +350,8 @@ pub const Program = struct {
     runtime: Runtime,
     selected: *@import("prepared_routes.zig").PreparedRoutes,
     bindings: []route.InputBinding,
+    /// Matched entries borrow source_queries witnesses; unmatched adapter
+    /// entries own their original independent lookup until Program teardown.
     weights: []?CT,
     weight_planes: []@import("storage_ownership.zig").Plane,
     source_queries: []SourceQuery,
@@ -400,32 +432,40 @@ pub const Program = struct {
             if (fact.shape != null) {
                 const witness = try context.graphWeight(fact.name);
                 query.witness = witness;
-                if (fact.quantized == null) _ = try Native.NativeCompute.authoredResidentF32Plane(&self.backend, fact.name, witness) else query.physical = try Native.NativeCompute.authoredQuantizedIdentity(&self.backend, fact.name, witness);
+                if (fact.quantized == null) query.plane[0] = try Native.NativeCompute.authoredResidentF32Plane(&self.backend, fact.name, witness) else query.physical = try Native.NativeCompute.authoredQuantizedIdentity(&self.backend, fact.name, witness);
             }
         }
         self.weights = try allocator.alloc(?CT, self.graph.nodeCount());
         @memset(self.weights, null);
         errdefer {
-            for (self.weights) |maybe| if (maybe) |value| self.backend.free(value);
+            // Matched parameters borrow the already owned current witness.
+            // Adapter-only names retain the original independent owner.
+            for (template.parameter_queries) |parameter| if (parameter.query == null) {
+                if (self.weights[parameter.node]) |value| self.backend.free(value);
+            };
             allocator.free(self.weights);
         }
-        self.weight_planes = try allocator.alloc(@import("storage_ownership.zig").Plane, self.graph.nodeCount());
+        // Standard parameters bind directly to their current query's plane.
+        // Only unmatched adapter spellings need the original independent table.
+        self.weight_planes = try allocator.alloc(@import("storage_ownership.zig").Plane, if (template.has_unmatched_parameters) self.graph.nodeCount() else 0);
         errdefer allocator.free(self.weight_planes);
         var bindings: std.ArrayList(route.InputBinding) = .empty;
         defer bindings.deinit(allocator);
         const descriptors = try allocator.alloc(?@import("../graph/backend_contracts.zig").TensorDesc, self.graph.nodeCount());
         defer allocator.free(descriptors);
         @memset(descriptors, null);
-        for (self.graph.nodes.items, 0..) |node, index| {
-            if (!self.analysis.reachable[index] or node.op != .parameter) continue;
-            if (index == self.input) {
-                continue;
-            }
-            const name = self.graph.parameterName(self.graph.node(@intCast(index)));
-            const answer = try Native.NativeCompute.authoredResidentSourceQuery(&self.backend, name);
+        for (template.parameter_queries) |parameter| {
+            const index = parameter.node;
+            const node = self.graph.node(index);
+            const name = self.graph.parameterName(node);
+            const query: ?*const SourceQuery = if (parameter.query) |query_index| &self.source_queries[query_index] else null;
+            // All witnesses were freshly resolved and checked above. The
+            // complete current transcript is checked again before publication;
+            // immutable template links never carry payload/source authority.
+            const answer = if (query) |entry| entry.fact else try Native.NativeCompute.authoredResidentSourceQuery(&self.backend, name);
             const actual = answer.shape orelse return error.IncompleteNativeProgram;
             if (!actual.eq(node.output_shape)) return error.IncompleteNativeProgram;
-            const value = try context.graphWeight(name);
+            const value = if (query) |entry| entry.witness orelse return error.IncompleteNativeProgram else try context.graphWeight(name);
             self.weights[index] = value;
             if (answer.quantized) |quantized_source| {
                 const contracts = @import("../graph/backend_contracts.zig");
@@ -436,8 +476,11 @@ pub const Program = struct {
                 descriptors[index] = packed_descriptor;
                 try bindings.append(allocator, .{ .node_id = @intCast(index), .value = .{ .tensor = .{ .value = value, .implementation = .{ .context = self.backend.ptr, .table = self.backend.vtable } } } });
             } else {
-                self.weight_planes[index] = try Native.NativeCompute.authoredResidentF32Plane(&self.backend, name, value);
-                try bindings.append(allocator, .{ .node_id = @intCast(index), .value = .{ .resident = .{ .logical = actual, .implementation = .{ .context = self.backend.ptr, .table = self.backend.vtable }, .planes = self.weight_planes[index..][0..1] } } });
+                const planes: []const @import("storage_ownership.zig").Plane = if (query) |entry| &entry.plane else blk: {
+                    self.weight_planes[index] = try Native.NativeCompute.authoredResidentF32Plane(&self.backend, name, value);
+                    break :blk self.weight_planes[index..][0..1];
+                };
+                try bindings.append(allocator, .{ .node_id = @intCast(index), .value = .{ .resident = .{ .logical = actual, .implementation = .{ .context = self.backend.ptr, .table = self.backend.vtable }, .planes = planes } } });
             }
         }
         self.bindings = try allocator.alloc(route.InputBinding, 1);
@@ -708,7 +751,9 @@ pub const Program = struct {
         }
         self.selected.releaseWithCleanup(cleanup);
         self.runtime.deinitWithCleanup(cleanup);
-        for (self.weights) |maybe| if (maybe) |value| self.backend.freeWithCleanup(value, cleanup);
+        for (self.template.parameter_queries) |parameter| if (parameter.query == null) {
+            if (self.weights[parameter.node]) |value| self.backend.freeWithCleanup(value, cleanup);
+        };
         for (self.source_queries) |query| {
             if (query.witness) |witness| self.backend.freeWithCleanup(witness, cleanup);
         }
@@ -1754,6 +1799,20 @@ test "native Definition template shares only immutable graph and descriptors acr
     defer second.destroyWithCleanup(.{ .outside_execution = true });
     try std.testing.expect(first.template == second.template and first.graph == second.graph and first.steps.ptr == second.steps.ptr);
     try std.testing.expect(first.source_queries.ptr != second.source_queries.ptr and first.values.ptr != second.values.ptr and first.weights.ptr != second.weights.ptr);
+    for ([_]*Program{ first, second }) |program| {
+        var reused: usize = 0;
+        for (program.template.parameter_queries) |parameter| {
+            if (parameter.query) |query_index| {
+                const query = &program.source_queries[query_index];
+                try std.testing.expect(query.witness.? == program.weights[parameter.node].?);
+                try std.testing.expectEqualStrings(program.graph.parameterName(program.graph.node(parameter.node)), query.fact.name);
+                reused += 1;
+            }
+        }
+        try std.testing.expect(reused > 0);
+        try std.testing.expect(!program.template.has_unmatched_parameters);
+        try std.testing.expectEqual(@as(usize, 0), program.weight_planes.len);
+    }
     try std.testing.expect(first.selected.pool != second.selected.pool);
     try std.testing.expectEqual(@as(u64, 1), slot.stats.builds);
     try std.testing.expectEqual(@as(u64, 1), slot.stats.hits);
@@ -2279,4 +2338,42 @@ test "native authored Q6_K strict activation policy remains an original precommi
         },
         .declined => |reason| try std.testing.expect(reason != null),
     }
+}
+
+test "native Definition parameter links preserve original independent lookup when an adapter name is unmatched" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var model = try TestModel.init(a);
+    defer model.data.deinitOwned();
+    var compute = Native.NativeCompute.init(a, &model.data, null);
+    defer compute.deinit();
+    const backend = compute.computeBackend();
+    const cfg = TestModel.config();
+    const context = Context{ .allocator = a, .cb = &backend, .gpt_config = &cfg };
+    const template = try Template.create(a, &context);
+    var slot = TemplateSlot{ .value = template };
+    defer slot.deinit();
+    // Configure one missing spelling link before the immutable template is
+    // shared with any Program. Graph/source semantics and the original
+    // transcript remain unchanged; only the optional optimization is absent.
+    const node_index = blk: {
+        for (template.parameter_queries, 0..) |parameter, index| if (parameter.query != null) break :blk index;
+        return error.MissingParameterQuery;
+    };
+    const query_index = template.parameter_queries[node_index].query.?;
+    const weight_node = template.parameter_queries[node_index].node;
+    template.parameter_queries[node_index].query = null;
+    template.has_unmatched_parameters = true;
+    const program = (try Program.tryCreateWithTemplate(a, &context, &slot)) orelse return error.MissingAuthoredNativeProgram;
+    defer program.destroyWithCleanup(.{ .outside_execution = true });
+    try std.testing.expect(program.template == template);
+    try std.testing.expectEqual(program.graph.nodeCount(), program.weight_planes.len);
+    const source = program.source_queries[query_index].witness orelse return error.MissingParameterQuery;
+    const weight = program.weights[weight_node] orelse return error.MissingWeight;
+    const expected = try backend.toFloat32(source, a);
+    defer a.free(expected);
+    const actual = try backend.toFloat32(weight, a);
+    defer a.free(actual);
+    try std.testing.expectEqualSlices(f32, expected, actual);
+    try Native.NativeCompute.validateAuthoredSourceQueries(&backend, program.source_queries);
 }

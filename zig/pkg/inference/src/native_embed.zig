@@ -963,7 +963,7 @@ test "embed result writers propagate output failures" {
         &output,
         "model",
         &.{},
-        &.{},
+        @as([][]f32, &.{}),
         &.{},
         &.{},
     ));
