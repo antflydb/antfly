@@ -2065,7 +2065,7 @@ test "generated append shared tail falls back to complete combined ID copy" {
     defer state.deinit();
     try state.notePrefill(17);
     const sequence = state.sequence_id.?;
-    const manager_pool = manager.getPool(pool).?;
+    const manager_pool = manager.getPoolMut(pool).?;
     const manager_tail = (try manager.sequenceMut(sequence)).block_table.last().?;
     const storage_tail = (try storage.sequenceMut(sequence)).block_table.last().?;
     try manager_pool.retain(manager_tail);

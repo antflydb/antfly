@@ -48557,7 +48557,7 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
     try std.testing.expectEqualSlices(f32, &identity, &decoded);
     const implementation = @import("../../execution/kernel_route.zig").Implementation{ .context = compute, .table = cb.vtable };
     const gamma_values: [width]f32 = @splat(1);
-    const gamma = if (recipe == .rounded_mirror) try cb.fromFloat32Shape(&gamma_values, &.{width}) else null;
+    const gamma: ?CT = if (recipe == .rounded_mirror) try cb.fromFloat32Shape(&gamma_values, &.{width}) else null;
     defer if (gamma) |value| cb.free(value);
     var fact_storage: [2]@import("../../execution/kernel_route.zig").InputBinding = undefined;
     fact_storage[0] = .{ .node_id = program.id_map[w], .value = .{ .tensor = .{ .value = weight, .implementation = implementation } } };
