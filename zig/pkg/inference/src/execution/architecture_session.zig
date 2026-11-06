@@ -6217,8 +6217,8 @@ pub fn resolveBudgetLimitsForSessions(
                 break;
             };
             if (duplicate) continue;
-            inline for (@typeInfo(memory.Limits).@"struct".fields) |field| {
-                @field(workspace_floor, field.name) = try std.math.add(usize, @field(workspace_floor, field.name), @field(workspace.floor, field.name));
+            inline for (@typeInfo(memory.Limits).@"struct".field_names) |name| {
+                @field(workspace_floor, name) = try std.math.add(usize, @field(workspace_floor, name), @field(workspace.floor, name));
             }
             prepaid_scratch = try std.math.add(usize, prepaid_scratch, workspace.capacity.backend_scratch_bytes);
         } else {
