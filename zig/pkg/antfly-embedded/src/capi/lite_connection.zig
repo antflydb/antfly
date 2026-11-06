@@ -5415,7 +5415,7 @@ test "capi native allocator proof issue1431 bounded allocator service rebases a 
     defer if (held) Owner.leaveMaintenanceWriter(detached);
     try std.testing.expect(std.meta.eql(file.header, owner.current.?.owned_lite_backend.?.native_docstore.?.file.header));
     try std.testing.expectEqual(admitted + 1, owner.publication_stats.allocator_service_admissions);
-    _ = try file.reclaimPagesForMaintenanceWithCancel(8, null);
+    _ = try file.reclaimPagesForMaintenanceWithCancel(8, null, true);
     try std.testing.expect((try file.check()).valid);
     Owner.leaveMaintenanceWriter(detached);
     held = false;
@@ -5443,7 +5443,7 @@ test "capi native logical generations maintenance snapshot replacement carries t
     first.maintenance_owner = owner;
     // Warm and verify the first snapshot's ledger under allocator service.
     try Owner.enterMaintenanceWriter(first, .allocator_service);
-    _ = try first.owned_lite_backend.?.native_docstore.?.file.reclaimPagesForMaintenanceWithCancel(8, null);
+    _ = try first.owned_lite_backend.?.native_docstore.?.file.reclaimPagesForMaintenanceWithCancel(8, null, true);
     Owner.leaveMaintenanceWriter(first);
     first.maintenance_owner = null;
     const first_file = &first.owned_lite_backend.?.native_docstore.?.file;
@@ -5463,7 +5463,7 @@ test "capi native logical generations maintenance snapshot replacement carries t
     second.maintenance_owner = owner;
     defer second.maintenance_owner = null;
     try Owner.enterMaintenanceWriter(second, .allocator_service);
-    _ = try file.reclaimPagesForMaintenanceWithCancel(8, null);
+    _ = try file.reclaimPagesForMaintenanceWithCancel(8, null, true);
     try std.testing.expect((try file.check()).valid);
     Owner.leaveMaintenanceWriter(second);
     try std.testing.expectEqual(full_loads, file.allocator_work.full_loads);

@@ -2229,7 +2229,14 @@ pub const Store = struct {
             try self.artifact_marker_sweep.run(&self.file);
             if (try self.file.retirementNeedsService()) {
                 try self.refreshAdmissionAssumeLocked();
-                _ = try self.file.reclaimPagesForMaintenanceWithCancel(self.maintenance_policy.options.retirement_work_pages, cancel);
+                // Ride-along (§3.2a): this ordinary pass never forces its own
+                // fsync. It becomes durable for free on the next durable
+                // commit (a foreground write, this store's own idle-flush/
+                // close barrier, or cross-process lease handoff). Hard
+                // retirement pressure still reclaims durably through
+                // reclaimRetirementPressure, called separately from
+                // applyMutationGroup before a foreground transaction opens.
+                _ = try self.file.reclaimPagesForMaintenanceWithCancel(self.maintenance_policy.options.retirement_work_pages, cancel, false);
                 self.maintenance_policy.status.state = if (self.maintenance_policy.options.enabled) .idle else .disabled;
                 self.maintenance_policy.status.reason = if (self.maintenance_policy.options.enabled) .none else .disabled;
                 self.maintenance_policy.status.last_error = null;
