@@ -516,7 +516,7 @@ pub const MetalKvStorage = struct {
             const end = try std.math.mul(usize, try std.math.add(usize, id, 1), page);
             if (try std.math.mul(usize, end, layout.key_row_bytes) > info.encoded_key_capacity or try std.math.mul(usize, end, layout.v_row_stride * @sizeOf(f32)) > info.v_capacity) return error.KvCapacityTooSmall;
         }
-        const layer = try self.pagedLayerKvDevice(.{ .sequence_id = kv.sequence_id, .layer_index = attention.layer_index, .token_count = attention.total_sequence_len, .num_kv_heads = @intCast(num_kv_heads), .head_dim = @intCast(head_dim) });
+        const layer = try pagedLayerKvDevice(self, .{ .sequence_id = kv.sequence_id, .layer_index = attention.layer_index, .token_count = attention.total_sequence_len, .num_kv_heads = @intCast(num_kv_heads), .head_dim = @intCast(head_dim) });
         const offsets = try self.pageTokenOffsets(table.blocks.items, blocks, page, 0);
         return .{ .layer = layer, .offsets = offsets.values(), .keys = info.encoded_key_handle orelse return error.InvalidSlot, .values = info.v_handle orelse return error.InvalidSlot };
     }

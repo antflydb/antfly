@@ -9609,7 +9609,7 @@ test "additional declared storage preserves both actual request floors and denie
     defer controller.deinit();
     var probe = AdmissionProbeSession{ .controller = &controller };
     const limits = memory.Limits{ .host_limit_bytes = 128 };
-    const session = Session{ .ptr = &probe, .vtable = &AdmissionProbeSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = limits, .check_live_memory = false } };
+    const session = Session{ .ptr = &probe, .vtable = &AdmissionProbeSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = limits, .static_workspace_bytes = 0, .check_live_memory = false } };
     var base = RunPermit{ .session = session, .request = .{}, .lease = try controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 16, .host_scratch_bytes = 16 }, false) };
     defer base.deinit();
     var cache = RunPermit{ .session = session, .lease = try controller.tryAcquire(.cpu, limits, .{ .host_kv_bytes = 32 }, false) };

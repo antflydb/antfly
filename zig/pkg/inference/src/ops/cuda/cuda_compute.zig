@@ -54793,6 +54793,10 @@ test "CUDA ordinary F32 paged batch writes parent spans without child allocation
     var storage = try kv_storage_runtime.KvStorageRuntime.init(a, .{ .backend = .cuda, .dtype = .f32, .page_size_tokens = 16, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 32, .store_cpu_bytes = false });
     defer storage.deinit();
     try cb.provisionKvDeviceWriteHook(&storage);
+    var manager = @import("../../runtime/kv/manager.zig").KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(storage.storage.config);
+    try std.testing.expectEqual(storage.poolId(), pool);
     var views: [2]ops.KvBatchView = undefined;
     const lengths = [_]usize{ 3, 5 };
     var suffix_values: [64]f32 = undefined;
@@ -54800,6 +54804,9 @@ test "CUDA ordinary F32 paged batch writes parent spans without child allocation
     for (lengths, 0..) |length, index| {
         const sequence = try storage.attachSequence(storage.poolId());
         try storage.appendTokens(sequence, @intCast(length));
+        const managed_sequence = try manager.attachSequence(pool);
+        try std.testing.expectEqual(sequence, managed_sequence);
+        try manager.appendTokens(managed_sequence, @intCast(length));
         const keys: [5 * 32]f32 = @splat(0);
         var values: [5 * 32]f32 = undefined;
         for (values[0 .. length * 32], 0..) |*value, element| value.* = @as(f32, @floatFromInt(index * 8 + element / 32)) + @as(f32, @floatFromInt(element % 32)) / 32;
@@ -54810,7 +54817,7 @@ test "CUDA ordinary F32 paged batch writes parent spans without child allocation
         try storage.writeLayerKvSuffixDevice(.{ .sequence_id = sequence, .layer_index = 0, .total_token_count = length, .suffix_token_count = length, .position_offset = 0, .num_kv_heads = 1, .head_dim = 32 }, .{ .handle = @ptrFromInt(tensorFromCt(k).buffer.ptr), .byte_offset = 0, .byte_len = length * 32 * 4 }, .{ .handle = @ptrFromInt(tensorFromCt(v).buffer.ptr), .byte_offset = 0, .byte_len = length * 32 * 4 });
         _ = try storage.logicalBlocksWithReservations(sequence); // Original metadata cache capacity.
         const table = storage.blockTable(sequence).?;
-        views[index] = .{ .kv_cache = .{ .sequence_id = sequence, .pool_id = storage.poolId(), .logical_block_count = table.len(), .tail_tokens = table.tail_tokens, .logical_blocks = table.blocks.items, .kv_storage = &storage }, .kv_storage = &storage, .per_item_query_len = 1, .per_item_total_len = length, .per_item_kv_len = length, .per_item_kv_position_offset = 0, .per_item_mode = .paged_decode };
+        views[index] = .{ .kv_cache = .{ .sequence_id = sequence, .pool_id = storage.poolId(), .logical_block_count = table.len(), .tail_tokens = table.tail_tokens, .logical_blocks = table.blocks.items, .kv_storage = &storage }, .kv_manager = &manager, .kv_storage = &storage, .per_item_query_len = 1, .per_item_total_len = length, .per_item_kv_len = length, .per_item_kv_position_offset = 0, .per_item_mode = .paged_decode };
         @memcpy(suffix_values[index * 32 ..][0..32], values[(length - 1) * 32 ..][0..32]);
         for (0..2) |head| for (0..32) |column| {
             var mean: f64 = 0;

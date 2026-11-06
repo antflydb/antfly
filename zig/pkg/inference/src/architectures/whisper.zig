@@ -745,7 +745,7 @@ const WeightFetcher = struct {
             if (try Native.prepareTypedWeightOutsideExecution(self.cb, source.expected_data, name, pin)) return;
         }
         const query = Native.authoredResidentSourceQuery(self.cb, name) catch |err| switch (err) {
-            error.WeightNotFound, error.MissingWeight => return, // original required/optional lookup owns this distinction
+            error.WeightNotFound => return, // original required/optional lookup owns this distinction
             error.UnsupportedAuthoredWeight => return error.UnsupportedDenseSchedule,
             else => return err,
         };

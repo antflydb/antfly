@@ -60701,7 +60701,7 @@ fn nativeOrdinaryProjectionIntoCase(a: std.mem.Allocator) !void {
     for ([_]bool{ false, true }) |biased| {
         for ([_]bool{ false, true }) |rank3| {
             const input_shape = if (rank3) Shape.init(.f32, &.{ 1, 3, 4 }) else Shape.init(.f32, &.{ 3, 4 });
-            const input = try cb.fromFloat32Shape(&values, input_shape.dims[0..input_shape.rank()]);
+            const input = try cb.fromFloat32Shape(&values, if (rank3) &.{ 1, 3, 4 } else &.{ 3, 4 });
             defer cb.free(input);
             const destination = try cb.fromFloat32Shape(&@as([15]f32, @splat(91)), &.{ 3, 5 });
             defer cb.free(destination);
@@ -60781,7 +60781,7 @@ test "Native ordinary projection into cold cache unwinds all allocation failures
 }
 
 fn nativeHeldSourceCase(a: std.mem.Allocator) !void {
-    const bits = [_]f32{ 1, 2, 3, 4 };
+    var bits = [_]f32{ 1, 2, 3, 4 };
     var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
     defer {
         deinitPrefetchQueue(&store);

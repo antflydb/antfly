@@ -191,7 +191,7 @@ test "cold metadata admits actual chunks with the whole held request and forbids
     defer controller.deinit();
     var marker: u8 = 0;
     const limit = 1024 * 1024;
-    const session = sessions.Session{ .ptr = &marker, .vtable = &TestSession.table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = limit }, .check_live_memory = false } };
+    const session = sessions.Session{ .ptr = &marker, .vtable = &TestSession.table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = limit }, .static_workspace_bytes = 0, .check_live_memory = false } };
     var base = sessions.RunPermit{ .session = session, .lease = try controller.tryAcquire(.cpu, .{ .host_limit_bytes = limit }, .{ .host_kv_bytes = 64 }, false) };
     defer base.deinit();
     const original = controller.snapshot();
@@ -224,7 +224,7 @@ test "cold metadata owner and payload allocation failures refund every acquired 
             defer controller.deinit();
             defer std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot()) catch @panic("cold metadata leaked admission");
             var marker: u8 = 0;
-            const session = sessions.Session{ .ptr = &marker, .vtable = &TestSession.table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .check_live_memory = false } };
+            const session = sessions.Session{ .ptr = &marker, .vtable = &TestSession.table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
             const owner = try Owner.create(a, session, &.{});
             defer owner.deinitOutsideExecution();
             const values = try owner.allocator().alloc(u32, 16);
@@ -241,7 +241,7 @@ test "cold metadata denial floor survives actual lease partition without grantin
     defer controller.deinit();
     var marker: u8 = 0;
     const limit = 1024 * 1024;
-    const session = sessions.Session{ .ptr = &marker, .vtable = &TestSession.table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = limit }, .check_live_memory = false } };
+    const session = sessions.Session{ .ptr = &marker, .vtable = &TestSession.table, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = limit }, .static_workspace_bytes = 0, .check_live_memory = false } };
     var base = sessions.RunPermit{ .session = session, .lease = try controller.tryAcquire(.cpu, .{ .host_limit_bytes = limit }, .{ .host_kv_bytes = 128 }, false), .request = .{} };
     defer base.deinit();
     const owner = try Owner.create(a, session, &.{&base});
@@ -302,7 +302,7 @@ test "cold metadata frees real payload and owner before refund callbacks and ret
     var probe = Probe{ .backing = std.testing.allocator };
     try controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.retain, .release = Probe.release });
     var model = sessions.Session.ModelLifetime{ .owner = &probe, .destroy_fn = Probe.destroyModel };
-    const session = sessions.Session{ .ptr = &probe, .vtable = &TestSession.table, .model_lifetime = &model, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .check_live_memory = false } };
+    const session = sessions.Session{ .ptr = &probe, .vtable = &TestSession.table, .model_lifetime = &model, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false } };
     const owner = try Owner.create(.{ .ptr = &probe, .vtable = &Probe.allocator_table }, session, &.{});
     const values = try owner.allocator().alloc(u8, 32);
     try owner.sealBeforeExecution();
