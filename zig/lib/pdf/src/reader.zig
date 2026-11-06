@@ -5432,6 +5432,136 @@ const StructureMetadataCache = struct {
     document: structure_text.Document,
 };
 
+// Resource tables stay as source views. Only requested names (including misses)
+// enter this index; returned objects borrow owned allocations, never map slots.
+const ResourceTableLookup = struct {
+    source: syntax.Object,
+    selected: std.StringHashMapUnmanaged(?syntax.Object) = .empty,
+    scans: usize = 0,
+    frame_budget: ?DecodeBudgetAllocator = null,
+    frames: MetadataObjectStreamCache = .{},
+    encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty,
+
+    fn scopedReader(self: *@This(), reader: *const Reader) Reader {
+        var scoped = reader.*;
+        scoped.encrypted_streams = &self.encrypted_streams;
+        scoped.encrypted_stream_generation = 0;
+        // Native extraction already shares a page-wide decoded-frame cache.
+        // Standalone/rendering lookups also need reuse across alias requests,
+        // without making optional frame retention necessary for required reads.
+        if (scoped.metadata_frames == null) {
+            if (self.frame_budget == null) {
+                const limit = reader.decode_limits.max_working_set_bytes;
+                self.frame_budget = DecodeBudgetAllocator.initWithCumulativeLimit(reader.alloc, 0, limit, limit *| 4);
+                self.frames.budget = &self.frame_budget.?;
+                self.frame_budget.?.reclaimer = .{ .context = &self.frames, .reclaim = MetadataObjectStreamCache.reclaim };
+            }
+            scoped.metadata_frames = &self.frames;
+            scoped.metadata_frame_fallback = true;
+        }
+        return scoped;
+    }
+
+    fn resolveValue(self: *@This(), reader: *const Reader, value: *const syntax.Object) !syntax.Object {
+        var scoped = self.scopedReader(reader);
+        return scoped.resolveValue(value);
+    }
+
+    fn deinit(self: *@This(), a: Allocator) void {
+        var entries = self.selected.iterator();
+        while (entries.next()) |entry| {
+            a.free(entry.key_ptr.*);
+            if (entry.value_ptr.*) |*value| value.deinit(a);
+        }
+        self.selected.deinit(a);
+        self.frames.deinit();
+        self.encrypted_streams.deinit(a);
+    }
+
+    fn prime(self: *@This(), reader: *const Reader, names: *const std.StringHashMapUnmanaged(void)) !void {
+        var pending: std.StringHashMapUnmanaged(void) = .empty;
+        defer pending.deinit(reader.alloc);
+        var keys = names.keyIterator();
+        while (keys.next()) |key| {
+            try reader.checkCancellation();
+            if (!self.selected.contains(key.*)) try pending.put(reader.alloc, key.*, {});
+        }
+        if (pending.count() == 0) return;
+        try self.selected.ensureUnusedCapacity(reader.alloc, pending.count());
+        var scoped = self.scopedReader(reader);
+        scoped.resource_names = &pending;
+        self.scans += 1;
+        var table = scoped.resourceTable(&self.source) catch |err| switch (err) {
+            error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.PdfMetadataWorkLimit, error.Canceled => return err,
+            // Existing color consumers treat malformed resource tables as
+            // empty. Keep that policy here without swallowing errors while
+            // interpreting a selected color definition.
+            else => syntax.Object.null,
+        };
+        defer table.deinit(reader.alloc);
+        // Preserve first-key semantics without quadratic searches when many
+        // names are selected. Partial successful entries survive allocation
+        // failure; negative results are published only after parsing succeeds.
+        if (table == .dict) for (table.dict) |entry| {
+            try reader.checkCancellation();
+            if (!pending.contains(entry.key) or self.selected.contains(entry.key)) continue;
+            const owned_key = try reader.alloc.dupe(u8, entry.key);
+            errdefer reader.alloc.free(owned_key);
+            const value = try entry.value.clone(reader.alloc);
+            self.selected.putAssumeCapacity(owned_key, value);
+        };
+        keys = pending.keyIterator();
+        while (keys.next()) |key| {
+            try reader.checkCancellation();
+            if (self.selected.contains(key.*)) continue;
+            const owned_key = try reader.alloc.dupe(u8, key.*);
+            self.selected.putAssumeCapacity(owned_key, null);
+        }
+    }
+
+    fn get(self: *@This(), reader: *const Reader, name: []const u8) !?syntax.Object {
+        if (self.selected.get(name)) |value| return value;
+        var names: std.StringHashMapUnmanaged(void) = .empty;
+        defer names.deinit(reader.alloc);
+        try names.put(reader.alloc, name, {});
+        try self.prime(reader, &names);
+        return self.selected.get(name).?;
+    }
+};
+
+// A page owns these stable records, so Forms sharing indirect or deferred tables
+// reuse both selected entries and negative lookups. Direct dictionaries borrow
+// their enclosing scope and use a local lookup instead.
+const ResourceLookupCache = struct {
+    tables: std.AutoHashMapUnmanaged(Key, *ResourceTableLookup) = .empty,
+    const Key = struct { reference: u64, start: usize, end: usize, deferred: bool };
+
+    fn deinit(self: *@This(), a: Allocator) void {
+        var values = self.tables.valueIterator();
+        while (values.next()) |value| {
+            value.*.deinit(a);
+            a.destroy(value.*);
+        }
+        self.tables.deinit(a);
+    }
+
+    fn table(self: *@This(), reader: *const Reader, source: syntax.Object) !*ResourceTableLookup {
+        const reference = if (source == .obj_ref) source.obj_ref else source.deferred.reference;
+        const key = Key{
+            .reference = (@as(u64, reference.id) << 16) | reference.gen,
+            .start = if (source == .deferred) source.deferred.start else 0,
+            .end = if (source == .deferred) source.deferred.end else 0,
+            .deferred = source == .deferred,
+        };
+        if (self.tables.get(key)) |cached| return cached;
+        try self.tables.ensureUnusedCapacity(reader.alloc, 1);
+        const lookup = try reader.alloc.create(ResourceTableLookup);
+        lookup.* = .{ .source = source };
+        self.tables.putAssumeCapacity(key, lookup);
+        return lookup;
+    }
+};
+
 pub const Reader = struct {
     const LengthResolution = struct {
         reference: syntax.ObjRef,
@@ -5447,6 +5577,7 @@ pub const Reader = struct {
     // retention a prerequisite for successfully reading a selected object.
     metadata_frame_fallback: bool = false,
     resource_names: ?*const std.StringHashMapUnmanaged(void) = null,
+    resource_lookup_cache: ?*ResourceLookupCache = null,
     structure_cache: ?*StructureMetadataCache = null,
     alloc: Allocator,
     bytes: []const u8,
@@ -6471,6 +6602,11 @@ pub const Reader = struct {
         var text_resources = TextResourceCache{ .budget = &resource_budget, .live_budget = &resource_live_budget };
         defer text_resources.deinit();
         text_resources.prepareScan(self);
+        var lookup_cache = ResourceLookupCache{};
+        defer lookup_cache.deinit(self.alloc);
+        const previous_lookup_cache = self.resource_lookup_cache;
+        self.resource_lookup_cache = &lookup_cache;
+        defer self.resource_lookup_cache = previous_lookup_cache;
         const previous_frames = self.metadata_frames;
         const previous_fallback = self.metadata_frame_fallback;
         self.metadata_frames = &text_resources.frames;
@@ -7686,11 +7822,35 @@ pub const Reader = struct {
     // Collectors select entries before resolving them; unused definitions are
     // scanned once and never allocated, even in indirect/compressed tables.
     fn resourceTable(self: *const Reader, obj: *const syntax.Object) !syntax.Object {
+        if (obj.* == .dict) if (self.resource_names) |names| {
+            var entries: std.ArrayList(syntax.DictEntry) = .empty;
+            errdefer {
+                for (entries.items) |*entry| entry.deinit(self.alloc);
+                entries.deinit(self.alloc);
+            }
+            for (obj.dict) |entry| {
+                try self.checkCancellation();
+                if (!names.contains(entry.key)) continue;
+                const key = try self.alloc.dupe(u8, entry.key);
+                errdefer self.alloc.free(key);
+                var value = try entry.value.clone(self.alloc);
+                errdefer value.deinit(self.alloc);
+                try entries.append(self.alloc, .{ .key = key, .value = value });
+            }
+            return .{ .dict = try entries.toOwnedSlice(self.alloc) };
+        };
         return switch (obj.*) {
             .obj_ref => |ptr| try self.readIndirectObjectProjected(ptr, .resource_entries),
             .deferred => |location| try self.readDeferredObjectProjected(location, .resource_entries),
             else => try obj.clone(self.alloc),
         };
+    }
+
+    fn resourceLookup(self: *const Reader, source: *const syntax.Object, local: *ResourceTableLookup) !*ResourceTableLookup {
+        if (source.* == .obj_ref or source.* == .deferred)
+            if (self.resource_lookup_cache) |cache| return cache.table(self, source.*);
+        local.* = .{ .source = source.* };
+        return local;
     }
 
     fn selectedResourceTable(self: *const Reader, obj: *const syntax.Object, references: *const ReferencedResourceNames) !syntax.Object {
@@ -8940,32 +9100,28 @@ pub const Reader = struct {
     fn classifyColorSpaceResource(
         self: *const Reader,
         value: *const syntax.Object,
-        resource_entries: []const syntax.DictEntry,
+        resource_entries: *ResourceTableLookup,
         depth: u8,
         allow_default_remap: bool,
     ) anyerror!ColorSpaceSelection {
         if (depth >= 8) return colorSpaceSelectionForKind(.unsupported);
-        var resolved = try self.resolveValue(value);
+        var resolved = try resource_entries.resolveValue(self, value);
         defer resolved.deinit(self.alloc);
         if (resolved.asName()) |name| {
             const direct = colorSpaceKindFromName(name);
             if (direct != .unsupported) {
                 if (allow_default_remap) if (defaultColorSpaceName(direct)) |default_name| {
-                    for (resource_entries) |entry| {
-                        if (!std.mem.eql(u8, entry.key, default_name)) continue;
-                        const remapped = try self.classifyColorSpaceResource(&entry.value, resource_entries, depth + 1, false);
+                    if (try resource_entries.get(self, default_name)) |entry| {
+                        const remapped = try self.classifyColorSpaceResource(&entry, resource_entries, depth + 1, false);
                         if (remapped.kind != .pattern and remapped.kind != .unsupported and
                             colorSpaceComponentCount(remapped.kind) == colorSpaceComponentCount(direct))
                             return remapped;
-                        break;
                     }
                 };
                 return colorSpaceSelectionForKind(direct);
             }
-            for (resource_entries) |entry| {
-                if (std.mem.eql(u8, entry.key, name))
-                    return try self.classifyColorSpaceResource(&entry.value, resource_entries, depth + 1, allow_default_remap);
-            }
+            if (try resource_entries.get(self, name)) |entry|
+                return try self.classifyColorSpaceResource(&entry, resource_entries, depth + 1, allow_default_remap);
             return colorSpaceSelectionForKind(.unsupported);
         }
         if (resolved != .array or resolved.array.len == 0) return colorSpaceSelectionForKind(.unsupported);
@@ -9206,28 +9362,30 @@ pub const Reader = struct {
         if (references.names.count() == 0) return try self.alloc.alloc(PageColorSpace, 0);
 
         const color_spaces_obj = resources.get("ColorSpace") orelse return try self.alloc.alloc(PageColorSpace, 0);
-        var resolved_color_spaces = self.resourceTable(color_spaces_obj) catch |err| switch (err) {
-            error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
+        var local = ResourceTableLookup{ .source = .null };
+        defer local.deinit(self.alloc);
+        const lookup = try self.resourceLookup(color_spaces_obj, &local);
+        lookup.prime(self, &references.names) catch |err| switch (err) {
+            error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.PdfMetadataWorkLimit, error.Canceled => return err,
             else => return try self.alloc.alloc(PageColorSpace, 0),
         };
-        defer resolved_color_spaces.deinit(self.alloc);
-        if (resolved_color_spaces != .dict) return try self.alloc.alloc(PageColorSpace, 0);
 
         var out = std.ArrayList(PageColorSpace).empty;
         defer out.deinit(self.alloc);
         errdefer for (out.items) |*color_space| color_space.deinit(self.alloc);
-        for (resolved_color_spaces.dict) |entry| {
+        var names = references.names.keyIterator();
+        while (names.next()) |key| {
             try self.checkCancellation();
-            if (!references.contains(entry.key)) continue;
-            var name: ?[]u8 = try self.alloc.dupe(u8, entry.key);
+            const entry = (try lookup.get(self, key.*)) orelse continue;
+            var name: ?[]u8 = try self.alloc.dupe(u8, key.*);
             errdefer if (name) |owned| self.alloc.free(owned);
             var selection = self.classifyColorSpaceResource(
-                &entry.value,
-                resolved_color_spaces.dict,
+                &entry,
+                lookup,
                 0,
-                !isDefaultDeviceColorSpaceName(entry.key),
+                !isDefaultDeviceColorSpaceName(key.*),
             ) catch |err| switch (err) {
-                error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
+                error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.PdfMetadataWorkLimit, error.Canceled => return err,
                 else => colorSpaceSelectionForKind(.unsupported),
             };
             var selection_owned = true;
@@ -9488,30 +9646,25 @@ pub const Reader = struct {
     ) !bool {
         const value = image.get("ColorSpace") orelse return false;
         const color_spaces_obj = resources.get("ColorSpace") orelse return false;
-        var color_spaces = self.resourceTable(color_spaces_obj) catch |err| switch (err) {
-            error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
-            else => return false,
-        };
-        defer color_spaces.deinit(self.alloc);
-        if (color_spaces != .dict) return false;
-        return try self.imageColorSpaceValueDependsOnResources(value, color_spaces.dict, 0);
+        var local = ResourceTableLookup{ .source = .null };
+        defer local.deinit(self.alloc);
+        const lookup = try self.resourceLookup(color_spaces_obj, &local);
+        return try self.imageColorSpaceValueDependsOnResources(value, lookup, 0);
     }
 
     fn imageColorSpaceValueDependsOnResources(
         self: *const Reader,
         value: *const syntax.Object,
-        resource_entries: []const syntax.DictEntry,
+        resource_entries: *ResourceTableLookup,
         depth: u8,
     ) anyerror!bool {
         if (depth >= 8) return true;
-        var resolved = try self.resolveValue(value);
+        var resolved = try resource_entries.resolveValue(self, value);
         defer resolved.deinit(self.alloc);
         if (resolved.asName()) |name| {
             const direct = colorSpaceKindFromName(name);
             const resource_name = if (defaultColorSpaceName(direct)) |default_name| default_name else name;
-            for (resource_entries) |entry|
-                if (std.mem.eql(u8, entry.key, resource_name)) return true;
-            return false;
+            return (try resource_entries.get(self, resource_name)) != null;
         }
         if (resolved != .array or resolved.array.len == 0) return false;
         const family = resolved.array[0].asName() orelse return false;
@@ -9539,11 +9692,11 @@ pub const Reader = struct {
     fn resolveImageColorSpaceValueAlloc(
         self: *const Reader,
         value: *const syntax.Object,
-        resource_entries: []const syntax.DictEntry,
+        resource_entries: *ResourceTableLookup,
         depth: u8,
         allow_default_remap: bool,
     ) anyerror!syntax.Object {
-        var resolved = try self.resolveValue(value);
+        var resolved = try resource_entries.resolveValue(self, value);
         errdefer resolved.deinit(self.alloc);
         if (depth >= 8) return resolved;
         if (resolved == .array and resolved.array.len > 0) {
@@ -9568,9 +9721,8 @@ pub const Reader = struct {
         const name = resolved.asName() orelse return resolved;
         const direct = colorSpaceKindFromName(name);
         if (allow_default_remap) if (defaultColorSpaceName(direct)) |default_name| {
-            for (resource_entries) |entry| {
-                if (!std.mem.eql(u8, entry.key, default_name)) continue;
-                var replacement = try self.resolveImageColorSpaceValueAlloc(&entry.value, resource_entries, depth + 1, false);
+            if (try resource_entries.get(self, default_name)) |entry| {
+                var replacement = try self.resolveImageColorSpaceValueAlloc(&entry, resource_entries, depth + 1, false);
                 errdefer replacement.deinit(self.alloc);
                 const component_count = self.colorSpaceInputComponentCount(&replacement) catch |err| switch (err) {
                     error.UnsupportedPdfRendering => 0,
@@ -9585,9 +9737,8 @@ pub const Reader = struct {
             }
         };
         if (direct != .unsupported) return resolved;
-        for (resource_entries) |entry| {
-            if (!std.mem.eql(u8, entry.key, name)) continue;
-            const replacement = try self.resolveImageColorSpaceValueAlloc(&entry.value, resource_entries, depth + 1, allow_default_remap);
+        if (try resource_entries.get(self, name)) |entry| {
+            const replacement = try self.resolveImageColorSpaceValueAlloc(&entry, resource_entries, depth + 1, allow_default_remap);
             resolved.deinit(self.alloc);
             return replacement;
         }
@@ -9610,13 +9761,10 @@ pub const Reader = struct {
     fn resolveImageColorSpaceForDecodeRawAlloc(self: *const Reader, value: *const syntax.Object) anyerror!syntax.Object {
         const resources = self.image_color_space_resources orelse return try self.resolveValue(value);
         const color_spaces_obj = resources.get("ColorSpace") orelse return try self.resolveValue(value);
-        var color_spaces = self.resourceTable(color_spaces_obj) catch |err| switch (err) {
-            error.OutOfMemory, error.PdfDecodeWorkingSetTooLarge, error.Canceled => return err,
-            else => return try self.resolveValue(value),
-        };
-        defer color_spaces.deinit(self.alloc);
-        if (color_spaces != .dict) return try self.resolveValue(value);
-        return try self.resolveImageColorSpaceValueAlloc(value, color_spaces.dict, 0, true);
+        var local = ResourceTableLookup{ .source = .null };
+        defer local.deinit(self.alloc);
+        const lookup = try self.resourceLookup(color_spaces_obj, &local);
+        return try self.resolveImageColorSpaceValueAlloc(value, lookup, 0, true);
     }
 
     fn collectImagesFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) ![]PageImage {
@@ -39439,4 +39587,187 @@ test "reader encrypted LRU frames preserve source keys and allocator ownership" 
         }
     }
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseNestedFrameOwnership, .{ sample, true });
+}
+
+fn buildSelectiveColorTableTestPdfAlloc(a: Allocator, unused: usize, forms: bool) ![]u8 {
+    var table: std.ArrayList(u8) = .empty;
+    defer table.deinit(a);
+    try table.appendSlice(a, "<< /C#53 /Alias /Alias /DeviceRGB /DefaultGray /Gray /Gray [/CalGray << /WhitePoint [0.9505 1 1.089] >>] /Cycle /Cycle /Dup /DeviceGray /Dup /DeviceRGB ");
+    for (0..unused) |i| try table.print(a, "/Unused{d} /DeviceRGB ", .{i});
+    try table.appendSlice(a, ">>");
+    const content = "/CS cs 0 0 0 sc BT /F1 10 Tf 10 100 Td (Hello) Tj ET";
+    const form = try std.fmt.allocPrint(a, "<< /Subtype /Form /BBox [0 0 200 200] /Resources << /Font << /F1 5 0 R >> /ColorSpace 9 0 R >> /Length {d} >>\nstream\n{s}\nendstream", .{ content.len, content });
+    defer a.free(form);
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "<< /Font << /F1 5 0 R >> /ColorSpace 9 0 R /XObject << /A 10 0 R /B 11 0 R >> >>", "null" },
+        .extra = &.{ table.items, form, form },
+        .content = if (forms) "/A Do /B Do" else content,
+    });
+}
+
+test "reader selective color tables bound allocations independently of unused names" {
+    const a = std.testing.allocator;
+    const sample = try buildSelectiveColorTableTestPdfAlloc(a, 100000, false);
+    defer a.free(sample);
+    var tracked = DecodeBudgetAllocator.init(a, 0, 256 * 1024);
+    var reader = try Reader.initWithDecodeLimits(tracked.allocator(), sample, .{ .max_decoded_stream_bytes = 128 * 1024, .max_working_set_bytes = 64 * 1024 });
+    defer reader.deinit();
+    inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+        reader.setTextExtractionPolicy(policy);
+        var analysis = try reader.extractPageTextAnalysisAlloc(1);
+        defer analysis.deinit(tracked.allocator());
+        try std.testing.expectEqualStrings("Hello\n", analysis.text);
+        try std.testing.expect(reader.resource_lookup_cache == null);
+    }
+}
+
+test "reader selective color tables preserve aliases defaults cycles and duplicate keys" {
+    const a = std.testing.allocator;
+    const sample = try buildSelectiveColorTableTestPdfAlloc(a, 4096, false);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var cache = ResourceLookupCache{};
+    defer cache.deinit(a);
+    reader.resource_lookup_cache = &cache;
+    const source = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+    const table = try cache.table(&reader, source);
+    const alias = (try table.get(&reader, "CS")).?;
+    var rgb = try reader.classifyColorSpaceResource(&alias, table, 0, true);
+    defer deinitColorSpaceSelection(&rgb, a);
+    try std.testing.expectEqual(ColorSpaceKind.device_rgb, rgb.kind);
+    const gray = (try table.get(&reader, "DefaultGray")).?;
+    var calibrated = try reader.classifyColorSpaceResource(&gray, table, 0, false);
+    defer deinitColorSpaceSelection(&calibrated, a);
+    try std.testing.expect(calibrated.value.calibrated != null);
+    const cycle = (try table.get(&reader, "Cycle")).?;
+    const cyclic = try reader.classifyColorSpaceResource(&cycle, table, 0, true);
+    try std.testing.expectEqual(ColorSpaceKind.unsupported, cyclic.kind);
+    const duplicate = (try table.get(&reader, "Dup")).?;
+    var resolved_duplicate = try reader.resolveValue(&duplicate);
+    defer resolved_duplicate.deinit(a);
+    try std.testing.expectEqualStrings("DeviceGray", resolved_duplicate.asName().?);
+    try std.testing.expect((try table.get(&reader, "Missing")) == null);
+    const scans = table.scans;
+    for (0..32) |_| {
+        try std.testing.expect((try table.get(&reader, "Missing")) == null);
+        const shared = try cache.table(&reader, source);
+        try std.testing.expect(shared == table);
+        _ = try shared.get(&reader, "CS");
+    }
+    try std.testing.expectEqual(scans, table.scans);
+    try std.testing.expect(table.selected.count() < 12);
+}
+
+fn exerciseSelectiveColorTableOwnership(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expect(std.mem.indexOf(u8, analysis.text, "Hello") != null);
+    try std.testing.expect(reader.resource_lookup_cache == null);
+}
+
+test "reader shared Form color tables preserve ownership through allocation failures" {
+    const a = std.testing.allocator;
+    const sample = try buildSelectiveColorTableTestPdfAlloc(a, 16, true);
+    defer a.free(sample);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseSelectiveColorTableOwnership, .{sample});
+}
+
+fn exerciseEncryptedColorLookup(a: Allocator, sample: []const u8, compressed: bool) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    reader.encryption = .{ .file_key = @splat(3), .file_key_len = 5, .method = .rc4 };
+    var cache = ResourceLookupCache{};
+    defer cache.deinit(a);
+    reader.resource_lookup_cache = &cache;
+    const reference = syntax.ObjRef{ .id = if (compressed) 7 else 9, .gen = 0 };
+    var resources = try reader.readIndirectObjectProjected(reference, .required_resources);
+    defer resources.deinit(a);
+    var local = ResourceTableLookup{ .source = .null };
+    defer local.deinit(a);
+    const table = try reader.resourceLookup(resources.get("ColorSpace").?, &local);
+    const raw = (try table.get(&reader, "CS")).?;
+    var resolved = try reader.resolveValue(&raw);
+    defer resolved.deinit(a);
+    try std.testing.expectEqualStrings("Label", resolved.get("Private").?.string);
+    const scans = table.scans;
+    _ = try table.get(&reader, "CS");
+    try std.testing.expectEqual(scans, table.scans);
+}
+
+test "reader selective color views preserve encrypted compressed and uncompressed ownership" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |compressed| {
+        var label = "Label".*;
+        const file_key: [16]u8 = @splat(3);
+        if (!compressed) {
+            const key = objectEncryptionKey(file_key, 5, .{ .id = 9, .gen = 0 }, .rc4);
+            rc4Crypt(key.bytes[0..key.len], &label);
+        }
+        const resources = try std.fmt.allocPrint(a, "<< /ColorSpace << /CS << /Private <{x:0>2}{x:0>2}{x:0>2}{x:0>2}{x:0>2}> >> /Unused /DeviceGray >> >>", .{ label[0], label[1], label[2], label[3], label[4] });
+        defer a.free(resources);
+        const sample = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{ if (compressed) resources else "null", "null" }, .extra = &.{resources}, .flate = false });
+        defer a.free(sample);
+        if (compressed) {
+            var reader = try Reader.init(a, sample);
+            defer reader.deinit();
+            var stream = try reader.readIndirectObject(.{ .id = 6, .gen = 0 });
+            defer stream.deinit(a);
+            const key = objectEncryptionKey(file_key, 5, .{ .id = 6, .gen = 0 }, .rc4);
+            rc4Crypt(key.bytes[0..key.len], sample[stream.stream.data_offset..][0..stream.stream.data_length]);
+        }
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedColorLookup, .{ sample, compressed });
+    }
+}
+
+test "reader selective color lookup propagates cancellation and work exhaustion without caching misses" {
+    const a = std.testing.allocator;
+    const sample = try buildSelectiveColorTableTestPdfAlloc(a, 4096, false);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var lookup = ResourceTableLookup{ .source = .{ .obj_ref = .{ .id = 9, .gen = 0 } } };
+    defer lookup.deinit(a);
+    var control = syntax.ScanControl{ .remaining_work = 256 };
+    reader.metadata_scan = &control;
+    try std.testing.expectError(error.PdfMetadataWorkLimit, lookup.get(&reader, "Missing"));
+    try std.testing.expectEqual(@as(u32, 0), lookup.selected.count());
+    reader.metadata_scan = null;
+    const Probe = struct {
+        calls: usize = 0,
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.calls >= 8;
+        }
+    };
+    var probe = Probe{};
+    reader.setCancellationProbe(.{ .context = &probe, .is_cancelled_fn = Probe.cancelled });
+    try std.testing.expectError(error.Canceled, lookup.get(&reader, "Missing"));
+    try std.testing.expectEqual(@as(u32, 0), lookup.selected.count());
+    reader.setCancellationProbe(.{});
+    try std.testing.expect((try lookup.get(&reader, "Missing")) == null);
+}
+
+test "reader standalone selective color aliases reuse compressed source frames" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 1024 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const table_bytes = try std.fmt.allocPrint(a, "<< /CS /Alias /Alias /DeviceRGB /Unused ({s}) >>", .{padding});
+    defer a.free(table_bytes);
+    const sample = try buildObjectStreamFixtureAlloc(a, .{ .objects = &.{table_bytes} });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var lookup = ResourceTableLookup{ .source = .{ .obj_ref = .{ .id = 7, .gen = 0 } } };
+    defer lookup.deinit(a);
+    const raw = (try lookup.get(&reader, "CS")).?;
+    var selected = try reader.classifyColorSpaceResource(&raw, &lookup, 0, true);
+    defer deinitColorSpaceSelection(&selected, a);
+    try std.testing.expectEqual(ColorSpaceKind.device_rgb, selected.kind);
+    try std.testing.expectEqual(@as(usize, 1), lookup.frames.decodes);
+    try std.testing.expectEqual(@as(usize, 1), lookup.frames.loads);
 }
