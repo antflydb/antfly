@@ -1440,7 +1440,7 @@ fn unchangedPublishedInstall(allocator: std.mem.Allocator, io: std.Io, destinati
         // An absent legacy digest can be proven below. Conflicting declared
         // digests require publication so a re-pull repairs a bad old receipt.
         if (old.sha256) |old_digest| if (artifact.sha256) |new_digest| {
-            if (!std.mem.eql(u8, old_digest, new_digest)) return false;
+            if (!std.ascii.eqlIgnoreCase(old_digest, new_digest)) return false;
         };
         const old_stat = try cwd.statFile(io, old.canonical_path, .{});
         const new_stat = try cwd.statFile(io, artifact.canonical_path, .{});
@@ -5707,7 +5707,13 @@ test "managed model transaction preserves unchanged publication and replaces cha
     defer transaction.deinit(io);
     const plan = try managedPath(a, transaction.staging, managed_download_plan_filename);
     defer a.free(plan);
-    try writeFileAtomically(a, io, plan, receipt);
+    // Hex letter case changes neither digest identity nor executable bytes.
+    const alternate_case = try a.dupe(u8, receipt);
+    defer a.free(alternate_case);
+    const digest_tag = "\"sha256\":\"";
+    const digest_start = std.mem.indexOf(u8, alternate_case, digest_tag).? + digest_tag.len;
+    for (alternate_case[digest_start..][0..64]) |*byte| byte.* = std.ascii.toUpper(byte.*);
+    try writeFileAtomically(a, io, plan, alternate_case);
     try completeManagedDownload(a, io, transaction.staging);
     try transaction.commit(io);
     try std.testing.expectEqual(before.inode, (try std.Io.Dir.cwd().statFile(io, directory, .{})).inode);

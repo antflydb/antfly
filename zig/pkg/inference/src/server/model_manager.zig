@@ -96,8 +96,20 @@ const ComponentConstruction = struct {
 /// on warm hits. Unmanaged directories deliberately bypass this cache.
 const MergedDecoderMembershipCache = struct {
     const capacity = 128;
-    const Entry = struct { key: [32]u8, path: ?[]u8, used: u64 };
-    const Lookup = union(enum) { miss, hit: ?[]u8 };
+    const Location = enum {
+        absent,
+        root,
+        onnx,
+        fn relative(self: Location) ?[]const u8 {
+            return switch (self) {
+                .absent => null,
+                .root => "decoder_model_merged.onnx",
+                .onnx => "onnx/decoder_model_merged.onnx",
+            };
+        }
+    };
+    const Entry = struct { key: [32]u8, location: Location, used: u64 };
+    const Lookup = union(enum) { miss, hit: Location };
     mutex: std.atomic.Mutex = .unlocked,
     builders: [8]std.atomic.Mutex = @splat(.unlocked),
     entries: std.ArrayListUnmanaged(Entry) = .empty,
@@ -109,25 +121,22 @@ const MergedDecoderMembershipCache = struct {
         hash.update(&selected.publication.?);
         return hash.finalResult();
     }
-    fn get(self: *MergedDecoderMembershipCache, a: std.mem.Allocator, key: [32]u8) !Lookup {
+    fn get(self: *MergedDecoderMembershipCache, key: [32]u8) Lookup {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
         for (self.entries.items) |*entry| if (std.mem.eql(u8, &entry.key, &key)) {
             self.clock +|= 1;
             entry.used = self.clock;
-            return .{ .hit = if (entry.path) |path| try a.dupe(u8, path) else null };
+            return .{ .hit = entry.location };
         };
         return .miss;
     }
-    fn put(self: *MergedDecoderMembershipCache, a: std.mem.Allocator, key: [32]u8, path: ?[]const u8) !void {
-        const owned = if (path) |value| try a.dupe(u8, value) else null;
-        errdefer if (owned) |value| a.free(value);
+    fn put(self: *MergedDecoderMembershipCache, a: std.mem.Allocator, key: [32]u8, location: Location) !void {
         spinLock(&self.mutex);
         defer self.mutex.unlock();
         self.clock +|= 1;
-        const next = Entry{ .key = key, .path = owned, .used = self.clock };
+        const next = Entry{ .key = key, .location = location, .used = self.clock };
         for (self.entries.items) |*entry| if (std.mem.eql(u8, &entry.key, &key)) {
-            if (entry.path) |value| a.free(value);
             entry.* = next;
             return;
         };
@@ -136,11 +145,9 @@ const MergedDecoderMembershipCache = struct {
         for (self.entries.items, 0..) |entry, i| if (entry.used < self.entries.items[oldest].used) {
             oldest = i;
         };
-        if (self.entries.items[oldest].path) |value| a.free(value);
         self.entries.items[oldest] = next;
     }
     fn deinit(self: *MergedDecoderMembershipCache, a: std.mem.Allocator) void {
-        for (self.entries.items) |entry| if (entry.path) |path| a.free(path);
         self.entries.deinit(a);
     }
 };
@@ -6659,7 +6666,12 @@ pub const ModelManager = struct {
             self: *const ComponentLoader,
             tokenizer_path: []const u8,
         ) !ManagedHfTokenizer {
-            return self.manager.loadManagedHfTokenizerFile(tokenizer_path);
+            var proof = try ComponentConstruction.init(self.manager.allocator, self.manager.session_manager.io orelse std.Options.debug_io, try self.selection(), null, self.borrowed_artifacts);
+            defer proof.deinit();
+            var tokenizer = try self.manager.loadManagedHfTokenizerFileWithArtifacts(tokenizer_path, proof.artifacts());
+            errdefer tokenizer.deinit();
+            try proof.finish();
+            return tokenizer;
         }
 
         /// Adapter for SessionPool's lazy factory. The pool takes ownership of
@@ -7140,6 +7152,14 @@ pub const ModelManager = struct {
         self: *ModelManager,
         tokenizer_path: []const u8,
     ) !ManagedHfTokenizer {
+        return self.loadManagedHfTokenizerFileWithArtifacts(tokenizer_path, null);
+    }
+
+    fn loadManagedHfTokenizerFileWithArtifacts(
+        self: *ModelManager,
+        tokenizer_path: []const u8,
+        artifacts: ?*const PublishedArtifacts,
+    ) !ManagedHfTokenizer {
         const plan = try tokenizerFileAdmissionPlan(
             self.allocator,
             tokenizer_path,
@@ -7148,7 +7168,10 @@ pub const ModelManager = struct {
         var resource_lease = try self.acquireTokenizerAdmission(plan);
         errdefer if (resource_lease) |*lease| lease.release();
 
-        const tok_bytes = try c_file.readFile(self.allocator, tokenizer_path);
+        const tok_bytes = if (artifacts) |verified|
+            try verified.readPath(tokenizer_path, std.math.maxInt(usize))
+        else
+            try c_file.readFile(self.allocator, tokenizer_path);
         defer self.allocator.free(tok_bytes);
         const tokenizer = try hf_tokenizer.HfTokenizer.loadFromBytes(
             self.allocator,
@@ -7999,19 +8022,23 @@ pub const ModelManager = struct {
         defer sidecars.deinit();
         if (publication != null and !std.meta.eql(publication, sidecars.managed_publication)) return error.ModelArtifactsChanging;
 
-        var managed_tokenizer = try self.loadManagedHfTokenizerFile(sidecars.tokenizer_path);
+        var managed_tokenizer = try self.loadManagedHfTokenizerFileWithArtifacts(sidecars.tokenizer_path, &artifacts);
         errdefer managed_tokenizer.deinit();
-        var prompt_cache: ?whisper_prompt.PromptCache = if (kind == .seq2seq) null else try whisper_prompt.PromptCache.initFromPaths(
+        const config_bytes = try artifacts.readPath(sidecars.config_path, 16 * 1024 * 1024);
+        defer self.allocator.free(config_bytes);
+        const generation_bytes = if (kind != .seq2seq and sidecars.generation_config_path != null)
+            try artifacts.readPath(sidecars.generation_config_path.?, 16 * 1024 * 1024)
+        else
+            null;
+        defer if (generation_bytes) |bytes| self.allocator.free(bytes);
+        var prompt_cache: ?whisper_prompt.PromptCache = if (kind == .seq2seq) null else try whisper_prompt.PromptCache.initFromBytes(
             self.allocator,
-            sidecars.generation_config_path,
-            sidecars.config_path,
+            generation_bytes,
+            config_bytes,
             managed_tokenizer.tokenizer.tokenizer(),
         );
         errdefer if (prompt_cache) |*cache| cache.deinit();
-        const decoder_config = try encoder_decoder.loadDecoderConfigFile(
-            self.allocator,
-            sidecars.config_path,
-        );
+        const decoder_config = try encoder_decoder.parseDecoderConfig(config_bytes);
         var encoder: ?ManagedSession = null;
         errdefer if (encoder) |*managed| managed.deinit();
         var decoder: ?ManagedSession = null;
@@ -8352,15 +8379,15 @@ pub const ModelManager = struct {
         var builder: ?*std.atomic.Mutex = null;
         defer if (builder) |mutex| mutex.unlock();
         if (key) |value| {
-            switch (try self.merged_decoder_membership.get(self.allocator, value)) {
-                .hit => |path| return path,
+            switch (self.merged_decoder_membership.get(value)) {
+                .hit => |location| return self.mergedDecoderPath(model_dir, location),
                 .miss => {},
             }
             const mutex = &self.merged_decoder_membership.builders[value[0] % self.merged_decoder_membership.builders.len];
             try control.lockWithPoll(mutex, 100 * std.time.ns_per_us);
             builder = mutex;
-            switch (try self.merged_decoder_membership.get(self.allocator, value)) {
-                .hit => |path| return path,
+            switch (self.merged_decoder_membership.get(value)) {
+                .hit => |location| return self.mergedDecoderPath(model_dir, location),
                 .miss => {},
             }
         }
@@ -8368,12 +8395,26 @@ pub const ModelManager = struct {
         defer lease.deinit(io);
         var artifacts = try PublishedArtifacts.init(self.allocator, io, model_dir, .{ .publication = selected.publication });
         defer artifacts.deinit();
-        const path = try encoder_decoder.findMergedDecoderWithArtifacts(&artifacts);
-        errdefer if (path) |value| self.allocator.free(value);
+        var location: MergedDecoderMembershipCache.Location = .absent;
+        for ([_]MergedDecoderMembershipCache.Location{ .root, .onnx }) |candidate| {
+            if (try artifacts.resolve(candidate.relative().?)) |path| {
+                self.allocator.free(path);
+                location = candidate;
+                break;
+            }
+        }
         try artifacts.verify();
         try control.check();
-        if (key) |value| self.merged_decoder_membership.put(self.allocator, value, path) catch {};
-        return path;
+        if (key) |value| self.merged_decoder_membership.put(self.allocator, value, location) catch {};
+        return self.mergedDecoderPath(model_dir, location);
+    }
+
+    fn mergedDecoderPath(self: *ModelManager, root: []const u8, location: MergedDecoderMembershipCache.Location) !?[]const u8 {
+        const relative = location.relative() orelse return null;
+        // Keep the logical path. The constructor resolves it under the current
+        // installation fence, so an alias retarget cannot leave a stale target
+        // cached even when both installations have the same receipt digest.
+        return try std.fs.path.join(self.allocator, &.{ root, relative });
     }
 
     fn verifyOptionalOnnxForFallback(self: *ModelManager, model_dir: []const u8, path: []const u8, control: ?InferenceExecutionControl) !void {
@@ -17238,7 +17279,7 @@ test "model selection merged membership remains bounded and legacy misses remain
     for (0..MergedDecoderMembershipCache.capacity * 2) |i| {
         var hash = std.crypto.hash.sha2.Sha256.init(.{});
         hash.update(std.mem.asBytes(&i));
-        try cache.put(a, hash.finalResult(), if (i % 2 == 0) "decoder.onnx" else null);
+        try cache.put(a, hash.finalResult(), if (i % 2 == 0) .root else .absent);
     }
     try std.testing.expectEqual(@as(usize, MergedDecoderMembershipCache.capacity), cache.entries.items.len);
     const io = std.testing.io;
@@ -17285,4 +17326,176 @@ test "model selection merged membership cancellation releases its cold builder g
     try std.testing.expect((try manager.findMergedDecoderCached(root, null)) == null);
     try std.testing.expect(builder.tryLock());
     builder.unlock();
+}
+test "model selection conflicting canonical aliases cannot substitute external tensor checksums" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const input = try b.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+    const weight = try b.parameter("weight", ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try b.add(input, weight));
+    const intended = [_]f32{ 1, 1, 1, 1 };
+    const other = [_]f32{ 2, 2, 2, 2 };
+    var exported = try onnx_graph.exportGraphWithExternalData(a, &graph, .{ .parameter_initializers = &.{.{ .name = "weight", .shape = ml.graph.Shape.init(.f32, &.{4}), .data = .{ .raw_bytes = std.mem.asBytes(&intended) } }} }, "weights.data");
+    defer exported.deinit(a);
+    try std.testing.expectEqual(exported.external_data.?.bytes.len, std.mem.asBytes(&other).len);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.onnx", .data = exported.model_bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "weights.data", .data = exported.external_data.?.bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "alternate.data", .data = std.mem.asBytes(&other) });
+    const config = "{\"model_type\":\"bert\",\"hidden_size\":4,\"num_attention_heads\":1,\"vocab_size\":4}";
+    const tokenizer = "{\"version\":\"1.0\",\"added_tokens\":[{\"id\":0,\"content\":\"<unk>\"}],\"model\":{\"type\":\"BPE\",\"vocab\":{\"<unk>\":0},\"merges\":[]}}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
+    var expected: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(exported.external_data.?.bytes, &expected, .{});
+    var alternate: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(std.mem.asBytes(&other), &alternate, .{});
+    const receipt = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "onnx", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{ .{ .path = "model.onnx", .size = exported.model_bytes.len }, .{ .path = "weights.data", .size = exported.external_data.?.bytes.len, .sha256 = std.fmt.bytesToHex(expected, .lower) }, .{ .path = "alternate.data", .size = std.mem.asBytes(&other).len, .sha256 = std.fmt.bytesToHex(alternate, .lower) }, .{ .path = "config.json", .size = config.len }, .{ .path = "tokenizer.json", .size = tokenizer.len } } }, .{});
+    defer a.free(receipt);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const selected = ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    try tmp.dir.deleteFile(io, "weights.data");
+    try tmp.dir.symLink(io, "alternate.data", "weights.data", .{});
+    const requested = try std.fs.path.join(a, &.{ root, "model.onnx" });
+    defer a.free(requested);
+    try std.testing.expectError(error.InvalidManagedDownload, PublishedArtifacts.init(a, io, root, .{ .publication = selected.publication }));
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    try std.testing.expectError(error.InvalidManagedDownload, manager.componentLoaderForPaths(root, &.{.native}, &.{requested}));
+}
+
+test "model selection merged membership follows identical-receipt installation aliases" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const input = try b.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+    const bias = try b.tensorConst(&.{ 1, 1, 1, 1 }, ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try b.add(input, bias));
+    const bytes = try onnx_graph.exportGraph(a, &graph, .{});
+    defer a.free(bytes);
+    const config = "{\"model_type\":\"t5\",\"vocab_size\":4,\"d_model\":4,\"decoder_start_token_id\":0}";
+    const tokenizer = "{\"version\":\"1.0\",\"added_tokens\":[{\"id\":0,\"content\":\"<unk>\"}],\"model\":{\"type\":\"BPE\",\"vocab\":{\"<unk>\":0},\"merges\":[]}}";
+    const receipt = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "onnx", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{ .{ .path = "encoder_model.onnx", .size = bytes.len }, .{ .path = "decoder_model.onnx", .size = bytes.len }, .{ .path = "decoder_model_merged.onnx", .size = bytes.len }, .{ .path = "config.json", .size = config.len }, .{ .path = "tokenizer.json", .size = tokenizer.len } } }, .{});
+    defer a.free(receipt);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "installed-a", "installed-b" }) |directory| {
+        try tmp.dir.createDirPath(io, directory);
+        var dir = try tmp.dir.openDir(io, directory, .{});
+        defer dir.close(io);
+        for ([_][]const u8{ "encoder_model.onnx", "decoder_model.onnx", "decoder_model_merged.onnx" }) |name| try dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+        try dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+        try dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
+        try dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    }
+    try tmp.dir.symLink(io, "installed-a", "current", .{ .is_directory = true });
+    const parent = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(parent);
+    const root = try std.fs.path.join(a, &.{ parent, "current" });
+    defer a.free(root);
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    const selected = ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    const control = selected.bind(InferenceExecutionControl{ .io = io, .native_call_policy = .in_process, .request_owned = false });
+    const before = try encoder_decoder.findEncoderDecoderPaths(a, root);
+    defer a.free(before.encoder);
+    defer a.free(before.decoder);
+    var first = try manager.acquireCompositeRuntime(root, &.{ before.encoder, before.decoder }, .seq2seq, control);
+    first.release();
+    try tmp.dir.deleteFile(io, "current");
+    try tmp.dir.symLink(io, "installed-b", "current", .{ .is_directory = true });
+    try selected.verify(a, io);
+    const current = try encoder_decoder.findEncoderDecoderPaths(a, root);
+    defer a.free(current.encoder);
+    defer a.free(current.decoder);
+    try std.testing.expect(!std.mem.eql(u8, before.encoder, current.encoder));
+    var retry = try manager.acquireCompositeRuntime(root, &.{ current.encoder, current.decoder }, .seq2seq, control);
+    defer retry.release();
+}
+
+test "model selection composite metadata rejects declared checksum mismatches" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var b = ml.graph.Builder.init(&graph);
+    const input = try b.parameter("input", ml.graph.Shape.init(.f32, &.{4}));
+    const bias = try b.tensorConst(&.{ 1, 1, 1, 1 }, ml.graph.Shape.init(.f32, &.{4}));
+    try graph.markOutput(try b.add(input, bias));
+    const bytes = try onnx_graph.exportGraph(a, &graph, .{});
+    defer a.free(bytes);
+    const config = "{\"model_type\":\"t5\",\"vocab_size\":4,\"d_model\":4,\"decoder_start_token_id\":0}";
+    const tokenizer = "{\"version\":\"1.0\",\"added_tokens\":[{\"id\":0,\"content\":\"<unk>\"}],\"model\":{\"type\":\"BPE\",\"vocab\":{\"<unk>\":0},\"merges\":[]}}";
+    const generation_json = "{\"eos_token_id\":0}";
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(config, &digest, .{});
+    var tokenizer_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(tokenizer, &tokenizer_digest, .{});
+    var generation_digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(generation_json, &generation_digest, .{});
+    const receipt = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "onnx", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{ .{ .path = "encoder_model.onnx", .size = bytes.len }, .{ .path = "decoder_model.onnx", .size = bytes.len }, .{ .path = "config.json", .size = config.len, .sha256 = std.fmt.bytesToHex(digest, .lower) }, .{ .path = "tokenizer.json", .size = tokenizer.len, .sha256 = std.fmt.bytesToHex(tokenizer_digest, .lower) }, .{ .path = "generation_config.json", .size = generation_json.len, .sha256 = std.fmt.bytesToHex(generation_digest, .lower) } } }, .{});
+    defer a.free(receipt);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    for ([_][]const u8{ "encoder_model.onnx", "decoder_model.onnx" }) |name| try tmp.dir.writeFile(io, .{ .sub_path = name, .data = bytes });
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
+    try tmp.dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = generation_json });
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const selected = ResolvedModel{ .path = root, .publication = try managed_receipt.publicationGeneration(a, io, root) };
+    const replacement = try a.dupe(u8, config);
+    defer a.free(replacement);
+    const tag = "\"decoder_start_token_id\":0";
+    const at = std.mem.indexOf(u8, replacement, tag).?;
+    replacement[at + tag.len - 1] = '1';
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = replacement });
+    var artifacts = try PublishedArtifacts.init(a, io, root, .{ .publication = selected.publication });
+    defer artifacts.deinit();
+    try std.testing.expectError(error.ChecksumMismatch, artifacts.verifyFile("config.json"));
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    sm.native_call_policy = .in_process;
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    manager.configureServingPolicy(.{ .allow_unknown = true });
+    const paths = try encoder_decoder.findEncoderDecoderPaths(a, root);
+    defer a.free(paths.encoder);
+    defer a.free(paths.decoder);
+    const control = selected.bind(InferenceExecutionControl{ .io = io, .native_call_policy = .in_process, .request_owned = false });
+    try std.testing.expectError(error.ChecksumMismatch, manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, control));
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config });
+    var valid = try manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, control);
+    defer valid.release();
+    try std.testing.expectEqual(@as(i32, 0), valid.get().decoder_config.decoder_start_token_id);
+    try std.testing.expectEqual(selected.publication, valid.get().managed_publication);
+    const bad_tokenizer = try a.dupe(u8, tokenizer);
+    defer a.free(bad_tokenizer);
+    const token_at = std.mem.indexOf(u8, bad_tokenizer, "<unk>").?;
+    bad_tokenizer[token_at + 1] = 'x';
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = bad_tokenizer });
+    try std.testing.expectError(error.ChecksumMismatch, manager.acquireCompositeRuntime(root, &.{ paths.encoder, paths.decoder }, .seq2seq, control));
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = tokenizer });
+    const bad_generation = try a.dupe(u8, generation_json);
+    defer a.free(bad_generation);
+    bad_generation[bad_generation.len - 2] = '1';
+    try tmp.dir.writeFile(io, .{ .sub_path = "generation_config.json", .data = bad_generation });
+    try std.testing.expectError(error.ChecksumMismatch, manager.acquireCompositeRuntime(root, &.{}, .whisper_metadata, control));
 }

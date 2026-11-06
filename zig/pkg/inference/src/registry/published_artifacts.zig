@@ -57,27 +57,37 @@ pub const PublishedArtifacts = struct {
     /// Verify bytes actually read/mapped, avoiding a hash-then-reopen race.
     pub fn verifyBytes(self: *const PublishedArtifacts, relative: []const u8, bytes: []const u8) !void {
         if (self.receipt) |*receipt| {
-            const artifact = receipt.find(relative) orelse return error.InvalidManagedDownload;
-            if (artifact.size != bytes.len) return error.InvalidManagedDownload;
-            if (artifact.sha256) |expected| {
-                if (expected.len != 64) return error.ChecksumMismatch;
-                var decoded: [32]u8 = undefined;
-                _ = std.fmt.hexToBytes(&decoded, expected) catch return error.ChecksumMismatch;
-                var actual: [32]u8 = undefined;
-                std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
-                if (!std.mem.eql(u8, &decoded, &actual)) return error.ChecksumMismatch;
-            }
+            try managed.verifyArtifactBytes(receipt.find(relative) orelse return error.InvalidManagedDownload, bytes);
         }
     }
     pub fn read(self: *const PublishedArtifacts, relative: []const u8, max_bytes: usize) ![]u8 {
         const path = (try self.resolve(relative)) orelse return error.FileNotFound;
         defer self.allocator.free(path);
-        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, path, self.allocator, .limited(max_bytes)) catch |err| switch (err) {
-            error.StreamTooLong => return error.FileTooLarge,
+        return self.readPath(path, max_bytes);
+    }
+    /// Read an already selected sidecar and authenticate the exact consumed
+    /// bytes. Managed paths use the normalized canonical receipt contract;
+    /// legacy paths retain containment without requiring a completion receipt.
+    pub fn readPath(self: *const PublishedArtifacts, path: []const u8, max_bytes: usize) ![]u8 {
+        const canonical = try managed.resolveRegularFilePath(self.allocator, self.io, path);
+        defer self.allocator.free(canonical);
+        const artifact: ?*const managed.ValidatedArtifact = if (self.receipt) |*receipt|
+            &receipt.artifacts[self.canonical_index.get(canonical) orelse return error.InvalidManagedDownload]
+        else legacy: {
+            const root = try std.Io.Dir.cwd().realPathFileAlloc(self.io, self.root, self.allocator);
+            defer self.allocator.free(root);
+            if (!managed.pathIsWithinRoot(root, canonical)) return error.ModelArtifactOutsideRoot;
+            break :legacy null;
+        };
+        const limit = if (artifact) |member| @min(max_bytes, std.math.cast(usize, member.size) orelse return error.FileTooLarge) else max_bytes;
+        // Io.Limit rejects a stream when the limit is reached, so leave one
+        // byte of headroom to observe EOF for an exactly sized artifact.
+        const bytes = std.Io.Dir.cwd().readFileAlloc(self.io, canonical, self.allocator, .limited(limit +| 1)) catch |err| switch (err) {
+            error.StreamTooLong => return if (artifact != null and artifact.?.size <= max_bytes) error.InvalidManagedDownload else error.FileTooLarge,
             else => return err,
         };
         errdefer self.allocator.free(bytes);
-        try self.verifyBytes(relative, bytes);
+        if (artifact) |member| try managed.verifyArtifactBytes(member, bytes);
         return bytes;
     }
     /// Verification belongs to one reader acquisition, not path resolution.
@@ -93,7 +103,8 @@ pub const PublishedArtifacts = struct {
     pub fn verifyFile(self: *PublishedArtifacts, relative: []const u8) !void {
         if (self.receipt) |*receipt| {
             const index = receipt.path_index.get(relative) orelse return error.InvalidManagedDownload;
-            try self.verifyIndex(index);
+            // Every canonical alias now shares one normalized digest and proof.
+            try self.verifyIndex(self.canonical_index.get(receipt.artifacts[index].canonical_path).?);
         }
     }
     /// ONNX external tensors are consumed by a component loader, not by
@@ -197,4 +208,42 @@ test "model selection reader acquisition hashes each unchanged artifact once" {
     try std.testing.expectError(error.ModelArtifactsChanging, published.verify());
     try std.testing.expectError(error.ChecksumMismatch, published.verifyFile("model.onnx"));
     try std.testing.expectEqual(@as(usize, 2), Probe.opens);
+}
+
+test "model selection canonical aliases retain the strongest checksum in either receipt order" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    for ([_]bool{ false, true }) |both_known| {
+        for ([_]bool{ false, true }) |reverse| {
+            var tmp = std.testing.tmpDir(.{});
+            defer tmp.cleanup();
+            try tmp.dir.writeFile(io, .{ .sub_path = "model.onnx", .data = "data" });
+            try tmp.dir.symLink(io, "model.onnx", "alias.onnx", .{});
+            var digest: [32]u8 = undefined;
+            std.crypto.hash.sha2.Sha256.hash("data", &digest, .{});
+            const hex = std.fmt.bytesToHex(digest, .lower);
+            const upper_hex = std.fmt.bytesToHex(digest, .upper);
+            const Artifact = struct { path: []const u8, size: u64 = 4, sha256: ?[]const u8 };
+            const strong = Artifact{ .path = "model.onnx", .sha256 = &hex };
+            const weak = Artifact{ .path = "alias.onnx", .sha256 = if (both_known) &upper_hex else null };
+            const files = if (reverse) [_]Artifact{ weak, strong } else [_]Artifact{ strong, weak };
+            const receipt = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .artifacts = files }, .{});
+            defer a.free(receipt);
+            try tmp.dir.writeFile(io, .{ .sub_path = managed.complete_filename, .data = receipt });
+            const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+            defer a.free(root);
+            var published = try PublishedArtifacts.init(a, io, root, null);
+            defer published.deinit();
+            try std.testing.expect(std.ascii.eqlIgnoreCase(&hex, published.receipt.?.find("model.onnx").?.sha256.?));
+            try std.testing.expect(std.ascii.eqlIgnoreCase(&hex, published.receipt.?.find("alias.onnx").?.sha256.?));
+            const data = try published.read("alias.onnx", 4);
+            a.free(data);
+            try std.testing.expectError(error.FileTooLarge, published.read("alias.onnx", 3));
+            try published.verifyFile("model.onnx");
+            try published.verifyFile("alias.onnx");
+            try tmp.dir.writeFile(io, .{ .sub_path = "model.onnx", .data = "tada" });
+            try std.testing.expectError(error.ChecksumMismatch, published.read("alias.onnx", 8));
+            try std.testing.expectError(error.ChecksumMismatch, published.read("model.onnx", 8));
+        }
+    }
 }
