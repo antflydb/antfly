@@ -1967,7 +1967,12 @@ source frames are pinned until their parser returns. Reclamation does not
 refund cumulative work or recover backing-allocator failures.
 Metadata scanning polls cancellation throughout tokens, strings, whitespace,
 comments, and skipped compound values. Stream-boundary searches for indirect
-lengths use bounded chunks with marker overlap, and numeric lookahead propagates
+lengths are a recovery path: valid indirect lengths are resolved first and
+seek directly to the declared payload end, preserving embedded endstream data.
+Length-reference chains and scalar parsing are depth-bounded, cycles are
+rejected, and compressed length objects are rejected before reading their
+container. Recovery searches use bounded chunks with marker overlap.
+Numeric lookahead propagates
 cancellation and work exhaustion rather than treating them as end-of-input.
 Ordinary object reads also poll the Reader cancellation probe when no shared
 metadata work allowance is active.

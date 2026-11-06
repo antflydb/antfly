@@ -5753,6 +5753,7 @@ pub const Reader = struct {
         var scanner = syntax.Scanner.initWithOffset(self.alloc, self.bytes[entry.offset..], entry.offset);
         scanner.max_object_depth = self.object_depth_limit;
         scanner.source_ref = ptr;
+        scanner.stream_length_resolver = .{ .context = self, .resolve = resolveStreamLengthReference };
         var scan_control: syntax.ScanControl = undefined;
         scanner.control = self.scannerControl(&scan_control);
         defer scanner.deinit();
@@ -5783,6 +5784,7 @@ pub const Reader = struct {
         var scanner = syntax.Scanner.initWithOffset(self.alloc, self.bytes[location.start..location.end], location.start);
         scanner.max_object_depth = self.object_depth_limit;
         scanner.source_ref = location.reference;
+        scanner.stream_length_resolver = .{ .context = self, .resolve = resolveStreamLengthReference };
         var scan_control: syntax.ScanControl = undefined;
         scanner.control = self.scannerControl(&scan_control);
         defer scanner.deinit();
@@ -5837,18 +5839,50 @@ pub const Reader = struct {
         return try self.alloc.dupe(u8, encoded);
     }
 
+    fn resolveStreamLengthReference(raw: *const anyopaque, initial: syntax.ObjRef) anyerror!?usize {
+        const self: *const Reader = @ptrCast(@alignCast(raw));
+        var scalar_reader = self.*;
+        scalar_reader.object_depth_limit = @min(self.object_depth_limit, 128);
+        var visited: [128]syntax.ObjRef = undefined;
+        var count: usize = 0;
+        var reference = initial;
+        while (count < visited.len) {
+            try self.checkCancellation();
+            for (visited[0..count]) |previous| {
+                if (previous.id == reference.id and previous.gen == reference.gen) return error.InvalidStreamLength;
+            }
+            visited[count] = reference;
+            count += 1;
+            const entry = self.findXref(reference) orelse return error.ObjectNotFound;
+            // PDF stream-length objects cannot themselves be compressed.
+            // Reject these before entering their container: a length pointing
+            // back into its own object stream must not recurse through headers.
+            if (entry.compressed_obj_stream_id != null) return error.InvalidStreamLength;
+            var value = try scalar_reader.readIndirectObjectProjected(reference, .integer);
+            defer value.deinit(self.alloc);
+            if (value.asInteger()) |length| {
+                if (length < 0) return error.InvalidStreamLength;
+                return std.math.cast(usize, length) orelse error.InvalidStreamLength;
+            }
+            if (value == .obj_ref) {
+                reference = value.obj_ref;
+                continue;
+            }
+            return null;
+        }
+        return error.InvalidStreamLength;
+    }
+
     fn resolvedStreamDataLength(self: *const Reader, obj: *const syntax.Object) !usize {
         if (obj.* != .stream) return error.NotAStream;
         const length_obj = obj.get("Length") orelse return obj.stream.data_length;
         if (length_obj.asInteger()) |length| {
             if (length < 0) return error.InvalidStreamLength;
-            return @intCast(length);
+            return std.math.cast(usize, length) orelse error.InvalidStreamLength;
         }
-        var resolved = try self.resolveValue(length_obj);
-        defer resolved.deinit(self.alloc);
-        const length = resolved.asInteger() orelse return obj.stream.data_length;
-        if (length < 0) return error.InvalidStreamLength;
-        return @intCast(length);
+        if (length_obj.* == .obj_ref)
+            return (try resolveStreamLengthReference(self, length_obj.obj_ref)) orelse obj.stream.data_length;
+        return obj.stream.data_length;
     }
 
     pub fn readDecodedStreamData(self: *const Reader, obj: *const syntax.Object) ![]u8 {
@@ -23591,7 +23625,7 @@ test "reader resolves indirect stream length when compressed payload ends in new
     defer reader.deinit();
     var obj = try reader.readIndirectObject(.{ .id = 1, .gen = 0 });
     defer obj.deinit(alloc);
-    try std.testing.expectEqual(@as(usize, 11), obj.stream.data_length);
+    try std.testing.expectEqual(@as(usize, 12), obj.stream.data_length);
     const decoded = try reader.readDecodedStreamData(&obj);
     defer alloc.free(decoded);
     try std.testing.expectEqualStrings("x103", decoded);
@@ -37094,6 +37128,7 @@ const ObjectStreamFixture = struct {
     extra: []const []const u8 = &.{},
     flate: bool = true,
     indirect_length: bool = false,
+    length_reference: ?usize = null,
 };
 
 fn buildObjectStreamFixtureAlloc(a: Allocator, fixture: ObjectStreamFixture) ![]u8 {
@@ -37122,7 +37157,7 @@ fn buildObjectStreamFixtureAlloc(a: Allocator, fixture: ObjectStreamFixture) ![]
     const encoded = if (fixture.flate) compressed.written() else raw.written();
     const content = fixture.content;
     const length_id = 7 + objects.len + fixture.extra.len;
-    const length = if (fixture.indirect_length) try std.fmt.allocPrint(a, "{d} 0 R", .{length_id}) else try std.fmt.allocPrint(a, "{d}", .{encoded.len});
+    const length = if (fixture.indirect_length) try std.fmt.allocPrint(a, "{d} 0 R", .{fixture.length_reference orelse length_id}) else try std.fmt.allocPrint(a, "{d}", .{encoded.len});
     defer a.free(length);
     const paint = try std.fmt.allocPrint(a, "<< /Length {d} >>\nstream\n{s}\nendstream", .{ content.len, content });
     defer a.free(paint);
@@ -37830,4 +37865,188 @@ test "reader ordinary object reads cancel stream searches before allocating payl
     var object = try reader.readIndirectObject(.{ .id = 7, .gen = 0 });
     defer object.deinit(tracked.allocator());
     try std.testing.expectEqual(@as(u32, 5), object.get("Font").?.get("F1").?.obj_ref.id);
+}
+
+fn exerciseIndirectLengthPayloadAllocations(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqualStrings("Label\n", analysis.text);
+    try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+    const plain = try reader.extractPlainTextAlloc();
+    defer a.free(plain);
+    try std.testing.expectEqualStrings(analysis.text, plain);
+}
+
+test "reader indirect lengths preserve endstream data and full payload boundaries" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "before\nendstream\nendobj\nafter", "before\rendstream\rafter", "before\r\nendstream\r\nafter" }) |private| {
+        const resources = try std.fmt.allocPrint(a, "<< /Font << /F1 5 0 R >> /Properties << /Tag << /ActualText (Label) >> >> /Private ({s}) >>", .{private});
+        defer a.free(resources);
+        const sample = try buildObjectStreamFixtureAlloc(a, .{
+            .objects = &.{resources},
+            .content = "/Span /Tag BDC BT /F1 10 Tf (SOURCE) Tj ET EMC",
+            .flate = false,
+            .indirect_length = true,
+        });
+        defer a.free(sample);
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        var stream = try reader.readIndirectObject(.{ .id = 6, .gen = 0 });
+        defer stream.deinit(a);
+        const raw = try reader.readRawStreamData(&stream);
+        defer a.free(raw);
+        try std.testing.expectEqualStrings(resources, raw[4 .. raw.len - 1]);
+        try std.testing.expectEqual(raw.len, stream.stream.data_length);
+        try std.testing.expectEqual(@as(u32, 8), stream.get("Length").?.obj_ref.id);
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try reader.extractPlainTextAlloc();
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("Label\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        }
+    }
+}
+
+test "reader indirect length ownership survives every allocation failure" {
+    const a = std.testing.allocator;
+    const sample = try buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{"<< /Font << /F1 5 0 R >> /Properties << /Tag << /ActualText (Label) >> >> /Private (before\nendstream\nafter) >>"},
+        .content = "/Span /Tag BDC BT /F1 10 Tf (SOURCE) Tj ET EMC",
+        .flate = false,
+        .indirect_length = true,
+    });
+    defer a.free(sample);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseIndirectLengthPayloadAllocations, .{sample});
+}
+
+test "reader indirect length references reject cycles and invalid lengths" {
+    const a = std.testing.allocator;
+    const cases = [_]struct { extra: []const []const u8, reference: usize, expected: anyerror }{
+        .{ .extra = &.{"8 0 R"}, .reference = 8, .expected = error.InvalidStreamLength },
+        .{ .extra = &.{ "9 0 R", "8 0 R" }, .reference = 8, .expected = error.InvalidStreamLength },
+        .{ .extra = &.{"-1"}, .reference = 8, .expected = error.InvalidStreamLength },
+        .{ .extra = &.{"2"}, .reference = 8, .expected = error.MissingEndStream },
+        .{ .extra = &.{"9223372036854775807"}, .reference = 8, .expected = error.UnexpectedEof },
+        .{ .extra = &.{}, .reference = 7, .expected = error.InvalidStreamLength },
+        .{ .extra = &.{}, .reference = 400, .expected = error.ObjectNotFound },
+    };
+    for (cases) |case| {
+        const sample = try buildObjectStreamFixtureAlloc(a, .{
+            .objects = &.{"<< /Font << /F1 5 0 R >> >>"},
+            .extra = case.extra,
+            .flate = false,
+            .indirect_length = true,
+            .length_reference = case.reference,
+        });
+        defer a.free(sample);
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        try std.testing.expectError(case.expected, reader.readIndirectObject(.{ .id = 6, .gen = 0 }));
+    }
+    // Invalid scalar types retain bounded marker-search recovery.
+    for ([_][]const u8{ "null", "[1 2]", "<< /Ignored [0 1] >>" }) |value| {
+        const sample = try buildObjectStreamFixtureAlloc(a, .{
+            .objects = &.{"<< /Font << /F1 5 0 R >> >>"},
+            .extra = &.{value},
+            .flate = false,
+            .indirect_length = true,
+            .length_reference = 8,
+        });
+        defer a.free(sample);
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        var stream = try reader.readIndirectObject(.{ .id = 6, .gen = 0 });
+        defer stream.deinit(a);
+        const raw = try reader.readRawStreamData(&stream);
+        defer a.free(raw);
+        try std.testing.expectEqual(stream.stream.data_length, raw.len);
+    }
+}
+
+test "reader indirect length reference chains have a fixed resolution bound" {
+    const a = std.testing.allocator;
+    for ([_]usize{ 1, 127, 128 }) |count| {
+        const extra = try a.alloc([]const u8, count);
+        var initialized: usize = 0;
+        defer {
+            for (extra[0..initialized]) |object| a.free(object);
+            a.free(extra);
+        }
+        for (extra, 0..) |*object, i| {
+            object.* = try std.fmt.allocPrint(a, "{d} 0 R", .{9 + i});
+            initialized += 1;
+        }
+        const sample = try buildObjectStreamFixtureAlloc(a, .{
+            .objects = &.{"<< /Font << /F1 5 0 R >> >>"},
+            .extra = extra,
+            .flate = false,
+            .indirect_length = true,
+            .length_reference = 8,
+        });
+        defer a.free(sample);
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        if (count == 128) {
+            try std.testing.expectError(error.InvalidStreamLength, reader.readIndirectObject(.{ .id = 6, .gen = 0 }));
+        } else {
+            var stream = try reader.readIndirectObject(.{ .id = 6, .gen = 0 });
+            defer stream.deinit(a);
+            try std.testing.expect(stream.stream.data_length > 0);
+        }
+    }
+}
+
+test "reader indirect length scalar parsing rejects excessive nesting" {
+    const a = std.testing.allocator;
+    var nested: std.ArrayList(u8) = .empty;
+    defer nested.deinit(a);
+    for (0..129) |_| try nested.appendSlice(a, "11 0 obj ");
+    try nested.appendSlice(a, "1 ");
+    for (0..129) |_| try nested.appendSlice(a, "endobj ");
+    const sample = try buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{"<< /Font << /F1 5 0 R >> >>"},
+        .extra = &.{nested.items},
+        .flate = false,
+        .indirect_length = true,
+        .length_reference = 8,
+    });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    try std.testing.expectError(error.PdfObjectNestingTooDeep, reader.readIndirectObject(.{ .id = 6, .gen = 0 }));
+}
+
+fn exerciseEncryptedIndirectStreamLengthAllocations(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    reader.encryption = .{ .file_key = @splat(3), .file_key_len = 5, .method = .rc4 };
+    var resources = try reader.readIndirectObject(.{ .id = 7, .gen = 0 });
+    defer resources.deinit(a);
+    try std.testing.expectEqualStrings("Label", resources.get("Properties").?.get("Tag").?.get("ActualText").?.string);
+}
+
+test "reader indirect lengths preserve encrypted stream ownership through allocation failure" {
+    const a = std.testing.allocator;
+    const sample = try buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{"<< /Font << /F1 5 0 R >> /Properties << /Tag << /ActualText (Label) >> >> /Private (before\nendstream\nafter) >>"},
+        .flate = false,
+        .indirect_length = true,
+    });
+    defer a.free(sample);
+    {
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        var stream = try reader.readIndirectObject(.{ .id = 6, .gen = 0 });
+        defer stream.deinit(a);
+        const file_key: [16]u8 = @splat(3);
+        const key = objectEncryptionKey(file_key, 5, .{ .id = 6, .gen = 0 }, .rc4);
+        rc4Crypt(key.bytes[0..key.len], sample[stream.stream.data_offset..][0..stream.stream.data_length]);
+    }
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedIndirectStreamLengthAllocations, .{sample});
 }

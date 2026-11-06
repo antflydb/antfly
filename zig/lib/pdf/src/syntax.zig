@@ -273,6 +273,10 @@ pub const Scanner = struct {
     allow_stream: bool = true,
     control: ?*ScanControl = null,
     last_checked_pos: usize = 0,
+    stream_length_resolver: ?struct {
+        context: *const anyopaque,
+        resolve: *const fn (*const anyopaque, ObjRef) anyerror!?usize,
+    } = null,
 
     fn checkpoint(self: *Scanner) !void {
         try self.checkpointUsing(self.control);
@@ -535,11 +539,13 @@ pub const Scanner = struct {
 
         const data_start = self.pos;
         const data_offset = self.base_offset + data_start;
-        const actual_length = if (streamLength(owned)) |direct_length| blk: {
-            if (self.pos + direct_length > self.bytes.len) {
+        const actual_length = if (try self.streamLength(owned)) |direct_length| blk: {
+            if (direct_length > self.bytes.len - self.pos) {
                 return error.UnexpectedEof;
             }
             self.pos += direct_length;
+            // Seeking by a validated length does not scan payload bytes.
+            if (self.control != null) self.last_checked_pos = self.pos;
             break :blk direct_length;
         } else blk: {
             const data_end = (try findEndStreamDataEnd(self.bytes, self.pos, self.control)) orelse {
@@ -561,6 +567,20 @@ pub const Scanner = struct {
             .data_offset = data_offset,
             .data_length = actual_length,
         } };
+    }
+
+    fn streamLength(self: *Scanner, entries: []const DictEntry) !?usize {
+        for (entries) |entry| {
+            if (!std.mem.eql(u8, entry.key, "Length")) continue;
+            if (entry.value.asInteger()) |length| {
+                if (length < 0) return error.InvalidStreamLength;
+                return std.math.cast(usize, length) orelse error.InvalidStreamLength;
+            }
+            if (entry.value == .obj_ref) if (self.stream_length_resolver) |resolver|
+                return resolver.resolve(resolver.context, entry.value.obj_ref);
+            return null;
+        }
+        return null;
     }
 
     fn readToken(self: *Scanner) anyerror!Token {
@@ -969,17 +989,6 @@ fn numberToken(text: []const u8) !?Token {
         return .{ .integer = value };
     }
     if (isReal(text)) return .{ .real = try std.fmt.parseFloat(f64, text) };
-    return null;
-}
-
-fn streamLength(entries: []const DictEntry) ?usize {
-    for (entries) |entry| {
-        if (std.mem.eql(u8, entry.key, "Length")) {
-            const len_i = entry.value.asInteger() orelse return null;
-            if (len_i < 0) return null;
-            return @intCast(len_i);
-        }
-    }
     return null;
 }
 
@@ -1739,4 +1748,65 @@ test "scanner controlled stream searches preserve markers across chunk boundarie
         var control = ScanControl{};
         try std.testing.expectEqual(@as(?usize, null), try findEndStreamDataEnd(input, 0, &control));
     }
+}
+
+test "scanner resolves indirect lengths before examining payload markers" {
+    const a = std.testing.allocator;
+    const payload = "before\nendstream\nendobj\nafter\r\n";
+    const input = "<< /Length 8 0 R >>\nstream\n" ++ payload ++ "\nendstream";
+    const Resolver = struct {
+        calls: usize = 0,
+        length: usize = payload.len,
+        failure: ?anyerror = null,
+        fn resolve(raw: *const anyopaque, ref: ObjRef) anyerror!?usize {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(u32, 8), ref.id);
+            if (self.failure) |err| return err;
+            return self.length;
+        }
+    };
+    var resolver = Resolver{};
+    var control = ScanControl{ .remaining_work = 1024 };
+    var scanner = Scanner.init(a, input);
+    scanner.control = &control;
+    scanner.stream_length_resolver = .{ .context = &resolver, .resolve = Resolver.resolve };
+    defer scanner.deinit();
+    var object = try scanner.readObject();
+    defer object.deinit(a);
+    try std.testing.expectEqualStrings(payload, input[object.stream.data_offset..][0..object.stream.data_length]);
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqual(@as(u32, 8), object.get("Length").?.obj_ref.id);
+    for ([_]anyerror{ error.OutOfMemory, error.Canceled, error.PdfMetadataWorkLimit, error.InvalidStreamLength }) |failure| {
+        var failing = Resolver{ .failure = failure };
+        var failed = Scanner.init(a, input);
+        failed.stream_length_resolver = .{ .context = &failing, .resolve = Resolver.resolve };
+        defer failed.deinit();
+        try std.testing.expectError(failure, failed.readObject());
+    }
+    var too_long = Resolver{ .length = std.math.maxInt(usize) };
+    var invalid = Scanner.init(a, input);
+    invalid.stream_length_resolver = .{ .context = &too_long, .resolve = Resolver.resolve };
+    defer invalid.deinit();
+    try std.testing.expectError(error.UnexpectedEof, invalid.readObject());
+}
+
+test "scanner known stream lengths seek without charging payload scan work" {
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 32 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'X');
+    const input = try std.fmt.allocPrint(a, "<< /Length {d} >>\nstream\n{s}\nendstream", .{ payload.len, payload });
+    defer a.free(input);
+    var control = ScanControl{ .remaining_work = 1024 };
+    var scanner = Scanner.init(a, input);
+    scanner.control = &control;
+    defer scanner.deinit();
+    var object = try scanner.readObject();
+    defer object.deinit(a);
+    try std.testing.expectEqual(payload.len, object.stream.data_length);
+    try std.testing.expect(control.remaining_work > 0);
+    var invalid = Scanner.init(a, "<< /Length -1 >>\nstream\nx\nendstream");
+    defer invalid.deinit();
+    try std.testing.expectError(error.InvalidStreamLength, invalid.readObject());
 }
