@@ -5192,7 +5192,12 @@ fn incrementalCachePermit(session: Session, base: *const @import("../backends/se
 }
 fn incrementalCachePermitForAmounts(session: Session, base: *const @import("../backends/session.zig").RunPermit, amounts: runtime.tier.memory.AdmissionAmounts) !?@import("../backends/session.zig").RunPermit {
     const lease = base.lease orelse return null;
-    return try session.admitSupplement(base, try lease.amounts.merge(amounts));
+    const target = try lease.amounts.merge(amounts);
+    // The base and mandatory cache belong to one request. Classify their
+    // complete intrinsic peak before ordinary admission acquires the deficit;
+    // independently held requests remain genuine temporary contention.
+    if (session.run_admission) |policy| try policy.validateOwnedRunAmounts(target);
+    return try session.admitSupplement(base, target);
 }
 
 fn createResidentIncrementalDecoder(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, source: RetainedEncoderSource) !WhisperNativeDecoder {
@@ -9861,16 +9866,16 @@ test "native incremental private cache is denied before actual cache weight look
     defer sizing_compute.deinit();
     const sizing_backend = sizing_compute.computeBackend();
     const extra = try geometry.cacheAmounts(&sizing_backend);
-    // The incremental request fits alone. The live base reservation occupies
-    // the cap when the constructor requests its supplement, so ordinary
-    // admission classifies this as temporary capacity pressure.
+    // The cache supplement fits alone, but this SAME request's mandatory
+    // base plus cache cannot fit. The complete intrinsic peak must be refused
+    // before weight lookup rather than reported as external contention.
     try std.testing.expect(extra.hostTotalBytes() <= base_amounts.hostTotalBytes());
     try std.testing.expect(extra.hostTotalBytes() > 0);
 
     const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
     // This model deliberately has no decoder weights. Reaching Cache.init
     // would produce MissingWeight rather than the expected admission failure.
-    try std.testing.expectError(error.ResourceTemporarilyUnavailable, whisperNativeDecoder(session, a, null, &hidden, 2));
+    try std.testing.expectError(error.ResourceLimitExceeded, whisperNativeDecoder(session, a, null, &hidden, 2));
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_kv_bytes);
 }
@@ -18527,6 +18532,8 @@ fn nativeWhisperAssignedSourceCase(a: std.mem.Allocator, admitted: bool) !void {
     var session = try IncrementalFixture.session(a);
     var session_open = true;
     defer if (session_open) session.close();
+    // Match LoadedRuntime/CompositeRuntime's real cold publication contract.
+    try session.installOwnedExecutionGate(a);
     const domain = if (admitted) try @import("../runtime/tier/admission_domain.zig").Domain.create() else null;
     defer if (domain) |value| value.release();
     if (domain) |value| {
@@ -18665,8 +18672,9 @@ test "actual Native Whisper cancellation refuses before planned ingress or KV mu
     };
     var probe = Probe{};
     const control = InferenceExecutionControl{ .ptr = &probe, .check_fn = Probe.check, .native_call_policy = .in_process };
-    const session = try IncrementalFixture.session(a);
+    var session = try IncrementalFixture.session(a);
     defer session.close();
+    try session.installOwnedExecutionGate(a);
     const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
     var decoder = (try whisperNativeDecoder(session, a, control, &hidden, 2)).?;
     defer decoder.deinit();
@@ -18699,6 +18707,7 @@ test "Native Whisper optional metadata quota declines cold and preserves the exa
     defer domain.release();
     var session = try IncrementalFixture.session(a);
     defer session.close();
+    try session.installOwnedExecutionGate(a);
     session.model_lifetime.?.admission_domain = domain.pin();
     session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
     const cfg = @import("testing/incremental_encoder_decoder.zig").config;
@@ -18729,6 +18738,17 @@ test "Native Whisper optional metadata quota declines cold and preserves the exa
     decoder.deinit();
     decoder_open = false;
     try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+    // The same complete request still fits intrinsically. An independent
+    // live byte makes admission temporarily unavailable and must survive all
+    // optional cold cleanup and the failed compatibility supplement.
+    {
+        const external = runtime.tier.memory.AdmissionAmounts{ .host_scratch_bytes = 1 };
+        var competing = try domain.controller.tryAcquire(.cpu, .{}, external, false);
+        defer competing.release();
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, whisperNativeDecoder(session, a, null, &hidden, 2));
+        try std.testing.expectEqualDeep(external, domain.controller.snapshot());
+    }
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
     session.run_admission.?.limits.host_limit_bytes -= 1;
     try std.testing.expectError(error.ResourceLimitExceeded, whisperNativeDecoder(session, a, null, &hidden, 2));
     try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
@@ -18737,8 +18757,9 @@ test "Native Whisper optional metadata quota declines cold and preserves the exa
 test "Native Whisper late required layer weight failure retires all cold owners before publication" {
     if (comptime !build_options.enable_native) return error.SkipZigTest;
     const a = std.testing.allocator;
-    const session = try IncrementalFixture.session(a);
+    var session = try IncrementalFixture.session(a);
     defer session.close();
+    try session.installOwnedExecutionGate(a);
     const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
     owner.arch_config.whisper.decoder_layers = 2; // genuine fixture has only layer zero
     const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
@@ -18750,8 +18771,19 @@ test "Native Whisper late required layer weight failure retires all cold owners 
 test "Native Whisper preserves unknown arena and bounded allocator compatibility without unwrapping limits" {
     if (comptime !build_options.enable_native) return error.SkipZigTest;
     const a = std.testing.allocator;
-    const session = try IncrementalFixture.session(a);
+    var session = try IncrementalFixture.session(a);
     defer session.close();
+    // A genuinely raw Session keeps compatibility; publishing its actual
+    // affiliated Model gate then isolates the allocator-contract negatives.
+    try std.testing.expect(session.execution_gate == null);
+    try std.testing.expect(nativeWeightPreparationModelData(session) == null);
+    {
+        const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+        var raw = (try whisperNativeDecoder(session, a, null, &hidden, 2)).?;
+        defer raw.deinit();
+        try std.testing.expect(raw.cache.native_program == null and raw.cold_metadata == null);
+    }
+    try session.installOwnedExecutionGate(a);
     const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();

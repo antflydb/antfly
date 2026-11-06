@@ -663,6 +663,15 @@ pub const Pool = struct {
                 try self.addStorageRequirement(seen, kernel.backend_index, auxiliary.allocation, &amounts);
             };
         };
+        // Frozen regions may replace every primitive kernel. Their actual
+        // output banks and tuned workspace still require independent backing;
+        // alias views and covered primitive slots share the same allocation ID.
+        for (self.regions) |installed| {
+            for (installed.outputs) |output| if (output.alias_index == null) {
+                try self.addStorageRequirement(seen, installed.backend_index, output.slot.allocation, &amounts);
+            };
+            if (installed.workspace_bytes != 0) try self.addStorageRequirement(seen, installed.backend_index, installed.workspace_allocation, &amounts);
+        }
         for (self.transfers) |maybe| if (maybe) |transfer| try self.addStorageRequirement(seen, transfer.backend_index, transfer.allocation, &amounts);
         if (self.literal_store) |store| {
             for (store.literals, 0..) |literal, literal_index| if (self.selection == null or self.literalEnabled(literal_index)) {
@@ -3613,4 +3622,134 @@ test "cached Native Frame refuses malformed bound input and output before math t
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, &data);
     try std.testing.expectEqual(@as(u64, 1), frame.stats.dispatches);
     try std.testing.expectEqual(allocations, frame.stats.allocations);
+}
+
+fn regionOnlyDeclaredStorageCase(a: std.mem.Allocator, covered_primitive: bool) !void {
+    const memory = @import("../runtime/tier/memory.zig");
+    const prepared_storage = @import("prepared_storage_admission.zig");
+    const region = @import("region_route.zig");
+    const binding = @import("region_binding.zig");
+    const Sink = @import("retirement_sink.zig");
+    const Source = struct {
+        controller: *memory.AdmissionController,
+        lease: *memory.AdmissionLease,
+        credit: *memory.AdmissionAmounts,
+        fn reserve(raw: *anyopaque, allocator: std.mem.Allocator, backend: ops.BackendKind, class: accounting.Class, bytes: usize) !admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            return admission.fromRunLease(allocator, self.lease, .{ .controller = self.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 88 }, .check_live_memory = false, .credit = self.credit }, backend, class, bytes);
+        }
+    };
+    const Consumer = struct {
+        fn matches(_: *anyopaque, _: region.Validate) bool {
+            return true;
+        }
+        fn validate(_: *anyopaque, _: region.Validate) !void {}
+        fn dispatch(_: *anyopaque, _: region.Invocation) !region.Outcome {
+            return .completed;
+        }
+        fn deinit(_: *anyopaque) void {}
+        const functions = region.Owned.VTable{ .matches = matches, .validate = validate, .dispatch = dispatch, .deinit = deinit };
+    };
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    var cb = context.computeBackend();
+    cb.vtable = &RegionFrameFixture.test_backend_table;
+    var marker: u8 = 0;
+    const shape = ml.graph.Shape.init(.f32, &.{4});
+    const requirements = [_]region.Output{ .{ .node = 0, .logical = shape, .bytes = 16 }, .{ .node = 1, .logical = ml.graph.Shape.init(.f32, &.{ 2, 2 }), .bytes = 16, .alias_of = 0 }, .{ .node = 2, .logical = shape, .bytes = 16 } };
+    const owner = region.Owned{ .context = &marker, .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .key = 7, .policy_key = 11, .covered_nodes = &.{ 0, 1, 2 }, .input_nodes = &.{}, .entry_node = 0, .requirements = .{ .outputs = &requirements, .dispatch_workspace = .{ .byte_size = 24, .host_byte_size = 16 }, .preparation_workspace = .{ .byte_size = 8, .host_byte_size = 32 }, .uncovered = .{} }, .vtable = &Consumer.functions };
+    const outputs = [_]binding.Installed.Output{
+        .{ .slot = .{ .node = 0, .allocation = 0, .epoch = 42, .logical = shape, .writable_bytes = 16 } },
+        .{ .slot = .{ .node = 1, .allocation = 0, .epoch = 42, .logical = ml.graph.Shape.init(.f32, &.{ 2, 2 }), .writable_bytes = 0 }, .alias_index = 0 },
+        .{ .slot = .{ .node = 2, .allocation = 1, .epoch = 42, .logical = shape, .writable_bytes = 16 } },
+    };
+    const regions = [_]binding.Installed{.{ .owner = &owner, .key = 7, .backend_index = 0, .epoch = 42, .outputs = &outputs, .workspace_allocation = 2, .workspace_bytes = 24, .host_workspace_bytes = 32 }};
+    const allocations = [_]buffers.PhysicalAllocation{
+        .{ .id = 0, .kind = .tensor, .backend = .native, .storage = .host_f32, .byte_size = 16, .first_use = 0, .last_use = 2, .reusable = true },
+        .{ .id = 1, .kind = .tensor, .backend = .native, .storage = .host_f32, .byte_size = 16, .first_use = 0, .last_use = 2, .reusable = true },
+        .{ .id = 2, .kind = .workspace, .backend = .native, .storage = .host_dense, .byte_size = 24, .first_use = 0, .last_use = 2, .reusable = true },
+        .{ .id = 3, .kind = .workspace, .backend = .native, .storage = .host_dense, .byte_size = 32, .first_use = 0, .last_use = 2, .reusable = true },
+    };
+    const descriptor = kernels.Descriptor{ .operation = .{ .unary = .negate }, .output_shape = shape, .input_shapes = .{ shape, undefined, undefined }, .input_count = 1 };
+    const primitive = [_]?KernelPlan{.{ .descriptor = descriptor, .inputs = @splat(ml.graph.null_node), .backend_index = 0, .output_allocation = 1, .workspace_bytes = 24 }};
+    const backends = [_]ops.ComputeBackend{cb};
+    const workspaces = [_]buffers.AllocationId{2};
+    var pool = Pool{ .allocator = a, .regions = @constCast(&regions), .plan = .{ .allocator = a, .slots = &.{}, .node_slots = &.{}, .node_positions = &.{}, .allocations = @constCast(&allocations), .transfers = &.{}, .transfer_index = .empty }, .kernels = if (covered_primitive) @constCast(&primitive) else &.{}, .transfers = &.{}, .backends = @constCast(&backends), .workspace_allocations = @constCast(&workspaces), .host_workspace_allocation = 3 };
+    const total = try pool.storageRequirement();
+    defer a.free(pool.storage_requirement_bounds);
+    try std.testing.expectEqual(@as(usize, 88), total.host_scratch_bytes);
+    try std.testing.expectEqualSlices(usize, &.{ 16, 16, 24, 32 }, pool.storage_requirement_bounds);
+    var controller: memory.AdmissionController = .{};
+    defer controller.deinit();
+    defer std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot()) catch @panic("region storage admission leaked");
+    const identity = admission.Identity{ .controller = &controller, .backend_class = .cpu };
+    var declared = prepared_storage.Builder{ .allocator = a };
+    defer declared.deinit();
+    try pool.collectAdmissionRequirements(&declared, null, identity);
+    try std.testing.expectEqual(@as(usize, 4), declared.items().len);
+    try std.testing.expectEqual(accounting.Class.activation, declared.items()[0].class);
+    try std.testing.expectEqual(accounting.Class.activation, declared.items()[1].class);
+    try std.testing.expectEqual(accounting.Class.workspace, declared.items()[2].class);
+    try std.testing.expectEqual(accounting.Class.host_workspace, declared.items()[3].class);
+    try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquire(.cpu, .{ .host_limit_bytes = 87 }, total, false));
+    var source = try controller.tryAcquire(.cpu, .{ .host_limit_bytes = 88 }, total, false);
+    defer source.release();
+    var credit = total;
+    var provider = Source{ .controller = &controller, .lease = &source, .credit = &credit };
+    const source_capability = admission.Capability{ .identity = identity, .context = &provider, .services = &.{ .reserve = Source.reserve } };
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    const prepared = (try prepared_storage.Prepared.prepare(source_capability, declared.items())).?;
+    defer prepared.finishInvocationWithBoundary(&epoch);
+    try prepared.bindConstructionEpoch(&epoch);
+    const current = @import("cleanup_context.zig").Context{ .boundary = &epoch };
+    const frame = try Frame.createWithAdmission(&pool, prepared.forDispatch(identity));
+    defer frame.deinitWithCleanup(current);
+    var bound = try frame.acquireRegionOutputs(&cb, &regions[0], &.{}, 11);
+    var bound_live = true;
+    defer if (bound_live) bound.deinit();
+    try cb.vtable.kernels.?.writePhysicalFloat32.?(cb.ptr, bound.outputs[0].tensor, &.{ 1, 2, 3, 4 });
+    try cb.vtable.kernels.?.writePhysicalFloat32.?(cb.ptr, bound.outputs[2].tensor, &.{ 9, 10, 11, 12 });
+    const alias = try cb.toFloat32(bound.outputs[1].tensor, a);
+    defer a.free(alias);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, alias);
+    try std.testing.expect(bound.workspace != null and bound.host_workspace.len == 32);
+    const held = try bound.take(0);
+    var held_live = true;
+    defer if (held_live) cb.free(held);
+    bound.deinit();
+    bound_live = false;
+    _ = try frame.finishWithCleanup(current);
+    try pool.frames.append(a, frame);
+    defer pool.frames.deinit(a);
+    if (try pool.claimWarm(identity)) |unexpected| {
+        var claim = unexpected;
+        claim.release();
+        return error.ExpectedHeldOutputToBlockWarmReuse;
+    }
+    cb.free(held);
+    held_live = false;
+    var warm = (try pool.claimWarm(identity)) orelse return error.ExpectedPreparedRegionWarmFrame;
+    defer warm.release();
+    var remaining = prepared_storage.Builder{ .allocator = a };
+    defer remaining.deinit();
+    try pool.collectAdmissionRequirements(&remaining, &warm, identity);
+    try std.testing.expectEqual(@as(usize, 0), remaining.items().len);
+    try std.testing.expectEqualDeep(total, try warm.ownedDemand(identity));
+}
+
+test "region-only physical output banks alias views and workspace share exact cold and warm admission" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    try regionOnlyDeclaredStorageCase(std.testing.allocator, false);
+    try regionOnlyDeclaredStorageCase(std.testing.allocator, true);
+}
+
+test "region-only physical bank acquisition unwinds cold metadata and view allocation failures" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, regionOnlyDeclaredStorageCase, .{false});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, regionOnlyDeclaredStorageCase, .{true});
 }

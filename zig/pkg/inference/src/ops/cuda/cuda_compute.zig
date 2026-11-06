@@ -48728,6 +48728,33 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
         try std.testing.expectEqual(@as(u32, buffer_mod.DeviceBuffer.allocation_alignment), selected_program.planned_mirror.?.alignment);
         var metadata = try @import("../../execution/backend_operation.zig").enter(cb, &program.graph, null, .metadata);
         defer metadata.deinitChecked() catch unreachable;
+        // Full current selected Pool proof, including its actual reduced
+        // auxiliary bank. None of these metadata negatives submit or fund.
+        const coverage = @import("../../execution/device_owned_coverage.zig");
+        try std.testing.expect(coverage.assess(routes.pool, cb, metadata.token()) == .complete);
+        const norm_kernel = &routes.pool.kernels[program.id_map[normalized]].?;
+        const mirror = norm_kernel.auxiliaries[0] orelse return error.MissingRmsMirrorAuxiliary;
+        const mirror_shape = mirror.requirement.shape;
+        try std.testing.expect(mirror.requirement.role == .bf16_mirror and mirror_shape.dtype == .bf16);
+        const mirror_bytes = try std.math.mul(usize, @intCast(mirror_shape.numElements().?), @sizeOf(u16));
+        const saved_allocation = routes.pool.plan.allocations[mirror.allocation];
+        routes.pool.plan.allocations[mirror.allocation].byte_size = mirror_bytes - 1;
+        const short = coverage.assess(routes.pool, cb, metadata.token());
+        routes.pool.plan.allocations[mirror.allocation] = saved_allocation;
+        try std.testing.expect(short == .compatibility and short.compatibility == .workspace);
+        routes.pool.plan.allocations[mirror.allocation].backend = .native;
+        const foreign_bank = coverage.assess(routes.pool, cb, metadata.token());
+        routes.pool.plan.allocations[mirror.allocation] = saved_allocation;
+        try std.testing.expect(foreign_bank == .compatibility and foreign_bank.compatibility == .workspace);
+        norm_kernel.auxiliaries[0].?.requirement.role = .mean;
+        const wrong_role = coverage.assess(routes.pool, cb, metadata.token());
+        norm_kernel.auxiliaries[0] = mirror;
+        try std.testing.expect(wrong_role == .compatibility and wrong_role.compatibility == .workspace);
+        norm_kernel.auxiliaries[1] = mirror;
+        const duplicate = coverage.assess(routes.pool, cb, metadata.token());
+        norm_kernel.auxiliaries[1] = null;
+        try std.testing.expect(duplicate == .compatibility and duplicate.compatibility == .workspace);
+        try std.testing.expect(coverage.assess(routes.pool, cb, metadata.token()) == .complete);
         var cold_inputs = [_]@import("../../execution/kernel_route.zig").Binding{ planned_input, facts[0].value };
         var request = @import("../../execution/kernel_route.zig").Prepare{ .allocator = a, .metadata_authority = metadata.token(), .implementation = implementation, .descriptor = &selected_program.descriptor, .inputs = &cold_inputs, .output = selected_program.slot };
         // No claimed predecessor witness means no new cold rounded route.

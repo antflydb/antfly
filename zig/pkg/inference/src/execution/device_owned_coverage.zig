@@ -26,6 +26,16 @@ fn bytes(shape: ml.graph.Shape) ?usize {
     if (count <= 0) return null;
     return std.math.mul(usize, @intCast(count), shape.dtype.byteSize()) catch null;
 }
+// Reduced auxiliary payload is a separate physical representation, never a
+// logical graph input/output permission. The caller already attests the exact
+// provider route and matches this role/shape against its declared auxiliaries.
+fn auxiliaryBytes(auxiliary: ops.kernel_descriptor.Auxiliary) ?usize {
+    if (auxiliary.shape.dtype != .bf16) return bytes(auxiliary.shape);
+    if (auxiliary.role != .bf16_mirror) return null;
+    const count = auxiliary.shape.numElements() orelse return null;
+    if (count <= 0) return null;
+    return std.math.mul(usize, @intCast(count), @sizeOf(u16)) catch null;
+}
 fn allocation(pool: *const physical.Pool, id: buffers.AllocationId, size: usize, kind: buffers.AllocationKind, host: bool) bool {
     const value = pool.plan.allocationById(id) orelse return false;
     const target = pool.coverage_backend orelse return false;
@@ -99,7 +109,7 @@ fn resources(pool: *const physical.Pool, kernel: physical.KernelPlan, owned: rou
     for (kernel.auxiliaries) |maybe| if (maybe) |aux| {
         if (count >= needed.auxiliaries.count) return false;
         const declared = needed.auxiliaries.items()[count];
-        const size = bytes(aux.requirement.shape) orelse return false;
+        const size = auxiliaryBytes(aux.requirement) orelse return false;
         if (aux.requirement.role != declared.role or !aux.requirement.shape.eq(declared.shape) or !allocation(pool, aux.allocation, size, .auxiliary, false)) return false;
         count += 1;
     };
