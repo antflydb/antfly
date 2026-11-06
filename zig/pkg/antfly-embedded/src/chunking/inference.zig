@@ -369,6 +369,7 @@ fn chunkInputDispatch(comptime paged: bool, alloc: Allocator, cfg: chunking_type
         header_count += 1;
     }
     var resp = try http.post(url, .{
+        .follow_redirects = false,
         .json = if (attachment_transport == .segmented_framed_binary) null else body.metadata_or_json,
         .borrowed_body_segments = if (body.envelope) |envelope| envelope.segments else null,
         .headers = header_storage[0..header_count],
