@@ -20,6 +20,174 @@ const runtime = @import("../runtime/root.zig");
 const cuda_compute = if (build_options.enable_cuda) @import("../ops/cuda/cuda_compute.zig") else struct {};
 const BorrowedDecodeStateRuntime = graph_mod.decode_state_runtime.BorrowedDecodeStateRuntime;
 
+/// A single owned F32 row destination for a prepared embedding layout. Task
+/// code supplies semantic text/image ordering; physical copies never rebuild or
+/// export the already assembled prefix. Capability decline occurs before writes.
+pub const EmbeddingRows = struct {
+    backend: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    tensor: ?ops.CT,
+    rows: usize,
+    width: usize,
+    namespace: @import("../execution/storage_ownership.zig").Identity,
+    written: usize = 0,
+
+    /// The actual accepted storage owner attests the physical readable plane.
+    /// A logical F32 dtype alone can also describe packed/opaque model storage,
+    /// which copyRows2D cannot necessarily consume. No callback or kind-tag copy
+    /// substitutes for this complete plain-row metadata proof.
+    fn sourceNamespace(backend: *const ComputeBackend, source: ops.CT, rows: usize, width: usize) !?@import("../execution/storage_ownership.zig").Identity {
+        const functions = backend.vtable.kernels orelse return null;
+        if (!functions.accepts(backend.vtable)) return null;
+        const inspect = functions.storageOwnership orelse return null;
+        const bytes = try std.math.mul(usize, try std.math.mul(usize, rows, width), @sizeOf(f32));
+        const Proof = struct {
+            bytes: usize,
+            primary: usize = 0,
+            namespace: ?@import("../execution/storage_ownership.zig").Identity = null,
+            valid: bool = true,
+            fn visit(raw: *anyopaque, report: @import("../execution/storage_ownership.zig").Report) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                const plane = switch (report) {
+                    .plane => |plane| plane,
+                    .backing => return,
+                };
+                if (plane.role != .primary) return;
+                self.primary += 1;
+                self.namespace = plane.backing;
+                const descriptor = plane.descriptor;
+                if (descriptor.shape.dtype != .f32 or descriptor.quant_format != null or descriptor.attention_kv_format != null or descriptor.attention_storage != null or plane.backing == null or plane.logical_bytes != self.bytes or plane.readable_bytes < self.bytes) {
+                    self.valid = false;
+                    return;
+                }
+                switch (descriptor.storage) {
+                    .host_f32, .host_dense, .metal_buffer, .cuda_buffer, .metadata_view => {},
+                    else => {
+                        self.valid = false;
+                        return;
+                    },
+                }
+                const elements = descriptor.shape.numElements() orelse {
+                    self.valid = false;
+                    return;
+                };
+                if (elements < 0 or std.math.cast(usize, elements) != self.bytes / @sizeOf(f32)) {
+                    self.valid = false;
+                    return;
+                }
+                const dense = @import("../graph/backend_contracts.zig").TensorStrides.dense(descriptor.shape);
+                if (!std.mem.eql(i64, dense.asSlice(), descriptor.strides.asSlice())) self.valid = false;
+            }
+        };
+        var proof = Proof{ .bytes = bytes };
+        const coverage = inspect(backend.ptr, source, .{ .context = &proof, .visit = Proof.visit }) catch |err| switch (err) {
+            error.UnsupportedShape, error.UnsupportedTensorType => return null,
+            else => return err,
+        };
+        return if (coverage == .complete and proof.valid and proof.primary == 1) proof.namespace else null;
+    }
+
+    pub fn supportsSource(backend: *const ComputeBackend, source: ops.CT, rows: usize, width: usize) !bool {
+        return (try sourceNamespace(backend, source, rows, width)) != null;
+    }
+    /// Device copies stay inside the actual destination provider namespace.
+    /// Host-readable F32 sources remain legitimate upload inputs.
+    pub fn acceptsSource(self: *const @This(), source: ops.CT, rows: usize) !bool {
+        const namespace = (try sourceNamespace(self.backend, source, rows, self.width)) orelse return false;
+        if (namespace.kind == .host) return namespace.context == null;
+        return namespace.kind == self.namespace.kind and namespace.context == self.namespace.context;
+    }
+
+    pub fn init(backend: *const ComputeBackend, allocator: std.mem.Allocator, rows: usize, width: usize) !?EmbeddingRows {
+        if (rows == 0 or width == 0) return error.InvalidShape;
+        _ = try std.math.mul(usize, rows, width);
+        const shape = [_]i32{ std.math.cast(i32, rows) orelse return error.InvalidShape, std.math.cast(i32, width) orelse return error.InvalidShape };
+        if (!backend.supportsCopyRows2D() or backend.vtable.allocUninitF32Shape == null) return null;
+        const functions = backend.vtable.kernels orelse return null;
+        if (!functions.accepts(backend.vtable) or functions.storageOwnership == null) return null;
+        const tensor = (backend.allocUninitF32Shape(&shape) catch |err| switch (err) {
+            error.UnsupportedShape, error.UnsupportedBackendOp, error.UnsupportedTensorType => return null,
+            else => return err,
+        }) orelse return null;
+        errdefer backend.free(tensor);
+        const namespace = (try sourceNamespace(backend, tensor, rows, width)) orelse {
+            backend.free(tensor);
+            return null;
+        };
+        return .{ .backend = backend, .allocator = allocator, .tensor = tensor, .rows = rows, .width = width, .namespace = namespace };
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.tensor) |tensor| self.backend.free(tensor);
+        self.tensor = null;
+    }
+    pub fn append(self: *@This(), source: ops.CT, start: usize, count: usize) !void {
+        const destination = self.tensor orelse return error.InvalidEmbeddingAssembly;
+        if (count > self.rows - self.written) return error.InvalidEmbeddingAssembly;
+        if (!try self.backend.copyRows2D(self.allocator, destination, self.written, source, start, count, self.width)) return error.UnsupportedBackendOp;
+        // An error after submission never selects a host replay.
+        self.written += count;
+    }
+    pub fn take(self: *@This()) !ops.CT {
+        if (self.written != self.rows) return error.IncompleteEmbeddingAssembly;
+        const tensor = self.tensor orelse return error.InvalidEmbeddingAssembly;
+        self.tensor = null;
+        return tensor;
+    }
+};
+
+/// Owns decoder hidden rows on their actual backend through optional learned
+/// projections. The only host conversion is the caller's requested final rows.
+pub const ResidentHiddenRows = struct {
+    backend: *const ComputeBackend,
+    allocator: std.mem.Allocator,
+    tensor: ?ops.CT,
+    rows: usize,
+    width: usize,
+
+    pub fn fromTokens(backend: *const ComputeBackend, allocator: std.mem.Allocator, config: gpt_arch.Config, ids: []const i64) !ResidentHiddenRows {
+        const hidden = try gpt_arch.hiddenForwardResident(backend, allocator, config, ids, 1, ids.len, null);
+        return .{ .backend = backend, .allocator = allocator, .tensor = hidden, .rows = ids.len, .width = config.hidden_size };
+    }
+    /// Consumes owned_input on both success and failure, as the existing
+    /// resident decoder does with its default (unbound) cleanup contract.
+    pub fn fromEmbeddings(backend: *const ComputeBackend, allocator: std.mem.Allocator, config: gpt_arch.Config, owned_input: ops.CT, rows: usize) !ResidentHiddenRows {
+        const hidden = try gpt_arch.hiddenForwardFromEmbeddingsResident(backend, allocator, config, owned_input, 1, rows, null, null);
+        return .{ .backend = backend, .allocator = allocator, .tensor = hidden, .rows = rows, .width = config.hidden_size };
+    }
+    pub fn deinit(self: *@This()) void {
+        if (self.tensor) |tensor| self.backend.free(tensor);
+        self.tensor = null;
+    }
+    /// Metadata-only preparation: callers may select a legacy shape-query
+    /// fallback here, before the separately submitted linear operation.
+    pub fn projectionWidth(self: *const @This(), bias: ops.CT) !usize {
+        // The original projection consumes an F32 host round-trip. Preserve
+        // that precision contract when another decoder emits a packed dtype.
+        if (try self.backend.tensorDType(self.tensor orelse return error.InvalidEmbeddingAssembly) != .f32) return error.UnsupportedTensorType;
+        const dimensions = try self.backend.tensorShape(bias, self.allocator);
+        defer self.allocator.free(dimensions);
+        var width: usize = 1;
+        for (dimensions) |dimension| {
+            const size = std.math.cast(usize, dimension) orelse return error.InvalidProjectionShape;
+            width = try std.math.mul(usize, width, size);
+        }
+        if (width == 0) return error.InvalidProjectionShape;
+        return width;
+    }
+    pub fn project(self: *const @This(), weight: ops.CT, bias: ops.CT, width: usize) !ResidentHiddenRows {
+        const input = self.tensor orelse return error.InvalidEmbeddingAssembly;
+        if (width == 0) return error.InvalidProjectionShape;
+        const projected = try self.backend.linear(input, weight, bias, self.rows, self.width, width);
+        return .{ .backend = self.backend, .allocator = self.allocator, .tensor = projected, .rows = self.rows, .width = width };
+    }
+    pub fn exportHost(self: *const @This()) ![]f32 {
+        const data = try self.backend.toFloat32(self.tensor orelse return error.InvalidEmbeddingAssembly, self.allocator);
+        errdefer self.allocator.free(data);
+        if (data.len != try std.math.mul(usize, self.rows, self.width)) return error.UnexpectedOutputShape;
+        return data;
+    }
+};
+
 pub const Output = struct {
     last_logits: ?[]f32 = null,
     greedy_token: ?usize = null,
@@ -1560,4 +1728,84 @@ fn checkPromptOwner(cb: ComputeBackend, _: ComputeBackend) !void {
 test "physical prompt owner preserves real Native eager chunk numerics and allocation-free planning" {
     const helper = @import("../ops/media_residency_test.zig");
     try helper.onNative(CompiledPrefillFixture.populate, checkPromptOwner);
+}
+
+fn checkResidentEmbeddingRows(backend_value: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const cb = &backend_value;
+    const source = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 }, &.{ 3, 4 });
+    defer cb.free(source);
+    const tail = try cb.fromFloat32Shape(&.{ 21, 22, 23, 24 }, &.{ 1, 4 });
+    defer cb.free(tail);
+    const weight = try cb.fromFloat32Shape(&.{ 1, 0, 0, 0, 0, 0, 0, 1 }, &.{ 2, 4 });
+    defer cb.free(weight);
+    const bias = try cb.fromFloat32Shape(&.{ 0.5, -0.5 }, &.{2});
+    defer cb.free(bias);
+    const transfers = @import("../ops/media_residency_test.zig").Transfers.snapshot(backend_value);
+    var assembly = (try EmbeddingRows.init(cb, a, 3, 4)) orelse return error.ExpectedResidentEmbeddingAssembly;
+    defer assembly.deinit();
+    try assembly.append(source, 1, 2);
+    try std.testing.expectError(error.IncompleteEmbeddingAssembly, assembly.take());
+    try assembly.append(tail, 0, 1);
+    var hidden = ResidentHiddenRows{ .backend = cb, .allocator = a, .tensor = try assembly.take(), .rows = 3, .width = 4 };
+    defer hidden.deinit();
+    var projected = try hidden.project(weight, bias, try hidden.projectionWidth(bias));
+    defer projected.deinit();
+    // A later independent layout cannot overwrite held resident source/head.
+    var later = (try EmbeddingRows.init(cb, a, 1, 4)) orelse return error.ExpectedResidentEmbeddingAssembly;
+    defer later.deinit();
+    try later.append(source, 0, 1);
+    try transfers.expectUnchanged(backend_value);
+    const values = try projected.exportHost();
+    defer a.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 5.5, 7.5, 9.5, 11.5, 21.5, 23.5 }, values);
+    const held = try hidden.exportHost();
+    defer a.free(held);
+    try std.testing.expectEqualSlices(f32, &.{ 5, 6, 7, 8, 9, 10, 11, 12, 21, 22, 23, 24 }, held);
+}
+
+test "Native physical embedding layout and projection retain rows without intermediate exports" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onNative(helper.noWeights, checkResidentEmbeddingRows);
+}
+
+test "Metal physical embedding layout and projection retain rows without intermediate exports" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onMetal(helper.noWeights, checkResidentEmbeddingRows);
+}
+
+test "Metal physical embedding layout rejects an initialized foreign provider source before copy" {
+    const Helper = @import("../ops/media_residency_test.zig");
+    const Check = struct {
+        fn run(backend_value: ComputeBackend, _: ComputeBackend) !void {
+            const a = std.testing.allocator;
+            const cb = &backend_value;
+            const Metal = @import("../ops/metal_compute.zig");
+            var store = @import("../ops/gpu_hosted_store.zig").WeightStore{ .allocator = a, .prefix = "", .lazy_weights = .{} };
+            defer store.lazy_weights.deinit(a);
+            Metal.initPrefetchQueue(&store, a);
+            defer Metal.deinitPrefetchQueue(&store);
+            defer Metal.deinitSharedNativeProvider(&store);
+            var foreign = try Metal.MetalCompute.init(a, &store, null);
+            defer foreign.deinit();
+            const foreign_cb = foreign.computeBackend();
+            const values = [_]f32{ 1, 2, 3, 4 };
+            const input = try foreign_cb.fromFloat32Shape(&values, &.{ 1, 4 });
+            defer foreign_cb.free(input);
+            var source = (try EmbeddingRows.init(&foreign_cb, a, 1, 4)) orelse return error.ExpectedResidentEmbeddingAssembly;
+            defer source.deinit();
+            try source.append(input, 0, 1);
+            const initialized = try source.take();
+            defer foreign_cb.free(initialized);
+            var destination = (try EmbeddingRows.init(cb, a, 1, 4)) orelse return error.ExpectedResidentEmbeddingAssembly;
+            defer destination.deinit();
+            try std.testing.expect(source.namespace.kind == destination.namespace.kind and source.namespace.context != destination.namespace.context);
+            const transfers = Helper.Transfers.snapshot(backend_value);
+            try std.testing.expect(!try destination.acceptsSource(initialized, 1));
+            try transfers.expectUnchanged(backend_value);
+            try std.testing.expectEqual(@as(usize, 0), destination.written);
+        }
+    };
+    try Helper.onMetal(Helper.noWeights, Check.run);
 }

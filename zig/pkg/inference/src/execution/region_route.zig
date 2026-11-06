@@ -353,7 +353,15 @@ pub const SelectionPolicy = enum { select_regions, compatibility_regions };
 
 /// Supplied by the invocation owner, never inferred from a previous workload's
 /// mutable provider state. Unknown keeps ordinary compatibility execution.
-pub const ExecutionProfile = enum { unknown, ordinary_frame, capture };
+pub const ExecutionProfile = enum {
+    unknown,
+    ordinary_frame,
+    /// Explicit backend operation with terminal synchronous native commands.
+    /// A live Claim still proves exact graph/provider/nonce authority; this
+    /// value alone never permits borrowing or disabling an ambient frame.
+    synchronous,
+    capture,
+};
 
 test "region phase workspace contracts cannot hide malformed requirements behind a shared maximum" {
     const shape = ml.graph.Shape.init(.f32, &.{4});

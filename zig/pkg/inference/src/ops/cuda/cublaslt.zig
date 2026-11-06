@@ -859,7 +859,7 @@ pub const CublasLt = struct {
             const actual = self.owner.tensorCoreKey(
                 if (self.with_bias) .dense_bias else .dense,
                 self.precision.native(),
-                CUDA_R_32F,
+                self.key.output_type,
                 1,
                 self.key.rows,
                 self.key.in_dim,
@@ -872,7 +872,7 @@ pub const CublasLt = struct {
         }
 
         fn request(self: *const PreparedDense) DenseRequest {
-            return .{ .precision = self.precision, .rows = self.key.rows, .in_dim = self.key.in_dim, .out_dim = self.key.out_dim, .with_bias = self.with_bias, .tuning = self.tuning };
+            return .{ .precision = self.precision, .output_precision = if (self.key.output_type == CUDA_R_16BF) .bf16 else .f32, .rows = self.key.rows, .in_dim = self.key.in_dim, .out_dim = self.key.out_dim, .with_bias = self.with_bias, .tuning = self.tuning };
         }
 
         pub fn submit(self: *PreparedDense, ctx: *context_mod.CudaContext, invocation: TensorCoreInvocation) Error!MatmulSelection {
@@ -919,14 +919,14 @@ pub const CublasLt = struct {
         alignments: [4]u32 = @splat(256), // A(weight), B(input), C/D(output)
         fn key(self: DenseLayout, owner: *const CublasLt) Error!TensorCorePlanKey {
             const r = self.request;
-            if (r.with_bias or r.input_gradient or r.output_precision != .f32 or r.rows == 0 or r.in_dim == 0 or r.out_dim == 0 or r.rows > std.math.maxInt(u32) or r.in_dim > std.math.maxInt(u32) or r.out_dim > std.math.maxInt(u32)) return error.CublasLtUnsupported;
+            if (r.with_bias or r.input_gradient or (r.output_precision != .f32 and (r.output_precision != .bf16 or r.precision != .bf16)) or r.rows == 0 or r.in_dim == 0 or r.out_dim == 0 or r.rows > std.math.maxInt(u32) or r.in_dim > std.math.maxInt(u32) or r.out_dim > std.math.maxInt(u32)) return error.CublasLtUnsupported;
             const element_bytes: usize = if (r.precision == .f32) 4 else 2;
             _ = try checkedMatrixBytes(r.rows, r.in_dim, element_bytes);
             _ = try checkedMatrixBytes(r.out_dim, r.in_dim, element_bytes);
-            _ = try checkedMatrixBytes(r.rows, r.out_dim, 4);
+            _ = try checkedMatrixBytes(r.rows, r.out_dim, if (r.output_precision == .f32) 4 else 2);
             for (self.alignments) |alignment| if (alignment == 0 or alignment > 256 or !std.math.isPowerOfTwo(alignment)) return error.CublasLtUnsupported;
             const tuning = r.tuning.normalized();
-            return .{ .kind = .dense, .input_type = r.precision.native(), .output_type = CUDA_R_32F, .batch_count = 1, .rows = @intCast(r.rows), .in_dim = @intCast(r.in_dim), .out_dim = @intCast(r.out_dim), .workspace_bytes = self.workspace_bytes, .alignment_a_bytes = self.alignments[0], .alignment_b_bytes = self.alignments[1], .alignment_c_bytes = self.alignments[2], .alignment_d_bytes = self.alignments[3], .tuning_fingerprint = tuning.fingerprint(), .canonical_rows = owner.canonicalDecodeRows(.dense, r.precision.native(), CUDA_R_32F, 1, r.rows, r.in_dim, r.out_dim, tuning) };
+            return .{ .kind = .dense, .input_type = r.precision.native(), .output_type = r.output_precision.native(), .batch_count = 1, .rows = @intCast(r.rows), .in_dim = @intCast(r.in_dim), .out_dim = @intCast(r.out_dim), .workspace_bytes = self.workspace_bytes, .alignment_a_bytes = self.alignments[0], .alignment_b_bytes = self.alignments[1], .alignment_c_bytes = self.alignments[2], .alignment_d_bytes = self.alignments[3], .tuning_fingerprint = tuning.fingerprint(), .canonical_rows = owner.canonicalDecodeRows(.dense, r.precision.native(), r.output_precision.native(), 1, r.rows, r.in_dim, r.out_dim, tuning) };
         }
     };
     /// Algorithms are copied by value in the existing cache/clone protocol.
@@ -2275,38 +2275,40 @@ test "prepared vendor descriptor ownership survives source retirement and every 
     // Exercise the SAME cold descriptor/heuristic/AlgoCheck implementation.
     // No driver table, stream, buffers or numerical function is initialized:
     // any accidental probe/submission would access undefined state.
-    const layout = CublasLt.DenseLayout{ .request = .{ .precision = .bf16, .rows = 3, .in_dim = 32, .out_dim = 16 }, .workspace_bytes = 4096 };
-    const cold_key = try layout.key(&blas);
-    var no_driver: context_mod.CudaContext = undefined;
-    for ([_]Status{ CUBLAS_STATUS_NOT_SUPPORTED, 3 }) |failure_status| {
-        var failure: usize = 1;
-        while (true) : (failure += 1) {
-            Fake.reset(failure);
-            Fake.failure_status = failure_status;
-            if (blas.createTensorCorePlanFacts(cold_key, .{}, &no_driver, null, true)) |plan| {
-                try std.testing.expect(failure > Fake.calls);
-                try std.testing.expectEqual(@as(usize, 5), Fake.count());
-                const recipe = CublasLt.DenseRecipe{ .owner = &blas, .key = cold_key, .algo = plan.algo, .workspace_size = plan.workspace_size, .selection = plan.selection, .precision = .bf16, .tuning = .{} };
-                blas.destroyTensorCorePlan(plan);
-                try std.testing.expectEqual(@as(usize, 0), Fake.count());
-                var exact = invocation;
-                exact.bias = null;
-                try recipe.validate(exact);
-                try std.testing.expect(recipe.matchesLayout(layout));
-                var changed = layout;
-                changed.workspace_bytes += 256;
-                try std.testing.expect(!recipe.matchesLayout(changed));
-                try std.testing.expectEqual(@as([8]u64, @splat(17)), recipe.algo.data);
-                break;
-            } else |err| {
-                try std.testing.expectEqual(if (failure_status == CUBLAS_STATUS_NOT_SUPPORTED) error.CublasLtUnsupported else error.CublasLtError, err);
-                try std.testing.expectEqual(@as(usize, 0), Fake.count());
+    for ([_]CublasLt.DensePrecision{ .f32, .bf16 }) |output_precision| {
+        const layout = CublasLt.DenseLayout{ .request = .{ .precision = .bf16, .output_precision = output_precision, .rows = 3, .in_dim = 32, .out_dim = 16 }, .workspace_bytes = 4096 };
+        const cold_key = try layout.key(&blas);
+        var no_driver: context_mod.CudaContext = undefined;
+        for ([_]Status{ CUBLAS_STATUS_NOT_SUPPORTED, 3 }) |failure_status| {
+            var failure: usize = 1;
+            while (true) : (failure += 1) {
+                Fake.reset(failure);
+                Fake.failure_status = failure_status;
+                if (blas.createTensorCorePlanFacts(cold_key, .{}, &no_driver, null, true)) |plan| {
+                    try std.testing.expect(failure > Fake.calls);
+                    try std.testing.expectEqual(@as(usize, 5), Fake.count());
+                    const recipe = CublasLt.DenseRecipe{ .owner = &blas, .key = cold_key, .algo = plan.algo, .workspace_size = plan.workspace_size, .selection = plan.selection, .precision = .bf16, .tuning = .{} };
+                    blas.destroyTensorCorePlan(plan);
+                    try std.testing.expectEqual(@as(usize, 0), Fake.count());
+                    var exact = invocation;
+                    exact.bias = null;
+                    try recipe.validate(exact);
+                    try std.testing.expect(recipe.matchesLayout(layout));
+                    var changed = layout;
+                    changed.workspace_bytes += 256;
+                    try std.testing.expect(!recipe.matchesLayout(changed));
+                    try std.testing.expectEqual(@as([8]u64, @splat(17)), recipe.algo.data);
+                    break;
+                } else |err| {
+                    try std.testing.expectEqual(if (failure_status == CUBLAS_STATUS_NOT_SUPPORTED) error.CublasLtUnsupported else error.CublasLtError, err);
+                    try std.testing.expectEqual(@as(usize, 0), Fake.count());
+                }
             }
         }
+        Fake.reset(0);
+        try std.testing.expectError(error.CublasLtUnsupported, blas.createTensorCorePlanFacts(cold_key, .{ .enabled = true }, &no_driver, null, true));
+        try std.testing.expectEqual(@as(usize, 0), Fake.calls);
     }
-    Fake.reset(0);
-    try std.testing.expectError(error.CublasLtUnsupported, blas.createTensorCorePlanFacts(cold_key, .{ .enabled = true }, &no_driver, null, true));
-    try std.testing.expectEqual(@as(usize, 0), Fake.calls);
     // Only SDK NOT_SUPPORTED is a compatibility decline; real SDK allocation
     // and execution failures keep the existing public error classification.
     try std.testing.expectError(error.CublasLtUnsupported, blas.checkDiscovery(CUBLAS_STATUS_NOT_SUPPORTED, true));
@@ -2749,4 +2751,22 @@ test "CUDA vendor captured GEMM replays after checked descriptor eviction and pe
         try std.testing.expectEqual(graph_handle, graph.exec);
     }
     try std.testing.expectEqual(@as(usize, 1), owner.plan_cache_refreshes);
+}
+
+test "cold vendor BF16 output recipe validates exact reduced bytes and keeps precision in its key" {
+    var blas: CublasLt = undefined;
+    blas.florence_canonical_f16_decode = false;
+    blas.lighton_projection_profile = .off;
+    const layout = CublasLt.DenseLayout{ .request = .{ .precision = .bf16, .output_precision = .bf16, .rows = 3, .in_dim = 32, .out_dim = 16 }, .workspace_bytes = 4096 };
+    const recipe = CublasLt.DenseRecipe{ .owner = &blas, .key = try layout.key(&blas), .algo = undefined, .workspace_size = 256, .selection = .heuristic, .precision = .bf16, .tuning = .{} };
+    var invocation = TensorCoreInvocation{ .input = .{ .ptr = 0x10000, .len = 3 * 32 * 2 }, .weight = .{ .ptr = 0x20000, .len = 16 * 32 * 2 }, .dst = .{ .ptr = 0x30000, .len = 3 * 16 * 2 }, .workspace = .{ .ptr = 0x40000, .len = 4096 } };
+    try recipe.validate(invocation);
+    var ordinary = layout;
+    ordinary.request.output_precision = .f32;
+    try std.testing.expect(!recipe.matchesLayout(ordinary));
+    invocation.dst.len -= 1;
+    try std.testing.expectError(error.CublasLtUnsupported, recipe.validate(invocation));
+    var invalid = layout;
+    invalid.request.precision = .f16;
+    try std.testing.expectError(error.CublasLtUnsupported, invalid.key(&blas));
 }

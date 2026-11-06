@@ -26,14 +26,14 @@ pub const Kernel = struct {
         self.program.deinit(ctx);
     }
 
-    fn init(self: *Kernel, ctx: *context.CudaContext) !void {
+    pub fn prepare(self: *Kernel, ctx: *context.CudaContext) !void {
         try self.program.init(ctx);
     }
 
     pub fn widen16Bit(self: *Kernel, ctx: *context.CudaContext, input: driver.CUdeviceptr, output: driver.CUdeviceptr, count: usize, bf16: bool) !void {
         if (count > std.math.maxInt(u32)) return error.InvalidTensorShape;
         if (count == 0) return;
-        try self.init(ctx);
+        try self.prepare(ctx);
         var src = input;
         var dst = output;
         var n: u32 = @intCast(count);
@@ -46,7 +46,7 @@ pub const Kernel = struct {
     pub fn launch(self: *Kernel, ctx: *context.CudaContext, input: driver.CUdeviceptr, output: driver.CUdeviceptr, count: usize, lower: ?f32, upper: ?f32) !void {
         if (count > std.math.maxInt(u32)) return error.InvalidTensorShape;
         if (count == 0) return;
-        try self.init(ctx);
+        try self.prepare(ctx);
         var src = input;
         var dst = output;
         var n: u32 = @intCast(count);

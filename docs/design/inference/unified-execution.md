@@ -249,6 +249,25 @@ preparation API do not by themselves complete these remaining requirements:
   prepaid workspaces before applying explicit operator limits once. Opaque
   providers and incompatible state transitions retain compatibility ownership; host-table
   retention alone does not certify every device cancellation/drain endpoint.
+- `execution/speculative_activation.zig` owns predictor rounds, including draft
+  chains, logits and accepted activation handoff. The physical decoder owns
+  verification suffix geometry and pending tensor/scalar selection; task code
+  retains acceptance, grammar, stopping and streaming. Unused private adapters
+  are removed while public compatibility entries remain.
+- `execution/decoder_prefill.zig` assembles plain embedding rows once and keeps
+  hidden rows resident through projection. ColQwen document and query paths
+  export final scoring vectors. Complete source-plane and destination-namespace
+  checks precede copies; packed or opaque sources retain the host path.
+- Metal installs synchronous assigned pair/QKV regions for complete row-one F32
+  projection heads through the production partition executor. Source pins,
+  output leases and actual operation ownership are explicit. Mixed graphs,
+  direct decoder APIs and multirow packed caches retain their original owners;
+  these regions receive no complete-payload quota credit.
+- CUDA prepared projections describe eligible BF16-rounded output separately
+  from F32 publication, activation conversion and vendor workspace. Cold
+  preparation loads the original widening program; dispatch retains the
+  original GEMM and widening order. This ordinary-only route preserves the
+  existing capture restriction and declines separate mutable mirror planes.
 - `execution/testing/model_formats.zig` compares deterministic one-layer BERT
   and sliding-window decoder graphs loaded through real ONNX, safetensors and
   GGUF parsers. Deliberately lossy Q8_0 weights use an independently rounded CPU

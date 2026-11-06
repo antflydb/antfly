@@ -133,6 +133,23 @@ pub const DeviceToken = struct {
 
 pub const DeviceTokenOutcome = struct { token: usize, token_tensor: ?ops.CT = null };
 pub const DeviceStepEvents = struct { handoff_attempts: usize = 0, handoff_hits: usize = 0, handoff_fallbacks: usize = 0 };
+pub const PendingCandidateRequest = struct {
+    token_ids: []const i64,
+    sequence_length: usize,
+    generated_tokens: usize,
+    input_token_tensor: ops.CT,
+    pure_greedy: bool,
+    grammar_active: bool,
+    prefetch_drain_budget: usize = 4,
+};
+pub const PendingCandidateEvents = struct {
+    tensor_route: ?DeviceRoute = null,
+    scalar_route: ?DeviceRoute = null,
+    attempts: usize = 0,
+    handoff: DeviceStepEvents = .{},
+};
+pub const PendingCandidate = union(enum) { tensor: ops.CT, scalar: DeviceTokenOutcome, declined };
+
 pub const DeviceStepRequest = struct {
     token_ids: []const i64,
     sequence_length: usize,
@@ -246,6 +263,24 @@ pub fn reserveSpeculativeTargetVerification(
     _ = try decode_runtime.appendGeneratedTokens(draft_count);
 }
 
+/// The physical target suffix for a predictor verification round. Context
+/// fields borrow the actual persistent state; no temporary adapter is retained.
+pub const PredictorVerificationWindow = struct {
+    state: *NativeDecodeState,
+    sequence_length: usize,
+    query_rows: usize,
+    forward_rows: usize,
+    logical_rows: usize,
+    input_start: usize,
+    draft_count: usize,
+    context: gpt_arch.DecodeContext,
+
+    pub fn rollbackForwardFailure(self: *const @This(), pending_count: usize) void {
+        var physical = BorrowedDecodeStateRuntime.init(self.state);
+        physical.truncateGeneratedTokens(self.draft_count + pending_count) catch {};
+    }
+};
+
 pub const Runtime = struct {
     fn classifyDeviceStep(result: DeviceStepResult) @import("invocation_observation.zig").ResultClassification {
         return .{ .unsupported = result == .declined };
@@ -282,6 +317,31 @@ pub const Runtime = struct {
         if (request.grammar_active) return .grammar_blocked;
         if (request.mode == .tensor and !deviceTokenHandoffEnabled()) return .handoff_disabled;
         return .eligible;
+    }
+
+    /// A pending greedy step keeps the original tensor-only -> scalar device
+    /// fallback order. Each accepted callback retains its own observation;
+    /// this selector neither wraps a second invocation nor publishes a token.
+    pub fn pendingCandidate(self: *Runtime, state: *NativeDecodeState, request: PendingCandidateRequest, events: *PendingCandidateEvents) !PendingCandidate {
+        if (!request.pure_greedy or request.grammar_active) return .declined;
+        events.attempts += 1;
+        events.tensor_route = self.deviceRoute(state, .{ .mode = .tensor, .generated_tokens = request.generated_tokens, .pure_greedy = request.pure_greedy, .grammar_active = request.grammar_active });
+        if (events.tensor_route.? == .eligible) {
+            if (try self.forwardDeviceTokenTensor(state, request.sequence_length, request.input_token_tensor, request.prefetch_drain_budget, &events.handoff)) |tensor| return .{ .tensor = tensor };
+        }
+        events.attempts += 1;
+        events.scalar_route = self.deviceRoute(state, .{ .mode = .scalar, .generated_tokens = request.generated_tokens, .pure_greedy = request.pure_greedy, .grammar_active = request.grammar_active });
+        if (events.scalar_route.? != .eligible) return .declined;
+        return switch (try self.forwardDeviceStep(state, .{ .token_ids = request.token_ids, .sequence_length = request.sequence_length, .input_token_tensor = request.input_token_tensor, .prefetch_drain_budget = request.prefetch_drain_budget }, &events.handoff)) {
+            .token => |value| .{ .scalar = value },
+            .declined => .declined,
+            .logits => |values| {
+                // Only sampled device steps return logits. This operation has
+                // no sampling request and cannot replay a submitted fallback.
+                self.context.allocator.free(values);
+                return error.InvalidModelOutput;
+            },
+        };
     }
 
     pub fn forwardDeviceStep(self: *Runtime, state: *NativeDecodeState, request: DeviceStepRequest, events: *DeviceStepEvents) !DeviceStepResult {
@@ -850,6 +910,42 @@ pub const Runtime = struct {
     fn forwardAllLogits(self: *Runtime, input_ids: []const i64, batch: usize, seq_len: usize, decode_context: *const gpt_arch.DecodeContext) ![]f32 {
         var fallback_count: u64 = 0;
         return graph_mod.decoder_step_executor.forwardAll(&self.context, self.graph_cache, input_ids, batch, seq_len, decode_context, self.replay_fallbacks orelse &fallback_count);
+    }
+
+    /// Reserve the real predictor verify suffix before deriving its query.
+    /// Cached first choices omit the already verified row; pending tokens
+    /// remain explicit supplied state facts and are never hidden in a cache key.
+    pub fn beginPredictorVerification(self: *Runtime, state: *NativeDecodeState, sequence_length: usize, draft_count: usize, entry_pending: usize, cached_first: bool) !PredictorVerificationWindow {
+        _ = self;
+        if (draft_count == 0 or draft_count > 16) return error.InvalidSpeculativeK;
+        if (entry_pending > 1 or (cached_first and entry_pending != 0)) return error.InvalidSpeculativeState;
+        var physical = BorrowedDecodeStateRuntime.init(state);
+        const appended = try std.math.add(usize, draft_count, entry_pending);
+        if (try std.math.add(usize, state.total_tokens, appended) != sequence_length or sequence_length <= draft_count) return error.InvalidSpeculativeState;
+        _ = try physical.appendGeneratedTokens(appended);
+        errdefer physical.truncateGeneratedTokens(appended) catch {};
+        if (state.total_tokens != sequence_length) return error.InvalidSpeculativeState;
+        const forward_rows = if (cached_first) draft_count else draft_count + 1;
+        const query_rows = if (physical.kvView() != null) forward_rows else sequence_length;
+        return .{
+            .state = state,
+            .sequence_length = sequence_length,
+            .query_rows = query_rows,
+            .forward_rows = forward_rows,
+            .logical_rows = draft_count + 1,
+            .input_start = if (query_rows == sequence_length) 0 else if (cached_first) sequence_length - draft_count else sequence_length - query_rows,
+            .draft_count = draft_count,
+            .context = physical.makeDecodeContext(sequence_length, query_rows),
+        };
+    }
+
+    /// Select the prepared hidden/head tail only when the real physical query
+    /// covers exactly the requested projection rows. Historical full-history
+    /// recomputation retains its original generic hidden producer.
+    pub fn forwardPredictorHidden(self: *Runtime, window: *const PredictorVerificationWindow, history: []const i64, source: HiddenSource, suppress: []const i32) !ForwardHiddenDevice {
+        const input = history[window.input_start..window.sequence_length];
+        if (window.query_rows == window.forward_rows) return self.forwardTargetHiddenDevicePreparedArgmax(input, 1, window.sequence_length, &window.context, source, "gpt.mtp_verify_final_hidden", suppress);
+        return self.forwardTargetHiddenDevice(input, 1, window.sequence_length, &window.context, source, "gpt.mtp_verify_final_hidden");
     }
 
     /// Draft KV is already positioned by the task's previous accepted proposal.
@@ -2372,4 +2468,112 @@ test "physical decoder Native eager step keeps actual KV query geometry compiled
 
 test "physical decoder Metal eager step keeps actual KV query geometry compiled declines and task state" {
     try @import("../ops/media_residency_test.zig").onMetal(populateDeviceStepWeights, checkActualEagerStep);
+}
+
+fn checkActualPendingCandidate(cb_value: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const cb = &cb_value;
+    const config = @import("../models/gpt.zig").Config{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .vocab_size = 4, .weight_tying = true, .norm_type = .rms_norm, .position_encoding = .rope };
+    const kv = @import("../runtime/root.zig").kv;
+    var manager = kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = if (cb.kind() == .metal) .metal else .native, .dtype = .f32, .page_size_tokens = 4, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 4, .store_cpu_bytes = false });
+    var state = NativeDecodeState.initPaged(a, &manager, pool, null);
+    defer state.deinit();
+    try state.notePrefill(2);
+    var numerical = Runtime{ .context = .{ .allocator = a, .cb = cb, .gpt_config = &config, .weight_semantics = .traced_decoder } };
+    const input = (try cb.fromInt32Shape(&.{1}, &.{ 1, 1 })) orelse return error.UnsupportedBackend;
+    defer cb.free(input);
+    var events = PendingCandidateEvents{};
+    const request = PendingCandidateRequest{ .token_ids = &.{ 0, 1 }, .sequence_length = 2, .generated_tokens = 1, .input_token_tensor = input, .pure_greedy = true, .grammar_active = false };
+    if (cb.kind() == .metal) {
+        // This actual backend declines the CUDA-only tensor route, then runs
+        // the original scalar callback against its real model/current KV view.
+        var expected_events = DeviceStepEvents{};
+        const expected = try numerical.forwardDeviceStep(&state, .{ .token_ids = request.token_ids, .sequence_length = 2, .input_token_tensor = input }, &expected_events);
+        defer if (expected == .token) if (expected.token.token_tensor) |tensor| cb.free(tensor);
+        try std.testing.expect(expected == .token);
+        const actual = try numerical.pendingCandidate(&state, request, &events);
+        defer if (actual == .scalar) if (actual.scalar.token_tensor) |tensor| cb.free(tensor);
+        try std.testing.expect(actual == .scalar);
+        try std.testing.expectEqual(expected.token.token, actual.scalar.token);
+        try std.testing.expectEqual(DeviceRoute.backend_not_device, events.tensor_route.?);
+        try std.testing.expectEqual(DeviceRoute.eligible, events.scalar_route.?);
+        try std.testing.expectEqualDeep(expected_events, events.handoff);
+    } else {
+        try std.testing.expect(try numerical.pendingCandidate(&state, request, &events) == .declined);
+        try std.testing.expectEqual(DeviceRoute.backend_not_device, events.tensor_route.?);
+        try std.testing.expectEqual(DeviceRoute.backend_not_device, events.scalar_route.?);
+        try std.testing.expectEqualDeep(DeviceStepEvents{}, events.handoff);
+    }
+    try std.testing.expectEqual(@as(usize, 2), events.attempts);
+    try std.testing.expectEqual(@as(usize, 2), state.total_tokens);
+    var grammar_events = PendingCandidateEvents{};
+    var grammar_request = request;
+    grammar_request.grammar_active = true;
+    try std.testing.expect(try numerical.pendingCandidate(&state, grammar_request, &grammar_events) == .declined);
+    try std.testing.expectEqualDeep(PendingCandidateEvents{}, grammar_events);
+}
+
+test "pending candidate preserves actual Native pre-numerical decline and mapped attempts" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try @import("../ops/media_residency_test.zig").onNative(populateDeviceStepWeights, checkActualPendingCandidate);
+}
+
+test "pending candidate keeps actual Metal tensor decline scalar fallback output and handoff counts" {
+    try @import("../ops/media_residency_test.zig").onMetal(populateDeviceStepWeights, checkActualPendingCandidate);
+}
+
+fn checkActualPredictorWindow(cb_value: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const cb = &cb_value;
+    const config = @import("../models/gpt.zig").Config{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .vocab_size = 4, .weight_tying = true, .norm_type = .rms_norm, .position_encoding = .rope };
+    var numerical = Runtime{ .context = .{ .allocator = a, .cb = cb, .gpt_config = &config, .weight_semantics = .traced_decoder } };
+    const kv = @import("../runtime/root.zig").kv;
+    var manager = kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 4, .store_cpu_bytes = false });
+    const history = [_]i64{ 0, 1, 2, 3, 1 };
+    for ([_]bool{ false, true }) |paged| for ([_]usize{ 0, 1 }) |pending| for ([_]bool{ false, true }) |cached| {
+        if (!paged and cached) continue;
+        var state = if (paged) NativeDecodeState.initPaged(a, &manager, pool, null) else NativeDecodeState.initContiguous(a);
+        defer state.deinit();
+        try state.notePrefill(3 - pending);
+        if (cached and pending != 0) {
+            try std.testing.expectError(error.InvalidSpeculativeState, numerical.beginPredictorVerification(&state, 5, 2, pending, cached));
+            try std.testing.expectEqual(3 - pending, state.total_tokens);
+            continue;
+        }
+        const window = try numerical.beginPredictorVerification(&state, 5, 2, pending, cached);
+        const expected_rows: usize = if (!paged) 5 else if (cached) 2 else 3;
+        const expected_start: usize = if (!paged) 0 else if (cached) 3 else 2;
+        try std.testing.expectEqual(expected_rows, window.query_rows);
+        try std.testing.expectEqual(expected_start, window.input_start);
+        try std.testing.expectEqual(@as(usize, 3), window.logical_rows);
+        try std.testing.expectEqual(@as(usize, if (cached) 2 else 3), window.forward_rows);
+        var original_context_owner = BorrowedDecodeStateRuntime.init(&state);
+        const original_context = original_context_owner.makeDecodeContext(5, expected_rows);
+        var expected = if (expected_rows == window.forward_rows)
+            try numerical.forwardTargetHiddenDevicePreparedArgmax(history[expected_start..], 1, 5, &original_context, .final, "gpt.mtp_verify_final_hidden", &.{})
+        else
+            try numerical.forwardTargetHiddenDevice(history[expected_start..], 1, 5, &original_context, .final, "gpt.mtp_verify_final_hidden");
+        defer expected.deinit();
+        var actual = try numerical.forwardPredictorHidden(&window, &history, .final, &.{});
+        defer actual.deinit();
+        const expected_values = try cb.toFloat32(expected.hidden, a);
+        defer a.free(expected_values);
+        const actual_values = try cb.toFloat32(actual.hidden, a);
+        defer a.free(actual_values);
+        try std.testing.expectEqualSlices(f32, expected_values, actual_values);
+        try std.testing.expectEqual(expected.rows, actual.rows);
+        try std.testing.expectEqual(@as(usize, 5), state.total_tokens);
+        window.rollbackForwardFailure(pending);
+        try std.testing.expectEqual(3 - pending, state.total_tokens);
+        if (paged) try std.testing.expectEqual(3 - pending, manager.tokenCount(state.sequence_id.?).?);
+    };
+}
+
+test "predictor verification window preserves actual Native mapped rows cached first pending suffix and rollback" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try @import("../ops/media_residency_test.zig").onNative(populateDeviceStepWeights, checkActualPredictorWindow);
 }

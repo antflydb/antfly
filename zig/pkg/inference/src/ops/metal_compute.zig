@@ -11531,15 +11531,118 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // whichever mutable encoder/frame/operation happens to be active.
         return self.provider_impl.raw_decode_runtime != null;
     }
-    fn ownedPayloadInput(_: *anyopaque, _: @import("../execution/kernel_route.zig").Binding, _: @import("ml").graph.Shape) !bool {
-        // Immutable model tensors retain live representation/policy taint.
-        // The first proof uses exact imported host banks, not assumed mirrors.
-        return false;
+    fn ownedPayloadInput(ctx: *anyopaque, binding: @import("../execution/kernel_route.zig").Binding, logical: @import("ml").graph.Shape) !bool {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        const known = switch (binding) {
+            .tensor => |value| value,
+            else => return false,
+        };
+        // Check the full provider identity before interpreting a concrete CT.
+        if (known.implementation.context != ctx or !acceptsPhysicalImplementation(known.implementation.table) or logical.dtype != .f32) return false;
+        const runtime = self.provider_impl.raw_decode_runtime orelse return false;
+        const buffer = toBuf(known.value);
+        if (buffer.resident_owner != ctx or buffer.cache_identity == 0 or buffer.mutable_state or buffer.integer_storage or
+            buffer.lazy_multiply != null or bufHasAnyQuantizedStorage(buffer) or buffer.native_dense_bytes != null or buffer.native_dense_dtype != null or
+            hasHostView(buffer) or buffer.logical_view_strides != null or buffer.view_base_offset != 0 or
+            buffer.materialized_view_cache != null or buffer.native_dense_host_cache != null or buffer.native_dense_mmap_source_bytes != null or
+            buffer.resident_index_storage != null or buffer.lazy_entry != null or buffer.owns_lazy_pin or
+            (buffer.owned and buffer.data.len != 0)) return false;
+        const tensor = buffer.metal_tensor orelse return false;
+        const device = tensor.device orelse return false;
+        const root = device.ref.write_owner orelse device.ref;
+        if (device.ref.runtime != @as(*anyopaque, @ptrCast(runtime)) or root.runtime != device.ref.runtime or
+            root.released or !root.release_on_drop or !root.recycle_on_drop or tensor.storageVersion() == null) return false;
+        if (tensor.physicalLease()) |lease| {
+            if (lease.backend.ptr != ctx or !acceptsPhysicalImplementation(lease.backend.vtable)) return false;
+        }
+        // Storage ownership resolves the canonical allocation and every plane;
+        // a retained foreign handle, a hidden mirror or a view map is not proof.
+        const Check = struct {
+            runtime: *anyopaque,
+            valid: bool = true,
+            primary: usize = 0,
+            mirrors: usize = 0,
+            backings: [2]?@import("../execution/storage_ownership.zig").Span = @splat(null),
+            backing_count: usize = 0,
+            fn emit(raw: *anyopaque, report: @import("../execution/storage_ownership.zig").Report) !void {
+                const check: *@This() = @ptrCast(@alignCast(raw));
+                switch (report) {
+                    .backing => |span| {
+                        const requested = span.requested_bytes orelse {
+                            check.valid = false;
+                            return;
+                        };
+                        const backing = span.backing_bytes orelse {
+                            check.valid = false;
+                            return;
+                        };
+                        if (span.identity.base == 0 or requested == 0 or requested > backing or span.ownership != .allocation or check.backing_count == check.backings.len) {
+                            check.valid = false;
+                            return;
+                        }
+                        switch (span.identity.kind) {
+                            .metal => if (span.identity.context != check.runtime or span.domain != .backend) {
+                                check.valid = false;
+                                return;
+                            },
+                            .host => if (span.identity.context != null or span.domain != .host) {
+                                check.valid = false;
+                                return;
+                            },
+                            else => {
+                                check.valid = false;
+                                return;
+                            },
+                        }
+                        for (check.backings[0..check.backing_count]) |previous| if (std.meta.eql(previous.?.identity, span.identity)) {
+                            check.valid = false;
+                            return;
+                        };
+                        check.backings[check.backing_count] = span;
+                        check.backing_count += 1;
+                    },
+                    .plane => |plane| {
+                        const identity = plane.backing orelse {
+                            check.valid = false;
+                            return;
+                        };
+                        const end = std.math.add(usize, plane.byte_offset, plane.readable_bytes) catch {
+                            check.valid = false;
+                            return;
+                        };
+                        var found = false;
+                        for (check.backings[0..check.backing_count]) |span| if (std.meta.eql(span.?.identity, identity) and end <= span.?.requested_bytes.?) {
+                            found = true;
+                        };
+                        if (!found or plane.logical_bytes == 0 or plane.readable_bytes < plane.logical_bytes or plane.descriptor.quant_format != null or plane.descriptor.shape.dtype != .f32) {
+                            check.valid = false;
+                            return;
+                        }
+                        switch (plane.role) {
+                            .primary => {
+                                check.primary += 1;
+                                if (identity.kind != .metal or identity.context != check.runtime or plane.descriptor.current_backend != .metal) check.valid = false;
+                            },
+                            .host_mirror => {
+                                check.mirrors += 1;
+                                if (check.mirrors > 1 or identity.kind != .host or plane.descriptor.current_backend != .native or plane.byte_offset != 0) check.valid = false;
+                            },
+                            else => check.valid = false,
+                        }
+                    },
+                }
+            }
+        };
+        var check = Check{ .runtime = @ptrCast(runtime) };
+        const coverage = try storageOwnershipOp(ctx, known.value, .{ .context = &check, .visit = Check.emit });
+        const backend = ops.ComputeBackend{ .ptr = self, .vtable = &vtable_impl };
+        return coverage == .complete and check.valid and check.primary == 1 and check.backing_count == 1 + check.mirrors and @import("../execution/assigned_kernel_route.zig").bindingDense(backend, binding, logical);
     }
     fn ownedPayloadRoute(ctx: *anyopaque, owned: *const @import("../execution/kernel_route.zig").Owned) bool {
         if (owned.implementation.context != ctx or !acceptsPhysicalImplementation(owned.implementation.table)) return false;
         const req = owned.requirements;
         if (req.workspace.byte_size != 0 or req.workspace.host_byte_size != 0 or req.probe_workspace.byte_size != 0 or req.probe_workspace.host_byte_size != 0 or req.auxiliaries.count != 0) return false;
+        if (owned.vtable == &PreparedDenseLinear.vtable) return PreparedDenseLinear.belongs(@ptrCast(@alignCast(ctx)), owned);
         return @import("../execution/assigned_kernel_route.zig").belongsToProgram(owned, .{ .ptr = ctx, .vtable = @ptrCast(@alignCast(owned.implementation.table)) }, directRouteSupported);
     }
 
@@ -11562,27 +11665,463 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return @import("../execution/assigned_kernel_route.zig").prepare(ops.ComputeBackend{ .ptr = self, .vtable = table }, request, directRouteSupported);
     }
 
-    fn assignedLinearSlot(self: *MetalCompute, request: ops.kernel_descriptor.Invocation) ?usize {
-        const linear = request.descriptor.operation.linear;
-        if (request.auxiliaries.len != 0) return null;
-        const weight = toBuf(request.inputs[1]);
-        if (weight.mutable_state or bufHasAnyQuantizedStorage(weight) or weight.native_dense_dtype != null) return null;
-        var key: DynamicLinearSlotKey = undefined;
-        if (linear.bias) {
-            if (toBuf(request.inputs[2]).mutable_state) return null;
-            key = dynamicLinearSlotKey(request.inputs[1], request.inputs[2], linear.in_dim, linear.out_dim);
-        } else {
-            const zeros = self.zero_bias_cache.get(linear.out_dim) orelse return null;
-            key = .{ .weight_value = parameterIdentity(weight), .bias_value = .{ .value = 0, .version = 0 }, .weight_buf = dynamicLinearDenseBufferKey(weight), .bias_buf = @intFromPtr(zeros.ptr), .quantized_storage = 0, .in_dim = linear.in_dim, .out_dim = linear.out_dim };
+    /// The generic direct owner proves dense bindings and output geometry;
+    /// this owner adds the actual prepared payload/declaration lifetime. It
+    /// never prepares a slot or uploads a weight during metadata selection.
+    const PreparedDenseLinear = struct {
+        const route = @import("../execution/kernel_route.zig");
+        allocator: std.mem.Allocator,
+        compute: *MetalCompute,
+        direct: route.Owned,
+        descriptor: ops.kernel_descriptor.Descriptor,
+        output_slot: route.OutputSlot,
+        slot: usize,
+        payload: ?@import("../backends/prepared_slot_owner.zig").Owner.Pin,
+        declaration: if (build_options.enable_metal) MetalNativeProvider.PrivateLinearPin else void,
+
+        fn supported(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
+            const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+            return descriptor.operation == .linear and descriptor.operation.linear.rows == 1 and DenseProjectionProfile.noFrame(self) and supportsAssignedDescriptor(descriptor);
         }
+        fn selectedSlot(compute: *MetalCompute, descriptor: *const ops.kernel_descriptor.Descriptor, bindings: []const route.Binding) ?usize {
+            // Activation inputs may be planned, but the prepared immutable
+            // weight/bias must be concrete source tensors, never guessed planes.
+            if (bindings.len != descriptor.input_count or bindings.len < 2 or bindings[1] != .tensor or (descriptor.operation.linear.bias and bindings[2] != .tensor)) return null;
+            for (bindings[1..]) |binding| {
+                const known = binding.tensor;
+                if (known.implementation.context != @as(*anyopaque, @ptrCast(compute)) or !acceptsPhysicalImplementation(known.implementation.table)) return null;
+            }
+            var inputs: [3]CT = undefined;
+            inputs[1] = bindings[1].tensor.value;
+            if (descriptor.operation.linear.bias) inputs[2] = bindings[2].tensor.value;
+            return compute.assignedLinearSlot(.{ .descriptor = descriptor, .inputs = inputs[0..descriptor.input_count], .output = null });
+        }
+        fn prepare(compute: *MetalCompute, request: route.Prepare, table: *const ops.ComputeBackend.VTable) !?route.Owned {
+            if (comptime !build_options.enable_metal) return null;
+            const slot = selectedSlot(compute, request.descriptor, request.inputs) orelse return null;
+            var direct = (try @import("../execution/assigned_kernel_route.zig").prepare(.{ .ptr = compute, .vtable = table }, request, supported)) orelse return null;
+            var committed = false;
+            defer if (!committed) direct.deinit();
+            const owner = try request.allocator.create(PreparedDenseLinear);
+            defer if (!committed) request.allocator.destroy(owner);
+            const payload = compute.provider_impl.pinLinearSlotForPersistentUse(slot) catch |err| switch (err) {
+                error.QueueFull, error.PreparedSlotUnavailable => return null,
+                else => return err,
+            };
+            defer if (!committed) if (payload) |pin| pin.release();
+            const epoch = compute.provider_impl.privateSlotDeclaration(.linear, slot);
+            const declaration = (if (payload) |pin|
+                compute.provider_impl.pinCachedLinearDeclaration(slot, epoch, pin)
+            else
+                compute.provider_impl.pinPrivateLinearDeclaration(slot, epoch)) catch |err| switch (err) {
+                error.QueueFull, error.PreparedSlotUnavailable, error.ForeignPreparedSlotOwner => return null,
+                else => return err,
+            };
+            owner.* = .{ .allocator = request.allocator, .compute = compute, .direct = direct, .descriptor = request.descriptor.*, .output_slot = request.output, .slot = slot, .payload = payload, .declaration = declaration };
+            committed = true;
+            return .{ .context = owner, .implementation = direct.implementation, .key = direct.key, .requirements = direct.requirements, .vtable = &vtable };
+        }
+        fn matches(raw: *anyopaque, request: route.Validate) bool {
+            const self: *PreparedDenseLinear = @ptrCast(@alignCast(raw));
+            if (comptime !build_options.enable_metal) return false;
+            if (!self.declaration.valid()) return false;
+            if (self.payload) |pin| if (!pin.valid()) return false;
+            return self.direct.vtable.matches(self.direct.context, request) and selectedSlot(self.compute, &self.descriptor, request.inputs) == self.slot;
+        }
+        fn matchesInputs(self: *PreparedDenseLinear, inputs: []const route.Binding) bool {
+            return matches(self, .{ .inputs = inputs, .output = self.output_slot });
+        }
+        fn validate(raw: *anyopaque, request: route.Validate) !void {
+            if (!matches(raw, request)) return error.PreparedKernelBindingChanged;
+        }
+        fn belongs(compute: *MetalCompute, owned: *const route.Owned) bool {
+            const self: *PreparedDenseLinear = @ptrCast(@alignCast(owned.context));
+            return self.compute == compute and supported(compute, &self.descriptor);
+        }
+        fn deinit(raw: *anyopaque) void {
+            const self: *PreparedDenseLinear = @ptrCast(@alignCast(raw));
+            self.direct.deinit();
+            if (comptime build_options.enable_metal) self.declaration.release();
+            if (self.payload) |pin| pin.release();
+            self.allocator.destroy(self);
+        }
+        const vtable: route.Owned.VTable = .{ .matches = matches, .validate = validate, .deinit = @This().deinit };
+    };
+
+    /// Explicit synchronous profile. This owner never borrows an ambient
+    /// frame or capture. Rows-one regions use the native ordinary schedule;
+    /// its individual commands complete before their retained pins are freed.
+    const DenseProjectionProfile = struct {
+        const profile = @import("../execution/region_execution_profile.zig");
+        compute: *MetalCompute,
+        program: *const ml.graph.Graph,
+        implementation: @import("../execution/kernel_route.zig").Implementation,
+        lease: ?operation_mod.Lease,
+        token: operation_mod.Borrowed,
+
+        fn noFrame(compute: *MetalCompute) bool {
+            const runtime = compute.provider_impl.raw_decode_runtime orelse return false;
+            return compute.audio_capture == null and !metal_runtime.hasActiveFrame(runtime) and !metal_runtime.hasSubmittedFrame(runtime);
+        }
+        fn request(self: *@This()) operation_mod.Request {
+            return .{ .implementation = self.implementation, .program = self.program, .mode = .managed };
+        }
+        fn validate(raw: *anyopaque, current: profile.Request) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (current.program != self.program or current.implementation.context != self.implementation.context or current.implementation.table != self.implementation.table or !noFrame(self.compute)) return error.RegionExecutionProfileChanged;
+            if (self.lease) |*lease| try lease.validate(self.request()) else try self.token.validate(self.request());
+        }
+        fn begin(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!noFrame(self.compute)) return error.RegionExecutionProfileChanged;
+            if (self.lease) |*lease| try lease.begin(self.request()) else try self.token.validate(self.request());
+        }
+        fn finish(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!noFrame(self.compute)) return error.RegionExecutionProfileChanged;
+            if (self.lease) |*lease| try lease.finish() else try self.token.validate(self.request());
+        }
+        fn drain(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.lease) |*lease| try lease.deinitChecked() else {
+                try self.token.validate(self.request());
+                try operationQuiesce(self.compute.provider_impl, true);
+            }
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.lease) |*lease| lease.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+            self.compute.allocator.destroy(self);
+        }
+        const table: profile.Claim.VTable = .{ .validate = validate, .begin = begin, .finish = finish, .drain = drain, .release = release };
+    };
+    fn denseRegionPolicyKey(ctx: *anyopaque) !?u64 {
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        return if (DenseProjectionProfile.noFrame(self)) 1 else null;
+    }
+    fn claimDenseProjectionProfile(ctx: *anyopaque, request: @import("../execution/region_execution_profile.zig").Request) !?@import("../execution/region_execution_profile.zig").Claim {
+        if (request.implementation.context != ctx or !acceptsPhysicalImplementation(request.implementation.table)) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (!DenseProjectionProfile.noFrame(self) or !DenseProjectionRegion.hasCandidates(request.program)) return null;
+        const owner = try self.allocator.create(DenseProjectionProfile);
+        var committed = false;
+        defer if (!committed) self.allocator.destroy(owner);
+        var lease: ?operation_mod.Lease = null;
+        const token = if (currentEngineOperation(self)) |current| blk: {
+            try current.validate(.{ .implementation = request.implementation, .program = request.program, .mode = .managed });
+            break :blk current;
+        } else blk: {
+            var owned: operation_mod.Lease = undefined;
+            if (!try operationPrepareInto(self, .{ .implementation = request.implementation, .program = request.program, .mode = .managed }, &owned)) return null;
+            lease = owned;
+            // This value becomes active only when Claim.ensureScope calls
+            // begin. Nested Runtime validates its real nonce after that point.
+            break :blk operation_mod.Borrowed{ .context = owned.context, .nonce = owned.nonce, .mode = owned.mode, .vtable = owned.vtable };
+        };
+        owner.* = .{ .compute = self, .program = request.program, .implementation = request.implementation, .lease = lease, .token = token };
+        committed = true;
+        return .{ .context = owner, .implementation = request.implementation, .program = request.program, .profile = .synchronous, .policy_key = 1, .operation_lease = token, .vtable = &DenseProjectionProfile.table };
+    }
+
+    /// Rows-one pair/QKV regions retain the same per-slot preparation and
+    /// native fused body as the original decoder. Multi-row packed schedules
+    /// still require an independent private-frame/completion custody profile.
+    const DenseProjectionRegion = struct {
+        const region = @import("../execution/region_route.zig");
+        const route = @import("../execution/kernel_route.zig");
+        allocator: std.mem.Allocator,
+        compute: *MetalCompute,
+        count: usize,
+        nodes: [3]ml.graph.NodeId,
+        inputs: [4]ml.graph.NodeId,
+        outputs: [3]region.Output,
+        linears: [3]route.Owned,
+
+        fn candidate(graph: *const ml.graph.Graph, node: ml.graph.NodeId) ?ops.kernel_descriptor.Descriptor {
+            const descriptor = ops.kernel_descriptor.lower(graph, node) orelse return null;
+            if (descriptor.operation != .linear or descriptor.operation.linear.bias or descriptor.operation.linear.rows != 1 or !supportsAssignedDescriptor(&descriptor)) return null;
+            return descriptor;
+        }
+        fn hasCandidates(graph: *const ml.graph.Graph) bool {
+            // The initial synchronous profile is a complete projection head,
+            // never a promise to disable profitable framing on a mixed graph.
+            if (graph.outputs.items.len < 2 or graph.outputs.items.len > 3) return false;
+            var common: ?ml.graph.NodeId = null;
+            var dimensions: [3]usize = undefined;
+            var width: usize = 0;
+            for (graph.outputs.items, 0..) |node, index| {
+                const descriptor = candidate(graph, node) orelse return false;
+                const current = graph.node(node);
+                if (graph.node(current.inputs[0]).op != .parameter or graph.node(current.inputs[1]).op != .parameter) return false;
+                if (common) |input| {
+                    if (input != current.inputs[0] or width != descriptor.operation.linear.in_dim) return false;
+                } else {
+                    common = current.inputs[0];
+                    width = descriptor.operation.linear.in_dim;
+                }
+                for (graph.outputs.items[0..index]) |prior| if (graph.node(prior).inputs[1] == current.inputs[1]) return false;
+                dimensions[index] = descriptor.operation.linear.out_dim;
+            }
+            return if (graph.outputs.items.len == 2) dimensions[0] == dimensions[1] else dimensions[1] == dimensions[2];
+        }
+        fn slotsSupported(self: *@This()) bool {
+            for (self.linears[0..self.count], 0..) |linear, index| {
+                const owner: *PreparedDenseLinear = @ptrCast(@alignCast(linear.context));
+                if (metal_runtime.termite_metal_decode_runtime_linear_slot_dtype(self.compute.provider_impl.raw_decode_runtime, owner.slot) != @backingInt(metal_runtime.DenseLinearSlotDtype.f32)) return false;
+                for (self.linears[0..index]) |prior| {
+                    const previous: *PreparedDenseLinear = @ptrCast(@alignCast(prior.context));
+                    if (owner.slot == previous.slot) return false;
+                }
+            }
+            return true;
+        }
+        fn matches(raw: *anyopaque, request: region.Validate) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!DenseProjectionProfile.noFrame(self.compute) or !self.slotsSupported() or request.inputs.len != self.count + 1 or request.outputs.len != self.count) return false;
+            for (self.linears[0..self.count], 0..) |linear, index| {
+                const owner: *PreparedDenseLinear = @ptrCast(@alignCast(linear.context));
+                const facts = [_]route.Binding{ request.inputs[0], request.inputs[index + 1] };
+                if (!owner.matchesInputs(&facts)) return false;
+            }
+            return true;
+        }
+        fn validate(raw: *anyopaque, request: region.Validate) !void {
+            if (!matches(raw, request)) return error.PreparedRegionBindingChanged;
+        }
+        fn tensor(self: *@This(), value: CT) !MetalTensor {
+            const buffer = toBuf(value);
+            const current = buffer.metal_tensor orelse return error.PreparedRegionBindingChanged;
+            if (buffer.integer_storage or buffer.lazy_multiply != null or bufHasAnyQuantizedStorage(buffer) or hasHostView(buffer) or
+                !current.isDevice() or current.dtype != .f32 or current.device.?.ref.runtime != @as(*anyopaque, @ptrCast(self.compute.provider_impl.raw_decode_runtime.?))) return error.PreparedRegionBindingChanged;
+            return current;
+        }
+        fn dispatch(raw: *anyopaque, invocation: region.Invocation) !region.Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (invocation.validation.inputs, invocation.inputs) |binding, value| {
+                if (binding == .tensor and binding.tensor.value != value) return error.PreparedRegionBindingChanged;
+            }
+            const input = try self.tensor(invocation.inputs[0]);
+            var outputs: [3]MetalTensor = undefined;
+            var slots: [3]usize = undefined;
+            for (invocation.outputs, 0..) |output, index| {
+                outputs[index] = try self.tensor(output.tensor);
+                const owner: *PreparedDenseLinear = @ptrCast(@alignCast(self.linears[index].context));
+                slots[index] = owner.slot;
+                if (outputs[index].isReadOnlyPhysical()) return error.ReadOnlyPhysicalStorage;
+                const assigned = output.authority orelse return error.InvalidPhysicalStorageAuthority;
+                const lease = outputs[index].physicalLease() orelse return error.InvalidPhysicalStorageAuthority;
+                if (lease.backend.ptr != @as(*anyopaque, @ptrCast(self.compute)) or !acceptsPhysicalImplementation(lease.backend.vtable) or
+                    !lease.acceptsWritableRegion(assigned.slot.allocation, assigned.slot.epoch, assigned.slot.writable_bytes, assigned.region)) return error.InvalidPhysicalStorageAuthority;
+                const base = toBuf(lease.tensor).metal_tensor orelse return error.InvalidPhysicalStorageAuthority;
+                const offset = try std.math.add(usize, base.deviceByteOffset(), assigned.region.byte_offset);
+                if (outputs[index].deviceHandle() != base.deviceHandle() or outputs[index].deviceByteOffset() != offset or outputs[index].deviceByteLen() != assigned.slot.writable_bytes) return error.InvalidPhysicalStorageAuthority;
+                for (outputs[0..index]) |previous| {
+                    if (previous.deviceHandle() == outputs[index].deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(previous.deviceByteOffset()), previous.deviceByteLen(), @intCast(outputs[index].deviceByteOffset()), outputs[index].deviceByteLen())) return error.InvalidAssignedAlias;
+                }
+                // All source/output aliases are refused BEFORE native entry.
+                for (invocation.inputs) |source| {
+                    const current = try self.tensor(source);
+                    if (current.deviceHandle() == outputs[index].deviceHandle() and kernel_geometry.byteRangesOverlap(@intCast(current.deviceByteOffset()), current.deviceByteLen(), @intCast(outputs[index].deviceByteOffset()), outputs[index].deviceByteLen())) return error.InvalidAssignedAlias;
+                }
+            }
+            const first: *PreparedDenseLinear = @ptrCast(@alignCast(self.linears[0].context));
+            const a = first.descriptor.operation.linear;
+            const entered = if (self.count == 2)
+                try metal_runtime.tryApplyDenseRuntimeLinearPairAssigned(self.compute.provider_impl, slots[0], slots[1], input, 1, a.in_dim, a.out_dim, outputs[0], outputs[1], null)
+            else blk: {
+                const second: *PreparedDenseLinear = @ptrCast(@alignCast(self.linears[1].context));
+                break :blk try metal_runtime.tryApplyDenseRuntimeLinearQkvAssigned(self.compute.provider_impl, slots[0], slots[1], slots[2], input, 1, a.in_dim, a.out_dim, second.descriptor.operation.linear.out_dim, outputs[0], outputs[1], outputs[2], null);
+            };
+            if (!entered) return error.PreparedRegionBindingChanged;
+            return .completed;
+        }
+        fn deinit(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            for (self.linears[0..self.count]) |*linear| linear.deinit();
+            self.allocator.destroy(self);
+        }
+        const table: region.Owned.VTable = .{ .matches = matches, .validate = validate, .dispatch = dispatch, .deinit = @This().deinit };
+    };
+    const DenseRegionReadiness = struct {
+        const region = @import("../execution/region_route.zig");
+        const Entry = struct { key: DynamicLinearSlotKey, slot: ?usize, declaration: u64 };
+        allocator: std.mem.Allocator,
+        compute: *MetalCompute,
+        entries: []Entry,
+        fn matches(raw: *anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (!DenseProjectionProfile.noFrame(self.compute)) return false;
+            for (self.entries) |entry| {
+                const slot = self.compute.assignedDenseLinearSlot(entry.key);
+                if (slot != entry.slot) return false;
+                if (slot) |value| if (self.compute.provider_impl.privateSlotDeclaration(.linear, value) != entry.declaration) return false;
+            }
+            return true;
+        }
+        fn validate(raw: *anyopaque) !void {
+            if (!matches(raw)) return error.PreparedRegionBindingChanged;
+        }
+        fn deinit(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.allocator.free(self.entries);
+            self.allocator.destroy(self);
+        }
+        const table: region.SelectionDependency.VTable = .{ .matches = matches, .validate = validate, .deinit = @This().deinit };
+    };
+    fn prepareDenseProjectionRegions(ctx: *anyopaque, request: @import("../execution/region_route.zig").Prepare) !?@import("../execution/region_route.zig").OwnedList {
+        const region = @import("../execution/region_route.zig");
+        const route = @import("../execution/kernel_route.zig");
+        if (comptime !build_options.enable_metal) return null;
+        const self: *MetalCompute = @ptrCast(@alignCast(ctx));
+        if (request.implementation.context != ctx or !acceptsPhysicalImplementation(request.implementation.table) or request.policy_key != 1 or request.execution_profile != .synchronous or !DenseProjectionProfile.noFrame(self)) return null;
+        const table: *const ops.ComputeBackend.VTable = @ptrCast(@alignCast(request.implementation.table));
+        const positions = try request.allocator.alloc(u32, request.graph.nodeCount());
+        defer request.allocator.free(positions);
+        @memset(positions, std.math.maxInt(u32));
+        for (request.node_order, 0..) |node, position| {
+            if (node >= positions.len or positions[node] != std.math.maxInt(u32)) return error.InvalidRegionOrder;
+            positions[node] = std.math.cast(u32, position) orelse return error.InvalidRegionOrder;
+        }
+        var result: std.ArrayList(region.Owned) = .empty;
+        defer result.deinit(request.allocator);
+        errdefer for (result.items) |*owner| owner.deinit();
+        var watched: std.ArrayList(DenseRegionReadiness.Entry) = .empty;
+        defer watched.deinit(request.allocator);
+        for (request.partition_nodes) |node| {
+            const descriptor = DenseProjectionRegion.candidate(request.graph, node) orelse continue;
+            const weight = request.graph.node(node).inputs[1];
+            if (request.node_facts[weight] != .tensor) continue;
+            const known = request.node_facts[weight].tensor;
+            if (known.implementation.context != ctx or !acceptsPhysicalImplementation(known.implementation.table)) continue;
+            const key = self.assignedDenseLinearKey(descriptor.operation.linear, known.value, null) orelse continue;
+            const slot = self.assignedDenseLinearSlot(key);
+            try watched.append(request.allocator, .{ .key = key, .slot = slot, .declaration = if (slot) |value| self.provider_impl.privateSlotDeclaration(.linear, value) else 0 });
+        }
+        var cursor: usize = 0;
+        while (cursor < request.partition_nodes.len) {
+            const first_node = request.partition_nodes[cursor];
+            const first = DenseProjectionRegion.candidate(request.graph, first_node) orelse {
+                cursor += 1;
+                continue;
+            };
+            const input = request.graph.node(first_node).inputs[0];
+            var count: usize = 1;
+            var dimensions: [3]usize = .{ first.operation.linear.out_dim, 0, 0 };
+            // Adjacent numerical projections only: no consumer or future
+            // source producer can be moved across this entry point.
+            while (count < 3 and cursor + count < request.partition_nodes.len) {
+                const next_node = request.partition_nodes[cursor + count];
+                const next = DenseProjectionRegion.candidate(request.graph, next_node) orelse break;
+                if (request.graph.node(next_node).inputs[0] != input or next.operation.linear.in_dim != first.operation.linear.in_dim) break;
+                dimensions[count] = next.operation.linear.out_dim;
+                count += 1;
+            }
+            if (count == 3 and dimensions[1] != dimensions[2]) count = 2;
+            if (count == 2 and dimensions[0] != dimensions[1]) {
+                cursor += 1;
+                continue;
+            }
+            if (count < 2) {
+                cursor += 1;
+                continue;
+            }
+            // Every external operand must already have been submitted when
+            // the first member is reached. Node IDs are not submission order.
+            const entry_position = positions[first_node];
+            if (entry_position == std.math.maxInt(u32)) return error.InvalidRegionOrder;
+            var ready = true;
+            for (request.partition_nodes[cursor..][0..count]) |node| for (request.graph.node(node).getInputs()) |source| {
+                if (source >= positions.len or positions[source] >= entry_position) ready = false;
+            };
+            for (request.partition_nodes[cursor..][0..count], 0..) |node, index| {
+                const weight = request.graph.node(node).inputs[1];
+                for (request.partition_nodes[cursor..][0..index]) |previous| if (request.graph.node(previous).inputs[1] == weight) {
+                    ready = false;
+                };
+            }
+            if (!ready) {
+                cursor += 1;
+                continue;
+            }
+            const owner = try request.allocator.create(DenseProjectionRegion);
+            owner.* = .{ .allocator = request.allocator, .compute = self, .count = 0, .nodes = undefined, .inputs = undefined, .outputs = undefined, .linears = undefined };
+            var transferred = false;
+            defer if (!transferred) DenseProjectionRegion.deinit(owner);
+            owner.inputs[0] = input;
+            for (request.partition_nodes[cursor..][0..count], 0..) |node, index| {
+                const descriptor = DenseProjectionRegion.candidate(request.graph, node).?;
+                const weight = request.graph.node(node).inputs[1];
+                const facts = [_]route.Binding{ request.node_facts[input], request.node_facts[weight] };
+                const bytes = try std.math.mul(usize, descriptor.elements(), @sizeOf(f32));
+                const output = route.OutputSlot{ .allocation = 0, .node = node, .epoch = 0, .logical = descriptor.output_shape, .writable_bytes = bytes };
+                owner.linears[index] = (try PreparedDenseLinear.prepare(self, .{ .allocator = request.allocator, .implementation = request.implementation, .descriptor = &descriptor, .inputs = &facts, .output = output }, table)) orelse break;
+                owner.count += 1;
+                owner.nodes[index] = node;
+                owner.inputs[index + 1] = weight;
+                owner.outputs[index] = .{ .node = node, .logical = descriptor.output_shape, .bytes = bytes };
+            }
+            if (owner.count != count or !owner.slotsSupported()) {
+                cursor += 1;
+                continue;
+            }
+            // Slices point into their stable heap owner, never this call frame.
+            try result.append(request.allocator, .{ .context = owner, .implementation = request.implementation, .key = first_node, .policy_key = request.policy_key, .covered_nodes = owner.nodes[0..count], .input_nodes = owner.inputs[0 .. count + 1], .entry_node = first_node, .requirements = .{ .outputs = owner.outputs[0..count], .uncovered = .{} }, .vtable = &DenseProjectionRegion.table });
+            transferred = true;
+            cursor += count;
+        }
+        // This synchronous execution profile is installed only for a fully
+        // covered numerical partition. Missing/cold slot or layout readiness
+        // selects the unchanged compatibility variant BEFORE recoloring.
+        var complete = true;
+        for (request.partition_nodes) |node| {
+            if (request.graph.node(node).op == .parameter) continue;
+            var covered = false;
+            for (result.items) |owner| if (std.mem.indexOfScalar(ml.graph.NodeId, owner.covered_nodes, node) != null) {
+                covered = true;
+                break;
+            };
+            if (!covered) {
+                complete = false;
+                break;
+            }
+        }
+        if (!complete) {
+            for (result.items) |*owner| owner.deinit();
+            result.clearRetainingCapacity();
+        }
+        const dependency = try request.allocator.create(DenseRegionReadiness);
+        errdefer request.allocator.destroy(dependency);
+        dependency.* = .{ .allocator = request.allocator, .compute = self, .entries = try watched.toOwnedSlice(request.allocator) };
+        errdefer request.allocator.free(dependency.entries);
+        return .{ .allocator = request.allocator, .items = try result.toOwnedSlice(request.allocator), .dependency = .{ .context = dependency, .vtable = &DenseRegionReadiness.table } };
+    }
+
+    fn assignedDenseLinearKey(self: *MetalCompute, linear: ops.kernel_descriptor.Linear, weight_ct: CT, bias_ct: ?CT) ?DynamicLinearSlotKey {
+        const weight = toBuf(weight_ct);
+        if (weight.mutable_state or bufHasAnyQuantizedStorage(weight) or weight.native_dense_dtype != null) return null;
+        if (linear.bias) {
+            const bias = bias_ct orelse return null;
+            if (toBuf(bias).mutable_state) return null;
+            return dynamicLinearSlotKey(weight_ct, bias, linear.in_dim, linear.out_dim);
+        }
+        const zeros = self.zero_bias_cache.get(linear.out_dim) orelse return null;
+        return .{ .weight_value = parameterIdentity(weight), .bias_value = .{ .value = 0, .version = 0 }, .weight_buf = dynamicLinearDenseBufferKey(weight), .bias_buf = @intFromPtr(zeros.ptr), .quantized_storage = 0, .in_dim = linear.in_dim, .out_dim = linear.out_dim };
+    }
+    fn assignedDenseLinearSlot(self: *MetalCompute, key: DynamicLinearSlotKey) ?usize {
         const entry = self.livePreparedSlot("dynamic_linear_slots", .linear, key) orelse return null;
         const slot = entry.slot;
         if (slot >= metal_runtime.decoder_runtime_linear_slot_capacity or
             !self.provider_impl.raw_linear_slots_prepared[slot] or
             self.provider_impl.raw_linear_slot_kinds[slot] != .dense or
-            self.provider_impl.raw_linear_slot_in_dims[slot] != linear.in_dim or
-            self.provider_impl.raw_linear_slot_out_dims[slot] != linear.out_dim) return null;
+            self.provider_impl.raw_linear_slot_in_dims[slot] != key.in_dim or
+            self.provider_impl.raw_linear_slot_out_dims[slot] != key.out_dim) return null;
         return slot;
+    }
+    fn assignedLinearSlot(self: *MetalCompute, request: ops.kernel_descriptor.Invocation) ?usize {
+        if (request.auxiliaries.len != 0) return null;
+        const linear = request.descriptor.operation.linear;
+        const key = self.assignedDenseLinearKey(linear, request.inputs[1], if (linear.bias) request.inputs[2] else null) orelse return null;
+        return self.assignedDenseLinearSlot(key);
     }
 
     fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
@@ -39077,7 +39616,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         return descriptor.operation == .slice and supportsAssignedDescriptor(descriptor);
     }
 
-    const kernel_backend_impl: ops.KernelBackend = .{ .ownedPayloadServices = &owned_payload_services, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .prepareKernelRoute = prepareKernelRouteOp };
+    const kernel_backend_impl: ops.KernelBackend = .{ .ownedPayloadServices = &owned_payload_services, .regionPolicyKey = denseRegionPolicyKey, .claimRegionExecutionProfile = claimDenseProjectionProfile, .prepareRegionRoutes = prepareDenseProjectionRegions, .hostInputRequirements = hostInputRequirementsOp, .createHostInput = createHostInputOp, .createMetadataAlias = createMetadataAliasOp, .materializesOutput = materializesOutputOp, .physicalReplayReshapeViews = true, .implementation_table = &vtable_impl, .acceptsImplementation = acceptsPhysicalImplementation, .storageOwnership = storageOwnershipOp, .physicalLiteralBindingSupported = physicalLiteralBindingSupportedOp, .writePhysicalFloat32 = writePhysicalFloat32Op, .physicalLiteralInitializer = physicalLiteralInitializerOp, .copyPhysicalInput = copyPhysicalInputOp, .readFloat32Into = readFloat32IntoOp, .physical_storage_policy = &physical_storage_policy, .physicalTensorView = physicalTensorViewOp, .runAssignedKernel = runAssignedKernelOp, .prepareKernelRoute = prepareKernelRouteOp };
 
     const vtable_impl: ops.ComputeBackend.VTable = blk: {
         var vt = native_compute_mod.vtable_impl;
@@ -53485,6 +54024,217 @@ const AssignedPackedFixture = struct {
 };
 test "Metal packed assigned pair and QKV preserve Native values actual output offsets and resident dispatch" {
     try @import("media_residency_test.zig").onMetal(AssignedPackedFixture.populate, AssignedPackedFixture.check);
+}
+
+const PreparedDenseRegionFixture = struct {
+    fn prepare(a: std.mem.Allocator, cb: ops.ComputeBackend, request: @import("../execution/region_route.zig").Prepare) !void {
+        var current = request;
+        current.allocator = a;
+        var selected = (try cb.vtable.kernels.?.prepareRegionRoutes.?(cb.ptr, current)) orelse return error.MissingPreparedRegion;
+        defer selected.deinit();
+        try std.testing.expectEqual(@as(usize, 1), selected.items.len);
+    }
+    fn runInstalled(cb: ops.ComputeBackend, graph: *const ml.graph.Graph, nodes: []const ml.graph.NodeId, values: []const CT, expected: []const []f32) !void {
+        const a = std.testing.allocator;
+        const interpreter = @import("../graph/interpreter.zig");
+        const route = @import("../execution/kernel_route.zig");
+        const parameter_count = values.len;
+        var bindings: [4]route.InputBinding = undefined;
+        var inputs: [4]interpreter.RuntimeInput = undefined;
+        for (nodes[0..parameter_count], values, 0..) |node, value, index| {
+            bindings[index] = .{ .node_id = node, .value = .{ .tensor = .{ .value = value, .implementation = .{ .context = cb.ptr, .table = cb.vtable } } } };
+            inputs[index] = .{ .node_id = node, .value = value, .source_backend = &cb };
+        }
+        var analysis = try interpreter.CachedAnalysis.compute(a, graph);
+        defer analysis.deinit(a);
+        var executable = try @import("../execution/executable.zig").prepareAnalyzedGraph(a, graph, analysis, &cb, .partitioned, .{ .immutable_input_bindings = bindings[0..parameter_count], .input_bindings = inputs[0..parameter_count] });
+        defer executable.deinit();
+        var profile = (try @import("../execution/region_execution_profile.zig").acquire(cb, graph)) orelse return error.MissingMetalRegionProfile;
+        defer profile.deinitChecked() catch unreachable;
+        const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+        const selected = (try pool.prepareRoutesWithProfile(bindings[0..parameter_count], .select_regions, profile.profile)) orelse return error.MissingPreparedRoutes;
+        defer selected.release();
+        try std.testing.expectEqual(@as(usize, 1), selected.pool.regions.len);
+        var result = try executable.run(a, .{ .runtime_inputs = inputs[0..parameter_count], .prepared_routes = selected, .region_execution_profile = &profile, .output_placement = .producer, .activation_readbacks = .forbidden, .collect_partition_stats = true });
+        defer result.deinit(&executable.runtime);
+        // This counter increments at the real Frame.executeRegion seam, and
+        // the synchronous executor returns before legacy node/fusion dispatch.
+        try std.testing.expectEqual(@as(u64, 1), result.stats.runtime_region_plan_dispatches);
+        try std.testing.expectEqual(expected.len, result.outputs.len);
+        for (result.outputs, expected) |output, wants| {
+            const actual = try cb.toFloat32(output, a);
+            defer a.free(actual);
+            for (actual, wants) |found, want| try std.testing.expectApproxEqAbs(want, found, 0.0001);
+        }
+    }
+    fn check(cb: ops.ComputeBackend, reference: ops.ComputeBackend) !void {
+        const a = std.testing.allocator;
+        const route = @import("../execution/kernel_route.zig");
+        const region = @import("../execution/region_route.zig");
+        const profile_mod = @import("../execution/region_execution_profile.zig");
+        const functions = cb.vtable.kernels.?;
+        var values: [4]CT = undefined;
+        var created: usize = 0;
+        defer for (values[0..created]) |value| cb.free(value);
+        var x: [64]f32 = undefined;
+        for (&x, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index % 7)) * 0.01;
+        values[0] = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&x, &.{ 1, 64 }));
+        created += 1;
+        const source_input = try reference.fromFloat32Shape(&x, &.{ 1, 64 });
+        defer reference.free(source_input);
+        var expected: [3][]f32 = undefined;
+        var original: [3][]f32 = undefined;
+        var compared: usize = 0;
+        defer for (0..compared) |index| {
+            a.free(expected[index]);
+            a.free(original[index]);
+        };
+        for ([_][]const u8{ "q", "k", "v" }, 0..) |name, index| {
+            values[index + 1] = try cb.ensureDeviceResidentOwned(try cb.getWeight(name));
+            created += 1;
+            // Ordinary production projection prepares the exact slot/policy.
+            const old = try cb.linearNoBias(values[0], values[index + 1], 1, 64, 64);
+            defer cb.free(old);
+            original[index] = try cb.toFloat32(old, a);
+            errdefer a.free(original[index]);
+            const weight = try reference.getWeight(name);
+            defer reference.free(weight);
+            const product = try reference.linearNoBias(source_input, weight, 1, 64, 64);
+            defer reference.free(product);
+            expected[index] = try reference.toFloat32(product, a);
+            compared += 1;
+        }
+        const activation_peer = try cb.ensureDeviceResidentOwned(try cb.fromFloat32Shape(&x, &.{ 1, 64 }));
+        defer cb.free(activation_peer);
+        const implementation = route.Implementation{ .context = cb.ptr, .table = cb.vtable };
+        const shape = ml.graph.Shape.init(.f32, &.{ 1, 64 });
+        const input_fact = route.Binding{ .tensor = .{ .value = values[0], .implementation = implementation } };
+        try std.testing.expect(try functions.ownedPayloadServices.?.input(cb.ptr, input_fact, shape));
+        var copied = cb.vtable.*;
+        const foreign = route.Binding{ .tensor = .{ .value = @ptrFromInt(16), .implementation = .{ .context = cb.ptr, .table = &copied } } };
+        try std.testing.expect(!try functions.ownedPayloadServices.?.input(cb.ptr, foreign, shape));
+        const input_buf = MetalCompute.toBuf(values[0]);
+        input_buf.mutable_state = true;
+        const mutable_result = functions.ownedPayloadServices.?.input(cb.ptr, input_fact, shape);
+        input_buf.mutable_state = false;
+        try std.testing.expect(!try mutable_result);
+        for ([_]usize{ 2, 3 }) |projection_count| {
+            var graph = ml.graph.Graph.init(a);
+            defer graph.deinit();
+            var builder = ml.graph.Builder.init(&graph);
+            var nodes: [7]ml.graph.NodeId = undefined;
+            nodes[0] = try builder.parameter("x", shape);
+            for (0..projection_count) |index| nodes[index + 1] = try builder.parameter(([_][]const u8{ "q", "k", "v" })[index], ml.graph.Shape.init(.f32, &.{ 64, 64 }));
+            for (0..projection_count) |index| {
+                nodes[projection_count + 1 + index] = try builder.linearNoBias(nodes[0], nodes[index + 1], 1, 64, 64);
+                try graph.markOutput(nodes[projection_count + 1 + index]);
+            }
+            const count = 2 * projection_count + 1;
+            const reachable = try a.alloc(bool, graph.nodeCount());
+            defer a.free(reachable);
+            @memset(reachable, false);
+            for (nodes[0..count]) |node| reachable[node] = true;
+            const last_use = try a.alloc(u32, graph.nodeCount());
+            defer a.free(last_use);
+            @memset(last_use, @intCast(count));
+            const facts = try a.alloc(route.Binding, graph.nodeCount());
+            defer a.free(facts);
+            @memset(facts, .unknown);
+            for (0..projection_count + 1) |index| facts[nodes[index]] = .{ .tensor = .{ .value = values[index], .implementation = implementation } };
+            try std.testing.expect(try cb.decoderRuntimeBeginFrame());
+            var foreign_frame = true;
+            defer if (foreign_frame) cb.decoderRuntimeCancelFrame() catch unreachable;
+            try std.testing.expect((try profile_mod.acquire(cb, &graph)) == null);
+            try cb.decoderRuntimeCancelFrame();
+            foreign_frame = false;
+            var profile = (try profile_mod.acquire(cb, &graph)) orelse return error.MissingMetalRegionProfile;
+            defer profile.deinitChecked() catch unreachable;
+            try std.testing.expect(try profile.ensureScope(.{ .operation = .graph_execution, .implementation = implementation, .program = &graph }));
+            const request = region.Prepare{ .allocator = a, .implementation = implementation, .policy_key = profile.policy_key, .execution_profile = profile.profile, .graph = &graph, .reachable = reachable, .node_order = nodes[0..count], .last_use = last_use, .partition_index = 0, .partition_nodes = nodes[0..count], .node_facts = facts };
+            try std.testing.checkAllAllocationFailures(a, prepare, .{ cb, request });
+            var selected = (try functions.prepareRegionRoutes.?(cb.ptr, request)) orelse return error.MissingPreparedRegion;
+            var selected_live = true;
+            defer if (selected_live) selected.deinit();
+            try std.testing.expectEqual(@as(usize, 1), selected.items.len);
+            const owner = &selected.items[0];
+            try std.testing.expectEqual(projection_count, owner.requirements.outputs.len);
+            try std.testing.expectEqual(@as(usize, 0), owner.requirements.dispatch_workspace.byte_size);
+            try std.testing.expect(owner.requirements.replacementEligible());
+            var leases: [3]*ops.physical_storage.Lease = undefined;
+            var outputs: [3]region.Assigned = undefined;
+            var slots: [3]route.OutputSlot = undefined;
+            var allocated: usize = 0;
+            defer for (0..allocated) |index| {
+                cb.free(outputs[index].tensor);
+                leases[index].release();
+            };
+            for (0..projection_count) |index| {
+                leases[index] = (try ops.physical_storage.Lease.create(a, cb, 64 * @sizeOf(f32))) orelse return error.MissingPhysicalStorage;
+                var lease_local = true;
+                errdefer if (lease_local) leases[index].release();
+                const output = (try functions.physicalTensorView.?(cb.ptr, .{ .storage = leases[index], .shape = &.{ 1, 64 } })) orelse return error.MissingPhysicalStorage;
+                outputs[index] = .{ .tensor = output, .authority = null };
+                allocated += 1;
+                lease_local = false;
+                const node = nodes[projection_count + 1 + index];
+                slots[index] = .{ .allocation = @intCast(index), .node = node, .epoch = 7, .logical = shape, .writable_bytes = 64 * @sizeOf(f32) };
+                try leases[index].bindAllocationSlot(@intCast(index), 7, 64 * @sizeOf(f32));
+                outputs[index].authority = .{ .slot = slots[index], .region = try leases[index].writableRegion(@intCast(index), 7, 64 * @sizeOf(f32)) };
+            }
+            var input_facts: [4]route.Binding = undefined;
+            for (0..projection_count + 1) |index| input_facts[index] = facts[nodes[index]];
+            var invocation = region.Invocation{ .validation = .{ .implementation = implementation, .policy_key = profile.policy_key, .inputs = input_facts[0 .. projection_count + 1], .outputs = slots[0..projection_count] }, .inputs = values[0 .. projection_count + 1], .outputs = outputs[0..projection_count] };
+            slots[0].writable_bytes -= 1;
+            try std.testing.expectError(error.PreparedRegionOutputMismatch, owner.dispatch(invocation));
+            slots[0].writable_bytes += 1;
+            const audit_mod = @import("../execution/transfer_audit.zig");
+            var audit = audit_mod.Audit{ .forbid_device_host_access = true };
+            try audit_mod.begin(&audit);
+            const dispatched = owner.dispatch(invocation);
+            audit_mod.end();
+            try std.testing.expectEqual(region.Outcome.completed, try dispatched);
+            try std.testing.expectEqual(@as(u64, 0), audit.download_bytes);
+            try std.testing.expectEqual(@as(u64, 0), audit.upload_bytes);
+            // Bindings are immutable metadata, not a license for caller CT swap.
+            var changed_values = values;
+            changed_values[0] = activation_peer;
+            invocation.inputs = changed_values[0 .. projection_count + 1];
+            try std.testing.expectError(error.PreparedRegionBindingChanged, owner.dispatch(invocation));
+            changed_values = values;
+            changed_values[1] = values[2];
+            invocation.inputs = changed_values[0 .. projection_count + 1];
+            try std.testing.expectError(error.PreparedRegionBindingChanged, owner.dispatch(invocation));
+            selected.deinit();
+            selected_live = false;
+            try profile.finishSubmission();
+            try runInstalled(cb, &graph, nodes[0..count], values[0 .. projection_count + 1], expected[0..projection_count]);
+            // Actual assigned output ownership survives the selected slot pins,
+            // and the following whole public execution of this same graph.
+            for (0..projection_count) |index| {
+                const actual = try cb.toFloat32(outputs[index].tensor, a);
+                defer a.free(actual);
+                for (actual, expected[index], original[index]) |found, want, old| {
+                    try std.testing.expectApproxEqAbs(want, found, 0.0001);
+                    try std.testing.expectApproxEqAbs(old, found, 0.0001);
+                }
+            }
+        }
+    }
+};
+
+test "Metal prepared dense row projections install pair QKV owners and preserve original values lifetimes and failure bounds" {
+    try @import("media_residency_test.zig").onMetal(AssignedPackedFixture.populate, PreparedDenseRegionFixture.check);
+}
+
+test "Metal prepared projection geometry keeps multirow packed schedules outside synchronous profile" {
+    const a = std.testing.allocator;
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 64 }));
+    const weight = try builder.parameter("w", ml.graph.Shape.init(.f32, &.{ 64, 64 }));
+    const output = try builder.linearNoBias(x, weight, 2, 64, 64);
+    try std.testing.expect(MetalCompute.DenseProjectionRegion.candidate(&graph, output) == null);
 }
 
 const ConcurrentMetalSiblings = struct {

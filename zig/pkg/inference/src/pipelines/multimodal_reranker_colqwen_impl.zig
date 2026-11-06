@@ -28,6 +28,7 @@ const qwen2vl = @import("multimodal_qwen_adapter.zig");
 const qwen2vl_vision = @import("../architectures/qwen2vl_vision.zig");
 const reranking = @import("reranking.zig");
 const runtime = @import("../runtime/root.zig");
+const decoder_prefill = @import("../execution/decoder_prefill.zig");
 
 // Internal ColQwen/Qwen2-VL implementation for the task-oriented
 // `multimodal_reranker.zig` surface.
@@ -228,10 +229,10 @@ pub fn encodeQuery(
     defer allocator.free(ids_i64);
     for (encoded.ids, 0..) |id, idx| ids_i64[idx] = id;
 
-    const hidden = try gpt_arch.hiddenForward(cb, allocator, gpt_cfg, ids_i64, 1, encoded.ids.len, null);
-    defer allocator.free(hidden);
+    var hidden = try decoder_prefill.ResidentHiddenRows.fromTokens(cb, allocator, gpt_cfg, ids_i64);
+    defer hidden.deinit();
     if (execution_control) |control| try control.check();
-    const projected = try applyRetrievalProjection(cb, allocator, hidden, encoded.ids.len, @intCast(gpt_cfg.hidden_size));
+    const projected = try applyResidentRetrievalProjection(cb, allocator, &hidden);
     return .{
         .allocator = allocator,
         .input_ids = encoded.ids,
@@ -501,53 +502,48 @@ pub fn encodeDocumentFromPrepared(
     defer cb.free(base_embeddings);
 
     const hidden_size: usize = @intCast(gpt_cfg.hidden_size);
-    const prompt_embeddings = try cb.toFloat32(base_embeddings, allocator);
-    errdefer allocator.free(prompt_embeddings);
+    const input_embeddings = embeddings: {
+        const prompt_embeddings = try cb.toFloat32(base_embeddings, allocator);
+        defer allocator.free(prompt_embeddings);
 
-    const embedding_scale = gpt_cfg.tokenEmbeddingScale();
-    if (!std.math.approxEqAbs(f32, embedding_scale, 1.0, 1e-6)) {
-        for (prompt_embeddings) |*value| value.* *= embedding_scale;
-    }
-
-    var image_index: usize = 0;
-    var pos: usize = 0;
-    while (pos < prepared_doc.input_ids.len) {
-        if (prepared_doc.input_ids[pos] != gpt_cfg.image_token_index) {
-            pos += 1;
-            continue;
+        const embedding_scale = gpt_cfg.tokenEmbeddingScale();
+        if (!std.math.approxEqAbs(f32, embedding_scale, 1.0, 1e-6)) {
+            for (prompt_embeddings) |*value| value.* *= embedding_scale;
         }
-        if (image_index >= image_embeddings.len) return error.ImagePlaceholderCountMismatch;
 
-        const image_emb = image_embeddings[image_index];
-        if (image_emb.len % hidden_size != 0) return error.ImageProjectionSizeMismatch;
-        const tokens = image_emb.len / hidden_size;
-        if (tokens == 0) return error.ImageTokenLengthMismatch;
+        var image_index: usize = 0;
+        var pos: usize = 0;
+        while (pos < prepared_doc.input_ids.len) {
+            if (prepared_doc.input_ids[pos] != gpt_cfg.image_token_index) {
+                pos += 1;
+                continue;
+            }
+            if (image_index >= image_embeddings.len) return error.ImagePlaceholderCountMismatch;
 
-        var run_len: usize = 0;
-        while (pos + run_len < prepared_doc.input_ids.len and prepared_doc.input_ids[pos + run_len] == gpt_cfg.image_token_index) : (run_len += 1) {}
-        if (run_len > tokens) return error.ImagePlaceholderCountMismatch;
+            const image_emb = image_embeddings[image_index];
+            if (image_emb.len % hidden_size != 0) return error.ImageProjectionSizeMismatch;
+            const tokens = image_emb.len / hidden_size;
+            if (tokens == 0) return error.ImageTokenLengthMismatch;
 
-        const copy_len = run_len * hidden_size;
-        @memcpy(prompt_embeddings[pos * hidden_size ..][0..copy_len], image_emb[0..copy_len]);
-        pos += run_len;
-        image_index += 1;
-    }
-    if (image_index != image_embeddings.len) return error.ImagePlaceholderCountMismatch;
+            var run_len: usize = 0;
+            while (pos + run_len < prepared_doc.input_ids.len and prepared_doc.input_ids[pos + run_len] == gpt_cfg.image_token_index) : (run_len += 1) {}
+            if (run_len > tokens) return error.ImagePlaceholderCountMismatch;
 
-    const embedding_shape = [_]i32{ @intCast(prepared_doc.input_ids.len), @intCast(hidden_size) };
-    const input_embeddings = try cb.fromFloat32Shape(prompt_embeddings, &embedding_shape);
-    allocator.free(prompt_embeddings);
+            const copy_len = run_len * hidden_size;
+            @memcpy(prompt_embeddings[pos * hidden_size ..][0..copy_len], image_emb[0..copy_len]);
+            pos += run_len;
+            image_index += 1;
+        }
+        if (image_index != image_embeddings.len) return error.ImagePlaceholderCountMismatch;
+
+        const embedding_shape = [_]i32{ @intCast(prepared_doc.input_ids.len), @intCast(hidden_size) };
+        break :embeddings try cb.fromFloat32Shape(prompt_embeddings, &embedding_shape);
+    };
 
     const hidden = try gpt_arch.hiddenForwardFromEmbeddings(cb, allocator, gpt_cfg, input_embeddings, 1, prepared_doc.input_ids.len, null, null);
+    defer allocator.free(hidden);
     const projected = try applyRetrievalProjection(cb, allocator, hidden, prepared_doc.input_ids.len, hidden_size);
-    allocator.free(hidden);
-    return .{
-        .allocator = allocator,
-        .input_ids = try allocator.dupe(i32, prepared_doc.input_ids),
-        .attention_mask = try allocator.dupe(i32, prepared_doc.attention_mask),
-        .hidden_states = projected.hidden_states,
-        .hidden_size = projected.hidden_size,
-    };
+    return finishEncodedSequence(allocator, prepared_doc, projected);
 }
 
 pub fn encodeDocumentFromPreparedNative(
@@ -563,7 +559,20 @@ pub fn encodeDocumentFromPreparedNative(
     const embed_w = try getEmbeddingWeight(cb, gpt_cfg);
     defer cb.free(embed_w);
     const hidden_size: usize = @intCast(gpt_cfg.hidden_size);
+    if (prepared_doc.input_ids.len == 0) return error.ImagePlaceholderCountMismatch;
 
+    var resident = resident: {
+        var assembly = (try decoder_prefill.EmbeddingRows.init(cb, allocator, prepared_doc.input_ids.len, hidden_size)) orelse break :resident null;
+        var transferred = false;
+        defer if (!transferred) assembly.deinit();
+        // Every supplied image is checked before the first copy, including its
+        // actual device namespace. Opaque/packed/foreign-provider sources keep
+        // the original host-compatible path without replaying submitted math.
+        for (image_embeddings) |image| if (!try assembly.acceptsSource(image.tensor, image.token_count)) break :resident null;
+        transferred = true;
+        break :resident assembly;
+    };
+    defer if (resident) |*assembly| assembly.deinit();
     var current: ?CT = null;
     var current_rows: usize = 0;
     defer if (current) |tensor| cb.free(tensor);
@@ -578,6 +587,13 @@ pub fn encodeDocumentFromPreparedNative(
             while (pos + run_len < prepared_doc.input_ids.len and prepared_doc.input_ids[pos + run_len] == gpt_cfg.image_token_index) : (run_len += 1) {}
             if (run_len > image_emb.token_count) return error.ImagePlaceholderCountMismatch;
 
+            if (resident) |*assembly| {
+                try assembly.append(image_emb.tensor, 0, run_len);
+                current_rows += run_len;
+                pos += run_len;
+                image_index += 1;
+                continue;
+            }
             const image_chunk = if (run_len == image_emb.token_count)
                 image_emb.tensor
             else
@@ -607,7 +623,10 @@ pub fn encodeDocumentFromPreparedNative(
         const text_chunk = try embedTextChunk(cb, allocator, embed_w, prepared_doc.input_ids[start..pos], hidden_size);
         var text_chunk_owned = true;
         defer if (text_chunk_owned) cb.free(text_chunk);
-        if (current == null) {
+        if (resident) |*assembly| {
+            try assembly.append(text_chunk, 0, text_rows);
+            current_rows += text_rows;
+        } else if (current == null) {
             current = text_chunk;
             current_rows = text_rows;
             text_chunk_owned = false;
@@ -619,18 +638,12 @@ pub fn encodeDocumentFromPreparedNative(
     if (image_index != image_embeddings.len) return error.ImagePlaceholderCountMismatch;
     if (current_rows != prepared_doc.input_ids.len) return error.ImagePlaceholderCountMismatch;
 
-    const input_embeddings = current orelse return error.ImagePlaceholderCountMismatch;
+    const input_embeddings = if (resident) |*assembly| try assembly.take() else current orelse return error.ImagePlaceholderCountMismatch;
     current = null;
-    const hidden = try gpt_arch.hiddenForwardFromEmbeddings(cb, allocator, gpt_cfg, input_embeddings, 1, prepared_doc.input_ids.len, null, null);
-    const projected = try applyRetrievalProjection(cb, allocator, hidden, prepared_doc.input_ids.len, hidden_size);
-    allocator.free(hidden);
-    return .{
-        .allocator = allocator,
-        .input_ids = try allocator.dupe(i32, prepared_doc.input_ids),
-        .attention_mask = try allocator.dupe(i32, prepared_doc.attention_mask),
-        .hidden_states = projected.hidden_states,
-        .hidden_size = projected.hidden_size,
-    };
+    var hidden = try decoder_prefill.ResidentHiddenRows.fromEmbeddings(cb, allocator, gpt_cfg, input_embeddings, prepared_doc.input_ids.len);
+    defer hidden.deinit();
+    const projected = try applyResidentRetrievalProjection(cb, allocator, &hidden);
+    return finishEncodedSequence(allocator, prepared_doc, projected);
 }
 
 fn embedTextChunk(
@@ -685,6 +698,37 @@ const ProjectedStates = struct {
     hidden_states: []f32,
     hidden_size: usize,
 };
+
+fn finishEncodedSequence(allocator: std.mem.Allocator, prepared: qwen2vl.PreparedTextInput, projected: ProjectedStates) !EncodedSequence {
+    errdefer allocator.free(projected.hidden_states);
+    const ids = try allocator.dupe(i32, prepared.input_ids);
+    errdefer allocator.free(ids);
+    const mask = try allocator.dupe(i32, prepared.attention_mask);
+    return .{ .allocator = allocator, .input_ids = ids, .attention_mask = mask, .hidden_states = projected.hidden_states, .hidden_size = projected.hidden_size };
+}
+
+fn applyResidentRetrievalProjection(cb: *const ComputeBackend, allocator: std.mem.Allocator, hidden: *const decoder_prefill.ResidentHiddenRows) !ProjectedStates {
+    const weight = cb.getWeight("embedding_proj_layer.weight") catch |err| switch (err) {
+        error.MissingWeight => return .{ .hidden_states = try hidden.exportHost(), .hidden_size = hidden.width },
+        else => return err,
+    };
+    defer cb.free(weight);
+    const bias = try cb.getWeight("embedding_proj_layer.bias");
+    defer cb.free(bias);
+    const width = hidden.projectionWidth(bias) catch |err| switch (err) {
+        // Opaque providers without shape metadata retain the original host
+        // projection route. No projection has submitted when shape query declines.
+        error.UnsupportedShape, error.UnsupportedTensorType => {
+            const values = try hidden.exportHost();
+            defer allocator.free(values);
+            return applyRetrievalProjection(cb, allocator, values, hidden.rows, hidden.width);
+        },
+        else => return err,
+    };
+    var projected = try hidden.project(weight, bias, width);
+    defer projected.deinit();
+    return .{ .hidden_states = try projected.exportHost(), .hidden_size = projected.width };
+}
 
 fn applyRetrievalProjection(
     cb: *const ComputeBackend,
@@ -867,4 +911,170 @@ test "encodeDocumentPromptWithImageExpansion truncates image placeholder run to 
     for (prepared.attention_mask) |value| {
         try std.testing.expectEqual(@as(i32, 1), value);
     }
+}
+
+const ResidentDocumentFixture = struct {
+    const helper = @import("../ops/media_residency_test.zig");
+    const native = @import("../ops/native_compute.zig");
+    const first_image = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    const second_image = [_]f32{ -1, -2, -3, -4, -5, -6, -7, -8 };
+
+    fn config() gpt_mod.Config {
+        return .{ .family = .qwen2, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .num_key_value_heads = 1, .intermediate_size = 4, .vocab_size = 8, .position_encoding = .rope, .norm_type = .rms_norm, .image_token_index = 7 };
+    }
+    fn populateBase(store: *native.WeightStore) !void {
+        try helper.putWeight(store, "model.embed_tokens.weight", &.{ 8, 4 }, null);
+        try helper.putWeight(store, "model.norm.weight", &.{4}, 1);
+    }
+    fn populateProjection(store: *native.WeightStore) !void {
+        try populateBase(store);
+        try helper.putWeight(store, "embedding_proj_layer.weight", &.{ 3, 4 }, null);
+        try helper.putWeight(store, "embedding_proj_layer.bias", &.{3}, null);
+    }
+    fn check(backend_value: ComputeBackend, _: ComputeBackend) !void {
+        const a = std.testing.allocator;
+        const cb = &backend_value;
+        var ids = [_]i32{ 1, 7, 7, 2, 7, 3 };
+        var mask = [_]i32{ 1, 1, 1, 1, 1, 1 };
+        const prepared = qwen2vl.PreparedTextInput{ .allocator = a, .input_ids = &ids, .attention_mask = &mask };
+        const first = try cb.fromFloat32Shape(&first_image, &.{ 3, 4 });
+        defer cb.free(first);
+        const second = try cb.fromFloat32Shape(&second_image, &.{ 2, 4 });
+        defer cb.free(second);
+        const images = [_]NativeImageEmbedding{ .{ .tensor = first, .token_count = 3 }, .{ .tensor = second, .token_count = 2 } };
+        // Original genuine-host feature path supplies an independent assembly
+        // oracle, including partial image runs and separated text segments.
+        var reference = try encodeDocumentFromPrepared(cb, a, config(), prepared, &.{ &first_image, &second_image });
+        defer reference.deinit();
+        var encoded = try encodeDocumentFromPreparedNative(cb, a, config(), prepared, &images);
+        defer encoded.deinit();
+        try std.testing.expectEqual(reference.hidden_size, encoded.hidden_size);
+        try std.testing.expectEqualSlices(i32, reference.input_ids, encoded.input_ids);
+        try std.testing.expectEqualSlices(i32, reference.attention_mask, encoded.attention_mask);
+        if (cb.kind() == .native) {
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.hidden_states), std.mem.sliceAsBytes(encoded.hidden_states));
+        } else {
+            for (reference.hidden_states, encoded.hidden_states) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+        }
+        const query_ids = [_]i64{ 1, 2 };
+        const query_hidden = try gpt_arch.hiddenForward(cb, a, config(), &query_ids, 1, query_ids.len, null);
+        defer a.free(query_hidden);
+        const reference_query = try applyRetrievalProjection(cb, a, query_hidden, query_ids.len, config().hidden_size);
+        defer a.free(reference_query.hidden_states);
+        var query_rows = try decoder_prefill.ResidentHiddenRows.fromTokens(cb, a, config(), &query_ids);
+        defer query_rows.deinit();
+        const resident_query = try applyResidentRetrievalProjection(cb, a, &query_rows);
+        defer a.free(resident_query.hidden_states);
+        try std.testing.expectEqual(reference_query.hidden_size, resident_query.hidden_size);
+        if (cb.kind() == .native) {
+            try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference_query.hidden_states), std.mem.sliceAsBytes(resident_query.hidden_states));
+        } else {
+            for (reference_query.hidden_states, resident_query.hidden_states) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 1e-5);
+        }
+        const special = tokenizer_mod.SpecialTokens{ .pad_id = 0, .cls_id = -1, .sep_id = -1, .unk_id = -1, .mask_id = -1 };
+        const expected_score = reranking.lateInteractionScore(reference_query.hidden_states, &.{ 1, 2 }, &.{ 1, 1 }, reference.hidden_states, reference.input_ids, reference.attention_mask, reference.hidden_size, special);
+        const score = reranking.lateInteractionScore(resident_query.hidden_states, &.{ 1, 2 }, &.{ 1, 1 }, encoded.hidden_states, encoded.input_ids, encoded.attention_mask, encoded.hidden_size, special);
+        try std.testing.expectApproxEqAbs(expected_score, score, 1e-5);
+        const held = try a.dupe(f32, encoded.hidden_states);
+        defer a.free(held);
+        ids[0] = 4;
+        var later = try encodeDocumentFromPreparedNative(cb, a, config(), prepared, &images);
+        defer later.deinit();
+        try std.testing.expectEqualSlices(f32, held, encoded.hidden_states);
+        const image_after = try cb.toFloat32(first, a);
+        defer a.free(image_after);
+        try std.testing.expectEqualSlices(f32, &first_image, image_after);
+    }
+    fn runOom(a: std.mem.Allocator) !void {
+        var weights = native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+        defer weights.deinitOwned();
+        try populateProjection(&weights);
+        var compute = native.NativeCompute.init(a, &weights, null);
+        defer compute.deinit();
+        const cb = compute.computeBackend();
+        var ids = [_]i32{ 1, 7, 7, 2, 7, 3 };
+        var mask = [_]i32{ 1, 1, 1, 1, 1, 1 };
+        const prepared = qwen2vl.PreparedTextInput{ .allocator = a, .input_ids = &ids, .attention_mask = &mask };
+        const first = try cb.fromFloat32Shape(&first_image, &.{ 3, 4 });
+        defer cb.free(first);
+        const second = try cb.fromFloat32Shape(&second_image, &.{ 2, 4 });
+        defer cb.free(second);
+        var encoded = try encodeDocumentFromPreparedNative(&cb, a, config(), prepared, &.{ .{ .tensor = first, .token_count = 3 }, .{ .tensor = second, .token_count = 2 } });
+        defer encoded.deinit();
+        try std.testing.expectEqual(@as(usize, 18), encoded.hidden_states.len);
+    }
+};
+
+test "Native ColQwen resident document assembly preserves partial images projection vectors and score" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try ResidentDocumentFixture.helper.onNative(ResidentDocumentFixture.populateProjection, ResidentDocumentFixture.check);
+}
+
+test "Metal ColQwen resident document assembly preserves partial images projection vectors and score" {
+    try ResidentDocumentFixture.helper.onMetal(ResidentDocumentFixture.populateProjection, ResidentDocumentFixture.check);
+}
+
+test "Native ColQwen resident document assembly preserves optional missing projection" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try ResidentDocumentFixture.helper.onNative(ResidentDocumentFixture.populateBase, ResidentDocumentFixture.check);
+}
+
+test "Metal ColQwen resident document assembly preserves optional missing projection" {
+    try ResidentDocumentFixture.helper.onMetal(ResidentDocumentFixture.populateBase, ResidentDocumentFixture.check);
+}
+
+test "Native ColQwen resident document assembly owns every allocation failure and final outputs" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try ResidentDocumentFixture.runOom(std.testing.allocator);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, ResidentDocumentFixture.runOom, .{});
+}
+
+test "Native ColQwen packed logical F32 image declines resident copy before preserving original document fallback" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Native = @import("../ops/native_compute.zig");
+    var weights = Native.WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer weights.deinitOwned();
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.putWeight(&weights, "model.embed_tokens.weight", &.{ 8, 32 }, null);
+    try helper.putWeight(&weights, "model.norm.weight", &.{32}, 1);
+    try helper.putWeight(&weights, "embedding_proj_layer.weight", &.{ 3, 32 }, null);
+    try helper.putWeight(&weights, "embedding_proj_layer.bias", &.{3}, null);
+    {
+        var dense: [64]f32 = undefined;
+        for (&dense, 0..) |*value, index| value.* = @as(f32, @floatFromInt(index)) * 0.025 - 0.5;
+        var source = try Tensor.initFloat32(a, "source", &.{ 2, 32 }, &dense);
+        defer source.deinit();
+        var quantized_image = try @import("../models/weight_source.zig").quantizeDenseQ8_0(a, &source);
+        errdefer quantized_image.deinit();
+        const key = try a.dupe(u8, "packed.image");
+        errdefer a.free(key);
+        try weights.resident_weights.put(a, key, .{
+            .tensor = .{ .name = key, .data = &.{}, .shape = &.{ 2, 32 }, .dtype = .f32, .allocator = a, .owns_data = false, .owns_shape = false },
+            .quantized = true,
+            .quantized_storage = quantized_image,
+        });
+    }
+    var compute = Native.NativeCompute.init(a, &weights, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const image = try cb.getWeight("packed.image");
+    defer cb.free(image);
+    // This is the real logical/physical distinction, not a fake dtype callback.
+    try std.testing.expectEqual(@import("../backends/tensor.zig").DType.f32, try cb.tensorDType(image));
+    try std.testing.expect(!try decoder_prefill.EmbeddingRows.supportsSource(&cb, image, 2, 32));
+    const decoded = try cb.toFloat32(image, a);
+    defer a.free(decoded);
+    var ids = [_]i32{ 7, 7, 1 };
+    var mask = [_]i32{ 1, 1, 1 };
+    const prepared = qwen2vl.PreparedTextInput{ .allocator = a, .input_ids = &ids, .attention_mask = &mask };
+    var config = ResidentDocumentFixture.config();
+    config.hidden_size = 32;
+    config.intermediate_size = 32;
+    var reference = try encodeDocumentFromPrepared(&cb, a, config, prepared, &.{decoded});
+    defer reference.deinit();
+    var actual = try encodeDocumentFromPreparedNative(&cb, a, config, prepared, &.{.{ .tensor = image, .token_count = 2 }});
+    defer actual.deinit();
+    try std.testing.expectEqualSlices(u8, std.mem.sliceAsBytes(reference.hidden_states), std.mem.sliceAsBytes(actual.hidden_states));
+    try std.testing.expectEqualSlices(i32, &ids, actual.input_ids);
 }

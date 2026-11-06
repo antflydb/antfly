@@ -1940,6 +1940,11 @@ pub const MetalPartitionExecutor = struct {
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_parameters_end partition={d}\n", .{partition_index});
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_parameters_end partition={d}\n", .{partition_index});
 
+        // A complete explicitly synchronous projection partition owns all
+        // numerical nodes. Validate the actual operation Claim and full cover
+        // BEFORE changing the ordinary frame/fusion path or writing any output.
+        if (try executeSynchronousPhysicalRegions(allocator, graph, cb, node_ids, reachable, values, value_device, device_id, options, exec_ctx.stats)) return;
+
         if (trace_nodes) std.debug.print("graph_executor_node_trace: materialize_constants_begin partition={d}\n", .{partition_index});
         if (trace_progress) std.debug.print("metal_partition_progress: phase=materialize_constants_begin partition={d}\n", .{partition_index});
         const constants_start_ns = if (collect_loop_profile) metalPartitionNowNs() else 0;
@@ -22870,4 +22875,52 @@ test "Metal public cached graph runtime rejects rebound same-shaped prepared slo
 /// allocating compatibility path after an exact admission has been granted.
 pub fn ownedFramePolicyAvailable() bool {
     return !metalPartitionFrameDisabled() and !metalPartitionRuntimeCommandsDisabled() and !runtimeRegionPlanDisabled();
+}
+
+fn executeSynchronousPhysicalRegions(allocator: std.mem.Allocator, graph: *const Graph, cb: *const ComputeBackend, nodes: []const NodeId, reachable: []const bool, values: []?CT, devices: []DeviceId, device_id: DeviceId, options: interpreter.ExecuteOptions, stats: ?*PartitionExecutor.ExecutionStats) !bool {
+    const profile = options.region_execution_profile orelse return false;
+    if (profile.profile != .synchronous) return false;
+    const frame = options.physical_frame orelse return false;
+    if (frame.pool.regions.len == 0) return false;
+    if (frame.pool.region_execution_profile != .synchronous or !profile.held or profile.phase != .active) return error.RegionExecutionProfileChanged;
+    try profile.validate(.{ .operation = .graph_execution, .implementation = .{ .context = cb.ptr, .table = cb.vtable }, .program = graph });
+    // A missing member can never fall back after the region recolored output
+    // lifetimes. Mixed partitions keep their original frames before selection.
+    for (nodes) |node| {
+        if (!reachable[node]) continue;
+        if (graph.node(node).op == .parameter) {
+            if (values[node] == null) return error.MissingValue;
+            continue;
+        }
+        const installed = frame.pool.regionForNode(node) orelse return error.PreparedRegionBoundaryChanged;
+        const backend = frame.pool.backends[installed.backend_index];
+        if (backend.ptr != cb.ptr or backend.vtable != cb.vtable) return error.PreparedRegionOwnerChanged;
+    }
+    const binding = @import("../execution/region_binding.zig");
+    const kernel = @import("../execution/kernel_route.zig");
+    for (nodes) |node| {
+        if (!reachable[node] or graph.node(node).op == .parameter) continue;
+        const installed = frame.pool.regionAtEntry(node) orelse continue;
+        if (installed.owner.input_nodes.len > binding.max_inputs) return error.PreparedRegionBindingChanged;
+        var facts: [binding.max_inputs]kernel.Binding = undefined;
+        var inputs: [binding.max_inputs]CT = undefined;
+        const count = installed.owner.input_nodes.len;
+        try frame.pool.regionExecutionFacts(installed.owner, facts[0..count]);
+        for (installed.owner.input_nodes, inputs[0..count]) |input, *value| value.* = values[input] orelse return error.MissingValue;
+        for (installed.outputs) |output| if (values[output.slot.node] != null) return error.PreparedRegionOutputMismatch;
+        var produced = try frame.executeRegion(installed, facts[0..count], inputs[0..count]);
+        defer produced.deinit();
+        for (installed.outputs, 0..) |output, index| {
+            values[output.slot.node] = try produced.take(index);
+            devices[output.slot.node] = device_id;
+        }
+        if (stats) |actual| {
+            actual.runtime_region_plan_dispatches += 1;
+            actual.runtime_region_plan_active_regions += 1;
+            actual.runtime_region_plan_covered_nodes += installed.owner.covered_nodes.len;
+            actual.runtime_region_plan_elided_nodes += installed.owner.covered_nodes.len - 1;
+        }
+    }
+    _ = allocator;
+    return true;
 }

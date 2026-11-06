@@ -14,6 +14,178 @@ const NativeDecodeState = state_mod.NativeDecodeState;
 const BorrowedDecodeStateRuntime = state_mod.BorrowedDecodeStateRuntime;
 
 pub const State = struct {
+    /// One physical drafting round. Retained deferred slots and logits own
+    /// their actual producer allocator/backend; ordinary chains own only the
+    /// latest activation. No task/sampler/tokenizer callback is retained.
+    pub const Round = struct {
+        owner: *State,
+        target: decoder_forward.Runtime,
+        draft: decoder_forward.Runtime,
+        deferred: bool,
+        host_chain: ?[]f32 = null,
+        device_chain: ?ops.CT = null,
+        host_steps: [16]?[]f32 = @splat(null),
+        device_steps: [16]?ops.CT = @splat(null),
+        logits: [16]?[]f32 = @splat(null),
+        step_written: [16]bool = @splat(false),
+        next_host: ?[]f32 = null,
+        next_device: ?ops.CT = null,
+
+        pub const Step = struct {
+            token: usize,
+            logit_source: @import("../architectures/gemma4_mtp.zig").DraftLogitSource,
+            profile: @import("../architectures/gemma4_mtp.zig").DraftStageProfile,
+        };
+        pub const Request = struct {
+            index: usize,
+            token_id: i64,
+            decode_context: *const gpt_arch.DecodeContext,
+            resident: bool,
+            target_embedding_on_draft: ?ops.CT = null,
+            debug_top_k: usize,
+            profile_enabled: bool,
+            profile_sync: bool,
+        };
+
+        pub fn deinit(self: *@This()) void {
+            if (self.next_device) |tensor| self.draft.context.cb.free(tensor);
+            if (self.next_host) |activation| self.owner.allocator.free(activation);
+            for (self.host_steps) |slot| if (slot) |activation| self.owner.allocator.free(activation);
+            for (self.device_steps) |slot| if (slot) |tensor| self.draft.context.cb.free(tensor);
+            if (!self.deferred) {
+                if (self.device_chain) |tensor| self.draft.context.cb.free(tensor);
+                if (self.host_chain) |activation| self.owner.allocator.free(activation);
+            }
+            for (self.logits) |slot| if (slot) |values| self.owner.allocator.free(values);
+            self.* = undefined;
+        }
+
+        pub fn step(self: *@This(), request: Request) !Step {
+            const mtp = @import("../architectures/gemma4_mtp.zig");
+            if (request.index >= self.logits.len) return error.InvalidSpeculativeK;
+            if (self.step_written[request.index]) return error.InvalidSpeculativeState;
+            const result: Step = if (request.resident) blk: {
+                const activation = self.device_chain orelse self.owner.device orelse return error.MissingGemma4MtpActivation;
+                const value = try mtp.draftTokenDevice(.{
+                    .allocator = self.owner.allocator,
+                    .target_cb = self.target.context.cb,
+                    .draft_cb = self.draft.context.cb,
+                    .target_config = self.target.context.gpt_config.*,
+                    .draft_config = self.draft.context.gpt_config.*,
+                    .token_id = request.token_id,
+                    .activation = activation,
+                    .target_embedding_on_draft = request.target_embedding_on_draft,
+                    .decode_context = request.decode_context,
+                    .debug_top_k = request.debug_top_k,
+                    .profile_enabled = request.profile_enabled,
+                    .profile_sync = request.profile_sync,
+                });
+                if (request.profile_sync) self.draft.context.cb.evalTensor(value.projected_activation) catch {};
+                if (self.deferred) self.device_steps[request.index] = value.projected_activation else if (self.device_chain) |old| self.draft.context.cb.free(old);
+                self.device_chain = value.projected_activation;
+                self.logits[request.index] = value.logits;
+                break :blk .{ .token = value.token, .logit_source = value.logit_source, .profile = value.profile };
+            } else blk: {
+                const activation = self.host_chain orelse self.owner.host orelse return error.MissingGemma4MtpActivation;
+                const value = try mtp.draftToken(.{
+                    .allocator = self.owner.allocator,
+                    .target_cb = self.target.context.cb,
+                    .draft_cb = self.draft.context.cb,
+                    .target_config = self.target.context.gpt_config.*,
+                    .draft_config = self.draft.context.gpt_config.*,
+                    .token_id = request.token_id,
+                    .activation = activation,
+                    .decode_context = request.decode_context,
+                    .debug_top_k = request.debug_top_k,
+                    .profile_enabled = request.profile_enabled,
+                    .profile_sync = request.profile_sync,
+                });
+                if (self.deferred) self.host_steps[request.index] = value.projected_activation else if (self.host_chain) |old| self.owner.allocator.free(old);
+                self.host_chain = value.projected_activation;
+                self.logits[request.index] = value.logits;
+                break :blk .{ .token = value.token, .logit_source = value.logit_source, .profile = value.profile };
+            };
+            self.step_written[request.index] = true;
+            return result;
+        }
+
+        /// The task selects an accepted logical step; this owner transfers its
+        /// already-produced physical activation once, without another forward.
+        pub fn retainStep(self: *@This(), index: usize, resident: bool) !void {
+            if (index >= self.logits.len) return error.InvalidSpeculativeK;
+            if (resident) {
+                self.next_device = self.device_steps[index] orelse return error.MissingGemma4MtpActivation;
+                self.device_steps[index] = null;
+            } else {
+                self.next_host = self.host_steps[index] orelse return error.MissingGemma4MtpActivation;
+                self.host_steps[index] = null;
+            }
+        }
+
+        pub fn captureHidden(self: *@This(), value: *const decoder_forward.ForwardHiddenDevice, row: usize, source: decoder_forward.HiddenSource, resident: bool, sync: bool) !void {
+            if (resident) {
+                self.next_device = (try self.target.copyTargetHiddenRowFromHiddenToBackend(value, row, source, self.draft.context.cb)) orelse return error.UnsupportedBackend;
+                if (sync) self.draft.context.cb.evalTensor(self.next_device.?) catch {};
+            } else {
+                var target = self.target;
+                target.context.allocator = self.owner.allocator;
+                self.next_host = try target.dupeTargetHiddenRowFromHiddenDevice(value, row, source);
+            }
+        }
+        pub fn captureAllDevice(self: *@This(), value: *const decoder_forward.ForwardAllWithHiddenDevice, row: usize, source: decoder_forward.HiddenSource, resident: bool, sync: bool) !void {
+            if (resident) {
+                self.next_device = (try self.target.copyTargetHiddenRowToBackend(value, row, source, self.draft.context.cb)) orelse return error.UnsupportedBackend;
+                if (sync) self.draft.context.cb.evalTensor(self.next_device.?) catch {};
+            } else {
+                var target = self.target;
+                target.context.allocator = self.owner.allocator;
+                self.next_host = try target.dupeTargetHiddenRowFromDevice(value, row, source);
+            }
+        }
+        pub fn captureAllHost(self: *@This(), value: *const decoder_forward.ForwardAllWithHiddenHost, row: usize, source: decoder_forward.HiddenSource) !void {
+            var target = self.target;
+            target.context.allocator = self.owner.allocator;
+            self.next_host = try target.dupeTargetHiddenRow(value, row, source);
+        }
+        pub fn replaceNextDevice(self: *@This(), activation: ops.CT) void {
+            if (self.next_device) |old| self.draft.context.cb.free(old);
+            self.next_device = activation;
+            if (self.next_host) |old| self.owner.allocator.free(old);
+            self.next_host = null;
+        }
+        pub fn replaceNextHost(self: *@This(), activation: []f32) void {
+            if (self.next_host) |old| self.owner.allocator.free(old);
+            self.next_host = activation;
+        }
+        pub fn materializeNext(self: *@This(), token_ids: []const i64, sequence_length: usize, state: *NativeDecodeState, source: decoder_forward.HiddenSource, resident: bool, sync: bool) !?u32 {
+            if (resident) {
+                const materialized = try self.target.materializeAcceptedTokenKvAndCopyHiddenToBackend(token_ids, sequence_length, state, source, self.draft.context.cb);
+                const activation = materialized.activation orelse return error.UnsupportedBackend;
+                if (sync) self.draft.context.cb.evalTensor(activation) catch {};
+                self.replaceNextDevice(activation);
+                return materialized.next_target_choice;
+            }
+            var target = self.target;
+            target.context.allocator = self.owner.allocator;
+            const materialized = try target.materializeAcceptedTokenKvAndReturnHidden(token_ids, sequence_length, state, source);
+            self.replaceNextHost(materialized.activation);
+            return materialized.next_target_choice;
+        }
+        pub fn publishActivation(self: *@This()) void {
+            if (self.next_device) |activation| {
+                self.owner.replaceDevice(activation);
+                self.next_device = null;
+            } else if (self.next_host) |activation| {
+                self.owner.replaceHost(activation);
+                self.next_host = null;
+            }
+        }
+    };
+
+    pub fn beginRound(self: *State, target: decoder_forward.Runtime, draft: decoder_forward.Runtime, deferred: bool) Round {
+        return .{ .owner = self, .target = target, .draft = draft, .deferred = deferred };
+    }
+
     const DraftEmbeddingCacheEntry = struct {
         token_id: i64,
         tensor: ops.CT,
@@ -363,4 +535,132 @@ test "speculative activation owner preserves actual host device provenance and b
 
 test "speculative activation owner retains actual Metal embeddings matching Native model values" {
     try @import("../ops/media_residency_test.zig").onMetal(populateActivationWeights, checkActualActivationOwner);
+}
+
+fn populateRoundWeights(store: *@import("../ops/native_compute.zig").WeightStore) !void {
+    try populateActivationWeights(store);
+    const fixture = @import("../ops/media_residency_test.zig");
+    try fixture.putWeight(store, "pre_projection.weight", &.{ 4, 8 }, null);
+    try fixture.putWeight(store, "post_projection.weight", &.{ 4, 4 }, null);
+}
+
+fn checkActualDraftRound(cb_value: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const cb = &cb_value;
+    const mtp = @import("../architectures/gemma4_mtp.zig");
+    const target_config = gpt_mod.Config{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .vocab_size = 4, .weight_tying = true, .norm_type = .rms_norm, .position_encoding = .rope };
+    var draft_config = target_config;
+    draft_config.gemma4_mtp_assistant = true;
+    draft_config.mtp_backbone_hidden_size = 4;
+    const decode = gpt_arch.DecodeContext{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1, .attention_mode = .full_recompute };
+    const seed = [_]f32{ 1, -2, 3, -4 };
+    const expected0 = try mtp.draftToken(.{ .allocator = a, .target_cb = cb, .draft_cb = cb, .target_config = target_config, .draft_config = draft_config, .token_id = 1, .activation = &seed, .decode_context = &decode, .debug_top_k = 1 });
+    defer a.free(expected0.projected_activation);
+    defer if (expected0.logits) |values| a.free(values);
+    const expected1 = try mtp.draftToken(.{ .allocator = a, .target_cb = cb, .draft_cb = cb, .target_config = target_config, .draft_config = draft_config, .token_id = @intCast(expected0.token), .activation = expected0.projected_activation, .decode_context = &decode, .debug_top_k = 1 });
+    defer a.free(expected1.projected_activation);
+    defer if (expected1.logits) |values| a.free(values);
+    var output_allocator = std.testing.FailingAllocator.init(a, .{});
+    const target = decoder_forward.Runtime{ .context = .{ .allocator = a, .cb = cb, .gpt_config = &target_config, .weight_semantics = .traced_decoder } };
+    const draft = decoder_forward.Runtime{ .context = .{ .allocator = a, .cb = cb, .gpt_config = &draft_config, .weight_semantics = .traced_decoder } };
+    var state = State{ .allocator = output_allocator.allocator(), .draft_cb = cb };
+    var state_live = true;
+    defer if (state_live) state.deinit();
+    state.replaceHost(try output_allocator.allocator().dupe(f32, &seed));
+    var round = state.beginRound(target, draft, true);
+    var round_live = true;
+    defer if (round_live) round.deinit();
+    const actual0 = try round.step(.{ .index = 0, .token_id = 1, .decode_context = &decode, .resident = false, .debug_top_k = 1, .profile_enabled = false, .profile_sync = false });
+    try std.testing.expectEqual(expected0.token, actual0.token);
+    try std.testing.expectEqualSlices(f32, expected0.projected_activation, round.host_steps[0].?);
+    try std.testing.expectEqualSlices(f32, expected0.logits.?, round.logits[0].?);
+    // Fail a real host allocation during the next original assistant call.
+    // The earlier retained activation/logits remain owned and unmodified.
+    output_allocator.fail_index = output_allocator.alloc_index;
+    try std.testing.expectError(error.OutOfMemory, round.step(.{ .index = 1, .token_id = @intCast(actual0.token), .decode_context = &decode, .resident = false, .debug_top_k = 1, .profile_enabled = false, .profile_sync = false }));
+    try std.testing.expect(round.host_steps[1] == null and round.logits[1] == null);
+    try std.testing.expectEqualSlices(f32, expected0.projected_activation, round.host_steps[0].?);
+    output_allocator.fail_index = std.math.maxInt(usize);
+    const actual1 = try round.step(.{ .index = 1, .token_id = @intCast(actual0.token), .decode_context = &decode, .resident = false, .debug_top_k = 1, .profile_enabled = false, .profile_sync = false });
+    try std.testing.expectEqual(expected1.token, actual1.token);
+    try std.testing.expectEqualSlices(f32, expected1.projected_activation, round.host_steps[1].?);
+    try std.testing.expectEqualSlices(f32, expected1.logits.?, round.logits[1].?);
+    try std.testing.expectEqualSlices(f32, expected0.projected_activation, round.host_steps[0].?);
+    try round.retainStep(0, false);
+    try std.testing.expectError(error.MissingGemma4MtpActivation, round.retainStep(0, false));
+    round.publishActivation();
+    round.deinit();
+    round_live = false;
+    try std.testing.expectEqualSlices(f32, expected0.projected_activation, state.host.?);
+    state.deinit();
+    state_live = false;
+    try std.testing.expect(output_allocator.allocated_bytes > 0);
+    try std.testing.expectEqual(output_allocator.allocated_bytes, output_allocator.freed_bytes);
+}
+
+test "predictor round invokes original Native assistant and retains independent producer allocations through failure and handoff" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try @import("../ops/media_residency_test.zig").onNative(populateRoundWeights, checkActualDraftRound);
+}
+
+test "predictor round invokes original Metal assistant with unchanged host chain and retained earlier rows" {
+    try @import("../ops/media_residency_test.zig").onMetal(populateRoundWeights, checkActualDraftRound);
+}
+
+fn checkActualResidentDraftRound(cb_value: ComputeBackend, _: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const cb = &cb_value;
+    const mtp = @import("../architectures/gemma4_mtp.zig");
+    if (!mtp.deviceResidentDraftAllowed(0)) return error.SkipZigTest;
+    const config = gpt_mod.Config{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .vocab_size = 4, .weight_tying = true, .norm_type = .rms_norm, .position_encoding = .rope };
+    var draft_config = config;
+    draft_config.gemma4_mtp_assistant = true;
+    draft_config.mtp_backbone_hidden_size = 4;
+    const decode = gpt_arch.DecodeContext{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1, .attention_mode = .full_recompute };
+    const weight = try gpt_arch.getEmbeddingWeight(cb, config);
+    defer cb.free(weight);
+    const embedding0 = try cb.embeddingLookup(weight, &.{1}, 1, 4);
+    defer cb.free(embedding0);
+    var state = State{ .allocator = a, .draft_cb = cb };
+    defer state.deinit();
+    state.replaceDevice(try cb.fromFloat32Shape(&.{ 1, -2, 3, -4 }, &.{ 1, 4 }));
+    const expected0 = try mtp.draftTokenDevice(.{ .allocator = a, .target_cb = cb, .draft_cb = cb, .target_config = config, .draft_config = draft_config, .token_id = 1, .activation = state.device.?, .target_embedding_on_draft = embedding0, .decode_context = &decode });
+    defer cb.free(expected0.projected_activation);
+    defer if (expected0.logits) |values| a.free(values);
+    const embedding1 = try cb.embeddingLookup(weight, &.{@intCast(expected0.token)}, 1, 4);
+    defer cb.free(embedding1);
+    const expected1 = try mtp.draftTokenDevice(.{ .allocator = a, .target_cb = cb, .draft_cb = cb, .target_config = config, .draft_config = draft_config, .token_id = @intCast(expected0.token), .activation = expected0.projected_activation, .target_embedding_on_draft = embedding1, .decode_context = &decode });
+    defer cb.free(expected1.projected_activation);
+    defer if (expected1.logits) |values| a.free(values);
+    const target = decoder_forward.Runtime{ .context = .{ .allocator = a, .cb = cb, .gpt_config = &config, .weight_semantics = .traced_decoder } };
+    const draft = decoder_forward.Runtime{ .context = .{ .allocator = a, .cb = cb, .gpt_config = &draft_config, .weight_semantics = .traced_decoder } };
+    var round = state.beginRound(target, draft, true);
+    var round_live = true;
+    defer if (round_live) round.deinit();
+    const actual0 = try round.step(.{ .index = 0, .token_id = 1, .decode_context = &decode, .resident = true, .target_embedding_on_draft = embedding0, .debug_top_k = 0, .profile_enabled = false, .profile_sync = false });
+    const actual1 = try round.step(.{ .index = 1, .token_id = @intCast(actual0.token), .decode_context = &decode, .resident = true, .target_embedding_on_draft = embedding1, .debug_top_k = 0, .profile_enabled = false, .profile_sync = false });
+    try std.testing.expectEqual(expected0.token, actual0.token);
+    try std.testing.expectEqual(expected1.token, actual1.token);
+    const expected_first = try cb.toFloat32(expected0.projected_activation, a);
+    defer a.free(expected_first);
+    const expected_second = try cb.toFloat32(expected1.projected_activation, a);
+    defer a.free(expected_second);
+    const actual_first = try cb.toFloat32(round.device_steps[0].?, a);
+    defer a.free(actual_first);
+    const actual_second = try cb.toFloat32(round.device_steps[1].?, a);
+    defer a.free(actual_second);
+    try std.testing.expectEqualSlices(f32, expected_first, actual_first);
+    try std.testing.expectEqualSlices(f32, expected_second, actual_second);
+    try round.retainStep(0, true);
+    try std.testing.expectError(error.MissingGemma4MtpActivation, round.retainStep(0, true));
+    round.publishActivation();
+    round.deinit();
+    round_live = false;
+    const held = try cb.toFloat32(state.device.?, a);
+    defer a.free(held);
+    try std.testing.expectEqualSlices(f32, expected_first, held);
+}
+
+test "predictor round preserves actual Metal resident assistant schedule and one-time deferred activation handoff" {
+    try @import("../ops/media_residency_test.zig").onMetal(populateRoundWeights, checkActualResidentDraftRound);
 }
