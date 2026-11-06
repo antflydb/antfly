@@ -197,9 +197,9 @@ pub const Inspection = struct {
             self.source.limits = source.limits;
         } else if (bytes.len == 0 or bytes.len > 64 * 1024 * 1024) return error.ResourceLimitExceeded;
         self.validated_bytes = if (borrowed) |reader| try packetBytes(reader) else bytes;
-        self.webm = configuration.webm != null or (borrowed == null and isWebm(bytes));
+        self.webm = configuration.webm != null or (borrowed == null and usesWebmLane(a, bytes));
         if (self.webm) {
-            self.webm_reader = if (configuration.webm) |input| input.reader.* else try media.webm.Reader.init(a, &self.source, .{});
+            self.webm_reader = if (configuration.webm) |input| input.reader.* else try openWebmLane(a, &self.source, bytes);
             self.owns_webm_reader = configuration.webm == null;
             self.webm_reader.input = &self.source;
             self.webm_index = if (configuration.webm) |input| input.index.* else try video.webm_pictures.index(a, &self.webm_reader, webmDecodeOptions(self.source.control, &self.pool));
@@ -811,6 +811,13 @@ fn parameterSession(a: std.mem.Allocator, reader: *media.mp4.Reader) !?*video.h2
 fn isWebm(bytes: []const u8) bool {
     return bytes.len >= 4 and std.mem.eql(u8, bytes[0..4], "\x1a\x45\xdf\xa3");
 }
+/// AV1 in MP4 shares WebM's reconstruction, display policy and Apple route.
+fn usesWebmLane(a: std.mem.Allocator, bytes: []const u8) bool {
+    return isWebm(bytes) or video.mp4_coded.usesWebmLane(a, bytes);
+}
+fn openWebmLane(a: std.mem.Allocator, source: *media.source.Source, bytes: []const u8) !media.webm.Reader {
+    return if (isWebm(bytes)) media.webm.Reader.init(a, source, .{}) else video.mp4_coded.openWebm(a, source);
+}
 // Own normalized TS storage alongside the packet reader. Returning this owner
 // is safe: the snapshot's Source address is stable until deinit.
 pub const PacketInput = struct {
@@ -1196,8 +1203,8 @@ pub fn inspectPlan(a: std.mem.Allocator, bytes: []const u8, control: Control, sa
     if (bytes.len == 0 or bytes.len > 64 * 1024 * 1024) return error.ResourceLimitExceeded;
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-preflight", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn }, .limits = .{ .max_total_bytes = 512 * 1024 * 1024 } };
-    if (isWebm(bytes)) {
-        var reader = try media.webm.Reader.init(a, &source, .{});
+    if (usesWebmLane(a, bytes)) {
+        var reader = try openWebmLane(a, &source, bytes);
         defer reader.deinit();
         var index = try video.webm_pictures.index(a, &reader, webmDecodeOptions(source.control, pool));
         defer index.deinit();
@@ -1241,8 +1248,8 @@ fn inspectSelectedPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, co
 pub fn selectedPresentationUs(a: std.mem.Allocator, bytes: []const u8, control: Control, sampling: Sampling, pool: ?*media.admission.Pool) ![]i64 {
     const adapter = control.imageWorkControl();
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-timestamps", .admission_pool = pool, .control = .{ .context = adapter.context, .check_fn = adapter.check_fn } };
-    if (isWebm(bytes)) {
-        var reader = try media.webm.Reader.init(a, &source, .{});
+    if (usesWebmLane(a, bytes)) {
+        var reader = try openWebmLane(a, &source, bytes);
         defer reader.deinit();
         var index = try video.webm_pictures.index(a, &reader, webmDecodeOptions(source.control, pool));
         defer index.deinit();
@@ -1456,7 +1463,7 @@ pub const Prefetch = struct {
             source.identity = input.reader.input.identity;
             source.limits = input.reader.input.limits;
         }
-        const webm = if (inspection) |owner| owner.webm else self.webm_input != null or (self.packet_reader == null and isWebm(bytes));
+        const webm = if (inspection) |owner| owner.webm else self.webm_input != null or (self.packet_reader == null and usesWebmLane(a, bytes));
         var webm_reader: media.webm.Reader = undefined;
         var reader: media.mp4.Reader = undefined;
         var packet_input: ?PacketInput = null;
@@ -1473,7 +1480,7 @@ pub const Prefetch = struct {
                 reader.input = &source;
             }
         } else if (webm) {
-            webm_reader = if (self.webm_input) |input| input.reader.* else try media.webm.Reader.init(a, &source, .{});
+            webm_reader = if (self.webm_input) |input| input.reader.* else try openWebmLane(a, &source, bytes);
             webm_reader.input = &source;
         } else if (self.packet_reader) |borrowed| {
             source.storage = borrowed.input.storage;
@@ -1956,7 +1963,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
         source.identity = input.reader.input.identity;
         source.limits = input.reader.input.limits;
     }
-    const webm = if (inspection) |owner| owner.webm else webm_input != null or (borrowed == null and isWebm(bytes));
+    const webm = if (inspection) |owner| owner.webm else webm_input != null or (borrowed == null and usesWebmLane(a, bytes));
     var webm_reader: media.webm.Reader = undefined;
     var reader: media.mp4.Reader = undefined;
     var packet_input: ?PacketInput = null;
@@ -1973,7 +1980,7 @@ fn encodeInput(a: std.mem.Allocator, cb: *const ComputeBackend, bytes: []const u
             reader.input = &source;
         }
     } else if (webm) {
-        webm_reader = if (webm_input) |input| input.reader.* else try media.webm.Reader.init(a, &source, .{});
+        webm_reader = if (webm_input) |input| input.reader.* else try openWebmLane(a, &source, bytes);
         webm_reader.input = &source;
     } else if (borrowed) |input| {
         source.storage = input.input.storage;

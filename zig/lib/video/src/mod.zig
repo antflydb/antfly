@@ -20,6 +20,7 @@ pub const transport_avc = @import("transport_avc.zig");
 pub const h264_pictures = @import("h264_pictures.zig");
 pub const webm_pictures = @import("webm_pictures.zig");
 pub const codecs = @import("codecs/decoder.zig");
+pub const mp4_coded = @import("mp4_coded.zig");
 pub const vp8 = @import("vp8.zig");
 pub const software = @import("software.zig");
 pub const h264_dynamic = @import("h264_dynamic.zig");
@@ -40,6 +41,7 @@ pub const tone = @import("tone.zig");
 pub const display = @import("display.zig");
 pub const sampling = @import("sampling.zig");
 test {
+    _ = mp4_coded;
     _ = live_coordinator;
     _ = live_windows;
     _ = transport_avc;

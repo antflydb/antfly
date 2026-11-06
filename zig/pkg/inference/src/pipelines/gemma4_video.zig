@@ -359,6 +359,30 @@ test "gemma4 video reserves portable memory through generation admission" {
     try std.testing.expectEqual(@as(usize, 0), (try generation.nativeGenerationMediaAdmissionForBackend(std.testing.allocator, "", &text, .{ .family = .gemma }, .generic)).host_scratch_bytes);
 }
 
+test "gemma4 video decodes AV1 in MP4 like its WebM route" {
+    const a = std.testing.allocator;
+    const bytes = @embedFile("../testdata/video/codecs/av1.mp4");
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes } };
+    const timestamps = try embedding_video.selectedPresentationUs(a, bytes, .{}, sampling, &pool);
+    defer a.free(timestamps);
+    try std.testing.expect(timestamps.len != 0);
+    const Count = struct {
+        frames: usize = 0,
+        width: u32 = 0,
+        fn accept(raw: *anyopaque, _: usize, frame: video.preparation.BorrowedFrame, options: video.preparation.Options, control: media.source.Control) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            var displayed = try frame.display(std.testing.allocator, options, control);
+            defer displayed.deinit(std.testing.allocator);
+            self.frames += 1;
+            self.width = displayed.width;
+        }
+    };
+    var count: Count = .{};
+    try embedding_video.observeConfigured(a, bytes, null, .{}, .{ .observer = .{ .context = &count, .accept = Count.accept }, .sampling = sampling, .pool = &pool, .decoder = .{ .policy = .portable } });
+    try std.testing.expectEqual(timestamps.len, count.frames);
+    try std.testing.expectEqual(@as(u32, 192), count.width);
+}
+
 test "gemma4 video reports presentation size for anamorphic containers" {
     const a = std.testing.allocator;
     inline for (.{ "anamorphic-2x1.mp4", "anamorphic-2x1.webm", "bframes.mp4" }, .{ true, true, false }) |name, anamorphic| {
