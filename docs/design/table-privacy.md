@@ -522,6 +522,51 @@ operator header lists remain replacements for those defaults.
 
 ## Validation
 
+### Forwarded reply ownership and editor recovery (2026-11-05)
+
+- Merge `ec422fdf54` incorporates main through
+  `93d85e2b476069cc5976e92cb1a7b3abd4a8f406`. The generated Go SDK conflict
+  was resolved from the combined schema. The CPU build-policy regression now
+  preserves main's independently measured CUDA Debug reservation.
+- Fix `acd154aa19` retains mutation ambiguity across response-less delivery
+  failures, transport reply ownership, the data-node allocator handoff and
+  processing-disclosure adjustment. Explicit unsent/rejected outcomes retain
+  their original error identity. No response copies, RPCs or replay loops are
+  added to successful mutations. Fault tests cover both owned buffers, every
+  allocation in policy disclosure, accepted and ambiguous replies, and the
+  unsent/maybe-sent/unknown transport matrix for policies and scans.
+- Regression `4e64350f50` also passes through the actual metadata discovery and
+  status-source handoff: eighteen deliveries cover success and both caller
+  buffer failures for accepted and ambiguous policy/scan replies, without replay.
+- Policy adoption and its ETag no longer depend on scan-status availability.
+  Independent serial pollers recover progress without overwriting edits;
+  scope changes cancel requests and explicit Refresh retries immediately.
+  An accepted save adopts its response without another policy GET.
+- Full generation, the rebuilt dashboard/type checking, Biome, Zig formatting,
+  license headers and the Apache boundary checks pass. The Go SDK suite passes;
+  TypeScript SDK passes 601 tests with one opt-in skip. Targeted UI tests pass
+  11 cases, including recovery, ETag retention, slow polling and cancellation.
+- Native ARM64 Linux CPU qualification passes all 132 build steps, 75
+  API/metadata tests, 172 storage/privacy tests, two ABI checks, two data-node
+  checks and two CORS checks. All 20 build-policy tests pass on Mac and Linux.
+  The API compile reports rounded 15G MaxRSS within its 20 GiB reservation.
+  One hundred warm bindings still allocate zero bytes against the
+  14,768,412-byte catalog. Logs use the `.privacy-forwarding-editor-` prefix.
+- Selected HTTP lifecycle, retry, curation and conditional-save cases pass in
+  standalone (eight, 301.25 s) and Raft (seven, 384.58 s). The subsequent real
+  discovery-handoff target passes all 57 build steps and both native cases.
+- Qualified Linux server SHA-256:
+  `0fbce51282acd5ea590c2825bd69f837019a12bad90c6fc460c7810d48edcf3a`.
+  Evidence and reproduction commands are retained locally under
+  `.benchmark-results/privacy/forwarding-editor-main-93d85/`.
+- Required cache cleanup completes on both hosts while preserving active or
+  recent builds. About 10 GiB of this worktree's idle compiler output was also
+  reclaimed after checking that no build used it; downloaded dependencies and
+  qualified local binaries remain intact. The temporary Glowworm worktree and
+  branch were removed after saving the evidence locally.
+- This qualification uses CPU execution; Metal/CUDA throughput is not remeasured
+  because inference and batching are unchanged by these fixes.
+
 ### Post-apply observations and browser conditional saves (2026-11-05)
 
 - Fix `8a674eebe7` places all fallible post-apply table observations behind one
