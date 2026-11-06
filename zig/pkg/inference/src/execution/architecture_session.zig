@@ -4771,6 +4771,8 @@ pub const WhisperNativeDecoder = struct {
     destination_model: ?*Session.ModelLifetime = null,
     base_permit: ?@import("../backends/session.zig").RunPermit = null,
     cache_permit: ?@import("../backends/session.zig").RunPermit = null,
+    program_permit: ?@import("../backends/session.zig").RunPermit = null,
+    cold_metadata: ?*@import("cold_metadata.zig").Owner = null,
     diagnostics_binding: ?incremental_observation.Binding = null,
     pending_observation: @import("pending_observation.zig").Span = .{},
     fn ensurePendingObservation(self: *WhisperNativeDecoder) void {
@@ -4886,7 +4888,7 @@ pub const WhisperNativeDecoder = struct {
         var scope = if (destination_model) |model| model.beginClose() else Session.CloseScope{};
         defer scope.deinit();
         self.drain();
-        self.cache.deinit(&self.cb.backend);
+        self.cache.deinitWithCleanup(&self.cb.backend, .{ .boundary = boundary });
         if (self.encoder_owned) self.cb.backend.freeWithBoundary(self.encoder_hidden, boundary);
         if (cleanup != null) self.cb.deinitWithCleanup(.{ .boundary = boundary }) else self.cb.deinit();
         self.pending_observation.deinit();
@@ -4897,13 +4899,17 @@ pub const WhisperNativeDecoder = struct {
         self.gate = null;
         var cache_permit = self.cache_permit;
         var base_permit = self.base_permit;
+        var program_permit = self.program_permit;
+        const cold_metadata = self.cold_metadata;
         self.cache_permit = null;
         self.base_permit = null;
         scope.deinit();
         self.* = undefined;
         // Producers see all concrete SDK/provider/model and close scopes ended.
+        if (program_permit) |*permit| permit.deinitWithCleanup(.{ .boundary = boundary });
         if (cache_permit) |*permit| permit.deinitWithCleanup(.{ .boundary = boundary });
         if (base_permit) |*permit| permit.deinitWithCleanup(.{ .boundary = boundary });
+        if (cold_metadata) |metadata| metadata.deinitOutsideExecution();
         if (destination_model) |model| model.releaseWithBoundary(boundary);
     }
 };
@@ -5007,6 +5013,155 @@ pub const RetainedEncoderSource = struct {
     }
 };
 
+/// Stable metadata belongs to its independently admitted owner. Every supplier
+/// and physical construction finishes before the actual receiver Model gate.
+const ColdNativeWhisper = struct {
+    metadata: *@import("cold_metadata.zig").Owner,
+    cb: ?ManagedComputeBackend = null,
+    weights: ?whisper_arch.PreparedDecoderWeights = null,
+    program: ?whisper_arch.PreparedSingleToken = null,
+    cache_permit: ?@import("../backends/session.zig").RunPermit = null,
+    bank_permit: ?@import("../backends/session.zig").RunPermit = null,
+    encoder: ?ops.CT = null,
+    encoder_owned: bool = false,
+
+    fn destroy(self: *ColdNativeWhisper, current: @import("cleanup_context.zig").Context) void {
+        const metadata = self.metadata;
+        if (self.program) |*program| program.deinit(current);
+        if (self.weights) |*weights| weights.deinit();
+        if (self.encoder_owned) if (self.encoder) |encoder| self.cb.?.backend.freeWithCleanup(encoder, current);
+        if (self.cb) |*cb| cb.deinitWithCleanup(current);
+        if (self.bank_permit) |*permit| permit.deinitWithCleanup(current);
+        if (self.cache_permit) |*permit| permit.deinitWithCleanup(current);
+        metadata.allocator().destroy(self);
+        metadata.deinitOutsideExecution();
+    }
+};
+const ColdWhisperEncoder = union(enum) { host: []const f32, resident: ops.CT };
+
+fn prepareColdNativeWhisper(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, base: *const @import("../backends/session.zig").RunPermit, encoder: ColdWhisperEncoder) !?*ColdNativeWhisper {
+    if (session.backend() != .native) return null;
+    if (!@import("dense_decoder_schedule.zig").preparationBackingSupported(allocator)) return null;
+    // This actual published source/Model pins the native store throughout cold
+    // metadata queries and any existing typed lazy-weight preparation.
+    const data = nativeWeightPreparationModelData(session) orelse return null;
+    const model = session.model_lifetime orelse return null;
+    if (session.run_admission == null and model.admission_domain != null) return null;
+    var domain = if (session.run_admission) |policy| model.retainAdmissionDomain(policy.controller) else null;
+    defer if (domain) |*pin| pin.release();
+    if (session.run_admission != null and domain == null) return null;
+    var construction = try ReceiverCleanup.beginStandalone();
+    defer construction.finish();
+    const current = @import("cleanup_context.zig").Context{ .boundary = construction.boundary() };
+    const metadata = try @import("cold_metadata.zig").Owner.create(allocator, session, &.{base});
+    var metadata_owned = true;
+    defer if (metadata_owned) metadata.deinitOutsideExecution();
+    const self = try metadata.allocator().create(ColdNativeWhisper);
+    self.* = .{ .metadata = metadata };
+    var transferred = false;
+    defer if (!transferred) {
+        metadata_owned = false;
+        self.destroy(current);
+    };
+    const ready = buildColdNativeWhisper(self, session, allocator, control, config, geometry, base, encoder, data, if (domain) |*pin| pin else null, current, construction.boundary()) catch |err| {
+        return if (err == error.OutOfMemory) metadata.admissionError() orelse err else err;
+    };
+    if (!ready) return null;
+    metadata_owned = false;
+    transferred = true;
+    return self;
+}
+
+fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, base: *const @import("../backends/session.zig").RunPermit, encoder: ColdWhisperEncoder, data: *native_mod.WeightStore, domain: ?*const @import("../runtime/tier/admission_domain.zig").Pin, current: @import("cleanup_context.zig").Context, construction_epoch: *const @import("retirement_sink.zig").Epoch) !bool {
+    const metadata = self.metadata;
+    self.cb = try getComputeBackendWithControl(session, allocator, control);
+    const cb = &self.cb.?.backend;
+    if (cb.vtable != &@import("../ops/native_compute.zig").vtable_impl) return false;
+    var kv_only = try geometry.cacheAmounts(cb);
+    const expected = runtime.tier.memory.AdmissionAmounts{ .host_scratch_bytes = geometry.known_metadata_bytes, .host_kv_bytes = kv_only.host_kv_bytes };
+    if (!std.meta.eql(kv_only, expected)) return error.UnsupportedDenseSchedule;
+    // Every old known metadata allocation (layer vectors, retained weight
+    // vector, encoder/self masks) is now exclusively charged by metadata AA.
+    // Keep the actual KV payload in its original class and ALL old base floors.
+    kv_only.host_scratch_bytes = try std.math.sub(usize, kv_only.host_scratch_bytes, geometry.known_metadata_bytes);
+    try metadata.validateAdditional(kv_only);
+    self.cache_permit = try incrementalCachePermitForAmounts(session, base, kv_only);
+    if (self.cache_permit) |*cache| try metadata.setHeldPermits(&.{ base, cache });
+    self.encoder = switch (encoder) {
+        .resident => |value| value,
+        .host => |values| block: {
+            const shape = [_]i32{ 1, @intCast(geometry.encoder_rows), @intCast(config.d_model) };
+            const value = try cb.fromFloat32Shape(values, &shape);
+            self.encoder_owned = true;
+            break :block value;
+        },
+    };
+    self.weights = try whisper_arch.PreparedDecoderWeights.initWithSource(cb, metadata.allocator(), config, true, .{ .expected_data = data, .domain = domain });
+    for (self.weights.?.fetcher.handles.items) |weight| {
+        const plane = @import("dense_decoder_schedule.zig").residentPlane(cb, weight) catch return false;
+        if (plane.descriptor.shape.dtype != .f32 or plane.descriptor.quant_format != null) return false;
+    }
+    try NativeCompute.stampHeldF32WeightSources(cb, data, self.weights.?.fetcher.handles.items);
+    self.program = (try whisper_arch.PreparedSingleToken.init(cb, metadata.allocator(), config, self.encoder.?, geometry.encoder_rows, &self.weights.?)) orelse return false;
+    try self.program.?.schedule.setHostWorkspaceAllocator(allocator);
+    var requirements = @import("prepared_storage_admission.zig").Builder{ .allocator = metadata.allocator() };
+    defer requirements.deinit();
+    if (session.run_admission) |policy| {
+        const identity = @import("storage_admission.zig").Identity{ .controller = policy.controller, .backend_class = policy.backend_class };
+        try self.program.?.schedule.requirements(&requirements, identity);
+        var required = @import("../runtime/tier/memory.zig").AdmissionAmounts{};
+        for (requirements.items()) |item| {
+            if (item.backend == .native or item.class == .host_workspace) required.host_scratch_bytes = try std.math.add(usize, required.host_scratch_bytes, item.bytes) else required.backend_scratch_bytes = try std.math.add(usize, required.backend_scratch_bytes, item.bytes);
+        }
+        try metadata.validateAdditional(required);
+        var pressure: ?@import("../runtime/tier/memory.zig").AdmissionPressure = null;
+        self.bank_permit = try session.admitAdditionalDeclaredStorageWithPressure(base, if (self.cache_permit) |*cache| cache else null, requirements.items(), &pressure);
+        if (self.cache_permit) |*cache| try metadata.setHeldPermits(&.{ base, cache, &self.bank_permit.? }) else try metadata.setHeldPermits(&.{ base, &self.bank_permit.? });
+        // Transfers do not reduce this complete request's denial floor while
+        // cold header/view preparation can still acquire metadata chunks.
+        try metadata.preserveHeldFloorBeforePartition();
+        try self.bank_permit.?.prepareDeclaredPhysicalStorageBeforeExecution(requirements.items());
+        try self.bank_permit.?.bindPhysicalCleanupEpoch(construction_epoch);
+    }
+    const capability = if (self.bank_permit) |*permit| try permit.declaredProgramStorageCapability(construction_epoch) else null;
+    try self.program.?.prepareInto(capability, current);
+    // Construction C owns no numerical work. It ends before the real receiver
+    // binds a fresh B to this already materialized Frame under its Model gate.
+    try metadata.sealBeforeExecution();
+    return true;
+}
+
+fn optionalColdNativeWhisper(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, config: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, base: *const @import("../backends/session.zig").RunPermit, encoder: ColdWhisperEncoder) !?*ColdNativeWhisper {
+    return prepareColdNativeWhisper(session, allocator, control, config, geometry, base, encoder) catch |err| switch (err) {
+        error.UnsupportedDenseSchedule, error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable, error.MemoryBudgetExceeded => null,
+        else => return err,
+    };
+}
+
+fn finishColdNativeWhisper(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, cold: *ColdNativeWhisper, config: whisper_mod.Config, rows: usize, base: @import("../backends/session.zig").RunPermit, gate: ?*std.atomic.Mutex, destination_model: ?*Session.ModelLifetime, source_resources: ?Session.ModelLifetime.ResourcePin, cleanup: *const ReceiverCleanup) !WhisperNativeDecoder {
+    _ = control;
+    const data = nativeWeightPreparationModelData(session) orelse return error.ForeignNativeWeightModel;
+    try NativeCompute.validateHeldF32WeightSources(&cold.cb.?.backend, data, cold.weights.?.fetcher.handles.items);
+    try bindOwnedDecoderCleanup(&cold.cb.?.backend, cleanup.boundary());
+    try cold.program.?.schedule.beginExecution(.{ .boundary = cleanup.boundary() });
+    const cache = try whisper_arch.DecodeCache.initPrepared(&cold.cb.?.backend, cold.metadata.allocator(), config, cold.encoder.?, rows, &cold.weights.?, &cold.program);
+    cold.weights.?.deinit();
+    cold.weights = null;
+    const cb = cold.cb.?;
+    cold.cb = null;
+    const encoder = cold.encoder.?;
+    cold.encoder = null;
+    const owns_encoder = cold.encoder_owned;
+    cold.encoder_owned = false;
+    const cache_permit = cold.cache_permit;
+    cold.cache_permit = null;
+    const bank_permit = cold.bank_permit;
+    cold.bank_permit = null;
+    const metadata = cold.metadata;
+    metadata.allocator().destroy(cold);
+    return .{ .allocator = allocator, .cb = cb, .config = config, .encoder_hidden = encoder, .cache = cache, .gate = gate, .encoder_owned = owns_encoder, .source_resources = source_resources, .receiver_cleanup = cleanup.*, .destination_model = destination_model, .base_permit = base, .cache_permit = cache_permit, .program_permit = bank_permit, .cold_metadata = metadata, .diagnostics_binding = session.invocation_diagnostics };
+}
+
 fn incrementalBasePermit(session: Session, config: whisper_mod.Config, geometry: whisper_arch.CacheGeometry, resident_input_held: bool, independent_device_copy: bool) !@import("../backends/session.zig").RunPermit {
     const hidden_bytes = std.math.mul(usize, geometry.encoder_rows, std.math.mul(usize, geometry.width, @sizeOf(f32)) catch return error.ResourceLimitExceeded) catch return error.ResourceLimitExceeded;
     const output_bytes = std.math.mul(usize, config.vocab_size, @sizeOf(f32)) catch return error.ResourceLimitExceeded;
@@ -5033,9 +5188,11 @@ fn incrementalBasePermit(session: Session, config: whisper_mod.Config, geometry:
 }
 
 fn incrementalCachePermit(session: Session, base: *const @import("../backends/session.zig").RunPermit, geometry: whisper_arch.CacheGeometry, cb: *const ops.ComputeBackend) !?@import("../backends/session.zig").RunPermit {
+    return incrementalCachePermitForAmounts(session, base, try geometry.cacheAmounts(cb));
+}
+fn incrementalCachePermitForAmounts(session: Session, base: *const @import("../backends/session.zig").RunPermit, amounts: runtime.tier.memory.AdmissionAmounts) !?@import("../backends/session.zig").RunPermit {
     const lease = base.lease orelse return null;
-    const target = try lease.amounts.merge(try geometry.cacheAmounts(cb));
-    return try session.admitSupplement(base, target);
+    return try session.admitSupplement(base, try lease.amounts.merge(amounts));
 }
 
 fn createResidentIncrementalDecoder(session: Session, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, source: RetainedEncoderSource) !WhisperNativeDecoder {
@@ -5069,6 +5226,8 @@ fn createResidentIncrementalDecoder(session: Session, allocator: std.mem.Allocat
     cleanup = try ReceiverCleanup.beginForOwnedGate(session);
     var base = try incrementalBasePermit(session, config, geometry, true, foreign_cuda);
     errdefer base.deinit();
+    var cold = try optionalColdNativeWhisper(session, allocator, control, config, geometry, &base, .{ .resident = source.value });
+    defer if (cold) |prepared| prepared.destroy(.{ .boundary = if (cleanup) |*owner| owner.boundary() else null });
     // Source authority precedes BOTH the destination lane and its older
     // compute/provider acquisition path. Raw sessions with no published lane
     // preserve their existing caller-guaranteed exclusive-use contract.
@@ -5115,7 +5274,11 @@ fn createResidentIncrementalDecoder(session: Session, allocator: std.mem.Allocat
     }
     errdefer if (gate) |mutex| mutex.unlock();
     const binding = session.invocation_diagnostics;
-    const decoder = try incremental_observation.callOperation(binding, .decoder_init, finishResidentIncrementalDecoder, .{ session, allocator, control, source, config, rows, geometry, base, gate, destination_model, if (foreign_copy) |*copy| copy else null, if (cleanup) |*owner| owner else null });
+    const decoder = if (cold) |prepared| result: {
+        const value = try incremental_observation.callOperation(binding, .decoder_init, finishColdNativeWhisper, .{ session, allocator, control, prepared, config, rows, base, gate, destination_model, @as(?Session.ModelLifetime.ResourcePin, source.resources), &cleanup.? });
+        cold = null;
+        break :result value;
+    } else try incremental_observation.callOperation(binding, .decoder_init, finishResidentIncrementalDecoder, .{ session, allocator, control, source, config, rows, geometry, base, gate, destination_model, if (foreign_copy) |*copy| copy else null, if (cleanup) |*owner| owner else null });
     transferred = true;
     return decoder;
 }
@@ -5224,12 +5387,18 @@ fn createHostIncrementalDecoder(
     const geometry = try whisper_arch.CacheGeometry.init(cfg, enc_seq);
     var base_permit = try incrementalBasePermit(session, cfg, geometry, false, false);
     errdefer base_permit.deinit();
+    var cold = try optionalColdNativeWhisper(session, allocator, control, cfg, geometry, &base_permit, .{ .host = encoder_hidden });
+    defer if (cold) |prepared| prepared.destroy(.{ .boundary = cleanup.boundary() });
     const gate = session.execution_gate;
     if (gate) |mutex| {
         if (control) |active| try active.lock(mutex) else while (!mutex.tryLock()) std.atomic.spinLoopHint();
     }
     errdefer if (gate) |mutex| mutex.unlock();
-    const result = try incremental_observation.callOperation(session.invocation_diagnostics, .decoder_init, finishHostIncrementalDecoder, .{ session, allocator, control, encoder_hidden, enc_seq, cfg, geometry, base_permit, gate, destination_model, &cleanup });
+    const result = if (cold) |prepared| ready: {
+        const value = try incremental_observation.callOperation(session.invocation_diagnostics, .decoder_init, finishColdNativeWhisper, .{ session, allocator, control, prepared, cfg, enc_seq, base_permit, gate, destination_model, @as(?Session.ModelLifetime.ResourcePin, null), &cleanup });
+        cold = null;
+        break :ready value;
+    } else try incremental_observation.callOperation(session.invocation_diagnostics, .decoder_init, finishHostIncrementalDecoder, .{ session, allocator, control, encoder_hidden, enc_seq, cfg, geometry, base_permit, gate, destination_model, &cleanup });
     transferred = true;
     return result;
 }
@@ -18351,4 +18520,253 @@ test "session budget resolver distinguishes nonzero automatic scratch from expli
     try std.testing.expectEqual(@as(usize, 0), unbounded.host_limit_bytes);
     try std.testing.expectEqual(@as(usize, 0), unbounded.combined_limit_bytes);
     try std.testing.expectEqual(@as(usize, 0), unbounded.scratch_limit_bytes);
+}
+
+fn nativeWhisperAssignedSourceCase(a: std.mem.Allocator, admitted: bool) !void {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    var session = try IncrementalFixture.session(a);
+    var session_open = true;
+    defer if (session_open) session.close();
+    const domain = if (admitted) try @import("../runtime/tier/admission_domain.zig").Domain.create() else null;
+    defer if (domain) |value| value.release();
+    if (domain) |value| {
+        session.model_lifetime.?.admission_domain = value.pin();
+        session.run_admission = .{ .controller = &value.controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 128 * 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false };
+    }
+
+    const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    // Duplicate the maintained fixture's nonzero layer to exercise a pending
+    // FC2 result across an actual layer boundary, not just the final norm.
+    const TensorCopy = struct { name: []const u8, tensor: Tensor };
+    var copies: [64]TensorCopy = undefined;
+    var count: usize = 0;
+    var entries = owner.backend_data.native.resident_weights.iterator();
+    while (entries.next()) |entry| if (std.mem.startsWith(u8, entry.key_ptr.*, "model.decoder.layers.0.")) {
+        copies[count] = .{ .name = entry.key_ptr.*, .tensor = entry.value_ptr.tensor };
+        count += 1;
+    };
+    for (copies[0..count]) |copy| {
+        const key = try std.fmt.allocPrint(a, "model.decoder.layers.1.{s}", .{copy.name["model.decoder.layers.0.".len..]});
+        errdefer a.free(key);
+        var tensor = try Tensor.initFloat32(a, key, copy.tensor.shape, copy.tensor.asFloat32());
+        errdefer tensor.deinit();
+        try owner.backend_data.native.resident_weights.put(a, key, .{ .tensor = tensor });
+    }
+    owner.arch_config.whisper.decoder_layers = 2;
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    var decoder = (try whisperNativeDecoder(session, a, null, &hidden, 2)).?;
+    var decoder_open = true;
+    defer if (decoder_open) decoder.deinit();
+    try std.testing.expect(decoder.cache.native_program != null);
+    const program = &decoder.cache.native_program.?;
+    const frame = program.schedule.frame.?;
+    try std.testing.expect(frame.native_program_storage_sealed and frame.storage_admission == null);
+    try std.testing.expectEqual(@as(usize, 1), frame.scope_backends);
+    if (domain) |value| {
+        try std.testing.expect(decoder.program_permit != null and decoder.cold_metadata != null);
+        try std.testing.expect(value.controller.snapshot().host_kv_bytes > 0);
+        try std.testing.expect(value.controller.snapshot().host_scratch_bytes > 0);
+        try std.testing.expectEqual(@as(usize, 0), decoder.cache_permit.?.lease.?.amounts.host_scratch_bytes);
+        const expected = try (try (try decoder.base_permit.?.lease.?.amounts.merge(decoder.cache_permit.?.lease.?.amounts)).merge(try program.schedule.selected.storageRequirement())).merge(decoder.cold_metadata.?.admittedAmounts());
+        try std.testing.expectEqualDeep(expected, value.controller.snapshot());
+    }
+    try std.testing.expect(frame.scope_cleanup.boundary.? == &program.schedule.numerical_epoch.?);
+    try std.testing.expectEqual(decoder.receiver_cleanup.?.epoch.record, program.schedule.numerical_epoch.?.record);
+    try std.testing.expectEqual(decoder.receiver_cleanup.?.epoch.nonce, program.schedule.numerical_epoch.?.nonce);
+    const cfg = decoder.config;
+    // This maintained direct API deliberately owns an ordinary eager cache:
+    // its entire numerical body is the original semantic implementation.
+    var original = try whisper_arch.DecodeCache.init(&decoder.cb.backend, a, cfg, decoder.encoder_hidden, 2);
+    var original_open = true;
+    defer if (original_open) original.deinit(&decoder.cb.backend);
+    try std.testing.expect(original.native_program == null);
+    const first = try decoder.step(&.{ 0, 1 });
+    defer a.free(first);
+    const first_original = try whisper_arch.decoderStepCachedLogits(&decoder.cb.backend, a, cfg, &.{ 0, 1 }, &original);
+    defer a.free(first_original);
+    try std.testing.expectEqualSlices(f32, first_original, first);
+    const held = try a.dupe(f32, first);
+    defer a.free(held);
+    const generation = frame.host_input_generation;
+    const positions = decoder.positions();
+    const initialized = try decoder.cb.backend.toFloat32(decoder.cache.layers[0].k_self.?, a);
+    defer a.free(initialized);
+    try std.testing.expectError(error.InvalidTensorShape, decoder.step(&.{-1}));
+    try std.testing.expectError(error.InvalidTensorShape, decoder.step(&.{@intCast(cfg.vocab_size)}));
+    try std.testing.expectEqual(positions, decoder.positions());
+    try std.testing.expectEqual(generation, frame.host_input_generation);
+    try std.testing.expect(!frame.retired);
+    var invalid_ids = [_]i64{ 0, 1 };
+    var current_position = [_]i64{@intCast(positions)};
+    var malformed = Tensor{ .allocator = a, .name = "bad.token", .dtype = .i64, .shape = &.{2}, .data = std.mem.asBytes(&invalid_ids), .owns_data = false, .owns_shape = false };
+    var valid_position = Tensor{ .allocator = a, .name = "position", .dtype = .i64, .shape = &.{1}, .data = std.mem.asBytes(&current_position), .owns_data = false, .owns_shape = false };
+    try std.testing.expectError(error.InvalidHostIngressBinding, frame.rebindNativeProgramHostInputs(&.{ .{ .node_id = program.token_node, .value = &malformed }, .{ .node_id = program.position_node, .value = &valid_position } }));
+    try std.testing.expectEqual(generation, frame.host_input_generation);
+    try std.testing.expectEqual(@as(usize, 2), frame.bound_host_input_count);
+    const after = try decoder.cb.backend.toFloat32(decoder.cache.layers[0].k_self.?, a);
+    defer a.free(after);
+    try std.testing.expectEqualSlices(f32, initialized[0 .. positions * cfg.d_model], after[0 .. positions * cfg.d_model]);
+    for ([_]i64{ 2, 3, 0 }) |token| {
+        const expected = try whisper_arch.decoderStepCachedLogits(&decoder.cb.backend, a, cfg, &.{token}, &original);
+        defer a.free(expected);
+        const actual = allocation_free: {
+            const compute: *NativeCompute = @ptrCast(@alignCast(decoder.cb.backend.ptr));
+            const original_allocator = compute.allocator;
+            var fail_all = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            compute.allocator = fail_all.allocator();
+            defer compute.allocator = original_allocator;
+            const values = try decoder.step(&.{token});
+            errdefer a.free(values);
+            try std.testing.expect(!fail_all.has_induced_failure);
+            break :allocation_free values;
+        };
+        defer a.free(actual);
+        try std.testing.expectEqualSlices(f32, expected, actual);
+        try std.testing.expectEqualSlices(f32, held, first);
+        try std.testing.expectEqual(program.schedule.steps.len, program.schedule.cursor);
+    }
+    try std.testing.expect(frame.host_input_generation > generation);
+    try std.testing.expectEqual(@as(usize, 1), program.schedule.selected.pool.frames.items.len);
+    // Real public close releases its Model reference. Both cache source planes
+    // and the independent previously published host output remain valid.
+    session.close();
+    session_open = false;
+    const next = try decoder.step(&.{1});
+    defer a.free(next);
+    const next_expected = try whisper_arch.decoderStepCachedLogits(&decoder.cb.backend, a, cfg, &.{1}, &original);
+    defer a.free(next_expected);
+    try std.testing.expectEqualSlices(f32, next_expected, next);
+    original.deinit(&decoder.cb.backend);
+    original_open = false;
+    decoder.deinit();
+    decoder_open = false;
+    try std.testing.expectEqualSlices(f32, held, first);
+    if (domain) |value| try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, value.controller.snapshot());
+}
+
+test "actual Native Whisper cold program preserves eager two-layer math invalid-token state and held output after Model close" {
+    try nativeWhisperAssignedSourceCase(std.testing.allocator, false);
+}
+
+test "actual Native Whisper cold program unwinds every constructor and output allocation failure" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, nativeWhisperAssignedSourceCase, .{false});
+}
+
+test "actual Native Whisper cancellation refuses before planned ingress or KV mutation" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Probe = struct {
+        cancelled: bool = false,
+        fn check(raw: ?*anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw.?));
+            if (self.cancelled) return error.Cancelled;
+        }
+    };
+    var probe = Probe{};
+    const control = InferenceExecutionControl{ .ptr = &probe, .check_fn = Probe.check, .native_call_policy = .in_process };
+    const session = try IncrementalFixture.session(a);
+    defer session.close();
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    var decoder = (try whisperNativeDecoder(session, a, control, &hidden, 2)).?;
+    defer decoder.deinit();
+    try std.testing.expect(decoder.cache.native_program != null);
+    const first = try decoder.step(&.{ 0, 1 });
+    defer a.free(first);
+    const positions = decoder.positions();
+    const frame = decoder.cache.native_program.?.schedule.frame.?;
+    const generation = frame.host_input_generation;
+    const dispatches = frame.stats.dispatches;
+    probe.cancelled = true;
+    try std.testing.expectError(error.Cancelled, decoder.step(&.{2}));
+    try std.testing.expectEqual(positions, decoder.positions());
+    try std.testing.expectEqual(generation, frame.host_input_generation);
+    try std.testing.expectEqual(dispatches, frame.stats.dispatches);
+    probe.cancelled = false;
+    const next = try decoder.step(&.{2});
+    defer a.free(next);
+    try std.testing.expectEqual(positions + 1, decoder.positions());
+}
+
+test "actual admitted Native Whisper program retires exact KV scratch metadata and moved construction capability after Model close" {
+    try nativeWhisperAssignedSourceCase(std.testing.allocator, true);
+}
+
+test "Native Whisper optional metadata quota declines cold and preserves the exact original KV floor" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    var session = try IncrementalFixture.session(a);
+    defer session.close();
+    session.model_lifetime.?.admission_domain = domain.pin();
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .cpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    const cfg = @import("testing/incremental_encoder_decoder.zig").config;
+    const geometry = try whisper_arch.CacheGeometry.init(cfg, 2);
+    var probe = try getComputeBackendWithControl(session, a, null);
+    var probe_open = true;
+    defer if (probe_open) probe.deinit();
+    var base = try incrementalBasePermit(session, cfg, geometry, false, false);
+    var base_open = true;
+    defer if (base_open) base.deinit();
+    const original = try base.lease.?.amounts.merge(try geometry.cacheAmounts(&probe.backend));
+    base.deinit();
+    base_open = false;
+    probe.deinit();
+    probe_open = false;
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+    session.run_admission.?.limits.host_limit_bytes = original.hostTotalBytes();
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    var decoder = (try whisperNativeDecoder(session, a, null, &hidden, 2)).?;
+    var decoder_open = true;
+    defer if (decoder_open) decoder.deinit();
+    try std.testing.expect(decoder.cache.native_program == null and decoder.program_permit == null and decoder.cold_metadata == null);
+    try std.testing.expectEqualDeep(original, domain.controller.snapshot());
+    const first = try decoder.step(&.{ 0, 1 });
+    defer a.free(first);
+    const next = try decoder.step(&.{2});
+    defer a.free(next);
+    decoder.deinit();
+    decoder_open = false;
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+    session.run_admission.?.limits.host_limit_bytes -= 1;
+    try std.testing.expectError(error.ResourceLimitExceeded, whisperNativeDecoder(session, a, null, &hidden, 2));
+    try std.testing.expectEqualDeep(runtime.tier.memory.AdmissionAmounts{}, domain.controller.snapshot());
+}
+
+test "Native Whisper late required layer weight failure retires all cold owners before publication" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const session = try IncrementalFixture.session(a);
+    defer session.close();
+    const owner: *ArchSession = @ptrCast(@alignCast(session.ptr));
+    owner.arch_config.whisper.decoder_layers = 2; // genuine fixture has only layer zero
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    try std.testing.expectError(error.MissingWeight, whisperNativeDecoder(session, a, null, &hidden, 2));
+    try std.testing.expect(session.execution_gate.?.tryLock());
+    session.execution_gate.?.unlock();
+}
+
+test "Native Whisper preserves unknown arena and bounded allocator compatibility without unwrapping limits" {
+    if (comptime !build_options.enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const session = try IncrementalFixture.session(a);
+    defer session.close();
+    const hidden = [_]f32{ 0.2, 0.4, -0.1, 0.7, 0.5, 0.6, -0.2, 0.3 };
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    var decoder = (try whisperNativeDecoder(session, arena.allocator(), null, &hidden, 2)).?;
+    var decoder_open = true;
+    defer if (decoder_open) decoder.deinit();
+    try std.testing.expect(decoder.cache.native_program == null and decoder.cold_metadata == null);
+    const first = try decoder.step(&.{ 0, 1 });
+    defer arena.allocator().free(first);
+    const next = try decoder.step(&.{2});
+    defer arena.allocator().free(next);
+    try std.testing.expectEqual(@as(usize, 3), decoder.positions());
+    decoder.deinit();
+    decoder_open = false;
+    var bound = @import("../runtime/bounded_allocator.zig").BoundedAllocator{ .backing = a, .limit = 1 };
+    try std.testing.expectError(error.OutOfMemory, whisperNativeDecoder(session, bound.allocator(), null, &hidden, 2));
+    try std.testing.expect(bound.denied and bound.live == 0);
 }

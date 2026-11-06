@@ -181,6 +181,7 @@ pub const Pool = struct {
     region_by_node: []u32 = &.{},
     region_runtime_last_use: []u32 = &.{},
     host_alignment: std.mem.Alignment = .@"1",
+    host_workspace_allocator: ?std.mem.Allocator = null,
     reshape_sources: []NodeId = &.{},
     metadata_aliases: []@import("metadata_alias.zig").Plan = &.{},
     /// Borrow the plan's heap-backed slices, never its movable struct address.
@@ -775,6 +776,14 @@ pub const Pool = struct {
         try selected.validate(self, inputs);
         try self.validateRegions(inputs);
     }
+    /// Numerical host scratch already has its independent reserveHost backing.
+    /// Its raw allocator must not be an admitted metadata allocator, which
+    /// would charge the same payload twice. The caller keeps this allocator
+    /// alive through every Frame; all physical reservation/ledger rules remain.
+    pub fn setDeclaredHostWorkspaceAllocator(self: *Pool, backing: std.mem.Allocator) !void {
+        if (self.frames.items.len != 0 or self.pending_frames != 0 or !self.native_frame_dispatch or self.backends.len != 1 or self.backends[0].vtable != &@import("../ops/native_compute.zig").vtable_impl) return error.InvalidHostWorkspaceAllocator;
+        self.host_workspace_allocator = backing;
+    }
     pub fn preparedKernelRoute(self: *const Pool, node: NodeId) ?*const route.Owned {
         const selected = if (self.selection) |*value| value else return null;
         if (node >= selected.routes.len or self.plan.slotForNode(node) == null) return null;
@@ -971,7 +980,7 @@ pub const Pool = struct {
         const ledger = try accounting.Ledger.create(self.allocator);
         errdefer ledger.release();
         const child = try self.allocator.create(Pool);
-        child.* = .{ .metadata_aliases = metadata_aliases, .replay_config = self.replay_config, .coverage_graph = self.coverage_graph, .coverage_reachable = self.coverage_reachable, .native_frame_dispatch = self.native_frame_dispatch, .cuda_frame_dispatch = self.cuda_frame_dispatch, .metal_frame_dispatch = self.metal_frame_dispatch, .coverage_backend = self.coverage_backend, .reshape_sources = reshapes, .allocator = self.allocator, .accounting = ledger, .plan = plan, .owns_plan = true, .kernels = selected, .transfers = transfers, .backends = backends, .workspace_allocations = workspaces, .host_workspace_allocation = self.host_workspace_allocation, .max_frames = self.max_frames, .replay_inputs = replay_inputs, .replay_input_indices = replay_indices, .replay_outputs = replay_outputs, .replay_kernel_count = self.replay_kernel_count, .replay_backend = self.replay_backend, .replay_decision = self.replay_decision, .host_alignment = self.host_alignment, .root_pool = self };
+        child.* = .{ .metadata_aliases = metadata_aliases, .replay_config = self.replay_config, .coverage_graph = self.coverage_graph, .coverage_reachable = self.coverage_reachable, .native_frame_dispatch = self.native_frame_dispatch, .cuda_frame_dispatch = self.cuda_frame_dispatch, .metal_frame_dispatch = self.metal_frame_dispatch, .coverage_backend = self.coverage_backend, .reshape_sources = reshapes, .allocator = self.allocator, .accounting = ledger, .plan = plan, .owns_plan = true, .kernels = selected, .transfers = transfers, .backends = backends, .workspace_allocations = workspaces, .host_workspace_allocation = self.host_workspace_allocation, .max_frames = self.max_frames, .replay_inputs = replay_inputs, .replay_input_indices = replay_indices, .replay_outputs = replay_outputs, .replay_kernel_count = self.replay_kernel_count, .replay_backend = self.replay_backend, .replay_decision = self.replay_decision, .host_alignment = self.host_alignment, .host_workspace_allocator = self.host_workspace_allocator, .root_pool = self };
         if (self.literal_store) |store| {
             store.retain();
             child.literal_store = store;
@@ -1620,6 +1629,7 @@ pub const Frame = struct {
     /// These headers never escape; physical allocation roots remain Leases.
     native_program_views: []?CT = &.{},
     native_program_view_pins: []usize = &.{},
+    native_program_storage_sealed: bool = false,
 
     owner_pin: ?*prepared_routes.PreparedRoutes = null,
     transient: bool = false,
@@ -1634,6 +1644,7 @@ pub const Frame = struct {
     storages: []?*storage.Lease,
     completions: []?storage.Completion,
     host_workspace: []u8 = &.{},
+    host_workspace_allocator: ?std.mem.Allocator = null,
     host_workspace_fresh: bool = true,
     collect_storage_stats: bool = false,
     in_use: bool = true,
@@ -1683,8 +1694,9 @@ pub const Frame = struct {
         const host_bytes: usize = if (pool.host_workspace_allocation == buffers.invalid_allocation) 0 else @intCast(pool.plan.allocations[pool.host_workspace_allocation].byte_size);
         const host_binding = if (capability) |cap| try reserveHost(pool, cap, host_bytes) else admission.Binding{};
         errdefer host_binding.rollback(pool.allocator);
-        const host_workspace: []u8 = if (host_bytes == 0) &.{} else (pool.allocator.rawAlloc(host_bytes, pool.host_alignment, @returnAddress()) orelse return error.OutOfMemory)[0..host_bytes];
-        errdefer if (host_bytes != 0) pool.allocator.rawFree(host_workspace, pool.host_alignment, @returnAddress());
+        const host_workspace_allocator = pool.host_workspace_allocator orelse pool.allocator;
+        const host_workspace: []u8 = if (host_bytes == 0) &.{} else (host_workspace_allocator.rawAlloc(host_bytes, pool.host_alignment, @returnAddress()) orelse return error.OutOfMemory)[0..host_bytes];
+        errdefer if (host_bytes != 0) host_workspace_allocator.rawFree(host_workspace, pool.host_alignment, @returnAddress());
         const assigned = try pool.allocator.alloc(?route.Assigned, if (pool.selection != null) pool.kernels.len else 0);
         errdefer pool.allocator.free(assigned);
         @memset(assigned, null);
@@ -1698,7 +1710,7 @@ pub const Frame = struct {
         errdefer pool.allocator.free(region_assigned);
         @memset(region_assigned, null);
         const self = try pool.allocator.create(Frame);
-        self.* = .{ .region_claims = region_claims, .region_started = region_started, .region_assigned = region_assigned, .host_input_resources = host_resources, .host_bound_inputs = host_inputs, .assigned = assigned, .storage_admission = capability, .host_workspace_admission = host_binding.reservation, .host_workspace_retirement_owner = if (host_binding.backing) |value| value.owner else null, .host_workspace = host_workspace, .capture_pins = capture_pins, .pool = pool, .storages = leases, .completions = completions, .bound_inputs = bound_inputs, .binding_states = binding_states, .stats = .{ .replay_decision = pool.replay_decision } };
+        self.* = .{ .region_claims = region_claims, .region_started = region_started, .region_assigned = region_assigned, .host_input_resources = host_resources, .host_bound_inputs = host_inputs, .assigned = assigned, .storage_admission = capability, .host_workspace_admission = host_binding.reservation, .host_workspace_retirement_owner = if (host_binding.backing) |value| value.owner else null, .host_workspace = host_workspace, .host_workspace_allocator = host_workspace_allocator, .capture_pins = capture_pins, .pool = pool, .storages = leases, .completions = completions, .bound_inputs = bound_inputs, .binding_states = binding_states, .stats = .{ .replay_decision = pool.replay_decision } };
         if (host_bytes != 0) {
             if (pool.accounting) |ledger| ledger.allocated(.host_workspace, host_bytes, host_bytes);
             self.stats.allocations += 1;
@@ -1877,7 +1889,7 @@ pub const Frame = struct {
             if (self.pool.plan.allocations[id].kind != .constant_binding) value.releaseWithCleanup(cleanup);
         };
         const host_bytes = self.host_workspace.len;
-        if (host_bytes != 0) self.pool.allocator.rawFree(self.host_workspace, self.pool.host_alignment, @returnAddress());
+        if (host_bytes != 0) (self.host_workspace_allocator orelse self.pool.allocator).rawFree(self.host_workspace, self.pool.host_alignment, @returnAddress());
         if (self.host_workspace_retirement_owner) |owned| {
             owned.release(cleanup.boundary orelse @import("antfly_platform").inference_process_supervisor.restartWorker());
         } else if (self.host_workspace_admission) |value| {
@@ -1902,13 +1914,7 @@ pub const Frame = struct {
             self.retired = true;
             return err;
         };
-        if (self.pool.host_input_plans.len != 0) {
-            for (self.pool.host_input_plans) |input| if (self.storages[input.allocation]) |storage_owner| storage_owner.invalidateHostIndices();
-            self.host_input_generation = std.math.add(u64, self.host_input_generation, 1) catch {
-                self.retired = true;
-                return error.HostInputGenerationExhausted;
-            };
-        }
+        try self.advanceHostInputGeneration();
         self.scope_cleanup = cleanup;
         errdefer self.endScope();
         for (self.pool.backends) |backend| {
@@ -1920,6 +1926,56 @@ pub const Frame = struct {
             }
             self.scope_backends += 1;
         }
+    }
+    /// Consume the borrowed construction service only after every required
+    /// Native output, host input, and scratch owner has materialized. Later
+    /// execution cannot recover a raw allocator by dropping the capability.
+    pub fn sealNativeProgramStorage(self: *Frame) !void {
+        if (self.native_program_views.len == 0 or self.pool.backends.len != 1 or self.pool.backends[0].vtable != &@import("../ops/native_compute.zig").vtable_impl or self.stats.dispatches != 0 or self.pool.regions.len != 0 or self.pool.replay_backend != null) return error.InvalidNativeProgramPreparation;
+        for (self.pool.kernels) |maybe| if (maybe) |kernel| {
+            if (self.storages[kernel.output_allocation] == null or kernel.workspace_bytes != 0) return error.UnpreparedNativeProgramStorage;
+            for (kernel.auxiliaries) |aux| if (aux != null) return error.UnpreparedNativeProgramStorage;
+        };
+        for (self.pool.host_input_plans, self.host_input_resources) |plan, resource| {
+            if (resource == null or (!plan.borrowed and self.storages[plan.allocation] == null)) return error.UnpreparedNativeProgramStorage;
+        }
+        const expected: usize = if (self.pool.host_workspace_allocation == buffers.invalid_allocation) 0 else @intCast(self.pool.plan.allocations[self.pool.host_workspace_allocation].byte_size);
+        if (self.host_workspace.len != expected) return error.UnpreparedNativeProgramStorage;
+        self.native_program_storage_sealed = true;
+        self.storage_admission = null;
+    }
+    /// Close only the cold preparation scope of a canonical synchronous Native
+    /// program. No numerical kernel may have executed. Materialized allocation
+    /// owners remain in this in-use Frame; later beginWithCleanup receives the
+    /// NEW actual numerical owner, never the construction epoch.
+    pub fn finishNativeProgramPreparation(self: *Frame) !void {
+        if (self.retired or self.native_program_views.len == 0 or self.pool.backends.len != 1 or self.scope_backends != 1 or self.pool.backends[0].vtable != &@import("../ops/native_compute.zig").vtable_impl or self.stats.dispatches != 0 or self.pool.regions.len != 0 or self.pool.replay_backend != null) return error.InvalidNativeProgramPreparation;
+        self.releaseHostInputs();
+        self.endScope();
+    }
+    fn advanceHostInputGeneration(self: *Frame) !void {
+        if (self.pool.host_input_plans.len != 0) {
+            for (self.pool.host_input_plans) |input| if (self.storages[input.allocation]) |storage_owner| storage_owner.invalidateHostIndices();
+            self.host_input_generation = std.math.add(u64, self.host_input_generation, 1) catch {
+                self.retired = true;
+                return error.HostInputGenerationExhausted;
+            };
+        }
+    }
+    /// Rebind scalar host inputs for a synchronous, wholly owned Native
+    /// program which deliberately keeps its one Frame scope entered. No host
+    /// input alias or asynchronous consumer may survive this call. Numerical
+    /// output/state views retain their existing allocation-slot epoch.
+    pub fn rebindNativeProgramHostInputs(self: *Frame, inputs: []const host_ingress.Input) ![]const interpreter.RuntimeInput {
+        if (self.retired or self.native_program_views.len == 0 or self.pool.backends.len != 1 or self.scope_backends != 1 or self.pool.backends[0].vtable != &@import("../ops/native_compute.zig").vtable_impl or self.pool.regions.len != 0 or self.pool.replay_backend != null) return error.InvalidNativeProgramRebind;
+        try self.pool.validateHostInputs(inputs);
+        if (self.host_input_generation == std.math.maxInt(u64)) return error.HostInputGenerationExhausted;
+        self.releaseHostInputs();
+        try self.advanceHostInputGeneration();
+        return self.bindHostInputs(inputs) catch |err| {
+            self.retired = true;
+            return err;
+        };
     }
     fn endScope(self: *Frame) void {
         while (self.scope_backends != 0) {
@@ -1988,6 +2044,7 @@ pub const Frame = struct {
         const required = if (plan.requirements.validation_scope == .prepared_program) plan.requirements else (try functions.hostInputRequirements.?(backend.ptr, plan.shape)) orelse return error.PreparedHostIngressUnavailable;
         if (!required.eql(plan.requirements)) return error.PreparedHostIngressChanged;
         if (self.host_input_resources[index]) |*resource| return resource;
+        if (self.native_program_storage_sealed) return error.UnpreparedNativeProgramStorage;
         const host_binding = if (self.storage_admission) |cap| try reserveHost(self.pool, cap, required.host_bytes) else admission.Binding{};
         errdefer host_binding.rollback(self.pool.allocator);
         const resource = (try functions.createHostInput.?(backend.ptr, .{
@@ -2267,6 +2324,7 @@ pub const Frame = struct {
     fn literalValue(self: *Frame, index: usize) !CT {
         const store = self.pool.literal_store orelse return error.InvalidLiteralPlan;
         const literal = store.literals[index];
+        if (self.native_program_storage_sealed and self.storages[literal.allocation] == null) return error.UnpreparedNativeProgramStorage;
         const cb = store.backends[literal.backend_index];
         if (self.completions[literal.backend_index] == null) {
             if (cb.vtable.kernels.?.createPhysicalCompletion) |make| self.completions[literal.backend_index] = try make(cb.ptr);
@@ -2333,6 +2391,7 @@ pub const Frame = struct {
     fn storageFor(self: *Frame, cb: *const ops.ComputeBackend, backend_index: usize, allocation_id: buffers.AllocationId) !?*storage.Lease {
         if (allocation_id >= self.storages.len or backend_index >= self.pool.backends.len or self.pool.plan.allocationById(allocation_id) == null) return error.InactivePhysicalAllocation;
         if (self.storages[allocation_id] == null) {
+            if (self.native_program_storage_sealed) return error.UnpreparedNativeProgramStorage;
             if (self.completions[backend_index] == null) {
                 if (cb.vtable.kernels.?.createPhysicalCompletion) |make_completion| self.completions[backend_index] = try make_completion(cb.ptr);
             }

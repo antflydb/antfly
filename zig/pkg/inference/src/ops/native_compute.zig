@@ -4370,6 +4370,76 @@ pub const NativeCompute = struct {
         return first.kind == second.kind and first.q8_activation == second.q8_activation and !originalPairNeedsTasks(self, descriptor, first, second);
     }
 
+    /// Cold binding of the existing cached-handle stamp, without new witness
+    /// arrays, value reads, preparation or allocation. All witnesses must still
+    /// be the actual retained F32 source before any missing stamp is published.
+    pub fn stampHeldF32WeightSources(backend: *const ops.ComputeBackend, expected_data: *const anyopaque, witnesses: []const CT) !void {
+        return heldF32WeightSources(backend, expected_data, witnesses, true);
+    }
+
+    /// Receiving Model gate only: every cold retained handle must still name
+    /// the SAME live source. Never initializes a missing stamp at reception.
+    pub fn validateHeldF32WeightSources(backend: *const ops.ComputeBackend, expected_data: *const anyopaque, witnesses: []const CT) !void {
+        return heldF32WeightSources(backend, expected_data, witnesses, false);
+    }
+
+    fn heldF32WeightSources(backend: *const ops.ComputeBackend, expected_data: *const anyopaque, witnesses: []const CT, comptime cold: bool) !void {
+        if (backend.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(backend.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        ResidentWeightPreparation.lock(self.data);
+        defer ResidentWeightPreparation.unlock(self.data);
+        const owner = self.weight_retirement orelse return error.NativeWeightPreparationChanged;
+        platform.sync.lockYielding(&owner.mutex);
+        defer owner.mutex.unlock();
+        if (owner.attached_compute != self or owner.data != self.data) return error.NativeWeightPreparationChanged;
+        for (witnesses) |witness| try self.heldF32WeightSourceLocked(witness, cold);
+        if (cold) for (witnesses) |witness| {
+            const handle = toBuf(witness).weight_handle.?;
+            if (handle.source_stamp.kind == .missing) handle.source_stamp = nativeCacheSourceStampLocked(self.data, handle.name());
+        };
+    }
+
+    fn heldF32WeightSourceLocked(self: *NativeCompute, witness: CT, comptime cold: bool) !void {
+        const view = toBuf(witness);
+        const handle = view.weight_handle orelse return error.NativeWeightPreparationChanged;
+        if (!handle.cached or handle.references == 0 or !view.cached_weight or !view.whole_named_weight or view.weight_retirement != self.weight_retirement or self.weight_handles.get(handle.name()) != witness) return error.NativeWeightPreparationChanged;
+        const current = nativeCacheSourceStampLocked(self.data, handle.name());
+        if (current.kind == .missing or ((!cold or handle.source_stamp.kind != .missing) and !std.meta.eql(handle.source_stamp, current))) return error.NativeWeightPreparationChanged;
+        const loaded: *const LoadedWeight = if (current.kind == .resident) block: {
+            if (view.lazy_entry != null) return error.NativeWeightPreparationChanged;
+            break :block self.data.resident_weights.getPtr(handle.name()) orelse return error.NativeWeightPreparationChanged;
+        } else block: {
+            const entry = self.data.lazy_weights.getPtr(handle.name()) orelse return error.NativeWeightPreparationChanged;
+            if (view.lazy_entry != entry or entry.pin_count == 0) return error.NativeWeightPreparationChanged;
+            break :block if (entry.loaded) |*value| value else return error.NativeWeightPreparationChanged;
+        };
+        const unsupported = if (cold) error.UnsupportedDenseSchedule else error.NativeWeightPreparationChanged;
+        const source = &loaded.tensor;
+        if (loaded.quantized or loaded.quantized_storage != null or source.dtype != .f32 or source.shape.len == 0 or source.shape.len > 2 or @intFromPtr(source.data.ptr) % @alignOf(f32) != 0 or view.owned or view.retained_parent != null or view.physical_lease != null or view.source_tensor != null or view.quantized_storage != null or view.owned_quantized_storage != null or view.view_strides != null or view.view_base_offset != 0 or (view.declared_dtype != null and view.declared_dtype != .f32)) return unsupported;
+        const shape = @import("ml").graph.Shape.init(.f32, source.shape);
+        const elements = shape.numElements() orelse return unsupported;
+        if (elements <= 0) return unsupported;
+        const bytes = std.math.mul(usize, @intCast(elements), @sizeOf(f32)) catch return unsupported;
+        if (source.data.len != bytes or view.data.len != elements or @intFromPtr(view.data.ptr) != @intFromPtr(source.data.ptr) or view.logical_shape == null or !std.mem.eql(i64, view.logical_shape.?, source.shape)) return error.NativeWeightPreparationChanged;
+    }
+
+    /// Ordinary cache initialization into an already owned dense destination.
+    /// This adds no assigned-slot, quota or capture authority. The caller owns
+    /// actual Native CT lifetimes and its existing model numerical scope.
+    pub fn canApplyDenseProjectionInto(backend: *const ops.ComputeBackend, descriptor: *const ops.kernel_descriptor.Descriptor, inputs: []const CT, destination: CT) bool {
+        return denseProjectionIntoBinding(backend, descriptor, inputs, destination) != null;
+    }
+
+    pub fn applyDenseProjectionInto(backend: *const ops.ComputeBackend, descriptor: *const ops.kernel_descriptor.Descriptor, inputs: []const CT, destination: CT) !bool {
+        const binding = denseProjectionIntoBinding(backend, descriptor, inputs, destination) orelse return false;
+        const geometry = descriptor.operation.linear;
+        if (geometry.bias) {
+            try linearInto(binding.compute, inputs[0], inputs[1], inputs[2], geometry.rows, geometry.in_dim, geometry.out_dim, binding.output);
+        } else try linearNoBiasInto(binding.compute, inputs[0], inputs[1], geometry.rows, geometry.in_dim, geometry.out_dim, binding.output);
+        return true;
+    }
+
     /// Joint physical launch only; the immutable authored schedule proves
     /// original pair membership/liveness. Both real outputs are validated before
     /// the SAME original pair dispatcher can write either one.
@@ -7553,6 +7623,7 @@ const kernel_backend_impl: ops.KernelBackend = .{
     .physicalReplayReshapeViews = true,
     .createMetadataAlias = &createMetadataAliasOp,
     .assignedKernelSupported = &assignedKernelSupportedOp,
+    .assignedKernelWorkspace = &assignedKernelWorkspaceOp,
     .materializesOutput = &materializesOutputOp,
     .prepareKernelRoute = &prepareKernelRouteOp,
     .hostInputRequirements = &nativeHostInputRequirementsOp,
@@ -9401,6 +9472,49 @@ fn dispatchQuantizedLinearStrictF32(request: QuantLinearRequest) !bool {
 
 fn linearOp(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize) anyerror!CT {
     return allocateLinearOutput(ctx, input, weight, bias, rows, in_dim, out_dim);
+}
+
+const DenseProjectionIntoBinding = struct { compute: *NativeCompute, output: []f32 };
+
+fn denseProjectionIntoBinding(backend: *const ops.ComputeBackend, descriptor: *const ops.kernel_descriptor.Descriptor, inputs: []const CT, destination: CT) ?DenseProjectionIntoBinding {
+    // Refuse copied/foreign callback tables BEFORE opaque context or CT access.
+    if (backend.vtable != &vtable_impl or descriptor.operation != .linear) return null;
+    const geometry = descriptor.operation.linear;
+    if (geometry.rows == 0 or geometry.in_dim == 0 or geometry.out_dim == 0 or descriptor.input_count != (if (geometry.bias) @as(u8, 3) else 2) or inputs.len != descriptor.input_count) return null;
+    const shape = descriptor.input_shapes[0];
+    const rank = shape.rank();
+    if (shape.dtype != .f32 or (rank != 2 and rank != 3) or (rank == 3 and shape.dims[0] != 1) or shape.dims[rank - 2] != geometry.rows or shape.dims[rank - 1] != geometry.in_dim) return null;
+    const weight = descriptor.input_shapes[1];
+    const output = descriptor.output_shape;
+    if (weight.dtype != .f32 or weight.rank() != 2 or weight.dims[0] != geometry.out_dim or weight.dims[1] != geometry.in_dim or output.dtype != .f32 or output.rank() != 2 or output.dims[0] != geometry.rows or output.dims[1] != geometry.out_dim) return null;
+    if (geometry.bias) {
+        const bias = descriptor.input_shapes[2];
+        if (bias.dtype != .f32 or bias.rank() != 1 or bias.dims[0] != geometry.out_dim) return null;
+    }
+    const count = std.math.mul(usize, geometry.rows, geometry.out_dim) catch return null;
+    const output_bytes = std.math.mul(usize, count, @sizeOf(f32)) catch return null;
+    const target = toBuf(destination);
+    if (nativeTensorReadOnly(target) or target.source_tensor != null or target.quantized_storage != null or target.view_strides != null or target.view_base_offset != 0 or (target.declared_dtype != null and target.declared_dtype != .f32) or target.data.len != count) return null;
+    const actual_output = tensorStoredShape(destination) orelse return null;
+    if (!std.mem.eql(i64, actual_output, output.dims[0..output.rank()])) return null;
+    for (inputs, descriptor.input_shapes[0..descriptor.input_count], 0..) |input, expected, index| {
+        const actual = tensorStoredShape(input) orelse return null;
+        if (!std.mem.eql(i64, actual, expected.dims[0..expected.rank()])) return null;
+        const source = assignedDenseF32Input(input, expected) orelse return null;
+        // The original ordinary kernels read activations and bias via getData;
+        // only weights have a separate source-tensor conversion/cache owner.
+        if (index != 1 and toBuf(input).data.len != source.len) return null;
+        const bytes = std.math.mul(usize, source.len, @sizeOf(f32)) catch return null;
+        if (kernel_geometry.byteRangesOverlap(@intFromPtr(source.ptr), bytes, @intFromPtr(target.data.ptr), output_bytes)) return null;
+        // Ordinary linearInto may read its original source even when a dense
+        // value is also present. Attest BOTH real representations before bias
+        // initialization or a prepared-panel probe can touch the destination.
+        if (index == 1) if (toBuf(input).source_tensor) |original| {
+            if (original.dtype != .f32 or original.data.len != bytes or !std.mem.eql(i64, original.shape, expected.dims[0..expected.rank()])) return null;
+            if (kernel_geometry.byteRangesOverlap(@intFromPtr(original.data.ptr), original.data.len, @intFromPtr(target.data.ptr), output_bytes)) return null;
+        };
+    }
+    return .{ .compute = @ptrCast(@alignCast(backend.ptr)), .output = target.data };
 }
 
 fn linearInto(ctx: *anyopaque, input: CT, weight: CT, bias: CT, rows: usize, in_dim: usize, out_dim: usize, output: []f32) anyerror!void {
@@ -34969,7 +35083,7 @@ fn crossAttentionOp(ctx: *anyopaque, q_ct: CT, k_ct: CT, v_ct: CT, enc_mask: []c
     const K = getData(k_ct);
     const V = getData(v_ct);
     const output = try linalg.crossAttentionHost(self.allocator, Q, K, V, enc_mask, batch, dec_seq, enc_seq, num_heads, head_dim);
-    return self.makeBuf(output, true);
+    return self.makeOwnedBuf(output);
 }
 
 fn relativePositionBiasOp(ctx: *anyopaque, weight: CT, q_len: usize, k_len: usize, num_heads: usize, num_buckets: usize, max_distance: usize, bidirectional: bool) anyerror!CT {
@@ -52975,10 +53089,18 @@ fn physicalTensorViewOp(ctx: *anyopaque, request: ops.physical_storage.View) any
     return view;
 }
 
+fn assignedKernelWorkspaceOp(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) !ops.kernel_descriptor.WorkspaceRequirement {
+    if (descriptor.operation != .dense_attention_prefix) return .{};
+    const prefix = descriptor.operation.dense_attention_prefix;
+    if (!prefix.valid(descriptor)) return error.InvalidAttentionShape;
+    return .{ .host_byte_size = try std.math.mul(usize, prefix.max_key_rows, @sizeOf(f32)) };
+}
+
 fn assignedKernelSupportedOp(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
     if (descriptor.output_shape.dtype != .f32) return descriptor.operation == .slice and (descriptor.output_shape.dtype == .i32 or descriptor.output_shape.dtype == .i64) and descriptor.input_shapes[0].dtype == descriptor.output_shape.dtype;
     return switch (descriptor.operation) {
         .paged_attention => |geometry| geometry.valid(descriptor),
+        .dense_attention_prefix => |geometry| geometry.valid(descriptor),
         // Reduced DOT weights remain on the existing converting compatibility
         // path until their source staging has an exact assigned-workspace route.
         .dot => descriptor.input_shapes[0].dtype == .f32 and descriptor.input_shapes[1].dtype == .f32,
@@ -53059,7 +53181,11 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         break :prepared @ptrCast(@alignCast(selected.context));
     } else null;
     if (!assignedKernelSupportedOp(ctx, descriptor)) return false;
-    if (descriptor.operation == .paged_attention and request.prepared_route == null) return false;
+    if ((descriptor.operation == .paged_attention or descriptor.operation == .dense_attention_prefix) and request.prepared_route == null) return false;
+    const dense_prefix: ?@import("../graph/backend_contracts.zig").DenseAttentionPrefixBinding = if (descriptor.operation == .dense_attention_prefix) (request.attention orelse return false).dense_attention_prefix orelse return false else null;
+    if (dense_prefix) |binding| {
+        if (binding.live_key_rows == 0 or binding.live_key_rows > descriptor.operation.dense_attention_prefix.max_key_rows or binding.mask.len != binding.live_key_rows) return error.InvalidAttentionShape;
+    }
     const paged: ?AssignedPagedBinding = if (descriptor.operation == .paged_attention)
         try validateAssignedPagedAttention(descriptor.operation.paged_attention, request.attention orelse return false)
     else
@@ -53117,7 +53243,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         if (kernel_geometry.byteRangesOverlap(@intFromPtr(source.ptr), source.len * 4, @intFromPtr(output.ptr), output.len * 4)) return error.InvalidAssignedAlias;
     };
     if (target.physical_lease == null or output.len != descriptor.elements()) return error.InvalidTensorShape;
-    if (descriptor.operation == .paged_attention) {
+    if (descriptor.operation == .paged_attention or descriptor.operation == .dense_attention_prefix) {
         const assigned = request.assigned_output orelse return error.MissingAssignedOutput;
         const selected = request.prepared_route orelse return error.MissingPreparedKernelRoute;
         if (!target.physical_lease.?.acceptsWritableRegion(assigned.slot.allocation, assigned.slot.epoch, assigned.slot.writable_bytes, assigned.region) or assigned.slot.writable_bytes != output.len * @sizeOf(f32) or !assigned.slot.logical.eq(descriptor.output_shape)) return error.InvalidAssignedOutputAuthority;
@@ -53139,6 +53265,19 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         if (kernel_geometry.byteRangesOverlap(@intFromPtr(source.ptr), source.len * 4, @intFromPtr(output.ptr), output.len * 4)) return error.InvalidAssignedAlias;
     }
     switch (descriptor.operation) {
+        .dense_attention_prefix => |geometry| {
+            const binding = dense_prefix orelse return error.InvalidAttentionShape;
+            const bytes = try std.math.mul(usize, geometry.max_key_rows, @sizeOf(f32));
+            if (request.host_workspace.len < bytes or @intFromPtr(request.host_workspace.ptr) % @alignOf(f32) != 0) return error.InsufficientAttentionWorkspace;
+            const scratch_bytes = request.host_workspace[0..bytes];
+            for (dense_inputs) |input| if (kernel_geometry.byteRangesOverlap(@intFromPtr(scratch_bytes.ptr), bytes, @intFromPtr(input.ptr), input.len * 4)) return error.InvalidAssignedAlias;
+            if (kernel_geometry.byteRangesOverlap(@intFromPtr(scratch_bytes.ptr), bytes, @intFromPtr(output.ptr), output.len * 4)) return error.InvalidAssignedAlias;
+            const mask_bytes = try std.math.mul(usize, binding.mask.len, @sizeOf(i64));
+            if (kernel_geometry.byteRangesOverlap(@intFromPtr(binding.mask.ptr), mask_bytes, @intFromPtr(output.ptr), output.len * 4) or kernel_geometry.byteRangesOverlap(@intFromPtr(binding.mask.ptr), mask_bytes, @intFromPtr(scratch_bytes.ptr), bytes)) return error.InvalidAssignedAlias;
+            const live_elements = try std.math.mul(usize, binding.live_key_rows, output.len);
+            const scores = std.mem.bytesAsSlice(f32, @as([]align(@alignOf(f32)) u8, @alignCast(scratch_bytes)));
+            linalg.crossAttentionHostInto(dense_inputs[0], dense_inputs[1][0..live_elements], dense_inputs[2][0..live_elements], binding.mask, 1, 1, binding.live_key_rows, geometry.num_heads, geometry.head_dim, output, scores);
+        },
         .paged_attention => |geometry| {
             const actual = paged orelse return error.InvalidPagedKvState;
             try actual.manager.writeLayerKvSuffix(actual.context.kv_cache.?.sequence_id, geometry.layer_index, actual.context.total_sequence_len, 1, dense_inputs[1], dense_inputs[2]);
@@ -56395,6 +56534,11 @@ fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../execution/kernel_r
     const target = ops.ComputeBackend{ .ptr = ctx, .vtable = @ptrCast(@alignCast(implementation.table)) };
     if ((target.vtable.kernels orelse return null).runAssignedKernel != &runAssignedKernelOp) return null;
     if (descriptor.operation == .gather) if (try preparePackedRowRoute(self, target, request)) |selected| return selected;
+    if (descriptor.operation == .dense_attention_prefix) {
+        var selected = (try @import("../execution/assigned_kernel_route.zig").prepareImmutable(target, request, nativeDirectRouteSupported)) orelse return null;
+        selected.requirements.host_alignment = @alignOf(f32);
+        return selected;
+    }
     if (descriptor.operation != .linear) return @import("../execution/assigned_kernel_route.zig").prepareImmutable(target, request, nativeDirectRouteSupported);
     // Dense resident model planes use the SAME original F32 Into schedule.
     // Source-tensor conversion and prepared-panel variants retain their route.
@@ -60431,4 +60575,270 @@ test "quant below threshold geometry proof never overflows or guesses serial for
     try std.testing.expect(!quantWorkProvablyBelow(1, 512, 2, 0));
     try std.testing.expect(!quantWorkProvablyBelow(maximum, 2, 1, maximum));
     try std.testing.expect(!quantWorkProvablyBelow(1, maximum, 2, maximum));
+}
+
+fn nativeDensePrefixParity(a: std.mem.Allocator) !void {
+    const Shape = @import("ml").graph.Shape;
+    const route = @import("../execution/kernel_route.zig");
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const queries = [_]f32{ 0.5, -0.25, 0.75, 0.125 };
+    const keys = [_]f32{ 1, 2, 3, 4, -1, 0.5, 2, -2, 0.25, -0.75, 1.5, 0.5, 2, 0, -1, 3, 0.5, 1, 2, -0.5 };
+    const values = [_]f32{ 1, -2, 3, 0.5, 4, 1, -1, 2, -3, 0.25, 2, 4, 0.75, 3, -2, 1, 5, -1, 0.5, 2 };
+    const q = try cb.fromFloat32Shape(&queries, &.{ 1, 4 });
+    defer cb.free(q);
+    const k = try cb.fromFloat32Shape(&keys, &.{ 5, 4 });
+    defer cb.free(k);
+    const v = try cb.fromFloat32Shape(&values, &.{ 5, 4 });
+    defer cb.free(v);
+    const inputs = [_]CT{ q, k, v };
+    const descriptor = ops.kernel_descriptor.Descriptor{
+        .operation = .{ .dense_attention_prefix = .{ .num_heads = 2, .head_dim = 2, .max_key_rows = 5 } },
+        .input_count = 3,
+        .input_shapes = .{ Shape.init(.f32, &.{ 1, 4 }), Shape.init(.f32, &.{ 5, 4 }), Shape.init(.f32, &.{ 5, 4 }) },
+        .output_shape = Shape.init(.f32, &.{ 1, 4 }),
+    };
+    const implementation = route.Implementation{ .context = &compute, .table = &vtable_impl };
+    var facts: [3]route.Binding = undefined;
+    for (inputs, &facts) |input, *fact| fact.* = .{ .tensor = .{ .value = input, .implementation = implementation } };
+    const slot = route.OutputSlot{ .allocation = 1, .node = 4, .epoch = 3, .logical = descriptor.output_shape, .writable_bytes = 16 };
+    var selected = (try prepareKernelRouteOp(&compute, .{ .allocator = a, .implementation = implementation, .descriptor = &descriptor, .inputs = &facts, .output = slot })) orelse return error.MissingDensePrefixRoute;
+    defer selected.deinit();
+    try std.testing.expectEqual(@as(usize, 20), selected.requirements.workspace.host_byte_size);
+    try std.testing.expectEqual(@as(u32, @alignOf(f32)), selected.requirements.host_alignment);
+    try std.testing.expect(selected.requirements.capture == .unsupported);
+    const lease = (try ops.physical_storage.Lease.create(a, cb, 16)).?;
+    defer lease.release();
+    try lease.bindAllocationSlot(1, 3, 16);
+    const output = (try physicalTensorViewOp(&compute, .{ .storage = lease, .shape = &.{ 1, 4 } })).?;
+    defer cb.free(output);
+    const assigned = route.AssignedOutput{ .slot = slot, .region = try lease.writableRegion(1, 3, 16) };
+    const scratch = try a.alloc(f32, 5);
+    defer a.free(scratch);
+    const mask = [_]i64{ 1, 0, 1, 1, 1 };
+    var context = ops.AttentionContext{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 };
+    var invocation = ops.kernel_descriptor.Invocation{ .descriptor = &descriptor, .inputs = &inputs, .output = output, .host_workspace = std.mem.sliceAsBytes(scratch), .prepared_route = &selected, .assigned_output = &assigned, .attention = &context };
+    for ([_]usize{ 1, 3, 5 }) |live| {
+        @memcpy(toBuf(k).data, &keys);
+        @memcpy(toBuf(v).data, &values);
+        @memset(toBuf(k).data[live * 4 ..], std.math.nan(f32));
+        @memset(toBuf(v).data[live * 4 ..], std.math.nan(f32));
+        context.dense_attention_prefix = .{ .live_key_rows = live, .mask = mask[0..live] };
+        const reference = try cb.crossAttention(q, k, v, mask[0..live], 1, 1, live, 2, 2);
+        defer cb.free(reference);
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        compute.allocator = failing.allocator();
+        const execution = runAssignedKernelOp(&compute, invocation);
+        compute.allocator = a;
+        try std.testing.expect(try execution);
+        try std.testing.expectEqualSlices(f32, getData(reference), toBuf(output).data);
+        // Independent F64 softmax + weighted values, never the shared helper.
+        var expected: [4]f64 = @splat(0);
+        for (0..2) |head| {
+            var scores: [5]f64 = undefined;
+            var maximum = -std.math.inf(f64);
+            for (0..live) |row| {
+                var dot: f64 = 0;
+                for (0..2) |dim| dot += @as(f64, queries[head * 2 + dim]) * @as(f64, keys[row * 4 + head * 2 + dim]);
+                scores[row] = if (mask[row] == 0) -std.math.inf(f64) else dot / @sqrt(@as(f64, 2));
+                maximum = @max(maximum, scores[row]);
+            }
+            var sum: f64 = 0;
+            for (scores[0..live]) |*score| {
+                score.* = @exp(score.* - maximum);
+                sum += score.*;
+            }
+            for (0..live) |row| for (0..2) |dim| {
+                expected[head * 2 + dim] += scores[row] / sum * @as(f64, values[row * 4 + head * 2 + dim]);
+            };
+        }
+        for (expected, toBuf(output).data) |gold, actual| try std.testing.expectApproxEqAbs(gold, @as(f64, actual), 0.000002);
+    }
+    const held = toBuf(output).data[0..4].*;
+    context.dense_attention_prefix.?.live_key_rows = 6;
+    try std.testing.expectError(error.InvalidAttentionShape, runAssignedKernelOp(&compute, invocation));
+    context.dense_attention_prefix = .{ .live_key_rows = 5, .mask = mask[0..4] };
+    try std.testing.expectError(error.InvalidAttentionShape, runAssignedKernelOp(&compute, invocation));
+    context.dense_attention_prefix = .{ .live_key_rows = 5, .mask = &mask };
+    invocation.host_workspace = std.mem.sliceAsBytes(scratch)[0..19];
+    try std.testing.expectError(error.InsufficientAttentionWorkspace, runAssignedKernelOp(&compute, invocation));
+    invocation.host_workspace = std.mem.sliceAsBytes(toBuf(k).data)[0..20];
+    try std.testing.expectError(error.InvalidAssignedAlias, runAssignedKernelOp(&compute, invocation));
+    try std.testing.expectEqualSlices(f32, &held, toBuf(output).data);
+    invocation.host_workspace = std.mem.sliceAsBytes(scratch);
+    invocation.prepared_route = null;
+    try std.testing.expect(!try runAssignedKernelOp(&compute, invocation));
+    var malformed = descriptor;
+    malformed.input_shapes[1] = Shape.init(.f32, &.{ 4, 4 });
+    try std.testing.expect(!assignedKernelSupportedOp(&compute, &malformed));
+}
+
+test "Native assigned dense attention prefix preserves original mask arithmetic and bounded allocation-free scores" {
+    try nativeDensePrefixParity(std.testing.allocator);
+}
+
+test "Native assigned dense attention prefix unwinds all cold metadata allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, nativeDensePrefixParity, .{});
+}
+
+fn nativeOrdinaryProjectionIntoCase(a: std.mem.Allocator) !void {
+    const Shape = @import("ml").graph.Shape;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const values = [_]f32{ 1, -2, 0.25, 0.5, -1, 0.75, 2, -0.5, 0.125, 1, -1.5, 3 };
+    const weights = [_]f32{ 0.5, -1, 2, 0.25, 1, 0.75, -0.5, 2, -1, 0.5, 1, 0.25, 2, -0.25, 0.5, 1, -0.5, 1, -2, 0.75 };
+    const biases = [_]f32{ 0.25, -0.5, 1, 2, -1 };
+    const weight = try cb.fromFloat32Shape(&weights, &.{ 5, 4 });
+    defer cb.free(weight);
+    const bias = try cb.fromFloat32Shape(&biases, &.{5});
+    defer cb.free(bias);
+    for ([_]bool{ false, true }) |biased| {
+        for ([_]bool{ false, true }) |rank3| {
+            const input_shape = if (rank3) Shape.init(.f32, &.{ 1, 3, 4 }) else Shape.init(.f32, &.{ 3, 4 });
+            const input = try cb.fromFloat32Shape(&values, input_shape.dims[0..input_shape.rank()]);
+            defer cb.free(input);
+            const destination = try cb.fromFloat32Shape(&@as([15]f32, @splat(91)), &.{ 3, 5 });
+            defer cb.free(destination);
+            const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .linear = .{ .rows = 3, .in_dim = 4, .out_dim = 5, .bias = biased } }, .input_count = if (biased) 3 else 2, .input_shapes = .{ input_shape, Shape.init(.f32, &.{ 5, 4 }), Shape.init(.f32, &.{5}) }, .output_shape = Shape.init(.f32, &.{ 3, 5 }) };
+            const all_inputs = [_]CT{ input, weight, bias };
+            const inputs = all_inputs[0..descriptor.input_count];
+            try std.testing.expect(NativeCompute.canApplyDenseProjectionInto(&cb, &descriptor, inputs, destination));
+            for (getData(destination)) |value| try std.testing.expectEqual(@as(f32, 91), value);
+            const reference = if (biased) try cb.linear(input, weight, bias, 3, 4, 5) else try cb.linearNoBias(input, weight, 3, 4, 5);
+            defer cb.free(reference);
+            var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+            compute.allocator = failing.allocator();
+            const applied = NativeCompute.applyDenseProjectionInto(&cb, &descriptor, inputs, destination);
+            compute.allocator = a;
+            try std.testing.expect(try applied);
+            try std.testing.expectEqualSlices(f32, getData(reference), getData(destination));
+            for (0..3) |row| for (0..5) |column| {
+                var expected: f64 = if (biased) biases[column] else 0;
+                for (0..4) |inner| expected += @as(f64, values[row * 4 + inner]) * @as(f64, weights[column * 4 + inner]);
+                try std.testing.expectApproxEqAbs(expected, @as(f64, getData(destination)[row * 5 + column]), 0.000002);
+            };
+            const held = getData(destination)[0..15].*;
+            toBuf(destination).cached_weight = true;
+            const read_only = NativeCompute.applyDenseProjectionInto(&cb, &descriptor, inputs, destination);
+            toBuf(destination).cached_weight = false;
+            try std.testing.expect(!try read_only);
+            var wrong_shape = descriptor;
+            wrong_shape.output_shape = Shape.init(.f32, &.{ 1, 15 });
+            try std.testing.expect(!try NativeCompute.applyDenseProjectionInto(&cb, &wrong_shape, inputs, destination));
+            var copied_table = vtable_impl;
+            std.mem.doNotOptimizeAway(&copied_table);
+            try std.testing.expect(@intFromPtr(&copied_table) != @intFromPtr(&vtable_impl));
+            const foreign = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied_table };
+            try std.testing.expect(!NativeCompute.canApplyDenseProjectionInto(&foreign, &descriptor, inputs, destination));
+            try std.testing.expect(!try NativeCompute.applyDenseProjectionInto(&foreign, &descriptor, inputs, destination));
+            try std.testing.expectEqualSlices(f32, &held, getData(destination));
+        }
+    }
+    const square_weight = try cb.fromFloat32Shape(weights[0..16], &.{ 4, 4 });
+    defer cb.free(square_weight);
+    const input = try cb.fromFloat32Shape(&values, &.{ 3, 4 });
+    defer cb.free(input);
+    const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .linear = .{ .rows = 3, .in_dim = 4, .out_dim = 4, .bias = false } }, .input_count = 2, .input_shapes = .{ Shape.init(.f32, &.{ 3, 4 }), Shape.init(.f32, &.{ 4, 4 }), undefined }, .output_shape = Shape.init(.f32, &.{ 3, 4 }) };
+    try std.testing.expect(!NativeCompute.canApplyDenseProjectionInto(&cb, &descriptor, &.{ input, square_weight }, input));
+    try std.testing.expect(!try NativeCompute.applyDenseProjectionInto(&cb, &descriptor, &.{ input, square_weight }, input));
+    try std.testing.expectEqualSlices(f32, &values, getData(input));
+    // A real Native header can retain both a dense value and original source.
+    // The ordinary kernel can choose the latter, so both must be attested.
+    const tall_input = try cb.fromFloat32Shape(&weights, &.{ 5, 4 });
+    defer cb.free(tall_input);
+    const tall_output = try cb.fromFloat32Shape(&@as([20]f32, @splat(73)), &.{ 5, 4 });
+    defer cb.free(tall_output);
+    var tall_descriptor = descriptor;
+    tall_descriptor.operation.linear.rows = 5;
+    tall_descriptor.input_shapes[0] = Shape.init(.f32, &.{ 5, 4 });
+    tall_descriptor.output_shape = Shape.init(.f32, &.{ 5, 4 });
+    var dual_source = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(getData(tall_output)[0..16]), .dtype = .f32, .shape = &.{ 4, 4 }, .name = "", .allocator = a, .owns_data = false, .owns_shape = false };
+    toBuf(square_weight).source_tensor = &dual_source;
+    const source_alias = NativeCompute.applyDenseProjectionInto(&cb, &tall_descriptor, &.{ tall_input, square_weight }, tall_output);
+    toBuf(square_weight).source_tensor = null;
+    try std.testing.expect(!try source_alias);
+    dual_source.data = std.mem.sliceAsBytes(&weights)[0..64];
+    dual_source.shape = &.{ 2, 8 }; // Same count, wrong original layout.
+    toBuf(square_weight).source_tensor = &dual_source;
+    const source_shape = NativeCompute.applyDenseProjectionInto(&cb, &tall_descriptor, &.{ tall_input, square_weight }, tall_output);
+    toBuf(square_weight).source_tensor = null;
+    try std.testing.expect(!try source_shape);
+    for (getData(tall_output)) |value| try std.testing.expectEqual(@as(f32, 73), value);
+}
+
+test "Native ordinary projection into cache-owned tensors preserves original F32 GEMM and rejects before writes" {
+    try nativeOrdinaryProjectionIntoCase(std.testing.allocator);
+}
+
+test "Native ordinary projection into cold cache unwinds all allocation failures" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, nativeOrdinaryProjectionIntoCase, .{});
+}
+
+fn nativeHeldSourceCase(a: std.mem.Allocator) !void {
+    const bits = [_]f32{ 1, 2, 3, 4 };
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty };
+    defer {
+        deinitPrefetchQueue(&store);
+        store.resident_weights.deinit(a);
+        store.lazy_weights.deinit(a);
+    }
+    const tensor = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(&bits), .shape = &.{ 2, 2 }, .dtype = .f32, .name = "resident", .allocator = a, .owns_data = false, .owns_shape = false };
+    try store.resident_weights.put(a, "resident", .{ .tensor = tensor, .source_version = 9 });
+    try store.lazy_weights.put(a, "lazy", .{ .tensor_ref = .{ .name = "lazy" }, .loaded = .{ .tensor = tensor }, .loaded_bytes = 16, .active_tier = .host });
+    initPrefetchQueue(&store, a);
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const resident = try cb.getWeight("resident");
+    defer cb.free(resident);
+    const lazy = try cb.getWeight("lazy");
+    defer cb.free(lazy);
+    const witnesses = [_]CT{ resident, lazy };
+    try std.testing.expect(toBuf(resident).weight_handle.?.source_stamp.kind == .missing);
+    try std.testing.expectError(error.NativeWeightPreparationChanged, NativeCompute.validateHeldF32WeightSources(&cb, &store, &witnesses));
+    const ordinary = try cb.fromFloat32Shape(&bits, &.{ 2, 2 });
+    defer cb.free(ordinary);
+    try std.testing.expectError(error.NativeWeightPreparationChanged, NativeCompute.stampHeldF32WeightSources(&cb, &store, &.{ resident, ordinary }));
+    try std.testing.expect(toBuf(resident).weight_handle.?.source_stamp.kind == .missing); // Atomic stamp publication.
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    compute.allocator = failing.allocator();
+    const stamped = NativeCompute.stampHeldF32WeightSources(&cb, &store, &witnesses);
+    const received = NativeCompute.validateHeldF32WeightSources(&cb, &store, &witnesses);
+    compute.allocator = a;
+    try stamped;
+    try received;
+    try std.testing.expect(toBuf(resident).weight_handle.?.source_stamp.kind == .resident);
+    try std.testing.expect(toBuf(lazy).weight_handle.?.source_stamp.kind == .immutable_lazy);
+    store.resident_weights.getPtr("resident").?.source_version += 1;
+    try std.testing.expectError(error.NativeWeightPreparationChanged, NativeCompute.validateHeldF32WeightSources(&cb, &store, &witnesses));
+    store.resident_weights.getPtr("resident").?.source_version -= 1;
+    const lazy_entry = store.lazy_weights.getPtr("lazy").?;
+    const pins = lazy_entry.pin_count;
+    lazy_entry.pin_count = 0;
+    const unpinned = NativeCompute.validateHeldF32WeightSources(&cb, &store, &witnesses);
+    lazy_entry.pin_count = pins;
+    try std.testing.expectError(error.NativeWeightPreparationChanged, unpinned);
+    try NativeCompute.validateHeldF32WeightSources(&cb, &store, &witnesses);
+    try std.testing.expectError(error.ForeignNativeWeightModel, NativeCompute.validateHeldF32WeightSources(&cb, @ptrFromInt(16), &witnesses));
+    var copied_table = vtable_impl;
+    std.mem.doNotOptimizeAway(&copied_table);
+    try std.testing.expect(@intFromPtr(&copied_table) != @intFromPtr(&vtable_impl));
+    const foreign = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied_table };
+    try std.testing.expectError(error.UnsupportedNativeWeightPreparation, NativeCompute.validateHeldF32WeightSources(&foreign, &store, &witnesses));
+    try std.testing.expectEqualSlices(f32, &bits, getData(resident));
+    try std.testing.expectEqualSlices(f32, &bits, getData(lazy));
+}
+
+test "Native held F32 source stamps revalidate actual resident and pinned lazy owners before reception" {
+    try nativeHeldSourceCase(std.testing.allocator);
+}
+
+test "Native held F32 source witnesses unwind every cold allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, nativeHeldSourceCase, .{});
 }

@@ -172,6 +172,7 @@ test {
     _ = execution.prepared_invocation;
     _ = execution.decoder_pending_step;
     _ = execution.decoder_prefill;
+    _ = @import("execution/cold_metadata.zig");
     _ = execution.cached_decoder;
     _ = execution.decoder_stage;
     _ = execution.speculative_activation;

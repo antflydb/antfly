@@ -33,7 +33,7 @@ pub fn supportsAssignedDescriptor(descriptor: *const ops.kernel_descriptor.Descr
     if (descriptor.output_shape.dtype != .f32) return false;
     if (descriptor.output_shape.rank() == 0) return false;
     switch (descriptor.operation) {
-        .paged_attention => return false,
+        .paged_attention, .dense_attention_prefix => return false,
         .linear => |linear| {
             if (linear.rows == 0 or linear.in_dim == 0 or linear.out_dim == 0 or
                 descriptor.output_shape.rank() != 2 or descriptor.input_shapes[0].rank() != 2 or descriptor.input_shapes[1].rank() != 2 or
@@ -12723,6 +12723,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     }
 
     fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
+        if (request.descriptor.operation == .dense_attention_prefix) return false;
         if (request.descriptor.output_shape.dtype != .f32) return false;
         const self: *MetalCompute = @ptrCast(@alignCast(ctx));
         if (self.audio_capture != null or !self.provider_impl.hasDecoderRuntime()) return false;
@@ -12777,7 +12778,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // the general CT adapters; the command/frame layer retains GPU resources.
         const input = toBuf(request.inputs[0]).metal_tensor.?;
         const written: bool = switch (descriptor.operation) {
-            .paged_attention => return false,
+            .paged_attention, .dense_attention_prefix => return false,
             .unary => |unary| switch (unary) {
                 inline .gelu, .gelu_exact, .relu, .silu => |activation| (try metal_runtime.decoderRuntimeApplyActivationDeviceInto(self.provider_impl, input, @backingInt(@field(ops.DecoderRuntimeActivationKind, @tagName(activation))), 1, descriptor.elements(), out_tensor)) != null,
                 inline else => |tag| (try metal_runtime.decoderRuntimeApplyPrimitiveUnaryInto(self.provider_impl, input, primitiveUnaryActivationKind(@field(HostUnaryOp, @tagName(tag))), out_tensor)) != null,

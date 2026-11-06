@@ -132,6 +132,23 @@ association are part of the numerical contract. Similar operation names do not
 make different contracts interchangeable. Keep a native schedule when sharing
 would alter its performance or arithmetic.
 
+Dense CPU decoder adapters can author a request-owned schedule through
+`execution/dense_decoder_schedule.zig`. The graph describes physical liveness;
+the adapter still calls its original eager operations in their original order.
+Reuse the existing Native projection and prefix-attention implementations rather
+than adding a second numerical forward. Prefix attention carries its actual
+live row count and mask separately from the capacity-shaped KV banks.
+
+Prepare metadata, retained weight sources and declared physical banks before
+taking the Model gate. Metadata has its own admitted owner; KV payload and
+physical workspace retain their original resource classes. Seal construction
+capabilities after materialization and use the actual execution epoch at a stable
+address. A reused Frame represents its real lifetime, not a completed invocation
+on every token. Unknown allocator contracts, unsupported precision and tuned
+schedules retain the original compatibility route. Validate source stamps again
+under the gate before starting numerical work, and release quota callbacks only
+after leaving that gate.
+
 ## Qualification and accounting
 
 Freeze the original programs before replacement. Compare original bits and

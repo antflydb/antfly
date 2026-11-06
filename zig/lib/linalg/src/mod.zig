@@ -564,6 +564,7 @@ pub const SegmentTrainingAttentionForward = attention.SegmentTrainingAttentionFo
 pub const SegmentTrainingAttentionGradient = attention.SegmentTrainingAttentionGradient;
 pub const segmentAttentionDropoutKeep = attention.segmentAttentionDropoutKeep;
 pub const crossAttentionHost = attention.crossAttentionHost;
+pub const crossAttentionHostInto = attention.crossAttentionHostInto;
 pub const debertaDisentangledAttentionHost = attention.debertaDisentangledAttentionHost;
 pub const WindowPack = layout.WindowPack;
 pub const padTokensToWindows = layout.padTokensToWindows;

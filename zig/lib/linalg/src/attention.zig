@@ -1594,13 +1594,32 @@ pub fn crossAttentionHost(
     head_dim: usize,
 ) ![]f32 {
     const H = std.math.mul(usize, num_heads, head_dim) catch return error.InvalidAttentionShape;
-    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
-
     const output = try allocator.alloc(f32, std.math.mul(usize, batch * dec_seq, H) catch return error.InvalidAttentionShape);
-    @memset(output, 0.0);
-
+    errdefer allocator.free(output);
     const scores = try allocator.alloc(f32, dec_seq * enc_seq);
     defer allocator.free(scores);
+    crossAttentionHostInto(Q, K, V, enc_mask, batch, dec_seq, enc_seq, num_heads, head_dim, output, scores);
+    return output;
+}
+
+/// Same synchronous arithmetic as crossAttentionHost. The caller validates and
+/// owns exact live input spans, output and one reusable query-by-key score span.
+pub fn crossAttentionHostInto(
+    Q: []const f32,
+    K: []const f32,
+    V: []const f32,
+    enc_mask: []const i64,
+    batch: usize,
+    dec_seq: usize,
+    enc_seq: usize,
+    num_heads: usize,
+    head_dim: usize,
+    output: []f32,
+    scores: []f32,
+) void {
+    const H = num_heads * head_dim;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    @memset(output, 0.0);
 
     for (0..batch) |b| {
         for (0..num_heads) |h| {
@@ -1629,8 +1648,6 @@ pub fn crossAttentionHost(
             }
         }
     }
-
-    return output;
 }
 
 // Per-(batch, head) work unit for the disentangled attention.  A single job

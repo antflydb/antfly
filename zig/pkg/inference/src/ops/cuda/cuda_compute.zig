@@ -36294,7 +36294,7 @@ fn physicalReplayTensorSupportedOp(ctx: *anyopaque, value: CT) bool {
 fn physicalReplayKernelSupportedOp(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
     const compute: *CudaCompute = @ptrCast(@alignCast(ctx));
     return switch (descriptor.operation) {
-        .paged_attention => false,
+        .paged_attention, .dense_attention_prefix => false,
         .dot => descriptor.input_shapes[0].rank() != 2 or compute.training_blas == null,
         // Strict-F32 cuBLASLt linear dispatch uses the bounded warmed plan
         // cache and an explicit zero-workspace invocation. Bias is the same
@@ -36452,7 +36452,7 @@ fn assignedProjectionWeightSupported(weight: *const CudaTensor, bias: bool) bool
 }
 
 fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocation) anyerror!bool {
-    if (request.descriptor.operation == .paged_attention) return false;
+    if (request.descriptor.operation == .paged_attention or request.descriptor.operation == .dense_attention_prefix) return false;
     if (request.descriptor.output_shape.dtype != .f32) return false;
     const self: *CudaCompute = @ptrCast(@alignCast(ctx));
     if (request.prepared_route) |selected| {
@@ -36521,7 +36521,7 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
     for (request.auxiliaries) |auxiliary| try retainPhysicalCaptureTensor(self, auxiliary.tensor);
     const a = tensorFromCt(request.inputs[0]);
     switch (descriptor.operation) {
-        .paged_attention => return false,
+        .paged_attention, .dense_attention_prefix => return false,
         .transpose, .broadcast => |layout| {
             const input_dims = ops.kernel_descriptor.nativeDimensions(u32, descriptor.input_shapes[0]);
             if (descriptor.operation == .transpose) {

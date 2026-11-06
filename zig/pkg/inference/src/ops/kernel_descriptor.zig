@@ -165,7 +165,28 @@ pub const PagedAttention = struct {
     }
 };
 
-pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, linear: Linear, norm: Norm, softmax: Softmax, rope: Rope, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather, paged_attention: PagedAttention };
+/// Authored single-query dense attention over an exact live prefix of cold
+/// capacity planes. Generic graph lowering never invents this operation.
+pub const DenseAttentionPrefix = struct {
+    num_heads: u32,
+    head_dim: u32,
+    max_key_rows: u32,
+
+    pub fn valid(self: @This(), descriptor: *const Descriptor) bool {
+        if (self.num_heads == 0 or self.head_dim == 0 or self.max_key_rows == 0 or descriptor.input_count != 3) return false;
+        const width = std.math.mul(i64, self.num_heads, self.head_dim) catch return false;
+        if (descriptor.output_shape.dtype != .f32 or descriptor.output_shape.rank() != 2 or descriptor.output_shape.dims[0] != 1 or descriptor.output_shape.dims[1] != width) return false;
+        for (descriptor.input_shapes[0..3], 0..) |shape, index| {
+            if (shape.numElements() == null or shape.dtype != .f32 or shape.rank() != 2 or shape.dims[0] != (if (index == 0) @as(i64, 1) else @as(i64, self.max_key_rows)) or shape.dims[1] != width) return false;
+            const count = std.math.cast(usize, shape.numElements().?) orelse return false;
+            _ = std.math.mul(usize, count, @sizeOf(f32)) catch return false;
+        }
+        _ = std.math.mul(usize, self.max_key_rows, @sizeOf(f32)) catch return false;
+        return true;
+    }
+};
+
+pub const Operation = union(enum) { transpose: Layout, broadcast: Layout, unary: Unary, binary: Binary, linear: Linear, norm: Norm, softmax: Softmax, rope: Rope, reduction: Reduction, dot: Dot, concat: kernel_geometry.ConcatAxis, slice: Slice, gather: Gather, paged_attention: PagedAttention, dense_attention_prefix: DenseAttentionPrefix };
 
 /// Value-only semantics for original independent, fused-pair, and grouped QKV
 /// projection heads. It never owns a CT, prepared slot, or execution policy.
@@ -505,7 +526,7 @@ pub fn lower(graph: *const ml.graph.Graph, id: ml.graph.NodeId) ?Descriptor {
         else => .{ .unary = unary(node.op) orelse return null },
     };
     const inputs: u8 = switch (operation) {
-        .paged_attention => 3,
+        .paged_attention, .dense_attention_prefix => 3,
         .unary => 1,
         .binary, .dot, .concat, .gather => 2,
         .softmax, .rope, .reduction, .transpose, .broadcast, .slice => 1,
@@ -681,4 +702,15 @@ test "semantic projection heads retain optimizer pair and grouped QKV source out
             try std.testing.expect(projectionHead(&optimized.graph) == null);
         }
     }
+}
+
+test "dense prefix cold legality rejects F32 byte extents overflowing address space" {
+    const width: i64 = @as(i64, 1) << 62;
+    const descriptor = Descriptor{
+        .operation = .{ .dense_attention_prefix = .{ .num_heads = @as(u32, 1) << 31, .head_dim = @as(u32, 1) << 31, .max_key_rows = 1 } },
+        .input_count = 3,
+        .input_shapes = .{ ml.graph.Shape.init(.f32, &.{ 1, width }), ml.graph.Shape.init(.f32, &.{ 1, width }), ml.graph.Shape.init(.f32, &.{ 1, width }) },
+        .output_shape = ml.graph.Shape.init(.f32, &.{ 1, width }),
+    };
+    try std.testing.expect(!descriptor.operation.dense_attention_prefix.valid(&descriptor));
 }

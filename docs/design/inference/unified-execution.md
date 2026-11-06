@@ -267,6 +267,19 @@ preparation API do not by themselves complete these remaining requirements:
   preserve their original launches and retirement owners. These ordinary
   optimizations grant no complete-Frame or capture credit; learned private
   decoder/audio temporary arenas retain compatibility ownership.
+  Eligible Native F32 incremental audio decoders instead prepare one authored
+  single-token schedule through the common physical pool. The architecture
+  supplies operation order and state bindings; its existing numerical forward
+  consumes the prepared views. Cross K/V projections write directly into the
+  original KV slabs, and self attention receives actual live prefixes without
+  allocating slice headers. The initial causal prompt retains eager execution.
+  Cold metadata has independently admitted storage, physical banks have exact
+  additional declarations, and the old request envelope remains intact. Source
+  stamps revalidate under the Model gate; construction capabilities are consumed
+  before the cache owns its stable execution epoch. Teardown releases callbacks
+  after leaving execution. Unknown allocator contracts, reduced formats and
+  unsupported schedules retain compatibility; this migration does not certify
+  every decoder or imply performance acceptance.
 - Native decoder templates retain only backend-free placement, buffer layout and
   output-policy facts. Graph runtime and decoder preparation use the same layout
   builder; each decoder program creates fresh physical pools and revalidates the

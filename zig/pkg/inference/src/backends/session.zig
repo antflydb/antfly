@@ -2688,6 +2688,40 @@ pub const Session = struct {
     pub fn admitDeclaredStorageWithPressure(self: Session, request: RunRequest, requirements: []const @import("../execution/prepared_storage_admission.zig").Requirement, pressure: *?memory.AdmissionPressure) !RunPermit {
         return self.admitDeclaredStorageWithHeldHostOutputWithPressure(request, requirements, null, pressure);
     }
+    fn declaredPhysicalAmounts(requirements: []const @import("../execution/prepared_storage_admission.zig").Requirement) !memory.AdmissionAmounts {
+        var physical = memory.AdmissionAmounts{};
+        for (requirements) |item| {
+            if (item.bytes == 0) return error.InvalidPhysicalStorageReservation;
+            if (item.backend == .native or item.class == .host_workspace)
+                physical.host_scratch_bytes = try addBytes(physical.host_scratch_bytes, item.bytes)
+            else
+                physical.backend_scratch_bytes = try addBytes(physical.backend_scratch_bytes, item.bytes);
+        }
+        return physical;
+    }
+
+    /// A pure additional bank beside the actual original request and optional
+    /// preprocessing/cache owner. Preserve every original class and acquire
+    /// exactly the declared deficit; no profile/estimate floor is replaced.
+    pub fn admitAdditionalDeclaredStorageWithPressure(self: Session, base: *const RunPermit, other: ?*const RunPermit, requirements: []const @import("../execution/prepared_storage_admission.zig").Requirement, pressure: *?memory.AdmissionPressure) !RunPermit {
+        pressure.* = null;
+        const policy = self.run_admission orelse return error.MissingRunAdmission;
+        if (base.request == null or base.invocation_started) return error.InvalidDeclaredStorageCredit;
+        const physical = try declaredPhysicalAmounts(requirements);
+        var target = (base.lease orelse return error.MissingRunAdmission).amounts;
+        if (other) |peer| if (peer.lease) |lease| {
+            target = try target.merge(lease.amounts);
+        };
+        target = try target.merge(physical);
+        if (!std.meta.eql(try self.supplementPairDeficit(base, other, target), physical)) return error.InvalidDeclaredStorageCredit;
+        try policy.validateOwnedRunAmounts(target);
+        var permit = try self.admitSupplementPairWithPressure(base, other, target, pressure);
+        permit.request = .{};
+        permit.physical_credit = physical;
+        permit.declared_storage_floor = .{};
+        return permit;
+    }
+
     pub fn admitDeclaredStorageWithHeldHostOutputWithPressure(self: Session, request: RunRequest, requirements: []const @import("../execution/prepared_storage_admission.zig").Requirement, held: ?HostOutputProducer.HeldAdmission, pressure: *?memory.AdmissionPressure) !RunPermit {
         pressure.* = null;
         const admission = self.run_admission orelse return error.MissingRunAdmission;
@@ -2697,14 +2731,7 @@ pub const Session = struct {
         if (request.workspace_planned or request.retained_backend_workspace_bytes != 0)
             return error.UnsupportedDeclaredStorageCredit;
         const original = try admission.planRequest(request, self.outputInfo());
-        var physical = memory.AdmissionAmounts{};
-        for (requirements) |item| {
-            if (item.bytes == 0) return error.InvalidPhysicalStorageReservation;
-            if (item.backend == .native or item.class == .host_workspace)
-                physical.host_scratch_bytes = try addBytes(physical.host_scratch_bytes, item.bytes)
-            else
-                physical.backend_scratch_bytes = try addBytes(physical.backend_scratch_bytes, item.bytes);
-        }
+        const physical = try declaredPhysicalAmounts(requirements);
         const required = try original.required.merge(physical);
         if (held) |bank| try bank.validateAdditional(self, required);
         return self.retainPermit(.{
@@ -3686,29 +3713,16 @@ pub const PreparedSource = struct {
             self.phase = .ready;
             return true;
         }
-        const extra = memory.AdmissionAmounts{ .host_scratch_bytes = geometry.bytes };
-        var target = try held.amounts.merge(extra);
-        if (preprocessing) |other| {
-            if (other.lease) |lease| target = try target.merge(lease.amounts);
-        }
-        // Existing pair policy proves independent same-controller tokens. Its
-        // deficit must equal EXACTLY this bank; no other owned class is lent.
-        if (!std.meta.eql(try source.supplementPairDeficit(original, preprocessing, target), extra)) return error.InvalidDeclaredStorageCredit;
-        self.native_matrix_supplement = supplement: {
-            policy.validateOwnedRunAmounts(target) catch break :supplement null;
-            break :supplement source.admitSupplementPair(original, preprocessing, target) catch |err| switch (err) {
-                error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => null,
-                else => return err,
-            };
+        const requirement = @import("../execution/prepared_storage_admission.zig").Requirement{ .backend = .native, .class = .host_workspace, .bytes = geometry.bytes };
+        var pressure: ?memory.AdmissionPressure = null;
+        self.native_matrix_supplement = source.admitAdditionalDeclaredStorageWithPressure(original, preprocessing, &.{requirement}, &pressure) catch |err| switch (err) {
+            error.ResourceLimitExceeded, error.ResourceTemporarilyUnavailable => null,
+            else => return err,
         };
         if (self.native_matrix_supplement) |*permit| {
-            permit.request = request;
-            permit.physical_credit = extra;
-            permit.declared_storage_floor = .{};
-            const requirement = @import("../execution/prepared_storage_admission.zig").Requirement{ .backend = .native, .class = .host_workspace, .bytes = geometry.bytes };
             try permit.prepareDeclaredPhysicalStorageBeforeExecution(&.{requirement});
             try permit.bindPhysicalCleanupEpoch(self.epoch() orelse return error.MissingCurrentCleanupEpoch);
-            const cap = permit.storageCapability() orelse return error.UnpreparedPhysicalStorageReservation;
+            const cap = (try permit.declaredProgramStorageCapability(self.epoch() orelse return error.MissingCurrentCleanupEpoch)) orelse return error.UnpreparedPhysicalStorageReservation;
             const bank = try cap.reserveBacking(allocator, .native, .host_workspace, geometry.bytes) orelse return error.UnpreparedPhysicalStorageReservation;
             errdefer bank.owner.release(bank.construction_epoch);
             const values = try allocator.alloc(f32, geometry.bytes / @sizeOf(f32));
@@ -4983,6 +4997,18 @@ pub const RunPermit = struct {
             .credit = &self.physical_credit,
             .lifetime = lifetime,
         }, kind, class, bytes);
+    }
+
+    /// Borrow the already prepared declarations for one cold authored program.
+    /// The permit stays at its final address until construction returns; the
+    /// program owns transferred banks, never this capability or its Source B.
+    pub fn declaredProgramStorageCapability(self: *RunPermit, expected: *const @import("../execution/retirement_sink.zig").Epoch) !?storage_admission.Capability {
+        if (self.declared_storage_floor == null or !self.physical_prepared or self.request == null or self.prepared != null or self.invocation_started or self.execution_yielded)
+            return error.UnpreparedPhysicalStorageReservation;
+        const current = if (self.dispatch_cleanup_epoch) |*value| value else return error.MissingCurrentCleanupEpoch;
+        if (current.record != expected.record or current.nonce != expected.nonce) return error.BackendOperationCleanupChanged;
+        if (try current.isSealed()) return error.RetirementEpochSealed;
+        return self.storageCapability();
     }
 
     fn storageCapability(self: *RunPermit) ?storage_admission.Capability {
@@ -9578,6 +9604,34 @@ test "later original Source exact held task bank is intrinsic demand not peer co
     try std.testing.expectEqualDeep(held.amounts, domain.controller.snapshot());
 }
 
+test "additional declared storage preserves both actual request floors and denies their full intrinsic peak" {
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    var probe = AdmissionProbeSession{ .controller = &controller };
+    const limits = memory.Limits{ .host_limit_bytes = 128 };
+    const session = Session{ .ptr = &probe, .vtable = &AdmissionProbeSession.vtable, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = limits, .check_live_memory = false } };
+    var base = RunPermit{ .session = session, .request = .{}, .lease = try controller.tryAcquire(.cpu, limits, .{ .host_weight_bytes = 16, .host_scratch_bytes = 16 }, false) };
+    defer base.deinit();
+    var cache = RunPermit{ .session = session, .lease = try controller.tryAcquire(.cpu, limits, .{ .host_kv_bytes = 32 }, false) };
+    defer cache.deinit();
+    const base_amounts = base.lease.?.amounts;
+    const cache_amounts = cache.lease.?.amounts;
+    const Requirement = @import("../execution/prepared_storage_admission.zig").Requirement;
+    var pressure: ?memory.AdmissionPressure = null;
+    var bank = try session.admitAdditionalDeclaredStorageWithPressure(&base, &cache, &.{Requirement{ .backend = .native, .class = .host_workspace, .bytes = 32 }}, &pressure);
+    defer bank.deinit();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{ .host_scratch_bytes = 32 }, bank.lease.?.amounts);
+    try std.testing.expectEqualDeep(bank.lease.?.amounts, bank.physical_credit);
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, bank.declared_storage_floor.?);
+    try std.testing.expectEqualDeep(base_amounts, base.lease.?.amounts);
+    try std.testing.expectEqualDeep(cache_amounts, cache.lease.?.amounts);
+    const before = controller.snapshot();
+    try std.testing.expectError(error.ResourceLimitExceeded, session.admitAdditionalDeclaredStorageWithPressure(&base, &cache, &.{Requirement{ .backend = .native, .class = .host_workspace, .bytes = 65 }}, &pressure));
+    try std.testing.expectEqualDeep(before, controller.snapshot());
+    try std.testing.expectError(error.InvalidAdmissionLeaseReduction, session.admitAdditionalDeclaredStorageWithPressure(&base, &base, &.{Requirement{ .backend = .native, .class = .host_workspace, .bytes = 1 }}, &pressure));
+    try std.testing.expectEqualDeep(before, controller.snapshot());
+}
+
 test "empty declared physical capability borrows exact live B without a lease supplier or storage credit" {
     const a = std.testing.allocator;
     const Mock = struct {
@@ -9627,8 +9681,16 @@ test "empty declared physical capability borrows exact live B without a lease su
     var epoch = try guard.retainEpoch();
     defer epoch.release();
     defer permit.deinitWithCleanup(.{ .boundary = &epoch });
+    try std.testing.expectError(error.MissingCurrentCleanupEpoch, permit.declaredProgramStorageCapability(&epoch));
     try permit.bindPhysicalCleanupEpoch(&epoch);
-    const capability = permit.storageCapability().?;
+    const capability = (try permit.declaredProgramStorageCapability(&epoch)).?;
+    var foreign_owner = try @import("../execution/retirement_sink.zig").Ref.create();
+    defer foreign_owner.release();
+    var foreign_guard = try foreign_owner.enter();
+    defer foreign_guard.finish();
+    var foreign_epoch = try foreign_guard.retainEpoch();
+    defer foreign_epoch.release();
+    try std.testing.expectError(error.BackendOperationCleanupChanged, permit.declaredProgramStorageCapability(&foreign_epoch));
     try std.testing.expect(capability.identity.controller == &controller and capability.identity.backend_class == .cpu);
     const actual = capability.currentCleanupEpoch().?;
     try std.testing.expect(actual.record == epoch.record and actual.nonce == epoch.nonce);
@@ -9641,6 +9703,7 @@ test "empty declared physical capability borrows exact live B without a lease su
     try std.testing.expect(permit.storageCapability() == null);
     permit.declared_storage_floor = .{};
     guard.finish();
+    try std.testing.expectError(error.RetirementEpochSealed, permit.declaredProgramStorageCapability(&epoch));
     try std.testing.expect(permit.storageCapability() == null); // sealed B is no authority
     try std.testing.expectEqual(@as(usize, 0), probe.calls);
     try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, controller.snapshot());

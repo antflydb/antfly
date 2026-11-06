@@ -37,6 +37,9 @@ pub const AdmittedAllocator = struct {
     admission_error: ?anyerror = null,
     blocks: ?*Header = null,
     reservations: ?*Reservation = null,
+    /// One real serving-resource owner, shared by every chunk and adopted run
+    /// lease. It outlives all external reservation callbacks, even Model close.
+    resource_pin: ?sessions.Session.ModelLifetime.ResourcePin = null,
 
     const quantum = 64 * 1024;
     const Header = struct { prev: ?*Header, next: ?*Header, bytes: usize, alignment: std.mem.Alignment };
@@ -86,9 +89,24 @@ pub const AdmittedAllocator = struct {
         return std.mem.alignForward(usize, @sizeOf(Header), alignment.toByteUnits());
     }
 
+    fn validateResourceOwner(self: *const @This(), session: sessions.Session) !void {
+        const held = self.resource_pin orelse return;
+        const lifetime = session.model_lifetime orelse return error.ForeignAdmissionResourceOwner;
+        const current = lifetime.resource_pin orelse return error.ForeignAdmissionResourceOwner;
+        if (!std.meta.eql(held, current)) return error.ForeignAdmissionResourceOwner;
+    }
+
+    fn retainRunResources(self: *@This(), permit: *const sessions.RunPermit) !void {
+        const pin = permit.resource_pin orelse return;
+        if (self.resource_pin) |held| {
+            if (!std.meta.eql(held, pin)) return error.ForeignAdmissionResourceOwner;
+        } else self.resource_pin = pin.retain() orelse return error.ForeignAdmissionResourceOwner;
+    }
+
     fn reserve(self: *@This(), amount: usize) !?memory.AdmissionLease {
         if (self.admit) |callback| return try callback(self.admission_context.?, amount);
         const session = self.session orelse return error.ResourceLimitExceeded;
+        try self.validateResourceOwner(session);
         // Separate chunk leases still belong to one request. Its own retained
         // bytes cannot turn an intrinsically oversized request into contention.
         if (session.run_admission) |admission| {
@@ -96,7 +114,21 @@ pub const AdmittedAllocator = struct {
             const total = std.math.add(usize, owned, amount) catch return error.ResourceLimitExceeded;
             try admission.validateOwnedHostScratch(total);
         }
-        return (try session.admitHostPreprocess(amount)).lease;
+        var permit = try session.admitHostPreprocess(amount);
+        errdefer permit.deinit();
+        if (permit.resource_pin) |pin| {
+            if (self.resource_pin) |held| {
+                if (!std.meta.eql(held, pin)) return error.ForeignAdmissionResourceOwner;
+                permit.resource_pin = null;
+                pin.release(); // Duplicate chunk retain; the AA owns one pin.
+            } else {
+                self.resource_pin = pin;
+                permit.resource_pin = null;
+            }
+        }
+        const lease = permit.lease;
+        permit.lease = null;
+        return lease;
     }
 
     /// Execution borrows this permit's workspace. On exit, adopt its lease
@@ -273,6 +305,7 @@ pub const AdmittedAllocator = struct {
     }
     fn admitRunWithTaskHostOutputUnpublished(self: *@This(), request: sessions.RunRequest, task_output: ?sessions.RunPermit.HostOutputGeometry) !RunScope {
         const session = self.session orelse return error.InvalidAdmissionLeaseReduction;
+        try self.validateResourceOwner(session);
         const admission = session.run_admission orelse {
             if (task_output != null) return error.UnmanagedHostOutput;
             return .{ .permit = try session.admit(request) };
@@ -296,6 +329,7 @@ pub const AdmittedAllocator = struct {
         if (task_output) |output| try output.validateHeld(session, owned);
         var permit = try admitTaskRequest(session, request, task_output);
         errdefer permit.deinit();
+        try self.retainRunResources(&permit);
         // The execution lease covers this node too. Allocate it now so cleanup
         // can transfer retained outputs without allocation or reacquisition.
         const node = try self.backing.create(Reservation);
@@ -385,6 +419,9 @@ pub const AdmittedAllocator = struct {
         self.live_bytes = 0;
         self.reserved_bytes = 0;
         self.metadata_bytes = 0;
+        const pin = self.resource_pin;
+        self.resource_pin = null;
+        if (pin) |held| held.release();
     }
 
     fn alloc(raw: *anyopaque, len: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
@@ -878,4 +915,118 @@ test "GPU Source class retirement separates exact host-only custody with zero sp
     // Actual cold cancellation/error can retain tokenizer/input CPU payloads
     // without ever acquiring numerical Model/lane. Class custody is identical.
     try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, gpuHostRetirementZeroSpareCase, .{false});
+}
+
+fn admittedResourceLifetimeCase(a: std.mem.Allocator, prepaid: bool) !void {
+    const Probe = struct {
+        controller: *memory.AdmissionController,
+        refs: usize = 1,
+        model_closed: bool = false,
+        final_releases: usize = 0,
+        callbacks: usize = 0,
+        violation: bool = false,
+        fn pinRetain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.refs == 0) self.violation = true;
+            self.refs += 1;
+        }
+        fn pinRelease(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.refs == 0) @panic("double resource release");
+            self.refs -= 1;
+            if (self.refs == 0) {
+                self.final_releases += 1;
+                if (!self.model_closed or self.controller.snapshot().hostTotalBytes() != 0) self.violation = true;
+            }
+        }
+        fn close(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.model_closed = true;
+        }
+        fn outputs(_: *anyopaque) []const @import("tensor.zig").TensorInfo {
+            return &.{};
+        }
+        fn observe(self: *@This()) void {
+            self.callbacks += 1;
+            if (self.refs == 0) self.violation = true;
+        }
+        fn reserve(raw: *anyopaque, _: memory.AdmissionAmounts) memory.AdmissionResourceError!usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+            return 1;
+        }
+        fn resizeLease(raw: *anyopaque, _: usize, _: memory.AdmissionAmounts) memory.AdmissionResourceError!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+        fn releaseLease(raw: *anyopaque, _: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.observe();
+        }
+    };
+    var controller: memory.AdmissionController = .{};
+    defer controller.deinit();
+    var probe = Probe{ .controller = &controller };
+    try controller.configureResourceBudget(.{ .context = &probe, .try_reserve = Probe.reserve, .retain = Probe.resizeLease, .release = Probe.releaseLease });
+    defer controller.configureResourceBudget(null) catch @panic("resource lifetime quota still live");
+    defer if (probe.refs != 0 or probe.final_releases != 1 or probe.violation) @panic("resource lifetime or failure cleanup violated");
+    var lifetime = sessions.Session.ModelLifetime{ .owner = &probe, .destroy_fn = Probe.close, .resource_pin = .{ .ptr = &probe, .retain_fn = Probe.pinRetain, .release_fn = Probe.pinRelease } };
+    var table: sessions.Session.VTable = undefined;
+    table.outputInfo = Probe.outputs;
+    const session = sessions.Session{ .ptr = &probe, .vtable = &table, .model_lifetime = &lifetime, .run_admission = .{ .controller = &controller, .backend_class = .cpu, .limits = .{ .host_limit_bytes = 1024 * 1024 }, .static_workspace_bytes = 0, .check_live_memory = false } };
+    var model_live = true;
+    defer if (model_live) session.close();
+    var owner = AdmittedAllocator{ .backing = a, .session = session };
+    var owner_live = true;
+    defer if (owner_live) owner.deinit();
+    var allocations: [2]?[]u8 = @splat(null);
+    defer for (allocations) |allocation| if (allocation) |bytes| owner.allocator().free(bytes);
+    if (prepaid) {
+        var scope = try owner.admitRun(.{ .host_preprocess_bytes = 256 * 1024, .workspace_bytes = 0, .output_bytes = 0 });
+        defer scope.deinit();
+        allocations[0] = try owner.allocator().alloc(u8, 70000);
+        allocations[1] = try owner.allocator().alloc(u8, 70000);
+        try std.testing.expectEqual(@as(usize, 3), probe.refs); // Model, AA, live permit.
+    } else {
+        allocations[0] = try owner.allocator().alloc(u8, 70000);
+        allocations[1] = try owner.allocator().alloc(u8, 70000);
+    }
+    try std.testing.expectEqual(@as(usize, 2), probe.refs); // One AA pin across all chunks.
+    try std.testing.expect(controller.snapshot().hostTotalBytes() != 0);
+    // A live allocator cannot silently switch the resources behind its leases.
+    var foreign_probe = Probe{ .controller = &controller };
+    var foreign_lifetime = sessions.Session.ModelLifetime{ .owner = &foreign_probe, .destroy_fn = Probe.close, .resource_pin = .{ .ptr = &foreign_probe, .retain_fn = Probe.pinRetain, .release_fn = Probe.pinRelease } };
+    var foreign_session = session;
+    foreign_session.model_lifetime = &foreign_lifetime;
+    owner.session = foreign_session;
+    try std.testing.expectError(error.ForeignAdmissionResourceOwner, owner.ensureCapacity(owner.reserved_bytes + 1));
+    owner.session = session;
+    try std.testing.expectEqual(@as(usize, 1), foreign_probe.refs);
+    session.close();
+    model_live = false;
+    try std.testing.expect(probe.model_closed);
+    try std.testing.expectEqual(@as(usize, 1), probe.refs);
+    try std.testing.expectEqual(@as(usize, 0), probe.final_releases);
+    for (&allocations) |*allocation| {
+        owner.allocator().free(allocation.*.?);
+        allocation.* = null;
+    }
+    const before_release = probe.callbacks;
+    owner.deinit();
+    owner_live = false;
+    try std.testing.expect(probe.callbacks > before_release);
+    try std.testing.expectEqual(@as(usize, 0), probe.refs);
+    try std.testing.expectEqual(@as(usize, 1), probe.final_releases);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+    try std.testing.expect(!probe.violation);
+}
+
+test "admitted allocator keeps actual serving resources alive through chunk callbacks after model close" {
+    try admittedResourceLifetimeCase(std.testing.allocator, false);
+    try admittedResourceLifetimeCase(std.testing.allocator, true);
+}
+
+test "admitted allocator serving resource pins unwind every cold allocation failure" {
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, admittedResourceLifetimeCase, .{false});
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, admittedResourceLifetimeCase, .{true});
 }

@@ -961,7 +961,15 @@ pub const AttentionSinkMetadata = struct {
     }
 };
 
+/// Borrowed synchronous live rows and exact mask for an authored dense-prefix
+/// program. The supplying cache and Frame retain the actual K/V capacity CTs.
+pub const DenseAttentionPrefixBinding = struct {
+    live_key_rows: usize,
+    mask: []const i64,
+};
+
 pub const AttentionContext = struct {
+    dense_attention_prefix: ?DenseAttentionPrefixBinding = null,
     mode: AttentionMode = .dense_causal,
     total_sequence_len: usize,
     query_sequence_len: usize,
