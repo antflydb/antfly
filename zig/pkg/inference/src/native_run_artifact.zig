@@ -1298,7 +1298,7 @@ fn runPjrtHloArtifactFull(
     var client = try prepared.createClient(plugin_path);
     defer client.deinit();
 
-    var model_executor_ctx = try graph_mod.pjrt_artifact_executor.createModelExecutorFromArtifactBytes(
+    var model_executor_ctx = try graph_mod.pjrt_artifact_executor.createModelExecutorFromAdmittedArtifactBytes(
         allocator,
         io,
         artifact,
@@ -1306,6 +1306,7 @@ fn runPjrtHloArtifactFull(
         &entry.graph,
         &cb,
         &client,
+        &context.admissionContext(),
     );
     var model_executor = model_executor_ctx.modelExecutor();
     defer model_executor.deinit();
@@ -3234,6 +3235,23 @@ fn managedExecutorMetadataScenario(a: std.mem.Allocator, prefill: []const u8, pl
     try std.testing.expect(quota.live_bytes > large_name.len);
     try std.testing.expect(manager.currentAdmissionAmounts().hostTotalBytes() >= quota.live_bytes);
     try std.testing.expect(executor.metadata_budget.?.capacity == null);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, graph_mod.pjrt_artifact_executor.createModelExecutorFromAdmittedArtifactBytes(quota.allocator(), std.testing.io, parsed.value, "fixture paged prefill", graph, backend, &executor.artifact_owner.?.client, &context));
+    for (parsed.value.pjrt_output_bindings) |*binding| {
+        if (std.mem.eql(u8, binding.kind, compiled_artifact.pjrt_binding_present_key)) binding.name = "explicit.present.key";
+    }
+    {
+        const explicit = try graph_mod.pjrt_artifact_executor.createModelExecutorFromAdmittedArtifactBytes(quota.allocator(), std.testing.io, parsed.value, "fixture paged prefill", graph, backend, &executor.artifact_owner.?.client, &context);
+        var explicit_owner = explicit.modelExecutor();
+        defer explicit_owner.deinit();
+        var no_allocations = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        var explicit_run = try explicit_owner.createRuntime(no_allocations.allocator());
+        defer explicit_run.deinit();
+        try std.testing.expect(!no_allocations.has_induced_failure);
+        const ids: [16]i64 = @splat(1);
+        var output = try explicit_run.prefill(quota.allocator(), .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill });
+        defer output.deinit(quota.allocator());
+        try std.testing.expectEqualSlices(f32, &.{ 0, 1 }, try output.hostLogits(quota.allocator()));
+    }
     manager.deinit();
     manager_live = false;
     var run = try owned.createRuntime(quota.allocator());

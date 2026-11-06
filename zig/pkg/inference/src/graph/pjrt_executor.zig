@@ -853,7 +853,7 @@ pub const PjrtModelExecutor = struct {
         var execution_lease = if (self.artifact_owner) |owner| try owner.acquireRuntime() else null;
         errdefer if (execution_lease) |*lease| lease.release();
         var selected: ?*RuntimeSlot = null;
-        if (self.artifact_owner != null) {
+        if (self.artifact_owner != null or self.metadata_budget != null) {
             for (self.runtime_slots) |*slot| {
                 if (slot.busy.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
                     selected = slot;
@@ -876,7 +876,7 @@ pub const PjrtModelExecutor = struct {
             .semantic_output_bindings = self.semantic_output_bindings,
             .decode_variants = self.decode_variants,
         };
-        if (self.artifact_owner != null) {
+        if (self.artifact_owner != null or self.metadata_budget != null) {
             _ = self.references.fetchAdd(1, .monotonic);
             runtime_ctx.artifact_executor_owner = self;
         }
@@ -885,7 +885,7 @@ pub const PjrtModelExecutor = struct {
 
     pub fn deinit(ctx: *anyopaque) void {
         const self: *PjrtModelExecutor = @ptrCast(@alignCast(ctx));
-        if (self.artifact_owner != null and self.references.fetchSub(1, .acq_rel) != 1) return;
+        if ((self.artifact_owner != null or self.metadata_budget != null) and self.references.fetchSub(1, .acq_rel) != 1) return;
         const allocator = self.allocator;
         if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelExecutor deinit begin", .{});
         self.executor.partitionExecutor().deinitExecutor();

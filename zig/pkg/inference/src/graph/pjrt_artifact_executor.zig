@@ -162,6 +162,20 @@ pub fn createModelExecutorFromPackageManifestPath(
     );
 }
 
+/// The explicit runner owns the already admitted client and verified bytes.
+/// Metadata and runtime slots use the same bounded ownership as managed loads.
+pub fn createModelExecutorFromAdmittedArtifactBytes(allocator: std.mem.Allocator, io: std.Io, artifact: compiled_artifact.Manifest, bytes: []const u8, graph: *const ml.graph.Graph, host_backend: *const ops.ComputeBackend, client: *pjrt_lib.pjrt.Client, policy: *const admission_mod.Context) !*pjrt_executor.PjrtModelExecutor {
+    const metadata = try @import("pjrt_metadata.zig").Budget.create(allocator, policy);
+    errdefer metadata.destroy();
+    const executor = createModelExecutorFromArtifactBytes(metadata.allocator(), io, artifact, bytes, graph, host_backend, client) catch |err| return metadata.translate(err);
+    errdefer pjrt_executor.PjrtModelExecutor.deinit(executor);
+    executor.retained_capacity = retainedCapacity(metadata.allocator(), executor.semantic_output_bindings, executor.decode_variants) catch |err| return metadata.translate(err);
+    executor.prepareRuntimeSlots(1) catch |err| return metadata.translate(err);
+    executor.metadata_budget = metadata;
+    metadata.finishConstruction();
+    return executor;
+}
+
 pub fn createAdmittedModelExecutorFromPackageManifestPath(
     allocator: std.mem.Allocator,
     io: std.Io,
