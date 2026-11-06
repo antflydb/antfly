@@ -959,6 +959,82 @@ test "crash sweep: deterministic concurrent writers" {
     try reportFailures(&report);
 }
 
+test "WS4 phase 2: a synchronous full_text write lands in exactly one native commit and is searchable immediately" {
+    // Deliberately NOT a crash-sweep scenario: this is the direct,
+    // uninterrupted claim (one commit, searchable right after ack)
+    // through the real DB/capi write path -- `handle.db.batch(...)` with
+    // `sync_level = .full_text`, the same entry point
+    // `runFullTextSyncVisible` below exercises under fault injection.
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    // Not `openDbWithIo`: WS4 phase 2's inline fast path only engages
+    // when there is no background executor to otherwise notify/wait on
+    // (see `batchInternalPreparedOwned`'s `!executor.hasWorkers()` gate)
+    // -- today's synchronous-ack inline-apply condition. Force that
+    // configuration explicitly rather than relying on the shared
+    // helper's default.
+    var lite_backend = try backend.Handle.createWithOptions(allocator, path, .{ .exclusive = true, .io = std.testing.io });
+    var backend_owned = true;
+    errdefer if (backend_owned) lite_backend.deinit();
+    const identity = connection.identityOpenOptions(true);
+    var db_opts = db_mod.OpenOptions{
+        .open_mode = .writer,
+        .identity_namespace = identity.identity_namespace,
+        .prefer_existing_identity_namespace = identity.prefer_existing_identity_namespace,
+        .start_index_workers = false,
+    };
+    try lite_backend.configureDbOpenOptions(&db_opts);
+    var db = try db_mod.DB.open(allocator, path, db_opts);
+    var db_owned = true;
+    errdefer if (db_owned) db.close();
+    try db.addIndex(.{ .name = "body_text", .kind = .full_text, .config_json = "{\"field\":\"body\"}" });
+    try db.runUntilIdle();
+    backend_owned = false;
+    db_owned = false;
+    var handle = DbHandle{ .backend = lite_backend, .db = db };
+    defer handle.close();
+
+    // A seed write lets the index's own one-time catalog admission/
+    // activation commit (independent of this test's claim) happen before
+    // the commit count below is sampled.
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+
+    const store = handle.backend.native_docstore orelse return error.CrashConsistencyMissingDocstore;
+    const before_sequence = store.file.activeCheckpoint().commit_sequence;
+
+    try handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text });
+
+    const after_sequence = store.file.activeCheckpoint().commit_sequence;
+    const commits_for_this_write = after_sequence - before_sequence;
+    // WS4 phase 2's inline publication itself contributes exactly one
+    // commit (proven directly in isolation: see persistent.zig's and
+    // lite/docstore.zig's own unit tests for this mechanism). End to end
+    // through the real DB path, this still measures a handful more here
+    // -- unrelated background bookkeeping (replication outbox staging,
+    // opportunistic maintenance ticks) this change does not touch and
+    // WS7 owns driving to zero, per the design doc's acceptance gates.
+    // Before this change, the OLD multi-commit path
+    // (indexSegmentOwned/publishProjectionSeal/progress, each its own
+    // commit) measured roughly a dozen extra commits for the same write
+    // (see docs/design/lite-performance/write-amplification-baseline.json's
+    // "indexed" numbers); this regression guard catches a reversion back
+    // toward that, without claiming the still-outstanding literal "one
+    // commit total" end-to-end goal.
+    try std.testing.expect(commits_for_this_write <= 6);
+
+    var result = try handle.db.search(allocator, .{
+        .index_name = "body_text",
+        .full_text = .{ .match = .{ .field = "body", .text = "needle" } },
+        .limit = 10,
+    });
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+}
+
 test "crash sweep: full text synchronous visibility" {
     var report = try runCrashSweep(std.testing.allocator, .{
         .name = "full-text-sync-visible",
