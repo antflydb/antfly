@@ -915,7 +915,10 @@ fn findings(server: anytype, a: A, table: []const u8, resource: catalog.Resource
     } else {
         var ids = FindingsIDs.init(scratch);
         defer ids.deinit();
-        const complete = source.scanStream(scratch, table, cursor.document, "", .{ .privacy_original = true, .inclusive_from = cursor.inclusive, .limit = 50, .include_documents = false, .execution_deadline_ns = request.deadline_ns, .cancellation = request.cancellation }, .read_index, .{ .context = &ids, .start_fn = FindingsIDs.start, .write_fn = FindingsIDs.write }) catch |err| blk: {
+        // Empty IDs are valid: an exclusive continuation must not become an
+        // initial unbounded scan. Inclusive cursors still revisit the current
+        // document to return its remaining findings.
+        const complete = source.scanStream(scratch, table, cursor.document, "", .{ .privacy_original = true, .resume_from_key = args.cursor != null and !cursor.inclusive, .inclusive_from = cursor.inclusive, .limit = 50, .include_documents = false, .execution_deadline_ns = request.deadline_ns, .cancellation = request.cancellation }, .read_index, .{ .context = &ids, .start_fn = FindingsIDs.start, .write_fn = FindingsIDs.write }) catch |err| blk: {
             if (ids.stopped and (err == error.Canceled or err == error.Cancelled)) break :blk false;
             return err;
         };

@@ -28,6 +28,7 @@ const entry_bytes = 72;
 const block_entry_bytes = 48;
 const max_index_bytes = 4 * 1024 * 1024;
 pub const max_partitions = 1024;
+pub const max_block_rows = 256;
 pub const max_object_bytes = 64 * 1024 * 1024;
 const magic = "AFSQLX02";
 pub const Block = struct { offset: u64, bytes: u32, rows: u32, hash: [32]u8 };
@@ -51,7 +52,16 @@ pub const Data = struct {
         _ = arena.reset(.free_all);
         return self.next(arena.allocator(), limit);
     }
+    /// Retain JSON as validated wire slices for native consumers. Lazy scalar
+    /// caches use a stable allocator that outlives the current metadata arena.
+    pub fn nextBlockForForwarding(self: *Data, arena: *std.heap.ArenaAllocator, cache_backing: A, limit: usize) !?spill.ColumnarBlock {
+        _ = arena.reset(.free_all);
+        return self.nextMode(arena.allocator(), cache_backing, limit);
+    }
     pub fn next(self: *Data, a: A, limit: usize) !?spill.ColumnarBlock {
+        return self.nextMode(a, null, limit);
+    }
+    fn nextMode(self: *Data, a: A, cache_backing: ?A, limit: usize) !?spill.ColumnarBlock {
         if (self.offset == self.blocks.len) {
             if (self.consumed != self.rows) return error.InvalidSqlExchange;
             return null;
@@ -80,7 +90,10 @@ pub const Data = struct {
             @memcpy(bytes, object.body);
         }
         if (!std.mem.eql(u8, &hash(bytes), &entry.hash)) return error.InvalidSqlExchange;
-        const block = try spill.decodeColumnarBlockInArena(a, bytes, limit);
+        const block = if (cache_backing) |backing|
+            try spill.decodeColumnarBlockForForwarding(a, backing, bytes, limit)
+        else
+            try spill.decodeColumnarBlockInArena(a, bytes, limit);
         errdefer block.deinit();
         if (block.count() != entry.rows) return error.InvalidSqlExchange;
         self.offset += 1;
@@ -147,7 +160,7 @@ pub const Store = struct {
             var begin: usize = 0;
             while (begin < rows.len()) {
                 _ = scratch.reset(.free_all);
-                const end = @min(rows.len(), begin + 256);
+                const end = @min(rows.len(), begin + max_block_rows);
                 const selection = try scratch.allocator().alloc(usize, end - begin);
                 for (selection, begin..) |*position, row| position.* = row;
                 const selected = try rows.select(scratch.allocator(), selection);
@@ -277,7 +290,7 @@ pub const Store = struct {
             for (blocks[next_block..][0..entry.blocks], next_block..) |*block, block_index| {
                 const raw = directory[count * entry_bytes + block_index * block_entry_bytes ..][0..block_entry_bytes];
                 block.* = .{ .offset = std.mem.readInt(u64, raw[0..8], .little), .bytes = std.mem.readInt(u32, raw[8..12], .little), .rows = std.mem.readInt(u32, raw[12..16], .little), .hash = raw[16..48].* };
-                if (block.offset != block_offset or block.bytes == 0 or block.rows == 0 or block.rows > 256 or block.bytes > entry.bytes -| (block_offset - offset)) return error.InvalidSqlExchange;
+                if (block.offset != block_offset or block.bytes == 0 or block.rows == 0 or block.rows > max_block_rows or block.bytes > entry.bytes -| (block_offset - offset)) return error.InvalidSqlExchange;
                 block_offset = try std.math.add(u64, block_offset, block.bytes);
                 block_rows = try std.math.add(u64, block_rows, block.rows);
             }
