@@ -3720,6 +3720,21 @@ const TransactionWrites = struct {
     // staging; a fifth file spills the transaction's private state.
     appends: [2]std.StringHashMapUnmanaged(*NativeFile.CatalogAppendState) = .{ .empty, .empty },
     append_count: usize = 0,
+    // Undo log for a per-member savepoint within a shared group transaction
+    // (WS2). Recorded only while `undo_depth > 0`, i.e. between
+    // `beginTransactionSavepoint` and its matching release/rollback, so a
+    // single member of a group-commit batch can be unwound without
+    // disturbing any other member's already-staged entries. Page allocations
+    // and catalog-append state made by a rolled-back member are not
+    // reclaimed; they stay allocated-but-unreferenced until the next vacuum.
+    undo: std.ArrayListUnmanaged(UndoEntry) = .empty,
+    undo_depth: usize = 0,
+
+    const UndoEntry = struct {
+        root: usize,
+        key: []u8,
+        previous: ?CatalogMutation,
+    };
 
     fn clear(self: *TransactionWrites, allocator: Allocator) void {
         for (&self.appends) |*map| {
@@ -3729,6 +3744,15 @@ const TransactionWrites = struct {
             map.* = .empty;
         }
         self.append_count = 0;
+        for (self.undo.items) |item| {
+            if (item.previous) |previous| {
+                allocator.free(previous.key);
+                allocator.free(previous.value);
+            }
+            allocator.free(item.key);
+        }
+        self.undo.clearRetainingCapacity();
+        self.undo_depth = 0;
         for (&self.maps) |*map| {
             var it = map.valueIterator();
             while (it.next()) |mutation| {
@@ -3743,6 +3767,7 @@ const TransactionWrites = struct {
 
     pub fn deinit(self: *TransactionWrites, allocator: Allocator) void {
         self.clear(allocator);
+        self.undo.deinit(allocator);
         for (&self.maps) |*map| map.deinit(allocator);
         self.pages.deinit();
         allocator.destroy(self);
@@ -3751,6 +3776,21 @@ const TransactionWrites = struct {
     fn entry(mutation: CatalogMutation) CatalogEntry {
         return .{ .previous_page = 0, .key = mutation.key, .value = mutation.value, .is_delete = mutation.is_delete, .external_value_root_page = mutation.external_value_root_page, .external_value_len = mutation.external_value_len };
     }
+};
+
+/// A mark taken mid-transaction so one group-commit member's staged writes
+/// can be unwound without aborting the members staged before or after it.
+/// `checkpoint` is a snapshot of the transaction's private root pointers,
+/// restored verbatim on rollback (safe even across a flush, since pages are
+/// copy-on-write). `writes_generation`/`undo_mark` additionally cover
+/// whatever is still only in the in-memory write set, for a member whose
+/// writes never triggered a flush; see `beginTransactionSavepoint`.
+/// External page allocations and catalog-append state made since the mark
+/// are not reclaimed by a rollback.
+pub const TransactionSavepoint = struct {
+    checkpoint: CheckpointSlot,
+    writes_generation: u64,
+    undo_mark: usize,
 };
 
 pub const OwnedDocument = struct {
@@ -4876,6 +4916,12 @@ pub const NativeFile = struct {
     allocator_ledger_rebased: bool = false,
     allocator_work: @import("reclamation.zig").AllocatorWork = .{},
     transaction_writes: ?*TransactionWrites = null,
+    /// Bumped each time `transactionWrites` allocates a new instance (a
+    /// flush destroys the old one). A `TransactionSavepoint` records the
+    /// generation of the instance live when it was taken, so a savepoint
+    /// can tell "no flush since" from "a flush recreated the write set,
+    /// possibly at the same address" without an ABA hazard on the pointer.
+    transaction_writes_generation: u64 = 0,
     flushing_transaction: bool = false,
     transaction_pages: ?*PageAllocator = null,
     durable_header: ?Header = null,
@@ -11686,6 +11732,7 @@ pub const NativeFile = struct {
         errdefer self.allocator.destroy(writes);
         writes.* = .{ .pages = try self.pageAllocatorFromFreeMap(self.activeCheckpoint()) };
         self.transaction_writes = writes;
+        self.transaction_writes_generation +%= 1;
         return writes;
     }
 
@@ -11727,12 +11774,27 @@ pub const NativeFile = struct {
         }
         const map = &writes.maps[@backingInt(root)];
         const slot = try map.getOrPut(self.allocator, owned.key);
+        const recording = writes.undo_depth > 0;
         if (slot.found_existing) {
             const old = slot.value_ptr.*;
             writes.bytes -= old.key.len + old.value.len;
-            self.allocator.free(old.key);
-            self.allocator.free(old.value);
-        } else writes.count += 1;
+            if (recording) {
+                // Transfer ownership of the replaced entry into the undo log
+                // instead of freeing it, so a savepoint rollback can restore
+                // it verbatim.
+                const undo_key = try self.allocator.dupe(u8, owned.key);
+                try writes.undo.append(self.allocator, .{ .root = @backingInt(root), .key = undo_key, .previous = old });
+            } else {
+                self.allocator.free(old.key);
+                self.allocator.free(old.value);
+            }
+        } else {
+            writes.count += 1;
+            if (recording) {
+                const undo_key = try self.allocator.dupe(u8, owned.key);
+                try writes.undo.append(self.allocator, .{ .root = @backingInt(root), .key = undo_key, .previous = null });
+            }
+        }
         slot.key_ptr.* = owned.key;
         slot.value_ptr.* = owned;
         writes.bytes += owned.key.len + owned.value.len;
@@ -11816,6 +11878,94 @@ pub const NativeFile = struct {
     pub fn beginArtifactLeaseTransaction(self: *NativeFile) !void {
         try self.beginTransaction();
         self.artifact_lease_transaction = true;
+    }
+
+    /// Mark a point inside an open transaction that one group-commit member's
+    /// writes can be unwound back to, without touching any entry staged by
+    /// another member before or after it (WS2). The caller must already hold
+    /// an open transaction (`beginTransaction`/`beginArtifactLeaseTransaction`).
+    ///
+    /// Two complementary mechanisms cover the member's writes:
+    ///  - `checkpoint` is a snapshot of this transaction's private root
+    ///    pointers (document/catalog/index roots, page count, commit
+    ///    sequence). A member's own writes are copy-on-write, so restoring
+    ///    this snapshot verbatim discards anything the member flushed to
+    ///    pages -- whether by `materializeTransactionCheckpoint` (any
+    ///    mid-transaction read) or a size-triggered spill in `stageMutation`
+    ///    -- without disturbing pages an earlier member already made
+    ///    reachable. The pages themselves are not reclaimed; they are
+    ///    unreferenced-but-allocated bytes until the next vacuum.
+    ///  - `undo`/`undo_mark` covers whatever is still only in the in-memory
+    ///    write set (`TransactionWrites.maps`), for the common case where no
+    ///    flush happens. A flush replaces the `TransactionWrites` instance
+    ///    (see `flushTransactionWrites`), so `writes` records which instance
+    ///    this savepoint's undo log belongs to: `release`/`rollback` only
+    ///    replay it when `self.transaction_writes` is still that same
+    ///    instance, and otherwise rely on the checkpoint restore alone.
+    pub fn beginTransactionSavepoint(self: *NativeFile) !TransactionSavepoint {
+        if (self.transaction_header == null) return error.InvalidTransactionState;
+        const writes = try self.transactionWrites();
+        writes.undo_depth += 1;
+        return .{
+            .checkpoint = self.activeCheckpoint(),
+            .writes_generation = self.transaction_writes_generation,
+            .undo_mark = writes.undo.items.len,
+        };
+    }
+
+    /// Keep every entry staged since `sp` and stop tracking undo for it.
+    pub fn releaseTransactionSavepoint(self: *NativeFile, sp: TransactionSavepoint) void {
+        const writes = self.transaction_writes orelse return;
+        if (self.transaction_writes_generation != sp.writes_generation) return; // a flush already retired sp's undo log.
+        std.debug.assert(writes.undo_depth > 0);
+        writes.undo_depth -= 1;
+        var i = writes.undo.items.len;
+        while (i > sp.undo_mark) {
+            i -= 1;
+            const item = writes.undo.items[i];
+            if (item.previous) |previous| {
+                self.allocator.free(previous.key);
+                self.allocator.free(previous.value);
+            }
+            self.allocator.free(item.key);
+        }
+        writes.undo.shrinkRetainingCapacity(sp.undo_mark);
+    }
+
+    /// Undo every entry staged since `sp`. Restores the private checkpoint
+    /// snapshot unconditionally (a no-op if nothing flushed since `sp`), and
+    /// additionally replays the undo log against `writes.maps` when the
+    /// `TransactionWrites` instance from `sp` is still the live one.
+    pub fn rollbackTransactionSavepoint(self: *NativeFile, sp: TransactionSavepoint) void {
+        defer self.header.checkpoints[self.header.active_checkpoint] = sp.checkpoint;
+        const writes = self.transaction_writes orelse return;
+        if (self.transaction_writes_generation != sp.writes_generation) return; // already superseded by the checkpoint restore above.
+        std.debug.assert(writes.undo_depth > 0);
+        writes.undo_depth -= 1;
+        while (writes.undo.items.len > sp.undo_mark) {
+            const item = writes.undo.pop().?;
+            defer self.allocator.free(item.key);
+            const map = &writes.maps[item.root];
+            if (item.previous) |previous| {
+                if (map.getPtr(item.key)) |current| {
+                    writes.bytes -= current.key.len + current.value.len;
+                    self.allocator.free(current.key);
+                    self.allocator.free(current.value);
+                    current.* = previous;
+                    writes.bytes += previous.key.len + previous.value.len;
+                } else {
+                    // The key was removed by a later undo entry already;
+                    // the replaced value still needs freeing.
+                    self.allocator.free(previous.key);
+                    self.allocator.free(previous.value);
+                }
+            } else if (map.fetchRemove(item.key)) |kv| {
+                writes.bytes -= kv.value.key.len + kv.value.value.len;
+                self.allocator.free(kv.value.key);
+                self.allocator.free(kv.value.value);
+                writes.count -= 1;
+            }
+        }
     }
 
     pub fn abortTransaction(self: *NativeFile) void {

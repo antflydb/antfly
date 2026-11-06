@@ -7491,6 +7491,23 @@ pub const DB = struct {
     /// `batchTracked` that also commits an outcome-receipt marker atomically
     /// with the primary write (see `apply_receipts.OutcomeMarker`).
     pub fn batchTrackedWithMarker(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker: ?apply_receipts.OutcomeMarker) anyerror!void {
+        return self.batchTrackedWithMarkerAndWriterLaneHook(req, primary_committed, marker, null);
+    }
+
+    /// `batchTrackedWithMarker` plus the WS3 in-process writer lane hook
+    /// (`execution_resources.WriterLaneReleaseHook`): a capi write export
+    /// passes its `HandleGuard`'s release callback here so the connection's
+    /// locks can drop across the primary write's durability wait too, not
+    /// just the DB apply lock. `hook` is forwarded as-is; `null` (the
+    /// default, via `batchTrackedWithMarker`) is a no-op in
+    /// `batchInternalPreparedOwned`.
+    pub fn batchTrackedWithMarkerAndWriterLaneHook(
+        self: *DB,
+        req: types.BatchRequest,
+        primary_committed: *bool,
+        marker: ?apply_receipts.OutcomeMarker,
+        hook: ?execution_resources.WriterLaneReleaseHook,
+    ) anyerror!void {
         primary_committed.* = false;
         var marker_key: [apply_receipts.outcome_marker_key_len]u8 = undefined;
         var marker_value: [apply_receipts.outcome_marker_value_len]u8 = undefined;
@@ -7503,7 +7520,7 @@ pub const DB = struct {
         const previous = backend_types.commit_progress;
         backend_types.commit_progress = &progress;
         defer backend_types.commit_progress = previous;
-        self.batchTrackedProfiled(req, primary_committed, marker_write) catch |err| {
+        self.batchTrackedProfiled(req, primary_committed, marker_write, hook) catch |err| {
             if (progress.maybe_applied and !primary_committed.* and !isOutcomeUnknownError(err)) {
                 std.log.warn("batch failed after its write may have applied: {s}", .{@errorName(err)});
                 return error.OutcomeUnknown;
@@ -7519,8 +7536,18 @@ pub const DB = struct {
         };
     }
 
-    fn batchTrackedProfiled(self: *DB, req: types.BatchRequest, primary_committed: *bool, marker_write: ?docstore_mod.KVPair) anyerror!void {
-        const opts: BatchExecutionOptions = .{ .primary_committed = primary_committed, .outcome_marker_write = marker_write };
+    fn batchTrackedProfiled(
+        self: *DB,
+        req: types.BatchRequest,
+        primary_committed: *bool,
+        marker_write: ?docstore_mod.KVPair,
+        writer_lane_release_before_wait: ?execution_resources.WriterLaneReleaseHook,
+    ) anyerror!void {
+        const opts: BatchExecutionOptions = .{
+            .primary_committed = primary_committed,
+            .outcome_marker_write = marker_write,
+            .writer_lane_release_before_wait = writer_lane_release_before_wait,
+        };
         if (benchMetricsEnabled()) {
             var profile = BatchProfile{};
             try self.batchInternal(req, &profile, opts);
