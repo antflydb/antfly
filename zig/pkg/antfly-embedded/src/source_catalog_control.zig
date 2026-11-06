@@ -199,6 +199,7 @@ pub const sql_relation_binding = @import("sql/relation_binding.zig");
 pub const sql_relation_runtime = @import("sql/relation_runtime.zig");
 pub const sql_runtime = @import("sql/runtime.zig");
 pub const sql_scalar = @import("sql/scalar.zig");
+pub const sql_regex_execution = @import("sql/regex_execution.zig");
 pub const sql_parameter_frame = @import("sql/parameter_frame.zig");
 pub const sql_bound_scalars = @import("sql/bound_scalars.zig");
 pub const sql_replay_rows = @import("sql/replay_rows.zig");
