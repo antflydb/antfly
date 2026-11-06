@@ -2232,10 +2232,27 @@ pub const Owner = struct {
             maintenance_error = err;
             break :blk false;
         } else false;
-        var pending = if (maintenance_error != null) true else if (run_database and !projected) database.runBackgroundTurnWithCancellation(cancellation, shadow_scopes.items.len != 0) catch |err| blk: {
-            maintenance_error = err;
-            break :blk true;
-        } else projected;
+        var pending = if (maintenance_error != null) true else if (run_database and !projected) (ran: {
+            const ran = database.runBackgroundTurnWithCancellation(cancellation, shadow_scopes.items.len != 0) catch |err| {
+                maintenance_error = err;
+                break :ran true;
+            };
+            // §3.6 no-consumer path: runBackgroundTurnWithCancellation's own
+            // "did real work happen" signal (storage/db/db.zig) includes
+            // the primary-commit sequence counter advancing past its
+            // snapshot taken at this turn's entry. That counter advances on
+            // every commit even with zero registered consumers (no journal
+            // record is written, but replay_meta_next_sequence still
+            // advances per design doc §3.6), so it is true on essentially
+            // every turn while concurrent foreground writes continue --
+            // regardless of whether anything is actually registered to
+            // consume the backlog. Without a registered consumer, that
+            // alone must not keep re-arming maintenance_pending for as long
+            // as writes continue; this is what the capi "no-consumer path
+            // 1037" regression (46 background turns/30 leases for 1,037
+            // no-consumer writes) traced back to.
+            break :ran ran and self.registeredDemand().any();
+        }) else projected;
         if (run_database) if (database.enrichment_runtime) |runtime| {
             runtime.dense_result_cache = null;
             runtime.generated_publication = null;
@@ -2258,9 +2275,22 @@ pub const Owner = struct {
             root.db_live = false;
         }
         if (comptime h.builtin.is_test) if (self.test_before_storage_service) |hook| hook.notify(hook.ptr, root);
-        store.maintainOnce(false) catch |err| {
-            if (maintenance_error == null) maintenance_error = err;
-            pending = true;
+        store.maintainOnce(false) catch |err| switch (err) {
+            // §3.6 no-consumer path: these three are enterMaintenanceWriter's
+            // ordinary "a concurrent admission/replacement raced this
+            // attempt" signals (see its other call sites throughout this
+            // file), not real failures -- maintainOnce's own next scheduled
+            // pass retries naturally. With continuous foreground writes,
+            // forcing `pending = true` here turned a benign race into an
+            // unconditional "retry at once" signal that, combined with
+            // `maintenance_storage_pending`'s own re-arming below, kept
+            // this turn's round self-sustaining for as long as writes
+            // continued (the capi "no-consumer path 1037" regression).
+            error.EnrichmentWaitCanceled, error.FileBusy, error.WouldBlock => {},
+            else => {
+                if (maintenance_error == null) maintenance_error = err;
+                pending = true;
+            },
         };
 
         self.gate.mutex.lockUncancelable(io);
@@ -2309,7 +2339,21 @@ pub const Owner = struct {
             self.maintenance_round_pending = false;
         }
         self.collectRetired();
-        return self.maintenance_storage_pending or self.maintenance_pending or self.maintenance_table_cursor != 0 or changed or ttl_pending;
+        // §3.6 no-consumer path: a bare tip move (`changed`) with nothing
+        // else pending exists only to prompt a fresh capture for a
+        // *registered* consumer (replay/catch-up/TTL watching this owner).
+        // With no durable consumer at all, continuous foreground writes
+        // would otherwise move the tip on essentially every idle turn,
+        // keeping this loop at maintenanceWaitMillis's 100ms "pending"
+        // cadence for as long as writes continue -- the whole reason the
+        // no-consumer capi test ("no-consumer path 1037 real primary
+        // writes") saw dozens of background turns/leases despite
+        // registeredDemand() never going non-empty. Gate `changed` on
+        // demand so a no-consumer owner's idle turn still reports "nothing
+        // to do" and the loop parks via maintenanceWaitMillis's
+        // no_scheduled_wait, exactly as it would if the tip had not moved.
+        const changed_matters = changed and self.registeredDemand().any();
+        return self.maintenance_storage_pending or self.maintenance_pending or self.maintenance_table_cursor != 0 or changed_matters or ttl_pending;
     }
 
     /// A storage-only capture has no provider calls or long-lived replay read
@@ -2360,7 +2404,13 @@ pub const Owner = struct {
         root.maintenance_references -= 1;
         inheritReclamationTelemetry(self.current.?.owned_lite_backend.?.native_docstore.?, store);
         try self.adoptIdleMaintenanceCheckpoint(foreground, entry_header, maintenance_entry_header, store);
-        try result;
+        // Same benign-race exception as the full turn's maintainOnce call
+        // (see that call site's comment): a concurrent admission/
+        // replacement racing this attempt is not a real failure.
+        result catch |err| switch (err) {
+            error.EnrichmentWaitCanceled, error.FileBusy, error.WouldBlock => {},
+            else => return err,
+        };
         return true;
     }
 
@@ -4683,14 +4733,23 @@ test "no-consumer path 1037 real primary writes cause no consumer-driven backgro
     // full_text_index_v0 (deleted above) still existed, and deleteIndex's
     // removal of that index's stored postings drains over several of the
     // worker's own turns rather than completing inline. Wait for the worker
-    // to go quiet (no turn for 200ms) before establishing the baseline below,
-    // so that startup/deletion drain isn't counted as this test's own
-    // no-consumer write amplification.
+    // to go quiet before establishing the baseline below, so that
+    // startup/deletion drain isn't counted as this test's own no-consumer
+    // write amplification. The drain's own turns are spaced about 100ms
+    // apart (maintenanceWaitMillis's "pending" retry interval), so require
+    // a full second of no new turn, not just long enough to span one
+    // retry: a shared, loaded build machine can delay the worker thread's
+    // *next* already-scheduled 100ms-timer turn past a shorter quiet
+    // window, which would otherwise land inside the measured window below
+    // and look like consumer-driven background work. Also require
+    // registeredDemand to be empty and no turn-local work left pending,
+    // both cheap, so a stalled-but-about-to-fire turn can't slip through
+    // either.
     {
         var quiet_ms: u64 = 0;
         var last = owner.test_background_turn_count.load(.acquire);
         var waited_ms: u64 = 0;
-        while (quiet_ms < 200 and waited_ms < 5000) : (waited_ms += 20) {
+        while ((quiet_ms < 1000 or owner.registeredDemandForTest().any() or owner.maintenance_pending) and waited_ms < 20000) : (waited_ms += 20) {
             io.sleep(.fromMilliseconds(20), .awake) catch {};
             const now_count = owner.test_background_turn_count.load(.acquire);
             if (now_count == last) {
@@ -4705,6 +4764,11 @@ test "no-consumer path 1037 real primary writes cause no consumer-driven backgro
     const write_count: usize = 1037;
     const turns_before = owner.test_background_turn_count.load(.acquire);
     const refreshes_before = owner.test_refresh_count.load(.acquire);
+    // Lifetime counter (never reset): the quiescence wait above legitimately
+    // acquires leases draining full_text_index_v0's deletion before this
+    // window starts, so the assertion below must compare a delta like every
+    // other counter here, not the raw cumulative value.
+    const lease_acquisitions_before = owner.publication_stats.maintenance_lease.acquisitions;
     const store_before = owner.current.?.owned_lite_backend.?.native_docstore.?;
     const retirement_checks_before = store_before.test_retirement_check_count.load(.acquire);
     const retirement_check_ns_before = store_before.test_retirement_check_ns.load(.acquire);
@@ -4757,22 +4821,22 @@ test "no-consumer path 1037 real primary writes cause no consumer-driven backgro
     try std.testing.expectEqual(@as(u64, 0), trace_report.op(.source_turn));
     try std.testing.expectEqual(@as(u64, 0), trace_report.op(.derived_worker_turn));
     // The design doc's full no-consumer target is 0 background turns / 0
-    // leases / 0 refreshes (lite-single-commit-write-path.md §5), but that
-    // needs WS2's group-commit protocol and WS5's owner-queued retirement,
-    // neither landed yet: today's commit path still wakes Owner.refresh()
-    // once per commit (notifyMutation only gates the *consumer* (index/
-    // enrichment/group-source/ttl/resolver) wake in `notifyDemand`, see
-    // design doc §3.6), and the worker's own poll schedule still observes
-    // whatever demand existed at spawn (here, the default full_text_index_v0
-    // this test deletes above, before the first write). This bounds the
-    // regression instead of pinning an exact count: 1,037 real primary
-    // writes with zero registered consumers must not scale background
-    // turns/leases anywhere near 1:1 with writes (the pre-WS7 baseline was
-    // 418 turns per 128 writes, about 3.3/write; this asserts two orders of
-    // magnitude better, not WS7's unreached end state).
-    try std.testing.expect(background_turns < write_count / 10);
-    try std.testing.expect(owner.publication_stats.maintenance_lease.acquisitions < write_count / 10);
-    try std.testing.expect(trace_report.op(.maintenance_lease_acquired) < write_count / 10);
+    // leases / 0 refreshes (lite-single-commit-write-path.md §5), now
+    // reached for this harness: once the post-quiescence worker is truly
+    // parked (maintenanceWaitMillis's no_scheduled_wait), nothing in the
+    // primary-only write path raises a non-empty Demand mask, so
+    // notifyDemand never wakes it again. The previous 46-turn/30-lease
+    // regression was `maintenanceTurn`'s own idle-turn "the physical tip
+    // moved" signal (`changed`) feeding back into its return value
+    // unconditionally: with continuous foreground writes, an idle turn's
+    // tip had almost always moved again by the time it finished, so every
+    // triggered turn rescheduled another one 100ms later for as long as
+    // writes kept landing. `changed` now only counts toward "more to do"
+    // when a consumer is actually registered (registeredDemand().any());
+    // see that call site's comment.
+    try std.testing.expectEqual(@as(u64, 0), background_turns);
+    try std.testing.expectEqual(@as(u64, 0), owner.publication_stats.maintenance_lease.acquisitions - lease_acquisitions_before);
+    try std.testing.expectEqual(@as(u64, 0), trace_report.op(.maintenance_lease_acquired));
     // The calling thread's own refreshes (one validation per capi entry) are
     // real required work, not background amplification; report the count
     // rather than pin an exact per-call multiplier, and only bound it
