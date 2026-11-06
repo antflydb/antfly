@@ -46006,6 +46006,17 @@ fn consumerTests() type {
                 try std.testing.expectEqualStrings("upstream-etag", response.etag.?);
                 try std.testing.expectEqual(if (status == 202) null else @as(?u32, 1), response.response.retry_after_seconds);
                 try std.testing.expectEqual(if (status == 202) null else @as(?@import("../api/public_table_http.zig").MetadataMutationOutcome, .unknown), response.response.metadata_mutation_outcome);
+                // Exercise the real status-source/discovery handoff rather
+                // than just a standalone response clone. Both caller-buffer
+                // failures happen after one accepted/ambiguous upstream reply.
+                for (0..2) |index| {
+                    var fail = std.testing.FailingAllocator.init(a, .{ .fail_index = index });
+                    try std.testing.expectError(error.MetadataMutationOutcomeUnknown, source.statusSource().forwardPrivacyMutation(fail.allocator(), "docs", "{}", if (scan) null else "etag", scan, .{}));
+                    expected_calls += 1;
+                    try std.testing.expectEqual(expected_calls, fake.mutations);
+                    try std.testing.expectEqual(expected_calls, fake.probes);
+                    try std.testing.expectEqualStrings("upstream-etag", response.etag.?);
+                }
             };
         }
 
