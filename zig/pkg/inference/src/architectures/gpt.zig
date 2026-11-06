@@ -14833,7 +14833,10 @@ test "LightOnOCR3 CUDA sampler downloads IDs and preserves suppression and lowes
     if (comptime !build_options.enable_cuda) return error.SkipZigTest;
     const cuda = @import("../ops/cuda/cuda_compute.zig");
     const a = std.testing.allocator;
-    var compute = try cuda.CudaCompute.init(a);
+    var compute = cuda.CudaCompute.init(a) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
     defer compute.deinit();
     const cb = compute.computeBackend();
     const vocab = 248320;

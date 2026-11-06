@@ -3485,8 +3485,12 @@ test "cached Native Frame refuses malformed bound input and output before math t
     const shape = ml.graph.Shape.init(.f32, &.{4});
     const input_node = try builder.parameter("x", shape);
     const output_node = try builder.neg(input_node);
+    // A later supported compute output keeps x live across the tested negation.
+    // Publishing the parameter itself would intentionally refuse complete
+    // Native coverage, so it cannot establish this cached-program fixture.
+    const later_output = try builder.absOp(input_node);
     try graph.markOutput(output_node);
-    try graph.markOutput(input_node); // Keep the input live, so the sentinel output cannot donate it.
+    try graph.markOutput(later_output);
     var analysis = try interpreter.CachedAnalysis.compute(a, &graph);
     defer analysis.deinit(a);
     var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
@@ -3498,6 +3502,7 @@ test "cached Native Frame refuses malformed bound input and output before math t
     const facts = [_]route.InputBinding{.{ .node_id = input_node, .value = .{ .imported_host = .{ .logical = shape, .target = .native, .owned_ingress = true, .borrowable_host = true } } }};
     const selected = (try root.prepareRoutes(&facts)) orelse return error.MissingPreparedRoutes;
     defer selected.release();
+    try std.testing.expect(selected.pool.completeOwnedPayload() != null);
     const frame = (try selected.pool.acquire()) orelse return error.MissingPhysicalFrame;
     defer _ = frame.finish() catch unreachable;
     try frame.begin();
@@ -3519,6 +3524,7 @@ test "cached Native Frame refuses malformed bound input and output before math t
     // The test owns this mutable Frame slot and its explicit write authority.
     const span = @constCast((try backend.hostFloat32Read(output)) orelse return error.MissingHostOutput);
     @memset(span, 91);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, &data);
     const malformed = (try backend.vtable.kernels.?.physicalTensorView.?(backend.ptr, .{ .storage = lease, .shape = &.{2} })) orelse return error.MissingPhysicalView;
     defer backend.free(malformed);
     const attention = ops.AttentionContext{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 };
@@ -3539,6 +3545,7 @@ test "cached Native Frame refuses malformed bound input and output before math t
     try std.testing.expectEqual(@as(u64, 0), frame.stats.dispatches);
     try std.testing.expectEqual(output, try frame.executeNativeProgram(&backend, values, output_node, null, &attention));
     try std.testing.expectEqualSlices(f32, &.{ -1, -2, -3, -4 }, span);
+    try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, &data);
     try std.testing.expectEqual(@as(u64, 1), frame.stats.dispatches);
     try std.testing.expectEqual(allocations, frame.stats.allocations);
 }

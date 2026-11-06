@@ -48145,7 +48145,11 @@ const CompleteCudaProgramBudget = struct {
         const request = session.RunRequest{ .input_bytes = input_bytes, .backend_input_bytes = input_bytes, .output_bytes = output_bytes };
         var policy = session.RunAdmission{ .controller = &domain.controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 1024 * 1024 * 1024, .static_workspace_kind = .estimate, .opaque_workspace_bytes = 257, .check_live_memory = false };
         const plan = try policy.planRequest(request, &.{});
-        try std.testing.expectEqual(input_bytes * 2 + output_bytes, plan.protected.host_scratch_bytes);
+        // Input tensors are one retained host payload; explicit materialized
+        // outputs retain producer and publication storage until handoff. The
+        // original symmetric IO cases hid these previously swapped factors.
+        const expected_host_io = try std.math.add(usize, input_bytes, try std.math.mul(usize, output_bytes, 2));
+        try std.testing.expectEqual(expected_host_io, plan.protected.host_scratch_bytes);
         try std.testing.expectEqual(@as(usize, 257), plan.opaque_compatibility.backend_scratch_bytes);
         policy.static_workspace_kind = .mandatory;
         const mandatory = try policy.planRequest(request, &.{});

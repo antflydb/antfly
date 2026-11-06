@@ -701,7 +701,7 @@ pub const Config = struct {
         return false;
     }
 
-    pub fn suppressTokenIds(self: Config) []const i32 {
+    pub fn suppressTokenIds(self: *const Config) []const i32 {
         return self.suppress_token_ids[0..self.suppress_token_ids_len];
     }
 
@@ -2969,6 +2969,11 @@ test "parse gemma4 multi eos and generation suppress tokens" {
     try std.testing.expectEqual(@as(usize, 2), config.suppressTokenIds().len);
     try std.testing.expectEqual(@as(i32, 258883), config.suppressTokenIds()[0]);
     try std.testing.expectEqual(@as(i32, 258882), config.suppressTokenIds()[1]);
+    // The returned slice borrows the caller, never a by-value receiver copy.
+    const borrowed = config.suppressTokenIds();
+    try std.testing.expectEqual(@intFromPtr(&config.suppress_token_ids[0]), @intFromPtr(borrowed.ptr));
+    config.suppress_token_ids[0] = 17;
+    try std.testing.expectEqual(@as(i32, 17), borrowed[0]);
 }
 
 test "parse GGUF tokenizer eos token metadata" {
