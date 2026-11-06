@@ -2021,6 +2021,13 @@ pub const PersistentIndex = struct {
                             });
                         }
                     }
+                    if (store.storage.openResidentImmutableSource(alloc, segment_path) catch |err| switch (err) {
+                        error.FileNotFound => {
+                            try stale_active_ids.append(alloc, seg_id);
+                            continue;
+                        },
+                        else => return err,
+                    }) |source| break :blk index_mod.SegmentData.fromNative(source);
                     if (store.storage.vtable.open_leased_immutable_source != null) {
                         const source = store.storage.openLeasedImmutableSource(alloc, segment_path) catch |err| switch (err) {
                             error.FileNotFound => {
@@ -7610,7 +7617,9 @@ test "persistent reopen falls back to heap reads when foreign mapping is unavail
     }
     var foreign_storage = storage.storage();
     var vtable = foreign_storage.vtable.*;
-    // Exercise the existing heap fallback on a provider without native leases.
+    // Exercise the heap fallback on a provider without owned-copy or lease
+    // capabilities, even when the underlying adapter supports both.
+    vtable.open_resident_immutable_source = null;
     vtable.open_leased_immutable_source = null;
     vtable.map_immutable_artifact = Foreign.map;
     foreign_storage.vtable = &vtable;

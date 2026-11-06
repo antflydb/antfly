@@ -627,6 +627,9 @@ pub const Storage = struct {
         open_immutable_source: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").Source = null,
         /// Artifact-specific reclamation lease with provider-independent
         /// descriptor/runtime ownership. Persistent readers use this capability.
+        /// Optional bounded owned copy. It retains no native extents; null
+        /// selects the normal leased source without changing serving semantics.
+        open_resident_immutable_source: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!?@import("../../segment_source.zig").Source = null,
         open_leased_immutable_source: ?*const fn (*anyopaque, Allocator, []const u8) anyerror!@import("../../segment_source.zig").Source = null,
         acquire_lease: ?*const fn (*anyopaque) anyerror!Lease = null,
         acquire_immutable_stager: ?*const fn (*anyopaque, Allocator) anyerror!?@import("../immutable_artifact.zig").Stager = null,
@@ -780,6 +783,11 @@ pub const Storage = struct {
     pub fn mapImmutableArtifact(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").MappedArtifact {
         const map = self.vtable.map_immutable_artifact orelse return error.MappedArtifactUnsupported;
         return BoundaryAbi.call("map_immutable_artifact", self.boundary_dispatch, map, .{ self.ptr, allocator, path });
+    }
+
+    pub fn openResidentImmutableSource(self: Storage, allocator: Allocator, path: []const u8) !?@import("../../segment_source.zig").Source {
+        const operation = self.vtable.open_resident_immutable_source orelse return null;
+        return BoundaryAbi.call("open_resident_immutable_source", self.boundary_dispatch, operation, .{ self.ptr, allocator, path });
     }
 
     pub fn openLeasedImmutableSource(self: Storage, allocator: Allocator, path: []const u8) !@import("../../segment_source.zig").Source {

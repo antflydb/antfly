@@ -264,3 +264,23 @@ replacement snapshots publish in one native checkpoint. Large unpublished
 construction remains bounded. Ordinary mutations leave the replay fragment
 unchanged. Deletion prepares private bitmap replacements before durability,
 instead of exposing an in-place tombstone and attempting to undo it on failure.
+
+
+## Bounded resident sources during reopen
+
+Small native text artifacts retain the same owned-memory policy on cold/runtime
+reopen as during publication. The optional resident-source capability copies at
+most 256 KiB under a short logical read pin, hashes the owned bytes and releases
+the pin. The resulting immutable source and decoded-cache leases retain their
+resource/IO owner independently of DB and Store lifetime. They need no durable
+alias, marker, inode fence or retained native extent.
+
+Resident allocation reserves memory before copying. Size or optional residency
+refusal selects the established range-backed source; corruption, cancellation
+and operational read errors propagate. Large artifacts keep bounded native ranges
+and their exact leases. Providers can expose either capability independently;
+the generic mapped/heap fallback remains available when both are absent.
+
+This removes durable lease publications for small artifacts when maintenance
+reconstructs a runtime. It does not remove the need to bind primary and index
+updates together or to compose posting deltas before freezing segments.

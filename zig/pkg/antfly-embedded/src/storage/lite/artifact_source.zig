@@ -24,6 +24,7 @@ const Source = @import("../../segment_source.zig").Source;
 const DecodedCache = @import("../../segment_source.zig").ImmutableDecodeCache;
 const limits = @import("antfly_runtime_fs").threaded_io_limits;
 const Allocator = std.mem.Allocator;
+const platform_sync = @import("antfly_platform").sync;
 
 const key_prefix = native.NativeFile.artifact_lease_key_prefix;
 const marker_prefix = ".aflite-lease-";
@@ -175,6 +176,158 @@ pub const WorkingSet = struct {
         self.inode = inode;
         // Existing entries do not extend their deadline on every poll.
         if (self.expires_ns == 0) self.expires_ns = now_ns +| lifetime_ns;
+    }
+};
+
+/// Fully owned small immutable data needs no durable page lease. Its resource
+/// owner and decoder leases outlive Store/runtime teardown independently.
+pub const OwnedBytes = struct {
+    const source_mod = @import("../../segment_source.zig");
+    const resources = @import("../resource_manager.zig");
+    const DecodeCache = source_mod.ImmutableDecodeCache;
+    const decode_limit = 1024 * 1024;
+    pub const maximum_length = 256 * 1024;
+    sealed: bool = false,
+    alloc: Allocator,
+    data: []u8,
+    registry: *Registry,
+    identity: [32]u8,
+    resource_manager: ?*resources.ResourceManager,
+    residency: ?resources.Reservation,
+    references: std.atomic.Value(usize) = .init(1),
+    cache_mutex: std.atomic.Mutex = .unlocked,
+    decoded_cache: ?*DecodeCache = null,
+    decoded_users: usize = 0,
+
+    pub fn allocate(registry: *Registry, manager: ?*resources.ResourceManager, length: usize) !*@This() {
+        if (length > maximum_length) return error.ArtifactTooLargeForResidency;
+        const a = registry.allocator;
+        var credit: ?resources.Reservation = if (manager) |owner|
+            try owner.reserveWithoutReclaim(.lite_native_page_cache, @sizeOf(@This()) + length)
+        else
+            null;
+        errdefer if (credit) |*value| value.release();
+        const self = try a.create(@This());
+        errdefer a.destroy(self);
+        const data = try a.alloc(u8, length);
+        self.* = .{ .alloc = a, .data = data, .registry = registry, .identity = @splat(0), .resource_manager = manager, .residency = credit };
+        registry.retainOwner();
+        return self;
+    }
+    pub fn copy(registry: *Registry, manager: ?*resources.ResourceManager, bytes: []const u8) !*@This() {
+        const self = try allocate(registry, manager, bytes.len);
+        @memcpy(self.data, bytes);
+        self.seal();
+        return self;
+    }
+    pub fn seal(self: *@This()) void {
+        std.debug.assert(!self.sealed);
+        std.crypto.hash.Blake3.hash(self.data, &self.identity, .{});
+        self.sealed = true;
+    }
+    pub fn deinit(self: *@This()) void {
+        close(self);
+    }
+
+    pub fn source(self: *@This()) Source {
+        std.debug.assert(self.sealed);
+        return .{ .ranges = .{
+            .ptr = self,
+            .length = self.data.len,
+            .read_into = read,
+            .close = close,
+            .retain_owned = retain,
+            .retained_bytes = retained,
+            .retention_overhead_bytes = @sizeOf(@This()) + self.data.len + decode_limit + DecodeCache.metadata_overhead,
+            .retention_artifact_only = true,
+            .immutable_identity = self.identity,
+            .resource_manager = self.resource_manager,
+            .acquire_decoded = acquireDecoded,
+            .lookup_decoded = lookupDecoded,
+        } };
+    }
+    fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (offset > self.data.len or out.len > self.data.len - @as(usize, @intCast(offset))) return error.EndOfStream;
+        @memcpy(out, self.data[@intCast(offset)..][0..out.len]);
+    }
+    fn retain(raw: *anyopaque) !Source {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        _ = self.references.fetchAdd(1, .monotonic);
+        return self.source();
+    }
+    fn retained(raw: *anyopaque) usize {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        platform_sync.lockYielding(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+        return self.data.len + if (self.decoded_cache) |cache| cache.retainedBytes() else @as(usize, 0);
+    }
+    fn pinDecoded(self: *@This()) void {
+        _ = self.references.fetchAdd(1, .monotonic);
+        platform_sync.lockYielding(&self.cache_mutex);
+        self.decoded_users += 1;
+        self.cache_mutex.unlock();
+    }
+    fn releaseDecodedPin(self: *@This()) void {
+        platform_sync.lockYielding(&self.cache_mutex);
+        std.debug.assert(self.decoded_users != 0);
+        self.decoded_users -= 1;
+        self.cache_mutex.unlock();
+        close(self);
+    }
+    fn discardDeclinedDecode(self: *@This()) void {
+        platform_sync.lockYielding(&self.cache_mutex);
+        defer self.cache_mutex.unlock();
+        // Another loader or returned lease owns its independent pin. A
+        // sole declined attempt refunds optional metadata before fallback.
+        if (self.decoded_users != 1) return;
+        if (self.decoded_cache) |cache| cache.deinit();
+        self.decoded_cache = null;
+    }
+    fn releaseDecoded(raw: *anyopaque, item: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        (DecodeCache.Lease{ .cache = self.decoded_cache.?, .entry = @ptrCast(@alignCast(item)) }).release();
+        self.releaseDecodedPin();
+    }
+    fn lookupDecoded(raw: *anyopaque, key: source_mod.DecodeKey) !?source_mod.Decoded {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.pinDecoded();
+        var transferred = false;
+        defer if (!transferred) self.releaseDecodedPin();
+        platform_sync.lockYielding(&self.cache_mutex);
+        const cache = self.decoded_cache;
+        self.cache_mutex.unlock();
+        const lease = (cache orelse return null).lookup(key) orelse return null;
+        transferred = true;
+        return .{ .value = lease.entry.value.?, .owner = self, .item = lease.entry, .release_fn = releaseDecoded, .retained_bytes = lease.entry.arena.queryCapacity() };
+    }
+    fn acquireDecoded(raw: *anyopaque, request: source_mod.DecodeRequest) !?source_mod.Decoded {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        self.pinDecoded();
+        var transferred = false;
+        defer if (!transferred) self.releaseDecodedPin();
+        platform_sync.lockYielding(&self.cache_mutex);
+        if (self.decoded_cache == null) self.decoded_cache = DecodeCache.create(self.alloc, self.resource_manager, decode_limit) catch null;
+        const cache = self.decoded_cache;
+        self.cache_mutex.unlock();
+        const lease = (try (cache orelse return null).acquire(request)) orelse {
+            self.discardDeclinedDecode();
+            return null;
+        };
+        transferred = true;
+        return .{ .value = lease.entry.value.?, .owner = self, .item = lease.entry, .release_fn = releaseDecoded, .retained_bytes = lease.entry.arena.queryCapacity() };
+    }
+    fn close(raw: *anyopaque) void {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        std.debug.assert(self.decoded_users == 0);
+        if (self.decoded_cache) |cache| cache.deinit();
+        if (self.residency) |*credit| credit.release();
+        const alloc = self.alloc;
+        const registry = self.registry;
+        alloc.free(self.data);
+        alloc.destroy(self);
+        registry.releaseOwner();
     }
 };
 
@@ -470,6 +623,29 @@ pub const Registry = struct {
         self.borrowed[slot].key = key;
         self.borrowed[slot].inline_bytes = inline_bytes;
         self.borrowed_next = (slot + 1) % self.borrowed.len;
+    }
+
+    /// Copy a bounded artifact under one short logical read pin. The returned
+    /// source owns every byte, so unlink/reuse and runtime refresh require no
+    /// persisted alias, inode fence, marker or coarse checkpoint retention.
+    /// Residency refusal is optional; operational read failures remain errors.
+    pub fn openResident(self: *Registry, key: []const u8) !?Source {
+        const owner = self.beginCallback() orelse return error.ReadOnly;
+        defer self.endCallback();
+        var pin = try owner.beginRead();
+        defer pin.abort();
+        var value = try pin.openIndexValue(self.allocator, key);
+        defer value.deinit(self.allocator);
+        if (value.length > OwnedBytes.maximum_length) return null;
+        const bytes = OwnedBytes.allocate(self, owner.resource_manager, value.length) catch |err| switch (err) {
+            error.ResourceBudgetExceeded, error.OutOfMemory => return null,
+            else => return err,
+        };
+        errdefer bytes.deinit();
+        try pin.readIndexValueInto(value, 0, bytes.data);
+        bytes.seal();
+        owner.recordArtifactSourceOpen(false);
+        return bytes.source();
     }
 
     pub fn open(self: *Registry, key: []const u8) !Source {

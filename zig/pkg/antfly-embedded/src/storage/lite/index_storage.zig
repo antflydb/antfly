@@ -69,6 +69,7 @@ pub const Store = struct {
         .open_immutable_source = openImmutableSource,
         // Root leases require hosted file descriptors and lock markers.
         .open_leased_immutable_source = if (supports_native_artifact_leases) openLeasedImmutableSource else null,
+        .open_resident_immutable_source = if (supports_native_artifact_leases) openResidentImmutableSource else null,
         .map_immutable_artifact = if (supports_mapped_artifacts) mapImmutableArtifact else null,
         .file_size = fileSize,
         .read_file_trailer_alloc = readFileTrailerAlloc,
@@ -291,6 +292,14 @@ fn openImmutableSource(ptr: *anyopaque, allocator: Allocator, path: []const u8) 
 }
 
 // Long-lived sources own their I/O lifetime and lease only immutable roots.
+fn openResidentImmutableSource(ptr: *anyopaque, _: Allocator, path: []const u8) !?SegmentSource {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    try validateIndexPath(self, path);
+    if (self.read_snapshot != null) return null;
+    const registry = try self.docs.artifactRegistry();
+    return registry.openResident(path);
+}
+
 fn openLeasedImmutableSource(ptr: *anyopaque, _: Allocator, path: []const u8) !SegmentSource {
     const self: *Store = @ptrCast(@alignCast(ptr));
     try validateIndexPath(self, path);
@@ -437,7 +446,7 @@ const NativeArtifactStager = struct {
     fn stage(raw: *anyopaque, bytes: []const u8) !immutable_artifact.Prepared {
         const self: *@This() = @ptrCast(@alignCast(raw));
         if (bytes.len == 0) return error.InvalidArtifactConstructionState;
-        if (bytes.len <= 256 * 1024) {
+        if (bytes.len <= artifacts.OwnedBytes.maximum_length) {
             if (InlinePreparedArtifact.create(self, bytes)) |prepared| return prepared else |err| switch (err) {
                 // Inline residency is optional. Fall back to bounded native
                 // construction when the resource owner cannot retain it.
@@ -486,122 +495,7 @@ const InlinePreparedArtifact = struct {
     path: ?[]u8 = null,
     const vtable: immutable_artifact.Prepared.VTable = .{ .link = link, .prepare_link = prepareLink, .stage_link = stageLink, .deinit = deinit };
 
-    const Bytes = struct {
-        const source_mod = @import("../../segment_source.zig");
-        const resources = @import("../resource_manager.zig");
-        const DecodeCache = source_mod.ImmutableDecodeCache;
-        const decode_limit = 1024 * 1024;
-        alloc: Allocator,
-        data: []u8,
-        registry: *artifacts.Registry,
-        identity: [32]u8,
-        resource_manager: ?*resources.ResourceManager,
-        residency: ?resources.Reservation,
-        references: std.atomic.Value(usize) = .init(1),
-        cache_mutex: std.atomic.Mutex = .unlocked,
-        decoded_cache: ?*DecodeCache = null,
-        decoded_users: usize = 0,
-
-        fn source(self: *@This()) SegmentSource {
-            return .{ .ranges = .{
-                .ptr = self,
-                .length = self.data.len,
-                .read_into = read,
-                .close = close,
-                .retain_owned = retain,
-                .retained_bytes = retained,
-                .retention_overhead_bytes = @sizeOf(@This()) + self.data.len + decode_limit + DecodeCache.metadata_overhead,
-                .retention_artifact_only = true,
-                .immutable_identity = self.identity,
-                .resource_manager = self.resource_manager,
-                .acquire_decoded = acquireDecoded,
-                .lookup_decoded = lookupDecoded,
-            } };
-        }
-        fn read(raw: *anyopaque, offset: u64, out: []u8) !void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            if (offset > self.data.len or out.len > self.data.len - @as(usize, @intCast(offset))) return error.EndOfStream;
-            @memcpy(out, self.data[@intCast(offset)..][0..out.len]);
-        }
-        fn retain(raw: *anyopaque) !SegmentSource {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            _ = self.references.fetchAdd(1, .monotonic);
-            return self.source();
-        }
-        fn retained(raw: *anyopaque) usize {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            platform_sync.lockYielding(&self.cache_mutex);
-            defer self.cache_mutex.unlock();
-            return self.data.len + if (self.decoded_cache) |cache| cache.retainedBytes() else @as(usize, 0);
-        }
-        fn pinDecoded(self: *@This()) void {
-            _ = self.references.fetchAdd(1, .monotonic);
-            platform_sync.lockYielding(&self.cache_mutex);
-            self.decoded_users += 1;
-            self.cache_mutex.unlock();
-        }
-        fn releaseDecodedPin(self: *@This()) void {
-            platform_sync.lockYielding(&self.cache_mutex);
-            std.debug.assert(self.decoded_users != 0);
-            self.decoded_users -= 1;
-            self.cache_mutex.unlock();
-            close(self);
-        }
-        fn discardDeclinedDecode(self: *@This()) void {
-            platform_sync.lockYielding(&self.cache_mutex);
-            defer self.cache_mutex.unlock();
-            // Another loader or returned lease owns its independent pin. A
-            // sole declined attempt refunds optional metadata before fallback.
-            if (self.decoded_users != 1) return;
-            if (self.decoded_cache) |cache| cache.deinit();
-            self.decoded_cache = null;
-        }
-        fn releaseDecoded(raw: *anyopaque, item: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            (DecodeCache.Lease{ .cache = self.decoded_cache.?, .entry = @ptrCast(@alignCast(item)) }).release();
-            self.releaseDecodedPin();
-        }
-        fn lookupDecoded(raw: *anyopaque, key: source_mod.DecodeKey) !?source_mod.Decoded {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.pinDecoded();
-            var transferred = false;
-            defer if (!transferred) self.releaseDecodedPin();
-            platform_sync.lockYielding(&self.cache_mutex);
-            const cache = self.decoded_cache;
-            self.cache_mutex.unlock();
-            const lease = (cache orelse return null).lookup(key) orelse return null;
-            transferred = true;
-            return .{ .value = lease.entry.value.?, .owner = self, .item = lease.entry, .release_fn = releaseDecoded, .retained_bytes = lease.entry.arena.queryCapacity() };
-        }
-        fn acquireDecoded(raw: *anyopaque, request: source_mod.DecodeRequest) !?source_mod.Decoded {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            self.pinDecoded();
-            var transferred = false;
-            defer if (!transferred) self.releaseDecodedPin();
-            platform_sync.lockYielding(&self.cache_mutex);
-            if (self.decoded_cache == null) self.decoded_cache = DecodeCache.create(self.alloc, self.resource_manager, decode_limit) catch null;
-            const cache = self.decoded_cache;
-            self.cache_mutex.unlock();
-            const lease = (try (cache orelse return null).acquire(request)) orelse {
-                self.discardDeclinedDecode();
-                return null;
-            };
-            transferred = true;
-            return .{ .value = lease.entry.value.?, .owner = self, .item = lease.entry, .release_fn = releaseDecoded, .retained_bytes = lease.entry.arena.queryCapacity() };
-        }
-        fn close(raw: *anyopaque) void {
-            const self: *@This() = @ptrCast(@alignCast(raw));
-            if (self.references.fetchSub(1, .acq_rel) != 1) return;
-            std.debug.assert(self.decoded_users == 0);
-            if (self.decoded_cache) |cache| cache.deinit();
-            if (self.residency) |*credit| credit.release();
-            const alloc = self.alloc;
-            const registry = self.registry;
-            alloc.free(self.data);
-            alloc.destroy(self);
-            registry.releaseOwner();
-        }
-    };
+    const Bytes = artifacts.OwnedBytes;
 
     fn create(stager: *NativeArtifactStager, bytes: []const u8) !immutable_artifact.Prepared {
         const owner = stager.registry.beginCallback() orelse return error.EnrichmentWaitCanceled;
@@ -609,23 +503,11 @@ const InlinePreparedArtifact = struct {
         const inode = (try owner.file.file.stat(owner.file.runtime())).inode;
         const state = try stager.alloc.create(@This());
         errdefer stager.alloc.destroy(state);
-        // Stager descriptors may belong to request scratch. Published source
-        // bytes must instead use the independently retained provider owner.
-        const backing_alloc = stager.registry.allocator;
-        var residency: ?Bytes.resources.Reservation = if (owner.resource_manager) |manager|
-            try manager.reserveWithoutReclaim(.lite_native_page_cache, @sizeOf(Bytes) + bytes.len)
-        else
-            null;
-        errdefer if (residency) |*credit| credit.release();
-        const backing = try backing_alloc.create(Bytes);
-        errdefer backing_alloc.destroy(backing);
+        // Published bytes have an independently retained resource/IO owner.
+        const backing = try Bytes.copy(stager.registry, owner.resource_manager, bytes);
+        errdefer backing.deinit();
         const prefix = try stager.alloc.dupe(u8, stager.prefix);
         errdefer stager.alloc.free(prefix);
-        const data = try backing_alloc.dupe(u8, bytes);
-        var identity: [32]u8 = undefined;
-        std.crypto.hash.Blake3.hash(data, &identity, .{});
-        backing.* = .{ .alloc = backing_alloc, .data = data, .registry = stager.registry, .identity = identity, .resource_manager = owner.resource_manager, .residency = residency };
-        stager.registry.retainOwner(); // Backing bytes may outlive the prepared publication.
         stager.registry.retainOwner(); // Publication callbacks own a separate reference.
         state.* = .{ .alloc = stager.alloc, .registry = stager.registry, .prefix = prefix, .inode = inode, .bytes = backing };
         return .{ .ptr = state, .vtable = &vtable };
@@ -835,7 +717,10 @@ fn retireTextSegments(ptr: *anyopaque, root: []const u8, ids: []const u64) !bool
                 const path = try std.fmt.allocPrint(a, "{s}/segments/{d}.seg", .{ request.root, id });
                 if (marker) |value| {
                     if (!std.mem.eql(u8, value, &.{1})) return error.InvalidRetiredSegmentMetadata;
-                } else if (try file.getIndexCatalogRecordSize(path) != null) return error.UnprovenArtifactRetirement;
+                } else {
+                    if (try file.getIndexCatalogRecordSize(path) != null) return error.UnprovenArtifactRetirement;
+                    continue;
+                }
                 mutations.appendAssumeCapacity(.{ .key = path, .is_delete = true });
                 mutations.appendAssumeCapacity(.{ .key = retired, .is_delete = true });
             }
@@ -4723,7 +4608,9 @@ test "lite typed text retirement preserves semantic plans and refuses active ali
     try std.testing.expectEqualStrings("ready", try read.get(ns, "unrelated-semantic-update"));
     // Missing path+marker is an idempotent completed retirement. A bare
     // unreferenced file is not sufficient authority for another unlink.
+    const completed = docs.file.activeCheckpoint();
     try std.testing.expect(try storage.retireTextSegments("/indexes/text", &.{1}));
+    try std.testing.expectEqualDeep(completed, docs.file.activeCheckpoint());
     try storage.writeFileAbsolute("/indexes/text/segments/3.seg", "unproven");
     try std.testing.expectError(error.UnprovenArtifactRetirement, storage.retireTextSegments("/indexes/text", &.{3}));
     {
@@ -4735,4 +4622,55 @@ test "lite typed text retirement preserves semantic plans and refuses active ali
     }
     try std.testing.expect(try storage.retireTextSegments("/indexes/text", &.{2}));
     try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "lite resident immutable sources retain owned bytes without durable range leases" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "resident-source.aflite");
+    defer a.free(path);
+    const original = try a.alloc(u8, 8192);
+    defer a.free(original);
+    @memset(original, 'a');
+    var store = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    var store_open = true;
+    defer if (store_open) store.close();
+    store.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &store);
+    const storage = adapter.storage();
+    try storage.writeFileAbsolute("/indexes/text/segments/1.seg", original);
+    const checkpoint = store.file.activeCheckpoint();
+    const barriers = store.file.test_durability_syncs.load(.monotonic);
+    var first = (try storage.openResidentImmutableSource(a, "/indexes/text/segments/1.seg")).?;
+    defer first.close();
+    try std.testing.expectEqualDeep(checkpoint, store.file.activeCheckpoint());
+    try std.testing.expectEqual(barriers, store.file.test_durability_syncs.load(.monotonic));
+    try std.testing.expect(store.artifact_registry.?.first == null);
+    var retained = try first.retainOwned();
+    defer retained.close();
+    @memset(original, 'b');
+    try storage.writeFileAbsolute("/indexes/text/segments/1.seg", original);
+    var second = (try storage.openResidentImmutableSource(a, "/indexes/text/segments/1.seg")).?;
+    defer second.close();
+    try std.testing.expect(!std.mem.eql(u8, &first.ranges.immutable_identity.?, &second.ranges.immutable_identity.?));
+    try storage.deleteFileAbsolute("/indexes/text/segments/1.seg");
+    const large = try a.alloc(u8, artifacts.OwnedBytes.maximum_length + 1);
+    defer a.free(large);
+    @memset(large, 'z');
+    try storage.writeFileAbsolute("/indexes/text/segments/large.seg", large);
+    const before_large = store.file.activeCheckpoint();
+    try std.testing.expect(try storage.openResidentImmutableSource(a, "/indexes/text/segments/large.seg") == null);
+    try std.testing.expectEqualDeep(before_large, store.file.activeCheckpoint());
+    for (0..8) |_| _ = try store.file.reclaimPages(64);
+    try std.testing.expect((try store.file.check()).valid);
+    store.close();
+    store_open = false;
+    var bytes: [8192]u8 = undefined;
+    try first.readInto(0, &bytes);
+    for (bytes) |byte| try std.testing.expectEqual(@as(u8, 'a'), byte);
+    try retained.readInto(0, &bytes);
+    for (bytes) |byte| try std.testing.expectEqual(@as(u8, 'a'), byte);
+    try second.readInto(0, &bytes);
+    for (bytes) |byte| try std.testing.expectEqual(@as(u8, 'b'), byte);
 }

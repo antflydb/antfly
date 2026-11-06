@@ -5797,6 +5797,7 @@ pub const NativeFile = struct {
             file: *NativeFile,
             checkpoint: CheckpointSlot,
             pub fn readFrame(reader: *@This(), allocator: Allocator, reference: commit_proof.Reference) ![]u8 {
+                if (reader.file.allocator_cancel_token) |cancel| try cancel.check();
                 const length = std.math.cast(usize, reference.length) orelse return error.InvalidCommitProof;
                 const out = try allocator.alloc(u8, length);
                 errdefer allocator.free(out);
@@ -5820,6 +5821,13 @@ pub const NativeFile = struct {
         return commit_proof.verify(self.allocator, &reader, checkpoint.proof, self.header.reader_epoch_namespace, checkpoint.commit_sequence, checkpointProofFingerprint(self.header, checkpoint), checkpoint.page_count);
     }
 
+    fn incompleteCommitProof(err: anyerror) bool {
+        return switch (err) {
+            error.InvalidCommitProof, error.CommitPostimageMismatch, error.InvalidPageId, error.EndOfStream, error.TruncatedNativeFile, error.TruncatedNativePage, error.TruncatedNativeValuePage, error.InvalidNativePageKind, error.UnexpectedNativePageKind, error.InvalidNativePageMagic, error.InvalidNativePageLength, error.NativePageChecksumMismatch, error.InvalidNativeValueChain, error.InvalidNativePageChain => true,
+            else => false,
+        };
+    }
+
     fn selectProvenCheckpoint(self: *NativeFile, raw_header: []const u8, file_size: u64) !void {
         const candidates = [_]u8{ self.header.active_checkpoint, 1 - self.header.active_checkpoint };
         for (candidates) |slot| {
@@ -5827,26 +5835,12 @@ pub const NativeFile = struct {
             if (!validCheckpointSlot(checkpoint) or (checkpointPrefixSize(checkpoint, self.header.page_size) catch continue) > file_size) continue;
             self.header.active_checkpoint = slot;
             if (checkpoint.proof.root == 0 or try self.exactDurabilityWitness(raw_header, checkpoint)) return;
-            _ = self.verifyCheckpointProof(checkpoint) catch |err| switch (err) {
-                error.InvalidCommitProof,
-                error.CommitPostimageMismatch,
-                error.InvalidPageId,
-                error.EndOfStream,
-                error.TruncatedNativeFile,
-                error.InvalidNativePageKind,
-                error.UnexpectedNativePageKind,
-                error.InvalidNativePageMagic,
-                error.InvalidNativePageLength,
-                error.NativePageChecksumMismatch,
-                error.InvalidNativeValueChain,
-                => {
-                    // A structurally checked slot can still precede its pages
-                    // after a reordered crash. Exclude it from all later
-                    // allocator/recovery graphs, just like a torn slot CRC.
-                    self.header.checkpoints[slot] = .{ .page_count = 0 };
-                    continue;
-                },
-                else => return err,
+            _ = self.verifyCheckpointProof(checkpoint) catch |err| {
+                if (!incompleteCommitProof(err)) return err;
+                // Structural slot validity cannot establish postimage durability.
+                // Exclude failed candidates from later allocator/recovery graphs.
+                self.header.checkpoints[slot] = .{ .page_count = 0 };
+                continue;
             };
             try self.settleDurableParent();
             return;
@@ -7042,7 +7036,6 @@ pub const NativeFile = struct {
     pub fn checkAtFileSizeWithCancel(self: *NativeFile, file_size: u64, cancel: ?*const maintenance.CancelToken) !CheckReport {
         if (self.logical_snapshot) return error.NativeSnapshotMetadataUnavailable;
         if (cancel) |token| try token.check();
-        if (self.activeCheckpoint().proof.root != 0) _ = try self.verifyCheckpointProof(self.activeCheckpoint());
         // Integrity checking must observe on-disk state, not cached pages.
         _ = self.page_cache_bypass.fetchAdd(1, .monotonic);
         defer _ = self.page_cache_bypass.fetchSub(1, .monotonic);
@@ -7064,6 +7057,15 @@ pub const NativeFile = struct {
 
         if (checkpoint.page_count == 0) return invalidCheck(report, "invalid_page_count");
         if (file_size < expected_size) return invalidCheck(report, "truncated_file");
+        if (checkpoint.proof.root != 0) {
+            const previous_cancel = self.allocator_cancel_token;
+            self.allocator_cancel_token = cancel orelse previous_cancel;
+            defer self.allocator_cancel_token = previous_cancel;
+            _ = self.verifyCheckpointProof(checkpoint) catch |err| {
+                if (!incompleteCommitProof(err)) return err;
+                return invalidCheck(report, issueForPageCheckError(err));
+            };
+        }
 
         if (self.header.indexed_reclamation) {
             // A writer/rebased cache contains transient traversal inventories,
@@ -10920,6 +10922,7 @@ pub const NativeFile = struct {
     /// the two header slots and never another ownership-table snapshot.
     pub fn finishPublicationSequence(self: *NativeFile, sequence: u64, selected: CheckpointSlot) !void {
         var checkpoint = selected;
+        if (checkpoint.proof.root != 0) return error.InvalidTransactionState;
         checkpoint.commit_sequence = sequence;
         // Catch-up can replay keys from failed/no-op foreground mutations, so
         // its private sequence may exceed the live store's publication sequence.
@@ -14611,6 +14614,8 @@ fn issueForDecodeError(err: anyerror) []const u8 {
 
 fn issueForPageCheckError(err: anyerror) []const u8 {
     return switch (err) {
+        error.InvalidCommitProof => "invalid_commit_proof",
+        error.CommitPostimageMismatch => "commit_postimage_mismatch",
         error.InvalidPageId => "invalid_page_id",
         error.InvalidNativeAllocator => "invalid_allocator",
         error.TruncatedNativePage => "truncated_page",
@@ -23859,6 +23864,9 @@ test "lite commit proof native emission recovery fallback and bounded retirement
     defer a.free(image);
     image[image.len - 1] ^= 1;
     try file.file.writePositionalAll(std.testing.io, image, damaged * file.header.page_size);
+    const corrupt = try file.check();
+    try std.testing.expect(!corrupt.valid);
+    try std.testing.expectEqualStrings("commit_postimage_mismatch", corrupt.issue.?);
     var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .no_sync = true });
     defer reopened.close();
     try std.testing.expectEqual(previous.commit_sequence, reopened.activeCheckpoint().commit_sequence);
@@ -23879,6 +23887,20 @@ test "lite commit proof missing witness settles parent and overflow uses safe ba
     errdefer file.abortTransaction();
     try file.putDocument("key", "first");
     try file.commitTransaction();
+    const Cancel = struct {
+        calls: usize = 0,
+        fn check(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            if (self.calls == 2) return error.MaintenanceCanceled;
+        }
+    };
+    var observer: Cancel = .{};
+    const cancellation: maintenance.CancelToken = .{ .observer = .{ .ptr = &observer, .check = Cancel.check } };
+    try std.testing.expectError(error.MaintenanceCanceled, file.checkAtFileSizeWithCancel((try file.file.stat(std.testing.io)).size, &cancellation));
+    try std.testing.expectEqual(@as(usize, 2), observer.calls);
+    try std.testing.expect(file.allocator_cancel_token == null);
+    try std.testing.expectError(error.InvalidTransactionState, file.finishPublicationSequence(file.activeCheckpoint().commit_sequence + 1, file.activeCheckpoint()));
     const zero: [2 * commit_proof.witness_size]u8 = @splat(0);
     try file.file.writePositionalAll(std.testing.io, &zero, durability_witnesses_offset);
     var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
