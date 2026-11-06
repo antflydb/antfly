@@ -44,9 +44,13 @@ const docstore = @import("docstore.zig");
 const native = @import("native.zig");
 const native_catalog_backend = @import("../native_catalog_backend.zig");
 
-const reserved_prefix = "\x00ncat/";
+pub const reserved_prefix = "\x00ncat/";
 
-fn durableKeyAlloc(allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) ![]u8 {
+/// Exposed so WS4 phase 2's inline single-commit path (`lite/docstore.zig`'s
+/// `Txn.putIndexCatalogBatch`) can encode durable index-catalog keys the
+/// exact same way `Sink.submit`'s own `ApplyCtx.apply` does, whichever path
+/// a given write takes.
+pub fn durableKeyAlloc(allocator: Allocator, scope: []const u8, namespace: ?[]const u8, key: []const u8) ![]u8 {
     return try std.mem.concat(allocator, u8, &.{
         reserved_prefix,
         scope,
