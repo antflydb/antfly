@@ -518,6 +518,15 @@ pub const ManagedDbEnrichmentSet = struct {
     }
 };
 
+/// `execution_context.DefaultCredential` resolver backed by the node secret
+/// store (or the environment when no store is configured).
+fn resolveInferenceCredential(resolver: ?*anyopaque, alloc: std.mem.Allocator, reference: []const u8) anyerror!?[]u8 {
+    const store: ?*common_secrets.FileStore = if (resolver) |ptr| @ptrCast(@alignCast(ptr)) else null;
+    var secret = (try common_secrets.SecretValue.initConfig(alloc, reference)) orelse return null;
+    defer secret.deinit(alloc);
+    return try secret.resolveOwned(alloc, store);
+}
+
 pub fn chunkProviderForRuntime(
     alloc: std.mem.Allocator,
     provider: ?managed_embedder.AntflyProvider,
@@ -525,6 +534,8 @@ pub fn chunkProviderForRuntime(
     remote_capability_cache: ?*remote_capabilities.Cache,
     inference_api_url: ?[]const u8,
     source_table: []const u8,
+    inference_api_key: ?[]const u8,
+    secret_store: ?*common_secrets.FileStore,
 ) !?db_mod.enrichment_runtime.ChunkProvider {
     const resolved_cache = if (provider) |resolved|
         resolved.remote_capability_cache orelse remote_capability_cache
@@ -542,6 +553,11 @@ pub fn chunkProviderForRuntime(
             .capability_cache = resolved_cache,
             .io = io,
             .routing = .{ .source_table = source_table },
+            .default_credential = if (inference_api_key) |reference| .{
+                .reference = reference,
+                .resolver = secret_store,
+                .resolve = resolveInferenceCredential,
+            } else null,
         },
     };
     if (provider) |resolved| if (callback) |chunk_input| {
@@ -590,6 +606,7 @@ pub fn createManagedDbEnrichments(
         break :blk try asset_producer_runtime.Runtime.createOwned(allocator, io, .{
             .antfly_provider = local_provider,
             .inference_api_url = inference_api_url,
+            .inference_api_key = inference_api_key,
             .secret_store = store,
             .remote_capability_cache = remote_capability_cache,
             .source_table = source_table,
@@ -604,6 +621,8 @@ pub fn createManagedDbEnrichments(
         remote_capability_cache,
         inference_api_url,
         source_table,
+        inference_api_key,
+        store,
     );
     result.generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json);
     return result;

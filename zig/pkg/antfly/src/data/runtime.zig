@@ -9232,6 +9232,7 @@ pub const DataServer = struct {
         const inference_api_key = self.api_server_cfg.inference_api_key;
         _ = self.read_source.withDecisionRegistry(if (self.api_server_cfg.node_config) |config| &config.registry else null);
         _ = self.read_source.withInferenceAPIURL(inference_api_url);
+        _ = self.read_source.withInferenceAPIKey(inference_api_key);
         _ = self.write_source.withInferenceAPIURL(inference_api_url);
         _ = self.write_source.withInferenceAPIKey(inference_api_key);
         if (self.data_raft_apply) |apply_sm| {

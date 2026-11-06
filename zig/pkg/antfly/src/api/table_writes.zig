@@ -34088,7 +34088,7 @@ fn consumerTests() type {
 
         test "remote chunk runtime services do not require a local callback provider" {
             var cache: remote_capabilities.Cache = undefined;
-            var context = (try chunkProviderForRuntime(std.testing.allocator, null, null, &cache, "http://inference", "docs")) orelse
+            var context = (try chunkProviderForRuntime(std.testing.allocator, null, null, &cache, "http://inference", "docs", null, null)) orelse
                 return error.TestExpectedRemoteChunkContext;
             defer context.deinit();
             try std.testing.expect(context.ptr == null);
@@ -34099,7 +34099,7 @@ fn consumerTests() type {
             try std.testing.expect(context.execution.http_client == null);
             try std.testing.expectEqualStrings("http://inference", context.execution.default_endpoint.?);
             try std.testing.expectEqualStrings("docs", context.execution.routing.source_table);
-            try std.testing.expect(try chunkProviderForRuntime(std.testing.allocator, null, null, null, null, "") == null);
+            try std.testing.expect(try chunkProviderForRuntime(std.testing.allocator, null, null, null, null, "", null, null) == null);
         }
 
         test "provisioning detects model backed graph shorthand assets inside config_json strings" {

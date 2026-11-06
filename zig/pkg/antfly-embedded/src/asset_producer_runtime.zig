@@ -462,6 +462,13 @@ pub const Runtime = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     inference_api_url: ?[]const u8 = null,
     owns_inference_api_url: bool = false,
+    /// Unresolved node credential (normally `${secret:...}`) paired with
+    /// `inference_api_url`. Antfly-provider producers inherit it only when a
+    /// request resolves to that default endpoint and the producer names no
+    /// credential of its own; it resolves through `secret_store` per request
+    /// and is never written into a durable producer config.
+    inference_api_key: ?[]const u8 = null,
+    owned_inference_api_key: ?[]u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     max_provider_response_bytes: usize = default_asset_provider_response_bytes,
     provider_response_envelope_bytes: usize = default_provider_response_envelope_bytes,
@@ -481,6 +488,8 @@ pub const Runtime = struct {
         /// this endpoint instead of falling back to an unrelated localhost
         /// default.
         inference_api_url: ?[]const u8 = null,
+        /// Unresolved credential for `inference_api_url`; see `Runtime.inference_api_key`.
+        inference_api_key: ?[]const u8 = null,
         secret_store: ?*common_secrets.FileStore = null,
         max_provider_response_bytes: usize = default_asset_provider_response_bytes,
         provider_response_envelope_bytes: usize = default_provider_response_envelope_bytes,
@@ -509,6 +518,7 @@ pub const Runtime = struct {
             .provider_runtime = options.provider_runtime,
             .antfly_provider = options.antfly_provider,
             .inference_api_url = options.inference_api_url,
+            .inference_api_key = options.inference_api_key,
             .secret_store = options.secret_store,
             .max_provider_response_bytes = options.max_provider_response_bytes,
             .provider_response_envelope_bytes = options.provider_response_envelope_bytes,
@@ -547,6 +557,11 @@ pub const Runtime = struct {
         else
             null;
         errdefer if (owned_source_table) |source_table| alloc.free(source_table);
+        const owned_inference_api_key = if (options.inference_api_key) |key|
+            try alloc.dupe(u8, key)
+        else
+            null;
+        errdefer if (owned_inference_api_key) |key| alloc.free(key);
 
         runtime.* = Runtime.initWithOptions(alloc, client, effective);
         runtime.owned_provider_runtime = owned_provider;
@@ -555,6 +570,8 @@ pub const Runtime = struct {
         runtime.execution.default_endpoint = owned_default_endpoint;
         runtime.execution.routing.source_table = owned_source_table orelse "";
         runtime.inference_api_url = owned_default_endpoint;
+        runtime.owned_inference_api_key = owned_inference_api_key;
+        runtime.inference_api_key = owned_inference_api_key;
         return runtime;
     }
 
@@ -562,6 +579,9 @@ pub const Runtime = struct {
         self.capability_cache.deinit();
         if (self.owned_default_endpoint) |endpoint| self.alloc.free(endpoint);
         if (self.owned_source_table) |source_table| self.alloc.free(source_table);
+        if (self.owned_inference_api_key) |key| self.alloc.free(key);
+        self.owned_inference_api_key = null;
+        self.inference_api_key = null;
         if (self.owns_inference_api_url) {
             if (self.inference_api_url) |owned| self.alloc.free(owned);
             self.inference_api_url = null;
@@ -638,6 +658,23 @@ pub const Runtime = struct {
         return provider.transcribe_audio != null or provider.transcribe_audio_with_context != null;
     }
 
+    /// The node default credential travels only with the node default
+    /// endpoint: a producer that names its own URL never receives it.
+    fn defaultInferenceCredentialReference(self: *const Runtime, explicit_url: ?[]const u8, routed_url: ?[]const u8) ?[]const u8 {
+        if (explicit_url) |url| if (std.mem.trim(u8, url, " \t\r\n").len > 0) return null;
+        const routed = routed_url orelse return null;
+        if (std.mem.trim(u8, routed, " \t\r\n").len == 0) return null;
+        return self.inference_api_key;
+    }
+
+    /// Resolve the default credential for one request. Caller owns the token.
+    fn resolveDefaultInferenceCredential(self: *const Runtime, alloc: Allocator, explicit_url: ?[]const u8, routed_url: ?[]const u8) !?[]u8 {
+        const reference = self.defaultInferenceCredentialReference(explicit_url, routed_url) orelse return null;
+        var secret = (try common_secrets.SecretValue.initConfig(alloc, reference)) orelse return null;
+        defer secret.deinit(alloc);
+        return try secret.resolveOwned(alloc, self.secret_store);
+    }
+
     fn routedReaderConfig(self: *const Runtime, cfg: readers.Config) readers.Config {
         if (cfg.provider != .antfly) return cfg;
         var routed = cfg;
@@ -658,6 +695,11 @@ pub const Runtime = struct {
         if (cfg.provider != .antfly or cfg.url.len > 0 or self.linkedGeneratorAvailable()) return;
         const endpoint = ProducerRouting.init(self.execution, self.antfly_provider).generatorEndpoint(null) orelse return;
         cfg.url = try alloc.dupe(u8, endpoint);
+        // The generation backend resolves this reference through the secret
+        // store per request; the routed config is request-scoped.
+        if (cfg.api_key == null) if (self.defaultInferenceCredentialReference(null, endpoint)) |reference| {
+            cfg.api_key = try alloc.dupe(u8, reference);
+        };
     }
 
     fn routeExtractorConfig(self: *const Runtime, alloc: Allocator, cfg: *extracting.Config) !void {
@@ -675,6 +717,10 @@ pub const Runtime = struct {
         if (cfg.provider != .antfly or cfg.resolvedUrl() != null or self.linkedExtractorAvailable()) return;
         const endpoint = ProducerRouting.init(self.execution, self.antfly_provider).extractorEndpoint(null) orelse return;
         cfg.url = try alloc.dupe(u8, endpoint);
+        // `extracting` sends `api_key` verbatim, so resolve the default
+        // reference for this request-scoped config only.
+        if (cfg.api_key == null and cfg.bearer_token == null)
+            cfg.api_key = try self.resolveDefaultInferenceCredential(alloc, null, endpoint);
     }
 
     pub fn producer(self: *Runtime) asset_producer.Producer {
@@ -1594,7 +1640,9 @@ pub const Runtime = struct {
         var cfg = self.routedReaderConfig(raw);
         if (cfg.provider != .antfly or isLocalReaderProvider(cfg.provider, cfg.resolvedUrl()))
             return .{ .config = cfg };
-        var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, cfg.bearer_token orelse cfg.api_key, "ANTFLY_INFERENCE_API_KEY");
+        const reference = cfg.bearer_token orelse cfg.api_key orelse
+            self.defaultInferenceCredentialReference(raw.resolvedUrl(), cfg.resolvedUrl());
+        var secret = try common_secrets.SecretValue.initConfigOrEnv(alloc, reference, "ANTFLY_INFERENCE_API_KEY");
         defer secret.deinit(alloc);
         const credential = try secret.resolveOwned(alloc, self.secret_store);
         cfg.api_key = credential;
@@ -1758,11 +1806,18 @@ pub const Runtime = struct {
         }
         if (cfg.provider != .antfly) return null;
         const remote_endpoint = endpoint orelse return null;
+        // Planning may see a config that was not routed yet; discovery must
+        // still authenticate exactly like the routed invocation.
+        const default_token = if (cfg.bearer_token == null and cfg.api_key == null)
+            try self.resolveDefaultInferenceCredential(alloc, cfg.resolvedUrl(), remote_endpoint)
+        else
+            null;
+        defer if (default_token) |token| alloc.free(token);
         var auth_value: ?[]u8 = null;
         defer if (auth_value) |value| alloc.free(value);
         var header_storage: [2][2][]const u8 = undefined;
         var header_count: usize = 0;
-        if (cfg.bearer_token orelse cfg.api_key) |token| {
+        if (cfg.bearer_token orelse cfg.api_key orelse default_token) |token| {
             auth_value = try std.fmt.allocPrint(alloc, "Bearer {s}", .{token});
             header_storage[header_count] = .{ "Authorization", auth_value.? };
             header_count += 1;
@@ -3904,8 +3959,18 @@ pub const Runtime = struct {
         });
         defer cfg_parsed.deinit();
         cfg_parsed.value.framed_attachments = false;
+        const explicit_transcriber_url = cfg_parsed.value.resolvedUrl();
         cfg_parsed.value = self.routedTranscriberConfig(cfg_parsed.value);
         cfg_parsed.value.max_response_bytes = self.responseLimitForTask(.transcriber, 1);
+        // `transcribing` sends `api_key` verbatim: resolve the node default
+        // credential for this request only when it routed to the default endpoint.
+        const default_transcriber_credential = if (cfg_parsed.value.provider == .antfly and
+            cfg_parsed.value.api_key == null and cfg_parsed.value.bearer_token == null)
+            try self.resolveDefaultInferenceCredential(alloc, explicit_transcriber_url, cfg_parsed.value.resolvedUrl())
+        else
+            null;
+        defer if (default_transcriber_credential) |token| alloc.free(token);
+        if (default_transcriber_credential) |token| cfg_parsed.value.api_key = token;
         if (request.media.len > 0) {
             if (!request.inline_media_trusted) return error.UntrustedInlineMedia;
             if (!cfg_parsed.value.provider.supportsResolvedAudio() or request.media.len != 1) return error.UnsupportedTranscriptionMedia;
@@ -6787,6 +6852,41 @@ fn freeGeneratorContentParts(alloc: Allocator, parts: []generating_runtime.Conte
         }
     }
     alloc.free(parts);
+}
+
+test "asset producer runtime sends the default inference credential only to the default endpoint" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+
+    const runtime = try Runtime.createOwned(alloc, io_impl.io(), .{
+        .inference_api_url = "http://shared.example/ai/v1",
+        .inference_api_key = "node-default-key",
+    });
+    defer {
+        runtime.deinit();
+        alloc.destroy(runtime);
+    }
+
+    // A generator that names no URL routes to the default endpoint and keeps
+    // only the unresolved reference; the backend resolves it per request.
+    var routed = generating_runtime.GeneratorConfig{ .provider = .antfly, .model = try alloc.dupe(u8, "gen"), .url = "" };
+    defer routed.deinit(alloc);
+    try runtime.routeGeneratorConfig(alloc, &routed);
+    try std.testing.expectEqualStrings(runtime.inference_api_url.?, routed.url);
+    try std.testing.expectEqualStrings("node-default-key", routed.api_key.?);
+
+    // An explicit (third-party) URL never inherits the node credential.
+    try std.testing.expect(runtime.defaultInferenceCredentialReference("http://third.example/ai/v1", "http://third.example/ai/v1") == null);
+    try std.testing.expect(runtime.defaultInferenceCredentialReference(null, null) == null);
+    const token = (try runtime.resolveDefaultInferenceCredential(alloc, null, runtime.inference_api_url)).?;
+    defer alloc.free(token);
+    try std.testing.expectEqualStrings("node-default-key", token);
+
+    var extractor = extracting.Config{ .provider = .antfly, .model = try alloc.dupe(u8, "ext") };
+    defer extractor.deinit(alloc);
+    try runtime.routeExtractorConfig(alloc, &extractor);
+    try std.testing.expectEqualStrings("node-default-key", extractor.api_key.?);
 }
 
 test "asset producer runtime external inference endpoint is canonical and authoritative" {
