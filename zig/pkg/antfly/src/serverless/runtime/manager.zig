@@ -29,6 +29,7 @@ const maintenance_cancellation = @import("../maintenance_cancellation.zig");
 const wal_collection = @import("../wal/collector.zig");
 
 pub const RuntimeConfig = struct {
+    sql_execution_gc: ?@import("../sql/collector.zig").Collector = null,
     tick_interval_ms: u64 = 25,
     role: api_mod.RuntimeRole = .combined,
     publish_enabled: bool = true,
@@ -39,6 +40,7 @@ pub const RuntimeConfig = struct {
 };
 
 pub const RuntimeRunStats = struct {
+    sql_execution_gc_steps: usize = 0,
     published_namespaces: usize = 0,
     publish_budget_rejected_namespaces: usize = 0,
     publish_head_conflicts: usize = 0,
@@ -96,6 +98,7 @@ pub const ManagedRuntime = struct {
     pruner: build_mod.Pruner,
     wal_collector: ?*wal_collection.Collector = null,
     wal_collection_cursor: usize = 0,
+    sql_gc_schedule: @import("../sql/collector.zig").Schedule = .{},
     stats_mu: std.atomic.Mutex = .unlocked,
     run_mu: std.atomic.Mutex = .unlocked,
     cumulative_stats: RuntimeRunStats = .{},
@@ -220,6 +223,23 @@ pub const ManagedRuntime = struct {
         defer self.run_mu.unlock();
 
         var stats = RuntimeRunStats{};
+        if (self.cfg.sql_execution_gc) |collector| {
+            const Bridge = struct {
+                fn canceled(raw: *const anyopaque) bool {
+                    const value: *maintenance_cancellation.GraphBridge = @ptrCast(@alignCast(@constCast(raw)));
+                    return value.token().isCancelled();
+                }
+            };
+            var arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer arena.deinit();
+            stats.sql_execution_gc_steps = self.sql_gc_schedule.runAt(arena.allocator(), collector, .{ .io = self.io, .cancellation = .{ .ptr = &bridge, .is_cancelled_fn = Bridge.canceled } }, platform_time.awakeNs(self.io) / std.time.ns_per_ms) catch |err| switch (err) {
+                error.Canceled, error.Cancelled => return err,
+                else => blk: {
+                    std.log.warn("distributed SQL expiry collection deferred: {s}", .{@errorName(err)});
+                    break :blk 0;
+                },
+            };
+        }
         if (self.cfg.publish_enabled) {
             try self.chargeWork(.publish_round, 1);
             const publish_stats = try self.publisher.runOnceWithCancellation(bridge.token());
@@ -593,6 +613,7 @@ pub const ManagedRuntime = struct {
     fn recordStats(self: *ManagedRuntime, stats: RuntimeRunStats) void {
         lockAtomic(&self.stats_mu);
         defer self.stats_mu.unlock();
+        self.cumulative_stats.sql_execution_gc_steps += stats.sql_execution_gc_steps;
         self.cumulative_stats.published_namespaces += stats.published_namespaces;
         self.cumulative_stats.publish_budget_rejected_namespaces += stats.publish_budget_rejected_namespaces;
         self.cumulative_stats.publish_head_conflicts += stats.publish_head_conflicts;
@@ -619,6 +640,14 @@ pub const ManagedRuntime = struct {
         self.cumulative_stats.work_lease_takeovers += stats.work_lease_takeovers;
     }
 
+    fn nextMaintenanceDelayMs(self: *ManagedRuntime) u64 {
+        lockAtomic(&self.run_mu);
+        defer self.run_mu.unlock();
+        if (self.cfg.sql_execution_gc != null and !self.cfg.publish_enabled and !self.cfg.compaction_enabled and !self.cfg.prune_enabled and !self.cfg.enrichment_enabled and self.wal_collector == null) {
+            return self.sql_gc_schedule.waitMs(platform_time.awakeNs(self.io) / std.time.ns_per_ms);
+        }
+        return self.publisher.nextWakeDelayMs(self.cfg.tick_interval_ms);
+    }
     fn runLoop(self: *ManagedRuntime) void {
         defer self.run_finished.set(self.io);
         while (!self.stop_requested.load(.monotonic)) {
@@ -630,7 +659,7 @@ pub const ManagedRuntime = struct {
                 return;
             };
             self.stop_wake.waitTimeout(self.io, .{ .duration = .{
-                .raw = .fromMilliseconds(@intCast(self.publisher.nextWakeDelayMs(self.cfg.tick_interval_ms))),
+                .raw = .fromMilliseconds(@intCast(self.nextMaintenanceDelayMs())),
                 .clock = .awake,
             } }) catch |err| switch (err) {
                 error.Timeout => continue,

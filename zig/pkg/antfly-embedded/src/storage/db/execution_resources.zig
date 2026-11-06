@@ -188,6 +188,7 @@ pub const AsyncContext = struct {
     full_text_preparation_ns: std.atomic.Value(u64) = .init(0),
     replay_index_publication: ?ReplayMetadataPublication = null,
     replay_metadata_publication: ?ReplayMetadataPublication = null,
+    apply_exclusive_held: bool = false,
     replay_publication: ?ReplayPublication = null,
     alloc: Allocator,
     io: ?std.Io = null,
@@ -645,6 +646,7 @@ pub const ProfiledLock = struct {
 };
 
 pub const BatchExecutionContext = struct {
+    apply_exclusive_held: bool = false,
     alloc: Allocator,
     io: ?std.Io = null,
     store: *docstore_mod.DocStore,

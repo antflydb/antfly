@@ -1950,7 +1950,17 @@ pub const IndexManager = struct {
         /// Default projections retain a native identity for every primary row,
         /// including rows with no text. Field and artifact projections have
         /// their own membership and cannot substitute the primary population.
+        pub fn isPrivacyProjection(self: *const TextIndex) bool {
+            return self.chunk_name == null and self.source_artifact_names.len == 1 and
+                @import("../../../privacy/document.zig").isProtectedArtifactName(self.source_artifact_names[0]);
+        }
+
         pub fn coversPrimaryDocuments(self: *const TextIndex) bool {
+            if (self.isPrivacyProjection()) {
+                if (self.selected_field != null) return false;
+                for (self.source_selected_fields) |field| if (field != null) return false;
+                return true;
+            }
             return self.chunk_name == null and self.source_artifact_names.len == 0 and self.selected_field == null;
         }
 
@@ -6805,6 +6815,38 @@ pub const IndexManager = struct {
         // than returning a cached epoch with the wrong schema identity.
         try std.testing.expectError(error.SchemaRegistryUnavailable, views.get(78));
         try std.testing.expectEqual(@as(u32, 77), views.transient.?.version());
+    }
+
+    test "privacy catalog guard is retained without executable document work" {
+        const a = std.testing.allocator;
+        const privacy = @import("../../../privacy/document.zig");
+        var manager = try IndexManager.init(a, ".");
+        defer manager.deinit();
+        try manager.enrichments.ensureUnusedCapacity(a, 2);
+        manager.enrichments.appendAssumeCapacity(try enrichment_catalog.EnrichmentConfig.clone(a, .{
+            .name = privacy.artifact_name,
+            .kind = .asset,
+            .source_field = privacy.source_field,
+        }));
+        _ = manager.write_plan_generation.fetchAdd(1, .release);
+        var before = try manager.acquireWritePlanSnapshot();
+        defer before.release();
+        manager.enrichments.appendAssumeCapacity(try enrichment_catalog.EnrichmentConfig.clone(a, .{
+            .name = privacy.state_artifact_name,
+            .kind = .asset,
+            .source_field = privacy.state_field,
+        }));
+        _ = manager.write_plan_generation.fetchAdd(1, .release);
+        var after = try manager.acquireWritePlanSnapshot();
+        defer after.release();
+        try std.testing.expect(manager.getEnrichment(.asset, privacy.state_artifact_name) != null);
+        try std.testing.expect(!before.plan().matchesArtifactInventory(after.plan().artifact_catalogs.?));
+        try std.testing.expectEqual(@as(usize, 1), after.plan().generated_templates.len);
+        try std.testing.expectEqualStrings(privacy.artifact_name, after.plan().generated_templates[0].artifact_name);
+        try std.testing.expectEqual(before.plan().completion_plan.?.nodes.len, after.plan().completion_plan.?.nodes.len);
+        const requests = try manager.planGeneratedEnrichments(a, "doc", "{}", &.{}, &.{});
+        defer enrichment_types.deinitGeneratedRequests(a, requests);
+        try std.testing.expectEqual(@as(usize, 1), requests.len);
     }
 
     test "ordered artifact inventory producer plan pins catalog bytes with compiled templates" {
@@ -14330,6 +14372,13 @@ pub const IndexManager = struct {
         return false;
     }
 
+    fn orderedPublicationOwnsSources(self: *IndexManager) !bool {
+        const store = self.primary_store orelse return false;
+        var read = try store.beginReadTxn();
+        defer read.abort();
+        return try @import("../artifact_publication.zig").authority(&read) != null;
+    }
+
     fn prepareGeneratedArtifactCleanupPlan(
         self: *IndexManager,
         name: []const u8,
@@ -14347,7 +14396,14 @@ pub const IndexManager = struct {
             .graph => .graph_artifacts,
             else => .generated_artifacts,
         };
-        plan.value = if (self.table_owns_embedding_artifacts and (kind == .dense_vector or kind == .sparse_vector))
+        const vector_kind = kind == .dense_vector or kind == .sparse_vector;
+        const ordered_sources = vector_kind and try self.orderedPublicationOwnsSources();
+        // Once ordered publication owns source artifacts, ANN retirement may
+        // only reclaim its physical/index metadata. Removing accepted source
+        // bytes through local cleanup would bypass their ordered authority and
+        // prevent a replacement consumer from rebuilding. Document/producer
+        // retirement, rather than ANN lifetime, determines source liveness.
+        plan.value = if (vector_kind and (self.table_owns_embedding_artifacts or ordered_sources))
             try self.encodeGeneratedArtifactCleanupRecord(initial_phase, null, null, &.{}, null)
         else
             try self.encodeGeneratedArtifactCleanupRecord(initial_phase, owned_chunk_name, owned_embedding_name, owned_embedding_names, null);
@@ -14391,6 +14447,19 @@ pub const IndexManager = struct {
                 }
                 return error.TestTransientGeneratedArtifactCleanup;
             }
+        }
+        // Recover cleanup admitted before ordered source ownership was
+        // activated (or by an older binary). Keep its retirement reservation,
+        // but retire only index metadata; accepted source artifacts are not
+        // local ANN garbage, even after their last consumer is removed.
+        if (record.phase == .generated_artifacts and
+            (record.chunk_name != null or record.embedding_name != null or record.embedding_name_count != 0) and
+            try self.orderedPublicationOwnsSources())
+        {
+            const next = try self.encodeGeneratedArtifactCleanupRecord(.dense_metadata, null, null, &.{}, null);
+            defer self.alloc.free(next);
+            try store.putBatch(&.{.{ .key = key, .value = next }}, &.{});
+            return .{ .found = true, .completed = false };
         }
         switch (record.phase) {
             .dense_metadata => {
@@ -15599,7 +15668,7 @@ pub const IndexManager = struct {
             }
             if (entry.chunk_name) |chunk_name| {
                 const chunk_cfg = self.getEnrichmentExcluding(.chunk, chunk_name, excluded_enrichment) orelse continue;
-                if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0 or self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name)) return true;
+                if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0 or self.assetSourceHasTextProjection(chunk_cfg.source_artifact_name)) return true;
             }
             for (entry.source_artifact_names) |artifact_name| {
                 if (self.getEnrichmentExcluding(.chunk, artifact_name, excluded_enrichment) != null or
@@ -16047,6 +16116,12 @@ pub const IndexManager = struct {
             var emit_progress = false;
             for (self.enrichments.items, 0..) |entry, entry_index| {
                 if (entry.kind != .asset or asset_emitted[entry_index]) continue;
+                // The privacy state entry pins the policy in catalog identity;
+                // it has no document input or materialized output. Scheduling
+                // it would add an ordered absence publication for every row.
+                const privacy = @import("../../../privacy/document.zig");
+                if (std.mem.eql(u8, entry.name, privacy.state_artifact_name) and
+                    std.mem.eql(u8, entry.source_field, privacy.state_field)) continue;
                 if (!emit_final_pass and entry.source_artifact_name.len > 0) {
                     var upstream_pending = false;
                     for (self.enrichments.items, 0..) |candidate, candidate_index| {
@@ -16089,14 +16164,14 @@ pub const IndexManager = struct {
         for (self.text_indexes.items) |entry| {
             if (entry.chunk_name) |chunk_name| {
                 if (self.getEnrichment(.chunk, chunk_name)) |chunk_cfg| {
-                    if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0 or self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name)) {
+                    if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0 or self.assetSourceHasTextProjection(chunk_cfg.source_artifact_name)) {
                         try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false, true);
                     }
                 }
             }
             for (entry.source_artifact_names) |artifact_name| {
                 const chunk_cfg = self.getEnrichment(.chunk, artifact_name) orelse continue;
-                if (chunk_cfg.source_artifact_name.len > 0 and self.assetGroupRoot(chunk_cfg.source_artifact_name).len == 0 and !self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name)) continue;
+                if (chunk_cfg.source_artifact_name.len > 0 and self.assetGroupRoot(chunk_cfg.source_artifact_name).len == 0 and !self.assetSourceHasTextProjection(chunk_cfg.source_artifact_name)) continue;
                 try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, true, false, true);
             }
         }
@@ -16104,7 +16179,7 @@ pub const IndexManager = struct {
         for (self.graph_indexes.items) |entry| {
             for (entry.artifact_sources) |source| {
                 const chunk_cfg = self.getEnrichment(.chunk, source.artifact_name) orelse continue;
-                if (chunk_cfg.source_artifact_name.len > 0 and self.assetGroupRoot(chunk_cfg.source_artifact_name).len == 0 and !self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name)) continue;
+                if (chunk_cfg.source_artifact_name.len > 0 and self.assetGroupRoot(chunk_cfg.source_artifact_name).len == 0 and !self.assetSourceHasTextProjection(chunk_cfg.source_artifact_name)) continue;
                 try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, true);
             }
         }
@@ -16170,7 +16245,7 @@ pub const IndexManager = struct {
                     if (embedding_cfg.expected_dims > 0 and embedding_cfg.expected_dims != entry.dims) continue;
                     if (embedding_cfg.source_artifact_name.len > 0) {
                         const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                        if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0 or self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name))
+                        if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0 or self.assetSourceHasTextProjection(chunk_cfg.source_artifact_name))
                             try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, false);
                         if (!hasGeneratedDenseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                             try appendOwnedGeneratedRequest(alloc, &requests, .{
@@ -16275,7 +16350,7 @@ pub const IndexManager = struct {
                     if (embedding_cfg.expected_dims != 0) continue;
                     if (embedding_cfg.source_artifact_name.len > 0) {
                         const chunk_cfg = self.getEnrichment(.chunk, embedding_cfg.source_artifact_name) orelse return error.InvalidIndexConfig;
-                        if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0 or self.assetSourceIsMediaOutput(chunk_cfg.source_artifact_name))
+                        if (chunk_cfg.source_artifact_name.len == 0 or self.assetGroupRoot(chunk_cfg.source_artifact_name).len > 0 or self.assetSourceHasTextProjection(chunk_cfg.source_artifact_name))
                             try appendGeneratedChunkRequest(alloc, &requests, entry.config.name, doc_key, chunk_cfg, false, true, false);
                         if (!hasGeneratedSparseEmbeddingRequest(requests.items, doc_key, embedding_cfg.source_field, embedding_cfg.source_template, chunk_cfg.name, embedding_name)) {
                             try appendOwnedGeneratedRequest(alloc, &requests, .{
@@ -18138,7 +18213,9 @@ pub const IndexManager = struct {
         return producer.type == .document_extraction;
     }
 
-    fn assetSourceIsMediaOutput(self: *const IndexManager, name: []const u8) bool {
+    fn assetSourceHasTextProjection(self: *const IndexManager, name: []const u8) bool {
+        const privacy = @import("../../../privacy/document.zig");
+        if (privacy.isProtectedArtifactName(name) or privacy.consumerPolicyVersion(name) != null) return true;
         const config = self.getEnrichment(.asset, name) orelse return false;
         var producer = asset_producer_mod.parseProducerConfig(self.alloc, config.producer_json) catch return false;
         defer producer.deinit(self.alloc);
@@ -20574,7 +20651,7 @@ pub const IndexManager = struct {
                     filtered.items[start..end],
                     projection_options,
                 );
-                const source_docs_with_ordinals = try self.textProjectionSourceDocsWithOrdinals(arena, store, source_batch.docs);
+                const source_docs_with_ordinals = try self.textProjectionSourceDocsWithOrdinals(arena, store, entry, source_batch.docs);
                 var chunk_observed = std.ArrayListUnmanaged(mapper.ObservedFieldAnalyzer).empty;
                 defer chunk_observed.deinit(arena);
                 const projection_batch = try buildTextProjectionBatchForEntry(
@@ -28179,7 +28256,7 @@ pub const IndexManager = struct {
         var ordinals_tracking = PhaseTrackingAllocator.init(arena, &ordinals_alloc_stats);
         const ordinals_alloc = if (detailed_profile_enabled) ordinals_tracking.allocator() else arena;
         const ordinals_start_ns = if (metrics_enabled) platform_time.monotonicNs() else 0;
-        const source_docs_with_ordinals = try self.textProjectionSourceDocsWithOrdinals(ordinals_alloc, store, source_docs);
+        const source_docs_with_ordinals = try self.textProjectionSourceDocsWithOrdinals(ordinals_alloc, store, entry, source_docs);
         if (metrics_enabled) ordinals_ns = platform_time.monotonicNs() - ordinals_start_ns;
         const memory_after_ordinals: process_memory.Stats = if (detailed_profile_enabled) process_memory.snapshot() else .{};
 
@@ -28574,9 +28651,13 @@ pub const IndexManager = struct {
         _: *IndexManager,
         arena: std.mem.Allocator,
         store: *docstore_mod.DocStore,
+        entry: *const TextIndex,
         source_docs: []const mapper.TextProjectionSourceDoc,
     ) ![]mapper.TextProjectionSourceDoc {
         var docs = try arena.dupe(mapper.TextProjectionSourceDoc, source_docs);
+        if (entry.isPrivacyProjection()) {
+            for (docs) |*doc| doc.* = try privacyTextSourceDoc(arena, doc.*);
+        }
 
         const PendingOrdinalLookup = struct {
             source_index: usize,
@@ -28635,8 +28716,18 @@ pub const IndexManager = struct {
         return index.snapshot().segments.len >= threshold;
     }
 
-    fn deleteTextBatchEntry(_: *IndexManager, entry: *TextIndex, keys: []const []const u8) !TextBatchMutationStats {
-        const delete_infos = try entry.persistent.deleteByIdsTracked(keys);
+    fn deleteTextBatchEntry(self: *IndexManager, entry: *TextIndex, keys: []const []const u8) !TextBatchMutationStats {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const effective = if (entry.isPrivacyProjection()) blk: {
+            const mapped = try a.dupe([]const u8, keys);
+            for (mapped) |*key| if (internal_keys.matchesAssetArtifactName(key.*, entry.source_artifact_names[0])) {
+                key.* = (try internal_keys.decodeDocumentComponentAlloc(a, key.*)) orelse return error.InvalidPrivacyDocument;
+            };
+            break :blk mapped;
+        } else keys;
+        const delete_infos = try entry.persistent.deleteByIdsTracked(effective);
         defer entry.persistent.freeDeleteInfos(delete_infos);
         entry.recordCommittedDeletes(delete_infos);
         return .{ .deleted_any = delete_infos.len != 0 };
@@ -34249,6 +34340,25 @@ fn textArtifactSourceMatches(self: *const IndexManager, key: []const u8, artifac
     return !self.assetSourceSupportsUnitGrouping(artifact_name);
 }
 
+/// A privacy document is a one-to-one primary projection, not a public
+/// artifact hit. Preserve source-document IDs/ordinals and omit receipt fields
+/// before creating postings, typed values, snippets or stored source columns.
+fn privacyTextSourceDoc(a: Allocator, source: mapper.TextProjectionSourceDoc) !mapper.TextProjectionSourceDoc {
+    var result = source;
+    result.key = (try internal_keys.decodeDocumentComponentAlloc(a, source.key)) orelse return error.InvalidPrivacyDocument;
+    const encoded = try std.json.Stringify.valueAlloc(a, source.root, .{});
+    var root = (try std.json.parseFromSlice(std.json.Value, a, encoded, .{ .allocate = .alloc_always, .parse_numbers = false })).value;
+    if (root != .object or !root.object.contains("_privacy")) return error.InvalidPrivacyReceipt;
+    _ = root.object.swapRemove("_privacy");
+    result.root = root;
+    result.typed_source = if (source.typed_source != null) root else null;
+    result.stored_data = if (source.stored_data.len != 0) try std.json.Stringify.valueAlloc(a, root, .{}) else "";
+    result.schema_less_text_fields = &.{};
+    result.schema_less_fast_projection = false;
+    result.doc_ordinal = null;
+    return result;
+}
+
 fn textIndexSelectsAnyField(entry: *const IndexManager.TextIndex) bool {
     if (entry.selected_field != null) return true;
     for (entry.source_selected_fields) |field| {
@@ -34298,6 +34408,8 @@ fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManag
 }
 
 fn textIndexShouldRetireDeletedDoc(self: *const IndexManager, entry: *const IndexManager.TextIndex, key: []const u8) !bool {
+    if (entry.isPrivacyProjection() and (internal_keys.isStoredDocumentRowKey(key) or
+        (!internal_keys.isInternalUserKey(key) and docstore_mod.KeyEncoder.parseEdgeKey(key) == null))) return true;
     if (try textIndexShouldConsumeDoc(self, entry, key)) return true;
     // A chunk artifact whose enrichment was deleted no longer routes into the
     // default index, but members it published earlier may still be posted
@@ -34809,7 +34921,8 @@ pub fn onlineBaseGeneratedVectorConfig(alloc: Allocator, cfg: types.IndexConfig,
         const config = try parseDenseConfig(alloc, cfg.config_json);
         defer config.deinit(alloc);
         if (config.external) return false;
-        if (generator != null) return config.embedding_names.len == 0 and config.embedding_name == null;
+        if (generator) |value| return config.embedding_names.len == 0 and
+            (config.embedding_name == null or std.mem.eql(u8, config.embedding_name.?, value.embedding_name orelse cfg.name));
         const names: []const []const u8 = if (config.embedding_names.len != 0) config.embedding_names else if (config.embedding_name) |name| &.{name} else return false;
         for (names) |name| {
             const found = for (producers) |producer| {
@@ -34822,7 +34935,8 @@ pub fn onlineBaseGeneratedVectorConfig(alloc: Allocator, cfg: types.IndexConfig,
     const config = try parseSparseConfig(alloc, cfg.config_json);
     defer config.deinit(alloc);
     if (config.external) return false;
-    if (generator != null) return config.embedding_names.len == 0 and config.embedding_name == null;
+    if (generator) |value| return config.embedding_names.len == 0 and
+        (config.embedding_name == null or std.mem.eql(u8, config.embedding_name.?, value.embedding_name orelse cfg.name));
     const names: []const []const u8 = if (config.embedding_names.len != 0) config.embedding_names else if (config.embedding_name) |name| &.{name} else return false;
     for (names) |name| {
         const found = for (producers) |producer| {
@@ -53097,4 +53211,22 @@ fn seedProducedEmbeddings(alloc: Allocator, store: *docstore_mod.DocStore, embed
 fn freeProducedEmbeddings(alloc: Allocator, keys: [][]u8) void {
     for (keys) |k| alloc.free(k);
     alloc.free(keys);
+}
+
+test "privacy text projection retains primary identity and removes private receipts from every representation" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const privacy = @import("../../../privacy/document.zig");
+    const name = try privacy.protectedArtifactName(a, @import("../../../privacy/contract.zig").fingerprint("policy"));
+    const key = try internal_keys.artifactNamedPrefixAlloc(a, "doc:Éva", "asset", name);
+    const raw = "{\"body\":\"[EMAIL]\",\"_privacy\":{\"source_fingerprint\":\"private\"}}";
+    const root = (try std.json.parseFromSlice(std.json.Value, a, raw, .{})).value;
+    const projected = try privacyTextSourceDoc(a, .{ .key = key, .root = root, .stored_data = raw, .typed_source = root, .doc_ordinal = 7, .schema_less_fast_projection = true });
+    try std.testing.expectEqualStrings("doc:Éva", projected.key);
+    try std.testing.expect(!projected.root.object.contains("_privacy"));
+    try std.testing.expect(!projected.typed_source.?.object.contains("_privacy"));
+    try std.testing.expect(std.mem.indexOf(u8, projected.stored_data, "private") == null);
+    try std.testing.expect(projected.doc_ordinal == null and !projected.schema_less_fast_projection);
+    try std.testing.expect(root.object.contains("_privacy"));
 }

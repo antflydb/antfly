@@ -308,6 +308,21 @@ fn persistOwnerCatalogContract(alloc: std.mem.Allocator, db: *db_mod.DB, indexes
     try db.core.store.put(owner_catalog_initialized_key, indexes_json);
 }
 
+fn persistPrivacyExecution(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const u8) !void {
+    if (indexes_json.len == 0) return;
+    var tree = try std.json.parseFromSlice(std.json.Value, alloc, indexes_json, .{});
+    defer tree.deinit();
+    var resource = (try @import("../privacy/catalog.zig").current(alloc, tree.value)) orelse return;
+    defer resource.deinit();
+    const document = @import("../privacy/document.zig");
+    const raw = try std.json.Stringify.valueAlloc(alloc, document.ExecutionOverride{ .policy_version = resource.value.policy_version, .execution = resource.value.policy.execution }, .{});
+    defer alloc.free(raw);
+    const prior = try db.core.getStoreValue(alloc, document.execution_key);
+    defer if (prior) |value| alloc.free(value);
+    if (prior) |value| if (std.mem.eql(u8, value, raw)) return;
+    try db.core.store.put(document.execution_key, raw);
+}
+
 pub fn batchWritesAsTransactionWrites(writes: []const db_mod.types.BatchWrite) []const db_mod.types.TransactionWrite {
     comptime std.debug.assert(@sizeOf(db_mod.types.BatchWrite) == @sizeOf(db_mod.types.TransactionWrite));
     comptime std.debug.assert(@alignOf(db_mod.types.BatchWrite) == @alignOf(db_mod.types.TransactionWrite));
@@ -1635,7 +1650,18 @@ pub const OwnerManagedConfig = struct {
 
     fn digest(indexes_json: []const u8) [32]u8 {
         var result: [32]u8 = undefined;
-        std.crypto.hash.sha2.Sha256.hash(indexes_json, &result, .{});
+        // Privacy scan cursors and counters are metadata job state, not a
+        // producer configuration. Restarting workers for each progress update
+        // cancels in-flight inspection and invalidates accepted publications.
+        var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const normalized = blk: {
+            var parsed = std.json.parseFromSlice(std.json.Value, a, indexes_json, .{}) catch break :blk indexes_json;
+            if (parsed.value == .object) _ = parsed.value.object.swapRemove("_privacy");
+            break :blk std.json.Stringify.valueAlloc(a, parsed.value, .{}) catch indexes_json;
+        };
+        std.crypto.hash.sha2.Sha256.hash(normalized, &result, .{});
         return result;
     }
     fn matches(self: *const @This(), indexes_json: []const u8) bool {
@@ -1741,6 +1767,7 @@ pub fn configureStorageKernelOwnerDbAtOpen(
     // catalog-driven index/runtime mutation or mark it configured yet.
     if (try db.childGenerationSourceDefersOwnerCatalog()) return true;
     if (indexes_json.len > 0) {
+        try persistPrivacyExecution(alloc, db, indexes_json);
         const installed_matches = if (installed) |state| state.matches(indexes_json) else false;
         const replace = backend_runtime != null and !installed_matches;
         if (replace) try reconfigureManagedDbEnrichmentRuntimePaused(
@@ -1920,6 +1947,7 @@ pub fn reconcileStorageKernelOwnerDb(
     if (try db.childGenerationSourceDefersOwnerCatalog())
         return .{ .state = .busy };
     if (target_index_name == null and schema_json.len > 0) try applyLocalTableSchemaJson(alloc, db, schema_json);
+    try persistPrivacyExecution(alloc, db, indexes_json);
     const installed_matches = if (installed) |state| state.matches(indexes_json) else false;
     const replace = indexes_json.len > 0 and backend_runtime != null and !installed_matches;
     if (replace) try reconfigureManagedDbEnrichmentRuntimePaused(
@@ -2344,4 +2372,11 @@ test "owner configuration preserves the prior excluded source epoch bytes" {
     const encoded = try reopened.core.store.get(a, storage_schema.schema_key);
     defer a.free(encoded);
     try std.testing.expectEqualSlices(u8, historical, encoded);
+}
+
+test "privacy job progress does not restart owner producers" {
+    var installed: OwnerManagedConfig = .{};
+    installed.publish("{\"enrichments\":[],\"_privacy\":{\"scanned\":0}}");
+    try std.testing.expect(installed.matches("{\"enrichments\":[],\"_privacy\":{\"scanned\":100}}"));
+    try std.testing.expect(!installed.matches("{\"enrichments\":[{\"name\":\"changed\"}],\"_privacy\":{\"scanned\":100}}"));
 }

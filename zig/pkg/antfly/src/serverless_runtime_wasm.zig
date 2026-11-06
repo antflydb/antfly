@@ -16,6 +16,7 @@
 const std = @import("std");
 const objects = @import("objectstore");
 const wasm_allocator = std.heap.wasm_allocator;
+var sql_builds: @import("serverless/sql/build_cache.zig").Cache = .{ .a = wasm_allocator, .bytes = 4 * 1024 * 1024 };
 var working_set_peak: usize = 0;
 var rejected_growth: usize = 0;
 var backing_failure: usize = 0;
@@ -27,6 +28,7 @@ var resident_shard: @import("serverless/query/serving_shard.zig").Shard = .{};
 var serving_scope: ?[32]u8 = null;
 var storage_binding: ?u64 = null;
 fn clearServingCaches() void {
+    sql_builds.deinit();
     decoded_manifests.deinit(wasm_allocator);
     prepared_reads.deinit(wasm_allocator);
     resident_shard.deinit(wasm_allocator);
@@ -211,6 +213,12 @@ pub fn requestAdditional(raw: []const u8) ![]u8 {
 }
 fn executeAdditional(a: std.mem.Allocator, raw: []const u8) ![]u8 {
     @import("antfly_platform").time.installHostClocks(.{ .monotonic_ns = monotonicNs, .realtime_ns = realtimeNs, .authority_ns = authorityNs });
+    const envelope = try std.json.parseFromSlice(struct { op: []const u8 = "" }, a, raw, .{ .ignore_unknown_fields = true });
+    defer envelope.deinit();
+    if (std.mem.startsWith(u8, envelope.value.op, "sql_")) {
+        var sql_host = objects.wasm_host.Host{ .alloc = a, .transfer_allocator = wasm_allocator };
+        return @import("serverless/sql/hosted.zig").executeCached(a, sql_host.client(), host_io, .{ .io = host_io, .cancellation = transport_cancellation }, raw, &sql_builds);
+    }
     const MutationGroup = struct { mutations: []const @import("serverless/api/types.zig").DocumentMutation, operation_id: []const u8, timestamp_ns: []const u8 = "0" };
     const Request = struct {
         op: enum { search, mutate, publish, compact, lookup, list, count, status, enrich, gc_prepare, gc_wal, gc_trace, reindex, coordinate, publication_acquire, publication_validate, publication_release },

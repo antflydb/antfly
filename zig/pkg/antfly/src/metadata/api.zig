@@ -310,6 +310,20 @@ pub const CatalogRoutingSnapshot = struct {
     ranges: []table_manager.RangeRecord,
 };
 
+/// Fixed-size authoritative privacy binding; no schema, producer or job bytes.
+/// Required fields make unsupported/malformed replies fail closed.
+pub const PrivacyPolicyBinding = struct {
+    metadata_group_id: u64,
+    metadata_incarnation: ?MetadataClusterIncarnation,
+    catalog_revision: u64,
+    policy_version: [64]u8,
+
+    pub fn validate(self: @This()) !void {
+        if (std.mem.allEqual(u8, &self.policy_version, 0)) return;
+        for (self.policy_version) |byte| if (!std.ascii.isHex(byte)) return error.InvalidPrivacyCatalog;
+    }
+};
+
 pub const CatalogRoutingChangeToken = struct {
     metadata_group_id: u64 = 0,
     metadata_incarnation: ?MetadataClusterIncarnation = null,

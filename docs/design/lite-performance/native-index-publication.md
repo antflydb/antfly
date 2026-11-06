@@ -132,3 +132,9 @@ can disappear only after every relevant consumer acknowledges it and every
 reference is physically deleted, including deletions in the same transaction.
 Legacy records without explicit hints retain the conservative uniform minimum.
 Continuation state becomes clean only for the exact set of cuts it examined.
+
+The integrated retry workset writes `ESQ4`, with explicit empty-document and
+fragment cursor fields. Its decoder accepts the earlier `ESQ2` header and both
+unreleased `ESQ3` layouts using exact lengths and bounded slot counts. Empty-key
+and fragment cursors cannot be claimed simultaneously. This preserves main's
+opaque empty-document IDs together with authenticated seekable discovery.

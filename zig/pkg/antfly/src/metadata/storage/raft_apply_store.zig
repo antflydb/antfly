@@ -5815,7 +5815,7 @@ pub const ExtensionLifecycleTablePrecondition = struct {
 pub const TableRestoreAdmission = apply_contract.TableRestoreAdmission;
 pub const TableDropProjection = apply_contract.TableDropProjection;
 
-const derived_catalog_index_version = "9";
+const derived_catalog_index_version = "10";
 
 /// One durable, atomic table-topology intent. Placement changes remain the
 /// responsibility of the normal reconciler, but the catalog definition and
@@ -11594,11 +11594,16 @@ pub const RaftApplyStore = struct {
             const key = try tableKeyForGroup(&key_buf, group_id, change.expected.table_id);
             const before = try decodeTableRecord(self.alloc, (try stagingGet(&txn, key)) orelse return error.TableGenerationChanged);
             defer metadata_table_manager.freeTable(self.alloc, before);
-            if (!metadata_table_manager.tableDefinitionsEqual(before, change.expected)) return error.TableGenerationChanged;
+            var expected = change.expected;
+            if (change.expected_indexes_digest) |digest| {
+                if (expected.indexes_json.len != 0 or !std.mem.eql(u8, &digest, &@import("../job_state.zig").digest(before.indexes_json))) return error.TableGenerationChanged;
+                expected.indexes_json = before.indexes_json;
+            }
+            if (!metadata_table_manager.tableDefinitionsEqual(before, expected)) return error.TableGenerationChanged;
             // Reuse replicated lifecycle admission, including owner coverage,
             // dependencies and topology fences. A rejected CAS aborts the whole
             // local transaction, including its logical delta and standby record.
-            try self.applyTableCompareAndReplaceTxn(&txn, group_id, change.expected, change.replacement);
+            try self.applyTableCompareAndReplaceTxn(&txn, group_id, expected, change.replacement);
             const actual = try decodeTableRecord(self.alloc, (try stagingGet(&txn, key)) orelse return error.TableLifecycleConflict);
             defer metadata_table_manager.freeTable(self.alloc, actual);
             var projection_arena = std.heap.ArenaAllocator.init(self.alloc);
@@ -14790,6 +14795,65 @@ pub const RaftApplyStore = struct {
         }
     }
 
+    fn privacyPrefix(buf: []u8, group: u64) ![]const u8 {
+        return std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:privacy_due:{d}:", .{group});
+    }
+    fn privacyReverseKey(buf: []u8, group: u64, id: u64) ![]const u8 {
+        return std.fmt.bufPrint(buf, "\x00\x00__metadata_derived__:privacy_table:{d}:{d}", .{ group, id });
+    }
+    fn removePrivacyWork(txn: *docstore.DocStore.Txn, group: u64, id: u64) !void {
+        var buf: [160]u8 = undefined;
+        const reverse = try privacyReverseKey(&buf, group, id);
+        if (try stagingGet(txn, reverse)) |due_key| {
+            try txn.delete(due_key);
+            try txn.delete(reverse);
+        }
+    }
+    fn putPrivacyWork(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: metadata.TableRecord) !void {
+        try attachPrivacyKeys(a, txn, group, table);
+        try removePrivacyWork(txn, group, table.table_id);
+        const due = (try @import("antfly_local_sources").privacy_catalog.workDue(a, table.indexes_json)) orelse return;
+        var prefix_buf: [128]u8 = undefined;
+        var key_buf: [192]u8 = undefined;
+        const key = try std.fmt.bufPrint(&key_buf, "{s}{x:0>16}:{x:0>16}", .{ try privacyPrefix(&prefix_buf, group), @as(u64, @intCast(due)), table.table_id });
+        var id: [8]u8 = undefined;
+        std.mem.writeInt(u64, &id, table.table_id, .little);
+        try txn.put(key, &id);
+        var reverse_buf: [160]u8 = undefined;
+        try txn.put(try privacyReverseKey(&reverse_buf, group, table.table_id), key);
+    }
+
+    /// One indexed due lookup and one primary table read. The derived index is
+    /// rebuilt on open/restore by the ordinary catalog-index migration path.
+    pub fn nextPrivacyTable(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, now: i64) !?metadata.TableRecord {
+        var read = try self.beginQueryCatalogReadTxn(group);
+        defer read.abort();
+        var buf: [128]u8 = undefined;
+        const prefix = try privacyPrefix(&buf, group);
+        var cursor = try read.openCursor();
+        defer cursor.close();
+        const row = (try cursor.seekAtOrAfter(prefix)) orelse return null;
+        if (!std.mem.startsWith(u8, row.key, prefix)) return null;
+        if (row.key.len != prefix.len + 33 or row.value.len != 8) return error.InvalidDerivedCatalogIndex;
+        const due = std.fmt.parseInt(u64, row.key[prefix.len..][0..16], 16) catch return error.InvalidDerivedCatalogIndex;
+        if (due > std.math.maxInt(i64) or row.key[prefix.len + 16] != ':') return error.InvalidDerivedCatalogIndex;
+        if (due > @as(u64, @intCast(@max(0, now)))) return null;
+        const id = std.mem.readInt(u64, row.value[0..8], .little);
+        const indexed_id = std.fmt.parseInt(u64, row.key[prefix.len + 17 ..], 16) catch return error.InvalidDerivedCatalogIndex;
+        if (id != indexed_id) return error.InvalidDerivedCatalogIndex;
+        var table_buf: [160]u8 = undefined;
+        const raw = (try stagingGet(&read, try tableKeyForGroup(&table_buf, group, id))) orelse return error.InvalidDerivedCatalogIndex;
+        const table = try decodeTableRecord(a, raw);
+        errdefer metadata_table_manager.freeTable(a, table);
+        if ((try @import("antfly_local_sources").privacy_catalog.workDue(a, table.indexes_json)) != @as(?i64, @intCast(due))) return error.InvalidDerivedCatalogIndex;
+        return table;
+    }
+    pub fn tableByName(self: *RaftApplyStore, a: std.mem.Allocator, group: u64, name: []const u8) !?metadata.TableRecord {
+        var read = try self.beginQueryCatalogReadTxn(group);
+        defer read.abort();
+        return self.getTableByNameTxn(a, &read, group, name);
+    }
+
     pub fn listTables(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64) ![]metadata.TableRecord {
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
@@ -17403,6 +17467,10 @@ pub const RaftApplyStore = struct {
     ) !void {
         var key_buf: [catalog_name_key_buffer_bytes]u8 = undefined;
         const key = try tableNameIndexKey(&key_buf, group_id, table_name);
+        if (try stagingGet(txn, key)) |raw| {
+            if (raw.len != 8) return error.InvalidDerivedCatalogIndex;
+            try removePrivacyWork(txn, group_id, std.mem.readInt(u64, raw[0..8], .little));
+        }
         try self.deleteLegacyListingTxn(txn, group_id, table_name);
         txn.delete(key) catch |err| switch (err) {
             error.NotFound => {},
@@ -17581,6 +17649,9 @@ pub const RaftApplyStore = struct {
             try putRestoreProgressRangeIndexTxn(txn, group_id, record);
         }
 
+        var privacy_buf: [160]u8 = undefined;
+        try self.deleteDerivedPrefixTxn(txn, try privacyPrefix(&privacy_buf, group_id));
+        try self.deleteDerivedPrefixTxn(txn, try std.fmt.bufPrint(&privacy_buf, "\x00\x00__metadata_derived__:privacy_table:{d}:", .{group_id}));
         const tables = try listPhysicalTableIdentities(self.alloc, txn, group_id);
         defer freePhysicalTableIdentities(self.alloc, tables);
         for (tables) |table| {
@@ -17589,6 +17660,13 @@ pub const RaftApplyStore = struct {
                 return error.InvalidDerivedCatalogIndex;
             } else |err| if (err != error.NotFound) return err;
             try self.putTableNameIndexTxn(txn, group_id, table.name, table.id);
+            var privacy_row_arena = std.heap.ArenaAllocator.init(self.alloc);
+            defer privacy_row_arena.deinit();
+            const privacy_alloc = privacy_row_arena.allocator();
+            var privacy_table_buf: [160]u8 = undefined;
+            const privacy_raw = try txn.get(try tableKeyForGroup(&privacy_table_buf, group_id, table.id));
+            try putPrivacyWork(privacy_alloc, txn, group_id, try decodeTableRecord(privacy_alloc, privacy_raw));
+
             var fence = try self.loadTableTransitionFenceTxn(txn, group_id, table.id);
             fence.range_membership = .{};
             var fence_key_buf: [192]u8 = undefined;
@@ -17752,6 +17830,152 @@ pub const RaftApplyStore = struct {
         if (value.len != 8) return error.InvalidDocumentCheckpoint;
         return std.mem.readInt(u64, value[0..8], .big);
     }
+    const privacy_keys = @import("antfly_local_sources").privacy_catalog.checkpoints;
+
+    fn privacyHeader(a: std.mem.Allocator, raw: []const u8) !privacy_keys.Header {
+        const parsed = try std.json.parseFromSlice(privacy_keys.Header, a, raw, .{});
+        defer parsed.deinit();
+        const value = parsed.value;
+        if (value.length == 0 or value.length > privacy_keys.max_bytes or value.created_at_millis < 0 or value.deleted_chunks > value.chunks()) return error.InvalidDocumentCheckpoint;
+        return value;
+    }
+    fn privacyIndexes(txn: *docstore.DocStore.Txn, group: u64, table: u64) ![]const u8 {
+        var buffer: [160]u8 = undefined;
+        const raw = txn.get(try tableKeyForGroup(&buffer, group, table)) catch |err| if (err == error.NotFound) return "" else return err;
+        const record = try borrowTableProjection(raw, .query);
+        // Borrow the pinned transaction bytes: GC must not duplicate the table
+        // schema and catalog for every checkpoint examined.
+        return record.query_definition.?.indexes_json;
+    }
+    fn privacyReferenced(txn: *docstore.DocStore.Txn, group: u64, table: u64, ref: privacy_keys.Ref) !bool {
+        // Tokens are printable and escape-free. A conservative substring hit
+        // can retain extra data, but can never reclaim a live reference.
+        return std.mem.indexOf(u8, try privacyIndexes(txn, group, table), &ref.token()) != null;
+    }
+    fn privacyQuota(txn: *docstore.DocStore.Txn, group: u64, table: u64, bytes: usize, increase: bool, retained: bool) !void {
+        var logical_buffer: [64]u8 = undefined;
+        const logical = try privacy_keys.quotaKey(&logical_buffer, table, retained);
+        var buffer: [256]u8 = undefined;
+        const selected = try jobStateKeyForGroup(&buffer, group, logical);
+        const raw = txn.get(selected) catch |err| if (err == error.NotFound) null else return err;
+        if (raw != null and raw.?.len != 8) return error.InvalidDocumentCheckpoint;
+        const previous = if (raw) |value| std.mem.readInt(u64, value[0..8], .little) else 0;
+        const charge = @max(bytes, 4096);
+        const next = if (increase) std.math.add(u64, previous, charge) catch return error.ResourceBudgetExceeded else std.math.sub(u64, previous, charge) catch return error.InvalidDocumentCheckpoint;
+        if (next > (if (retained) privacy_keys.max_retained_bytes else privacy_keys.max_pending_bytes)) return error.ResourceBudgetExceeded;
+        var encoded: [8]u8 = undefined;
+        std.mem.writeInt(u64, &encoded, next, .little);
+        if (next == 0) {
+            txn.delete(selected) catch |err| if (err != error.NotFound) return err;
+        } else try txn.put(selected, &encoded);
+    }
+    const PrivacyWrite = enum { store, skip, erase };
+    fn privacyWrite(self: *RaftApplyStore, a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, logical: []const u8, current: ?[]const u8, value: []const u8) !PrivacyWrite {
+        _ = self;
+        const selected = try privacy_keys.parseKey(logical);
+        if (selected.kind == .quota) return error.InvalidDocumentCheckpoint;
+        if (selected.kind == .gc) {
+            if (value.len > 256) return error.InvalidDocumentCheckpoint;
+            return .store;
+        }
+        const ref = selected.ref.?;
+        var logical_buffer: [128]u8 = undefined;
+        var buffer: [256]u8 = undefined;
+        if (selected.kind == .chunk) {
+            const raw_header = txn.get(try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, selected.table, null))) catch |err| if (err == error.NotFound) return .skip else return err;
+            const header = try privacyHeader(a, raw_header);
+            if (header.state != .staged) return .skip;
+            if (selected.index >= header.chunks() or value.len != @min(privacy_keys.chunk_bytes, @as(usize, header.length) - selected.index * privacy_keys.chunk_bytes) + 1 or value[0] != 'V') return error.InvalidDocumentCheckpoint;
+            return .store;
+        }
+        const old: ?privacy_keys.Header = if (current) |raw| try privacyHeader(a, raw) else null;
+        if (std.mem.eql(u8, value, privacy_keys.erase)) {
+            const header = old orelse return .skip;
+            if (header.state != .deleting or header.deleted_chunks != header.chunks()) return error.InvalidDocumentCheckpoint;
+            if (header.accounted) try privacyQuota(txn, group, selected.table, header.length, false, true);
+            return .erase;
+        }
+        const next = try privacyHeader(a, value);
+        if (old == null) {
+            if (next.state != .staged or next.attached or next.deleted_chunks != 0) return error.InvalidDocumentCheckpoint;
+            _ = txn.get(try tableKeyForGroup(&buffer, group, selected.table)) catch |err| if (err == error.NotFound) return .skip else return err;
+            if (next.accounted) {
+                const quota_key = try privacy_keys.quotaKey(&logical_buffer, selected.table, true);
+                const quota = txn.get(try jobStateKeyForGroup(&buffer, group, quota_key)) catch |err| if (err == error.NotFound) null else return err;
+                if (quota != null and quota.?.len != 8) return error.InvalidDocumentCheckpoint;
+                const used = if (quota) |bytes| std.mem.readInt(u64, bytes[0..8], .little) else 0;
+                if (@max(next.length, 4096) > privacy_keys.max_retained_bytes -| used) return .skip;
+            }
+            privacyQuota(txn, group, selected.table, next.length, true, false) catch |err| if (err == error.ResourceBudgetExceeded) return .skip else return err;
+            if (next.accounted) try privacyQuota(txn, group, selected.table, next.length, true, true);
+            return .store;
+        }
+        const previous = old.?;
+        if (next.length != previous.length or next.created_at_millis != previous.created_at_millis or next.attached != previous.attached or next.accounted != previous.accounted) return error.InvalidDocumentCheckpoint;
+        if (next.state == .ready) {
+            if (previous.state != .staged) return .skip;
+            if (next.deleted_chunks != 0) return error.InvalidDocumentCheckpoint;
+            var hash = std.crypto.hash.sha2.Sha256.init(.{});
+            for (0..next.chunks()) |index| {
+                const raw = txn.get(try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, selected.table, index))) catch |err| if (err == error.NotFound) return .skip else return err;
+                if (raw.len != @min(privacy_keys.chunk_bytes, @as(usize, next.length) - index * privacy_keys.chunk_bytes) + 1 or raw[0] != 'V') return error.InvalidDocumentCheckpoint;
+                hash.update(raw[1..]);
+            }
+            var digest: [32]u8 = undefined;
+            hash.final(&digest);
+            if (!std.mem.eql(u8, &std.fmt.bytesToHex(digest, .lower), &ref.digest)) return error.InvalidDocumentCheckpoint;
+            return .store;
+        }
+        if (next.state != .deleting or (previous.state == .deleting and next.deleted_chunks < previous.deleted_chunks) or next.deleted_chunks > previous.deleted_chunks + privacy_keys.gc_chunks) return error.InvalidDocumentCheckpoint;
+        if (try privacyReferenced(txn, group, selected.table, ref)) return .skip;
+        if (previous.state != .deleting and !previous.attached) try privacyQuota(txn, group, selected.table, previous.length, false, false);
+        for (previous.deleted_chunks..next.deleted_chunks) |index| {
+            txn.delete(try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, selected.table, index))) catch |err| if (err != error.NotFound) return err;
+        }
+        return .store;
+    }
+    fn privacyKeysReady(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: metadata.TableRecord) !bool {
+        if (std.mem.indexOf(u8, table.indexes_json, "\"_privacy\"") == null) return true;
+        const catalog = @import("antfly_local_sources").privacy_catalog;
+        const tree = try std.json.parseFromSlice(std.json.Value, a, table.indexes_json, .{});
+        defer tree.deinit();
+        var resource = (try catalog.current(a, tree.value)) orelse return true;
+        defer resource.deinit();
+        const refs = try privacy_keys.refs(a, resource.value);
+        defer a.free(refs);
+        for (refs) |ref| {
+            var logical_buffer: [128]u8 = undefined;
+            var buffer: [256]u8 = undefined;
+            const raw = txn.get(try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, table.table_id, null))) catch |err| if (err == error.NotFound) return false else return err;
+            if ((try privacyHeader(a, raw)).state != .ready) return false;
+        }
+        return true;
+    }
+
+    fn attachPrivacyKeys(a: std.mem.Allocator, txn: *docstore.DocStore.Txn, group: u64, table: metadata.TableRecord) !void {
+        const catalog = @import("antfly_local_sources").privacy_catalog;
+        const tree = try std.json.parseFromSlice(std.json.Value, a, table.indexes_json, .{});
+        defer tree.deinit();
+        var resource = (try catalog.current(a, tree.value)) orelse return;
+        defer resource.deinit();
+        const refs = try privacy_keys.refs(a, resource.value);
+        defer a.free(refs);
+        for (refs) |ref| {
+            var logical_buffer: [128]u8 = undefined;
+            var buffer: [256]u8 = undefined;
+            const selected = try jobStateKeyForGroup(&buffer, group, try ref.storageKey(&logical_buffer, table.table_id, null));
+            var header = try privacyHeader(a, try txn.get(selected));
+            if (header.state != .ready) return error.InvalidDocumentCheckpoint;
+            if (!header.attached) {
+                header.attached = true;
+                const raw = try std.json.Stringify.valueAlloc(a, header, .{});
+                defer a.free(raw);
+                try txn.put(selected, raw);
+                try privacyQuota(txn, group, table.table_id, header.length, false, false);
+            }
+        }
+    }
+
     pub fn getJobState(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, logical_key: []const u8) !?[]u8 {
         var buf: [256]u8 = undefined;
         return self.store.get(alloc, try jobStateKeyForGroup(&buf, group_id, logical_key)) catch |err| switch (err) {
@@ -17764,6 +17988,36 @@ pub const RaftApplyStore = struct {
         var scratch = std.heap.ArenaAllocator.init(a);
         defer scratch.deinit();
         const work = scratch.allocator();
+        if (after) |cursor| if (std.mem.startsWith(u8, cursor, "privacy/m/")) {
+            try @import("../job_state.zig").validateKey(cursor);
+            var prefix_buffer: [128]u8 = undefined;
+            const prefix = try jobStateKeyForGroup(&prefix_buffer, group, "privacy/m/");
+            var after_buffer: [256]u8 = undefined;
+            const rows = try self.store.scanPrefixPage(work, prefix, try jobStateKeyForGroup(&after_buffer, group, cursor), contract.max_page_rows);
+            var selected: std.ArrayList(contract.Row) = .empty;
+            var txn = try self.store.beginReadTxn();
+            defer txn.abort();
+            // Manifest keys are ordered by table. Reuse the pinned catalog
+            // even on read backends that allocate a value for each get call.
+            var cached_table: ?u64 = null;
+            var cached_indexes: []const u8 = "";
+            for (rows) |row| {
+                const logical = row.key[prefix.len - "privacy/m/".len ..];
+                const key = try privacy_keys.parseKey(logical);
+                const header = try privacyHeader(work, row.value);
+                const expired = @as(i64, @intCast(@divFloor(@import("antfly_platform").time.realtimeNs(), std.time.ns_per_ms))) -| header.created_at_millis >= privacy_keys.lease_ms;
+                if (header.state != .deleting) {
+                    if (!header.attached and !expired) continue;
+                    if (cached_table == null or cached_table.? != key.table) {
+                        cached_indexes = try privacyIndexes(&txn, group, key.table);
+                        cached_table = key.table;
+                    }
+                    if (std.mem.indexOf(u8, cached_indexes, &key.ref.?.token()) != null) continue;
+                }
+                try selected.append(work, .{ .key = logical, .value = row.value });
+            }
+            return std.json.Stringify.valueAlloc(a, contract.Page{ .rows = selected.items, .next = if (rows.len == contract.max_page_rows) rows[rows.len - 1].key[prefix.len - "privacy/m/".len ..] else null }, .{});
+        };
         var base_buf: [128]u8 = undefined;
         const base = try jobSchedulePrefixForGroup(&base_buf, group);
         if (after) |cursor| if (cursor.len < 19 or cursor.len > 160 or (cursor[0] != '0' and cursor[0] != '1') or cursor[1] != ':') return error.InvalidDocumentCheckpoint;
@@ -21121,6 +21375,16 @@ pub const RaftApplyStore = struct {
                     const hash = @import("../job_state.zig").digest(bytes);
                     if (!std.mem.eql(u8, &hash, record.expected_hash)) return;
                 } else if (record.expected_hash.len != 0) return;
+                var erase_privacy = false;
+                if (std.mem.startsWith(u8, record.key, "privacy/")) {
+                    var scratch = std.heap.ArenaAllocator.init(self.alloc);
+                    defer scratch.deinit();
+                    switch (try self.privacyWrite(scratch.allocator(), txn, group_id, record.key, current, record.value)) {
+                        .skip => return,
+                        .erase => erase_privacy = true,
+                        .store => {},
+                    }
+                }
                 if (std.mem.startsWith(u8, record.key, "documents/")) {
                     const contract = @import("../job_state.zig");
                     var scratch = std.heap.ArenaAllocator.init(self.alloc);
@@ -21162,7 +21426,7 @@ pub const RaftApplyStore = struct {
                     try txn.put(quota_key, &encoded_count);
                     self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = quota_key });
                 }
-                try txn.put(key, record.value);
+                if (erase_privacy) try txn.delete(key) else try txn.put(key, record.value);
                 self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
                 self.notifyProjectionListeners(.{ .kind = .restore_job, .metadata_group_id = group_id });
             },
@@ -21476,6 +21740,8 @@ pub const RaftApplyStore = struct {
         };
         var retained: ?metadata.TableRecord = null;
         defer if (retained) |existing| metadata_table_manager.freeTable(self.alloc, existing);
+        var privacy_indexes: ?[]u8 = null;
+        defer if (privacy_indexes) |raw| self.alloc.free(raw);
         var admission = record;
         if (encoded_existing) |encoded| {
             const existing = try decodeTableRecord(self.alloc, encoded);
@@ -21489,6 +21755,8 @@ pub const RaftApplyStore = struct {
             // retains internal state so schema reconciliation can continue
             // without taking ownership of the publication lifecycle.
             if (record.lake_index_catalog_json.len == 0) admission.lake_index_catalog_json = existing.lake_index_catalog_json else if (!std.mem.eql(u8, existing.lake_index_catalog_json, record.lake_index_catalog_json)) return;
+            privacy_indexes = (try @import("antfly_local_sources").privacy_catalog.reconcileIndexes(self.alloc, existing.indexes_json, admission.indexes_json)) orelse return;
+            admission.indexes_json = privacy_indexes.?;
             if (metadata_table_manager.tableDefinitionsEqual(existing, admission)) return;
             if (!try self.policyDefinitionMutationAllowedTxn(txn, group_id, existing, admission)) return;
             if ((existing.relational_retirement_json.len != 0 or admission.relational_retirement_json.len != 0) and
@@ -23088,17 +23356,42 @@ pub const RaftApplyStore = struct {
         };
         const current = try decodeTableRecord(self.alloc, encoded);
         defer metadata_table_manager.freeTable(self.alloc, current);
-        if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) return;
+        if (!metadata_table_manager.tableDefinitionsEqual(current, expected)) {
+            // A point-read preflight can race progress before this command
+            // applies. Persist the exact rejection in this transaction so the
+            // receipt reader may retry rather than report an ambiguous outcome.
+            // Runtime-only contenders must not overwrite a pending authored
+            // command's rejection receipt.
+            if (!try metadata_table_manager.privacyProgressOnly(self.alloc, expected, replacement))
+                try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
+            return;
+        }
+        if (!try privacyKeysReady(self.alloc, txn, group_id, replacement)) {
+            if (!try metadata_table_manager.privacyProgressOnly(self.alloc, current, replacement))
+                try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
+            return;
+        }
+        if (try metadata_table_manager.privacyProgressOnly(self.alloc, current, replacement)) {
+            if ((try self.loadTableTransitionFenceTxn(txn, group_id, current.table_id)).active()) return;
+            // Runtime state and its derived schedule commit atomically. Keep
+            // semantic projections intact: no table/schema/name notification,
+            // resolver re-publication, or catalog revision bump is required.
+            const value = try encodeTableRecord(self.alloc, replacement);
+            defer self.alloc.free(value);
+            try putPrivacyWork(self.alloc, txn, group_id, replacement);
+            try txn.put(key, value);
+            const fingerprint = policyTableSchemaRecordDigest(replacement);
+            var fingerprint_key_buf: [192]u8 = undefined;
+            try txn.put(try tableSchemaFingerprintKeyForGroup(&fingerprint_key_buf, group_id, replacement.table_id), &fingerprint);
+            self.notifyCommittedKeyListeners(.{ .metadata_group_id = group_id, .key = key });
+            return;
+        }
         {
             var arena = std.heap.ArenaAllocator.init(self.alloc);
             defer arena.deinit();
             const a = arena.allocator();
             if (!try resolverNamespaceAdoptionAllowedTxn(txn, group_id, a, current, replacement) or !try self.resolverProjectionValidTxn(a, txn, group_id, replacement)) {
-                try txn.put(try resolverRejectionKey(a, group_id, expected.table_id), try std.json.Stringify.valueAlloc(a, ResolverRejection{
-                    .digest = try resolverReplacementDigest(a, expected, replacement),
-                    .term = self.active_resolver_apply_position.term,
-                    .index = self.active_resolver_apply_position.index,
-                }, .{}));
+                try self.recordTableDefinitionRejectionTxn(txn, group_id, expected, replacement);
                 return;
             }
             try txn.delete(try resolverRejectionKey(a, group_id, expected.table_id));
@@ -25064,7 +25357,21 @@ pub const RaftApplyStore = struct {
         }
         return projected;
     }
-    const ResolverRejection = struct { digest: [32]u8, term: u64, index: u64 };
+    // One bounded rejection per table, shared with existing resolver failures.
+    // Keep the durable key and encoding compatible. Later progress commits do
+    // not erase the marker; a later authored replacement may supersede it, in
+    // which case its receipt reader conservatively retains outcome-unknown.
+    fn recordTableDefinitionRejectionTxn(self: *RaftApplyStore, txn: *docstore.DocStore.Txn, group_id: u64, expected: metadata.TableRecord, replacement: metadata.TableRecord) !void {
+        var arena = std.heap.ArenaAllocator.init(self.alloc);
+        defer arena.deinit();
+        const a = arena.allocator();
+        try txn.put(try resolverRejectionKey(a, group_id, expected.table_id), try std.json.Stringify.valueAlloc(a, TableDefinitionRejection{
+            .digest = try resolverReplacementDigest(a, expected, replacement),
+            .term = self.active_resolver_apply_position.term,
+            .index = self.active_resolver_apply_position.index,
+        }, .{}));
+    }
+    const TableDefinitionRejection = struct { digest: [32]u8, term: u64, index: u64 };
     fn resolverRejectionKey(a: std.mem.Allocator, group_id: u64, table_id: u64) ![]const u8 {
         return std.fmt.allocPrint(a, "\x00\x00__metadata__:resolver_namespaces:{d}:rejected:{x:0>16}", .{ group_id, table_id });
     }
@@ -25073,14 +25380,14 @@ pub const RaftApplyStore = struct {
         std.crypto.hash.sha2.Sha256.hash(try std.json.Stringify.valueAlloc(a, .{ expected, replacement }, .{}), &digest, .{});
         return digest;
     }
-    pub fn resolverNamespaceReplacementRejected(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, term: u64, index: u64, expected: metadata.TableRecord, replacement: metadata.TableRecord) !bool {
+    pub fn tableDefinitionReplacementRejected(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, term: u64, index: u64, expected: metadata.TableRecord, replacement: metadata.TableRecord) !bool {
         var arena = std.heap.ArenaAllocator.init(alloc);
         defer arena.deinit();
         const a = arena.allocator();
         var txn = try self.store.beginReadTxn();
         defer txn.abort();
         const value = (try stagingGet(&txn, try resolverRejectionKey(a, group_id, expected.table_id))) orelse return false;
-        const receipt = try std.json.parseFromSliceLeaky(ResolverRejection, a, value, .{});
+        const receipt = try std.json.parseFromSliceLeaky(TableDefinitionRejection, a, value, .{});
         return receipt.term == term and receipt.index == index and std.mem.eql(u8, &receipt.digest, &(try resolverReplacementDigest(a, expected, replacement)));
     }
     pub fn resolverNamespaceReplacementMatches(self: *RaftApplyStore, alloc: std.mem.Allocator, group_id: u64, current: metadata.TableRecord, replacement: metadata.TableRecord) !bool {
@@ -25550,6 +25857,7 @@ pub const RaftApplyStore = struct {
             const digest = relationTableSourceDigest(record.table_id, record.name, record.schema_json);
             if (previous_digest == null or !std.mem.eql(u8, &previous_digest.?, &digest)) try relation_reconciliation.advanceSource(txn, group_id);
         }
+        try putPrivacyWork(self.alloc, txn, group_id, record);
         try txn.put(key, value);
         const fingerprint = policyTableSchemaRecordDigest(record);
         var fingerprint_key_buf: [192]u8 = undefined;
@@ -41532,16 +41840,16 @@ test "resolver curation namespace propagation rejects alias cycles without poiso
     try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 52, .name = "new-consumer", .indexes_json = indexes } });
     try std.testing.expectError(error.CatalogGenerationChanged, store.resolverCatalogRead(a, group, .{ .table_name = "entities", .expected_revision = revision, .standalone = true }));
     try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = before, .replacement = replacement } });
-    try std.testing.expect(try store.resolverNamespaceReplacementRejected(std.testing.allocator, group, 0, 0, before, replacement));
+    try std.testing.expect(try store.tableDefinitionReplacementRejected(std.testing.allocator, group, 0, 0, before, replacement));
     try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(before, (try store.getTable(a, group, 1)).?));
     const rejected_command = try encodeTransitionCommand(a, .{ .compare_and_replace_table = .{ .expected = before, .replacement = replacement } });
     for ([_]u64{ 1, 2 }) |index| {
         var outcome = try MetadataReplayTest.apply(&store, group, &.{.{ .term = 7, .index = index, .entry_type = .normal, .data = rejected_command }});
         outcome.deinit();
-        try std.testing.expect(try store.resolverNamespaceReplacementRejected(std.testing.allocator, group, 7, index, before, replacement));
-        try std.testing.expect(!try store.resolverNamespaceReplacementRejected(std.testing.allocator, group, 7, index + 1, before, replacement));
+        try std.testing.expect(try store.tableDefinitionReplacementRejected(std.testing.allocator, group, 7, index, before, replacement));
+        try std.testing.expect(!try store.tableDefinitionReplacementRejected(std.testing.allocator, group, 7, index + 1, before, replacement));
     }
-    try std.testing.expect(!try store.resolverNamespaceReplacementRejected(std.testing.allocator, group, 7, 1, before, replacement));
+    try std.testing.expect(!try store.tableDefinitionReplacementRejected(std.testing.allocator, group, 7, 1, before, replacement));
     // Replay a proposal that bypassed public preflight with the relation
     // journal enabled, then prove the next committed entry still applies.
     {
@@ -41608,7 +41916,7 @@ test "resolver curation namespace propagation rejects source edits racing adopti
     const command = try encodeTransitionCommand(a, .{ .compare_and_replace_table = .{ .expected = source, .replacement = replacement } });
     var outcome = try MetadataReplayTest.apply(&store, group, &.{.{ .term = 9, .index = 1, .entry_type = .normal, .data = command }});
     outcome.deinit();
-    try std.testing.expect(try store.resolverNamespaceReplacementRejected(a, group, 9, 1, source, replacement));
+    try std.testing.expect(try store.tableDefinitionReplacementRejected(a, group, 9, 1, source, replacement));
     try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(source, (try store.getTable(a, group, 2)).?));
     // An ordinary source definition edit is allowed to inherit the namespace.
     var ordinary = source;
@@ -41681,7 +41989,7 @@ test "resolver curation namespace propagation rejects source edits racing propos
     const command = try encodeTransitionCommand(a, .{ .compare_and_replace_table = .{ .expected = source, .replacement = replacement } });
     var outcome = try MetadataReplayTest.apply(&store, group, &.{.{ .term = 9, .index = 1, .entry_type = .normal, .data = command }});
     outcome.deinit();
-    try std.testing.expect(try store.resolverNamespaceReplacementRejected(a, group, 9, 1, source, replacement));
+    try std.testing.expect(try store.tableDefinitionReplacementRejected(a, group, 9, 1, source, replacement));
     try std.testing.expect(metadata_table_manager.tableDefinitionsEqual(source, (try store.getTable(a, group, 2)).?));
     // The same source-only CAS remains rejected when replicated again, while
     // unrelated schema changes still commit without adopting resolver policy.
@@ -43619,6 +43927,87 @@ test "metadata durable job state snapshot retains scheduling quotas and group is
     try std.testing.expectEqualStrings("documents/finished", page.value.rows[0].key);
 }
 
+test "privacy work index follows atomic table updates deletion and derived index rebuild" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/privacy-work", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    const group = 7301;
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    var resource = try privacy.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    resource.coverage.updated_at_millis = 10;
+    resource.coverage.retry_after_millis = 20;
+    for (1..33) |id| try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = id, .name = try std.fmt.allocPrint(a, "unrelated-{d}", .{id}) } });
+    try std.testing.expect(try store.nextPrivacyTable(a, group, 100) == null);
+    const table = metadata.TableRecord{ .table_id = 50, .name = "private", .indexes_json = try privacy.install(a, "{}", resource) };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    try std.testing.expect(try store.nextPrivacyTable(a, group, 19) == null);
+    try std.testing.expectEqual(@as(u64, 50), (try store.nextPrivacyTable(a, group, 20)).?.table_id);
+    const before = (try store.tableByName(a, group, "private")).?;
+    const revision = try store.writeValidationRevision(group);
+    try std.testing.expect(!try metadata_table_manager.privacyProgressOnly(a, before, before));
+    resource.coverage.retry_after_millis = 200;
+    var replacement = before;
+    replacement.indexes_json = try privacy.replaceResource(a, before.indexes_json, resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = before, .replacement = replacement } });
+    try std.testing.expectEqual(revision, try store.writeValidationRevision(group));
+    // A second CAS based on the same cut cannot overwrite committed progress.
+    var stale = replacement;
+    resource.coverage.retry_after_millis = 300;
+    stale.indexes_json = try privacy.replaceResource(a, before.indexes_json, resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = before, .replacement = stale } });
+    const committed = (try store.tableByName(a, group, "private")).?;
+    try std.testing.expectEqualStrings(replacement.indexes_json, committed.indexes_json);
+    try std.testing.expect(!try store.tableDefinitionReplacementRejected(a, group, 0, 0, before, stale));
+    // An authored save based on an older runtime cut must also produce a known
+    // rejection. Later successful progress must retain that exact receipt.
+    var policy_save = before;
+    const saved_resource = try privacy.next(a, resource, resource.policy, try privacy.etag(a, resource));
+    policy_save.indexes_json = try privacy.install(a, before.indexes_json, saved_resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = before, .replacement = policy_save } });
+    try std.testing.expect(try store.tableDefinitionReplacementRejected(a, group, 0, 0, before, policy_save));
+    var later_resource = resource;
+    later_resource.coverage.retry_after_millis = 200;
+    later_resource.coverage.updated_at_millis += 1;
+    var later = committed;
+    later.indexes_json = try privacy.replaceResource(a, committed.indexes_json, later_resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = committed, .replacement = later } });
+    try std.testing.expect(try store.tableDefinitionReplacementRejected(a, group, 0, 0, before, policy_save));
+    // Restore this test's expected runtime cut through another valid CAS.
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = later, .replacement = committed } });
+    try store.applyStandaloneCommand(group, .{ .upsert_table = before });
+    const after_reconcile = (try store.tableByName(a, group, "private")).?;
+    try std.testing.expectEqualStrings(replacement.indexes_json, after_reconcile.indexes_json);
+    try std.testing.expectEqual(revision, try store.writeValidationRevision(group));
+    var schema_reconcile = before;
+    schema_reconcile.description = "reconciled";
+    try store.applyStandaloneCommand(group, .{ .upsert_table = schema_reconcile });
+    const after_schema = (try store.tableByName(a, group, "private")).?;
+    try std.testing.expectEqualStrings("reconciled", after_schema.description);
+    try std.testing.expectEqualStrings(replacement.indexes_json, after_schema.indexes_json);
+    try std.testing.expect(try store.nextPrivacyTable(a, group, 100) == null);
+    try store.rebuildDerivedCatalogIndexes(group);
+    try std.testing.expectEqual(@as(u64, 50), (try store.nextPrivacyTable(a, group, 200)).?.table_id);
+    // Derived hints are omitted from the replicated snapshot and rebuilt from
+    // durable policy/job state in the destination store.
+    const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+    const rows = try decodeMetadataSnapshotAlloc(a, snapshot);
+    for (rows) |row| try std.testing.expect(!std.mem.startsWith(u8, row.key, "\x00\x00__metadata_derived__:"));
+    var restored = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = try std.fmt.allocPrint(a, "{s}-restored", .{root}) });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(a, group, 100, snapshot));
+    try std.testing.expect(try restored.nextPrivacyTable(a, group, 100) == null);
+    try std.testing.expectEqual(@as(u64, 50), (try restored.nextPrivacyTable(a, group, 200)).?.table_id);
+    const fence = try store.getTableTransitionFence(group, 50);
+    try store.applyStandaloneCommand(group, .{ .remove_table = .{ .table_id = 50, .expected_transition_generation = fence.generation } });
+    try std.testing.expect(try store.nextPrivacyTable(a, group, 999) == null);
+    try std.testing.expect(try store.tableByName(a, group, "private") == null);
+}
+
 test "system catalog relation namespace transaction FK generation publication completion history survives replacement and restart" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -43972,4 +44361,174 @@ test "system catalog relation namespace transaction prepared table and FK consum
         defer complete.deinit();
         try std.testing.expect(complete.value.record.?.complete);
     }
+}
+
+test "privacy key attachment and incremental reclamation are atomic and survive snapshots" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/privacy-keys", .{tmp.sub_path});
+    var store = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    const privacy = @import("antfly_local_sources").privacy_catalog;
+    const keys = privacy.checkpoints;
+    const jobs = @import("../job_state.zig");
+    const group = 7302;
+    var resource = try privacy.next(a, null, .{ .mode = .monitor, .fields = &.{"body"} }, null);
+    const table: metadata.TableRecord = .{ .table_id = 1, .name = "private", .indexes_json = try privacy.install(a, "{}", resource) };
+    try store.applyStandaloneCommand(group, .{ .upsert_table = table });
+    const content = try a.alloc(u8, keys.chunk_bytes * 9 + 3);
+    @memset(content, 'x');
+    const ref: keys.Ref = .{ .digest = std.fmt.bytesToHex(jobs.digest(content), .lower), .generation = @splat('a') };
+    var buffer: [128]u8 = undefined;
+    const manifest = try a.dupe(u8, try ref.storageKey(&buffer, 1, null));
+    var header: keys.Header = .{ .accounted = true, .length = @intCast(content.len), .created_at_millis = 1 };
+    const initial = try std.json.Stringify.valueAlloc(a, header, .{});
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = "", .value = initial } });
+    resource.checkpoint_encoding = 1;
+    resource.coverage.cursor = try a.dupe(u8, &ref.token());
+    var attached = table;
+    attached.indexes_json = try privacy.replaceResource(a, table.indexes_json, resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = table, .replacement = attached } });
+    try std.testing.expectEqualStrings(table.indexes_json, (try store.tableByName(a, group, "private")).?.indexes_json);
+    header.state = .ready;
+    const ready = try std.json.Stringify.valueAlloc(a, header, .{});
+    const initial_hash = jobs.digest(initial);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &initial_hash, .value = ready } });
+    try std.testing.expectEqualStrings(initial, (try store.getJobState(a, group, manifest)).?);
+    for (0..header.chunks()) |index| {
+        const start = index * keys.chunk_bytes;
+        const part = content[start..@min(content.len, start + keys.chunk_bytes)];
+        try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = try ref.storageKey(&buffer, 1, index), .expected_hash = "", .value = try std.mem.concat(a, u8, &.{ "V", part }) } });
+    }
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &initial_hash, .value = ready } });
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = table, .replacement = attached } });
+    const attached_header = (try store.getJobState(a, group, manifest)).?;
+    var parsed_header = try std.json.parseFromSlice(keys.Header, a, attached_header, .{});
+    defer parsed_header.deinit();
+    try std.testing.expect(parsed_header.value.attached);
+    const retained_key = try a.dupe(u8, try keys.quotaKey(&buffer, 1, true));
+    try std.testing.expectEqual(@as(u64, content.len), std.mem.readInt(u64, (try store.getJobState(a, group, retained_key)).?[0..8], .little));
+    // Reclamation and table attachment serialize through the same transaction.
+    header = parsed_header.value;
+    header.state = .deleting;
+    header.deleted_chunks = 8;
+    const deleting = try std.json.Stringify.valueAlloc(a, header, .{});
+    const attached_hash = jobs.digest(attached_header);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &attached_hash, .value = deleting } });
+    try std.testing.expectEqualStrings(attached_header, (try store.getJobState(a, group, manifest)).?);
+    const live = try store.scanJobState(a, group, "privacy/m/");
+    var live_page = try std.json.parseFromSlice(jobs.Page, a, live, .{});
+    defer live_page.deinit();
+    try std.testing.expectEqual(@as(usize, 0), live_page.value.rows.len);
+    resource.coverage.cursor = null;
+    var detached = attached;
+    detached.indexes_json = try privacy.replaceResource(a, attached.indexes_json, resource);
+    try store.applyStandaloneCommand(group, .{ .compare_and_replace_table = .{ .expected = attached, .replacement = detached } });
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &attached_hash, .value = deleting } });
+    try std.testing.expect(try store.getJobState(a, group, try ref.storageKey(&buffer, 1, 0)) == null);
+    try std.testing.expect(try store.getJobState(a, group, try ref.storageKey(&buffer, 1, 8)) != null);
+    // Snapshot restores both remaining chunks and the deletion checkpoint.
+    const snapshot = try store.snapshotBuilder().buildSnapshot(a, group);
+    var restored = try RaftApplyStore.init(std.testing.allocator, .{ .root_dir = try std.fmt.allocPrint(a, "{s}-restored", .{root}) });
+    defer restored.deinit();
+    try std.testing.expect(try restored.snapshotBuilder().installSnapshot(a, group, 100, snapshot));
+    const deleting_hash = jobs.digest(deleting);
+    header.deleted_chunks = @intCast(header.chunks());
+    const final = try std.json.Stringify.valueAlloc(a, header, .{});
+    try restored.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &deleting_hash, .value = final } });
+    const final_hash = jobs.digest(final);
+    try restored.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &final_hash, .value = keys.erase } });
+    try std.testing.expect(try restored.getJobState(a, group, manifest) == null);
+    try std.testing.expect(try restored.getJobState(a, group, retained_key) == null);
+    try std.testing.expect(try restored.getJobState(a, group, try ref.storageKey(&buffer, 1, 9)) == null);
+    // A late uploader cannot recreate chunks after the manifest was erased.
+    try restored.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = try ref.storageKey(&buffer, 1, 9), .expected_hash = "", .value = "Vxxx" } });
+    try std.testing.expect(try restored.getJobState(a, group, try ref.storageKey(&buffer, 1, 9)) == null);
+}
+
+test "privacy checkpoint ownership borrows large table records without allocator growth" {
+    const a = std.testing.allocator;
+    const schema = try a.alloc(u8, 8 * 1024 * 1024);
+    defer a.free(schema);
+    @memset(schema, ' ');
+    const record = try encodeTableRecord(a, .{ .table_id = 7, .name = "privacy", .schema_json = schema, .indexes_json = "{\"_privacy\":{}}" });
+    defer a.free(record);
+    // A complete GC page can examine the same large record without creating
+    // any schema/catalog copies. The projection retains the pinned row.
+    for (0..32) |_| {
+        const view = try borrowTableProjection(record, .query);
+        const indexes = view.query_definition.?.indexes_json;
+        try std.testing.expectEqualStrings("{\"_privacy\":{}}", indexes);
+        try std.testing.expect(@intFromPtr(indexes.ptr) >= @intFromPtr(record.ptr));
+        try std.testing.expect(@intFromPtr(indexes.ptr) + indexes.len <= @intFromPtr(record.ptr) + record.len);
+    }
+    try std.testing.expectError(error.InvalidMetadataTransitionEncoding, borrowTableProjection(record[0 .. record.len - 1], .query));
+}
+
+test "privacy retained capacity denies staging atomically and releases only on final erase" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/privacy-capacity", .{tmp.sub_path});
+    defer a.free(root);
+    var store = try RaftApplyStore.init(a, .{ .root_dir = root });
+    defer store.deinit();
+    const group = 7305;
+    const keys = RaftApplyStore.privacy_keys;
+    const jobs = @import("../job_state.zig");
+    try store.applyStandaloneCommand(group, .{ .upsert_table = .{ .table_id = 1, .name = "capacity" } });
+    var logical_buffer: [128]u8 = undefined;
+    const quota = try a.dupe(u8, try keys.quotaKey(&logical_buffer, 1, true));
+    defer a.free(quota);
+    var physical_buffer: [256]u8 = undefined;
+    // Model already-attached payloads without allocating gigabytes in a test.
+    var encoded: [8]u8 = undefined;
+    std.mem.writeInt(u64, &encoded, keys.max_retained_bytes - 4096, .little);
+    {
+        var txn = try store.store.beginWriteTxn();
+        errdefer txn.abort();
+        try txn.put(try jobStateKeyForGroup(&physical_buffer, group, quota), &encoded);
+        try txn.commit();
+    }
+    const ref: keys.Ref = .{ .digest = @splat('a'), .generation = @splat('b') };
+    const manifest = try a.dupe(u8, try ref.storageKey(&logical_buffer, 1, null));
+    defer a.free(manifest);
+    var header: keys.Header = .{ .accounted = true, .length = 1, .created_at_millis = 1 };
+    const staged = try std.json.Stringify.valueAlloc(a, header, .{});
+    defer a.free(staged);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = "", .value = staged } });
+    const second: keys.Ref = .{ .digest = @splat('c'), .generation = @splat('d') };
+    const denied = try a.dupe(u8, try second.storageKey(&logical_buffer, 1, null));
+    defer a.free(denied);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = denied, .expected_hash = "", .value = staged } });
+    try std.testing.expect(try store.getJobState(a, group, denied) == null);
+    const pending_key = try a.dupe(u8, try keys.quotaKey(&logical_buffer, 1, false));
+    defer a.free(pending_key);
+    const pending = (try store.getJobState(a, group, pending_key)).?;
+    defer a.free(pending);
+    try std.testing.expectEqual(@as(u64, 4096), std.mem.readInt(u64, pending[0..8], .little));
+    header.state = .deleting;
+    header.deleted_chunks = 1;
+    const deleting = try std.json.Stringify.valueAlloc(a, header, .{});
+    defer a.free(deleting);
+    const staged_hash = jobs.digest(staged);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &staged_hash, .value = deleting } });
+    const retained = (try store.getJobState(a, group, quota)).?;
+    defer a.free(retained);
+    try std.testing.expectEqual(keys.max_retained_bytes, std.mem.readInt(u64, retained[0..8], .little));
+    const deleting_hash = jobs.digest(deleting);
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = manifest, .expected_hash = &deleting_hash, .value = keys.erase } });
+    const released = (try store.getJobState(a, group, quota)).?;
+    defer a.free(released);
+    try std.testing.expectEqual(keys.max_retained_bytes - 4096, std.mem.readInt(u64, released[0..8], .little));
+    try store.applyStandaloneCommand(group, .{ .compare_and_set_job_state = .{ .key = denied, .expected_hash = "", .value = staged } });
+    const admitted = (try store.getJobState(a, group, denied)).?;
+    defer a.free(admitted);
+    try std.testing.expectEqualStrings(staged, admitted);
+    var legacy = try std.json.parseFromSlice(keys.Header, a, "{\"length\":1,\"created_at_millis\":1}", .{});
+    defer legacy.deinit();
+    try std.testing.expect(!legacy.value.accounted);
 }
