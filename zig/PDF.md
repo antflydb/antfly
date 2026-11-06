@@ -1976,14 +1976,17 @@ Validated indirect lengths are normalized to integers in the owned header,
 avoiding repeated reference lookups and allocations during payload reads without
 increasing Object storage. Recovery searches use bounded chunks with marker
 overlap. Native text extraction classifies XObjects in a single dictionary pass.
-Images retain only their subtype and structure-presence marker and stop at the
-stream header, without resolving lengths, decoding length containers, or
-inspecting payload boundaries. Subtype order does not affect classification:
-unused image fields are skipped, while Form-only fields preceding Subtype stay
-as source offsets and are materialized only for Forms. Forms retain the metadata
-used by extraction and continue through ordinary length validation and decoding
-without reparsing their header. Image header
-views carry no payload range and cannot be decoded. OOM, cancellation, and
+Only PDF Forms proceed to payload validation and decoding. Images, PostScript
+XObjects (both Subtype PS and Form/Subtype2 PS), and other ignored subtypes stop
+at the stream header, without resolving lengths, decoding length containers, or
+inspecting payload boundaries. Header views retain classification and the
+structure-presence marker, carry no payload range, and cannot be decoded.
+Dictionary order does not affect classification: unused fields are skipped,
+while allocating Form-only fields stay as source offsets until classification
+is complete, including an optional late Subtype2 PS. Common scalar resource
+references are parsed once. PDF Forms materialize only their extraction fields
+and continue through ordinary length validation and decoding without reparsing
+the whole header. OOM, cancellation, and
 exhausted work still propagate; payload readers remain strict.
 Numeric lookahead propagates
 cancellation and work exhaustion rather than treating them as end-of-input.

@@ -10041,8 +10041,8 @@ pub const Reader = struct {
     }
 
     fn textXObject(self: *const Reader, raw: *const syntax.Object) !syntax.Object {
-        // Classify and parse once: images stop at their header, while Forms
-        // retain the fields and validated payload range needed by extraction.
+        // Classify and parse once: only PDF Forms need validated payloads.
+        // Images and ignored XObjects stop at their header.
         return switch (raw.*) {
             .obj_ref => |reference| try self.readIndirectObjectProjected(reference, .text_xobject),
             else => try raw.clone(self.alloc),
@@ -10083,7 +10083,7 @@ pub const Reader = struct {
                 try out.append(self.alloc, .{ .name = name, .content = content, .text_image = true, .structure_object = xobj.get("StructParent") != null });
                 continue;
             }
-            if (!std.mem.eql(u8, subtype.asName() orelse continue, "Form")) continue;
+            if (xobj != .stream or !std.mem.eql(u8, subtype.asName() orelse continue, "Form")) continue;
 
             var content: ?[]u8 = try self.readDecodedStreamData(&xobj);
             errdefer if (content) |owned| self.alloc.free(owned);
@@ -38471,4 +38471,73 @@ test "reader native Form projection decrypts deferred resources exactly once" {
         }
     }
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedNativeFormProjection, .{sample});
+}
+
+fn buildIgnoredTextXObjectTestPdfAlloc(a: Allocator, classification: []const u8, length: []const u8) ![]u8 {
+    const padding = try a.alloc(u8, 256 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    padding[0] = '(';
+    padding[padding.len - 1] = ')';
+    // Deliberately put classification after decoder fields and resources.
+    const object = try std.fmt.allocPrint(a, "<< /Type /XObject /Resources << /Unused (ignored) >> /Filter /Unsupported /Length {s} {s} >>\nstream\n%PS\nendstream", .{ length, classification });
+    defer a.free(object);
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "3", padding },
+        .extra = &.{object},
+        .resources = "<< /Font << /F1 5 0 R >> /XObject << /A 9 0 R /B 9 0 R >> >>",
+        .content = "BT /F1 10 Tf 10 100 Td (Hello) Tj ET /A Do /B Do",
+    });
+}
+
+fn exerciseIgnoredTextXObject(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    const reference = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+    var header = try reader.textXObject(&reference);
+    defer header.deinit(a);
+    try std.testing.expect(header == .stream_header);
+    try std.testing.expect(header.get("Length") == null);
+    try std.testing.expect(header.get("Resources") == null);
+    try std.testing.expectError(error.NotAStream, reader.readDecodedStreamData(&header));
+}
+
+test "reader ignored XObjects preserve native text independently of length and filters" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "/Subtype /PS", "/Subtype /Form /Subtype2 /PS", "/Subtype2 /PS /Subtype /Form", "/Subtype /Unknown", "" }) |classification| {
+        for ([_][]const u8{ "7 0 R", "99 0 R", "-1", "1" }) |length| {
+            const sample = try buildIgnoredTextXObjectTestPdfAlloc(a, classification, length);
+            defer a.free(sample);
+            var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 16 * 1024, .max_working_set_bytes = 32 * 1024 });
+            defer reader.deinit();
+            inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+                reader.setTextExtractionPolicy(policy);
+                var analysis = try reader.extractPageTextAnalysisAlloc(1);
+                defer analysis.deinit(a);
+                const plain = try reader.extractPlainTextAlloc();
+                defer a.free(plain);
+                try std.testing.expectEqualStrings("Hello\n", analysis.text);
+                try std.testing.expectEqualStrings(analysis.text, plain);
+                try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+            }
+            // Native-only projection must not relax ordinary stream reads.
+            const reference = syntax.ObjRef{ .id = 9, .gen = 0 };
+            if (std.mem.eql(u8, length, "99 0 R")) {
+                try std.testing.expectError(error.ObjectNotFound, reader.readIndirectObject(reference));
+            } else if (std.mem.eql(u8, length, "-1")) {
+                try std.testing.expectError(error.InvalidStreamLength, reader.readIndirectObject(reference));
+            } else if (std.mem.eql(u8, length, "1")) {
+                try std.testing.expectError(error.MissingEndStream, reader.readIndirectObject(reference));
+            }
+        }
+    }
+}
+
+test "reader ignored XObject header ownership preserves allocation failures" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "/Subtype /PS", "/Subtype /Form /Subtype2 /PS", "/Subtype2 /PS /Subtype /Form" }) |classification| {
+        const sample = try buildIgnoredTextXObjectTestPdfAlloc(a, classification, "7 0 R");
+        defer a.free(sample);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseIgnoredTextXObject, .{sample});
+    }
 }
