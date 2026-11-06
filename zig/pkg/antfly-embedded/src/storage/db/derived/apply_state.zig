@@ -606,14 +606,36 @@ pub const ProjectionSnapshot = struct {
     }
 };
 
+/// A stable identity for `store`, suitable as a lock-registry key across
+/// separate calls that both mean "the same logical store". This must be
+/// computed from the caller's own value, never from a `backend_erased.Store`
+/// built by `initRuntimeStore`: `storeFrom` heap-allocates a fresh erasure
+/// box on every call for any `store` that isn't already erased (which is the
+/// common case — most callers pass `*DocStore`), so `(try
+/// initRuntimeStore(...)).store.ptr` is a different address on every call
+/// even for the exact same underlying store, and two concurrent acquisitions
+/// against "the same store" would never collide. A pointer's own value does
+/// not have that problem: `db.core.store` is one stable `*DocStore` for the
+/// whole life of the DB.
+fn projectionSnapshotLockKey(store: anytype) usize {
+    const T = @TypeOf(store);
+    if (T == backend_erased.Store) return @intFromPtr(store.ptr);
+    if (T == *backend_erased.Store) return @intFromPtr(store.ptr);
+    switch (@typeInfo(T)) {
+        .pointer => return @intFromPtr(store),
+        else => return @intFromPtr(&store),
+    }
+}
+
 /// Open a coherent read for a batch of index evidence publications, not once
 /// per document/requirement. Returns null when there is no active authority
 /// to validate against (nothing to serve from yet), or when another
 /// snapshot against the same store is already outstanding.
 pub fn tryAcquireProjectionSnapshot(alloc: Allocator, store: anytype) !?ProjectionSnapshot {
+    const lock_key = projectionSnapshotLockKey(store);
     var runtime = try initRuntimeStore(alloc, store);
     errdefer runtime.deinit();
-    const lock = try retainProjectionSnapshotLock(@intFromPtr(runtime.store.ptr));
+    const lock = try retainProjectionSnapshotLock(lock_key);
     if (!lock.mutex.tryLock()) {
         releaseProjectionSnapshotLock(lock);
         runtime.deinit();
