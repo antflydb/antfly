@@ -694,22 +694,16 @@ pub const DocStore = struct {
                 try self.artifact_footprint.stage(self);
                 try self.document_revisions.stage(self);
             }
-            // From here on, a failure (including `write.commit()` itself)
-            // must still release what staging above captured -- these three
-            // own real allocations (in particular `document_revisions`'s
-            // hash map), not just flags, and the success path below is the
-            // only other place that frees them. Without this, a commit that
-            // fails after staging (a transient write/sync error surfacing
-            // through `write.commit()`, in particular -- see native.zig's
-            // `reconcilePublicationUncertainty` and the derived-worker
-            // retry classification in catch_up_policy.zig, both of which
-            // make that failure far more commonly observed than before)
-            // leaks every one of them.
-            errdefer {
-                self.retained.deinit(self.alloc);
-                self.artifact_inputs.deinit(self.alloc);
-                self.document_revisions.deinit(self.alloc);
-            }
+            // NOT an `errdefer self.retained.deinit(...)` (and friends) here:
+            // every caller of `commit()` in this codebase already pairs it
+            // with its own `errdefer write.abort()` (see e.g.
+            // `artifact_footprint.zig`'s `initializeEmpty`/`invalidate`),
+            // and `abort()` deinits these same three. Adding a second deinit
+            // here double-frees them -- `HashMapUnmanaged.deinit` sets the
+            // map to `undefined`, so a caller's subsequent `abort()` would
+            // crash (caught by the crash sweep as an "incorrect alignment"
+            // panic inside `retained_effects.Capture.deinit`). Cleanup on a
+            // failed commit is the caller's `abort()`, by convention.
             const reader_owner = self.portable_import_reader_owner;
             const columnar_owner = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             const source_owner = self.columnar_owner;
@@ -1255,18 +1249,26 @@ pub const DocStore = struct {
                 self.ticket.wait() catch |err| {
                     self.batch.retained.poisoned = true;
                     if (self.source_owner) |owner| owner.committed_replay_next_cached.store(0, .release);
-                    // `commitStaged` already staged these three (that is
-                    // what makes `source_certificates`/the payload session
-                    // above valid to reference); a ticket that never durably
-                    // lands (a transient write/sync error, in particular --
-                    // see `reconcilePublicationUncertainty` and
-                    // `catch_up_policy.isTransientIoError`, which together
-                    // make this far more commonly observed than before)
-                    // must still release them, the same as `Txn.commit`'s
-                    // own `errdefer` does for the non-staged commit path.
-                    self.batch.retained.deinit(self.batch.alloc);
-                    self.batch.artifact_inputs.deinit(self.batch.alloc);
-                    self.batch.document_revisions.deinit(self.batch.alloc);
+                    // Deliberately not releasing `retained`/`artifact_inputs`/
+                    // `document_revisions` here even though `commitStaged`
+                    // already staged them: not every caller reaches `wait`
+                    // through `backend_erased.Batch.commitStaged`'s
+                    // inert-vtable swap (which makes a caller's later
+                    // `errdefer batch.abort()` a safe no-op once a ticket
+                    // exists). A caller that drives this inner `StagedBatch`
+                    // directly -- `db.zig`'s `saveIndexStatusSnapshots`, in
+                    // particular -- still wraps `commit()` (`commitStaged`
+                    // then `wait`) in its own `errdefer status_batch.abort()`
+                    // and expects `abort()` to be the one place these three
+                    // are released on any failure, including a failed
+                    // `wait`. Releasing them here too double-frees (caught as
+                    // an "incorrect alignment" panic inside
+                    // `retained_effects.Capture.deinit`'s `keyIterator` on
+                    // the now-`undefined` map). This path's leak when
+                    // nothing else aborts is real (see git history for the
+                    // attempted fix and why it was reverted) but needs a
+                    // change to the abort/release contract itself, not a
+                    // second release bolted on here.
                     return err;
                 };
                 if (self.payload_session) |session| {
@@ -1297,17 +1299,19 @@ pub const DocStore = struct {
                 try self.artifact_footprint.stage(self.asTxn());
                 try self.document_revisions.stage(self.asTxn());
             }
-            // Mirrors `Txn.commit`'s own post-stage `errdefer`: once staged,
-            // these three must be released on any failure from here on
-            // (the payload session's own staging calls below, or the
-            // runtime's `commitStaged()` itself), not only on the success
-            // path a few lines down -- `StagedBatch.wait` covers the
-            // window after a `StagedBatch` is actually returned.
-            errdefer {
-                self.retained.deinit(self.alloc);
-                self.artifact_inputs.deinit(self.alloc);
-                self.document_revisions.deinit(self.alloc);
-            }
+            // NOT an `errdefer` deinit of these three here, matching
+            // `Txn.commit`: `backend_erased.Batch.commitStaged` only swaps
+            // its own vtable to the inert `consumed_vtable` (making a
+            // caller's later `errdefer batch.abort()` a safe no-op) *after*
+            // this inner `commitStaged` has actually returned a
+            // `StagedBatch`. A failure before that point leaves this batch
+            // still abortable by convention, exactly like a failed
+            // `Txn.commit`; double-releasing here would crash the same way
+            // reverting `Txn.commit`'s own attempt at this did (see that
+            // comment). Only `StagedBatch.wait` -- reached after a ticket
+            // already exists, where that inert-vtable swap has already
+            // happened and nothing else will ever call `abort()` again --
+            // owns cleanup for a failure after staging.
             const bump_columnar_revision = if (self.columnar_mutation != null or self.columns_invalidated) self.columnar_owner else null;
             const source_owner = self.columnar_owner;
             const payload_session = self.payload_session;
