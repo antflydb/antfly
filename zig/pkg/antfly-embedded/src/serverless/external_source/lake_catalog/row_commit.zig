@@ -23,6 +23,7 @@ const types = @import("types.zig");
 const parquet = @import("parquet_writer.zig");
 const avro = @import("avro_writer.zig");
 const iceberg = @import("../iceberg_avro.zig");
+const bucket = @import("bucket.zig");
 const A = std.mem.Allocator;
 const V = std.json.Value;
 pub const Batch = struct {
@@ -222,7 +223,7 @@ pub const manifest_merge_min_count: usize = 100;
 /// Merged manifests stop growing at this size and leave the merge pool. The
 /// bound keeps them below compaction's 4 MiB whole-manifest admission limit.
 pub const manifest_merge_target_bytes: u64 = 1024 * 1024;
-const MergeContext = struct { spec_id: i32, spec_string: []const u8, schema_json: []const u8, snapshot_id: i64, sequence: i64, digest: []const u8 };
+const MergeContext = struct { bucket_spec: ?bucket.Spec = null, entry_schema: []const u8 = avro.entry_schema, partition_spec: []const u8 = "[]", spec_id: i32, spec_string: []const u8, schema_json: []const u8, snapshot_id: i64, sequence: i64, digest: []const u8 };
 fn mergeable(entry: iceberg.ManifestListEntry, spec_id: i32) bool {
     if (entry.partition_spec_id != spec_id or entry.manifest_length >= manifest_merge_target_bytes) return false;
     if (std.mem.indexOf(u8, entry.manifest_path, "/metadata/antfly-") == null) return false;
@@ -244,7 +245,7 @@ fn carryManifestKind(a: A, files: Files, previous: []const iceberg.ManifestListE
     try carryMergePool(a, files, pool.items, manifests, kind, context);
 }
 fn mergeMetadata(comptime kind: iceberg.ManifestContent, context: MergeContext) [5]avro.Metadata {
-    return .{ .{ .key = "schema", .value = context.schema_json }, .{ .key = "partition-spec", .value = "[]" }, .{ .key = "partition-spec-id", .value = context.spec_string }, .{ .key = "format-version", .value = "2" }, .{ .key = "content", .value = if (kind == .deletes) "deletes" else "data" } };
+    return .{ .{ .key = "schema", .value = context.schema_json }, .{ .key = "partition-spec", .value = context.partition_spec }, .{ .key = "partition-spec-id", .value = context.spec_string }, .{ .key = "format-version", .value = "2" }, .{ .key = "content", .value = if (kind == .deletes) "deletes" else "data" } };
 }
 const MergeBatch = struct {
     arena: std.heap.ArenaAllocator,
@@ -268,7 +269,7 @@ const MergeBatch = struct {
         if (self.sources == 1 and !sealed) {
             try append(manifests, try listEntry(a, self.original.?));
         } else {
-            const encoded = try avro.ocf(output_alloc, avro.entry_schema, self.records.array.items, &mergeMetadata(kind, context));
+            const encoded = try avro.ocf(output_alloc, context.entry_schema, self.records.array.items, &mergeMetadata(kind, context));
             if (encoded.len > manifest_merge_target_bytes) return error.InvalidLakeManifest;
             const label = if (kind == .deletes) "delete" else "data";
             const uri = try upload(output_alloc, files, try std.fmt.allocPrint(output_alloc, "metadata/antfly-{s}-{s}-merge-{s}{s}.avro", .{ context.digest, types.digestHex(encoded), label, if (sealed) "-full" else "" }), encoded);
@@ -285,14 +286,14 @@ const MergeBatch = struct {
 };
 fn carryMergePool(a: A, files: Files, pool: []const iceberg.ManifestListEntry, manifests: *V, comptime kind: iceberg.ManifestContent, context: MergeContext) !void {
     if (pool.len == 0) return;
-    const header_bytes = try avro.ocf(a, avro.entry_schema, &.{}, &mergeMetadata(kind, context));
+    const header_bytes = try avro.ocf(a, context.entry_schema, &.{}, &mergeMetadata(kind, context));
     const header = header_bytes.len;
     a.free(header_bytes);
     if (header + 36 >= manifest_merge_target_bytes) {
         for (pool) |entry| try append(manifests, try listEntry(a, entry));
         return;
     }
-    const entry_schema = try std.json.parseFromSliceLeaky(V, a, avro.entry_schema, .{});
+    const entry_schema = try std.json.parseFromSliceLeaky(V, a, context.entry_schema, .{});
     var batch = MergeBatch.init(a);
     defer batch.arena.deinit();
     var input = std.heap.ArenaAllocator.init(a);
@@ -312,11 +313,22 @@ fn carryMergePool(a: A, files: Files, pool: []const iceberg.ManifestListEntry, m
         for (manifest.entries) |raw| {
             if (raw.status == .deleted) continue;
             const file = try @import("../iceberg_inventory.zig").resolveManifestEntry(raw, manifest_entry, 2);
-            if (file.partition_field_count != 0 or file.partition_values.len != 0 or file.lower_bounds.len != 0 or file.upper_bounds.len != 0 or (kind == .deletes) != (file.content != .data)) {
+            if ((if (context.bucket_spec != null) file.partition_field_count != 1 else file.partition_field_count != 0 or file.partition_values.len != 0) or file.lower_bounds.len != 0 or file.upper_bounds.len != 0 or (kind == .deletes) != (file.content != .data)) {
                 supported = false;
                 break;
             }
-            var data_file = try json(scratch, .{ .content = @as(i32, @backingInt(file.content)), .file_path = file.file_path, .file_format = file.file_format, .partition = object(scratch), .record_count = file.record_count, .file_size_in_bytes = file.file_size_in_bytes });
+            var partition = object(scratch);
+            if (context.bucket_spec) |spec| {
+                var value: ?u32 = null;
+                if (file.partition_values.len > 1) return error.InvalidLakeManifest;
+                for (file.partition_values) |stored| {
+                    if (!std.mem.eql(u8, stored.column_id, spec.name)) return error.InvalidLakeManifest;
+                    value = try std.fmt.parseInt(u32, stored.string_value, 10);
+                    if (value.? >= spec.count) return error.InvalidLakeManifest;
+                }
+                partition = try spec.partition(scratch, value);
+            }
+            var data_file = try json(scratch, .{ .content = @as(i32, @backingInt(file.content)), .file_path = file.file_path, .file_format = file.file_format, .partition = partition, .record_count = file.record_count, .file_size_in_bytes = file.file_size_in_bytes });
             if (file.equality_ids.len != 0) try put(scratch, &data_file, "equality_ids", try json(scratch, file.equality_ids));
             const sequence = file.data_sequence_number orelse return error.InvalidLakeManifest;
             const record = try json(scratch, .{ .status = 0, .snapshot_id = file.snapshot_id orelse return error.InvalidLakeManifest, .sequence_number = sequence, .file_sequence_number = file.file_sequence_number orelse return error.InvalidLakeManifest, .data_file = data_file });
@@ -371,8 +383,8 @@ pub fn prepare(a: A, table: types.Table, files: Files, batch: Batch, wal_lsn: u6
     const parent = root.object.get("current-snapshot-id") orelse .null;
     try append(&requirements, try json(a, .{ .type = "assert-ref-snapshot-id", .ref = "main", .@"snapshot-id" = parent }));
     try append(&requirements, try json(a, .{ .type = "assert-current-schema-id", .@"current-schema-id" = try m.int(try m.get(root, "current-schema-id")) }));
-    // Use an unpartitioned spec for global key deletes and their replacements;
-    // existing partitioned manifests remain intact and keep their own specs.
+    // Equality deletes remain global across spec evolution and bucket moves.
+    // Replacement data honors a supported default bucket spec.
     var spec_id: i32 = -1;
     var max_spec: i32 = 0;
     for ((try m.get(root, "partition-specs")).array.items) |spec| {
@@ -381,9 +393,10 @@ pub fn prepare(a: A, table: types.Table, files: Files, batch: Batch, wal_lsn: u6
         if ((try m.get(spec, "fields")).array.items.len == 0) spec_id = id;
     }
     if (spec_id < 0) {
-        spec_id = max_spec + 1;
+        spec_id = std.math.add(i32, max_spec, 1) catch return error.InvalidLakeMetadata;
         try append(&updates, try json(a, .{ .action = "add-spec", .spec = .{ .@"spec-id" = spec_id, .fields = @as([]const V, &.{}) } }));
     }
+    const data_bucket = try bucket.defaultSpec(root, s);
     const schema_json = try std.json.Stringify.valueAlloc(a, s, .{});
     const spec_string = try std.fmt.allocPrint(a, "{d}", .{spec_id});
     if (parent != .null and try m.int(parent) != -1) {
@@ -391,22 +404,36 @@ pub fn prepare(a: A, table: types.Table, files: Files, batch: Batch, wal_lsn: u6
             const bytes = try read(a, files, try m.str(try m.get(snapshot, "manifest-list")));
             var previous = try iceberg.parseManifestListAlloc(a, bytes);
             defer previous.deinit(a);
-            try carryManifests(a, files, previous.entries, &manifests, .{ .spec_id = spec_id, .spec_string = spec_string, .schema_json = schema_json, .snapshot_id = snapshot_id, .sequence = seq, .digest = &digest });
+            // Merge each known spec independently; carry unknown layouts once.
+            for ((try m.get(root, "partition-specs")).array.items) |spec| {
+                const id: i32 = @intCast(try m.int(try m.get(spec, "spec-id")));
+                const b = try bucket.parse(spec, s);
+                var matching: std.ArrayList(iceberg.ManifestListEntry) = .empty;
+                for (previous.entries) |entry| if (entry.partition_spec_id == id) try matching.append(a, entry);
+                if (id == spec_id or b != null) {
+                    try carryManifests(a, files, matching.items, &manifests, .{ .spec_id = id, .spec_string = try std.fmt.allocPrint(a, "{d}", .{id}), .schema_json = schema_json, .snapshot_id = snapshot_id, .sequence = seq, .digest = &digest, .bucket_spec = b, .entry_schema = if (b) |v| try v.entrySchema(a) else avro.entry_schema, .partition_spec = if (b) |v| try std.json.Stringify.valueAlloc(a, v.fields, .{}) else "[]" });
+                } else for (matching.items) |entry| try append(&manifests, try listEntry(a, entry));
+            }
             break;
         };
     }
     inline for (.{ false, true }) |deletes| {
         const group = if (deletes) rows.keys else rows.data;
         if (group.len != 0) {
-            const data = try parquet.encode(a, if (deletes) rows.key_schema else s, group, files.context);
+            const layout: ?bucket.Spec = if (deletes) null else data_bucket;
+            const groups = if (layout) |spec| try bucket.group(a, spec, group) else &[_]bucket.Group{.{ .bucket = null, .rows = group }};
+            var entries = array(a);
             const kind = if (deletes) "delete" else "data";
-            const data_uri = try upload(a, files, try std.fmt.allocPrint(a, "data/antfly-{s}-{s}.parquet", .{ digest, kind }), data);
-            var data_file = try json(a, .{ .content = if (deletes) @as(i32, 2) else @as(i32, 0), .file_path = data_uri, .file_format = "PARQUET", .partition = object(a), .record_count = group.len, .file_size_in_bytes = data.len });
-            if (deletes) try put(a, &data_file, "equality_ids", rows.ids);
-            const entry = try json(a, .{ .status = 1, .snapshot_id = snapshot_id, .sequence_number = seq, .file_sequence_number = seq, .data_file = data_file });
-            const manifest = try avro.ocf(a, avro.entry_schema, &.{entry}, &.{ .{ .key = "schema", .value = schema_json }, .{ .key = "partition-spec", .value = "[]" }, .{ .key = "partition-spec-id", .value = spec_string }, .{ .key = "format-version", .value = "2" }, .{ .key = "content", .value = if (deletes) "deletes" else "data" } });
+            for (groups, 0..) |part, ordinal| {
+                const data = try parquet.encode(a, if (deletes) rows.key_schema else s, part.rows, files.context);
+                const data_uri = try upload(a, files, try std.fmt.allocPrint(a, "data/antfly-{s}-{s}-{d}.parquet", .{ digest, kind, ordinal }), data);
+                var data_file = try json(a, .{ .content = if (deletes) @as(i32, 2) else @as(i32, 0), .file_path = data_uri, .file_format = "PARQUET", .partition = if (layout) |spec| try spec.partition(a, part.bucket) else object(a), .record_count = part.rows.len, .file_size_in_bytes = data.len });
+                if (deletes) try put(a, &data_file, "equality_ids", rows.ids);
+                try append(&entries, try json(a, .{ .status = 1, .snapshot_id = snapshot_id, .sequence_number = seq, .file_sequence_number = seq, .data_file = data_file }));
+            }
+            const manifest = try avro.ocf(a, if (layout) |spec| try spec.entrySchema(a) else avro.entry_schema, entries.array.items, &.{ .{ .key = "schema", .value = schema_json }, .{ .key = "partition-spec", .value = if (layout) |spec| try std.json.Stringify.valueAlloc(a, spec.fields, .{}) else "[]" }, .{ .key = "partition-spec-id", .value = if (layout) |spec| try std.fmt.allocPrint(a, "{d}", .{spec.id}) else spec_string }, .{ .key = "format-version", .value = "2" }, .{ .key = "content", .value = if (deletes) "deletes" else "data" } });
             const manifest_uri = try upload(a, files, try std.fmt.allocPrint(a, "metadata/antfly-{s}-{s}.avro", .{ digest, kind }), manifest);
-            try append(&manifests, try json(a, .{ .manifest_path = manifest_uri, .manifest_length = manifest.len, .partition_spec_id = spec_id, .content = if (deletes) @as(i32, 1) else @as(i32, 0), .sequence_number = seq, .min_sequence_number = seq, .added_snapshot_id = snapshot_id, .added_files_count = 1, .existing_files_count = 0, .deleted_files_count = 0, .added_rows_count = group.len, .existing_rows_count = 0, .deleted_rows_count = 0 }));
+            try append(&manifests, try json(a, .{ .manifest_path = manifest_uri, .manifest_length = manifest.len, .partition_spec_id = if (layout) |spec| spec.id else spec_id, .content = if (deletes) @as(i32, 1) else @as(i32, 0), .sequence_number = seq, .min_sequence_number = seq, .added_snapshot_id = snapshot_id, .added_files_count = groups.len, .existing_files_count = 0, .deleted_files_count = 0, .added_rows_count = group.len, .existing_rows_count = 0, .deleted_rows_count = 0 }));
         }
     }
     const manifest_list = try avro.ocf(a, avro.list_schema, manifests.array.items, &.{ .{ .key = "format-version", .value = "2" }, .{ .key = "snapshot-id", .value = try std.fmt.allocPrint(a, "{d}", .{snapshot_id}) }, .{ .key = "sequence-number", .value = try std.fmt.allocPrint(a, "{d}", .{seq}) } });

@@ -1625,6 +1625,11 @@ test "session maintenance activation follows current range leadership without fo
 }
 
 pub const ApiHttpServerConfig = struct {
+    /// Optional query-role distributed SQL service; scoped by authenticated capabilities.
+    distributed_sql: ?@import("../serverless/sql/runtime.zig").Factory = null,
+    sql_deployment: ?@import("../serverless/sql/deployment.zig").Config = null,
+    distributed_sql_scope_seed: ?[64]u8 = null,
+    distributed_sql_join: ?@import("antfly_local_sources").sql_catalog.DistributedJoin = null,
     /// Node-local personal connection owner; never populated by distributed configuration.
     chatgpt: ?*@import("antfly_local_sources").chatgpt_manager.Manager = null,
     pgwire: ?common_config.Config.PgwireConfig = null,
@@ -4123,6 +4128,7 @@ pub const ApiHttpServer = struct {
     /// parameter state; every execution still binds against its own snapshot.
     sql_plan_cache: sql_plan_cache.Cache,
     sql_schema_cache: sql_schema_cache.Cache,
+    owned_sql_deployment: ?*@import("../serverless/sql/deployment.zig").Owned = null,
     lake_read_cache: @import("antfly_local_sources").serverless_query_lake_serving_cache.Cache,
     // A persistent worker must not consume the last request executor slot or
     // inherit the single-threaded provider fallback. Allocate at a stable
@@ -4874,6 +4880,7 @@ pub const ApiHttpServer = struct {
             errdefer opened.deinit();
             try server.restore_job_store.attach(opened);
         }
+        try server.initializeDistributedSql();
         return server;
     }
 
@@ -4893,6 +4900,17 @@ pub const ApiHttpServer = struct {
         self.foreign_registry = registry;
         self.cfg.foreign_registry = registry;
         return registry;
+    }
+
+    /// Construct inside the API kernel after its config crosses the ABI. No
+    /// SQL planner callbacks or allocator vtables cross a codegen boundary.
+    pub fn initializeDistributedSql(self: *ApiHttpServer) !void {
+        if (self.owned_sql_deployment != null) return;
+        const config = self.cfg.sql_deployment orelse return;
+        try @import("internal_service_auth.zig").validateCredentialIsolation(config.authentication.secret, self.cfg.trusted_principal_secret);
+        const owned = try @import("../serverless/sql/deployment.zig").Owned.init(self.alloc, self.embedding_provider_runtime.io, config, .api_only, self.cfg.node_config, self.cfg.secret_store, self.cfg.deployment_mode, self.cfg.native_lake_artifact_base_dir);
+        self.owned_sql_deployment = owned;
+        owned.attachApi(self);
     }
 
     pub fn deinit(self: *ApiHttpServer) void {
@@ -4971,6 +4989,7 @@ pub const ApiHttpServer = struct {
             state.deinit();
             self.alloc.destroy(state);
         }
+        if (self.owned_sql_deployment) |owned| owned.deinit();
         self.lake_search_metadata.deinit();
         self.lake_reader_leases.deinit(self.embedding_provider_runtime.io);
         self.lake_read_cache.deinit();
