@@ -130,6 +130,28 @@ pub const DeviceRoute = enum {
     handoff_disabled,
 };
 
+/// A synchronous hidden-row/head binding. The source hidden value remains
+/// borrowed; only a sliced row view and the resolved head handle are owned.
+/// No pointer to the temporary Runtime adapter escapes preparation.
+pub const HeadRows = struct {
+    backend: *const ComputeBackend,
+    input: ops.CT,
+    owns_input: bool,
+    weight: ops.CT,
+
+    pub fn deinit(self: *HeadRows) void {
+        self.backend.free(self.weight);
+        if (self.owns_input) self.backend.free(self.input);
+        self.* = undefined;
+    }
+};
+
+pub const HeadPreparationTrace = struct {
+    started_at: std.Io.Timestamp,
+    slice_us: u64 = 0,
+    weight_us: u64 = 0,
+};
+
 pub const Runtime = struct {
     fn classifyDeviceStep(result: DeviceStepResult) @import("invocation_observation.zig").ResultClassification {
         return .{ .unsupported = result == .declined };
@@ -292,6 +314,109 @@ pub const Runtime = struct {
             &decode_context,
         );
         self.context.allocator.free(logits);
+    }
+
+    /// Select only the requested resident vocabulary rows. Null preserves the
+    /// backend's existing scalar fallback, with no eager host-logits export.
+    /// The caller owns returned token IDs; acceptance, EOS and grammar remain
+    /// task policy. Both paths use the same model suppression semantics.
+    pub fn greedyLogitRows(self: *Runtime, logits: ops.CT, row_start: usize, row_count: usize) !?[]u32 {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .decode_step, @This().greedyLogitRowsUnobserved, .{ self, logits, row_start, row_count });
+    }
+
+    fn greedyLogitRowsUnobserved(self: *Runtime, logits: ops.CT, row_start: usize, row_count: usize) !?[]u32 {
+        const width: usize = @intCast(self.context.gpt_config.*.vocab_size);
+        const suppress = self.context.gpt_config.*.suppressTokenIds();
+        return if (suppress.len == 0)
+            self.context.cb.argmaxRows(logits, row_start, row_count, width, self.context.allocator)
+        else
+            self.context.cb.argmaxRowsSuppress(logits, row_start, row_count, width, suppress, self.context.allocator);
+    }
+
+    pub fn greedyLogitRow(self: *Runtime, result: *const ForwardAllWithHiddenDevice, row: usize) !usize {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .decode_step, @This().greedyLogitRowUnobserved, .{ self, result, row });
+    }
+
+    fn greedyLogitRowUnobserved(
+        self: *Runtime,
+        result: *const ForwardAllWithHiddenDevice,
+        row: usize,
+    ) !usize {
+        const vocab_size: usize = @intCast(self.context.gpt_config.*.vocab_size);
+        if (row >= result.rows) return error.InvalidTensorShape;
+        const row_logits = try self.context.cb.sliceRows2D(self.context.allocator, result.logits, row, 1, vocab_size);
+        defer self.context.cb.free(row_logits);
+        const suppress_token_ids = self.context.gpt_config.*.suppressTokenIds();
+        if (suppress_token_ids.len > 0) {
+            const token_tensor = (try self.context.cb.argmaxLastRowSuppressTensor(row_logits, 1, vocab_size, suppress_token_ids)) orelse return error.UnsupportedBackend;
+            defer self.context.cb.free(token_tensor);
+            const token_host = try self.context.cb.toFloat32(token_tensor, self.context.allocator);
+            defer self.context.allocator.free(token_host);
+            if (token_host.len != 1 or token_host[0] < 0) return error.InvalidModelOutput;
+            return @intFromFloat(token_host[0]);
+        }
+        const token = (try self.context.cb.argmaxLastRow(row_logits, 1, vocab_size)) orelse return error.UnsupportedBackend;
+        return @intCast(token);
+    }
+
+    /// Bind the exact selected hidden rows and resolve the existing architecture
+    /// weight adapter before trying either head implementation. This preserves
+    /// the original load/error order even when a prepared tail is already ready.
+    pub fn prepareHeadRows(self: *Runtime, source: *const ForwardHiddenDevice, start: usize, rows: usize, trace: ?*HeadPreparationTrace) !HeadRows {
+        var input = source.hidden;
+        var owns_input = false;
+        errdefer if (owns_input) self.context.cb.free(input);
+        if (start != 0 or source.rows != rows) {
+            input = try self.context.cb.sliceRows2D(self.context.allocator, source.hidden, start, rows, @intCast(self.context.gpt_config.*.hidden_size));
+            owns_input = true;
+        }
+        if (trace) |capture| capture.slice_us = @divTrunc(profileElapsedNs(true, self.io, capture.started_at), std.time.ns_per_us);
+        const weight = try self.context.graphWeight("lm_head.weight");
+        if (trace) |capture| capture.weight_us = @divTrunc(profileElapsedNs(true, self.io, capture.started_at), std.time.ns_per_us);
+        return .{ .backend = self.context.cb, .input = input, .owns_input = owns_input, .weight = weight };
+    }
+
+    /// Prefer the same prepared quantized head used by decode frames; preserve
+    /// a precomputed tail and leave a clean decline available to the caller.
+    pub fn prepareHeadChoices(self: *Runtime, head: *const HeadRows, rows: usize, suppress: []const i32, prepared: *?[]u32) !void {
+        if (prepared.* == null and self.context.cb.kind() == .metal) {
+            prepared.* = try @import("invocation_observation.zig").callContextOperation(&self.context, .decode_step, decoder_gated_runtime.forwardPreparedLmHeadArgmaxRows, .{ self.context.cb, self.context.gpt_config.*, self.context.gpt_config.*.num_hidden_layers, head.input, rows, suppress, self.context.allocator });
+        }
+    }
+
+    /// Transfer a ready tail exactly once, otherwise invoke the unchanged
+    /// resident linear/argmax callback. Returned IDs belong to the caller.
+    pub fn headChoices(self: *Runtime, head: *const HeadRows, rows: usize, suppress: []const i32, prepared: *?[]u32) !?[]u32 {
+        if (prepared.*) |choices| {
+            prepared.* = null;
+            return choices;
+        }
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .decode_step, @This().headChoicesUnobserved, .{ self, head, rows, suppress });
+    }
+
+    fn headChoicesUnobserved(self: *Runtime, head: *const HeadRows, rows: usize, suppress: []const i32) !?[]u32 {
+        return self.context.cb.linearNoBiasArgmaxRowsSuppress(head.input, head.weight, rows, @intCast(self.context.gpt_config.*.hidden_size), @intCast(self.context.gpt_config.*.vocab_size), suppress, self.context.allocator);
+    }
+
+    pub fn requireHeadChoices(self: *Runtime, head: *const HeadRows, rows: usize, suppress: []const i32, prepared: *?[]u32) ![]u32 {
+        return (try self.headChoices(head, rows, suppress, prepared)) orelse {
+            const model = self.context.gpt_config.*;
+            std.log.err(
+                "gemma4_mtp_target_tail_argmax_unsupported: backend={s} rows={d} hidden={d} vocab={d} suppress={d} weight_tying={}",
+                .{ @tagName(self.context.cb.kind()), rows, model.hidden_size, model.vocab_size, suppress.len, model.weight_tying },
+            );
+            return error.UnsupportedBackend;
+        };
+    }
+
+    /// The task supplies acceptance semantics; the physical owner binds the
+    /// already selected rows and head to the existing specialized region.
+    pub fn verifyHeadChoices(self: *Runtime, head: *const HeadRows, rows: usize, suppress: []const i32, draft_tokens: []const i64, eos_token_ids: []const i32, accept_bonus: bool) !?ops.Gemma4MtpVerifyCommitResult {
+        return @import("invocation_observation.zig").callContextOperation(&self.context, .decode_step, @This().verifyHeadChoicesUnobserved, .{ self, head, rows, suppress, draft_tokens, eos_token_ids, accept_bonus });
+    }
+
+    fn verifyHeadChoicesUnobserved(self: *Runtime, head: *const HeadRows, rows: usize, suppress: []const i32, draft_tokens: []const i64, eos_token_ids: []const i32, accept_bonus: bool) !?ops.Gemma4MtpVerifyCommitResult {
+        return self.context.cb.gemma4MtpVerifyCommit(&.{ .input = head.input, .weight = head.weight, .rows = rows, .in_dim = @intCast(self.context.gpt_config.*.hidden_size), .out_dim = @intCast(self.context.gpt_config.*.vocab_size), .suppress_token_ids = suppress, .draft_tokens = draft_tokens, .eos_token_ids = eos_token_ids, .accept_bonus = accept_bonus, .allocator = self.context.allocator });
     }
 
     pub fn greedyTargetChoiceFromFinalHiddenDevice(
@@ -1949,4 +2074,90 @@ test "Native actual decoder without prepared Program records legacy attempt befo
     try std.testing.expect(report.native_definition_templates == null);
     try std.testing.expectEqual(@as(u64, 1), report.authored_native_programs.?.fallback_no_prepared_native_program);
     try std.testing.expectEqual(@as(u8, 0), report.authored_native_programs.?.count);
+}
+
+fn checkPhysicalLogitRowSelection(backend_value: ops.ComputeBackend, _: ops.ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const backend = &backend_value;
+    var config = @import("../models/gpt.zig").Config{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .vocab_size = 4, .weight_tying = true, .norm_type = .rms_norm, .position_encoding = .rope };
+    const logits = try backend.fromFloat32Shape(&.{ 9, 0, 1, 0, 0, 5, 4, 0, 0, 3, 0, 7 }, &.{ 3, 4 });
+    defer backend.free(logits);
+    var numerical = Runtime{ .context = .{ .allocator = a, .cb = backend, .gpt_config = &config } };
+    const rows = ForwardAllWithHiddenDevice{ .cb = backend, .logits = logits, .hidden = logits, .pre_norm_hidden = logits, .rows = 3 };
+    const choices = (try numerical.greedyLogitRows(logits, 1, 2)) orelse return error.MissingLogitChoices;
+    defer a.free(choices);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 3 }, choices);
+    for (choices, 1..) |choice, row| try std.testing.expectEqual(@as(usize, choice), try numerical.greedyLogitRow(&rows, row));
+    try std.testing.expectError(error.InvalidTensorShape, numerical.greedyLogitRow(&rows, rows.rows));
+    config.suppress_token_ids_len = 1;
+    config.suppress_token_ids[0] = 3;
+    const suppressed = (try numerical.greedyLogitRows(logits, 1, 2)) orelse return error.MissingLogitChoices;
+    defer a.free(suppressed);
+    try std.testing.expectEqualSlices(u32, &.{ 1, 1 }, suppressed);
+    for (suppressed, 1..) |choice, row| {
+        if (backend.vtable.argmaxLastRowSuppressTensor != null) {
+            try std.testing.expectEqual(@as(usize, choice), try numerical.greedyLogitRow(&rows, row));
+        } else {
+            // Native has the original batched suppression callback but no
+            // scalar-tensor callback. Preserve its explicit fallback refusal.
+            try std.testing.expectError(error.UnsupportedBackend, numerical.greedyLogitRow(&rows, row));
+        }
+    }
+}
+
+test "physical decoder Native resident row selection preserves offset suppression and scalar fallback" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onNative(helper.noWeights, checkPhysicalLogitRowSelection);
+}
+
+test "physical decoder Metal resident row selection preserves offset suppression and scalar fallback" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onMetal(helper.noWeights, checkPhysicalLogitRowSelection);
+}
+
+fn checkPhysicalHeadRows(backend_value: ops.ComputeBackend, _: ops.ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const backend = &backend_value;
+    const config = @import("../models/gpt.zig").Config{ .family = .llama, .hidden_size = 4, .num_hidden_layers = 0, .num_attention_heads = 1, .vocab_size = 4, .weight_tying = true, .norm_type = .rms_norm, .position_encoding = .rope };
+    const values = [_]f32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 };
+    const hidden = try backend.fromFloat32Shape(&values, &.{ 3, 4 });
+    defer backend.free(hidden);
+    const source = ForwardHiddenDevice{ .cb = backend, .hidden = hidden, .pre_norm_hidden = null, .rows = 3 };
+    var numerical = Runtime{ .context = .{ .allocator = a, .cb = backend, .gpt_config = &config, .weight_semantics = .traced_decoder } };
+    var full = try numerical.prepareHeadRows(&source, 0, 3, null);
+    defer full.deinit();
+    try std.testing.expect(!full.owns_input);
+    try std.testing.expect(full.input == hidden);
+    var selected = try numerical.prepareHeadRows(&source, 1, 2, null);
+    defer selected.deinit();
+    try std.testing.expect(selected.owns_input);
+    try std.testing.expect(selected.backend == backend);
+    const selected_values = try backend.toFloat32(selected.input, a);
+    defer a.free(selected_values);
+    try std.testing.expectEqualSlices(f32, values[4..], selected_values);
+    const ready = try a.dupe(u32, &.{ 1, 3 });
+    var prepared: ?[]u32 = ready;
+    defer if (prepared) |ids| a.free(ids);
+    try numerical.prepareHeadChoices(&selected, 2, &.{}, &prepared);
+    try std.testing.expect(prepared.?.ptr == ready.ptr);
+    const taken = (try numerical.headChoices(&selected, 2, &.{}, &prepared)) orelse return error.MissingHeadChoices;
+    defer a.free(taken);
+    try std.testing.expect(taken.ptr == ready.ptr);
+    try std.testing.expect(prepared == null);
+    const expected = try backend.linearNoBiasArgmaxRowsSuppress(selected.input, selected.weight, 2, 4, 4, &.{}, a);
+    defer if (expected) |ids| a.free(ids);
+    const actual = try numerical.headChoices(&selected, 2, &.{}, &prepared);
+    defer if (actual) |ids| a.free(ids);
+    try std.testing.expectEqual(expected != null, actual != null);
+    if (actual) |ids| try std.testing.expectEqualSlices(u32, expected.?, ids);
+}
+
+test "physical decoder Native head rows preserve borrowed source selected slice and one-time prepared tail transfer" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    try @import("../ops/media_residency_test.zig").onNative(populateDeviceStepWeights, checkPhysicalHeadRows);
+}
+
+test "physical decoder Metal head rows preserve borrowed source selected slice and one-time prepared tail transfer" {
+    try @import("../ops/media_residency_test.zig").onMetal(populateDeviceStepWeights, checkPhysicalHeadRows);
 }

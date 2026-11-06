@@ -50,8 +50,17 @@ pub const Requirements = struct {
     literals: []const NodeId = &.{},
     uncovered: Opaque,
 
+    /// Each phase must declare valid alignment independently. Taking a
+    /// maximum can hide an invalid boundary behind its valid peer.
+    pub fn validWorkspace(self: Requirements) bool {
+        for ([_]descriptor.WorkspaceRequirement{ self.dispatch_workspace, self.preparation_workspace }) |workspace| {
+            if (workspace.alignment == 0 or !std.math.isPowerOfTwo(workspace.alignment)) return false;
+        }
+        return @max(self.dispatch_workspace.byte_size, self.preparation_workspace.byte_size) % @sizeOf(f32) == 0 and self.host_alignment != 0 and self.preparation_host_alignment != 0 and std.math.isPowerOfTwo(self.host_alignment) and std.math.isPowerOfTwo(self.preparation_host_alignment);
+    }
+
     pub fn replacementEligible(self: Requirements) bool {
-        if (!self.uncovered.complete() or self.outputs.len == 0 or self.host_alignment == 0 or self.preparation_host_alignment == 0 or !std.math.isPowerOfTwo(self.host_alignment) or !std.math.isPowerOfTwo(self.preparation_host_alignment)) return false;
+        if (!self.uncovered.complete() or self.outputs.len == 0 or !self.validWorkspace()) return false;
         for (self.outputs, 0..) |output, index| {
             const elements = output.logical.numElements() orelse return false;
             if (elements <= 0) return false;
@@ -192,6 +201,7 @@ pub const Owned = struct {
     }
     fn validateAssigned(self: *const Owned, request: Invocation) !void {
         if (self.requirements.payload_claim_required and request.validation.payload_claim == null) return error.PreparedRegionClaimRequired;
+        if (!self.requirements.validWorkspace()) return error.PreparedRegionWorkspaceMismatch;
         const host_bytes = @max(self.requirements.dispatch_workspace.host_byte_size, self.requirements.preparation_workspace.host_byte_size);
         const host_alignment = @max(self.requirements.host_alignment, self.requirements.preparation_host_alignment);
         if (host_alignment == 0 or !std.math.isPowerOfTwo(host_alignment) or request.host_workspace.len < host_bytes or (host_bytes != 0 and @intFromPtr(request.host_workspace.ptr) % host_alignment != 0)) return error.PreparedRegionWorkspaceMismatch;
@@ -344,3 +354,72 @@ pub const SelectionPolicy = enum { select_regions, compatibility_regions };
 /// Supplied by the invocation owner, never inferred from a previous workload's
 /// mutable provider state. Unknown keeps ordinary compatibility execution.
 pub const ExecutionProfile = enum { unknown, ordinary_frame, capture };
+
+test "region phase workspace contracts cannot hide malformed requirements behind a shared maximum" {
+    const shape = ml.graph.Shape.init(.f32, &.{4});
+    const outputs = [_]Output{.{ .node = 0, .logical = shape, .bytes = 16 }};
+    const original = Requirements{ .outputs = &outputs, .dispatch_workspace = .{ .byte_size = 64, .alignment = 16 }, .preparation_workspace = .{ .byte_size = 32, .alignment = 8 }, .host_alignment = 16, .preparation_host_alignment = 8, .uncovered = .{} };
+    try std.testing.expect(original.replacementEligible());
+    inline for (.{ "dispatch_workspace", "preparation_workspace" }) |phase| {
+        var malformed = original;
+        // The valid peer's larger alignment used to mask this fault.
+        @field(malformed, phase).alignment = 3;
+        try std.testing.expect(!malformed.replacementEligible());
+    }
+    inline for (.{ "host_alignment", "preparation_host_alignment" }) |phase| {
+        var malformed = original;
+        @field(malformed, phase) = 3;
+        try std.testing.expect(!malformed.replacementEligible());
+    }
+}
+
+test "region malformed phase workspace refuses actual cold preparation and dispatch before provider callbacks" {
+    const Probe = struct {
+        preparations: usize = 0,
+        dispatches: usize = 0,
+        fn matches(_: *anyopaque, _: Validate) bool {
+            return true;
+        }
+        fn validate(_: *anyopaque, _: Validate) !void {}
+        fn prepare(raw: *anyopaque, _: Invocation) !?AssignedResources {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.preparations += 1;
+            return null;
+        }
+        fn dispatch(raw: *anyopaque, _: Invocation) !Outcome {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.dispatches += 1;
+            return .completed;
+        }
+        fn deinit(_: *anyopaque) void {}
+        const table = Owned.VTable{ .matches = matches, .validate = validate, .prepare_assigned = prepare, .dispatch = dispatch, .deinit = deinit };
+    };
+    var probe = Probe{};
+    // No tensor access is necessary to exercise the actual resource boundary.
+    // The valid zero-scratch control must reach both real provider callbacks.
+    const implementation = kernel.Implementation{ .context = &probe, .table = &Probe.table };
+    var owner = Owned{ .context = &probe, .implementation = implementation, .key = 7, .policy_key = 11, .covered_nodes = &.{}, .input_nodes = &.{}, .entry_node = 0, .requirements = .{ .outputs = &.{}, .dispatch_workspace = .{ .alignment = 16 }, .preparation_workspace = .{ .alignment = 8 }, .host_alignment = 16, .preparation_host_alignment = 8, .uncovered = .{} }, .vtable = &Probe.table };
+    const original = owner.requirements;
+    const request = Invocation{ .validation = .{ .implementation = implementation, .policy_key = 11, .inputs = &.{}, .outputs = &.{} }, .inputs = &.{}, .outputs = &.{} };
+    try std.testing.expect((try owner.prepareAssigned(request)) == null);
+    try std.testing.expectEqual(Outcome.completed, try owner.dispatch(request));
+    inline for (.{ "dispatch_workspace", "preparation_workspace" }) |phase| {
+        owner.requirements = original;
+        @field(owner.requirements, phase).alignment = 3;
+        try std.testing.expectError(error.PreparedRegionWorkspaceMismatch, owner.prepareAssigned(request));
+        try std.testing.expectError(error.PreparedRegionWorkspaceMismatch, owner.dispatch(request));
+    }
+    inline for (.{ "host_alignment", "preparation_host_alignment" }) |phase| {
+        owner.requirements = original;
+        @field(owner.requirements, phase) = 3;
+        try std.testing.expectError(error.PreparedRegionWorkspaceMismatch, owner.prepareAssigned(request));
+        try std.testing.expectError(error.PreparedRegionWorkspaceMismatch, owner.dispatch(request));
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.preparations);
+    try std.testing.expectEqual(@as(usize, 1), probe.dispatches);
+    owner.requirements = original;
+    try std.testing.expect((try owner.prepareAssigned(request)) == null);
+    try std.testing.expectEqual(Outcome.completed, try owner.dispatch(request));
+    try std.testing.expectEqual(@as(usize, 2), probe.preparations);
+    try std.testing.expectEqual(@as(usize, 2), probe.dispatches);
+}

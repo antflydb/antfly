@@ -10,6 +10,12 @@ pub const Report = struct {
     operation: []const u8,
     publication_scope: []const u8,
     synchronous_interval: enum { invocation_body, pending_phase_only } = .invocation_body,
+    /// Exact model-owned cohort metadata. A shared publication cannot be
+    /// attributed to an arbitrary single participant or request.
+    batch: ?@import("diagnostics.zig").Batch = null,
+    /// Copied phase identity and outcome survive pending/model retirement.
+    /// Counters still cover this synchronous phase, not the whole lifetime.
+    pending_interval: ?@import("diagnostics.zig").PendingInterval = null,
     backend: ?[]const u8 = null,
     backend_counter_scope: []const u8,
     outcome: []const u8,
@@ -101,6 +107,8 @@ pub const Report = struct {
         report.device_allocator_roots = value.runtime.device_allocator_roots;
         report.metal_buffer_interval = value.runtime.metal_buffer_interval;
         report.video_owned_resources = value.runtime.video_owned_resources;
+        report.batch = value.batch;
+        report.pending_interval = value.pending_interval;
         if (value.pending_interval != null) report.synchronous_interval = .pending_phase_only;
         if (value.error_name) |failure| report.failure = @import("runtime_observation.zig").FailureText.init(failure.view());
         if (value.program_error) |failure| {

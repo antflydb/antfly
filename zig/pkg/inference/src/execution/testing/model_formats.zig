@@ -469,8 +469,28 @@ pub fn runDecoder(kind: Backend) !void {
 
 // Append beside the existing model_formats test fixtures. Its graph/weight
 // serializers remain private here; no new production fixture API is needed.
-const NativeResidentLifetimeCase = enum { output, weight, control, observed_weight, observed_oom, inventory, uniform_diagnostics };
-fn nativeResidentCloseCase(mode: NativeResidentLifetimeCase) !void {
+const ResidentLifetimeCase = enum { output, weight, control, observed_weight, observed_oom, inventory, uniform_diagnostics, metal_uniform_diagnostics, cuda_uniform_diagnostics };
+fn residentCloseCase(mode: ResidentLifetimeCase) !void {
+    const managed_gpu: ?Backend = switch (mode) {
+        .metal_uniform_diagnostics => .metal,
+        .cuda_uniform_diagnostics => .cuda,
+        else => null,
+    };
+    if (managed_gpu) |kind| {
+        if (!kind.available()) return error.SkipZigTest;
+        if (kind == .metal) {
+            if (comptime @import("build_options").enable_metal) {
+                if (!@import("../../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+            } else return error.SkipZigTest;
+        } else if (kind == .cuda) {
+            if (comptime @import("build_options").enable_cuda) {
+                _ = @import("../../ops/cuda/context.zig").probeDefault() catch |err| switch (err) {
+                    error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+                    else => return err,
+                };
+            } else return error.SkipZigTest;
+        }
+    }
     const hold_weight = mode == .weight or mode == .observed_weight or mode == .inventory;
     const Probe = struct {
         alive: bool = true,
@@ -528,13 +548,25 @@ fn nativeResidentCloseCase(mode: NativeResidentLifetimeCase) !void {
         try std.testing.checkAllAllocationFailures(allocation_only.allocator(), Case.run, .{path});
         return;
     }
-    var session = if (mode == .observed_weight or mode == .uniform_diagnostics)
+    var session = if (managed_gpu) |kind| blk: {
+        const backends = @import("../../backends/backends.zig");
+        var manager = backends.SessionManager{ .allocator = a, .preferred_backends = &.{kind}, .required_backend = kind, .execution_diagnostics = .{ .enabled = true } };
+        break :blk try manager.loadModel(path);
+    } else if (mode == .observed_weight or mode == .uniform_diagnostics)
         try factory.createNativeSessionWithOptions(a, path, .generic, .{ .observe_allocations = true })
     else
         try factory.createNativeSessionWithTaskOverride(a, path, .generic);
     if (mode == .uniform_diagnostics) try std.testing.expect(session.configureExecutionDiagnostics(true));
     var session_open = true;
     defer if (session_open) session.close();
+    const model_owner = if (managed_gpu != null) blk: {
+        const binding = session.invocation_diagnostics orelse return error.MissingModelDiagnostics;
+        const allocator = binding.model_allocator orelse return error.MissingModelAllocator;
+        const owner = @import("../allocation_observer.zig").State.forAllocator(allocator) orelse return error.MissingModelAllocationObserver;
+        try std.testing.expectEqual(@import("../allocation_observer.zig").Coverage.from_owner_creation, owner.coverage);
+        try std.testing.expect(owner.snapshot().requested_live_bytes > 0);
+        break :blk owner;
+    } else null;
     var token_ids = try Tensor.initInt64(a, "input_ids", &.{ 1, 4 }, &.{ 0, 1, 2, 3 });
     defer token_ids.deinit();
     var attention_mask = try Tensor.initInt64(a, "attention_mask", &.{ 1, 4 }, &.{ 1, 1, 1, 1 });
@@ -568,6 +600,23 @@ fn nativeResidentCloseCase(mode: NativeResidentLifetimeCase) !void {
         try std.testing.expect(allocated and live);
         try std.testing.expect(owners.maximum_individual_lifetime_peak_bytes.? > 0);
     }
+    const retained_report = if (managed_gpu) |kind| blk: {
+        try std.testing.expectEqualStrings(@tagName(kind), @tagName(resident.backend.kind()));
+        const measured = session.executionDiagnostics() orelse return error.MissingModelDiagnostics;
+        try std.testing.expect(measured.scope == .session_numerical_dispatch and measured.outcome == .success);
+        const owners = measured.runtime.allocation_owners orelse return error.MissingModelAllocationReport;
+        try std.testing.expect(owners.model_owners > 0);
+        try std.testing.expectEqual(@as(usize, 0), owners.missing_model_registrations);
+        try std.testing.expectEqual(@as(usize, 0), owners.metadata_failures);
+        var found = false;
+        for (owners.reports[0..owners.reports_count]) |report| if (report.owner_identity == @intFromPtr(model_owner.?)) {
+            found = true;
+            try std.testing.expectEqual(@import("../allocation_observer.zig").Coverage.from_owner_creation, report.coverage);
+            try std.testing.expect(report.usage.requested_live_bytes > 0);
+        };
+        try std.testing.expect(found);
+        break :blk measured.report.?;
+    } else null;
     const value = if (hold_weight) try resident.backend.getWeight("embeddings.word_embeddings.weight") else resident.outputs[0];
     defer if (hold_weight) resident.backend.free(value);
     const before = try resident.backend.toFloat32(value, a);
@@ -583,6 +632,14 @@ fn nativeResidentCloseCase(mode: NativeResidentLifetimeCase) !void {
     const after = try resident.backend.toFloat32(value, a);
     defer a.free(after);
     try std.testing.expectEqualSlices(f32, before, after);
+    if (retained_report) |report| {
+        // The escaped output retains its real backend/model and allocator
+        // State after the public session handle closes. Report is value-owned.
+        try std.testing.expect(model_owner.?.snapshot().requested_live_bytes > 0);
+        try std.testing.expect(report.observed_allocator_roots.? > 0);
+        try std.testing.expect(report.maximum_individual_host_owner_lifetime_peak_bytes.? > 0);
+        try std.testing.expect(report.whole_backend_residency_and_invocation_peak == .unavailable);
+    }
     if (mode == .observed_weight) {
         const model = resident.backend.debugTimingSnapshot().runtime.native_allocations.?.model.?;
         try std.testing.expectEqual(@import("../allocation_observer.zig").Coverage.from_owner_creation, model.coverage);
@@ -606,29 +663,37 @@ fn nativeResidentCloseCase(mode: NativeResidentLifetimeCase) !void {
 }
 
 test "native resident outputs survive session close with their backend owner" {
-    try nativeResidentCloseCase(.output);
+    try residentCloseCase(.output);
 }
 
 test "native acquired resident weights retain their model inventory after session close" {
-    try nativeResidentCloseCase(.weight);
+    try residentCloseCase(.weight);
 }
 
 test "native resident results do not retain request execution callbacks" {
-    try nativeResidentCloseCase(.control);
+    try residentCloseCase(.control);
 }
 
 test "native early allocator observations survive model close with mapped resident weights" {
-    try nativeResidentCloseCase(.observed_weight);
+    try residentCloseCase(.observed_weight);
 }
 
 test "native early observed model construction unwinds every allocation failure" {
-    try nativeResidentCloseCase(.observed_oom);
+    try residentCloseCase(.observed_oom);
 }
 
 test "native cold persistent inventory measures actual mappings after owner close and unwinds collection failures" {
-    try nativeResidentCloseCase(.inventory);
+    try residentCloseCase(.inventory);
 }
 
 test "native architecture session diagnostics measure actual temporary compute owners without inventing program stats" {
-    try nativeResidentCloseCase(.uniform_diagnostics);
+    try residentCloseCase(.uniform_diagnostics);
+}
+
+test "Metal managed model host allocation observations survive public session close with resident outputs" {
+    try residentCloseCase(.metal_uniform_diagnostics);
+}
+
+test "CUDA managed model host allocation observations survive public session close with resident outputs" {
+    try residentCloseCase(.cuda_uniform_diagnostics);
 }

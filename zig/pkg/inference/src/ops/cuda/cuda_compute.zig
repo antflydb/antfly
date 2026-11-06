@@ -43140,6 +43140,14 @@ fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../../execution/kerne
     if (implementation.context != @as(*anyopaque, @ptrCast(self)) or !acceptsPhysicalImplementation(implementation.table)) return null;
     const table: *const ops.ComputeBackend.VTable = @ptrCast(@alignCast(implementation.table));
     if (request.descriptor.operation == .gather) return PreparedHostGather.prepare(self, request);
+    if (request.descriptor.operation == .dot and request.descriptor.input_shapes[0].rank() > 2) {
+        // The existing batched primitive has no conversion/vendor workspace.
+        // Keep live training/kernel-policy checks on every invocation while
+        // attesting only this program's explicitly assigned dense F32 output.
+        var selected = (try @import("../../execution/assigned_kernel_route.zig").prepare(.{ .ptr = self, .vtable = table }, request, batchedCudaDotRouteSupported)) orelse return null;
+        selected.output_plane_metadata = .assigned_dense;
+        return selected;
+    }
     if (PreparedCudaProjection.geometry(request.descriptor) == null) {
         // RMS auxiliary mirrors depend on live environment/provider readiness.
         // Preserve their per-invocation policy checks even with dense inputs.
@@ -43162,6 +43170,28 @@ fn prepareKernelRouteOp(ctx: *anyopaque, request: @import("../../execution/kerne
     // validated by matches/run; no model Tensor plane inherits this authority.
     return route.Owned{ .context = owner, .output_plane_metadata = .assigned_dense, .implementation = .{ .context = implementation.context, .table = implementation.table, .policy_epoch = key }, .key = key, .requirements = .{ .primary_bytes = profile.primary_bytes, .primary_alignment = if (cold_recipe != null) @as(u32, @intCast(buffer_mod.DeviceBuffer.allocation_alignment)) else 1, .profile = @backingInt(profile.family), .workspace = .{ .byte_size = profile.workspace_bytes, .alignment = 256 }, .probe_output = if (cold_recipe == null and PreparedCudaProjection.isVendor(profile)) .assigned_unpublished else .none, .capture = .supported }, .vtable = &PreparedCudaProjection.vtable };
 }
+/// Strict F32 batched contractions keep their original matrix-axis flags and
+/// primitive kernel. Training BLAS, reduced operands and rank-two vendor paths
+/// remain on their existing independently selected implementations.
+fn batchedCudaDotRouteSupported(ctx: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
+    if (descriptor.operation != .dot or descriptor.input_count != 2 or descriptor.output_shape.dtype != .f32 or descriptor.input_shapes[0].rank() <= 2) return false;
+    const rank = descriptor.input_shapes[0].rank();
+    if (rank > 8 or descriptor.input_shapes[1].rank() != rank or descriptor.output_shape.rank() != rank) return false;
+    for (descriptor.input_shapes[0..descriptor.input_count]) |shape| {
+        const count = shape.numElements() orelse return false;
+        if (shape.dtype != .f32 or count <= 0 or count > std.math.maxInt(u32)) return false;
+    }
+    const count = descriptor.output_shape.numElements() orelse return false;
+    if (count <= 0 or count > std.math.maxInt(u32)) return false;
+    const dot = descriptor.operation.dot;
+    const batch_axes = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7 };
+    const expected = planBatchedDotGeneral(descriptor.input_shapes[0].dims[0..rank], descriptor.input_shapes[1].dims[0..rank], &.{if (dot.lhs_contract_last) rank - 1 else rank - 2}, &.{if (dot.rhs_contract_last) rank - 1 else rank - 2}, batch_axes[0 .. rank - 2], batch_axes[0 .. rank - 2]) catch return false;
+    if (!std.meta.eql(dot, expected) or descriptor.output_shape.dim(rank - 2) != dot.m or descriptor.output_shape.dim(rank - 1) != dot.n) return false;
+    for (0..rank - 2) |axis| if (descriptor.output_shape.dim(@intCast(axis)) != descriptor.input_shapes[0].dim(@intCast(axis))) return false;
+    const self: *CudaCompute = @ptrCast(@alignCast(ctx));
+    return self.training_blas == null and !self.resident_training_cache and self.kernels.primitive_batched_dot_f32 != null;
+}
+
 fn directCudaRouteSupported(_: *anyopaque, descriptor: *const ops.kernel_descriptor.Descriptor) bool {
     // Index metadata gathering and non-projection dots retain their existing
     // compatibility path until their exact metadata/vendor route is qualified.
@@ -48039,8 +48069,15 @@ fn ownedPayloadRoute(ctx: *anyopaque, owned: *const @import("../../execution/ker
         const expected = std.math.mul(usize, @intCast(count), @sizeOf(f32)) catch return false;
         return gather.compute == @as(*CudaCompute, @ptrCast(@alignCast(ctx))) and gather.implementation.context == ctx and gather.implementation.table == owned.implementation.table and required.primary_bytes == expected and required.workspace.byte_size == 0 and required.workspace.host_byte_size == 0 and required.probe_workspace.byte_size == 0 and required.probe_workspace.host_byte_size == 0 and required.auxiliaries.count == 0;
     }
+    const direct = @import("../../execution/assigned_kernel_route.zig");
+    const backend = ops.ComputeBackend{ .ptr = ctx, .vtable = @ptrCast(@alignCast(owned.implementation.table)) };
+    if (direct.belongsToProgram(owned, backend, batchedCudaDotRouteSupported)) {
+        // Dynamic validation protects the original nontraining schedule; it
+        // does not imply hidden output or temporary ownership for this family.
+        return owned.output_plane_metadata == .assigned_dense and required.workspace.byte_size == 0 and required.workspace.host_byte_size == 0 and required.probe_workspace.byte_size == 0 and required.probe_workspace.host_byte_size == 0 and required.auxiliaries.count == 0;
+    }
     if (owned.validation_scope != .prepared_program) return false;
-    return @import("../../execution/assigned_kernel_route.zig").belongsTo(owned, .{ .ptr = ctx, .vtable = @ptrCast(@alignCast(owned.implementation.table)) });
+    return direct.belongsTo(owned, backend);
 }
 
 // Test-only cold funding shared by all four real ModelProgram weight formats.
@@ -53811,4 +53848,163 @@ test "embeddinggemma2 CUDA generic full batch attention keeps read operands disj
         defer a.free(actual);
         for (actual) |value| try std.testing.expectEqual(@as(f32, 0), value);
     }
+}
+
+test "CUDA batched dot owned route keeps every matrix-axis layout on original F32 planned storage" {
+    inline for (.{ false, true }) |lhs_transposed| inline for (.{ false, true }) |rhs_transposed| {
+        try qualifyCudaBatchedDotOwnedRoute(lhs_transposed, rhs_transposed);
+    };
+}
+
+fn qualifyCudaBatchedDotOwnedRoute(comptime lhs_transposed: bool, comptime rhs_transposed: bool) !void {
+    if (comptime !cuda_enabled) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const shared = @import("../../backends/compute_context.zig").SharedBackendContext.init(a, .cuda, null) catch |err| switch (err) {
+        error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
+        else => return err,
+    };
+    defer shared.release();
+    var budget: ?CompleteCudaProgramBudget = null;
+    defer if (budget) |*value| value.deinit();
+    const compute = shared.ctx.cuda;
+    const cb = shared.computeBackend();
+    const ml = @import("ml");
+    const route = @import("../../execution/kernel_route.zig");
+    const Tensor = @import("../../backends/tensor.zig").Tensor;
+    const batches = 2;
+    const rows = 3;
+    const width = 5;
+    const columns = 4;
+    const lhs_shape = if (lhs_transposed) [_]i64{ batches, width, rows } else [_]i64{ batches, rows, width };
+    const rhs_shape = if (rhs_transposed) [_]i64{ batches, columns, width } else [_]i64{ batches, width, columns };
+    var graph = ml.graph.Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const lhs = try builder.parameter("lhs", ml.graph.Shape.init(.f32, &lhs_shape));
+    const rhs = try builder.parameter("rhs", ml.graph.Shape.init(.f32, &rhs_shape));
+    const dot = try builder.matmul3DLayout(lhs, rhs, lhs_transposed, rhs_transposed);
+    var output = dot;
+    for (0..8) |_| output = try builder.add(output, dot);
+    try graph.markOutput(output);
+    var program = try @import("../../execution/program.zig").ModelProgram.init(a, &graph, &.{ .{ .name = "lhs", .node_id = lhs, .kind = .input }, .{ .name = "rhs", .node_id = rhs, .kind = .input }, .{ .name = "out", .node_id = output, .kind = .output } });
+    defer program.deinit();
+    var executable = try @import("../../execution/executable.zig").prepareWithOptions(a, &program, &cb, .partitioned, .{});
+    defer executable.deinitWithCleanup(if (budget) |*value| value.cleanup() else .{});
+    const facts = [_]route.InputBinding{ .{ .node_id = program.id_map[lhs], .value = .{ .imported_host = .{ .logical = ml.graph.Shape.init(.f32, &lhs_shape), .target = .cuda, .owned_ingress = true } } }, .{ .node_id = program.id_map[rhs], .value = .{ .imported_host = .{ .logical = ml.graph.Shape.init(.f32, &rhs_shape), .target = .cuda, .owned_ingress = true } } } };
+    const pool = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const routes = (try pool.prepareRoutes(&facts)) orelse return error.MissingPreparedKernelRoute;
+    defer routes.releaseWithCleanup(if (budget) |*value| value.cleanup() else .{});
+    const witness = routes.pool.completeOwnedPayload() orelse return error.MissingCompleteCudaPayload;
+    try std.testing.expectEqual(.device, witness.accounting_class);
+    const selected = routes.pool.preparedKernelRoute(program.id_map[dot]) orelse return error.MissingBatchedDotRoute;
+    try std.testing.expectEqual(route.ValidationScope.invocation, selected.validation_scope);
+    try std.testing.expectEqual(route.OutputPlaneMetadata.assigned_dense, selected.output_plane_metadata);
+    try std.testing.expectEqual(@as(usize, 0), selected.requirements.workspace.byte_size);
+    try std.testing.expectEqual(@as(usize, 0), selected.requirements.workspace.host_byte_size);
+    try std.testing.expect(routes.pool.replay_backend != null);
+    const current = route.Validate{ .inputs = &.{ facts[0].value, facts[1].value }, .output = routes.pool.outputSlot(program.id_map[dot], batches * rows * columns * 4) };
+    // A live training-policy change must refuse before numerical dispatch;
+    // restoring the original policy reuses the same immutable route owner.
+    compute.resident_training_cache = true;
+    defer compute.resident_training_cache = false;
+    try std.testing.expectError(error.PreparedKernelBindingChanged, selected.validate(current));
+    compute.resident_training_cache = false;
+    // Validate the optional training-owner discriminant without calling any
+    // SDK function or inspecting its intentionally unavailable payload.
+    compute.training_blas = @as(@import("libraries.zig").CublasF32, undefined);
+    defer compute.training_blas = null;
+    try std.testing.expectError(error.PreparedKernelBindingChanged, selected.validate(current));
+    compute.training_blas = null;
+    try selected.validate(current);
+    budget = try CompleteCudaProgramBudget.initForIO(routes.pool, batches * (rows + columns) * width * 4, batches * rows * columns * 4, compute);
+    var lhs_values: [batches * rows * width]f32 = undefined;
+    var rhs_values: [batches * columns * width]f32 = undefined;
+    for (&lhs_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 9)) - 4)) / 4;
+    for (&rhs_values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 7)) - 3)) / 4;
+    var lhs_input = try Tensor.initFloat32(a, "lhs", &lhs_shape, &lhs_values);
+    defer lhs_input.deinit();
+    var rhs_input = try Tensor.initFloat32(a, "rhs", &rhs_shape, &rhs_values);
+    defer rhs_input.deinit();
+    const host = [_]@import("../../execution/host_ingress.zig").Input{ .{ .node_id = program.id_map[lhs], .value = &lhs_input }, .{ .node_id = program.id_map[rhs], .value = &rhs_input } };
+    var captures: u64 = 0;
+    var replays: u64 = 0;
+    for (0..5) |iteration| {
+        lhs_input.asFloat32Mut()[0] = @as(f32, @floatFromInt(iteration)) / 4;
+        const original_lhs = try cb.fromFloat32Shape(lhs_input.asFloat32(), &.{ @intCast(lhs_shape[0]), @intCast(lhs_shape[1]), @intCast(lhs_shape[2]) });
+        defer cb.free(original_lhs);
+        const original_rhs = try cb.fromFloat32Shape(rhs_input.asFloat32(), &.{ @intCast(rhs_shape[0]), @intCast(rhs_shape[1]), @intCast(rhs_shape[2]) });
+        defer cb.free(original_rhs);
+        const original_dot = try cb.primDotGeneral(original_lhs, original_rhs, &lhs_shape, &rhs_shape, &.{if (lhs_transposed) 1 else 2}, &.{if (rhs_transposed) 2 else 1}, &.{0}, &.{0});
+        defer cb.free(original_dot);
+        const original = try cb.toFloat32(original_dot, a);
+        defer a.free(original);
+        const before = compute.ctx.device_allocations.snapshot();
+        const ordinal = compute.temp_trace_seq;
+        var audit = @import("../../execution/transfer_audit.zig").Audit{ .forbid_device_host_access = true };
+        try @import("../../execution/transfer_audit.zig").begin(&audit);
+        var result = executable.run(a, .{ .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability(), .collect_partition_stats = true, .activation_readbacks = .forbidden }) catch |err| {
+            @import("../../execution/transfer_audit.zig").end();
+            return err;
+        };
+        @import("../../execution/transfer_audit.zig").end();
+        defer result.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
+        try std.testing.expectEqual(@as(u64, 2), audit.upload_calls);
+        try std.testing.expectEqual(@as(u64, 0), audit.download_calls);
+        try std.testing.expectEqual(ordinal, compute.temp_trace_seq);
+        if (iteration >= 2) try std.testing.expectEqualDeep(before, compute.ctx.device_allocations.snapshot());
+        captures += result.stats.physical_graph_captures;
+        replays += result.stats.physical_graph_replays;
+        if (iteration == 0) try std.testing.expect(result.stats.assigned_kernel_dispatches >= 1);
+        const actual = try cb.toFloat32(result.outputs[0], a);
+        defer a.free(actual);
+        for (actual, original, 0..) |value, original_value, index| {
+            const batch = index / (rows * columns);
+            const row = index / columns % rows;
+            const column = index % columns;
+            var sum: f32 = 0;
+            for (0..width) |k| {
+                const li = batch * rows * width + (if (lhs_transposed) k * rows + row else row * width + k);
+                const ri = batch * columns * width + (if (rhs_transposed) column * width + k else k * columns + column);
+                sum += lhs_input.asFloat32()[li] * rhs_input.asFloat32()[ri];
+            }
+            try std.testing.expectEqual(sum, original_value);
+            try std.testing.expectEqual(sum * 9, value);
+        }
+    }
+    try std.testing.expectEqual(@as(u64, 1), captures);
+    try std.testing.expect(replays >= 2);
+}
+
+test "CUDA batched dot owned route legality rejects changed geometry precision training and unavailable kernel" {
+    const ml = @import("ml");
+    var graph = ml.graph.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const lhs = try builder.parameter("lhs", ml.graph.Shape.init(.f32, &.{ 2, 3, 5 }));
+    const rhs = try builder.parameter("rhs", ml.graph.Shape.init(.f32, &.{ 2, 5, 4 }));
+    const product = try builder.matmul3D(lhs, rhs);
+    const descriptor = ops.kernel_descriptor.lower(&graph, product) orelse return error.MissingBatchedDotDescriptor;
+    var compute: CudaCompute = undefined;
+    initPreparedCudaMetadataFixture(&compute);
+    compute.kernels.primitive_batched_dot_f32 = @ptrFromInt(16);
+    try std.testing.expect(batchedCudaDotRouteSupported(&compute, &descriptor));
+    var changed = descriptor;
+    changed.operation.dot.batch_count += 1;
+    try std.testing.expect(!batchedCudaDotRouteSupported(&compute, &changed));
+    changed = descriptor;
+    changed.input_shapes[1].dtype = .bf16;
+    try std.testing.expect(!batchedCudaDotRouteSupported(&compute, &changed));
+    changed = descriptor;
+    changed.output_shape = ml.graph.Shape.init(.f32, &.{ 1, 3, 4 });
+    try std.testing.expect(!batchedCudaDotRouteSupported(&compute, &changed));
+    compute.training_blas = @as(@import("libraries.zig").CublasF32, undefined);
+    try std.testing.expect(!batchedCudaDotRouteSupported(&compute, &descriptor));
+    compute.training_blas = null;
+    compute.resident_training_cache = true;
+    try std.testing.expect(!batchedCudaDotRouteSupported(&compute, &descriptor));
+    compute.resident_training_cache = false;
+    compute.kernels.primitive_batched_dot_f32 = null;
+    try std.testing.expect(!batchedCudaDotRouteSupported(&compute, &descriptor));
+    compute.kernels.primitive_batched_dot_f32 = @ptrFromInt(16);
+    try std.testing.expect(batchedCudaDotRouteSupported(&compute, &descriptor));
 }

@@ -517,6 +517,9 @@ test "pending readback observations retain publication only and separate submiss
             try std.testing.expect(submitted.pending_interval.?.phase == .submit);
             try std.testing.expect(submitted.pending_interval.?.completion == .unavailable);
             try std.testing.expectEqual(@as(?u64, 91), submitted.pending_interval.?.request_id);
+            try std.testing.expectEqualDeep(submitted.pending_interval.?, submitted.report.?.pending_interval.?);
+            try std.testing.expectEqual(.pending_phase_only, submitted.report.?.synchronous_interval);
+            try std.testing.expect(submitted.report.?.batch == null);
             lifetime.release(); // simulate the model handle leaving first
             owns_model = false;
             try std.testing.expect(!F.destroyed);
@@ -534,6 +537,7 @@ test "pending readback observations retain publication only and separate submiss
                 try std.testing.expect(ready.pending_interval.?.completion == .readback_returned);
                 try std.testing.expect(ready.pending_interval.?.counters_scope == .synchronous_phase_only);
                 try std.testing.expect(ready.pending_interval.?.whole_interval_counters == .unavailable);
+                try std.testing.expectEqualDeep(ready.pending_interval.?, ready.report.?.pending_interval.?);
             }
         }
         pending.deinit();
@@ -543,6 +547,12 @@ test "pending readback observations retain publication only and separate submiss
             try std.testing.expect(F.destroyed);
             const latest = diagnostics.snapshot().?;
             try std.testing.expectEqual(identity, latest.pending_interval.?.identity);
+            const retained_report = latest.report.?;
+            diagnostics.configure(false);
+            try std.testing.expect(diagnostics.snapshot() == null);
+            try std.testing.expectEqualDeep(latest.pending_interval.?, retained_report.pending_interval.?);
+            try std.testing.expectEqual(identity, retained_report.pending_interval.?.identity);
+            if (mode == 1) try std.testing.expectEqualStrings("PendingAwaitFailure", retained_report.pending_interval.?.prior_failure.?.view());
             if (mode == 1) try std.testing.expectEqualStrings("PendingAwaitFailure", latest.pending_interval.?.prior_failure.?.view());
             if (mode == 1 or mode == 2) {
                 try std.testing.expect(latest.pending_interval.?.phase == .cancel);

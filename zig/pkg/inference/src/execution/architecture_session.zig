@@ -6144,6 +6144,11 @@ fn archSessionHandle(impl: *ArchSession) Session {
             .model_allocator = switch (impl.backend_type) {
                 .native => impl.backend_data.native.allocator,
                 .pjrt => impl.backend_data.pjrt.native.allocator,
+                // Managed diagnostic loading already observes construction
+                // from its real allocator. Publish that retained host owner;
+                // device buffers and opaque vendor heaps stay separate.
+                .metal => if (comptime build_options.enable_metal) impl.backend_data.metal.allocator else null,
+                .cuda => if (comptime build_options.enable_cuda) impl.backend_data.cuda.compute.allocator else null,
                 else => null,
             },
             .stable_backend = if (comptime build_options.enable_cuda) if (impl.backend_type == .cuda) impl.backend_data.cuda.compute.computeBackend() else null else null,

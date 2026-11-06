@@ -99,6 +99,9 @@ test "shared cohort observation is owned by model sink with exact participants a
     try std.testing.expectEqual(@as(usize, 2), success.batch.?.participant_count);
     try std.testing.expectEqual(@as(?u64, 101), success.batch.?.participants[0].request_id);
     try std.testing.expectEqual(@as(?u64, 202), success.batch.?.participants[1].request_id);
+    try std.testing.expectEqualDeep(success.batch.?, success.report.?.batch.?);
+    try std.testing.expect(success.report.?.pending_interval == null);
+    try std.testing.expectEqual(.invocation_body, success.report.?.synchronous_interval);
     try std.testing.expectError(error.SharedNumericalFailure, call(binding, backend, .scheduled_step, &ids, Probe.describe, Probe.run, .{true}));
     const failed = owner.snapshot().?;
     try std.testing.expect(failed.outcome == .failed and failed.batch.?.identity != success.batch.?.identity);
@@ -106,6 +109,8 @@ test "shared cohort observation is owned by model sink with exact participants a
     const rejected = owner.snapshot().?;
     try std.testing.expect(rejected.runtime.submission == null and rejected.context_runtime_scope == .unavailable);
     try std.testing.expectEqualStrings("Cancelled", rejected.error_name.?.view());
+    try std.testing.expectEqualDeep(rejected.batch.?, rejected.report.?.batch.?);
+    try std.testing.expect(rejected.report.?.backend == null);
     try std.testing.expectEqual(@as(usize, 3), Probe.calls);
     var many: [40]u64 = @splat(303);
     _ = try call(binding, backend, .scheduled_step, &many, Probe.describe, Probe.run, .{false});
@@ -115,4 +120,10 @@ test "shared cohort observation is owned by model sink with exact participants a
     try std.testing.expectEqual(@as(usize, 40), bounded.participant_count);
     try std.testing.expectEqual(@as(u8, 32), bounded.stored_count);
     try std.testing.expectEqual(@as(?u64, 303), bounded.participants[0].request_id);
+    const retained_report = owner.snapshot().?.report.?;
+    owner.configure(false);
+    try std.testing.expect(owner.snapshot() == null);
+    try std.testing.expectEqualDeep(bounded, retained_report.batch.?);
+    try std.testing.expect(retained_report.batch.?.truncated);
+    try std.testing.expectEqual(@as(?u64, 303), retained_report.batch.?.participants[0].request_id);
 }

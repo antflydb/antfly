@@ -1173,6 +1173,7 @@ pub const Pool = struct {
         errdefer self.allocator.free(region_by_node);
         @memset(region_by_node, std.math.maxInt(u32));
         for (owned.owners, owned.backend_indices, 0..) |owner, backend_index, index| {
+            if (!owner.requirements.validWorkspace()) return error.PreparedRegionWorkspaceMismatch;
             const outputs = try self.allocator.alloc(region_binding.Installed.Output, owner.requirements.outputs.len);
             errdefer self.allocator.free(outputs);
             for (owner.requirements.outputs, outputs, 0..) |output, *target, output_index| {
@@ -1198,23 +1199,7 @@ pub const Pool = struct {
             }
             const workspace = @max(owner.requirements.dispatch_workspace.byte_size, owner.requirements.preparation_workspace.byte_size);
             const host = @max(owner.requirements.dispatch_workspace.host_byte_size, owner.requirements.preparation_workspace.host_byte_size);
-            const alignment = @max(owner.requirements.dispatch_workspace.alignment, owner.requirements.preparation_workspace.alignment);
-            try validateAlignment(alignment);
-            if (workspace % 4 != 0) return error.InvalidWorkspaceSize;
-            if (workspace != 0) {
-                const allocation = &self.workspace_allocations[backend_index];
-                if (allocation.* == buffers.invalid_allocation) allocation.* = try self.plan.addWorkspace(self.backends[backend_index].kind(), workspace, @min(alignment, @alignOf(f32))) else try self.growAllocation(allocation.*, workspace);
-            }
-            const host_alignment = @max(owner.requirements.host_alignment, owner.requirements.preparation_host_alignment);
-            try validateAlignment(host_alignment);
-            if (host != 0) {
-                const needed = std.mem.Alignment.fromByteUnits(host_alignment);
-                if (@backingInt(needed) > @backingInt(self.host_alignment)) self.host_alignment = needed;
-                if (self.host_workspace_allocation == buffers.invalid_allocation) {
-                    const rounded = try std.math.add(usize, host, 3);
-                    self.host_workspace_allocation = try self.plan.addHostWorkspace(rounded / 4 * 4);
-                } else try self.growAllocation(self.host_workspace_allocation, host);
-            }
+            try self.reserveWorkspace(backend_index, .{ .byte_size = workspace, .host_byte_size = host, .alignment = @max(owner.requirements.dispatch_workspace.alignment, owner.requirements.preparation_workspace.alignment) }, @max(owner.requirements.host_alignment, owner.requirements.preparation_host_alignment));
             installed[index] = .{ .owner = owner, .key = owner.key, .backend_index = backend_index, .epoch = selected.epoch, .outputs = outputs, .workspace_allocation = self.workspace_allocations[backend_index], .workspace_bytes = workspace, .host_workspace_bytes = host };
             for (owner.covered_nodes) |node| region_by_node[node] = @intCast(index);
             for (owner.requirements.literals) |node| {
@@ -1389,6 +1374,30 @@ pub const Pool = struct {
         self.plan.allocations[id].byte_size = @max(self.plan.allocations[id].byte_size, rounded / 4 * 4);
     }
 
+    /// All selected operation and region schedules use the same sequential
+    /// per-backend scratch bank. Their declared probe/preparation phases have
+    /// already been validated before taking the maximum; sharing changes no
+    /// physical allocation ID, payload lifetime, or provider dispatch policy.
+    fn reserveWorkspace(self: *Pool, backend_index: usize, required: kernels.WorkspaceRequirement, host_alignment: u32) !void {
+        try validateAlignment(required.alignment);
+        try validateAlignment(host_alignment);
+        if (required.byte_size % @sizeOf(f32) != 0) return error.InvalidWorkspaceSize;
+        if (required.byte_size != 0) {
+            const id = &self.workspace_allocations[backend_index];
+            // Provider banks establish device alignment; assigned-resource
+            // validation checks the actual address before numerical dispatch.
+            if (id.* == buffers.invalid_allocation) id.* = try self.plan.addWorkspace(self.backends[backend_index].kind(), required.byte_size, @min(required.alignment, @alignOf(f32))) else try self.growAllocation(id.*, required.byte_size);
+        }
+        if (required.host_byte_size != 0) {
+            const alignment = std.mem.Alignment.fromByteUnits(host_alignment);
+            if (@backingInt(alignment) > @backingInt(self.host_alignment)) self.host_alignment = alignment;
+            if (self.host_workspace_allocation == buffers.invalid_allocation) {
+                const rounded = try std.math.add(usize, required.host_byte_size, 3);
+                self.host_workspace_allocation = try self.plan.addHostWorkspace(rounded / 4 * 4);
+            } else try self.growAllocation(self.host_workspace_allocation, required.host_byte_size);
+        }
+    }
+
     fn validateAlignment(value: u32) !void {
         if (value == 0 or !std.math.isPowerOfTwo(value)) return error.InvalidPreparedKernelAlignment;
     }
@@ -1411,26 +1420,10 @@ pub const Pool = struct {
             if (kind == .native and (required.primary_alignment > @alignOf(u64) or required.workspace.alignment > @alignOf(f32) or required.probe_workspace.alignment > @alignOf(f32))) return error.UnsupportedPhysicalWorkspaceAlignment;
             try self.growAllocation(kernel.output_allocation, required.primary_bytes);
             const workspace_bytes = @max(required.workspace.byte_size, required.probe_workspace.byte_size);
-            const workspace_alignment = @max(required.workspace.alignment, required.probe_workspace.alignment);
             if (workspace_bytes % 4 != 0) return error.InvalidWorkspaceSize;
             kernel.workspace_bytes = workspace_bytes;
-            if (workspace_bytes != 0) {
-                const id = &self.workspace_allocations[kernel.backend_index];
-                if (id.* == buffers.invalid_allocation) {
-                    // Provider-owned device banks establish their actual
-                    // alignment; Assigned.validate checks exact addresses.
-                    id.* = try self.plan.addWorkspace(kind, workspace_bytes, @min(workspace_alignment, @alignOf(f32)));
-                } else try self.growAllocation(id.*, workspace_bytes);
-            }
             kernel.host_workspace_bytes = @max(required.workspace.host_byte_size, required.probe_workspace.host_byte_size);
-            if (kernel.host_workspace_bytes != 0) {
-                const alignment = std.mem.Alignment.fromByteUnits(@max(required.host_alignment, required.probe_host_alignment));
-                if (@backingInt(alignment) > @backingInt(self.host_alignment)) self.host_alignment = alignment;
-                if (self.host_workspace_allocation == buffers.invalid_allocation) {
-                    const rounded = try std.math.add(usize, kernel.host_workspace_bytes, 3);
-                    self.host_workspace_allocation = try self.plan.addHostWorkspace(rounded / 4 * 4);
-                } else try self.growAllocation(self.host_workspace_allocation, kernel.host_workspace_bytes);
-            }
+            try self.reserveWorkspace(kernel.backend_index, .{ .byte_size = workspace_bytes, .host_byte_size = kernel.host_workspace_bytes, .alignment = @max(required.workspace.alignment, required.probe_workspace.alignment) }, @max(required.host_alignment, required.probe_host_alignment));
             // Reuse existing role slots only for the same primary allocation.
             // The shared primary lifetime already governs alias protection.
             var auxiliaries: [kernels.max_auxiliaries]?AuxiliaryPlan = @splat(null);
@@ -2676,7 +2669,12 @@ pub const Frame = struct {
             }
         };
         const request = kernels.Invocation{ .attention = attention, .input_generation = self.host_input_generation, .assigned_inputs = if (issue_inputs) &issued_inputs else null, .prepared_route = selected_route, .descriptor = descriptor, .operator_plan = if (kernel.operator_plan) |*plan| plan else null, .inputs = inputs[0..descriptor.input_count] };
-        if (!try run(cb.ptr, request)) {
+        // A cached canonical Native program already owns its output views and
+        // exact resources. Its bound call below performs all current input,
+        // source/policy, output-authority and alias checks before any write.
+        // Keep the allocation-avoiding probe for generic/copied providers.
+        const probe = !cached or cb.vtable != &@import("../ops/native_compute.zig").vtable_impl;
+        if (probe and !try run(cb.ptr, request)) {
             if (selected_route != null) return error.PreparedKernelBindingChanged;
             return null;
         }
@@ -2724,7 +2722,15 @@ pub const Frame = struct {
             } else self.assigned[id] = try selected_owner.prepareAssigned(assignment);
             if (self.assigned[id]) |*resources| bound.prepared_resources = resources;
         }
-        if (!try run(cb.ptr, bound)) return error.AssignedKernelDeclinedAfterBinding;
+        if (!try run(cb.ptr, bound)) {
+            // Canonical Native declines before output writes. Preserve the
+            // original unbound probe's error for an invalid current input.
+            if (!probe) {
+                if (selected_route != null) return error.PreparedKernelBindingChanged;
+                return null;
+            }
+            return error.AssignedKernelDeclinedAfterBinding;
+        }
         self.stats.dispatches += 1;
         return output;
     }
@@ -3468,4 +3474,71 @@ test "physical Frame typed scope error unwind clears exact caller cleanup before
     try std.testing.expectEqual(&frame.scope_cleanup, second.borrowed.?);
     frame.endScope();
     try std.testing.expect(frame.scope_cleanup.boundary == null and first.borrowed == null and second.borrowed == null);
+}
+
+test "cached Native Frame refuses malformed bound input and output before math then reuses exact storage" {
+    if (comptime !@import("build_options").enable_native) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const shape = ml.graph.Shape.init(.f32, &.{4});
+    const input_node = try builder.parameter("x", shape);
+    const output_node = try builder.neg(input_node);
+    try graph.markOutput(output_node);
+    try graph.markOutput(input_node); // Keep the input live, so the sentinel output cannot donate it.
+    var analysis = try interpreter.CachedAnalysis.compute(a, &graph);
+    defer analysis.deinit(a);
+    var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+    defer context.deinit(a);
+    const backend = context.computeBackend();
+    var executable = try @import("executable.zig").prepareAnalyzedGraph(a, &graph, analysis, &backend, .partitioned, .{});
+    defer executable.deinit();
+    const root = executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+    const facts = [_]route.InputBinding{.{ .node_id = input_node, .value = .{ .imported_host = .{ .logical = shape, .target = .native, .owned_ingress = true, .borrowable_host = true } } }};
+    const selected = (try root.prepareRoutes(&facts)) orelse return error.MissingPreparedRoutes;
+    defer selected.release();
+    const frame = (try selected.pool.acquire()) orelse return error.MissingPhysicalFrame;
+    defer _ = frame.finish() catch unreachable;
+    try frame.begin();
+    var data = [_]f32{ 1, 2, 3, 4 };
+    const tensor = @import("../backends/tensor.zig").Tensor{ .data = std.mem.sliceAsBytes(&data), .shape = &.{4}, .dtype = .f32, .name = "", .allocator = a, .owns_data = false, .owns_shape = false };
+    const inputs = [_]host_ingress.Input{.{ .node_id = input_node, .value = &tensor }};
+    const uploaded = try frame.bindHostInputs(&inputs);
+    const values = try a.alloc(?CT, graph.nodeCount());
+    defer a.free(values);
+    @memset(values, null);
+    for (uploaded) |input| values[input.node_id] = input.value;
+    try frame.prepareNativeProgramViews(&backend, &graph, values, .{});
+    const output = frame.native_program_views[output_node] orelse return error.MissingValue;
+    const slot = selected.pool.plan.slotForNode(output_node) orelse return error.MissingPhysicalSlot;
+    const lease = frame.storages[slot.allocation] orelse return error.MissingPhysicalStorage;
+    const assigned = try frame.assignedOutput(output_node, lease);
+    try std.testing.expectEqual(@as(usize, 4 * @sizeOf(f32)), assigned.slot.writable_bytes);
+    // A physical view intentionally has no owning-header write capability.
+    // The test owns this mutable Frame slot and its explicit write authority.
+    const span = @constCast((try backend.hostFloat32Read(output)) orelse return error.MissingHostOutput);
+    @memset(span, 91);
+    const malformed = (try backend.vtable.kernels.?.physicalTensorView.?(backend.ptr, .{ .storage = lease, .shape = &.{2} })) orelse return error.MissingPhysicalView;
+    defer backend.free(malformed);
+    const attention = ops.AttentionContext{ .total_sequence_len = 1, .query_sequence_len = 1, .kv_sequence_len = 1 };
+    const allocations = frame.stats.allocations;
+    {
+        frame.native_program_views[output_node] = malformed;
+        defer frame.native_program_views[output_node] = output;
+        try std.testing.expectError(error.InvalidTensorShape, frame.executeNativeProgram(&backend, values, output_node, null, &attention));
+    }
+    try std.testing.expectEqualSlices(f32, &.{ 91, 91, 91, 91 }, span);
+    {
+        const original = values[input_node];
+        values[input_node] = malformed;
+        defer values[input_node] = original;
+        try std.testing.expectError(error.PreparedKernelBindingChanged, frame.executeNativeProgram(&backend, values, output_node, null, &attention));
+    }
+    try std.testing.expectEqualSlices(f32, &.{ 91, 91, 91, 91 }, span);
+    try std.testing.expectEqual(@as(u64, 0), frame.stats.dispatches);
+    try std.testing.expectEqual(output, try frame.executeNativeProgram(&backend, values, output_node, null, &attention));
+    try std.testing.expectEqualSlices(f32, &.{ -1, -2, -3, -4 }, span);
+    try std.testing.expectEqual(@as(u64, 1), frame.stats.dispatches);
+    try std.testing.expectEqual(allocations, frame.stats.allocations);
 }

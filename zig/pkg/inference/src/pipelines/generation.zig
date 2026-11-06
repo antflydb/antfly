@@ -43,7 +43,6 @@ const contracts = @import("../graph/backend_contracts.zig");
 const ComputeBackend = ops.ComputeBackend;
 const activations = @import("../backends/activations.zig");
 const backends = @import("../backends/backends.zig");
-const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
 const decoder_tail_runtime = @import("../backends/decoder_tail_runtime.zig");
 const metal_runtime = @import("../backends/metal_runtime.zig");
 const runtime = @import("../runtime/root.zig");
@@ -6959,58 +6958,17 @@ pub const NativeGenerationPipeline = struct {
                 defer if (prepared_tail_choices) |choices| allocator.free(choices);
                 mtp_activation.notePendingKvWritten();
 
-                const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
-                const vocab_size_usize: usize = @intCast(self.gpt_config.vocab_size);
                 const verify_trace = enableGemma4MtpVerifyTrace();
                 const tail_trace_started_at = mtpProfileTimestamp(verify_trace, self.io);
-                var lm_input = target_hidden.hidden;
-                var lm_input_owned = false;
-                defer if (lm_input_owned) self.cb.free(lm_input);
-                if (logit_base_row != 0 or target_hidden.rows != target_lm_rows) {
-                    lm_input = try self.cb.sliceRows2D(self.allocator, target_hidden.hidden, logit_base_row, target_lm_rows, hidden_size);
-                    lm_input_owned = true;
-                }
-                const trace_slice_us = if (verify_trace) @divTrunc(mtpProfileElapsedNs(true, self.io, tail_trace_started_at), std.time.ns_per_us) else 0;
-
-                const lm_w = try self.graphWeight("lm_head.weight");
-                defer self.cb.free(lm_w);
-                const trace_lmw_us = if (verify_trace) @divTrunc(mtpProfileElapsedNs(true, self.io, tail_trace_started_at), std.time.ns_per_us) else 0;
-                // Prefer the prepared final-lm-head slot (same quantized weight
-                // the planned decode frames use for their tail) over the dense
-                // lm_head fallback inside the generic linearNoBias path.
-                if (prepared_tail_choices == null and self.cb.kind() == .metal) {
-                    prepared_tail_choices = try decoder_gated_runtime.forwardPreparedLmHeadArgmaxRows(
-                        &self.cb,
-                        self.gpt_config,
-                        self.gpt_config.num_hidden_layers,
-                        lm_input,
-                        target_lm_rows,
-                        suppress_token_ids,
-                        allocator,
-                    );
-                }
+                var tail_trace = decoder_forward.HeadPreparationTrace{ .started_at = tail_trace_started_at };
+                var numerical = self.physicalDecoder();
+                var head = try numerical.prepareHeadRows(&target_hidden, logit_base_row, target_lm_rows, if (verify_trace) &tail_trace else null);
+                defer head.deinit();
+                const trace_slice_us = tail_trace.slice_us;
+                const trace_lmw_us = tail_trace.weight_us;
+                try numerical.prepareHeadChoices(&head, target_lm_rows, suppress_token_ids, &prepared_tail_choices);
                 if (cached_first_target_choice) |cached_choice| {
-                    const target_tail_choices = blk: {
-                        if (prepared_tail_choices) |choices| {
-                            prepared_tail_choices = null;
-                            break :blk choices;
-                        }
-                        break :blk (try self.cb.linearNoBiasArgmaxRowsSuppress(
-                            lm_input,
-                            lm_w,
-                            target_lm_rows,
-                            hidden_size,
-                            vocab_size_usize,
-                            suppress_token_ids,
-                            allocator,
-                        )) orelse {
-                            std.log.err(
-                                "gemma4_mtp_target_tail_argmax_unsupported: backend={s} rows={d} hidden={d} vocab={d} suppress={d} weight_tying={}",
-                                .{ @tagName(self.cb.kind()), target_lm_rows, hidden_size, vocab_size_usize, suppress_token_ids.len, self.gpt_config.weight_tying },
-                            );
-                            return error.UnsupportedBackend;
-                        };
-                    };
+                    const target_tail_choices = try numerical.requireHeadChoices(&head, target_lm_rows, suppress_token_ids, &prepared_tail_choices);
                     defer allocator.free(target_tail_choices);
                     if (verify_trace) {
                         const argmax_done_us = @divTrunc(mtpProfileElapsedNs(true, self.io, tail_trace_started_at), std.time.ns_per_us);
@@ -7094,18 +7052,7 @@ pub const NativeGenerationPipeline = struct {
                             eos_token_ids_len += 1;
                         }
                     }
-                    if (try self.cb.gemma4MtpVerifyCommit(&.{
-                        .input = lm_input,
-                        .weight = lm_w,
-                        .rows = verify_len,
-                        .in_dim = hidden_size,
-                        .out_dim = vocab_size_usize,
-                        .suppress_token_ids = suppress_token_ids,
-                        .draft_tokens = draft_tokens[0..draft_count],
-                        .eos_token_ids = eos_token_ids_buf[0..eos_token_ids_len],
-                        .accept_bonus = accept_bonus,
-                        .allocator = allocator,
-                    })) |runtime_result_owned| {
+                    if (try numerical.verifyHeadChoices(&head, verify_len, suppress_token_ids, draft_tokens[0..draft_count], eos_token_ids_buf[0..eos_token_ids_len], accept_bonus)) |runtime_result_owned| {
                         var runtime_result = runtime_result_owned;
                         defer runtime_result.deinit(allocator);
                         verify_result = try self.acceptGemma4MtpVerifyCommitResultGreedy(
@@ -7168,21 +7115,7 @@ pub const NativeGenerationPipeline = struct {
                     }
                 }
                 if (!used_fused_verify) {
-                    const maybe_target_choices: ?[]u32 = blk: {
-                        if (prepared_tail_choices) |choices| {
-                            prepared_tail_choices = null;
-                            break :blk choices;
-                        }
-                        break :blk try self.cb.linearNoBiasArgmaxRowsSuppress(
-                            lm_input,
-                            lm_w,
-                            verify_len,
-                            hidden_size,
-                            vocab_size_usize,
-                            suppress_token_ids,
-                            allocator,
-                        );
-                    };
+                    const maybe_target_choices = try numerical.headChoices(&head, verify_len, suppress_token_ids, &prepared_tail_choices);
                     if (maybe_target_choices) |target_choices| {
                         defer allocator.free(target_choices);
                         verify_result = try self.acceptVerifiedDraftTokenChoicesGreedy(
@@ -7585,28 +7518,6 @@ pub const NativeGenerationPipeline = struct {
         };
     }
 
-    fn argmaxDeviceLogitRow(
-        self: *NativeGenerationPipeline,
-        result: *const ForwardAllWithHiddenDevice,
-        row: usize,
-    ) !usize {
-        const vocab_size: usize = @intCast(self.gpt_config.vocab_size);
-        if (row >= result.rows) return error.InvalidTensorShape;
-        const row_logits = try self.cb.sliceRows2D(self.allocator, result.logits, row, 1, vocab_size);
-        defer self.cb.free(row_logits);
-        const suppress_token_ids = self.gpt_config.suppressTokenIds();
-        if (suppress_token_ids.len > 0) {
-            const token_tensor = (try self.cb.argmaxLastRowSuppressTensor(row_logits, 1, vocab_size, suppress_token_ids)) orelse return error.UnsupportedBackend;
-            defer self.cb.free(token_tensor);
-            const token_host = try self.cb.toFloat32(token_tensor, self.allocator);
-            defer self.allocator.free(token_host);
-            if (token_host.len != 1 or token_host[0] < 0) return error.InvalidModelOutput;
-            return @intFromFloat(token_host[0]);
-        }
-        const token = (try self.cb.argmaxLastRow(row_logits, 1, vocab_size)) orelse return error.UnsupportedBackend;
-        return @intCast(token);
-    }
-
     fn acceptVerifiedDraftTokensGreedyDevice(
         self: *NativeGenerationPipeline,
         token_ids: []i64,
@@ -7622,12 +7533,8 @@ pub const NativeGenerationPipeline = struct {
         const verify_len = draft_tokens.len + 1;
         if (target_query_len < verify_len or target_result.rows < target_query_len) return error.InvalidTensorShape;
         const logit_base_row = target_query_len - verify_len;
-        const vocab_size: usize = @intCast(self.gpt_config.vocab_size);
-        const suppress_token_ids = self.gpt_config.suppressTokenIds();
-        const batched_choices: ?[]u32 = if (suppress_token_ids.len == 0)
-            try self.cb.argmaxRows(target_result.logits, logit_base_row, verify_len, vocab_size, self.allocator)
-        else
-            try self.cb.argmaxRowsSuppress(target_result.logits, logit_base_row, verify_len, vocab_size, suppress_token_ids, self.allocator);
+        var numerical = self.physicalDecoder();
+        const batched_choices = try numerical.greedyLogitRows(target_result.logits, logit_base_row, verify_len);
         defer if (batched_choices) |choices| self.allocator.free(choices);
         if (batched_choices != null and mtp_profile.enabled) {
             mtp_profile.target_verify_argmax_calls += 1;
@@ -7658,7 +7565,7 @@ pub const NativeGenerationPipeline = struct {
                 mtp_profile.target_verify_argmax_syncs += 1;
                 mtp_profile.target_choice_downloads += 1;
             }
-            fallback_choices_buf[i] = @intCast(try self.argmaxDeviceLogitRow(target_result, logit_base_row + i));
+            fallback_choices_buf[i] = @intCast(try numerical.greedyLogitRow(target_result, logit_base_row + i));
         }
         return try self.acceptVerifiedDraftTokenChoicesGreedy(
             token_ids,

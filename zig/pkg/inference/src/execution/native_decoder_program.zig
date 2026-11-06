@@ -860,7 +860,7 @@ pub const Call = struct {
         const program = self.program orelse return error.NativeProgramCallConsumed;
         const frame = self.frame orelse return error.UnpreparedNativeProgramCall;
         const output = self.output orelse return error.UnpreparedNativeProgramCall;
-        if (self.ran or backend.ptr != program.backend.ptr or backend.vtable != program.backend.vtable or config.fingerprint() != program.config.fingerprint() or !program.supportsCall(&.{self.token}, 1, decode)) return error.NativeProgramCallChanged;
+        if (self.ran or backend.ptr != program.backend.ptr or backend.vtable != program.backend.vtable or config.fingerprint() != program.template.config_hash or !program.supportsCall(&.{self.token}, 1, decode)) return error.NativeProgramCallChanged;
         const attention = gpt.attentionContextFromDecode(decode);
         if (attention.kv_manager != self.manager or attention.kv_cache == null or attention.kv_cache.?.sequence_id != self.sequence or attention.kv_cache.?.pool_id != self.pool or attention.total_sequence_len != self.total_tokens) return error.NativeProgramCallChanged;
         try Native.NativeCompute.validateAuthoredSourceQueries(backend, program.source_queries);
@@ -1260,6 +1260,11 @@ fn nativeAuthoredDecodeFormatSteps(config: gpt.Config, steps: usize, reset_step:
             defer sealed.release();
             owner.finishAfterUnlock();
             try std.testing.expectError(error.RetirementEpochSealed, call.run(&backend, config, &actual_context, .{ .boundary = &sealed }));
+            try std.testing.expect(!call.ran);
+            try std.testing.expectEqual(@as(u64, 0), program.assigned_operations);
+            var changed_config = config;
+            changed_config.rope_theta *= 2;
+            try std.testing.expectError(error.NativeProgramCallChanged, call.run(&backend, changed_config, &actual_context, .{ .outside_execution = true }));
             try std.testing.expect(!call.ran);
             try std.testing.expectEqual(@as(u64, 0), program.assigned_operations);
             // Include trace-resolved names even if optimization consumed their

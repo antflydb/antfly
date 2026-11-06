@@ -2051,6 +2051,28 @@ pub const EmbeddingPipeline = struct {
                 defer {
                     if (cleanup.boundary != null) managed.deinitWithCleanup(cleanup) else managed.deinit();
                 }
+                // This direct encoder consumes the SAME Source dispatch as
+                // the permit route below. Borrow its final-address cache loan
+                // on the actual fresh Native header for this synchronous call.
+                // The callback parks the real Model/lane before cold funding.
+                var native_invocation = @import("../execution/invocation_context.zig").Context{
+                    .cleanup = cleanup,
+                    .native_weights = run_permit.native_weights,
+                };
+                const native_source = if (comptime build_options.enable_native)
+                    managed.backend.vtable == &@import("../ops/native_compute.zig").vtable_impl and run_permit.session.nativePanelPreparationReceiver()
+                else
+                    false;
+                if (native_source) {
+                    if (native_invocation.native_weights == null or cleanup.boundary == null) return error.ForeignNativeWeightModel;
+                    if (managed.backend.call_context != null) return error.NativeWeightPreparationReentered;
+                    managed.backend.call_context = &native_invocation;
+                }
+                // Clear the actual header before provider destruction; neither
+                // returned CPU rows nor a durable backend can retain Source.
+                defer if (native_source) {
+                    managed.backend.call_context = null;
+                };
                 const prepaid_source = if (source_cohort) |cohort| switch (cohort) {
                     .prepared => |owner| if (owner.shape_scope) |scope| scope.owner != null else false,
                     .legacy => false,
@@ -8574,6 +8596,15 @@ test "Gemma public text original source task escrow preserves four-row windows c
         session.model_lifetime.?.admission_domain = domain.pin();
         const GiB: usize = 1024 * 1024 * 1024;
         session.run_admission = .{ .controller = &domain.controller, .backend_class = if (kind == .native) .cpu else .gpu, .limits = .{ .host_limit_bytes = 8 * GiB, .backend_limit_bytes = 4 * GiB }, .static_workspace_bytes = 0, .check_live_memory = false };
+        if (kind == .native) {
+            // Match the production published Model/cache Domain before any
+            // forward. The first call below must cold-publish typed entries.
+            try @import("../execution/architecture_session.zig").configureSharedCacheAdmissionForSession(session, a, &domain.controller, .cpu, session.run_admission.?.limits, .{});
+            const data = @import("../execution/architecture_session.zig").nativePanelPreparationModelData(session) orelse return error.MissingCanonicalNativeModel;
+            try std.testing.expect(data.prefetch_initialized);
+            try std.testing.expectEqual(@as(usize, 0), data.embeddinggemma2_f32_cache.count());
+            try std.testing.expectEqual(@as(usize, 0), data.embeddinggemma2_canonical_panels.count());
+        }
         probe.model_gate = session.execution_gate;
         var pipeline = EmbeddingPipeline.init(a, session, hf.tokenizer(), .{ .resident_text_encoder = true, .normalize = true, .pooling = .mean, .max_length = 128, .strict_max_length = true, .trim_padding_to_batch_max = true, .embedding_gemma2_dimensions = 768, .text_prefix = try @import("../architectures/embedding_gemma2.zig").taskPrefix("CLUSTERING") });
         pipeline.execution_control = control;
@@ -8602,6 +8633,16 @@ test "Gemma public text original source task escrow preserves four-row windows c
         // no tokenized/reference warmup or alternate encoder is introduced.
         var owned = try pipeline.embedOwned(&texts, .{ .outside_execution = true });
         defer owned.deinitOutsideExecution();
+        if (kind == .native) {
+            const data = @import("../execution/architecture_session.zig").nativePanelPreparationModelData(session) orelse return error.MissingCanonicalNativeModel;
+            if (!@import("../backends/native.zig").useBlas()) {
+                try std.testing.expect(data.embeddinggemma2_canonical_panels.count() > 0);
+                try std.testing.expect(data.canonical_panel_prepared_map_bytes > 0);
+                var entries = data.embeddinggemma2_canonical_panels.valueIterator();
+                while (entries.next()) |entry| try std.testing.expect(entry.prepared_physical_bytes > 0);
+            }
+            try std.testing.expect(!probe.violation.load(.acquire) and !lane.owned and scheduler.head == null);
+        }
         var no_normalize_held: ?session_mod.OwnedHostVectors = null;
         defer if (no_normalize_held) |*value| value.deinitOutsideExecution();
         var no_normalize_expected: [128]f32 = undefined;

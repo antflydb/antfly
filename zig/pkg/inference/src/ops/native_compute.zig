@@ -4197,11 +4197,16 @@ pub const NativeCompute = struct {
         defer if (data.prefetch_initialized) data.prefetch.unlock();
         return authoredResidentF32ShapeLocked(data, name);
     }
-    fn authoredResidentF32ShapeLocked(data: *WeightStore, name: []const u8) !@import("ml").graph.Shape {
-        const loaded = data.resident_weights.getPtr(name) orelse {
+    fn authoredSourceLoadedLocked(data: *WeightStore, name: []const u8) !*LoadedWeight {
+        return data.resident_weights.getPtr(name) orelse {
             if (data.lazy_weights.contains(name)) return error.UnsupportedAuthoredWeight;
             return error.WeightNotFound;
         };
+    }
+    fn authoredResidentF32ShapeLocked(data: *WeightStore, name: []const u8) !@import("ml").graph.Shape {
+        return authoredResidentF32ShapeFromLoaded(try authoredSourceLoadedLocked(data, name));
+    }
+    fn authoredResidentF32ShapeFromLoaded(loaded: *const LoadedWeight) !@import("ml").graph.Shape {
         const tensor = &loaded.tensor;
         if (loaded.quantized or loaded.quantized_storage != null or tensor.dtype != .f32 or tensor.shape.len == 0 or tensor.shape.len > 2 or @intFromPtr(tensor.data.ptr) % @alignOf(f32) != 0) return error.UnsupportedAuthoredWeight;
         const shape = @import("ml").graph.Shape.init(.f32, tensor.shape);
@@ -4220,10 +4225,9 @@ pub const NativeCompute = struct {
         return authoredResidentSourceQueryLocked(self.data, name);
     }
     fn authoredResidentSourceQueryLocked(data: *WeightStore, name: []const u8) !AuthoredSourceQuery {
-        const loaded = data.resident_weights.getPtr(name) orelse {
-            if (data.lazy_weights.contains(name)) return error.UnsupportedAuthoredWeight;
-            return error.WeightNotFound;
-        };
+        return authoredResidentSourceQueryFromLoaded(name, try authoredSourceLoadedLocked(data, name));
+    }
+    fn authoredResidentSourceQueryFromLoaded(name: []const u8, loaded: *const LoadedWeight) !AuthoredSourceQuery {
         if (loaded.quantized_storage) |*storage| {
             if (!loaded.quantized or loaded.tensor.data.len != 0 or quantizedRawBacking(storage) == null or (loaded.tensor.shape.len != 0 and !std.mem.eql(i64, loaded.tensor.shape, storage.shape)) or storage.shape.len != 2 or storage.shape[0] <= 0 or storage.shape[1] <= 0 or storage.packed_expert != null or storage.prepared_group_cache != null) return error.UnsupportedAuthoredWeight;
             const kind = switch (storage.tensor_type) {
@@ -4244,7 +4248,7 @@ pub const NativeCompute = struct {
             };
             return .{ .name = name, .shape = @import("ml").graph.Shape.init(.f32, storage.shape), .quantized = .{ .kind = kind, .raw_bytes = storage.raw_bytes.len, .prepared_lengths = lengths } };
         }
-        return .{ .name = name, .shape = try authoredResidentF32ShapeLocked(data, name) };
+        return .{ .name = name, .shape = try authoredResidentF32ShapeFromLoaded(loaded) };
     }
 
     /// Actual whole-program cold ownership preflight. Generic route selection
@@ -4276,8 +4280,11 @@ pub const NativeCompute = struct {
         return authoredQuantizedIdentityLocked(self, name, witness);
     }
     fn authoredQuantizedIdentityLocked(self: *NativeCompute, name: []const u8, witness: CT) !AuthoredQuantizedIdentity {
+        return authoredQuantizedIdentityFromLoadedLocked(self, name, witness, null);
+    }
+    fn authoredQuantizedIdentityFromLoadedLocked(self: *NativeCompute, name: []const u8, witness: CT, loaded: ?*const LoadedWeight) !AuthoredQuantizedIdentity {
         if (!std.mem.eql(u8, toBuf(witness).name, name)) return error.AuthoredResidentWeightChanged;
-        const storage = namedResidentQuantizedStorageLocked(self, witness) orelse return error.AuthoredResidentWeightChanged;
+        const storage = namedResidentQuantizedStorageFromLoadedLocked(self, witness, loaded) orelse return error.AuthoredResidentWeightChanged;
         var pointers: [@typeInfo(QuantizedStorage.PreparedQuantLayout).@"enum".field_names.len]usize = @splat(0);
         var lengths: [pointers.len]usize = @splat(0);
         for (storage.prepared.entries, 0..) |entry, i| if (entry) |value| {
@@ -4299,11 +4306,17 @@ pub const NativeCompute = struct {
         defer ResidentWeightPreparation.unlock(data);
         for (queries) |entry| {
             const query: AuthoredSourceQuery = if (@TypeOf(entry) == AuthoredSourceQuery) entry else entry.fact;
-            const actual: ?AuthoredSourceQuery = authoredResidentSourceQueryLocked(data, query.name) catch |err| switch (err) {
+            // One actual lookup for this name under the SAME metadata
+            // window. The slot is consumed here only, never saved in Program
+            // or Template; every positive and MissingWeight answer is checked.
+            const loaded: ?*const LoadedWeight = authoredSourceLoadedLocked(data, query.name) catch |err| switch (err) {
                 error.WeightNotFound => null,
                 error.UnsupportedAuthoredWeight => return error.AuthoredResidentTopologyChanged,
-                else => return err,
             };
+            const actual: ?AuthoredSourceQuery = if (loaded) |source| authoredResidentSourceQueryFromLoaded(query.name, source) catch |err| switch (err) {
+                error.UnsupportedAuthoredWeight => return error.AuthoredResidentTopologyChanged,
+                else => return err,
+            } else null;
             if (query.shape) |expected| {
                 if (actual == null or !expected.eq(actual.?.shape.?) or !std.meta.eql(query.quantized, actual.?.quantized)) return error.AuthoredResidentTopologyChanged;
             } else if (actual != null or query.quantized != null) return error.AuthoredResidentTopologyChanged;
@@ -4311,11 +4324,11 @@ pub const NativeCompute = struct {
                 if ((query.shape != null) != (entry.witness != null)) return error.AuthoredResidentTopologyChanged;
                 if (entry.witness) |witness| {
                     if (query.quantized != null) {
-                        const physical = try authoredQuantizedIdentityLocked(self, query.name, witness);
+                        const physical = try authoredQuantizedIdentityFromLoadedLocked(self, query.name, witness, loaded.?);
                         if (@hasField(@TypeOf(entry), "physical")) {
                             if (entry.physical == null or !std.meta.eql(physical, entry.physical.?)) return error.AuthoredResidentWeightChanged;
                         } else return error.AuthoredResidentWeightChanged;
-                    } else _ = try authoredResidentF32PlaneLocked(data, query.name, witness, actual.?.shape.?);
+                    } else _ = try authoredResidentF32PlaneFromLoaded(query.name, witness, actual.?.shape.?, loaded.?);
                 }
             }
         }
@@ -4335,6 +4348,9 @@ pub const NativeCompute = struct {
     }
     fn authoredResidentF32PlaneLocked(data: *WeightStore, name: []const u8, value: CT, shape: @import("ml").graph.Shape) !@import("../execution/storage_ownership.zig").Plane {
         const source = data.resident_weights.getPtr(name) orelse return error.UnsupportedAuthoredWeight;
+        return authoredResidentF32PlaneFromLoaded(name, value, shape, source);
+    }
+    fn authoredResidentF32PlaneFromLoaded(name: []const u8, value: CT, shape: @import("ml").graph.Shape, source: *const LoadedWeight) !@import("../execution/storage_ownership.zig").Plane {
         const view = toBuf(value);
         if (!view.cached_weight or view.weight_handle == null or view.weight_handle.?.references == 0 or view.owned or view.retained_parent != null or view.physical_lease != null or view.source_tensor != null or view.quantized_storage != null or view.owned_quantized_storage != null or view.view_strides != null or view.view_base_offset != 0 or !std.mem.eql(u8, view.name, name) or @intFromPtr(view.data.ptr) != @intFromPtr(source.tensor.data.ptr) or std.mem.sliceAsBytes(view.data).len != source.tensor.data.len or view.logical_shape == null or !std.mem.eql(i64, view.logical_shape.?, source.tensor.shape)) return error.AuthoredResidentWeightChanged;
         var descriptor = backend_contracts.TensorDesc.init(shape, .host_f32);
@@ -15642,6 +15658,14 @@ const Q8KActivationQuantWorkerCtx = struct {
     err: ?anyerror = null,
 };
 
+/// This predicate cannot overflow or turn an unknown-large workload into a
+/// serial decision. Callers retain their original arithmetic after CPU<=1.
+fn quantWorkProvablyBelow(rows: usize, out_dim: usize, row_blocks: usize, minimum: usize) bool {
+    const rows_output = std.math.mul(usize, rows, out_dim) catch return false;
+    const work = std.math.mul(usize, rows_output, row_blocks) catch return false;
+    return work < minimum;
+}
+
 fn chooseQuantLinearParallelPlan(
     requested: bool,
     rows: usize,
@@ -15650,7 +15674,7 @@ fn chooseQuantLinearParallelPlan(
     max_workers: usize,
 ) QuantLinearParallelPlan {
     if (!requested) return .disabled();
-    if (rows == 0 or out_dim == 0 or row_blocks == 0) return .disabled();
+    if (rows <= 1 or out_dim == 0 or row_blocks == 0 or max_workers <= 1) return .disabled();
 
     const cpu_count = std.Thread.getCpuCount() catch 1;
     const capped_cpu_count = @max(@as(usize, 1), @min(cpu_count, max_workers));
@@ -15691,16 +15715,20 @@ fn chooseQuantLinearColumnParallelPlanWithMaxRows(
     max_rows: usize,
 ) QuantLinearParallelPlan {
     if (!requested) return .disabled();
-    if (rows == 0 or out_dim == 0 or row_blocks == 0) return .disabled();
+    if (rows == 0 or out_dim == 0 or row_blocks == 0 or max_workers <= 1) return .disabled();
     if (rows > max_rows) return .disabled();
     if (out_dim < quant_col_parallel_min_out_dim) return .disabled();
 
+    // Preserve the live threshold, but avoid the OS query when checked
+    // geometry already proves the original result is serial. Overflow is
+    // unknown, not permission to decline; original CPU<=1/error order stays.
+    const min_work_units_per_worker = quantParallelMinWorkUnitsPerWorker();
+    if (quantWorkProvablyBelow(rows, out_dim, row_blocks, min_work_units_per_worker)) return .disabled();
     const cpu_count = std.Thread.getCpuCount() catch 1;
     const capped_cpu_count = @max(@as(usize, 1), @min(cpu_count, max_workers));
     if (capped_cpu_count <= 1) return .disabled();
 
     const work_units = rows * out_dim * row_blocks;
-    const min_work_units_per_worker = quantParallelMinWorkUnitsPerWorker();
     if (work_units < min_work_units_per_worker) return .disabled();
 
     const worker_count = @min(capped_cpu_count, out_dim / quant_col_parallel_min_cols_per_worker);
@@ -15715,7 +15743,7 @@ fn chooseActivationQuantParallelPlan(
     max_workers: usize,
 ) QuantLinearParallelPlan {
     if (!requested) return .disabled();
-    if (rows == 0 or in_dim == 0) return .disabled();
+    if (rows <= 1 or in_dim == 0 or max_workers <= 1) return .disabled();
 
     const cpu_count = std.Thread.getCpuCount() catch 1;
     const capped_cpu_count = @max(@as(usize, 1), @min(cpu_count, max_workers));
@@ -56034,13 +56062,16 @@ fn quantizedRawBacking(storage: *const QuantizedStorage) ?QuantizedRawBacking {
 /// Borrowed named source under the existing model metadata lock. This is NOT
 /// authority over arbitrary quantized CTs, nor permission to prepare a layout.
 fn namedResidentQuantizedStorageLocked(self: *NativeCompute, tensor: CT) ?*const QuantizedStorage {
+    return namedResidentQuantizedStorageFromLoadedLocked(self, tensor, null);
+}
+fn namedResidentQuantizedStorageFromLoadedLocked(self: *NativeCompute, tensor: CT, selected_source: ?*const LoadedWeight) ?*const QuantizedStorage {
     const view = toBuf(tensor);
     if (view.owned or view.source_tensor != null or (view.declared_dtype != null and view.declared_dtype != .f32) or !view.whole_named_weight or weightData(self, view) != self.data or view.view_strides != null or view.view_base_offset != 0 or view.physical_lease != null or view.owned_quantized_storage != null) return null;
     var root = view;
     while (root.retained_parent) |parent| root = toBuf(parent);
     if (!root.cached_weight or root.weight_handle == null or root.weight_handle.?.references == 0 or root.owned or root.data.len != 0 or view.data.len != 0 or root.source_tensor != null or root.physical_lease != null or root.lazy_entry != null) return null;
     if (!std.mem.eql(u8, root.name, view.name)) return null;
-    const loaded = self.data.resident_weights.getPtr(root.name) orelse return null;
+    const loaded = selected_source orelse self.data.resident_weights.getPtr(root.name) orelse return null;
     const source = if (loaded.quantized_storage) |*storage| storage else return null;
     if (!loaded.quantized or loaded.tensor.data.len != 0 or quantizedRawBacking(source) == null or root.quantized_storage != source or view.quantized_storage != source or source.packed_expert != null or source.prepared_group_cache != null) return null;
     if (root.logical_shape == null or view.logical_shape == null or !std.mem.eql(i64, root.logical_shape.?, source.shape) or !std.mem.eql(i64, view.logical_shape.?, source.shape)) return null;
@@ -60284,4 +60315,58 @@ test "Native prepared audio constant original count byte and zero payload ceilin
     data.embeddinggemma2_constant_bytes = embeddinggemma2_weight_cache.prepared_max_bytes - 15;
     try std.testing.expect(!f32ConstantWithinLimits(&data, 16));
     try std.testing.expect(f32ConstantWithinLimits(&data, 15));
+}
+
+test "quant geometry serial exits match original worker formula across live policy inputs" {
+    const Original = struct {
+        fn row(rows: usize, out_dim: usize, blocks: usize, cpu: usize, maximum: usize, minimum: usize) usize {
+            if (rows == 0 or out_dim == 0 or blocks == 0) return 1;
+            const capped = @max(@as(usize, 1), @min(cpu, maximum));
+            if (capped <= 1 or rows * out_dim * blocks < minimum) return 1;
+            return @min(capped, rows);
+        }
+        fn column(rows: usize, out_dim: usize, blocks: usize, cpu: usize, maximum: usize, minimum: usize, max_rows: usize) usize {
+            if (rows == 0 or out_dim == 0 or blocks == 0 or rows > max_rows or out_dim < quant_col_parallel_min_out_dim) return 1;
+            const capped = @max(@as(usize, 1), @min(cpu, maximum));
+            if (capped <= 1 or rows * out_dim * blocks < minimum) return 1;
+            return @max(@as(usize, 1), @min(capped, out_dim / quant_col_parallel_min_cols_per_worker));
+        }
+        fn activation(rows: usize, width: usize, cpu: usize, maximum: usize, minimum: usize) usize {
+            if (rows == 0 or width == 0) return 1;
+            const capped = @max(@as(usize, 1), @min(cpu, maximum));
+            if (capped <= 1 or rows * width < minimum) return 1;
+            return @min(capped, rows);
+        }
+    };
+    // CPU and environment values are explicit pure inputs, never sampled or
+    // changed by this test. All original products below fit even on32bit.
+    for ([_]usize{ 0, 1, 2, 3, 77, 129, 385 }) |rows| {
+        for ([_]usize{ 0, 64, 511, 512, 1024, 4096 }) |out_dim| {
+            for ([_]usize{ 0, 1, 2, 8 }) |blocks| {
+                for ([_]usize{ 0, 1, 2, 4, 64 }) |cpu| {
+                    for ([_]usize{ 0, 1, 2, 8, 128 }) |maximum| {
+                        for ([_]usize{ 0, 1, 1023, 1024, 1025, 16383, 16384, 16385 }) |minimum| {
+                            const row = if (rows <= 1 or maximum <= 1) 1 else Original.row(rows, out_dim, blocks, cpu, maximum, minimum);
+                            try std.testing.expectEqual(Original.row(rows, out_dim, blocks, cpu, maximum, minimum), row);
+                            const activation = if (rows <= 1 or maximum <= 1) 1 else Original.activation(rows, out_dim * blocks, cpu, maximum, minimum);
+                            try std.testing.expectEqual(Original.activation(rows, out_dim * blocks, cpu, maximum, minimum), activation);
+                            for ([_]usize{ 0, 2, 128, 384 }) |max_rows| {
+                                const column = if (maximum <= 1 or quantWorkProvablyBelow(rows, out_dim, blocks, minimum)) 1 else Original.column(rows, out_dim, blocks, cpu, maximum, minimum, max_rows);
+                                try std.testing.expectEqual(Original.column(rows, out_dim, blocks, cpu, maximum, minimum, max_rows), column);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+test "quant below threshold geometry proof never overflows or guesses serial for unknown work" {
+    const maximum = std.math.maxInt(usize);
+    try std.testing.expect(quantWorkProvablyBelow(1, 512, 2, 1025));
+    try std.testing.expect(!quantWorkProvablyBelow(1, 512, 2, 1024));
+    try std.testing.expect(!quantWorkProvablyBelow(1, 512, 2, 0));
+    try std.testing.expect(!quantWorkProvablyBelow(maximum, 2, 1, maximum));
+    try std.testing.expect(!quantWorkProvablyBelow(1, maximum, 2, maximum));
 }
