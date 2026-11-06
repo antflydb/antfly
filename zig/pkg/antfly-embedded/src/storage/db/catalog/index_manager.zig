@@ -8803,6 +8803,21 @@ pub const IndexManager = struct {
         _ = try self.elideLeannVectorsTxn(txn, index_name, entries);
     }
 
+    /// Whether a local transient LEANN index has covered vectors waiting to
+    /// become stubs, so callers can skip the exclusive apply lock that
+    /// `elideLocalLeannVectors` needs. Call with the apply lock held (shared
+    /// is enough).
+    pub fn localLeannElisionPending(self: *IndexManager) bool {
+        if (self.leann_replication) return false;
+        for (self.dense_indexes.items) |*entry| {
+            if (!entry.leann_transient) continue;
+            const leann_store = entry.index.leann orelse continue;
+            if (leann_store.isReplicated()) continue;
+            if (leann_store.pendingElideCount() > 0) return true;
+        }
+        return false;
+    }
+
     /// Local (unreplicated) transient LEANN indexes: replaces stored vectors
     /// their synced graphs cover by stubs. Call after `syncAll` while holding
     /// the DB apply lock.

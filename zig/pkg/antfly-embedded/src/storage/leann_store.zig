@@ -272,6 +272,13 @@ pub const LeannStore = struct {
         return out;
     }
 
+    /// Covered keys whose stored vectors are waiting to become stubs.
+    pub fn pendingElideCount(self: *LeannStore) usize {
+        self.lock.lockSharedUncancelable(self.io);
+        defer self.lock.unlockShared(self.io);
+        return self.elide_durable;
+    }
+
     pub fn freeElide(alloc: Allocator, entries: []ElideEntry) void {
         for (entries) |e| alloc.free(e.key);
         alloc.free(entries);

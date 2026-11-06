@@ -496,8 +496,12 @@ are `persistent`.
     the stubs inside the Raft apply transaction, so every replica changes
     the same data at the same log position. Pending keys are persisted in
     the replicated state.
-  - **Local (Lite):** `LeannStore` lists keys its persisted graph covers;
-    `DB.syncIndexes` writes their stubs under the apply lock after syncing.
+  - **Local (Lite):** `LeannStore` lists keys its persisted graph covers.
+    Derived replay persists the graph, then writes their stubs under the
+    exclusive apply lock once its own locks are released: at the end of each
+    dense catch-up session with background workers, and after inline replay
+    without them. `DB.syncIndexes` does the same after syncing. Stubs may land
+    just after a `full_index` write returns.
 - **Re-embedding.** The index manager's `DenseReembedder` (installed by the
   DB; it calls `enrichment_runtime.reembedDenseDocuments`) renders each
   document's field or template exactly as the dense producer does and
@@ -526,7 +530,8 @@ are `persistent`.
   are re-embedded on demand" (local) and "replicated transient leann
   replicas stub vectors in log order and rebuild from codes";
   `enrichment_runtime.zig`: "transient leann re-embeds one chunk from its
-  re-chunked parent like the producer".
+  re-chunked parent like the producer"; `db.zig`: "db transient leann stubs
+  covered vectors through ordinary writes".
 
 ## Remaining work
 

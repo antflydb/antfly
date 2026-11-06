@@ -21558,6 +21558,23 @@ pub const DB = struct {
         }
     }
 
+    /// Inline replay (no derived workers) persists LEANN graphs without
+    /// writing the stubs they allow; write them now, as `syncIndexes` does.
+    /// Callers must not hold the apply lock. Failures only delay the stubs.
+    fn elideLocalLeannVectorsAfterReplay(self: *DB) void {
+        self.elideLocalLeannVectorsAfterReplayFallible() catch |err| switch (err) {
+            error.PortableRuntimeActivationPending => {},
+            else => std.log.warn("transient leann elision deferred: {s}", .{@errorName(err)}),
+        };
+    }
+
+    fn elideLocalLeannVectorsAfterReplayFallible(self: *DB) !void {
+        try self.lockApplyForPortableRuntime();
+        defer self.core.unlockApply();
+        if (!self.core.index_manager.localLeannElisionPending()) return;
+        try self.core.index_manager.elideLocalLeannVectors();
+    }
+
     pub fn syncIndexes(self: *DB, force: bool) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("syncIndexes", .{ self, force });
         try self.lockApplyForPortableRuntime();
@@ -32103,6 +32120,7 @@ pub const DB = struct {
         if (!self.executor.hasWorkers()) {
             try ensureSnapshotActive(options.cancellation);
             try replayPendingDerivedBatches(self, null, null, options);
+            self.elideLocalLeannVectorsAfterReplay();
             try ensureSnapshotActive(options.cancellation);
             return;
         }
@@ -32181,6 +32199,7 @@ pub const DB = struct {
         if (!self.executor.hasWorkers()) {
             try wait.check();
             try replayPendingDerivedBatches(self, null, null, .{});
+            self.elideLocalLeannVectorsAfterReplay();
             try wait.check();
             return;
         }
@@ -32568,6 +32587,7 @@ pub const DB = struct {
     pub fn catchUpPendingDerivedReplay(self: *DB) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("catchUpPendingDerivedReplay", .{self});
         try replayPendingDerivedBatches(self, null, null, .{});
+        self.elideLocalLeannVectorsAfterReplay();
     }
 
     pub fn catchUpPendingDerivedReplayWithProgress(
@@ -32577,6 +32597,7 @@ pub const DB = struct {
     ) !void {
         if (comptime storage_engine.enabled) return storage_engine.call("catchUpPendingDerivedReplayWithProgress", .{ self, progress_ctx, progress_hook, storage_engine.ReplayBoundary.local_dispatch });
         try replayPendingDerivedBatches(self, progress_ctx, progress_hook, .{});
+        self.elideLocalLeannVectorsAfterReplay();
     }
 
     /// Appends internal derived work without exposing the DB's batch execution
@@ -53346,6 +53367,47 @@ fn lockApplyForPortableRuntimeAsync(ctx: *const AsyncContext) !void {
     try enforcePortableRuntimeGateOptional(&ctx.portable_runtime_activation_pending);
 }
 
+/// Transient LEANN (local mode): turns stored vectors that persisted graphs
+/// cover into stubs. Derived replay persists LEANN graphs without writing the
+/// stubs, so replay calls this once a dense session's locks are released. The
+/// stub writes take the exclusive apply lock that orders primary writes, as in
+/// `DB.syncIndexes`; a shared check first keeps other tables off that lock.
+/// Failures only delay the stubs (the pending keys stay persisted), so they
+/// are logged rather than failing replay.
+fn elideLocalLeannVectorsAsync(ctx: *AsyncContext) void {
+    elideLocalLeannVectorsAsyncFallible(ctx) catch |err| switch (err) {
+        error.PortableRuntimeActivationPending => {},
+        else => std.log.warn("transient leann elision deferred: {s}", .{@errorName(err)}),
+    };
+}
+
+fn elideLocalLeannVectorsAsyncFallible(ctx: *AsyncContext) !void {
+    {
+        try lockApplySharedForPortableRuntimeAsync(ctx);
+        defer ctx.apply_mutex.unlockShared();
+        if (!ctx.index_manager.localLeannElisionPending()) return;
+    }
+    try lockApplyForPortableRuntimeAsync(ctx);
+    defer ctx.apply_mutex.unlockExclusive();
+    try ctx.index_manager.elideLocalLeannVectors();
+}
+
+/// Inline replay (no derived workers): same as `elideLocalLeannVectorsAsync`.
+/// The caller must not hold the apply lock.
+fn elideLocalLeannVectorsContext(ctx: *const BatchExecutionContext) void {
+    elideLocalLeannVectorsContextFallible(ctx) catch |err| switch (err) {
+        error.PortableRuntimeActivationPending => {},
+        else => std.log.warn("transient leann elision deferred: {s}", .{@errorName(err)}),
+    };
+}
+
+fn elideLocalLeannVectorsContextFallible(ctx: *const BatchExecutionContext) !void {
+    try lockApplyForPortableRuntimeContext(ctx);
+    defer ctx.apply_mutex.unlockExclusive();
+    if (!ctx.index_manager.localLeannElisionPending()) return;
+    try ctx.index_manager.elideLocalLeannVectors();
+}
+
 fn replicationMutationBarrierFromContext(ctx: *const BatchExecutionContext) ?*MutationBarrier {
     var barrier: ?*MutationBarrier = null;
     const mirrors = .{
@@ -55578,6 +55640,8 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
     }
     try saveAppliedSequencesBatchContext(ctx, updates.items);
     try truncateReplayJournalIfSafeContext(ctx);
+    // Replay persisted LEANN graphs at each window; stub what they cover.
+    if (saw_entries) elideLocalLeannVectorsContext(ctx);
 }
 
 const loadManagedAppliedSequenceContext = local_mutation.loadManagedAppliedSequenceContext;
@@ -60278,6 +60342,9 @@ fn finishDerivedCatchUpSessionAsync(
     // the idle observation and durable lifecycle completion.
     lifecycle_completed = try finishDenseCatchUpSessionTrackedAndFinalize(ctx, index_ref.name) or lifecycle_completed;
     if (lifecycle_completed) DB.notifyQueryVisibilityHook(ctx, .publish_blocking);
+    // The session finish above persisted any LEANN graph it touched; with
+    // every session lock released, its covered vectors can become stubs.
+    elideLocalLeannVectorsAsync(ctx);
     return .{
         .applied_sequence_persisted = posting_applied_sequence_persisted and lifecycle_handoff_persisted,
     };
@@ -102657,6 +102724,72 @@ test "db replay records wrong-dimension dense embedding artifact as repair debt"
     const dense_applied = try reopened.core.loadAppliedSequence(alloc, "dv_v1");
     try std.testing.expectEqual(@as(u64, 0), dense_applied);
     try std.testing.expect(appended_sequence > dense_applied);
+}
+
+test "db transient leann stubs covered vectors through ordinary writes" {
+    // Derived replay persists LEANN graphs on its own; nothing else calls
+    // syncIndexes, so stubs must follow from ordinary writes, with and
+    // without background index workers.
+    const alloc = std.testing.allocator;
+    const n = 300; // past LeannStore's default build threshold of 256
+    for ([_]bool{ false, true }) |workers| {
+        var path_tmp = try TestDirectory.init("db-leann-stubs");
+        defer path_tmp.cleanup();
+        const path = path_tmp.path().ptr;
+        defer cleanupTempDir(path);
+
+        var deterministic = embedder_mod.DeterministicDenseEmbedder{};
+        var db = try DB.open(alloc, std.mem.span(path), .{
+            .start_index_workers = workers,
+            .ttl_cleanup = .{ .enabled = false },
+            .enrichment = .{ .owner_id = "leann-stubs", .dense_embedder = deterministic.interface() },
+        });
+        defer db.close();
+        try db.addIndex(.{
+            .name = "leann_idx",
+            .kind = .dense_vector,
+            .config_json = "{\"field\":\"embedding\",\"dims\":8,\"metric\":\"cosine\",\"generator\":{\"kind\":\"dense_embedding\",\"source_field\":\"body\",\"embedding_name\":\"leann_idx\"},\"algorithm\":\"leann\",\"leann\":{\"max_degree\":8,\"quantizer\":\"rabitq\",\"quantization_bits\":4,\"vector_storage\":\"transient\"}}",
+        });
+        const entry = db.core.index_manager.denseIndex("leann_idx") orelse return error.IndexNotFound;
+        try std.testing.expect(entry.leann_transient);
+
+        var keys: [n][16]u8 = undefined;
+        var key_slices: [n][]const u8 = undefined;
+        var start: usize = 0;
+        while (start < n) : (start += 50) {
+            var writes: [50]types.BatchWrite = undefined;
+            var values: [50][64]u8 = undefined;
+            for (0..50) |j| {
+                const i = start + j;
+                key_slices[i] = try std.fmt.bufPrint(&keys[i], "doc:{d:0>4}", .{i});
+                writes[j] = .{ .key = key_slices[i], .value = try std.fmt.bufPrint(&values[j], "{{\"body\":\"passage number {d}\"}}", .{i}) };
+            }
+            try db.batch(.{ .writes = &writes, .sync_level = .full_index });
+        }
+
+        const deadline = monotonicTimeNs() + 20 * std.time.ns_per_s;
+        var stubs: usize = 0;
+        while (true) {
+            stubs = 0;
+            for (key_slices) |key| {
+                const artifact_key = try expectedDocumentEmbeddingArtifactKeyAlloc(alloc, key, "leann_idx");
+                defer alloc.free(artifact_key);
+                const raw = db.core.store.get(alloc, artifact_key) catch |err| switch (err) {
+                    error.NotFound => continue,
+                    else => return err,
+                };
+                defer alloc.free(raw);
+                if (try enrichment_artifact_codec.elidedDenseEmbedding(raw) != null) stubs += 1;
+            }
+            // Vectors still in LEANN's exact buffer stay stored until a build.
+            if (stubs > 0 and !db.core.index_manager.localLeannElisionPending()) break;
+            if (monotonicTimeNs() >= deadline) break;
+            try db.runUntilIdle();
+        }
+        try std.testing.expect(entry.index.leann.?.index != null);
+        try std.testing.expect(stubs >= 256);
+        try std.testing.expect(!db.core.index_manager.localLeannElisionPending());
+    }
 }
 
 test "db repair queue reprocesses corrupt generated dense embedding artifacts" {
