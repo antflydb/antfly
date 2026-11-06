@@ -20,6 +20,8 @@ const std = @import("std");
 
 pub const Lease = struct {
     directory: ?std.Io.Dir = null,
+    alias_directories: std.ArrayListUnmanaged(std.Io.Dir) = .empty,
+    allocator: ?std.mem.Allocator = null,
 
     fn file(dir: std.Io.Dir) std.Io.File {
         return .{ .handle = dir.handle, .flags = .{ .nonblocking = false } };
@@ -46,14 +48,44 @@ pub const Lease = struct {
         return false;
     }
 
-    pub fn shared(a: std.mem.Allocator, io: std.Io, model: []const u8) !Lease {
-        if (try immutableSnapshot(a, io, model)) return .{};
+    fn sharedParent(io: std.Io, model: []const u8) !std.Io.Dir {
         const dir = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(model) orelse ".", .{ .iterate = true });
         errdefer dir.close(io);
-        // Fail promptly if a publisher owns the namespace; the caller returns
-        // a retryable publication error rather than losing its request deadline.
         if (!try file(dir).tryLock(io, .shared)) return error.ModelArtifactsChanging;
-        return .{ .directory = dir };
+        return dir;
+    }
+
+    pub fn shared(a: std.mem.Allocator, io: std.Io, model: []const u8) !Lease {
+        if (try immutableSnapshot(a, io, model)) return .{};
+        var lease = Lease{ .directory = try sharedParent(io, model), .allocator = a };
+        errdefer lease.deinit(io);
+        var current = try a.dupe(u8, model);
+        defer a.free(current);
+        var buffer: [std.fs.max_path_bytes]u8 = undefined;
+        // Fence every link in a model alias chain, not only the final target.
+        // Nonblocking shared acquisition avoids cycles between alias parents;
+        // the bounded walk also rejects loops and unwinds all prior leases.
+        for (0..40) |_| {
+            const length = std.Io.Dir.cwd().readLink(io, current, &buffer) catch |err| switch (err) {
+                error.NotLink, error.FileNotFound, error.NotDir => return lease,
+                else => return err,
+            };
+            if (length == buffer.len) return error.NameTooLong;
+            const target = if (std.fs.path.isAbsolute(buffer[0..length]))
+                try a.dupe(u8, buffer[0..length])
+            else
+                try std.fs.path.join(a, &.{ std.fs.path.dirname(current) orelse ".", buffer[0..length] });
+            a.free(current);
+            current = target;
+            if (try immutableSnapshot(a, io, current)) return lease;
+            const dir = try sharedParent(io, current);
+            lease.alias_directories.append(a, dir) catch |err| {
+                file(dir).unlock(io);
+                dir.close(io);
+                return err;
+            };
+        }
+        return error.SymLinkLoop;
     }
 
     pub fn assertMutable(a: std.mem.Allocator, io: std.Io, model: []const u8) !void {
@@ -69,6 +101,12 @@ pub const Lease = struct {
     }
 
     pub fn deinit(self: *Lease, io: std.Io) void {
+        for (self.alias_directories.items) |dir| {
+            file(dir).unlock(io);
+            dir.close(io);
+        }
+        if (self.allocator) |a| self.alias_directories.deinit(a);
+        self.alias_directories = .empty;
         if (self.directory) |dir| {
             file(dir).unlock(io);
             dir.close(io);
@@ -111,4 +149,58 @@ test "model selection publication lease accepts immutable read-only snapshot con
     defer lease.deinit(io);
     try std.testing.expect(lease.directory == null);
     try std.testing.expectError(error.ReadOnlyFileSystem, Lease.exclusive(a, io, model));
+}
+
+test "model selection publication lease fences both model aliases and their installation parents" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "aliases");
+    try tmp.dir.createDirPath(io, "middle");
+    try tmp.dir.createDirPath(io, "installed/model");
+    try tmp.dir.symLink(io, "../installed/model", "middle/model", .{ .is_directory = true });
+    try tmp.dir.symLink(io, "../middle/model", "aliases/model", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const alias = try std.fs.path.join(a, &.{ root, "aliases/model" });
+    defer a.free(alias);
+    var lease = try Lease.shared(a, io, alias);
+    defer lease.deinit(io);
+    try std.testing.expectEqual(@as(usize, 2), lease.alias_directories.items.len);
+    for ([_][]const u8{ "aliases", "middle", "installed" }) |parent| {
+        const dir = try tmp.dir.openDir(io, parent, .{ .iterate = true });
+        defer dir.close(io);
+        try std.testing.expect(!try Lease.file(dir).tryLock(io, .exclusive));
+    }
+    lease.deinit(io);
+    for ([_][]const u8{ "aliases", "middle", "installed" }) |parent| {
+        const dir = try tmp.dir.openDir(io, parent, .{ .iterate = true });
+        defer dir.close(io);
+        try std.testing.expect(try Lease.file(dir).tryLock(io, .exclusive));
+        Lease.file(dir).unlock(io);
+    }
+}
+
+test "model selection alias lease contention releases previously acquired parents" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "aliases");
+    try tmp.dir.createDirPath(io, "installed/model");
+    try tmp.dir.symLink(io, "../installed/model", "aliases/model", .{ .is_directory = true });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const alias = try std.fs.path.join(a, &.{ root, "aliases/model" });
+    defer a.free(alias);
+    const writer = try tmp.dir.openDir(io, "installed", .{ .iterate = true });
+    defer writer.close(io);
+    try Lease.file(writer).lock(io, .exclusive);
+    defer Lease.file(writer).unlock(io);
+    try std.testing.expectError(error.ModelArtifactsChanging, Lease.shared(a, io, alias));
+    const alias_parent = try tmp.dir.openDir(io, "aliases", .{ .iterate = true });
+    defer alias_parent.close(io);
+    try std.testing.expect(try Lease.file(alias_parent).tryLock(io, .exclusive));
+    Lease.file(alias_parent).unlock(io);
 }
