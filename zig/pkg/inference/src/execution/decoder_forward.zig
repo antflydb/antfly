@@ -324,11 +324,7 @@ pub const Runtime = struct {
     /// this selector neither wraps a second invocation nor publishes a token.
     pub fn pendingCandidate(self: *Runtime, state: *NativeDecodeState, request: PendingCandidateRequest, events: *PendingCandidateEvents) !PendingCandidate {
         if (!request.pure_greedy or request.grammar_active) return .declined;
-        events.attempts += 1;
-        events.tensor_route = self.deviceRoute(state, .{ .mode = .tensor, .generated_tokens = request.generated_tokens, .pure_greedy = request.pure_greedy, .grammar_active = request.grammar_active });
-        if (events.tensor_route.? == .eligible) {
-            if (try self.forwardDeviceTokenTensor(state, request.sequence_length, request.input_token_tensor, request.prefetch_drain_budget, &events.handoff)) |tensor| return .{ .tensor = tensor };
-        }
+        if (try self.pendingTensorCandidate(state, request, events)) |tensor| return .{ .tensor = tensor };
         events.attempts += 1;
         events.scalar_route = self.deviceRoute(state, .{ .mode = .scalar, .generated_tokens = request.generated_tokens, .pure_greedy = request.pure_greedy, .grammar_active = request.grammar_active });
         if (events.scalar_route.? != .eligible) return .declined;
@@ -342,6 +338,17 @@ pub const Runtime = struct {
                 return error.InvalidModelOutput;
             },
         };
+    }
+
+    /// Tensor-only lookahead must never resolve a scalar or select another
+    /// physical forward after the pending position has been reserved. The
+    /// regular pending selector shares this first attempt before its scalar
+    /// fallback; actual route and partial callback events remain caller-owned.
+    pub fn pendingTensorCandidate(self: *Runtime, state: *NativeDecodeState, request: PendingCandidateRequest, events: *PendingCandidateEvents) !?ops.CT {
+        events.attempts += 1;
+        events.tensor_route = self.deviceRoute(state, .{ .mode = .tensor, .generated_tokens = request.generated_tokens, .pure_greedy = request.pure_greedy, .grammar_active = request.grammar_active });
+        if (events.tensor_route.? != .eligible) return null;
+        return self.forwardDeviceTokenTensor(state, request.sequence_length, request.input_token_tensor, request.prefetch_drain_budget, &events.handoff);
     }
 
     pub fn forwardDeviceStep(self: *Runtime, state: *NativeDecodeState, request: DeviceStepRequest, events: *DeviceStepEvents) !DeviceStepResult {
@@ -2486,6 +2493,13 @@ fn checkActualPendingCandidate(cb_value: ComputeBackend, _: ComputeBackend) !voi
     defer cb.free(input);
     var events = PendingCandidateEvents{};
     const request = PendingCandidateRequest{ .token_ids = &.{ 0, 1 }, .sequence_length = 2, .generated_tokens = 1, .input_token_tensor = input, .pure_greedy = true, .grammar_active = false };
+    var tensor_events = PendingCandidateEvents{};
+    try std.testing.expect(try numerical.pendingTensorCandidate(&state, request, &tensor_events) == null);
+    try std.testing.expectEqual(@as(usize, 1), tensor_events.attempts);
+    try std.testing.expectEqual(DeviceRoute.backend_not_device, tensor_events.tensor_route.?);
+    try std.testing.expect(tensor_events.scalar_route == null);
+    try std.testing.expectEqual(@as(usize, 0), tensor_events.handoff.handoff_attempts);
+    try std.testing.expectEqual(@as(usize, 2), state.total_tokens);
     if (cb.kind() == .metal) {
         // This actual backend declines the CUDA-only tensor route, then runs
         // the original scalar callback against its real model/current KV view.

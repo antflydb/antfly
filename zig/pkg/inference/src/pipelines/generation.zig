@@ -5830,16 +5830,22 @@ pub const NativeGenerationPipeline = struct {
                 seq_len.* -= 1;
             };
             _ = try pending.reservePosition();
-            if (try self.forwardGreedyDeviceDecodeTokenTensor(
-                seq_len.*,
-                tokens_generated + 1,
-                decode_state,
-                config,
-                token_table,
-                json_grammar,
-                gbnf_grammar,
-                candidate,
-            )) |next| {
+            var lookahead_runtime = self.physicalDecoder();
+            var lookahead_events = decoder_forward.PendingCandidateEvents{};
+            const lookahead = lookahead_runtime.pendingTensorCandidate(decode_state, .{
+                .token_ids = token_ids,
+                .sequence_length = seq_len.*,
+                .generated_tokens = tokens_generated + 1,
+                .input_token_tensor = candidate,
+                .pure_greedy = isPureGreedyConfig(config),
+                .grammar_active = token_table != null or json_grammar.* != null or gbnf_grammar != null,
+                .prefetch_drain_budget = prefetch_drain_budget_per_step,
+            }, &lookahead_events) catch |err| {
+                notePendingCandidateEvents(lookahead_events);
+                return err;
+            };
+            notePendingCandidateEvents(lookahead_events);
+            if (lookahead) |next| {
                 try pending.retainLookahead(next);
             }
 
