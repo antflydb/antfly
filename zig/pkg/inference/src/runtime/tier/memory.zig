@@ -248,6 +248,10 @@ pub fn maxCompositeLimits(a: Limits, b: Limits) Limits {
 pub const SharedAdmissionLimits = struct {
     host_limit_bytes: usize = 0,
     unified_limit_bytes: usize = 0,
+    /// Explicit invocation quotas span host/device allocations even when the
+    /// physical pools and automatic workload policies are independent.
+    kv_limit_bytes: usize = 0,
+    scratch_limit_bytes: usize = 0,
 };
 
 pub const SystemMemoryInfo = struct {
@@ -784,6 +788,8 @@ pub const ReservedGenerationWorkspace = struct {
 pub const AdmissionPressure = union(enum) {
     shared_host,
     shared_unified,
+    shared_kv,
+    shared_scratch,
     domain_host: BackendClass,
     domain_backend: BackendClass,
     domain_combined: BackendClass,
@@ -942,6 +948,13 @@ pub const AdmissionController = struct {
             @min(self.shared_limits.unified_limit_bytes, bytes);
     }
 
+    pub fn tightenInvocationQuotas(self: *AdmissionController, limits: Limits) void {
+        spinLockAdmission(&self.mutex);
+        defer self.mutex.unlock();
+        self.shared_limits.kv_limit_bytes = intersectAdmissionLimit(self.shared_limits.kv_limit_bytes, limits.kv_limit_bytes);
+        self.shared_limits.scratch_limit_bytes = intersectAdmissionLimit(self.shared_limits.scratch_limit_bytes, limits.scratch_limit_bytes);
+    }
+
     pub fn configureProcessMemoryLimit(
         self: *AdmissionController,
         limit_bytes: usize,
@@ -1028,7 +1041,8 @@ pub const AdmissionController = struct {
 
     /// Atomically acquire one or more CPU/GPU resource domains. Requests in the
     /// same domain are merged under the strictest non-zero limit, while requests
-    /// in different domains are checked independently. Aggregate bytes continue
+    /// in different domains retain separate limits plus invocation-wide quotas.
+    /// Aggregate bytes continue
     /// to be reserved once against the process-owner resource budget.
     pub fn tryAcquireRequests(
         self: *AdmissionController,
@@ -1069,6 +1083,8 @@ pub const AdmissionController = struct {
 
         const request_host = amounts.hostTotalBytesChecked() catch return error.ResourceLimitExceeded;
         const request_backend = amounts.backendTotalBytesChecked() catch return error.ResourceLimitExceeded;
+        const request_kv = amounts.kvTotalBytesChecked() catch return error.ResourceLimitExceeded;
+        const request_scratch = amounts.scratchTotalBytesChecked() catch return error.ResourceLimitExceeded;
         const request_combined = std.math.add(usize, request_host, request_backend) catch
             return error.ResourceLimitExceeded;
 
@@ -1093,6 +1109,8 @@ pub const AdmissionController = struct {
             // the accounting lock, before testing aggregate occupancy.
             try checkAdmissionLimit(request_host, request_host, self.shared_limits.host_limit_bytes);
             try checkAdmissionLimit(request_combined, request_combined, self.shared_limits.unified_limit_bytes);
+            try checkAdmissionLimit(request_kv, request_kv, self.shared_limits.kv_limit_bytes);
+            try checkAdmissionLimit(request_scratch, request_scratch, self.shared_limits.scratch_limit_bytes);
 
             const next = addAdmissionAmounts(self.admitted, amounts) orelse
                 return error.ResourceLimitExceeded;
@@ -1102,8 +1120,10 @@ pub const AdmissionController = struct {
                 return error.ResourceLimitExceeded;
             _ = std.math.add(usize, next_global_host, next_global_backend) catch
                 return error.ResourceLimitExceeded;
-            _ = next.kvTotalBytesChecked() catch return error.ResourceLimitExceeded;
-            _ = next.scratchTotalBytesChecked() catch return error.ResourceLimitExceeded;
+            const next_shared_kv = next.kvTotalBytesChecked() catch return error.ResourceLimitExceeded;
+            const next_shared_scratch = next.scratchTotalBytesChecked() catch return error.ResourceLimitExceeded;
+            try checkAdmissionLimitWithPressure(request_kv, next_shared_kv, self.shared_limits.kv_limit_bytes, .shared_kv, pressure);
+            try checkAdmissionLimitWithPressure(request_scratch, next_shared_scratch, self.shared_limits.scratch_limit_bytes, .shared_scratch, pressure);
 
             // CPU work and CUDA staging/cache allocations consume the same host
             // RAM. Enforce that physical domain before backend-local policies so
@@ -2949,19 +2969,31 @@ pub const GptGenerationBudgetComponent = struct {
     /// bounds constrain chunk selection independently of the process envelope.
     /// Null means ordinary admission; zero capacity provides no workspace.
     workspace_capacity: ?AdmissionAmounts = null,
+    /// Host graph preparation for a managed executable owns page geometry,
+    /// while the executable's own admission owns the actual KV storage.
+    backend_owns_kv: bool = false,
+    /// A persisted prefill executable has one exact prompt shape; reducing
+    /// chunk rows would select a different executable, not a smaller workspace.
+    fixed_prefill_shape: bool = false,
 
-    fn reserveEstimate(self: @This(), budget: *RunBudget, estimate: Estimate) !void {
+    pub fn estimate(self: @This(), prompt_tokens: usize, max_tokens: usize, chunk: usize) !Estimate {
+        var result = try estimateGptGenerationForKvPolicy(self.backend, self.kv_dtype, self.config, prompt_tokens, max_tokens, chunk, self.kv_capacity_policy);
+        if (self.backend == .native and self.backend_owns_kv) result.kv_bytes = 0;
+        return result;
+    }
+
+    fn reserveEstimate(self: @This(), budget: *RunBudget, estimated: Estimate) !void {
         if (self.workspace_capacity) |capacity| {
-            if (estimate.kv_tier == .backend and estimate.kv_bytes > capacity.backend_kv_bytes) {
-                budget.recordDenial(.workspace_kv, .{ .kind = .kv, .tier = .backend, .bytes = estimate.kv_bytes }, 0, estimate.kv_bytes, capacity.backend_kv_bytes);
+            if (estimated.kv_tier == .backend and estimated.kv_bytes > capacity.backend_kv_bytes) {
+                budget.recordDenial(.workspace_kv, .{ .kind = .kv, .tier = .backend, .bytes = estimated.kv_bytes }, 0, estimated.kv_bytes, capacity.backend_kv_bytes);
                 return error.MemoryBudgetExceeded;
             }
-            if (estimate.scratch_tier == .backend and estimate.scratch_bytes > capacity.backend_scratch_bytes) {
-                budget.recordDenial(.workspace_scratch, .{ .kind = .scratch, .tier = .backend, .bytes = estimate.scratch_bytes }, 0, estimate.scratch_bytes, capacity.backend_scratch_bytes);
+            if (estimated.scratch_tier == .backend and estimated.scratch_bytes > capacity.backend_scratch_bytes) {
+                budget.recordDenial(.workspace_scratch, .{ .kind = .scratch, .tier = .backend, .bytes = estimated.scratch_bytes }, 0, estimated.scratch_bytes, capacity.backend_scratch_bytes);
                 return error.MemoryBudgetExceeded;
             }
         }
-        try budget.reserveEstimate(estimate);
+        try budget.reserveEstimate(estimated);
     }
 };
 
@@ -3001,20 +3033,14 @@ pub fn reserveGptGenerationPrefill(
     chunk_ceiling: usize,
 ) !GptGenerationPrefillAdmission {
     const scratch_before = budget.scratchTotalBytes();
-    var chunk = @max(chunk_ceiling, 1);
+    var fixed_shape = false;
+    for (components) |component| fixed_shape = fixed_shape or component.fixed_prefill_shape;
+    var chunk = if (fixed_shape) @max(prompt_tokens, 1) else @max(chunk_ceiling, 1);
     while (true) {
         var trial = budget.*;
         var failed = false;
         for (components) |component| {
-            component.reserveEstimate(&trial, try estimateGptGenerationForKvPolicy(
-                component.backend,
-                component.kv_dtype,
-                component.config,
-                prompt_tokens,
-                max_tokens,
-                chunk,
-                component.kv_capacity_policy,
-            )) catch |err| {
+            component.reserveEstimate(&trial, try component.estimate(prompt_tokens, max_tokens, chunk)) catch |err| {
                 if (err != error.MemoryBudgetExceeded) return err;
                 failed = true;
                 break;
@@ -3028,7 +3054,7 @@ pub fn reserveGptGenerationPrefill(
                 .max_scratch_bytes = selected_scratch,
             };
         }
-        if (chunk <= 32) {
+        if (chunk <= 32 or fixed_shape) {
             const denial_count = trial.denials;
             const last_denial = trial.last_denial;
             budget.denials = denial_count;
@@ -4773,4 +4799,44 @@ test "permanent admission limits win over unrelated host contention" {
     var recovered = try controller.tryAcquire(.cpu, .{}, .{ .host_scratch_bytes = 30 }, false);
     recovered.release();
     try std.testing.expectEqual(@as(usize, 0), controller.snapshot().hostTotalBytes());
+}
+
+test "shared invocation quotas aggregate CPU and GPU KV and scratch atomically" {
+    inline for (.{ true, false }) |kv| {
+        var controller = AdmissionController{};
+        controller.tightenInvocationQuotas(if (kv) .{ .kv_limit_bytes = 8 } else .{ .scratch_limit_bytes = 8 });
+        // A later, wider consumer cannot relax the invocation's policy.
+        controller.tightenInvocationQuotas(.{ .kv_limit_bytes = 80, .scratch_limit_bytes = 80 });
+        const cpu = if (kv) AdmissionAmounts{ .host_kv_bytes = 6 } else AdmissionAmounts{ .host_scratch_bytes = 6 };
+        const gpu = if (kv) AdmissionAmounts{ .backend_kv_bytes = 6 } else AdmissionAmounts{ .backend_scratch_bytes = 6 };
+        var first = try controller.tryAcquire(.cpu, .{}, cpu, false);
+        defer first.release();
+        var pressure: ?AdmissionPressure = null;
+        try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquireWithPressure(.gpu, .{}, gpu, false, &pressure));
+        try std.testing.expectEqualDeep(cpu, controller.snapshot());
+        try std.testing.expectEqual(if (kv) AdmissionPressure.shared_kv else AdmissionPressure.shared_scratch, pressure.?);
+        first.release();
+        var second = try controller.tryAcquire(.gpu, .{}, gpu, false);
+        second.release();
+        try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+        try std.testing.expectError(error.ResourceLimitExceeded, controller.tryAcquireRequests(&.{
+            .{ .backend_class = .cpu, .limits = .{}, .amounts = cpu },
+            .{ .backend_class = .gpu, .limits = .{}, .amounts = gpu },
+        }, false));
+        try std.testing.expectEqualDeep(AdmissionAmounts{}, controller.snapshot());
+    }
+}
+
+test "generation budget preserves managed prefill shape and external KV ownership" {
+    const cfg = gpt_mod.Config{ .hidden_size = 8, .num_hidden_layers = 1, .num_attention_heads = 1, .num_key_value_heads = 1, .attention_head_dim = 8, .vocab_size = 1, .position_encoding = .rope };
+    const component = GptGenerationBudgetComponent{ .backend = .native, .kv_dtype = .f32, .config = cfg, .backend_owns_kv = true, .fixed_prefill_shape = true };
+    const expected = try component.estimate(200, 8, 200);
+    try std.testing.expectEqual(@as(usize, 0), expected.kv_bytes);
+    var roomy = RunBudget.init(.{});
+    const admitted = try reserveGptGenerationPrefill(&roomy, &.{component}, 200, 8, 32);
+    try std.testing.expectEqual(@as(usize, 200), admitted.max_chunk_rows);
+    try std.testing.expectEqual(expected.scratch_bytes, admitted.max_scratch_bytes);
+    var tight = RunBudget.init(.{ .scratch_limit_bytes = expected.scratch_bytes - 1 });
+    try std.testing.expectError(error.MemoryBudgetExceeded, reserveGptGenerationPrefill(&tight, &.{component}, 200, 8, 32));
+    try std.testing.expectEqual(@as(usize, 0), tight.scratchTotalBytes());
 }
