@@ -261,7 +261,7 @@ pub const KvManager = struct {
     pub fn prepareGeneratedAppend(self: *KvManager, sequence_id: SequenceId, count: usize, reserve_to: usize) !writable.PreparedAppend {
         const state = try self.sequenceMut(sequence_id);
         const storage = self.getPoolMut(state.pool_id) orelse return error.InvalidPoolId;
-        const window = if (state.compacted) null else storage.config.sliding_window_size;
+        const window: ?usize = if (state.compacted) null else if (storage.config.sliding_window_size) |value| @as(usize, value) else null;
         return writable.prepareAppend(storage, &state.block_table, &state.reserved_tail_blocks, self.allocator, count, reserve_to, window, sequence_id, true, null);
     }
 

@@ -1620,3 +1620,107 @@ test "legacy prefill metadata allocation failure cannot publish new token count 
     try std.testing.expectEqual(@as(usize, 6), state.total_tokens);
     try std.testing.expectEqual(@as(usize, 6), manager.tokenCount(state.sequence_id.?).?);
 }
+
+test "paired generated append host bound covers both simultaneous real plan spills and retained view" {
+    const a = std.testing.allocator;
+    const Tracked = struct {
+        const Entry = struct { address: usize = 0, bytes: usize = 0 };
+        backing: std.mem.Allocator,
+        entries: [256]Entry = @splat(.{}),
+        live: usize = 0,
+        peak: usize = 0,
+        armed: bool = false,
+        growth_attempts: usize = 0,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn add(self: *@This(), ptr: [*]u8, bytes: usize) void {
+            for (&self.entries) |*entry| if (entry.address == 0) {
+                entry.* = .{ .address = @intFromPtr(ptr), .bytes = bytes };
+                self.live += bytes;
+                self.peak = @max(self.peak, self.live);
+                return;
+            };
+            @panic("allocation peak fixture tracking capacity exceeded");
+        }
+        fn remove(self: *@This(), ptr: [*]u8) void {
+            for (&self.entries) |*entry| if (entry.address == @intFromPtr(ptr)) {
+                self.live -= entry.bytes;
+                entry.* = .{};
+                return;
+            };
+            // Manager/storage allocations made before instrumentation still
+            // retire through their real backing allocator, without fake credit.
+        }
+        fn alloc(raw: *anyopaque, bytes: usize, alignment: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const ptr = self.backing.rawAlloc(bytes, alignment, ra) orelse return null;
+            self.add(ptr, bytes);
+            return ptr;
+        }
+        fn resize(raw: *anyopaque, buffer: []u8, _: std.mem.Alignment, bytes: usize, _: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (bytes == buffer.len) return true;
+            if (self.armed) self.growth_attempts += 1;
+            // Make every backing transfer observable through actual alloc/free.
+            return false;
+        }
+        fn remap(raw: *anyopaque, buffer: []u8, _: std.mem.Alignment, bytes: usize, _: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (bytes == buffer.len) return buffer.ptr;
+            if (self.armed) self.growth_attempts += 1;
+            return null;
+        }
+        fn free(raw: *anyopaque, buffer: []u8, alignment: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.remove(buffer.ptr);
+            self.backing.rawFree(buffer, alignment, ra);
+        }
+    };
+    var tracked = Tracked{ .backing = a };
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const config = runtime.kv.pool.KvPoolConfig{ .backend = .native, .dtype = .f32, .page_size_tokens = 16, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 1, .sliding_window_size = 512 };
+    const pool = try manager.addPool(config);
+    var storage = try runtime.kv.storage_runtime.KvStorageRuntime.init(a, config);
+    defer storage.deinit();
+    var state = NativeDecodeState.initPaged(tracked.allocator(), &manager, pool, null);
+    state.kv_storage = &storage;
+    defer state.deinit();
+    const prompt = 24000;
+    try state.notePrefill(prompt);
+    const sequence = state.sequence_id.?;
+    // Prewarm the preexisting KV pool and mutable table owners separately.
+    // Measurement then contains only real state view backing plus both plans.
+    try manager.reserveTokenCapacity(sequence, 24016);
+    try storage.reserveTokenCapacity(sequence, 24016);
+    const manager_sequence = try manager.sequenceMut(sequence);
+    const storage_sequence = try storage.sequenceMut(sequence);
+    try manager_sequence.block_table.blocks.ensureTotalCapacityPrecise(a, 1501);
+    try storage_sequence.block_table.blocks.ensureTotalCapacityPrecise(a, 1501);
+    try manager_sequence.reserved_tail_blocks.ensureTotalCapacityPrecise(a, 1);
+    try storage_sequence.reserved_tail_blocks.ensureTotalCapacityPrecise(a, 1);
+    const actual_view_bytes = state.kv_block_ids.capacity * @sizeOf(runtime.kv.block.KvBlockId);
+    try std.testing.expectEqual(actual_view_bytes, tracked.live);
+    manager.allocator = tracked.allocator();
+    storage.allocator = tracked.allocator();
+    tracked.peak = tracked.live;
+    tracked.armed = true;
+    defer tracked.armed = false;
+    try state.appendGeneratedTokens(1);
+    tracked.armed = false;
+    const retired_blocks = (prompt + 1 - 512) / 16;
+    const actual_joint_peak = actual_view_bytes + 2 * retired_blocks * @sizeOf(runtime.kv.block.KvBlockId);
+    try std.testing.expectEqual(@as(usize, 19936), actual_joint_peak);
+    try std.testing.expectEqual(actual_joint_peak, tracked.peak);
+    try std.testing.expectEqual(@as(usize, 0), tracked.growth_attempts);
+    const old_view_only_bound = try view_metadata.hostBytes(prompt + 1, 16, false);
+    const one_plan_bound = try @import("../runtime/kv/writable_blocks.zig").spillHostBytes(prompt + 1, 1, 0, 16, false);
+    const joint_bound = try std.math.add(usize, old_view_only_bound, try std.math.mul(usize, one_plan_bound, 2));
+    try std.testing.expect(tracked.peak > old_view_only_bound);
+    try std.testing.expect(tracked.peak <= joint_bound);
+    // Spill cleanup retires only the plans; the actual published view stays live.
+    try std.testing.expectEqual(actual_view_bytes, tracked.live);
+    try std.testing.expectEqual(@as(usize, prompt + 1), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 513), state.kvView().?.token_count);
+}

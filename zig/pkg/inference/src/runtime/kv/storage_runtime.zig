@@ -983,7 +983,7 @@ pub const KvStorageRuntime = struct {
         if (!self.canPrepareGeneratedAppend(sequence_id, count)) return error.SharedKvWriteUnsupported;
         const state = try self.sequenceMut(sequence_id);
         const provider: ?block_copy.Provider = if (self.device_write_hook) |hook| if (hook.vtable.copySharedBlockPrefixes) |copy| .{ .context = hook.ctx, .implementation = hook.vtable, .copy_and_wait = copy, .cleanup = current } else null else null;
-        var prepared = try writable.prepareAppend(&self.storage, &state.block_table, &state.reserved_tail_blocks, self.allocator, count, reserve_to, if (state.compacted) null else self.storage.config.sliding_window_size, sequence_id, self.device_write_hook == null, provider);
+        var prepared = try writable.prepareAppend(&self.storage, &state.block_table, &state.reserved_tail_blocks, self.allocator, count, reserve_to, if (state.compacted) null else if (self.storage.config.sliding_window_size) |window| @as(usize, window) else null, sequence_id, self.device_write_hook == null, provider);
         errdefer prepared.abort();
         // Front retirement/reuse may invalidate a real device capture owner.
         // Authorize and drain that mutation with the actual current B before
@@ -2010,7 +2010,7 @@ test "prepared generated storage append authorizes front retirement before publi
         calls: usize = 0,
         fn prepare(raw: *anyopaque, implementation: *const anyopaque, _: Cleanup) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            if (implementation != &table) return error.ForeignMutationHook;
+            if (implementation != @as(*const anyopaque, @ptrCast(&table))) return error.ForeignMutationHook;
             self.calls += 1;
             return error.FrontMutationRefused;
         }

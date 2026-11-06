@@ -6208,7 +6208,10 @@ test "CUDA A4B serving reuses retained workspace and unwinds failed requests" {
         const session = backends.Session{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
         const strict_host_limits = session_factory.widenBudgetLimitsForSession(session, .{ .host_limit_bytes = 1024, .backend_limit_bytes = 9 * 1024 * 1024 * 1024 });
         try std.testing.expectEqual(@as(usize, 1024), strict_host_limits.host_limit_bytes);
-        const host_metadata = try @import("../runtime/kv/view_metadata.zig").hostBytes(@max(@as(usize, 2049), platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") orelse 0), memory.generation_kv_page_size_tokens, false);
+        const replay_capacity = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") orelse 0;
+        const view_metadata = try @import("../runtime/kv/view_metadata.zig").hostBytes(@max(@as(usize, 2049), replay_capacity), memory.generation_kv_page_size_tokens, false);
+        const owner_spills = try @import("../runtime/kv/writable_blocks.zig").spillHostBytes(2049, 1, replay_capacity, memory.generation_kv_page_size_tokens, false);
+        const host_metadata = try std.math.add(usize, view_metadata, try std.math.mul(usize, 2, owner_spills));
         const operator_host_limit = @max(@as(usize, 1024), host_metadata);
         const limits = session_factory.widenBudgetLimitsForSession(session, .{ .host_limit_bytes = operator_host_limit, .backend_limit_bytes = 9 * 1024 * 1024 * 1024 });
         try std.testing.expectEqual(operator_host_limit, limits.host_limit_bytes);

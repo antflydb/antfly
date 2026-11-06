@@ -240,7 +240,8 @@ preparation API do not by themselves complete these remaining requirements:
   before committing either owner. The unchanged-ID path preserves the existing
   table without allocation or a history copy. Grown host tables retain their
   allocating owner through state teardown; generation admission declares their
-  checked host footprint separately from device scratch. Serial batches take
+  checked host footprint and both simultaneous plans' ID-array scratch
+  separately from device scratch. Serial batches take
   the peak after request-state death; coordinated participants add their live
   metadata. Metadata synchronization failures propagate before publishing a new
   view. Detached attachment, opaque providers and other state transitions retain

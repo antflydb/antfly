@@ -29,6 +29,7 @@ pub fn tailCopies(storage: *const storage_mod.KvStorage, table: *const tables.Se
 
 pub const CopyProvider = @import("block_copy.zig").Provider;
 const BlockCopy = @import("block_copy.zig");
+const append_inline_capacity = 8;
 
 /// Only the exact host metadata owner can promise infallible staged-ref
 /// retirement. Unknown storage callbacks retain their compatibility contract.
@@ -41,6 +42,34 @@ pub fn canPrepareAppend(storage: *storage_mod.KvStorage, table: *const tables.Se
     if (tail.refcount == 0) return false;
     if (table.tail_tokens == storage.config.page_size_tokens or tail.refcount == 1) return true;
     return provider != null or (host_copy_allowed and storage.supportsExactHostBlockCopy());
+}
+
+/// Upper bound for the THREE literal temporary ID-array allocations below.
+/// The caller bounds logical history, one generated append (the request's
+/// remaining-token budget, not a guessed speculative burst), and replay reserve.
+/// Existing reserved IDs cancel out of new acquisition demand; they are not
+/// another allocation or a transferable quota credit. Two simultaneously
+/// prepared owners must independently declare this amount.
+pub fn spillHostBytes(max_logical_tokens: usize, max_append_tokens: usize, max_replay_tokens: usize, page_size: usize, admitted: bool) !usize {
+    if (page_size == 0) return error.InvalidPoolId;
+    if (max_append_tokens == 0) return 0;
+    const logical_pages = try std.math.divCeil(usize, max_logical_tokens, page_size);
+    const append_pages = try std.math.divCeil(usize, max_append_tokens, page_size);
+    const replay_pages = try std.math.divCeil(usize, max_replay_tokens, page_size);
+    // A = Lafter-Lbefore <= ceil(count/page), including a partial tail.
+    // acquire = (A+C+baseFutureReserved-oldReserved)^+ <= A+1+R.
+    // retire <= dropped+C <= L+1; recycleLimit <= min(oldDropped,R).
+    const acquire = try std.math.add(usize, try std.math.add(usize, append_pages, 1), replay_pages);
+    const retire = try std.math.add(usize, logical_pages, 1);
+    const recycle = @min(logical_pages, replay_pages);
+    var total: usize = 0;
+    for ([_]usize{ acquire, retire, recycle }) |count| {
+        if (count <= append_inline_capacity) continue; // No out-of-line allocation.
+        const payload = try std.math.mul(usize, count, @sizeOf(block.KvBlockId));
+        const bytes = if (admitted) try @import("../../backends/admitted_allocator.zig").AdmittedAllocator.allocationHostBytes(payload, .of(block.KvBlockId)) else payload;
+        total = try std.math.add(usize, total, bytes);
+    }
+    return total;
 }
 
 /// A synchronous exclusive transaction. Only private destinations change
@@ -63,15 +92,15 @@ pub const PreparedAppend = struct {
     future_reserved: usize,
     base_reserved: usize,
     recycle_count: usize = 0,
-    recycle_inline: [8]block.KvBlockId = undefined,
+    recycle_inline: [append_inline_capacity]block.KvBlockId = undefined,
     recycle_spill: ?[]block.KvBlockId = null,
     cow: ?BlockCopy.Item = null,
     recycle_cow: bool = false,
     acquired: usize = 0,
-    acquire_inline: [8]block.KvBlockId = undefined,
+    acquire_inline: [append_inline_capacity]block.KvBlockId = undefined,
     acquire_spill: ?[]block.KvBlockId = null,
     retire_count: usize = 0,
-    retire_inline: [8]block.KvBlockId = undefined,
+    retire_inline: [append_inline_capacity]block.KvBlockId = undefined,
     retire_spill: ?[]block.KvBlockId = null,
     active: bool = true,
 
@@ -213,7 +242,7 @@ pub fn prepareAppend(storage: *storage_mod.KvStorage, table: *tables.SequenceBlo
     const retirement_count = (try std.math.add(usize, drop_pages, copies)) - plan.recycle_count - @intFromBool(plan.recycle_cow);
     if (retirement_count > plan.retire_inline.len) plan.retire_spill = try allocator.alloc(block.KvBlockId, retirement_count);
     try table.blocks.ensureTotalCapacity(allocator, logical);
-    try reserved.ensureTotalCapacity(allocator, @max(total_reserved, future_reserved));
+    try reserved.ensureTotalCapacity(allocator, future_reserved);
     for (0..acquire_count) |_| {
         const id = try storage.acquire(allocator);
         plan.acquiredItems()[plan.acquired] = id;
@@ -699,4 +728,50 @@ test "prepared KV metadata-only canonical shared tail requires an exact payload 
     try std.testing.expectEqualSlices(block.KvBlockId, &.{id}, table.blocks.items);
     try std.testing.expectEqual(@as(u16, 1), table.tail_tokens);
     try std.testing.expectEqual(@as(usize, 0), reserved.items.len);
+}
+
+test "prepared KV page boundary consumes a free page without unused reservation metadata allocation" {
+    const a = std.testing.allocator;
+    var storage = try storage_mod.initHost(a, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1 });
+    defer storage.deinit(a);
+    var table: tables.SequenceBlockTable = .{};
+    defer table.deinit(a);
+    var reserved: std.ArrayListUnmanaged(block.KvBlockId) = .empty;
+    defer reserved.deinit(a);
+    defer {
+        for (table.blocks.items) |id| _ = storage.releaseRef(a, id) catch unreachable;
+    }
+    _ = try appendAcquired(&storage, &table, a);
+    table.tail_tokens = 2;
+    try table.blocks.ensureTotalCapacity(a, 2);
+    const free = try storage.acquire(a);
+    _ = try storage.releaseRef(a, free);
+    const before = storage.liveBlocks();
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var prepared = try prepareAppend(&storage, &table, &reserved, failing.allocator(), 1, 0, null, 1, true, null);
+    defer prepared.abort();
+    try std.testing.expectEqual(@as(usize, 0), prepared.futureReservedBlockCount());
+    prepared.commit();
+    try std.testing.expectEqual(@as(usize, 3), table.tokenCount(2));
+    try std.testing.expectEqual(free, table.last().?);
+    try std.testing.expectEqual(@as(usize, 0), reserved.capacity);
+    try std.testing.expectEqual(before, storage.liveBlocks());
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+}
+
+test "prepared KV spill declaration counts only literal out of line owner arrays" {
+    try std.testing.expectEqual(@as(usize, 0), try spillHostBytes(7 * 16, 7 * 16, 0, 16, false));
+    try std.testing.expectEqual(@as(usize, 18 * @sizeOf(block.KvBlockId)), try spillHostBytes(8 * 16, 8 * 16, 0, 16, false));
+    try std.testing.expectEqual(@as(usize, 1502 * @sizeOf(block.KvBlockId)), try spillHostBytes(24001, 1, 0, 16, false));
+    // All three temporary owners can spill; each real allocation contributes
+    // one tracking Header, without inventing a RunScope/Reservation per array.
+    const counts = [_]usize{ 14, 13, 9 }; // L12,A4,R9 => acquire14,retire13,recycle9
+    const admitted_mod = @import("../../backends/admitted_allocator.zig");
+    var expected: usize = 0;
+    for (counts) |count| expected += try admitted_mod.AdmittedAllocator.allocationHostBytes(count * @sizeOf(block.KvBlockId), .of(block.KvBlockId));
+    try std.testing.expectEqual(expected, try spillHostBytes(12 * 16, 4 * 16, 9 * 16, 16, true));
+    try std.testing.expectEqual(@as(usize, 0), try spillHostBytes(std.math.maxInt(usize), 0, 0, 16, true));
+    try std.testing.expectError(error.InvalidPoolId, spillHostBytes(1, 1, 0, 0, false));
+    try std.testing.expectError(error.Overflow, spillHostBytes(std.math.maxInt(usize), 1, 0, 1, false));
+    try std.testing.expectError(error.Overflow, spillHostBytes(1, 1, std.math.maxInt(usize), 1, false));
 }

@@ -3219,7 +3219,13 @@ pub fn estimateGptGenerationForKvPolicy(
         platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") orelse 0
     else
         0;
-    const host_metadata_bytes = @import("../kv/view_metadata.zig").hostBytes(@max(total_tokens, replay_capacity), generation_kv_page_size_tokens, false) catch return error.ResourceLimitExceeded;
+    const view_metadata_bytes = @import("../kv/view_metadata.zig").hostBytes(@max(total_tokens, replay_capacity), generation_kv_page_size_tokens, false) catch return error.ResourceLimitExceeded;
+    // Both canonical KV owners retain their prepared deltas until the paired
+    // table/total/view publication completes. Their real temporary ID spills
+    // coexist with the state-owned view history and each other.
+    const owner_spill_bytes = @import("../kv/writable_blocks.zig").spillHostBytes(total_tokens, max_tokens, replay_capacity, generation_kv_page_size_tokens, false) catch return error.ResourceLimitExceeded;
+    const paired_spill_bytes = std.math.mul(usize, 2, owner_spill_bytes) catch return error.ResourceLimitExceeded;
+    const host_metadata_bytes = std.math.add(usize, view_metadata_bytes, paired_spill_bytes) catch return error.ResourceLimitExceeded;
 
     return .{
         .host_metadata_bytes = host_metadata_bytes,
@@ -5636,4 +5642,26 @@ test "generation host metadata remains independent checked host scratch across b
     try std.testing.expectEqual(@as(usize, 60), (try AdmissionAmounts.fromEstimate(native)).host_scratch_bytes);
     native.scratch_bytes = std.math.maxInt(usize);
     try std.testing.expectError(error.ResourceLimitExceeded, AdmissionAmounts.fromEstimate(native));
+}
+
+test "generation host metadata adds both simultaneous prepared KV spill owners to state view history" {
+    const cfg = gpt_mod.Config{ .hidden_size = 4, .num_hidden_layers = 1, .num_attention_heads = 1, .num_key_value_heads = 1, .intermediate_size = 8, .vocab_size = 16 };
+    const estimate = try estimateGptGeneration(.native, .f32, cfg, 24000, 1, 1);
+    const view_bytes = try @import("../kv/view_metadata.zig").hostBytes(24001, generation_kv_page_size_tokens, false);
+    const owner_spills = try @import("../kv/writable_blocks.zig").spillHostBytes(24001, 1, 0, generation_kv_page_size_tokens, false);
+    // One generated token cannot spill the acquired-ID inline array. The
+    // independently large front-retirement array must still be declared.
+    try std.testing.expectEqual(@as(usize, (1501 + 1) * @sizeOf(@import("../kv/block.zig").KvBlockId)), owner_spills);
+    try std.testing.expectEqual(try std.math.add(usize, view_bytes, try std.math.mul(usize, 2, owner_spills)), estimate.host_metadata_bytes);
+    try std.testing.expect(estimate.host_metadata_bytes > view_bytes);
+    var below = RunBudget.init(.{ .host_limit_bytes = estimate.host_metadata_bytes - 1 });
+    var host_only = estimate;
+    host_only.kv_bytes = 0;
+    host_only.scratch_bytes = 0;
+    try std.testing.expectError(error.MemoryBudgetExceeded, below.reserveEstimate(host_only));
+    try std.testing.expectEqual(@as(usize, 0), below.hostTotalBytes());
+    var exact = RunBudget.init(.{ .host_limit_bytes = estimate.host_metadata_bytes });
+    try exact.reserveEstimate(host_only);
+    exact.releaseEstimate(host_only);
+    try std.testing.expectEqual(@as(usize, 0), exact.hostTotalBytes());
 }
