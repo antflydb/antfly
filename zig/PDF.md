@@ -1975,10 +1975,16 @@ lengths may be compressed; an object stream's own length remains uncompressed.
 Validated indirect lengths are normalized to integers in the owned header,
 avoiding repeated reference lookups and allocations during payload reads without
 increasing Object storage. Recovery searches use bounded chunks with marker
-overlap. Native text extraction can inspect a damaged image's projected stream
-header after a recoverable payload-boundary failure. Such header views carry no
-payload range and cannot be decoded. OOM, cancellation, and exhausted work still
-propagate; payload readers remain strict.
+overlap. Native text extraction classifies XObjects in a single dictionary pass.
+Images retain only their subtype and structure-presence marker and stop at the
+stream header, without resolving lengths, decoding length containers, or
+inspecting payload boundaries. Subtype order does not affect classification:
+unused image fields are skipped, while Form-only fields preceding Subtype stay
+as source offsets and are materialized only for Forms. Forms retain the metadata
+used by extraction and continue through ordinary length validation and decoding
+without reparsing their header. Image header
+views carry no payload range and cannot be decoded. OOM, cancellation, and
+exhausted work still propagate; payload readers remain strict.
 Numeric lookahead propagates
 cancellation and work exhaustion rather than treating them as end-of-input.
 Ordinary object reads also poll the Reader cancellation probe when no shared

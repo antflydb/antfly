@@ -231,6 +231,7 @@ pub const Lexeme = Token;
 // Full parsing remains the default for rendering and general object consumers.
 pub const Projection = enum {
     full,
+    text_xobject,
     xobject_header,
     name,
     resources,
@@ -248,6 +249,15 @@ pub const Projection = enum {
     fn field(self: Projection, key: []const u8) Field {
         return switch (self) {
             .full => .{ .keep = true },
+            .text_xobject => blk: {
+                if (std.mem.eql(u8, key, "Subtype") or std.mem.eql(u8, key, "Type")) break :blk .{ .keep = true, .child = .name };
+                if (std.mem.eql(u8, key, "StructParent")) break :blk .{ .keep = true, .skip = true };
+                if (std.mem.eql(u8, key, "Length") or std.mem.eql(u8, key, "StructParents")) break :blk .{ .keep = true, .child = .integer };
+                for ([_][]const u8{ "Resources", "BBox", "Matrix", "Group", "Filter", "DecodeParms" }) |name| {
+                    if (std.mem.eql(u8, key, name)) break :blk .{ .keep = true };
+                }
+                break :blk .{ .keep = false };
+            },
             .xobject_header => if (std.mem.eql(u8, key, "Subtype")) .{ .keep = true, .child = .name } else if (std.mem.eql(u8, key, "StructParent")) .{ .keep = true, .skip = true } else .{ .keep = false },
             .resources, .required_resources => blk: {
                 if (std.mem.eql(u8, key, "Properties")) break :blk .{ .keep = true, .skip = self == .required_resources, .child = .property_table };
@@ -385,7 +395,7 @@ pub const Scanner = struct {
                             }
                             boxed.* = try self.readObjectProjected(projection);
                             boxed_initialized = true;
-                            if (projection == .xobject_header and boxed.* == .stream_header) {
+                            if (boxed.* == .stream_header) {
                                 return .{ .obj_def = .{ .ptr = .{ .id = @intCast(value), .gen = @intCast(tok2.integer) }, .value = boxed } };
                             }
 
@@ -470,6 +480,9 @@ pub const Scanner = struct {
 
     fn readDictOrStream(self: *Scanner, projection: Projection) anyerror!Object {
         var entries = std.ArrayList(DictEntry).empty;
+        var image_header = false;
+        var subtype_seen = false;
+        var deferred_form_fields = false;
         defer {
             for (entries.items) |*entry| entry.deinit(self.alloc);
             entries.deinit(self.alloc);
@@ -482,7 +495,7 @@ pub const Scanner = struct {
             if (tok == .keyword and std.mem.eql(u8, tok.keyword, ">>")) break;
             if (tok != .name) return error.UnexpectedDictKey;
 
-            const selected = projection.field(tok.name);
+            const selected = (if (image_header) Projection.xobject_header else projection).field(tok.name);
             if (!selected.keep) {
                 try self.skipObject(self.object_depth);
                 continue;
@@ -490,7 +503,15 @@ pub const Scanner = struct {
             const key = try self.alloc.dupe(u8, tok.name);
             errdefer self.alloc.free(key);
 
-            const value: Object = if (projection == .property_table and self.source_ref != null and self.unread.items.len == 0 and (try self.nextIsDictionary())) blk: {
+            const value: Object = if (projection == .text_xobject and !subtype_seen and selected.child == .full and !selected.skip) blk: {
+                // A late Subtype must not force allocation of image filters or
+                // Form resources. Borrow their offsets until classification.
+                try self.skipSpaceAndComments();
+                const start = self.base_offset + self.pos;
+                try self.skipObject(self.object_depth);
+                deferred_form_fields = true;
+                break :blk .{ .deferred = .{ .reference = self.source_ref orelse .{ .id = 0, .gen = 0 }, .start = start, .end = self.base_offset + self.pos } };
+            } else if (projection == .property_table and self.source_ref != null and self.unread.items.len == 0 and (try self.nextIsDictionary())) blk: {
                 try self.skipSpaceAndComments();
                 const start = self.base_offset + self.pos;
                 try self.skipObject(self.object_depth);
@@ -519,8 +540,37 @@ pub const Scanner = struct {
             }
 
             try entries.append(self.alloc, .{ .key = key, .value = value });
+            if (projection == .text_xobject and !subtype_seen and std.mem.eql(u8, key, "Subtype")) {
+                subtype_seen = true;
+                image_header = std.mem.eql(u8, value.asName() orelse "", "Image");
+            }
         }
 
+        if (image_header) {
+            // Subtype may occur anywhere in a dictionary. Drop deferred Form
+            // fields before it; subsequent image fields were already skipped.
+            var kept: usize = 0;
+            for (entries.items) |*entry| {
+                if (Projection.xobject_header.field(entry.key).keep) {
+                    entries.items[kept] = entry.*;
+                    kept += 1;
+                } else entry.deinit(self.alloc);
+            }
+            entries.shrinkRetainingCapacity(kept);
+        } else if (deferred_form_fields) {
+            for (entries.items) |*entry| {
+                if (entry.value != .deferred) continue;
+                const location = entry.value.deferred;
+                var field_scanner = Scanner.initWithOffset(self.alloc, self.bytes[location.start - self.base_offset .. location.end - self.base_offset], location.start);
+                field_scanner.source_ref = self.source_ref;
+                field_scanner.control = self.control;
+                field_scanner.max_object_depth = self.max_object_depth;
+                field_scanner.object_depth = self.object_depth;
+                field_scanner.stream_length_resolver = self.stream_length_resolver;
+                defer field_scanner.deinit();
+                entry.value = try field_scanner.readObjectProjected(projection.field(entry.key).child);
+            }
+        }
         const owned = try entries.toOwnedSlice(self.alloc);
         entries = .empty;
         errdefer {
@@ -548,7 +598,7 @@ pub const Scanner = struct {
 
         // Header-only views deliberately have no payload range. They cannot
         // be passed to a stream decoder or mistaken for a validated stream.
-        if (projection == .xobject_header) return .{ .stream_header = owned };
+        if (projection == .xobject_header or image_header) return .{ .stream_header = owned };
 
         const data_start = self.pos;
         const data_offset = self.base_offset + data_start;
@@ -1869,4 +1919,99 @@ test "scanner image header views never inspect payloads or resolve lengths" {
     try std.testing.expect(header.get("Length") == null);
     try std.testing.expectEqual(@as(usize, 0), resolver.calls);
     try std.testing.expect(scanner.pos < input.len / 2);
+}
+
+test "scanner native XObjects classify images without resolving lengths in either dictionary order" {
+    const a = std.testing.allocator;
+    const Resolver = struct {
+        fn resolve(_: *const anyopaque, _: ObjRef, _: bool) anyerror!?usize {
+            return error.InvalidStreamLength;
+        }
+    };
+    for ([_][]const u8{
+        \\8 0 obj << /Subtype /Image /Length 99 0 R /StructParent 10 0 R /Resources << /Private (ignored) >> /Matrix [1 0 0 1 0 0] >>
+        \\stream
+        \\payload without a terminator
+        ,
+        \\8 0 obj << /Length 99 0 R /Resources << /Private (ignored) >> /Matrix [1 0 0 1 0 0] /StructParent 10 0 R /Subtype /Image >>
+        \\stream
+        \\payload without a terminator
+        ,
+    }) |input| {
+        var scanner = Scanner.init(a, input);
+        defer scanner.deinit();
+        scanner.stream_length_resolver = .{ .context = &scanner, .resolve = Resolver.resolve };
+        var object = try scanner.readObjectProjected(.text_xobject);
+        defer object.deinit(a);
+        const image = object.obj_def.value;
+        try std.testing.expect(image.* == .stream_header);
+        try std.testing.expectEqual(@as(usize, 2), image.stream_header.len);
+        try std.testing.expectEqualStrings("Image", image.get("Subtype").?.asName().?);
+        try std.testing.expect(image.get("StructParent") != null);
+        try std.testing.expect(image.get("Length") == null);
+        try std.testing.expect(image.get("Resources") == null);
+    }
+}
+
+fn exerciseNativeFormProjection(a: Allocator, input: []const u8) !void {
+    const payload = "BT (Hello) Tj ET";
+    const Resolver = struct {
+        calls: usize = 0,
+        fn resolve(raw: *const anyopaque, reference: ObjRef, object_stream: bool) anyerror!?usize {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(u32, 9), reference.id);
+            try std.testing.expect(!object_stream);
+            return payload.len;
+        }
+    };
+    var resolver = Resolver{};
+    var scanner = Scanner.init(a, input);
+    defer scanner.deinit();
+    scanner.stream_length_resolver = .{ .context = &resolver, .resolve = Resolver.resolve };
+    var object = try scanner.readObjectProjected(.text_xobject);
+    defer object.deinit(a);
+    const form = object.obj_def.value;
+    try std.testing.expect(form.* == .stream);
+    try std.testing.expectEqual(@as(usize, 1), resolver.calls);
+    try std.testing.expectEqualStrings(payload, input[form.stream.data_offset..][0..form.stream.data_length]);
+    for ([_][]const u8{ "Subtype", "Type", "Length", "StructParents", "StructParent", "Resources", "BBox", "Matrix", "Group", "Filter", "DecodeParms" }) |field|
+        try std.testing.expect(form.get(field) != null);
+    try std.testing.expect(form.get("Private") == null);
+    try std.testing.expectEqual(@as(i64, payload.len), form.get("Length").?.integer);
+    try std.testing.expectEqual(@as(u32, 10), form.get("StructParents").?.obj_ref.id);
+}
+
+test "scanner native Form projection retains extraction fields and resolves length once" {
+    const a = std.testing.allocator;
+    const fields = "/Type /XObject /Length 9 0 R /StructParents 10 0 R /StructParent 11 0 R /Resources << /Font << /F1 5 0 R >> >> /BBox [0 0 10 10] /Matrix [1 0 0 1 0 0] /Group << /S /Transparency /I true /K false >> /Filter [] /DecodeParms null /Private (ignored) ";
+    for ([_][]const u8{
+        "8 0 obj << /Subtype /Form " ++ fields ++ ">>\nstream\nBT (Hello) Tj ET\nendstream\nendobj",
+        "8 0 obj << " ++ fields ++ "/Subtype /Form >>\nstream\nBT (Hello) Tj ET\nendstream\nendobj",
+    }) |input| {
+        try exerciseNativeFormProjection(a, input);
+        try std.testing.checkAllAllocationFailures(a, exerciseNativeFormProjection, .{input});
+    }
+}
+
+test "scanner native image fields before Subtype do not materialize" {
+    const a = std.testing.allocator;
+    const padding = try a.alloc(u8, 256 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const input = try std.fmt.allocPrint(a, "8 0 obj << /Resources << /Private ({s}) >> /Filter [/FlateDecode /{s}] /DecodeParms [null << /Private ({s}) >>] /Subtype /Image /Length 99 0 R >>\nstream\nABC", .{ padding, padding, padding });
+    defer a.free(input);
+    var backing: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    var scanner = Scanner.init(fixed.allocator(), input);
+    defer scanner.deinit();
+    var object = try scanner.readObjectProjected(.text_xobject);
+    defer object.deinit(fixed.allocator());
+    try std.testing.expect(object.obj_def.value.* == .stream_header);
+    try std.testing.expectEqual(@as(usize, 1), object.obj_def.value.stream_header.len);
+    var control = ScanControl{ .remaining_work = 1024 };
+    var limited = Scanner.init(a, input);
+    defer limited.deinit();
+    limited.control = &control;
+    try std.testing.expectError(error.PdfMetadataWorkLimit, limited.readObjectProjected(.text_xobject));
 }

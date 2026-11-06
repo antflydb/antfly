@@ -10041,18 +10041,11 @@ pub const Reader = struct {
     }
 
     fn textXObject(self: *const Reader, raw: *const syntax.Object) !syntax.Object {
-        return self.resolveValue(raw) catch |original| {
-            switch (original) {
-                error.OutOfMemory, error.Canceled, error.PdfMetadataWorkLimit => return original,
-                else => {},
-            }
-            if (raw.* != .obj_ref) return original;
-            var header_reader = self.*;
-            header_reader.object_depth_limit = @min(self.object_depth_limit, 128);
-            var header = try header_reader.readIndirectObjectProjected(raw.obj_ref, .xobject_header);
-            errdefer header.deinit(self.alloc);
-            if (header != .stream_header or !std.mem.eql(u8, (header.get("Subtype") orelse return original).asName() orelse "", "Image")) return original;
-            return header;
+        // Classify and parse once: images stop at their header, while Forms
+        // retain the fields and validated payload range needed by extraction.
+        return switch (raw.*) {
+            .obj_ref => |reference| try self.readIndirectObjectProjected(reference, .text_xobject),
+            else => try raw.clone(self.alloc),
         };
     }
 
@@ -37175,6 +37168,7 @@ const ObjectStreamFixture = struct {
     length_reference: ?usize = null,
     content_length_reference: ?usize = null,
     object_stream_type: []const u8 = "ObjStm",
+    resources: []const u8 = "7 0 R",
 };
 
 fn buildObjectStreamFixtureAlloc(a: Allocator, fixture: ObjectStreamFixture) ![]u8 {
@@ -37211,10 +37205,12 @@ fn buildObjectStreamFixtureAlloc(a: Allocator, fixture: ObjectStreamFixture) ![]
     defer a.free(paint);
     const stream = try std.fmt.allocPrint(a, "<< /Type /{s} /N {d} /First {d} {s}/Length {s} >>\nstream\n{s}\nendstream", .{ fixture.object_stream_type, objects.len, header_bytes.len, if (fixture.flate) "/Filter /FlateDecode " else "", length, encoded });
     defer a.free(stream);
+    const page = try std.fmt.allocPrint(a, "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Resources {s} /Contents 4 0 R >>", .{fixture.resources});
+    defer a.free(page);
     const fixed = [_][]const u8{
         "<< /Type /Catalog /Pages 2 0 R >>",
         "<< /Type /Pages /Count 1 /Kids [3 0 R] >>",
-        "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Resources 7 0 R /Contents 4 0 R >>",
+        page,
         paint,
         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
         stream,
@@ -38355,4 +38351,124 @@ test "stream filter cancellation owns the input before inspecting filters" {
         const raw = try a.dupe(u8, "owned input");
         try std.testing.expectError(error.Canceled, decodeStreamFiltersOwnedAlloc(a, raw, filter, null, .{}, .{ .is_cancelled_fn = Probe.cancelled }));
     }
+}
+
+fn buildNativeImageLengthContainerTestPdfAlloc(a: Allocator, subtype_first: bool) ![]u8 {
+    const padding = try a.alloc(u8, 256 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    padding[0] = '(';
+    padding[padding.len - 1] = ')';
+    const image = if (subtype_first)
+        "<< /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 7 0 R >>\nstream\nABC\nendstream"
+    else
+        "<< /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length 7 0 R /Subtype /Image >>\nstream\nABC\nendstream";
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "3", padding },
+        .extra = &.{image},
+        .resources = "<< /Font << /F1 5 0 R >> /XObject << /A 9 0 R /B 9 0 R >> >>",
+        .content = "BT /F1 10 Tf 10 100 Td (Hello) Tj ET /A Do /B Do",
+    });
+}
+
+fn exerciseNativeImageLengthContainer(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 16 * 1024, .max_working_set_bytes = 32 * 1024 });
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqualStrings("Hello\n", analysis.text);
+    try std.testing.expect(analysis.has_nontext_visual);
+    try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+}
+
+test "reader native image inspection never decodes compressed length containers" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |subtype_first| {
+        const sample = try buildNativeImageLengthContainerTestPdfAlloc(a, subtype_first);
+        defer a.free(sample);
+        {
+            var tracked = DecodeBudgetAllocator.init(a, 0, 16 * 1024);
+            var reader = try Reader.initWithDecodeLimits(tracked.allocator(), sample, .{ .max_decoded_stream_bytes = 16 * 1024, .max_working_set_bytes = 32 * 1024 });
+            defer reader.deinit();
+            const reference = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+            const before = tracked.cumulative_growth_bytes;
+            var image = try reader.textXObject(&reference);
+            defer image.deinit(tracked.allocator());
+            try std.testing.expect(image == .stream_header);
+            try std.testing.expect(tracked.cumulative_growth_bytes - before < 4096);
+            try std.testing.expect(!tracked.limit_exceeded);
+            // Payload consumers still resolve and enforce the container limits.
+            if (reader.readIndirectObject(reference.obj_ref)) |value| {
+                var owned = value;
+                defer owned.deinit(tracked.allocator());
+                return error.TestUnexpectedResult;
+            } else |err| try std.testing.expect(err == error.OutOfMemory or err == error.DecodedStreamTooLarge or err == error.PdfDecodeWorkingSetTooLarge);
+        }
+        // Font caches and output are unrelated to stream decoder allowances.
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 16 * 1024, .max_working_set_bytes = 32 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try reader.extractPlainTextAlloc();
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("Hello\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(analysis.has_nontext_visual);
+        }
+    }
+}
+
+test "reader native image header projection preserves allocation failures" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |subtype_first| {
+        const sample = try buildNativeImageLengthContainerTestPdfAlloc(a, subtype_first);
+        defer a.free(sample);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseNativeImageLengthContainer, .{sample});
+    }
+}
+
+fn exerciseEncryptedNativeFormProjection(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    reader.encryption = .{ .file_key = @splat(3), .file_key_len = 5, .method = .rc4 };
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqualStrings("Label\n", analysis.text);
+    try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+}
+
+test "reader native Form projection decrypts deferred resources exactly once" {
+    const a = std.testing.allocator;
+    const file_key: [16]u8 = @splat(3);
+    const key = objectEncryptionKey(file_key, 5, .{ .id = 6, .gen = 0 }, .rc4);
+    var label: [5]u8 = "Label".*;
+    rc4Crypt(key.bytes[0..key.len], &label);
+    var hex: std.ArrayList(u8) = .empty;
+    defer hex.deinit(a);
+    for (label) |byte| try hex.print(a, "{x:0>2}", .{byte});
+    const paint = "/Span /Tag BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC";
+    const form = try std.fmt.allocPrint(a, "6 0 obj\n<< /Resources << /Font << /F1 5 0 R >> /Properties << /Tag << /ActualText <{s}> >> >> >> /BBox [0 0 400 300] /Filter [] /Subtype /Form /Length {d} >>\nstream\n{s}\nendstream\nendobj\n", .{ hex.items, paint.len, paint });
+    defer a.free(form);
+    const sample = try buildImageDecodeTestPdfAlloc(a, &.{
+        "1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n",
+        "2 0 obj\n<< /Type /Pages /Count 1 /Kids [3 0 R] >>\nendobj\n",
+        "3 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 400 300] /Resources << /XObject << /Fm 6 0 R >> >> /Contents 4 0 R >>\nendobj\n",
+        "4 0 obj\n<< /Length 6 >>\nstream\n/Fm Do\nendstream\nendobj\n",
+        "5 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n",
+        form,
+    });
+    defer a.free(sample);
+    {
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        for ([_]u32{ 4, 6 }) |id| {
+            var stream = try reader.readIndirectObject(.{ .id = id, .gen = 0 });
+            defer stream.deinit(a);
+            const stream_key = objectEncryptionKey(file_key, 5, .{ .id = id, .gen = 0 }, .rc4);
+            rc4Crypt(stream_key.bytes[0..stream_key.len], sample[stream.stream.data_offset..][0..stream.stream.data_length]);
+        }
+    }
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedNativeFormProjection, .{sample});
 }
