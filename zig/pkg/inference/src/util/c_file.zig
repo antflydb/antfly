@@ -326,6 +326,25 @@ pub fn fileSize(allocator: std.mem.Allocator, path: []const u8) !u64 {
     return try fileSizeFromFd(fd);
 }
 
+/// Content identity without mapping a large artifact/plugin into host memory.
+/// Callers admitting this cold-path operation need only a bounded read buffer.
+pub fn sha256File(allocator: std.mem.Allocator, path: []const u8) ![32]u8 {
+    const path_z = try allocator.dupeSentinel(u8, path, 0);
+    defer allocator.free(path_z);
+    const fd = try openReadOnlyZ(path_z);
+    defer closeFd(fd);
+    var buffer: [64 * 1024]u8 = undefined;
+    var hash = std.crypto.hash.sha2.Sha256.init(.{});
+    var offset: u64 = 0;
+    while (true) {
+        const n = try readAt(fd, &buffer, offset);
+        if (n == 0) break;
+        hash.update(buffer[0..n]);
+        offset = try std.math.add(u64, offset, n);
+    }
+    return hash.finalResult();
+}
+
 pub const FileIdentity = struct {
     size: u64,
     inode: u64,

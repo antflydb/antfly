@@ -320,6 +320,23 @@ pub const LoadedReader = union(enum) {
         model_manager: *model_manager_mod.ModelManager,
         control: ?InferenceExecutionControl,
     ) !LoadedReader {
+        const io = if (control) |active| active.io orelse session_manager.io orelse std.Options.debug_io else session_manager.io orelse std.Options.debug_io;
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(allocator, io, model_path);
+        defer publication_lease.deinit(io);
+        if (control) |active| try active.verifyModelSelection(allocator, io, model_path);
+        var result = try loadSelectedReader(allocator, model_path, session_manager, model_manager, control);
+        errdefer result.deinit();
+        if (control) |active| try active.verifyModelSelection(allocator, io, model_path);
+        return result;
+    }
+
+    fn loadSelectedReader(
+        allocator: std.mem.Allocator,
+        model_path: []const u8,
+        session_manager: *backends.SessionManager,
+        model_manager: *model_manager_mod.ModelManager,
+        control: ?InferenceExecutionControl,
+    ) !LoadedReader {
         if (try multistage_metadata.isMultiStageModelDir(allocator, model_path)) {
             return .{ .multistage = try multistage_reader_mod.LoadedMultiStageReader.loadFromDirWithControl(
                 allocator,
@@ -365,9 +382,10 @@ pub const LoadedReader = union(enum) {
     pub fn acquireExecutionFence(
         model_path: []const u8,
         model_manager: *model_manager_mod.ModelManager,
+        control: InferenceExecutionControl,
     ) !?ExecutionFence {
-        var handle = model_manager.acquireFromDir(model_path) catch |err| switch (err) {
-            error.OutOfMemory => return err,
+        var handle = model_manager.acquireFromDirWithControl(model_path, control) catch |err| switch (err) {
+            error.OutOfMemory, error.ModelArtifactsChanging, error.IncompleteManagedDownload, error.ModelInventoryChanged, error.Canceled, error.Cancelled, error.Timeout => return err,
             // The direct typed loader remains responsible for reporting model
             // layout and publication failures. Broker eligibility is optional.
             else => return null,
@@ -620,7 +638,7 @@ pub fn probeManifest(
     man: manifest_mod.ModelManifest,
 ) !ReaderSupport {
     const multistage = multistage_metadata.isMultiStageModelDir(allocator, model_path) catch |err| switch (err) {
-        error.InvalidMetadata, error.FileTooLarge, error.IsDir, error.SymLinkLoop => return .{ .unsupported = .invalid_metadata },
+        error.InvalidMetadata, error.FileTooLarge, error.IsDir, error.SymLinkLoop, error.ChecksumMismatch => return .{ .unsupported = .invalid_metadata },
         else => return err,
     };
     if (multistage) return .{ .supported = .multistage };

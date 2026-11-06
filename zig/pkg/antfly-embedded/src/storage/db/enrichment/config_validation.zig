@@ -92,7 +92,6 @@ pub fn validatePublicConfig(alloc: Allocator, cfg: types.EnrichmentConfig) !void
             if ((source_producer.type == .vector_labels or source_producer.type == .media_output) and cfg.source_artifact_name.len == 0) return error.InvalidEnrichmentConfig;
             if (cfg.neighbor_context) |context| try validateNeighborContextConfig(alloc, context, cfg.producer_json);
             if (cfg.source_artifact_name.len > 0) {
-                if (cfg.field.len > 0 or cfg.template.len > 0) return error.InvalidEnrichmentConfig;
                 try validateUpstreamAssetProducer(alloc, cfg.producer_json);
             }
         },

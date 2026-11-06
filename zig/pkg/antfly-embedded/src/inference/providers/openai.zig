@@ -144,6 +144,7 @@ pub const Provider = struct {
         });
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
+            .follow_redirects = false,
             .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.authHeaders(),
@@ -273,6 +274,7 @@ pub const Provider = struct {
         const json_body = try self.chatRequestJsonAlloc(self.allocator, model, messages);
         defer self.allocator.free(json_body);
         var resp = try self.http.post(url, .{
+            .follow_redirects = false,
             .attempt_observer = self.attempt_observer,
             .json = json_body,
             .headers = self.authHeaders(),

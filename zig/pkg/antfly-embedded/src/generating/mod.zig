@@ -1630,6 +1630,7 @@ pub fn generateAntflyTextBatchResponse(
     var headers: [1][2][]const u8 = undefined;
     if (authorization) |value| headers[0] = .{ "Authorization", value };
     return http.post(url, .{
+        .follow_redirects = false,
         .json = body,
         .headers = if (authorization != null) &headers else null,
         .timeout_ms = if (options.request_context) |context| try context.remainingTimeoutMs() else 300_000,

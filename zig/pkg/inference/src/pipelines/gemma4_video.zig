@@ -23,6 +23,8 @@ const embedding_video = @import("embedding_gemma2_video.zig");
 const embedding_gemma2 = @import("embedding_gemma2.zig");
 const ComputeBackend = @import("../ops/ops.zig").ComputeBackend;
 const Control = @import("../execution_control.zig").InferenceExecutionControl;
+const Session = @import("../backends/session.zig").Session;
+const memory = @import("../runtime/tier/memory.zig");
 
 const sampling: embedding_video.Sampling = .{ .timestamps = .{} };
 
@@ -33,9 +35,192 @@ const portable_frame_bytes: usize = 96 * 1024 * 1024 + 48 * 1024 * 1024;
 /// Reserved through generation admission before any portable video work starts.
 pub const portable_host_bytes: usize = portable_pool_bytes + portable_frame_bytes;
 
-pub fn encode(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
-    if (cb.kind() == .cuda) return projector_mod.encodeProjectedVideoResident(cb, a, projector, bytes);
+/// The run budget owns per-invocation limits, including offline CLI overrides.
+/// The session additionally owns process-wide serving admission. Neither replaces
+/// the other: a CLI session normally has no shared admission controller.
+pub const Admission = struct {
+    run_budget: ?*memory.RunBudget = null,
+    session: ?Session = null,
+    explicit_scratch_limit: usize = 0,
+
+    fn acquire(self: Admission, additional_shared: bool) !Permit {
+        var permit: Permit = .{};
+        errdefer permit.deinit();
+        if (self.run_budget) |budget| {
+            permit.budget = budget;
+            permit.previous_scratch_limit = budget.limits.scratch_limit_bytes;
+            if (budget.limits.scratch_limit_bytes != 0) budget.limits = try memory.withAutomaticScratchFloor(budget.limits, self.explicit_scratch_limit, budget.scratchTotalBytes(), portable_host_bytes);
+            try budget.reserveEstimate(hostEstimate());
+            permit.reserved = true;
+        }
+        // Non-CUDA serving requests already reserve portable host memory during
+        // generation admission. CUDA acquires it only after a decoder rejection.
+        if (additional_shared) if (self.session) |session| {
+            permit.shared = try admitPortableFallback(session, self.explicit_scratch_limit);
+        };
+        return permit;
+    }
+};
+
+const Permit = struct {
+    budget: ?*memory.RunBudget = null,
+    previous_scratch_limit: usize = 0,
+    reserved: bool = false,
+    shared: ?@import("../backends/session.zig").RunPermit = null,
+
+    fn deinit(self: *Permit) void {
+        if (self.shared) |*held| held.deinit();
+        if (self.budget) |budget| {
+            if (self.reserved) budget.releaseEstimate(hostEstimate());
+            budget.limits.scratch_limit_bytes = self.previous_scratch_limit;
+        }
+        self.* = .{};
+    }
+};
+
+fn hostEstimate() memory.Estimate {
+    return .{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = portable_host_bytes, .scratch_tier = .host };
+}
+
+pub fn encode(cb: *const ComputeBackend, admission: Admission, a: std.mem.Allocator, projector: *projector_mod.ProjectorStore, bytes: []const u8) !projector_mod.ProjectedVideo {
+    if (cb.kind() == .cuda) {
+        // NVDEC takes a narrower set of clips than the catalog advertises, and
+        // some rejections only surface mid-bitstream. Portable decoding decides
+        // what's really invalid; either route projects on the device.
+        if (projector_mod.encodeProjectedVideoResident(cb, a, projector, bytes)) |projected| {
+            return projected;
+        } else |err| {
+            if (err != error.NvdecUnavailable and inputError(err) != error.InvalidVideoInput) return err;
+            std.log.info("gemma4 video falling back to portable decoding: {s}", .{@errorName(err)});
+        }
+        var permit = try admission.acquire(true);
+        defer permit.deinit();
+        return encodePortable(cb, a, projector, bytes);
+    }
+    var permit = try admission.acquire(false);
+    defer permit.deinit();
     return encodePortable(cb, a, projector, bytes);
+}
+
+/// Admission reserved nothing for this route, since most clips never take it, and
+/// the run's own scratch can already fill the automatic cap. Grow that cap to fit,
+/// as model scratch floors do; physical limits and an operator's cap still hold.
+fn admitPortableFallback(session: Session, explicit_scratch_limit: usize) !@import("../backends/session.zig").RunPermit {
+    var fallback = session;
+    if (fallback.run_admission) |*admission| {
+        admission.limits = try memory.withAutomaticScratchFloor(
+            admission.limits,
+            explicit_scratch_limit,
+            admission.controller.snapshot().scratchTotalBytes(),
+            portable_host_bytes,
+        );
+    }
+    return fallback.admitHostPreprocess(portable_host_bytes);
+}
+
+test "gemma4 video portable fallback fits beside a run's scratch unless the operator capped it" {
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    const cap = portable_host_bytes + 1024;
+    const session = Session{
+        .ptr = undefined,
+        .vtable = undefined,
+        .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .scratch_limit_bytes = cap }, .static_workspace_bytes = 0 },
+    };
+    var run = try session.admitHostPreprocess(cap);
+    defer run.deinit();
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, session.admitHostPreprocess(portable_host_bytes));
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, admitPortableFallback(session, cap));
+    var permit = try admitPortableFallback(session, 0);
+    defer permit.deinit();
+    try std.testing.expectEqual(cap + portable_host_bytes, controller.snapshot().host_scratch_bytes);
+}
+
+test "gemma4 video portable admission enforces CLI host combined and scratch limits without session admission" {
+    const cases = [_]memory.Limits{
+        .{ .host_limit_bytes = portable_host_bytes - 1 },
+        .{ .combined_limit_bytes = portable_host_bytes - 1 },
+        .{ .scratch_limit_bytes = portable_host_bytes - 1 },
+    };
+    const session = Session{ .ptr = undefined, .vtable = undefined };
+    for (cases) |limits| {
+        var budget = memory.RunBudget.init(limits);
+        const admission = Admission{ .run_budget = &budget, .session = session, .explicit_scratch_limit = limits.scratch_limit_bytes };
+        try std.testing.expectError(error.MemoryBudgetExceeded, admission.acquire(true));
+        try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+        try std.testing.expectEqual(limits, budget.limits);
+    }
+}
+
+test "gemma4 video portable admission refunds both owners and restores automatic scratch floors on failure" {
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    const session = Session{
+        .ptr = undefined,
+        .vtable = undefined,
+        .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false },
+    };
+    var budget = memory.RunBudget.init(.{ .scratch_limit_bytes = 1024 });
+    const base: memory.Estimate = .{ .prompt_tokens = 0, .retained_tokens = 0, .kv_bytes = 0, .kv_tier = .host, .scratch_bytes = 1024, .scratch_tier = .backend };
+    try budget.reserveEstimate(base);
+    const Probe = struct {
+        fn decode(admission: Admission) !void {
+            var permit = try admission.acquire(true);
+            defer permit.deinit();
+            try std.testing.expectEqual(portable_host_bytes, admission.run_budget.?.host_scratch_bytes);
+            try std.testing.expectEqual(portable_host_bytes, admission.session.?.run_admission.?.controller.snapshot().host_scratch_bytes);
+            return error.InvalidVideoInput;
+        }
+    };
+    try std.testing.expectError(error.InvalidVideoInput, Probe.decode(.{ .run_budget = &budget, .session = session }));
+    try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 1024), budget.backend_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 1024), budget.limits.scratch_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 0), controller.snapshot().host_scratch_bytes);
+}
+
+test "gemma4 video portable admission rolls back local capacity on shared denial and reuses prepaid serving memory" {
+    var controller = memory.AdmissionController{};
+    defer controller.deinit();
+    const session = Session{
+        .ptr = undefined,
+        .vtable = undefined,
+        .run_admission = .{ .controller = &controller, .backend_class = .gpu, .limits = .{ .host_limit_bytes = portable_host_bytes }, .static_workspace_bytes = 0, .check_live_memory = false },
+    };
+    var existing = try session.admitHostPreprocess(portable_host_bytes);
+    defer existing.deinit();
+    var budget = memory.RunBudget.init(.{ .scratch_limit_bytes = 1024 });
+    const admission = Admission{ .run_budget = &budget, .session = session };
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, admission.acquire(true));
+    try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 1024), budget.limits.scratch_limit_bytes);
+    // Non-CUDA serving admission already holds the shared host reservation.
+    var permit = try admission.acquire(false);
+    try std.testing.expectEqual(portable_host_bytes, budget.host_scratch_bytes);
+    try std.testing.expectEqual(portable_host_bytes, controller.snapshot().host_scratch_bytes);
+    permit.deinit();
+    try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 1024), budget.limits.scratch_limit_bytes);
+}
+
+test "gemma4 video portable encode admits before parsing and refunds malformed input" {
+    const Probe = struct {
+        fn kind(_: *anyopaque) @import("../ops/ops.zig").BackendKind {
+            return .native;
+        }
+    };
+    // Malformed media fails before accessing projector tensors or compute ops.
+    var vtable: ComputeBackend.VTable = undefined;
+    vtable.backendKind = Probe.kind;
+    const cb = ComputeBackend{ .ptr = &vtable, .vtable = &vtable };
+    var projector: projector_mod.ProjectorStore = undefined;
+    var budget = memory.RunBudget.init(.{ .host_limit_bytes = portable_host_bytes - 1 });
+    const admission = Admission{ .run_budget = &budget };
+    try std.testing.expectError(error.MemoryBudgetExceeded, encode(&cb, admission, std.testing.allocator, &projector, "not a video"));
+    budget.limits.host_limit_bytes = portable_host_bytes;
+    try std.testing.expectError(error.InvalidVideoInput, encode(&cb, admission, std.testing.allocator, &projector, "not a video"));
+    try std.testing.expectEqual(@as(usize, 0), budget.host_scratch_bytes);
+    try std.testing.expectEqual(@as(usize, 0), budget.limits.scratch_limit_bytes);
 }
 
 const Observer = struct {

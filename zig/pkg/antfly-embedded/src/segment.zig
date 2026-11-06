@@ -682,6 +682,40 @@ pub const SegmentWriter = struct {
 
 /// Reads a segment file.
 pub const PostingsLoader = inverted.PostingsLoader;
+// Field navigation is keyed by name, independently of wire directory order.
+// Sort owned admission metadata once: wide documents must not cause quadratic
+// duplicate validation or repeated linear scans during text compaction.
+fn sortSegmentFields(comptime Field: type, fields: []Field) !void {
+    std.mem.sort(Field, fields, {}, struct {
+        fn lessThan(_: void, lhs: Field, rhs: Field) bool {
+            return std.mem.order(u8, lhs.name, rhs.name) == .lt;
+        }
+    }.lessThan);
+    for (fields, 0..) |field, i| {
+        if (i != 0 and std.mem.eql(u8, fields[i - 1].name, field.name)) return error.InvalidSegment;
+    }
+}
+
+fn findSegmentField(comptime Field: type, fields: []Field, sorted: bool, name: []const u8) ?*Field {
+    // Hand-built/borrowed readers may retain legacy ordering. Admitted readers
+    // opt in only after their directory has been sorted and validated.
+    if (!sorted) {
+        for (fields) |*field| if (std.mem.eql(u8, field.name, name)) return field;
+        return null;
+    }
+    var lo: usize = 0;
+    var hi = fields.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        switch (std.mem.order(u8, fields[mid].name, name)) {
+            .lt => lo = mid + 1,
+            .gt => hi = mid,
+            .eq => return &fields[mid],
+        }
+    }
+    return null;
+}
+
 pub const SegmentReader = struct {
     postings_loader: ?PostingsLoader = null,
     alloc: Allocator,
@@ -695,6 +729,7 @@ pub const SegmentReader = struct {
     doc_count: u32,
     num_fields: u16,
     fields: []FieldInfo,
+    fields_sorted: bool = false,
 
     native: ?*Native = null,
     deferred: ?*const fn (Allocator, SegmentSource) anyerror!SegmentReader = null,
@@ -732,7 +767,7 @@ pub const SegmentReader = struct {
             field.* = .{ .name = name, .sections = sections, .inverted_stats = route_field.stats };
             initialized += 1;
         }
-        return .{ .alloc = a, .data = &.{}, .doc_count = doc_count, .num_fields = @intCast(fields.len), .fields = fields, .stored_offset = 0, .stored_length = 0, .stored_metadata_length = 0, .index_offset = 0, .deferred = load };
+        return .{ .alloc = a, .data = &.{}, .doc_count = doc_count, .num_fields = @intCast(fields.len), .fields = fields, .fields_sorted = true, .stored_offset = 0, .stored_length = 0, .stored_metadata_length = 0, .index_offset = 0, .deferred = load };
     }
 
     const Native = struct {
@@ -899,7 +934,7 @@ pub const SegmentReader = struct {
             initialized += 1;
         }
         const blocks = if (metadata.stored_header[0] == stored_fields_version_block_compressed) std.mem.readInt(u32, metadata.stored_header[5..9], .little) else 0;
-        native.* = .{ .stored_metadata = metadata.stored_header, .range = .{ .alloc = alloc, .source = input_source, .authenticated_source = true, .owns_source = false, .fields = fields, .doc_count = metadata.doc_count, .stored_offset = metadata.stored_offset, .stored_length = metadata.stored_length, .stored_metadata_length = metadata.stored_metadata_length, .num_blocks = blocks, .id_bytes_length = if (blocks != 0) std.mem.readInt(u64, metadata.stored_header[13..21], .little) else 0 } };
+        native.* = .{ .stored_metadata = metadata.stored_header, .range = .{ .alloc = alloc, .source = input_source, .authenticated_source = true, .owns_source = false, .fields = fields, .fields_sorted = true, .doc_count = metadata.doc_count, .stored_offset = metadata.stored_offset, .stored_length = metadata.stored_length, .stored_metadata_length = metadata.stored_metadata_length, .num_blocks = blocks, .id_bytes_length = if (blocks != 0) std.mem.readInt(u64, metadata.stored_header[13..21], .little) else 0 } };
         native.metadata_cache = try @import("segment_source.zig").ConcurrentBlockCache.init(alloc, input_source, 256 * 1024);
         errdefer native.metadata_cache.?.deinit();
         const info = try alloc.alloc(FieldInfo, fields.len);
@@ -907,7 +942,7 @@ pub const SegmentReader = struct {
         for (info, fields, metadata.fields) |*out, field, descriptor| out.* = .{ .name = field.name, .sections = field.sections, .inverted_stats = descriptor.stats };
         const validations = try alloc.alloc(std.atomic.Value(u8), blocks);
         for (validations) |*validation| validation.* = .init(integrity_unverified);
-        return .{ .alloc = alloc, .data = &.{}, .native = native, .stored_offset = metadata.stored_offset, .stored_length = metadata.stored_length, .stored_metadata_length = metadata.stored_metadata_length, .index_offset = metadata.index_offset, .doc_count = metadata.doc_count, .num_fields = @intCast(fields.len), .fields = info, .stored_block_validations = validations };
+        return .{ .alloc = alloc, .data = &.{}, .native = native, .stored_offset = metadata.stored_offset, .stored_length = metadata.stored_length, .stored_metadata_length = metadata.stored_metadata_length, .index_offset = metadata.index_offset, .doc_count = metadata.doc_count, .num_fields = @intCast(fields.len), .fields = info, .fields_sorted = true, .stored_block_validations = validations };
     }
 
     /// The caller owns the immutable source and keeps it alive until reader deinit.
@@ -971,13 +1006,12 @@ pub const SegmentReader = struct {
         var index_bytes: [8]u8 = undefined;
         errdefer alloc.free(validations);
         try input_source.readInto(input_source.len() - 24, &index_bytes);
-        return .{ .alloc = alloc, .data = &.{}, .native = native, .stored_offset = native.range.stored_offset, .stored_length = native.range.stored_length, .stored_metadata_length = native.range.stored_metadata_length, .stored_block_validations = validations, .index_offset = std.mem.readInt(u64, &index_bytes, .big), .doc_count = native.range.doc_count, .num_fields = @intCast(fields.len), .fields = fields };
+        return .{ .alloc = alloc, .data = &.{}, .native = native, .stored_offset = native.range.stored_offset, .stored_length = native.range.stored_length, .stored_metadata_length = native.range.stored_metadata_length, .stored_block_validations = validations, .index_offset = std.mem.readInt(u64, &index_bytes, .big), .doc_count = native.range.doc_count, .num_fields = @intCast(fields.len), .fields = fields, .fields_sorted = native.range.fields_sorted };
     }
 
     pub fn hasSection(self: *const SegmentReader, name: []const u8, kind: SectionType) bool {
-        for (self.fields) |field| if (std.mem.eql(u8, field.name, name)) {
-            for (field.sections) |section| if (section.section_type == kind) return true;
-        };
+        const field = findSegmentField(FieldInfo, self.fields, self.fields_sorted, name) orelse return false;
+        for (field.sections) |section| if (section.section_type == kind) return true;
         return false;
     }
 
@@ -989,13 +1023,10 @@ pub const SegmentReader = struct {
             var reader = try load(alloc, input_source);
             errdefer reader.deinit();
             if (reader.doc_count != self.doc_count or reader.fields.len != self.fields.len) return error.InvalidSegment;
-            // Routing directories are canonicalized by name; historical
-            // physical segments retain writer field order. Bind identities,
-            // not positions, while still verifying every admitted field.
+            // Bind field identities independently of historical wire order.
+            // Admitted physical metadata supports logarithmic name lookup.
             for (self.fields) |expected| {
-                const actual = for (reader.fields) |field| {
-                    if (std.mem.eql(u8, field.name, expected.name)) break field;
-                } else return error.InvalidSegment;
+                const actual = findSegmentField(FieldInfo, reader.fields, reader.fields_sorted, expected.name) orelse return error.InvalidSegment;
                 if (!std.meta.eql(try reader.invertedFieldStats(expected.name), expected.inverted_stats) or actual.sections.len != expected.sections.len) return error.InvalidSegment;
                 for (expected.sections) |section| if (!reader.hasSection(expected.name, section.section_type)) return error.InvalidSegment;
             }
@@ -1178,9 +1209,6 @@ pub const SegmentReader = struct {
             if (name_len > footer_start - pos) return error.InvalidSegment;
             const name = data[pos..][0..name_len];
             pos += name_len;
-            for (fields[0..fi]) |field| {
-                if (std.mem.eql(u8, field.name, name)) return error.InvalidSegment;
-            }
             if (footer_start - pos < 2) return error.InvalidSegment;
             const num_sections = std.mem.readInt(u16, data[pos..][0..2], .big);
             pos += 2;
@@ -1220,6 +1248,7 @@ pub const SegmentReader = struct {
             }
         }
         if (pos != footer_start) return error.InvalidSegment;
+        try sortSegmentFields(FieldInfo, fields);
 
         const stored_block_validations = try alloc.alloc(std.atomic.Value(u8), stored_block_count);
         errdefer alloc.free(stored_block_validations);
@@ -1237,6 +1266,7 @@ pub const SegmentReader = struct {
             .doc_count = doc_count,
             .num_fields = num_fields,
             .fields = fields,
+            .fields_sorted = true,
         };
     }
 
@@ -1295,32 +1325,30 @@ pub const SegmentReader = struct {
             try native.navigation.put(self.alloc, entry.offset, bytes);
             return bytes;
         }
-        for (self.fields) |*field| {
-            if (std.mem.eql(u8, field.name, field_name)) {
-                for (field.sections) |*section| {
-                    if (section.section_type == section_type) {
-                        if (section.length == 0) return null;
-                        const offset: usize = @intCast(section.offset);
-                        const length: usize = @intCast(section.length);
-                        const bytes = self.data[offset..][0..length];
-                        // Seekable remote payloads authenticate each immutable
-                        // posting block separately; metadata is authenticated
-                        // before admission. A whole-section CRC would read all
-                        // postings and defeat selective access.
-                        if (section_type == .inverted_text and self.postings_loader != null) return bytes;
-                        const validation = @constCast(&section.validation);
-                        switch (validation.load(.acquire)) {
-                            integrity_valid => return bytes,
-                            integrity_invalid => return error.CrcMismatch,
-                            else => {},
-                        }
-                        if (Crc32.hash(bytes) != section.checksum) {
-                            validation.store(integrity_invalid, .release);
-                            return error.CrcMismatch;
-                        }
-                        validation.store(integrity_valid, .release);
-                        return bytes;
+        if (findSegmentField(FieldInfo, self.fields, self.fields_sorted, field_name)) |field| {
+            for (field.sections) |*section| {
+                if (section.section_type == section_type) {
+                    if (section.length == 0) return null;
+                    const offset: usize = @intCast(section.offset);
+                    const length: usize = @intCast(section.length);
+                    const bytes = self.data[offset..][0..length];
+                    // Seekable remote payloads authenticate each immutable
+                    // posting block separately; metadata is authenticated
+                    // before admission. A whole-section CRC would read all
+                    // postings and defeat selective access.
+                    if (section_type == .inverted_text and self.postings_loader != null) return bytes;
+                    const validation = @constCast(&section.validation);
+                    switch (validation.load(.acquire)) {
+                        integrity_valid => return bytes,
+                        integrity_invalid => return error.CrcMismatch,
+                        else => {},
                     }
+                    if (Crc32.hash(bytes) != section.checksum) {
+                        validation.store(integrity_invalid, .release);
+                        return error.CrcMismatch;
+                    }
+                    validation.store(integrity_valid, .release);
+                    return bytes;
                 }
             }
         }
@@ -1437,16 +1465,16 @@ pub const SegmentReader = struct {
     pub fn invertedFieldStats(self: *const SegmentReader, field: []const u8) !?InvertedFieldStats {
         if (self.native != null or self.deferred != null) {
             // Immutable admission metadata survives cache capability sealing.
-            for (self.fields) |info| if (std.mem.eql(u8, info.name, field)) return info.inverted_stats;
-            return null;
+            const info = findSegmentField(FieldInfo, self.fields, self.fields_sorted, field) orelse return null;
+            return info.inverted_stats;
         }
-        for (self.fields) |info| if (std.mem.eql(u8, info.name, field)) {
+        if (findSegmentField(FieldInfo, self.fields, self.fields_sorted, field)) |info| {
             for (info.sections) |section| if (section.section_type == .inverted_text) {
                 if (section.offset > self.data.len or section.length > self.data.len - section.offset) return null;
                 const reader = inverted.InvertedIndexReader.init(self.alloc, self.data[@intCast(section.offset)..][0..@intCast(section.length)]) catch return null;
                 return .{ .doc_count = reader.doc_count, .total_field_len = reader.total_field_len };
             };
-        };
+        }
         return null;
     }
 
@@ -7441,6 +7469,7 @@ pub const RangeSegmentReader = struct {
     alloc: Allocator,
     source: SegmentSource,
     fields: []Field,
+    fields_sorted: bool = false,
     doc_count: u32,
     stored_offset: u64,
     stored_length: u64,
@@ -7534,7 +7563,7 @@ pub const RangeSegmentReader = struct {
         }
         if (options.key_range_only) {
             const fields = try keyRangeNavigation(alloc, source, navigation_start, footer_start, stored + stored_len, &checksum_scratch);
-            return .{ .alloc = alloc, .source = source, .fields = fields, .doc_count = count, .stored_offset = stored, .stored_length = stored_len, .stored_metadata_length = stored_meta_len, .num_blocks = blocks, .id_bytes_length = ids, .paged_source = paged_source };
+            return .{ .alloc = alloc, .source = source, .fields = fields, .fields_sorted = true, .doc_count = count, .stored_offset = stored, .stored_length = stored_len, .stored_metadata_length = stored_meta_len, .num_blocks = blocks, .id_bytes_length = ids, .paged_source = paged_source };
         }
         var cursor = MetadataCursor{ .source = source, .pos = navigation_start, .end = footer_start, .buffer = &checksum_scratch };
         const field_count = try cursor.int(u16);
@@ -7549,13 +7578,12 @@ pub const RangeSegmentReader = struct {
             alloc.free(fields);
         }
         var allocated: usize = fields.len * @sizeOf(Field);
-        for (fields, 0..) |*field, fi| {
+        for (fields) |*field| {
             const name_len = try cursor.int(u16);
             if (name_len > options.metadata_limit_bytes -| allocated) return error.SegmentMetadataTooLarge;
             const name = try alloc.alloc(u8, name_len);
             errdefer alloc.free(name);
             try cursor.read(name);
-            for (fields[0..fi]) |previous| if (std.mem.eql(u8, previous.name, name)) return error.InvalidSegment;
             const sections_count = try cursor.int(u16);
             allocated += name_len;
             const section_bytes = @as(usize, sections_count) * @sizeOf(SegmentReader.SectionInfo);
@@ -7578,7 +7606,8 @@ pub const RangeSegmentReader = struct {
             initialized += 1;
         }
         if (cursor.pos != cursor.end) return error.InvalidSegment;
-        return .{ .alloc = alloc, .source = source, .fields = fields, .doc_count = count, .stored_offset = stored, .stored_length = stored_len, .stored_metadata_length = stored_meta_len, .num_blocks = blocks, .id_bytes_length = ids, .paged_source = paged_source };
+        try sortSegmentFields(Field, fields);
+        return .{ .alloc = alloc, .source = source, .fields = fields, .fields_sorted = true, .doc_count = count, .stored_offset = stored, .stored_length = stored_len, .stored_metadata_length = stored_meta_len, .num_blocks = blocks, .id_bytes_length = ids, .paged_source = paged_source };
     }
 
     pub fn deinit(self: *RangeSegmentReader) void {
@@ -7598,9 +7627,8 @@ pub const RangeSegmentReader = struct {
     }
 
     pub fn findSection(self: *const RangeSegmentReader, field_name: []const u8, kind: SectionType) ?*const SegmentReader.SectionInfo {
-        for (self.fields) |field| if (std.mem.eql(u8, field.name, field_name)) {
-            for (field.sections) |*entry| if (entry.section_type == kind) return entry;
-        };
+        const field = findSegmentField(Field, self.fields, self.fields_sorted, field_name) orelse return null;
+        for (field.sections) |*entry| if (entry.section_type == kind) return entry;
         return null;
     }
 
@@ -12788,4 +12816,54 @@ test "merge provenance fuses typed preparation and coalesces contiguous source r
     std.debug.print("MERGE_PROVENANCE rows=8192 prior_point_callbacks=8192 fused_range_callbacks={d} extra_plan_passes=0\n", .{observed.calls});
     var failed: Observe = .{ .fail = true };
     try std.testing.expectError(error.Canceled, SortedPreparation.initWithProvenance(a, asSortedRecords(records), &inputs, .{ .ptr = &failed, .emit = Observe.emit }));
+}
+
+test "privacy wide segment directories use sorted navigation and reject duplicate fields" {
+    const a = std.testing.allocator;
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    const count = 2048;
+    for (0..count) |position| {
+        const i = count - 1 - position;
+        var name: [32]u8 = undefined;
+        const field = try writer.addField(try std.fmt.bufPrint(&name, "field-{d}", .{i}));
+        var value: [4]u8 = undefined;
+        std.mem.writeInt(u32, &value, @intCast(i), .little);
+        try writer.addSection(field, .synonym, &value);
+    }
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var mapped = try SegmentReader.init(a, bytes);
+    defer mapped.deinit();
+    var range = try RangeSegmentReader.init(a, .{ .contiguous = bytes }, .{});
+    defer range.deinit();
+    var native = try SegmentReader.initSource(a, .{ .contiguous = bytes });
+    defer native.deinit();
+    try std.testing.expect(mapped.fields_sorted and range.fields_sorted and native.fields_sorted);
+    for (mapped.fields, 0..) |field, i| {
+        if (i != 0) try std.testing.expect(std.mem.order(u8, mapped.fields[i - 1].name, field.name) == .lt);
+    }
+    for (0..count) |i| {
+        var name: [32]u8 = undefined;
+        const field = try std.fmt.bufPrint(&name, "field-{d}", .{i});
+        var value: [4]u8 = undefined;
+        var scratch: [1024]u8 = undefined;
+        try std.testing.expect(try range.readSectionInto(field, .synonym, 0, &value, &scratch));
+        try std.testing.expectEqual(@as(u32, @intCast(i)), std.mem.readInt(u32, &value, .little));
+        try std.testing.expectEqualSlices(u8, &value, (try mapped.getSection(field, .synonym)).?);
+        try std.testing.expectEqualSlices(u8, &value, (try native.getSection(field, .synonym)).?);
+        try std.testing.expect(mapped.hasSection(field, .synonym));
+        try std.testing.expect(!mapped.hasSection(field, .vector));
+        try std.testing.expect(try mapped.getSection(field, .vector) == null);
+    }
+    try std.testing.expect(try mapped.getSection("missing", .synonym) == null);
+    try std.testing.expect(range.findSection("missing", .synonym) == null);
+    var duplicate = SegmentWriter.init(a);
+    defer duplicate.deinit();
+    _ = try duplicate.addField("same");
+    _ = try duplicate.addField("same");
+    const invalid = try duplicate.build();
+    defer a.free(invalid);
+    try std.testing.expectError(error.InvalidSegment, SegmentReader.init(a, invalid));
+    try std.testing.expectError(error.InvalidSegment, RangeSegmentReader.init(a, .{ .contiguous = invalid }, .{}));
 }

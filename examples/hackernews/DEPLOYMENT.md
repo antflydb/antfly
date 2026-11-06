@@ -24,38 +24,18 @@ qualification infrastructure and is not attached to the real Cloud instance.
 
 ## Managed Cloud setup
 
-The matching Colony implementation and runbook are in
-`docs/cloud/hackernews-rc-qualification.md`. That change requires a new Colony
-application release: it adds a pinned first-boot native runtime, immutable remote
-artifact placement, instance-bound default-identity GCS connections and trusted
-principal forwarding for native composed queries. A runtime catalog edit alone
-cannot install it. RC.9 is pinned in `runtime.json`; verify final release
-publication before rollout. Build success or a local library test does not
-qualify a managed instance.
-Deploy Colony's RC.7 signing compatibility change (#877, backported to v0.2.83)
-before upgrading an existing managed instance. RC.7 verifies signed Cloud
-principals in standalone mode and preserves object generations during catalog
-binding; these fixes unblock scoped overlay queries and object-table searches.
-RC.9 includes scoped CDC writer authorization (#1417) and the accepted-read
-empty-WAL key-binding fix (#1442), qualified locally with text, dense, sparse
-and hybrid searches and retained cursor recovery. The producer keeps
-table read/write permission; catalog initialization and maintenance remain admin
-operations. Resume the seed producer's existing durable epoch/checkpoint when
-qualifying or launching it, rather than introducing a second CDC owner.
+Use the runtime in `runtime.json` for the database and the producer library.
+Verify that the managed instance reports the pinned image, accepts the gateway's
+scoped queries, and permits the producer's table writes. Reserve catalog
+initialization and maintenance for an administrator.
 
-The seed producer created with RC.8 uses an indexed revision-4 `.aflite` file;
-RC.9 uses revision 7 and rejects that physical file. Migrate through a portable
-`.afb` backup using the matching RC.8 binary/library for export and RC.9 for
-restore, as described in [Lite backup and restore](../../docs/guides/lite.mdx).
-Use the producer writer lock to capture a stable copy, retain the original, and
-restore into a new file. Compare every logical key/document, the source epoch,
-checkpoint, cohort and pending intent before promotion. Do not initialize a new
-CDC owner or silently reset a pending intent. Qualification restored all 497
-seed-state documents with identical logical digest, epoch and checkpoint 2;
-the original owner file remains unchanged until an explicitly managed switch.
+For an existing producer, hold its writer lock and retain a backup before moving
+its durable checkpoint. If the physical format differs, export a portable
+`.afb` with the source runtime and restore it into a fresh file with the pinned
+runtime. Compare all logical records, the source epoch, checkpoint, cohort and
+pending intent before resuming the producer. See [Lite backup and restore](../../docs/guides/lite.mdx).
 
-The plan defaults to the exact published RC.9 OCI index in `runtime.json`. An
-optional `--image` accepts a registry mirror only when its digest matches that pin.
+The plan accepts a registry mirror with the same pinned OCI index digest.
 Generate reviewable requests in a new directory, without contacting Cloud:
 
 ```sh
@@ -130,7 +110,7 @@ and native producer retain the tenant prefix and reject redirects, so credential
 and exact write retries cannot silently move to another host. Browser requests
 cannot select backend URLs, table names or pass their own upstream credential.
 
-Prepare the producer's matching RC.9 library from the repository root. This checks
+Prepare the producer's pinned library from the repository root. This checks
 published source/version metadata, archive size and SHA-256 against `runtime.json`;
 it refuses to overwrite an existing extracted library. The receipt is included in
 the producer image. Select the same architecture for preparation and Docker build.
@@ -224,7 +204,7 @@ view at `hn.antfly.io`. The prior $150 ceiling covers incremental qualification;
 review remaining spend before archive jobs and agree on an ongoing serving budget.
 
 Local validation on October 27: 56 relevant HN tests passed against the checksum-verified
-RC.5 draft native server and embedded library, including real filtered/date-sorted
+then-current native server and embedded library, including real filtered/date-sorted
 gateway and saved-overlay pagination. Two JavaScript URL/date-state tests passed;
 fixture browser checks covered desktop/mobile layout, filters, pagination, shared
 URL reloads, copy-link sanitization and Back/Forward restoration. Both amd64

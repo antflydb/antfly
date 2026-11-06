@@ -170,6 +170,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         "db public artifact reprocess accepts durable work despite unrelated provider retries",
         "db public extraction budget rejection publishes a failure manifest",
         "db document extraction manifest inspection and reprocess API",
+        "db artifact manifest list",
         "db generic artifact repair queue",
         "db successful asset publication clears terminal debt",
         "db artifact repair kind",

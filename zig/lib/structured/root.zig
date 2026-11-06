@@ -1367,6 +1367,7 @@ test "constrained batches pack physical pixels and isolate oversized or malforme
     var fake = Fake{};
     var png: [24]u8 = @splat(0);
     @memcpy(png[0..8], "\x89PNG\r\n\x1a\n");
+    @memcpy(png[12..16], "IHDR");
     std.mem.writeInt(u32, png[16..20], 7, .big);
     std.mem.writeInt(u32, png[20..24], 5, .big);
     const encoded = try a.alloc(u8, std.base64.standard.Encoder.calcSize(png.len));

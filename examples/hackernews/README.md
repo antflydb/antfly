@@ -1162,7 +1162,7 @@ and its retained disk are not prerequisites for the managed deployment.
 For the managed Cloud deployment, staged provider/table plans, authenticated gateway,
 resumable initial seed and supervised Lite producer, see [DEPLOYMENT.md](DEPLOYMENT.md).
 The production target reuses Colony’s `antfly-showcases` hosting foundation; the
-standalone renderer is a qualification tool. Managed RC.5 and archive-scale
+standalone renderer is a qualification tool. Managed deployment and archive-scale
 acceptance remain deployment gates.
 
 For continuous writable Iceberg changes, publication visibility, catalog-history
