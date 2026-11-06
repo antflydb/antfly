@@ -7,20 +7,10 @@ export interface AntflySqlToolOptions {
   database?: string;
   namespace?: string;
   /**
-   * Default `true`. When true, only statements that look like reads
-   * (SELECT/WITH/SHOW/EXPLAIN/VALUES/TABLE) are allowed.
-   *
-   * IMPORTANT: this is a client-side syntax check, not a security boundary.
-   * A model (or anything else holding this tool) could rephrase a statement
-   * to slip past a naive keyword check, and this package cannot enforce
-   * anything the credential itself does not enforce. The real server-side
-   * enforcement is per-table `read` vs `write` permission grants, checked
-   * in `zig/pkg/antfly/src/api/sql_execution.zig` via
-   * `http_server.permissionsAllow(identity.permissions, .table, ..., .write)`
-   * (see `specs/openapi/auth/api.yaml`'s table-scoped grants). Construct
-   * this tool with a credential that only has `read` grants on the tables
-   * it should touch if you need that guarantee; this flag only gives a
-   * fast, honest, client-side fail-safe on top of that.
+   * Default `true`: refuse statements that look like writes. This catches mistakes
+   * when the credential is broader than it should be, or when a local server runs
+   * with authentication off. It is not a security boundary. Antfly's permissions
+   * are: give this tool an API key whose grants only allow `read`.
    */
   readOnly?: boolean;
   /** Admission bound on result rows, not an implicit SQL LIMIT. Default 128. */

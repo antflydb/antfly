@@ -53,13 +53,14 @@ constructor options, not model-controllable tool arguments, per antfly#1505.
 - **Graph**: bounded canonical Antfly graph JSON (`match`/`traverse`/
   `shortest_path`/`k_shortest_paths`) against one fixed table/index. Cypher
   is not supported, matching `@antfly/langchain`'s graph tool.
-- **SQL**: read-only by default. This is enforced two ways: a client-side
-  statement-shape check (not a security boundary -- documented on
-  `AntflySqlToolOptions.readOnly`), and, for real enforcement, the
-  credential's own server-side per-table `read`/`write` grant (checked in
-  `zig/pkg/antfly/src/api/sql_execution.zig`). Construct the tool with a
-  credential that only has `read` grants if you need that guarantee. Writing
-  requires `readOnly: false` in code, never a tool argument.
+- **SQL**: Antfly's normal permissions decide what a statement can do: every
+  table a statement touches is checked against the caller's `read` or `write`
+  grant. Give the tool an API key scoped to `"operations": ["read"]` (see
+  `docs/reference/auth.md`). The tool also refuses statements that look like
+  writes unless constructed with `readOnly: false`. That check is a guard against
+  mistakes when a key is broader than it should be, or when a local server runs
+  with authentication off and permissions aren't checked at all. It isn't a
+  security boundary. Writing is never a tool argument.
 
 ## Chat history
 
