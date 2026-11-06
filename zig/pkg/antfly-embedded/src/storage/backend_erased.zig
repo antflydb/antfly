@@ -938,6 +938,29 @@ pub const NamespaceWriteTxn = struct {
     }
 };
 
+/// A durability ticket returned by `Batch.commitStaged`. The write's effects
+/// are applied (and, for backends with a staged commit phase, enqueued into a
+/// group that some thread will drive to a shared fsync) by the time the
+/// ticket is returned; `wait` blocks only for that durability, not for
+/// applying the write itself. Backends with no staged-commit phase (the
+/// hosted LSM, hbc and in-memory backends, which fsync or otherwise durably
+/// apply inline) hand back a ticket whose `wait` is a no-op: WS3 §3.2.
+pub const Ticket = struct {
+    allocator: Allocator = undefined,
+    ptr: *anyopaque = undefined,
+    wait_fn: ?*const fn (Allocator, *anyopaque) anyerror!void = null,
+
+    /// A ticket for a write that is already durable (or needed no durability
+    /// phase of its own) by the time it is returned.
+    pub fn alreadyDurable() Ticket {
+        return .{};
+    }
+
+    pub fn wait(self: Ticket) !void {
+        if (self.wait_fn) |run| try run(self.allocator, self.ptr);
+    }
+};
+
 pub const Batch = struct {
     allocator: Allocator,
     ptr: *anyopaque,
@@ -948,6 +971,11 @@ pub const Batch = struct {
     pub const VTable = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         commit: *const fn (Allocator, *anyopaque) anyerror!void,
+        /// Optional: a backend that can separate "apply and enqueue for
+        /// durability" from "wait for durability" (Lite's group commit)
+        /// implements this. Backends without it fall back to `commit` plus
+        /// an already-durable ticket in `Batch.commitStaged`.
+        commit_staged: ?*const fn (Allocator, *anyopaque) anyerror!Ticket = null,
         get: *const fn (*anyopaque, []const u8) anyerror![]const u8,
         has_prefix: ?*const fn (*anyopaque, []const u8) anyerror!bool = null,
         get_many_sorted: ?*const fn (*anyopaque, []const []const u8, []?[]const u8) anyerror!void = null,
@@ -961,6 +989,36 @@ pub const Batch = struct {
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
+    /// Installed by `commitStaged` once a ticket has been handed out: the
+    /// underlying handle is already owned by that ticket, so every method
+    /// is inert instead of touching `ptr` (which may itself be freed by the
+    /// time, if ever, one of these runs).
+    const consumed_vtable: VTable = .{
+        .abort = struct {
+            fn run(_: Allocator, _: *anyopaque) void {}
+        }.run,
+        .commit = struct {
+            fn run(_: Allocator, _: *anyopaque) anyerror!void {
+                return error.TransactionClosed;
+            }
+        }.run,
+        .get = struct {
+            fn run(_: *anyopaque, _: []const u8) anyerror![]const u8 {
+                return error.TransactionClosed;
+            }
+        }.run,
+        .put = struct {
+            fn run(_: *anyopaque, _: []const u8, _: []const u8) anyerror!void {
+                return error.TransactionClosed;
+            }
+        }.run,
+        .delete = struct {
+            fn run(_: *anyopaque, _: []const u8) anyerror!void {
+                return error.TransactionClosed;
+            }
+        }.run,
+    };
+
     pub fn abort(self: *Batch) void {
         const gate = self.write_gate;
         self.vtable.abort(self.allocator, self.ptr);
@@ -968,10 +1026,37 @@ pub const Batch = struct {
         self.* = undefined;
     }
 
-    pub fn commit(self: *Batch) !void {
+    /// Apply the batch and enqueue it for durability, returning a ticket
+    /// instead of blocking for the fsync. Callers release locks scoped to
+    /// "a transaction is open" (an apply lock, a connection gate, a writer
+    /// slot) between this call and `Ticket.wait`, so independent writers can
+    /// share one group-commit fsync (WS3). `commit` is exactly this plus an
+    /// immediate wait, for callers that have no locks to drop in between.
+    pub fn commitStaged(self: *Batch) !Ticket {
+        if (self.vtable.commit_staged) |staged| {
+            const ticket = try BoundaryAbi.call("commit_staged", self.boundary_dispatch, staged, .{ self.allocator, self.ptr });
+            // Ownership of the underlying handle has moved into the ticket,
+            // which will tear it down once `wait` resolves -- whether that
+            // succeeds or fails, since a staged write cannot be recalled
+            // (WS3 design doc §3.2a). `self` must still tolerate a caller's
+            // `errdefer batch.abort()` firing later if `wait` itself fails
+            // (`commit` is exactly `commitStaged` then `wait`), so leave it
+            // pointed at an inert vtable instead of `undefined`: that keeps
+            // the pre-split contract that a failed `commit` leaves `self`
+            // safely abortable, even though there is nothing left to abort.
+            self.vtable = &consumed_vtable;
+            return ticket;
+        }
         try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
-        if (self.write_gate) |mutex| mutex.unlock();
+        const gate = self.write_gate;
         self.* = undefined;
+        if (gate) |mutex| mutex.unlock();
+        return Ticket.alreadyDurable();
+    }
+
+    pub fn commit(self: *Batch) !void {
+        var ticket = try self.commitStaged();
+        try ticket.wait();
     }
 
     pub fn get(self: *Batch, key: []const u8) ![]const u8 {
@@ -2042,6 +2127,70 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             try unbox(ptr).commit();
         }
 
+        /// Mirrors `ParentBox.commit`'s close guard, but the fsync-durability
+        /// wait moves into the returned ticket instead of running here. If
+        /// `Handle.commitStaged` itself fails synchronously, `finalizing` is
+        /// rolled back and the box is left alone, exactly like `commit`'s
+        /// error path (the caller may still call `abort`). Once a ticket is
+        /// handed out, the parent box is torn down only from the ticket's
+        /// `wait` callback below, whether that wait succeeds or fails.
+        fn commitStaged(ticket_allocator: Allocator, ptr: *anyopaque) anyerror!Ticket {
+            const parent = unbox(ptr);
+            platform.sync.lockYielding(&parent.mutex);
+            if (parent.owner_closed or parent.finalizing) {
+                parent.mutex.unlock();
+                return error.TransactionClosed;
+            }
+            if (parent.child_count != 0) {
+                parent.mutex.unlock();
+                return error.TransactionCursorActive;
+            }
+            parent.finalizing = true;
+            parent.mutex.unlock();
+
+            const payload = parent.handle.commitStaged() catch |err| {
+                platform.sync.lockYielding(&parent.mutex);
+                parent.finalizing = false;
+                parent.mutex.unlock();
+                return err;
+            };
+
+            const TicketBox = struct {
+                parent: *ParentBox(Handle),
+                payload: @TypeOf(payload),
+            };
+            const box = try ticket_allocator.create(TicketBox);
+            box.* = .{ .parent = parent, .payload = payload };
+            return .{
+                .allocator = ticket_allocator,
+                .ptr = box,
+                .wait_fn = struct {
+                    fn run(alloc: Allocator, raw: *anyopaque) anyerror!void {
+                        const typed: *TicketBox = @ptrCast(@alignCast(raw));
+                        const boxed_parent = typed.parent;
+                        const parent_allocator = boxed_parent.allocator;
+                        defer alloc.destroy(typed);
+                        defer parent_allocator.destroy(boxed_parent);
+                        typed.payload.wait() catch |err| {
+                            // On success `payload.wait` (the backend's own
+                            // staged-commit type) already released/freed
+                            // everything it owns. On failure it deliberately
+                            // leaves the handle exactly as `commitStaged`
+                            // left it -- abortable, not yet torn down -- so
+                            // `OutcomeUnknown`/a rejected apply does not leak
+                            // the pending-write state. Finish that abort here
+                            // instead of in `Batch.abort` (which cannot reach
+                            // it any more: the caller's `backend_erased.Batch`
+                            // was already pointed at the inert `consumed_vtable`
+                            // once this ticket was handed out).
+                            boxed_parent.handle.abort();
+                            return err;
+                        };
+                    }
+                }.run,
+            };
+        }
+
         fn get(ptr: *anyopaque, key: []const u8) anyerror![]const u8 {
             return try unbox(ptr).handle.get(key);
         }
@@ -2105,6 +2254,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
         .vtable = &.{
             .abort = vt.abort,
             .commit = vt.commit,
+            .commit_staged = if (@hasDecl(Handle, "commitStaged")) vt.commitStaged else null,
             .get = vt.get,
             .get_many_sorted = vt.getManySorted,
             .has_prefix = if (@hasDecl(Handle, "hasPrefix")) vt.hasPrefix else null,

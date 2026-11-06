@@ -3623,7 +3623,63 @@ pub const Txn = struct {
         self.* = undefined;
     }
 
-    pub fn commit(self: *Txn) !void {
+    const PrimaryCommitContext = struct {
+        mutations: []const native.DocumentMutation,
+        fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
+            const context: *@This() = @ptrCast(@alignCast(ptr));
+            try file.putDocumentBatch(context.mutations);
+        }
+    };
+
+    /// Returned by `commitStaged` (WS3). The write is staged (applied into
+    /// the group's in-memory buffer, or already past that point) by the
+    /// time this is returned; `wait` blocks only for the group's fsync. Any
+    /// locks scoped to "a transaction is open" may be released by the
+    /// caller between `commitStaged` returning and calling `wait`, so an
+    /// outer caller (storage/docstore.zig's `commitStaged`, and above that
+    /// the DB apply lock and the capi connection gate) can drop its own
+    /// locks before paying for durability instead of holding them across it.
+    ///
+    /// `mutations`/`context` must stay alive until the group's apply runs,
+    /// which is only guaranteed once the ticket resolves -- not merely once
+    /// it is staged, since staging may just enqueue behind an in-flight
+    /// group. `wait` is therefore also where the transaction's pending
+    /// buffers (which `mutations`' key/value slices borrow from) are freed:
+    /// freeing them any earlier would race the group leader's apply.
+    pub const StagedCommit = struct {
+        allocator: Allocator = undefined,
+        txn: ?*Txn = null,
+        ticket: ?Store.Ticket = null,
+        context: ?*PrimaryCommitContext = null,
+
+        pub fn wait(self: StagedCommit) !void {
+            // Unconditional: `mutations`/`context` are never touched again
+            // after the ticket resolves, success or failure, since the
+            // group's apply (the only reader) has already run either way.
+            defer if (self.context) |ctx| {
+                self.allocator.free(ctx.mutations);
+                self.allocator.destroy(ctx);
+            };
+            if (self.ticket) |ticket| try ticket.wait();
+            // Only on success: a failed ticket (OutcomeUnknown, a rejected
+            // apply) leaves the transaction exactly as `commitStaged` left
+            // it -- generation lock and writer slot already released, but
+            // pending writes intact -- so the caller can still call `abort`,
+            // matching `commit`'s original contract before this split.
+            if (self.txn) |txn| {
+                txn.freePending();
+                txn.freeOwnedReads();
+                txn.* = undefined;
+            }
+        }
+    };
+
+    /// Stage this transaction's writes and return once they are enqueued
+    /// (WS3): the writer slot and the generation read lock are released
+    /// here, before any durability wait. `commit` is this plus an
+    /// immediate `wait`, for callers with no locks of their own to drop
+    /// in between.
+    pub fn commitStaged(self: *Txn) !StagedCommit {
         if (self.read_only) return error.ReadOnly;
         const store = self.store orelse return error.ReadOnly;
         // Metadata probes may use a write transaction without staging changes.
@@ -3631,11 +3687,11 @@ pub const Txn = struct {
         // would unnecessarily run retirement pressure and allocator proof work.
         if (self.pending_count == 0) {
             self.abort();
-            return;
+            return .{};
         }
         const allocator = self.allocator;
         var mutations = try allocator.alloc(native.DocumentMutation, self.pending_count);
-        defer allocator.free(mutations);
+        errdefer allocator.free(mutations);
         var node = self.pending_tree.getMin();
         var i: usize = 0;
         var estimated_bytes: usize = 0;
@@ -3646,14 +3702,9 @@ pub const Txn = struct {
             node = current.next();
         }
 
-        const Commit = struct {
-            mutations: []const native.DocumentMutation,
-            fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
-                const context: *@This() = @ptrCast(@alignCast(ptr));
-                try file.putDocumentBatch(context.mutations);
-            }
-        };
-        var context = Commit{ .mutations = mutations };
+        const context = try allocator.create(PrimaryCommitContext);
+        errdefer allocator.destroy(context);
+        context.* = .{ .mutations = mutations };
         errdefer {
             if (self.writer_reserved) {
                 store.releaseWriterSlot();
@@ -3667,17 +3718,19 @@ pub const Txn = struct {
         // who must wait for this one's fsync. Releasing it here lets the next
         // writer open and stage into the same group while this one's commit
         // (and the fsync it may share with other stagers) is still running.
-        const ticket = try store.stage(.{ .context = &context, .apply = Commit.apply, .estimated_bytes = estimated_bytes });
+        const ticket = try store.stage(.{ .context = context, .apply = PrimaryCommitContext.apply, .estimated_bytes = estimated_bytes });
         self.releaseGenerationReadLock();
         if (self.writer_reserved) {
             store.releaseWriterSlot();
             self.writer_reserved = false;
         }
-        try ticket.wait();
 
-        self.freePending();
-        self.freeOwnedReads();
-        self.* = undefined;
+        return .{ .allocator = allocator, .txn = self, .ticket = ticket, .context = context };
+    }
+
+    pub fn commit(self: *Txn) !void {
+        var staged = try self.commitStaged();
+        try staged.wait();
     }
 
     /// Caller owns the result. Unlike get(), this does not retain keys or

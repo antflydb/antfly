@@ -3057,6 +3057,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 test_before_primary_commit = null;
                 try hook.run(hook.ptr);
             };
+            // WS3: staged, not yet durable. The primary write is applied and
+            // enqueued for the native store's group commit here, under the
+            // apply lock (sequence assignment/validation above stays under
+            // it, per WS2's durability-order-equals-apply-order guarantee),
+            // but the fsync wait moves past the apply lock release below so
+            // concurrent writers can share one group-commit fsync instead of
+            // serializing behind each other's durability wait.
+            var primary_ticket: ?docstore_mod.DocStore.StagedDocBatch = null;
             const transaction_applied = if (opts.transaction_resolution) |resolution| blk: {
                 const outcome = try S.ownerField(self, "core").*.resolveTransactionIntentsWithExtraBatch(
                     resolution.txn_id,
@@ -3081,7 +3089,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             } else blk: {
                 if (durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null)
                     S.ownerField(self, "local_execution").*.durable_replication_outbox_maybe.store(true, .release);
-                try S.ownerField(self, "core").*.store.putBatchWithReplayAndParticipant(
+                primary_ticket = try S.ownerField(self, "core").*.store.putBatchWithReplayStagedAndParticipant(
                     S.ownerField(self, "backend_runtime").*.io(),
                     write_buffers.store_writes.items,
                     write_buffers.delete_keys.items,
@@ -3092,6 +3100,14 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 schedule_replication_recovery_on_exit = durable_replication_batch_outbox_key != null or durable_replication_replay_outbox_key != null;
                 break :blk transactions_mod.ResolutionOutcome{ .applied = true, .replay_sequence = sequence };
             };
+            // The write is staged regardless of what happens next in this
+            // function: once `putBatchWithReplayStagedAndParticipant`
+            // returns a ticket, it will become durable on its own (WS2's
+            // group commit does not take instructions back). If anything
+            // below fails before the normal wait point, still wait here so
+            // the ticket's heap state is freed and the apply order this
+            // write was assigned is honored, surfacing the later error above it.
+            errdefer if (primary_ticket) |*ticket| ticket.wait() catch {};
             local_coverage_guard.release();
             if (opts.primary_committed) |committed| committed.* = true;
             if (graph_publication) |*lease| lease.release();
@@ -3165,6 +3181,15 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                 split_shadow_ticket = reserveSplitShadowApplyTicket(self);
             }
             unlockProfiledApply(self, profile, &apply_mutex_held, apply_lock_acquired_ns);
+            // WS3: wait for the primary write's durability only now, with the
+            // apply lock (and, above `batchInternalPreparedOwned`, the capi
+            // connection gate) already released, so this call's fsync can
+            // share a group with whatever other writers staged while this
+            // one ran its own apply-lock-protected bookkeeping above.
+            if (primary_ticket) |*ticket| {
+                try ticket.wait();
+                primary_ticket = null;
+            }
             snapshot_mutation.release();
             if (split_shadow_ticket) |ticket| {
                 const apply_shadow_start_ns = monotonicTimeNs();
