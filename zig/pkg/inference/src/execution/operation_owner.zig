@@ -10,6 +10,15 @@ const retirement_sink = @import("retirement_sink.zig");
 /// address. No field borrows a caller stack/allocator; checked provider teardown
 /// retires every real command-buffer handler before destroying these records.
 pub const Owner = struct {
+    /// Exact inline scope field in the canonical managed Metal Compute. The
+    /// shared provider metadata endpoint charges this singleton once and lives
+    /// no shorter than that Compute. This is only same-thread metadata/index
+    /// exclusion evidence, never numerical or cleanup-boundary authority.
+    pub const MetadataIndexScope = struct {
+        token: ?operation.Borrowed = null,
+        previous: ?*MetadataIndexScope = null,
+    };
+
     // Null for the unchanged embedded Native/CUDA owner. Metal's independently
     // allocated metadata has a provider root and explicit B-use storage pins.
     storage_allocator: ?std.mem.Allocator = null,
@@ -255,7 +264,8 @@ pub const Owner = struct {
             extern fn antfly_metal_packed_use_service_metadata_bytes() usize;
         };
         const service = if (comptime @import("build_options").enable_metal) Native.antfly_metal_packed_use_service_metadata_bytes() else 0;
-        return std.math.add(usize, @sizeOf(Owner), service) catch @panic("operation metadata size overflow");
+        const project = std.math.add(usize, @sizeOf(Owner), @sizeOf(MetadataIndexScope)) catch @panic("operation metadata size overflow");
+        return std.math.add(usize, project, service) catch @panic("operation metadata size overflow");
     }
     pub fn createRetained(allocator: std.mem.Allocator) !*Owner {
         const result = try allocator.create(Owner);

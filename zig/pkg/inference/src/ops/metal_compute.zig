@@ -884,6 +884,29 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     const operation_mod = @import("../execution/backend_operation.zig");
     const operation_owner_mod = @import("../execution/operation_owner.zig");
 
+    const MetadataIndexScope = operation_owner_mod.Owner.MetadataIndexScope;
+    threadlocal var current_metadata_index_scope: ?*MetadataIndexScope = null;
+
+    fn leaveMetadataIndexScope(self: *MetalCompute, raw: *anyopaque, nonce: u64) !void {
+        const scope = &self.metadata_index_scope;
+        if (current_metadata_index_scope != scope) return error.BackendOperationChanged;
+        const token = scope.token orelse return error.BackendOperationInactive;
+        if (token.context != raw or token.nonce != nonce) return error.BackendOperationChanged;
+        current_metadata_index_scope = scope.previous;
+        scope.* = .{};
+    }
+    fn ownsMetadataIndex(self: *MetalCompute) bool {
+        const scope = current_metadata_index_scope orelse return false;
+        const token = scope.token orelse return false;
+        if (token.vtable != &operation_vtable or token.mode != .metadata) return false;
+        const snapshot = operationRecord(token.context, token.nonce) catch return false;
+        if (!snapshot.entered or snapshot.source.context != @as(*anyopaque, @ptrCast(self)) or
+            !acceptsPhysicalImplementation(snapshot.source.table) or
+            !(snapshot.ticket.ownsGate() catch return false)) return false;
+        validateOperationSnapshot(&snapshot, .{ .implementation = snapshot.source, .program = null, .mode = .metadata }) catch return false;
+        return true;
+    }
+
     fn operationAccepts(table: *const ops.ComputeBackend.VTable) bool {
         return table == &vtable_impl or table == &owned_vtable_impl;
     }
@@ -965,7 +988,10 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             // introducing an index -> residency lock-order inversion.
             if (!self.provider_impl.linear_slot_index_mutex.tryLock()) return error.QueueFull;
             errdefer self.provider_impl.linear_slot_index_mutex.unlock();
+            if (self.metadata_index_scope.token != null) return error.BackendOperationChanged;
             try operationSetEntered(raw, nonce, true);
+            self.metadata_index_scope = .{ .token = .{ .context = raw, .nonce = nonce, .mode = .metadata, .vtable = &operation_vtable }, .previous = current_metadata_index_scope };
+            current_metadata_index_scope = &self.metadata_index_scope;
             return;
         }
         try operationSetEntered(raw, nonce, true);
@@ -995,7 +1021,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         // Unknown legacy frames retain their original caller-owned lifecycle;
         // only synchronous SDK mutations were serialized. No region profile or
         // physical credit may be inferred from this mode.
-        if (record.mode == .metadata) provider.linear_slot_index_mutex.unlock() else {
+        if (record.mode == .metadata) {
+            const self: *MetalCompute = @ptrCast(@alignCast(record.source.context));
+            try self.leaveMetadataIndexScope(raw, nonce);
+            provider.linear_slot_index_mutex.unlock();
+        } else {
             _ = try provider.retirePrivateSlotsAtTerminal(&record);
             if (metal_runtime.antfly_metal_unbind_packed_use_service(provider.raw_decode_runtime, raw, nonce) != 0) return error.PackedProjectionUseScopeChanged;
         }
@@ -1015,6 +1045,8 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         if (record.entered and record.mode == .metadata) {
             const provider: *MetalNativeProvider = @ptrCast(@alignCast(record.provider));
+            const self: *MetalCompute = @ptrCast(@alignCast(record.source.context));
+            try self.leaveMetadataIndexScope(raw, nonce);
             provider.linear_slot_index_mutex.unlock();
         }
         const state: *operation_owner_mod.Owner.Record = @ptrCast(@alignCast(raw));
@@ -1853,6 +1885,7 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
     engine_operation: ?@import("../execution/backend_operation.zig").Lease = null,
     engine_cleanup_finish: ?*@import("../execution/retirement_finish_holder.zig").Holder = null,
     engine_borrowed_operation: ?@import("../execution/backend_operation.zig").Borrowed = null,
+    metadata_index_scope: MetadataIndexScope = .{},
     // Explicit synchronous receiving-wrapper loan. NEVER on shared Provider,
     // Engine, graph/cache or escaping tensor. Public free does not read it.
     workspace_invocation_context: ?*const @import("../execution/invocation_context.zig").Context = null,
@@ -11842,6 +11875,12 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         fn matchesScope(self: *@This()) bool {
             if (self.packed_owner) |pack| {
+                // Reuse only the exact entered same-thread metadata scope.
+                // Before Claim.begin and during numerical execution, acquire
+                // the independent residency index explicitly instead.
+                const inherited_index = self.compute.ownsMetadataIndex();
+                if (!inherited_index and !self.compute.provider_impl.linear_slot_index_mutex.tryLock()) return false;
+                defer if (!inherited_index) self.compute.provider_impl.linear_slot_index_mutex.unlock();
                 const facts = self.packed_request orelse return false;
                 if (self.compute.packed_projection_profile != self or (facts.count == 3 and platform.env.getenvBool("TERMITE_METAL_DISABLE_DENSE_QKV_PACKED")) or
                     metal_runtime.antfly_metal_projection_pack_available(self.compute.provider_impl.raw_decode_runtime, facts.count, &facts.slots, facts.width, &facts.widths) == 0 or
@@ -12437,6 +12476,18 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         if (!self.provider_impl.linear_slot_index_mutex.tryLock()) return error.QueueFull;
         var index_locked = true;
         defer if (index_locked) self.provider_impl.linear_slot_index_mutex.unlock();
+        // Funding ran outside all execution gates. Another cold caller may
+        // have published this exact request in the meantime. Recheck under
+        // the real source/index and creator-map exclusion before any packing.
+        platform.sync.lockYielding(&self.packed_projection_mutex);
+        const already_published = self.packedProjection(request) != null;
+        self.packed_projection_mutex.unlock();
+        if (already_published) {
+            self.provider_impl.linear_slot_index_mutex.unlock();
+            index_locked = false;
+            try active.finish();
+            return;
+        }
         const entry = try metal_runtime.PackedProjectionEntry.create(self.provider_impl.raw_decode_runtime, request, roots);
         // No fallible operation separates initialization and creator publication.
         // A later cache-publication/operation error leaves a valid cache creator,
@@ -12539,7 +12590,16 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         };
         if (storage_host != 0) {
             storage_backing = try backings.?[0].takePart(storage_host);
-            try self.provider_impl.operations.attachStorageBacking(&storage_backing);
+            self.provider_impl.operations.attachStorageBacking(&storage_backing) catch |err| switch (err) {
+                error.BackendOperationStorageAlreadyFunded => {
+                    // A concurrent cold preparation installed the singleton.
+                    // This unused split owns only its independently funded
+                    // bytes; return them outside every execution/cache gate.
+                    storage_backing.?.releaseAfterMetadataDeathOutsideExecution();
+                    storage_backing = null;
+                },
+                else => return err,
+            };
         }
         const charge = try shell.armCacheBackings(&backings);
         pending_charge = charge;
@@ -55831,11 +55891,27 @@ test "Metal provider operation leases exclude real calls and preserve sequential
     var metadata = try operation.enter(cb, null, null, .metadata);
     defer metadata.deinitChecked() catch @panic("metadata scope cleanup failed");
     try std.testing.expect(!compute.provider_impl.linear_slot_index_mutex.tryLock());
+    try std.testing.expect(compute.ownsMetadataIndex());
+    {
+        var nested_context = try @import("../backends/compute_context.zig").BackendContext.init(a, .metal, null);
+        defer nested_context.deinit(a);
+        const nested_cb = nested_context.computeBackend();
+        const nested_compute: *MetalCompute = @ptrCast(@alignCast(nested_cb.ptr));
+        var nested_metadata = try operation.enter(nested_cb, null, null, .metadata);
+        defer nested_metadata.deinitChecked() catch @panic("nested metadata cleanup failed");
+        try std.testing.expect(nested_compute.ownsMetadataIndex());
+        try std.testing.expect(!compute.ownsMetadataIndex());
+        try nested_metadata.finish();
+        try std.testing.expect(compute.ownsMetadataIndex());
+        try std.testing.expect(!nested_compute.ownsMetadataIndex());
+    }
     var borrowed_metadata = try operation.enter(cb, null, metadata.token(), .metadata);
     try borrowed_metadata.finish();
+    try std.testing.expect(compute.ownsMetadataIndex());
     _ = cb.debugTimingSnapshot();
     try std.testing.expectError(error.BackendOperationChanged, operation.call(cb, metadata.token(), ops.ComputeBackend.add, .{ &cb, input, input }));
     try metadata.finish();
+    try std.testing.expect(!compute.ownsMetadataIndex());
     try std.testing.expect(compute.provider_impl.linear_slot_index_mutex.tryLock());
     compute.provider_impl.linear_slot_index_mutex.unlock();
     try std.testing.expectEqual(before, metal_runtime_mod.frameCommandBufferCount(runtime));
@@ -55844,6 +55920,7 @@ test "Metal provider operation leases exclude real calls and preserve sequential
     try metal_runtime_mod.beginFrame(runtime);
     var failed_metadata = try operation.enter(cb, null, null, .metadata);
     try failed_metadata.deinitChecked();
+    try std.testing.expect(!compute.ownsMetadataIndex());
     try std.testing.expect(metal_runtime_mod.hasActiveFrame(runtime));
     try std.testing.expect(compute.provider_impl.linear_slot_index_mutex.tryLock());
     compute.provider_impl.linear_slot_index_mutex.unlock();

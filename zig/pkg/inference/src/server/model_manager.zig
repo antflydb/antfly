@@ -11872,6 +11872,11 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
         var other_graph_request = profile_request;
         other_graph_request.program = &graph;
         try std.testing.expectError(error.RegionExecutionProfileChanged, claim.validate(other_graph_request));
+        try std.testing.expect(compute.provider_impl.linear_slot_index_mutex.tryLock());
+        const contended_profile = claim.validate(profile_request);
+        compute.provider_impl.linear_slot_index_mutex.unlock();
+        try std.testing.expectError(error.RegionExecutionProfileChanged, contended_profile);
+        try claim.validate(profile_request);
         try std.testing.expect(try claim.ensureScope(profile_request));
         try claim.bindOwnedCleanupEpoch(&guard.epoch);
         try claim.deinitChecked();

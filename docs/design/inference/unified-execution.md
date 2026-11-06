@@ -283,11 +283,15 @@ preparation API do not by themselves complete these remaining requirements:
   normalization before export and the original prefix-copy order.
 - Metal installs synchronous assigned pair/QKV regions for complete F32
   projection heads through the production partition executor. Row-one regions
-  use the existing source ownership. Managed multirow heads can prepare one
+  use the existing source ownership. Managed multirow no-bias heads can prepare one
   immutable packed weight/bias pair after the original compatibility call has
   established source slots. The actual Source cold phase funds both host
   metadata and backend roots outside execution gates, then creates a fresh
-  request-bound profile. Dispatch retains the original direct GEMM/split policy
+  request-bound profile. Publication rechecks the exact source request under
+  execution and index exclusion after funding; concurrent losers refund their
+  unpublished allocation. Pre-entry source checks acquire the actual index or
+  validate the entered metadata owner. Its scope fields share the singleton HOST
+  charge. Dispatch retains the original direct GEMM/split policy
   and waits its exact private command buffer before publishing outputs.
   Each reuse retains its actual operation ticket, independently owned metadata
   and cleanup boundary; SDK payload death and model-close cleanup both gate
