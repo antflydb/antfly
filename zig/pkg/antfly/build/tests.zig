@@ -7393,6 +7393,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.typed_json.",
             "storage.vector_payload_store.",
             "storage.vector_wal_view.",
+            "storage.write_amplification_trace.",
             "storage.backend_conformance_test.",
             "storage.backend_erased.",
             "storage.backend_types.",

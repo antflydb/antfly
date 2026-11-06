@@ -174,9 +174,61 @@ fn jsonString(alloc: std.mem.Allocator, value: []const u8) ![]const u8 {
 const ModeReport = struct {
     updates: usize,
     report: wal_trace.Report,
+    /// Wall-clock duration of the measured loop. Zero means "not timed".
+    /// Sync/write/op counts never depend on build mode (see the README);
+    /// this is the one field in the report that does, which is why every
+    /// consumer of it is labeled "indicative only, Debug".
+    elapsed_ns: u64 = 0,
 
     fn perUpdate(self: ModeReport, lane: wal_trace.Lane) f64 {
         return @as(f64, @floatFromInt(self.report.totalSyncs(lane))) / @as(f64, @floatFromInt(self.updates));
+    }
+
+    fn totalCommitsOverall(self: ModeReport) u64 {
+        var total: u64 = 0;
+        for (std.meta.tags(wal_trace.Stage)) |s| {
+            const counts = self.report.stage(s);
+            total += counts.commits_calling_thread + counts.commits_background;
+        }
+        return total;
+    }
+
+    /// Every durable fsync this run issued, calling-thread and background
+    /// combined, per logical update -- the harness's single "total I/O
+    /// durability cost" number, as opposed to `perUpdate`'s calling-thread-
+    /// only rate.
+    fn fsyncsPerWriteOverall(self: ModeReport) f64 {
+        const total = self.report.totalSyncs(.calling_thread) + self.report.totalSyncs(.background);
+        return @as(f64, @floatFromInt(total)) / @as(f64, @floatFromInt(self.updates));
+    }
+
+    /// Every durable commit (native commit_sequence advance) this run
+    /// issued, per logical update. The inverse of group size when every
+    /// commit groups the same number of updates; reported separately
+    /// because real runs mix grouped and ungrouped commits across stages.
+    fn durableCommitsPerWrite(self: ModeReport) f64 {
+        return @as(f64, @floatFromInt(self.totalCommitsOverall())) / @as(f64, @floatFromInt(self.updates));
+    }
+
+    /// How many logical updates, on average, one durable primary-commit
+    /// transaction covered. This is the group-commit metric: it reads 1.0
+    /// when every update gets its own commit (no grouping, e.g. one
+    /// writer with no contention) and rises above 1.0 only when concurrent
+    /// writers' intents actually got bundled into shared commits.
+    fn meanPrimaryGroupSize(self: ModeReport) f64 {
+        const commits = self.report.stage(.primary_commit).commits_calling_thread;
+        if (commits == 0) return 0;
+        return @as(f64, @floatFromInt(self.updates)) / @as(f64, @floatFromInt(commits));
+    }
+
+    /// Indicative only: wall-clock throughput is sensitive to build mode,
+    /// machine load and scheduling, unlike every other field here. Debug
+    /// by default; see the README for a ReleaseFast run.
+    fn writesPerSecondIndicative(self: ModeReport) f64 {
+        if (self.elapsed_ns == 0) return 0;
+        const seconds = @as(f64, @floatFromInt(self.elapsed_ns)) / 1_000_000_000.0;
+        if (seconds <= 0) return 0;
+        return @as(f64, @floatFromInt(self.updates)) / seconds;
     }
 };
 
@@ -188,19 +240,51 @@ fn measureSingleWriter(alloc: std.mem.Allocator, comptime name: []const u8, inde
     var key_buffer: [32]u8 = undefined;
     wal_trace.reset();
     wal_trace.registerCallingThread();
+    const start_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
     for (0..updates) |i| {
         const key = try std.fmt.bufPrint(&key_buffer, "doc-{d}", .{i % 128});
         const text = payload(&buffer, 0, i);
         try insertOne(alloc, fixture.handle, key, text, if (indexed) "full_index" else "write");
     }
-    return .{ .updates = updates, .report = wal_trace.snapshot() };
+    const elapsed_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(std.testing.io).nanoseconds - start_ns));
+    return .{ .updates = updates, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
 }
+
+/// A plain spin barrier over a fixed, known set of OS threads. Every writer
+/// thread calls `wait` immediately before each of its updates, so all
+/// `participants` threads arrive at Lite's single-writer admission queue
+/// for a given round at (as close to) the same moment as the OS scheduler
+/// allows: real, deterministic contention every round, rather than leaving
+/// overlap to chance. Before this, the 8-writer modes spawned real OS
+/// threads but gave them no reason to ever be waiting at the same time, so
+/// each update's commit reliably finished before the next one arrived and
+/// group commit never had a window to bundle anything -- the harness
+/// reported numbers identical to one writer doing the same total work
+/// serially (see the former "Known limitations" note in the README).
+const Barrier = struct {
+    participants: usize,
+    count: std.atomic.Value(usize) = .init(0),
+    generation: std.atomic.Value(usize) = .init(0),
+
+    fn wait(self: *Barrier) void {
+        const gen = self.generation.load(.acquire);
+        const arrived = self.count.fetchAdd(1, .acq_rel) + 1;
+        if (arrived == self.participants) {
+            self.count.store(0, .release);
+            _ = self.generation.fetchAdd(1, .release);
+        } else {
+            while (self.generation.load(.acquire) == gen) std.Thread.yield() catch {};
+        }
+    }
+};
 
 const ConcurrentWorker = struct {
     alloc: std.mem.Allocator,
     handle: *anyopaque,
     worker: usize,
     updates_per_writer: usize,
+    sync_level: []const u8,
+    barrier: *Barrier,
     err: ?anyerror = null,
 
     fn run(self: *ConcurrentWorker) void {
@@ -208,12 +292,13 @@ const ConcurrentWorker = struct {
         var buffer: [text_bytes]u8 = undefined;
         var key_buffer: [32]u8 = undefined;
         for (0..self.updates_per_writer) |i| {
+            self.barrier.wait();
             const key = std.fmt.bufPrint(&key_buffer, "w{d}-doc-{d}", .{ self.worker, i % 128 }) catch |err| {
                 self.err = err;
                 return;
             };
             const text = payload(&buffer, self.worker, i);
-            insertOne(self.alloc, self.handle, key, text, "full_index") catch |err| {
+            insertOne(self.alloc, self.handle, key, text, self.sync_level) catch |err| {
                 self.err = err;
                 return;
             };
@@ -221,20 +306,37 @@ const ConcurrentWorker = struct {
     }
 };
 
-fn measureConcurrent(alloc: std.mem.Allocator, writers: usize, updates_per_writer: usize) !ModeReport {
-    var fixture = try Fixture.open(alloc, "lite-write-amp-concurrent", true);
+/// Real concurrent threads issuing writes through the same public path as
+/// the single-writer modes (`insertOne` -> `antfly_db_batch_json`), with
+/// `indexed` selecting the same primary-only/full_index split
+/// `measureSingleWriter` uses. Every round is barrier-synchronized (see
+/// `Barrier`) so the comparison against the matching single-writer mode
+/// actually reflects contention, not scheduling luck.
+fn measureConcurrent(alloc: std.mem.Allocator, comptime name: []const u8, indexed: bool, writers: usize, updates_per_writer: usize) !ModeReport {
+    var fixture = try Fixture.open(alloc, name, indexed);
     defer fixture.close();
 
     wal_trace.reset();
+    var barrier = Barrier{ .participants = writers };
     var workers = try alloc.alloc(ConcurrentWorker, writers);
     defer alloc.free(workers);
     var threads = try alloc.alloc(std.Thread, writers);
     defer alloc.free(threads);
-    for (0..writers) |w| workers[w] = .{ .alloc = alloc, .handle = fixture.handle, .worker = w, .updates_per_writer = updates_per_writer };
+    const sync_level: []const u8 = if (indexed) "full_index" else "write";
+    for (0..writers) |w| workers[w] = .{
+        .alloc = alloc,
+        .handle = fixture.handle,
+        .worker = w,
+        .updates_per_writer = updates_per_writer,
+        .sync_level = sync_level,
+        .barrier = &barrier,
+    };
+    const start_ns = std.Io.Clock.awake.now(std.testing.io).nanoseconds;
     for (0..writers) |w| threads[w] = try std.Thread.spawn(.{}, ConcurrentWorker.run, .{&workers[w]});
     for (threads) |thread| thread.join();
+    const elapsed_ns: u64 = @intCast(@max(0, std.Io.Clock.awake.now(std.testing.io).nanoseconds - start_ns));
     for (workers) |worker| if (worker.err) |err| return err;
-    return .{ .updates = writers * updates_per_writer, .report = wal_trace.snapshot() };
+    return .{ .updates = writers * updates_per_writer, .report = wal_trace.snapshot(), .elapsed_ns = elapsed_ns };
 }
 
 // ---------------------------------------------------------------------------
@@ -242,12 +344,19 @@ fn measureConcurrent(alloc: std.mem.Allocator, writers: usize, updates_per_write
 // ---------------------------------------------------------------------------
 
 fn printStageTable(mode_name: []const u8, mode: ModeReport) void {
-    std.debug.print("  {s}: updates={d} calling_thread_syncs_per_update={d:.3} background_syncs_per_update={d:.3}\n", .{
-        mode_name,
-        mode.updates,
-        mode.perUpdate(.calling_thread),
-        mode.perUpdate(.background),
-    });
+    std.debug.print(
+        "  {s}: updates={d} calling_thread_syncs_per_update={d:.3} background_syncs_per_update={d:.3} fsyncs_per_write_overall={d:.3} durable_commits_per_write={d:.3} mean_primary_group_size={d:.3} writes_per_second_indicative_debug={d:.1}\n",
+        .{
+            mode_name,
+            mode.updates,
+            mode.perUpdate(.calling_thread),
+            mode.perUpdate(.background),
+            mode.fsyncsPerWriteOverall(),
+            mode.durableCommitsPerWrite(),
+            mode.meanPrimaryGroupSize(),
+            mode.writesPerSecondIndicative(),
+        },
+    );
     for (std.meta.tags(wal_trace.Stage)) |stage| {
         const counts = mode.report.stage(stage);
         if (counts.sync_calling_thread + counts.sync_background + counts.write_calls_calling_thread + counts.write_calls_background == 0) continue;
@@ -312,6 +421,13 @@ const ModeJson = struct {
     updates: usize,
     calling_thread_syncs_per_update: f64,
     background_syncs_per_update: f64,
+    fsyncs_per_write_overall: f64,
+    durable_commits_per_write: f64,
+    mean_primary_group_size: f64,
+    /// Wall-clock writes/s for this mode's run. Indicative only: unlike
+    /// every other field in this report, it is sensitive to build mode,
+    /// machine load, and scheduling (see the README).
+    indicative_writes_per_second_debug: f64,
     stages: StagesJson,
     background_ops: BackgroundOpsJson,
 };
@@ -335,6 +451,10 @@ fn modeJson(mode: ModeReport) ModeJson {
         .updates = mode.updates,
         .calling_thread_syncs_per_update = mode.perUpdate(.calling_thread),
         .background_syncs_per_update = mode.perUpdate(.background),
+        .fsyncs_per_write_overall = mode.fsyncsPerWriteOverall(),
+        .durable_commits_per_write = mode.durableCommitsPerWrite(),
+        .mean_primary_group_size = mode.meanPrimaryGroupSize(),
+        .indicative_writes_per_second_debug = mode.writesPerSecondIndicative(),
         .stages = .{
             .primary_commit = stageJson(mode, .primary_commit),
             .artifact_stage = stageJson(mode, .artifact_stage),
@@ -368,6 +488,7 @@ fn modeJson(mode: ModeReport) ModeJson {
 const ReportJson = struct {
     text_bytes: usize,
     primary_only: ModeJson,
+    primary_only_8_writers: ModeJson,
     indexed: ModeJson,
     indexed_8_writers: ModeJson,
 };
@@ -378,16 +499,19 @@ test "lite write amplification report" {
 
     const primary = try measureSingleWriter(alloc, "lite-write-amp-primary", false, updates);
     const indexed = try measureSingleWriter(alloc, "lite-write-amp-indexed", true, updates);
-    const concurrent = try measureConcurrent(alloc, default_writers, updates / default_writers);
+    const primary_concurrent = try measureConcurrent(alloc, "lite-write-amp-primary-concurrent", false, default_writers, updates / default_writers);
+    const concurrent = try measureConcurrent(alloc, "lite-write-amp-concurrent", true, default_writers, updates / default_writers);
 
     std.debug.print("lite write amplification report (updates={d}, text_bytes={d}):\n", .{ updates, text_bytes });
     printStageTable("primary-only", primary);
+    printStageTable("primary-only, 8 writers", primary_concurrent);
     printStageTable("full-text-visible (indexed)", indexed);
     printStageTable("full-text-visible, 8 writers", concurrent);
 
     const report: ReportJson = .{
         .text_bytes = text_bytes,
         .primary_only = modeJson(primary),
+        .primary_only_8_writers = modeJson(primary_concurrent),
         .indexed = modeJson(indexed),
         .indexed_8_writers = modeJson(concurrent),
     };
@@ -414,6 +538,22 @@ test "lite write amplification ceilings" {
     const slack = 1.25;
     try expectAtMost(primary.perUpdate(.calling_thread), 3.0 * slack, "primary-only calling-thread syncs/update");
     try expectAtMost(indexed.perUpdate(.calling_thread), 67.0 * slack, "indexed calling-thread syncs/update");
+
+    // Extend the same ceilings to the 8-writer modes: the writer slot, the
+    // DB apply lock and the per-call cross-process path lease are all held
+    // across the fsync (see docs/design/lite-performance/
+    // lite-single-commit-write-path.md's "throughput falls as writers are
+    // added" note), so the existing group-commit queue cannot yet bundle
+    // concurrent foreground writers' commits -- measured mean_primary_group_
+    // size is 1.0 today, confirmed by this same harness's report test.
+    // Concurrency must not make amplification *worse* than the matching
+    // single-writer mode, even though it cannot yet make it better; this
+    // gate exists so a future regression in the concurrent path specifically
+    // (as opposed to the primary/indexed path in general) is still caught.
+    const primary_concurrent = try measureConcurrent(alloc, "lite-write-amp-ceil-primary-concurrent", false, default_writers, updates / default_writers);
+    const indexed_concurrent = try measureConcurrent(alloc, "lite-write-amp-ceil-indexed-concurrent", true, default_writers, updates / default_writers);
+    try expectAtMost(primary_concurrent.perUpdate(.calling_thread), 3.0 * slack, "primary-only 8-writer calling-thread syncs/update");
+    try expectAtMost(indexed_concurrent.perUpdate(.calling_thread), 67.0 * slack, "indexed 8-writer calling-thread syncs/update");
 }
 
 fn expectAtMost(actual: f64, ceiling: f64, comptime label: []const u8) !void {

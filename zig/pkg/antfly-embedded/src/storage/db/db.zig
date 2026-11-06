@@ -22869,6 +22869,38 @@ pub const DB = struct {
                 std.log.warn("native backup projection validation deferred index={s} err={s}", .{ projection.name, err_name });
                 return error.NativeBackupProjectionValidationIndeterminate;
             }
+            // A restored primary store carries forward whatever progress v2
+            // record its source had as an ordinary part of the physical KV
+            // copy -- no extra plumbing needed when both ends speak v2. A
+            // backup captured before progress v2 existed (see
+            // testdata/v02-server: a genuine v0.2.5 release artifact, not an
+            // internal fixture) has no v2 record at all: its per-projection
+            // applied_sequence came from the since-deleted v1 checkpoint
+            // representation and was folded into this authenticated manifest
+            // at capture time. Treat that total absence as a migration, not
+            // corruption: seed v2 once from the manifest's already-
+            // authenticated values, the same way an invalidated projection's
+            // checkpoint is seeded below. A v2 record that *does* exist and
+            // disagrees with the manifest is still a genuine mismatch.
+            //
+            // Dense projections are excluded: their checkpoint authority is
+            // HBC metadata (denseProjectionCheckpointMetadata), not this v2
+            // key, and the comment below already explains why this generic
+            // comparison cannot validate them before physical installation.
+            // Seeding v2 here would route through saveProjectionCheckpoint's
+            // dense branch and overwrite that HBC metadata with the
+            // manifest's generic fields instead of leaving dense's own,
+            // later, physical-coverage check as the sole authority.
+            if (cfg.kind != .dense_vector and
+                try apply_state.loadProgress(alloc, self.core.store, projection.name) == null)
+            {
+                try self.core.saveProjectionCheckpoint(projection.name, .{
+                    .applied_sequence = projection.applied_sequence,
+                    .status = .clean,
+                    .generation = projection.checkpoint_generation,
+                    .config_hash = projection.config_hash,
+                });
+            }
             // The primary-only transfer plan cannot validate a dense checkpoint:
             // its authoritative sequence lives in the still-unrestored posting
             // generation. Validate physical coverage only after installation.
