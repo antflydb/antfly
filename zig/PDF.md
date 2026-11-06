@@ -1956,18 +1956,26 @@ then commit without allocation. Their in-place introsort polls cancellation and
 charges comparison work without a second index-sized buffer; a heapsort
 fallback bounds worst-case work and smaller-partition recursion bounds stack
 space.
-Metadata resolution shares one decoded object-stream frame and validated offset
-index per page. Both count against the retained/live byte allowance; codec
-scratch has a separate per-decode cumulative allowance. Decoded frames and
-projected object graphs move between accounting ledgers without copying or
-double-charging the shared backing allocator. Native required-resource collectors
-share this frame cache, including inline entries reached through deferred source
-spans. Retention quota failures fall back to an uncached required read; genuine
-backing OOM, cancellation, and required decoder limits still propagate. Optional
-property reads retain their separate quota/fallback policy. Allocation pressure reclaims an unrelated optional frame before
-rejecting live-byte growth, including while parsing a selected value. Active
-source frames are pinned until their parser returns. Reclamation does not
-refund cumulative work or recover backing-allocator failures.
+Metadata resolution uses a byte-budgeted LRU of decoded object-stream frames
+and validated offset indexes per page. Frame records, lookup storage, indexes,
+and payloads count against the retained/live allowance; codec scratch has a
+separate per-decode cumulative allowance. Stable frame records keep active
+parsers pinned while allocation pressure evicts only enough unpinned least
+recently used data. Required font/dependency reads share this cache, so a small
+descriptor container does not evict a reusable resource container when both fit.
+Lookup-table growth cannot reenter eviction on that table; verified allocation
+quota failures can evict before retrying index reservation. Genuine backing OOM
+is never retried as an admission failure.
+Decoded frames and projected object graphs move between accounting ledgers
+without copying or charging backing live bytes twice. Admission is preflighted
+against known minimum storage and the remaining cumulative allowance. A required
+read can parse a completed decode transiently if retention adoption fails; it
+does not discard that buffer and reinflate the container. When admission fails
+before decoding, required reads use the ordinary bounded uncached path. Private
+retention outcomes remain distinct from configured decoder limits: output-limit
+errors, actual decoder working-set errors, cancellation, and malformed input
+propagate immediately. Optional property reads retain their quota/fallback
+policy. Eviction never refunds cumulative allocation charges.
 Metadata scanning polls cancellation throughout tokens, strings, whitespace,
 comments, and skipped compound values. Stream-boundary searches for indirect
 lengths are a recovery path: valid indirect lengths are resolved first and
