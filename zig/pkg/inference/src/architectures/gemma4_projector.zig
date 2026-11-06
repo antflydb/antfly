@@ -271,7 +271,8 @@ pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.me
         }
         fn consume(user_data: *anyopaque, frame: video.Frame) !void {
             const self: *@This() = @ptrCast(@alignCast(user_data));
-            const g = targetGeometry(self.cfg, frame.width, frame.height);
+            const display = frame.displaySize();
+            const g = targetGeometry(self.cfg, display[0], display[1]);
             const patches = try self.preprocess.patches(self.cb, frame, @intCast(g.width), @intCast(g.height), @intCast(self.cfg.patch_size), self.cfg.image_mean, self.cfg.image_std);
             defer self.cb.free(patches);
             const projected = try encodeResidentPatches(self.cb, self.allocator, self.weights, self.cfg, patches, g);
@@ -477,7 +478,9 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
         }
         fn consume(raw: *anyopaque, frame: video.Frame) !void {
             const self: *@This() = @ptrCast(@alignCast(raw));
-            const g = targetGeometry(self.cfg, frame.width, frame.height);
+            const display = frame.displaySize();
+            const raster = frame.rasterSize();
+            const g = targetGeometry(self.cfg, display[0], display[1]);
             const repeated_rows = std.math.mul(usize, frame.repetitions, g.tokenCount()) catch return error.EmbeddingInputTooLong;
             if (frame.repetitions == 0 or frame.repetitions > 32 - self.scheduled or self.scheduled_rows + repeated_rows + (self.scheduled + frame.repetitions) * 2 + 2 > self.max_tokens) return error.EmbeddingInputTooLong;
             if (self.geometry) |previous| if (embeddingGemma2GeometryKey(previous) != embeddingGemma2GeometryKey(g)) try self.flush();
@@ -488,7 +491,7 @@ pub fn encodeEmbeddingGemma2VideoResident(cb: *const ComputeBackend, allocator: 
             // Only RGB conversion borrows NVDEC pixels. Everything after this
             // event reads owned storage, allowing decode/vision overlap.
             try c.ctx.recordEvent(self.staging_event);
-            const patches = try c.preprocessEmbeddingGemma2ResidentRgb(rgb, frame.width, frame.height, @intCast(g.width), @intCast(g.height));
+            const patches = try c.preprocessEmbeddingGemma2ResidentRgb(rgb, raster[0], raster[1], @intCast(g.width), @intCast(g.height));
             defer self.cb.free(patches);
             const dim = self.cfg.patch_size * self.cfg.patch_size * 3;
             const weight = try projectorLinearWeightCt(self.cb, self.allocator, self.weights, "v.patch_embd.weight", dim, self.cfg.vision_hidden);
