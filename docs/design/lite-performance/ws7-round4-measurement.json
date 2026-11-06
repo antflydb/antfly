@@ -1,0 +1,81 @@
+{
+  "source_commit": "dc3ffe4761",
+  "base_commit_before_this_round": "fc161ffb79",
+  "harness_commit": "dc3ffe4761 (WS7 round 4: closed the owner-turn no-consumer background-work leak -- maintenanceTurn's runBackgroundTurnWithCancellation/maintainOnce-error/changed-tip feedback loops that kept the no-consumer owner loop spinning at its 100ms retry cadence for as long as foreground writes continued; made Store.maintenanceLoop's own small reclamation pass ride-along (NativeFile.reclaimPagesForMaintenanceWithCancel now takes a durable:bool, called false from the ordinary maintenance path, calling commitTransactionWithDurability(durable) instead of the always-durable commitTransaction()); marked the remaining background segment-catalog publications (replaceSegmentsWithReservedIdsOwned multi-id merge, removeSegmentsLocked, pruneMissingActiveSegmentsLocked) ride-along via MainTxn.setDurable(false), matching the pre-existing single-id merge call)",
+  "measurement_scope": "Two measurements, same workload definitions as ws7-round3-measurement.json, for before/after comparison against that file (measured at fc161ffb79, before this round's commits):\n1. capi \"no-consumer path 1037 real primary writes\" (pkg/antfly-embedded/src/capi/lite_connection.zig) -- 1,037 single-document inserts through the real public C API batch path, live Owner.worker, no registered consumer.\n2. Lite write-amplification counting harness (zig build lite-write-amplification, Debug) -- 128 single-doc updates, 1 KiB changing text per update, bypasses the Owner/connection-pool layer entirely (capi.openLiteHandleWithRuntime with a .manual BackendRuntime), so it measures Store.maintenanceLoop's own background work independent of any consumer.",
+  "capi_no_consumer_path_1037_real_writes": {
+    "test": "zig build capi-contract-test -Dtest-filter=\"no-consumer path 1037\"",
+    "before": {
+      "background_turns": 46,
+      "maintenance_leases_acquired": 30,
+      "source_turns": 0,
+      "derived_worker_turns": 0,
+      "calling_thread_refreshes": 1052
+    },
+    "after": {
+      "background_turns": 0,
+      "maintenance_leases_acquired": 0,
+      "source_turns": 0,
+      "derived_worker_turns": 0,
+      "calling_thread_refreshes": 1037
+    },
+    "note": "Design doc §5's full no-consumer target (0 background turns / 0 leases / 0 refreshes) is reached. The test (lite_connection.zig) now asserts exactly 0 for background_turns, owner.publication_stats.maintenance_lease.acquisitions (delta against a pre-measurement-window baseline -- that counter is a lifetime total, not reset, and the quiescence wait above the measured window legitimately acquires a few leases draining the fixture's default full_text_index_v0 deletion), and the wal_trace maintenance_lease_acquired op, instead of the previous loose \"< write_count / 10\" bound. calling_thread_refreshes (1,037, one per capi batch entry) is real required foreground work, not background amplification, and is unaffected -- it only dropped from 1,052 to 1,037 because the prior run's leftover background turns/refreshes (the bug) are gone, not because foreground work changed. The owner loop's own quiescence-wait helper in this test was also hardened (1000ms-quiet requirement instead of 200ms, plus explicit registeredDemand()/maintenance_pending checks) because a loaded build machine can delay the worker's own already-scheduled 100ms timer past a short quiet window and miscount it as consumer-driven work in the measured delta."
+  },
+  "root_causes_found_and_fixed": [
+    {
+      "source": "DB.runBackgroundTurnWithCancellation's own \"did real work happen\" signal (storage/db/db.zig) includes core.nextDerivedSequence() advancing past its entry snapshot, which happens on every primary commit regardless of whether any consumer exists (replay_meta_next_sequence always advances, per design doc §3.6). With concurrent foreground writes landing throughout a background turn, this was true on almost every call once Owner.maintenance_pending had been set true even once (e.g. by the fixture's own startup index-deletion drain), re-arming maintenance_pending forever.",
+      "fix": "capi/lite_connection.zig maintenanceTurn: gate that result on registeredDemand().any() before letting it re-arm maintenance_pending."
+    },
+    {
+      "source": "Store.maintainOnce's EnrichmentWaitCanceled/FileBusy/WouldBlock -- enterMaintenanceWriter's ordinary \"a concurrent admission/replacement raced this attempt\" signals, treated as benign skip-and-retry at every other call site in this file -- were instead escalated to a hard error that forced `pending = true` unconditionally, in both the full turn and storageMaintenanceTurn.",
+      "fix": "Treat those three errors as no-ops (not maintenance_error, not forced pending) in both call sites."
+    },
+    {
+      "source": "A bare moved-tip signal (`changed`, native checkpoint header mismatch between the maintenance snapshot and the live serving root) was OR'd unconditionally into maintenanceTurn's return value, so a turn that raced even one concurrent foreground write (near-certain under sustained writes) always reported \"more to do\".",
+      "fix": "Only let `changed` count toward \"more to do\" when registeredDemand().any() -- a tip move matters for a registered consumer's prompt catch-up, not for a no-consumer owner with nothing to catch up."
+    },
+    {
+      "source": "Store.maintenanceLoop's own small reclamation pass (independent of any Owner/consumer) called reclaimPagesForMaintenanceWithCancel -> a fully durable commitTransaction() every time retirementNeedsService found any debt, which happens on nearly every primary commit even with zero consumers (ordinary COW b-tree churn retires old catalog/metadata pages on every insert, not just document supersession).",
+      "fix": "reclaimPagesForMaintenanceWithCancel takes an explicit durable:bool, threaded to reclaimPagesImpl's trailing commit as commitTransactionWithDurability(durable) instead of the always-durable commitTransaction(); the ordinary (non-pressure) caller in docstore.zig now passes false."
+    },
+    {
+      "source": "persistent.zig's multi-segment merge (replaceSegmentsWithReservedIdsOwned), structural segment removal (removeSegmentsLocked), and stale-active-segment repair (pruneMissingActiveSegmentsLocked) never called MainTxn.setDurable(false), unlike their already-fixed single-segment-merge sibling (replaceSegmentsWithReservedIdOwned).",
+      "fix": "Added txn.setDurable(false) to all three, matching the existing call's placement/reasoning; confirmed (text_index_maintenance.zig, index_manager.zig) every call site is background merge/compaction/split/repair work, never a synchronous client ack."
+    }
+  ],
+  "lite_write_amplification_harness": {
+    "command": "zig build lite-write-amplification",
+    "workload": "primary-only, 128 updates, 1024 text_bytes per update",
+    "before": {
+      "calling_thread_syncs_per_update": 2.0,
+      "background_syncs_per_update": 8.546875,
+      "background_commits": 547
+    },
+    "after": {
+      "calling_thread_syncs_per_update": 2.0,
+      "background_syncs_per_update": 0.0,
+      "background_commits": 0,
+      "background_write_calls": 323,
+      "background_write_bytes": 1323008
+    },
+    "note": "background_syncs_per_update and background_commits (wal_trace's durable-commit counter, incremented only on a real durable publishCheckpoint) both go from nonzero to exactly 0: primary-only writes now cause 0 background fsyncs, matching this round's stated requirement. Background write calls/bytes stay nonzero (reclamation still writes freed/reorganized pages) -- that work is simply no longer counted as a durable commit and forces no sync of its own; it rides along on the next durable commit, this store's own idle-flush/close barrier, or lease handoff. The indexed (full-text-visible) modes also improved as a side effect of the persistent.zig ride-along fixes: calling_thread_syncs_per_update 6.219 -> 6.000 and main_txn_commit commits_calling_thread 142 -> 128 (14 fewer durable per-generation commits), though those modes were not this round's primary target."
+  },
+  "tests_added_or_tightened": [
+    "zig/pkg/antfly-embedded/src/capi/lite_connection.zig: \"no-consumer path 1037 real primary writes cause no consumer-driven background work\" now asserts background_turns == 0, maintenance_lease.acquisitions delta == 0, and wal_trace maintenance_lease_acquired == 0 (previously a loose < write_count/10 bound); its quiescence-wait helper hardened against build-machine scheduling jitter.",
+    "zig/pkg/antfly-embedded/src/storage/lite/docstore.zig: new \"lite reclamation ride-along passes force no sync before the next durable write\" -- 5 background reclamation passes over real retirement debt move NativeFile.test_sync_calls (the real fsync/syncData syscall counter) by exactly 0; the following foreground write still syncs."
+  ],
+  "tests_verified_unchanged": {
+    "lite reclamation": "34/34 pass (zig build antfly-storage-test -Dtest-filter=\"lite reclamation\")",
+    "lite allocator": "60/60 pass, including \"lite allocator v4 reuse frontier withholds pages retired by undurable commits\" (WS1(d), the durable-epoch page-reuse invariant this round's instructions called out to keep)",
+    "persistent": "88/88 pass (84 + 4 across two owner partitions), including \"persistent index replaceSegmentsIfActiveManyOwned publishes bounded merge outputs atomically\" and \"persistent index open prunes stale active segment references\"",
+    "no-consumer path (all 4)": "pass, including the two scenarios that exercise real Demand-driven wakeups (registering an index wakes a turn; backfilling after writes)"
+  },
+  "known_pre_existing_flakiness_not_attributable_to_this_round": {
+    "suite": "storage.lite.crash_consistency_test, \"crash sweep\" filter",
+    "finding": "Rerunning the identical pre-this-round code (fc161ffb79 plus only this round's commit 1, the owner-turn fix, reverted back out for the check) twice in a row produced two different failing-test sets (3 then 2 failures, overlapping but not identical: \"full text with non-durable commit\" and \"exhaustive: full text synchronous visibility\" in both runs, \"exhaustive: full text with non-durable commit\" in only the first). This matches the pre-existing WS7-round-3 code comment in lite_connection.zig noting that \"crash sweep: full text with retirement turn\" reproduces identically against the unmodified merge base. Two runs with this round's reclamation ride-along fix applied (durable:bool threaded to reclaimPagesImpl) produced 4 and 5 failures respectively, drawn from the same small set of test names seen in the baseline reruns -- consistent with pre-existing flakiness in the sweep harness, not a regression from this round's changes.",
+    "disposition": "Not fixed in this round: out of scope (the sweep harness's own determinism, and whatever makes these specific crash points fail, belongs to WS1/WS2/WS8, not WS7's no-consumer/ride-along scope), and the instructions explicitly reserve native.zig's commitTransactionWithDurability/publishCheckpoint/slot/manifest code for another agent."
+  },
+  "deferred_with_reason": {
+    "reclamation_batching": "docs/design/lite-performance/lite-single-commit-write-path.md §3.2a/§3.6 also asks for the small reclamation pass to run only past a byte threshold (batched), not just non-durably. A first attempt gated it on NativeFile.retirement_activity_bytes growing past a threshold since the last pass. Reverted: that counter only increases *after* a reclaim pass actually frees pages (native.zig's publishCheckpoint folds the ledger's released_data_pages/retired_inline_bytes into it on a durable publish), so it reads ~0 at the exact moment there is real pending debt waiting for its *first* reclaim -- a permanently-stuck-at-zero gate that broke 7 of the 34 \"lite reclamation\" tests (the shrinking/budget tests that need the small pass to actually run on modest test data). A correct batching signal needs a counter bumped where retirement is *recorded* (PageAllocator.retire in native.zig), not one that only reflects already-completed reclamation. Left for a follow-up: the ride-along change alone already meets this round's stated 0-background-fsync acceptance target without that risk."
+  }
+}

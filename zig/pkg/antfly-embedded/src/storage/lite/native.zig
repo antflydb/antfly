@@ -1768,7 +1768,7 @@ test "lite allocator v4 rejects a durable free bit for a live page" {
     try file.putCatalogRecord(NativeFile.artifact_lease_key_prefix ++ "probe", "lease");
     try file.commitTransaction();
     try std.testing.expect(!file.free_pages_verified);
-    _ = try file.reclaimPagesForMaintenanceWithCancel(1, null);
+    _ = try file.reclaimPagesForMaintenanceWithCancel(1, null, true);
     try std.testing.expect(!file.free_pages_verified);
     const preserved = (try file.getDocumentAlloc(a, "doc")).?;
     defer a.free(preserved);
@@ -6733,18 +6733,28 @@ pub const NativeFile = struct {
     }
 
     pub fn reclaimPagesWithCancel(self: *NativeFile, budget: usize, cancel: ?*const maintenance.CancelToken) !usize {
-        return self.reclaimPagesImpl(budget, cancel, true);
+        return self.reclaimPagesImpl(budget, cancel, true, true);
     }
 
     /// Detached housekeeping must not move an open's deferred graph proof
     /// into its short foreground publication fence. Unverified owners append
     /// allocator metadata; verified owners retain normal page reuse. Capacity
     /// limits still require proof/admission before using the free pool.
-    pub fn reclaimPagesForMaintenanceWithCancel(self: *NativeFile, budget: usize, cancel: ?*const maintenance.CancelToken) !usize {
-        return self.reclaimPagesImpl(budget, cancel, false);
+    ///
+    /// `durable`: §3.2a ride-along. An ordinary background reclamation pass
+    /// (the Store's own self-driven maintenance loop, not hard retirement
+    /// pressure) passes `false`: the commit stages its freed pages and
+    /// advanced checkpoint into `self.header`/`self.durable_header` without
+    /// its own `syncData`, becoming durable for free on the next durable
+    /// commit (a foreground write, this file's own idle-flush/close
+    /// barrier, or cross-process lease handoff). Freed pages stay
+    /// unreusable until then: page reuse is already gated on the durable
+    /// epoch (`reuseFrontier`/`durable_header`), not on this commit alone.
+    pub fn reclaimPagesForMaintenanceWithCancel(self: *NativeFile, budget: usize, cancel: ?*const maintenance.CancelToken, durable: bool) !usize {
+        return self.reclaimPagesImpl(budget, cancel, false, durable);
     }
 
-    fn reclaimPagesImpl(self: *NativeFile, budget: usize, cancel: ?*const maintenance.CancelToken, require_reuse_proof: bool) !usize {
+    fn reclaimPagesImpl(self: *NativeFile, budget: usize, cancel: ?*const maintenance.CancelToken, require_reuse_proof: bool, durable: bool) !usize {
         if (!self.header.indexed_reclamation or self.read_only) return 0;
         if (cancel) |token| try token.check();
         const previous_cancel = self.allocator_cancel_token;
@@ -6787,7 +6797,7 @@ pub const NativeFile = struct {
         if (cancel) |token| try token.check();
         // No cancellation checks after checkpoint publication begins: preserve
         // the usual uncertain-outcome fencing across the durability boundary.
-        try self.commitTransaction();
+        try self.commitTransactionWithDurability(durable);
         return count;
     }
 
@@ -22878,7 +22888,7 @@ test "lite logical generations authenticate allocator adoption after root page r
         try writer.beginTransaction();
         try writer.putDocument("churn", "warmup");
         try writer.commitTransaction();
-        _ = try writer.reclaimPagesForMaintenanceWithCancel(128, null);
+        _ = try writer.reclaimPagesForMaintenanceWithCancel(128, null, true);
     }
     var cached = try NativeFile.openWithIo(a, io, path, .{ .externally_locked = true, .no_sync = true });
     defer cached.close();
@@ -22894,7 +22904,7 @@ test "lite logical generations authenticate allocator adoption after root page r
             reused = true;
             break;
         }
-        _ = try writer.reclaimPagesForMaintenanceWithCancel(128, null);
+        _ = try writer.reclaimPagesForMaintenanceWithCancel(128, null, true);
         if (writer.activeCheckpoint().free_map_root_page == old_root) {
             reused = true;
             break;
@@ -22923,7 +22933,7 @@ test "lite logical generations authenticate allocator adoption after root page r
     // transient traversal inventories must never become ownership evidence.
     for (0..32) |_| {
         try cached.putDocument("after-adoption", "updated");
-        _ = try cached.reclaimPagesForMaintenanceWithCancel(128, null);
+        _ = try cached.reclaimPagesForMaintenanceWithCancel(128, null, true);
     }
     try std.testing.expect((try cached.check()).valid);
     var reopened = try NativeFile.openWithIo(a, io, path, .{ .read_only = true, .internal_reader = true });
