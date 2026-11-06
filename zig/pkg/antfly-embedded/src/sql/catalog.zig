@@ -646,6 +646,9 @@ pub const ReadCapability = struct {
     estimated_bytes: u64,
     estimated_rows: u64,
 };
+/// Result batches borrow the producer's current page until the next pull or
+/// close. A pull may return fewer than maximum rows at a physical page boundary;
+/// only an empty batch marks EOF. Retaining consumers copy before advancing.
 pub const RelationCursor = struct {
     ptr: *anyopaque,
     next: *const fn (*anyopaque, std.mem.Allocator, usize) anyerror!@import("execution_batch.zig").Batch,

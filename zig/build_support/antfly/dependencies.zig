@@ -1382,6 +1382,7 @@ pub fn create(b: *std.Build, comptime asking_build_zig: type) ?Shared {
     // Shared scheduling's memory admission reaches named native callbacks in
     // both the SQL contract root and its extracted local-source test owner.
     sql_test_mod.addImport("antfly_runtime_abi", runtime_abi_mod);
+    sql_test_mod.addImport("antfly_cancellation", cancellation_mod);
     antfly_imports.storage_boundary.configureSources(sql_test_mod, false, false);
     sql_test_mod.addImport("sql_parser", sql_parser_mod);
     sql_test_mod.addImport("antfly-json", json_mod);
