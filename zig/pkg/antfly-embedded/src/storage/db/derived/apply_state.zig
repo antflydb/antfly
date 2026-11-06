@@ -674,15 +674,15 @@ test "progress v2 record rejects corruption and ignores legacy v1 keys" {
 
 test "contributeProgress never leaves progress ahead of what actually committed" {
     // Proxy for "crash between effects and progress": fail the progress
-    // commit itself (via allocation-failure injection, the pattern this file
-    // already uses to model partial-write interruption) after a real effects
-    // boundary is durable, and confirm recovery (a fresh read) still reports
-    // only the last value that actually committed — never the attempted,
-    // uncommitted one. The transaction's own atomicity (errdefer txn.abort())
-    // is what the callers in db.zig rely on: `contributeProgress` is always
-    // called strictly after the physical effects and the legacy v1
-    // checkpoint it accompanies, so a crash here can only leave progress
-    // behind those effects, never ahead of them.
+    // commit itself partway through a multi-consumer batch, after a real
+    // effects boundary is already durable, and confirm recovery (a fresh
+    // read) still reports only the last value that actually committed —
+    // never a partially-applied one from the failed attempt. This is what
+    // the callers in db.zig rely on: `contributeProgress` is always called
+    // strictly after the physical effects and the legacy v1 checkpoint it
+    // accompanies, so a crash here can only leave progress behind those
+    // effects, never ahead of them, and a failed batch can never advance
+    // only some of its consumers.
     var backend = mem_backend.Backend.init(std.testing.allocator, .{});
     defer backend.close();
     var runtime = try backend.runtimeStore(std.testing.allocator, .{ .name = "docs" });
@@ -692,23 +692,23 @@ test "contributeProgress never leaves progress ahead of what actually committed"
     try contributeProgress(std.testing.allocator, runtime, &.{.{ .consumer = "text", .sequence = 5 }}, &.{});
     try std.testing.expectEqual(@as(u64, 5), (try loadProgress(std.testing.allocator, runtime, "text")).?.applied_sequence);
 
-    // A later attempt to advance to sequence 10 fails partway (simulated
-    // crash/OOM) before its commit lands.
-    var failed_once = false;
-    for (0..256) |fail_index| {
-        var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        contributeProgress(failing.allocator(), runtime, &.{.{ .consumer = "text", .sequence = 10 }}, &.{}) catch |err| {
-            if (err != error.OutOfMemory) return err;
-            failed_once = true;
-            // Never ahead of the last real commit, regardless of where the
-            // attempted write failed.
-            try std.testing.expectEqual(@as(u64, 5), (try loadProgress(std.testing.allocator, runtime, "text")).?.applied_sequence);
-            continue;
-        };
-        break;
-    }
-    try std.testing.expect(failed_once);
+    // A later attempt batches "text" advancing to 10 together with a second
+    // consumer whose name cannot fit the fixed key buffer, failing the
+    // whole transaction deterministically (one txn, one commit: a failure
+    // encoding any member's key must not leave an earlier member's write
+    // behind — there is nothing to abort if nothing was put yet, but the
+    // guarantee that matters is that the batch is all-or-nothing).
+    var long_name_buf: [300]u8 = @splat('x');
+    try std.testing.expectError(error.NoSpaceLeft, contributeProgress(std.testing.allocator, runtime, &.{
+        .{ .consumer = "text", .sequence = 10 },
+        .{ .consumer = &long_name_buf, .sequence = 1 },
+    }, &.{}));
+    // Never ahead of the last real commit: the failed batch's "text" update
+    // never landed even though, taken alone, it would have succeeded.
+    try std.testing.expectEqual(@as(u64, 5), (try loadProgress(std.testing.allocator, runtime, "text")).?.applied_sequence);
+
     // Once allowed to run to completion, the real advance is visible.
+    try contributeProgress(std.testing.allocator, runtime, &.{.{ .consumer = "text", .sequence = 10 }}, &.{});
     try std.testing.expectEqual(@as(u64, 10), (try loadProgress(std.testing.allocator, runtime, "text")).?.applied_sequence);
 }
 
