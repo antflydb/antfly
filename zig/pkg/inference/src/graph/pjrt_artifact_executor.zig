@@ -14,6 +14,7 @@
 // limitations under the License.
 
 const std = @import("std");
+const admission_mod = @import("pjrt_admission.zig");
 const ml = @import("ml");
 const pjrt_lib = @import("pjrt");
 
@@ -50,7 +51,21 @@ pub fn createModelExecutorFromArtifact(
     host_backend: *const ops.ComputeBackend,
     client: *pjrt_lib.pjrt.Client,
 ) !*pjrt_executor.PjrtModelExecutor {
-    return createModelExecutorFromArtifacts(allocator, io, artifact, &.{}, graph, host_backend, client);
+    return createModelExecutorFromArtifacts(allocator, io, artifact, &.{}, graph, host_backend, client, null);
+}
+
+/// The caller retains a verified, admitted buffer through executable loading.
+/// Avoid a second full-file allocation hidden inside the executor factory.
+pub fn createModelExecutorFromArtifactBytes(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    artifact: compiled_artifact.Manifest,
+    bytes: []const u8,
+    graph: *const ml.graph.Graph,
+    host_backend: *const ops.ComputeBackend,
+    client: *pjrt_lib.pjrt.Client,
+) !*pjrt_executor.PjrtModelExecutor {
+    return createModelExecutorFromArtifacts(allocator, io, artifact, &.{}, graph, host_backend, client, bytes);
 }
 
 pub fn createModelExecutorFromManifestPaths(
@@ -87,6 +102,7 @@ pub fn createModelExecutorFromManifestPaths(
         graph,
         host_backend,
         client,
+        null,
     );
 }
 
@@ -131,6 +147,7 @@ pub fn createModelExecutorFromPackageManifestPath(
         package.value,
         prefill_manifest_path,
         prefill_seq_len,
+        null,
     );
     defer allocator.free(decode_manifest_paths);
 
@@ -145,6 +162,186 @@ pub fn createModelExecutorFromPackageManifestPath(
     );
 }
 
+pub fn createAdmittedModelExecutorFromPackageManifestPath(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    package_manifest_path: []const u8,
+    prefill_seq_len: usize,
+    prefill_query_seq_len: usize,
+    prefill_attention_mode: []const u8,
+    graph: *const ml.graph.Graph,
+    host_backend: *const ops.ComputeBackend,
+    policy: *const admission_mod.Context,
+    plugin: [:0]const u8,
+) !*pjrt_executor.PjrtModelExecutor {
+    var package = try compiled_artifact.readPackageManifest(allocator, io, package_manifest_path);
+    defer package.deinit();
+
+    if (!std.mem.eql(u8, package.value.kind, "pjrt_hlo") and
+        !std.mem.eql(u8, package.value.kind, "pjrt_executable"))
+    {
+        return error.UnsupportedArtifactKind;
+    }
+    try compiled_artifact.validatePackageManifest(
+        package.value,
+        "xla",
+        package.value.model_dir,
+        package.value.kind,
+        package.value.pjrt_parameter_mode,
+    );
+
+    const prefill_entry = try compiled_artifact.findUniqueMatchingPackageEntry(package.value, .{
+        .artifact_role = compiled_artifact.artifact_role_prefill,
+        .seq_len = prefill_seq_len,
+        .query_seq_len = prefill_query_seq_len,
+        .attention_mode = prefill_attention_mode,
+    });
+    const prefill_manifest_path = if (prefill_entry) |entry| entry.manifest_path else return error.ArtifactShapeMismatch;
+
+    var prefill_manifest = try compiled_artifact.readManifest(allocator, io, prefill_manifest_path);
+    defer prefill_manifest.deinit();
+    if (!compiled_artifact.matchesRequest(prefill_manifest.value, .{ .backend = "xla", .model_dir = package.value.model_dir, .kind = "pjrt_executable", .artifact_role = compiled_artifact.artifact_role_prefill, .seq_len = prefill_seq_len, .query_seq_len = prefill_query_seq_len, .attention_mode = prefill_attention_mode, .pjrt_parameter_mode = package.value.pjrt_parameter_mode, .require_pjrt_memory_plan = true })) return error.ArtifactShapeMismatch;
+
+    const decode_manifest_paths = try findPackageDecodeManifestPaths(
+        allocator,
+        io,
+        package.value,
+        prefill_manifest_path,
+        prefill_seq_len,
+        policy.decode_steps_limit,
+    );
+    defer allocator.free(decode_manifest_paths);
+
+    return createAdmittedModelExecutorFromManifestPaths(
+        allocator,
+        io,
+        prefill_manifest_path,
+        decode_manifest_paths,
+        graph,
+        host_backend,
+        policy,
+        plugin,
+    );
+}
+
+pub fn createAdmittedModelExecutorFromManifestPaths(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    prefill_path: []const u8,
+    decode_paths: []const []const u8,
+    graph: *const ml.graph.Graph,
+    host_backend: *const ops.ComputeBackend,
+    policy: *const admission_mod.Context,
+    plugin: [:0]const u8,
+) !*pjrt_executor.PjrtModelExecutor {
+    const selected_decode_paths = decode_paths[0..@min(decode_paths.len, policy.decode_steps_limit orelse decode_paths.len)];
+    if (policy.decode_steps_limit) |required| {
+        if (selected_decode_paths.len != required) return error.PjrtLoadOnlyArtifactsRequired;
+    }
+    const manifests = try allocator.alloc(std.json.Parsed(compiled_artifact.Manifest), selected_decode_paths.len + 1);
+    defer allocator.free(manifests);
+    var initialized: usize = 0;
+    defer for (manifests[0..initialized]) |*parsed| parsed.deinit();
+    manifests[0] = try compiled_artifact.readManifest(allocator, io, prefill_path);
+    initialized += 1;
+    for (selected_decode_paths, 1..) |path, i| {
+        manifests[i] = try compiled_artifact.readManifest(allocator, io, path);
+        initialized += 1;
+    }
+    const artifacts = try allocator.alloc(compiled_artifact.Manifest, manifests.len);
+    defer allocator.free(artifacts);
+    for (manifests, artifacts) |parsed, *artifact| artifact.* = parsed.value;
+    return createAdmittedModelExecutorFromManifests(allocator, artifacts, graph, host_backend, policy, plugin);
+}
+
+/// The selector retains these parsed manifests through construction, avoiding
+/// a second read/parse of every selected decode sidecar.
+pub fn createAdmittedModelExecutorFromManifests(
+    allocator: std.mem.Allocator,
+    artifacts: []const compiled_artifact.Manifest,
+    graph: *const ml.graph.Graph,
+    host_backend: *const ops.ComputeBackend,
+    policy: *const admission_mod.Context,
+    plugin: [:0]const u8,
+) !*pjrt_executor.PjrtModelExecutor {
+    if (artifacts.len == 0) return error.MissingArtifactMetadata;
+    if (policy.decode_steps_limit) |required| if (artifacts.len - 1 != required) return error.PjrtLoadOnlyArtifactsRequired;
+    for (artifacts[1..], 1..) |artifact, i| {
+        if (artifact.seq_len != (std.math.add(usize, artifacts[0].seq_len, i) catch return error.ArtifactShapeMismatch) or !std.mem.eql(u8, artifact.kind, artifacts[0].kind) or !std.mem.eql(u8, artifact.artifact_role, compiled_artifact.artifact_role_decode) or artifact.query_seq_len != 1 or !std.mem.eql(u8, artifact.attention_mode, "paged_decode") or !std.mem.eql(u8, artifact.model_dir, artifacts[0].model_dir) or !std.mem.eql(u8, artifact.backend, artifacts[0].backend) or !std.mem.eql(u8, artifact.pjrt_parameter_mode, artifacts[0].pjrt_parameter_mode)) return error.ArtifactShapeMismatch;
+        if (!@import("pjrt_artifact_selection.zig").kvShapesCompatible(artifacts[i - 1], artifact)) return error.ArtifactShapeMismatch;
+    }
+    const graph_allocator = @import("antfly_platform").allocator.reclaimingScratch(allocator);
+    var metadata_bytes = try std.math.add(usize, @sizeOf(ml.graph.Graph), @sizeOf(pjrt_executor.PjrtModelExecutor));
+    metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, graph.nodes.items.len, @sizeOf(ml.graph.Node)));
+    metadata_bytes = try std.math.add(usize, metadata_bytes, graph.constant_pool.items.len);
+    metadata_bytes = try std.math.add(usize, metadata_bytes, graph.string_table.items.len);
+    metadata_bytes = try std.math.add(usize, metadata_bytes, try std.math.mul(usize, try std.math.add(usize, graph.outputs.items.len, graph.parameters.items.len), @sizeOf(u32)));
+    const owner = try admission_mod.Package.init(policy, artifacts, plugin, metadata_bytes);
+    errdefer owner.deinit();
+    const owned_graph = try graph_allocator.create(ml.graph.Graph);
+    errdefer graph_allocator.destroy(owned_graph);
+    owned_graph.* = ml.graph.Graph.init(graph_allocator);
+    errdefer owned_graph.deinit();
+    // Exact-capacity copies keep the admitted graph byte count authoritative.
+    owned_graph.nodes = .fromOwnedSlice(try graph_allocator.dupe(ml.graph.Node, graph.nodes.items));
+    const constants = try graph_allocator.alignedAlloc(u8, .@"8", graph.constant_pool.items.len);
+    @memcpy(constants, graph.constant_pool.items);
+    owned_graph.constant_pool = .fromOwnedSlice(constants);
+    owned_graph.string_table = .fromOwnedSlice(try graph_allocator.dupe(u8, graph.string_table.items));
+    owned_graph.outputs = .fromOwnedSlice(try graph_allocator.dupe(ml.graph.NodeId, graph.outputs.items));
+    owned_graph.parameters = .fromOwnedSlice(try graph_allocator.dupe(ml.graph.NodeId, graph.parameters.items));
+    const prefill = try loadAdmittedVariant(graph_allocator, owned_graph, host_backend, owner, 0, artifacts[0]);
+    errdefer freeAdmittedVariant(graph_allocator, prefill);
+    const variants = try graph_allocator.alloc(pjrt_executor.PjrtModelExecutor.DecodeVariant, artifacts.len - 1);
+    var loaded: usize = 0;
+    errdefer {
+        for (variants[0..loaded]) |variant| freeAdmittedVariant(graph_allocator, variant);
+        graph_allocator.free(variants);
+    }
+    for (artifacts[1..], 0..) |artifact, i| {
+        variants[i] = try loadAdmittedVariant(graph_allocator, owned_graph, host_backend, owner, i + 1, artifact);
+        loaded += 1;
+    }
+    try owner.loaded();
+    const executor = try graph_allocator.create(pjrt_executor.PjrtModelExecutor);
+    executor.* = .{
+        .allocator = graph_allocator,
+        .graph = owned_graph,
+        .owned_graph = owned_graph,
+        .executor = prefill.executor,
+        .host_backend = host_backend,
+        .artifact_owner = owner,
+        .input_materialization = prefill.input_materialization,
+        .semantic_input_bindings = prefill.semantic_input_bindings,
+        .semantic_output_bindings = prefill.semantic_output_bindings,
+        .decode_variants = variants,
+    };
+    return executor;
+}
+
+fn freeAdmittedVariant(allocator: std.mem.Allocator, variant: pjrt_executor.PjrtModelExecutor.DecodeVariant) void {
+    variant.executor.partitionExecutor().deinitExecutor();
+    freeSemanticInputBindings(allocator, variant.semantic_input_bindings);
+    freeSemanticOutputBindings(allocator, variant.semantic_output_bindings);
+}
+
+fn loadAdmittedVariant(allocator: std.mem.Allocator, graph: *const ml.graph.Graph, host_backend: *const ops.ComputeBackend, owner: *admission_mod.Package, index: usize, artifact: compiled_artifact.Manifest) !pjrt_executor.PjrtModelExecutor.DecodeVariant {
+    const bytes = try owner.read(index, artifact);
+    defer owner.allocator.free(bytes);
+    const inputs = try buildInputBindings(allocator, artifact.pjrt_input_bindings);
+    defer allocator.free(inputs);
+    const outputs = try cloneOutputNodeIds(allocator, artifact.pjrt_output_node_ids);
+    defer allocator.free(outputs);
+    const semantic_inputs = try buildSemanticInputBindings(allocator, artifact.pjrt_input_bindings);
+    errdefer freeSemanticInputBindings(allocator, semantic_inputs);
+    const semantic_outputs = try buildSemanticOutputBindings(allocator, artifact.pjrt_output_node_ids, artifact.pjrt_output_bindings);
+    errdefer freeSemanticOutputBindings(allocator, semantic_outputs);
+    const executable = try pjrt_executor.createExecutorFromSerializedExecutableWithShapes(allocator, graph, bytes, inputs, outputs, artifact.pjrt_input_shapes, artifact.pjrt_output_shapes, host_backend, &owner.client);
+    errdefer executable.partitionExecutor().deinitExecutor();
+    try admission_mod.ArtifactDeviceAdmission.verifyLoaded(artifact, try executable.executable.compiledMemoryStats());
+    return .{ .seq_len = artifact.seq_len, .executor = executable, .input_materialization = pjrt_executor.detectInputMaterialization(inputs, semantic_inputs, semantic_outputs), .semantic_input_bindings = semantic_inputs, .semantic_output_bindings = semantic_outputs };
+}
+
 fn createModelExecutorFromArtifacts(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -153,6 +350,7 @@ fn createModelExecutorFromArtifacts(
     graph: *const ml.graph.Graph,
     host_backend: *const ops.ComputeBackend,
     client: *pjrt_lib.pjrt.Client,
+    provided_prefill_bytes: ?[]const u8,
 ) !*pjrt_executor.PjrtModelExecutor {
     if (prefill_artifact.pjrt_input_bindings.len == 0 or prefill_artifact.pjrt_output_node_ids.len == 0) {
         return error.MissingArtifactMetadata;
@@ -188,8 +386,8 @@ fn createModelExecutorFromArtifacts(
     const prefill_output_node_ids = try cloneOutputNodeIds(allocator, prefill_artifact.pjrt_output_node_ids);
     defer allocator.free(prefill_output_node_ids);
 
-    const prefill_artifact_bytes = try std.Io.Dir.cwd().readFileAlloc(io, prefill_artifact.artifact_path, allocator, .limited(std.math.maxInt(usize)));
-    defer allocator.free(prefill_artifact_bytes);
+    const prefill_artifact_bytes = provided_prefill_bytes orelse try std.Io.Dir.cwd().readFileAlloc(io, prefill_artifact.artifact_path, allocator, .limited(std.math.maxInt(usize)));
+    defer if (provided_prefill_bytes == null) allocator.free(prefill_artifact_bytes);
     if (prefill_artifact_bytes.len == 0) return error.InvalidArtifact;
 
     const decode_packages = try allocator.alloc(pjrt_executor.DecodePackageSpec, decode_artifacts.len);
@@ -272,7 +470,9 @@ fn findPackageDecodeManifestPaths(
     package: compiled_artifact.PackageManifest,
     prefill_manifest_path: []const u8,
     prefill_seq_len: usize,
+    max_decode_steps: ?usize,
 ) ![]const []const u8 {
+    if (max_decode_steps == 0) return &.{};
     var matches = std.ArrayListUnmanaged(compiled_artifact.PackageArtifactEntry).empty;
     defer matches.deinit(allocator);
     for (package.artifacts) |entry| {
@@ -282,6 +482,7 @@ fn findPackageDecodeManifestPaths(
             .attention_mode = "paged_decode",
         })) continue;
         if (entry.seq_len <= prefill_seq_len) continue;
+        if (max_decode_steps) |limit| if (entry.seq_len > prefill_seq_len +| limit) continue;
         try matches.append(allocator, entry);
     }
 
@@ -322,45 +523,7 @@ fn packageKvShapesCompatible(
     var target_parsed = try compiled_artifact.readManifest(allocator, io, target_manifest_path);
     defer target_parsed.deinit();
 
-    const source = source_parsed.value;
-    const target = target_parsed.value;
-    if (source.pjrt_output_shapes.len != source.pjrt_output_node_ids.len or
-        target.pjrt_input_shapes.len != target.pjrt_input_bindings.len)
-    {
-        return false;
-    }
-
-    for (target.pjrt_input_bindings, 0..) |input_binding, input_index| {
-        if (!pjrtBindingIsPastKv(input_binding.kind)) continue;
-        const output_index = findMatchingPresentOutputIndex(source, input_binding) orelse return false;
-        if (!std.mem.eql(i64, source.pjrt_output_shapes[output_index], target.pjrt_input_shapes[input_index])) return false;
-    }
-    return true;
-}
-
-fn pjrtBindingIsPastKv(kind: []const u8) bool {
-    return std.mem.eql(u8, kind, compiled_artifact.pjrt_binding_past_key) or
-        std.mem.eql(u8, kind, compiled_artifact.pjrt_binding_past_value);
-}
-
-fn pjrtBindingIsPresentKv(kind: []const u8) bool {
-    return std.mem.eql(u8, kind, compiled_artifact.pjrt_binding_present_key) or
-        std.mem.eql(u8, kind, compiled_artifact.pjrt_binding_present_value);
-}
-
-fn findMatchingPresentOutputIndex(
-    source: compiled_artifact.Manifest,
-    input_binding: compiled_artifact.PjrtInputBindingMeta,
-) ?usize {
-    for (source.pjrt_output_bindings, 0..) |output_binding, output_index| {
-        if (!pjrtBindingIsPresentKv(output_binding.kind)) continue;
-        if (output_binding.layer_index != input_binding.layer_index) continue;
-        if (std.mem.eql(u8, input_binding.kind, compiled_artifact.pjrt_binding_past_key) and
-            std.mem.eql(u8, output_binding.kind, compiled_artifact.pjrt_binding_present_key)) return output_index;
-        if (std.mem.eql(u8, input_binding.kind, compiled_artifact.pjrt_binding_past_value) and
-            std.mem.eql(u8, output_binding.kind, compiled_artifact.pjrt_binding_present_value)) return output_index;
-    }
-    return null;
+    return @import("pjrt_artifact_selection.zig").kvShapesCompatible(source_parsed.value, target_parsed.value);
 }
 
 fn buildInputBindings(
@@ -668,7 +831,7 @@ test "PJRT package selectors resolve prefill and contiguous decode chain" {
         .attention_mode = "paged_prefill",
     })).?;
     try std.testing.expectEqualStrings(prefill_manifest_path, prefill_entry.manifest_path);
-    const decode_paths = try findPackageDecodeManifestPaths(allocator, io, package, prefill_manifest_path, 2);
+    const decode_paths = try findPackageDecodeManifestPaths(allocator, io, package, prefill_manifest_path, 2, null);
     defer allocator.free(decode_paths);
     try std.testing.expectEqual(@as(usize, 2), decode_paths.len);
     try std.testing.expectEqualStrings(decode3_manifest_path, decode_paths[0]);

@@ -378,7 +378,7 @@ pub const PullModelContext = extern struct {
 /// Snapshot of the last denied memory admission, independent of any one request.
 /// A zero timestamp means this runtime has not recorded a denial.
 pub const MemoryAdmissionStats = extern struct {
-    pressure: enum(c_int) { none, shared_host, shared_unified, domain_host, domain_backend, domain_combined, domain_kv, domain_scratch, external_budget, live_host, unknown } = .none,
+    pressure: enum(c_int) { none, shared_host, shared_unified, domain_host, domain_backend, domain_combined, domain_kv, domain_scratch, external_budget, live_host, unknown, shared_kv, shared_scratch } = .none,
     denied_count: u64 = 0,
     last_denied_ns: u64 = 0,
     request_count: u64 = 0,
