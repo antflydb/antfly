@@ -7580,7 +7580,11 @@ pub const HostedProvisionedTableReadSource = struct {
             var route = (try table_router.resolveGroupRoute(alloc, self.catalog, self.router.withBudget(.fromRequest(req)), group_ids[0], routePolicyForConsistency(consistency))) orelse return null;
             defer route.deinit(alloc);
 
-            if (route == .local)
+            // Like the provisioned source, only bypass the coordinator when no
+            // coordinator-side finalization (reranking, pruning, hit
+            // evaluation, projection receipts, algebraic joins) is requested;
+            // the physical owner does not apply those transforms.
+            if (route == .local and !ProvisionedTableReadSource.queryRequiresCoordinatorFinalization(req))
                 return try (try self.groupLocalSourceForGroup(alloc, group_ids[0], table_name, .{ .deadline_ns = req.execution_deadline_ns }, req.cancellation)).queryGroupLocal(alloc, group_ids[0], table_name, graphScopedSearchRequest(req, group_ids.len, table_name), consistency);
             // A retained cover is executed completely by its current carrier.
             // Preserve its finalized response when the carrier is remote too;
