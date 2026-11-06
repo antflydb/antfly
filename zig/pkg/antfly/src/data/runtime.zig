@@ -9226,11 +9226,17 @@ pub const DataServer = struct {
 
     fn syncInferenceRuntimeConfig(self: *DataServer) void {
         const inference_api_url = self.configuredInferenceAPIURL();
+        // The default endpoint's credential travels with it: background
+        // enrichment must authenticate exactly like create-time probes and
+        // query embedding, which read the same node-level key.
+        const inference_api_key = self.api_server_cfg.inference_api_key;
         _ = self.read_source.withDecisionRegistry(if (self.api_server_cfg.node_config) |config| &config.registry else null);
         _ = self.read_source.withInferenceAPIURL(inference_api_url);
         _ = self.write_source.withInferenceAPIURL(inference_api_url);
+        _ = self.write_source.withInferenceAPIKey(inference_api_key);
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withInferenceAPIURL(inference_api_url);
+            _ = apply_sm.write_source.withInferenceAPIKey(inference_api_key);
         }
     }
 

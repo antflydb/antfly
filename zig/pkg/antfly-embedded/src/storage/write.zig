@@ -408,6 +408,9 @@ pub const ManagedDbOpenOptions = struct {
     /// records committed to the log.
     leann_replication: bool = false,
     inference_api_url: ?[]const u8 = null,
+    /// Node-level default credential for `inference_api_url`. Managed
+    /// embedders without their own `api_key` inherit it with the endpoint.
+    inference_api_key: ?[]const u8 = null,
     remote_capability_cache: ?*remote_capabilities.Cache = null,
     replication_write_gate: ?db_mod.ReplicationWriteGate = null,
     replication_async_effect_mirror: ?db_mod.ReplicationAsyncEffectMirror = null,
@@ -569,11 +572,12 @@ pub fn createManagedDbEnrichments(
     local_provider: ?managed_embedder.AntflyProvider,
     remote_capability_cache: ?*remote_capabilities.Cache,
     inference_api_url: ?[]const u8,
+    inference_api_key: ?[]const u8,
     source_table: []const u8,
     store: ?*common_secrets.FileStore,
     remote: ?*const scraping.RemoteContentConfig,
 ) !ManagedDbEnrichmentSet {
-    if (comptime storage_engine.enabled) return storage_engine.call("writeCreateManagedDbEnrichments", .{ allocator, raw_indexes_json, runtime, local_provider, remote_capability_cache, inference_api_url, source_table, store, remote });
+    if (comptime storage_engine.enabled) return storage_engine.call("writeCreateManagedDbEnrichments", .{ allocator, raw_indexes_json, runtime, local_provider, remote_capability_cache, inference_api_url, inference_api_key, source_table, store, remote });
     // Managed HTTP providers use a concurrent watchdog to enforce the
     // whole-request deadline. Reuse the table's backend executor so write
     // enrichment never falls back to the process-global single-threaded I/O,
@@ -591,8 +595,8 @@ pub fn createManagedDbEnrichments(
             .source_table = source_table,
         });
     } else null;
-    result.dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .remote_capability_cache = remote_capability_cache, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url, .source_table = source_table });
-    result.sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .remote_capability_cache = remote_capability_cache, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url, .source_table = source_table });
+    result.dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .remote_capability_cache = remote_capability_cache, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url, .inference_api_key = inference_api_key, .source_table = source_table });
+    result.sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .remote_capability_cache = remote_capability_cache, .io = managed_io, .bounded_http_request = managed_io != null, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url, .inference_api_key = inference_api_key, .source_table = source_table });
     result.chunk_provider = try chunkProviderForRuntime(
         allocator,
         local_provider,
@@ -613,11 +617,12 @@ pub fn reconfigureManagedDbEnrichmentRuntime(
     antfly_provider: ?managed_embedder.AntflyProvider,
     remote_capability_cache: ?*remote_capabilities.Cache,
     inference_api_url: ?[]const u8,
+    inference_api_key: ?[]const u8,
     source_table: []const u8,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
 ) !void {
-    if (comptime storage_engine.enabled) return storage_engine.call("writeReconfigureManagedDbEnrichmentRuntime", .{ ignored_allocator, db, indexes_json, backend_runtime, antfly_provider, remote_capability_cache, inference_api_url, source_table, secret_store, remote_content });
+    if (comptime storage_engine.enabled) return storage_engine.call("writeReconfigureManagedDbEnrichmentRuntime", .{ ignored_allocator, db, indexes_json, backend_runtime, antfly_provider, remote_capability_cache, inference_api_url, inference_api_key, source_table, secret_store, remote_content });
     var enrichments = try createManagedDbEnrichments(
         db.runtime_alloc,
         indexes_json,
@@ -625,6 +630,7 @@ pub fn reconfigureManagedDbEnrichmentRuntime(
         antfly_provider,
         remote_capability_cache,
         inference_api_url,
+        inference_api_key,
         source_table,
         secret_store,
         remote_content,
@@ -704,7 +710,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
         reconcile_options.replication_async_batch_mirror = null;
         reconcile_options.replication_async_metadata_mirror = null;
     }
-    var enrichments = try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.remote_capability_cache, options.inference_api_url, options.source_table, secret_store, remote_content);
+    var enrichments = try createManagedDbEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.remote_capability_cache, options.inference_api_url, options.inference_api_key, options.source_table, secret_store, remote_content);
     // takeConfig() clears every transferred owner. An unconditional defer is
     // therefore both the success-path cleanup for an unused provider-only set
     // and the error-path cleanup for a partially constructed replacement.
@@ -1061,6 +1067,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
         .embedding_options = .{
             .antfly_provider = antfly_provider,
             .inference_api_url = options.inference_api_url,
+            .inference_api_key = options.inference_api_key,
         },
         .source_table = options.source_table,
         .destination_authorizer = options.destination_authorizer,
@@ -1087,6 +1094,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
             antfly_provider,
             options.remote_capability_cache,
             options.inference_api_url,
+            options.inference_api_key,
             options.source_table,
             secret_store,
             remote_content,
@@ -1727,7 +1735,7 @@ pub fn configureStorageKernelOwnerDbAtOpen(
             // the physical index catalog. "1" is the prior marker format;
             // the next current-catalog acquisition upgrades it to JSON.
             if (!std.mem.eql(u8, value, "1") and backend_runtime != null) {
-                try reconfigureManagedDbEnrichmentRuntimePaused(alloc, db, value, backend_runtime, antfly_provider, null, null, table_name, secret_store, remote_content);
+                try reconfigureManagedDbEnrichmentRuntimePaused(alloc, db, value, backend_runtime, antfly_provider, null, null, null, table_name, secret_store, remote_content);
                 try db.resumeEnrichmentRuntimeAfterReconfigure("historical owner reopen", "*");
                 if (installed) |state| state.publish(value);
             }
@@ -1776,6 +1784,7 @@ pub fn configureStorageKernelOwnerDbAtOpen(
             indexes_json,
             backend_runtime,
             antfly_provider,
+            null,
             null,
             null,
             table_name,
@@ -1956,6 +1965,7 @@ pub fn reconcileStorageKernelOwnerDb(
         indexes_json,
         backend_runtime,
         antfly_provider,
+        null,
         null,
         null,
         table_name,
@@ -2263,11 +2273,12 @@ pub fn reconfigureManagedDbEnrichmentRuntimePaused(
     antfly_provider: ?managed_embedder.AntflyProvider,
     remote_capability_cache: ?*remote_capabilities.Cache,
     inference_api_url: ?[]const u8,
+    inference_api_key: ?[]const u8,
     source_table: []const u8,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
 ) !void {
-    if (comptime storage_engine.enabled) return storage_engine.call("writeReconfigureManagedDbEnrichmentRuntimePaused", .{ ignored_allocator, db, indexes_json, backend_runtime, antfly_provider, remote_capability_cache, inference_api_url, source_table, secret_store, remote_content });
+    if (comptime storage_engine.enabled) return storage_engine.call("writeReconfigureManagedDbEnrichmentRuntimePaused", .{ ignored_allocator, db, indexes_json, backend_runtime, antfly_provider, remote_capability_cache, inference_api_url, inference_api_key, source_table, secret_store, remote_content });
     var enrichments = try createManagedDbEnrichments(
         db.runtime_alloc,
         indexes_json,
@@ -2275,6 +2286,7 @@ pub fn reconfigureManagedDbEnrichmentRuntimePaused(
         antfly_provider,
         remote_capability_cache,
         inference_api_url,
+        inference_api_key,
         source_table,
         secret_store,
         remote_content,
@@ -2379,4 +2391,83 @@ test "privacy job progress does not restart owner producers" {
     installed.publish("{\"enrichments\":[],\"_privacy\":{\"scanned\":0}}");
     try std.testing.expect(installed.matches("{\"enrichments\":[],\"_privacy\":{\"scanned\":100}}"));
     try std.testing.expect(!installed.matches("{\"enrichments\":[{\"name\":\"changed\"}],\"_privacy\":{\"scanned\":100}}"));
+}
+
+test "managed enrichments inherit the default inference credential with the default endpoint" {
+    const http_common = @import("../common/http/http_common.zig");
+    const std_http_listener = @import("../common/http/std_http_listener.zig");
+    const FakeInference = struct {
+        var last_authorization: [64]u8 = undefined;
+        var last_authorization_len: usize = 0;
+        var embed_calls: usize = 0;
+
+        fn executor() http_common.RequestExecutor {
+            return .{ .ptr = undefined, .vtable = &.{ .execute = execute } };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            const authorization = req.authorization orelse req.header("Authorization") orelse "";
+            if (req.method == .GET) return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, "{\"embedders\":{\"remote-model\":{}}}"),
+            };
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/ai/v1/embed"));
+            embed_calls += 1;
+            last_authorization_len = @min(authorization.len, last_authorization.len);
+            @memcpy(last_authorization[0..last_authorization_len], authorization[0..last_authorization_len]);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8, "{\"data\":[{\"embedding\":[0.125,0.25,0.5]}]}"),
+            };
+        }
+
+        fn lastAuthorization() []const u8 {
+            return last_authorization[0..last_authorization_len];
+        }
+    };
+
+    var listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeInference.executor());
+    defer listener.deinit();
+    try listener.start();
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+
+    const Case = struct { indexes_json: []const u8, expected: []const u8 };
+    for ([_]Case{
+        // Shared inference: the index names only the model and inherits the
+        // node-level endpoint and credential.
+        .{
+            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"remote-model\"}}}",
+            .expected = "Bearer node-default-key",
+        },
+        // An index-scoped credential keeps precedence over the node default.
+        .{
+            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3,\"embedder\":{\"provider\":\"antfly\",\"model\":\"remote-model\",\"api_key\":\"index-key\"}}}",
+            .expected = "Bearer index-key",
+        },
+    }) |case| {
+        FakeInference.embed_calls = 0;
+        FakeInference.last_authorization_len = 0;
+        var enrichments = try createManagedDbEnrichments(
+            std.testing.allocator,
+            case.indexes_json,
+            null,
+            null,
+            null,
+            base_uri,
+            "node-default-key",
+            "docs",
+            null,
+            null,
+        );
+        defer enrichments.deinit(std.testing.allocator);
+        const dense = enrichments.dense orelse return error.TestExpectedDenseEmbedder;
+        const vector = try dense.embedDense(std.testing.allocator, "semantic_idx", "alpha concept", 3);
+        defer std.testing.allocator.free(vector);
+        try std.testing.expectEqualSlices(f32, &.{ 0.125, 0.25, 0.5 }, vector);
+        try std.testing.expectEqual(@as(usize, 1), FakeInference.embed_calls);
+        try std.testing.expectEqualStrings(case.expected, FakeInference.lastAuthorization());
+    }
 }
