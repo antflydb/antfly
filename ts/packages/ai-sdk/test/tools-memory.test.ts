@@ -42,7 +42,7 @@ describe("createMemoryTools", () => {
     expect(body.space).toBeUndefined();
   });
 
-  it("remembers evidence with an idempotency key", async () => {
+  it("remembers a fact as linked evidence and an assertion, with an idempotency key", async () => {
     let captured: Request | undefined;
     vi.stubGlobal(
       "fetch",
@@ -53,12 +53,28 @@ describe("createMemoryTools", () => {
     );
     const client = new AntflyClient({ baseUrl: "http://memory.test" });
     const tools = createMemoryTools({ client, space: "assistant" });
-    await tools.antfly_memory_remember.execute?.({ text: "Mira owns operations." }, toolOptions());
+    await tools.antfly_memory_remember.execute?.(
+      {
+        subject: "Mira Chen",
+        predicate: "owns",
+        value: "operations",
+        statement: "Mira Chen owns operations.",
+      },
+      toolOptions()
+    );
     expect(captured?.url).toContain("/memory/v1/spaces/assistant/observations");
     expect(captured?.headers.get("Idempotency-Key")).toBeTruthy();
     const body = await bodyOf(captured);
     expect(body.evidence).toHaveLength(1);
-    expect(body.evidence[0].text).toBe("Mira owns operations.");
+    expect(body.evidence[0].text).toBe("Mira Chen owns operations.");
+    expect(body.assertions).toHaveLength(1);
+    expect(body.assertions[0]).toMatchObject({
+      subject: "Mira Chen",
+      predicate: "owns",
+      value: "operations",
+      statement: "Mira Chen owns operations.",
+    });
+    expect(body.assertions[0].evidence[0].id).toBe(body.evidence[0].id);
   });
 
   it("marks forget as needing approval, since it is destructive", () => {

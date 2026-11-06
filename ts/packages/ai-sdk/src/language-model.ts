@@ -107,6 +107,7 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
       });
     }
     const responseFormat = toResponseFormat(options.responseFormat, warnings);
+    const tools = toInferenceTools(options.tools, warnings);
     return {
       model: this.modelId,
       messages: toInferenceMessages(options.prompt, warnings),
@@ -116,8 +117,7 @@ export class AntflyChatLanguageModel implements LanguageModelV4 {
       top_k: options.topK,
       presence_penalty: options.presencePenalty,
       frequency_penalty: options.frequencyPenalty,
-      tools: toInferenceTools(options.tools, warnings),
-      tool_choice: toInferenceToolChoice(options.toolChoice),
+      ...(tools ? { tools, tool_choice: toInferenceToolChoice(options.toolChoice) } : {}),
       ...(responseFormat ? { response_format: responseFormat } : {}),
     };
   }

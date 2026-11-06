@@ -34,13 +34,7 @@ export function createChatHistory(options: AntflyChatHistoryOptions) {
   async function save(chatId: string, messages: UIMessage[]): Promise<void> {
     const row: ChatHistoryRow = { messages, updatedAt: new Date().toISOString() };
     const result = await options.client.tables.batchWithOptions(options.table, {
-      transforms: [
-        {
-          key: keyFor(chatId),
-          upsert: true,
-          operations: [{ op: "$set", path: "$", value: row }],
-        },
-      ],
+      inserts: { [keyFor(chatId)]: row },
       sync_level: "full_index",
     });
     if (result.status !== "committed") {

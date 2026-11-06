@@ -75,14 +75,30 @@ export function createMemoryTools(options: AntflyMemoryToolsOptions): Record<str
   });
 
   const remember = tool({
-    description: `Record a new memory in the Antfly memory space '${options.space}', backed by one piece of evidence text. Returns the durable operation.`,
+    description: `Record a new fact in the Antfly memory space '${options.space}', as a subject-predicate-value assertion backed by free-text evidence. Returns the durable operation.`,
     inputSchema: z
       .object({
-        text: z.string().min(1).max(20000).describe("The memory content, as evidence text."),
+        subject: z.string().min(1).max(500).describe("What the fact is about, e.g. 'Mira Chen'."),
+        predicate: z.string().min(1).max(200).describe("The relation, e.g. 'owns'."),
+        value: z
+          .string()
+          .min(1)
+          .max(2000)
+          .describe("The value of the relation, e.g. 'operations'."),
+        statement: z
+          .string()
+          .min(1)
+          .max(20000)
+          .describe("Free-text statement of the fact, used as recall evidence."),
         sourceUrl: z.string().url().optional(),
       })
       .strict(),
-    execute: async ({ text, sourceUrl }) => {
+    execute: async ({ subject, predicate, value, statement, sourceUrl }) => {
+      // Recall only matches memory *assertions*, not raw evidence text, so a
+      // useful "remember" call must write both in the same request: evidence
+      // is the source text, and the assertion is the structured, recallable
+      // claim that cites it (antfly#1505 qualification).
+      const evidenceId = randomUUID();
       const { data, error, response } = await options.client.memoryApi.POST(
         "/memory/v1/spaces/{space}/observations",
         {
@@ -90,7 +106,19 @@ export function createMemoryTools(options: AntflyMemoryToolsOptions): Record<str
             path: { space: options.space },
             header: { ...header(), "Idempotency-Key": randomUUID() },
           },
-          body: { evidence: [{ id: randomUUID(), text, source_url: sourceUrl }] },
+          body: {
+            evidence: [{ id: evidenceId, text: statement, source_url: sourceUrl }],
+            assertions: [
+              {
+                id: randomUUID(),
+                subject,
+                predicate,
+                value,
+                statement,
+                evidence: [{ id: evidenceId }],
+              },
+            ],
+          },
         }
       );
       if (!response.ok)

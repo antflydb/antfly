@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import type { AntflyClient } from "@antfly/sdk";
+import { type AntflyClient, InferenceCapacityError } from "@antfly/sdk";
 import { embedMany, generateText, rerank, streamText, tool } from "ai";
 import { describe, expect, it } from "vitest";
 import { z } from "zod";
@@ -15,6 +15,19 @@ const baseUrl = process.env.ANTFLY_URL ?? "http://127.0.0.1:8080";
 const chatModel = process.env.ANTFLY_CHAT_MODEL;
 const embeddingModel = process.env.ANTFLY_EMBEDDING_MODEL;
 const rerankModel = process.env.ANTFLY_RERANK_MODEL;
+
+/** Retries once on a transient, server-declared capacity limit (this is
+ * exactly what InferenceCapacityError.retryAfterMs is for), rather than
+ * treating a busy shared inference host as a test failure. */
+async function withCapacityRetry<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } catch (error) {
+    if (!(error instanceof InferenceCapacityError)) throw error;
+    await new Promise((resolve) => setTimeout(resolve, error.retryAfterMs));
+    return await run();
+  }
+}
 
 async function waitForOperation(client: AntflyClient, space: string, id: string): Promise<void> {
   for (let attempt = 0; attempt < 30; attempt++) {
@@ -84,10 +97,12 @@ describe.skipIf(!live)("@antfly/ai-sdk against a real Antfly server", () => {
   it("embeddingModel: embedMany", async () => {
     if (!embeddingModel) throw new Error("Set ANTFLY_EMBEDDING_MODEL");
     const antfly = createAntfly({ baseUrl });
-    const { embeddings } = await embedMany({
-      model: antfly.embeddingModel(embeddingModel),
-      values: ["apples are stored in the warehouse", "the shipment target is 120 crates"],
-    });
+    const { embeddings } = await withCapacityRetry(() =>
+      embedMany({
+        model: antfly.embeddingModel(embeddingModel),
+        values: ["apples are stored in the warehouse", "the shipment target is 120 crates"],
+      })
+    );
     expect(embeddings).toHaveLength(2);
     expect(embeddings[0].length).toBeGreaterThan(0);
     expect(embeddings[0].length).toBe(embeddings[1].length);
@@ -120,7 +135,12 @@ describe.skipIf(!live)("@antfly/ai-sdk against a real Antfly server", () => {
       const tools = createMemoryTools({ client: antfly.client, space });
       const toolOptions = { toolCallId: "t1", messages: [] } as never;
       const remembered = (await tools.antfly_memory_remember.execute?.(
-        { text: "Mira Chen owns operations and handles shipment escalation." },
+        {
+          subject: "Mira Chen",
+          predicate: "owns",
+          value: "operations",
+          statement: "Mira Chen owns operations and handles shipment escalation.",
+        },
         toolOptions
       )) as { id: string };
       await waitForOperation(antfly.client, space, remembered.id);

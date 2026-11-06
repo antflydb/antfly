@@ -37,8 +37,7 @@ describe("createChatHistory", () => {
     expect(captured?.url).toContain("/db/v1/tables/chats/batch");
     const body = await bodyOf(captured);
     expect(body.sync_level).toBe("full_index");
-    expect(body.transforms[0].key).toBe("chat_history/chat-1");
-    expect(body.transforms[0].operations[0].value.messages).toEqual(messages);
+    expect(body.inserts["chat_history/chat-1"].messages).toEqual(messages);
   });
 
   it("throws when the save does not commit", async () => {
@@ -94,6 +93,6 @@ describe("createChatHistory", () => {
     const history = createChatHistory({ client, table: "chats" });
     await history.onFinish("chat-2")({ messages });
     const body = await bodyOf(captured);
-    expect(body.transforms[0].key).toBe("chat_history/chat-2");
+    expect(body.inserts["chat_history/chat-2"]).toBeDefined();
   });
 });
