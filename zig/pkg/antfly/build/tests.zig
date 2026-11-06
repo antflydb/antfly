@@ -2279,6 +2279,14 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-api-test", "Run mounted API lake and SQL integration tests").dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, lake_api_tests, lake_api_filters).step);
+    const distributed_sql_api_filters = &.{"distributed SQL API"};
+    const distributed_sql_api_tests = b.addTest(.{
+        .root_module = api_http_runtime_test_mod,
+        .filters = distributed_sql_api_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("distributed-sql-api-test", "Verify distributed SQL worker RPC authorization")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, distributed_sql_api_tests, distributed_sql_api_filters).step);
     const relational_index_http_tests = b.addTest(.{
         .name = "relational-index-http-tests",
         .root_module = api_http_runtime_test_mod,
@@ -3159,6 +3167,15 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
         .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
     });
     b.step("lake-integration-test", "Run public lake binding and SQL cursor integration tests").dependOn(&addFilteredTestRunArtifact(b, lake_integration_tests).step);
+    const distributed_sql_filters = &.{ "distributed SQL", "internal service strict" };
+    const distributed_sql_tests = b.addTest(.{
+        .root_module = lake_integration_mod,
+        .filters = distributed_sql_filters,
+        .test_runner = .{ .path = b.path("pkg/antfly-embedded/src/test_runner.zig"), .mode = .simple },
+    });
+    b.step("distributed-sql-test", "Verify distributed lake SQL semantics, RPC, ownership and recovery")
+        .dependOn(&addFilteredTestRunArtifactWithRuntimeFilters(b, distributed_sql_tests, distributed_sql_filters).step);
+
     const lake_vacuum_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lake_vacuum_test_root.zig"),
         .target = target,
