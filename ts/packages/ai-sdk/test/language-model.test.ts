@@ -1,5 +1,6 @@
-import { InferenceAPIError, InferenceClient } from "@antfly/sdk";
+import { AntflyClient, InferenceAPIError, InferenceClient } from "@antfly/sdk";
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { assetProviderReference } from "../src/asset/reference.js";
 import { AntflyChatLanguageModel } from "../src/language-model.js";
 
 afterEach(() => vi.unstubAllGlobals());
@@ -259,5 +260,86 @@ describe("doStream", () => {
     };
     expect(call.toolCallId).toBe("call_1");
     expect(call.input).toBe('{"a":1}');
+  });
+});
+
+describe("providerReference.antfly file parts", () => {
+  const reference = { table: "files", key: "row-1" };
+  const resource = {
+    type: "source" as const,
+    uri: "https://sources.example.com/v1/media/abc/def",
+    mime_type: "video/mp4",
+    version: '"etag-1"',
+    length: 4,
+  };
+
+  it("resolves the reference into a typed source content part when constructed with a client", async () => {
+    let generateBody: string | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const url =
+          typeof input === "string" ? input : input instanceof URL ? input.toString() : input.url;
+        if (url.includes("/db/v1/tables/")) {
+          return new Response(JSON.stringify({ content: { resource } }), {
+            headers: { "Content-Type": "application/json", "x-antfly-version": "1" },
+          });
+        }
+        generateBody = String(init?.body);
+        return new Response(
+          JSON.stringify({
+            id: "c",
+            object: "chat.completion",
+            created: 1,
+            model: "test-model",
+            choices: [
+              { index: 0, message: { role: "assistant", content: "ok" }, finish_reason: "stop" },
+            ],
+          }),
+          { headers: { "Content-Type": "application/json" } }
+        );
+      })
+    );
+    const withClient = new AntflyChatLanguageModel({
+      inference: new InferenceClient({ baseUrl: "http://generate.test" }),
+      client: new AntflyClient({ baseUrl: "http://generate.test" }),
+      modelId: "test-model",
+    });
+    await withClient.doGenerate({
+      prompt: [
+        {
+          role: "user",
+          content: [
+            { type: "text", text: "describe" },
+            {
+              type: "file",
+              mediaType: "video/mp4",
+              data: { type: "reference", reference: assetProviderReference(reference) },
+            },
+          ],
+        },
+      ],
+    });
+    const body = JSON.parse(generateBody ?? "{}");
+    expect(body.messages[0].content[1]).toEqual({ type: "source", source: resource });
+  });
+
+  it("throws a clear error for a providerReference.antfly part when constructed without a client", async () => {
+    await expect(
+      model().doGenerate({
+        prompt: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "file",
+                mediaType: "video/mp4",
+                data: { type: "reference", reference: assetProviderReference(reference) },
+              },
+            ],
+          },
+        ],
+      })
+    ).rejects.toThrow(/client to resolve/);
   });
 });
