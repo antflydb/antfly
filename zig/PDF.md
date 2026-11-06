@@ -1969,9 +1969,16 @@ Metadata scanning polls cancellation throughout tokens, strings, whitespace,
 comments, and skipped compound values. Stream-boundary searches for indirect
 lengths are a recovery path: valid indirect lengths are resolved first and
 seek directly to the declared payload end, preserving embedded endstream data.
-Length-reference chains and scalar parsing are depth-bounded, cycles are
-rejected, and compressed length objects are rejected before reading their
-container. Recovery searches use bounded chunks with marker overlap.
+Length-reference chains and scalar parsing are depth-bounded. Dependency paths
+survive container reads so reentrant cycles are rejected. Ordinary stream
+lengths may be compressed; an object stream's own length remains uncompressed.
+Validated indirect lengths are normalized to integers in the owned header,
+avoiding repeated reference lookups and allocations during payload reads without
+increasing Object storage. Recovery searches use bounded chunks with marker
+overlap. Native text extraction can inspect a damaged image's projected stream
+header after a recoverable payload-boundary failure. Such header views carry no
+payload range and cannot be decoded. OOM, cancellation, and exhausted work still
+propagate; payload readers remain strict.
 Numeric lookahead propagates
 cancellation and work exhaustion rather than treating them as end-of-input.
 Ordinary object reads also poll the Reader cancellation probe when no shared

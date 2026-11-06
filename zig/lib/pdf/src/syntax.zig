@@ -68,6 +68,7 @@ pub const Object = union(enum) {
     name: []u8,
     array: []Object,
     dict: []DictEntry,
+    stream_header: []DictEntry,
     stream: struct {
         header: []DictEntry,
         data_offset: usize,
@@ -102,7 +103,7 @@ pub const Object = union(enum) {
                 }
                 break :blk .{ .array = out };
             },
-            .dict => |entries| blk: {
+            .dict, .stream_header => |entries| blk: {
                 const out = try alloc.alloc(DictEntry, entries.len);
                 var initialized: usize = 0;
                 errdefer {
@@ -117,7 +118,7 @@ pub const Object = union(enum) {
                     initialized += 1;
                     out[i].value = try entry.value.clone(alloc);
                 }
-                break :blk .{ .dict = out };
+                break :blk if (self == .stream_header) .{ .stream_header = out } else .{ .dict = out };
             },
             .stream => |stream_value| blk: {
                 const out = try alloc.alloc(DictEntry, stream_value.header.len);
@@ -154,6 +155,7 @@ pub const Object = union(enum) {
     pub fn get(self: *const Object, key: []const u8) ?*const Object {
         const entries = switch (self.*) {
             .dict => self.dict,
+            .stream_header => self.stream_header,
             .stream => self.stream.header,
             else => return null,
         };
@@ -185,7 +187,7 @@ pub const Object = union(enum) {
                 for (items) |*item| item.deinit(alloc);
                 alloc.free(items);
             },
-            .dict => |entries| {
+            .dict, .stream_header => |entries| {
                 for (entries) |*entry| entry.deinit(alloc);
                 alloc.free(entries);
             },
@@ -229,6 +231,8 @@ pub const Lexeme = Token;
 // Full parsing remains the default for rendering and general object consumers.
 pub const Projection = enum {
     full,
+    xobject_header,
+    name,
     resources,
     required_resources,
     resource_container,
@@ -244,6 +248,7 @@ pub const Projection = enum {
     fn field(self: Projection, key: []const u8) Field {
         return switch (self) {
             .full => .{ .keep = true },
+            .xobject_header => if (std.mem.eql(u8, key, "Subtype")) .{ .keep = true, .child = .name } else if (std.mem.eql(u8, key, "StructParent")) .{ .keep = true, .skip = true } else .{ .keep = false },
             .resources, .required_resources => blk: {
                 if (std.mem.eql(u8, key, "Properties")) break :blk .{ .keep = true, .skip = self == .required_resources, .child = .property_table };
                 for ([_][]const u8{ "Font", "XObject", "ExtGState", "ColorSpace" }) |name| {
@@ -256,7 +261,7 @@ pub const Projection = enum {
             .resource_properties => .{ .keep = std.mem.eql(u8, key, "Properties"), .child = .property_table },
             .property_table => .{ .keep = true, .child = .property },
             .property => if (std.mem.eql(u8, key, "ActualText")) .{ .keep = true, .child = .text } else if (std.mem.eql(u8, key, "MCID")) .{ .keep = true, .child = .integer } else .{ .keep = false },
-            .integer, .text => .{ .keep = false },
+            .integer, .text, .name => .{ .keep = false },
         };
     }
 };
@@ -275,7 +280,7 @@ pub const Scanner = struct {
     last_checked_pos: usize = 0,
     stream_length_resolver: ?struct {
         context: *const anyopaque,
-        resolve: *const fn (*const anyopaque, ObjRef) anyerror!?usize,
+        resolve: *const fn (*const anyopaque, ObjRef, bool) anyerror!?usize,
     } = null,
 
     fn checkpoint(self: *Scanner) !void {
@@ -340,6 +345,7 @@ pub const Scanner = struct {
                     .full => false,
                     .integer => compound or string or first == '/',
                     .text => compound or first == '/',
+                    .name => compound or string,
                     else => first == '[' or string or first == '/',
                 };
                 if (reject) {
@@ -379,6 +385,9 @@ pub const Scanner = struct {
                             }
                             boxed.* = try self.readObjectProjected(projection);
                             boxed_initialized = true;
+                            if (projection == .xobject_header and boxed.* == .stream_header) {
+                                return .{ .obj_def = .{ .ptr = .{ .id = @intCast(value), .gen = @intCast(tok2.integer) }, .value = boxed } };
+                            }
 
                             var end_tok = try self.readToken();
                             defer end_tok.deinit(self.alloc);
@@ -537,6 +546,10 @@ pub const Scanner = struct {
             else => return error.StreamMissingNewline,
         }
 
+        // Header-only views deliberately have no payload range. They cannot
+        // be passed to a stream decoder or mistaken for a validated stream.
+        if (projection == .xobject_header) return .{ .stream_header = owned };
+
         const data_start = self.pos;
         const data_offset = self.base_offset + data_start;
         const actual_length = if (try self.streamLength(owned)) |direct_length| blk: {
@@ -569,15 +582,30 @@ pub const Scanner = struct {
         } };
     }
 
-    fn streamLength(self: *Scanner, entries: []const DictEntry) !?usize {
-        for (entries) |entry| {
+    fn streamLength(self: *Scanner, entries: []DictEntry) !?usize {
+        for (entries) |*entry| {
             if (!std.mem.eql(u8, entry.key, "Length")) continue;
             if (entry.value.asInteger()) |length| {
                 if (length < 0) return error.InvalidStreamLength;
                 return std.math.cast(usize, length) orelse error.InvalidStreamLength;
             }
-            if (entry.value == .obj_ref) if (self.stream_length_resolver) |resolver|
-                return resolver.resolve(resolver.context, entry.value.obj_ref);
+            if (entry.value == .obj_ref) if (self.stream_length_resolver) |resolver| {
+                var object_stream = false;
+                for (entries) |field| {
+                    if (std.mem.eql(u8, field.key, "Type") and std.mem.eql(u8, field.value.asName() orelse "", "ObjStm")) {
+                        object_stream = true;
+                        break;
+                    }
+                }
+                const length = try resolver.resolve(resolver.context, entry.value.obj_ref, object_stream);
+                if (length) |resolved| {
+                    if (resolved > self.bytes.len - self.pos) return error.UnexpectedEof;
+                    // Cache the validated scalar in the owned header without
+                    // enlarging every Object or retaining a second map.
+                    entry.value = .{ .integer = std.math.cast(i64, resolved) orelse return error.InvalidStreamLength };
+                }
+                return length;
+            };
             return null;
         }
         return null;
@@ -1758,7 +1786,7 @@ test "scanner resolves indirect lengths before examining payload markers" {
         calls: usize = 0,
         length: usize = payload.len,
         failure: ?anyerror = null,
-        fn resolve(raw: *const anyopaque, ref: ObjRef) anyerror!?usize {
+        fn resolve(raw: *const anyopaque, ref: ObjRef, _: bool) anyerror!?usize {
             const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
             self.calls += 1;
             try std.testing.expectEqual(@as(u32, 8), ref.id);
@@ -1776,7 +1804,7 @@ test "scanner resolves indirect lengths before examining payload markers" {
     defer object.deinit(a);
     try std.testing.expectEqualStrings(payload, input[object.stream.data_offset..][0..object.stream.data_length]);
     try std.testing.expectEqual(@as(usize, 1), resolver.calls);
-    try std.testing.expectEqual(@as(u32, 8), object.get("Length").?.obj_ref.id);
+    try std.testing.expectEqual(@as(i64, payload.len), object.get("Length").?.integer);
     for ([_]anyerror{ error.OutOfMemory, error.Canceled, error.PdfMetadataWorkLimit, error.InvalidStreamLength }) |failure| {
         var failing = Resolver{ .failure = failure };
         var failed = Scanner.init(a, input);
@@ -1809,4 +1837,36 @@ test "scanner known stream lengths seek without charging payload scan work" {
     var invalid = Scanner.init(a, "<< /Length -1 >>\nstream\nx\nendstream");
     defer invalid.deinit();
     try std.testing.expectError(error.InvalidStreamLength, invalid.readObject());
+}
+
+test "scanner image header views never inspect payloads or resolve lengths" {
+    const a = std.testing.allocator;
+    const payload = try a.alloc(u8, 32 * 1024);
+    defer a.free(payload);
+    @memset(payload, 'X');
+    const input = try std.fmt.allocPrint(a, "8 0 obj\n<< /Subtype /Image /Length 99 0 R /StructParent 10 0 R >>\nstream\n{s}", .{payload});
+    defer a.free(input);
+    const Resolver = struct {
+        calls: usize = 0,
+        fn resolve(raw: *const anyopaque, _: ObjRef, _: bool) anyerror!?usize {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw)));
+            self.calls += 1;
+            return error.InvalidStreamLength;
+        }
+    };
+    var resolver = Resolver{};
+    var control = ScanControl{ .remaining_work = 1024 };
+    var scanner = Scanner.init(a, input);
+    scanner.control = &control;
+    scanner.stream_length_resolver = .{ .context = &resolver, .resolve = Resolver.resolve };
+    defer scanner.deinit();
+    var object = try scanner.readObjectProjected(.xobject_header);
+    defer object.deinit(a);
+    const header = object.obj_def.value;
+    try std.testing.expect(header.* == .stream_header);
+    try std.testing.expectEqualStrings("Image", header.get("Subtype").?.asName().?);
+    try std.testing.expect(header.get("StructParent") != null);
+    try std.testing.expect(header.get("Length") == null);
+    try std.testing.expectEqual(@as(usize, 0), resolver.calls);
+    try std.testing.expect(scanner.pos < input.len / 2);
 }

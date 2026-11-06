@@ -5285,6 +5285,13 @@ const StructureMetadataCache = struct {
 };
 
 pub const Reader = struct {
+    const LengthResolution = struct {
+        reference: syntax.ObjRef,
+        parent: ?*const LengthResolution,
+        depth: usize,
+    };
+    // Borrowed only by synchronous scoped readers during length resolution.
+    length_resolution: ?*const LengthResolution = null,
     object_depth_limit: usize = std.math.maxInt(usize),
     metadata_scan: ?*syntax.ScanControl = null,
     metadata_frames: ?*MetadataObjectStreamCache = null,
@@ -5845,26 +5852,38 @@ pub const Reader = struct {
         return try self.alloc.dupe(u8, encoded);
     }
 
-    fn resolveStreamLengthReference(raw: *const anyopaque, initial: syntax.ObjRef) anyerror!?usize {
+    fn resolveStreamLengthReference(raw: *const anyopaque, initial: syntax.ObjRef, object_stream: bool) anyerror!?usize {
         const self: *const Reader = @ptrCast(@alignCast(raw));
         var scalar_reader = self.*;
         scalar_reader.object_depth_limit = @min(self.object_depth_limit, 128);
-        var visited: [128]syntax.ObjRef = undefined;
+        var encrypted_streams: std.AutoHashMapUnmanaged(usize, syntax.ObjRef) = .empty;
+        defer encrypted_streams.deinit(self.alloc);
+        scalar_reader.encrypted_streams = &encrypted_streams;
+        scalar_reader.encrypted_stream_generation = 0;
+        var visited: [128]LengthResolution = undefined;
         var count: usize = 0;
         var reference = initial;
         while (count < visited.len) {
             try self.checkCancellation();
-            for (visited[0..count]) |previous| {
-                if (previous.id == reference.id and previous.gen == reference.gen) return error.InvalidStreamLength;
+            const parent = scalar_reader.length_resolution;
+            if (parent) |node| if (node.depth >= visited.len) return error.InvalidStreamLength;
+            var ancestor = parent;
+            while (ancestor) |node| : (ancestor = node.parent) {
+                if (node.reference.id == reference.id and node.reference.gen == reference.gen) return error.InvalidStreamLength;
             }
-            visited[count] = reference;
+            visited[count] = .{ .reference = reference, .parent = parent, .depth = if (parent) |node| node.depth + 1 else 1 };
+            scalar_reader.length_resolution = &visited[count];
             count += 1;
             const entry = self.findXref(reference) orelse return error.ObjectNotFound;
-            // PDF stream-length objects cannot themselves be compressed.
-            // Reject these before entering their container: a length pointing
-            // back into its own object stream must not recurse through headers.
-            if (entry.compressed_obj_stream_id != null) return error.InvalidStreamLength;
-            var value = try scalar_reader.readUncompressedIndirectObjectProjected(reference, entry, .integer);
+            if (!entry.in_use) return error.ObjectNotInUse;
+            // Only an object stream's own Length must be uncompressed. Ordinary
+            // stream lengths may live in another object stream. The dependency
+            // path survives those container reads and bounds malformed cycles.
+            if (object_stream and entry.compressed_obj_stream_id != null) return error.InvalidStreamLength;
+            var value = if (entry.compressed_obj_stream_id) |stream_id|
+                try scalar_reader.readCompressedObject(reference, stream_id, entry.compressed_index orelse return error.InvalidObjectStream, .integer, null)
+            else
+                try scalar_reader.readUncompressedIndirectObjectProjected(reference, entry, .integer);
             defer value.deinit(self.alloc);
             if (value.asInteger()) |length| {
                 if (length < 0) return error.InvalidStreamLength;
@@ -5887,7 +5906,7 @@ pub const Reader = struct {
             return std.math.cast(usize, length) orelse error.InvalidStreamLength;
         }
         if (length_obj.* == .obj_ref)
-            return (try resolveStreamLengthReference(self, length_obj.obj_ref)) orelse obj.stream.data_length;
+            return (try resolveStreamLengthReference(self, length_obj.obj_ref, if (obj.get("Type")) |ty| std.mem.eql(u8, ty.asName() orelse "", "ObjStm") else false)) orelse obj.stream.data_length;
         return obj.stream.data_length;
     }
 
@@ -10021,6 +10040,22 @@ pub const Reader = struct {
         return value.asInteger() orelse -1;
     }
 
+    fn textXObject(self: *const Reader, raw: *const syntax.Object) !syntax.Object {
+        return self.resolveValue(raw) catch |original| {
+            switch (original) {
+                error.OutOfMemory, error.Canceled, error.PdfMetadataWorkLimit => return original,
+                else => {},
+            }
+            if (raw.* != .obj_ref) return original;
+            var header_reader = self.*;
+            header_reader.object_depth_limit = @min(self.object_depth_limit, 128);
+            var header = try header_reader.readIndirectObjectProjected(raw.obj_ref, .xobject_header);
+            errdefer header.deinit(self.alloc);
+            if (header != .stream_header or !std.mem.eql(u8, (header.get("Subtype") orelse return original).asName() orelse "", "Image")) return original;
+            return header;
+        };
+    }
+
     fn collectTextFormsFromResourcesAlloc(
         self: *const Reader,
         resources: *const syntax.Object,
@@ -10043,9 +10078,9 @@ pub const Reader = struct {
         for (resolved_xobjects.dict) |entry| {
             try self.checkCancellation();
             if (!references.contains(entry.key)) continue;
-            var xobj = try self.resolveValue(&entry.value);
+            var xobj = try self.textXObject(&entry.value);
             defer xobj.deinit(self.alloc);
-            if (xobj != .stream) continue;
+            if (xobj != .stream and xobj != .stream_header) continue;
             const subtype = xobj.get("Subtype") orelse continue;
             if (std.mem.eql(u8, subtype.asName() orelse continue, "Image")) {
                 const name = try self.alloc.dupe(u8, entry.key);
@@ -15324,7 +15359,10 @@ fn decodeStreamFiltersOwnedBudgetAlloc(
     final_output_limit: ?usize,
     cancellation: CancellationProbe,
 ) ![]u8 {
-    try cancellation.check();
+    cancellation.check() catch |err| {
+        alloc.free(raw);
+        return err;
+    };
     const terminal_limit = if (final_output_limit) |limit|
         @min(limit, max_decoded_stream_bytes)
     else
@@ -37135,6 +37173,8 @@ const ObjectStreamFixture = struct {
     flate: bool = true,
     indirect_length: bool = false,
     length_reference: ?usize = null,
+    content_length_reference: ?usize = null,
+    object_stream_type: []const u8 = "ObjStm",
 };
 
 fn buildObjectStreamFixtureAlloc(a: Allocator, fixture: ObjectStreamFixture) ![]u8 {
@@ -37165,9 +37205,11 @@ fn buildObjectStreamFixtureAlloc(a: Allocator, fixture: ObjectStreamFixture) ![]
     const length_id = 7 + objects.len + fixture.extra.len;
     const length = if (fixture.indirect_length) try std.fmt.allocPrint(a, "{d} 0 R", .{fixture.length_reference orelse length_id}) else try std.fmt.allocPrint(a, "{d}", .{encoded.len});
     defer a.free(length);
-    const paint = try std.fmt.allocPrint(a, "<< /Length {d} >>\nstream\n{s}\nendstream", .{ content.len, content });
+    const content_length = if (fixture.content_length_reference) |reference| try std.fmt.allocPrint(a, "{d} 0 R", .{reference}) else try std.fmt.allocPrint(a, "{d}", .{content.len});
+    defer a.free(content_length);
+    const paint = try std.fmt.allocPrint(a, "<< /Length {s} >>\nstream\n{s}\nendstream", .{ content_length, content });
     defer a.free(paint);
-    const stream = try std.fmt.allocPrint(a, "<< /Type /ObjStm /N {d} /First {d} {s}/Length {s} >>\nstream\n{s}\nendstream", .{ objects.len, header_bytes.len, if (fixture.flate) "/Filter /FlateDecode " else "", length, encoded });
+    const stream = try std.fmt.allocPrint(a, "<< /Type /{s} /N {d} /First {d} {s}/Length {s} >>\nstream\n{s}\nendstream", .{ fixture.object_stream_type, objects.len, header_bytes.len, if (fixture.flate) "/Filter /FlateDecode " else "", length, encoded });
     defer a.free(stream);
     const fixed = [_][]const u8{
         "<< /Type /Catalog /Pages 2 0 R >>",
@@ -37905,7 +37947,7 @@ test "reader indirect lengths preserve endstream data and full payload boundarie
         defer a.free(raw);
         try std.testing.expectEqualStrings(resources, raw[4 .. raw.len - 1]);
         try std.testing.expectEqual(raw.len, stream.stream.data_length);
-        try std.testing.expectEqual(@as(u32, 8), stream.get("Length").?.obj_ref.id);
+        try std.testing.expectEqual(@as(i64, @intCast(raw.len)), stream.get("Length").?.integer);
         inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
             reader.setTextExtractionPolicy(policy);
             var analysis = try reader.extractPageTextAnalysisAlloc(1);
@@ -38055,4 +38097,262 @@ test "reader indirect lengths preserve encrypted stream ownership through alloca
         rc4Crypt(key.bytes[0..key.len], sample[stream.stream.data_offset..][0..stream.stream.data_length]);
     }
     try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedIndirectStreamLengthAllocations, .{sample});
+}
+
+fn buildCompressedOrdinaryLengthTestPdfAlloc(a: Allocator, flate: bool) ![]u8 {
+    const content = "/Span /Tag BDC BT /F1 10 Tf 10 100 Td (SOURCE) Tj ET EMC";
+    const length = try std.fmt.allocPrint(a, "{d}", .{content.len});
+    defer a.free(length);
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "<< /Font << /F1 5 0 R >> /Properties << /Tag << /ActualText (Label) >> >> >>", length },
+        .content = content,
+        .content_length_reference = 8,
+        .flate = flate,
+    });
+}
+
+fn exerciseCompressedOrdinaryLength(a: Allocator, sample: []const u8, encrypted: bool) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    if (encrypted) reader.encryption = .{ .file_key = @splat(3), .file_key_len = 5, .method = .rc4 };
+    var stream = try reader.readIndirectObject(.{ .id = 4, .gen = 0 });
+    defer stream.deinit(a);
+    try std.testing.expect(stream.get("Length").?.* == .integer);
+    if (encrypted) {
+        // Length-container decryption uses a scoped registry; only the actual
+        // content stream may have changed the source reader's registry here.
+        try std.testing.expectEqual(@as(usize, 1), reader.encrypted_streams.count());
+        try std.testing.expectEqual(@as(u64, 1), reader.encrypted_stream_generation);
+    }
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqualStrings("Label\n", analysis.text);
+    try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+}
+
+test "reader ordinary stream lengths may be stored in object streams" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |flate| {
+        const sample = try buildCompressedOrdinaryLengthTestPdfAlloc(a, flate);
+        defer a.free(sample);
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try reader.extractPlainTextAlloc();
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("Label\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        }
+    }
+}
+
+test "reader compressed ordinary lengths preserve ownership through allocation failure" {
+    const a = std.testing.allocator;
+    const sample = try buildCompressedOrdinaryLengthTestPdfAlloc(a, true);
+    defer a.free(sample);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseCompressedOrdinaryLength, .{ sample, false });
+    // Encrypt both payloads. Integer length objects are decrypted only as part
+    // of their enclosing object stream; they are not independently encrypted.
+    {
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        for ([_]u32{ 4, 6 }) |id| {
+            var stream = try reader.readIndirectObject(.{ .id = id, .gen = 0 });
+            defer stream.deinit(a);
+            const file_key: [16]u8 = @splat(3);
+            const key = objectEncryptionKey(file_key, 5, .{ .id = id, .gen = 0 }, .rc4);
+            rc4Crypt(key.bytes[0..key.len], sample[stream.stream.data_offset..][0..stream.stream.data_length]);
+        }
+    }
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseCompressedOrdinaryLength, .{ sample, true });
+}
+
+test "reader length dependencies reject reentrant container cycles" {
+    const a = std.testing.allocator;
+    const content = "BT /F1 10 Tf (SOURCE) Tj ET";
+    const length = try std.fmt.allocPrint(a, "{d}", .{content.len});
+    defer a.free(length);
+    // A malformed container without Type ObjStm must still be cycle-safe:
+    // resolving the ordinary length enters its owner, which references it again.
+    const sample = try buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "<< /Font << /F1 5 0 R >> >>", length },
+        .content = content,
+        .content_length_reference = 8,
+        .indirect_length = true,
+        .length_reference = 8,
+        .object_stream_type = "Other",
+    });
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    try std.testing.expectError(error.InvalidStreamLength, reader.readIndirectObject(.{ .id = 4, .gen = 0 }));
+    try std.testing.expect(reader.length_resolution == null);
+}
+
+test "reader length dependency limit spans compressed container reads" {
+    const a = std.testing.allocator;
+    const content = "BT /F1 10 Tf (SOURCE) Tj ET";
+    const length = try std.fmt.allocPrint(a, "{d}", .{content.len});
+    defer a.free(length);
+    for ([_]usize{ 126, 127 }) |count| {
+        const extra = try a.alloc([]const u8, count);
+        var initialized: usize = 0;
+        defer {
+            for (extra[0..initialized]) |item| a.free(item);
+            a.free(extra);
+        }
+        for (extra, 0..) |*item, i| {
+            item.* = try std.fmt.allocPrint(a, "{d} 0 R", .{if (i + 1 == count) @as(usize, 8) else 10 + i});
+            initialized += 1;
+        }
+        const sample = try buildObjectStreamFixtureAlloc(a, .{
+            .objects = &.{ "<< /Font << /F1 5 0 R >> >>", length },
+            .extra = extra,
+            .content = content,
+            .content_length_reference = 9,
+            .indirect_length = true,
+        });
+        defer a.free(sample);
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        if (count == 127) {
+            try std.testing.expectError(error.InvalidStreamLength, reader.readIndirectObject(.{ .id = 4, .gen = 0 }));
+        } else {
+            var stream = try reader.readIndirectObject(.{ .id = 4, .gen = 0 });
+            defer stream.deinit(a);
+            try std.testing.expectEqual(content.len, stream.stream.data_length);
+        }
+    }
+}
+
+test "reader validated stream lengths do not allocate to resolve again" {
+    const a = std.testing.allocator;
+    const sample = try buildCompressedOrdinaryLengthTestPdfAlloc(a, true);
+    defer a.free(sample);
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var stream = try reader.readIndirectObject(.{ .id = 4, .gen = 0 });
+    defer stream.deinit(a);
+    try std.testing.expectEqual(@as(i64, @intCast(stream.stream.data_length)), stream.get("Length").?.integer);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+    var raw_reader = reader;
+    raw_reader.alloc = failing.allocator();
+    const raw = try raw_reader.readRawStreamData(&stream);
+    defer failing.allocator().free(raw);
+    try std.testing.expectEqual(@as(usize, 1), failing.alloc_index);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqual(stream.stream.data_length, raw.len);
+}
+
+fn buildDamagedTextImageTestPdfAlloc(a: Allocator, length: []const u8) ![]u8 {
+    const resources = "<< /Font << /F1 5 0 R >> /XObject << /Im 8 0 R >> >>";
+    const image = try std.fmt.allocPrint(a, "<< /Type /XObject /Subtype /Image /Width 1 /Height 1 /ColorSpace /DeviceRGB /BitsPerComponent 8 /Length {s} >>\nstream\nABC\nendstream", .{length});
+    defer a.free(image);
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{resources},
+        .extra = &.{image},
+        .content = "BT /F1 10 Tf 10 100 Td (Hello) Tj ET /Im Do",
+    });
+}
+
+fn exerciseDamagedTextImage(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    var analysis = try reader.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    try std.testing.expectEqualStrings("Hello\n", analysis.text);
+    try std.testing.expect(analysis.has_nontext_visual);
+    try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+}
+
+test "reader damaged image lengths preserve native text without relaxing payload reads" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "99 0 R", "-1" }, [_]anyerror{ error.ObjectNotFound, error.InvalidStreamLength }) |length, failure| {
+        const sample = try buildDamagedTextImageTestPdfAlloc(a, length);
+        defer a.free(sample);
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try reader.extractPlainTextAlloc();
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("Hello\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+            try std.testing.expect(analysis.has_nontext_visual);
+        }
+        try std.testing.expectError(failure, reader.readIndirectObject(.{ .id = 8, .gen = 0 }));
+        var header = try reader.readIndirectObjectProjected(.{ .id = 8, .gen = 0 }, .xobject_header);
+        defer header.deinit(a);
+        try std.testing.expect(header == .stream_header);
+        try std.testing.expectError(error.NotAStream, reader.readRawStreamData(&header));
+        var copy = try header.clone(a);
+        defer copy.deinit(a);
+        try std.testing.expectEqualStrings("Image", copy.get("Subtype").?.asName().?);
+    }
+}
+
+test "reader damaged image header recovery preserves allocation failures" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "99 0 R", "-1" }) |length| {
+        const sample = try buildDamagedTextImageTestPdfAlloc(a, length);
+        defer a.free(sample);
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseDamagedTextImage, .{sample});
+    }
+}
+
+test "reader damaged image recovery propagates cancellation and work exhaustion" {
+    const a = std.testing.allocator;
+    const sample = try buildDamagedTextImageTestPdfAlloc(a, "99 0 R");
+    defer a.free(sample);
+    const Probe = struct {
+        calls: usize = 0,
+        cancel_at: usize = std.math.maxInt(usize),
+        fn cancelled(raw: ?*const anyopaque) bool {
+            const self: *@This() = @ptrCast(@alignCast(@constCast(raw.?)));
+            self.calls += 1;
+            return self.calls >= self.cancel_at;
+        }
+    };
+    var baseline = try Reader.init(a, sample);
+    defer baseline.deinit();
+    _ = try baseline.pageCount();
+    var probe = Probe{};
+    baseline.setCancellationProbe(.{ .context = &probe, .is_cancelled_fn = Probe.cancelled });
+    var analysis = try baseline.extractPageTextAnalysisAlloc(1);
+    defer analysis.deinit(a);
+    const checkpoints = probe.calls;
+    try std.testing.expect(checkpoints > 0);
+    for (1..checkpoints + 1) |cancel_at| {
+        var reader = try Reader.init(a, sample);
+        defer reader.deinit();
+        _ = try reader.pageCount();
+        var cancellation = Probe{ .cancel_at = cancel_at };
+        reader.setCancellationProbe(.{ .context = &cancellation, .is_cancelled_fn = Probe.cancelled });
+        try std.testing.expectError(error.Canceled, reader.extractPageTextAnalysisAlloc(1));
+    }
+    var work = syntax.ScanControl{ .remaining_work = 0 };
+    baseline.metadata_scan = &work;
+    const raw = syntax.Object{ .obj_ref = .{ .id = 8, .gen = 0 } };
+    try std.testing.expectError(error.PdfMetadataWorkLimit, baseline.textXObject(&raw));
+}
+
+test "stream filter cancellation owns the input before inspecting filters" {
+    const a = std.testing.allocator;
+    const Probe = struct {
+        fn cancelled(_: ?*const anyopaque) bool {
+            return true;
+        }
+    };
+    const name = syntax.Object{ .name = @constCast("FlateDecode") };
+    const empty = syntax.Object{ .array = &.{} };
+    for ([_]?*const syntax.Object{ null, &name, &empty }) |filter| {
+        const raw = try a.dupe(u8, "owned input");
+        try std.testing.expectError(error.Canceled, decodeStreamFiltersOwnedAlloc(a, raw, filter, null, .{}, .{ .is_cancelled_fn = Probe.cancelled }));
+    }
 }
