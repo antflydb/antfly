@@ -2631,8 +2631,31 @@ pub const DocStore = struct {
         replay_observation: ?StagedReplayObservation = null,
 
         pub fn wait(self: StagedDocBatch) !void {
-            defer self.heap_alloc.destroy(self.heap_batch);
-            try self.inner.wait();
+            // `inner.wait()` (`Batch.StagedBatch.wait`) deliberately does
+            // *not* release `heap_batch`'s retained/artifact_inputs/
+            // document_revisions captures on failure -- that contract
+            // (documented on `Batch.commitStaged`/`StagedBatch.wait`) leaves
+            // them owned by `heap_batch` so a caller's own `errdefer
+            // batch.abort()` is the one place that frees them, exactly
+            // once. But no caller of this `StagedDocBatch` ever holds such
+            // an `errdefer` on `heap_batch` -- `mutation_commit.zig`'s
+            // `batchInternalPreparedOwned`, in particular, only ever calls
+            // `wait()` itself (see its comment: "wait frees the ticket's
+            // owned heap state unconditionally the first time"). Unlike the
+            // success path below, a failure here used to fall straight
+            // through to the unconditional `defer destroy(heap_batch)`
+            // without ever calling `abort()` first, leaking those captures'
+            // underlying allocations (the hash maps' backing arrays) even
+            // though the struct that pointed to them was freed. This is
+            // the one and only place responsible for finishing that abort
+            // on this path, matching `backend_erased.zig`'s own `TicketBox`
+            // wait_fn wrapper, which does the same for its layer.
+            self.inner.wait() catch |err| {
+                self.heap_batch.abort();
+                self.heap_alloc.destroy(self.heap_batch);
+                return err;
+            };
+            self.heap_alloc.destroy(self.heap_batch);
             if (self.replay_observation) |observation| {
                 observation.store.markReplayIndexAvailable();
                 observation.store.observeCommittedReplaySequence(observation.sequence);

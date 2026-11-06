@@ -1153,6 +1153,72 @@ test "crash sweep: full text recovers from one transient io fault with no crash"
     }
 }
 
+// Bug repro: a commit that fails *after staging* (an injected, persistent
+// `error.InputOutput` on the write op below -- `IoFaultPlan.repeat = true`
+// never clears it) must not leak the retained/artifact_inputs/
+// document_revisions captures `storage/docstore.zig`'s `DocStore.Txn.commit`
+// / `Batch.commitStaged` / `StagedBatch.wait` stage into the batch before
+// the native write itself runs. The real bug: `DocStore.StagedDocBatch.wait`
+// (the wrapper `mutation_commit.zig`'s `batchInternalPreparedOwned` actually
+// calls) unconditionally `defer`-destroyed its heap-boxed `*Batch` without
+// ever calling `abort()` on it first when `inner.wait()` failed, so those
+// captures' backing allocations (document_mutation_revision.zig's `touch`,
+// in particular) became unreachable the moment that memory was freed --
+// a leak the crash sweep's `SafeAllocator` catches directly. Separately,
+// also bound `close()` on its own thread with a deadline: a short
+// `test_visibility_wait_timeout_ms` combined with a persistent fault drives
+// the same derived-worker recoverable-retry path `ee89ce70b5` added, and a
+// regression there must fail loudly instead of hanging the whole suite.
+test "crash sweep: commit failing after staging under a persistent io fault does not leak or hang close" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testAflitePath(allocator, tmp);
+    defer allocator.free(path);
+
+    const sim = try sim_io.SimIo.init(allocator, std.testing.io);
+    defer sim.deinit();
+
+    var handle = try openDbWithIo(allocator, path, sim.io(), true);
+    var handle_open = true;
+    defer if (handle_open) handle.close();
+    try handle.db.batch(.{ .writes = &.{.{ .key = "seed", .value = "{\"body\":\"seed body\"}" }}, .sync_level = .write });
+
+    // Never clears: every subsequent write-kind op faults, including this
+    // next write's own primary commit (not only the derived worker's
+    // catch-up) -- exactly "a commit fails after staging" as described.
+    sim.setIoFaultPlan(.{ .at_op = 0, .kind = .write, .err = error.InputOutput, .repeat = true });
+    db_mod.test_visibility_wait_timeout_ms = 1;
+    defer db_mod.test_visibility_wait_timeout_ms = null;
+
+    handle.db.batch(.{ .writes = &.{.{ .key = "ft-doc", .value = "{\"body\":\"needle in a haystack\"}" }}, .sync_level = .full_text }) catch |err| switch (err) {
+        error.CommitVisibilityNotSatisfied, error.InputOutput => {},
+        else => return err,
+    };
+
+    const Closer = struct {
+        handle: *DbHandle,
+        done: std.atomic.Value(bool) = .init(false),
+        fn run(self: *@This()) void {
+            self.handle.close();
+            self.done.store(true, .release);
+        }
+    };
+    var closer: Closer = .{ .handle = &handle };
+    const thread = try std.Thread.spawn(.{}, Closer.run, .{&closer});
+    const platform_time = @import("antfly_platform").time;
+    const deadline_ns = platform_time.monotonicNs() +| (20 * std.time.ns_per_s);
+    while (!closer.done.load(.acquire)) {
+        if (platform_time.monotonicNs() >= deadline_ns) {
+            thread.detach();
+            return error.ShutdownHangDetected;
+        }
+        std.Thread.yield() catch {};
+    }
+    thread.join();
+    handle_open = false;
+}
+
 fn reportFailures(report: *const SweepReport) !void {
     if (report.ok()) return;
     for (report.failures.items) |f| {
