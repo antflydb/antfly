@@ -2278,7 +2278,7 @@ fn decodeSelection(a: std.mem.Allocator, reader: *media.mp4.Reader, requested: [
     if (reader.track.codec == .hevc) {
         if (capture.prefetch) |producer| try producer.waitForDecoder();
         if (try decodeAppleHevc(a, reader, selected, capture)) return;
-        return error.UnsupportedVideoCodec;
+        return error.HevcDecoderUnavailable;
     }
     if (reader.track.codec == .mjpeg) {
         if (capture.prefetch) |producer| try producer.waitForDecoder();

@@ -409,6 +409,21 @@ test "gemma4 video decodes HEVC in MP4 at FFmpeg's timestamps" {
     try std.testing.expectEqual(@as(u32, 192), count.width);
 }
 
+test "gemma4 video names the missing HEVC route instead of calling the clip corrupt" {
+    const a = std.testing.allocator;
+    const Reject = struct {
+        fn accept(_: *anyopaque, _: usize, _: video.preparation.BorrowedFrame, _: video.preparation.Options, _: media.source.Control) anyerror!void {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var context: u8 = 0;
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes } };
+    const result = embedding_video.observeConfigured(a, @embedFile("../testdata/video/codecs/hevc-hvc1.mp4"), null, .{}, .{ .observer = .{ .context = &context, .accept = Reject.accept }, .sampling = sampling, .pool = &pool, .decoder = .{ .policy = .portable } });
+    try std.testing.expectError(error.HevcDecoderUnavailable, result);
+    // The shared input normalizer must keep this distinct from corrupt media.
+    try std.testing.expectEqual(error.HevcDecoderUnavailable, inputError(error.HevcDecoderUnavailable));
+}
+
 test "gemma4 video tone maps HEVC whose HDR signal is only in the bitstream" {
     if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
     const a = std.testing.allocator;

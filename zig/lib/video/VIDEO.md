@@ -24,8 +24,9 @@ current contracts; historical progress and raw reports live in Git history.
 | Apple VideoToolbox | Eligible static progressive limited-range avc1 8-bit 4:2:0; fixed-format VP9/AV1 WebM 8/10-bit 4:2:0 with one visible picture per packet; AV1 MP4 through [mp4_coded](src/mp4_coded.zig); [HEVC MP4](src/backends/apple_hevc.zig) with out-of-band parameter sets, 8/10-bit 4:2:0. Library hardware-only default; model automatic selection explicitly permits Apple software. |
 
 AV1 in MP4 translates its container metadata onto the WebM lane, so it shares
-the portable and Apple AV1 routes. HEVC has no portable decoder yet: outside
-VideoToolbox and NVDEC it fails as an unsupported codec.
+the portable and Apple AV1 routes. HEVC has no portable decoder: outside
+VideoToolbox and NVDEC, inference requests get a 400 `VIDEO_CODEC_UNAVAILABLE`
+that says to transcode or use a host with hardware decoding.
 
 Compile-time [capabilities](src/capabilities.zig) distinguish built routes from
 runtime hardware/profile availability. Unsupported tools fail explicitly; the

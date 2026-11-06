@@ -198,6 +198,12 @@ budgets in both serving and the native CLI, and serving also holds shared sessio
 admission. Explicit memory caps remain authoritative; decoder failures release
 the reservations before returning.
 
+**Video decoders by host.** Local generation decodes H.264, AV1, VP8, VP9 and MJPEG
+on any host. HEVC needs hardware decoding: VideoToolbox on a Mac or NVDEC on an
+NVIDIA GPU. Elsewhere, or for an HEVC clip no available decoder accepts, the request
+returns 400 `VIDEO_CODEC_UNAVAILABLE`; transcode the clip to H.264 or AV1, or run on
+a host with hardware HEVC decoding.
+
 ## Direct Anthropic generation
 
 Use `provider: anthropic` for the native Claude Messages API. Named generators,
