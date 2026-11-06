@@ -700,7 +700,20 @@ pub fn managedCacheAdmissionSnapshot(session: Session) ?@import("../runtime/tier
     return cache.admissionSnapshot();
 }
 
-const invocation_services = prepared_mod.Services{ .accepts = acceptsPreparedInvocation, .prepare = prepareInvocation, .prepare_into = prepareInvocationInto, .prepare_into_with_cleanup = prepareInvocationIntoWithCleanup };
+const invocation_services = prepared_mod.Services{ .accepts = acceptsPreparedInvocation, .prepare = prepareInvocation, .prepare_into = prepareInvocationInto, .prepare_into_with_cleanup = prepareInvocationIntoWithCleanup, .needs_before_execution = needsBeforeExecution };
+
+fn needsBeforeExecution(session: Session) !bool {
+    if (comptime !build_options.enable_metal) return false;
+    if (!acceptsPreparedInvocation(session)) return false;
+    const model = session.model_lifetime orelse return false;
+    if (model.owner != session.ptr) return error.ForeignManagedCacheModel;
+    const self: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    // This is a call-order hint for complete fixed heads only. Dynamic roots
+    // keep their existing explicit Source/specialization preparation path.
+    const head = @import("../ops/kernel_descriptor.zig").projectionHead(self.executable.graph) orelse return false;
+    if (head.linears[0].operation.linear.rows <= 1) return false;
+    return managedProjectionPackReceiver(session, &self.cb);
+}
 
 fn acceptsPreparedInvocation(session: Session) bool {
     // An inherited hook may never bypass an altered public callback table.
@@ -6540,6 +6553,7 @@ test "actual Imported Metal cache attachment is concurrent idempotent and reject
     };
     const initial: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
     try std.testing.expect((try initial.shared_backend_ctx.managedMetalCache()) == null);
+    try std.testing.expect(!try prepared_mod.needsBeforeExecution(session));
     var attach = Attach{ .session = session, .pin = &pin };
     const first = try std.Thread.spawn(.{}, Attach.run, .{ &attach, 0 });
     const second = std.Thread.spawn(.{}, Attach.run, .{ &attach, 1 }) catch |err| {
@@ -6558,6 +6572,7 @@ test "actual Imported Metal cache attachment is concurrent idempotent and reject
     try attach.attach();
     try std.testing.expect(cache.admission.? == binding and cache.retirementDomainMatches(&pin));
     try std.testing.expect(try managedProjectionPackReceiver(session, &actual.cb));
+    try std.testing.expect(!try prepared_mod.needsBeforeExecution(session)); // unrelated Neg graph keeps its ordinary entry
     const other = try @import("../runtime/tier/admission_domain.zig").Domain.create();
     defer other.release();
     const other_pin = other.pin();

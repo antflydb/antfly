@@ -37,7 +37,17 @@ pub const Services = struct {
     /// by the returned invocation beyond this call. Value providers remain valid.
     prepare_into: ?*const fn (*const Session, session_mod.ShapeInputs, std.mem.Allocator, ?Control, *PreparedInvocation) anyerror!void = null,
     prepare_into_with_cleanup: ?*const fn (*const Session, session_mod.ShapeInputs, std.mem.Allocator, ?Control, *PreparedInvocation, @import("cleanup_context.zig").Context) anyerror!void = null,
+    /// Actual provider-owned cold work must run at an explicit Source phase,
+    /// before Model/FIFO/numerical entry and with its real cleanup owner.
+    needs_before_execution: ?*const fn (Session) anyerror!bool = null,
 };
+
+pub fn needsBeforeExecution(session: Session) !bool {
+    const services = session.invocation_services orelse return false;
+    if (!services.accepts(session)) return false;
+    const query = services.needs_before_execution orelse return false;
+    return query(session);
+}
 
 pub fn prepare(session: Session, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator, control: ?Control) !?PreparedInvocation {
     var result: ?PreparedInvocation = null;

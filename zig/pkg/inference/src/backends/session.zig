@@ -2140,6 +2140,7 @@ pub const Session = struct {
             if (present) return true;
         }
         if (self.nativeWeightPreparationReceiver() or self.nativePanelPreparationReceiver()) return true;
+        if (try invocation.needsBeforeExecution(self)) return true;
         return self.needsEagerRecurrentFunding();
     }
     pub fn executionOwnerStats(self: Session) @import("../ops/execution_scope.zig").OwnerSnapshot {
@@ -3226,15 +3227,15 @@ pub const Session = struct {
     /// Same original resident producer, one Source admission and no numerical
     /// replay. The actual Model/FIFO/B and output retirement shell are ready
     /// before entry; outputs receive that SAME primary lease exactly once.
-    fn runColdNativeResident(self: Session, inputs: []const Tensor, allocator: std.mem.Allocator) !?ResidentOutputs {
+    fn runBeforeExecutionResident(self: Session, inputs: invocation.Inputs, declared: RunRequest, allocator: std.mem.Allocator) !?ResidentOutputs {
         var source: PreparedSource = .{};
         defer source.deinitOutsideExecution();
         // Keep the original public resident IO envelope, including an admitted
         // input's old charged floor. Source resolves numerical geometry; it
         // does not newly subtract planRun's input-residency credit here.
-        try source.initBeforeExecutionInto(self, self, self.execution_gate, .{ .host = inputs }, try RunRequest.fromTensors(inputs), null, .resident_consumer, allocator, null);
+        try source.initBeforeExecutionInto(self, self, self.execution_gate, inputs, declared, null, .resident_consumer, allocator, null);
         try source.enter();
-        var outputs = (try source.runResident(.{ .host = inputs })) orelse return null;
+        var outputs = (try source.runResident(inputs)) orelse return null;
         errdefer outputs.deinitWithBoundary(source.epoch());
         if (!try source.handoffResident(&outputs)) return error.UnsupportedNativeResidentHandoff;
         // The stored backend's synchronous fields were cleared by the actual
@@ -3246,7 +3247,7 @@ pub const Session = struct {
         // A mutable public policy bit cannot restore raw cache production on
         // an actual Model/cache which still owns its admission Domain.
         try @import("../execution/architecture_session.zig").validateNativePanelPreparationReceiver(self);
-        if (self.nativePanelPreparationReceiver()) return self.runColdNativeResident(inputs, allocator);
+        if (self.nativePanelPreparationReceiver() or try invocation.needsBeforeExecution(self)) return self.runBeforeExecutionResident(.{ .host = inputs }, try RunRequest.fromTensors(inputs), allocator);
         if (self.preparesInvocation()) {
             var permit: RunPermit = undefined;
             try self.admitInputsInto(inputs, allocator, null, &permit);
@@ -3284,13 +3285,15 @@ pub const Session = struct {
     }
 
     pub fn runResidentInputs(self: Session, inputs: []const ResidentInput, allocator: std.mem.Allocator) !?ResidentOutputs {
-        if (self.preparesInvocation()) {
+        const before_execution = try invocation.needsBeforeExecution(self);
+        if (self.preparesInvocation() or before_execution) {
             var arena = std.heap.ArenaAllocator.init(allocator);
             defer arena.deinit();
             const info = try residentShapeInfo(self, inputs, arena.allocator());
             var request = try self.planShapes(info, if (info.len > 0) positiveDimension(info[0].shape, 0) else 1);
             request.input_bytes = 0;
             for (inputs) |input| request.input_bytes = try addBytes(request.input_bytes, input.estimated_bytes);
+            if (before_execution) return self.runBeforeExecutionResident(.{ .resident = inputs }, request, allocator);
             var permit = try self.admitShapeRequest(.{ .resident_inputs = .{ .info = info, .values = inputs } }, request, allocator, null);
             defer permit.deinit();
             try permit.prepareResidentOutputRetirement();
@@ -3440,22 +3443,26 @@ pub const PreparedSource = struct {
             .host => |host| @import("../execution/architecture_session.zig").nativePackedSourceInputs(source, host),
             else => false,
         };
-        if (packed_source and supplied_preprocess == null) {
+        const cold_invocation = try invocation.needsBeforeExecution(source);
+        if (cold_invocation) scheduling.leaveSelectedCohort(&self.waiter);
+        if ((packed_source or cold_invocation) and supplied_preprocess == null) {
             // Do not hold a FIFO head while primary/supplemental suppliers or
             // an older pending producer may need that same Model to finish.
-            scheduling.leaveSelectedCohort(&self.waiter);
+            if (!cold_invocation) scheduling.leaveSelectedCohort(&self.waiter);
             self.permit = if (source.run_admission == null and !source.preparesInvocation())
                 try source.admit(request)
             else
                 try source.admitShapeRequestBeforeExecution(shapes, request, allocator, control);
-            if (try @import("../execution/architecture_session.zig").nativeMatrixScratchCandidate(source, inputs)) |geometry| {
-                _ = try self.prepareNativeMatrixCallOutsideExecution(&self.permit.?, null, inputs.host, geometry);
+            if (packed_source) {
+                if (try @import("../execution/architecture_session.zig").nativeMatrixScratchCandidate(source, inputs)) |geometry| {
+                    _ = try self.prepareNativeMatrixCallOutsideExecution(&self.permit.?, null, inputs.host, geometry);
+                }
             }
         }
         // Optional exact additional MAX: never subtract a weight-derived static
         // estimate or any protected/opaque amount. Denial precedes all math and
         // retains the original scratch route and its original admission policy.
-        if (!packed_source and supplied_preprocess == null and !request.workspace_planned and request.retained_backend_workspace_bytes == 0) {
+        if (!packed_source and !cold_invocation and supplied_preprocess == null and !request.workspace_planned and request.retained_backend_workspace_bytes == 0) {
             const adapter = @import("../execution/architecture_session.zig");
             const geometry = if (try adapter.nativeMatrixScratchCandidate(source, inputs) != null) actual: {
                 try scheduling.acquireSelectedCohort(control orelse .{}, &self.waiter);

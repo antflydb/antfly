@@ -11724,6 +11724,9 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
     const controller = pin.controller();
     const cache = (try impl.shared_backend_ctx.managedMetalCache()) orelse return error.MissingImportedManagedCache;
     try std.testing.expect(cache.admission != null and cache.admission.?.controller == controller);
+    const head = @import("../ops/kernel_descriptor.zig").projectionHead(impl.executable.graph) orelse return error.MissingSemanticProjectionHead;
+    try std.testing.expectEqual(@as(u8, count), head.count);
+    try std.testing.expect(try @import("../execution/prepared_invocation.zig").needsBeforeExecution(session));
     var values: [rows * width]f32 = undefined;
     for (&values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 17)) - 8)) / 32;
     var input = try Tensor.initFloat32(a, "x", &.{ rows, width }, &values);
@@ -11829,6 +11832,33 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
             try std.testing.expectEqualSlices(f32, previous, actual);
         }
     }
+    // Public host publication and already-resident inputs must use the same
+    // Source preparation owner; neither may silently bypass its packed claim.
+    {
+        const outputs = try session.run(&.{input}, a);
+        defer {
+            for (outputs) |*output| output.deinit();
+            a.free(outputs);
+        }
+        try std.testing.expectEqual(@as(u64, 1), session.executionDiagnostics().?.execution.?.runtime_region_plan_dispatches);
+        try std.testing.expectEqual(@as(u64, head.covered_count), session.executionDiagnostics().?.execution.?.runtime_region_plan_covered_nodes);
+        for (outputs, 0..) |output, index| for (output.asFloat32(), &values) |got, value| {
+            try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)), got, 0.0001);
+        };
+    }
+    {
+        const resident = try target.cb.ensureDeviceResidentOwned(try target.cb.fromFloat32Shape(&values, &.{ rows, width }));
+        defer target.cb.free(resident);
+        var outputs = (try session.runResidentInputs(&.{.{ .value = resident, .backend = &target.cb, .estimated_bytes = @sizeOf(@TypeOf(values)), .shape = &.{ rows, width } }}, a)) orelse return error.MissingResidentResult;
+        defer outputs.deinit();
+        try std.testing.expectEqual(@as(u64, 1), session.executionDiagnostics().?.execution.?.runtime_region_plan_dispatches);
+        try std.testing.expectEqual(@as(u64, head.covered_count), session.executionDiagnostics().?.execution.?.runtime_region_plan_covered_nodes);
+        for (outputs.outputs, 0..) |output, index| {
+            const actual = try outputs.backend.toFloat32(output, a);
+            defer a.free(actual);
+            for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)), got, 0.0001);
+        }
+    }
     try std.testing.expectEqual(warm_cache.backend_weight_bytes, cache.admissionAmounts().backend_weight_bytes);
     try std.testing.expectEqual(warm_cache.host_weight_bytes, cache.admissionAmounts().host_weight_bytes);
     // Compatibility and assigned calls consume exactly the same physical
@@ -11842,7 +11872,7 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
         const pool = target.executable.runtime.physical_pool.?;
         const immutable = pool.immutable_bindings.?;
         var weights: [3]@import("../ops/ops.zig").CT = undefined;
-        for (target.executable.graph.outputs.items, 0..) |node, index| weights[index] = (immutable.originalTensor(target.executable.graph.node(node).inputs[1]) orelse return error.MissingProjectionWeight).value;
+        for (head.weights[0..head.count], 0..) |node, index| weights[index] = (immutable.originalTensor(node) orelse return error.MissingProjectionWeight).value;
         var sink = try session.model_lifetime.?.retainRetirementSink();
         defer sink.release();
         var guard = try sink.enter();

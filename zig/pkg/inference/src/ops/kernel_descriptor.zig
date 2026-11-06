@@ -240,6 +240,7 @@ pub fn groupedProjectionHeadWithSelection(graph: *const ml.graph.Graph, linear_i
     const rows = std.math.cast(usize, linear.output_shape.dim(0)) orelse return null;
     const total = std.math.cast(usize, linear.output_shape.dim(1)) orelse return null;
     if (rows == 0 or total == 0) return null;
+    if (selection == null and (attrs.rows != rows or attrs.out_dim != total)) return null;
     var result = ProjectionHead{ .form = .grouped_qkv, .count = 3, .input = linear.inputs[0], .entry = linear_id };
     var leaves: [3]ml.graph.NodeId = undefined;
     var count: usize = 0;
@@ -620,7 +621,16 @@ test "semantic projection heads retain optimizer pair and grouped QKV source out
         const input = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ rows, width }));
         for (([_][]const u8{ "q", "k", "v" })[0..count]) |name| {
             const weight = try builder.parameter(name, ml.graph.Shape.init(.f32, &.{ width, width }));
-            try graph.markOutput(try builder.linearNoBias(input, weight, rows, width, width));
+            // Inference import has semantic linears without training-only
+            // VJP alternates. The public ONNX fixture covers real conversion;
+            // this pure graph test lets the default optimizer form the head.
+            const output = try graph.addNode(.{
+                .op = .{ .fused_linear_no_bias = .{ .rows = rows, .in_dim = width, .out_dim = width } },
+                .output_shape = ml.graph.Shape.init(.f32, &.{ rows, width }),
+                .inputs = .{ input, weight, ml.graph.null_node, ml.graph.null_node },
+                .num_inputs = 2,
+            });
+            try graph.markOutput(output);
         }
         var optimized = try ml.graph.passes.pipeline.Pipeline.default.run(a, &graph);
         defer optimized.deinit();
@@ -644,6 +654,10 @@ test "semantic projection heads retain optimizer pair and grouped QKV source out
         if (count == 3) {
             const first_slice = optimized.graph.node(head.outputs[0]);
             const linear = first_slice.inputs[0];
+            const saved_rows = optimized.graph.nodes.items[linear].op.fused_linear_no_bias.rows;
+            optimized.graph.nodes.items[linear].op.fused_linear_no_bias.rows += 1;
+            try std.testing.expect(projectionHead(&optimized.graph) == null);
+            optimized.graph.nodes.items[linear].op.fused_linear_no_bias.rows = saved_rows;
             const saved = optimized.graph.nodes.items[head.outputs[1]].op.slice.strides[1];
             optimized.graph.nodes.items[head.outputs[1]].op.slice.strides[1] = 2;
             try std.testing.expect(projectionHead(&optimized.graph) == null);

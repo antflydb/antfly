@@ -297,7 +297,11 @@ preparation API do not by themselves complete these remaining requirements:
   projections, the optimizer's fused pair/second-output marker and grouped
   concat/projection/slice forms. Source preparation and assigned regions share
   those exact node identities. Region-only heads retain physical output plans
-  without pretending to own individual primitive kernels. Managed multirow
+  without pretending to own individual primitive kernels. Public host-output,
+  host-to-resident and resident-input entrypoints consult the same provider-owned
+  preparation hint for eligible managed fixed heads. They share the existing
+  Source owner, release the FIFO selection before cold funding and reselect it
+  before execution; the hint grants no admission credit. Managed multirow
   no-bias heads can prepare one
   immutable packed weight/bias pair after the original compatibility call has
   established source slots. The actual Source cold phase funds both host
