@@ -1370,7 +1370,7 @@ test "relational integrity restore follower repairs projection and CHECK debt be
                     // Model the last physical projection watermark being
                     // lost at the crash cut while the primary Raft/HA receipt
                     // remains durable. Replay must restore this local proof.
-                    try @import("derived/apply_state.zig").clearAppliedSequenceWithCheckpoint(alloc, std.testing.io, target.core.store, target.core.applied_sequence_checkpoint_path, "text");
+                    try @import("derived/apply_state.zig").clearAppliedSequence(target.core.store, "text");
                     // Import replay is intentionally idempotent; its durable
                     // receipt cannot falsely imply projections caught up.
                     const debt = try target.listDerivedReplayDebt(alloc);

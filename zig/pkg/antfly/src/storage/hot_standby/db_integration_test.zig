@@ -3364,7 +3364,6 @@ test "db ordered artifact inventory reconciles committed receiver catalog before
             var producer: EnrichmentAppendContext = .{
                 .alloc = alloc,
                 .store = producer_base.store,
-                .applied_sequence_checkpoint_path = producer_base.applied_sequence_checkpoint_path,
                 .shard_manager = producer_base.shard_manager,
                 .index_manager = producer_base.index_manager,
                 .apply_mutex = producer_base.apply_mutex,
