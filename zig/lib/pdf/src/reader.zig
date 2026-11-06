@@ -5715,7 +5715,7 @@ pub const Reader = struct {
                 obj.* = .{ .string = decrypted };
             },
             .array => |items| for (items) |*item| try self.decryptObject(item, ptr),
-            .dict => |entries| for (entries) |*entry| try self.decryptObject(&entry.value, ptr),
+            .dict, .stream_header => |entries| for (entries) |*entry| try self.decryptObject(&entry.value, ptr),
             .stream => |stream| {
                 for (stream.header) |*entry| try self.decryptObject(&entry.value, ptr);
                 // Do not decrypt or retain stream payloads during object
@@ -7512,6 +7512,24 @@ pub const Reader = struct {
     fn resolveValue(self: *const Reader, obj: *const syntax.Object) !syntax.Object {
         return switch (obj.*) {
             .obj_ref => |ptr| try self.readIndirectObject(ptr),
+            .deferred => |location| blk: {
+                var value = try self.readDeferredObjectProjected(location, .full);
+                if (value == .obj_ref) {
+                    defer value.deinit(self.alloc);
+                    break :blk try self.readIndirectObject(value.obj_ref);
+                }
+                break :blk value;
+            },
+            else => try obj.clone(self.alloc),
+        };
+    }
+
+    // Color-space consumers use N, Alternate and Range, never ICC payloads.
+    // Keep their probes independent of stream lengths and decoder allowances.
+    fn colorProfileMetadata(self: *const Reader, obj: *const syntax.Object) !syntax.Object {
+        return switch (obj.*) {
+            .obj_ref => |ptr| try self.readIndirectObjectProjected(ptr, .color_profile_header),
+            .deferred => |location| try self.readDeferredObjectProjected(location, .color_profile_header),
             else => try obj.clone(self.alloc),
         };
     }
@@ -8788,7 +8806,7 @@ pub const Reader = struct {
             return try self.classifyCalibratedColorSpace(family, &resolved.array[1]);
         }
         if (std.mem.eql(u8, family, "ICCBased") and resolved.array.len >= 2) {
-            var profile = try self.resolveValue(&resolved.array[1]);
+            var profile = try self.colorProfileMetadata(&resolved.array[1]);
             defer profile.deinit(self.alloc);
             const components_integer = if (profile.get("N")) |count| try self.resolvedIntegerObjectValue(count) else null;
             const components: u8 = switch (components_integer orelse 0) {
@@ -9203,11 +9221,12 @@ pub const Reader = struct {
 
     fn collectFontsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) ![]PageFont {
         const fonts_obj = resources.get("Font") orelse return try self.alloc.alloc(PageFont, 0);
+        var references = try collectReferencedFontNamesCancelableAlloc(self.alloc, content, self.cancellation);
+        defer references.deinit(self.alloc);
+        if (references.names.count() == 0) return try self.alloc.alloc(PageFont, 0);
         var resolved_fonts = try self.resolveValue(fonts_obj);
         defer resolved_fonts.deinit(self.alloc);
         if (resolved_fonts != .dict) return try self.alloc.alloc(PageFont, 0);
-        var references = try collectReferencedFontNamesCancelableAlloc(self.alloc, content, self.cancellation);
-        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageFont).empty;
         errdefer {
@@ -9257,11 +9276,12 @@ pub const Reader = struct {
     /// their own resource dictionary.
     fn collectNonType3FontsFromResourcesAlloc(self: *const Reader, resources: *const syntax.Object, content: []const u8) anyerror![]PageFont {
         const fonts_obj = resources.get("Font") orelse return try self.alloc.alloc(PageFont, 0);
+        var references = try collectReferencedFontNamesCancelableAlloc(self.alloc, content, self.cancellation);
+        defer references.deinit(self.alloc);
+        if (references.names.count() == 0) return try self.alloc.alloc(PageFont, 0);
         var resolved_fonts = try self.resolveValue(fonts_obj);
         defer resolved_fonts.deinit(self.alloc);
         if (resolved_fonts != .dict) return try self.alloc.alloc(PageFont, 0);
-        var references = try collectReferencedFontNamesCancelableAlloc(self.alloc, content, self.cancellation);
-        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageFont).empty;
         errdefer {
@@ -9333,7 +9353,7 @@ pub const Reader = struct {
         if (nested_index) |index|
             return try self.imageColorSpaceValueDependsOnResources(&resolved.array[index], resource_entries, depth + 1);
         if (std.mem.eql(u8, family, "ICCBased") and resolved.array.len > 1) {
-            var profile = try self.resolveValue(&resolved.array[1]);
+            var profile = try self.colorProfileMetadata(&resolved.array[1]);
             defer profile.deinit(self.alloc);
             if (profile.get("Alternate")) |alternate|
                 return try self.imageColorSpaceValueDependsOnResources(alternate, resource_entries, depth + 1);
@@ -9563,11 +9583,12 @@ pub const Reader = struct {
         decode_soft_masks: bool,
     ) ![]PageExtGState {
         const ext_obj = resources.get("ExtGState") orelse return try self.alloc.alloc(PageExtGState, 0);
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, content, &.{"gs"}, self.cancellation);
+        defer references.deinit(self.alloc);
+        if (references.names.count() == 0) return try self.alloc.alloc(PageExtGState, 0);
         var resolved_ext = try self.resolveValue(ext_obj);
         defer resolved_ext.deinit(self.alloc);
         if (resolved_ext != .dict) return try self.alloc.alloc(PageExtGState, 0);
-        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, content, &.{"gs"}, self.cancellation);
-        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageExtGState).empty;
         defer out.deinit(self.alloc);
@@ -10059,11 +10080,12 @@ pub const Reader = struct {
     ) anyerror![]PageForm {
         if (depth > 1) return try self.alloc.alloc(PageForm, 0);
         const xobject_obj = resources.get("XObject") orelse return try self.alloc.alloc(PageForm, 0);
+        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, parent_content, &.{"Do"}, self.cancellation);
+        defer references.deinit(self.alloc);
+        if (references.names.count() == 0) return try self.alloc.alloc(PageForm, 0);
         var resolved_xobjects = try self.resolveValue(xobject_obj);
         defer resolved_xobjects.deinit(self.alloc);
         if (resolved_xobjects != .dict) return try self.alloc.alloc(PageForm, 0);
-        var references = try collectReferencedResourceNamesCancelableAlloc(self.alloc, parent_content, &.{"Do"}, self.cancellation);
-        defer references.deinit(self.alloc);
 
         var out = std.ArrayList(PageForm).empty;
         defer out.deinit(self.alloc);
@@ -10204,9 +10226,9 @@ pub const Reader = struct {
         if (resolved != .array or resolved.array.len < 2) return error.UnsupportedPdfRendering;
         const family = resolved.array[0].asName() orelse return error.UnsupportedPdfRendering;
         if (!std.mem.eql(u8, family, "ICCBased")) return error.UnsupportedPdfRendering;
-        var profile = try self.resolveValue(&resolved.array[1]);
+        var profile = try self.colorProfileMetadata(&resolved.array[1]);
         defer profile.deinit(self.alloc);
-        if (profile != .stream) return error.UnsupportedPdfRendering;
+        if (profile != .stream and profile != .stream_header) return error.UnsupportedPdfRendering;
         if (profile.get("Alternate")) |alternate| return try self.shadingColorSpaceKind(alternate);
         const components = (try self.resolvedIntegerObjectValue(profile.get("N") orelse return error.UnsupportedPdfRendering)) orelse
             return error.UnsupportedPdfRendering;
@@ -10490,9 +10512,9 @@ pub const Reader = struct {
         const family = color_space.array[0].asName() orelse return false;
         if (!std.mem.eql(u8, family, "ICCBased")) return false;
 
-        var profile = try self.resolveValue(&color_space.array[1]);
+        var profile = try self.colorProfileMetadata(&color_space.array[1]);
         defer profile.deinit(self.alloc);
-        if (profile != .stream) return false;
+        if (profile != .stream and profile != .stream_header) return false;
         const component_count = (try self.resolvedIntegerObjectValue(profile.get("N") orelse return false)) orelse return false;
         if (component_count != 4) return false;
 
@@ -11678,9 +11700,9 @@ pub const Reader = struct {
         }
         if (std.mem.eql(u8, family, "ICCBased")) {
             if (color_space.array.len < 2) return error.UnsupportedPdfRendering;
-            var profile = try self.resolveValue(&color_space.array[1]);
+            var profile = try self.colorProfileMetadata(&color_space.array[1]);
             defer profile.deinit(self.alloc);
-            if (profile != .stream) return error.UnsupportedPdfRendering;
+            if (profile != .stream and profile != .stream_header) return error.UnsupportedPdfRendering;
             const count = (profile.get("N") orelse return error.UnsupportedPdfRendering).asInteger() orelse
                 return error.UnsupportedPdfRendering;
             if (count <= 0) return error.UnsupportedPdfRendering;
@@ -11743,9 +11765,9 @@ pub const Reader = struct {
         const color_space_name = color_space[0].asName() orelse return false;
         if (!std.mem.eql(u8, color_space_name, "ICCBased")) return false;
 
-        var profile = try self.resolveValue(&color_space[1]);
+        var profile = try self.colorProfileMetadata(&color_space[1]);
         defer profile.deinit(self.alloc);
-        if (profile != .stream) return error.UnsupportedPdfRendering;
+        if (profile != .stream and profile != .stream_header) return error.UnsupportedPdfRendering;
 
         const components_obj = profile.get("N") orelse return error.UnsupportedPdfRendering;
         const components_i = (try self.resolvedIntegerObjectValue(components_obj)) orelse
@@ -11813,9 +11835,9 @@ pub const Reader = struct {
         if (std.mem.eql(u8, name, "CalGray")) return true;
         if (!std.mem.eql(u8, name, "ICCBased") or color_space.array.len < 2) return false;
 
-        var profile = try self.resolveValue(&color_space.array[1]);
+        var profile = try self.colorProfileMetadata(&color_space.array[1]);
         defer profile.deinit(self.alloc);
-        if (profile != .stream) return false;
+        if (profile != .stream and profile != .stream_header) return false;
         if (profile.get("N")) |components| {
             if ((components.asInteger() orelse 0) == 1) return true;
         }
@@ -13004,9 +13026,9 @@ pub const Reader = struct {
         }
         if (std.mem.eql(u8, family, "ICCBased")) {
             if (color_space.array.len < 2) return error.UnsupportedPdfRendering;
-            var profile = try self.resolveValue(&color_space.array[1]);
+            var profile = try self.colorProfileMetadata(&color_space.array[1]);
             defer profile.deinit(self.alloc);
-            if (profile != .stream) return error.UnsupportedPdfRendering;
+            if (profile != .stream and profile != .stream_header) return error.UnsupportedPdfRendering;
             if (profile.get("Range")) |range_obj| {
                 var resolved_range = try self.resolveValue(range_obj);
                 defer resolved_range.deinit(self.alloc);
@@ -38539,5 +38561,142 @@ test "reader ignored XObject header ownership preserves allocation failures" {
         const sample = try buildIgnoredTextXObjectTestPdfAlloc(a, classification, "7 0 R");
         defer a.free(sample);
         try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseIgnoredTextXObject, .{sample});
+    }
+}
+
+fn buildProfileMetadataTestPdfAlloc(a: Allocator, length: []const u8, alternate: []const u8) ![]u8 {
+    const padding = try a.alloc(u8, 256 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    padding[0] = '(';
+    padding[padding.len - 1] = ')';
+    const profile = try std.fmt.allocPrint(a, "<< /N 3 /Alternate {s} /Range [0 1 0 1 0 1] /Length {s} >>\nstream\nICC\nendstream", .{ alternate, length });
+    defer a.free(profile);
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "3", padding },
+        .extra = &.{profile},
+        .resources = "<< /Font << /F1 5 0 R >> /ColorSpace << /C [/ICCBased 9 0 R] >> >>",
+        .content = "/C cs BT /F1 10 Tf 10 100 Td (Hello) Tj ET",
+    });
+}
+
+test "reader ICC metadata probes preserve native text within decoder limits" {
+    const a = std.testing.allocator;
+    for ([_][]const u8{ "7 0 R", "99 0 R", "-1" }) |length| {
+        const sample = try buildProfileMetadataTestPdfAlloc(a, length, "/DeviceRGB");
+        defer a.free(sample);
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 128 * 1024, .max_working_set_bytes = 64 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const plain = try reader.extractPlainTextAlloc();
+            defer a.free(plain);
+            try std.testing.expectEqualStrings("Hello\n", analysis.text);
+            try std.testing.expectEqualStrings(analysis.text, plain);
+        }
+        const name = syntax.Object{ .name = @constCast("ICCBased") };
+        const reference = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+        var components = [_]syntax.Object{ name, reference };
+        const color_space = syntax.Object{ .array = &components };
+        try std.testing.expectEqual(@as(usize, 3), try reader.colorSpaceInputComponentCount(&color_space));
+        try std.testing.expectEqual(ColorSpaceKind.device_rgb, try reader.shadingColorSpaceKind(&color_space));
+        var rgba: [4]u8 = undefined;
+        try std.testing.expect(try reader.tryDecodeIccBasedImageToRgba(&rgba, 1, &.{ 10, 20, 30 }, &components, null));
+        try std.testing.expectEqualSlices(u8, &.{ 10, 20, 30, 255 }, &rgba);
+        var header = try reader.colorProfileMetadata(&reference);
+        defer header.deinit(a);
+        try std.testing.expect(header == .stream_header);
+        try std.testing.expectError(error.NotAStream, reader.readRawStreamData(&header));
+        if (std.mem.eql(u8, length, "99 0 R"))
+            try std.testing.expectError(error.ObjectNotFound, reader.readIndirectObject(reference.obj_ref));
+        if (std.mem.eql(u8, length, "-1"))
+            try std.testing.expectError(error.InvalidStreamLength, reader.readIndirectObject(reference.obj_ref));
+    }
+}
+
+fn exerciseEncryptedProfileMetadata(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    reader.encryption = .{ .file_key = @splat(3), .file_key_len = 5, .method = .rc4 };
+    const reference = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+    var header = try reader.colorProfileMetadata(&reference);
+    defer header.deinit(a);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 20, 30 }, header.get("Alternate").?.array[3].string);
+    try std.testing.expectEqual(@as(usize, 0), reader.encrypted_streams.count());
+    try std.testing.expectEqual(@as(u64, 0), reader.encrypted_stream_generation);
+}
+
+test "reader color profile header views decrypt owned metadata without registering payloads" {
+    const a = std.testing.allocator;
+    var palette = [_]u8{ 10, 20, 30 };
+    const file_key: [16]u8 = @splat(3);
+    const key = objectEncryptionKey(file_key, 5, .{ .id = 9, .gen = 0 }, .rc4);
+    rc4Crypt(key.bytes[0..key.len], &palette);
+    const alternate = try std.fmt.allocPrint(a, "[/Indexed /DeviceRGB 0 <{x:0>2}{x:0>2}{x:0>2}>]", .{ palette[0], palette[1], palette[2] });
+    defer a.free(alternate);
+    const sample = try buildProfileMetadataTestPdfAlloc(a, "99 0 R", alternate);
+    defer a.free(sample);
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseEncryptedProfileMetadata, .{sample});
+}
+
+fn buildFormResourceViewTestPdfAlloc(a: Allocator, indirect_font: bool) ![]u8 {
+    const padding = try a.alloc(u8, 128 * 1024);
+    defer a.free(padding);
+    @memset(padding, 'X');
+    const paint = "BT /F1 10 Tf 10 100 Td (Hello) Tj ET";
+    const form = try std.fmt.allocPrint(a, "<< /Subtype /Form /Resources << /Font {s}\n%{s}\n/Private ({s}) /Properties << /Unused << /ActualText ({s}) >> >> /XObject 99 0 R /ExtGState 99 0 R >> /Length {d} >>\nstream\n{s}\nendstream", .{ if (indirect_font) "10 0 R" else "<< /F1 5 0 R >>", padding, padding, padding, paint.len, paint });
+    defer a.free(form);
+    return buildObjectStreamFixtureAlloc(a, .{
+        .objects = &.{ "null", "null" },
+        .extra = &.{ form, "<< /F1 5 0 R >>" },
+        .resources = "<< /XObject << /Fm 9 0 R >> >>",
+        .content = "/Fm Do",
+    });
+}
+
+fn exerciseFormResourceViewOwnership(a: Allocator, sample: []const u8) !void {
+    var reader = try Reader.init(a, sample);
+    defer reader.deinit();
+    const reference = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+    var form = try reader.textXObject(&reference);
+    defer form.deinit(a);
+    const resources = form.get("Resources").?;
+    try std.testing.expect(resources.get("Private") == null);
+    var fonts = try reader.resolveValue(resources.get("Font").?);
+    defer fonts.deinit(a);
+    try std.testing.expectEqual(@as(u32, 5), fonts.get("F1").?.obj_ref.id);
+}
+
+test "reader native Form resource views retain only needed metadata and resolve scalar references" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |indirect_font| {
+        const sample = try buildFormResourceViewTestPdfAlloc(a, indirect_font);
+        defer a.free(sample);
+        {
+            var budget = DecodeBudgetAllocator.init(a, 0, 16 * 1024);
+            var reader = try Reader.init(budget.allocator(), sample);
+            defer reader.deinit();
+            const before = budget.cumulative_growth_bytes;
+            const reference = syntax.Object{ .obj_ref = .{ .id = 9, .gen = 0 } };
+            var form = try reader.textXObject(&reference);
+            defer form.deinit(budget.allocator());
+            try std.testing.expect(budget.cumulative_growth_bytes - before < 8192);
+            try std.testing.expect(!budget.limit_exceeded);
+        }
+        var reader = try Reader.initWithDecodeLimits(a, sample, .{ .max_decoded_stream_bytes = 128 * 1024, .max_working_set_bytes = 64 * 1024 });
+        defer reader.deinit();
+        inline for (.{ TextExtractionPolicy.source, .page, .visible }) |policy| {
+            reader.setTextExtractionPolicy(policy);
+            var analysis = try reader.extractPageTextAnalysisAlloc(1);
+            defer analysis.deinit(a);
+            const text = try reader.extractPlainTextAlloc();
+            defer a.free(text);
+            try std.testing.expectEqualStrings("Hello\n", text);
+            try std.testing.expectEqualStrings(text, analysis.text);
+            try std.testing.expect(!analysis.diagnostics.actual_text_incomplete);
+        }
+        try @import("antfly_platform").allocator.checkAllAllocationFailures(a, exerciseFormResourceViewOwnership, .{sample});
     }
 }

@@ -1983,10 +1983,22 @@ inspecting payload boundaries. Header views retain classification and the
 structure-presence marker, carry no payload range, and cannot be decoded.
 Dictionary order does not affect classification: unused fields are skipped,
 while allocating Form-only fields stay as source offsets until classification
-is complete, including an optional late Subtype2 PS. Common scalar resource
-references are parsed once. PDF Forms materialize only their extraction fields
-and continue through ordinary length validation and decoding without reparsing
-the whole header. OOM, cancellation, and
+is complete, including an optional late Subtype2 PS. Form resource dictionaries
+are traversed once into at most five required fields; compound resource tables
+retain source views. Opaque entries and intervening comments are consumed in
+that pass; later lookups address the required field spans. Resource tables are
+resolved only when their names are used by the content. Scalar references are
+parsed once. Source views preserve their owning
+object's identity so encrypted nested properties are decrypted exactly once.
+PDF Forms continue through ordinary length validation and decoding without
+reparsing the whole header.
+
+ICC color-space probes use a projected header containing only N, Alternate, and
+Range. Native classification, component counts, shading, mask ranges, and image
+alternate-space decoding never resolve ICC stream lengths or read ICC payloads.
+Encrypted retained header values are decrypted without registering a payload
+range. Header-only objects cannot be passed to payload decoders; ordinary stream
+and payload reads remain strict. OOM, cancellation, and
 exhausted work still propagate; payload readers remain strict.
 Numeric lookahead propagates
 cancellation and work exhaustion rather than treating them as end-of-input.
