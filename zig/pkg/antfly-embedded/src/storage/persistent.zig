@@ -3348,6 +3348,13 @@ pub const PersistentIndex = struct {
 
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
+        // Self-healing repair of a stale catalog reference (open/replay
+        // recovery, or a missing range/data discovery during a read), never
+        // a synchronous client ack: safe to redo from the same discovery on
+        // the next open or read, so this rides along on the next real
+        // durable boundary instead of its own sync. See MainTxn.setDurable
+        // and replaceSegmentsWithReservedIdOwned's identical comment.
+        txn.setDurable(false);
 
         for (stale_seg_ids) |seg_id| {
             const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
@@ -3532,6 +3539,12 @@ pub const PersistentIndex = struct {
 
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
+        // Multi-segment merge/compaction publication: the same "safe to
+        // redo after a crash" reasoning as the single-segment
+        // replaceSegmentsWithReservedIdOwned above (the pre-merge segments
+        // stay active until this commits), so this never needs its own
+        // durable sync either. See MainTxn.setDurable.
+        txn.setDurable(false);
 
         if (require_active) {
             const active_ids = try self.loadActiveSegmentIds(&txn, scratch_alloc);
@@ -3598,6 +3611,13 @@ pub const PersistentIndex = struct {
 
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
+        // Background structural removal (a merge that produced no surviving
+        // segment, or a split with no remainder) -- the same "safe to redo
+        // after a crash" ride-along as replaceSegmentsWithReservedIdOwned's
+        // merge publication: the old segments simply stay active until this
+        // commits, so a lost attempt just means removal is retried on the
+        // next pass. See MainTxn.setDurable.
+        txn.setDurable(false);
         var writer_publication = try self.writer.prepareSegmentsManyData(old_seg_ids, &.{});
         defer writer_publication.abort();
         // Unlike compaction replacement, structural removal is not a proof
