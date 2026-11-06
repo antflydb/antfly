@@ -3499,7 +3499,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
             defer if (permit) |*value| value.release();
             // No catalog lock survives waiting for the owner writer gate.
             const port = ctx.replay_index_publication;
-            if (port) |publication| try publication.enter(publication.ptr);
+            if (port) |publication| try publication.enter(publication.ptr, index_ref.name);
             defer if (port) |publication| publication.leave(publication.ptr);
             var guard = try ctx.index_manager.lockManagedIndexApply(index_ref);
             defer guard.unlock();
@@ -3671,7 +3671,7 @@ pub fn ImplementationFor(comptime S: type, comptime D: type) type {
                         // prepared chunk under one exact catalog/input fence.
                         const native_publication = ctx.replay_index_publication;
                         if (native_publication) |port| {
-                            try port.enter(port.ptr);
+                            try port.enter(port.ptr, index_ref.name);
                         }
                         defer if (native_publication) |port| port.leave(port.ptr);
                         const apply_lock_wait_start_ns = monotonicTimeNs();

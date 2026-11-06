@@ -432,6 +432,12 @@ const ImmutableTextHandoff = struct {
 pub const ShadowScope = struct { name: []const u8, generation: u64, prefix: []const u8 };
 
 pub const PreparedPublication = struct {
+    const IndexScope = struct {
+        name: []const u8,
+        domain: []const u8,
+        identity: ?[16]u8,
+        valid: bool = true,
+    };
     const DocumentGuards = struct {
         arena: std.heap.ArenaAllocator,
         keys: std.StringHashMapUnmanaged(void) = .empty,
@@ -451,6 +457,9 @@ pub const PreparedPublication = struct {
     document_guards: ?*DocumentGuards = null,
     relational_rows: bool,
     index_inputs_changed: bool = false,
+    // Owned by the turn arena; capture happens before releasing admission.
+    index_scopes: []IndexScope = &.{},
+    admitted_index_scope: ?usize = null,
     resolver_dependency: ?struct { table: []const u8, template: []const u8, table_id: ?u64, head: ?@import("resolver_authority.zig").Stamp } = null,
 
     fn current(self: *@This()) !*h.db_mod.DB {
@@ -665,6 +674,18 @@ pub const PreparedPublication = struct {
             try held.publication.guardKey(held.database, key);
         }
     };
+
+    fn findIndexScope(self: *@This(), name: []const u8) ?usize {
+        if (self.shadow_scopes.len != 0 or self.resolver_dependency != null or !(self.catalog orelse return null).recovery_clean) return null;
+        for (self.index_scopes, 0..) |scope, i| if (scope.valid and std.mem.eql(u8, scope.name, name)) return i;
+        return null;
+    }
+
+    fn indexScopeUnchanged(self: *@This(), i: usize, latest: *native.NativeFile) !bool {
+        const scope = self.index_scopes[i];
+        return scope.valid and latest.header.indexed_reclamation and latest.header.indexed_revision >= 12 and
+            std.meta.eql(scope.identity, try latest.indexScopeIdentity(scope.domain));
+    }
 
     fn indexInputsUnchanged(self: *@This(), captured: *native.NativeFile, latest: *native.NativeFile) !bool {
         if (self.snapshot_root.owned_lite_backend.?.native_docstore.?.index_reads_require_admission == true) {
@@ -2091,11 +2112,11 @@ pub const Owner = struct {
     // Primary transactions and index publications join the fair writer queue.
     // Their DB/index locks belong to the detached runtime; foreground refresh
     // opens a separate runtime. Reclamation admission yields on contention.
-    fn enterReplayIndexPublication(ptr: *anyopaque) !void {
+    fn enterReplayIndexPublication(ptr: *anyopaque, index_name: []const u8) !void {
         const root: *h.Handle = @ptrCast(@alignCast(ptr));
         if (comptime h.builtin.is_test) if (root.maintenance_owner.?.test_before_replay_index_publication) |hook| hook.notify(hook.ptr, root);
         const started = @import("antfly_platform").time.monotonicNs();
-        try enterMaintenanceWriter(root, .index);
+        try enterMaintenanceWriterForIndex(root, .index, index_name);
         root.maintenance_owner.?.publication_stats.replay_index_admission_ns +|= @import("antfly_platform").time.monotonicNs() -| started;
         root.maintenance_owner.?.publication_stats.replay_index_groups +|= 1;
     }
@@ -2116,6 +2137,10 @@ pub const Owner = struct {
     }
 
     fn enterMaintenanceWriter(ptr: *anyopaque, scope: PublicationScope) !void {
+        return enterMaintenanceWriterForIndex(ptr, scope, null);
+    }
+
+    fn enterMaintenanceWriterForIndex(ptr: *anyopaque, scope: PublicationScope, index_name: ?[]const u8) !void {
         const root: *h.Handle = @ptrCast(@alignCast(ptr));
         const self = root.maintenance_owner.?;
         const admission_started = std.Io.Clock.awake.now(h.handleLockIo()).nanoseconds;
@@ -2125,10 +2150,19 @@ pub const Owner = struct {
         defer root.maintenance_admission_mutex.unlock(h.handleLockIo());
         if (self.stopping.load(.acquire)) return error.Canceled;
         if (needsOutcomeReconciliation(root)) return error.OutcomeReconciliationRequired;
+        const publication_context = root.maintenance_publication;
+        const scoped_index = if (publication_context) |p|
+            if (index_name) |name| p.findIndexScope(name) else if (root.maintenance_writer_references != 0) p.admitted_index_scope else null
+        else
+            null;
+        // Nested storage writes borrow only the already validated index domain.
+        if (root.maintenance_writer_references != 0 and index_name != null) {
+            if (publication_context) |p| if (p.admitted_index_scope != scoped_index) return error.EnrichmentWaitCanceled;
+        }
         // A primary publication can rebase onto changed index inputs while
         // recording completed replay progress. Nesting shares its writer
         // lease, but cannot grant its stale index runtimes new authority.
-        if (scope == .index or scope == .index_read) if (root.maintenance_publication) |p| if (p.index_inputs_changed) {
+        if (scope == .index or scope == .index_read) if (root.maintenance_publication) |p| if (p.index_inputs_changed and scoped_index == null) {
             self.publication_stats.index_input_refusals +|= 1;
             return error.EnrichmentWaitCanceled;
         };
@@ -2157,6 +2191,11 @@ pub const Owner = struct {
         const probe_inode = (try probe.file.stat(probe.runtime())).inode;
         if (probe_inode != (try file.file.stat(file.runtime())).inode) return error.EnrichmentWaitCanceled;
         self.reader_coordinator.observeCurrent(probe_inode, probe.headerFingerprint());
+        // Allocator-only adoption can advance this file without validating
+        // its captured catalog. Scoped permission must recheck the durable
+        // recovery proof even when the file already carries the current tip.
+        // findIndexScope permits only the non-mutating native proof path.
+        if (scoped_index != null) try publication_context.?.validateStorageCurrent(&probe);
         if (!std.meta.eql(probe.header, file.header) and scope == .allocator_service) {
             // Bounded allocator/orphan service computes no detached output.
             // Start it on the current ledger under the fair writer lease;
@@ -2169,7 +2208,7 @@ pub const Owner = struct {
         } else if (!std.meta.eql(probe.header, file.header)) {
             if (scope == .reclamation) return error.EnrichmentWaitCanceled;
             const publication = root.maintenance_publication orelse return error.EnrichmentWaitCanceled;
-            try publication.validateStorageCurrent(&probe);
+            if (scoped_index == null) try publication.validateStorageCurrent(&probe);
             // Rebase before opening a primary transaction as well as before
             // publishing immutable index bytes. Lease acquisition and replay
             // checkpoints must not require a quiet interval between capture
@@ -2185,16 +2224,24 @@ pub const Owner = struct {
             if (root.owned_lite_backend.?.native_docstore.?.index_reads_require_admission or file.activeCheckpoint().index_catalog_root_page != latest.activeCheckpoint().index_catalog_root_page) {
                 if (!try publication.indexInputsUnchanged(file, &latest)) {
                     publication.index_inputs_changed = true;
-                    if (scope == .index or scope == .index_read) {
+                    if ((scope == .index or scope == .index_read) and scoped_index == null) {
                         self.publication_stats.index_input_refusals +|= 1;
                         return error.EnrichmentWaitCanceled;
                     }
                 }
             }
+            if (scoped_index) |i| if (!try publication.indexScopeUnchanged(i, &latest)) {
+                self.publication_stats.index_input_refusals +|= 1;
+                return error.EnrichmentWaitCanceled;
+            };
             try root.owned_lite_backend.?.native_docstore.?.refreshIndexPublicationCheckpoint(latest.header);
             if (self.current) |current| try file.inheritAllocatorVerification(&current.owned_lite_backend.?.native_docstore.?.file);
             self.publication_stats.rebased +|= 1;
         }
+        if (scoped_index) |i| if (!try publication_context.?.indexScopeUnchanged(i, file)) {
+            self.publication_stats.index_input_refusals +|= 1;
+            return error.EnrichmentWaitCanceled;
+        };
         // A changed tip invalidates a detached proof. Retry outside the gate
         // instead of falling back to a whole-file scan in this publication.
         // Metadata-only validation need not open a serving runtime to donate
@@ -2209,6 +2256,7 @@ pub const Owner = struct {
         }
         if (scope == .allocator_service) self.publication_stats.allocator_service_admissions +|= 1;
         root.maintenance_writer_lease = lease;
+        if (publication_context) |p| p.admitted_index_scope = scoped_index;
         root.maintenance_writer_references = 1;
         root.maintenance_writer_scope = @backingInt(scope);
         root.maintenance_writer_held_from = held_from;
@@ -2223,6 +2271,17 @@ pub const Owner = struct {
         std.debug.assert(root.maintenance_writer_references != 0);
         root.maintenance_writer_references -= 1;
         if (root.maintenance_writer_references != 0) return;
+        // Refresh the owned witness before releasing the path lease. Never
+        // turn a completed publication into a retryable error if this read
+        // fails: invalidate future use and discard the cached runtime instead.
+        if (root.maintenance_publication) |p| if (p.admitted_index_scope) |i| {
+            p.index_scopes[i].identity = root.owned_lite_backend.?.native_docstore.?.file.indexScopeIdentity(p.index_scopes[i].domain) catch blk: {
+                p.index_scopes[i].valid = false;
+                p.index_inputs_changed = true;
+                break :blk null;
+            };
+            p.admitted_index_scope = null;
+        };
         var lease = root.maintenance_writer_lease.?;
         root.maintenance_writer_lease = null;
         if (root.maintenance_publication_started_ns) |started| {
@@ -3322,6 +3381,15 @@ pub const Owner = struct {
         defer if (source_runtime_cache) |cache| cache.destroy();
         var publication: PreparedPublication = .{ .owner = self, .name = publication_name, .identity = database.core.identity_namespace, .incarnation = database.root_incarnation, .catalog = if (catalog) |*proof| proof else null, .index_prefix = index_prefix, .shadow_scopes = shadow_scopes.items, .snapshot_root = root, .snapshot_database = database, .publication_overhead_ns = &group_state.publication_overhead_ns, .source_read = if (source_read) |*read| read else null, .relational_rows = if (database.enrichment_runtime) |runtime| runtime.config.relational_base_rows else false };
         const managed = try database.core.index_manager.managedIndexes(turn_alloc);
+        const captured_file = &root.owned_lite_backend.?.native_docstore.?.file;
+        if (run_source and captured_file.header.indexed_reclamation and captured_file.header.indexed_revision >= 12) {
+            const scopes = try turn_alloc.alloc(PreparedPublication.IndexScope, managed.len);
+            for (managed, scopes) |index, *scope| {
+                const domain = try std.fmt.allocPrint(turn_alloc, "{s}/indexes/{s}", .{ database.core.index_manager.base_path, index.name });
+                scope.* = .{ .name = index.name, .domain = domain, .identity = try captured_file.indexScopeIdentity(domain) };
+            }
+            publication.index_scopes = scopes;
+        }
         const replay_progress = if (run_source) try ReplayProgress.capture(turn_alloc, database, managed) else null;
         // Keep the primary epoch until runBackgroundTurn returns and every
         // replay cursor has closed. Preparing the last text segment does not
@@ -9723,6 +9791,108 @@ test "capi native cooperative replay separates raw text from generated artifact 
     }
 }
 
+test "capi native staged text replay distinguishes foreign index changes from its own target" {
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    for ([_][]const u8{ "graph", "text", "catalog" }) |changed_index| {
+        var fixture = try AdmissionFollowupFixture.init("scoped-text-replay-progress", 5000, .batch);
+        defer fixture.deinit();
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_add_index_json(fixture.id, .fromSlice("{\"name\":\"text\",\"type\":\"full_text\"}")));
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+        const owner = fixture.connection.owner;
+        var target: u64 = 0;
+        {
+            var lease = try fixture.connection.acquire();
+            defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            defer lease.close();
+            target = (try owner.refresh()).db.core.nextDerivedSequence();
+        }
+        const Probe = struct {
+            connection: *Connection,
+            changed_index: []const u8,
+            publications: usize = 0,
+            broad_refusals: usize = 0,
+            failure: ?anyerror = null,
+            fn notify(raw: *anyopaque, detached: *h.Handle) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.changeOtherIndex() catch |err| {
+                    self.failure = err;
+                    return;
+                };
+                if (std.mem.eql(u8, self.changed_index, "catalog")) {
+                    Owner.enterMaintenanceWriter(detached, .allocator_service) catch |err| {
+                        self.failure = err;
+                        return;
+                    };
+                    Owner.leaveMaintenanceWriter(detached);
+                    return;
+                }
+                // Exercise the former broad admission on this exact captured
+                // runtime as a control, without building another library.
+                Owner.enterMaintenanceWriter(detached, .index) catch |err| {
+                    if (err == error.EnrichmentWaitCanceled) self.broad_refusals += 1 else self.failure = err;
+                    return;
+                };
+                Owner.leaveMaintenanceWriter(detached);
+                self.failure = error.TestExpectedBroadIndexRefusal;
+            }
+            fn changeOtherIndex(self: *@This()) !void {
+                var lease = try self.connection.acquire();
+                defer self.connection.gate.mutex.unlock(h.handleLockIo());
+                defer lease.close();
+                const root = try self.connection.owner.refresh();
+                if (std.mem.eql(u8, self.changed_index, "catalog")) {
+                    self.publications += 1;
+                    var value: [8]u8 = undefined;
+                    std.mem.writeInt(u64, &value, self.publications, .little);
+                    try root.owned_lite_backend.?.native_docstore.?.file.putCatalogRecord("scoped-replay-catalog-canary", &value);
+                    return;
+                }
+                const path = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}/replay-progress-canary", .{ root.db.core.index_manager.base_path, self.changed_index });
+                defer alloc.free(path);
+                var value: [8]u8 = undefined;
+                self.publications += 1;
+                std.mem.writeInt(u64, &value, self.publications, .little);
+                try root.owned_lite_backend.?.native_docstore.?.file.putIndexCatalogRecord(path, &value);
+            }
+        };
+        var probe: Probe = .{ .connection = fixture.connection, .changed_index = changed_index };
+        owner.test_before_replay_index_publication = .{ .ptr = &probe, .notify = Probe.notify };
+        defer owner.test_before_replay_index_publication = null;
+        var caught_up = false;
+        for (0..32) |_| {
+            _ = owner.maintenanceTurnForTest() catch |err| switch (err) {
+                error.EnrichmentWaitCanceled => false,
+                else => return err,
+            };
+            if (probe.failure) |err| return err;
+            var lease = try fixture.connection.acquire();
+            defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+            defer lease.close();
+            const root = try owner.refresh();
+            if (try root.db.core.loadAppliedSequence(alloc, "text") >= target) {
+                caught_up = true;
+                break;
+            }
+        }
+        try std.testing.expect(probe.publications != 0);
+        if (!std.mem.eql(u8, changed_index, "catalog")) try std.testing.expectEqual(probe.publications, probe.broad_refusals);
+        try std.testing.expectEqual(std.mem.eql(u8, changed_index, "graph"), caught_up);
+        owner.test_before_replay_index_publication = null;
+        try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_run_until_idle(fixture.id));
+        var lease = try fixture.connection.acquire();
+        defer fixture.connection.gate.mutex.unlock(h.handleLockIo());
+        defer lease.close();
+        const root = try owner.refresh();
+        const text_domain = try std.fmt.allocPrint(alloc, "{s}/indexes/text", .{root.db.core.index_manager.base_path});
+        defer alloc.free(text_domain);
+        try std.testing.expect(try root.owned_lite_backend.?.native_docstore.?.file.indexScopeIdentity(text_domain) != null);
+        try std.testing.expect((try root.owned_lite_backend.?.native_docstore.?.checkWithCancel(null)).valid);
+        const snapshot = root.db.core.index_manager.textIndex("text").?.acquireSnapshot();
+        defer snapshot.release();
+        try std.testing.expectEqual(@as(u32, 1), snapshot.liveDocCount());
+    }
+}
+
 test "capi native staged replay rejects a dropped and recreated target before activation" {
     if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
     var fixture = try AdmissionFollowupFixture.init("staged-replay-replacement", 5000, .batch);
@@ -9876,6 +10046,15 @@ test "capi native registered replay fragments oversized batches across maintenan
             try std.testing.expectEqual(@as(u64, 1024), position.total_items);
             try std.testing.expect(try live.db.core.loadAppliedSequence(a, "text") < target);
             observed = position.next_item;
+            const debts = try live.db.listDerivedReplayDebt(a);
+            defer {
+                for (debts) |*debt| debt.deinit(a);
+                a.free(debts);
+            }
+            try std.testing.expectEqual(@as(usize, 1), debts.len);
+            try std.testing.expectEqual(target, debts[0].fragment_sequence);
+            try std.testing.expectEqual(observed, debts[0].fragment_next_item);
+            try std.testing.expectEqual(@as(u64, 1024), debts[0].fragment_total_items);
             if (observed == expected) {
                 // Close the actual actor; the next registered worker must
                 // resume from durable fragment state rather than RAM.

@@ -15,7 +15,7 @@
 
 //! Native single-file Antfly Lite format primitives.
 //!
-//! This module owns revision-3 compatibility and the revision-11 indexed `.aflite`
+//! This module owns revision-3 compatibility and the revision-12 indexed `.aflite`
 //! format, checkpoint publication, ownership retirement, and physical page reuse.
 
 const std = @import("std");
@@ -34,6 +34,44 @@ const ScoreSink = @import("../backend_types.zig").ScoreSink;
 const CompleteScoreSink = @import("../backend_types.zig").CompleteScoreSink;
 const ReadIdentity = struct { canonical: u64, namespace: []const u8 };
 const Allocator = std.mem.Allocator;
+
+test "lite index scope identities publish atomically and isolate foreign index changes" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "index-scope-identities.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .no_sync = true, .indexed_reclamation = true });
+    defer file.close();
+    const text = "__antfly_lite/indexes/text";
+    const graph = "__antfly_lite/indexes/graph";
+    try file.putIndexCatalogRecord(text ++ "/main/wal", "text state");
+    const original = (try file.indexScopeIdentity(text)).?;
+    const no_op_sequence = file.activeCheckpoint().commit_sequence;
+    try file.putIndexCatalogRecord(text ++ "/main/wal", "text state");
+    try std.testing.expectEqual(original, (try file.indexScopeIdentity(text)).?);
+    try std.testing.expectEqual(no_op_sequence, file.activeCheckpoint().commit_sequence);
+    const before = file.activeCheckpoint().commit_sequence;
+    try file.putIndexCatalogRecord(graph ++ "/main/wal", "graph state");
+    try std.testing.expectEqual(before + 1, file.activeCheckpoint().commit_sequence);
+    try std.testing.expectEqual(original, (try file.indexScopeIdentity(text)).?);
+    const graph_before = (try file.indexScopeIdentity(graph)).?;
+    try file.beginTransaction();
+    try file.putIndexCatalogRecord(text ++ "/main/wal", "uncommitted");
+    try std.testing.expect(!std.meta.eql(original, (try file.indexScopeIdentity(text)).?));
+    file.abortTransaction();
+    try std.testing.expectEqual(original, (try file.indexScopeIdentity(text)).?);
+    try file.appendIndexCatalogRecord(text ++ "/main/wal", " appended");
+    const appended = (try file.indexScopeIdentity(text)).?;
+    try std.testing.expect(!std.meta.eql(original, appended));
+    try file.renameIndexCatalogRecord(text ++ "/main/wal", graph ++ "/moved");
+    try std.testing.expect(!std.meta.eql(appended, (try file.indexScopeIdentity(text)).?));
+    try std.testing.expect(!std.meta.eql(graph_before, (try file.indexScopeIdentity(graph)).?));
+    const before_delete = (try file.indexScopeIdentity(graph)).?;
+    try file.deleteIndexCatalogRecord(graph ++ "/moved");
+    try std.testing.expect(!std.meta.eql(before_delete, (try file.indexScopeIdentity(graph)).?));
+    try std.testing.expect((try file.check()).valid);
+}
 
 test "lite index prefix comparison scales past 4096 records and detects mutations" {
     const a = std.testing.allocator;
@@ -1132,9 +1170,10 @@ const previous_indexed_magic = "AFLITE\x07P";
 const revision8_magic = "AFLITE\x08P";
 const revision9_magic = "AFLITE\x09P";
 const revision10_magic = "AFLITE\x0aP";
-const indexed_magic = "AFLITE\x0bP";
+const revision11_magic = "AFLITE\x0bP";
+const indexed_magic = "AFLITE\x0cP";
 pub const format_version: u32 = 3;
-pub const indexed_format_version: u32 = 11;
+pub const indexed_format_version: u32 = 12;
 pub const default_page_size: u32 = 4096;
 
 test "lite reclamation catalog snapshots visit live indexes rather than history" {
@@ -7075,6 +7114,13 @@ pub const NativeFile = struct {
     /// source alive and unchanged throughout this call. No staged data enters
     /// the committed catalog until the final checkpoint publication.
     pub fn putIndexCatalogRecordFromFile(self: *NativeFile, key: []const u8, source: std.Io.File, len: usize, options: WriteOptions) !void {
+        const owned = try self.beginIndexScopeMutation(&.{key});
+        errdefer if (owned) self.abortTransaction();
+        try self.putIndexCatalogRecordFromFileInner(key, source, len, options);
+        if (owned) try self.commitTransaction();
+    }
+
+    fn putIndexCatalogRecordFromFileInner(self: *NativeFile, key: []const u8, source: std.Io.File, len: usize, options: WriteOptions) !void {
         self.noteIndexPathMutation(key);
         if (self.change_capture) |capture| capture.record(self.allocator, .index, key);
         if (self.read_only) return error.ReadOnly;
@@ -7289,7 +7335,64 @@ pub const NativeFile = struct {
         }
     }
 
+    const IndexScopes = @import("index_scope.zig");
+
+    /// Scoped identities join the same native transaction as their effects.
+    /// The virtual index layout fixes /indexes/<name> as a domain boundary.
+    fn beginIndexScopeMutation(self: *NativeFile, paths: []const []const u8) !bool {
+        if (!self.header.indexed_reclamation or self.header.indexed_revision < 12 or self.flushing_transaction) return false;
+        var domains: std.StringHashMapUnmanaged(void) = .empty;
+        defer domains.deinit(self.allocator);
+        for (paths) |path| if (IndexScopes.root(path)) |domain| try domains.put(self.allocator, domain, {});
+        if (domains.count() == 0) return false;
+        const owned = self.transaction_header == null;
+        if (owned) try self.beginTransaction();
+        errdefer if (owned) self.abortTransaction();
+        var nonce: [16]u8 = undefined;
+        try self.runtimeIo().randomSecure(&nonce);
+        var domains_it = domains.keyIterator();
+        while (domains_it.next()) |domain| {
+            var encoded: [IndexScopes.key_capacity]u8 = undefined;
+            const marker = IndexScopes.key(&encoded, domain.*);
+            try self.putCatalogBatchForRootInner(.index, &.{.{ .key = marker, .value = &nonce }}, .{}, false);
+        }
+        return owned;
+    }
+
+    pub fn indexScopeIdentity(self: *NativeFile, domain: []const u8) !?[16]u8 {
+        var encoded: [IndexScopes.key_capacity]u8 = undefined;
+        const marker = IndexScopes.key(&encoded, domain);
+        const raw = (try self.getCatalogRecordFromRootAlloc(self.allocator, .index, marker)) orelse return null;
+        defer self.allocator.free(raw);
+        if (raw.len != 16) return error.InvalidNativeCheckpoint;
+        return raw[0..16].*;
+    }
+
     fn putCatalogBatchForRoot(self: *NativeFile, root: CatalogRoot, mutations: []const CatalogMutation, options: WriteOptions) anyerror!void {
+        if (root != .index or self.flushing_transaction) return self.putCatalogBatchForRootInner(root, mutations, options, true);
+        // Keep existing idempotent file writes free of identity churn. A
+        // fresh identity certifies an actual mutation, not an attempted sync.
+        if (!self.read_only and !self.artifact_lease_transaction and mutations.len == 1 and !self.checkpoint_publication_uncertain) {
+            const mutation = mutations[0];
+            try self.validateCatalogMutation(mutation);
+            const size = try self.getCatalogRecordSizeFromRoot(root, mutation.key);
+            if (mutation.is_delete and size == null) return self.syncIfRequired();
+            if (mutation.external_value_root_page == 0 and !mutation.is_delete and size != null and size.? == mutation.value.len and self.catalogEntryFitsInline(mutation.key, mutation.value)) {
+                const existing = try self.getCatalogRecordFromRootAlloc(self.allocator, root, mutation.key);
+                defer if (existing) |bytes| self.allocator.free(bytes);
+                if (existing) |bytes| if (std.mem.eql(u8, bytes, mutation.value)) return self.syncIfRequired();
+            }
+        }
+        const paths = try self.allocator.alloc([]const u8, mutations.len);
+        defer self.allocator.free(paths);
+        for (mutations, paths) |mutation, *path| path.* = mutation.key;
+        const owned = try self.beginIndexScopeMutation(paths);
+        errdefer if (owned) self.abortTransaction();
+        try self.putCatalogBatchForRootInner(root, mutations, options, false);
+        if (owned) try self.commitTransaction();
+    }
+
+    fn putCatalogBatchForRootInner(self: *NativeFile, root: CatalogRoot, mutations: []const CatalogMutation, options: WriteOptions, compare_inline: bool) anyerror!void {
         if (root == .index) for (mutations) |mutation| self.noteIndexPathMutation(mutation.key);
         if (self.read_only) return error.ReadOnly;
         if (mutations.len == 0) return;
@@ -7305,7 +7408,7 @@ pub const NativeFile = struct {
         // reset to the same contents. Avoid growing catalog history for those
         // writes. Bound comparison work to one inline record; bulk mutations
         // and spilled values retain the normal publication path.
-        if (!self.flushing_transaction and root == .index and mutations.len == 1 and !self.checkpoint_publication_uncertain) {
+        if (compare_inline and !self.flushing_transaction and root == .index and mutations.len == 1 and !self.checkpoint_publication_uncertain) {
             const mutation = mutations[0];
             const size = try self.getCatalogRecordSizeFromRoot(root, mutation.key);
             if (mutation.is_delete and size == null) return self.syncIfRequired();
@@ -7505,6 +7608,13 @@ pub const NativeFile = struct {
     }
 
     fn appendCatalogRecordForRoot(self: *NativeFile, root: CatalogRoot, key: []const u8, suffix: []const u8) !void {
+        const owned = if (root == .index) try self.beginIndexScopeMutation(&.{key}) else false;
+        errdefer if (owned) self.abortTransaction();
+        try self.appendCatalogRecordForRootInner(root, key, suffix);
+        if (owned) try self.commitTransaction();
+    }
+
+    fn appendCatalogRecordForRootInner(self: *NativeFile, root: CatalogRoot, key: []const u8, suffix: []const u8) !void {
         if (root == .index) self.noteIndexPathMutation(key);
         if (self.change_capture) |capture| capture.record(self.allocator, if (root == .metadata) .metadata else .index, key);
         if (self.read_only) return error.ReadOnly;
@@ -7578,6 +7688,13 @@ pub const NativeFile = struct {
     }
 
     fn renameCatalogRecordForRoot(self: *NativeFile, root: CatalogRoot, old_key: []const u8, new_key: []const u8) !void {
+        const owned = if (root == .index) try self.beginIndexScopeMutation(&.{ old_key, new_key }) else false;
+        errdefer if (owned) self.abortTransaction();
+        try self.renameCatalogRecordForRootInner(root, old_key, new_key);
+        if (owned) try self.commitTransaction();
+    }
+
+    fn renameCatalogRecordForRootInner(self: *NativeFile, root: CatalogRoot, old_key: []const u8, new_key: []const u8) !void {
         if (root == .index) {
             self.noteIndexPathMutation(old_key);
             self.noteIndexPathMutation(new_key);
@@ -13415,7 +13532,7 @@ pub fn inspectBytes(raw: []const u8) InspectReport {
 
 pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
     @memset(out, 0);
-    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) (if (header.indexed_revision == 7) previous_indexed_magic else if (header.indexed_revision == 8) revision8_magic else if (header.indexed_revision == 9) revision9_magic else if (header.indexed_revision == 10) revision10_magic else indexed_magic) else if (header.packed_records) magic else unpacked_v3_magic);
+    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) (if (header.indexed_revision == 7) previous_indexed_magic else if (header.indexed_revision == 8) revision8_magic else if (header.indexed_revision == 9) revision9_magic else if (header.indexed_revision == 10) revision10_magic else if (header.indexed_revision == 11) revision11_magic else indexed_magic) else if (header.packed_records) magic else unpacked_v3_magic);
     std.mem.writeInt(u32, out[version_offset..][0..4], if (header.indexed_reclamation) header.indexed_revision else format_version, .little);
     std.mem.writeInt(u32, out[page_size_offset..][0..4], header.page_size, .little);
     std.mem.writeInt(u32, out[header_size_offset..][0..4], header_size, .little);
@@ -13438,12 +13555,13 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const revision8 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision8_magic);
     const revision9 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision9_magic);
     const revision10 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision10_magic);
-    const indexed_reclamation = previous_indexed or revision8 or revision9 or revision10 or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
+    const revision11 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision11_magic);
+    const indexed_reclamation = previous_indexed or revision8 or revision9 or revision10 or revision11 or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
     const has_packed_records = indexed_reclamation or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic);
     if (!has_packed_records and !std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], unpacked_v3_magic)) return error.InvalidNativeMagic;
 
     const version = std.mem.readInt(u32, header_raw[version_offset..][0..4], .little);
-    if (version != (if (previous_indexed) @as(u32, 7) else if (revision8) @as(u32, 8) else if (revision9) @as(u32, 9) else if (revision10) @as(u32, 10) else if (indexed_reclamation) indexed_format_version else format_version)) return error.UnsupportedNativeFormatVersion;
+    if (version != (if (previous_indexed) @as(u32, 7) else if (revision8) @as(u32, 8) else if (revision9) @as(u32, 9) else if (revision10) @as(u32, 10) else if (revision11) @as(u32, 11) else if (indexed_reclamation) indexed_format_version else format_version)) return error.UnsupportedNativeFormatVersion;
 
     const encoded_header_size = std.mem.readInt(u32, header_raw[header_size_offset..][0..4], .little);
     if (encoded_header_size != header_size) return error.InvalidNativeHeaderSize;
@@ -14078,7 +14196,7 @@ fn headerChecksum(raw: []const u8) u32 {
     var crc = Crc32.init();
     crc.update(raw[0..active_checkpoint_offset]);
     crc.update(raw[active_checkpoint_offset + 1 .. checkpoint_slots_offset]);
-    const end = if (std.mem.eql(u8, raw[0..indexed_magic.len], indexed_magic) or std.mem.eql(u8, raw[0..revision8_magic.len], revision8_magic) or std.mem.eql(u8, raw[0..revision9_magic.len], revision9_magic) or std.mem.eql(u8, raw[0..revision10_magic.len], revision10_magic)) logical_generations_end else checkpoint_slots_end;
+    const end = if (std.mem.eql(u8, raw[0..indexed_magic.len], indexed_magic) or std.mem.eql(u8, raw[0..revision8_magic.len], revision8_magic) or std.mem.eql(u8, raw[0..revision9_magic.len], revision9_magic) or std.mem.eql(u8, raw[0..revision10_magic.len], revision10_magic) or std.mem.eql(u8, raw[0..revision11_magic.len], revision11_magic)) logical_generations_end else checkpoint_slots_end;
     crc.update(raw[end..header_checksum_offset]);
     return crc.final();
 }

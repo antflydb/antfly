@@ -857,6 +857,10 @@ pub const DerivedReplayDebtStatus = struct {
     /// means the index is missing content it will never retry for on its
     /// own -- an operator-visible signal distinct from ordinary catch-up lag.
     replay_document_not_visible_skipped: u64 = 0,
+    /// Durable continuation within a source record; families include deletes and artifacts.
+    fragment_sequence: u64 = 0,
+    fragment_next_item: u64 = 0,
+    fragment_total_items: u64 = 0,
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(@constCast(self.index_name));
@@ -31469,12 +31473,20 @@ pub const DB = struct {
                 index_ref,
                 applied_sequence,
             );
+            const fragment = if (index_ref.kind == .full_text and try supportsReplayFragmentsAsync(self.async_context, index_ref.name))
+                try loadReplayFragmentAsync(self.async_context, index_ref.name)
+            else
+                null;
+            const pending_fragment = if (fragment) |position| position.sequence > applied_sequence else false;
             out[initialized] = .{
                 .index_name = index_ref.name,
                 .kind = index_ref.kind,
                 .applied_sequence = applied_sequence,
                 .target_sequence = target_sequence,
                 .catch_up_required = applied_sequence < target_sequence,
+                .fragment_sequence = if (pending_fragment) fragment.?.sequence else 0,
+                .fragment_next_item = if (pending_fragment) fragment.?.next_item else 0,
+                .fragment_total_items = if (pending_fragment) fragment.?.total_items else 0,
                 .replay_document_not_visible_skipped = if (self.core.index_manager.resource_manager) |manager|
                     manager.replayDocumentNotVisibleSkippedTotal(resource_manager_mod.replayOwnerIdFromPtr(self.core.index_manager), index_ref.name)
                 else

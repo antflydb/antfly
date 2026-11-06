@@ -1168,16 +1168,16 @@ The naming recommendation is:
 
 ## Native throughput and online compaction
 
-Native owners create revision-11 files (`AFLITE\x0bP`) with packed records and
+Native owners create revision-12 files (`AFLITE\x0cP`) with packed records and
 durable page ownership. Existing revision-3 signatures (`AFLITE\x03N` for
 unpacked records and `AFLITE\x03P` for packed records) remain readable. Writable
-owners migrate revisions 3, 7, 8, 9 and 10 through an atomic compact-generation replacement;
+owners migrate revisions 3, 7, 8, 9, 10 and 11 through an atomic compact-generation replacement;
 read-only opens preserve the existing encoding. The Zig `page_reuse = false`
 option preserves revision-3 creation/open behavior. Raw native primitives also
 retain their revision-3 default for compatibility. Revision 2 remains unsupported,
-and older binaries reject the revision-11 signature before checkpoint selection.
+and older binaries reject the revision-12 signature before checkpoint selection.
 Unreleased revision-4/5/6 prototypes are rejected rather than mixing reader,
-logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-11 image.
+logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-12 image.
 
 Struct and JSON document batches capture an owned catalog plan under a short
 lifetime guard, then map document, graph-field and direct embedding inputs before
@@ -1186,6 +1186,13 @@ transforms and predicates still resolve against the authoritative transaction.
 Prepared allocations use the database owner's allocator, including across the
 shared-library boundary. Benchmark profiles report consumed and fallback document
 counts so an unused preparation plan cannot masquerade as a performance gain.
+
+Revision 12 adds durable per-index mutation identities in the index catalog.
+Identity changes publish in the same native transaction as index files, including
+append, rename and deletion. Detached text publication validates its own index
+identity under writer admission, so an unrelated index cannot invalidate its
+prepared work. Structural catalog and inode checks remain mandatory. The new
+signature fences older writers that do not maintain these identities.
 
 Revision 11 adds seekable canonical family chunks with a fixed-size Merkle-root
 manifest. Each physical chunk decodes at most 64 families. A replay turn reads

@@ -182,11 +182,19 @@ pub const ReplayMetadataPublication = struct {
     leave: *const fn (*anyopaque) void,
 };
 
+/// A prepared index publication depends on one index, not every index in its
+/// namespace. The owner validates that domain under its writer lease.
+pub const ReplayIndexPublication = struct {
+    ptr: *anyopaque,
+    enter: *const fn (*anyopaque, []const u8) anyerror!void,
+    leave: *const fn (*anyopaque) void,
+};
+
 pub const AsyncContext = struct {
     /// Work proportional to prepared text families, excluding cursor setup,
     /// capacity waits, durable publication and continuation checkpoints.
     full_text_preparation_ns: std.atomic.Value(u64) = .init(0),
-    replay_index_publication: ?ReplayMetadataPublication = null,
+    replay_index_publication: ?ReplayIndexPublication = null,
     replay_metadata_publication: ?ReplayMetadataPublication = null,
     apply_exclusive_held: bool = false,
     replay_publication: ?ReplayPublication = null,

@@ -1477,7 +1477,12 @@ test "lite native index storage persists logical files across reopen" {
         try std.testing.expect(checkpoint.index_catalog_root_page != 0);
         const records = try docs.file.snapshotIndexCatalogRecordsAlloc(allocator);
         defer native.NativeFile.freeSnapshotCatalogRecords(allocator, records);
-        try std.testing.expectEqual(@as(usize, 2), records.len);
+        var logical_files: usize = 0;
+        for (records) |record| if (std.mem.startsWith(u8, record.key, "/indexes/ft/")) {
+            logical_files += 1;
+        };
+        try std.testing.expectEqual(@as(usize, 2), logical_files);
+        try std.testing.expect(try docs.file.indexScopeIdentity("/indexes/ft") != null);
     }
 
     {

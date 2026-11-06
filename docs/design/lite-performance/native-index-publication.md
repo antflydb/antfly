@@ -38,6 +38,36 @@ publication. This prevents newly visible primary progress from authorizing a
 new capture of the old in-memory index. Previously retained snapshots continue
 to represent their original cut. Contended capture waits yield the CPU.
 
+## Index-specific admission
+
+A table-wide index identity is too broad for detached text work: eager graph
+publication can change it after every text preparation, even though no text
+input changed. Revision 12 therefore gives each `/indexes/<name>` domain a
+random durable mutation identity. Its bounded hash key lives outside the virtual
+file namespace. File writes, appends, deletes and both domains of a cross-index
+rename stage their identities in the same native transaction as their effects.
+An aborted transaction restores both; unchanged inline file writes do not
+advance the identity or create another checkpoint.
+
+The replay publication port names its target index. The maintenance turn captures
+owned identities before releasing admission and compares the selected identity
+against the current inode under its final writer lease. Catalog, namespace,
+incarnation and recovery validation still apply, including after allocator-only
+admission has already adopted a newer header. Changes to other indexes still
+invalidate whole-runtime cache reuse and unscoped operations; they no longer
+invalidate this prepared text publication. The selected witness is refreshed
+before releasing the lease, so later pieces recognize the worker's own writes.
+A witness-read failure after commit invalidates future reuse rather than
+returning a retryable error for a committed publication.
+
+The signature change excludes writers that do not maintain these identities.
+Older file revisions keep conservative admission until writable-owner migration.
+This is a scoped publication fix, not a replacement for validating merge inputs
+or for qualifying sustained mixed-index traffic. The [Debug correctness receipt](scoped-replay-admission-debug.json)
+records the full native/C API results and remaining qualification. Local regressions inject a
+foreign index mutation before each text publication, retain target-replacement
+refusal, and verify durable fragment progress across runtime replacement.
+
 ## Refusal and uncertainty
 
 A prepublication failure aborts all staged links and the WAL append. Prepared
