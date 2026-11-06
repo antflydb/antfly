@@ -87,7 +87,7 @@ pub fn encode(cb: *const ComputeBackend, admission: Admission, a: std.mem.Alloca
         // NVDEC takes a narrower set of clips than the catalog advertises, and
         // some rejections only surface mid-bitstream. Portable decoding decides
         // what's really invalid; either route projects on the device.
-        if (projector_mod.encodeProjectedVideoResident(cb, a, projector, bytes)) |projected| {
+        if (projector_mod.encodeProjectedVideoResident(cb, a, projector, bytes, explicit_scratch_limit == 0)) |projected| {
             return projected;
         } else |err| {
             if (err != error.NvdecUnavailable and inputError(err) != error.InvalidVideoInput) return err;

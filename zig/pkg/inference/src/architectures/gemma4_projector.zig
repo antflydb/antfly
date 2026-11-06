@@ -242,12 +242,18 @@ pub const ProjectedVideo = struct {
 
 /// Decode one bounded MP4 clip and project each selected frame directly from
 /// CUDA memory. Only timestamp/count metadata is retained on the host.
-pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, bytes: []const u8) !ProjectedVideo {
+pub fn encodeProjectedVideoResident(cb: *const ComputeBackend, allocator: std.mem.Allocator, projector: *ProjectorStore, bytes: []const u8, grow_automatic_scratch: bool) !ProjectedVideo {
     if (comptime !@import("build_options").enable_cuda or @import("builtin").os.tag != .linux) return error.UnsupportedVideoBackend;
     if (cb.kind() != .cuda or !cb.supportsCopyRows2D() or cb.vtable.sliceRows2D == null) return error.UnsupportedVideoBackend;
     const video = @import("../ops/cuda/video.zig");
     const cuda = @import("../ops/cuda/cuda_compute.zig");
     const compute: *cuda.CudaCompute = @ptrCast(@alignCast(cb.ptr));
+    compute.ctx.video_cache_budget.grow_automatic_scratch = grow_automatic_scratch;
+    // Surfaces held over the cap would refuse the next run, so don't retain them.
+    defer {
+        compute.ctx.video_cache_budget.grow_automatic_scratch = false;
+        if (compute.ctx.video_cache_budget.exceedsScratchCap()) _ = compute.ctx.evictVideoDecoder() catch 0;
+    }
     var weights = ProjectorWeights.init(cb, allocator, projector.gguf, projector);
     defer weights.deinit();
     var cfg = try parseConfig(&projector.gguf.parsed);
