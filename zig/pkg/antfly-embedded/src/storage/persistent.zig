@@ -2994,6 +2994,71 @@ pub const PersistentIndex = struct {
         index_mod.IndexWriter.freeDeleteInfos(self.alloc, delete_infos);
     }
 
+    /// WS4 phase 2: `deleteByIdsTracked`'s own in-memory lookup
+    /// (`writer.deleteAllByIdsTracked`), split from its commit. Common case
+    /// for a batch of brand-new document keys: no matching postings exist
+    /// anywhere yet, so `delete_infos.len == 0` and there is nothing to
+    /// write at all -- the caller's inline fast path can proceed with no
+    /// `.deletions` mutation. When postings DO exist (an update or delete
+    /// of a previously-indexed document), `mutationsAlloc` builds the same
+    /// per-segment bitmap mutations `deleteByIdsTracked`'s own commit loop
+    /// would have written, for the caller to fold into an externally-owned
+    /// native transaction. Exactly one of `installInlineDeleteByIdsTracked`
+    /// (mutations committed durably) or `abortInlineDeleteByIdsTracked`
+    /// (they did not, or the caller fell back to another path) must run
+    /// exactly once -- mirrors `deleteByIdsTracked`'s own persisted/
+    /// rollback split.
+    pub const PreparedDeleteByIds = struct {
+        delete_infos: []index_mod.IndexWriter.DeleteInfo,
+        seg_keys: [][8]u8,
+
+        pub fn isEmpty(self: *const PreparedDeleteByIds) bool {
+            return self.delete_infos.len == 0;
+        }
+
+        pub fn mutationsAlloc(self: *const PreparedDeleteByIds, alloc: Allocator) ![]native_catalog_backend.Mutation {
+            const out = try alloc.alloc(native_catalog_backend.Mutation, self.delete_infos.len);
+            for (self.delete_infos, self.seg_keys, out) |info, *seg_key, *mutation| {
+                mutation.* = .{ .namespace = "deletions", .key = seg_key, .value = info.bitmap_bytes };
+            }
+            return out;
+        }
+    };
+
+    pub fn prepareInlineDeleteByIdsTracked(self: *PersistentIndex, alloc: Allocator, doc_ids: []const []const u8) !PreparedDeleteByIds {
+        if (self.main_backend != .native_catalog) return error.NotNativeCatalogBackend;
+        if (doc_ids.len == 0) return .{ .delete_infos = &.{}, .seg_keys = &.{} };
+        self.lockStorage();
+        defer self.unlockStorage();
+        const delete_infos = try self.writer.deleteAllByIdsTracked(self.alloc, doc_ids);
+        errdefer index_mod.IndexWriter.freeDeleteInfos(self.alloc, delete_infos);
+        if (delete_infos.len == 0) return .{ .delete_infos = delete_infos, .seg_keys = &.{} };
+        const seg_keys = try alloc.alloc([8]u8, delete_infos.len);
+        for (delete_infos, seg_keys) |info, *seg_key| seg_key.* = std.mem.toBytes(std.mem.nativeToBig(u64, info.seg_id));
+        return .{ .delete_infos = delete_infos, .seg_keys = seg_keys };
+    }
+
+    /// Runs only after `prepared`'s mutations are already durable in an
+    /// externally-owned transaction's commit: the in-memory writer
+    /// tracking state was already updated synchronously by
+    /// `deleteAllByIdsTracked` inside `prepareInlineDeleteByIdsTracked`, so
+    /// there is nothing left to "install" -- just release the bookkeeping.
+    pub fn installInlineDeleteByIdsTracked(self: *PersistentIndex, alloc: Allocator, prepared: *PreparedDeleteByIds) void {
+        if (prepared.seg_keys.len > 0) alloc.free(prepared.seg_keys);
+        index_mod.IndexWriter.freeDeleteInfos(self.alloc, prepared.delete_infos);
+        prepared.* = undefined;
+    }
+
+    /// The mutations were never committed (or the caller fell back to
+    /// another path before reaching a commit at all): undo the in-memory
+    /// writer tracking change `deleteAllByIdsTracked` already made.
+    pub fn abortInlineDeleteByIdsTracked(self: *PersistentIndex, alloc: Allocator, prepared: *PreparedDeleteByIds) void {
+        self.writer.rollbackDeleteInfos(prepared.delete_infos);
+        if (prepared.seg_keys.len > 0) alloc.free(prepared.seg_keys);
+        index_mod.IndexWriter.freeDeleteInfos(self.alloc, prepared.delete_infos);
+        prepared.* = undefined;
+    }
+
     /// Tombstone a batch and return the exact newly-deleted local document IDs
     /// after their bitmap transaction commits. Merge publication uses this
     /// committed delta directly, avoiding a scan of historical tombstones.
@@ -5151,6 +5216,25 @@ test "persistent index prepares an inline segment publication, applies it throug
         alloc.free(ranges);
     }
     try std.testing.expectEqual(@as(usize, 1), ranges.len);
+
+    // WS4 phase 2: deleting a key with no matching posting anywhere (the
+    // common brand-new-document case) needs no commit at all -- confirmed
+    // directly by isEmpty(), and aborting an empty one is a safe no-op.
+    var empty_delete = try pi.prepareInlineDeleteByIdsTracked(alloc, &.{"doc:never-indexed"});
+    try std.testing.expect(empty_delete.isEmpty());
+    pi.abortInlineDeleteByIdsTracked(alloc, &empty_delete);
+
+    // Deleting the key just published above DOES find a posting and needs
+    // a `.deletions` mutation, committed the same way as everything else.
+    var real_delete = try pi.prepareInlineDeleteByIdsTracked(alloc, &.{"doc:a"});
+    try std.testing.expect(!real_delete.isEmpty());
+    const delete_mutations = try real_delete.mutationsAlloc(alloc);
+    defer alloc.free(delete_mutations);
+    switch (pi.main_store_owner) {
+        .native_catalog => |backend| try backend.applyExternallyCommittedMutations(delete_mutations),
+        else => return error.TestUnexpectedResult,
+    }
+    pi.installInlineDeleteByIdsTracked(alloc, &real_delete);
 
     _ = scope;
 }
