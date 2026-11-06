@@ -69,7 +69,7 @@ const Fixture = struct {
                 }
                 const projected = try a.alloc(Datum, self.columns.len);
                 for (self.columns, projected) |column, *out| {
-                    out.* = if (std.mem.eql(u8, column.name, "id")) cells[0] else if (std.mem.eql(u8, column.name, "payload")) cells[1] else if (std.mem.eql(u8, column.name, "flag")) cells[2] else if (std.mem.eql(u8, column.name, "_id")) Datum.json(.{ .string = "row" }) else return error.InvalidSqlBackendResponse;
+                    out.* = if (std.mem.eql(u8, column.name, "id")) cells[0] else if (std.mem.eql(u8, column.name, "payload")) (if (cells.len > 1) cells[1] else Datum{}) else if (std.mem.eql(u8, column.name, "flag")) (if (cells.len > 2) cells[2] else Datum{}) else if (std.mem.eql(u8, column.name, "_id")) Datum.json(.{ .string = "row" }) else return error.InvalidSqlBackendResponse;
                 }
                 if (self.filter) |filter| {
                     var filter_keys: [32]Datum = undefined;
@@ -547,19 +547,18 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
                 errdefer arena.deinit();
                 const sa = arena.allocator();
                 var rows: std.ArrayList(local.sql_catalog.Row) = .empty;
-                const count = if (self.table == 1) self.fixture.left.len else self.fixture.right.len;
+                const count = if (self.table == 1) self.fixture.left.len else if (self.fixture.custom_right) |rows_| rows_.len else self.fixture.right.len;
+                const layout = try local.sql_catalog.Row.TypedLayout.init(sa, &.{ "id", "payload", "flag" });
                 while (self.position < count and rows.items.len < maximum) {
-                    const cells: []const Datum = if (self.table == 1) &self.fixture.left[self.position] else &self.fixture.right[self.position];
-                    var object: std.json.Value = .{ .object = .empty };
-                    try object.object.put(sa, "id", cells[0].value);
-                    try rows.append(sa, .{ .id = "row", .version = 0, .value = object });
+                    const cells: []const Datum = if (self.table == 1) &self.fixture.left[self.position] else if (self.fixture.custom_right) |rows_| rows_[self.position] else &self.fixture.right[self.position];
+                    try rows.append(sa, try local.sql_catalog.Row.fromDatums(sa, "row", layout, &.{ cells[0], if (cells.len > 1) cells[1] else .{}, if (cells.len > 2) cells[2] else .{} }));
                     self.position += 1;
                 }
                 return .{ .rows = rows.items, .owned_arena = arena, .after = if (self.position == count) null else "more" };
             }
         };
         fn resolve(_: *anyopaque, _: A, name: local.sql_ast.Name, _: local.sql_catalog.Action) !local.sql_catalog.Table {
-            return .{ .id = if (std.mem.eql(u8, name.table, "l")) 1 else 2, .physical_name = name.table, .schema_version = 1, .columns = &.{.{ .name = "id", .path = "id", .type = .integer }} };
+            return .{ .id = if (std.mem.eql(u8, name.table, "l")) 1 else 2, .physical_name = name.table, .schema_version = 1, .columns = &.{ .{ .name = "id", .path = "id", .type = .integer }, .{ .name = "payload", .path = "payload", .type = .json }, .{ .name = "flag", .path = "flag", .type = .array, .element_type = .int64 } } };
         }
         fn scan(_: *anyopaque, _: A, _: local.sql_catalog.Table, _: local.sql_catalog.Scan) !local.sql_catalog.Page {
             return error.UnexpectedBackendCall;
@@ -622,14 +621,19 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
             return error.UnexpectedForegroundControl;
         }
     };
-    const Query = struct { sql: []const u8, parameters: []const std.json.Value = &.{} };
+    const Query = struct { sql: []const u8, parameters: []const std.json.Value = &.{}, wide_payload: bool = false };
     const queries = [_]Query{
+        .{ .sql = "SELECT l.id, r.payload, r.flag FROM l JOIN r ON l.id=r.id WHERE l.id=2 ORDER BY r.payload", .wide_payload = true },
+        .{ .sql = "SELECT r.payload, count(*) FROM l JOIN r ON l.id=r.id GROUP BY r.payload ORDER BY r.payload", .wide_payload = true },
         .{ .sql = "SELECT l.id, r.id FROM l JOIN r ON l.id=r.id ORDER BY l.id, r.id" },
         .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id>5 ORDER BY l.id NULLS LAST, r.id NULLS LAST" },
         .{ .sql = "SELECT l.id, r.id FROM l FULL JOIN r ON l.id=r.id ORDER BY l.id NULLS LAST, r.id NULLS LAST" },
         .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id WHERE l.id>1 ORDER BY l.id, r.id" },
         .{ .sql = "SELECT l.id, r.id FROM l RIGHT JOIN r ON l.id=r.id AND l.id>1 ORDER BY l.id NULLS LAST, r.id NULLS LAST" },
         .{ .sql = "SELECT count(*) AS n FROM l LEFT JOIN r ON l.id=r.id" },
+        .{ .sql = "SELECT count(*) AS n FROM l JOIN r ON l.id=r.id" },
+        .{ .sql = "SELECT count(*), sum(c.id), min(b.id), max(c.id) FROM l a JOIN r b ON a.id=b.id JOIN l c ON b.id=c.id", .wide_payload = true },
+        .{ .sql = "SELECT b.id, count(*), sum(c.id) FROM l a JOIN r b ON a.id=b.id JOIN l c ON b.id=c.id GROUP BY b.id ORDER BY b.id", .wide_payload = true },
         .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id>$1 ORDER BY l.id NULLS LAST, r.id NULLS LAST", .parameters = &.{.{ .integer = 5 }} },
         .{ .sql = "SELECT l.id, r.id FROM l JOIN r ON l.id=r.id AND NOT is_missing(r.id) ORDER BY l.id, r.id" },
         .{ .sql = "SELECT l.id, r.id FROM l LEFT JOIN r ON l.id=r.id AND r.id = ANY($1::bigint[]) ORDER BY l.id NULLS LAST, r.id NULLS LAST", .parameters = &.{.{ .string = "[-2:0]={1,6,NULL}" }} },
@@ -641,16 +645,38 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         var memory = storage.MemoryClient.init(a);
         defer memory.deinit();
         var fixture: Fixture = .{};
+        var payload_arena = std.heap.ArenaAllocator.init(a);
+        defer payload_arena.deinit();
+        if (query_case.wide_payload) {
+            const work = payload_arena.allocator();
+            const text = try work.alloc(u8, 512);
+            @memset(text, 'x');
+            var json: std.json.Value = .{ .object = .empty };
+            try json.object.put(work, "payload", .{ .string = text });
+            try json.object.put(work, "exact", .{ .number_string = "9007199254740993.1250" });
+            const array = try work.create(local.sql_array_value.Value);
+            array.* = try local.sql_array_value.Value.init(.int64, &.{.{ .length = 2, .lower = -3 }}, &.{ Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
+            try json.object.put(work, "group", .{ .integer = 0 });
+            var other = json;
+            other.object = try json.object.clone(work);
+            try other.object.put(work, "group", .{ .integer = 1 });
+            const cells = try work.dupe(Datum, &.{ Datum.json(.{ .integer = 2 }), Datum.json(json), Datum.typedArray(array) });
+            const other_cells = try work.dupe(Datum, &.{ cells[0], Datum.json(other), cells[2] });
+            const rows = try work.alloc([]const Datum, 300);
+            for (rows, 0..) |*row, index| row.* = if (index < 150) cells else other_cells;
+            fixture.custom_right = rows;
+        }
         var backend: Backend = .{ .fixture = &fixture, .reverse_estimates = reverse_estimates };
         var dispatch: Dispatch = .{ .workers = .{ fixture.service(a, memory.client(), "worker-a"), fixture.service(a, memory.client(), "worker-b") }, .drop_once = false };
-        var bridge: @import("bridge.zig").Bridge = .{ .service = fixture.service(a, memory.client(), "coordinator"), .dispatcher = .{ .ptr = &dispatch, .dispatch = Dispatch.run }, .local_bytes = 0, .limits = .{ .task_output_bytes = 16384 } };
+        var bridge: @import("bridge.zig").Bridge = .{ .service = fixture.service(a, memory.client(), "coordinator"), .dispatcher = .{ .ptr = &dispatch, .dispatch = Dispatch.run }, .local_bytes = 0, .limits = .{ .task_output_bytes = if (query_case.wide_payload) 1 << 20 else 16384 } };
         var remote_service: Remote = .{ .service = bridge.service, .dispatcher = bridge.dispatcher };
         var routing: @import("routing.zig").Routing = .{};
         var client: @import("transport.zig").Client = .{ .a = a, .routing = &routing, .executor = .{ .ptr = &remote_service, .vtable = &.{ .execute = Remote.execute } }, .authentication = .{ .secret = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", .issuer = "test" }, .workers = &.{"http://query"} };
         if (remote) bridge.gateway = &client;
         var compiled = try local.sql_compiler.compile(a, sql, .{});
         defer compiled.deinit();
-        var ordinary = try local.sql_runtime.execute(a, backend.backend(), &compiled, query_case.parameters, .{});
+        const execution_limits: local.sql_runtime.Limits = .{ .result_rows = if (query_case.wide_payload) 512 else 128 };
+        var ordinary = try local.sql_runtime.execute(a, backend.backend(), &compiled, query_case.parameters, execution_limits);
         defer ordinary.deinit();
         const baseline = try std.json.Stringify.valueAlloc(a, ordinary.output.rows, .{});
         defer a.free(baseline);
@@ -682,7 +708,7 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         var distributed = backend.backend();
         distributed.distributed_context.cancellation = .{ .ptr = &ReadGuard.canceled, .is_cancelled_fn = ReadGuard.check };
         distributed.distributed_join = bridge.port();
-        var actual = local.sql_runtime.execute(a, distributed, &compiled, query_case.parameters, .{}) catch |err| {
+        var actual = local.sql_runtime.execute(a, distributed, &compiled, query_case.parameters, execution_limits) catch |err| {
             std.debug.print("failed distributed SQL parity query: {s}\n", .{sql});
             return err;
         };
@@ -696,14 +722,15 @@ test "distributed SQL compiler bridge preserves local SQL filters outer residual
         }
         try std.testing.expect(ReadGuard.reads > 0);
         try std.testing.expect(backend.captures >= 2);
+        const scanned_before_cancel = backend.scanned;
         var canceled: bool = true;
         distributed.distributed_context.cancellation = .{ .ptr = &canceled, .is_cancelled_fn = struct {
             fn check(raw: *const anyopaque) bool {
                 return @as(*const bool, @ptrCast(@alignCast(raw))).*;
             }
         }.check };
-        try std.testing.expectError(error.Canceled, local.sql_runtime.execute(a, distributed, &compiled, query_case.parameters, .{}));
-        try std.testing.expectEqual(@as(usize, 0), backend.scanned);
+        try std.testing.expectError(error.Canceled, local.sql_runtime.execute(a, distributed, &compiled, query_case.parameters, execution_limits));
+        try std.testing.expectEqual(scanned_before_cancel, backend.scanned);
     };
 }
 
