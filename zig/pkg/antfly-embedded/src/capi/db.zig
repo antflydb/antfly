@@ -10256,15 +10256,33 @@ fn ws3WriterLaneProbeWrite(handle: ?*anyopaque, ordinal: usize, index: usize) !v
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch_json(handle, .{ .ptr = request.ptr, .len = request.len }, &output));
 }
 
+/// This used to read `connection.owner.current`'s live `NativeFile.
+/// test_sync_calls` directly. That counter resets to zero every time
+/// `Owner.refresh`'s slow path replaces `owner.current` with a fresh
+/// `NativeFile` (a vacuum/compaction-triggered reopen, or any of `refresh`'s
+/// other slow-path reasons) -- which measurably happens even within one of
+/// this test's short 64-write runs (confirmed empirically: before this fix,
+/// a plain saturating subtraction across such a swap silently read as "0
+/// syncs" for the shared-handle scenario -- the new file's barely-
+/// incremented counter minus the old file's much larger one, floored at 0
+/// instead of underflowing -- a measurement artifact that looked like
+/// perfect fsync sharing rather than an invalid sample spanning two
+/// generations). `Owner.test_cumulative_sync_calls` (lite_connection.zig)
+/// carries every outgoing generation's final count forward across such a
+/// swap, so `that + the live generation's own counter` is a true running
+/// total regardless of how many swaps happened in between two reads.
 fn ws3WriterLaneTestSyncCalls(handle_ptr: ?*anyopaque) u64 {
     const entry = HandleEntry.capture(handle_ptr).?;
     defer entry.release();
     const connection = entry.lock_handle.lite_connection.?;
-    // `owner.current`, not `connection.current`: all connections to the same
-    // path share one `Owner` and one underlying `NativeFile`, so this stays
-    // correct even if a different connection's refresh moved the owner's
-    // current generation since this handle last looked.
-    return connection.owner.current.?.owned_lite_backend.?.native_docstore.?.file.test_sync_calls.load(.monotonic);
+    // `owner.current`/`owner.test_cumulative_sync_calls`, not
+    // `connection.current`: all connections to the same path share one
+    // `Owner`, so this stays correct even if a different connection's
+    // refresh moved the owner's current generation since this handle last
+    // looked.
+    const owner = connection.owner;
+    return owner.test_cumulative_sync_calls.load(.monotonic) +
+        owner.current.?.owned_lite_backend.?.native_docstore.?.file.test_sync_calls.load(.monotonic);
 }
 
 // WS3 acceptance test (lite-single-commit-write-path.md §6 test 9's shape,
@@ -10300,7 +10318,22 @@ test "WS3 writer lane: concurrent public-API writers share group-commit fsyncs" 
             var start = std.atomic.Value(bool).init(false);
             var workers: [writer_count]Worker = undefined;
             var threads: [writer_count]std.Thread = undefined;
-            const per_writer = writes_per_run / writer_handles.len;
+            // `writer_count` threads are spawned below regardless of how
+            // many distinct handles back them (1 for "shared", writer_count
+            // for "separate"), so the total write volume this scenario
+            // issues scales with `writer_count`, not `writer_handles.len`.
+            // Dividing by `writer_handles.len` here (as this used to) only
+            // happened to be correct for "separate" (where the two are
+            // equal); for "shared" it silently ran `writer_count`x the
+            // intended total writes (512 instead of 64 for this test's
+            // numbers) while still reporting the smaller, intended total --
+            // undercounting `.writes` by exactly `writer_count` and making
+            // the shared-handle scenario look `writer_count`x worse per
+            // write than it actually was. Confirmed empirically: before this
+            // fix, the shared-handle case measured 1024 real syncs over 512
+            // real writes (2.000/write, identical to solo) but reported
+            // 1024/64 = 16.000/write.
+            const per_writer = writes_per_run / writer_count;
             for (&workers, &threads, 0..) |*worker, *thread, ordinal| {
                 worker.* = .{ .handle = writer_handles[ordinal % writer_handles.len], .ordinal = ordinal, .count = per_writer, .start = &start };
                 thread.* = try std.Thread.spawn(.{}, Worker.run, .{worker});
@@ -10310,12 +10343,10 @@ test "WS3 writer lane: concurrent public-API writers share group-commit fsyncs" 
             for (workers) |worker| if (worker.failure) |err| return err;
             const after = ws3WriterLaneTestSyncCalls(writer_handles[0]);
             _ = dir_name;
-            // Saturating: a generation swap (vacuum/compaction) between the
-            // two reads would otherwise show as a smaller counter on a
-            // fresh `NativeFile`, underflowing a plain subtraction. None of
-            // these short runs should trigger one, but this is a counting
-            // probe, not the write path itself -- never let it panic.
-            return .{ .syncs = after -| before, .writes = per_writer * writer_handles.len };
+            // Plain subtraction is safe now: `ws3WriterLaneTestSyncCalls`
+            // returns a running total stable across any `Owner.refresh`
+            // generation swap in between (see its doc comment).
+            return .{ .syncs = after - before, .writes = per_writer * writer_count };
         }
     };
 
@@ -10331,7 +10362,7 @@ test "WS3 writer lane: concurrent public-API writers share group-commit fsyncs" 
     const solo_before = ws3WriterLaneTestSyncCalls(solo_handle);
     for (0..writes_per_run) |i| try ws3WriterLaneProbeWrite(solo_handle, 0, i);
     const solo_after = ws3WriterLaneTestSyncCalls(solo_handle);
-    const solo_syncs = solo_after -| solo_before;
+    const solo_syncs = solo_after - solo_before;
     const solo_per_write: f64 = @as(f64, @floatFromInt(solo_syncs)) / @as(f64, @floatFromInt(writes_per_run));
 
     // Eight writer threads sharing one handle (one Connection, one QueuedMutex
