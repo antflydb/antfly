@@ -22,10 +22,35 @@ const display = @import("display.zig");
 /// True when the clip's first decodable track belongs on the WebM lane. A clip
 /// the MP4 reader can't open isn't claimed; its own route reports the failure.
 pub fn usesWebmLane(a: std.mem.Allocator, bytes: []const u8) bool {
+    // Most clips aren't AV1. Settle those without building a packet index.
+    if (!moovMentionsAv1(bytes)) return false;
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "video-route" };
     var reader = media.mp4.Reader.init(a, &source, limits) catch return false;
     defer reader.deinit();
     return reader.track.codec == .av1;
+}
+
+/// Walks top-level boxes only. A false positive just costs the full parse below.
+fn moovMentionsAv1(bytes: []const u8) bool {
+    var cursor: usize = 0;
+    while (bytes.len - cursor >= 8) {
+        var size: u64 = std.mem.readInt(u32, bytes[cursor..][0..4], .big);
+        var header: usize = 8;
+        if (size == 1) {
+            if (bytes.len - cursor < 16) return false;
+            size = std.mem.readInt(u64, bytes[cursor + 8 ..][0..8], .big);
+            header = 16;
+        } else if (size == 0) {
+            size = bytes.len - cursor;
+        }
+        if (size < header or size > bytes.len - cursor) return false;
+        const box: usize = @intCast(size);
+        if (std.mem.eql(u8, bytes[cursor + 4 ..][0..4], "moov")) {
+            return std.mem.indexOf(u8, bytes[cursor + header .. cursor + box], "av01") != null;
+        }
+        cursor += box;
+    }
+    return false;
 }
 
 pub const limits: media.mp4.Limits = .{ .codecs = std.EnumSet(media.mp4.Codec).initMany(&.{ .avc, .mjpeg, .hevc, .av1 }) };
@@ -81,7 +106,7 @@ fn nanoseconds(ticks: i64, timescale: u32) !i64 {
 pub fn webmTrack(track: media.mp4.Track) !media.webm.Track {
     // Geometry is validated by the shared MP4 policy before it's re-expressed.
     const layout = try display.layout(track, track.width, track.height, .presentation);
-    const sar = track.pixel_aspect;
+    const display_aspect = try displayRatio(track);
     return .{
         .number = track.id,
         .codec = .av1,
@@ -89,8 +114,8 @@ pub fn webmTrack(track: media.mp4.Track) !media.webm.Track {
         .height = track.height,
         .codec_private = track.codec_config,
         .presentation = .{
-            .display_width = @as(u32, track.width) * sar.horizontal,
-            .display_height = @as(u32, track.height) * sar.vertical,
+            .display_width = display_aspect[0],
+            .display_height = display_aspect[1],
             .roll = switch (layout.rotation) {
                 .none => 0,
                 .clockwise90 => -90,
@@ -99,6 +124,20 @@ pub fn webmTrack(track: media.mp4.Track) !media.webm.Track {
             },
         },
         .colour = try colour(track.color_info),
+    };
+}
+
+/// Display ratio in lowest terms. SAR components can be as large as their box
+/// allows while still describing a small ratio, so they can't simply be multiplied.
+fn displayRatio(track: media.mp4.Track) ![2]u32 {
+    const sar = track.pixel_aspect;
+    const reduced = std.math.gcd(sar.horizontal, sar.vertical);
+    const width = @as(u64, track.width) * (sar.horizontal / reduced);
+    const height = @as(u64, track.height) * (sar.vertical / reduced);
+    const common = std.math.gcd(width, height);
+    return .{
+        std.math.cast(u32, width / common) orelse return error.UnsupportedVideoDisplay,
+        std.math.cast(u32, height / common) orelse return error.UnsupportedVideoDisplay,
     };
 }
 
@@ -121,6 +160,8 @@ test "AV1 MP4 keeps its packets and display metadata on the WebM lane" {
     const bytes = @embedFile("../testdata/av1-mp4.mp4");
     try std.testing.expect(usesWebmLane(a, bytes));
     try std.testing.expect(!usesWebmLane(a, @embedFile("../testdata/mjpeg.mov")));
+    try std.testing.expect(!moovMentionsAv1(@embedFile("../testdata/hevc-mp4.mp4")));
+    try std.testing.expect(!moovMentionsAv1("not an mp4 at all"));
     var source = media.source.Source{ .allocator = a, .storage = .{ .borrowed = bytes }, .identity = "av1" };
     var original = try media.mp4.Reader.init(a, &source, limits);
     defer original.deinit();
@@ -144,6 +185,19 @@ test "MP4 display transforms and SAR survive the translation to WebM layout" {
     try std.testing.expectEqual(expected.rotation, actual.rotation);
     try std.testing.expectEqual(expected.width, actual.width);
     try std.testing.expectEqual(expected.height, actual.height);
+}
+
+test "Large equivalent SAR components don't overflow the display ratio" {
+    var track = media.mp4.Track{ .id = 1, .timescale = 1000, .width = 64, .height = 48, .avcc = &.{}, .nal_length_bytes = 4, .display_matrix = .{ 65536, 0, 0, 0, 65536, 0, 0, 0, 1073741824 } };
+    track.pixel_aspect = .{ .horizontal = 100_000_000, .vertical = 100_000_000 };
+    const presentation = (try webmTrack(track)).presentation;
+    try std.testing.expectEqual(@as(?u32, 4), presentation.display_width);
+    try std.testing.expectEqual(@as(?u32, 3), presentation.display_height);
+    const layout = try display.webmLayout(try webmTrack(track), 64, 48, .presentation);
+    try std.testing.expectEqual(@as(u32, 64), layout.display.width);
+    // A ratio that truly can't be represented is refused rather than wrapped.
+    track.pixel_aspect = .{ .horizontal = std.math.maxInt(u32), .vertical = 1 };
+    try std.testing.expectError(error.ResourceLimitExceeded, display.layout(track, 64, 48, .presentation));
 }
 
 test "MP4 color declarations map to WebM colour" {

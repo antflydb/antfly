@@ -792,6 +792,15 @@ fn policyLayout(track: media.mp4.Track, display: video.display.Layout, width: u3
     return .{ .width = g.width, .height = g.height, .presentation_width = display.width, .presentation_height = display.height, .matrix = matrix, .rotation = display.rotation, .tone_mapping = tone, .torchvision = true, .rgb_rounding = if (matrix == .gbr_identity) .gbr_reference else if (width % 16 == 0) .q13_components else .q16_luma };
 }
 
+/// The bitstream's color and aspect apply where the container says nothing, and
+/// policySignal refuses a declaration that conflicts with them.
+fn hevcPolicy(a: std.mem.Allocator, track: media.mp4.Track, width: u32, height: u32) !video.preparation.Options {
+    const signal = (try video.hevc_config.parse(a, track.codec_config)) orelse return policy(track, width, height);
+    var effective = track;
+    if (track.pixel_aspect.horizontal == track.pixel_aspect.vertical) effective.pixel_aspect = .{ .horizontal = signal.sar.horizontal, .vertical = signal.sar.vertical };
+    return policySignal(effective, width, height, .{ .primaries = signal.primaries, .transfer = signal.transfer, .matrix = signal.matrix });
+}
+
 fn parameterSession(a: std.mem.Allocator, reader: *media.mp4.Reader) !?*video.h264_dynamic.Session {
     if (reader.track.codec != .avc) return null;
     if (reader.track.inband_parameter_sets) {
@@ -974,6 +983,9 @@ pub const Plan = struct {
     // Preserve the unfiltered envelope when a precomputed plan is admitted
     // again under a different cache owner. A past hit is not a future pin.
     source_apple_surface_bytes: ?usize = null,
+    /// The surface envelope is a decoder pool that cache hits don't shrink, rather
+    /// than one surface per selected picture.
+    apple_surfaces_fixed: bool = false,
     patch_output_bytes: usize = 0,
     commands: u64 = 0,
     pub fn hostBytes(self: Plan) !usize {
@@ -1167,7 +1179,7 @@ pub fn pinCachedPlan(original: Plan, bytes: []const u8, reader: ?*const media.mp
     // Retain all 24 decoder/reference slots, reducing only selected-output
     // surfaces. The original maximum geometry/depth still bounds every miss.
     result.source_apple_surface_bytes = original.source_apple_surface_bytes orelse original.apple_surface_bytes;
-    result.apple_surface_bytes = if (decode_count == 0) 0 else try std.math.mul(usize, result.source_apple_surface_bytes.? / (original.pictures + 24), @as(usize, @intCast(decode_count)) + 24);
+    result.apple_surface_bytes = if (decode_count == 0) 0 else if (original.apple_surfaces_fixed) result.source_apple_surface_bytes.? else try std.math.mul(usize, result.source_apple_surface_bytes.? / (original.pictures + 24), @as(usize, @intCast(decode_count)) + 24);
     return result;
 }
 /// Only AVC currently consumes these pins. Never discount a decoder path
@@ -1233,7 +1245,10 @@ fn inspectSelectedPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, co
     }
     if (metal and reader.track.codec == .hevc and video.apple_hevc.hasParameterSets(reader.track.codec_config)) {
         if (video.apple_hevc.surfaceBytes(reader.track)) |bytes| {
-            if (bytes <= video.apple_hevc.max_surface_bytes) plan.apple_surface_bytes = std.math.cast(usize, bytes) orelse return error.ResourceLimitExceeded;
+            if (bytes <= video.apple_hevc.max_surface_bytes) {
+                plan.apple_surface_bytes = std.math.cast(usize, bytes) orelse return error.ResourceLimitExceeded;
+                plan.apple_surfaces_fixed = true;
+            }
         } else |_| {}
     }
     for (selected) |index| {
@@ -1243,7 +1258,7 @@ fn inspectSelectedPacketPlan(a: std.mem.Allocator, reader: *media.mp4.Reader, co
         const cfg = if (configurations) |session| try session.configAt(index) else static_config;
         const width = if (cfg) |value| value.width else reader.track.width;
         const height = if (cfg) |value| value.height else reader.track.height;
-        try plan.picture(@intCast(width), @intCast(height), if (cfg) |value| try policySignal(reader.track, @intCast(width), @intCast(height), value.color) else try policy(reader.track, @intCast(width), @intCast(height)));
+        try plan.picture(@intCast(width), @intCast(height), if (cfg) |value| try policySignal(reader.track, @intCast(width), @intCast(height), value.color) else if (reader.track.codec == .hevc) try hevcPolicy(a, reader.track, @intCast(width), @intCast(height)) else try policy(reader.track, @intCast(width), @intCast(height)));
     }
     return plan;
 }
@@ -3022,7 +3037,7 @@ const Capture = struct {
         self.apple_published += 1;
         const slot = std.mem.indexOfScalar(usize, self.selected, id) orelse return error.InvalidPacketIndex;
         if (self.copyDuplicate(slot)) return;
-        var options = try policy(self.track, surface.width, surface.height);
+        var options = try hevcPolicy(self.a, self.track, surface.width, surface.height);
         options.admission_pool = self.pool;
         if (try self.observe(slot, .{ .surface = surface }, options)) return;
         if (self.metal) |metal| {
@@ -4617,6 +4632,16 @@ test "embeddinggemma2 video cache admission removes only pinned unique preparati
     try std.testing.expect(try partial.deviceBytes() < try original.deviceBytes());
     for (original.picture_indexes[0..original.pictures]) |id| cache.storeCpu(.{ .clip = hash, .picture = @intCast(id) }, &values, 1);
     const cached = try inspectConfiguredPlan(a, bytes, null, .{}, configuration, true);
+    var fixed_miss_cache = FrameCache{ .allocator = a, .session = session };
+    defer fixed_miss_cache.deinit();
+    var fixed_miss_pins = CachePins{ .cache = &fixed_miss_cache };
+    defer fixed_miss_pins.deinit();
+    var fixed_plan = original;
+    fixed_plan.apple_surface_bytes = 25 * 4096;
+    fixed_plan.apple_surfaces_fixed = true;
+    try std.testing.expectEqual(@as(usize, 0), (try pinCachedPlan(fixed_plan, bytes, null, .{}, configuration)).apple_surface_bytes);
+    const fixed_miss = try pinCachedPlan(fixed_plan, bytes, null, .{}, .{ .sampling = sampling, .cache_pins = &fixed_miss_pins });
+    try std.testing.expectEqual(fixed_plan.apple_surface_bytes, fixed_miss.apple_surface_bytes);
     var decoder_plan = original;
     decoder_plan.apple_surface_bytes = (original.pictures + 24) * 4096;
     const pinned_decoder = try pinCachedPlan(decoder_plan, bytes, null, .{}, configuration);

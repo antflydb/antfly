@@ -474,6 +474,9 @@ pub fn parseSps(bits: *Bits) !Sps {
     };
 }
 
+/// Table E-1, for aspect_ratio_idc 1 through 16.
+const sar_table = [_][2]u16{ .{ 1, 1 }, .{ 12, 11 }, .{ 10, 11 }, .{ 16, 11 }, .{ 40, 33 }, .{ 24, 11 }, .{ 20, 11 }, .{ 32, 11 }, .{ 80, 33 }, .{ 18, 11 }, .{ 15, 11 }, .{ 64, 33 }, .{ 160, 99 }, .{ 4, 3 }, .{ 3, 2 }, .{ 2, 1 } };
+
 fn parseVui(bits: *Bits, max_sub_layers_minus1: u3) !Vui {
     var vui = Vui{};
     if (try bits.flag()) { // aspect_ratio_info_present_flag
@@ -481,6 +484,9 @@ fn parseVui(bits: *Bits, max_sub_layers_minus1: u3) !Vui {
         if (idc == 255) {
             vui.sar_width = @intCast(try bits.read(16));
             vui.sar_height = @intCast(try bits.read(16));
+        } else if (idc >= 1 and idc < sar_table.len + 1) {
+            vui.sar_width = sar_table[idc - 1][0];
+            vui.sar_height = sar_table[idc - 1][1];
         }
     }
     if (try bits.flag()) _ = try bits.flag(); // overscan_info_present_flag -> overscan_appropriate_flag

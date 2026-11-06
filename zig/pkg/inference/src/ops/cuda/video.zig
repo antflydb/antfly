@@ -226,7 +226,7 @@ pub fn inspectEmbedding(allocator: std.mem.Allocator, bytes: []const u8, control
     try validateTrack(reader.track);
     const end_us = try validateTimeline(reader.track, reader.packets);
     const sampler = try embeddingSamplerForReader(&reader, end_us);
-    const frame = Frame{ .device = 0, .pitch = 0, .width = reader.track.width, .height = reader.track.height, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = try quarterTurns(reader.track.display_matrix), .sar = .{ .horizontal = reader.track.pixel_aspect.horizontal, .vertical = reader.track.pixel_aspect.vertical } };
+    const frame = Frame{ .device = 0, .pitch = 0, .width = reader.track.width, .height = reader.track.height, .timestamp_us = 0, .matrix = 0, .full_range = 0, .rotation = try quarterTurns(reader.track.display_matrix), .sar = try displayAspect(allocator, reader.track) };
     const display = frame.displaySize();
     return .{ .width = reader.track.width, .height = reader.track.height, .frames = sampler.length, .codec = reader.track.codec, .display_width = display[0], .display_height = display[1] };
 }
@@ -249,6 +249,20 @@ fn validateTrack(track: anytype) !void {
     if (track.pixel_aspect.horizontal == 0 or track.pixel_aspect.vertical == 0) return error.UnsupportedVideoFormat;
     _ = try quarterTurns(track.display_matrix);
     _ = try containerColor(track.color_info);
+}
+
+/// In lowest terms. A stream's SAR applies when the container declares none.
+fn displayAspect(a: std.mem.Allocator, track: media.mp4.Track) !PixelAspect {
+    var horizontal = track.pixel_aspect.horizontal;
+    var vertical = track.pixel_aspect.vertical;
+    if (horizontal == vertical and track.codec == .hevc) {
+        if (try @import("antfly_video").hevc_config.parse(a, track.codec_config)) |signal| {
+            horizontal = signal.sar.horizontal;
+            vertical = signal.sar.vertical;
+        }
+    }
+    const common = std.math.gcd(horizontal, vertical);
+    return .{ .horizontal = horizontal / common, .vertical = vertical / common };
 }
 
 /// Orthogonal MP4 display transforms, including translation. Reflection, shear and
@@ -393,7 +407,7 @@ pub fn decodeMp4Sampled(allocator: std.mem.Allocator, ctx: *context.CudaContext,
     try validateTrack(track);
     const color = try containerColor(track.color_info);
     state.rotation = try quarterTurns(track.display_matrix);
-    state.sar = .{ .horizontal = track.pixel_aspect.horizontal, .vertical = track.pixel_aspect.vertical };
+    state.sar = try displayAspect(allocator, track);
     if (reader.packets.len == 0) return error.EmptyVideo;
     state.sampler.end_us = try validateTimeline(track, reader.packets);
     if (sampling == .embedding_gemma2) {
@@ -1094,6 +1108,36 @@ test "video CUDA kernels follow the portable HDR policy and quarter turns" {
                 const expected = tone.render64(encoded(&surface, x, y), true, case.policy)[c];
                 try std.testing.expectApproxEqAbs(@as(f32, @floatFromInt(expected)) / 255, actual[index], 1.5 / 255.0);
             };
+        }
+    }
+}
+
+test "video CUDA kernel cost by depth and tone" {
+    if (comptime !build_options.enable_cuda or builtin.os.tag != .linux) return error.SkipZigTest;
+    if (!@import("antfly_platform").env.getenvBoolDefault("ANTFLY_VIDEO_KERNEL_BENCH", false)) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var compute = try cuda.CudaCompute.init(a);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    var preprocess = try Preprocessor.init(a, &compute.ctx);
+    defer preprocess.deinit();
+    const width = 3840;
+    const height = 2160;
+    const pitch = width * 2;
+    const surface = try a.alloc(u8, pitch * height * 3 / 2);
+    defer a.free(surface);
+    for (surface, 0..) |*value, i| value.* = @truncate(i *% 2654435761 >> 13);
+    var buffer = try @import("buffer.zig").DeviceBuffer.alloc(&compute.ctx, surface.len);
+    defer buffer.free(&compute.ctx);
+    try buffer.copyFromHost(&compute.ctx, surface);
+    for ([_]struct { high: u32, tone: u32, name: []const u8 }{ .{ .high = 0, .tone = 0, .name = "8-bit SDR" }, .{ .high = 1, .tone = 0, .name = "10-bit SDR" }, .{ .high = 1, .tone = 1, .name = "PQ" }, .{ .high = 1, .tone = 2, .name = "HLG" } }) |case| {
+        for (0..4) |round| {
+            const start = @import("antfly_platform").time.monotonicNs();
+            const output = try preprocess.patches(&cb, .{ .device = buffer.ptr, .pitch = pitch, .width = width, .height = height, .timestamp_us = 0, .matrix = if (case.tone != 0) 9 else 1, .full_range = 0, .high_depth = case.high, .tone = case.tone }, 960, 544, 16, .{ 0, 0, 0 }, .{ 1, 1, 1 });
+            try compute.ctx.synchronize();
+            const elapsed = @import("antfly_platform").time.monotonicNs() - start;
+            cb.free(output);
+            if (round != 0) std.debug.print("video kernel bench {s}: {d:.2} ms for 960x544 from 4K\n", .{ case.name, @as(f64, @floatFromInt(elapsed)) / 1e6 });
         }
     }
 }

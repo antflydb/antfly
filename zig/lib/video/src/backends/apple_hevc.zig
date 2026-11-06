@@ -20,13 +20,14 @@ const builtin = @import("builtin");
 const media = @import("antfly_media");
 const apple = @import("apple.zig");
 const restart = @import("../hevc_restart.zig");
+const config_info = @import("../hevc_config.zig");
 
 pub const max_surface_bytes: u64 = 1024 * 1024 * 1024;
 
 /// Selected pictures leave as soon as they decode, so only the reference pool and
 /// one output stay live. That keeps ordinary 4K clips on the hardware route.
 pub fn surfaceBytes(track: media.mp4.Track) !u64 {
-    const surface_format = try format(track.codec_config, track.color_info);
+    const surface_format = try format(track.codec_config, false);
     return apple.surfaceAdmissionBytesForDepth(track.width, track.height, 1, surface_format.bitDepth());
 }
 
@@ -45,10 +46,9 @@ pub const Options = struct {
 };
 pub const Receipt = struct { hardware: bool, submitted_packets: usize };
 
-/// hvcC carries the sample layout this route can decode, without parsing an SPS.
-pub fn format(config: []const u8, color_info: []const u8) !apple.Format {
+/// hvcC carries the sample layout this route can decode.
+pub fn format(config: []const u8, full: bool) !apple.Format {
     if (config.len < 23 or config[0] != 1 or config[16] & 3 != 1 or config[17] & 7 != config[18] & 7) return error.UnsupportedVideoProfile;
-    const full = color_info.len >= 11 and std.mem.eql(u8, color_info[0..4], "nclx") and color_info[10] & 0x80 != 0;
     return switch (config[17] & 7) {
         0 => if (full) .nv12_full else .nv12_video,
         2 => if (full) .p010_full else .p010_video,
@@ -119,7 +119,8 @@ pub fn decodeTo(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []con
     if (reader.track.codec != .hevc or !hasParameterSets(reader.track.codec_config)) return error.UnsupportedVideoProfile;
     if (selected.len == 0 or selected.len > options.max_frames) return error.ResourceLimitExceeded;
     if (reader.track.timescale > std.math.maxInt(i32)) return error.UnsupportedTimeline;
-    const surface_format = try format(reader.track.codec_config, reader.track.color_info);
+    const signal = try config_info.parse(a, reader.track.codec_config);
+    const surface_format = try format(reader.track.codec_config, try config_info.fullRange(signal, reader.track.color_info));
     const sorted = try a.dupe(usize, selected);
     defer a.free(sorted);
     std.mem.sort(usize, sorted, {}, std.sort.asc(usize));
@@ -169,13 +170,13 @@ test "HEVC format comes from hvcC and rejects layouts the route can't output" {
     var config = @as([23]u8, @splat(0));
     config[0] = 1;
     config[16] = 1;
-    try std.testing.expectEqual(apple.Format.nv12_video, try format(&config, ""));
-    try std.testing.expectEqual(apple.Format.nv12_full, try format(&config, "nclx" ++ [_]u8{ 0, 1, 0, 1, 0, 1, 0x80 }));
+    try std.testing.expectEqual(apple.Format.nv12_video, try format(&config, false));
+    try std.testing.expectEqual(apple.Format.nv12_full, try format(&config, true));
     config[17] = 2;
     config[18] = 2;
-    try std.testing.expectEqual(apple.Format.p010_video, try format(&config, ""));
+    try std.testing.expectEqual(apple.Format.p010_video, try format(&config, false));
     config[16] = 2;
-    try std.testing.expectError(error.UnsupportedVideoProfile, format(&config, ""));
+    try std.testing.expectError(error.UnsupportedVideoProfile, format(&config, false));
 }
 
 test "VideoToolbox HEVC decodes selected pictures from a sparse open timeline" {

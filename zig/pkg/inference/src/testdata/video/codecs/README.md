@@ -49,3 +49,7 @@ NVDEC depth, transfer and rotation signalling. Each starts from a two-second x26
 red/blue split; FFmpeg's `hevc_metadata` bitstream filter writes the HLG or PQ
 signal (the x265 parameters alone left it unset), and `-display_rotation 90` writes
 the display matrix. They aren't in `receipt.json`, because no reference hash applies.
+
+`hevc-hlg-nocolr.mp4` is `hevc-hlg.mp4` with its `colr` box renamed to `free`, so the
+HDR signal is only in the SPS. `lib/video/testdata/hevc-hlg-config.bin` is that
+clip's `hvcC` payload.

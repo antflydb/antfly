@@ -409,6 +409,25 @@ test "gemma4 video decodes HEVC in MP4 at FFmpeg's timestamps" {
     try std.testing.expectEqual(@as(u32, 192), count.width);
 }
 
+test "gemma4 video tone maps HEVC whose HDR signal is only in the bitstream" {
+    if (@import("builtin").os.tag != .macos) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    const Tone = struct {
+        seen: usize = 0,
+        fn accept(raw: *anyopaque, _: usize, _: video.preparation.BorrowedFrame, options: video.preparation.Options, _: media.source.Control) anyerror!void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try std.testing.expectEqual(video.preparation.Matrix.bt2020_ncl, options.matrix);
+            try std.testing.expectEqual(video.tone.Policy.hlg_reinhard_100, options.tone_mapping);
+            self.seen += 1;
+        }
+    };
+    var tone: Tone = .{};
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes, .device_bytes = video.apple_hevc.max_surface_bytes } };
+    const bytes = @embedFile("../testdata/video/codecs/hevc-hlg-nocolr.mp4");
+    try embedding_video.observeConfigured(a, bytes, null, .{}, .{ .observer = .{ .context = &tone, .accept = Tone.accept }, .sampling = sampling, .pool = &pool });
+    try std.testing.expect(tone.seen != 0);
+}
+
 test "gemma4 video reports presentation size for anamorphic containers" {
     const a = std.testing.allocator;
     inline for (.{ "anamorphic-2x1.mp4", "anamorphic-2x1.webm", "bframes.mp4" }, .{ true, true, false }) |name, anamorphic| {
