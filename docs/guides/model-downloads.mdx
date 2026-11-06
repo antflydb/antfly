@@ -26,7 +26,10 @@ resolved commit, and selected format. Repeating a pull resolves moving refs agai
 verified files; inference uses the installed snapshot without network refresh.
 
 Managed pulls publish a store-wide catalog generation while swapping completed
-installations. Inference checks that generation and the selected receipt, so warm
+installations. Waiting for active model construction and comparing unchanged
+content happen while the catalog remains readable. The busy journal covers only
+namespace mutation and its durability boundary. Inference checks the generation
+and selected receipt, so warm
 pinned requests do not scan unrelated models. Interrupted publication remains
 unavailable until a subsequent pull recovers the interrupted installation named
 in its durable journal, even when that pull requests another model. Invalid
@@ -43,7 +46,9 @@ Direct readers and VAD consume only receipt-listed artifacts and verify availabl
 checksums against the bytes read or mapped; stale sibling files do not supply a
 missing model component. Multistage readers reuse checksum verification within
 one acquisition while the file identity remains unchanged, then recheck those
-identities before returning the reader.
+identities before returning the reader. Lazy secondary sessions and GGUF
+projectors retain the owning primary runtime's publication; an update cannot
+combine new components with an older primary.
 
 Traditional ML predictor pulls also resolve one snapshot before downloading,
 including explicit branches or commits:

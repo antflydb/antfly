@@ -23,6 +23,7 @@ const std = @import("std");
 const httpx = @import("httpx");
 const builtin = @import("builtin");
 const managed_receipt = @import("managed_receipt.zig");
+const publication_lease = @import("publication_lease.zig");
 const gliner_catalog = @import("gliner_catalog.zig");
 const qwen3vl_catalog = @import("qwen3vl_catalog.zig");
 const qwen3_embedding_catalog = @import("qwen3_embedding_catalog.zig");
@@ -1461,10 +1462,18 @@ fn unchangedPublishedInstall(allocator: std.mem.Allocator, io: std.Io, destinati
 pub fn recoverManagedPublication(allocator: std.mem.Allocator, io: std.Io, destination: []const u8) !void {
     const backup = try managedSiblingPath(allocator, destination, managed_download_backup_suffix);
     defer allocator.free(backup);
+    if (!try pathExists(std.Io.Dir.cwd(), io, backup)) return;
+    var lease = try publication_lease.WriteLease.acquire(allocator, io, destination);
+    defer lease.deinit(io);
+    return recoverManagedPublicationWithLease(allocator, io, destination, &lease, null);
+}
+
+pub fn recoverManagedPublicationWithLease(allocator: std.mem.Allocator, io: std.Io, destination: []const u8, lease: *const publication_lease.WriteLease, journal: ?publication_lease.MutationJournal) !void {
+    try lease.requireDestination(io, destination);
+    const backup = try managedSiblingPath(allocator, destination, managed_download_backup_suffix);
+    defer allocator.free(backup);
     const cwd = std.Io.Dir.cwd();
     if (!try pathExists(cwd, io, backup)) return;
-    var lease = try @import("publication_lease.zig").Lease.exclusive(allocator, io, destination);
-    defer lease.deinit(io);
     const destination_exists = try pathExists(cwd, io, destination);
     var current = if (destination_exists) managed_receipt.loadValidated(allocator, io, destination) catch |err| switch (@as(anyerror, err)) {
         error.InvalidManagedDownload, error.IncompleteManagedDownload, error.InvalidModelArtifactPath, error.InvalidModelArtifactKind, error.ModelArtifactOutsideRoot, error.FileNotFound, error.NotDir, error.IsDir, error.SymLinkLoop, error.StreamTooLong => null,
@@ -1479,6 +1488,7 @@ pub fn recoverManagedPublication(allocator: std.mem.Allocator, io: std.Io, desti
         // installation remains valid rollback state for its first managed pull.
         var receipt = try managed_receipt.loadValidated(allocator, io, backup);
         defer if (receipt) |*value| value.deinit();
+        if (journal) |active| try active.beforeMutation();
         if (destination_exists) try removeTreeIfExists(cwd, io, destination);
         try std.Io.Dir.rename(cwd, backup, cwd, destination, io);
     }
@@ -1503,6 +1513,15 @@ pub const ManagedModelTransaction = struct {
         io: std.Io,
         destination: []const u8,
     ) !ManagedModelTransaction {
+        return beginPrepared(allocator, io, destination, null);
+    }
+
+    pub fn beginWithLease(allocator: std.mem.Allocator, io: std.Io, destination: []const u8, lease: *const publication_lease.WriteLease) !ManagedModelTransaction {
+        try lease.requireDestination(io, destination);
+        return beginPrepared(allocator, io, destination, lease);
+    }
+
+    fn beginPrepared(allocator: std.mem.Allocator, io: std.Io, destination: []const u8, lease: ?*const publication_lease.WriteLease) !ManagedModelTransaction {
         try @import("publication_lease.zig").Lease.assertMutable(allocator, io, destination);
         const owned_destination = try allocator.dupe(u8, destination);
         errdefer allocator.free(owned_destination);
@@ -1518,7 +1537,12 @@ pub const ManagedModelTransaction = struct {
         };
 
         const cwd = std.Io.Dir.cwd();
-        try recoverManagedPublication(allocator, io, destination);
+        if (lease) |active| {
+            // A catalog publisher recovers under its journal before preparing
+            // private staging. Do not permit a hidden namespace mutation here.
+            if (try pathExists(cwd, io, transaction.backup)) return error.ModelArtifactsChanging;
+            try active.requireDestination(io, destination);
+        } else try recoverManagedPublication(allocator, io, destination);
 
         if (!try pathExists(cwd, io, transaction.staging)) {
             try cwd.createDirPath(io, transaction.staging);
@@ -1529,8 +1553,14 @@ pub const ManagedModelTransaction = struct {
     }
 
     pub fn commit(self: *ManagedModelTransaction, io: std.Io) !void {
-        var lease = try @import("publication_lease.zig").Lease.exclusive(self.allocator, io, self.destination);
+        if (self.committed) return error.ManagedDownloadAlreadyCommitted;
+        var lease = try publication_lease.WriteLease.acquire(self.allocator, io, self.destination);
         defer lease.deinit(io);
+        return self.commitWithLease(io, &lease, null);
+    }
+
+    pub fn commitWithLease(self: *ManagedModelTransaction, io: std.Io, lease: *const publication_lease.WriteLease, journal: ?publication_lease.MutationJournal) !void {
+        try lease.requireDestination(io, self.destination);
         if (self.committed) return error.ManagedDownloadAlreadyCommitted;
         if (managedDownloadState(self.allocator, io, self.staging) != .complete) {
             return error.IncompleteManagedDownload;
@@ -1545,6 +1575,7 @@ pub const ManagedModelTransaction = struct {
             self.committed = true;
             return;
         }
+        if (journal) |active| try active.beforeMutation();
         try removeTreeIfExists(cwd, io, self.backup);
         const had_destination = try pathExists(cwd, io, self.destination);
         if (had_destination) {

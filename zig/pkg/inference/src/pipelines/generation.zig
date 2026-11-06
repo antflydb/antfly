@@ -4218,6 +4218,9 @@ pub const NativeGenerationPipeline = struct {
     /// The model's open projector file for Gemma media prompts. Null makes
     /// the pipeline open (and parse) the projector for the request.
     projector_store: ?*gemma4_projector.ProjectorStore = null,
+    /// Preserve cached acquisition failures for media without penalizing a
+    /// text-only request or retrying through an unbound pathname fallback.
+    projector_store_error: ?anyerror = null,
     decode_state: ?*NativeDecodeState = null,
     scheduler: ?*runtime.scheduler.native_generate.NativeGenerateCoordinator = null,
     scheduler_lease: ?*runtime.scheduler.native_generate.Lease = null,
@@ -5851,7 +5854,7 @@ pub const NativeGenerationPipeline = struct {
                     var execution_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
                     defer if (execution_scope) |*scope| scope.deinit();
                     const request_projector = if (self.projector_store == null)
-                        try gemma4_projector.ProjectorStore.open(allocator, projector_path)
+                        try self.openRequestProjector(allocator, projector_path)
                     else
                         null;
                     defer if (request_projector) |store| store.close();
@@ -14402,6 +14405,23 @@ pub const NativeGenerationPipeline = struct {
         }
     };
 
+    /// A request-owned fallback must preserve the same proof as the cached
+    /// projector. In particular, a failed cached acquisition cannot silently
+    /// reopen a replacement installation through its old pathname.
+    fn openRequestProjector(self: *NativeGenerationPipeline, allocator: std.mem.Allocator, path: []const u8) !*gemma4_projector.ProjectorStore {
+        if (self.projector_store_error) |err| return err;
+        const model_dir = self.model_dir orelse std.fs.path.dirname(path) orelse ".";
+        const io = self.io orelse std.Options.debug_io;
+        const control = self.execution_control orelse InferenceExecutionControl{};
+        var lease = try @import("../registry/publication_lease.zig").Lease.shared(allocator, io, model_dir);
+        defer lease.deinit(io);
+        try control.verifyModelSelection(allocator, io, model_dir);
+        const store = try gemma4_projector.ProjectorStore.open(allocator, path);
+        errdefer store.close();
+        try control.verifyModelSelection(allocator, io, model_dir);
+        return store;
+    }
+
     const SuccessfulStepPublisher = struct {
         vocab_size: usize,
         greedy_tokens: ?[]const u32 = null,
@@ -20990,4 +21010,35 @@ test "cooperative decode publication cancels only the expired row after a shared
     try std.testing.expect(x.logits == null and x.ready.load(.acquire));
     defer a.free(y.logits.?);
     try std.testing.expectEqualSlices(f32, &.{ 4, 5, 6 }, y.logits.?);
+}
+
+test "model selection request projector fallback cannot reopen a replacement publication" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.gguf", .data = "decoder" });
+    try tmp.dir.writeFile(io, .{ .sub_path = ".antfly-download-complete.json", .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const publication = try @import("../registry/managed_receipt.zig").publicationGeneration(a, io, root);
+    const selected = @import("../registry/model_selection.zig").ResolvedModel{ .path = root, .publication = publication };
+    try tmp.dir.writeFile(io, .{ .sub_path = ".antfly-download-complete.json", .data = "{\"version\":1,\"artifacts\":[{\"path\":\"model.gguf\",\"size\":7}]}\n" });
+    var pipeline: NativeGenerationPipeline = undefined;
+    pipeline.model_dir = root;
+    pipeline.io = io;
+    pipeline.projector_store_error = null;
+    pipeline.execution_control = selected.bind(InferenceExecutionControl{ .io = io });
+    const path = try std.fs.path.join(a, &.{ root, "model.gguf" });
+    defer a.free(path);
+    try std.testing.expectError(error.ModelArtifactsChanging, pipeline.openRequestProjector(a, path));
+    // Offline pipelines can supply only an absolute projector path. Deriving
+    // its directory still enforces a supplied model-selection constraint.
+    pipeline.model_dir = null;
+    try std.testing.expectError(error.ModelArtifactsChanging, pipeline.openRequestProjector(a, path));
+    pipeline.execution_control = null;
+    pipeline.projector_store_error = error.ModelArtifactsChanging;
+    try std.testing.expectError(error.ModelArtifactsChanging, pipeline.openRequestProjector(a, path));
+    pipeline.projector_store_error = error.Cancelled;
+    try std.testing.expectError(error.Cancelled, pipeline.openRequestProjector(a, path));
 }

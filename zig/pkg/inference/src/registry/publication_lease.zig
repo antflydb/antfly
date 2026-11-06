@@ -115,6 +115,41 @@ pub const Lease = struct {
     }
 };
 
+/// Capability retained by a publisher across preparation and namespace mutation.
+/// Borrow it in commit/recovery instead of recursively locking the same parent.
+pub const WriteLease = struct {
+    allocator: std.mem.Allocator,
+    lease: Lease,
+    destination: []const u8,
+
+    pub fn acquire(a: std.mem.Allocator, io: std.Io, destination: []const u8) !WriteLease {
+        var lease = try Lease.exclusive(a, io, destination);
+        errdefer lease.deinit(io);
+        return .{ .allocator = a, .lease = lease, .destination = try @import("managed_receipt.zig").resolveRequestedFilePath(a, io, destination) };
+    }
+    pub fn requireDestination(self: *const WriteLease, io: std.Io, destination: []const u8) !void {
+        if (self.lease.directory == null) return error.ModelArtifactsChanging;
+        const canonical = try @import("managed_receipt.zig").resolveRequestedFilePath(self.allocator, io, destination);
+        defer self.allocator.free(canonical);
+        if (!std.mem.eql(u8, canonical, self.destination)) return error.ModelArtifactsChanging;
+    }
+    pub fn deinit(self: *WriteLease, io: std.Io) void {
+        if (self.lease.directory == null) return;
+        self.lease.deinit(io);
+        self.allocator.free(self.destination);
+        self.destination = "";
+    }
+};
+
+/// Called only immediately before an active installation can change.
+pub const MutationJournal = struct {
+    ptr: *anyopaque,
+    begin_fn: *const fn (*anyopaque) anyerror!void,
+    pub fn beforeMutation(self: MutationJournal) !void {
+        try self.begin_fn(self.ptr);
+    }
+};
+
 test "model selection publication lease fences replacement and rollback without serializing readers" {
     const a = std.testing.allocator;
     const io = std.testing.io;
@@ -203,4 +238,23 @@ test "model selection alias lease contention releases previously acquired parent
     defer alias_parent.close(io);
     try std.testing.expect(try Lease.file(alias_parent).tryLock(io, .exclusive));
     Lease.file(alias_parent).unlock(io);
+}
+
+test "model selection write lease rejects another installation and released ownership" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "first");
+    try tmp.dir.createDirPath(io, "second");
+    const first = try tmp.dir.realPathFileAlloc(io, "first", a);
+    defer a.free(first);
+    const second = try tmp.dir.realPathFileAlloc(io, "second", a);
+    defer a.free(second);
+    var lease = try WriteLease.acquire(a, io, first);
+    defer lease.deinit(io);
+    try lease.requireDestination(io, first);
+    try std.testing.expectError(error.ModelArtifactsChanging, lease.requireDestination(io, second));
+    lease.deinit(io);
+    try std.testing.expectError(error.ModelArtifactsChanging, lease.requireDestination(io, first));
 }

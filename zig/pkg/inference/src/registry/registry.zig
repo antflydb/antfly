@@ -684,8 +684,9 @@ pub const ModelRegistry = struct {
             else
                 false;
             if (cached) {
-                var publication = try @import("catalog_publication.zig").Publication.begin(self.allocator, io, resolved_models_dir, std.mem.trimStart(u8, dest[resolved_models_dir.len..], "/"));
+                var publication = try @import("catalog_publication.zig").Publication.prepare(self.allocator, io, resolved_models_dir, std.mem.trimStart(u8, dest[resolved_models_dir.len..], "/"));
                 defer publication.deinit();
+                try publication.recoverDestination();
                 try download.finishVerifiedManagedInstall(self.allocator, io, dest);
                 try publication.finish();
                 return;
@@ -694,11 +695,12 @@ pub const ModelRegistry = struct {
 
         var transaction = blk: {
             // begin() can restore a backup after an interrupted publication.
-            var publication = try @import("catalog_publication.zig").Publication.begin(self.allocator, io, resolved_models_dir, std.mem.trimStart(u8, dest[resolved_models_dir.len..], "/"));
+            var publication = try @import("catalog_publication.zig").Publication.prepare(self.allocator, io, resolved_models_dir, std.mem.trimStart(u8, dest[resolved_models_dir.len..], "/"));
             defer publication.deinit();
-            var pending = try download.ManagedModelTransaction.begin(self.allocator, io, dest);
-            errdefer pending.deinit(io);
+            try publication.recoverDestination();
             try publication.finish();
+            var pending = try download.ManagedModelTransaction.beginWithLease(self.allocator, io, dest, &publication.write_lease);
+            errdefer pending.deinit(io);
             break :blk pending;
         };
         defer transaction.deinit(io);
@@ -828,9 +830,9 @@ pub const ModelRegistry = struct {
                 try io.checkCancel();
             }
         }
-        var publication = try @import("catalog_publication.zig").Publication.begin(self.allocator, io, resolved_models_dir, std.mem.trimStart(u8, dest[resolved_models_dir.len..], "/"));
+        var publication = try @import("catalog_publication.zig").Publication.prepare(self.allocator, io, resolved_models_dir, std.mem.trimStart(u8, dest[resolved_models_dir.len..], "/"));
         defer publication.deinit();
-        try transaction.commit(io);
+        try publication.commit(&transaction);
         try publication.finish();
     }
 

@@ -6435,6 +6435,11 @@ pub const Node = struct {
         }
         defer decode_state.deinit();
 
+        var projector_store_error: ?anyerror = null;
+        const projector_store = model.ensureProjectorStoreWithControl(execution_control) catch |err| blk: {
+            projector_store_error = err;
+            break :blk null;
+        };
         var pipeline = generation.NativeGenerationPipeline{
             .allocator = allocator,
             .io = io,
@@ -6455,7 +6460,8 @@ pub const Node = struct {
             .print_timing = timing != null,
             .model_dir = model_path,
             .gguf_projector_path = model.manifest.gguf_projector_path,
-            .projector_store = model.ensureProjectorStore() catch null,
+            .projector_store = projector_store,
+            .projector_store_error = projector_store_error,
             .decode_state = &decode_state,
             .scheduler = if (scheduler_lease != null) model.native_generate_coordinator else null,
             .scheduler_lease = if (scheduler_lease) |*lease| lease else null,
@@ -17172,6 +17178,11 @@ pub const Node = struct {
             }
         };
 
+        var projector_store_error: ?anyerror = null;
+        const projector_store = model.ensureProjectorStoreWithControl(execution_control) catch |err| blk: {
+            projector_store_error = err;
+            break :blk null;
+        };
         var pipeline = generation.NativeGenerationPipeline{
             .allocator = execution_allocator,
             .io = ctx.io,
@@ -17202,7 +17213,8 @@ pub const Node = struct {
             .print_timing = request_generate_timing,
             .model_dir = model_path,
             .gguf_projector_path = model.manifest.gguf_projector_path,
-            .projector_store = model.ensureProjectorStore() catch null,
+            .projector_store = projector_store,
+            .projector_store_error = projector_store_error,
             .decode_state = &decode_state,
             .scheduler = if (use_scheduler) model.native_generate_coordinator else null,
             .scheduler_lease = if (use_scheduler) if (native_generate_lease) |*lease| lease else null else null,
@@ -19306,6 +19318,11 @@ pub const Node = struct {
                     decode_states[pos] = generation.NativeDecodeState.initPaged(task_alloc, &kv_manager, pool_id, model.shared_moe_cache);
                     decode_states[pos].kv_lock = &kv_mutex;
                     decode_states[pos].kv_storage = &kv_storage;
+                    var projector_store_error: ?anyerror = null;
+                    const projector_store = model.ensureProjectorStoreWithControl(execution_control) catch |err| blk: {
+                        projector_store_error = err;
+                        break :blk null;
+                    };
                     tasks[pos] = .{
                         .allocator = task_alloc,
                         .pipeline = .{
@@ -19329,7 +19346,8 @@ pub const Node = struct {
                             .print_timing = serverGenerateTimingEnabled(),
                             .model_dir = model_path,
                             .gguf_projector_path = model.manifest.gguf_projector_path,
-                            .projector_store = model.ensureProjectorStore() catch null,
+                            .projector_store = projector_store,
+                            .projector_store_error = projector_store_error,
                             .decode_state = &decode_states[pos],
                             .scheduler = model.native_generate_coordinator,
                             .scheduler_lease = if (model.native_generate_coordinator != null) &leases[pos] else null,

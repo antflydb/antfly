@@ -2982,6 +2982,24 @@ pub const LoadedModel = struct {
         );
     }
 
+    fn checkOwnerSelection(self: *const LoadedModel, control: ?InferenceExecutionControl) !void {
+        if (control) |active| {
+            try active.check();
+            if (active.model_selection) |selected| {
+                if (!selected.matches(self.model_dir) or !std.meta.eql(selected.publication, self.managed_publication)) return error.ModelArtifactsChanging;
+            }
+        }
+    }
+
+    fn publicationIo(self: *const LoadedModel, control: ?InferenceExecutionControl) std.Io {
+        return if (control) |active| active.io orelse self.session_manager.io orelse std.Options.debug_io else self.session_manager.io orelse std.Options.debug_io;
+    }
+
+    fn verifyOwnerPublication(self: *const LoadedModel, control: ?InferenceExecutionControl) !void {
+        try self.checkOwnerSelection(control);
+        if (!std.meta.eql(self.managed_publication, try managed_receipt.publicationGeneration(self.allocator, self.publicationIo(control), self.model_dir))) return error.ModelArtifactsChanging;
+    }
+
     fn ensureOptionalSessionWithControl(
         self: *LoadedModel,
         kind: DeclaredOptionalSessionKind,
@@ -2990,9 +3008,13 @@ pub const LoadedModel = struct {
         path: ?[]const u8,
         control: ?InferenceExecutionControl,
     ) !bool {
-        if (control) |active| try active.check();
+        try self.checkOwnerSelection(control);
         if (slot.* != null) return false;
         const session_path = path orelse return false;
+        const io = self.publicationIo(control);
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, self.model_dir);
+        defer publication_lease.deinit(io);
+        try self.verifyOwnerPublication(control);
         const shared_ctx = backends.imported_onnx_session.sharedBackendContext(self.session);
         const strict_backend = [_]backends.BackendType{if (shared_ctx) |shared|
             shared.backendType()
@@ -3016,7 +3038,7 @@ pub const LoadedModel = struct {
             control,
         );
         defer loaded.deinit();
-        if (control) |active| try active.check();
+        try self.verifyOwnerPublication(control);
         const owned = loaded.take();
         slot.* = owned.session;
         lease_slot.* = owned.resource_lease;
@@ -3514,11 +3536,22 @@ pub const LoadedModel = struct {
     /// The model's open projector file, opened on first use. Null when the
     /// manifest has no GGUF projector.
     pub fn ensureProjectorStore(self: *LoadedModel) !?*gemma4_projector.ProjectorStore {
+        return self.ensureProjectorStoreWithControl(null);
+    }
+
+    pub fn ensureProjectorStoreWithControl(self: *LoadedModel, control: ?InferenceExecutionControl) !?*gemma4_projector.ProjectorStore {
         const path = self.manifest.gguf_projector_path orelse return null;
-        platform.sync.lockYielding(&self.projector_store_mutex);
+        try self.checkOwnerSelection(control);
+        if (control) |active| try active.lock(&self.projector_store_mutex) else platform.sync.lockYielding(&self.projector_store_mutex);
         defer self.projector_store_mutex.unlock();
         if (self.projector_store) |store| return store;
+        const io = self.publicationIo(control);
+        var publication_lease = try @import("../registry/publication_lease.zig").Lease.shared(self.allocator, io, self.model_dir);
+        defer publication_lease.deinit(io);
+        try self.verifyOwnerPublication(control);
         const store = try gemma4_projector.ProjectorStore.open(self.allocator, path);
+        errdefer store.close();
+        try self.verifyOwnerPublication(control);
         self.projector_store = store;
         return store;
     }
@@ -11597,6 +11630,7 @@ test "optional session adoption owns rollback and transfers admission exactly on
         const baseline = manager.admissionController().snapshot();
         var model: LoadedModel = undefined;
         model.managed_publication = null;
+        model.model_dir = root;
         model.allocator = allocator;
         model.session = primary.session;
         model.session_manager = &manager.session_manager;
@@ -16091,4 +16125,65 @@ test "model selection runtime snapshots carry composite asset and flight publica
         const expected = if (entry.runtime_id == 17) asset_publication else flight_publication;
         try std.testing.expectEqual(expected, entry.managed_publication.?);
     }
+}
+
+test "model selection lazy optional component retains primary publication" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try writeCancellationTestModel(tmp.dir, a);
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const gguf = try std.fs.path.join(a, &.{ root, "model.gguf" });
+    defer a.free(gguf);
+    const size = (try tmp.dir.statFile(io, "model.gguf", .{})).size;
+    const receipt_a = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .source = .{ .owner = "acme", .name = "model", .variant = "gguf", .resolved_revision = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" }, .artifacts = .{.{ .path = "model.gguf", .size = size }} }, .{});
+    defer a.free(receipt_a);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt_a });
+    const publication_a = try managed_receipt.publicationGeneration(a, io, root);
+    var sm = backends.SessionManager.initWithIo(a, io);
+    sm.preferred_backends = &.{.native};
+    var manager = ModelManager.init(a, sm);
+    defer manager.deinit();
+    var primary = try manager.loadManagedSessionWithAdmission(root, &.{.native}, null, null);
+    defer primary.deinit();
+    var model: LoadedModel = undefined;
+    model.managed_publication = publication_a;
+    model.model_dir = root;
+    model.allocator = a;
+    model.session = primary.session;
+    model.session_manager = &manager.session_manager;
+    model.model_manager = &manager;
+    model.kernel_jit_profile_bundle = null;
+    model.manifest = .{ .allocator = a, .gguf_projector_path = gguf };
+    model.projector_store_mutex = .unlocked;
+    model.projector_store = null;
+    const old_selection = @import("../registry/model_selection.zig").ResolvedModel{ .path = root, .publication = publication_a };
+    const control = old_selection.bind(InferenceExecutionControl{ .io = io, .native_call_policy = .in_process });
+    var existing: ?backends.Session = null;
+    var existing_lease: ?runtime.tier.memory.AdmissionLease = null;
+    defer if (existing_lease) |*held| held.release();
+    defer if (existing) |session| session.close();
+    try std.testing.expect(try model.ensureOptionalSessionWithControl(.text_projection, &existing, &existing_lease, root, control));
+    const previous_session = existing.?.ptr;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, gguf, a, .limited(1024 * 1024));
+    defer a.free(bytes);
+    std.mem.writeInt(u32, bytes[bytes.len - 4 ..][0..4], @bitCast(@as(f32, 1.0)), .little);
+    try @import("../registry/download.zig").writeFileAtomically(a, io, gguf, bytes);
+    const receipt_b = try a.dupe(u8, receipt_a);
+    defer a.free(receipt_b);
+    const pin = std.mem.indexOf(u8, receipt_b, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").?;
+    @memset(receipt_b[pin..][0..40], 'b');
+    try tmp.dir.writeFile(io, .{ .sub_path = managed_receipt.complete_filename, .data = receipt_b });
+    try std.testing.expect(!std.meta.eql(publication_a, try managed_receipt.publicationGeneration(a, io, root)));
+    // Already materialized A remains safe for the request that owns A.
+    try std.testing.expect(!try model.ensureOptionalSessionWithControl(.text_projection, &existing, &existing_lease, root, control));
+    try std.testing.expect(existing.?.ptr == previous_session);
+    try std.testing.expectError(error.ModelArtifactsChanging, model.ensureProjectorStoreWithControl(control));
+    var slot: ?backends.Session = null;
+    var lease: ?runtime.tier.memory.AdmissionLease = null;
+    defer if (lease) |*held| held.release();
+    defer if (slot) |session| session.close();
+    try std.testing.expectError(error.ModelArtifactsChanging, model.ensureOptionalSessionWithControl(.text_projection, &slot, &lease, root, control));
 }
