@@ -169,6 +169,14 @@ Each kind of ride-along work is safe to lose in a crash because it can be recomp
 
 **Crash invariant.** Ride-along work may be lost at a crash. Acknowledged work may not, and credits may not leak.
 
+**Prefix-ordered durability.** A durable copy-on-write checkpoint makes every earlier transaction durable, in apply order. After recovery, the set of applied transactions is always a prefix of apply order. This is what makes ride-along safe: retirement applied after the progress it depends on is lost or kept together with that progress.
+
+**Group membership, not standalone commits.** On Lite, `BatchOptions.durability = .ride_along` maps to `Store.stageRideAlong`. The plan joins the next foreground group's native transaction, so one copy-on-write publication (one path copy, one allocator-ledger write, one slot write) covers the whole group. Standalone non-durable commits would still pay those bytes on every commit. Only the idle flush commits ride-along work without a foreground group.
+
+**Manifest coverage.** A durable commit's manifest covers every page written since the last durable checkpoint, not just the current transaction's pages. Otherwise a torn page from an earlier non-durable transaction would pass verification.
+
+**Hosted follow-up (not in this change).** The hosted LSM backend treats `.ride_along` as durable. The equivalent there is a WAL append that doesn't wait for a sync and becomes durable with the next group sync in `storage/wal.zig`.
+
 ### 3.3 One physical commit for a small indexed write
 
 **`CommitPlan`** is a typed list of native operations in one native transaction:
