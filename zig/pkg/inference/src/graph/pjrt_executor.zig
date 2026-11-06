@@ -684,9 +684,12 @@ pub const PjrtSemanticInputBinding = struct {
 pub const PjrtRetainedBufferCache = struct {
     allocator: Allocator,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
+    owns_entries: bool = true,
+    fixed_capacity: bool = false,
 
     pub const Entry = struct {
-        name: []u8,
+        name: []const u8,
+        owns_name: bool = true,
         layer_index: ?u32,
         kind: PjrtRetainedBufferKind,
         buffer: pjrt_lib.pjrt.Buffer,
@@ -698,7 +701,7 @@ pub const PjrtRetainedBufferCache = struct {
 
     pub fn deinit(self: *PjrtRetainedBufferCache) void {
         self.clear();
-        self.entries.deinit(self.allocator);
+        if (self.owns_entries) self.entries.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -709,7 +712,7 @@ pub const PjrtRetainedBufferCache = struct {
             if (debug) std.log.info("PJRT retained buffer deinit[{d}] name={s}", .{ i, entry.name });
             entry.buffer.deinit();
             if (debug) std.log.info("PJRT retained buffer deinit[{d}] complete", .{i});
-            self.allocator.free(entry.name);
+            if (entry.owns_name) self.allocator.free(entry.name);
         }
         self.entries.clearRetainingCapacity();
     }
@@ -745,20 +748,37 @@ pub const PjrtRetainedBufferCache = struct {
     ) !void {
         const owned_name = try self.allocator.dupe(u8, name);
         errdefer self.allocator.free(owned_name);
+        try self.putName(owned_name, true, layer_index, kind, buffer);
+    }
+
+    /// The runtime retains the executor that owns these immutable names.
+    pub fn putBorrowed(self: *@This(), name: []const u8, layer_index: ?u32, kind: PjrtRetainedBufferKind, buffer: pjrt_lib.pjrt.Buffer) !void {
+        try self.putName(name, false, layer_index, kind, buffer);
+    }
+
+    fn putName(self: *@This(), name: []const u8, owns_name: bool, layer_index: ?u32, kind: PjrtRetainedBufferKind, buffer: pjrt_lib.pjrt.Buffer) !void {
         for (self.entries.items) |*entry| {
-            if (!std.mem.eql(u8, entry.name, name)) continue;
+            const matches = if (owns_name) std.mem.eql(u8, entry.name, name) else entry.layer_index == layer_index and entry.kind == kind;
+            if (!matches) continue;
             entry.buffer.deinit();
-            self.allocator.free(entry.name);
+            if (entry.owns_name) self.allocator.free(entry.name);
             entry.* = .{
-                .name = owned_name,
+                .name = name,
+                .owns_name = owns_name,
                 .layer_index = layer_index,
                 .kind = kind,
                 .buffer = buffer,
             };
             return;
         }
+        if (self.fixed_capacity) {
+            if (self.entries.items.len == self.entries.capacity) return error.MissingArtifactMetadata;
+            self.entries.appendAssumeCapacity(.{ .name = name, .owns_name = owns_name, .layer_index = layer_index, .kind = kind, .buffer = buffer });
+            return;
+        }
         try self.entries.append(self.allocator, .{
-            .name = owned_name,
+            .name = name,
+            .owns_name = owns_name,
             .layer_index = layer_index,
             .kind = kind,
             .buffer = buffer,
@@ -777,6 +797,9 @@ pub const PjrtModelExecutor = struct {
     references: std.atomic.Value(usize) = .init(1),
     owned_graph: ?*Graph = null,
     metadata_budget: ?*@import("pjrt_metadata.zig").Budget = null,
+    retained_capacity: usize = 0,
+    runtime_slots: []RuntimeSlot = &.{},
+
     artifact_owner: ?*@import("pjrt_admission.zig").Package = null,
     allocator: Allocator,
     graph: *const Graph,
@@ -795,6 +818,27 @@ pub const PjrtModelExecutor = struct {
         semantic_output_bindings: []PjrtSemanticOutputBinding,
     };
 
+    const RuntimeSlot = struct {
+        busy: std.atomic.Value(bool) = .init(false),
+        runtime: PjrtModelRuntime = undefined,
+        entries: []PjrtRetainedBufferCache.Entry,
+    };
+
+    /// Host metadata for every execution slot is admitted and allocated during
+    /// loading. Runtime creation and KV replacement need no allocator or live
+    /// manager, and cannot acquire unplanned metadata after fixing the pool.
+    pub fn prepareRuntimeSlots(self: *@This(), capacity: usize) !void {
+        const slots = try self.allocator.alloc(RuntimeSlot, capacity);
+        errdefer self.allocator.free(slots);
+        var initialized: usize = 0;
+        errdefer for (slots[0..initialized]) |slot| self.allocator.free(slot.entries);
+        for (slots) |*slot| {
+            slot.* = .{ .entries = try self.allocator.alloc(PjrtRetainedBufferCache.Entry, self.retained_capacity) };
+            initialized += 1;
+        }
+        self.runtime_slots = slots;
+    }
+
     const executor_vtable = model_runtime.ModelExecutor.VTable{
         .create_runtime = createRuntime,
         .deinit = deinit,
@@ -808,14 +852,25 @@ pub const PjrtModelExecutor = struct {
         const self: *PjrtModelExecutor = @ptrCast(@alignCast(ctx));
         var execution_lease = if (self.artifact_owner) |owner| try owner.acquireRuntime() else null;
         errdefer if (execution_lease) |*lease| lease.release();
-        const runtime_ctx = try allocator.create(PjrtModelRuntime);
+        var selected: ?*RuntimeSlot = null;
+        if (self.artifact_owner != null) {
+            for (self.runtime_slots) |*slot| {
+                if (slot.busy.cmpxchgStrong(false, true, .acq_rel, .acquire) == null) {
+                    selected = slot;
+                    break;
+                }
+            }
+            if (selected == null) return error.ResourceTemporarilyUnavailable;
+        }
+        const runtime_ctx = if (selected) |slot| &slot.runtime else try allocator.create(PjrtModelRuntime);
         runtime_ctx.* = .{
             .allocator = allocator,
+            .runtime_slot = selected,
             .graph = self.graph,
             .executor = self.executor,
             .host_backend = self.host_backend,
             .input_materialization = self.input_materialization,
-            .retained_buffers = PjrtRetainedBufferCache.init(allocator),
+            .retained_buffers = if (selected) |slot| .{ .allocator = self.allocator, .entries = .initBuffer(slot.entries), .owns_entries = false, .fixed_capacity = true } else PjrtRetainedBufferCache.init(allocator),
             .execution_lease = execution_lease,
             .semantic_input_bindings = self.semantic_input_bindings,
             .semantic_output_bindings = self.semantic_output_bindings,
@@ -843,6 +898,11 @@ pub const PjrtModelExecutor = struct {
             graph.deinit();
             allocator.destroy(graph);
         }
+        for (self.runtime_slots) |slot| {
+            std.debug.assert(!slot.busy.load(.acquire));
+            allocator.free(slot.entries);
+        }
+        allocator.free(self.runtime_slots);
         if (self.artifact_owner) |owner| owner.deinit();
         const metadata = self.metadata_budget;
         allocator.destroy(self);
@@ -859,6 +919,7 @@ const PjrtModelRuntime = struct {
     execution_lease: ?@import("pjrt_admission.zig").Package.RuntimeLease = null,
     artifact_executor_owner: ?*PjrtModelExecutor = null,
     allocator: Allocator,
+    runtime_slot: ?*PjrtModelExecutor.RuntimeSlot = null,
     graph: *const Graph,
     executor: *PjrtExecutor,
     host_backend: *const ComputeBackend,
@@ -1011,7 +1072,9 @@ const PjrtModelRuntime = struct {
                     .{ binding.output_index, binding.name },
                 );
             }
-            try self.retained_buffers.put(binding.name, binding.layer_index, binding.kind, outputs[binding.output_index]);
+            if (self.artifact_executor_owner != null) {
+                try self.retained_buffers.putBorrowed(binding.name, binding.layer_index, binding.kind, outputs[binding.output_index]);
+            } else try self.retained_buffers.put(binding.name, binding.layer_index, binding.kind, outputs[binding.output_index]);
             retained[binding.output_index] = true;
         }
 
@@ -1070,13 +1133,15 @@ const PjrtModelRuntime = struct {
     pub fn deinit(ctx: *anyopaque) void {
         const self: *PjrtModelRuntime = @ptrCast(@alignCast(ctx));
         const allocator = self.allocator;
-        if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelRuntime deinit begin", .{});
         self.retained_buffers.deinit();
-        if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelRuntime retained buffers deinit complete", .{});
-        if (self.execution_lease) |*lease| lease.release();
-        if (self.artifact_executor_owner) |owner| PjrtModelExecutor.deinit(owner);
-        allocator.destroy(self);
-        if (pjrtExecDebugEnabled()) std.log.info("PJRT ModelRuntime deinit complete", .{});
+        var lease = self.execution_lease;
+        const owner = self.artifact_executor_owner;
+        if (self.runtime_slot) |slot| {
+            // All old state is copied before publishing this slot for reuse.
+            slot.busy.store(false, .release);
+        } else allocator.destroy(self);
+        if (lease) |*held| held.release();
+        if (owner) |executor| PjrtModelExecutor.deinit(executor);
     }
 };
 
@@ -1926,4 +1991,36 @@ test "PJRT upload shape resolver rejects ambiguous dynamic dimensions" {
         error.UnsupportedShape,
         resolveUploadShapeFromElementCount(std.testing.allocator, &.{ -1, -1 }, 16),
     );
+}
+
+test "managed PJRT borrowed KV names replace semantic identities without allocation" {
+    const c = pjrt_lib.c_types;
+    const Fake = struct {
+        var destroyed: usize = 0;
+        fn destroy(_: *c.BufferDestroyArgs) callconv(.c) ?*c.PjrtError {
+            destroyed += 1;
+            return null;
+        }
+    };
+    var api = std.mem.zeroes(c.Api);
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[58] = @ptrCast(&Fake.destroy);
+    Fake.destroyed = 0;
+    var failure = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var cache = PjrtRetainedBufferCache.init(failure.allocator());
+    var live = true;
+    defer if (live) cache.deinit();
+    try cache.entries.ensureTotalCapacityPrecise(failure.allocator(), 1);
+    failure.fail_index = failure.alloc_index;
+    const buffer = pjrt_lib.pjrt.Buffer{ .api = &api, .handle = @ptrFromInt(1) };
+    try cache.putBorrowed("prefill.key", 0, .key, buffer);
+    try cache.putBorrowed("decode.key", 0, .key, buffer);
+    try std.testing.expect(!failure.has_induced_failure);
+    try std.testing.expectEqual(@as(usize, 1), cache.len());
+    try std.testing.expectEqual(@as(usize, 1), Fake.destroyed);
+    try std.testing.expectEqualStrings("decode.key", cache.entries.items[0].name);
+    try std.testing.expect(cache.getForSemanticInput(.{ .input_index = 0, .name = "past.key", .layer_index = 0, .kind = .key }) != null);
+    cache.deinit();
+    live = false;
+    try std.testing.expectEqual(@as(usize, 2), Fake.destroyed);
 }

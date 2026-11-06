@@ -6127,6 +6127,29 @@ pub const ModelManager = struct {
         requested_limits: runtime.tier.memory.Limits,
         amounts: runtime.tier.memory.AdmissionAmounts,
     ) !runtime.tier.memory.AdmissionLease {
+        return self.acquireAmountsWithEvictionMode(backend_class, requested_limits, amounts, true);
+    }
+
+    pub fn acquireMetadataAmounts(self: *ModelManager, limits: runtime.tier.memory.Limits, bytes: usize) !runtime.tier.memory.AdmissionLease {
+        return self.acquireAmountsWithEvictionMode(.cpu, limits, .{ .host_weight_bytes = bytes }, false);
+    }
+
+    pub fn reserveMetadataCapacity(self: *ModelManager, bytes: usize) !runtime.tier.memory.LiveReservation {
+        try self.ensureResourceOwnerReady();
+        return self.admissionController().reserveLiveCapacity(bytes) catch |err| {
+            if (err != error.ResourceTemporarilyUnavailable) return err;
+            spinLock(&self.eviction_lock);
+            defer self.eviction_lock.unlock();
+            while (true) {
+                if (self.admissionController().reserveLiveCapacity(bytes)) |reservation| return reservation else |retry| {
+                    if (retry != error.ResourceTemporarilyUnavailable) return retry;
+                }
+                if (!self.reclaimOneForAdmission(.live_host)) return error.ResourceTemporarilyUnavailable;
+            }
+        };
+    }
+
+    fn acquireAmountsWithEvictionMode(self: *ModelManager, backend_class: runtime.tier.memory.BackendClass, requested_limits: runtime.tier.memory.Limits, amounts: runtime.tier.memory.AdmissionAmounts, check_live: bool) !runtime.tier.memory.AdmissionLease {
         try self.ensureResourceOwnerReady();
         const limits = self.physicalRunLimits(backend_class, requested_limits);
         self.tightenUnifiedDeviceAdmission();
@@ -6140,7 +6163,7 @@ pub const ModelManager = struct {
             backend_class,
             limits,
             amounts,
-            true,
+            check_live,
             &pressure,
         ) catch |first_err| switch (first_err) {
             error.ResourceTemporarilyUnavailable => {
@@ -6151,7 +6174,7 @@ pub const ModelManager = struct {
                         backend_class,
                         limits,
                         amounts,
-                        true,
+                        check_live,
                         &pressure,
                     )) |lease| return lease else |retry_err| switch (retry_err) {
                         error.ResourceTemporarilyUnavailable => {},

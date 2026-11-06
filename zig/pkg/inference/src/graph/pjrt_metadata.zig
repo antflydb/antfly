@@ -31,6 +31,8 @@ pub const Budget = struct {
     /// Actual requested backing bytes, including the owner and block headers.
     live_bytes: usize = 0,
     capacity: ?memory.LiveReservation = null,
+    /// Borrowed only during synchronous construction, detached before escape.
+    manager: ?*Manager = null,
 
     const Header = struct { lease: memory.AdmissionLease, residency: memory.LiveReservation.Residency };
 
@@ -44,8 +46,13 @@ pub const Budget = struct {
         const self = try reclaiming.create(Budget);
         errdefer reclaiming.destroy(self);
         try lease.retain(lease.amounts);
-        self.* = .{ .backing = reclaiming, .lifetime = lifetime, .limits = limits, .lease = lease, .live_bytes = @sizeOf(Budget) };
+        self.* = .{ .backing = reclaiming, .lifetime = lifetime, .limits = limits, .lease = lease, .live_bytes = @sizeOf(Budget), .manager = context.manager };
         return self;
+    }
+
+    pub fn finishConstruction(self: *Budget) void {
+        self.releaseCapacity();
+        self.manager = null;
     }
 
     /// End a construction phase before delegating to another admission owner.
@@ -64,10 +71,14 @@ pub const Budget = struct {
         if (self.capacity) |capacity| if (capacity.remaining >= bytes) return;
         self.releaseCapacity();
         const batch = @max(bytes, 64 * 1024);
-        self.capacity = self.lifetime.reserveMetadataCapacity(batch) catch |err| blk: {
-            // Batching must not reject a small allocation that fits on its own.
-            if (batch == bytes or err != error.ResourceTemporarilyUnavailable) return err;
-            break :blk try self.lifetime.reserveMetadataCapacity(bytes);
+        self.capacity = self.lifetime.reserveMetadataCapacity(batch) catch {
+            // Reclaim only for the actual request, not speculative batch credit.
+            if (self.manager) |manager| {
+                self.capacity = try manager.reserveMetadataCapacity(bytes);
+                return;
+            }
+            self.capacity = try self.lifetime.reserveMetadataCapacity(bytes);
+            return;
         };
     }
 
@@ -98,7 +109,7 @@ pub const Budget = struct {
             self.denial = error.ResourceLimitExceeded;
             return null;
         };
-        var lease = self.lifetime.acquireMetadata(self.limits, total) catch |err| {
+        var lease = (if (self.manager) |manager| manager.acquireMetadataAmounts(self.limits, total) else self.lifetime.acquireMetadata(self.limits, total)) catch |err| {
             self.denial = err;
             return null;
         };
@@ -192,4 +203,45 @@ test "managed PJRT metadata batches physical headroom without exempting small al
     try std.testing.expectEqual(@as(usize, 1), controller.live_pending_bytes);
     try std.testing.expectEqual(@as(usize, 128 * 1024 + 1), controller.live_capacity_bytes);
     try std.testing.expectEqualDeep(before, manager.currentAdmissionAmounts());
+}
+
+test "managed PJRT metadata admission reclaims optional host cache" {
+    const Cache = struct {
+        allocator: std.mem.Allocator,
+        bytes: ?[]u8,
+        lease: memory.AdmissionLease,
+        calls: usize = 0,
+        fn reclaim(raw: *anyopaque, _: usize) usize {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const bytes = self.bytes orelse return 0;
+            const len = bytes.len;
+            self.allocator.free(bytes);
+            self.bytes = null;
+            self.lease.release();
+            self.calls += 1;
+            return len;
+        }
+    };
+    const a = std.testing.allocator;
+    var manager = Manager.init(a, @import("../backends/backends.zig").SessionManager.init(a));
+    defer manager.deinit();
+    const policy = @import("../server/model_manager.zig").ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 12 * 1024 * 1024 } };
+    try policy.configure(&manager);
+    const context = admission.Context{ .allocator = a, .manager = &manager, .policy = policy };
+    const limits = admission.ArtifactDeviceAdmission.limitsFor(&context, true);
+    var cache = Cache{ .allocator = a, .bytes = null, .lease = try manager.acquireRunResourceAmounts(.cpu, limits, .{ .host_weight_bytes = 8 * 1024 * 1024 }) };
+    defer {
+        _ = Cache.reclaim(&cache, 0);
+        cache.lease.release();
+    }
+    cache.bytes = try a.alloc(u8, 8 * 1024 * 1024);
+    try cache.lease.retain(cache.lease.amounts);
+    manager.setHostCacheReclaimer(.{ .context = &cache, .reclaim = Cache.reclaim });
+    defer manager.setHostCacheReclaimer(null);
+    const budget = try Budget.create(a, &context);
+    defer budget.destroy();
+    const bytes = try budget.allocator().alloc(u8, 5 * 1024 * 1024);
+    defer budget.allocator().free(bytes);
+    try std.testing.expectEqual(@as(usize, 1), cache.calls);
+    try std.testing.expect(cache.bytes == null);
 }

@@ -64,21 +64,17 @@ const Catalog = struct {
 
     fn read(self: *@This(), path: []const u8, filter: ?Request) !?usize {
         if (self.by_path.get(path)) |index| return index;
-        var parsed = artifact.readManifest(self.allocator, self.io, path) catch |err| switch (err) {
+        const parsed = (if (filter) |request| artifact.readManifestIf(self.allocator, self.io, path, request, relevant) else artifact.readManifestIf(self.allocator, self.io, path, {}, struct {
+            fn matches(_: artifact.Manifest, _: void) bool {
+                return true;
+            }
+        }.matches)) catch |err| switch (err) {
             error.FileNotFound => return null,
             else => return err,
         };
-        errdefer parsed.deinit();
-        if (filter) |request| {
-            const value = parsed.value;
-            const relevant_prefill = matchesPrefill(value, request, artifact.pjrt_parameter_mode_embedded) or matchesPrefill(value, request, artifact.pjrt_parameter_mode_inputs);
-            const relevant_decode = artifact.hasManagedPjrtPlan(value) and std.mem.eql(u8, value.backend, "xla") and std.mem.eql(u8, value.kind, "pjrt_executable") and std.mem.eql(u8, value.model_dir, request.model_dir) and std.mem.eql(u8, value.artifact_role, artifact.artifact_role_decode) and value.query_seq_len == 1 and std.mem.eql(u8, value.attention_mode, "paged_decode") and inRange(value.seq_len, request);
-            if (!relevant_prefill and !relevant_decode) {
-                parsed.deinit();
-                return null;
-            }
-        }
-        const stat = std.Io.Dir.cwd().statFile(self.io, parsed.value.artifact_path, .{}) catch |err| switch (err) {
+        var retained = parsed orelse return null;
+        errdefer retained.deinit();
+        const stat = std.Io.Dir.cwd().statFile(self.io, retained.value.artifact_path, .{}) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
@@ -88,7 +84,7 @@ const Catalog = struct {
         try self.entries.ensureUnusedCapacity(self.allocator, 1);
         try self.by_path.ensureUnusedCapacity(self.allocator, 1);
         const index = self.entries.items.len;
-        self.entries.appendAssumeCapacity(.{ .path = owned, .parsed = parsed, .available = available });
+        self.entries.appendAssumeCapacity(.{ .path = owned, .parsed = retained, .available = available });
         self.by_path.putAssumeCapacity(owned, index);
         return index;
     }
@@ -115,6 +111,12 @@ const Catalog = struct {
         }
     }
 };
+
+fn relevant(value: artifact.Manifest, request: Request) bool {
+    return matchesPrefill(value, request, artifact.pjrt_parameter_mode_embedded) or
+        matchesPrefill(value, request, artifact.pjrt_parameter_mode_inputs) or
+        (artifact.hasManagedPjrtPlan(value) and std.mem.eql(u8, value.backend, "xla") and std.mem.eql(u8, value.kind, "pjrt_executable") and std.mem.eql(u8, value.model_dir, request.model_dir) and std.mem.eql(u8, value.artifact_role, artifact.artifact_role_decode) and value.query_seq_len == 1 and std.mem.eql(u8, value.attention_mode, "paged_decode") and inRange(value.seq_len, request));
+}
 
 fn matchesPrefill(value: artifact.Manifest, request: Request, mode: []const u8) bool {
     return artifact.matchesRequest(value, .{ .backend = "xla", .model_dir = request.model_dir, .kind = "pjrt_executable", .artifact_role = artifact.artifact_role_prefill, .seq_len = request.seq_len, .query_seq_len = request.query_seq_len, .attention_mode = request.attention_mode, .pjrt_parameter_mode = mode, .require_pjrt_memory_plan = true });
@@ -183,14 +185,14 @@ fn packageChain(catalog: *Catalog, directory: []const u8, request: Request, mode
     defer package.deinit();
     try artifact.validatePackageManifest(package.value, "xla", request.model_dir, "pjrt_executable", mode);
     const entry = (try artifact.findUniqueMatchingPackageEntry(package.value, .{ .artifact_role = artifact.artifact_role_prefill, .seq_len = request.seq_len, .query_seq_len = request.query_seq_len, .attention_mode = request.attention_mode })) orelse return null;
-    const prefill = (try catalog.read(entry.manifest_path, null)) orelse return null;
+    const prefill = (try catalog.read(entry.manifest_path, request)) orelse return null;
     const value = catalog.entries.items[prefill].parsed.value;
     if (!catalog.entries.items[prefill].available or !matchesPrefill(value, request, mode)) return null;
     var decodes: std.ArrayListUnmanaged(usize) = .empty;
     defer decodes.deinit(catalog.allocator);
     for (package.value.artifacts) |decode| {
         if (!artifact.packageEntryMatches(decode, .{ .artifact_role = artifact.artifact_role_decode, .query_seq_len = 1, .attention_mode = "paged_decode" }) or !inRange(decode.seq_len, request)) continue;
-        const index = (try catalog.read(decode.manifest_path, null)) orelse return null;
+        const index = (try catalog.read(decode.manifest_path, request)) orelse return null;
         const parsed = catalog.entries.items[index].parsed.value;
         if (!catalog.entries.items[index].available or parsed.seq_len != decode.seq_len or !matchesDecode(parsed, value)) return null;
         try decodes.append(catalog.allocator, index);
@@ -229,7 +231,7 @@ pub fn findAdmitted(allocator: std.mem.Allocator, io: std.Io, directory: []const
     errdefer selection.deinit();
     selection.manifests = selection.values(budget.allocator()) catch |err| return budget.translate(err);
     selection.budget = budget;
-    budget.releaseCapacity();
+    budget.finishConstruction();
     transferred = true;
     return selection;
 }
@@ -421,4 +423,44 @@ fn admittedMetadataScenario(directory: []const u8, sidecar: []const u8, package:
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     try admittedSelectionFailureScenario(arena.allocator(), directory, &context);
+}
+
+test "managed PJRT streaming inspection skips unrelated large fields before full allocation" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const directory = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(directory);
+    const path = try std.fs.path.join(a, &.{ directory, "large.inference.json" });
+    defer a.free(path);
+    const large = try a.alloc(u8, 2 * 1024 * 1024);
+    defer a.free(large);
+    @memset(large, 'k');
+    const manager_mod = @import("../server/model_manager.zig");
+    var manager = manager_mod.ModelManager.init(a, @import("../backends/backends.zig").SessionManager.init(a));
+    defer manager.deinit();
+    const policy = manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 128 * 1024 } };
+    try policy.configure(&manager);
+    const context = @import("pjrt_admission.zig").Context{ .allocator = a, .manager = &manager, .policy = policy };
+    const request = Request{ .model_dir = directory, .seq_len = 1, .query_seq_len = 1, .attention_mode = "paged_prefill", .decode_steps = 0 };
+    for ([_][]const u8{ "pjrt_hlo", "pjrt_executable" }) |kind| {
+        const bytes = try std.json.Stringify.valueAlloc(a, .{ .kind = kind, .backend = "xla", .model_dir = directory, .seq_len = 1, .query_seq_len = 1, .attention_mode = "paged_prefill", .artifact_path = "unused", .prompt_tokens = 1, .raw_prompt = true, .chat_template_applied = false, .ignored = large, .pjrt_memory_plan = artifact.PjrtMemoryPlan{ .platform = .cpu, .artifact_sha256 = @splat(0), .plugin_sha256 = @splat(0), .memory = .{} } }, .{});
+        defer a.free(bytes);
+        try tmp.dir.writeFile(io, .{ .sub_path = "large.inference.json", .data = bytes });
+        var quota = @import("antfly_platform").allocator.reclamation.Quota.init(a, 128 * 1024);
+        defer quota.deinit();
+        const budget = try @import("pjrt_metadata.zig").Budget.create(quota.allocator(), &context);
+        defer budget.destroy();
+        var catalog = Catalog{ .allocator = budget.allocator(), .io = io };
+        defer catalog.deinit();
+        if (std.mem.eql(u8, kind, "pjrt_hlo")) {
+            try std.testing.expectEqual(null, try catalog.read(path, request));
+            try std.testing.expect(quota.peak_bytes < 64 * 1024);
+        } else {
+            try std.testing.expectError(error.OutOfMemory, catalog.read(path, request));
+            try std.testing.expectEqual(error.ResourceLimitExceeded, budget.translate(error.OutOfMemory));
+            try std.testing.expectEqual(@as(usize, 0), quota.largest_rejected_growth);
+        }
+    }
 }

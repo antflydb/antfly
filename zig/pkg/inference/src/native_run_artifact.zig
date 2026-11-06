@@ -2792,8 +2792,10 @@ fn admittedPjrtPackageScenario(a: std.mem.Allocator, root: []const u8, prefill: 
         try std.testing.expect(!prefill_runtime.capabilities().supports_decode);
         try std.testing.expectError(error.UnsupportedDecode, prefill_runtime.decode(a, .{ .token_id = 0, .position = 16 }));
     }
+    const before_runtime = context.manager.currentAdmissionAmounts().host_weight_bytes;
     var retained_runtime = try owned.createRuntime(a);
     defer retained_runtime.deinit();
+    const runtime_metadata = context.manager.currentAdmissionAmounts().host_weight_bytes - before_runtime;
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, owned.createRuntime(a));
     owned.deinit();
     owns_executor = false;
@@ -2802,7 +2804,7 @@ fn admittedPjrtPackageScenario(a: std.mem.Allocator, root: []const u8, prefill: 
     try std.testing.expectEqual(@as(usize, 1), executor.decode_variants.len);
     // Code is retained twice, argument buffers are shared across phases, and
     // both provider-owned serialized representations remain charged.
-    try std.testing.expectEqual(before.host_weight_bytes + 2 * 64 + 4096 + 2 * "fixture executable".len + executor.artifact_owner.?.metadata_bytes + executor.metadata_budget.?.live_bytes, context.manager.currentAdmissionAmounts().host_weight_bytes);
+    try std.testing.expectEqual(before.host_weight_bytes + 2 * 64 + 4096 + 2 * "fixture executable".len + executor.artifact_owner.?.metadata_bytes + executor.metadata_budget.?.live_bytes + runtime_metadata, context.manager.currentAdmissionAmounts().host_weight_bytes);
 }
 
 test "run-artifact admitted PJRT packages share phase memory and refund every failed allocation" {
@@ -2981,6 +2983,8 @@ test "run-artifact managed decode runtime survives executor graph and manager te
             artifact.attention_mode = "paged_decode";
             artifact.pjrt_input_bindings = &decode_inputs;
             artifact.pjrt_input_shapes = &decode_shapes;
+            output_bindings[1].name = "decode.present.0.key";
+            output_bindings[2].name = "decode.present.0.value";
         }
         var digest: [32]u8 = undefined;
         std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
@@ -3041,8 +3045,12 @@ test "run-artifact managed decode runtime survives executor graph and manager te
     var executor_live = true;
     defer if (executor_live) owned.deinit();
     var failing_runtime_allocator = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
-    try std.testing.expectError(error.OutOfMemory, owned.createRuntime(failing_runtime_allocator.allocator()));
+    var allocation_free_runtime = try owned.createRuntime(failing_runtime_allocator.allocator());
+    allocation_free_runtime.deinit();
+    try std.testing.expect(!failing_runtime_allocator.has_induced_failure);
+    const before_runtime = manager.currentAdmissionAmounts().host_weight_bytes;
     var run = try owned.createRuntime(a);
+    const runtime_metadata = manager.currentAdmissionAmounts().host_weight_bytes - before_runtime;
     var runtime_live = true;
     defer if (runtime_live) run.deinit();
     const ids: [16]i64 = @splat(1);
@@ -3050,7 +3058,7 @@ test "run-artifact managed decode runtime survives executor graph and manager te
     defer first.deinit(a);
     try std.testing.expectEqualSlices(f32, &.{ 0, 1 }, try first.hostLogits(a));
     {
-        const admitted_before = manager.currentAdmissionAmounts();
+        var admitted_before = manager.currentAdmissionAmounts();
         try std.testing.expectEqual(@as(usize, 48), admitted_before.host_kv_bytes);
         var other = try owned.createRuntime(a);
         var other_live = true;
@@ -3064,6 +3072,7 @@ test "run-artifact managed decode runtime survives executor graph and manager te
         defer third_output.deinit(a);
         try std.testing.expectEqual(@as(usize, 6), count(8) - count(9));
         try std.testing.expect((count(8) - count(9)) * 4 <= admitted_before.host_kv_bytes);
+        admitted_before.host_weight_bytes += 2 * runtime_metadata;
         try std.testing.expectEqualDeep(admitted_before, manager.currentAdmissionAmounts());
         other.deinit();
         other_live = false;
@@ -3216,7 +3225,7 @@ fn managedExecutorMetadataScenario(a: std.mem.Allocator, prefill: []const u8, pl
     var manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
     var manager_live = true;
     defer if (manager_live) manager.deinit();
-    const policy = model_manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 64 * 1024 * 1024 } };
+    const policy = model_manager_mod.ModelLoadPolicy{ .limits = .{ .host_limit_bytes = 24 * 1024 * 1024 } };
     try policy.configure(&manager);
     const context = pjrt_admission.Context{ .allocator = a, .manager = &manager, .policy = policy, .decode_steps_limit = 0 };
     const executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifests(quota.allocator(), &.{parsed.value}, graph, backend, &context, plugin);
@@ -3227,4 +3236,19 @@ fn managedExecutorMetadataScenario(a: std.mem.Allocator, prefill: []const u8, pl
     try std.testing.expect(executor.metadata_budget.?.capacity == null);
     manager.deinit();
     manager_live = false;
+    var run = try owned.createRuntime(quota.allocator());
+    defer run.deinit();
+    const controller = &executor.metadata_budget.?.lifetime.domain.admission;
+    const admitted = controller.snapshot();
+    const retained = quota.live_bytes;
+    try std.testing.expect(admitted.hostTotalBytes() >= retained);
+    const ids: [16]i64 = @splat(1);
+    for (0..3) |_| {
+        var output = try run.prefill(quota.allocator(), .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill });
+        output.deinit(quota.allocator());
+        try std.testing.expectEqual(retained, quota.live_bytes);
+        try std.testing.expectEqualDeep(admitted, controller.snapshot());
+    }
+    // An admitted immutable name is shared, not copied for each forward pass.
+    try std.testing.expect(quota.peak_bytes < 24 * 1024 * 1024);
 }

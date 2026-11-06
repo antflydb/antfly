@@ -303,10 +303,12 @@ pub fn createAdmittedModelExecutorFromManifests(
     const metadata = try @import("pjrt_metadata.zig").Budget.create(allocator, policy);
     errdefer metadata.destroy();
     const executor = createAdmittedModelExecutorWithAllocator(metadata.allocator(), artifacts, graph, host_backend, policy, plugin) catch |err| return metadata.translate(err);
+    errdefer pjrt_executor.PjrtModelExecutor.deinit(executor);
+    executor.prepareRuntimeSlots(policy.runtime_capacity) catch |err| return metadata.translate(err);
     executor.metadata_budget = metadata;
     // Retained executor metadata keeps its individual residency; unconsumed
     // construction headroom must not remain pinned for the executor's lifetime.
-    metadata.releaseCapacity();
+    metadata.finishConstruction();
     return executor;
 }
 
@@ -352,6 +354,7 @@ fn createAdmittedModelExecutorWithAllocator(
         variants[i] = try loadAdmittedVariant(graph_allocator, owned_graph, host_backend, owner, i + 1, artifact);
         loaded += 1;
     }
+    const retained_capacity = try retainedCapacity(graph_allocator, prefill.semantic_output_bindings, variants);
     try owner.loaded();
     const executor = try graph_allocator.create(pjrt_executor.PjrtModelExecutor);
     executor.* = .{
@@ -361,12 +364,26 @@ fn createAdmittedModelExecutorWithAllocator(
         .executor = prefill.executor,
         .host_backend = host_backend,
         .artifact_owner = owner,
+        .retained_capacity = retained_capacity,
         .input_materialization = prefill.input_materialization,
         .semantic_input_bindings = prefill.semantic_input_bindings,
         .semantic_output_bindings = prefill.semantic_output_bindings,
         .decode_variants = variants,
     };
     return executor;
+}
+
+/// Compute the union once at load time. Runtimes preallocate cache entries and
+/// replace by semantic identity, even when phases use different binding names.
+fn retainedCapacity(a: std.mem.Allocator, prefill: []const pjrt_executor.PjrtSemanticOutputBinding, variants: []const pjrt_executor.PjrtModelExecutor.DecodeVariant) !usize {
+    const Key = struct { layer: ?u32, kind: pjrt_executor.PjrtRetainedBufferKind };
+    var keys: std.AutoHashMapUnmanaged(Key, void) = .empty;
+    defer keys.deinit(a);
+    for (prefill) |binding| try keys.put(a, .{ .layer = binding.layer_index, .kind = binding.kind }, {});
+    for (variants) |variant| for (variant.semantic_output_bindings) |binding| {
+        try keys.put(a, .{ .layer = binding.layer_index, .kind = binding.kind }, {});
+    };
+    return keys.count();
 }
 
 fn freeAdmittedVariant(allocator: std.mem.Allocator, variant: pjrt_executor.PjrtModelExecutor.DecodeVariant) void {

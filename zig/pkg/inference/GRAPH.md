@@ -458,6 +458,19 @@ physical headroom, including small parser allocations: a bounded pending-credit
 batch amortizes OS probes, with an exact-size fallback under pressure. Unused
 headroom is returned before handing off construction and after loading; frees
 return only residency credit from their own pressure epoch.
+Construction admission uses the manager's pressure/reclamation path, including
+optional host caches, while retaining batched OS probes. Escaped metadata owners
+detach the borrowed manager and derive accounting lifetimes from retained owners.
+Loading admits and preallocates each runtime slot, including the union of
+semantic KV identities. They borrow immutable executor binding names and replace entries by
+(layer, kind), so phase-specific aliases do not copy names or grow the cache on
+every token. Runtime creation remains valid after manager shutdown.
+
+Standalone selection streams a compact request header for large sidecars,
+skipping shape/binding arrays and unknown fields without retaining their values.
+Unrelated artifacts cannot exhaust the request's metadata budget. Matching files
+still undergo full admitted parsing, compatibility checks, and identity checks;
+inspection is only a filter and does not authorize execution.
 The loader still verifies executable/provider identity and loaded statistics;
 identity or deserialization failures do not trigger another candidate.
 
