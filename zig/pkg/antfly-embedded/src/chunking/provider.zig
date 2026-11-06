@@ -34,6 +34,7 @@ pub const Provider = struct {
     owned_allocator: ?std.mem.Allocator = null,
     owned_default_endpoint: ?[]u8 = null,
     owned_source_table: ?[]u8 = null,
+    owned_default_credential_reference: ?[]u8 = null,
     owned_http_client: ?*httpx.Client = null,
 
     /// Create the persistent form stored by an enrichment runtime. The
@@ -47,6 +48,7 @@ pub const Provider = struct {
         owned.owned_allocator = null;
         owned.owned_default_endpoint = null;
         owned.owned_source_table = null;
+        owned.owned_default_credential_reference = null;
         // Transports are never implicitly copied: ownership and the borrowed
         // execution pointer must remain paired. The durable constructor may
         // attach a fresh lifetime client after this value owns its strings.
@@ -61,6 +63,11 @@ pub const Provider = struct {
         if (self.execution.routing.source_table.len > 0) {
             owned.owned_source_table = try alloc.dupe(u8, self.execution.routing.source_table);
             owned.execution.routing.source_table = owned.owned_source_table.?;
+        }
+        // Only the unresolved reference is retained; each request resolves it.
+        if (self.execution.default_credential) |credential| {
+            owned.owned_default_credential_reference = try alloc.dupe(u8, credential.reference);
+            owned.execution.default_credential.?.reference = owned.owned_default_credential_reference.?;
         }
         return owned;
     }
@@ -93,6 +100,7 @@ pub const Provider = struct {
         }
         if (self.owned_default_endpoint) |value| alloc.free(value);
         if (self.owned_source_table) |value| alloc.free(value);
+        if (self.owned_default_credential_reference) |value| alloc.free(value);
         self.* = undefined;
     }
 };
