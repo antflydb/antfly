@@ -9622,6 +9622,13 @@ pub const IndexManager = struct {
     pub fn statusPersistDue(self: *const IndexManager, now_ns: u64, force: bool) bool {
         if (force) return true;
         const last = self.last_status_persist_ns.load(.monotonic);
+        // Never persisted yet: due immediately, regardless of how large (or
+        // how close to the process/clock origin) `now_ns` happens to be.
+        // Comparing against an absolute clock reading here would make the
+        // very first persist depend on how much time has passed since
+        // whatever epoch the clock counts from, not on this gate's own
+        // state.
+        if (last == 0) return true;
         return now_ns -| last >= self.status_persist_interval_ns;
     }
 

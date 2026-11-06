@@ -28,6 +28,7 @@ const std = @import("std");
 const Crc32 = @import("antfly_hash").Crc32;
 const Allocator = std.mem.Allocator;
 const backend_erased = @import("../../backend_erased.zig");
+const platform_sync = @import("antfly_platform").sync;
 const lsm_backend = @import("../../lsm_backend.zig");
 const mem_backend = @import("../../mem_backend.zig");
 const artifact_projection_epoch = @import("../artifact_projection_epoch.zig");
@@ -519,13 +520,65 @@ fn invalidatesCompletion(previous: ?ProjectionCheckpoint, next: ProjectionCheckp
 
 // --- Coherent multi-consumer read for serving-certificate validation ------
 
+const checkpoint_lock_alloc = std.heap.page_allocator;
+var checkpoint_lock_registry_mutex: std.atomic.Mutex = .unlocked;
+var checkpoint_locks: std.AutoHashMapUnmanaged(usize, *ProjectionSnapshotLock) = .empty;
+
+const ProjectionSnapshotLock = struct {
+    key: usize,
+    mutex: std.atomic.Mutex = .unlocked,
+    refs: usize = 0,
+};
+
+const ProjectionSnapshotGuard = struct {
+    lock: *ProjectionSnapshotLock,
+
+    fn release(self: *@This()) void {
+        self.lock.mutex.unlock();
+        releaseProjectionSnapshotLock(self.lock);
+    }
+};
+
+fn retainProjectionSnapshotLock(key: usize) !*ProjectionSnapshotLock {
+    platform_sync.lockYielding(&checkpoint_lock_registry_mutex);
+    defer checkpoint_lock_registry_mutex.unlock();
+
+    const gop = try checkpoint_locks.getOrPut(checkpoint_lock_alloc, key);
+    if (!gop.found_existing) {
+        errdefer _ = checkpoint_locks.remove(key);
+        const lock = try checkpoint_lock_alloc.create(ProjectionSnapshotLock);
+        lock.* = .{ .key = key };
+        gop.value_ptr.* = lock;
+    }
+    const lock = gop.value_ptr.*;
+    lock.refs += 1;
+    return lock;
+}
+
+fn releaseProjectionSnapshotLock(lock: *ProjectionSnapshotLock) void {
+    platform_sync.lockYielding(&checkpoint_lock_registry_mutex);
+    defer checkpoint_lock_registry_mutex.unlock();
+
+    std.debug.assert(lock.refs > 0);
+    lock.refs -= 1;
+    if (lock.refs != 0) return;
+    const removed = checkpoint_locks.fetchRemove(lock.key) orelse {
+        std.debug.panic("missing projection snapshot lock for key {d}", .{lock.key});
+    };
+    std.debug.assert(removed.value == lock);
+    checkpoint_lock_alloc.destroy(lock);
+}
+
 /// One coherently-read view of several consumers' progress, backed by one
-/// open read transaction (itself a consistent MVCC snapshot — no file lock
-/// needed, unlike the old file-sidecar design this replaces). Acquire
-/// before opening a primary write transaction; `requireCurrent` re-checks
-/// the authority/epoch fence in that later transaction, since a writer may
-/// revoke completion after this snapshot was taken.
+/// open read transaction (a consistent MVCC snapshot, so no I/O contention
+/// to avoid — unlike the old file-sidecar design this replaces) plus a
+/// per-store try-lock. The lock is not for consistency (the transaction
+/// already gives that); it is the same admission control the old file lock
+/// gave: a busy publisher yields no snapshot rather than letting an
+/// unbounded number of concurrent evidence-publication passes pile up
+/// against the same store.
 pub const ProjectionSnapshot = struct {
+    guard: ProjectionSnapshotGuard,
     runtime: RuntimeStoreHandle,
     txn: backend_erased.ProbeTxn,
     authority: artifact_publication.Authority,
@@ -534,6 +587,7 @@ pub const ProjectionSnapshot = struct {
     pub fn deinit(self: *@This()) void {
         self.txn.abort();
         self.runtime.deinit();
+        self.guard.release();
         self.* = undefined;
     }
 
@@ -553,11 +607,21 @@ pub const ProjectionSnapshot = struct {
 };
 
 /// Open a coherent read for a batch of index evidence publications, not once
-/// per document/requirement. Returns null only when there is no active
-/// authority to validate against (nothing to serve from yet).
+/// per document/requirement. Returns null when there is no active authority
+/// to validate against (nothing to serve from yet), or when another
+/// snapshot against the same store is already outstanding.
 pub fn tryAcquireProjectionSnapshot(alloc: Allocator, store: anytype) !?ProjectionSnapshot {
     var runtime = try initRuntimeStore(alloc, store);
     errdefer runtime.deinit();
+    const lock = try retainProjectionSnapshotLock(@intFromPtr(runtime.store.ptr));
+    if (!lock.mutex.tryLock()) {
+        releaseProjectionSnapshotLock(lock);
+        runtime.deinit();
+        return null;
+    }
+    var guard: ProjectionSnapshotGuard = .{ .lock = lock };
+    var owned = true;
+    defer if (owned) guard.release();
     var txn = try runtime.store.beginProbe();
     errdefer txn.abort();
     const authority = (try artifact_publication.authority(&txn)) orelse {
@@ -566,7 +630,8 @@ pub fn tryAcquireProjectionSnapshot(alloc: Allocator, store: anytype) !?Projecti
         return null;
     };
     const epoch = try artifact_projection_epoch.load(&txn);
-    return .{ .runtime = runtime, .txn = txn, .authority = authority, .epoch = epoch };
+    owned = false;
+    return .{ .guard = guard, .runtime = runtime, .txn = txn, .authority = authority, .epoch = epoch };
 }
 
 const RuntimeStoreHandle = struct {
@@ -963,6 +1028,10 @@ test "ordered artifact inventory projection snapshot owns a coherent checkpoint 
     try saveProjectionCheckpoint(db.core.store, "text", .{ .applied_sequence = 11, .generation = 2, .config_hash = 7 });
     var snapshot = (try tryAcquireProjectionSnapshot(alloc, db.core.store)).?;
     defer snapshot.deinit();
+    // A second acquire against the same store, while the first snapshot is
+    // still outstanding, is "busy" and yields no snapshot rather than
+    // piling up concurrent evidence-publication passes against one store.
+    try std.testing.expect(try tryAcquireProjectionSnapshot(alloc, db.core.store) == null);
     try std.testing.expectEqual(@as(u64, 11), snapshot.get("text").?.applied_sequence);
     try std.testing.expect(snapshot.get("missing") == null);
     {
