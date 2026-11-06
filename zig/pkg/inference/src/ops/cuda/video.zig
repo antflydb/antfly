@@ -1186,7 +1186,7 @@ test "embeddinggemma2 video staging fences coalesce repeats and drain consumer e
     try std.testing.expectEqual(@as(usize, 1), consumer.ready);
     try std.testing.expectEqual(@as(usize, 0), Mock.synchronizations);
     consumer.fail = true;
-    try std.testing.expectEqual(@as(c_int, -1), DecodeState.callback(&state, 1, 256, 160, 96, 1, 2, 0));
+    try std.testing.expectEqual(@as(c_int, -1), DecodeState.callback(&state, 1, 256, 160, 96, 1, 2, 0, 8, 2));
     try std.testing.expectEqual(@as(usize, 1), consumer.ready);
     try std.testing.expectEqual(@as(usize, 1), Mock.synchronizations);
     try std.testing.expectEqual(error.Cancelled, state.failure.?);
