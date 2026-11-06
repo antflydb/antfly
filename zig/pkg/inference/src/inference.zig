@@ -58,6 +58,10 @@ test "CUDA process allocation budget declarations compile" {
     _ = @import("ops/cuda/allocation_ledger.zig");
 }
 
+test "dense projection cache metadata declarations compile" {
+    _ = @import("backends/dense_projection_pack.zig");
+}
+
 test "generation deadline declarations compile" {
     _ = @import("pipelines/generation.zig");
     _ = server;

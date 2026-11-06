@@ -26,6 +26,31 @@ pub const Context = struct {
     }
 };
 
+/// Bounded device bursts may already have written all but their final KV
+/// position. Publication may stop at EOS/cancellation before consuming the
+/// burst; only accepted outputs request further state advancement here.
+pub const AcceptedTokens = struct {
+    pub const max_count: usize = 8;
+    state: *state_mod.NativeDecodeState,
+    count: usize,
+    reserved: usize,
+    accepted: usize = 0,
+
+    pub fn init(state: *state_mod.NativeDecodeState, count: usize, reserved: usize) !AcceptedTokens {
+        if (count == 0 or count > max_count or (reserved != 0 and reserved != count - 1)) return error.InvalidBatchDecodeState;
+        return .{ .state = state, .count = count, .reserved = reserved };
+    }
+
+    /// Actual publication calls this AFTER accepting a token. Keep the
+    /// original shared-KV lock and single-position append ordering. Caller
+    /// still owns the actual executor lane; no lifetime or quota is inferred.
+    pub fn commitNext(self: *AcceptedTokens) !void {
+        if (self.accepted >= self.count) return error.InvalidBatchDecodeState;
+        if (self.accepted >= self.reserved) try self.state.appendGeneratedToken();
+        self.accepted += 1;
+    }
+};
+
 pub const Readback = struct {
     observation: @import("pending_observation.zig").Span = .{},
     context: Context,
@@ -603,4 +628,43 @@ test "actual CUDA pending scalar observation labels submission readback and canc
         error.CudaUnavailable, error.NoCudaDevices => return error.SkipZigTest,
         else => return err,
     };
+}
+
+test "accepted burst runtime preserves actual paged reservations and advances only published outputs" {
+    const runtime = @import("../runtime/root.zig");
+    const a = std.testing.allocator;
+    var manager = runtime.kv.manager.KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f16, .page_size_tokens = 4, .num_kv_heads = 1, .head_dim = 8 });
+    var state = state_mod.NativeDecodeState.initPaged(a, &manager, pool, null);
+    defer state.deinit();
+    try state.notePrefill(4);
+    const sequence = state.sequence_id.?;
+    {
+        var scalar = try AcceptedTokens.init(&state, 1, 0);
+        try scalar.commitNext();
+        try std.testing.expectEqual(@as(usize, 5), state.total_tokens);
+        try std.testing.expectEqual(@as(usize, 5), state.kvView().?.token_count);
+        try std.testing.expectError(error.InvalidBatchDecodeState, scalar.commitNext());
+        try std.testing.expectEqual(@as(usize, 5), state.kvView().?.token_count);
+    }
+    // Same actual prefix the executor already wrote for a three-token burst.
+    try state.appendGeneratedTokens(2);
+    var burst = try AcceptedTokens.init(&state, 3, 2);
+    try burst.commitNext();
+    try burst.commitNext();
+    try std.testing.expectEqual(@as(usize, 7), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 7), state.kvView().?.token_count);
+    try burst.commitNext();
+    try std.testing.expectEqual(@as(usize, 8), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 8), state.kvView().?.token_count);
+    try std.testing.expectEqual(sequence, state.sequence_id.?);
+    // Publication stops on EOS/cancellation before the next acceptance. The
+    // cursor is borrowed, so dropping it never appends or truncates state.
+    var stopped = try AcceptedTokens.init(&state, 3, 0);
+    try stopped.commitNext();
+    try std.testing.expectEqual(@as(usize, 9), state.total_tokens);
+    try std.testing.expectEqual(@as(usize, 9), state.kvView().?.token_count);
+    for ([_][2]usize{ .{ 0, 0 }, .{ 9, 8 }, .{ 3, 1 } }) |invalid| try std.testing.expectError(error.InvalidBatchDecodeState, AcceptedTokens.init(&state, invalid[0], invalid[1]));
+    try std.testing.expectEqual(@as(usize, 9), state.kvView().?.token_count);
 }

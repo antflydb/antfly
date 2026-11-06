@@ -45,6 +45,69 @@ pub fn CachedDecoder(comptime Architecture: type) type {
             timing_count: usize = 0,
         };
 
+        /// Borrowed full-prefix execution uses this same architecture binding
+        /// when incremental execution is disabled or unavailable. The caller
+        /// supplies token/suppression semantics; this owner selects and retires
+        /// the actual decoder output and vocabulary-head implementation.
+        pub const FullPrefix = struct {
+            context: Context,
+            encoder_hidden: CT,
+            encoder_mask: []const i64,
+            batch: usize,
+            encoder_length: usize,
+
+            pub const Output = struct {
+                allocator: std.mem.Allocator,
+                backend: *const ComputeBackend,
+                logits: CT,
+                batch: usize,
+                rows: usize,
+                vocabulary: usize,
+                unsupported_suppression: anyerror,
+
+                pub fn deinit(self: *@This()) void {
+                    self.backend.free(self.logits);
+                    self.* = undefined;
+                }
+                pub fn greedyToken(self: *const @This(), suppressed: []const i32) !u32 {
+                    if (self.batch != 1) return error.InvalidInputShape;
+                    return switch (try selectLogitsHead(self.backend, self.allocator, self.logits, self.rows, self.vocabulary, suppressed, self.unsupported_suppression)) {
+                        .token => |value| value,
+                        .tensor => |value| blk: {
+                            defer self.backend.free(value);
+                            const tokens = try self.backend.toFloat32(value, self.allocator);
+                            defer self.allocator.free(tokens);
+                            if (tokens.len != 1 or tokens[0] < 0) return error.InvalidTensorShape;
+                            break :blk @intFromFloat(tokens[0]);
+                        },
+                    };
+                }
+            };
+            fn validate(self: *const @This(), tokens: []const i64, rows: usize) !void {
+                const count = std.math.mul(usize, self.batch, rows) catch return error.InvalidInputShape;
+                if (self.batch == 0 or rows == 0 or tokens.len != count) return error.InvalidInputShape;
+                if (self.context.control) |control| try control.check();
+            }
+            pub fn stepResident(self: *const @This(), tokens: []const i64, rows: usize) !Output {
+                try self.validate(tokens, rows);
+                return .{
+                    .allocator = self.context.allocator,
+                    .backend = self.context.backend,
+                    .logits = try Architecture.decoderForwardTensor(self.context.backend, self.context.allocator, self.context.model.*, tokens, self.encoder_hidden, self.encoder_mask, self.batch, rows, self.encoder_length),
+                    .batch = self.batch,
+                    .rows = rows,
+                    .vocabulary = self.context.model.vocab_size,
+                    .unsupported_suppression = self.context.unsupported_suppression,
+                };
+            }
+            /// Explicit requested host logits preserve the original batched
+            /// full-prefix schedule; only the numerical owner chooses its body.
+            pub fn stepHost(self: *const @This(), tokens: []const i64, rows: usize) ![]f32 {
+                try self.validate(tokens, rows);
+                return Architecture.decoderForward(self.context.backend, self.context.allocator, self.context.model.*, tokens, self.encoder_hidden, self.encoder_mask, self.batch, rows, self.encoder_length);
+            }
+        };
+
         context: Context,
         mode: Mode,
         cache: Architecture.DecoderIncrementalCache,
@@ -206,26 +269,16 @@ pub fn CachedDecoder(comptime Architecture: type) type {
             hidden_live.* = false;
             defer cb.free(logits);
 
-            if (suppress_tokens.len == 0) {
-                if (self.head_events.lm_head_path == null) self.head_events.lm_head_path = "full_logits";
-                const token = (try cb.argmaxLastRow(logits, 1, model.vocab_size)) orelse return error.UnsupportedOperation;
-                return token;
-            }
-
-            if (try cb.argmaxRowsSuppress(logits, 0, 1, model.vocab_size, suppress_tokens, allocator)) |tokens| {
-                defer allocator.free(tokens);
-                if (tokens.len != 1) return error.InvalidTensorShape;
-                if (self.head_events.lm_head_path == null) self.head_events.lm_head_path = "full_logits";
-                return tokens[0];
-            }
-
-            if (try cb.argmaxLastRowSuppressTensor(logits, 1, model.vocab_size, suppress_tokens)) |token_tensor| {
-                defer cb.free(token_tensor);
-                if (self.head_events.lm_head_path == null) self.head_events.lm_head_path = "full_logits";
-                return try self.downloadToken(token_tensor);
-            }
-
-            return self.context.unsupported_suppression;
+            if (suppress_tokens.len == 0 and self.head_events.lm_head_path == null) self.head_events.lm_head_path = "full_logits";
+            const selected = try selectLogitsHead(cb, allocator, logits, 1, model.vocab_size, suppress_tokens, self.context.unsupported_suppression);
+            if (self.head_events.lm_head_path == null) self.head_events.lm_head_path = "full_logits";
+            return switch (selected) {
+                .token => |value| value,
+                .tensor => |value| blk: {
+                    defer cb.free(value);
+                    break :blk try self.downloadToken(value);
+                },
+            };
         }
 
         fn recordHeadTiming(self: *Self, stage: HeadEvents.Stage, start: u64) void {
@@ -254,6 +307,21 @@ pub fn CachedDecoder(comptime Architecture: type) type {
             return true;
         }
     };
+}
+
+const HeadSelection = union(enum) { token: u32, tensor: CT };
+
+/// The same ordered head candidates serve incremental and full-prefix output.
+/// A returned tensor is owned by its receiving output owner through readback.
+fn selectLogitsHead(cb: *const ComputeBackend, allocator: std.mem.Allocator, logits: CT, rows: usize, vocabulary: usize, suppressed: []const i32, unsupported: anyerror) !HeadSelection {
+    if (suppressed.len == 0) return .{ .token = (try cb.argmaxLastRow(logits, rows, vocabulary)) orelse return error.UnsupportedOperation };
+    if (try cb.argmaxRowsSuppress(logits, rows - 1, 1, vocabulary, suppressed, allocator)) |tokens| {
+        defer allocator.free(tokens);
+        if (tokens.len != 1) return error.InvalidTensorShape;
+        return .{ .token = tokens[0] };
+    }
+    if (try cb.argmaxLastRowSuppressTensor(logits, rows, vocabulary, suppressed)) |tensor| return .{ .tensor = tensor };
+    return unsupported;
 }
 
 pub fn beginStepFrame(cb: *const ComputeBackend, enabled: bool) !bool {
@@ -422,6 +490,74 @@ fn checkActualCachedDecoder(cb_value: ComputeBackend, _: ComputeBackend) !void {
         }
     };
     try std.testing.checkAllAllocationFailures(a, Oom.run, .{ cb, &config, encoder });
+}
+
+fn checkActualFullPrefixDecoder(cb_value: ComputeBackend, reference_backend: ComputeBackend) !void {
+    const a = std.testing.allocator;
+    const cb = &cb_value;
+    const config = TestArchitecture.Config{ .d_model = 4, .decoder_layers = 1, .decoder_attention_heads = 1, .decoder_ffn_dim = 8, .vocab_size = 4 };
+    const reference_encoder = try reference_backend.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 1, 2, 4 });
+    defer reference_backend.free(reference_encoder);
+    const cpu_oracle = try TestArchitecture.decoderForward(&reference_backend, a, config, &.{ 1, 2 }, reference_encoder, &.{ 1, 1 }, 1, 2, 2);
+    defer a.free(cpu_oracle);
+    const encoder = try cb.fromFloat32Shape(&.{ 1, 2, 3, 4, 5, 6, 7, 8 }, &.{ 1, 2, 4 });
+    defer cb.free(encoder);
+    const owner = TestDecoder.FullPrefix{
+        .context = .{ .allocator = a, .backend = cb, .model = &config },
+        .encoder_hidden = encoder,
+        .encoder_mask = &.{ 1, 1 },
+        .batch = 1,
+        .encoder_length = 2,
+    };
+    const reference = try TestArchitecture.decoderForward(cb, a, config, &.{ 1, 2 }, encoder, &.{ 1, 1 }, 1, 2, 2);
+    defer a.free(reference);
+    const host = try owner.stepHost(&.{ 1, 2 }, 2);
+    defer a.free(host);
+    try std.testing.expectEqualSlices(f32, reference, host);
+    try std.testing.expectEqual(cpu_oracle.len, host.len);
+    for (cpu_oracle, host) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+    var first = try owner.stepResident(&.{ 1, 2 }, 2);
+    defer first.deinit();
+    var second = try owner.stepResident(&.{ 1, 2, 3 }, 3);
+    defer second.deinit();
+    // A later full-prefix forward cannot overwrite the earlier owned result.
+    const retained = try cb.toFloat32(first.logits, a);
+    defer a.free(retained);
+    try std.testing.expectEqual(reference.len, retained.len);
+    for (reference, retained) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+    for (cpu_oracle, retained) |expected, actual| try std.testing.expectApproxEqAbs(expected, actual, 0.00001);
+    // Greedy and suppression expectations come from the independent CPU
+    // forward, not either candidate head implementation or GPU export.
+    const last = cpu_oracle[cpu_oracle.len - config.vocab_size ..];
+    var top: usize = 0;
+    for (last[1..], 1..) |value, index| if (value > last[top]) {
+        top = index;
+    };
+    var next: usize = if (top == 0) 1 else 0;
+    for (last, 0..) |value, index| if (index != top and value > last[next]) {
+        next = index;
+    };
+    try std.testing.expectEqual(@as(u32, @intCast(top)), try first.greedyToken(&.{}));
+    try std.testing.expectEqual(@as(u32, @intCast(next)), try first.greedyToken(&.{@intCast(top)}));
+    const Cancel = struct {
+        fn check(_: ?*anyopaque) !void {
+            return error.Cancelled;
+        }
+    };
+    var cancelled = owner;
+    cancelled.context.control = .{ .check_fn = Cancel.check };
+    try std.testing.expectError(error.Cancelled, cancelled.stepResident(&.{ 1, 2 }, 2));
+    try std.testing.expectError(error.Cancelled, cancelled.stepHost(&.{ 1, 2 }, 2));
+}
+
+test "full prefix decoder actual Native preserves host resident heads held outputs and cancellation" {
+    try @import("../ops/media_residency_test.zig").onNative(populateTestWeights, checkActualFullPrefixDecoder);
+}
+test "full prefix decoder actual Metal preserves host resident heads held outputs and cancellation" {
+    try @import("../ops/media_residency_test.zig").onMetal(populateTestWeights, checkActualFullPrefixDecoder);
+}
+test "full prefix decoder actual CUDA preserves host resident heads held outputs and cancellation" {
+    try @import("../ops/media_residency_test.zig").onCuda(populateTestWeights, checkActualFullPrefixDecoder);
 }
 
 test "cached decoder owner matches actual native scalar batch and compacted state and preserves cancelled ownership" {

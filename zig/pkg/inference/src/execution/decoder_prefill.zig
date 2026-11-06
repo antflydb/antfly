@@ -137,10 +137,20 @@ pub const EmbeddingRows = struct {
 
 /// Semantic row locations stay with the task. Sources are borrowed only for
 /// the synchronous replace call; the completed prompt owns separate storage.
+pub const EmbeddingSource = union(enum) { resident: ops.CT, host: []const f32 };
 pub const EmbeddingReplacement = struct {
     offset: usize,
     rows: usize,
-    source: union(enum) { resident: ops.CT, host: []const f32 },
+    source: EmbeddingSource,
+};
+
+/// Borrowed rows from an actual projected-input owner. Counts and ordering are
+/// semantic producer metadata; the source retains its original allocator or
+/// backend owner until synchronous prompt assembly has consumed this view.
+pub const ProjectedInputRows = struct {
+    rows_per_item: []const usize,
+    width: usize,
+    source: EmbeddingSource,
 };
 
 /// Borrow a contiguous host producer without allocating an image-span array.
@@ -171,6 +181,18 @@ pub const EmbeddingReplacements = union(enum) {
 /// Unsupported image storage is materialized only for that source, BEFORE its
 /// copy. Already submitted producer math and assembled prefixes never replay.
 pub const PromptEmbeddingRows = struct {
+    pub const ProjectionPlacement = enum { none, host, resident };
+
+    /// Resolve the actual row operations BEFORE producer math. The producer
+    /// supplies its bounded resident geometry and an explicit host request;
+    /// task code never rediscovers backend/vtable placement after projection.
+    pub fn projectionPlacement(backend: *const ComputeBackend, item_count: usize, resident_limit: usize, host_requested: bool) ProjectionPlacement {
+        if (item_count == 0) return .none;
+        if (!host_requested and item_count <= resident_limit and backend.supportsCopyRows2D() and
+            backend.vtable.concatRows2D != null and backend.vtable.multiplyScalar != null) return .resident;
+        return .host;
+    }
+
     backend: *const ComputeBackend,
     allocator: std.mem.Allocator,
     rows: usize,
@@ -644,6 +666,14 @@ pub const Runtime = struct {
             request.prefilled_tokens == 0 and decoder_storage.ringRequestEligible(request.route.storage, request.sampled_ring_qualified));
     }
 
+    /// Post-forward selected-KV maintenance is shared by eager and scheduled
+    /// chunks. The task supplies its requested cache semantics; only this
+    /// runtime owns the donor-compaction decision and actual state mutation.
+    /// Call after the numerical chunk completed, before publishing its cursor.
+    pub fn finishChunkState(self: *Runtime, selected_kv: bool, gpu_oracle: bool) !void {
+        if (selected_kv) try self.state.compactSelectedGlobalDonors(self.forward.context.gpt_config.*, self.forward.context.execution_control, gpu_oracle);
+    }
+
     fn checkWork(raw: ?*anyopaque) !void {
         const self: *Runtime = @ptrCast(@alignCast(raw.?));
         try self.work_control.check();
@@ -857,7 +887,7 @@ pub const Runtime = struct {
         }
         // The chunk's KV writes and query captures are committed at
         // this point. Selection never runs inside an active forward.
-        if (request.compact_selected) try self.state.compactSelectedGlobalDonors(self.forward.context.gpt_config.*, self.forward.context.execution_control, request.selection_gpu_oracle);
+        try self.finishChunkState(request.compact_selected, request.selection_gpu_oracle);
         return .{ .complete = .{ .last_logits = prefill_last_logits, .greedy_token = prefill_greedy_token, .last_hidden = prefill_last_hidden, .last_hidden_rows = prefill_last_hidden_rows } };
     }
 

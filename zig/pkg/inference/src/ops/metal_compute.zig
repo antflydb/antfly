@@ -54852,7 +54852,15 @@ test "Metal prepared projection geometry keeps multirow packed schedules outside
     const x = try builder.parameter("x", ml.graph.Shape.init(.f32, &.{ 2, 64 }));
     const weight = try builder.parameter("w", ml.graph.Shape.init(.f32, &.{ 64, 64 }));
     const output = try builder.linearNoBias(x, weight, 2, 64, 64);
-    try std.testing.expect(MetalCompute.DenseProjectionRegion.candidate(&graph, output) == null);
+    const second_weight = try builder.parameter("second_weight", ml.graph.Shape.init(.f32, &.{ 64, 64 }));
+    const second_output = try builder.linearNoBias(x, second_weight, 2, 64, 64);
+    try graph.markOutput(output);
+    try graph.markOutput(second_output);
+    // Geometry may form a region, but generic profile acquisition still has
+    // no authority to promise the privately prepared multirow execution.
+    try std.testing.expect(MetalCompute.DenseProjectionRegion.candidate(&graph, output) != null);
+    try std.testing.expect(MetalCompute.DenseProjectionRegion.hasProjectionHead(&graph, false));
+    try std.testing.expect(!MetalCompute.DenseProjectionRegion.hasCandidates(&graph));
 }
 
 const ConcurrentMetalSiblings = struct {

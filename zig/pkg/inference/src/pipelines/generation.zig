@@ -2455,7 +2455,7 @@ const ExecutionScope = @import("../ops/execution_scope.zig").Scope;
 
 pub const NativeGenerationPipeline = struct {
     /// Token publication is bounded; GPU steps reuse two frame/logit banks.
-    pub const max_gpu_token_burst_width: usize = 8;
+    pub const max_gpu_token_burst_width: usize = pending_step.AcceptedTokens.max_count;
     allocator: std.mem.Allocator,
     io: ?std.Io = null,
     cb: ComputeBackend,
@@ -3171,21 +3171,13 @@ pub const NativeGenerationPipeline = struct {
                     const projector = self.projector_store orelse request_projector.?;
                     var projected_video = if (video_bytes) |bytes| try gemma4_video.encode(&self.cb, allocator, projector, bytes) else null;
                     defer if (projected_video) |*video| video.deinit();
-                    const resident_images_enabled = images.len <= 8 and self.cb.supportsCopyRows2D() and self.cb.vtable.concatRows2D != null and
-                        self.cb.vtable.multiplyScalar != null and !platform.env.getenvBoolDefault("ANTFLY_GEMMA4_GENERATION_IMAGE_HOST", false);
-                    var resident_images = if (images.len > 0 and resident_images_enabled)
-                        try gemma4_projector.encodeProjectedImagesResident(&self.cb, allocator, projector, images)
-                    else
-                        null;
-                    defer if (resident_images) |*projected| projected.deinit();
-                    const resident_features = if (projected_video) |*video| &video.images else if (resident_images) |*images_resident| images_resident else null;
+                    var projected_images = try gemma4_projector.PromptImageInput.begin(&self.cb, allocator, projector, images);
+                    defer projected_images.deinit();
                     const video_prompt = if (projected_video) |*video| try gemma4_mm.expandVideoPromptText(allocator, prompt, video.timestamps_us) else null;
                     defer if (video_prompt) |text| allocator.free(text);
-                    var projected_images = if (images.len > 0 and resident_images == null)
-                        try gemma4_projector.encodeProjectedImages(&self.cb, allocator, projector, images)
-                    else
-                        null;
-                    defer if (projected_images) |*projected| projected.deinit();
+                    try projected_images.prepareHost();
+                    defer projected_images.releaseHost();
+                    const image_rows: ?decoder_prefill.ProjectedInputRows = if (projected_video) |*video| video.images.promptRows() else try projected_images.rows();
                     var projected_audio = if (audio_clips.len > 0)
                         try gemma4_projector.encodeProjectedAudioInputs(&self.cb, allocator, projector, audio_clips)
                     else
@@ -3194,7 +3186,7 @@ pub const NativeGenerationPipeline = struct {
                     const expanded_prompt = try gemma4_mm.expandPromptText(
                         allocator,
                         video_prompt orelse prompt,
-                        if (resident_features) |projected| projected.tokens_per_image else if (projected_images) |*projected| projected.tokens_per_image else &.{},
+                        if (image_rows) |rows| rows.rows_per_item else &.{},
                         if (projected_audio) |*projected| projected.tokens_per_audio else &.{},
                     );
                     defer allocator.free(expanded_prompt);
@@ -3211,26 +3203,15 @@ pub const NativeGenerationPipeline = struct {
                     while (expanded_prompt_tokens < expanded_encoded.attention_mask.len and expanded_encoded.attention_mask[expanded_prompt_tokens] != 0) : (expanded_prompt_tokens += 1) {}
                     if (expanded_prompt_tokens == 0) return error.EmptyPrompt;
 
-                    prepared_multimodal_prompt = if (resident_features) |projected|
-                        try gemma4_mm.prepareExpandedPromptEmbeddingsResident(
-                            &self.cb,
-                            allocator,
-                            self.tokenizer,
-                            self.gpt_config,
-                            expanded_encoded.ids[0..expanded_prompt_tokens],
-                            projected,
-                            if (projected_audio) |*audio| audio else null,
-                        )
-                    else
-                        try gemma4_mm.prepareExpandedPromptEmbeddings(
-                            &self.cb,
-                            allocator,
-                            self.tokenizer,
-                            self.gpt_config,
-                            expanded_encoded.ids[0..expanded_prompt_tokens],
-                            if (projected_images) |*projected| projected else null,
-                            if (projected_audio) |*projected| projected else null,
-                        );
+                    prepared_multimodal_prompt = try gemma4_mm.prepareExpandedPromptEmbeddingsFromRows(
+                        &self.cb,
+                        allocator,
+                        self.tokenizer,
+                        self.gpt_config,
+                        expanded_encoded.ids[0..expanded_prompt_tokens],
+                        image_rows,
+                        if (projected_audio) |*audio| audio else null,
+                    );
                 }
             } else {
                 if (has_audio) return error.NativeAudioGenerationNotImplemented;
@@ -4667,7 +4648,7 @@ pub const NativeGenerationPipeline = struct {
                                     if (try cursor.retryMemoryBudgetExceeded(attempt, err)) continue;
                                     return err;
                                 };
-                                if (config.kv_cache_mode == .select_v1) try decode_state.compactSelectedGlobalDonors(self.gpt_config, self.execution_control, select_v1_gpu_oracle);
+                                try prompt_runtime.finishChunkState(config.kv_cache_mode == .select_v1, select_v1_gpu_oracle);
                                 try cursor.commit(attempt);
                                 scheduler.notePrefillProgress(lease, prefilled_tokens + cursor.processed, seq_len);
                                 continue;
@@ -7694,11 +7675,11 @@ pub const NativeGenerationPipeline = struct {
         }
 
         fn acceptTokens(self: *@This(), tokens: []const u32, reserved: usize) !void {
-            if (tokens.len == 0 or tokens.len > max_gpu_token_burst_width or (reserved != 0 and reserved != tokens.len - 1)) return error.InvalidBatchDecodeState;
+            var accepted = try pending_step.AcceptedTokens.init(self.work.decode_state, tokens.len, reserved);
             // Publish every accepted output while the work is still borrowed;
             // enqueue exactly once, after the last accepted output. Enqueue
             // may transfer this stack continuation to an idle canceller.
-            for (tokens, 0..) |token, index| {
+            for (tokens) |token| {
                 try self.control.check();
                 if (!self.ignore_eos and self.model_config.isEosToken(token)) {
                     self.finish_reason = "stop";
@@ -7709,9 +7690,7 @@ pub const NativeGenerationPipeline = struct {
                 self.token_ids[self.seq_len.*] = @intCast(token);
                 self.seq_len.* += 1;
                 self.generated += 1;
-                // executeClaimedStep owns the GPU gate here. appendGeneratedToken
-                // separately locks the shared KV manager, as on the caller path.
-                if (index >= reserved) try self.work.decode_state.appendGeneratedToken();
+                try accepted.commitNext();
                 self.scheduler.noteDecodeProgress(self.lease, self.generated);
                 if (self.generated >= self.max_tokens) {
                     self.work.ready.store(true, .release);

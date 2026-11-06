@@ -19,6 +19,19 @@ pub const Cleanup = union(enum) {
     /// The input owner cannot create, finish, or substitute the caller's epoch.
     outer: Sink.Epoch,
 
+    /// The caller explicitly owns a lane-free task. Only the execution owner
+    /// chooses whether its actual encoder/receiver pair needs a detached root.
+    /// An ineligible pair keeps its original alias/borrowed-provider lifetime.
+    pub fn beginForPairWithoutEnclosingLanes(encoder: Session, destination: Session, control: ?@import("../execution_control.zig").InferenceExecutionControl) !Cleanup {
+        const backend = encoder.backend();
+        if (backend != .cuda and !(backend == .metal and control != null)) return .unqualified;
+        if (destination.backend() != backend or (encoder.ptr == destination.ptr and encoder.vtable == destination.vtable)) return .unqualified;
+        const receiver = @import("architecture_session.zig").IncrementalDecoderAdapter.qualify(encoder, destination) orelse return .unqualified;
+        if (receiver.same_model_owner) return .unqualified;
+        const supervised_async = if (control) |active| active.native_call_policy == .require_supervision and active.deadline_ns != null else false;
+        if (receiver.backend != .metal and !(receiver.backend == .cuda and supervised_async)) return .unqualified;
+        return beginTaskWithoutEnclosingLanes(control);
+    }
     pub fn beginTaskWithoutEnclosingLanes(control: ?@import("../execution_control.zig").InferenceExecutionControl) !Cleanup {
         var ref = try Sink.Ref.create();
         errdefer ref.release();

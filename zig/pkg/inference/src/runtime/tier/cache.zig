@@ -886,6 +886,16 @@ pub const SharedCache = struct {
             const binding = self.parts[0].binding orelse return error.MissingCacheRetirementDomain;
             if (self.metadata != null or pin.controller() != binding.controller) return error.ForeignAdmissionDomain;
             const metadata_bytes = try self.fundingMetadataBytes();
+            // These independently owned components are mandatory parts of one
+            // fresh transaction. Individual reservations must not classify our
+            // own earlier parts as competing work when their sum cannot fit.
+            var demand = memory.AdmissionAmounts{ .host_weight_bytes = metadata_bytes };
+            for (self.parts) |part| demand = try demand.merge(AdmissionBinding.amountsFor(part.tier, part.credit_bytes));
+            const shared = binding.controller.sharedLimitsSnapshot();
+            if (!try demand.fitsLimits(binding.limits) or !try demand.fitsLimits(.{
+                .host_limit_bytes = shared.host_limit_bytes,
+                .combined_limit_bytes = shared.unified_limit_bytes,
+            })) return error.MemoryBudgetExceeded;
             if (metadata_bytes != 0) {
                 const node = try self.metadata_allocator.create(BindingMetadata);
                 node.* = .{};
@@ -2076,6 +2086,7 @@ test "two tier physical cache transaction denies either exact cap without publis
         .{ .host_limit_bytes = metadata + 15, .backend_limit_bytes = 32 },
         .{ .host_limit_bytes = metadata + 16, .backend_limit_bytes = 31 },
         .{ .host_limit_bytes = metadata + 16, .backend_limit_bytes = 32 },
+        .{ .combined_limit_bytes = metadata + 16 + 32 - 1 },
     };
     for (limits, 0..) |limit, index| {
         const owner = try domain.Domain.create();
@@ -2191,4 +2202,36 @@ test "cache admission snapshot identifies actual shared binding only within a he
     try std.testing.expectEqual(@as(usize, 8), one.amounts.backend_weight_bytes);
     first.noteRelease(.backend, 8);
     try first.flushReleasedOutsideExecution();
+}
+
+test "two tier mandatory fresh sum distinguishes shared impossibility from actual peer contention" {
+    const metadata = @sizeOf(BindingMetadata) + 2 * (try retirement.PreparedCharge.requestedMetadataBytes(0)) + 2 * @sizeOf(AdmissionCredit);
+    for (0..3) |index| {
+        const owner = try domain.Domain.create();
+        defer owner.release();
+        const pin = owner.pin();
+        defer pin.release();
+        const controller = pin.controller();
+        controller.configureSharedLimits(switch (index) {
+            0 => .{ .host_limit_bytes = metadata + 15 },
+            1 => .{ .unified_limit_bytes = metadata + 16 + 32 - 1 },
+            else => .{},
+        });
+        var peer: ?memory.AdmissionLease = null;
+        defer if (peer) |*lease| lease.release();
+        if (index == 2) peer = try controller.tryAcquire(.gpu, .{}, .{ .host_weight_bytes = 1 }, false);
+        const before = controller.snapshot();
+        var cache = SharedCache.init(.{ .backend_limit_bytes = 16 });
+        defer cache.deinitAdmission();
+        try cache.configureManagedAdmissionOutsideExecution(controller, .gpu, .{ .host_limit_bytes = metadata + 16, .backend_limit_bytes = 32 }, .{});
+        try cache.installRetirementDomainOutsideExecution(&pin);
+        var growth = try cache.snapshotPhysicalGrowthLocked(16, 16, 32);
+        defer growth.finishOutsideExecution();
+        if (index == 2) {
+            try std.testing.expectError(error.ResourceTemporarilyUnavailable, growth.fundOutsideExecution(&pin));
+        } else try std.testing.expectError(error.MemoryBudgetExceeded, growth.fundOutsideExecution(&pin));
+        try std.testing.expectEqualDeep(before, controller.snapshot());
+        try std.testing.expectEqual(@as(usize, 0), cache.host_bytes);
+        try std.testing.expectEqual(@as(usize, 0), cache.backend_bytes);
+    }
 }

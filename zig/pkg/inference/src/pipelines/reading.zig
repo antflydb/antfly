@@ -45,6 +45,7 @@ const antfly_image = @import("antfly_image");
 
 const CT = ops.CT;
 const ComputeBackend = ops.ComputeBackend;
+const FlorenceDecoder = cached_decoder.CachedDecoder(florence_arch);
 
 pub const ReadTelemetry = struct {
     resident_decoder: bool = false,
@@ -799,7 +800,7 @@ pub const ReadingPipeline = struct {
         }
 
         const cache_start = nowNs();
-        var decoder = try cached_decoder.CachedDecoder(florence_arch).init(.{ .allocator = allocator, .backend = cb, .model = &florence_cfg, .control = self.execution_control }, .batched, encoder_hidden, batch, enc_seq_len, max_len);
+        var decoder = try FlorenceDecoder.init(.{ .allocator = allocator, .backend = cb, .model = &florence_cfg, .control = self.execution_control }, .batched, encoder_hidden, batch, enc_seq_len, max_len);
         defer decoder.deinit();
         last_read_telemetry.kv_cache_mode = if (decoder.preallocated()) "batched_preallocated" else "batched_concat";
         logReadProfile("batch_florence_decoder_kv_cache_build", cache_start);
@@ -1047,6 +1048,13 @@ pub const ReadingPipeline = struct {
         var decoder_run_total_ns: u64 = 0;
         var decoder_steps: usize = 0;
         var finished_count: usize = 0;
+        const decoder = FlorenceDecoder.FullPrefix{
+            .context = .{ .allocator = allocator, .backend = cb, .model = &florence_cfg, .control = self.execution_control },
+            .encoder_hidden = encoder_hidden,
+            .encoder_mask = encoder_attention_mask,
+            .batch = batch,
+            .encoder_length = enc_seq_len,
+        };
         while (dec_len < max_len and finished_count < batch) {
             if (self.execution_control) |control| try control.update(.executing, dec_len, max_len);
             {
@@ -1054,17 +1062,7 @@ pub const ReadingPipeline = struct {
                 defer allocator.free(decoder_input_ids);
 
                 const decoder_run_start = nowNs();
-                const logits = try florence_arch.decoderForward(
-                    cb,
-                    allocator,
-                    florence_cfg,
-                    decoder_input_ids,
-                    encoder_hidden,
-                    encoder_attention_mask,
-                    batch,
-                    dec_len,
-                    enc_seq_len,
-                );
+                const logits = try decoder.stepHost(decoder_input_ids, dec_len);
                 const decoder_run_ns = nowNs() - decoder_run_start;
                 decoder_run_total_ns += decoder_run_ns;
                 decoder_steps += 1;
@@ -1218,174 +1216,6 @@ pub const ReadingPipeline = struct {
         return vision_encoder.runWithControl(&.{ pixel_tensor, prompt_tensor }, allocator, execution_control);
     }
 
-    fn readNativeFlorencePixelValues(self: *ReadingPipeline, pixel_values: []const f32, florence_cfg: florence_arch.Config) !ReadResult {
-        const allocator = self.allocator;
-        var run_permit: ?session_mod.RunPermit = null;
-        defer if (run_permit) |*permit| permit.deinit();
-        const debug_cuda_session = platform.env.getenvBool("ANTFLY_INFERENCE_DEBUG_CUDA_SESSION");
-        const prompt_text = self.config.prompt orelse "<OCR>";
-        if (debug_cuda_session) std.log.info("reading: native florence prompt ids start prompt={s}", .{prompt_text});
-        const prompt_i32 = try buildFlorencePromptIds(
-            allocator,
-            self.tokenizer,
-            florence_cfg,
-            prompt_text,
-        );
-        if (debug_cuda_session) std.log.info("reading: native florence prompt ids done len={d}", .{prompt_i32.len});
-        defer allocator.free(prompt_i32);
-
-        const prompt_i64 = try allocator.alloc(i64, prompt_i32.len);
-        defer allocator.free(prompt_i64);
-        for (prompt_i32, 0..) |id, i| prompt_i64[i] = id;
-
-        // Direct compute bypasses Session.run, so retain its admission permit
-        // through both encoder/decoder execution and backend cleanup.
-        run_permit = try self.vision_encoder.admit(try nativeFlorenceRunRequest(
-            florence_cfg,
-            1,
-            pixel_values.len,
-            prompt_i32.len,
-            self.config.max_length,
-        ));
-
-        const PreparedOcrRequest = if (build_options.enable_cuda) @import("../execution/architecture_session.zig").PreparedComputeAdmission.LockedRequest else struct {};
-        var prepared_ocr: ?*PreparedOcrRequest = null;
-        if (comptime build_options.enable_cuda) if (run_permit.?.lease) |*primary| {
-            prepared_ocr = try PreparedOcrRequest.acquireAfterAdmissionWithUploadBytes(self.vision_encoder, primary, try std.math.mul(usize, pixel_values.len, @sizeOf(f32)), null, self.native_execution_lane, self.execution_control orelse .{ .io = self.config.preprocess_io });
-        };
-        defer if (comptime build_options.enable_cuda) if (prepared_ocr) |prepared| prepared.deinit();
-        const lane: ?@import("../execution_control.zig").ExecutionLane.Lease =
-            if (prepared_ocr == null) (if (self.native_execution_lane) |owner|
-                try owner.acquire(self.execution_control orelse .{ .io = self.config.preprocess_io })
-            else
-                null) else null;
-        defer if (lane) |lease| lease.release();
-        var managed = if (comptime build_options.enable_cuda) blk: {
-            if (prepared_ocr) |prepared| break :blk try prepared.acquireManaged(allocator, self.execution_control);
-            break :blk try compute_provider.acquireWithControl(self.vision_encoder, allocator, self.execution_control);
-        } else try compute_provider.acquireWithControl(self.vision_encoder, allocator, self.execution_control);
-        defer {
-            if (comptime build_options.enable_cuda) {
-                if (prepared_ocr) |prepared| prepared.closeManaged(&managed) else managed.deinit();
-            } else managed.deinit();
-        }
-        const cb = &managed.backend;
-
-        if (debug_cuda_session) std.log.info("reading: native florence encoder tensor run start", .{});
-        const encoder_start = nowNs();
-        const encoder = try florence_arch.encoderForwardTensor(
-            cb,
-            allocator,
-            florence_cfg,
-            pixel_values,
-            1,
-            prompt_i64,
-            prompt_i64.len,
-        );
-        logReadProfile("encoder", encoder_start);
-        if (debug_cuda_session) std.log.info("reading: native florence encoder tensor run done seq={d}", .{encoder.seq_len});
-        defer cb.free(encoder.hidden);
-
-        const decode_start = nowNs();
-        const result = try self.decodeNativeFlorenceFromEncoder(cb, florence_cfg, encoder.hidden, encoder.seq_len);
-        logReadProfile("decode_from_encoder", decode_start);
-        return result;
-    }
-
-    fn decodeNativeFlorenceFromEncoder(
-        self: *ReadingPipeline,
-        cb: *const ComputeBackend,
-        florence_cfg: florence_arch.Config,
-        encoder_hidden: CT,
-        enc_seq_len: usize,
-    ) !ReadResult {
-        const allocator = self.allocator;
-        const encoder_attention_mask = try allocator.alloc(i64, enc_seq_len);
-        defer allocator.free(encoder_attention_mask);
-        @memset(encoder_attention_mask, 1);
-
-        const max_len = self.config.max_length;
-        if (max_len == 0) return .{ .text = try allocator.dupe(u8, ""), .allocator = allocator, .completion = .length, .completion_tokens = 0 };
-        var dec_ids = try allocator.alloc(i64, max_len);
-        defer allocator.free(dec_ids);
-        dec_ids[0] = self.config.decoder_start_token_id;
-        var dec_len: usize = 1;
-        if (self.config.forced_bos_token_id) |forced_bos| {
-            if (max_len > 1) {
-                dec_ids[1] = forced_bos;
-                dec_len = 2;
-            }
-        }
-
-        var cross_cache: ?florence_arch.DecoderCrossCache = null;
-        defer {
-            if (cross_cache) |*cache| cache.deinit(cb, allocator);
-        }
-        if (platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_CROSS_KV_CACHE")) {
-            const cache_start = nowNs();
-            cross_cache = try florence_arch.buildDecoderCrossCache(cb, allocator, florence_cfg, encoder_hidden, 1, enc_seq_len);
-            logReadProfile("decoder_cross_cache", cache_start);
-        }
-
-        const decode_loop_start = nowNs();
-        var decoder_run_total_ns: u64 = 0;
-        var decoder_steps: usize = 0;
-        while (dec_len < max_len) {
-            if (self.execution_control) |control| try control.update(.executing, dec_len, max_len);
-            const decoder_run_start = nowNs();
-            const logits = if (cross_cache) |*cache|
-                try florence_arch.decoderForwardCached(
-                    cb,
-                    allocator,
-                    florence_cfg,
-                    dec_ids[0..dec_len],
-                    encoder_attention_mask,
-                    1,
-                    dec_len,
-                    enc_seq_len,
-                    cache,
-                )
-            else
-                try florence_arch.decoderForward(
-                    cb,
-                    allocator,
-                    florence_cfg,
-                    dec_ids[0..dec_len],
-                    encoder_hidden,
-                    encoder_attention_mask,
-                    1,
-                    dec_len,
-                    enc_seq_len,
-                );
-            const decoder_run_ns = nowNs() - decoder_run_start;
-            decoder_run_total_ns += decoder_run_ns;
-            decoder_steps += 1;
-            logReadProfileStep("decoder_run", decoder_steps, dec_len, decoder_run_ns);
-            defer allocator.free(logits);
-
-            const vocab_size = florence_cfg.vocab_size;
-            const last_logits = logits[(dec_len - 1) * vocab_size ..][0..vocab_size];
-            const best_id = selectGreedyToken(last_logits, dec_ids[0..dec_len], self.config.no_repeat_ngram_size);
-            if (@as(i32, @intCast(best_id)) == self.config.eos_token_id) break;
-
-            dec_ids[dec_len] = @intCast(best_id);
-            dec_len += 1;
-        }
-        logReadProfileStep("decoder_total", decoder_steps, dec_len, nowNs() - decode_loop_start);
-        logReadProfileStep("decoder_run_total", decoder_steps, dec_len, decoder_run_total_ns);
-
-        const prefix_len: usize = if (self.config.forced_bos_token_id != null and dec_len > 1) 2 else 1;
-        const text_len = if (dec_len > prefix_len) dec_len - prefix_len else 0;
-        const token_ids = try allocator.alloc(i32, text_len);
-        defer allocator.free(token_ids);
-        for (0..text_len) |i| token_ids[i] = @intCast(dec_ids[prefix_len + i]);
-
-        const text = try self.tokenizer.decode(allocator, token_ids);
-        const cleaned = try cleanupPureText(allocator, text);
-        allocator.free(text);
-        return .{ .text = cleaned, .allocator = allocator, .completion = if (dec_len >= self.config.max_length) .length else .complete, .completion_tokens = text_len };
-    }
-
     fn readPixelValuesFlorenceResident(self: *ReadingPipeline, pixel_values: []const f32) !?ReadResult {
         const backend = self.vision_encoder.backend();
         if (backend != .native and backend != .metal and backend != .cuda) return null;
@@ -1504,20 +1334,18 @@ pub const ReadingPipeline = struct {
             }
         }
 
+        const decoder = FlorenceDecoder.FullPrefix{
+            .context = .{ .allocator = allocator, .backend = cb, .model = &florence_cfg, .control = self.execution_control, .unsupported_suppression = error.UnsupportedFlorence2NoRepeatMetal },
+            .encoder_hidden = encoder.hidden,
+            .encoder_mask = encoder_attention_mask,
+            .batch = 1,
+            .encoder_length = encoder.seq_len,
+        };
         while (dec_len < max_len) {
             if (self.execution_control) |control| try control.update(.executing, dec_len, max_len);
-            const logits = (try session_factory.runFlorenceDecoderResident(
-                self.decoder,
-                cb,
-                allocator,
-                dec_ids[0..dec_len],
-                encoder.hidden,
-                encoder_attention_mask,
-                1,
-                dec_len,
-                encoder.seq_len,
-            )) orelse return null;
-            defer cb.free(logits);
+            var output = try decoder.stepResident(dec_ids[0..dec_len], dec_len);
+            defer output.deinit();
+            const logits = output.logits;
 
             if (florenceDebugStats() and dec_len <= 5) {
                 const logits_host = try cb.toFloat32(logits, allocator);
@@ -1533,25 +1361,7 @@ pub const ReadingPipeline = struct {
             );
             defer allocator.free(suppress_tokens);
 
-            const best_id = if (suppress_tokens.len == 0) blk: {
-                break :blk (try cb.argmaxLastRow(logits, dec_len, florence_cfg.vocab_size)) orelse return error.UnsupportedOperation;
-            } else blk: {
-                if (try cb.argmaxRowsSuppress(logits, dec_len - 1, 1, florence_cfg.vocab_size, suppress_tokens, allocator)) |tokens| {
-                    defer allocator.free(tokens);
-                    if (tokens.len != 1) return error.InvalidTensorShape;
-                    break :blk tokens[0];
-                }
-
-                if (try cb.argmaxLastRowSuppressTensor(logits, dec_len, florence_cfg.vocab_size, suppress_tokens)) |token_tensor| {
-                    defer cb.free(token_tensor);
-                    const token_ids = try cb.toFloat32(token_tensor, allocator);
-                    defer allocator.free(token_ids);
-                    if (token_ids.len != 1 or token_ids[0] < 0) return error.InvalidTensorShape;
-                    break :blk @as(u32, @intFromFloat(token_ids[0]));
-                }
-
-                return error.UnsupportedFlorence2NoRepeatMetal;
-            };
+            const best_id = try output.greedyToken(suppress_tokens);
             if (@as(i32, @intCast(best_id)) == self.config.eos_token_id) break;
 
             dec_ids[dec_len] = @intCast(best_id);
@@ -1575,7 +1385,7 @@ pub const ReadingPipeline = struct {
         if (initial_len == 0 or initial_len > max_len or dec_ids.len < max_len) return error.InvalidInputShape;
 
         const cache_start = nowNs();
-        var decoder = try cached_decoder.CachedDecoder(florence_arch).init(.{ .allocator = allocator, .backend = cb, .model = &florence_cfg, .control = self.execution_control, .profile_stages = readProfileEnabled(), .replay_key = "florence.lm_head_argmax", .replay_input_label = "florence.lm_head_input", .unsupported_suppression = error.UnsupportedFlorence2NoRepeatMetal }, .scalar, encoder_hidden, 1, enc_seq_len, max_len);
+        var decoder = try FlorenceDecoder.init(.{ .allocator = allocator, .backend = cb, .model = &florence_cfg, .control = self.execution_control, .profile_stages = readProfileEnabled(), .replay_key = "florence.lm_head_argmax", .replay_input_label = "florence.lm_head_input", .unsupported_suppression = error.UnsupportedFlorence2NoRepeatMetal }, .scalar, encoder_hidden, 1, enc_seq_len, max_len);
         defer decoder.deinit();
         last_read_telemetry.kv_cache_mode = if (decoder.preallocated()) "preallocated" else "concat";
         logReadProfile("florence_decoder_kv_cache_build", cache_start);
@@ -1966,7 +1776,7 @@ fn florenceCudaGraphEnabled() bool {
     return platform.env.getenvBool("ANTFLY_INFERENCE_FLORENCE_CUDA_GRAPH");
 }
 
-fn recordCachedDecoderHeadEvents(events: cached_decoder.CachedDecoder(florence_arch).HeadEvents) void {
+fn recordCachedDecoderHeadEvents(events: FlorenceDecoder.HeadEvents) void {
     if (events.cuda_graph_replay) last_read_telemetry.cuda_graph_replay = true;
     last_read_telemetry.cuda_graph_replay_steps += events.cuda_graph_replay_steps;
     last_read_telemetry.cuda_graph_capture_steps += events.cuda_graph_capture_steps;

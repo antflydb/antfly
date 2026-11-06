@@ -11678,6 +11678,7 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
     if (!metal.metalDeviceAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const imported = @import("../backends/imported_onnx_session.zig");
+    const session_mod = @import("../backends/session.zig");
     const Graph = ml.graph.Graph;
     const Shape = ml.graph.Shape;
     const Tensor = @import("../backends/tensor.zig").Tensor;
@@ -11728,33 +11729,65 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
     for (&values, 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 17)) - 8)) / 32;
     var input = try Tensor.initFloat32(a, "x", &.{ rows, width }, &values);
     defer input.deinit();
-    // The first real compatibility call prepares ordinary source slots. Cold
-    // packed ownership is intentionally not fabricated for that first call.
-    {
-        var original = (try session.runResident(&.{input}, a)) orelse return error.MissingResidentResult;
-        defer original.deinit();
-        try std.testing.expectEqual(@as(u64, 0), session.executionDiagnostics().?.execution.?.runtime_region_plan_dispatches);
+    // Public admitted preparation chooses and pins the actual numerical
+    // specialization. The public root may be a format/cache owner without a
+    // physical pool; loader preparation may already have warmed source slots.
+    // This explicit admitted call uses its existing ordinary preparation ABI,
+    // rather than assuming the first normal Source call must be compatibility.
+    const target = warm: {
+        var permit = try session.admitInputs(&.{input}, a, null);
+        var permit_live = true;
+        defer if (permit_live) permit.deinit();
+        const selected = if (permit.prepared) |*value| value else return error.MissingPreparedInvocation;
+        const actual: *imported.ImportedOnnxSession = @ptrCast(@alignCast(selected.target));
+        try permit.prepareResidentOutputRetirement();
+        try permit.preparePhysicalStorage(a);
+        var sink = try session.model_lifetime.?.retainRetirementSink();
+        defer sink.release();
+        var guard = try sink.enter();
+        defer guard.finish();
+        defer if (permit_live) {
+            permit.deinitWithCleanup(.{ .boundary = &guard.epoch });
+            permit_live = false;
+        };
+        try permit.bindPhysicalCleanupEpoch(&guard.epoch);
+        var original = (try permit.runResident(&.{input}, a)) orelse return error.MissingResidentResult;
+        var original_live = true;
+        defer if (original_live) original.deinitWithBoundary(&guard.epoch);
         for (original.outputs, 0..) |output, index| {
-            const actual = try original.backend.toFloat32(output, a);
-            defer a.free(actual);
-            for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)), got, 0.0001);
+            const values_host = try original.backend.toFloat32(output, a);
+            defer a.free(values_host);
+            for (values_host, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)), got, 0.0001);
         }
-    }
-    const compute = impl.shared_backend_ctx.ctx.metal_hosted.compute;
+        original.deinitWithBoundary(&guard.epoch);
+        original_live = false;
+        _ = actual.model_lifetime.retain();
+        // Actual B protects physical/frame cleanup. The independent target pin
+        // retains only this real selected program for the following controls.
+        permit.deinitWithCleanup(.{ .boundary = &guard.epoch });
+        permit_live = false;
+        break :warm actual;
+    };
+    var target_pinned = true;
+    defer if (target_pinned) target.model_lifetime.releaseOutsideExecution();
+    const compute = target.shared_backend_ctx.ctx.metal_hosted.compute;
     const request = blk: {
-        var metadata = try @import("../execution/backend_operation.zig").enter(impl.cb, impl.executable.graph, null, .metadata);
+        var metadata = try @import("../execution/backend_operation.zig").enter(target.cb, target.executable.graph, null, .metadata);
         defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
-        const pool = impl.executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
-        break :blk (try @import("../ops/metal_compute.zig").MetalCompute.collectProjectionPackRequest(&impl.cb, impl.executable.graph, pool)) orelse return error.MissingWarmProjectionPackRequest;
+        const pool = target.executable.runtime.physical_pool orelse return error.MissingPhysicalPool;
+        break :blk (try @import("../ops/metal_compute.zig").MetalCompute.collectProjectionPackRequest(&target.cb, target.executable.graph, pool)) orelse return error.MissingWarmProjectionPackRequest;
     };
     const before = controller.snapshot();
     const sdk_before = @import("../backends/metal_tensor.zig").memoryStatsSnapshot();
+    const source_request = try session_mod.RunRequest.fromTensors(&.{input});
     for (0..2) |fail_index| {
         var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
         const previous_allocator = compute.allocator;
         compute.allocator = failing.allocator();
-        const outcome = @import("../ops/metal_compute.zig").MetalCompute.prepareProjectionPackOutsideExecution(&impl.cb, impl.executable.graph, request, &pin, .{ .outside_execution = true });
+        var source: session_mod.PreparedSource = .{};
+        const outcome = source.initBeforeExecutionInto(session, session, session.execution_gate, .{ .host = &.{input} }, source_request, null, .resident_consumer, a, null);
         compute.allocator = previous_allocator;
+        defer source.deinitOutsideExecution();
         try std.testing.expectError(error.OutOfMemory, outcome);
         try std.testing.expectEqualDeep(before, controller.snapshot());
         try std.testing.expectEqual(sdk_before.device_owned_buffers_created, @import("../backends/metal_tensor.zig").memoryStatsSnapshot().device_owned_buffers_created);
@@ -11812,34 +11845,34 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
         const cached = compute.packed_projection_entries orelse return error.MissingPackedProjectionEntry;
         const current_runtime = compute.provider_impl.raw_decode_runtime;
         try std.testing.expectEqual(@as(c_int, 3), metal.antfly_metal_packed_projection_is_cached(current_runtime, cached.owner.entry));
-        const resident = try impl.cb.ensureDeviceResidentOwned(try impl.cb.fromFloat32Shape(&values, &.{ rows, width }));
-        defer impl.cb.free(resident);
-        const pool = impl.executable.runtime.physical_pool.?;
+        const resident = try target.cb.ensureDeviceResidentOwned(try target.cb.fromFloat32Shape(&values, &.{ rows, width }));
+        defer target.cb.free(resident);
+        const pool = target.executable.runtime.physical_pool.?;
         const immutable = pool.immutable_bindings.?;
         var weights: [3]@import("../ops/ops.zig").CT = undefined;
-        for (impl.executable.graph.outputs.items, 0..) |node, index| weights[index] = (immutable.originalTensor(impl.executable.graph.node(node).inputs[1]) orelse return error.MissingProjectionWeight).value;
+        for (target.executable.graph.outputs.items, 0..) |node, index| weights[index] = (immutable.originalTensor(target.executable.graph.node(node).inputs[1]) orelse return error.MissingProjectionWeight).value;
         var sink = try session.model_lifetime.?.retainRetirementSink();
         defer sink.release();
         var guard = try sink.enter();
         defer guard.finish();
         const owner_references = cached.owner.references;
-        var operation = try @import("../execution/backend_operation.zig").enter(impl.cb, impl.executable.graph, null, .managed);
+        var operation = try @import("../execution/backend_operation.zig").enter(target.cb, target.executable.graph, null, .managed);
         defer operation.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
         try std.testing.expect(try operation.bindCleanupEpoch(&guard.epoch));
         var frame = try metal.AssignedDenseFrame.begin(current_runtime);
         defer frame.drain() catch platform.inference_process_supervisor.restartWorker();
         var outputs: [3]@import("../ops/ops.zig").CT = undefined;
         if (comptime count == 2) {
-            const pair = try impl.cb.linearNoBiasPair(resident, weights[0], weights[1], rows, width, width);
+            const pair = try target.cb.linearNoBiasPair(resident, weights[0], weights[1], rows, width, width);
             outputs[0] = pair.first;
             outputs[1] = pair.second;
         } else {
-            const triple = try impl.cb.linearNoBiasQkv(resident, weights[0], weights[1], weights[2], rows, width, width, width);
+            const triple = try target.cb.linearNoBiasQkv(resident, weights[0], weights[1], weights[2], rows, width, width, width);
             outputs[0] = triple.first;
             outputs[1] = triple.second;
             outputs[2] = triple.third;
         }
-        defer for (outputs[0..count]) |output| impl.cb.free(output);
+        defer for (outputs[0..count]) |output| target.cb.free(output);
         try frame.finish();
         try operation.finish();
         try std.testing.expectEqual(owner_references + 1, cached.owner.references);
@@ -11847,7 +11880,7 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
         try std.testing.expectEqual(owner_references, cached.owner.references);
         try std.testing.expectEqual(@as(c_int, 3), metal.antfly_metal_packed_projection_is_cached(current_runtime, cached.owner.entry));
         for (outputs[0..count], 0..) |output, index| {
-            const actual = try impl.cb.toFloat32(output, a);
+            const actual = try target.cb.toFloat32(output, a);
             defer a.free(actual);
             for (actual, &values) |got, value| try std.testing.expectApproxEqAbs(value * @as(f32, @floatFromInt(index + 1)), got, 0.0001);
         }
@@ -11857,18 +11890,18 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
     // drains only its own newly opened empty frame.
     {
         const compute_mod = @import("../ops/metal_compute.zig");
-        var copied_table = impl.cb.vtable.*;
+        var copied_table = target.cb.vtable.*;
         std.mem.doNotOptimizeAway(&copied_table);
-        try std.testing.expect(@intFromPtr(&copied_table) != @intFromPtr(impl.cb.vtable));
+        try std.testing.expect(@intFromPtr(&copied_table) != @intFromPtr(target.cb.vtable));
         const foreign = @import("../ops/ops.zig").ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied_table };
-        try std.testing.expectError(error.ForeignPreparedProjectionBackend, compute_mod.MetalCompute.claimPreparedProjectionProfile(&foreign, impl.executable.graph, request));
+        try std.testing.expectError(error.ForeignPreparedProjectionBackend, compute_mod.MetalCompute.claimPreparedProjectionProfile(&foreign, target.executable.graph, request));
         var sink = try session.model_lifetime.?.retainRetirementSink();
         defer sink.release();
         var guard = try sink.enter();
         defer guard.finish();
-        var claim = (try session.prepareProjectionPackBeforeExecution(&impl.cb, impl.executable.graph, request, .{ .boundary = &guard.epoch }, null)) orelse return error.MissingPreparedProjectionProfile;
+        var claim = (try session.prepareProjectionPackBeforeExecution(&target.cb, target.executable.graph, request, .{ .boundary = &guard.epoch }, null)) orelse return error.MissingPreparedProjectionProfile;
         defer claim.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
-        const profile_request = @import("../execution/region_execution_profile.zig").Request{ .operation = .graph_execution, .implementation = .{ .context = impl.cb.ptr, .table = impl.cb.vtable }, .program = impl.executable.graph };
+        const profile_request = @import("../execution/region_execution_profile.zig").Request{ .operation = .graph_execution, .implementation = .{ .context = target.cb.ptr, .table = target.cb.vtable }, .program = target.executable.graph };
         var other_graph_request = profile_request;
         other_graph_request.program = &graph;
         try std.testing.expectError(error.RegionExecutionProfileChanged, claim.validate(other_graph_request));
@@ -11899,6 +11932,8 @@ fn checkManagedPackedProjectionHead(comptime count: usize, comptime rows: usize)
     const second_snapshot = @import("../execution/architecture_session.zig").sharedCacheAdmissionSnapshot(second.session) orelse return error.MissingImportedManagedCache;
     try std.testing.expectEqual(first_snapshot.identity, second_snapshot.identity);
     try std.testing.expectEqualDeep(first_snapshot.amounts, second_snapshot.amounts);
+    target.model_lifetime.releaseOutsideExecution();
+    target_pinned = false;
     const first_runtime = handle.get().runtime_id;
     handle.release();
     handle_open = false;

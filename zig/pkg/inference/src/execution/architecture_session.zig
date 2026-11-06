@@ -11086,7 +11086,14 @@ test "foreign Metal public Whisper encoder final norm promotes before receiver a
     defer features[0].deinit();
     const Root = @import("owned_incremental_input.zig");
     const stages = @import("encoder_decoder_runtime.zig");
-    var cleanup = try Root.Cleanup.beginTaskWithoutEnclosingLanes(control);
+    var uncontrolled = try Root.Cleanup.beginForPairWithoutEnclosingLanes(encoder, destination, null);
+    defer uncontrolled.finish();
+    try std.testing.expect(uncontrolled == .unqualified);
+    var same = try Root.Cleanup.beginForPairWithoutEnclosingLanes(encoder, encoder, control);
+    defer same.finish();
+    try std.testing.expect(same == .unqualified);
+    var cleanup = try Root.Cleanup.beginForPairWithoutEnclosingLanes(encoder, destination, control);
+    try std.testing.expect(cleanup == .task);
     defer cleanup.finish();
     var permit = try encoder.admitInputs(&features, request_allocator, control);
     defer permit.deinit();
