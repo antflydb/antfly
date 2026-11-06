@@ -311,6 +311,8 @@ pub const ModelManifest = struct {
 
     // Files (allocated strings — absolute paths)
     onnx_path: ?[]const u8 = null,
+    /// Selected graph name under the captured directory, before resolving its leaf symlink.
+    onnx_logical_path: ?[]const u8 = null,
     safetensors_path: ?[]const u8 = null,
     safetensors_index_path: ?[]const u8 = null,
     gguf_path: ?[]const u8 = null,
@@ -525,6 +527,7 @@ pub const ModelManifest = struct {
     pub fn deinit(self: *ModelManifest) void {
         if (self.gliner_boundary_bundle) |*receipt| receipt.deinit();
         if (self.onnx_path) |p| self.allocator.free(p);
+        if (self.onnx_logical_path) |p| self.allocator.free(p);
         if (self.safetensors_path) |p| self.allocator.free(p);
         if (self.safetensors_index_path) |p| self.allocator.free(p);
         if (self.gguf_path) |p| self.allocator.free(p);
@@ -1556,7 +1559,7 @@ fn loadFromCatalog(allocator: std.mem.Allocator, catalog: *const ArtifactCatalog
     // explicitly resolved to its GGUF pair. The GGUF pair embeds projection
     // weights, so falling through to the default ONNX files would mix variants.
     if (!manifest.isClipclapGgufBundle()) {
-        if (manifest.onnx_path == null) manifest.onnx_path = try findFileInSubdirs(allocator, catalog, &onnx_candidates, &onnx_subdirs);
+        if (manifest.onnx_path == null) try findPrimaryOnnx(&manifest, catalog);
         if (manifest.visual_model_path == null) manifest.visual_model_path = try findFileInSubdirs(allocator, catalog, &visual_model_candidates, &onnx_subdirs);
         if (manifest.audio_model_path == null) manifest.audio_model_path = try findFileInSubdirs(allocator, catalog, &audio_model_candidates, &onnx_subdirs);
         if (manifest.text_projection_path == null) manifest.text_projection_path = try findFileInSubdirs(allocator, catalog, &text_projection_candidates, &onnx_subdirs);
@@ -1745,7 +1748,7 @@ pub fn loadListingFromDir(allocator: std.mem.Allocator, model_dir_path: []const 
     try applyListingGlinerHint(&manifest, allocator, &catalog);
 
     if (!manifest.isClipclapGgufBundle()) {
-        if (manifest.onnx_path == null) manifest.onnx_path = try findFileInSubdirs(allocator, &catalog, &onnx_candidates, &onnx_subdirs);
+        if (manifest.onnx_path == null) try findPrimaryOnnx(&manifest, &catalog);
         if (manifest.visual_model_path == null) manifest.visual_model_path = try findFileInSubdirs(allocator, &catalog, &visual_model_candidates, &onnx_subdirs);
         if (manifest.audio_model_path == null) manifest.audio_model_path = try findFileInSubdirs(allocator, &catalog, &audio_model_candidates, &onnx_subdirs);
         if (manifest.text_projection_path == null) manifest.text_projection_path = try findFileInSubdirs(allocator, &catalog, &text_projection_candidates, &onnx_subdirs);
@@ -2503,6 +2506,27 @@ fn findMetadataEntry(parsed: *const gguf_format.File, key: []const u8) ?*const g
         if (std.mem.eql(u8, entry.key, key)) return entry;
     }
     return null;
+}
+
+fn findPrimaryOnnx(manifest: *ModelManifest, catalog: *const ArtifactCatalog) !void {
+    const a = manifest.allocator;
+    for (onnx_subdirs) |subdir| for (onnx_candidates) |name| {
+        const relative = try std.fs.path.join(a, &.{ subdir, name });
+        defer a.free(relative);
+        if (try catalog.resolve(relative)) |path| {
+            errdefer a.free(path);
+            // A managed export can remap a root candidate into onnx/. Keep the
+            // selected member's logical directory, never the leaf target's.
+            const member = if (catalog.receipt != null) catalog.find(relative).?.path else relative;
+            const requested_base = try std.fs.path.join(a, &.{ catalog.model_dir_path, std.fs.path.dirname(member) orelse "." });
+            defer a.free(requested_base);
+            const base = try std.Io.Dir.cwd().realPathFileAlloc(std.Options.debug_io, requested_base, a);
+            defer a.free(base);
+            manifest.onnx_logical_path = try std.fs.path.join(a, &.{ base, std.fs.path.basename(member) });
+            manifest.onnx_path = path;
+            return;
+        }
+    };
 }
 
 fn findFileInSubdirs(
@@ -8526,6 +8550,7 @@ test "manifest clone owns metadata and unwinds every allocation failure" {
     const source = ModelManifest{
         .allocator = allocator,
         .gguf_path = "model.gguf",
+        .onnx_logical_path = "/captured/onnx/model.onnx",
         .config_model_arch = "qwen3",
         .embedding_style = .qwen3_embedding,
         .hidden_size = 1024,

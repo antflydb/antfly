@@ -158,6 +158,14 @@ pub const PublishedArtifacts = struct {
             else => return err,
         };
     }
+    /// Component discovery retains the selected filename and dependency base.
+    /// The cold constructor will pin the leaf target separately. Resolve first
+    /// to enforce receipt membership and containment before exposing this name.
+    pub fn resolveModel(self: *const PublishedArtifacts, relative: []const u8) !?[]u8 {
+        const canonical = (try self.resolve(relative)) orelse return null;
+        defer self.allocator.free(canonical);
+        return try std.fs.path.join(self.allocator, &.{ self.physical_root, relative });
+    }
     /// Verify bytes actually read/mapped, avoiding a hash-then-reopen race.
     pub fn verifyBytes(self: *const PublishedArtifacts, relative: []const u8, bytes: []const u8) !void {
         if (self.receipt) |*receipt| {
@@ -187,9 +195,11 @@ pub const PublishedArtifacts = struct {
         defer self.allocator.free(absolute);
         if (self.canonical_index.get(absolute)) |index| return index;
         if (self.direct_path) |direct| if (std.mem.eql(u8, absolute, direct)) return self.direct_index orelse error.InvalidManagedDownload;
-        if (managed.pathIsWithinRoot(self.requested_root, absolute)) {
-            const offset = self.requested_root.len + @intFromBool(!std.fs.path.isSep(self.requested_root[self.requested_root.len - 1]));
-            if (self.receipt.?.path_index.get(absolute[offset..])) |index| return index;
+        for ([_][]const u8{ self.requested_root, self.physical_root }) |root| {
+            if (managed.pathIsWithinRoot(root, absolute)) {
+                const offset = root.len + @intFromBool(!std.fs.path.isSep(root[root.len - 1]));
+                if (self.receipt.?.path_index.get(absolute[offset..])) |index| return index;
+            }
         }
         return error.InvalidManagedDownload;
     }
@@ -263,9 +273,12 @@ pub const PublishedArtifacts = struct {
     /// importer can read it. Callers retain a shared publication lease through
     /// construction and call verify() before publishing the resulting session.
     pub fn verifyOnnx(self: *PublishedArtifacts, path: []const u8) !void {
+        return self.verifyOnnxWithBase(path, null);
+    }
+    pub fn verifyOnnxWithBase(self: *PublishedArtifacts, path: []const u8, external_base_dir: ?[]const u8) !void {
         if (self.receipt == null) return;
         try self.verifyPath(path);
-        var graph = try @import("../backends/imported_onnx_session.zig").inspectArtifactSet(self.allocator, path);
+        var graph = try @import("../backends/imported_onnx_session.zig").inspectArtifactSetWithBase(self.allocator, path, external_base_dir);
         defer graph.deinit();
         for (graph.external_paths) |external| try self.verifyPath(external);
     }
