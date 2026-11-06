@@ -18564,6 +18564,25 @@ fn nativeWhisperAssignedSourceCase(a: std.mem.Allocator, admitted: bool) !void {
     var decoder = (try whisperNativeDecoder(session, a, null, &hidden, 2)).?;
     var decoder_open = true;
     defer if (decoder_open) decoder.deinit();
+    if (decoder.cache.native_program == null) {
+        // Unexpected compatibility in this positive fixture must reveal the
+        // SAME cold constructor's original error-return trace. Release the
+        // actual numerical decoder/gate/B before making that cold query;
+        // never retry or substitute numerical execution after dispatch.
+        decoder.deinit();
+        decoder_open = false;
+        try std.testing.expect(session.execution_gate.?.tryLock());
+        session.execution_gate.?.unlock();
+        var diagnostic_cleanup = try ReceiverCleanup.beginForOwnedGate(session);
+        defer diagnostic_cleanup.finish();
+        const diagnostic_config = owner.arch_config.whisper;
+        const diagnostic_geometry = try whisper_arch.CacheGeometry.init(diagnostic_config, 2);
+        var diagnostic_base = try incrementalBasePermit(session, diagnostic_config, diagnostic_geometry, false, false);
+        defer diagnostic_base.deinit();
+        const attempted = (try prepareColdNativeWhisper(session, a, null, diagnostic_config, diagnostic_geometry, &diagnostic_base, .{ .host = &hidden })) orelse return error.NativeWhisperColdPreparationDeclined;
+        defer attempted.destroy(.{ .boundary = diagnostic_cleanup.boundary() });
+        return error.NativeWhisperColdPreparedButNotInstalled;
+    }
     try std.testing.expect(decoder.cache.native_program != null);
     const program = &decoder.cache.native_program.?;
     const frame = program.schedule.frame.?;
