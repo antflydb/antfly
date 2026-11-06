@@ -7232,7 +7232,7 @@ pub const ModelManager = struct {
         defer construction_proof.deinit();
         if (construction_proof.owned != null) construction_proof.artifacts().verification_cache = &self.verified_artifacts;
         const construction_path = try construction_proof.artifacts().constructionPath(model_path);
-        defer self.allocator.free(construction_path);
+        defer construction_proof.artifacts().allocator.free(construction_path);
         try construction_proof.verifyPath(construction_path);
         var device_order_scratch: backends.BackendOrderBuffer = undefined;
         const available_backends = try source_session_manager.executionBackendOrder(&device_order_scratch, preferred_backends, control);
@@ -11813,7 +11813,7 @@ fn loadSessionForPreferredBackendsWithArtifacts(
     defer proof.deinit();
     if (proof.owned != null) proof.artifacts().verification_cache = &manager.verified_artifacts;
     const construction_root = try proof.artifacts().constructionPath(model_dir);
-    defer manager.allocator.free(construction_root);
+    defer proof.artifacts().allocator.free(construction_root);
     var verified_onnx_path: ?[]const u8 = null;
     var device_order_scratch: backends.BackendOrderBuffer = undefined;
     const available_backends = try source_session_manager.executionBackendOrder(&device_order_scratch, preferred_backends, control);
@@ -11866,7 +11866,7 @@ fn loadSessionForPreferredBackendsWithArtifacts(
             !backend.supportsKernelJitSession()) continue;
         const selected_path = preferredModelPathForBackend(model_dir, man, backend) orelse continue;
         const candidate_path = try proof.artifacts().constructionPath(selected_path);
-        defer manager.allocator.free(candidate_path);
+        defer proof.artifacts().allocator.free(candidate_path);
         // Reuse the manifest and checksum proofs already acquired by the
         // primary loader. Graph inspection is shared across backend retries.
         if (std.mem.endsWith(u8, candidate_path, ".onnx")) {
@@ -18275,7 +18275,7 @@ test "model selection legacy Whisper metadata growth cannot exceed its admission
 test "component and primary construction reject same-receipt namespace retargets" {
     const a = std.testing.allocator;
     const io = std.testing.io;
-    for ([_]bool{ false, true }) |primary| {
+    for (0..3) |loader| {
         for ([_]bool{ false, true }) |direct_file| {
             var tmp = std.testing.tmpDir(.{});
             defer tmp.cleanup();
@@ -18335,10 +18335,18 @@ test "component and primary construction reject same-receipt namespace retargets
             defer manager.deinit();
             const selected = ResolvedModel{ .path = alias, .publication = try managed_receipt.publicationGeneration(a, io, alias) };
             const control = selected.bind(InferenceExecutionControl{ .io = counted, .request_owned = false, .native_call_policy = .in_process, .ptr = &probe, .check_fn = Probe.check });
-            if (primary) {
+            if (loader != 0) {
                 var man = try manifest_mod.loadFromDir(a, alias);
                 defer man.deinit();
-                try std.testing.expectError(error.ModelArtifactsChanging, loadSessionForPreferredBackends(&manager, &.{.native}, alias, man, &manager.session_manager, control));
+                if (loader == 2) {
+                    var tracking = std.testing.FailingAllocator.init(a, .{});
+                    {
+                        var artifacts = try PublishedArtifacts.init(tracking.allocator(), counted, alias, null);
+                        defer artifacts.deinit();
+                        try std.testing.expectError(error.ModelArtifactsChanging, loadSessionForPreferredBackendsWithArtifacts(&manager, &.{.native}, alias, man, &manager.session_manager, control, &artifacts));
+                    }
+                    try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
+                } else try std.testing.expectError(error.ModelArtifactsChanging, loadSessionForPreferredBackends(&manager, &.{.native}, alias, man, &manager.session_manager, control));
             } else {
                 try std.testing.expectError(error.ModelArtifactsChanging, manager.loadManagedSessionWithAdmission(alias, &.{.native}, null, control, selected, null));
             }
@@ -18353,7 +18361,7 @@ test "component and primary construction reject same-receipt namespace retargets
     }
 }
 
-test "Whisper prompt cache propagates tokenizer resource failures propagates tokenizer resource failures" {
+test "Whisper prompt cache propagates tokenizer resource failures" {
     const a = std.testing.allocator;
     const tok = try hf_tokenizer.HfTokenizer.loadFromBytes(a,
         \\{"version":"1.0","added_tokens":[{"id":0,"content":"<unk>"},{"id":10,"content":"<|en|>"},{"id":12,"content":"<|transcribe|>"},{"id":13,"content":"<|notimestamps|>"}],"model":{"type":"BPE","vocab":{"<unk>":0,"<|en|>":10,"<|transcribe|>":12,"<|notimestamps|>":13},"merges":[]}}
@@ -18378,7 +18386,7 @@ test "Whisper prompt cache propagates tokenizer resource failures propagates tok
     const wrapped = tokenizer_mod.Tokenizer{ .ptr = &wrapper, .vtable = &Wrapper.vtable };
     for ([_]anyerror{ error.OutOfMemory, error.Cancelled, error.ResourceLimitExceeded }) |failure| {
         wrapper.failure = failure;
-        for ([_][]const u8{ "<|en|>", "<|transcribe|>", "<|notimestamps|>", "<|startofprev|>", "<|endoftext|>", "<|0.00|>", " -", "!", "♩", " " }) |fail_text| {
+        for ([_][]const u8{ "<|en|>", "<|transcribe|>", "<|notimestamps|>", "<|startofprev|>", "<|endoftext|>", "<|0.00|>", " -", "#", " #", "♩", " ♩", " " }) |fail_text| {
             wrapper.fail_text = fail_text;
             try std.testing.expectError(failure, whisper_prompt.PromptCache.initFromBytes(a, null, null, wrapped));
         }

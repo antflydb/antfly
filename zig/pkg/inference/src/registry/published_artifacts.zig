@@ -782,7 +782,8 @@ test "model selection construction keeps captured root and directory targets" {
             defer a.free(nested);
             try tmp.dir.createDirPath(io, nested);
         }
-        if (managed_model) try tmp.dir.writeFile(io, .{ .sub_path = "first/.antfly-download-complete.json", .data = "{\"version\":2,\"artifacts\":[]}" });
+        try tmp.dir.writeFile(io, .{ .sub_path = "first/encoder/model.gguf", .data = "aaaa" });
+        if (managed_model) try tmp.dir.writeFile(io, .{ .sub_path = "first/.antfly-download-complete.json", .data = "{\"version\":2,\"artifacts\":[{\"path\":\"encoder/model.gguf\",\"size\":4}]}" });
         try tmp.dir.symLink(io, "first", "current", .{ .is_directory = true });
         const root = try tmp.dir.realPathFileAlloc(io, ".", a);
         defer a.free(root);
