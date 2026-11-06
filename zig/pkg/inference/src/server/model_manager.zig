@@ -6186,6 +6186,20 @@ test "A4B GPU admission lease equals the configured memory envelope" {
 
 test "CUDA A4B serving reuses retained workspace and unwinds failed requests" {
     const memory = runtime.tier.memory;
+    const Reject = struct {
+        // A failing assertion must still retire an unexpectedly successful
+        // resource/workspace lease before the fixture tears down its owners.
+        fn expect(expected: anyerror, result: anytype) !void {
+            if (result) |value| {
+                var lease = value;
+                lease.release();
+                std.testing.failPrint("expected error.{s}, found a successful lease\n", .{@errorName(expected)});
+                return error.TestExpectedError;
+            } else |actual| {
+                try std.testing.expectError(expected, @as(anyerror!void, actual));
+            }
+        }
+    };
     for ([_]?backend_contracts.A4bInferenceRequest{ null, .{ .residency_mode = .resident, .memory_budget_mb = 24 * 1024 } }) |request| {
         const config = try backend_contracts.buildCudaA4bInferenceConfig(request, backend_contracts.qualified_a4b_geometries[0]);
         const plan = a4bGpuModelLoadAdmission(config, 4 * 1024 * 1024 * 1024, .cuda);
@@ -6246,7 +6260,7 @@ test "CUDA A4B serving reuses retained workspace and unwinds failed requests" {
         // The old strict operator cap remains strict: actual mandatory host
         // metadata cannot be paid by the precharged device workspace.
         try std.testing.expect(host_metadata > strict_host_limits.host_limit_bytes);
-        try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireGenerationResources(&.{.{
+        try Reject.expect(error.ResourceLimitExceeded, manager.acquireGenerationResources(&.{.{
             .session = session,
             .resources = .{ .backend_class = .gpu, .limits = strict_host_limits, .amounts = try memory.AdmissionAmounts.fromEstimate(estimate) },
         }}));
@@ -6256,6 +6270,7 @@ test "CUDA A4B serving reuses retained workspace and unwinds failed requests" {
             .session = session,
             .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = try runtime.tier.memory.AdmissionAmounts.fromEstimate(estimate) },
         }});
+        defer prompt_lease.release();
         try std.testing.expectEqual(host_metadata, estimate.host_metadata_bytes);
         const with_request_host = try plan.resident.merge(.{ .host_scratch_bytes = estimate.host_metadata_bytes });
         try std.testing.expectEqualDeep(with_request_host, controller.snapshot());
@@ -6264,38 +6279,45 @@ test "CUDA A4B serving reuses retained workspace and unwinds failed requests" {
         try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
         const one_byte = memory.AdmissionAmounts{ .backend_scratch_bytes = 1 };
         // AJ's reproduction: preserving the floor alone still double-charges.
-        try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.gpu, limits, one_byte, false));
+        try Reject.expect(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.gpu, limits, one_byte, false));
         var requests = [_]GenerationAdmissionRequest{.{ .session = session, .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = one_byte } }};
         var ordinary = try manager.acquireGenerationResources(&requests);
+        defer ordinary.release();
         try std.testing.expectEqualDeep(plan.resident, controller.snapshot());
         ordinary.release();
         // A streaming lifetime can hold the complete KV/scratch allowance;
         // another borrower cannot spend the same bytes until it releases.
         requests[0].resources.amounts = workspace.capacity;
         var streaming = try manager.acquireGenerationResources(&requests);
+        defer streaming.release();
         try std.testing.expectEqualDeep(plan.resident, controller.snapshot());
         requests[0].resources.amounts = one_byte;
-        try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireGenerationResources(&requests));
+        try Reject.expect(error.ResourceTemporarilyUnavailable, manager.acquireGenerationResources(&requests));
         streaming.release();
         var retry = try manager.acquireGenerationResources(&requests);
+        defer retry.release();
         retry.release();
         // Operator caps still apply even when the global request increment is zero.
         inline for (.{ memory.Limits{ .backend_limit_bytes = limits.backend_limit_bytes - 1 }, memory.Limits{ .combined_limit_bytes = limits.backend_limit_bytes - 1 }, memory.Limits{ .kv_limit_bytes = plan.resident.backend_kv_bytes - 1 }, memory.Limits{ .scratch_limit_bytes = plan.resident.backend_scratch_bytes - 1 } }) |cap| {
             requests[0].resources.limits = memory.applyLimitOverrides(limits, cap);
-            try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireGenerationResources(&requests));
+            try Reject.expect(error.ResourceTemporarilyUnavailable, manager.acquireGenerationResources(&requests));
             try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
         }
         requests[0].resources.limits = limits;
         requests[0].resources.amounts = .{ .backend_kv_bytes = workspace.capacity.backend_kv_bytes + 1 };
-        try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireGenerationResources(&requests));
+        try Reject.expect(error.ResourceLimitExceeded, manager.acquireGenerationResources(&requests));
         requests[0].resources.amounts = .{ .backend_scratch_bytes = workspace.capacity.backend_scratch_bytes + 1 };
-        try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireGenerationResources(&requests));
-        // Host work remains charged; a rejected host request restores credits.
+        try Reject.expect(error.ResourceLimitExceeded, manager.acquireGenerationResources(&requests));
+        // The original 1024-byte operator cap rejects 1025 host bytes,
+        // independently of the larger mandatory-metadata positive policy.
+        requests[0].resources.limits = strict_host_limits;
         requests[0].resources.amounts = .{ .backend_scratch_bytes = 1, .host_weight_bytes = 1025 };
-        try std.testing.expectError(error.ResourceLimitExceeded, manager.acquireGenerationResources(&requests));
+        try Reject.expect(error.ResourceLimitExceeded, manager.acquireGenerationResources(&requests));
         try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
+        requests[0].resources.limits = limits;
         requests[0].resources.amounts = .{ .backend_scratch_bytes = 1, .host_weight_bytes = 8 };
         var host = try manager.acquireGenerationResources(&requests);
+        defer host.release();
         try std.testing.expectEqual(@as(usize, 8), controller.snapshot().host_weight_bytes);
         host.release();
         // Target borrowing must unwind if admission of a second session fails.
@@ -6304,7 +6326,7 @@ test "CUDA A4B serving reuses retained workspace and unwinds failed requests" {
             .session = .{ .ptr = &workspace, .vtable = undefined },
             .resources = .{ .backend_class = .gpu, .limits = limits, .amounts = .{ .backend_weight_bytes = 1 } },
         } };
-        try std.testing.expectError(error.ResourceTemporarilyUnavailable, manager.acquireGenerationResources(&pair));
+        try Reject.expect(error.ResourceTemporarilyUnavailable, manager.acquireGenerationResources(&pair));
         try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, workspace.borrowed.snapshot());
         try std.testing.expectEqualDeep(plan.resident, controller.snapshot());
     }
