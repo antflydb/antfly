@@ -594,9 +594,9 @@ test "lite secrets publication errors distinguish rollback from uncertain outcom
     var vtable = std.Options.debug_io.vtable.*;
     vtable.fileSync = SyncFault.fileSync;
     const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
-    for (1..5) |scenario| {
-        const fail_sync = (scenario - 1) % 2 + 1;
-        const removing = scenario > 2;
+    for ([_]bool{ false, true }) |proof| for (1..@as(usize, if (proof) 3 else 5)) |scenario| {
+        const fail_sync = if (proof) 1 else (scenario - 1) % 2 + 1;
+        const removing = if (proof) scenario == 2 else scenario > 2;
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(alloc, tmp);
@@ -605,6 +605,7 @@ test "lite secrets publication errors distinguish rollback from uncertain outcom
         {
             var docs = try docstore.Store.createWithOptions(alloc, path, .{ .exclusive = true, .io = io });
             defer docs.close();
+            docs.file.test_force_two_barrier_commit = !proof;
             docs.maintenance_start_suppressed = true;
             var store = try Store.init(alloc, &docs, "scope", provider.provider());
             defer store.deinit();
@@ -615,9 +616,9 @@ test "lite secrets publication errors distinguish rollback from uncertain outcom
             defer SyncFault.remaining = 0;
             const writer = store.nativeStore().?.writer;
             const mutation = if (removing) writer.removeOverride("scope", "key", .{ .exact = 1 }) else writer.put("scope", "key", "after", .{ .exact = 1 });
-            try std.testing.expectError(if (fail_sync == 1) error.InputOutput else error.OutcomeUnknown, mutation);
+            try std.testing.expectError(if (!proof and fail_sync == 1) error.InputOutput else error.OutcomeUnknown, mutation);
             try std.testing.expectEqual(@as(usize, 0), SyncFault.remaining);
-            if (fail_sync == 1) {
+            if (!proof and fail_sync == 1) {
                 try expectValue(&other, "key", "before", 1);
                 try std.testing.expect(!docs.secret_store_uncertain);
                 try std.testing.expect((try docs.checkWithCancel(null)).valid);
@@ -641,7 +642,7 @@ test "lite secrets publication errors distinguish rollback from uncertain outcom
             try std.testing.expectEqual(result.revision, result.value.?.revision);
             try std.testing.expectEqualStrings(if (result.revision == 1) "before" else "after", result.value.?.secret.bytes);
         }
-    }
+    };
 }
 
 test "lite secrets preserve index commits made during wrapping and reject stale read-only snapshots" {

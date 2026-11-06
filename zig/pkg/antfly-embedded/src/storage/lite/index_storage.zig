@@ -79,6 +79,7 @@ pub const Store = struct {
         .rename_absolute = renameAbsolute,
         .delete_file_absolute = deleteFileAbsolute,
         .delete_files_absolute = deleteFilesAbsolute,
+        .retire_text_segments = retireTextSegments,
         .delete_tree = deleteTree,
         .list_file_names_alloc = listFileNamesAlloc,
         .list_directory_names_alloc = listDirectoryNamesAlloc,
@@ -793,6 +794,60 @@ fn renameAbsolute(ptr: *anyopaque, old_path: []const u8, new_path: []const u8) !
         coordinator.forgetWalCheckpoints(old_path);
         coordinator.forgetWalCheckpoints(new_path);
     }
+}
+
+/// The marker and active membership are checked against the current native
+/// transaction, not a detached runtime. This remains safe when a stale cleanup
+/// callback races index replacement or an ID is reused in a newer generation.
+fn retireTextSegments(ptr: *anyopaque, root: []const u8, ids: []const u64) !bool {
+    const self: *Store = @ptrCast(@alignCast(ptr));
+    if (ids.len > StorageIo.max_atomic_file_deletions) return error.FileDeletionBatchTooLarge;
+    try validateWritePath(self, root);
+    const Retirement = struct {
+        allocator: Allocator,
+        root: []const u8,
+        ids: []const u64,
+        handled: bool = false,
+        fn apply(raw: *anyopaque, file: *native.NativeFile) !void {
+            const request: *@This() = @ptrCast(@alignCast(raw));
+            var arena = std.heap.ArenaAllocator.init(request.allocator);
+            defer arena.deinit();
+            const a = arena.allocator();
+            // Optional cleanup must not move a detached allocator proof under
+            // its short writer lease. At a hard cap, yield to a checked owner;
+            // otherwise the ordinary append-only allocator is sufficient.
+            if (file.max_file_bytes != null and !file.free_pages_verified) return error.EnrichmentWaitCanceled;
+            const namespaces = @import("namespace_store.zig");
+            const main = try std.mem.concat(a, u8, &.{ request.root, "/index" });
+            const generation_key = try std.mem.concat(a, u8, &.{ main, "/.native-state/generation" });
+            const generation = (try file.getIndexCatalogRecordAlloc(a, generation_key)) orelse return;
+            if (generation.len != 21 or !std.mem.startsWith(u8, generation, "AFNS1")) return error.InvalidNativeIndexGeneration;
+            const legacy = try namespaces.catalogKey(a, main, .{ .name = "meta" }, "active_segments");
+            if (try file.getIndexCatalogRecordSize(legacy) != null) return;
+            var mutations = std.ArrayListUnmanaged(native.CatalogMutation).empty;
+            try mutations.ensureTotalCapacity(a, request.ids.len * 2);
+            for (request.ids) |id| {
+                const suffix = std.mem.toBytes(std.mem.nativeToBig(u64, id));
+                const active = try namespaces.catalogKey(a, main, .{ .name = "meta" }, try std.mem.concat(a, u8, &.{ "active_segment:", &suffix }));
+                if (try file.getIndexCatalogRecordSize(active) != null) return error.ArtifactStillActive;
+                const retired = try namespaces.catalogKey(a, main, .{ .name = "meta" }, try std.mem.concat(a, u8, &.{ "retired_segment:", &suffix }));
+                const marker = try file.getIndexCatalogRecordAlloc(a, retired);
+                const path = try std.fmt.allocPrint(a, "{s}/segments/{d}.seg", .{ request.root, id });
+                if (marker) |value| {
+                    if (!std.mem.eql(u8, value, &.{1})) return error.InvalidRetiredSegmentMetadata;
+                } else if (try file.getIndexCatalogRecordSize(path) != null) return error.UnprovenArtifactRetirement;
+                mutations.appendAssumeCapacity(.{ .key = path, .is_delete = true });
+                mutations.appendAssumeCapacity(.{ .key = retired, .is_delete = true });
+            }
+            // Verify the entire cohort before staging any unlink. Neither the
+            // namespace generation nor the scoped semantic identity changes.
+            try file.retireIndexCatalogRecords(mutations.items);
+            request.handled = true;
+        }
+    };
+    var request: Retirement = .{ .allocator = self.allocator, .root = root, .ids = ids };
+    try self.docs.submitArtifactRetirement(&request, Retirement.apply);
+    return request.handled;
 }
 
 fn deleteFileAbsolute(ptr: *anyopaque, path: []const u8) !void {
@@ -4051,7 +4106,7 @@ test "lite native replay publication sync failures recover one metadata artifact
     var vtable = std.testing.io.vtable.*;
     vtable.fileSync = Fault.sync;
     const io = std.Io{ .userdata = std.testing.io.userdata, .vtable = &vtable };
-    for ([_]usize{ 128, 256 * 1024 + 1 }) |length| for (1..3) |fail_sync| {
+    for ([_]bool{ false, true }) |proof| for ([_]usize{ 128, 256 * 1024 + 1 }) |length| for (1..@as(usize, if (proof) 2 else 3)) |fail_sync| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(a, tmp, "publication-sync.aflite");
@@ -4059,6 +4114,7 @@ test "lite native replay publication sync failures recover one metadata artifact
         {
             var docs = try docstore.Store.createWithOptions(a, path, .{ .exclusive = true, .io = io });
             defer docs.close();
+            docs.file.test_force_two_barrier_commit = !proof;
             docs.maintenance_start_suppressed = true;
             var indexes = Store.initWithNamespace(a, &docs, "/index");
             const storage = indexes.storage();
@@ -4082,9 +4138,9 @@ test "lite native replay publication sync failures recover one metadata artifact
             defer Fault.target = null;
             Fault.remaining = fail_sync;
             defer Fault.remaining = 0;
-            try std.testing.expectError(if (fail_sync == 1) error.InputOutput else error.OutcomeUnknown, storage.appendPublication("/index/wal/1", "after", true, participant));
+            try std.testing.expectError(if (!proof and fail_sync == 1) error.InputOutput else error.OutcomeUnknown, storage.appendPublication("/index/wal/1", "after", true, participant));
             try std.testing.expectEqual(@as(usize, 0), Fault.remaining);
-            if (fail_sync == 2) try std.testing.expectError(error.OutcomeReconciliationRequired, storage.appendPublication("/index/wal/1", "again", true, participant));
+            if (proof or fail_sync == 2) try std.testing.expectError(error.OutcomeReconciliationRequired, storage.appendPublication("/index/wal/1", "again", true, participant));
         }
         var reopened = try native.NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true });
         defer reopened.close();
@@ -4096,7 +4152,7 @@ test "lite native replay publication sync failures recover one metadata artifact
         defer if (metadata) |bytes| a.free(bytes);
         const committed = std.mem.eql(u8, wal, "beforeafter");
         try std.testing.expect(committed or std.mem.eql(u8, wal, "before"));
-        if (fail_sync == 1) try std.testing.expect(!committed);
+        if (!proof and fail_sync == 1) try std.testing.expect(!committed);
         try std.testing.expectEqual(committed, alias != null);
         try std.testing.expectEqual(committed, metadata != null);
         if (committed) {
@@ -4615,5 +4671,68 @@ test "lite native vector metadata reopens without an inner LSM" {
         try std.testing.expectEqual(@as(usize, 2), results.getHits().len);
         try std.testing.expectEqual(@as(u64, 1), results.getHits()[0].vector_id);
     }
+    try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "lite typed text retirement preserves semantic plans and refuses active aliases atomically" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "typed-retirement.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &docs);
+    const storage = adapter.storage();
+    var namespaces = try @import("namespace_store.zig").Backend.open(a, &docs, "/indexes/text/index", false);
+    defer namespaces.deinit();
+    const ns: @import("../backend_types.zig").Namespace = .{ .name = "meta" };
+    const one = std.mem.toBytes(std.mem.nativeToBig(u64, 1));
+    const two = std.mem.toBytes(std.mem.nativeToBig(u64, 2));
+    const retired_one = "retired_segment:" ++ one;
+    const retired_two = "retired_segment:" ++ two;
+    const active_two = "active_segment:" ++ two;
+    {
+        var seed = try namespaces.beginWrite();
+        errdefer seed.abort();
+        try seed.put(ns, retired_one, &.{1});
+        try seed.put(ns, active_two, &.{1});
+        try seed.commit();
+    }
+    try storage.writeFileAbsolute("/indexes/text/segments/1.seg", "retired");
+    try storage.writeFileAbsolute("/indexes/text/segments/2.seg", "active");
+    const before = docs.file.activeCheckpoint();
+    try std.testing.expectError(error.ArtifactStillActive, storage.retireTextSegments("/indexes/text", &.{ 1, 2 }));
+    try std.testing.expectEqualDeep(before, docs.file.activeCheckpoint());
+    try std.testing.expectEqual(@as(?u64, 7), try docs.file.getIndexCatalogRecordSize("/indexes/text/segments/1.seg"));
+    var prepared = try namespaces.beginWrite();
+    errdefer prepared.abort();
+    try prepared.put(ns, "unrelated-semantic-update", "ready");
+    const identity = (try docs.file.indexScopeIdentity("/indexes/text")).?;
+    try std.testing.expect(try storage.retireTextSegments("/indexes/text", &.{1}));
+    try std.testing.expectEqual(identity, (try docs.file.indexScopeIdentity("/indexes/text")).?);
+    try std.testing.expectEqualDeep(before.logical, docs.file.activeCheckpoint().logical);
+    try std.testing.expectEqual(@as(?u64, null), try docs.file.getIndexCatalogRecordSize("/indexes/text/segments/1.seg"));
+    try std.testing.expectEqual(@as(?u64, 6), try docs.file.getIndexCatalogRecordSize("/indexes/text/segments/2.seg"));
+    // The exact namespace generation remains current through physical cleanup.
+    try prepared.commit();
+    var read = try namespaces.beginRead();
+    defer read.abort();
+    try std.testing.expectError(error.NotFound, read.get(ns, retired_one));
+    try std.testing.expectEqualStrings("ready", try read.get(ns, "unrelated-semantic-update"));
+    // Missing path+marker is an idempotent completed retirement. A bare
+    // unreferenced file is not sufficient authority for another unlink.
+    try std.testing.expect(try storage.retireTextSegments("/indexes/text", &.{1}));
+    try storage.writeFileAbsolute("/indexes/text/segments/3.seg", "unproven");
+    try std.testing.expectError(error.UnprovenArtifactRetirement, storage.retireTextSegments("/indexes/text", &.{3}));
+    {
+        var retire = try namespaces.beginWrite();
+        errdefer retire.abort();
+        try retire.delete(ns, active_two);
+        try retire.put(ns, retired_two, &.{1});
+        try retire.commit();
+    }
+    try std.testing.expect(try storage.retireTextSegments("/indexes/text", &.{2}));
     try std.testing.expect((try docs.file.check()).valid);
 }

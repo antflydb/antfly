@@ -1160,6 +1160,7 @@ pub const WriteOptions = struct {
     payload_cache: enum { normal, cold_sequential } = .normal,
 };
 
+const commit_proof = @import("commit_proof.zig");
 const recovery_agenda = @import("recovery_agenda.zig");
 pub const replay_admission = @import("replay_admission.zig");
 pub const semantic_revision = @import("semantic_revision.zig");
@@ -1173,9 +1174,10 @@ const revision10_magic = "AFLITE\x0aP";
 const revision11_magic = "AFLITE\x0bP";
 const revision12_magic = "AFLITE\x0cP";
 const revision13_magic = "AFLITE\x0dP";
-const indexed_magic = "AFLITE\x0eP";
+const revision14_magic = "AFLITE\x0eP";
+const indexed_magic = "AFLITE\x0fP";
 pub const format_version: u32 = 3;
-pub const indexed_format_version: u32 = 14;
+pub const indexed_format_version: u32 = 15;
 pub const default_page_size: u32 = 4096;
 
 test "lite reclamation catalog snapshots visit live indexes rather than history" {
@@ -1951,6 +1953,11 @@ const checkpoint_slots_offset: usize = 64;
 const checkpoint_slots_end: usize = checkpoint_slots_offset + checkpoint_slot_count * checkpoint_slot_size;
 const logical_generations_size: usize = 48;
 const logical_generations_end = checkpoint_slots_end + checkpoint_slot_count * logical_generations_size;
+const proof_reference_size: usize = 48;
+const proof_references_offset: usize = logical_generations_end;
+const proof_references_end = proof_references_offset + checkpoint_slot_count * proof_reference_size;
+const durability_witnesses_offset = proof_references_end;
+const durability_witnesses_end = durability_witnesses_offset + 2 * commit_proof.witness_size;
 const checkpoint_slot_payload_size: usize = 64;
 const checkpoint_slot_checksum_offset: usize = checkpoint_slot_payload_size;
 const header_checksum_offset: usize = header_size - 4;
@@ -3877,6 +3884,7 @@ pub const LogicalGenerations = struct {
 };
 
 pub const CheckpointSlot = struct {
+    proof: commit_proof.Reference = .{},
     logical: LogicalGenerations = .{},
     commit_sequence: u64 = 0,
     catalog_root_page: u64 = 0,
@@ -4817,6 +4825,7 @@ const PageWriteBatch = struct {
             start = end;
         }
         for (self.page_ids[0..count], 0..) |page_id, i| {
+            if (file.transaction_postimages) |*images| images.note(file.allocator, page_id, self.pageBytes(i));
             file.cacheWrittenPage(page_id, self.pageBytes(i), self.options);
             self.occupied &= ~(@as(u16, 1) << @intCast(self.buffer_slots[i]));
         }
@@ -4899,7 +4908,14 @@ test "lite header fingerprints cache unchanged state and fence every header fiel
         if (comptime std.mem.eql(u8, field, "checkpoints")) {
             inline for (0..checkpoint_slot_count) |slot| {
                 inline for (@typeInfo(CheckpointSlot).@"struct".field_names) |checkpoint_field| {
-                    if (comptime std.mem.eql(u8, checkpoint_field, "logical")) {
+                    if (comptime std.mem.eql(u8, checkpoint_field, "proof")) {
+                        file.header = original;
+                        file.header.indexed_reclamation = true;
+                        const indexed_before = NativeFile.fingerprintHeader(file.header);
+                        file.header.checkpoints[slot].proof = .{ .root = 1, .length = commit_proof.header_size, .digest = @splat(7) };
+                        try std.testing.expect(!std.mem.eql(u8, &indexed_before, &file.headerFingerprint()));
+                        continue;
+                    } else if (comptime std.mem.eql(u8, checkpoint_field, "logical")) {
                         inline for (@typeInfo(LogicalGenerations).@"struct".field_names) |identity| {
                             file.header = original;
                             file.header.indexed_reclamation = true;
@@ -5030,6 +5046,7 @@ pub const NativeFile = struct {
     // Lease-only metadata transactions may append without proving free-page
     // reuse. General mutations still validate before any physical reuse.
     artifact_lease_transaction: bool = false,
+    artifact_retirement_transaction: bool = false,
     /// Native connection owners carry checked allocator ownership across live
     /// commits. Primitives retain explicit certification and proof semantics.
     allocator_certificate_on_commit: bool = false,
@@ -5053,6 +5070,9 @@ pub const NativeFile = struct {
     replay_wait_hint: ?replay_admission.WaitHint = null,
     durable_header: ?Header = null,
     last_synced_header: ?Header = null,
+    durable_parent: ?commit_proof.Witness = null,
+    transaction_postimages: ?commit_proof.Postimages = null,
+    preparing_commit_proof: bool = false,
     change_capture: ?*ChangeCapture = null,
     /// Logical-only captures retain catalog/document roots, not allocator
     /// graphs. They must never authorize integrity or allocator inspection.
@@ -5127,6 +5147,8 @@ pub const NativeFile = struct {
     test_page_reads: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_index_view_hits: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_index_comparisons: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
+    test_force_two_barrier_commit: if (builtin.is_test) bool else void = if (builtin.is_test) false else {},
+    test_durability_syncs: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
     test_page_writes: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
 
     test_page_write_calls: if (builtin.is_test) @import("antfly_platform").atomic.Value(u64) else void = if (builtin.is_test) .init(0) else {},
@@ -5196,6 +5218,7 @@ pub const NativeFile = struct {
             .no_sync = opts.no_sync,
             .page_cache_enabled = .init(true),
         };
+        if (header.indexed_reclamation and header.indexed_revision >= 15) try result.selectProvenCheckpoint(&header_bytes, file_size);
         if (opts.read_only and !opts.internal_reader and !opts.externally_locked) {
             if (opts.reader_coordinator) |coordinator| result.reader_fence = if (header.indexed_reclamation)
                 try coordinator.registerEpoch(file, path, header.reader_epoch_namespace, (try file.stat(io)).inode, result.metadataReuseFrontier(), result.headerFingerprint(), true)
@@ -5375,6 +5398,7 @@ pub const NativeFile = struct {
     pub fn close(self: *NativeFile) void {
         std.debug.assert(self.reader_window_depth == 0);
         if (self.reader_fence) |fence| self.reader_coordinator.?.unregister(fence);
+        self.clearTransactionPostimages();
         if (self.transaction_writes) |writes| writes.deinit(self.allocator);
         self.transaction_writes = null;
         self.finishTransactionAllocatorLoan();
@@ -5706,6 +5730,130 @@ pub const NativeFile = struct {
         return digest;
     }
 
+    /// Slot identity for proofs and durability witnesses. Other-slot damage or
+    /// selector tears must not invalidate an otherwise complete candidate.
+    fn checkpointProofFingerprint(header: Header, checkpoint: CheckpointSlot) [32]u8 {
+        var canonical = header;
+        canonical.active_checkpoint = 0;
+        canonical.checkpoints = .{ checkpoint, .{} };
+        canonical.checkpoints[0].proof.digest = @splat(0);
+        return fingerprintHeader(canonical);
+    }
+
+    fn allocatorFingerprintHeader(header: Header) [32]u8 {
+        if (!header.indexed_reclamation or header.indexed_revision < 15) return fingerprintHeader(header);
+        var canonical = header;
+        for (&canonical.checkpoints) |*slot| slot.proof.digest = @splat(0);
+        return fingerprintHeader(canonical);
+    }
+    fn allocatorHeaderFingerprint(self: *NativeFile) [32]u8 {
+        return allocatorFingerprintHeader(self.transaction_header orelse self.header);
+    }
+
+    fn durabilityWitness(self: *NativeFile, checkpoint: CheckpointSlot) !commit_proof.Witness {
+        return .{ .namespace = self.header.reader_epoch_namespace, .sequence = checkpoint.commit_sequence, .checkpoint = checkpointProofFingerprint(self.header, checkpoint), .proof = checkpoint.proof.digest, .inode = (try self.file.stat(self.runtime())).inode };
+    }
+
+    /// Written only after fsync succeeds. Failure cannot turn a committed write
+    /// into a retryable error; a later owner can recover with an extra barrier.
+    fn rememberDurability(self: *NativeFile) void {
+        if (self.no_sync or !self.header.indexed_reclamation or self.header.indexed_revision < 15) return;
+        const witness = self.durabilityWitness(self.activeCheckpoint()) catch return;
+        self.durable_parent = witness;
+        if (!self.read_only) {
+            const encoded = witness.encode();
+            self.file.writePositionalAll(self.runtimeIo(), &encoded, durability_witnesses_offset + @as(u64, self.header.active_checkpoint) * commit_proof.witness_size) catch {};
+        }
+    }
+
+    fn settleDurableParent(self: *NativeFile) !void {
+        if (self.no_sync) return;
+        var raw: [header_size]u8 = undefined;
+        try readHeaderExactAt(self.file, self.runtimeIo(), &raw);
+        if (try self.exactDurabilityWitness(&raw, self.activeCheckpoint())) return;
+        try self.durabilitySync();
+        self.rememberDurability();
+    }
+
+    fn clearTransactionPostimages(self: *NativeFile) void {
+        if (self.transaction_postimages) |*images| images.deinit(self.allocator);
+        self.transaction_postimages = null;
+    }
+
+    fn exactDurabilityWitness(self: *NativeFile, raw: []const u8, checkpoint: CheckpointSlot) !bool {
+        if (!self.header.indexed_reclamation or self.header.indexed_revision < 15) return false;
+        const expected = try self.durabilityWitness(checkpoint);
+        if (self.durable_parent) |remembered| if (remembered.matches(expected)) return true;
+        for (0..2) |slot| {
+            const offset = durability_witnesses_offset + slot * commit_proof.witness_size;
+            const witness = commit_proof.Witness.decode(raw[offset..][0..commit_proof.witness_size]) catch continue;
+            if (witness.matches(expected)) return true;
+        }
+        return false;
+    }
+
+    fn verifyCheckpointProof(self: *NativeFile, checkpoint: CheckpointSlot) !commit_proof.Verification {
+        const Reader = struct {
+            file: *NativeFile,
+            checkpoint: CheckpointSlot,
+            pub fn readFrame(reader: *@This(), allocator: Allocator, reference: commit_proof.Reference) ![]u8 {
+                const length = std.math.cast(usize, reference.length) orelse return error.InvalidCommitProof;
+                const out = try allocator.alloc(u8, length);
+                errdefer allocator.free(out);
+                const value: IndexValue = .{ .root = reference.root, .length = length };
+                try reader.file.readIndexValueInto(value, 0, out, reader.checkpoint);
+                const prefix = try commit_proof.decodePrefix(out, reference.length);
+                if (prefix.count > commit_proof.max_postimage_bytes / reader.file.header.page_size or
+                    prefix.header.parent != null or prefix.header.sequence == 0 or
+                    prefix.header.anchor != prefix.header.sequence - 1) return error.InvalidCommitProof;
+                return out;
+            }
+            pub fn readPage(reader: *@This(), allocator: Allocator, page: u64) ![]u8 {
+                if (reader.file.allocator_cancel_token) |cancel| try cancel.check();
+                return reader.file.readPageAllocForCheckpoint(allocator, page, reader.checkpoint);
+            }
+        };
+        // Recovery verifies physical bytes, independently of stale cache cells.
+        _ = self.page_cache_bypass.fetchAdd(1, .monotonic);
+        defer _ = self.page_cache_bypass.fetchSub(1, .monotonic);
+        var reader: Reader = .{ .file = self, .checkpoint = checkpoint };
+        return commit_proof.verify(self.allocator, &reader, checkpoint.proof, self.header.reader_epoch_namespace, checkpoint.commit_sequence, checkpointProofFingerprint(self.header, checkpoint), checkpoint.page_count);
+    }
+
+    fn selectProvenCheckpoint(self: *NativeFile, raw_header: []const u8, file_size: u64) !void {
+        const candidates = [_]u8{ self.header.active_checkpoint, 1 - self.header.active_checkpoint };
+        for (candidates) |slot| {
+            const checkpoint = self.header.checkpoints[slot];
+            if (!validCheckpointSlot(checkpoint) or (checkpointPrefixSize(checkpoint, self.header.page_size) catch continue) > file_size) continue;
+            self.header.active_checkpoint = slot;
+            if (checkpoint.proof.root == 0 or try self.exactDurabilityWitness(raw_header, checkpoint)) return;
+            _ = self.verifyCheckpointProof(checkpoint) catch |err| switch (err) {
+                error.InvalidCommitProof,
+                error.CommitPostimageMismatch,
+                error.InvalidPageId,
+                error.EndOfStream,
+                error.TruncatedNativeFile,
+                error.InvalidNativePageKind,
+                error.UnexpectedNativePageKind,
+                error.InvalidNativePageMagic,
+                error.InvalidNativePageLength,
+                error.NativePageChecksumMismatch,
+                error.InvalidNativeValueChain,
+                => {
+                    // A structurally checked slot can still precede its pages
+                    // after a reordered crash. Exclude it from all later
+                    // allocator/recovery graphs, just like a torn slot CRC.
+                    self.header.checkpoints[slot] = .{ .page_count = 0 };
+                    continue;
+                },
+                else => return err,
+            };
+            try self.settleDurableParent();
+            return;
+        }
+        return error.InvalidNativeCheckpoint;
+    }
+
     pub fn headerFingerprint(self: *NativeFile) [32]u8 {
         const header = self.transaction_header orelse self.header;
         if (self.header_fingerprint_cache.lookup(header)) |digest| return digest;
@@ -5797,7 +5945,7 @@ pub const NativeFile = struct {
             defer self.allocator.free(root);
             _ = try allocator_v4.State.decodeRoot(root);
             if (root.len == 192) {
-                if (!std.mem.eql(u8, root[128..160], &self.headerFingerprint())) return false;
+                if (!std.mem.eql(u8, root[128..160], &self.allocatorHeaderFingerprint())) return false;
                 return self.acceptAllocatorDigest(root[160..192], true);
             }
         }
@@ -5815,7 +5963,7 @@ pub const NativeFile = struct {
         if (certificate.len != allocator_certificate_size) return false;
         const live = std.mem.eql(u8, certificate[0..8], allocator_certificate_live_magic);
         if (!live and !std.mem.eql(u8, certificate[0..8], allocator_certificate_magic)) return false;
-        const header_hash = self.headerFingerprint();
+        const header_hash = self.allocatorHeaderFingerprint();
         if (!std.mem.eql(u8, certificate[8..40], &header_hash)) return false;
         return self.acceptAllocatorDigest(certificate[40..72], live);
     }
@@ -5868,7 +6016,7 @@ pub const NativeFile = struct {
             const checkpoint = self.activeCheckpoint();
             const root = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
             defer self.allocator.free(root);
-            if (root.len == 192 and std.mem.eql(u8, root[128..160], &self.headerFingerprint())) return true;
+            if (root.len == 192 and std.mem.eql(u8, root[128..160], &self.allocatorHeaderFingerprint())) return true;
         }
         // Use the ordinary rollback/publication boundary. Allocation, budget
         // and page-write errors must leave no unpublished tail at clean close;
@@ -5911,7 +6059,7 @@ pub const NativeFile = struct {
         published.checkpoints[published.active_checkpoint] = next;
         var certificate: [allocator_certificate_size]u8 = undefined;
         @memcpy(certificate[0..8], if (root == .index) allocator_certificate_live_magic else allocator_certificate_magic);
-        @memcpy(certificate[8..40], &fingerprintHeader(published));
+        @memcpy(certificate[8..40], &allocatorFingerprintHeader(published));
         const ownership_hash = if (root == .index) try pages.ledger.?.incrementalFingerprint() else try allocatorFingerprint(pages.ledger.?);
         @memcpy(certificate[40..72], &ownership_hash);
         var encoded = std.ArrayListUnmanaged(u8).empty;
@@ -6063,7 +6211,7 @@ pub const NativeFile = struct {
             if (rebased and !retained) {
                 const root = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
                 defer self.allocator.free(root);
-                authenticated = root.len == 192 and std.mem.eql(u8, root[128..160], &self.headerFingerprint()) and
+                authenticated = root.len == 192 and std.mem.eql(u8, root[128..160], &self.allocatorHeaderFingerprint()) and
                     std.mem.eql(u8, root[160..192], &try state.incrementalFingerprint());
             }
             if (rebased and authenticated) {
@@ -6112,6 +6260,7 @@ pub const NativeFile = struct {
         pages: ReachablePageSet = .empty,
         nodes: ReachablePageSet = .empty,
         records: ReachablePageSet = .empty,
+        proofs: ReachablePageSet = .empty,
         values: std.AutoHashMapUnmanaged(u64, u64) = .empty,
         owners: ?*allocator_v4.State = null,
         record_count: u64 = 0,
@@ -6123,6 +6272,7 @@ pub const NativeFile = struct {
             graph.pages.deinit(a);
             graph.nodes.deinit(a);
             graph.records.deinit(a);
+            graph.proofs.deinit(a);
             graph.values.deinit(a);
             graph.record_reader.deinit(a);
         }
@@ -6241,6 +6391,24 @@ pub const NativeFile = struct {
         }
     }
 
+    fn proofPrefix(self: *NativeFile, checkpoint: CheckpointSlot, root: u64, length: u64) !commit_proof.Header {
+        const raw = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, root, .value, checkpoint);
+        defer self.allocator.free(raw);
+        const value = try decodeValuePage(raw);
+        return (try commit_proof.decodePrefix(value.chunk, length)).header;
+    }
+
+    fn indexedProof(self: *NativeFile, graph: *IndexedGraph, checkpoint: CheckpointSlot, root: u64, length: u64, sequence: ?u64, namespace: ?[32]u8, cancel: ?*const maintenance.CancelToken) !void {
+        if (cancel) |token| try token.check();
+        const prefix = try self.proofPrefix(checkpoint, root, length);
+        if (sequence) |expected| if (prefix.sequence != expected) return error.InvalidCommitProof;
+        if (namespace) |expected| if (!std.mem.eql(u8, &expected, &prefix.namespace)) return error.InvalidCommitProof;
+        const visited = try graph.proofs.getOrPut(self.allocator, root);
+        try self.indexedValue(graph, checkpoint, root, length, cancel);
+        if (visited.found_existing) return;
+        if (prefix.parent) |parent| try self.indexedProof(graph, checkpoint, parent.root, parent.length, prefix.sequence - 1, prefix.namespace, cancel);
+    }
+
     fn indexedGraph(self: *NativeFile, checkpoint: CheckpointSlot, owners: ?*allocator_v4.State, cancel: ?*const maintenance.CancelToken) !IndexedGraph {
         return self.indexedGraphUsingLeaves(checkpoint, owners, null, false, cancel);
     }
@@ -6258,6 +6426,7 @@ pub const NativeFile = struct {
             try self.indexedTree(&graph, checkpoint, roots.index, .catalog, null, null, 0, cancel);
         }
         try self.indexedTree(&graph, checkpoint, checkpoint.document_index_root_page, .document, null, null, 0, cancel);
+        if (checkpoint.proof.root != 0) try self.indexedProof(&graph, checkpoint, checkpoint.proof.root, checkpoint.proof.length, checkpoint.commit_sequence, self.header.reader_epoch_namespace, cancel);
         return graph;
     }
 
@@ -6293,6 +6462,8 @@ pub const NativeFile = struct {
                     try metadata_retirements.put(self.allocator, item.page, {});
                 },
                 .page => try expected.retain(item.page),
+                .commit_proof => try self.indexedProof(graph, checkpoint, item.page, item.length, null, null, cancel),
+                .proof_value => try self.indexedValue(graph, checkpoint, item.page, item.length, cancel),
                 .value => try self.indexedValue(graph, checkpoint, item.page, item.length, cancel),
                 .index => {
                     if (graph.nodes.contains(item.page)) return error.InvalidNativeAllocator;
@@ -6409,10 +6580,10 @@ pub const NativeFile = struct {
         var frontier: u64 = std.math.maxInt(u64);
         const header = self.transaction_header orelse self.header;
         for (header.checkpoints) |slot| if (validCheckpointSlot(slot)) {
-            frontier = @min(frontier, slot.commit_sequence);
+            frontier = @min(frontier, slot.commit_sequence -| @intFromBool(slot.proof.root != 0));
         };
         if (self.durable_header) |durable| for (durable.checkpoints) |slot| {
-            if (validCheckpointSlot(slot)) frontier = @min(frontier, slot.commit_sequence);
+            if (validCheckpointSlot(slot)) frontier = @min(frontier, slot.commit_sequence -| @intFromBool(slot.proof.root != 0));
         };
         if (self.epoch_window) |epochs| if (epochs.metadata) |sequence| {
             frontier = @min(frontier, sequence);
@@ -6452,8 +6623,27 @@ pub const NativeFile = struct {
             const root = state.metadata_heap.peek() orelse break;
             if (root.epoch > metadata_frontier) break;
             if (root.page == 0 or root.page >= checkpoint.page_count) return error.InvalidNativeAllocator;
+            if (root.kind != .metadata and state.pending.count() + 4 >= state.pending_limit + allocator_v4.collector_reserve) break;
             try state.complete(root);
-            try state.releaseMetadata(root.page);
+            switch (root.kind) {
+                .metadata => try state.releaseMetadata(root.page),
+                .commit_proof, .proof_value => {
+                    if (try state.releaseDeferred(root.page)) {
+                        const raw = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, root.page, .value, checkpoint);
+                        defer self.allocator.free(raw);
+                        const value = try decodeValuePage(raw);
+                        if (value.chunk.len == 0 or value.chunk.len > root.length) return error.InvalidCommitProof;
+                        if (root.kind == .commit_proof) {
+                            const prefix = try commit_proof.decodePrefix(value.chunk, root.length);
+                            if (prefix.header.parent) |parent| try state.retireCollected(.{ .epoch = root.epoch, .page = parent.root, .length = parent.length, .kind = .commit_proof });
+                        }
+                        if ((value.chunk.len == root.length) != (value.next_page == 0)) return error.InvalidCommitProof;
+                        if (value.next_page != 0) try state.retireCollected(.{ .epoch = root.epoch, .page = value.next_page, .length = root.length - value.chunk.len, .kind = .proof_value });
+                        try state.retireCollected(.{ .epoch = self.publicationEpoch(), .page = root.page, .kind = .metadata });
+                    }
+                },
+                else => return error.InvalidNativeAllocator,
+            }
         }
         // Metadata service must retire more pages than its own publication
         // creates. Scale cleanup with data work and keep an eight-page minimum
@@ -6487,7 +6677,7 @@ pub const NativeFile = struct {
             try state.complete(item);
             switch (item.kind) {
                 .metadata => try state.releaseMetadata(item.page),
-                .allocator_chain => return error.InvalidNativeAllocator,
+                .allocator_chain, .commit_proof, .proof_value => return error.InvalidNativeAllocator,
                 .page => {
                     _ = try self.releaseRetiredPage(state, item.page);
                 },
@@ -6581,7 +6771,7 @@ pub const NativeFile = struct {
             before.namespace_directory_root_page != checkpoint.namespace_directory_root_page) and
             std.mem.eql(u8, &before.logical.primary, &checkpoint.logical.primary))
             try self.runtimeIo().randomSecure(&checkpoint.logical.primary);
-        if (before.index_catalog_root_page != checkpoint.index_catalog_root_page and
+        if (before.index_catalog_root_page != checkpoint.index_catalog_root_page and !self.artifact_retirement_transaction and
             std.mem.eql(u8, &before.logical.indexes, &checkpoint.logical.indexes))
             try self.runtimeIo().randomSecure(&checkpoint.logical.indexes);
         if (before.catalog_root_page != checkpoint.catalog_root_page and !self.artifact_lease_transaction and
@@ -6597,6 +6787,10 @@ pub const NativeFile = struct {
             return self.writeFreeMapPage(checkpoint.free_map_root_page, checkpoint.page_count, pages.remainingFreePages());
         }
         const state = pages.ledger orelse return error.InvalidNativeAllocator;
+        if (!self.preparing_commit_proof and checkpoint.proof.root != 0) {
+            try state.retire(.{ .epoch = self.publicationEpoch(), .page = checkpoint.proof.root, .length = checkpoint.proof.length, .kind = .commit_proof });
+            checkpoint.proof = .{};
+        }
         var orphaned = pages.pending_values.iterator();
         while (orphaned.next()) |entry| try state.retire(.{ .epoch = self.publicationEpoch(), .page = entry.key_ptr.*, .length = entry.value_ptr.*, .kind = .value });
         pages.pending_values.clearRetainingCapacity();
@@ -6793,6 +6987,9 @@ pub const NativeFile = struct {
         const previous_cancel = self.allocator_cancel_token;
         self.allocator_cancel_token = cancel;
         defer self.allocator_cancel_token = previous_cancel;
+        const previous_maintenance = self.maintenance_publication;
+        self.maintenance_publication = true;
+        defer self.maintenance_publication = previous_maintenance;
         try self.beginTransaction();
         errdefer self.abortTransaction();
         const before = self.activeCheckpoint();
@@ -6818,9 +7015,6 @@ pub const NativeFile = struct {
             // size. Each service publication makes its partial chains durable.
             try self.advanceAllocatorCheckpoint(&pages, @max(@as(usize, 1), @min(work, 16)));
         }
-        const previous_maintenance = self.maintenance_publication;
-        self.maintenance_publication = true;
-        defer self.maintenance_publication = previous_maintenance;
         var next = before;
         next.commit_sequence += 1;
         next.free_map_root_page = try pages.allocate();
@@ -6848,6 +7042,7 @@ pub const NativeFile = struct {
     pub fn checkAtFileSizeWithCancel(self: *NativeFile, file_size: u64, cancel: ?*const maintenance.CancelToken) !CheckReport {
         if (self.logical_snapshot) return error.NativeSnapshotMetadataUnavailable;
         if (cancel) |token| try token.check();
+        if (self.activeCheckpoint().proof.root != 0) _ = try self.verifyCheckpointProof(self.activeCheckpoint());
         // Integrity checking must observe on-disk state, not cached pages.
         _ = self.page_cache_bypass.fetchAdd(1, .monotonic);
         defer _ = self.page_cache_bypass.fetchSub(1, .monotonic);
@@ -7432,6 +7627,7 @@ pub const NativeFile = struct {
         if (self.read_only) return error.ReadOnly;
         if (mutations.len == 0) return;
         for (mutations) |mutation| {
+            if (self.artifact_retirement_transaction and (root != .index or !mutation.is_delete)) return error.InvalidArtifactRetirement;
             if (self.artifact_lease_transaction and (root != .metadata or !std.mem.startsWith(u8, mutation.key, artifact_lease_key_prefix)))
                 return error.InvalidArtifactLeaseMutation;
             try self.validateCatalogMutation(mutation);
@@ -9006,6 +9202,7 @@ pub const NativeFile = struct {
     }
 
     pub fn putDocumentBatch(self: *NativeFile, mutations: []const DocumentMutation) anyerror!void {
+        if (self.artifact_retirement_transaction and mutations.len != 0) return error.InvalidArtifactRetirement;
         if (self.read_only) return error.ReadOnly;
         if (mutations.len == 0) return;
         if (self.header.indexed_reclamation and self.header.indexed_revision >= 9 and !self.flushing_transaction) {
@@ -10995,7 +11192,9 @@ pub const NativeFile = struct {
         if (!replace and !dest_exists and pathExists(io, dest_path)) return error.PathAlreadyExists;
 
         const checkpoint = self.activeCheckpoint();
-        const snapshot_size = try checkpointPrefixSize(checkpoint, self.header.page_size);
+        const source_prefix_size = try checkpointPrefixSize(checkpoint, self.header.page_size);
+        var snapshot_size = source_prefix_size;
+        var snapshot_checkpoint = checkpoint;
         const source_size = (try self.file.stat(io)).size;
         if (source_size < snapshot_size) return error.TruncatedNativeSnapshotSource;
 
@@ -11019,9 +11218,12 @@ pub const NativeFile = struct {
                 try out_file.writePositionalAll(io, buffer[0..len], offset);
                 offset += len;
             }
-            var destination = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = @constCast(dest_path), .file = out_file, .header = self.header, .no_sync = false, .page_cache_enabled = .init(false) };
+            var destination = NativeFile{ .allocator = self.allocator, .io_impl = undefined, .borrowed_io = io, .path = tmp_path, .file = out_file, .header = self.header, .no_sync = false, .page_cache_enabled = .init(false) };
             defer destination.page_cache.deinit(self.allocator);
+            defer destination.invalidateLedger();
             try destination.bindPrivateEpochNamespace(dest_path);
+            snapshot_checkpoint = destination.activeCheckpoint();
+            snapshot_size = try checkpointPrefixSize(snapshot_checkpoint, self.header.page_size);
             try out_file.setLength(io, snapshot_size);
             try out_file.sync(io);
         }
@@ -11038,9 +11240,9 @@ pub const NativeFile = struct {
         return .{
             .source_size = source_size,
             .snapshot_size = snapshot_size,
-            .checkpoint_sequence = checkpoint.commit_sequence,
-            .page_count = checkpoint.page_count,
-            .tail_bytes = source_size - snapshot_size,
+            .checkpoint_sequence = snapshot_checkpoint.commit_sequence,
+            .page_count = snapshot_checkpoint.page_count,
+            .tail_bytes = source_size - source_prefix_size,
         };
     }
 
@@ -11713,7 +11915,7 @@ pub const NativeFile = struct {
     }
 
     fn pageAllocatorFromFreeMap(self: *NativeFile, checkpoint: CheckpointSlot) !PageAllocator {
-        return self.pageAllocatorFromFreeMapWithProof(checkpoint, !self.artifact_lease_transaction);
+        return self.pageAllocatorFromFreeMapWithProof(checkpoint, !self.artifact_lease_transaction and !self.artifact_retirement_transaction);
     }
 
     fn pageAllocatorFromFreeMapWithProof(self: *NativeFile, checkpoint: CheckpointSlot, require_reuse_proof: bool) !PageAllocator {
@@ -12383,6 +12585,7 @@ pub const NativeFile = struct {
     }
 
     fn stageMutation(self: *NativeFile, root: TransactionWrites.Root, mutation: CatalogMutation, options: WriteOptions) !void {
+        if (self.artifact_retirement_transaction and (root != .index or !mutation.is_delete)) return error.InvalidArtifactRetirement;
         if (self.artifact_lease_transaction and (root != .metadata or !std.mem.startsWith(u8, mutation.key, artifact_lease_key_prefix)))
             return error.InvalidArtifactLeaseMutation;
         // Acquire ownership before a spill: callers may be appending/renaming
@@ -12509,11 +12712,18 @@ pub const NativeFile = struct {
         if (self.read_only) return error.ReadOnly;
         if (self.transaction_header != null) return error.TransactionAlreadyActive;
         if (self.checkpoint_publication_uncertain) return error.OutcomeReconciliationRequired;
+        const prove = self.header.indexed_reclamation and self.header.indexed_revision >= 15 and
+            !self.no_sync and !self.maintenance_publication and self.durable_header == null and
+            !(builtin.is_test and self.test_force_two_barrier_commit);
+        if (prove) try self.settleDurableParent();
         self.transaction_allocator_loan = try self.enterWriterAllocator();
+        self.clearTransactionPostimages();
+        if (prove) self.transaction_postimages = .{};
         self.transaction_header = self.header;
         self.replay_preflight_refused = false;
         self.replay_wait_hint = null;
         self.artifact_lease_transaction = false;
+        self.artifact_retirement_transaction = false;
         self.allocator_certificate_staged = false;
     }
 
@@ -12534,14 +12744,30 @@ pub const NativeFile = struct {
     /// Internal publication of durable immutable-source aliases. These groups
     /// contain no authored document/index writes. Mixed groups use the normal
     /// transaction policy instead, preserving batching and mandatory proof.
+    /// Typed cleanup has already proved every path retired and inactive in
+    /// this transaction. It changes physical retention, never index semantics.
+    pub fn beginArtifactRetirementTransaction(self: *NativeFile) !void {
+        if (!self.maintenance_publication) return error.InvalidTransactionState;
+        try self.beginTransaction();
+        self.artifact_retirement_transaction = true;
+    }
+
+    pub fn retireIndexCatalogRecords(self: *NativeFile, mutations: []const CatalogMutation) !void {
+        if (!self.artifact_retirement_transaction or self.transaction_header == null) return error.InvalidTransactionState;
+        for (mutations) |mutation| if (!mutation.is_delete) return error.InvalidArtifactRetirement;
+        try self.putCatalogBatchForRootInner(.index, mutations, .{}, false);
+    }
+
     pub fn beginArtifactLeaseTransaction(self: *NativeFile) !void {
         try self.beginTransaction();
         self.artifact_lease_transaction = true;
     }
 
     pub fn abortTransaction(self: *NativeFile) void {
+        defer self.clearTransactionPostimages();
         defer self.finishTransactionAllocatorLoan();
         defer self.artifact_lease_transaction = false;
+        defer self.artifact_retirement_transaction = false;
         defer self.allocator_certificate_staged = false;
         defer self.replay_preflight_refused = false;
         const previous = self.transaction_header orelse {
@@ -12576,16 +12802,76 @@ pub const NativeFile = struct {
         };
     }
 
+    /// Reserve the manifest before sealing the final allocator. Its value-chain
+    /// pages are authenticated by the slot's digest, not recursively by their
+    /// own postimage list. A fixed headroom bounds setup; an unexpectedly large
+    /// final allocator falls back to the data-before-slot protocol.
+    fn prepareCommitProof(self: *NativeFile, previous: Header, checkpoint: *CheckpointSlot) !bool {
+        const images = if (self.transaction_postimages) |*value| value else return false;
+        if (images.overflowed) return false;
+        const capacity = @min(commit_proof.max_postimage_entries, images.pages.count() +| 256);
+        const length = try commit_proof.encodedSize(capacity);
+        const chunk_size = self.maxValuePagePayloadBytes();
+        const count = try std.math.divCeil(usize, length, chunk_size);
+        const ids = try self.allocator.alloc(u64, count);
+        defer self.allocator.free(ids);
+        const bytes = try self.allocator.alloc(u8, length);
+        defer self.allocator.free(bytes);
+        var pages = try self.pageAllocatorFromFreeMap(checkpoint.*);
+        defer pages.deinit();
+        for (ids) |*id| {
+            id.* = try pages.allocate();
+            try pages.ledger.?.retain(id.*);
+        }
+        checkpoint.proof = .{ .root = ids[0], .length = length };
+        checkpoint.free_map_root_page = try pages.allocate();
+        self.preparing_commit_proof = true;
+        defer self.preparing_commit_proof = false;
+        try self.persistAllocator(&pages, checkpoint);
+        // The native seal uses the same canonical header with the proof digest
+        // zeroed, eliminating a seal/manifest hash cycle.
+        try self.sealAllocatorCheckpoint(previous, checkpoint.*);
+        if (images.overflowed or images.pages.count() > capacity) {
+            try pages.ledger.?.retire(.{ .epoch = self.publicationEpoch(), .page = ids[0], .length = length, .kind = .commit_proof });
+            // The GC must see an actual chain even for an unused reservation.
+            @memset(bytes, 0);
+            try commit_proof.encode(bytes, .{ .namespace = self.header.reader_epoch_namespace, .sequence = checkpoint.commit_sequence, .anchor = checkpoint.commit_sequence - 1, .checkpoint = checkpointProofFingerprint(previous, checkpoint.*) }, &.{}, capacity);
+            const ignored = self.transaction_postimages;
+            self.transaction_postimages = null;
+            defer self.transaction_postimages = ignored;
+            for (ids, 0..) |_, i| try self.writeValuePageChunk(ids, i, bytes[i * chunk_size .. @min(length, (i + 1) * chunk_size)], .{});
+            checkpoint.proof = .{};
+            pages.metadata_reserve.clearRetainingCapacity();
+            pages.metadata_cursor = 0;
+            checkpoint.free_map_root_page = try pages.allocate();
+            try self.persistAllocator(&pages, checkpoint);
+            try self.sealAllocatorCheckpoint(previous, checkpoint.*);
+            return false;
+        }
+        const entries = try images.sorted(self.allocator);
+        defer self.allocator.free(entries);
+        try commit_proof.encode(bytes, .{ .namespace = self.header.reader_epoch_namespace, .sequence = checkpoint.commit_sequence, .anchor = checkpoint.commit_sequence - 1, .checkpoint = checkpointProofFingerprint(previous, checkpoint.*) }, entries, capacity);
+        checkpoint.proof.digest = commit_proof.hash(bytes);
+        // Suspend collection only while writing the self-authenticated frame.
+        const collected = self.transaction_postimages;
+        self.transaction_postimages = null;
+        defer self.transaction_postimages = collected;
+        for (ids, 0..) |_, i| try self.writeValuePageChunk(ids, i, bytes[i * chunk_size .. @min(length, (i + 1) * chunk_size)], .{});
+        return true;
+    }
+
     pub fn commitTransaction(self: *NativeFile) !void {
         return self.commitTransactionWithDurability(true);
     }
 
     pub fn commitTransactionWithDurability(self: *NativeFile, durable: bool) !void {
         defer self.artifact_lease_transaction = false;
+        defer self.artifact_retirement_transaction = false;
         defer self.allocator_certificate_staged = false;
         const previous = self.transaction_header orelse return error.InvalidTransactionState;
         defer if (self.transaction_header == null) self.finishTransactionAllocatorLoan();
         try self.flushTransactionWrites();
+        defer self.clearTransactionPostimages();
         var next = self.activeCheckpoint();
         const changed = next.commit_sequence != previous.checkpoints[previous.active_checkpoint].commit_sequence;
         const deferred_publication = !durable and !self.no_sync and !self.externally_locked;
@@ -12595,6 +12881,11 @@ pub const NativeFile = struct {
         {
             next.commit_sequence = previous.checkpoints[previous.active_checkpoint].commit_sequence + 1;
             try self.sealAllocatorCheckpoint(previous, next);
+        }
+        var proved = false;
+        if (changed and !deferred_publication) {
+            next.commit_sequence = previous.checkpoints[previous.active_checkpoint].commit_sequence + 1;
+            proved = try self.prepareCommitProof(previous, &next);
         }
         self.header = previous;
         self.transaction_header = null;
@@ -12618,7 +12909,7 @@ pub const NativeFile = struct {
             return;
         }
         if (changed) {
-            try self.syncIfRequired();
+            if (!proved) try self.syncIfRequired();
             try self.publishCheckpoint(next);
         } else try self.sync();
     }
@@ -12635,7 +12926,7 @@ pub const NativeFile = struct {
         var root: [192]u8 = @splat(0);
         allocator_v4.State.encodeRoot(state.root, root[0..128]);
         std.mem.writeInt(u64, root[56..64], 3, .little);
-        @memcpy(root[128..160], &fingerprintHeader(published));
+        @memcpy(root[128..160], &allocatorFingerprintHeader(published));
         @memcpy(root[160..192], &try state.incrementalFingerprint());
         try self.writePage(next.free_map_root_page, .free_map, &root);
     }
@@ -12677,7 +12968,11 @@ pub const NativeFile = struct {
         var encoded_slot: [checkpoint_slot_size]u8 = undefined;
         var identities: [logical_generations_size]u8 = undefined;
         encodeLogicalGenerations(&identities, checkpoint.logical);
-        encodeCheckpointSlot(&encoded_slot, checkpoint, if (self.header.indexed_reclamation) &identities else null);
+        var encoded_proof: [proof_reference_size]u8 = undefined;
+        encodeProofReference(&encoded_proof, checkpoint.proof);
+        var slot_auth: [logical_generations_size + proof_reference_size]u8 = undefined;
+        const authentication = slotAuthentication(&slot_auth, if (self.header.indexed_reclamation) &identities else null, if (self.header.indexed_reclamation and self.header.indexed_revision >= 15) &encoded_proof else null);
+        encodeCheckpointSlot(&encoded_slot, checkpoint, authentication);
 
         const io = self.runtimeIo();
         self.checkpoint_publication_uncertain = true;
@@ -12693,6 +12988,8 @@ pub const NativeFile = struct {
             };
             if (self.header.indexed_reclamation)
                 self.file.writePositionalAll(io, &identities, logicalGenerationsOffset(next_slot)) catch |err| break :blk err;
+            if (self.header.indexed_reclamation and self.header.indexed_revision >= 15)
+                self.file.writePositionalAll(io, &encoded_proof, proofReferenceOffset(next_slot)) catch |err| break :blk err;
             self.file.writePositionalAll(io, &encoded_slot, checkpointOffset(next_slot)) catch |err| break :blk err;
             if (!ordered_slot) self.syncIfRequired() catch |err| break :blk err;
             const active_checkpoint: [1]u8 = .{next_slot};
@@ -12710,6 +13007,7 @@ pub const NativeFile = struct {
         self.header.active_checkpoint = next_slot;
         self.checkpoint_publication_uncertain = false;
         self.last_synced_header = self.header;
+        self.rememberDurability();
         if (self.ledger) |state| {
             self.retirement_activity_bytes +|= state.released_data_pages *| self.header.page_size;
             self.retirement_activity_bytes +|= state.retired_inline_bytes;
@@ -12722,8 +13020,13 @@ pub const NativeFile = struct {
         if (self.publication_observer) |observer| observer.notify(observer.context, self.activeCheckpoint(), self.checkpoint_publication_uncertain);
     }
 
+    fn durabilitySync(self: *NativeFile) !void {
+        if (builtin.is_test) _ = self.test_durability_syncs.fetchAdd(1, .monotonic);
+        try self.file.sync(self.runtimeIo());
+    }
+
     fn syncIfRequired(self: *NativeFile) !void {
-        if (!self.no_sync and self.transaction_header == null) try self.file.sync(self.runtimeIo());
+        if (!self.no_sync and self.transaction_header == null) try self.durabilitySync();
     }
 
     pub fn syncAlreadyComplete(self: *const NativeFile) bool {
@@ -12749,15 +13052,24 @@ pub const NativeFile = struct {
     /// changed when this private image acquired its final publication name.
     fn bindPrivateEpochNamespace(self: *NativeFile, destination_path: []const u8) !void {
         if (self.transaction_header != null or self.durable_header != null or self.checkpoint_publication_uncertain) return error.InvalidTransactionState;
+        // This inode is exclusively owned and unpublished. Retire the active
+        // proof through the allocator, then remove the obsolete recovery slot
+        // before changing the proof namespace or rewriting its sealed root.
+        if (self.header.indexed_reclamation and self.header.indexed_revision >= 15 and self.activeCheckpoint().proof.root != 0)
+            _ = try self.reclaimPages(0);
         var next = self.header;
+        if (next.indexed_reclamation and next.indexed_revision >= 15) {
+            next.checkpoints = .{ self.activeCheckpoint(), self.activeCheckpoint() };
+            next.active_checkpoint = 0;
+        }
         if (next.indexed_reclamation) {
             next.reader_epoch_namespace = try @import("reader_epochs.zig").namespaceForPublicationWithDurability(self.allocator, self.runtime(), destination_path, self.no_sync);
             const checkpoint = self.activeCheckpoint();
             if (checkpoint.free_map_root_page != 0) {
                 const root = try self.readPagePayloadByKindAllocForCheckpoint(self.allocator, checkpoint.free_map_root_page, .free_map, checkpoint);
                 defer self.allocator.free(root);
-                if (root.len == 192 and std.mem.eql(u8, root[128..160], &self.headerFingerprint())) {
-                    @memcpy(root[128..160], &fingerprintHeader(next));
+                if (root.len == 192 and std.mem.eql(u8, root[128..160], &self.allocatorHeaderFingerprint())) {
+                    @memcpy(root[128..160], &allocatorFingerprintHeader(next));
                     try self.writePage(checkpoint.free_map_root_page, .free_map, root);
                 }
             }
@@ -13567,7 +13879,7 @@ pub fn inspectBytes(raw: []const u8) InspectReport {
 
 pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
     @memset(out, 0);
-    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) (if (header.indexed_revision == 7) previous_indexed_magic else if (header.indexed_revision == 8) revision8_magic else if (header.indexed_revision == 9) revision9_magic else if (header.indexed_revision == 10) revision10_magic else if (header.indexed_revision == 11) revision11_magic else if (header.indexed_revision == 12) revision12_magic else if (header.indexed_revision == 13) revision13_magic else indexed_magic) else if (header.packed_records) magic else unpacked_v3_magic);
+    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) (if (header.indexed_revision == 7) previous_indexed_magic else if (header.indexed_revision == 8) revision8_magic else if (header.indexed_revision == 9) revision9_magic else if (header.indexed_revision == 10) revision10_magic else if (header.indexed_revision == 11) revision11_magic else if (header.indexed_revision == 12) revision12_magic else if (header.indexed_revision == 13) revision13_magic else if (header.indexed_revision == 14) revision14_magic else indexed_magic) else if (header.packed_records) magic else unpacked_v3_magic);
     std.mem.writeInt(u32, out[version_offset..][0..4], if (header.indexed_reclamation) header.indexed_revision else format_version, .little);
     std.mem.writeInt(u32, out[page_size_offset..][0..4], header.page_size, .little);
     std.mem.writeInt(u32, out[header_size_offset..][0..4], header_size, .little);
@@ -13577,7 +13889,12 @@ pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
     for (header.checkpoints, 0..) |slot, index| {
         const identities = out[logicalGenerationsOffset(index)..][0..logical_generations_size];
         if (header.indexed_reclamation) encodeLogicalGenerations(identities, slot.logical);
-        encodeCheckpointSlot(out[checkpointOffset(index)..][0..checkpoint_slot_size], slot, if (header.indexed_reclamation) identities else null);
+        var auth: [logical_generations_size + proof_reference_size]u8 = undefined;
+        if (header.indexed_reclamation and header.indexed_revision >= 15) {
+            encodeProofReference(out[proofReferenceOffset(index)..][0..proof_reference_size], slot.proof);
+        }
+        const checked = slotAuthentication(&auth, if (header.indexed_reclamation) identities else null, if (header.indexed_reclamation and header.indexed_revision >= 15) out[proofReferenceOffset(index)..][0..proof_reference_size] else null);
+        encodeCheckpointSlot(out[checkpointOffset(index)..][0..checkpoint_slot_size], slot, checked);
     }
 
     std.mem.writeInt(u32, out[header_checksum_offset..][0..4], headerChecksum(out), .little);
@@ -13593,12 +13910,13 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const revision11 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision11_magic);
     const revision12 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision12_magic);
     const revision13 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision13_magic);
-    const indexed_reclamation = previous_indexed or revision8 or revision9 or revision10 or revision11 or revision12 or revision13 or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
+    const revision14 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision14_magic);
+    const indexed_reclamation = previous_indexed or revision8 or revision9 or revision10 or revision11 or revision12 or revision13 or revision14 or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
     const has_packed_records = indexed_reclamation or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic);
     if (!has_packed_records and !std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], unpacked_v3_magic)) return error.InvalidNativeMagic;
 
     const version = std.mem.readInt(u32, header_raw[version_offset..][0..4], .little);
-    if (version != (if (previous_indexed) @as(u32, 7) else if (revision8) @as(u32, 8) else if (revision9) @as(u32, 9) else if (revision10) @as(u32, 10) else if (revision11) @as(u32, 11) else if (revision12) @as(u32, 12) else if (revision13) @as(u32, 13) else if (indexed_reclamation) indexed_format_version else format_version)) return error.UnsupportedNativeFormatVersion;
+    if (version != (if (previous_indexed) @as(u32, 7) else if (revision8) @as(u32, 8) else if (revision9) @as(u32, 9) else if (revision10) @as(u32, 10) else if (revision11) @as(u32, 11) else if (revision12) @as(u32, 12) else if (revision13) @as(u32, 13) else if (revision14) @as(u32, 14) else if (indexed_reclamation) indexed_format_version else format_version)) return error.UnsupportedNativeFormatVersion;
 
     const encoded_header_size = std.mem.readInt(u32, header_raw[header_size_offset..][0..4], .little);
     if (encoded_header_size != header_size) return error.InvalidNativeHeaderSize;
@@ -13615,7 +13933,8 @@ pub fn decodeHeader(raw: []const u8) !Header {
     var valid_slots: [checkpoint_slot_count]bool = @splat(false);
     for (&checkpoints, 0..) |*slot, index| {
         const raw_slot = header_raw[checkpointOffset(index)..][0..checkpoint_slot_size];
-        const identities: ?[]const u8 = if (indexed_reclamation) header_raw[logicalGenerationsOffset(index)..][0..logical_generations_size] else null;
+        var auth: [logical_generations_size + proof_reference_size]u8 = undefined;
+        const identities = slotAuthentication(&auth, if (indexed_reclamation) header_raw[logicalGenerationsOffset(index)..][0..logical_generations_size] else null, if (indexed_reclamation and version >= 15) header_raw[proofReferenceOffset(index)..][0..proof_reference_size] else null);
         // Zero checksums are a legacy v3 compatibility encoding. Revision 4
         // requires each recoverable slot to authenticate its ownership root.
         if (indexed_reclamation and std.mem.readInt(u32, raw_slot[checkpoint_slot_checksum_offset..][0..4], .little) != checkpointSlotChecksum(raw_slot, identities)) {
@@ -13639,6 +13958,28 @@ pub fn decodeHeader(raw: []const u8) !Header {
         .active_checkpoint = active_checkpoint,
         .checkpoints = checkpoints,
     };
+}
+
+fn proofReferenceOffset(index: usize) usize {
+    return proof_references_offset + index * proof_reference_size;
+}
+fn encodeProofReference(out: []u8, reference: commit_proof.Reference) void {
+    std.debug.assert(out.len == proof_reference_size);
+    std.mem.writeInt(u64, out[0..8], reference.root, .little);
+    std.mem.writeInt(u64, out[8..16], reference.length, .little);
+    @memcpy(out[16..48], &reference.digest);
+}
+fn decodeProofReference(raw: []const u8) commit_proof.Reference {
+    return .{ .root = std.mem.readInt(u64, raw[0..8], .little), .length = std.mem.readInt(u64, raw[8..16], .little), .digest = raw[16..48].* };
+}
+fn slotAuthentication(out: *[logical_generations_size + proof_reference_size]u8, identities: ?[]const u8, proof: ?[]const u8) ?[]const u8 {
+    const logical = identities orelse return null;
+    @memcpy(out[0..logical_generations_size], logical);
+    if (proof) |reference| if (!std.mem.allEqual(u8, reference, 0)) {
+        @memcpy(out[logical_generations_size..], reference);
+        return out;
+    };
+    return out[0..logical_generations_size];
 }
 
 fn checkpointOffset(index: usize) usize {
@@ -13674,6 +14015,7 @@ fn decodeCheckpointSlot(raw: []const u8, identities: ?[]const u8) !CheckpointSlo
     const expected_checksum = std.mem.readInt(u32, raw[checkpoint_slot_checksum_offset..][0..4], .little);
     if (expected_checksum != 0 and expected_checksum != checkpointSlotChecksum(raw, identities)) return error.NativeCheckpointChecksumMismatch;
     return .{
+        .proof = if (identities) |bytes| if (bytes.len == logical_generations_size + proof_reference_size) decodeProofReference(bytes[logical_generations_size..]) else .{} else .{},
         .logical = if (identities) |bytes| .{ .primary = bytes[0..16].*, .metadata = bytes[16..32].*, .indexes = bytes[32..48].* } else .{},
         .commit_sequence = std.mem.readInt(u64, raw[0..8], .little),
         .catalog_root_page = std.mem.readInt(u64, raw[8..16], .little),
@@ -13688,6 +14030,9 @@ fn decodeCheckpointSlot(raw: []const u8, identities: ?[]const u8) !CheckpointSlo
 
 fn validCheckpointSlot(slot: CheckpointSlot) bool {
     if (slot.page_count == 0) return false;
+    if (slot.proof.root == 0) {
+        if (slot.proof.length != 0 or !std.mem.allEqual(u8, &slot.proof.digest, 0)) return false;
+    } else if (slot.commit_sequence == 0 or slot.proof.root >= slot.page_count or slot.proof.length < commit_proof.header_size or slot.proof.length > commit_proof.max_frame_bytes) return false;
     if (!validCheckpointRoot(slot.catalog_root_page, slot.page_count)) return false;
     if (!validCheckpointRoot(slot.document_root_page, slot.page_count)) return false;
     if (!validCheckpointRoot(slot.index_catalog_root_page, slot.page_count)) return false;
@@ -14233,7 +14578,7 @@ fn headerChecksum(raw: []const u8) u32 {
     var crc = Crc32.init();
     crc.update(raw[0..active_checkpoint_offset]);
     crc.update(raw[active_checkpoint_offset + 1 .. checkpoint_slots_offset]);
-    const end = if (std.mem.eql(u8, raw[0..indexed_magic.len], indexed_magic) or std.mem.eql(u8, raw[0..revision8_magic.len], revision8_magic) or std.mem.eql(u8, raw[0..revision9_magic.len], revision9_magic) or std.mem.eql(u8, raw[0..revision10_magic.len], revision10_magic) or std.mem.eql(u8, raw[0..revision11_magic.len], revision11_magic) or std.mem.eql(u8, raw[0..revision12_magic.len], revision12_magic) or std.mem.eql(u8, raw[0..revision13_magic.len], revision13_magic)) logical_generations_end else checkpoint_slots_end;
+    const end = if (std.mem.eql(u8, raw[0..indexed_magic.len], indexed_magic)) durability_witnesses_end else if (std.mem.eql(u8, raw[0..revision14_magic.len], revision14_magic) or std.mem.eql(u8, raw[0..revision8_magic.len], revision8_magic) or std.mem.eql(u8, raw[0..revision9_magic.len], revision9_magic) or std.mem.eql(u8, raw[0..revision10_magic.len], revision10_magic) or std.mem.eql(u8, raw[0..revision11_magic.len], revision11_magic) or std.mem.eql(u8, raw[0..revision12_magic.len], revision12_magic) or std.mem.eql(u8, raw[0..revision13_magic.len], revision13_magic)) logical_generations_end else checkpoint_slots_end;
     crc.update(raw[end..header_checksum_offset]);
     return crc.final();
 }
@@ -14339,6 +14684,28 @@ test "lite native revision fourteen preserves revision thirteen checked headers"
         try std.testing.expect(std.meta.eql(header, decoded));
         try std.testing.expectEqual(@as(u8, @intCast(revision)), encoded[6]);
     }
+}
+
+test "lite native proof references authenticate with their selected checkpoint" {
+    var header: Header = .{ .indexed_reclamation = true, .indexed_revision = 15, .reader_epoch_namespace = @splat(11) };
+    header.checkpoints[0] = .{ .commit_sequence = 2, .page_count = 20, .proof = .{ .root = 9, .length = commit_proof.header_size, .digest = @splat(7) } };
+    var encoded: [header_size]u8 = undefined;
+    encodeHeader(&encoded, header);
+    try std.testing.expect(std.meta.eql(header, try decodeHeader(&encoded)));
+    // Every byte of a present reference is authenticated by its own slot.
+    for (0..proof_reference_size) |offset| {
+        var torn = encoded;
+        torn[proofReferenceOffset(0) + offset] ^= 1;
+        const decoded = try decodeHeader(&torn);
+        try std.testing.expectEqual(@as(u8, 1), decoded.active_checkpoint);
+    }
+    // A lost/torn inactive proof must not spoil the selected slot.
+    encoded[proofReferenceOffset(1) + 17] = 1;
+    const selected = try decodeHeader(&encoded);
+    try std.testing.expectEqual(@as(u8, 0), selected.active_checkpoint);
+    // Witness bytes have their own checked records, not the static header CRC.
+    encoded[durability_witnesses_offset] ^= 1;
+    try std.testing.expectEqual(@as(u8, 0), (try decodeHeader(&encoded)).active_checkpoint);
 }
 
 test "lite native header rejects corrupted checksum" {
@@ -23373,4 +23740,171 @@ test "lite semantic revisions keep revision eight headers readable" {
     const decoded = try decodeHeader(&encoded);
     try std.testing.expectEqual(@as(u32, 8), decoded.indexed_revision);
     try std.testing.expectEqualSlices(u8, &legacy.reader_epoch_namespace, &decoded.reader_epoch_namespace);
+}
+
+test "lite commit proof retirement retains shared parents and ignores logical reader metadata" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "proof-retirement.aflite");
+    defer a.free(path);
+    var coordinator = ReaderCoordinator.init(a, std.testing.io);
+    defer coordinator.deinit();
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true, .no_sync = true });
+    defer file.close();
+    file.reader_coordinator = &coordinator;
+    try file.putDocument("keep", "unchanged");
+    var reader = try file.captureLogicalReadSnapshot();
+    defer reader.close();
+    const before = file.activeCheckpoint();
+    var parent: [commit_proof.header_size]u8 = undefined;
+    try commit_proof.encode(&parent, .{ .namespace = file.header.reader_epoch_namespace, .sequence = 2, .anchor = 1, .checkpoint = @splat(2) }, &.{}, 0);
+    try file.beginTransaction();
+    errdefer file.abortTransaction();
+    {
+        var pages = try file.pageAllocatorFromFreeMap(before);
+        defer pages.deinit();
+        const parent_root = try file.writeValuePagesAllocated(&pages, &parent);
+        try pages.retainValue(parent_root);
+        const length = try commit_proof.encodedSize(256);
+        const child = try a.alloc(u8, length);
+        defer a.free(child);
+        try commit_proof.encode(child, .{ .namespace = file.header.reader_epoch_namespace, .sequence = 3, .anchor = 1, .parent = .{ .root = parent_root, .length = parent.len, .digest = commit_proof.hash(&parent) }, .checkpoint = @splat(3) }, &.{}, 256);
+        const child_root = try file.writeValuePagesAllocated(&pages, child);
+        try pages.retainValue(child_root);
+        try pages.ledger.?.retain(parent_root);
+        // Each header claim retires independently. The child still owns a
+        // second parent claim until its own final reference is collected.
+        try pages.ledger.?.retire(.{ .epoch = file.publicationEpoch(), .page = parent_root, .length = parent.len, .kind = .commit_proof });
+        try pages.ledger.?.retire(.{ .epoch = file.publicationEpoch(), .page = child_root, .length = child.len, .kind = .commit_proof });
+        try std.testing.expectEqual(@as(u32, 2), pages.ledger.?.count(parent_root));
+        try std.testing.expectEqual(@as(u64, 0), pages.ledger.?.data_pending);
+        var next = before;
+        next.commit_sequence += 1;
+        next.free_map_root_page = try pages.allocate();
+        try file.persistAllocator(&pages, &next);
+        try file.publishCheckpoint(next);
+    }
+    try file.commitTransaction();
+    try std.testing.expect((try file.check()).valid);
+    var settled = false;
+    for (0..32) |_| {
+        _ = try file.reclaimPages(8);
+        const state = try file.loadLedger(file.activeCheckpoint());
+        var found = false;
+        var pending = state.pending.valueIterator();
+        while (pending.next()) |item| if (item.kind == .commit_proof or item.kind == .proof_value) {
+            found = true;
+            break;
+        };
+        if (!found) {
+            settled = true;
+            break;
+        }
+    }
+    try std.testing.expect(settled);
+    const kept = (try reader.getDocumentAlloc(a, "keep")).?;
+    defer a.free(kept);
+    try std.testing.expectEqualStrings("unchanged", kept);
+    try std.testing.expect((try file.check()).valid);
+}
+
+test "lite commit proof native emission recovery fallback and bounded retirement" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "proof-publication.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true });
+    defer file.close();
+    for (0..6) |i| {
+        try file.beginTransaction();
+        errdefer file.abortTransaction();
+        const value = [_]u8{@intCast(i)};
+        try file.putDocument("key", &value);
+        const barriers = file.test_durability_syncs.load(.monotonic);
+        try file.commitTransaction();
+        try std.testing.expectEqual(@as(u64, 1), file.test_durability_syncs.load(.monotonic) - barriers);
+        const checkpoint = file.activeCheckpoint();
+        try std.testing.expect(checkpoint.proof.root != 0);
+        const verified = try file.verifyCheckpointProof(checkpoint);
+        try std.testing.expectEqual(@as(usize, 1), verified.frames);
+        try std.testing.expect(verified.checked_pages > 0);
+        try std.testing.expectEqual(checkpoint.commit_sequence - 1, verified.anchor);
+        try std.testing.expect((try file.check()).valid);
+        _ = try file.reclaimPages(8);
+    }
+    try file.beginTransaction();
+    errdefer file.abortTransaction();
+    try file.putDocument("key", "final");
+    try file.commitTransaction();
+    try file.beginTransaction();
+    try file.putDocument("key", "torn-successor");
+    try file.commitTransaction();
+    const tip = file.activeCheckpoint();
+    const previous = file.header.checkpoints[1 - file.header.active_checkpoint];
+    try std.testing.expect(previous.proof.root != 0);
+    _ = try file.verifyCheckpointProof(previous);
+    // Lose the optional post-sync witnesses, then tear a current postimage.
+    // Recovery must reject the otherwise authenticated new slot and retain
+    // the prior durable checkpoint, including its complete proof images.
+    const zero: [2 * commit_proof.witness_size]u8 = @splat(0);
+    try file.file.writePositionalAll(std.testing.io, &zero, durability_witnesses_offset);
+    const raw = try a.alloc(u8, @intCast(tip.proof.length));
+    defer a.free(raw);
+    try file.readIndexValueInto(.{ .root = tip.proof.root, .length = @intCast(tip.proof.length) }, 0, raw, tip);
+    const frame = try commit_proof.decode(raw, tip.page_count);
+    const damaged = frame.entry(0).page;
+    const image = try file.readPageAllocForCheckpoint(a, damaged, tip);
+    defer a.free(image);
+    image[image.len - 1] ^= 1;
+    try file.file.writePositionalAll(std.testing.io, image, damaged * file.header.page_size);
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .no_sync = true });
+    defer reopened.close();
+    try std.testing.expectEqual(previous.commit_sequence, reopened.activeCheckpoint().commit_sequence);
+    const value = (try reopened.getDocumentAlloc(a, "key")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("final", value);
+}
+
+test "lite commit proof missing witness settles parent and overflow uses safe barriers" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "proof-recovery-barrier.aflite");
+    defer a.free(path);
+    var file = try NativeFile.createWithIo(a, std.testing.io, path, .{ .indexed_reclamation = true });
+    defer file.close();
+    try file.beginTransaction();
+    errdefer file.abortTransaction();
+    try file.putDocument("key", "first");
+    try file.commitTransaction();
+    const zero: [2 * commit_proof.witness_size]u8 = @splat(0);
+    try file.file.writePositionalAll(std.testing.io, &zero, durability_witnesses_offset);
+    var reopened = try NativeFile.openWithIo(a, std.testing.io, path, .{ .read_only = true, .internal_reader = true });
+    try std.testing.expectEqual(@as(u64, 1), reopened.test_durability_syncs.load(.monotonic));
+    try std.testing.expectEqual(file.activeCheckpoint().commit_sequence, reopened.activeCheckpoint().commit_sequence);
+    reopened.close();
+    file.durable_parent = null;
+    const before = file.test_durability_syncs.load(.monotonic);
+    try file.beginTransaction();
+    try std.testing.expectEqual(before + 1, file.test_durability_syncs.load(.monotonic));
+    try file.putDocument("key", "second");
+    // An optimization allocation failure must never emit a partial proof.
+    file.transaction_postimages.?.overflowed = true;
+    const fallback_barriers = file.test_durability_syncs.load(.monotonic);
+    try file.commitTransaction();
+    try std.testing.expectEqual(@as(u64, 2), file.test_durability_syncs.load(.monotonic) - fallback_barriers);
+    try std.testing.expectEqual(@as(u64, 0), file.activeCheckpoint().proof.root);
+    try std.testing.expect((try file.check()).valid);
+    // Namespace rebinding invalidates postimage hashes, so unpublished images
+    // drop proofs through their allocator before rebinding and sealing.
+    try file.beginTransaction();
+    try file.putDocument("key", "third");
+    try file.commitTransaction();
+    try std.testing.expect(file.activeCheckpoint().proof.root != 0);
+    try file.preparePrivatePublication(path);
+    try std.testing.expectEqual(@as(u64, 0), file.activeCheckpoint().proof.root);
+    try std.testing.expectEqualDeep(file.header.checkpoints[0], file.header.checkpoints[1]);
+    try std.testing.expect((try file.check()).valid);
 }

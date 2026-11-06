@@ -56,6 +56,7 @@ class CatalogAccounting:
             12,
             13,
             14,
+            15,
         ):
             raise ValueError("unsupported diagnostic file signature")
         self.version = struct.unpack_from("<I", header, 8)[0]
@@ -73,9 +74,13 @@ class CatalogAccounting:
             raw = header[64 + i * 72 : 136 + i * 72]
             extra = (
                 header[208 + i * 48 : 256 + i * 48]
-                if self.version in (7, 8, 9, 10, 11, 12, 13, 14)
+                if self.version in (7, 8, 9, 10, 11, 12, 13, 14, 15)
                 else b""
             )
+            if self.version >= 15:
+                proof = header[304 + i * 48 : 352 + i * 48]
+                if any(proof):
+                    extra += proof
             checksum = struct.unpack_from("<I", raw, 64)[0]
             if checksum != zlib.crc32(raw[:64] + extra) and not (
                 self.version == 3 and checksum == 0

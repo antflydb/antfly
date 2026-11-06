@@ -706,6 +706,22 @@ const RetiredSegmentFileDeleter = struct {
         // every durable retirement marker. Standalone files retain per-file
         // outcomes and their existing missing-file semantics.
         if (self.defer_deletions) {
+            const index_root = std.fs.path.dirname(self.root_dir) orelse self.root_dir;
+            const retired_atomically = self.storage.retireTextSegments(index_root, ids[0..count]) catch {
+                platform_sync.lockYielding(&self.delete_mu);
+                defer self.delete_mu.unlock();
+                for (ids[0..count]) |seg_id| self.finishAttemptLocked(seg_id, true);
+                return;
+            };
+            if (retired_atomically) {
+                // The capability removed the durable markers in the same
+                // publication. Do not restage their deletion through a stale
+                // namespace snapshot or manufacture a semantic generation.
+                platform_sync.lockYielding(&self.delete_mu);
+                defer self.delete_mu.unlock();
+                for (ids[0..count]) |seg_id| self.removeRetryLocked(seg_id);
+                return;
+            }
             var failed = false;
             self.storage.deleteFilesAbsolute(paths[0..count]) catch {
                 failed = true;

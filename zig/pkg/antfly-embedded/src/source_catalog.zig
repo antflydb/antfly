@@ -578,6 +578,7 @@ pub const storage_lite_ledger_digest = @import("storage/lite/ledger_digest.zig")
 pub const storage_lite_mod = @import("storage/lite/mod.zig");
 pub const storage_lite_path_lock_wait = @import("storage/lite/path_lock_wait.zig");
 pub const storage_lite_writer_queue = @import("storage/lite/writer_queue.zig");
+pub const storage_lite_commit_proof = @import("storage/lite/commit_proof.zig");
 pub const storage_lite_native = @import("storage/lite/native.zig");
 pub const storage_lite_semantic_revision = @import("storage/lite/semantic_revision.zig");
 pub const storage_lite_paths = @import("storage/lite/paths.zig");

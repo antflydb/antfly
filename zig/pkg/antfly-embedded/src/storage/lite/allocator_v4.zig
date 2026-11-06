@@ -62,7 +62,19 @@ pub fn serviceJournalPages(payload: usize, work: usize) u64 {
         pages = next;
     }
 }
-pub const Kind = enum(u8) { record, index, value, metadata, page, allocator_chain };
+pub const Kind = enum(u8) {
+    record,
+    index,
+    value,
+    metadata,
+    page,
+    allocator_chain,
+    commit_proof,
+    proof_value,
+    pub fn isMetadata(self: Kind) bool {
+        return self == .metadata or self == .allocator_chain or self == .commit_proof or self == .proof_value;
+    }
+};
 pub const Retirement = struct {
     id: u64 = 0,
     epoch: u64,
@@ -481,7 +493,7 @@ pub const State = struct {
     }
     fn queue(self: *State, kind: Kind) *Heap {
         return switch (kind) {
-            .metadata => &self.metadata_heap,
+            .metadata, .commit_proof, .proof_value => &self.metadata_heap,
             .allocator_chain => &self.chains_heap,
             else => &self.heap,
         };
@@ -504,7 +516,7 @@ pub const State = struct {
         if (self.last_pending != 0) self.pending.getPtr(self.last_pending).?.next = owned.id else self.first_pending = owned.id;
         self.last_pending = owned.id;
         try self.queue(owned.kind).push(self.allocator, owned);
-        if (owned.kind != .metadata and owned.kind != .allocator_chain) self.data_pending += 1;
+        if (!owned.kind.isMetadata()) self.data_pending += 1;
     }
     pub fn oldest(self: *State, frontier: u64) ?Retirement {
         return self.eligible(frontier, frontier);
@@ -535,7 +547,7 @@ pub const State = struct {
         _ = self.removePending(item.id);
         self.pruneHeap(self.queue(item.kind));
         self.collected +|= 1;
-        if (item.kind != .metadata and item.kind != .allocator_chain) self.data_pending -= 1;
+        if (!item.kind.isMetadata()) self.data_pending -= 1;
     }
     /// Private-image publication discards all earlier private recovery roots.
     /// Rebase pending epochs and checkpoint the queue at that final boundary.
@@ -626,7 +638,7 @@ pub const State = struct {
                         if (self.last_pending != 0) self.pending.getPtr(self.last_pending).?.next = item.id else self.first_pending = item.id;
                         self.last_pending = item.id;
                         try self.queue(item.kind).push(self.allocator, item);
-                        if (item.kind != .metadata and item.kind != .allocator_chain) self.data_pending += 1;
+                        if (!item.kind.isMetadata()) self.data_pending += 1;
                     },
                     3 => {
                         const id = get64(entry, 8);
@@ -636,7 +648,7 @@ pub const State = struct {
                         if (item.next != 0) self.pending.getPtr(item.next).?.previous = item.previous else self.last_pending = item.previous;
                         _ = self.removePending(id);
                         self.stale_heap_items += 1;
-                        if (item.kind != .metadata and item.kind != .allocator_chain) self.data_pending -= 1;
+                        if (!item.kind.isMetadata()) self.data_pending -= 1;
                     },
                     else => return error.InvalidNativeAllocator,
                 }
@@ -828,7 +840,7 @@ pub const State = struct {
             self.last_pending = id;
             if (item.id >= self.root.next_id or item.page == 0) return error.InvalidNativeAllocator;
             try self.queue(item.kind).push(a, item.*);
-            if (item.kind != .metadata and item.kind != .allocator_chain) self.data_pending += 1;
+            if (!item.kind.isMetadata()) self.data_pending += 1;
         }
         // The stop page is a live sentinel, even though replay excludes its
         // payload. Reusing its ID could otherwise stop at an unrelated new page.

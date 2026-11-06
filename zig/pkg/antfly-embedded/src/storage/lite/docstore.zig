@@ -1379,6 +1379,7 @@ const MutationRequest = struct {
     durable: bool = true,
     index_only: bool = false,
     artifact_lease: bool = false,
+    artifact_retirement: bool = false,
     publication_possible: bool = false,
     result: anyerror!void = {},
 };
@@ -3004,18 +3005,18 @@ pub const Store = struct {
     }
 
     pub fn submitMutationWithPublicationState(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, publication_possible: *bool) !void {
-        return self.submitScopedMutation(context, apply, true, false, false, publication_possible);
+        return self.submitScopedMutation(context, apply, true, false, false, false, publication_possible);
     }
 
     pub fn submitIndexMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, true, false, null);
+        return self.submitScopedMutation(context, apply, durable, true, false, false, null);
     }
 
     /// Report the group's decision, captured before another group can change
     /// the file's uncertainty flags. Queued callers receive the same snapshot
     /// as their leader, including cancellation before checkpoint publication.
     pub fn submitIndexMutationWithPublicationState(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, publication_possible: *bool) !void {
-        return self.submitScopedMutation(context, apply, durable, true, false, publication_possible);
+        return self.submitScopedMutation(context, apply, durable, true, false, false, publication_possible);
     }
 
     /// A durability barrier allocates no pages and requires no allocator
@@ -3039,16 +3040,23 @@ pub const Store = struct {
     }
 
     pub fn submitMutationWithDurability(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
-        return self.submitScopedMutation(context, apply, durable, false, false, null);
+        return self.submitScopedMutation(context, apply, durable, false, false, false, null);
     }
 
     /// Immutable source aliases are read-path metadata, not authored writes.
     /// Only groups containing exclusively these aliases may defer reuse proof.
     pub fn submitArtifactLeaseMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
-        return self.submitScopedMutation(context, apply, true, false, true, null);
+        return self.submitScopedMutation(context, apply, true, false, true, false, null);
     }
 
-    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool, publication_possible: ?*bool) !void {
+    /// Only the typed retirement capability may submit these groups. Keep them
+    /// separate from authored changes so physical unlink cannot rotate logical
+    /// index identities or bypass the admission of a primary mutation.
+    pub fn submitArtifactRetirement(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void) !void {
+        return self.submitScopedMutation(context, apply, true, true, false, true, null);
+    }
+
+    fn submitScopedMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool, index_only: bool, artifact_lease: bool, artifact_retirement: bool, publication_possible: ?*bool) !void {
         if (publication_possible) |out| out.* = false;
         if (self.read_only) return error.ReadOnly;
         defer {
@@ -3058,7 +3066,7 @@ pub const Store = struct {
             self.maintenance_wake.set(self.file.runtime());
         }
         const io = self.file.runtime();
-        var request = MutationRequest{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease };
+        var request = MutationRequest{ .context = context, .apply = apply, .durable = durable, .index_only = index_only, .artifact_lease = artifact_lease, .artifact_retirement = artifact_retirement };
         defer if (publication_possible) |out| {
             out.* = request.publication_possible;
         };
@@ -3082,7 +3090,7 @@ pub const Store = struct {
             // semantics even when ordinary writes arrive concurrently. Mixing
             // it into a normal transaction changes the logical metadata
             // generation and invalidates unrelated detached constructions.
-            if (next.artifact_lease != head.artifact_lease) break;
+            if (next.artifact_lease != head.artifact_lease or next.artifact_retirement != head.artifact_retirement) break;
             tail = next;
         }
         self.commit_head = tail.next;
@@ -3139,12 +3147,14 @@ pub const Store = struct {
         publication_possible.* = false;
         var index_only = true;
         var artifact_lease_only = true;
+        var artifact_retirement_only = true;
         var member: ?*MutationRequest = head;
         while (member) |item| : (member = item.next) {
             index_only = index_only and item.index_only;
             artifact_lease_only = artifact_lease_only and item.artifact_lease;
+            artifact_retirement_only = artifact_retirement_only and item.artifact_retirement;
         }
-        if (self.writer_admission) |admission| try admission.enter(admission.ptr, if (artifact_lease_only) .artifact_lease else if (index_only) .index else .primary);
+        if (self.writer_admission) |admission| try admission.enter(admission.ptr, if (artifact_lease_only) .artifact_lease else if (artifact_retirement_only) .reclamation else if (index_only) .index else .primary);
         defer if (self.writer_admission) |admission| admission.leave(admission.ptr);
         lockStore(self);
         defer self.mutex.unlock();
@@ -3156,7 +3166,12 @@ pub const Store = struct {
         try self.refreshAdmissionAssumeLocked();
         try self.initializeReadGenerationAssumeLocked();
         errdefer self.publishReadCheckpointAssumeLocked();
-        if (artifact_lease_only) {
+        const was_maintenance = self.file.maintenance_publication;
+        if (artifact_retirement_only) self.file.maintenance_publication = true;
+        defer self.file.maintenance_publication = was_maintenance;
+        if (artifact_retirement_only) {
+            try self.file.beginArtifactRetirementTransaction();
+        } else if (artifact_lease_only) {
             try self.file.beginArtifactLeaseTransaction();
         } else {
             try self.file.beginTransactionWithRetirementPressure();
@@ -6809,7 +6824,7 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
     var vtable = std.Options.debug_io.vtable.*;
     vtable.fileSync = Fault.sync;
     const io = std.Io{ .userdata = std.Options.debug_io.userdata, .vtable = &vtable };
-    for (1..3) |barrier| {
+    for ([_]bool{ false, true }) |proof| for (1..@as(usize, if (proof) 2 else 3)) |barrier| {
         var tmp = std.testing.tmpDir(.{});
         defer tmp.cleanup();
         const path = try testPath(alloc, tmp, "group-sync-failure.aflite");
@@ -6817,20 +6832,20 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
         {
             var store = try Store.createWithOptions(alloc, path, .{ .io = io });
             defer store.close();
+            store.file.test_force_two_barrier_commit = !proof;
             try store.file.putDocument("doc", "before");
             try store.file.putIndexCatalogRecord("index", "before");
             try store.file.putCatalogRecord("meta", "before");
             Fault.remaining = barrier;
             defer Fault.remaining = 0;
             var context: u8 = 0;
-            // The first barrier precedes checkpoint publication, so nothing
-            // committed. Later barriers fail while the checkpoint is being
-            // published, which leaves the commit's durability unknown.
-            const expected: anyerror = if (barrier == 1) error.InputOutput else error.OutcomeUnknown;
+            // A one-sync proof commits pages and slot at the same barrier.
+            // The safe fallback still distinguishes its pre-slot barrier.
+            const expected: anyerror = if (!proof and barrier == 1) error.InputOutput else error.OutcomeUnknown;
             try std.testing.expectError(expected, store.submitMutation(&context, Fault.apply));
             try std.testing.expectEqual(@as(usize, 0), Fault.remaining);
             // Later mutations never run until the outcome is reconciled.
-            if (barrier > 1) try std.testing.expectError(error.OutcomeReconciliationRequired, store.submitMutation(&context, Fault.apply));
+            if (proof or barrier > 1) try std.testing.expectError(error.OutcomeReconciliationRequired, store.submitMutation(&context, Fault.apply));
         }
         var reopened = try Store.open(alloc, path, true);
         defer reopened.close();
@@ -6844,7 +6859,7 @@ test "lite grouped durability failures recover all roots at one checkpoint" {
         try std.testing.expectEqualStrings(doc, index);
         try std.testing.expectEqualStrings(doc, meta);
         try std.testing.expect((try reopened.file.check()).valid);
-    }
+    };
 }
 
 test "lite packed document cursors read each physical bundle once per scan" {

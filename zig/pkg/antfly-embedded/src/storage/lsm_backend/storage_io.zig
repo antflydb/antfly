@@ -664,6 +664,10 @@ pub const Storage = struct {
         /// Providers with publication admission can amortize its lease and
         /// durability barrier. Borrowed paths remain live through this call.
         delete_files_absolute: ?*const fn (*anyopaque, []const []const u8) anyerror!void = null,
+        /// Atomically verify durable inactive/retired membership, unlink text
+        /// artifacts and remove retirement markers without changing semantics.
+        /// False means this generation uses the compatibility metadata backend.
+        retire_text_segments: ?*const fn (*anyopaque, []const u8, []const u64) anyerror!bool = null,
         delete_tree: *const fn (*anyopaque, []const u8) anyerror!void,
         list_file_names_alloc: ?*const fn (*anyopaque, Allocator, []const u8) anyerror![][]u8 = null,
         /// Immediate child directories, including virtual directories inferred
@@ -939,6 +943,13 @@ pub const Storage = struct {
         if (paths.len == 0) return;
         const remove = self.vtable.delete_files_absolute orelse return error.AtomicFileDeletionUnsupported;
         return BoundaryAbi.call("delete_files_absolute", self.boundary_dispatch, remove, .{ self.ptr, paths });
+    }
+
+    pub fn retireTextSegments(self: Storage, root: []const u8, ids: []const u64) !bool {
+        if (ids.len > max_atomic_file_deletions) return error.FileDeletionBatchTooLarge;
+        if (ids.len == 0) return true;
+        const operation = self.vtable.retire_text_segments orelse return false;
+        return BoundaryAbi.call("retire_text_segments", self.boundary_dispatch, operation, .{ self.ptr, root, ids });
     }
 
     pub fn deleteTree(self: Storage, path: []const u8) !void {

@@ -1168,16 +1168,36 @@ The naming recommendation is:
 
 ## Native throughput and online compaction
 
-Native owners create revision-14 files (`AFLITE\x0eP`) with packed records and
+Native owners create revision-15 files (`AFLITE\x0fP`) with packed records and
 durable page ownership. Existing revision-3 signatures (`AFLITE\x03N` for
 unpacked records and `AFLITE\x03P` for packed records) remain readable. Writable
-owners migrate revisions 3, 7, 8, 9, 10, 11, 12 and 13 through an atomic compact-generation replacement;
+owners migrate revisions 3, 7, 8, 9, 10, 11, 12, 13 and 14 through an atomic compact-generation replacement;
 read-only opens preserve the existing encoding. The Zig `page_reuse = false`
 option preserves revision-3 creation/open behavior. Raw native primitives also
 retain their revision-3 default for compatibility. Revision 2 remains unsupported,
-and older binaries reject the revision-14 signature before checkpoint selection.
+and older binaries reject the revision-15 signature before checkpoint selection.
 Unreleased revision-4/5/6 prototypes are rejected rather than mixing reader,
-logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-14 image.
+logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-15 image.
+
+
+Revision 15 adds authenticated per-checkpoint physical postimage manifests.
+Eligible synced native transactions write their pages, allocator seal, manifest
+and checked recovery slot before one file sync. An exact inode/namespace-bound
+witness is written after that sync; losing the optional witness requires a
+recovery sync before another transaction can anchor the recovered state. Recovery
+validates the complete selected manifest when its witness is absent, and falls
+back to the older checkpoint if any required postimage is missing or torn.
+Both recovery slots retain all physical postimages through their prior sequence.
+Proof metadata has bounded retirement independent of logical-only readers.
+
+Manifest collection is limited to 16,384 physical pages and 64 MiB per transaction.
+Allocation failure or overflow disables this optimization rather than publishing
+an incomplete manifest. Raw writes, deferred durability, maintenance and overflow
+retain the data-before-checkpoint protocol. `no_sync` retains its weaker
+contract and never publishes durability witnesses. Private snapshot and generation
+publication drop proofs before changing the file namespace or allocator seal.
+See [the native commit protocol](../docs/design/lite-performance/native-commit-proofs.md)
+for recovery and retention invariants.
 
 
 New hosted native text indexes store their main namespaces and logical WAL

@@ -70,6 +70,15 @@ fn decode(a: A, encoded: []const u8) ![]u8 {
     return result;
 }
 
+/// Canonical native layout shared with typed maintenance capabilities. The
+/// caller owns the returned bytes; no snapshot or backend lifetime is borrowed.
+pub fn catalogKey(a: A, root: []const u8, ns: NS, key: []const u8) ![]u8 {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const scratch = arena.allocator();
+    return std.mem.concat(a, u8, &.{ root, "/.native-state/ns/", if (ns.name != null) "1" else "0", try encode(scratch, ns.name orelse ""), "/k", try encode(scratch, key) });
+}
+
 fn mapNamespace(ns: NS) !NS {
     return ns;
 }
