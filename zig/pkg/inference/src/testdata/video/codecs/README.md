@@ -1,8 +1,8 @@
 # MP4 codec qualification fixtures
 
 These fixtures exercise EmbeddingGemma2 CUDA NVDEC with progressive 8-bit SDR
-H.264 (`avc1`), HEVC Main (`hvc1`/`hev1`), and AV1 Main (`av01`). The 10-bit
-HEVC/AV1 files are rejection controls. `hevc-aac.mp4` carries the same HEVC
+H.264 (`avc1`), HEVC Main and Main 10 (`hvc1`/`hev1`), and AV1 Main (`av01`).
+The 10-bit HEVC/AV1 files decode to P016 on NVDEC. `hevc-aac.mp4` carries the same HEVC
 pictures with AAC audio: video embedding ignores the audio track, while an
 explicit audio request decodes it.
 
@@ -43,3 +43,9 @@ mismatched references across the silence/transient/music/speech cohort. PCM erro
 is checked separately (mean absolute error <= 1e-4 for all, plus SNR >= 50 dB for
 the owned HE-AAC/PS fixtures). Exact native-decoded-PCM embedding equivalence is
 an additional check, never a replacement for the independent reference gate.
+
+`hevc-hlg.mp4`, `hevc-pq.mp4`, `hevc-rot90.mp4` and `hevc-hlg-rot90.mp4` check
+NVDEC depth, transfer and rotation signalling. Each starts from a two-second x265
+red/blue split; FFmpeg's `hevc_metadata` bitstream filter writes the HLG or PQ
+signal (the x265 parameters alone left it unset), and `-display_rotation 90` writes
+the display matrix. They aren't in `receipt.json`, because no reference hash applies.

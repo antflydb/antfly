@@ -21,7 +21,11 @@ current contracts; historical progress and raw reports live in Git history.
 | Portable VP8 | Versions 0–3, stateful interframes and hidden references; planar owned output. |
 | Portable VP9 | Profiles 0–3, 8/10/12-bit 4:2:0/4:2:2/4:4:4, interframes and superframes. |
 | Portable AV1 | Profiles 0–2, 8/10/12-bit monochrome and 4:2:0/4:2:2/4:4:4, interframes, show-existing and film grain; low-overhead and Annex B framing. |
-| Apple VideoToolbox | Eligible static progressive limited-range avc1 8-bit 4:2:0; fixed-format VP9/AV1 WebM 8/10-bit 4:2:0 with one visible picture per packet. Library hardware-only default; model automatic selection explicitly permits Apple software. |
+| Apple VideoToolbox | Eligible static progressive limited-range avc1 8-bit 4:2:0; fixed-format VP9/AV1 WebM 8/10-bit 4:2:0 with one visible picture per packet; AV1 MP4 through [mp4_coded](src/mp4_coded.zig); [HEVC MP4](src/backends/apple_hevc.zig) with out-of-band parameter sets, 8/10-bit 4:2:0. Library hardware-only default; model automatic selection explicitly permits Apple software. |
+
+AV1 in MP4 translates its container metadata onto the WebM lane, so it shares
+the portable and Apple AV1 routes. HEVC has no portable decoder yet: outside
+VideoToolbox and NVDEC it fails as an unsupported codec.
 
 Compile-time [capabilities](src/capabilities.zig) distinguish built routes from
 runtime hardware/profile availability. Unsupported tools fail explicitly; the
