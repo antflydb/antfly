@@ -424,6 +424,99 @@ private addresses or ports. Run one source with
 `POST /v1/sync` and `{"source_id": "<uuid>"}` to publish a new upload without syncing
 the others. Runs are serialized across the service, so a concurrent run returns 409.
 
+### Moving a local store to a bucket
+
+```sh
+# Against a live "serve" instance -- no delivery downtime; its own admission
+# serializes the repoint with any other run there.
+antfly-source migrate-local --server http://127.0.0.1:8082 --admin-token-env ANTFLY_SOURCE_ADMIN_TOKEN \
+  --source <source-uuid> --from-connection local --from-prefix assets \
+  --to-connection bucket --to-bucket my-bucket --to-prefix migrated \
+  [--dry-run]
+
+# Without --server, in-process against a stopped service's state directory
+# (nothing is being delivered either way, so there's no downtime to protect).
+antfly-source migrate-local --config sources.json --state-dir /var/lib/antfly-sources/runner \
+  --public-url http://127.0.0.1:8082 --admin-token-env ANTFLY_SOURCE_ADMIN_TOKEN --media-key-env ANTFLY_SOURCE_MEDIA_KEY \
+  --source <source-uuid> --from-connection local --from-prefix assets \
+  --to-connection bucket --to-bucket my-bucket --to-prefix migrated \
+  [--dry-run]
+```
+
+This copies one source's objects to an S3-compatible or GCS connection,
+keeping the `objects/sha256/<digest>[.ext]` layout so the digest stays the
+key. Every copy is verified by an independent read-back and hash of the
+destination object, whether just uploaded or already there from an earlier
+run, before anything can reference it; a mismatch fails that object and the
+run (GCS gives back CRC32C and MD5, not SHA-256, so this reads the object
+back and hashes it the same way S3 does, rather than trusting either). GCS
+uploads pass `ifGenerationMatch=0`, so two runs (or a run colliding with
+anything else) can never overwrite each other's object at the same
+content-addressed key; S3 has no equivalent atomic precondition, so it relies
+on the existence check before uploading instead. Rerunning only uploads
+what's still missing, and a clean rerun uploads nothing. It never deletes or
+edits the local store; once satisfied, remove
+`<local_root>/<prefix>/objects/sha256` yourself.
+
+Copying and verifying never take any service lock; they only read the local
+store and write the destination bucket. Repointing (the catalog `PUT` and
+resync) is the one step that needs admission, and has two modes:
+
+- **`--server URL`**: sends the same `PUT /v1/sources/{id}` and
+  `POST /v1/sync` an operator would, over real HTTP to that live `serve`
+  instance's own admin API, and polls the job. Its own run admission
+  serializes this with any other run there, so there's no need to stop it
+  and no delivery downtime from this process holding a lock. A live 409 ("a
+  run is already in progress") is retried with bounded backoff before
+  failing clearly.
+- **No `--server`**: repoints in-process against `--state-dir`, exactly like
+  `serve` would, taking that directory's exclusive lock for the repoint step.
+  Use this only with `serve` stopped -- nothing is being delivered either
+  way, so there's no downtime to protect, and `migrate-local` refuses to
+  start if `serve` (or another `migrate-local` run) already holds that
+  directory, rather than racing it.
+
+The destination connection must already exist in the repointed-against
+profile (the live server's own, or the one seeded at `--state-dir`); this is
+checked, and fails clearly, before anything is copied. An upload that lands
+in the local store while this runs (or afterward) is simply left there; it is
+never lost, and a later `migrate-local` run copies and publishes it even
+after the source already points at the bucket.
+
+**A reference issued before repointing stops working immediately, not
+gradually.** The signed media URL a client already holds is bound to a hash
+of the source's own connection and config; `PUT`-ing the new connection
+changes that hash before a single byte is re-copied or any resync runs, so
+the very next fetch of an old reference gets `410 Gone`. Local bytes are
+never deleted -- only the reference stops resolving. Measured against a real
+`serve` process and a real MinIO bucket while continuously re-querying the
+catalog and fetching whatever reference it currently returned: delivery
+degraded only in that one window, lasting well under a second between the
+`PUT` and the resync publishing the bucket-backed row (5 of 151 fetch
+attempts, in one run, got `410` there); it never went down because of a held
+lock, and a client that always fetches the current reference (rather than
+holding on to an old one) sees at most that one short gap. Fetching the exact
+URL a client already has, right in that gap, fails with `410`, consistent
+with the reference's own contract that an invalidated URL never serves
+different bytes under the old signature.
+
+**Repointing re-keys every document.** A provider switch changes the item
+identity (`local://...` becomes `s3://...` or `gcs://...`), and the catalog's
+document ID is a hash of that identity, not of the bytes. The resync
+therefore deletes each old row and inserts a new one, even though the digest
+is unchanged. Any derived data attached to the old row -- OCR text, chunks,
+embeddings -- does not carry over and must be recomputed against the new
+row. Only the original content's digest survives unrecomputed; search over
+the migrated content still works once that recomputation finishes (plain
+text and metadata are available immediately). `migrate-local` prints this
+plainly before copying anything, including on a dry run.
+
+A GCS destination uses `GoogleCredentialsForGCSWrite` (read/write scope)
+rather than the read-only scope every other Google connection requests;
+a credential that only has read-only storage access fails the upload itself
+with a clear `HTTP 403` naming the missing scope, rather than failing
+earlier with something more cryptic.
+
 ## Media and runtime source registration
 
 Run the optional **source companion** when applications need runtime connections,

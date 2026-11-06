@@ -30,18 +30,9 @@ func GoogleCredentials(ctx context.Context, provider, secret string) (*google.Cr
 // GoogleCredentialsForServices requests only the selected Workspace services.
 // Refresh credentials must already have those grants; adding a service requires
 // renewed user consent. Service accounts do not implicitly gain mailbox access.
+// Every scope requested here is read-only; GCS as a migrate-local destination
+// needs write access instead, via GoogleCredentialsForGCSWrite.
 func GoogleCredentialsForServices(ctx context.Context, provider, secret string, services []string) (*google.Credentials, error) {
-	var config struct {
-		Type     string `json:"type"`
-		TokenURI string `json:"token_uri"`
-		Universe string `json:"universe_domain"`
-	}
-	if json.Unmarshal([]byte(secret), &config) != nil || (config.Type != "service_account" && config.Type != "authorized_user") {
-		return nil, fmt.Errorf("Google sources require service_account or authorized_user credential JSON")
-	}
-	if (config.TokenURI != "" && config.TokenURI != "https://oauth2.googleapis.com/token" && config.TokenURI != "https://accounts.google.com/o/oauth2/token") || (config.Universe != "" && config.Universe != "googleapis.com") {
-		return nil, fmt.Errorf("Google credential endpoints must use the supported Google identity service")
-	}
 	scopes := []string{"https://www.googleapis.com/auth/devstorage.read_only"}
 	if provider == ProviderGoogleDrive {
 		scopes = []string{"https://www.googleapis.com/auth/drive.readonly"}
@@ -69,6 +60,34 @@ func GoogleCredentialsForServices(ctx context.Context, provider, secret string, 
 		}
 	} else if provider != ProviderGCS {
 		return nil, fmt.Errorf("unsupported Google source provider")
+	}
+	return googleCredentialsWithScopes(ctx, secret, scopes)
+}
+
+// GoogleCredentialsForGCSWrite requests GCS read/write scope instead of the
+// read-only scope every other Google connection uses, for migrate-local's GCS
+// destination. A credential that only grants read_only (or a narrower,
+// bucket/object-scoped read grant) fails the upload itself with a 403 that
+// names the missing scope, rather than failing here.
+func GoogleCredentialsForGCSWrite(ctx context.Context, secret string) (*google.Credentials, error) {
+	return googleCredentialsWithScopes(ctx, secret, []string{"https://www.googleapis.com/auth/devstorage.read_write"})
+}
+
+// googleCredentialsWithScopes validates the credential JSON shape and
+// identity-service endpoints shared by every Google connection, then
+// requests exactly scopes -- the one axis that differs between a read-only
+// source connection and migrate-local's write-scoped GCS destination.
+func googleCredentialsWithScopes(ctx context.Context, secret string, scopes []string) (*google.Credentials, error) {
+	var config struct {
+		Type     string `json:"type"`
+		TokenURI string `json:"token_uri"`
+		Universe string `json:"universe_domain"`
+	}
+	if json.Unmarshal([]byte(secret), &config) != nil || (config.Type != "service_account" && config.Type != "authorized_user") {
+		return nil, fmt.Errorf("Google sources require service_account or authorized_user credential JSON")
+	}
+	if (config.TokenURI != "" && config.TokenURI != "https://oauth2.googleapis.com/token" && config.TokenURI != "https://accounts.google.com/o/oauth2/token") || (config.Universe != "" && config.Universe != "googleapis.com") {
+		return nil, fmt.Errorf("Google credential endpoints must use the supported Google identity service")
 	}
 	credentials, err := google.CredentialsFromJSON(ctx, []byte(secret), scopes...)
 	if err != nil {
