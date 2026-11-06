@@ -50,7 +50,7 @@ func run() error {
 	catalog := flags.String("catalog-out", "", "portable search catalog path")
 	restart := flags.Bool("restart", false, "discard a failed pinned selection and enumerate afresh (retain ownership)")
 	if len(os.Args) < 2 || os.Args[1] != "sync" {
-		return fmt.Errorf("usage: antfly-source sync --config FILE --state-dir DIR [--catalog-out FILE] [--restart]; or antfly-source serve --config FILE --state-dir DIR --public-url URL; or antfly-source migrate-local --config FILE --state-dir DIR --public-url URL --source ID --from-connection NAME --to-connection NAME --to-bucket BUCKET [--from-prefix PREFIX] [--to-prefix PREFIX] [--dry-run]")
+		return fmt.Errorf("usage: antfly-source sync --config FILE --state-dir DIR [--catalog-out FILE] [--restart]; or antfly-source serve --config FILE --state-dir DIR --public-url URL; or antfly-source migrate-local --source ID --from-connection NAME --to-connection NAME --to-bucket BUCKET [--server URL | (--config FILE --state-dir DIR --public-url URL)] [--from-prefix PREFIX] [--to-prefix PREFIX] [--dry-run]")
 	}
 	if err := flags.Parse(os.Args[2:]); err != nil {
 		return err
