@@ -134,9 +134,7 @@ pub const LoadedMultiStageReader = struct {
         // construction. Directory containment alone does not prove membership.
         for (component_paths) |path| {
             if (!std.mem.endsWith(u8, path, ".onnx")) continue;
-            var graph = try backends.imported_onnx_session.inspectArtifactSet(allocator, path);
-            defer graph.deinit();
-            for (graph.external_paths) |external| try asset_resolver.published.verifyPath(external);
+            try asset_resolver.published.verifyOnnx(path);
         }
         var component_loader = try model_manager.componentLoaderForPathsWithContract(
             model_path,
@@ -144,6 +142,7 @@ pub const LoadedMultiStageReader = struct {
             component_paths,
             .multistage_ocr,
         );
+        component_loader = component_loader.withArtifacts(&asset_resolver.published);
         var preflight = try PreflightAssets.load(
             allocator,
             &asset_resolver,
