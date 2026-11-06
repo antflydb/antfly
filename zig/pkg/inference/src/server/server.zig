@@ -42154,7 +42154,7 @@ fn generationRequestFailure(err: anyerror) ?GenerationRequestFailure {
         error.MalformedAnnexB,
         error.MissingVideoParameterSet,
         => .{ .status = 400, .code = "INVALID_VIDEO", .message = "unsupported, empty, or corrupt video", .retryable = false },
-        error.VideoDurationExceeded, error.VideoInputTooLarge => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds this backend's duration or size limit", .retryable = false },
+        error.VideoDurationExceeded, error.VideoInputTooLarge, error.SharedAdmissionExceeded => .{ .status = 400, .code = "VIDEO_TOO_LARGE", .message = "video exceeds this backend's duration or size limit", .retryable = false },
         error.NvdecUnavailable => .{ .status = 503, .code = "VIDEO_BACKEND_UNAVAILABLE", .message = "the CUDA video decoder is unavailable on this server", .retryable = true },
         error.Timeout => .{
             .status = 504,

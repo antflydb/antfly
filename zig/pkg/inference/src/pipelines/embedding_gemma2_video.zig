@@ -2213,7 +2213,7 @@ fn decodeAppleHevc(a: std.mem.Allocator, reader: *media.mp4.Reader, selected: []
     if (!appleAllowed(capture.decoder)) return false;
     const receipt = video.apple_hevc.decodeTo(a, reader, selected, .{
         .pool = capture.pool,
-        .device_surfaces = capture.metal != null,
+        .device_surfaces = capture.metal != null or capture.observer != null,
     }, .{ .context = capture, .accept = Capture.publishAppleHevc }) catch |err| {
         try appleUnavailable(capture, err);
         return false;

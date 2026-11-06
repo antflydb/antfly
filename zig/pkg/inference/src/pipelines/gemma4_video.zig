@@ -240,7 +240,8 @@ fn encodePortable(cb: *const ComputeBackend, a: std.mem.Allocator, projector: *p
     // Indexing and decoding run under the model execution lock, so they must honor
     // the request's cancellation and deadline between selected frames too.
     const control = cb.execution_control orelse Control{};
-    var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes } };
+    // VideoToolbox surfaces are a separate budget from decoder heap memory.
+    var pool = media.admission.Pool{ .limits = .{ .host_bytes = portable_pool_bytes, .device_bytes = video.apple_hevc.max_surface_bytes } };
     const timestamps = embedding_video.selectedPresentationUs(a, bytes, control, sampling, &pool) catch |err| return inputError(err);
     defer a.free(timestamps);
     var frames = try projector_mod.PortableVideoFrames.init(cb, a, projector, timestamps.len);
