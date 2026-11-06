@@ -4335,3 +4335,285 @@ test "lite native namespace capability preserves legacy authority and reopens na
     try std.testing.expectEqualStrings("native authority", try read.get(.{ .name = "meta" }, "active"));
     try std.testing.expect((try docs.checkWithCancel(null)).valid);
 }
+
+test "lite native prepared namespace joins primary publication and rejects stale plans" {
+    const backend = @import("namespace_store.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-primary-publication.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var store = try backend.Backend.open(a, &docs, "/indexes/text/index", false);
+    defer store.deinit();
+    const ns: @import("../backend_types.zig").Namespace = .{ .name = "meta" };
+    var staged = try store.beginWrite();
+    var staged_open = true;
+    defer if (staged_open) staged.abort();
+    try staged.put(ns, "active", "generation-one");
+    {
+        var cursor = try staged.openCursor(ns);
+        defer cursor.close();
+        try std.testing.expectError(error.TransactionCursorActive, staged.prepareNativePublication());
+    }
+    var prepared = try staged.prepareNativePublication();
+    staged_open = false;
+    defer prepared.deinit();
+    const Participant = struct {
+        namespace: native_publication.Participant,
+        inode: u64,
+        fail: bool = true,
+        fn stage(raw: *anyopaque, view: native_publication.View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.namespace.apply(view);
+            try view.put(self.inode, "/indexes/text/segment", "postings");
+            if (self.fail) return error.InjectedFailure;
+        }
+    };
+    var participant: Participant = .{ .namespace = prepared.participant, .inode = (try docs.file.file.stat(docs.file.runtime())).inode };
+    const before = docs.file.activeCheckpoint().commit_sequence;
+    {
+        var txn = try docs.beginBatch();
+        defer txn.abort();
+        try txn.put("document", "value");
+        try txn.setNativePublication(.{ .ptr = &participant, .stage = Participant.stage });
+        try std.testing.expectError(error.InjectedFailure, txn.commit());
+    }
+    try std.testing.expectEqual(before, docs.file.activeCheckpoint().commit_sequence);
+    try std.testing.expect((try docs.file.getDocumentAlloc(a, "document")) == null);
+    try std.testing.expect((try docs.file.getIndexCatalogRecordSize("/indexes/text/segment")) == null);
+    {
+        var check = try store.beginRead();
+        defer check.abort();
+        try std.testing.expectError(error.NotFound, check.get(ns, "active"));
+    }
+    participant.fail = false;
+    {
+        var txn = try docs.beginBatch();
+        errdefer txn.abort();
+        try txn.put("document", "value");
+        try txn.setNativePublication(.{ .ptr = &participant, .stage = Participant.stage });
+        try txn.commit();
+    }
+    try std.testing.expectEqual(before + 1, docs.file.activeCheckpoint().commit_sequence);
+    {
+        var check = try store.beginRead();
+        defer check.abort();
+        try std.testing.expectEqualStrings("generation-one", try check.get(ns, "active"));
+    }
+    {
+        var txn = try docs.beginBatch();
+        defer txn.abort();
+        try txn.put("document", "must roll back");
+        try txn.setNativePublication(prepared.participant);
+        try std.testing.expectError(error.FileBusy, txn.commit());
+    }
+    const value = (try docs.file.getDocumentAlloc(a, "document")).?;
+    defer a.free(value);
+    try std.testing.expectEqualStrings("value", value);
+    try std.testing.expectEqual(before + 1, docs.file.activeCheckpoint().commit_sequence);
+    try std.testing.expect((try docs.checkWithCancel(null)).valid);
+}
+
+test "lite native primary publication preserves group uncertainty on the calling thread" {
+    const backend = @import("namespace_store.zig");
+    const types = @import("../backend_types.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-primary-uncertainty.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var store = try backend.Backend.open(a, &docs, "/indexes/text/index", false);
+    defer store.deinit();
+    var staged = try store.beginWrite();
+    var staged_open = true;
+    defer if (staged_open) staged.abort();
+    try staged.put(.{}, "active", "new metadata");
+    var prepared = try staged.prepareNativePublication();
+    staged_open = false;
+    defer prepared.deinit();
+    var txn = try docs.beginBatch();
+    defer txn.abort();
+    try txn.put("document", "new value");
+    try txn.setNativePublication(prepared.participant);
+    var progress: types.CommitProgress = .{};
+    const parent = types.commit_progress;
+    types.commit_progress = &progress;
+    defer types.commit_progress = parent;
+    docs.file.test_fail_checkpoint_publication = error.InputOutput;
+    try std.testing.expectError(error.OutcomeUnknown, txn.commit());
+    try std.testing.expect(progress.maybe_applied);
+    try std.testing.expect(docs.file.checkpoint_publication_uncertain);
+}
+
+test "lite native graph and sparse metadata reopen without inner LSM files" {
+    const graph_mod = @import("../../graph/graph.zig");
+    const sparse_mod = @import("../../sparse/sparse.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-other-indexes.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &docs);
+    const storage = adapter.storage();
+    const graph_opts: graph_mod.GraphIndexOptions = .{ .no_sync = true, .reverse_lsm_storage = storage };
+    const sparse_opts: sparse_mod.SparseIndexOptions = .{ .no_sync = true, .lsm_storage = storage };
+    {
+        var graph = try graph_mod.GraphIndex.open(a, {}, "/indexes/graph", "g", graph_opts);
+        defer graph.close();
+        try graph.addEdge("a", "b", "link", 1, 0, 0, "");
+        var sparse = try sparse_mod.SparseIndex.open(a, "/indexes/sparse", sparse_opts);
+        defer sparse.close();
+        try sparse.batch(&.{.{ .doc_id = "a", .vec = .{ .indices = &.{3}, .values = &.{0.75} } }}, &.{});
+    }
+    {
+        var graph = try graph_mod.GraphIndex.open(a, {}, "/indexes/graph", "g", graph_opts);
+        defer graph.close();
+        const edges = try graph.getEdges(a, "b", "link", .in);
+        defer graph_mod.GraphIndex.freeEdges(a, edges);
+        try std.testing.expectEqual(@as(usize, 1), edges.len);
+        var sparse = try sparse_mod.SparseIndex.open(a, "/indexes/sparse", sparse_opts);
+        defer sparse.close();
+        const query: sparse_mod.SparseVector = .{ .indices = &.{3}, .values = &.{1} };
+        const hits = try sparse.search(a, &query, 10);
+        defer sparse_mod.SparseIndex.freeResults(a, hits);
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqualStrings("a", hits[0].doc_id);
+    }
+    var cursor = try docs.file.indexCatalogCursor(docs.file.activeCheckpoint(), "/indexes/");
+    defer cursor.deinit();
+    while (try cursor.next()) |entry| {
+        defer a.free(entry.key);
+        try std.testing.expect(std.mem.indexOf(u8, entry.key, "/.native-state/") != null);
+    }
+    try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "lite native scalar namespace forks retain one snapshot after owner close" {
+    const namespaces = @import("namespace_store.zig");
+    const bound = @import("../namespace_bound_store.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-scalar-fork.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    var docs_open = true;
+    defer if (docs_open) docs.close();
+    docs.maintenance_start_suppressed = true;
+    var namespace_store = try namespaces.Backend.open(a, &docs, "/indexes/scalar", false);
+    var namespace_open = true;
+    defer if (namespace_open) namespace_store.deinit();
+    const backend = try bound.Backend.init(a, namespace_store);
+    namespace_open = false;
+    var backend_open = true;
+    defer if (backend_open) backend.close();
+    var scalar = try backend.runtimeStore(a);
+    var scalar_open = true;
+    defer if (scalar_open) scalar.deinit();
+    {
+        var txn = try scalar.beginBatch();
+        errdefer txn.abort();
+        try txn.put("\x00binary\xff", "original");
+        try txn.commit();
+    }
+    var original = try scalar.beginRead();
+    var original_open = true;
+    defer if (original_open) original.abort();
+    var fork = try original.forkRead();
+    var fork_open = true;
+    defer if (fork_open) fork.abort();
+    original.abort();
+    original_open = false;
+    {
+        var txn = try scalar.beginBatch();
+        errdefer txn.abort();
+        try txn.put("\x00binary\xff", "replacement");
+        try txn.commit();
+    }
+    var last = try fork.forkRead();
+    defer last.abort();
+    fork.abort();
+    fork_open = false;
+    scalar.deinit();
+    scalar_open = false;
+    backend.close();
+    backend_open = false;
+    docs.close();
+    docs_open = false;
+    try std.testing.expectEqualStrings("original", try last.get("\x00binary\xff"));
+    var cursor = try last.openCursor();
+    defer cursor.close();
+    try std.testing.expectEqualStrings("original", (try cursor.first()).?.value);
+}
+
+test "lite native namespace logical snapshots retain data without allocator fences" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-logical-namespace.aflite");
+    defer a.free(path);
+    var coordinator = native.ReaderCoordinator.init(a, std.testing.io);
+    defer coordinator.deinit();
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    docs.file.reader_coordinator = &coordinator;
+    try docs.file.putIndexCatalogRecord("/indexes/text/value", "old");
+    var snapshot = try docs.file.captureLogicalReadSnapshot();
+    defer snapshot.close();
+    try std.testing.expect(snapshot.logical_snapshot);
+    const inode = (try docs.file.file.stat(docs.file.runtime())).inode;
+    const readers = coordinator.readerStats(inode);
+    try std.testing.expect(readers.frontier.data != null);
+    try std.testing.expect(readers.frontier.metadata == null);
+    try std.testing.expectError(error.NativeSnapshotMetadataUnavailable, snapshot.check());
+    try std.testing.expectError(error.NativeSnapshotMetadataUnavailable, snapshot.captureFullReadSnapshot());
+    for (0..64) |_| try docs.file.putIndexCatalogRecord("/indexes/text/value", "new");
+    const old = (try snapshot.getIndexCatalogRecordAlloc(a, "/indexes/text/value")).?;
+    defer a.free(old);
+    try std.testing.expectEqualStrings("old", old);
+    var full = try docs.file.captureFullReadSnapshot();
+    defer full.close();
+    try std.testing.expect(coordinator.readerStats(inode).frontier.metadata != null);
+    try std.testing.expect((try full.checkAtFileSizeWithCancel((try full.file.stat(full.runtime())).size, null)).valid);
+}
+
+test "lite native vector metadata reopens without an inner LSM" {
+    const hbc = @import("../hbc_adapter.zig");
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-vector-metadata.aflite");
+    defer a.free(path);
+    var docs = try docstore.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, &docs);
+    const options: @import("../hbc_backend.zig").LsmOptions = .{ .storage = adapter.storage() };
+    {
+        var index = try hbc.HBCIndex.openWithLsmOptions(a, "/indexes/vector", .{ .dims = 3, .storage_backend = .lsm, .no_sync = true }, options);
+        defer index.close();
+        try std.testing.expect(index.snapshotLsmWriteStats() == null);
+        try index.insert(1, &.{ 1, 0, 0 });
+        try index.insert(2, &.{ 0, 1, 0 });
+    }
+    {
+        var index = try hbc.HBCIndex.openWithLsmOptions(a, "/indexes/vector", .{ .dims = 3, .storage_backend = .lsm, .no_sync = true }, options);
+        defer index.close();
+        try std.testing.expect(index.snapshotLsmWriteStats() == null);
+        var results = try index.search(&.{ 1, 0, 0 }, 2);
+        defer results.deinit();
+        try std.testing.expectEqual(@as(usize, 2), results.getHits().len);
+        try std.testing.expectEqual(@as(u64, 1), results.getHits()[0].vector_id);
+    }
+    try std.testing.expect((try docs.file.check()).valid);
+}

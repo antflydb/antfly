@@ -9963,9 +9963,18 @@ test "capi native mixed index turns retain bounded immutable sources after catch
         }
         const root = try owner.refresh();
         try root.db.addIndex(.{ .name = "graph", .kind = .graph, .config_json = "{}" });
-        try std.testing.expect(root.db.detachedTextSourceBlock() != null);
+        if (root.db.detachedTextSourceBlock() == null) return error.ExpectedMixedIndexCacheExclusion;
     }
-    try std.testing.expectEqual(h.capi.ErrorCode.ok, fixture.call(.batch));
+    // Direct native graph metadata has no SST source to retain. Exercise a
+    // real range-backed text artifact, rather than accidentally counting an
+    // unrelated inner-LSM graph file as evidence of text source handoff.
+    var text: std.ArrayList(u8) = .empty;
+    defer text.deinit(std.testing.allocator);
+    for (0..32768) |word| try text.print(std.testing.allocator, "handoff{d:0>8} ", .{word});
+    const value = try std.json.Stringify.valueAlloc(std.testing.allocator, .{ .text = text.items }, .{});
+    defer std.testing.allocator.free(value);
+    var write: h.capi.WriteIntent = .{ .key = .fromSlice("large-text"), .value = .fromSlice(value), .is_delete = false };
+    try std.testing.expectEqual(h.capi.ErrorCode.ok, api.antfly_db_batch(fixture.id, @ptrCast(&write), 1, null, 0, 0, 0));
     var complete = false;
     for (0..32) |_| {
         // Clear prior partial-turn pins: this assertion concerns the turn
@@ -9989,12 +9998,12 @@ test "capi native mixed index turns retain bounded immutable sources after catch
         // Both paths must retain independently leased immutable sources.
         if (owner.maintenance_snapshot) |actor| if (actor.db_live) owner.discardMaintenanceRuntime();
         if (owner.maintenance_snapshot) |actor| try std.testing.expect(!actor.db_live);
-        try std.testing.expect(owner.immutable_sources.count > 0);
+        if (owner.immutable_sources.count == 0) return error.MissingImmutableSourceHandoff;
         try std.testing.expect(owner.immutable_sources.range_bytes <= artifact_source.WorkingSet.max_range_bytes);
         complete = true;
         break;
     }
-    try std.testing.expect(complete);
+    if (!complete) return error.MixedIndexReplayDidNotSettle;
 }
 
 test "capi native registered replay fragments oversized batches across maintenance runtime replacement" {

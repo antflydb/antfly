@@ -25,7 +25,7 @@ pub const Host = struct {
     index_prefix: []const u8,
 
     pub fn view(self: *Host) publication.View {
-        return .{ .ptr = self, .link_fn = link, .put_fn = put, .get_metadata_fn = getMetadata, .put_metadata_fn = putMetadata };
+        return .{ .ptr = self, .link_fn = link, .put_fn = put, .get_metadata_fn = getMetadata, .put_metadata_fn = putMetadata, .namespace_fn = publishNamespace };
     }
 
     fn checkedFile(self: *Host, inode: u64) !*native.NativeFile {
@@ -36,12 +36,35 @@ pub const Host = struct {
     fn validateDestination(self: *Host, path: []const u8) !void {
         if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidNativeIndexPath;
         const prefix = self.index_prefix;
-        if (prefix.len == 0) return;
-        if (!std.mem.startsWith(u8, path, prefix) or
-            (path.len != prefix.len and path[prefix.len] != '/')) return error.InvalidNativeIndexPath;
+        if (prefix.len != 0 and (!std.mem.startsWith(u8, path, prefix) or
+            (path.len != prefix.len and path[prefix.len] != '/'))) return error.InvalidNativeIndexPath;
         if (path.len == prefix.len) return;
-        var parts = std.mem.splitScalar(u8, path[prefix.len + 1 ..], '/');
+        const start = if (prefix.len == 0) @as(usize, @intFromBool(path[0] == '/')) else prefix.len + 1;
+        var parts = std.mem.splitScalar(u8, path[start..], '/');
         while (parts.next()) |part| if (part.len == 0 or std.mem.eql(u8, part, ".") or std.mem.eql(u8, part, "..")) return error.InvalidNativeIndexPath;
+    }
+
+    fn publishNamespace(raw: *anyopaque, plan: publication.NamespacePlan) !void {
+        const self: *Host = @ptrCast(@alignCast(raw));
+        const file = try self.checkedFile(plan.inode);
+        if (!file.header.indexed_reclamation or file.header.indexed_revision < 14) return error.UnsupportedNativeFormatVersion;
+        if (!std.mem.eql(u8, &file.header.reader_epoch_namespace, &plan.file_namespace)) return error.FileBusy;
+        try self.validateDestination(plan.generation_key);
+        if (!std.mem.endsWith(u8, plan.prefix, "/.native-state/") or
+            !std.mem.startsWith(u8, plan.generation_key, plan.prefix) or
+            !std.mem.eql(u8, plan.generation_key[plan.prefix.len..], "generation")) return error.InvalidNativeIndexPath;
+        for (plan.mutations) |mutation| {
+            try self.validateDestination(mutation.key);
+            if (!std.mem.startsWith(u8, mutation.key, plan.prefix) or
+                mutation.external_value_root_page != 0 or mutation.external_value_len != 0) return error.InvalidNativeIndexPath;
+        }
+        const current = try file.getIndexCatalogRecordAlloc(self.allocator, plan.generation_key);
+        defer if (current) |value| self.allocator.free(value);
+        if (current) |value| {
+            if (value.len != 21 or !std.mem.startsWith(u8, value, "AFNS1")) return error.InvalidNativeIndexGeneration;
+            if (plan.expected_generation == null or !std.mem.eql(u8, value[5..], &plan.expected_generation.?)) return error.FileBusy;
+        } else if (plan.expected_generation != null) return error.FileBusy;
+        try file.putIndexCatalogBatch(plan.mutations);
     }
 
     fn link(raw: *anyopaque, inode: u64, construction: []const u8, destination: []const u8, length: usize) !void {

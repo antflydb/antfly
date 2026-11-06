@@ -149,8 +149,9 @@ pub const BatchMode = enum {
 /// direct ingest was attempted, or the write was published). The commit
 /// returns its original error so internal callers can act on the cause, for
 /// example cancellation; a caller that must classify a public outcome
-/// installs a record here for the duration of its call. Thread-local because
-/// commits run on the calling thread under the backend lock.
+/// installs a record here for the duration of its call. Thread-local to the requesting operation. Grouped native commits may run
+/// on a leader thread; the group result must carry its captured uncertainty
+/// back to each originating thread before updating this record.
 pub const CommitProgress = struct {
     maybe_applied: bool = false,
 };

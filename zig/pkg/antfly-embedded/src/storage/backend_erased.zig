@@ -112,6 +112,29 @@ fn ParentBox(comptime T: type) type {
             allocator.destroy(self);
         }
 
+        fn prepareNativePublication(self: *@This()) !@import("native_publication.zig").Prepared {
+            platform.sync.lockYielding(&self.mutex);
+            if (self.owner_closed or self.finalizing) {
+                self.mutex.unlock();
+                return error.TransactionClosed;
+            }
+            if (self.child_count != 0) {
+                self.mutex.unlock();
+                return error.TransactionCursorActive;
+            }
+            self.finalizing = true;
+            self.mutex.unlock();
+            const prepared = self.handle.prepareNativePublication() catch |err| {
+                platform.sync.lockYielding(&self.mutex);
+                self.finalizing = false;
+                self.mutex.unlock();
+                return err;
+            };
+            const allocator = self.allocator;
+            allocator.destroy(self);
+            return prepared;
+        }
+
         fn finalizeAbort(self: *@This()) void {
             const allocator = self.allocator;
             const parent_release = self.parent_release;
@@ -911,6 +934,7 @@ pub const NamespaceWriteTxn = struct {
         abort: *const fn (Allocator, *anyopaque) void,
         commit: *const fn (Allocator, *anyopaque) anyerror!void,
         commit_publication: ?*const fn (Allocator, *anyopaque, @import("native_publication.zig").Participant) anyerror!void = null,
+        prepare_native_publication: ?*const fn (Allocator, *anyopaque) anyerror!@import("native_publication.zig").Prepared = null,
         get: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, backend_types.Namespace, []const []const u8, []?[]const u8) anyerror!void = null,
         put: *const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void,
@@ -934,6 +958,13 @@ pub const NamespaceWriteTxn = struct {
         const operation = self.vtable.commit_publication orelse return error.Unsupported;
         try BoundaryAbi.call("commit_publication", self.boundary_dispatch, operation, .{ self.allocator, self.ptr, participant });
         self.* = undefined;
+    }
+
+    pub fn prepareNativePublication(self: *NamespaceWriteTxn) !@import("native_publication.zig").Prepared {
+        const operation = self.vtable.prepare_native_publication orelse return error.Unsupported;
+        const prepared = try BoundaryAbi.call("prepare_native_publication", self.boundary_dispatch, operation, .{ self.allocator, self.ptr });
+        self.* = undefined;
+        return prepared;
     }
 
     pub fn get(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
@@ -990,6 +1021,7 @@ pub const Batch = struct {
         open_cursor: ?*const fn (Allocator, *anyopaque) anyerror!Cursor = null,
         set_replay_opaque: ?*const fn (*anyopaque, u64, []const u8) anyerror!void = null,
         set_commit_participant: ?*const fn (*anyopaque, @import("commit_participant.zig").Participant) anyerror!void = null,
+        set_native_publication: ?*const fn (*anyopaque, @import("native_publication.zig").Participant) anyerror!void = null,
         contains_many_sorted: ?*const fn (*anyopaque, []const []const u8, []bool) anyerror!void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
@@ -1075,6 +1107,11 @@ pub const Batch = struct {
 
     /// Optional facade capability, not a raw-engine callback. Unsupported
     /// backends must fail rather than silently omit atomic acceptance work.
+    pub fn setNativePublication(self: *Batch, participant: @import("native_publication.zig").Participant) !void {
+        const attach = self.vtable.set_native_publication orelse return error.Unsupported;
+        try BoundaryAbi.call("set_native_publication", self.boundary_dispatch, attach, .{ self.ptr, participant });
+    }
+
     pub fn setCommitParticipant(self: *Batch, participant: @import("commit_participant.zig").Participant) !void {
         const attach = self.vtable.set_commit_participant orelse return error.Unsupported;
         try BoundaryAbi.call("set_commit_participant", self.boundary_dispatch, attach, .{ self.ptr, participant });
@@ -2031,6 +2068,10 @@ pub fn namespaceWriteTxnFrom(
             try unbox(ptr).commitWithPublication(participant);
         }
 
+        fn prepareNativePublication(_: Allocator, ptr: *anyopaque) anyerror!@import("native_publication.zig").Prepared {
+            return unbox(ptr).prepareNativePublication();
+        }
+
         fn get(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8) anyerror![]const u8 {
             return try unbox(ptr).handle.get(try mapNamespace(namespace), key);
         }
@@ -2068,6 +2109,7 @@ pub fn namespaceWriteTxnFrom(
             .abort = vt.abort,
             .commit = vt.commit,
             .commit_publication = if (@hasDecl(Handle, "commitWithPublication")) vt.commitPublication else null,
+            .prepare_native_publication = if (@hasDecl(Handle, "prepareNativePublication")) vt.prepareNativePublication else null,
             .get = vt.get,
             .get_many_sorted = if (@hasDecl(Handle, "getManySorted")) vt.getManySorted else null,
             .put = vt.put,
@@ -2148,6 +2190,10 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             return error.Unsupported;
         }
 
+        pub fn setNativePublication(ptr: *anyopaque, participant: @import("native_publication.zig").Participant) anyerror!void {
+            return unbox(ptr).handle.setNativePublication(participant);
+        }
+
         pub fn setCommitParticipant(ptr: *anyopaque, participant: @import("commit_participant.zig").Participant) anyerror!void {
             return unbox(ptr).handle.setCommitParticipant(participant);
         }
@@ -2168,6 +2214,7 @@ pub fn batchFrom(allocator: Allocator, handle: anytype) !Batch {
             .open_cursor = if (@hasDecl(Handle, "openCursor")) vt.openCursor else null,
             .set_replay_opaque = if (@hasDecl(Handle, "setReplayOpaque")) vt.setReplayOpaque else null,
             .set_commit_participant = if (@hasDecl(Handle, "setCommitParticipant")) vt.setCommitParticipant else null,
+            .set_native_publication = if (@hasDecl(Handle, "setNativePublication")) vt.setNativePublication else null,
             .contains_many_sorted = if (@hasDecl(Handle, "containsManySorted")) vt.containsManySorted else null,
         },
     };

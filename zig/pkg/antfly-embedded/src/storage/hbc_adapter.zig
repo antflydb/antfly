@@ -5238,6 +5238,7 @@ pub const HBCIndex = struct {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.root_dir,
             .native => |backend| backend.root_dir,
+            .namespaces => |backend| backend.root_dir,
         };
     }
 
@@ -5923,35 +5924,35 @@ pub const HBCIndex = struct {
     pub fn snapshotLsmWriteStats(self: *const HBCIndex) ?LsmWriteStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotWriteStats(),
-            .native => null,
+            .native, .namespaces => null,
         };
     }
 
     pub fn snapshotLsmMaintenanceStats(self: *const HBCIndex) ?LsmMaintenanceStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotMaintenanceStats(),
-            .native => null,
+            .native, .namespaces => null,
         };
     }
 
     pub fn snapshotLsmOpenStats(self: *const HBCIndex) ?LsmOpenStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotOpenStats(),
-            .native => null,
+            .native, .namespaces => null,
         };
     }
 
     pub fn checkpointLsmWalAfterDurableBoundary(self: *HBCIndex) !void {
         switch (self.env_owner) {
             .lsm => |handle| try handle.backend.checkpointWalAfterDurableBoundary(),
-            .native => {},
+            .native, .namespaces => {},
         }
     }
 
     pub fn pinNativeCheckpoint(self: *HBCIndex) !lsm_backend.Backend.NativeCheckpoint {
         return switch (self.env_owner) {
             .lsm => |*handle| try handle.backend.pinNativeCheckpoint(),
-            .native => error.Unsupported,
+            .native, .namespaces => error.Unsupported,
         };
     }
 
@@ -6020,42 +6021,42 @@ pub const HBCIndex = struct {
     pub fn snapshotLsmNativeStorageStats(self: *const HBCIndex) ?lsm_backend.NativeStorageStats {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.snapshotNativeStorageStats(),
-            .native => null,
+            .native, .namespaces => null,
         };
     }
 
     pub fn lsmMaintenanceScore(self: *const HBCIndex) u64 {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.maintenanceScore(),
-            .native => 0,
+            .native, .namespaces => 0,
         };
     }
 
     pub fn lsmMaintenanceDebtHint(self: *const HBCIndex) u64 {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.maintenanceDebtHint(),
-            .native => 0,
+            .native, .namespaces => 0,
         };
     }
 
     pub fn nextLsmMaintenanceWakeDelayNsBestEffort(self: *const HBCIndex) ?u64 {
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.nextMaintenanceWakeDelayNsBestEffort(),
-            .native => null,
+            .native, .namespaces => null,
         };
     }
 
     pub fn refreshLsmMaintenanceDebtHint(self: *HBCIndex) void {
         switch (self.env_owner) {
             .lsm => |handle| handle.backend.refreshMaintenanceDebtHint(),
-            .native => {},
+            .native, .namespaces => {},
         }
     }
 
     pub fn runLsmMaintenanceStep(self: *HBCIndex) !bool {
         return switch (self.env_owner) {
             .lsm => |handle| try handle.backend.runMaintenanceStep(),
-            .native => false,
+            .native, .namespaces => false,
         };
     }
 
@@ -6074,7 +6075,7 @@ pub const HBCIndex = struct {
                 }
                 break :blk try handle.backend.runMaintenanceStepBestEffort();
             },
-            .native => false,
+            .native, .namespaces => false,
         };
     }
 
@@ -6089,7 +6090,7 @@ pub const HBCIndex = struct {
         if (self.nativeHbcAuthoritative()) return 0;
         return switch (self.env_owner) {
             .lsm => |handle| @max(handle.backend.options.manifest_commit_backlog_bytes / 4, 1 << 20),
-            .native => 0,
+            .native, .namespaces => 0,
         };
     }
 
@@ -6120,7 +6121,7 @@ pub const HBCIndex = struct {
         if (self.nativeHbcAuthoritative()) return false;
         return switch (self.env_owner) {
             .lsm => |handle| handle.backend.options.backend.durability != .full,
-            .native => false,
+            .native, .namespaces => false,
         };
     }
 
@@ -6130,7 +6131,7 @@ pub const HBCIndex = struct {
         }
         if (!self.nativeHbcAuthoritative()) switch (self.env_owner) {
             .lsm => |handle| handle.backend.beginBulkIngestSession() catch |err| return err,
-            .native => {},
+            .native, .namespaces => {},
         };
         const opening_outermost = self.write_session_depth == 0;
         if (opening_outermost) {
@@ -6156,7 +6157,7 @@ pub const HBCIndex = struct {
                 self.write_session_kind = null;
                 switch (self.env_owner) {
                     .lsm => |handle| handle.backend.abortBulkIngestSession(),
-                    .native => {},
+                    .native, .namespaces => {},
                 }
                 return err;
             };
@@ -6280,7 +6281,7 @@ pub const HBCIndex = struct {
                 }
                 return err;
             },
-            .native => {},
+            .native, .namespaces => {},
         };
         if (finishing_outermost and expected_kind == .streaming_replay) self.endStreamingSplitVectorWorkspace();
         self.write_session_depth -= 1;
@@ -6335,7 +6336,7 @@ pub const HBCIndex = struct {
         if (self.write_session_depth == 0 or self.write_session_kind != expected_kind) return;
         if (!self.nativeHbcAuthoritative()) switch (self.env_owner) {
             .lsm => |handle| handle.backend.abortBulkIngestSession(),
-            .native => {},
+            .native, .namespaces => {},
         };
         self.write_session_depth -= 1;
         if (self.write_session_depth == 0) {
@@ -9563,10 +9564,15 @@ pub const HBCIndex = struct {
                 .root_dir = handle.backend.root_dir orelse return error.MissingStorageRoot,
             },
             .native => |backend| .{ .storage = backend.storage, .root_dir = backend.root_dir },
+            .namespaces => |backend| .{ .storage = backend.storage, .root_dir = backend.root_dir },
         };
         const posting_root = try std.fs.path.join(self.alloc, &.{ location.root_dir, "posting-segments" });
         defer self.alloc.free(posting_root);
-        if (self.env_owner == .native and self.env_owner.native.read_only) return try posting_segment_store_mod.Store.openReadOnly(self.alloc, location.storage, posting_root);
+        if (switch (self.env_owner) {
+            .native => |owner| owner.read_only,
+            .namespaces => |owner| owner.read_only,
+            .lsm => false,
+        }) return try posting_segment_store_mod.Store.openReadOnly(self.alloc, location.storage, posting_root);
         return try posting_segment_store_mod.Store.open(self.alloc, location.storage, posting_root);
     }
 
@@ -9577,10 +9583,15 @@ pub const HBCIndex = struct {
                 .root_dir = handle.backend.root_dir orelse return error.MissingStorageRoot,
             },
             .native => |backend| .{ .storage = backend.storage, .root_dir = backend.root_dir },
+            .namespaces => |backend| .{ .storage = backend.storage, .root_dir = backend.root_dir },
         };
         const posting_root = try std.fs.path.join(self.alloc, &.{ location.root_dir, "posting-segments" });
         defer self.alloc.free(posting_root);
-        if (self.env_owner == .native and self.env_owner.native.read_only) return try posting_segment_store_mod.Store.openReadOnlyWithSegmentAlloc(self.alloc, location.storage, posting_root);
+        if (switch (self.env_owner) {
+            .native => |owner| owner.read_only,
+            .namespaces => |owner| owner.read_only,
+            .lsm => false,
+        }) return try posting_segment_store_mod.Store.openReadOnlyWithSegmentAlloc(self.alloc, location.storage, posting_root);
         return try posting_segment_store_mod.Store.openWithSegmentAlloc(self.alloc, location.storage, posting_root);
     }
 
@@ -13839,7 +13850,7 @@ pub const HBCIndex = struct {
     fn runtimeBatchMode(self: *const HBCIndex, in_bulk_session: bool) vectorindex_store.BatchMode {
         return switch (self.env_owner) {
             .lsm => |handle| hbcRuntimeBatchMode(in_bulk_session, handle.backend.options.direct_bulk_ingest),
-            .native => hbcRuntimeBatchMode(in_bulk_session, null),
+            .native, .namespaces => hbcRuntimeBatchMode(in_bulk_session, null),
         };
     }
 

@@ -21481,6 +21481,20 @@ pub const IndexManager = struct {
         for (self.text_indexes.items) |*entry| {
             if (!std.mem.eql(u8, entry.config.name, index_name)) continue;
 
+            if (try entry.persistent.acquireReplayStager(self.alloc)) |stager_value| {
+                var stager = stager_value;
+                defer stager.deinit();
+                if (prepared.observed_field_analyzers.len > 0) {
+                    try mergeObservedTextFieldAnalyzers(self, store, entry, prepared.observed_field_analyzers);
+                }
+                try prepared.stage(stager);
+                const infos = try entry.persistent.publishPreparedSegments(prepared.staged, delete_keys);
+                defer entry.persistent.freeDeleteInfos(infos);
+                entry.recordCommittedDeletes(infos);
+                try self.finalizeTextBatchMutations(entry, opts, .{ .indexed_any = prepared.staged.len != 0, .deleted_any = infos.len != 0 });
+                return;
+            }
+
             var stats = TextBatchMutationStats{};
             if (delete_keys.len > 0) {
                 stats.noteDelete((try self.deleteTextBatchEntry(entry, delete_keys)).deleted_any);

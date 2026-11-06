@@ -1172,9 +1172,10 @@ const revision9_magic = "AFLITE\x09P";
 const revision10_magic = "AFLITE\x0aP";
 const revision11_magic = "AFLITE\x0bP";
 const revision12_magic = "AFLITE\x0cP";
-const indexed_magic = "AFLITE\x0dP";
+const revision13_magic = "AFLITE\x0dP";
+const indexed_magic = "AFLITE\x0eP";
 pub const format_version: u32 = 3;
-pub const indexed_format_version: u32 = 13;
+pub const indexed_format_version: u32 = 14;
 pub const default_page_size: u32 = 4096;
 
 test "lite reclamation catalog snapshots visit live indexes rather than history" {
@@ -3809,14 +3810,7 @@ const PendingDocumentIndexEntry = struct {
     }
 };
 
-pub const CatalogMutation = struct {
-    key: []const u8,
-    value: []const u8 = "",
-    is_delete: bool = false,
-    /// Internal transaction-local reference to a streamed, already written value.
-    external_value_root_page: u64 = 0,
-    external_value_len: usize = 0,
-};
+pub const CatalogMutation = @import("../native_catalog_mutation.zig").CatalogMutation;
 
 /// Bounded final-key write set shared by all callbacks in a native transaction.
 /// Payloads larger than one record are streamed immediately; only their extent
@@ -5060,6 +5054,9 @@ pub const NativeFile = struct {
     durable_header: ?Header = null,
     last_synced_header: ?Header = null,
     change_capture: ?*ChangeCapture = null,
+    /// Logical-only captures retain catalog/document roots, not allocator
+    /// graphs. They must never authorize integrity or allocator inspection.
+    logical_snapshot: bool = false,
     read_only: bool = false,
     no_sync: bool = false,
     // An error after slot publication may leave disk ahead of header. Do not
@@ -5628,7 +5625,31 @@ pub const NativeFile = struct {
     /// Full scans need allocator metadata as well as logical data protected.
     /// Same-owner writers may suspend this inode lock only while both
     /// retirement frontiers retain the captured recovery slots.
+    /// Capture immutable logical roots under the owner's path lease. Index
+    /// namespaces never inspect allocator metadata; retaining its old frontier
+    /// across a cached reader would unnecessarily block allocator-page reuse.
+    pub fn captureLogicalReadSnapshot(self: *NativeFile) !NativeFile {
+        if (self.logical_snapshot) return error.NativeSnapshotMetadataUnavailable;
+        if (self.transaction_header != null or self.checkpoint_publication_uncertain) return error.FileBusy;
+        if (self.reader_coordinator == null or self.read_only or self.durable_header != null or !self.header.indexed_reclamation)
+            return self.captureFullReadSnapshot();
+        var reader = try NativeFile.openWithIo(self.allocator, self.runtime(), self.path, .{
+            .read_only = true,
+            .internal_reader = true,
+            .reader_coordinator = self.reader_coordinator,
+            .no_sync = self.no_sync,
+            .resource_manager = self.page_cache.resource_manager,
+        });
+        errdefer reader.close();
+        if (!std.meta.eql(self.header, reader.header) or
+            (try self.file.stat(self.runtime())).inode != (try reader.file.stat(reader.runtime())).inode) return error.EnrichmentWaitCanceled;
+        try reader.acquireReaderFence(self.activeCheckpoint().commit_sequence, self);
+        reader.logical_snapshot = true;
+        return reader;
+    }
+
     pub fn captureFullReadSnapshot(self: *NativeFile) !NativeFile {
+        if (self.logical_snapshot) return error.NativeSnapshotMetadataUnavailable;
         if (self.transaction_header != null or self.checkpoint_publication_uncertain) return error.FileBusy;
         // Deferred standalone images have unpublished roots. Preserve their
         // existing whole-inode protection until a durability barrier publishes
@@ -6007,6 +6028,7 @@ pub const NativeFile = struct {
         return self.loadLedgerForDigest(checkpoint, cancel, self.allocator_certificate_on_commit);
     }
     fn loadLedgerForDigest(self: *NativeFile, checkpoint: CheckpointSlot, cancel: ?*const maintenance.CancelToken, prepare_digest: bool) !*allocator_v4.State {
+        if (self.logical_snapshot) return error.NativeSnapshotMetadataUnavailable;
         if (cancel) |token| try token.check();
         // Adoption may return to the same physical root number after reuse.
         // A pending rebase is never a cache hit merely because IDs match.
@@ -6824,6 +6846,7 @@ pub const NativeFile = struct {
     /// Check a pinned header against the file length captured with that header.
     /// Appends after pinning do not turn a valid snapshot into a tail error.
     pub fn checkAtFileSizeWithCancel(self: *NativeFile, file_size: u64, cancel: ?*const maintenance.CancelToken) !CheckReport {
+        if (self.logical_snapshot) return error.NativeSnapshotMetadataUnavailable;
         if (cancel) |token| try token.check();
         // Integrity checking must observe on-disk state, not cached pages.
         _ = self.page_cache_bypass.fetchAdd(1, .monotonic);
@@ -13544,7 +13567,7 @@ pub fn inspectBytes(raw: []const u8) InspectReport {
 
 pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
     @memset(out, 0);
-    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) (if (header.indexed_revision == 7) previous_indexed_magic else if (header.indexed_revision == 8) revision8_magic else if (header.indexed_revision == 9) revision9_magic else if (header.indexed_revision == 10) revision10_magic else if (header.indexed_revision == 11) revision11_magic else if (header.indexed_revision == 12) revision12_magic else indexed_magic) else if (header.packed_records) magic else unpacked_v3_magic);
+    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) (if (header.indexed_revision == 7) previous_indexed_magic else if (header.indexed_revision == 8) revision8_magic else if (header.indexed_revision == 9) revision9_magic else if (header.indexed_revision == 10) revision10_magic else if (header.indexed_revision == 11) revision11_magic else if (header.indexed_revision == 12) revision12_magic else if (header.indexed_revision == 13) revision13_magic else indexed_magic) else if (header.packed_records) magic else unpacked_v3_magic);
     std.mem.writeInt(u32, out[version_offset..][0..4], if (header.indexed_reclamation) header.indexed_revision else format_version, .little);
     std.mem.writeInt(u32, out[page_size_offset..][0..4], header.page_size, .little);
     std.mem.writeInt(u32, out[header_size_offset..][0..4], header_size, .little);
@@ -13569,12 +13592,13 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const revision10 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision10_magic);
     const revision11 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision11_magic);
     const revision12 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision12_magic);
-    const indexed_reclamation = previous_indexed or revision8 or revision9 or revision10 or revision11 or revision12 or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
+    const revision13 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision13_magic);
+    const indexed_reclamation = previous_indexed or revision8 or revision9 or revision10 or revision11 or revision12 or revision13 or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
     const has_packed_records = indexed_reclamation or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic);
     if (!has_packed_records and !std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], unpacked_v3_magic)) return error.InvalidNativeMagic;
 
     const version = std.mem.readInt(u32, header_raw[version_offset..][0..4], .little);
-    if (version != (if (previous_indexed) @as(u32, 7) else if (revision8) @as(u32, 8) else if (revision9) @as(u32, 9) else if (revision10) @as(u32, 10) else if (revision11) @as(u32, 11) else if (revision12) @as(u32, 12) else if (indexed_reclamation) indexed_format_version else format_version)) return error.UnsupportedNativeFormatVersion;
+    if (version != (if (previous_indexed) @as(u32, 7) else if (revision8) @as(u32, 8) else if (revision9) @as(u32, 9) else if (revision10) @as(u32, 10) else if (revision11) @as(u32, 11) else if (revision12) @as(u32, 12) else if (revision13) @as(u32, 13) else if (indexed_reclamation) indexed_format_version else format_version)) return error.UnsupportedNativeFormatVersion;
 
     const encoded_header_size = std.mem.readInt(u32, header_raw[header_size_offset..][0..4], .little);
     if (encoded_header_size != header_size) return error.InvalidNativeHeaderSize;
@@ -14209,7 +14233,7 @@ fn headerChecksum(raw: []const u8) u32 {
     var crc = Crc32.init();
     crc.update(raw[0..active_checkpoint_offset]);
     crc.update(raw[active_checkpoint_offset + 1 .. checkpoint_slots_offset]);
-    const end = if (std.mem.eql(u8, raw[0..indexed_magic.len], indexed_magic) or std.mem.eql(u8, raw[0..revision8_magic.len], revision8_magic) or std.mem.eql(u8, raw[0..revision9_magic.len], revision9_magic) or std.mem.eql(u8, raw[0..revision10_magic.len], revision10_magic) or std.mem.eql(u8, raw[0..revision11_magic.len], revision11_magic) or std.mem.eql(u8, raw[0..revision12_magic.len], revision12_magic)) logical_generations_end else checkpoint_slots_end;
+    const end = if (std.mem.eql(u8, raw[0..indexed_magic.len], indexed_magic) or std.mem.eql(u8, raw[0..revision8_magic.len], revision8_magic) or std.mem.eql(u8, raw[0..revision9_magic.len], revision9_magic) or std.mem.eql(u8, raw[0..revision10_magic.len], revision10_magic) or std.mem.eql(u8, raw[0..revision11_magic.len], revision11_magic) or std.mem.eql(u8, raw[0..revision12_magic.len], revision12_magic) or std.mem.eql(u8, raw[0..revision13_magic.len], revision13_magic)) logical_generations_end else checkpoint_slots_end;
     crc.update(raw[end..header_checksum_offset]);
     return crc.final();
 }
@@ -14302,6 +14326,19 @@ test "lite native header round trips initial checkpoint" {
     try std.testing.expect(report.valid);
     try std.testing.expectEqual(format_version, report.format_version);
     try std.testing.expectEqual(@as(u64, 1), report.page_count);
+}
+
+test "lite native revision fourteen preserves revision thirteen checked headers" {
+    for ([_]u32{ 13, 14 }) |revision| {
+        var header: Header = .{ .indexed_reclamation = true, .indexed_revision = revision, .reader_epoch_namespace = @splat(17) };
+        header.checkpoints[0].logical = .{ .primary = @splat(1), .metadata = @splat(2), .indexes = @splat(3) };
+        var encoded: [header_size]u8 = undefined;
+        encodeHeader(&encoded, header);
+        const decoded = try decodeHeader(&encoded);
+        try std.testing.expectEqual(revision, decoded.indexed_revision);
+        try std.testing.expect(std.meta.eql(header, decoded));
+        try std.testing.expectEqual(@as(u8, @intCast(revision)), encoded[6]);
+    }
 }
 
 test "lite native header rejects corrupted checksum" {

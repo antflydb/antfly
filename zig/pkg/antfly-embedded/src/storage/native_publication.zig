@@ -29,6 +29,29 @@ pub const Scope = struct {
     }
 };
 
+/// Owned by a prepared namespace transaction until publication completes.
+/// All keys and values are prepared before writer admission; external extent
+/// references are forbidden here and use the artifact capability instead.
+pub const NamespacePlan = struct {
+    inode: u64,
+    file_namespace: [32]u8,
+    prefix: []const u8,
+    generation_key: []const u8,
+    expected_generation: ?[16]u8,
+    mutations: []const @import("native_catalog_mutation.zig").CatalogMutation,
+};
+
+/// Consumes the originating transaction. No snapshots or runtime mutexes remain
+/// held. The owner must retain this handle until its participant has returned.
+pub const Prepared = struct {
+    participant: Participant,
+    release_fn: *const fn (*anyopaque) void,
+    pub fn deinit(self: *Prepared) void {
+        self.release_fn(self.participant.ptr);
+        self.* = undefined;
+    }
+};
+
 pub const View = struct {
     ptr: *anyopaque,
     link_fn: *const fn (*anyopaque, u64, []const u8, []const u8, usize) anyerror!void,
@@ -36,13 +59,20 @@ pub const View = struct {
     put_fn: *const fn (*anyopaque, u64, []const u8, []const u8) anyerror!void,
     get_metadata_fn: *const fn (*anyopaque, std.mem.Allocator, Scope, []const u8) anyerror![]u8,
     put_metadata_fn: *const fn (*anyopaque, Scope, []const u8, []const u8) anyerror!void,
+    namespace_fn: ?*const fn (*anyopaque, NamespacePlan) anyerror!void = null,
     dispatch: Boundary.Dispatch = Boundary.local_dispatch,
     const Boundary = abi.Boundary(struct {
+        namespace: *const fn (*anyopaque, NamespacePlan) anyerror!void,
         link: *const fn (*anyopaque, u64, []const u8, []const u8, usize) anyerror!void,
         put: *const fn (*anyopaque, u64, []const u8, []const u8) anyerror!void,
         get_metadata: *const fn (*anyopaque, std.mem.Allocator, Scope, []const u8) anyerror![]u8,
         put_metadata: *const fn (*anyopaque, Scope, []const u8, []const u8) anyerror!void,
     });
+
+    pub fn publishNamespace(self: View, plan: NamespacePlan) !void {
+        const operation = self.namespace_fn orelse return error.Unsupported;
+        return Boundary.call("namespace", self.dispatch, operation, .{ self.ptr, plan });
+    }
 
     pub fn getMetadata(self: View, alloc: std.mem.Allocator, scope: Scope, key: []const u8) ![]u8 {
         return Boundary.call("get_metadata", self.dispatch, self.get_metadata_fn, .{ self.ptr, alloc, scope, key });
@@ -67,6 +97,19 @@ pub const Participant = struct {
     const Boundary = abi.Boundary(struct { stage: *const fn (*anyopaque, View) anyerror!void });
     pub fn apply(self: Participant, view: View) !void {
         return Boundary.call("stage", self.dispatch, self.stage, .{ self.ptr, view });
+    }
+};
+
+/// Synchronous owner of a primary publication. The index supplies its fully
+/// prepared participant; the caller stages it with primary effects and commits
+/// once. A failed commit must preserve the host's uncertainty classification.
+pub const Committer = struct {
+    ptr: *anyopaque,
+    commit_fn: *const fn (*anyopaque, Participant) anyerror!void,
+    dispatch: Boundary.Dispatch = Boundary.local_dispatch,
+    const Boundary = abi.Boundary(struct { commit: *const fn (*anyopaque, Participant) anyerror!void });
+    pub fn commit(self: Committer, participant: Participant) !void {
+        return Boundary.call("commit", self.dispatch, self.commit_fn, .{ self.ptr, participant });
     }
 };
 

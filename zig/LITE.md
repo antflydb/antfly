@@ -1168,20 +1168,23 @@ The naming recommendation is:
 
 ## Native throughput and online compaction
 
-Native owners create revision-13 files (`AFLITE\x0dP`) with packed records and
+Native owners create revision-14 files (`AFLITE\x0eP`) with packed records and
 durable page ownership. Existing revision-3 signatures (`AFLITE\x03N` for
 unpacked records and `AFLITE\x03P` for packed records) remain readable. Writable
-owners migrate revisions 3, 7, 8, 9, 10, 11 and 12 through an atomic compact-generation replacement;
+owners migrate revisions 3, 7, 8, 9, 10, 11, 12 and 13 through an atomic compact-generation replacement;
 read-only opens preserve the existing encoding. The Zig `page_reuse = false`
 option preserves revision-3 creation/open behavior. Raw native primitives also
 retain their revision-3 default for compatibility. Revision 2 remains unsupported,
-and older binaries reject the revision-13 signature before checkpoint selection.
+and older binaries reject the revision-14 signature before checkpoint selection.
 Unreleased revision-4/5/6 prototypes are rejected rather than mixing reader,
-logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-13 image.
+logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-14 image.
 
 
 New hosted native text indexes store their main namespaces and logical WAL
-entries directly in the native index catalog. They do not create inner LSM
+entries directly in the native index catalog. Graph forward/reverse stores, sparse
+indexes and HBC vector metadata use the same native namespace engine. Revision 14
+fences older binaries that would otherwise interpret these new graph/vector roots
+as empty filesystem LSMs. They do not create inner LSM
 manifests, mutable tables or replay WALs for those stores. The `AFNS1` generation
 record identifies this namespace layout. Namespace names and keys use ordered
 hex encoding with bounded path components, keeping binary keys compatible with

@@ -3003,6 +3003,10 @@ pub const Store = struct {
         return self.submitMutationWithDurability(context, apply, true);
     }
 
+    pub fn submitMutationWithPublicationState(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, publication_possible: *bool) !void {
+        return self.submitScopedMutation(context, apply, true, false, false, publication_possible);
+    }
+
     pub fn submitIndexMutation(self: *Store, context: *anyopaque, apply: *const fn (*anyopaque, *native.NativeFile) anyerror!void, durable: bool) !void {
         return self.submitScopedMutation(context, apply, durable, true, false, null);
     }
@@ -3473,6 +3477,7 @@ pub const Txn = struct {
     snapshot_reads: std.StringHashMapUnmanaged(?[]const u8) = .empty,
     read_generation: ?*ReadGeneration = null,
     read_pin: ?*ReadPin = null,
+    native_publication: ?@import("../native_publication.zig").Participant = null,
     checkpoint: native.CheckpointSlot = .{},
 
     pub fn decodedResultsNamespace(self: *const Txn) []const u8 {
@@ -3604,13 +3609,19 @@ pub const Txn = struct {
         self.* = undefined;
     }
 
+    pub fn setNativePublication(self: *Txn, participant: @import("../native_publication.zig").Participant) !void {
+        if (self.read_only) return error.ReadOnly;
+        if (self.native_publication != null) return error.InvalidBatch;
+        self.native_publication = participant;
+    }
+
     pub fn commit(self: *Txn) !void {
         if (self.read_only) return error.ReadOnly;
         const store = self.store orelse return error.ReadOnly;
         // Metadata probes may use a write transaction without staging changes.
         // Release their admission and snapshot directly: entering publication
         // would unnecessarily run retirement pressure and allocator proof work.
-        if (self.pending_count == 0) {
+        if (self.pending_count == 0 and self.native_publication == null) {
             self.abort();
             return;
         }
@@ -3627,19 +3638,31 @@ pub const Txn = struct {
 
         const Commit = struct {
             mutations: []const native.DocumentMutation,
+            publication: ?@import("../native_publication.zig").Participant,
+            allocator: Allocator,
             fn apply(ptr: *anyopaque, file: *native.NativeFile) !void {
                 const context: *@This() = @ptrCast(@alignCast(ptr));
                 try file.putDocumentBatch(context.mutations);
+                if (context.publication) |participant| {
+                    var host: @import("publication_host.zig").Host = .{ .file = file, .allocator = context.allocator, .index_prefix = "" };
+                    try participant.apply(host.view());
+                }
             }
         };
-        var context = Commit{ .mutations = mutations };
+        var context = Commit{ .mutations = mutations, .publication = self.native_publication, .allocator = allocator };
         errdefer {
             if (self.writer_reserved) {
                 store.releaseWriterSlot();
                 self.writer_reserved = false;
             }
         }
-        try store.submitMutation(&context, Commit.apply);
+        var possible = false;
+        store.submitMutationWithPublicationState(&context, Commit.apply, &possible) catch |err| {
+            if (possible) if (backend_types.commit_progress) |progress| {
+                progress.maybe_applied = true;
+            };
+            return err;
+        };
         self.releaseGenerationReadLock();
         if (self.writer_reserved) {
             store.releaseWriterSlot();

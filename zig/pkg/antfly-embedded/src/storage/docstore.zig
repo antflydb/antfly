@@ -922,6 +922,11 @@ pub const DocStore = struct {
         unordered_bulk_append_puts: bool = false,
         runtime: ?backend_erased.Batch = null,
 
+        pub fn setNativePublication(self: *Batch, participant: @import("native_publication.zig").Participant) !void {
+            if (self.runtime) |*runtime| return runtime.setNativePublication(participant);
+            return error.Unsupported;
+        }
+
         pub fn setCommitParticipant(self: *Batch, participant: @import("commit_participant.zig").Participant) !void {
             try self.artifact_inputs.attach(participant);
         }
@@ -2372,7 +2377,7 @@ pub const DocStore = struct {
         replay: ?ReplayAppend,
         options: backend_types.BatchOptions,
     ) !void {
-        return self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, null);
+        return self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, null, null);
     }
 
     fn putBatchWithReplayOnceAndParticipant(
@@ -2382,6 +2387,7 @@ pub const DocStore = struct {
         replay: ?ReplayAppend,
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
+        native_participant: ?@import("native_publication.zig").Participant,
     ) !void {
         const has_owner_job = blk: {
             for (writes) |write| if (internal_keys.isGraphOwnerReplayJobKey(write.key)) break :blk true;
@@ -2394,6 +2400,7 @@ pub const DocStore = struct {
         var batch = try self.beginWriteBatchWithOptions(options);
         errdefer batch.abort();
         if (participant) |observer| try batch.setCommitParticipant(observer);
+        if (native_participant) |observer| try batch.setNativePublication(observer);
         var txn = batch.asTxn();
         const graph_bulk = bulk_candidate and !try graphBulkIncomingNeedsDelete(self.alloc, txn, writes);
         const retirement_mask = if (graph_bulk) try graphBulkRetirementMask(self.alloc, txn, writes) else null;
@@ -2453,9 +2460,22 @@ pub const DocStore = struct {
         options: backend_types.BatchOptions,
         participant: ?@import("commit_participant.zig").Participant,
     ) !void {
+        return self.putBatchWithPublications(io, writes, deletes, replay, options, participant, null);
+    }
+
+    pub fn putBatchWithPublications(
+        self: *DocStore,
+        io: ?std.Io,
+        writes: []const KVPair,
+        deletes: []const []const u8,
+        replay: ?ReplayAppend,
+        options: backend_types.BatchOptions,
+        participant: ?@import("commit_participant.zig").Participant,
+        native_participant: ?@import("native_publication.zig").Participant,
+    ) !void {
         var attempt: usize = 0;
         while (true) : (attempt += 1) {
-            self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, participant) catch |err| switch (err) {
+            self.putBatchWithReplayOnceAndParticipant(writes, deletes, replay, options, participant, native_participant) catch |err| switch (err) {
                 error.WriterLocked => {
                     if (attempt >= writer_locked_retry_count) return err;
                     backoffWriterLockRetry(io);

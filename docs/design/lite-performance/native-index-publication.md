@@ -213,3 +213,54 @@ end-to-end or optimized performance qualification is claimed by this stage.
 
 Current-stage Debug validation and explicit qualification limits are recorded in
 [direct-native-namespaces-debug.json](direct-native-namespaces-debug.json).
+
+## Prepared namespace participation in primary publication
+
+A namespace write transaction can detach into an owned prepared publication.
+Detachment refuses live cursors, materializes the write descriptors and successor
+generation before admission, and closes the metadata snapshot before the writer
+queue. Its retained backend and IO owner remain alive until the prepared handle
+is released. It has staging authority; it cannot commit or activate a runtime.
+
+The primary native transaction accepts this capability independently of its
+restricted document-metadata observer. The native host validates inode, file
+namespace and the exact captured namespace generation, then stages the namespace
+and artifact changes beside the primary write set. An injected staging error
+rolls the entire transaction back. A stale namespace witness refuses publication
+without leaving the primary changes committed.
+
+Persistent text publication also accepts a synchronous primary committer. Its
+namespace witness is captured before reading the segment frontier and fragment
+position, and retained throughout preparation. The caller publishes primary
+changes, index metadata, immutable aliases and progress in one checkpoint.
+Prepared reader activation follows durable success; uncertain primary outcomes
+propagate the group's captured decision back to the originating caller and
+fence the serving owner. An already applied replay fragment cannot silently
+skip an attached primary commit.
+
+This is the shared publication mechanism. Foreground callers still need to
+supply their text plans before admission and use this mechanism; merely exposing
+the capability does not eliminate the remaining separate primary/index commits.
+Commit cohorts must compose same-index plans before staging. Queuing separate
+prepared replacements that each hold the same writer mutex through durability
+would deadlock a shared group and is not a supported coalescing strategy.
+
+Hosted graph forward/reverse stores and sparse metadata now select the direct
+native namespace provider for new roots. Existing LSM roots retain their
+existing authority. Scalar namespace views retain read snapshots across fork
+and owner shutdown, preserve ordered binary keys, and keep transaction-wide
+write serialization explicit. Their native transactions provide durability;
+there is no inner manifest or WAL to sync or maintain.
+
+Revision 14 fences the additional native graph, sparse and HBC metadata roots.
+Revision-13 namespace data remains readable, and writable owners migrate through
+the existing generation-replacement protocol before publishing new namespace
+mutations. A version-13 binary must not open a new native graph root as an empty
+LSM. Existing logical-identity and allocator/recovery encodings remain intact.
+
+Ordinary native text segment insertion and deletion use the same prepared
+activation machinery as replay. Small artifacts, active metadata and immutable
+replacement snapshots publish in one native checkpoint. Large unpublished
+construction remains bounded. Ordinary mutations leave the replay fragment
+unchanged. Deletion prepares private bitmap replacements before durability,
+instead of exposing an in-place tombstone and attempting to undo it on failure.

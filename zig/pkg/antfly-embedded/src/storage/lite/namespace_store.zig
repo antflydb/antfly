@@ -132,6 +132,7 @@ pub const Backend = struct {
 };
 const State = struct {
     backend: *Backend,
+    read_mutex: std.atomic.Mutex = .unlocked,
     budget: ?resources.BudgetedAllocator = null,
     arena: std.heap.ArenaAllocator,
     snapshot: ?native.NativeFile = null,
@@ -164,24 +165,31 @@ const State = struct {
     }
     fn stage(raw: *anyopaque, file: *native.NativeFile) !void {
         const self: *State = @ptrCast(@alignCast(raw));
-        if (!file.header.indexed_reclamation or file.header.indexed_revision < 13) return error.UnsupportedNativeFormatVersion;
-        if ((try file.file.stat(file.runtime())).inode != self.inode or
-            !std.mem.eql(u8, &file.header.reader_epoch_namespace, &self.file_namespace)) return error.FileBusy;
-        const current = try file.getIndexCatalogRecordAlloc(self.a(), self.backend.generation_key);
-        if (current) |value| {
-            const identity = try generationIdentity(value);
-            if (self.expected == null or !std.mem.eql(u8, &identity, &self.expected.?)) return error.FileBusy;
-        } else if (self.expected != null) return error.FileBusy;
-        if (self.participant) |participant| {
-            // The namespace belongs to <index>/index. Artifacts live beside
-            // that directory and are constrained to this exact index domain.
-            const data_root = self.backend.prefix[0 .. self.backend.prefix.len - "/.native-state/".len];
-            const root = std.fs.path.dirname(data_root) orelse "";
-            var host: Host = .{ .file = file, .allocator = self.a(), .index_prefix = root };
-            try participant.apply(host.view());
-        }
-        try file.putIndexCatalogBatch(self.mutations);
+        const data_root = self.backend.prefix[0 .. self.backend.prefix.len - "/.native-state/".len];
+        const root = std.fs.path.dirname(data_root) orelse "";
+        var host: Host = .{ .file = file, .allocator = self.a(), .index_prefix = root };
+        try self.stageView(host.view());
     }
+    fn stageView(self: *State, view: publication.View) !void {
+        try view.publishNamespace(.{
+            .inode = self.inode,
+            .file_namespace = self.file_namespace,
+            .prefix = self.backend.prefix,
+            .generation_key = self.backend.generation_key,
+            .expected_generation = self.expected,
+            .mutations = self.mutations,
+        });
+        if (self.participant) |participant| try participant.apply(view);
+    }
+    fn stagePrepared(raw: *anyopaque, view: publication.View) !void {
+        const self: *State = @ptrCast(@alignCast(raw));
+        try self.stageView(view);
+    }
+    fn releasePrepared(raw: *anyopaque) void {
+        const self: *State = @ptrCast(@alignCast(raw));
+        self.destroy();
+    }
+
     fn prepare(self: *State) !void {
         const mutations = try self.a().alloc(native.CatalogMutation, self.pending.count() + 1);
         var values = self.pending.valueIterator();
@@ -207,7 +215,7 @@ const Txn = struct {
         owner.generation_lock.lockSharedUncancelable(io);
         defer owner.generation_lock.unlockShared(io);
         owner.mutex.lock();
-        var snapshot = owner.file.captureFullReadSnapshot() catch |err| {
+        var snapshot = owner.file.captureLogicalReadSnapshot() catch |err| {
             owner.mutex.unlock();
             return err;
         };
@@ -237,6 +245,8 @@ const Txn = struct {
     }
     pub fn get(self: *Txn, ns: NS, key: []const u8) ![]const u8 {
         const state = self.state;
+        @import("antfly_platform").sync.lockYielding(&state.read_mutex);
+        defer state.read_mutex.unlock();
         const snapshot = if (state.snapshot) |*value| value else return error.TransactionClosed;
         const full = try state.key(ns, key);
         if (state.pending.get(full)) |change| return if (change.is_delete) error.NotFound else change.value;
@@ -257,6 +267,16 @@ const Txn = struct {
         if (self.state.snapshot == null) return error.TransactionClosed;
         const full = try self.state.key(ns, key);
         try self.state.pending.put(self.state.a(), full, .{ .key = full, .is_delete = true });
+    }
+    pub fn prepareNativePublication(self: *Txn) !publication.Prepared {
+        const state = self.state;
+        if (!state.writable) return error.ReadOnly;
+        if (state.snapshot == null) return error.TransactionClosed;
+        try state.prepare();
+        state.snapshot.?.close();
+        state.snapshot = null;
+        self.* = undefined;
+        return .{ .participant = .{ .ptr = state, .stage = State.stagePrepared }, .release_fn = State.releasePrepared };
     }
     pub fn commitWithPublication(self: *Txn, participant: publication.Participant) !void {
         self.state.participant = participant;
@@ -288,6 +308,8 @@ const Txn = struct {
     }
     pub fn openCursor(self: *Txn, ns: NS) !Cursor {
         const state = self.state;
+        @import("antfly_platform").sync.lockYielding(&state.read_mutex);
+        defer state.read_mutex.unlock();
         const snapshot = if (state.snapshot) |*value| value else return error.TransactionClosed;
         const prefix = try state.namespacePrefix(ns);
         var base = try snapshot.indexCatalogCursor(snapshot.activeCheckpoint(), prefix);

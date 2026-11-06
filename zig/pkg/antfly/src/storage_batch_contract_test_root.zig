@@ -26,6 +26,8 @@ test {
     _ = @import("antfly_local_sources").storage_persistent;
     _ = @import("antfly_local_sources").storage_wal;
     _ = @import("antfly_local_sources").storage_lite_index_storage;
+    _ = @import("antfly_local_sources").storage_lite_native;
+    _ = @import("antfly_local_sources").storage_db_catalog_index_manager;
     _ = @import("antfly_local_sources").index;
     _ = @import("antfly_local_sources").storage_db_result_collectors;
     _ = @import("antfly_local_sources").storage_db_enrichment_enrichment_runtime;

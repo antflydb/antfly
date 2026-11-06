@@ -1347,32 +1347,78 @@ pub const PersistentIndex = struct {
         seal: ?projection_seal.Seal = null,
     };
 
-    pub fn publishReplayWithMetadata(self: *PersistentIndex, segments: []PreparedReplaySegment, delete_keys: []const []const u8, checkpoint: ReplayFragment.Checkpoint, metadata: ?ReplayPublicationMetadata) ![]index_mod.IndexWriter.DeleteInfo {
-        if (metadata != null and (!checkpoint.position.applied or checkpoint.position.next_item != checkpoint.position.total_items)) return error.InvalidDerivedApplyState;
+    /// Ordinary prepared text effects use the same atomic physical activation
+    /// without manufacturing or advancing a journal continuation.
+    pub fn publishPreparedSegments(self: *PersistentIndex, segments: []PreparedReplaySegment, delete_keys: []const []const u8) ![]index_mod.IndexWriter.DeleteInfo {
         self.lockStorage();
         defer self.unlockStorage();
+        return self.publishPreparedNativeLocked(segments, delete_keys, null, null, null);
+    }
+
+    pub fn publishReplayWithMetadata(self: *PersistentIndex, segments: []PreparedReplaySegment, delete_keys: []const []const u8, checkpoint: ReplayFragment.Checkpoint, metadata: ?ReplayPublicationMetadata) ![]index_mod.IndexWriter.DeleteInfo {
+        return self.publishReplayWithCommitter(segments, delete_keys, checkpoint, metadata, null);
+    }
+
+    /// The primary owner supplies the only commit boundary. Namespace metadata,
+    /// artifacts, primary writes and progress are staged atomically; memory
+    /// activation below remains infallible and follows durable success.
+    pub fn publishReplayWithCommitter(
+        self: *PersistentIndex,
+        segments: []PreparedReplaySegment,
+        delete_keys: []const []const u8,
+        checkpoint: ReplayFragment.Checkpoint,
+        metadata: ?ReplayPublicationMetadata,
+        committer: ?@import("native_publication.zig").Committer,
+    ) ![]index_mod.IndexWriter.DeleteInfo {
+        self.lockStorage();
+        defer self.unlockStorage();
+        return self.publishPreparedNativeLocked(segments, delete_keys, checkpoint, metadata, committer);
+    }
+
+    /// Shared physical publication for replay and ordinary foreground index
+    /// mutations. Non-replay operations never overwrite a replay checkpoint.
+    fn publishPreparedNativeLocked(
+        self: *PersistentIndex,
+        segments: []PreparedReplaySegment,
+        delete_keys: []const []const u8,
+        checkpoint: ?ReplayFragment.Checkpoint,
+        metadata: ?ReplayPublicationMetadata,
+        committer: ?@import("native_publication.zig").Committer,
+    ) ![]index_mod.IndexWriter.DeleteInfo {
+        if (metadata != null) {
+            const point = checkpoint orelse return error.InvalidDerivedApplyState;
+            if (!point.position.applied or point.position.next_item != point.position.total_items) return error.InvalidDerivedApplyState;
+        }
         if (!self.main_store_owner.supportsAtomicNativePublication()) return error.Unsupported;
         const files = if (self.segment_files) |*value| value else return error.Unsupported;
+        // Capture one exact namespace witness before inspecting either the
+        // frontier or continuation. A later snapshot must not legitimize a
+        // replacement prepared from an older foreign index generation.
+        var txn = try self.beginWriteMainTxn();
+        defer txn.abort();
         {
-            var previous_txn = try self.beginReadMainTxn();
-            defer previous_txn.abort();
-            const next = previous_txn.get(.meta, meta_next_seg_id) catch |err|
+            const next = txn.get(.meta, meta_next_seg_id) catch |err|
                 if (err == error.NotFound) null else return err;
             if (next) |bytes| {
                 if (bytes.len < @sizeOf(u64)) return error.InvalidDerivedApplyState;
                 if (self.writer.next_segment_id < std.mem.readInt(u64, bytes[0..8], .little)) return error.EnrichmentWaitCanceled;
             }
-            const raw = previous_txn.get(.meta, meta_replay_fragment) catch |err|
-                if (err == error.NotFound) null else return err;
-            if (raw) |bytes| {
-                const previous = try ReplayFragment.decode(bytes);
-                if (std.meta.eql(previous.identity, checkpoint.identity)) {
-                    if (previous.position.sequence > checkpoint.position.sequence) return error.EnrichmentWaitCanceled;
-                    if (previous.position.sequence == checkpoint.position.sequence) {
-                        if (previous.position.total_items != checkpoint.position.total_items or
-                            !std.mem.eql(u8, &previous.position.fingerprint, &checkpoint.position.fingerprint)) return error.InvalidDerivedApplyState;
-                        if (previous.position.next_item > checkpoint.position.next_item) return error.EnrichmentWaitCanceled;
-                        if (previous.position.next_item == checkpoint.position.next_item) return self.alloc.alloc(index_mod.IndexWriter.DeleteInfo, 0);
+            if (checkpoint) |point| {
+                const raw = txn.get(.meta, meta_replay_fragment) catch |err|
+                    if (err == error.NotFound) null else return err;
+                if (raw) |bytes| {
+                    const previous = try ReplayFragment.decode(bytes);
+                    if (std.meta.eql(previous.identity, point.identity)) {
+                        if (previous.position.sequence > point.position.sequence) return error.EnrichmentWaitCanceled;
+                        if (previous.position.sequence == point.position.sequence) {
+                            if (previous.position.total_items != point.position.total_items or
+                                !std.mem.eql(u8, &previous.position.fingerprint, &point.position.fingerprint)) return error.InvalidDerivedApplyState;
+                            if (previous.position.next_item > point.position.next_item) return error.EnrichmentWaitCanceled;
+                            if (previous.position.next_item == point.position.next_item) {
+                                if (committer != null) return error.EnrichmentWaitCanceled;
+                                return self.alloc.alloc(index_mod.IndexWriter.DeleteInfo, 0);
+                            }
+                        }
                     }
                 }
             }
@@ -1380,6 +1426,7 @@ pub const PersistentIndex = struct {
         const infos = try self.writer.prepareDeleteInfos(self.alloc, delete_keys);
         errdefer self.freeDeleteInfos(infos);
         const count = infos.len + segments.len;
+        if (count == 0 and checkpoint == null and metadata == null and committer == null) return infos;
         const replacements = try self.alloc.alloc(index_mod.ReplacementSegmentData, count);
         defer self.alloc.free(replacements);
         const deleted = try self.alloc.alloc(roaring.RoaringBitmap, infos.len);
@@ -1449,8 +1496,6 @@ pub const PersistentIndex = struct {
         else
             null;
         defer if (publication) |*prepared| prepared.abort();
-        var txn = try self.beginWriteMainTxn();
-        errdefer txn.abort();
         try self.checkReplayAliasCollisions(&txn, collided_ids[0..collided_count]);
         for (infos) |info| {
             const key = std.mem.toBytes(std.mem.nativeToBig(u64, info.seg_id));
@@ -1462,8 +1507,10 @@ pub const PersistentIndex = struct {
         }
         try saveNextSegmentId(&txn, self.writer.next_segment_id);
         if (publication) |*prepared| try self.savePreparedSegmentAdmissions(&txn, prepared);
-        const encoded = ReplayFragment.encode(checkpoint);
-        try txn.put(.meta, meta_replay_fragment, &encoded);
+        if (checkpoint) |point| {
+            const encoded = ReplayFragment.encode(point);
+            try txn.put(.meta, meta_replay_fragment, &encoded);
+        }
         if (metadata) |joined| if (joined.seal) |seal| {
             var next = seal;
             const previous = txn.get(.meta, projection_seal.metadata_key) catch |err| if (err == error.NotFound) null else return err;
@@ -1480,17 +1527,15 @@ pub const PersistentIndex = struct {
             metadata: ?ReplayPublicationMetadata,
             snapshot_publication: ?*index_mod.IndexWriter.PreparedSegmentReplacement,
             target_writer: *index_mod.IndexWriter,
+            guard_visibility: bool,
             fn stage(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
                 const self_: *@This() = @ptrCast(@alignCast(raw));
                 if (self_.snapshot_publication) |prepared| try prepared.bind(self_.target_writer);
                 for (self_.segments) |segment| try segment.artifact.stageLink(view);
-                if (self_.metadata) |joined| {
-                    // Arm only at the actual native boundary, after LSM
-                    // pressure relief and all fallible memtable preparation.
-                    // New progress cannot authorize a newly captured old view.
-                    if (self_.snapshot_publication) |prepared| prepared.guardExternalVisibility();
-                    try joined.participant.apply(view);
-                }
+                // New primary bytes or progress must not authorize a fresh
+                // old-index capture during the durable-to-memory handoff.
+                if (self_.guard_visibility) if (self_.snapshot_publication) |prepared| prepared.guardExternalVisibility();
+                if (self_.metadata) |joined| try joined.participant.apply(view);
             }
         };
         var participation: Participation = .{
@@ -1498,9 +1543,41 @@ pub const PersistentIndex = struct {
             .metadata = metadata,
             .snapshot_publication = if (publication) |*prepared| prepared else null,
             .target_writer = &self.writer,
+            .guard_visibility = metadata != null or committer != null,
         };
         if (publication) |*prepared| try prepared.detach();
-        try self.commitPreparedPublicationWithParticipant(&txn, &uncertain, .{ .ptr = &participation, .stage = Participation.stage });
+        if (committer) |primary| {
+            // Detachment consumes only the namespace transaction; its immutable
+            // write set remains owned until the synchronous primary returns.
+            const namespace_txn = if (txn.write) |*value| value else return error.ReadOnly;
+            var prepared_namespace = try namespace_txn.prepareNativePublication();
+            txn.write = null;
+            defer prepared_namespace.deinit();
+            const Joined = struct {
+                namespace: @import("native_publication.zig").Participant,
+                artifacts: @import("native_publication.zig").Participant,
+                fn stage(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
+                    const joined: *@This() = @ptrCast(@alignCast(raw));
+                    try joined.namespace.apply(view);
+                    try joined.artifacts.apply(view);
+                }
+            };
+            var joined: Joined = .{ .namespace = prepared_namespace.participant, .artifacts = .{ .ptr = &participation, .stage = Participation.stage } };
+            var progress: backend_types.CommitProgress = .{};
+            const parent_progress = backend_types.commit_progress;
+            backend_types.commit_progress = &progress;
+            defer backend_types.commit_progress = parent_progress;
+            primary.commit(.{ .ptr = &joined, .stage = Joined.stage }) catch |err| {
+                uncertain = progress.maybe_applied;
+                if (uncertain) {
+                    if (parent_progress) |parent| parent.maybe_applied = true;
+                    files.storage.fenceUncertainPublication();
+                }
+                return err;
+            };
+        } else {
+            try self.commitPreparedPublicationWithParticipant(&txn, &uncertain, .{ .ptr = &participation, .stage = Participation.stage });
+        }
         if (publication) |*prepared| prepared.publish();
         published = true;
         return infos;
@@ -2567,6 +2644,16 @@ pub const PersistentIndex = struct {
             return;
         }
 
+        if (self.main_store_owner == .native) {
+            var stager = (try self.acquireReplayStager(self.alloc)) orelse return error.Unsupported;
+            defer stager.deinit();
+            var staged = [_]PreparedReplaySegment{try prepareReplaySegment(self.alloc, stager, owned.?)};
+            defer staged[0].deinit();
+            const infos = try self.publishPreparedNativeLocked(&staged, &.{}, null, null, null);
+            defer self.freeDeleteInfos(infos);
+            return;
+        }
+
         const profile_enabled = benchPersistentPublishEnabled();
         const total_start_ns = if (profile_enabled) platform_time.monotonicNs() else 0;
         var wal_append_ns: u64 = 0;
@@ -3171,6 +3258,8 @@ pub const PersistentIndex = struct {
         if (doc_ids.len == 0) return try self.alloc.alloc(index_mod.IndexWriter.DeleteInfo, 0);
         self.lockStorage();
         defer self.unlockStorage();
+
+        if (self.main_store_owner == .native) return self.publishPreparedNativeLocked(&.{}, doc_ids, null, null, null);
 
         const delete_infos = try self.writer.deleteAllByIdsTracked(self.alloc, doc_ids);
         errdefer index_mod.IndexWriter.freeDeleteInfos(self.alloc, delete_infos);
@@ -8228,7 +8317,9 @@ test "lite direct native replay publishes metadata and artifacts in one checkpoi
     try std.testing.expect(index.wal.store_owner == .native);
     const alpha = try buildSimpleSegment(a, "doc:a", "alpha");
     defer a.free(alpha);
+    const initial_checkpoint = docs.file.activeCheckpoint().commit_sequence;
     try index.indexSegment(alpha);
+    try std.testing.expectEqual(initial_checkpoint + 1, docs.file.activeCheckpoint().commit_sequence);
     const old = index.acquireSnapshot();
     defer old.release();
     var stager = (try index.acquireReplayStager(a)).?;
@@ -8239,8 +8330,40 @@ test "lite direct native replay publishes metadata and artifacts in one checkpoi
     defer for (&staged) |*segment| segment.deinit();
     const identity: ReplayFragment.Identity = .{ .generation = 4, .config_hash = 5, .incarnation = 6 };
     const checkpoint: ReplayFragment.Checkpoint = .{ .identity = identity, .position = .{ .sequence = 1, .next_item = 1, .total_items = 1, .fingerprint = @splat(7), .applied = true } };
+    var primary_store = try @import("docstore.zig").DocStore.openRuntime(a, docs.backendStore());
+    defer primary_store.close();
+    const Primary = struct {
+        store: *@import("docstore.zig").DocStore,
+        writer: *index_mod.IndexWriter,
+        fail: bool = true,
+        fn commit(raw: *anyopaque, participant: @import("native_publication.zig").Participant) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const Joined = struct {
+                index: @import("native_publication.zig").Participant,
+                writer: *index_mod.IndexWriter,
+                fail: bool,
+                fn stage(ctx: *anyopaque, view: @import("native_publication.zig").View) !void {
+                    const joined: *@This() = @ptrCast(@alignCast(ctx));
+                    try joined.index.apply(view);
+                    if (joined.writer.external_visibility_gate.tryLock()) {
+                        joined.writer.external_visibility_gate.unlock();
+                        return error.MissingPrimaryVisibilityGuard;
+                    }
+                    if (joined.fail) return error.InjectedFailure;
+                }
+            };
+            var joined: Joined = .{ .index = participant, .writer = self.writer, .fail = self.fail };
+            try self.store.putBatchWithPublications(std.testing.io, &.{.{ .key = "doc:a", .value = "beta" }}, &.{}, null, .{}, null, .{ .ptr = &joined, .stage = Joined.stage });
+        }
+    };
+    var primary: Primary = .{ .store = &primary_store, .writer = &index.writer };
     const before = docs.file.activeCheckpoint().commit_sequence;
-    const deletes = try index.publishReplay(&staged, &.{"doc:a"}, checkpoint);
+    try std.testing.expectError(error.InjectedFailure, index.publishReplayWithCommitter(&staged, &.{"doc:a"}, checkpoint, null, .{ .ptr = &primary, .commit_fn = Primary.commit }));
+    try std.testing.expectEqual(before, docs.file.activeCheckpoint().commit_sequence);
+    try std.testing.expect((try docs.file.getDocumentAlloc(a, "doc:a")) == null);
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    primary.fail = false;
+    const deletes = try index.publishReplayWithCommitter(&staged, &.{"doc:a"}, checkpoint, null, .{ .ptr = &primary, .commit_fn = Primary.commit });
     index.freeDeleteInfos(deletes);
     try std.testing.expectEqual(before + 1, docs.file.activeCheckpoint().commit_sequence);
     try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, old, "alpha"));
@@ -8255,5 +8378,13 @@ test "lite direct native replay publishes metadata and artifacts in one checkpoi
     try std.testing.expect(index.wal.store_owner == .native);
     try std.testing.expect(std.meta.eql(checkpoint.position, (try index.loadReplayFragment(identity)).?));
     try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    const before_delete = docs.file.activeCheckpoint().commit_sequence;
+    try std.testing.expect(try index.deleteById("doc:a"));
+    try std.testing.expectEqual(before_delete + 1, docs.file.activeCheckpoint().commit_sequence);
+    try std.testing.expect(std.meta.eql(checkpoint.position, (try index.loadReplayFragment(identity)).?));
+    try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+    const primary_value = (try docs.file.getDocumentAlloc(a, "doc:a")).?;
+    defer a.free(primary_value);
+    try std.testing.expectEqualStrings("beta", primary_value);
     try std.testing.expect((try docs.file.check()).valid);
 }
