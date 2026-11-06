@@ -13473,7 +13473,6 @@ pub const ProvisionedTableWriteSource = struct {
                 .embedding_options = .{
                     .antfly_provider = self.antfly_provider,
                     .inference_api_url = self.inference_api_url,
-                    .inference_api_key = self.inference_api_key,
                 },
                 .destination_authorizer = self.destination_authorizer,
             },
@@ -13565,7 +13564,6 @@ pub const ProvisionedTableWriteSource = struct {
                 .embedding_options = .{
                     .antfly_provider = self.antfly_provider,
                     .inference_api_url = self.inference_api_url,
-                    .inference_api_key = self.inference_api_key,
                 },
             });
             summary.merge(.{
@@ -17497,7 +17495,6 @@ pub const ProvisionedTableWriteSource = struct {
                     .embedding_options = .{
                         .antfly_provider = self.antfly_provider,
                         .inference_api_url = self.inference_api_url,
-                        .inference_api_key = self.inference_api_key,
                     },
                     .source_table = table_name,
                     .destination_authorizer = self.destination_authorizer,
@@ -19281,7 +19278,6 @@ pub const ProvisionedTableWriteSource = struct {
                     .embedding_options = .{
                         .antfly_provider = self.antfly_provider,
                         .inference_api_url = self.inference_api_url,
-                        .inference_api_key = self.inference_api_key,
                     },
                     .source_table = table_name,
                     .destination_authorizer = self.destination_authorizer,
@@ -19490,7 +19486,6 @@ pub const ProvisionedTableWriteSource = struct {
                 .embedding_options = .{
                     .antfly_provider = self.antfly_provider,
                     .inference_api_url = self.inference_api_url,
-                    .inference_api_key = self.inference_api_key,
                 },
                 .source_table = table_name,
                 .destination_authorizer = self.destination_authorizer,
@@ -20557,7 +20552,6 @@ pub const ProvisionedTableWriteSource = struct {
                             .embedding_options = .{
                                 .antfly_provider = self.antfly_provider,
                                 .inference_api_url = self.inference_api_url,
-                                .inference_api_key = self.inference_api_key,
                             },
                             .source_table = table_name,
                             .destination_authorizer = self.destination_authorizer,
@@ -20742,7 +20736,6 @@ pub const ProvisionedTableWriteSource = struct {
                         .embedding_options = .{
                             .antfly_provider = self.antfly_provider,
                             .inference_api_url = self.inference_api_url,
-                            .inference_api_key = self.inference_api_key,
                         },
                     });
                 }
@@ -28258,7 +28251,6 @@ fn applyIndexCreateToCachedDb(
         .embedding_options = .{
             .antfly_provider = antfly_provider,
             .inference_api_url = inference_api_url,
-            .inference_api_key = inference_api_key,
             .source_table = source_table,
         },
     });
@@ -28427,7 +28419,6 @@ fn reconcileCachedLocalTableIndexDrop(
                 .embedding_options = .{
                     .antfly_provider = self.antfly_provider,
                     .inference_api_url = self.inference_api_url,
-                    .inference_api_key = self.inference_api_key,
                 },
             },
         ) catch |err| {
@@ -28638,7 +28629,6 @@ fn reconcileUncachedLocalTableIndexCreate(
             .embedding_options = .{
                 .antfly_provider = self.antfly_provider,
                 .inference_api_url = self.inference_api_url,
-                .inference_api_key = self.inference_api_key,
             },
         });
         recordLocalIndexCreateRepairDebt(alloc, &db, group_id, repair_group_ids);
@@ -29455,7 +29445,6 @@ fn reconfigureManagedDbEnrichments(
     try reconcileDbArtifactEnrichmentsFromIndexesJson(alloc, db, indexes_json, .{
         .antfly_provider = antfly_provider,
         .inference_api_url = inference_api_url,
-        .inference_api_key = inference_api_key,
         .source_table = source_table,
     });
 }

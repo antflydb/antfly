@@ -1067,7 +1067,6 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
         .embedding_options = .{
             .antfly_provider = antfly_provider,
             .inference_api_url = options.inference_api_url,
-            .inference_api_key = options.inference_api_key,
         },
         .source_table = options.source_table,
         .destination_authorizer = options.destination_authorizer,

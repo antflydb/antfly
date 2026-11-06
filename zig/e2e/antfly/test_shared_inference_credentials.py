@@ -20,6 +20,11 @@ Antfly Cloud configures only the node-level ``inference.api_url`` and
 Index embedders name the model and inherit both. The create-time dimension
 probe and query embedding already authenticated; background enrichment
 inherited the URL but not the key, so every backfill request was rejected.
+
+The node config carries only the secret reference; the value is resolved at
+use time, so rotating the stored secret reaches running enrichment workers,
+and a restart rebuilds them from current runtime config rather than from
+anything persisted with the index.
 """
 
 import json
@@ -36,6 +41,7 @@ from helpers import start_http_server, wait_until
 MODEL = "shared/embedder"
 DIMENSIONS = 4
 API_KEY = "shared-inference-e2e-key"
+ROTATED_API_KEY = "shared-inference-e2e-rotated-key"
 SECRET_KEY = "antfly.antfly_inference.api_key"
 
 
@@ -45,8 +51,14 @@ class _SharedInference(ThreadingHTTPServer):
     def __init__(self) -> None:
         super().__init__(("127.0.0.1", 0), _SharedInferenceHandler)
         self.lock = threading.Lock()
+        self.api_key = API_KEY
         self.embed_requests: list[str | None] = []
         self.unauthorized = 0
+
+    def rotate(self, api_key: str) -> None:
+        with self.lock:
+            self.api_key = api_key
+            self.embed_requests.clear()
 
     @property
     def api_url(self) -> str:
@@ -72,9 +84,9 @@ class _SharedInferenceHandler(BaseHTTPRequestHandler):
         self.wfile.write(raw)
 
     def _authorized(self) -> bool:
-        if self.headers.get("Authorization") == f"Bearer {API_KEY}":
-            return True
         with self.server.lock:
+            if self.headers.get("Authorization") == f"Bearer {self.server.api_key}":
+                return True
             self.server.unauthorized += 1
         self._reply(401, {"error": "missing or invalid API key"})
         return False
@@ -115,13 +127,21 @@ def shared_inference():
         thread.join(timeout=5)
 
 
-def _write_config(root: Path, api_url: str) -> Path:
+def _write_secret(root: Path, value: str) -> Path:
+    """Replace the projected secret file the way a Kubernetes Secret update does."""
     secrets_path = root / "secrets.json"
-    secrets_path.write_text(
-        json.dumps({"secrets": [{"key": SECRET_KEY, "value": API_KEY}]}),
+    staged = root / "secrets.json.tmp"
+    staged.write_text(
+        json.dumps({"secrets": [{"key": SECRET_KEY, "value": value}]}),
         encoding="utf-8",
     )
-    secrets_path.chmod(0o600)
+    staged.chmod(0o600)
+    os.replace(staged, secrets_path)
+    return secrets_path
+
+
+def _write_config(root: Path, api_url: str) -> Path:
+    secrets_path = _write_secret(root, API_KEY)
     reference = "${secret:" + SECRET_KEY + "}"
     config_path = root / "shared-inference.json"
     config_path.write_text(
@@ -173,6 +193,13 @@ def _insert(api_url: str, table: str, start: int) -> None:
         f"{api_url}/tables/{table}/batch", json={"inserts": inserts}, timeout=30
     )
     response.raise_for_status()
+
+
+def _assert_only(shared_inference: _SharedInference, api_key: str) -> None:
+    authorizations = shared_inference.embed_authorizations()
+    assert authorizations, "background enrichment never reached shared inference"
+    assert set(authorizations) == {f"Bearer {api_key}"}
+    assert shared_inference.unauthorized == 0
 
 
 def _wait_covered(api_url: str, table: str, expected: int) -> dict:
@@ -231,16 +258,23 @@ def test_default_inference_api_key_authenticates_background_enrichment(
 
         _insert(api_url, table, 1)
         _wait_covered(api_url, table, 3)
+        _assert_only(shared_inference, API_KEY)
 
-        # Persisted indexes must recover the node-level credential on reopen.
-        server.restart()
-        api_url = server.api_url
+        # Rotating the referenced secret reaches running enrichment workers.
+        shared_inference.rotate(ROTATED_API_KEY)
+        _write_secret(tmp_path, ROTATED_API_KEY)
         _insert(api_url, table, 4)
         _wait_covered(api_url, table, 6)
+        _assert_only(shared_inference, ROTATED_API_KEY)
 
-        authorizations = shared_inference.embed_authorizations()
-        assert authorizations, "background enrichment never reached shared inference"
-        assert set(authorizations) == {f"Bearer {API_KEY}"}
-        assert shared_inference.unauthorized == 0
+        # Persisted indexes take the credential from current runtime config on
+        # reopen, never from state stored with the index.
+        shared_inference.rotate(API_KEY)
+        _write_secret(tmp_path, API_KEY)
+        server.restart()
+        api_url = server.api_url
+        _insert(api_url, table, 7)
+        _wait_covered(api_url, table, 9)
+        _assert_only(shared_inference, API_KEY)
     finally:
         server.stop()
