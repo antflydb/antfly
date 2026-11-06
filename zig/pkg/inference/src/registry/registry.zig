@@ -699,7 +699,7 @@ pub const ModelRegistry = struct {
             defer publication.deinit();
             try publication.recoverDestination();
             try publication.finish();
-            var pending = try download.ManagedModelTransaction.beginWithLease(self.allocator, io, dest, &publication.write_lease);
+            var pending = try download.ManagedModelTransaction.beginWithLease(self.allocator, io, dest, try publication.writeLease());
             errdefer pending.deinit(io);
             break :blk pending;
         };
