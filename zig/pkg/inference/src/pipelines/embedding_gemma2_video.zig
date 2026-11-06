@@ -934,12 +934,12 @@ test "embeddinggemma2 video contract pixel inspection admits CUDA MP4 codecs wit
     }
 }
 
-test "embeddinggemma2 video contract pixels cover CUDA track before smaller portable track" {
+test "embeddinggemma2 video contract pixels follow the first decodable track on both routes" {
     const bytes = @embedFile("../testdata/video/codecs/hevc-avc-tracks.mp4");
     var pool = media.admission.Pool{ .limits = .{ .host_bytes = 512 * 1024 * 1024 } };
     const portable = try inspectPlan(std.testing.allocator, bytes, .{}, .reference, &pool, false);
     const cuda = try @import("../ops/cuda/video.zig").inspectEmbedding(std.testing.allocator, bytes, .{});
-    try std.testing.expectEqual(@as(u64, 32 * 32), portable.pixels);
+    try std.testing.expectEqual(@as(u64, 192 * 192), portable.pixels);
     try std.testing.expectEqual(@as(u64, 4 * 192 * 192), @as(u64, cuda.width) * cuda.height * cuda.frames);
     try std.testing.expectEqual(@as(u64, 4 * 192 * 192), try inspectPixels(bytes, .{}));
     try std.testing.expectError(error.Timeout, inspectPixels(bytes, .{ .deadline_ns = 0 }));
