@@ -41,14 +41,38 @@ const Namespace = struct {
     guard: std.Io.File,
     digest: [32]u8,
     fn open(a: Allocator, io: std.Io, path: []const u8, publication: bool, no_sync: bool) !Namespace {
-        const canonical = if (publication) blk: {
-            const parent = try std.Io.Dir.cwd().realPathFileAlloc(io, std.fs.path.dirname(path) orelse ".", a);
-            defer a.free(parent);
-            break :blk try std.fs.path.joinZ(a, &.{ parent, std.fs.path.basename(path) });
-        } else try std.Io.Dir.cwd().realPathFileAlloc(io, path, a);
+        // Resolve the `.aflite` file's parent directory *once*, as an
+        // already-open handle, and reuse that same handle for everything
+        // below -- rather than asking the OS to canonicalize a cwd-relative
+        // *string* (`std.fs.path.dirname(path) orelse "."`) and then
+        // re-opening whatever string comes back. `std.Io.Dir.realPathFile`
+        // -- what the old resolution used -- documents itself as having
+        // "limited platform support" and warns "using it can lead to
+        // unnecessary failures and race conditions"; a relative `path`
+        // resolved against a cwd that is not exactly what the caller
+        // expects at that instant silently points the whole reader-epoch
+        // namespace, and the "identity" marker inside it, at the wrong
+        // directory entirely -- observed in practice as a bare `identity`
+        // file landing directly in the process's cwd instead of inside its
+        // own `.aflite-readers-*` directory next to the `.aflite` file.
+        // Resolving the already-open parent handle's own identity via
+        // `Dir.realPath` (no `sub_path`, no fresh cwd lookup) and reusing
+        // that handle removes any dependency on cwd for the rest of this
+        // call.
+        var parent = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(path) orelse ".", .{});
+        var parent_open = true;
+        errdefer if (parent_open) parent.close(io);
+        if (!publication) {
+            // Preserve the original contract: a missing `.aflite` file
+            // must surface as `error.FileNotFound` (translated by callers
+            // into `UnsafeNativeReaderAlias`/`WouldBlock`), not silently
+            // resolve only its still-existing parent directory.
+            try parent.access(io, std.fs.path.basename(path), .{});
+        }
+        var parent_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const parent_path_len = try parent.realPath(io, &parent_path_buf);
+        const canonical = try std.fs.path.joinZ(a, &.{ parent_path_buf[0..parent_path_len], std.fs.path.basename(path) });
         errdefer a.free(canonical);
-        const parent = try std.Io.Dir.cwd().openDir(io, std.fs.path.dirname(canonical).?, .{});
-        defer parent.close(io);
         // The path chooses a bounded location, never the authority to reuse.
         var path_digest: [32]u8 = undefined;
         std.crypto.hash.Blake3.hash(canonical, &path_digest, .{});
@@ -60,6 +84,8 @@ const Namespace = struct {
         };
         const directory = try parent.openDir(io, directory_name, .{ .iterate = true });
         errdefer directory.close(io);
+        parent.close(io);
+        parent_open = false;
         // Never recreate this authority for an already published inode. Missing
         // or replaced namespaces must retain inode fencing, including writers.
         const guard = if (publication)
