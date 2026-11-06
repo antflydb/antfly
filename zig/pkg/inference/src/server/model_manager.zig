@@ -5438,6 +5438,7 @@ pub const ModelManager = struct {
             .loaded = LoadedModelMap{},
             .loaded_aliases = LoadedModelMap{},
             .runtime_epoch = runtime_epoch,
+            .verified_artifacts = .{ .owner_allocator = allocator },
         };
     }
 
@@ -7305,6 +7306,14 @@ pub const ModelManager = struct {
             const backend_runtime = session_manager.resolveBackendRuntime(backend) catch |err| {
                 rememberPreferredLoadError(&first_err, err);
                 continue;
+            };
+
+            validateSessionConstruction(control, backend_runtime) catch |err| {
+                if (err == error.ProcessIsolationRequired) {
+                    rememberPreferredLoadError(&first_err, err);
+                    continue;
+                }
+                return err;
             };
 
             var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
@@ -11801,6 +11810,14 @@ fn nativeModelLoadAdmission(
     };
 }
 
+/// Check isolation policy before admission without arming a native-call monitor.
+fn validateSessionConstruction(control: ?InferenceExecutionControl, backend_runtime: backends.BackendRuntime) !void {
+    if (control) |active| {
+        try active.check();
+        try active.validateUninterruptible(backend_runtime.loadInterruption());
+    }
+}
+
 /// All managed constructors share this boundary. Keep the returned guard in
 /// the attempt's scope until post-construction checks and rollback finish.
 fn enterSessionConstruction(
@@ -11932,14 +11949,13 @@ fn loadSessionForPreferredBackendsWithArtifacts(
             rememberPreferredLoadError(&first_err, err);
             continue;
         };
-        var hard_cancellation = enterSessionConstruction(control, backend_runtime) catch |err| {
+        validateSessionConstruction(control, backend_runtime) catch |err| {
             if (err == error.ProcessIsolationRequired) {
                 rememberPreferredLoadError(&first_err, err);
                 continue;
             }
             return err;
         };
-        defer hard_cancellation.deinit();
         var resource_lease: ?runtime.tier.memory.AdmissionLease = null;
         // This attempt owns admission until the successful result explicitly
         // takes it. Includes cancellation, guard-arm failure, and fallback.
@@ -11991,6 +12007,14 @@ fn loadSessionForPreferredBackendsWithArtifacts(
                 continue;
             };
         }
+        var hard_cancellation = enterSessionConstruction(control, backend_runtime) catch |err| {
+            if (err == error.ProcessIsolationRequired) {
+                rememberPreferredLoadError(&first_err, err);
+                continue;
+            }
+            return err;
+        };
+        defer hard_cancellation.deinit();
         var close_protection = manager.prepareSessionClose(backend_runtime) catch |err| {
             if (err == error.ProcessIsolationRequired) {
                 rememberPreferredLoadError(&first_err, err);
@@ -12661,7 +12685,7 @@ test "preferred load attempt releases admission on cancellation and guard failur
     };
     const controls = [_]InferenceExecutionControl{
         .{},
-        .{ .ptr = &manager, .check_fn = Hooks.cancelAfterAdmission },
+        .{ .native_call_policy = .in_process, .ptr = &manager, .check_fn = Hooks.cancelAfterAdmission },
         .{ .hard_cancellation = .{ .ptr = &manager, .arm_fn = Hooks.failArm, .disarm_fn = Hooks.disarm } },
     };
     const errors = [_]anyerror{ error.ProcessIsolationRequired, error.Timeout, error.OutOfMemory };
@@ -18382,7 +18406,9 @@ test "component and primary construction reject same-receipt namespace retargets
                     {
                         var artifacts = try PublishedArtifacts.init(tracking.allocator(), counted, alias, null);
                         defer artifacts.deinit();
+                        artifacts.verification_cache = &manager.verified_artifacts;
                         try std.testing.expectError(error.ModelArtifactsChanging, loadSessionForPreferredBackendsWithArtifacts(&manager, &.{.native}, alias, man, &manager.session_manager, control, &artifacts));
+                        try std.testing.expect(manager.verified_artifacts.entries.count() > 0);
                     }
                     try std.testing.expectEqual(tracking.allocated_bytes, tracking.freed_bytes);
                 } else try std.testing.expectError(error.ModelArtifactsChanging, loadSessionForPreferredBackends(&manager, &.{.native}, alias, man, &manager.session_manager, control));

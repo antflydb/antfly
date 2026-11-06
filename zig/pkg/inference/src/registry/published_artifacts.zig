@@ -24,6 +24,8 @@ pub const Expected = struct { publication: ?[32]u8 };
 pub const VerificationCache = struct {
     pub const capacity = 4096;
     const Entry = struct { stamp: managed.ArtifactStamp, used: u64 };
+    /// Manager-owned caches outlive the allocators of borrowed acquisitions.
+    owner_allocator: ?std.mem.Allocator = null,
     mutex: std.atomic.Mutex = .unlocked,
     builders: [16]std.Io.Mutex = @splat(.init),
     entries: std.AutoHashMapUnmanaged([32]u8, Entry) = .empty,
@@ -64,7 +66,7 @@ pub const VerificationCache = struct {
             };
             _ = self.entries.remove(oldest.?);
         }
-        try self.entries.put(a, key, .{ .stamp = stamp, .used = self.clock });
+        try self.entries.put(self.owner_allocator orelse a, key, .{ .stamp = stamp, .used = self.clock });
     }
     fn verify(self: *VerificationCache, a: std.mem.Allocator, io: std.Io, publication: [32]u8, artifact: *const managed.ValidatedArtifact, initial: managed.ArtifactStamp) !managed.ArtifactStamp {
         const key = keyFor(publication, artifact);
@@ -82,7 +84,7 @@ pub const VerificationCache = struct {
         return verified;
     }
     pub fn deinit(self: *VerificationCache, a: std.mem.Allocator) void {
-        self.entries.deinit(a);
+        self.entries.deinit(self.owner_allocator orelse a);
     }
 };
 
