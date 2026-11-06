@@ -163,7 +163,7 @@ fn destroyBuffer(args: *c.BufferDestroyArgs) callconv(.c) ?*c.PjrtError {
     return null;
 }
 fn bufferSize(args: *c.BufferOnDeviceSizeInBytesArgs) callconv(.c) ?*c.PjrtError {
-    args.on_device_size_in_bytes = dataBuffer(args.buffer).bytes.len;
+    args.on_device_size_in_bytes = std.mem.alignForward(usize, dataBuffer(args.buffer).bytes.len, 256);
     return null;
 }
 fn bufferType(args: *c.BufferElementTypeArgs) callconv(.c) ?*c.PjrtError {
@@ -178,6 +178,11 @@ fn bufferDimensions(args: *c.BufferDimensionsArgs) callconv(.c) ?*c.PjrtError {
 }
 fn download(args: *c.BufferToHostBufferArgs) callconv(.c) ?*c.PjrtError {
     const data = dataBuffer(args.src).bytes;
+    const layout = args.host_layout orelse @panic("host layout must be explicit");
+    const shape = dataBuffer(args.src).dims;
+    std.debug.assert(layout.layout_type == 0 and layout.layout.tiled.num_tiles == 0);
+    std.debug.assert(layout.layout.tiled.minor_to_major_size == shape.len);
+    for (layout.layout.tiled.minor_to_major.?[0..shape.len], 0..) |dimension, i| std.debug.assert(dimension == @as(i64, @intCast(shape.len - i - 1)));
     if (args.dst == null) {
         args.dst_size = data.len;
         args.event = null;

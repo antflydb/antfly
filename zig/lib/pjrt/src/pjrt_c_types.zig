@@ -251,7 +251,7 @@ pub const BufferToHostBufferArgs = extern struct {
     struct_size: usize,
     extension_start: ?*anyopaque,
     src: ?*PjrtBuffer,
-    host_layout: ?*anyopaque,
+    host_layout: ?*const BufferMemoryLayout,
     dst: ?*anyopaque,
     dst_size: usize,
     event: ?*PjrtEvent, // out
@@ -496,8 +496,11 @@ pub const Api = extern struct {
         const f = castFn(*const fn (*BufferDimensionsArgs) callconv(.c) ?*PjrtError, self._fns[FN_BUFFER_DIMENSIONS].?);
         return f(args);
     }
+    pub fn hasBufferShape(self: *const Api) bool {
+        return self.hasFunction(FN_BUFFER_ELEMENT_TYPE) and self.hasFunction(FN_BUFFER_DIMENSIONS);
+    }
     pub fn hasBufferReadback(self: *const Api) bool {
-        return self.hasFunction(FN_BUFFER_ELEMENT_TYPE) and self.hasFunction(FN_BUFFER_DIMENSIONS) and self.hasFunction(FN_BUFFER_TO_HOST);
+        return self.hasBufferShape() and self.hasFunction(FN_BUFFER_TO_HOST);
     }
 
     pub fn bufferDestroy(self: *const Api, args: *BufferDestroyArgs) ?*PjrtError {
@@ -554,4 +557,27 @@ pub const ExecutableOutputDimensionsArgs = extern struct {
     num_outputs: usize,
     dims: ?[*]const i64,
     dim_sizes: ?[*]const usize,
+};
+
+/// Upstream layout union, including both members to preserve C size/alignment.
+pub const BufferMemoryLayoutTiled = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    minor_to_major: ?[*]const i64,
+    minor_to_major_size: usize,
+    tile_dims: ?[*]const i64,
+    tile_dim_sizes: ?[*]const usize,
+    num_tiles: usize,
+};
+pub const BufferMemoryLayoutStrides = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    byte_strides: ?[*]const i64,
+    num_byte_strides: usize,
+};
+pub const BufferMemoryLayout = extern struct {
+    struct_size: usize,
+    extension_start: ?*anyopaque,
+    layout: extern union { tiled: BufferMemoryLayoutTiled, strides: BufferMemoryLayoutStrides },
+    layout_type: c_int,
 };

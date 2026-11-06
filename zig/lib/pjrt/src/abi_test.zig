@@ -18,7 +18,7 @@
 const std = @import("std");
 const c = @import("pjrt_c_types.zig");
 extern const antfly_pjrt_api_offsets: [26]usize;
-extern const antfly_pjrt_arg_layouts: [38]usize;
+extern const antfly_pjrt_arg_layouts: [56]usize;
 
 test "PJRT function slots match the upstream C header" {
     const Slot = struct { index: usize, name: []const u8 };
@@ -106,6 +106,24 @@ test "PJRT executable ownership and arity argument layouts match upstream" {
         @offsetOf(c.ExecutableOutputDimensionsArgs, "num_outputs"),
         @offsetOf(c.ExecutableOutputDimensionsArgs, "dims"),
         @offsetOf(c.ExecutableOutputDimensionsArgs, "dim_sizes"),
+        @sizeOf(c.BufferMemoryLayoutTiled),
+        @offsetOf(c.BufferMemoryLayoutTiled, "struct_size"),
+        @offsetOf(c.BufferMemoryLayoutTiled, "extension_start"),
+        @offsetOf(c.BufferMemoryLayoutTiled, "minor_to_major"),
+        @offsetOf(c.BufferMemoryLayoutTiled, "minor_to_major_size"),
+        @offsetOf(c.BufferMemoryLayoutTiled, "tile_dims"),
+        @offsetOf(c.BufferMemoryLayoutTiled, "tile_dim_sizes"),
+        @offsetOf(c.BufferMemoryLayoutTiled, "num_tiles"),
+        @sizeOf(c.BufferMemoryLayoutStrides),
+        @offsetOf(c.BufferMemoryLayoutStrides, "struct_size"),
+        @offsetOf(c.BufferMemoryLayoutStrides, "extension_start"),
+        @offsetOf(c.BufferMemoryLayoutStrides, "byte_strides"),
+        @offsetOf(c.BufferMemoryLayoutStrides, "num_byte_strides"),
+        @sizeOf(c.BufferMemoryLayout),
+        @offsetOf(c.BufferMemoryLayout, "struct_size"),
+        @offsetOf(c.BufferMemoryLayout, "extension_start"),
+        @offsetOf(c.BufferMemoryLayout, "layout"),
+        @offsetOf(c.BufferMemoryLayout, "layout_type"),
     };
     try std.testing.expectEqualSlices(usize, &antfly_pjrt_arg_layouts, &layouts);
 }

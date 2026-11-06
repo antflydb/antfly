@@ -184,11 +184,9 @@ pub const ArtifactDeviceAdmission = struct {
             if (!compiled_artifact.pjrtBindingIsInputIds(binding)) largest_input = @max(largest_input, try artifactShapeBytes(shape, 4));
         }
         var largest_output: usize = 0;
-        var logical_outputs: usize = 0;
         const whole_model = std.mem.eql(u8, artifact.kind, "pjrt_executable");
         for (artifact.pjrt_output_shapes, artifact.pjrt_output_node_ids) |shape, node_id| {
             const bytes = try artifactShapeBytes(shape, 4);
-            logical_outputs = try std.math.add(usize, logical_outputs, bytes);
             var retained_kv = false;
             for (artifact.pjrt_output_bindings) |binding| if (binding.node_id == node_id and compiled_artifact.pjrtBindingIsKvCache(binding)) {
                 retained_kv = true;
@@ -197,7 +195,7 @@ pub const ArtifactDeviceAdmission = struct {
             // downloads logits. Partition comparison may download any output.
             if (!whole_model or !retained_kv) largest_output = @max(largest_output, bytes);
         }
-        if (largest_output != 0) largest_output = try std.math.add(usize, largest_output, stats.outputs -| logical_outputs);
+        // Readback requests dense row-major data; native padding stays on device.
         const transfers = @max(largest_input, try std.math.mul(usize, largest_output, 2));
         required.host_scratch_bytes = try std.math.add(usize, required.host_scratch_bytes, transfers);
         return required;

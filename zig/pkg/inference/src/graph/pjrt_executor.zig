@@ -102,7 +102,19 @@ pub const PjrtExecutor = struct {
         retained_cache: ?*const PjrtRetainedBufferCache,
         semantic_input_bindings: []const PjrtSemanticInputBinding,
     ) ![]pjrt_lib.pjrt.Buffer {
-        const staging_allocator = @import("antfly_platform").allocator.reclaimingScratch(allocator);
+        return self.executeToBuffersWithAllocators(values, exec_ctx, allocator, allocator, retained_cache, semantic_input_bindings);
+    }
+
+    fn executeToBuffersWithAllocators(
+        self: *PjrtExecutor,
+        values: []?CT,
+        exec_ctx: PartitionExecutor.ExecutionContext,
+        allocator: Allocator,
+        transfer_allocator: Allocator,
+        retained_cache: ?*const PjrtRetainedBufferCache,
+        semantic_input_bindings: []const PjrtSemanticInputBinding,
+    ) ![]pjrt_lib.pjrt.Buffer {
+        const staging_allocator = @import("antfly_platform").allocator.reclaimingScratch(transfer_allocator);
         const num_inputs = self.input_bindings.len;
         const debug = pjrtExecDebugEnabled();
         if (debug) {
@@ -149,20 +161,8 @@ pub const PjrtExecutor = struct {
                     }
                     return error.MissingPastKeyValue;
                 };
-                if (try retainedBufferShapeMismatch(retained, self.input_shapes_[i])) |sizes| {
-                    if (debug) {
-                        std.log.warn(
-                            "PJRT execute input[{d}/{d}] retained buffer shape mismatch name={s} expected_shape={any} expected_bytes={d} actual_bytes={d}",
-                            .{
-                                i + 1,
-                                num_inputs,
-                                semantic_binding.name,
-                                self.input_shapes_[i],
-                                sizes.expected_bytes,
-                                sizes.actual_bytes,
-                            },
-                        );
-                    }
+                if (!try retained.matchesFloat32Shape(self.input_shapes_[i])) {
+                    if (debug) std.log.warn("PJRT retained input shape/type mismatch input={d} expected={any}", .{ i, self.input_shapes_[i] });
                     return error.UnsupportedShape;
                 }
                 if (debug and shouldLogPjrtInput(i, num_inputs)) {
@@ -845,25 +845,60 @@ pub const PjrtModelExecutor = struct {
         runtime: PjrtModelRuntime = undefined,
         entries: []PjrtRetainedBufferCache.Entry,
         semantic_index: []usize,
+        values: []?CT,
+        scratch: []align(8) u8,
     };
+
+    /// Conservative arena bound for the concrete execution allocation sites.
+    /// Shapes may coexist with an inferred shape; native argument/output lists
+    /// and wrappers coexist until the phase returns. Every term is checked.
+    fn phaseWorkspaceBytes(exec: *const PjrtExecutor) !usize {
+        var bytes: usize = 0;
+        const c = pjrt_lib.c_types;
+        try workspaceArray(&bytes, bool, exec.output_node_ids.len); // retained flags
+        try workspaceArray(&bytes, pjrt_lib.pjrt.Buffer, exec.input_bindings.len);
+        try workspaceArray(&bytes, bool, exec.input_bindings.len); // owned inputs
+        try workspaceArray(&bytes, ?*c.PjrtBuffer, exec.input_bindings.len);
+        try workspaceArray(&bytes, ?*c.PjrtBuffer, exec.output_node_ids.len);
+        try workspaceArray(&bytes, pjrt_lib.pjrt.Buffer, exec.output_node_ids.len);
+        for (exec.input_shapes_) |shape| {
+            try workspaceArray(&bytes, i64, shape.len);
+            try workspaceArray(&bytes, i64, shape.len);
+        }
+        for (exec.output_shapes) |shape| try workspaceArray(&bytes, i64, shape.len);
+        return bytes;
+    }
+
+    fn workspaceArray(bytes: *usize, comptime T: type, count: usize) !void {
+        bytes.* = try std.math.add(usize, bytes.*, try std.math.add(usize, try std.math.mul(usize, count, @sizeOf(T)), @alignOf(T) - 1));
+    }
 
     /// Host metadata for every execution slot is admitted and allocated during
     /// loading. Runtime creation and KV replacement need no allocator or live
     /// manager, and cannot acquire unplanned metadata after fixing the pool.
     pub fn prepareRuntimeSlots(self: *@This(), capacity: usize) !void {
+        var scratch_bytes = try phaseWorkspaceBytes(self.executor);
+        for (self.decode_variants) |variant| scratch_bytes = @max(scratch_bytes, try phaseWorkspaceBytes(variant.executor));
         const slots = try self.allocator.alloc(RuntimeSlot, capacity);
         errdefer self.allocator.free(slots);
         var initialized: usize = 0;
         errdefer for (slots[0..initialized]) |slot| {
             self.allocator.free(slot.entries);
             self.allocator.free(slot.semantic_index);
+            self.allocator.free(slot.values);
+            self.allocator.free(slot.scratch);
         };
         for (slots) |*slot| {
             const entries = try self.allocator.alloc(PjrtRetainedBufferCache.Entry, self.retained_capacity);
             errdefer self.allocator.free(entries);
             const index = try self.allocator.alloc(usize, try std.math.add(usize, try std.math.mul(usize, self.retained_capacity, 2), 1));
             @memset(index, 0);
-            slot.* = .{ .entries = entries, .semantic_index = index };
+            errdefer self.allocator.free(index);
+            const values = try self.allocator.alloc(?CT, self.graph.nodeCount());
+            errdefer self.allocator.free(values);
+            @memset(values, null);
+            const scratch = try self.allocator.alignedAlloc(u8, .@"8", scratch_bytes);
+            slot.* = .{ .entries = entries, .semantic_index = index, .values = values, .scratch = scratch };
             initialized += 1;
         }
         self.runtime_slots = slots;
@@ -933,6 +968,8 @@ pub const PjrtModelExecutor = struct {
             std.debug.assert(!slot.busy.load(.acquire));
             allocator.free(slot.entries);
             allocator.free(slot.semantic_index);
+            allocator.free(slot.values);
+            allocator.free(slot.scratch);
         }
         allocator.free(self.runtime_slots);
         if (self.artifact_owner) |owner| owner.deinit();
@@ -1065,30 +1102,38 @@ const PjrtModelRuntime = struct {
         query_seq_len: usize,
         phase: Phase,
     ) !model_runtime.ModelOutput {
-        const count = self.graph.nodeCount();
-        const values = try allocator.alloc(?CT, count);
+        var workspace = std.heap.FixedBufferAllocator.init(if (self.runtime_slot) |slot| slot.scratch else &.{});
+        const bookkeeping = if (self.runtime_slot != null) workspace.allocator() else allocator;
+        const values = if (self.runtime_slot) |slot| slot.values else try allocator.alloc(?CT, self.graph.nodeCount());
+        if (self.runtime_slot == null) @memset(values, null);
         defer {
-            for (values) |maybe_ct| {
-                if (maybe_ct) |ct| self.host_backend.free(ct);
+            // Only bound inputs can be populated. Clear those positions so a
+            // large traced graph causes no graph-wide work on every token.
+            for (phase.executor.input_bindings) |binding| {
+                const node_id = switch (binding) {
+                    .embedding_ids => continue,
+                    .graph_node, .semantic_past_graph_node => |id| id,
+                };
+                if (node_id >= values.len) continue;
+                if (values[node_id]) |ct| self.host_backend.free(ct);
+                values[node_id] = null;
             }
-            allocator.free(values);
+            if (self.runtime_slot == null) allocator.free(values);
         }
-        @memset(values, null);
-
         try self.materializeGraphInputs(values, phase);
-
-        const retained = try allocator.alloc(bool, phase.executor.output_node_ids.len);
-        defer allocator.free(retained);
+        const retained = try bookkeeping.alloc(bool, phase.executor.output_node_ids.len);
+        defer bookkeeping.free(retained);
         @memset(retained, false);
         const exec_ctx: PartitionExecutor.ExecutionContext = .{ .embedding_ids = input_ids };
-        var outputs = try phase.executor.executeToBuffersWithRetained(
+        var outputs = try phase.executor.executeToBuffersWithAllocators(
             values,
             exec_ctx,
+            bookkeeping,
             allocator,
             &self.retained_buffers,
             phase.semantic_input_bindings,
         );
-        defer allocator.free(outputs);
+        defer bookkeeping.free(outputs);
         const debug = pjrtExecDebugEnabled();
         if (debug) {
             std.log.info(
@@ -1107,20 +1152,6 @@ const PjrtModelRuntime = struct {
             }
         }
 
-        for (phase.semantic_output_bindings) |binding| {
-            if (binding.output_index >= outputs.len) return error.MissingOutput;
-            if (debug) {
-                std.log.info(
-                    "PJRT ModelRuntime retain output[{d}] name={s}",
-                    .{ binding.output_index, binding.name },
-                );
-            }
-            if (self.artifact_executor_owner != null) {
-                try self.retained_buffers.putBorrowed(binding.name, binding.layer_index, binding.kind, outputs[binding.output_index]);
-            } else try self.retained_buffers.put(binding.name, binding.layer_index, binding.kind, outputs[binding.output_index]);
-            retained[binding.output_index] = true;
-        }
-
         const logits_index = phase.logits_index orelse return error.MissingOutput;
         if (debug) {
             const size_bytes = try outputs[logits_index].onDeviceSizeInBytes();
@@ -1130,10 +1161,29 @@ const PjrtModelRuntime = struct {
             );
         }
         const staging_allocator = @import("antfly_platform").allocator.reclaimingScratch(allocator);
-        const output_f32 = try outputs[logits_index].toFloat32WithShape(staging_allocator, phase.executor.output_shapes[logits_index]);
+        const output_f32 = try outputs[logits_index].toFloat32WithShapeAndScratch(staging_allocator, bookkeeping, phase.executor.output_shapes[logits_index]);
         defer staging_allocator.free(output_f32);
         if (debug) std.log.info("PJRT ModelRuntime logits read floats={d}", .{output_f32.len});
         const logits = try sliceLastLogits(allocator, output_f32, phase.executor.output_shapes[logits_index], query_seq_len);
+        errdefer allocator.free(logits);
+        // Publish KV only after readback and host-logits allocation succeed.
+        // A failed decode can retry against the previous cache generation.
+        {
+            errdefer self.retained_buffers.clear();
+            for (phase.semantic_output_bindings) |binding| {
+                if (binding.output_index >= outputs.len) return error.MissingOutput;
+                if (debug) {
+                    std.log.info(
+                        "PJRT ModelRuntime retain output[{d}] name={s}",
+                        .{ binding.output_index, binding.name },
+                    );
+                }
+                if (self.artifact_executor_owner != null) {
+                    try self.retained_buffers.putBorrowed(binding.name, binding.layer_index, binding.kind, outputs[binding.output_index]);
+                } else try self.retained_buffers.put(binding.name, binding.layer_index, binding.kind, outputs[binding.output_index]);
+                retained[binding.output_index] = true;
+            }
+        }
         if (debug) std.log.info("PJRT ModelRuntime returning logits floats={d}", .{logits.len});
         return .{ .logits = logits };
     }
@@ -1648,34 +1698,6 @@ fn numElements(shape: []const i64) usize {
     var n: usize = 1;
     for (shape) |d| n *= @intCast(d);
     return n;
-}
-
-const RetainedBufferSizeMismatch = struct {
-    expected_bytes: usize,
-    actual_bytes: usize,
-};
-
-fn staticNumElements(shape: []const i64) ?usize {
-    var n: usize = 1;
-    for (shape) |d| {
-        if (d < 0) return null;
-        n *= @intCast(d);
-    }
-    return n;
-}
-
-fn retainedBufferShapeMismatch(
-    buffer: *const pjrt_lib.pjrt.Buffer,
-    expected_shape: []const i64,
-) !?RetainedBufferSizeMismatch {
-    const expected_elements = staticNumElements(expected_shape) orelse return null;
-    const expected_bytes = expected_elements * @sizeOf(f32);
-    const actual_bytes = try buffer.onDeviceSizeInBytes();
-    if (actual_bytes == expected_bytes) return null;
-    return .{
-        .expected_bytes = expected_bytes,
-        .actual_bytes = actual_bytes,
-    };
 }
 
 fn resolveUploadShapeFromTensor(

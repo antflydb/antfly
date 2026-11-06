@@ -180,26 +180,44 @@ pub const Buffer = struct {
         return args.on_device_size_in_bytes;
     }
 
+    /// Logical dimensions are independent of device padding and tiling.
+    pub fn matchesFloat32Shape(self: *const Buffer, expected: []const i64) !bool {
+        if (!self.api.hasBufferShape()) return error.UnsupportedPjrtFeature;
+        var kind = std.mem.zeroes(c.BufferElementTypeArgs);
+        kind.struct_size = @sizeOf(@TypeOf(kind));
+        kind.buffer = self.handle;
+        try checkError(self.api, self.api.bufferElementType(&kind));
+        if (kind.buffer_type != .float32) return false;
+        var dims = std.mem.zeroes(c.BufferDimensionsArgs);
+        dims.struct_size = @sizeOf(@TypeOf(dims));
+        dims.buffer = self.handle;
+        try checkError(self.api, self.api.bufferDimensions(&dims));
+        if (dims.num_dims != expected.len) return false;
+        if (expected.len != 0) {
+            for ((dims.dims orelse return error.PjrtApiError)[0..expected.len], expected) |actual, wanted| {
+                if (actual < 0 or (wanted >= 0 and actual != wanted)) return false;
+            }
+        }
+        return true;
+    }
+
     pub fn toFloat32(self: *const Buffer, allocator: std.mem.Allocator) ![]f32 {
-        return self.downloadFloat32(allocator, null);
+        return self.downloadFloat32(allocator, allocator, null);
     }
 
     pub fn toFloat32WithShape(self: *const Buffer, allocator: std.mem.Allocator, expected: []const i64) ![]f32 {
-        return self.downloadFloat32(allocator, expected);
+        return self.downloadFloat32(allocator, allocator, expected);
     }
 
-    fn downloadFloat32(self: *const Buffer, allocator: std.mem.Allocator, expected: ?[]const i64) ![]f32 {
+    pub fn toFloat32WithShapeAndScratch(self: *const Buffer, allocator: std.mem.Allocator, scratch: std.mem.Allocator, expected: []const i64) ![]f32 {
+        return self.downloadFloat32(allocator, scratch, expected);
+    }
+
+    fn downloadFloat32(self: *const Buffer, allocator: std.mem.Allocator, scratch: std.mem.Allocator, expected: ?[]const i64) ![]f32 {
         if (!self.api.hasBufferReadback()) return error.UnsupportedPjrtFeature;
         var kind = c.BufferElementTypeArgs{ .struct_size = @sizeOf(c.BufferElementTypeArgs), .extension_start = null, .buffer = self.handle, .buffer_type = .invalid };
         try checkError(self.api, self.api.bufferElementType(&kind));
         if (kind.buffer_type != .float32) return error.PjrtApiError;
-        var query = c.BufferToHostBufferArgs{ .struct_size = @sizeOf(c.BufferToHostBufferArgs), .extension_start = null, .src = self.handle, .host_layout = null, .dst = null, .dst_size = 0, .event = null };
-        const query_error = self.api.bufferToHostBuffer(&query);
-        if (query_error != null) {
-            if (query.event) |event| awaitAndDestroyEvent(self.api, event) catch {};
-            try checkError(self.api, query_error);
-        }
-        if (query.event) |event| try awaitAndDestroyEvent(self.api, event);
         var dims = std.mem.zeroes(c.BufferDimensionsArgs);
         dims.struct_size = @sizeOf(@TypeOf(dims));
         dims.buffer = self.handle;
@@ -215,6 +233,25 @@ pub const Buffer = struct {
                 elements = try std.math.mul(usize, elements, n);
             }
         }
+        // Ask for dense row-major host data, regardless of native layout.
+        var inline_order: [8]i64 = undefined;
+        const order = if (dims.num_dims <= inline_order.len) inline_order[0..dims.num_dims] else try scratch.alloc(i64, dims.num_dims);
+        defer if (dims.num_dims > inline_order.len) scratch.free(order);
+        for (order, 0..) |*dim, i| dim.* = @intCast(order.len - i - 1);
+        var layout = std.mem.zeroes(c.BufferMemoryLayout);
+        layout.struct_size = @sizeOf(@TypeOf(layout));
+        layout.layout_type = 0; // PJRT_Buffer_MemoryLayout_Type_Tiled
+        layout.layout.tiled = std.mem.zeroes(c.BufferMemoryLayoutTiled);
+        layout.layout.tiled.struct_size = @sizeOf(c.BufferMemoryLayoutTiled);
+        layout.layout.tiled.minor_to_major = order.ptr;
+        layout.layout.tiled.minor_to_major_size = order.len;
+        var query = c.BufferToHostBufferArgs{ .struct_size = @sizeOf(c.BufferToHostBufferArgs), .extension_start = null, .src = self.handle, .host_layout = &layout, .dst = null, .dst_size = 0, .event = null };
+        const query_error = self.api.bufferToHostBuffer(&query);
+        if (query_error != null) {
+            if (query.event) |event| awaitAndDestroyEvent(self.api, event) catch {};
+            try checkError(self.api, query_error);
+        }
+        if (query.event) |event| try awaitAndDestroyEvent(self.api, event);
         const size = query.dst_size;
         if (size != try std.math.mul(usize, elements, @sizeOf(f32))) return error.PjrtApiError;
         const num_floats = size / @sizeOf(f32);
@@ -225,7 +262,7 @@ pub const Buffer = struct {
             .struct_size = @sizeOf(c.BufferToHostBufferArgs),
             .extension_start = null,
             .src = self.handle,
-            .host_layout = null,
+            .host_layout = &layout,
             .dst = @ptrCast(result.ptr),
             .dst_size = size,
             .event = null,
@@ -1328,7 +1365,7 @@ test "float32 downloads use logical host bytes and reject invalid type size and 
     Fake.kind = .int64;
     try std.testing.expectError(error.PjrtApiError, buffer.toFloat32(std.testing.allocator));
     try std.testing.expectEqual(@as(usize, 1), Fake.transfers);
-    try std.testing.expectEqual(@as(usize, 6), Fake.events_destroyed);
+    try std.testing.expectEqual(@as(usize, 5), Fake.events_destroyed);
     try std.testing.expectEqual(Fake.events_destroyed, Fake.events_awaited);
     api.struct_size = @offsetOf(c.Api, "_fns") + c.Api.FN_BUFFER_TO_HOST * @sizeOf(?*const anyopaque);
     try std.testing.expectError(error.UnsupportedPjrtFeature, buffer.toFloat32(std.testing.allocator));
@@ -1378,4 +1415,53 @@ test "native output metadata rejects sidecar dimensions and types before executi
     api.struct_size = @offsetOf(c.Api, "_fns") + c.Api.FN_EXEC_OUTPUT_DIMENSIONS * @sizeOf(?*const anyopaque);
     try std.testing.expectError(error.UnsupportedPjrtFeature, executable.validateOutputShapes(&.{&.{2}}));
     try std.testing.expectEqual(@as(usize, 4), Fake.destroyed);
+}
+
+test "row major readback canonicalizes native layout and KV shape ignores padding" {
+    const Fake = struct {
+        const dims = [_]i64{ 2, 2 };
+        var kind: c.BufferType = .float32;
+        fn elementType(args: *c.BufferElementTypeArgs) callconv(.c) ?*c.PjrtError {
+            args.buffer_type = kind;
+            return null;
+        }
+        fn dimensions(args: *c.BufferDimensionsArgs) callconv(.c) ?*c.PjrtError {
+            args.dims = &dims;
+            args.num_dims = dims.len;
+            return null;
+        }
+        fn download(args: *c.BufferToHostBufferArgs) callconv(.c) ?*c.PjrtError {
+            const layout = args.host_layout.?;
+            std.debug.assert(layout.layout_type == 0);
+            std.debug.assert(layout.layout.tiled.num_tiles == 0);
+            std.debug.assert(std.mem.eql(i64, layout.layout.tiled.minor_to_major.?[0..2], &.{ 1, 0 }));
+            if (args.dst == null) {
+                args.dst_size = 16;
+                return null;
+            }
+            // Native column-major storage would be [10,20,0,1]. The requested
+            // host layout must expose logical rows [10,0],[20,1] instead.
+            @memcpy(@as([*]u8, @ptrCast(args.dst.?))[0..16], std.mem.sliceAsBytes(&[_]f32{ 10, 0, 20, 1 }));
+            return null;
+        }
+    };
+    var api = std.mem.zeroes(c.Api);
+    api.struct_size = @sizeOf(c.Api);
+    api._fns[c.Api.FN_BUFFER_ELEMENT_TYPE] = @ptrCast(&Fake.elementType);
+    api._fns[c.Api.FN_BUFFER_DIMENSIONS] = @ptrCast(&Fake.dimensions);
+    api._fns[c.Api.FN_BUFFER_TO_HOST] = @ptrCast(&Fake.download);
+    // No physical-size callback: padding cannot decide logical compatibility.
+    const buffer = Buffer{ .api = &api, .handle = @ptrFromInt(1) };
+    Fake.kind = .float32;
+    try std.testing.expect(try buffer.matchesFloat32Shape(&.{ 2, 2 }));
+    try std.testing.expect(!try buffer.matchesFloat32Shape(&.{4}));
+    try std.testing.expect(try buffer.matchesFloat32Shape(&.{ -1, 2 }));
+    try std.testing.expect(!try buffer.matchesFloat32Shape(&.{ -1, 3 }));
+    Fake.kind = .int64;
+    try std.testing.expect(!try buffer.matchesFloat32Shape(&.{ 2, 2 }));
+    Fake.kind = .float32;
+    const values = try buffer.toFloat32WithShape(std.testing.allocator, &.{ 2, 2 });
+    defer std.testing.allocator.free(values);
+    try std.testing.expectEqualSlices(f32, &.{ 10, 0, 20, 1 }, values);
+    try std.testing.expect(values[2] > values[3]);
 }

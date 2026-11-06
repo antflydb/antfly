@@ -2906,6 +2906,10 @@ test "run-artifact reserves host upload and comparison staging outside compiler 
     artifact.pjrt_output_node_ids = &outputs;
     const output = try ArtifactDeviceAdmission.plannedAmounts(artifact);
     try std.testing.expectEqual(64 * mib, output.host_scratch_bytes);
+    artifact.pjrt_memory_plan.?.memory.outputs = 64 * mib;
+    const padded = try ArtifactDeviceAdmission.plannedAmounts(artifact);
+    try std.testing.expectEqual(output.host_scratch_bytes, padded.host_scratch_bytes);
+    try std.testing.expect(padded.backend_scratch_bytes > output.backend_scratch_bytes);
 }
 
 test "run-artifact selection skips HLO packages and unprofiled standalone executables" {
@@ -3096,12 +3100,19 @@ test "run-artifact managed decode runtime survives executor graph and manager te
     manager.deinit();
     manager_live = false;
     try std.testing.expectEqual(closed_clients_before, count(2));
+    // Both readback and logits-allocation failures must preserve the previous
+    // KV generation, so retrying the same decode receives prefill's value 1.
+    for (0..2) |fail_index| {
+        var failure = std.testing.FailingAllocator.init(a, .{ .fail_index = fail_index });
+        try std.testing.expectError(error.OutOfMemory, run.decode(failure.allocator(), .{ .token_id = 1, .position = 16 }));
+        try std.testing.expectEqual(@as(usize, 2), count(8) - count(9));
+    }
     var second = try run.decode(a, .{ .token_id = 1, .position = 16 });
     defer second.deinit(a);
     try std.testing.expectEqualSlices(f32, &.{ 1, 0 }, try second.hostLogits(a));
     run.deinit();
     runtime_live = false;
-    try std.testing.expectEqual(executions_before + 4, count(10));
+    try std.testing.expectEqual(executions_before + 6, count(10));
     try std.testing.expectEqual(count(1), count(2));
     try std.testing.expectEqual(count(3), count(4));
     try std.testing.expectEqual(count(8), count(9));
@@ -3184,6 +3195,33 @@ fn managedPrefillReuseScenario(a: std.mem.Allocator, prefill: []const u8, plugin
     defer retry.deinit(a);
     try std.testing.expectEqual(@as(usize, 8), count(12));
     try std.testing.expectEqualDeep(admitted, manager.currentAdmissionAmounts());
+    {
+        var large_manager = model_manager_mod.ModelManager.init(a, backends.SessionManager.init(a));
+        defer large_manager.deinit();
+        try policy.configure(&large_manager);
+        const large_context = pjrt_admission.Context{ .allocator = a, .manager = &large_manager, .policy = policy, .decode_steps_limit = 0 };
+        var large_graph = ml.graph.Graph.init(a);
+        defer large_graph.deinit();
+        var large_builder = ml.graph.Builder.init(&large_graph);
+        const token = try large_builder.parameter("input_ids", ml.graph.Shape.init(.i64, &.{16}));
+        try large_graph.markOutput(token);
+        for (0..10000) |_| _ = try large_builder.parameter("unused", ml.graph.Shape.init(.f32, &.{1}));
+        const large_executor = try graph_mod.pjrt_artifact_executor.createAdmittedModelExecutorFromManifestPaths(a, std.testing.io, prefill, &.{}, &large_graph, &backend, &large_context, plugin);
+        var large_owned = large_executor.modelExecutor();
+        defer large_owned.deinit();
+        var large_run = try large_owned.createRuntime(a);
+        defer large_run.deinit();
+        var quota = platform.allocator.reclamation.Quota.init(a, 2 * 1024 * 1024);
+        defer quota.deinit();
+        const before_run = large_manager.currentAdmissionAmounts();
+        var result = try large_run.prefill(quota.allocator(), .{ .input_ids = &ids, .seq_len = 16, .query_seq_len = 16, .attention_mode = .paged_prefill });
+        defer result.deinit(quota.allocator());
+        // The graph-sized values table belongs to the admitted runtime slot.
+        // Caller allocations contain only planned transfer/logits storage.
+        try std.testing.expect(quota.peak_bytes <= before_run.host_scratch_bytes);
+        try std.testing.expect(large_executor.metadata_budget.?.live_bytes >= large_graph.nodeCount() * @sizeOf(?@import("graph/backend_contracts.zig").CT));
+        try std.testing.expectEqualDeep(before_run, large_manager.currentAdmissionAmounts());
+    }
 }
 
 fn managedPrefillFailureScenario(a: std.mem.Allocator, owned: *model_runtime.ModelExecutor, count: *const fn (usize) callconv(.c) usize) !void {

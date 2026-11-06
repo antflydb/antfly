@@ -642,3 +642,15 @@ F32 readback queries the provider's host-transfer size rather than physical devi
 storage, validates element type, logical dimensions, and checked byte count before
 allocation, and releases completion events on failures. Whole-model readback also
 checks runtime dimensions against the admitted logits shape before slicing.
+
+Each admitted runtime slot also owns its graph-indexed value table and a bounded
+bookkeeping arena sized for the largest phase. Argument/output handle lists,
+ownership flags, upload shapes, and readback layout metadata use that arena;
+only the admitted transfer buffers and returned logits use the request allocator.
+Per-token cleanup visits bound inputs rather than scanning the whole graph.
+Readback requests explicit untiled row-major host layout for both size discovery
+and transfer. Native device padding is charged to device execution memory and
+never determines logical host size or retained-KV compatibility. KV matching
+checks native F32 type and logical dimensions (with dynamic input dimensions
+acting as wildcards). New KV is published only after logits allocation succeeds,
+so failed decode readback can retry against the previous cache generation.
