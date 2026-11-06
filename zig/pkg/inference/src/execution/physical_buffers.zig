@@ -157,7 +157,12 @@ pub const FrameClaim = struct {
     }
 };
 
+const TerminalBinding = struct { graph: *const Graph, operation: @import("backend_operation.zig").Borrowed };
+
 pub const Pool = struct {
+    // Cold immutable installed-plan legality; the actual live operation/profile
+    // is still attested at every receiving boundary before any backend hook.
+    managed_terminal_eligible: bool = false,
     prepared_backings: std.atomic.Value(bool) = .init(false),
     allocator: std.mem.Allocator,
     accounting: ?*accounting.Ledger = null,
@@ -1244,6 +1249,16 @@ pub const Pool = struct {
         self.replay_backend = null;
         self.replay_kernel_count = 0;
         self.replay_decision = .unsupported_graph;
+        self.managed_terminal_eligible = self.managedTerminalPlanEligible(graph, reachable);
+    }
+    fn managedTerminalPlanEligible(self: *const Pool, graph: *const Graph, reachable: []const bool) bool {
+        if (self.region_execution_profile != .synchronous or self.regions.len == 0 or self.backends.len != 1 or self.backends[0].kind() != .metal or self.replay_backend != null or self.transfers.len != 0 or reachable.len != graph.nodeCount()) return false;
+        for (graph.nodes.items, 0..) |node, index| {
+            if (!reachable[index] or node.op == .parameter) continue;
+            const installed = self.regionForNode(@intCast(index)) orelse return false;
+            if (installed.backend_index != 0) return false;
+        }
+        return true;
     }
 
     /// Called BEFORE fitting/admission. The warm FrameClaim must remain held until
@@ -1332,6 +1347,12 @@ pub const Pool = struct {
     /// Exact admitted handoff. Legacy acquisition is forbidden for variants with
     /// selected regions: it cannot silently omit the pre-admission payload pins.
     pub fn acquirePreparedWithRegions(self: *Pool, capability: ?admission.Capability, warm: ?*FrameClaim, pending: ?*@import("region_claims.zig").Set) !?*Frame {
+        return self.acquirePreparedWithRegionsImpl(capability, warm, pending, null);
+    }
+    pub fn acquirePreparedWithRegionsAndOperation(self: *Pool, capability: ?admission.Capability, warm: ?*FrameClaim, pending: ?*@import("region_claims.zig").Set, graph: *const Graph, operation: ?@import("backend_operation.zig").Borrowed) !?*Frame {
+        return self.acquirePreparedWithRegionsImpl(capability, warm, pending, if (operation) |token| .{ .graph = graph, .operation = token } else null);
+    }
+    fn acquirePreparedWithRegionsImpl(self: *Pool, capability: ?admission.Capability, warm: ?*FrameClaim, pending: ?*@import("region_claims.zig").Set, terminal: ?TerminalBinding) !?*Frame {
         if (self.regions.len == 0) {
             if (pending != null) return error.InvalidPreparedRegionClaim;
             return self.acquirePrepared(capability, warm);
@@ -1347,6 +1368,14 @@ pub const Pool = struct {
             const frame = token.frame orelse return error.PhysicalFrameClaimConsumed;
             const cap = capability orelse return error.InvalidPhysicalFrameClaim;
             if (!token.identity.eql(cap.identity)) return error.PhysicalStorageAdmissionMismatch;
+            @import("antfly_platform").sync.lockYielding(&self.mutex);
+            const exact_claim = frame.pool == self and frame.claimed and frame.in_use and frame.claim_nonce == token.nonce;
+            self.mutex.unlock();
+            if (!exact_claim) return error.InvalidPhysicalFrameClaim;
+            // Warm claim is still exclusive and unconsumed. Capture refusal
+            // rolls back through its original owner before any claims move,
+            // admission adoption, backend hook, or retired-bank transition.
+            try frame.receiveTerminalBinding(terminal);
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             if (frame.pool != self or !frame.claimed or !frame.in_use or frame.claim_nonce != token.nonce) {
                 self.mutex.unlock();
@@ -1368,7 +1397,7 @@ pub const Pool = struct {
                 return err;
             };
         }
-        const frame = (try self.acquireWithAdmission(capability)) orelse return error.PreparedRegionStorageUnavailable;
+        const frame = (try self.acquireWithAdmissionForOperation(capability, terminal)) orelse return error.PreparedRegionStorageUnavailable;
         errdefer {
             @import("antfly_platform").sync.lockYielding(&self.mutex);
             frame.retired = true;
@@ -1547,6 +1576,9 @@ pub const Pool = struct {
     /// Caller reserved the frame and its route pin under mutex. Completion,
     /// admission and driver callbacks run only after that mutex is released.
     fn prepareAcquired(self: *Pool, frame: *Frame, capability: ?admission.Capability) !*Frame {
+        return self.prepareAcquiredForOperation(frame, capability, null, false);
+    }
+    fn prepareAcquiredForOperation(self: *Pool, frame: *Frame, capability: ?admission.Capability, terminal: ?TerminalBinding, receive: bool) !*Frame {
         if (capability) |cap| if (cap.services.takeBacking != null) self.prepared_backings.store(true, .release);
         std.debug.assert(frame.in_use and !frame.claimed);
         errdefer {
@@ -1558,6 +1590,7 @@ pub const Pool = struct {
             self.mutex.unlock();
             if (owner) |value| value.release();
         }
+        if (receive) try frame.receiveTerminalBinding(terminal);
         // A prior failed SDK attachment owns cleanup custody only. Even a
         // raw/claimed fast path must not receive that quarantined bank.
         for (frame.storages) |maybe| if (maybe) |lease| if (lease.isQuarantined())
@@ -1577,6 +1610,9 @@ pub const Pool = struct {
         return self.acquireWithAdmission(null);
     }
     pub fn acquireWithAdmission(self: *Pool, capability: ?admission.Capability) !?*Frame {
+        return self.acquireWithAdmissionForOperation(capability, null);
+    }
+    fn acquireWithAdmissionForOperation(self: *Pool, capability: ?admission.Capability, terminal: ?TerminalBinding) !?*Frame {
         if (capability) |cap| if (cap.services.takeBacking != null) self.prepared_backings.store(true, .release);
         @import("antfly_platform").sync.lockYielding(&self.mutex);
         for (self.frames.items) |frame| {
@@ -1589,7 +1625,7 @@ pub const Pool = struct {
             std.debug.assert(frame.owner_pin == null);
             frame.owner_pin = if (self.route_owner) |owner| owner.retain() else null;
             self.mutex.unlock();
-            return try self.prepareAcquired(frame, capability);
+            return try self.prepareAcquiredForOperation(frame, capability, terminal, true);
         }
         const full = self.frames.items.len >= self.max_frames or self.pending_frames >= self.max_frames - self.frames.items.len;
         if (full and self.route_owner == null) {
@@ -1600,7 +1636,7 @@ pub const Pool = struct {
         if (!full) self.pending_frames += 1;
         self.mutex.unlock();
         defer if (owner) |value| value.release();
-        const frame = Frame.createWithAdmission(self, capability) catch |err| {
+        const frame = Frame.createWithAdmissionForOperation(self, capability, terminal) catch |err| {
             if (!full) {
                 @import("antfly_platform").sync.lockYielding(&self.mutex);
                 self.pending_frames -= 1;
@@ -1660,6 +1696,7 @@ pub const Frame = struct {
     claimed: bool = false,
     claim_nonce: u64 = 0,
     retired: bool = false,
+    managed_terminal_evidence: @import("backend_operation.zig").TerminalEvidence = .{},
     stats: Stats = .{},
     scope_backends: usize = 0,
     scope_cleanup: @import("cleanup_context.zig").Context = .{},
@@ -1681,6 +1718,9 @@ pub const Frame = struct {
         return createWithAdmission(pool, null);
     }
     fn createWithAdmission(pool: *Pool, capability: ?admission.Capability) !*Frame {
+        return createWithAdmissionForOperation(pool, capability, null);
+    }
+    fn createWithAdmissionForOperation(pool: *Pool, capability: ?admission.Capability, terminal: ?TerminalBinding) !*Frame {
         const leases = try pool.allocator.alloc(?*storage.Lease, pool.plan.allocations.len);
         errdefer pool.allocator.free(leases);
         @memset(leases, null);
@@ -1719,7 +1759,12 @@ pub const Frame = struct {
         errdefer pool.allocator.free(region_assigned);
         @memset(region_assigned, null);
         const self = try pool.allocator.create(Frame);
+        errdefer pool.allocator.destroy(self);
         self.* = .{ .region_claims = region_claims, .region_started = region_started, .region_assigned = region_assigned, .host_input_resources = host_resources, .host_bound_inputs = host_inputs, .assigned = assigned, .storage_admission = capability, .host_workspace_admission = host_binding.reservation, .host_workspace_retirement_owner = if (host_binding.backing) |value| value.owner else null, .host_workspace = host_workspace, .host_workspace_allocator = host_workspace_allocator, .capture_pins = capture_pins, .pool = pool, .storages = leases, .completions = completions, .bound_inputs = bound_inputs, .binding_states = binding_states, .stats = .{ .replay_decision = pool.replay_decision } };
+        // This is the first stable Frame address. Register before publication,
+        // claim transfer or any later adoption/assigned-resource callback.
+        errdefer self.managed_terminal_evidence.deinit();
+        try self.receiveTerminalBinding(terminal);
         if (host_bytes != 0) {
             if (pool.accounting) |ledger| ledger.allocated(.host_workspace, host_bytes, host_bytes);
             self.stats.allocations += 1;
@@ -1727,8 +1772,26 @@ pub const Frame = struct {
         }
         return self;
     }
+    fn managedTerminalReadyForReuse(self: *const Frame) bool {
+        // Only this immutable cold-installed family can contain a receiver.
+        // Unrelated Native/CUDA paths do not touch any new mutex/atomic.
+        if (!self.pool.managed_terminal_eligible) return true;
+        const node = @constCast(&self.managed_terminal_evidence);
+        node.lock();
+        defer node.mutex.unlock();
+        if (node.context != null or node.detach != null or node.next != null) return false;
+        // Fresh or explicitly cleared/unattested nodes keep the original
+        // completion/claim/reference contract below; no new proof is inferred.
+        if (node.implementation == null and node.nonce == 0 and !node.terminal) return true;
+        if (!node.terminal or node.nonce == 0 or self.pool.backends.len != 1) return false;
+        const source = node.implementation orelse return false;
+        const backend = self.pool.backends[0];
+        return source.context == backend.ptr and source.table == @as(*const anyopaque, @ptrCast(backend.vtable));
+    }
+
     fn reusableCredit(self: *const Frame, identity: ?admission.Identity, requirement: ?*@import("../runtime/tier/memory.zig").AdmissionAmounts) !?@import("../runtime/tier/memory.zig").AdmissionAmounts {
         if (self.in_use or self.retired) return null;
+        if (!self.managedTerminalReadyForReuse()) return null;
         for (self.region_claims) |maybe| if (maybe) |claim| if (claim.held) return null;
         if (self.native_program_views.len != 0) {
             for (self.native_program_views, 0..) |maybe, node| if (maybe) |value| {
@@ -1853,6 +1916,11 @@ pub const Frame = struct {
                     proven = true;
                 };
             };
+            if (!proven and kind == .metal and self.pool.backends.len == 1) {
+                const backend = self.pool.backends[0];
+                try self.managed_terminal_evidence.validateTerminal(.{ .context = backend.ptr, .table = backend.vtable });
+                proven = true;
+            }
             if (!proven) return error.PhysicalCompletionUnavailable;
         };
         for (self.completions) |completion| if (completion) |value| try value.wait();
@@ -1908,7 +1976,24 @@ pub const Frame = struct {
         if (host_bytes != 0) if (self.pool.accounting) |ledger| ledger.freed(.host_workspace, host_bytes, host_bytes);
         self.pool.allocator.free(self.completions);
         self.pool.allocator.free(self.storages);
+        self.managed_terminal_evidence.deinit();
         self.pool.allocator.destroy(self);
+    }
+    /// Receive the exact entered owner before ingress or preparation can fail.
+    /// Only a wholly region-owned synchronous single-Metal program qualifies;
+    /// transfers, replay, mixed targets and uncovered numerical nodes retain
+    /// their original mandatory SDK completion path.
+    fn invalidateManagedTerminalEvidence(self: *Frame) void {
+        if (!self.pool.managed_terminal_eligible) return;
+        self.managed_terminal_evidence.deinit();
+    }
+    fn receiveTerminalBinding(self: *Frame, binding: ?TerminalBinding) !void {
+        if (!self.pool.managed_terminal_eligible) return;
+        self.managed_terminal_evidence.deinit();
+        const current = binding orelse return;
+        if (self.pool.replay_backend != null) return;
+        const backend = self.pool.backends[0];
+        _ = try current.operation.bindTerminalEvidence(.{ .implementation = .{ .context = backend.ptr, .table = backend.vtable }, .program = current.graph, .mode = .managed }, &self.managed_terminal_evidence);
     }
     pub fn begin(self: *Frame) !void {
         return self.beginWithCleanup(.{});
@@ -2367,6 +2452,7 @@ pub const Frame = struct {
             if (self.pool.completeOwnedPayload() != null) return error.PreparedPhysicalLiteralChanged;
             return null;
         };
+        self.invalidateManagedTerminalEvidence();
         const value = try self.literalValue(index);
         const lease = self.storages[literal.allocation].?;
         var dimensions: [8]i32 = undefined;
@@ -2387,6 +2473,7 @@ pub const Frame = struct {
         const query = cb.vtable.kernels.?.storageOwnership orelse return null;
         _ = try query(cb.ptr, value, access.visitor());
         if (!access.value or access.largest_requested > self.pool.plan.allocations[publication.allocation].byte_size) return null;
+        self.invalidateManagedTerminalEvidence();
         const backing = (try self.storageFor(cb, literal.backend_index, publication.allocation)) orelse return null;
         var dimensions: [8]i32 = undefined;
         for (publication.shape.dims[0..publication.shape.rank()], 0..) |dimension, axis| dimensions[axis] = @intCast(dimension);
@@ -2518,6 +2605,10 @@ pub const Frame = struct {
         if (installed.workspace_bytes != 0) {
             if (installed.workspace_allocation == buffers.invalid_allocation or installed.workspace_bytes % @sizeOf(f32) != 0) return error.PreparedRegionWorkspaceMismatch;
             const lease = (try self.storageFor(cb, installed.backend_index, installed.workspace_allocation)) orelse return error.PreparedRegionStorageUnavailable;
+            // Scratch owns a real Frame allocation slot, independently of any
+            // logical graph output. Bind its canonical full-bank provenance at
+            // the same origin as outputs before issuing a reduced scratch view.
+            try lease.bindAllocationSlot(installed.workspace_allocation, installed.epoch, @intCast(self.pool.plan.allocations[installed.workspace_allocation].byte_size));
             result.workspace = (try cb.vtable.kernels.?.physicalTensorView.?(cb.ptr, .{ .storage = lease, .shape = &.{@intCast(installed.workspace_bytes / @sizeOf(f32))} })) orelse return error.UnsupportedPhysicalTensorView;
         }
         if (installed.host_workspace_bytes > self.host_workspace.len) return error.PreparedRegionWorkspaceMismatch;
@@ -2542,6 +2633,7 @@ pub const Frame = struct {
             if (source.kind() != .native) return null;
             const host = (try source.hostFloat32Read(value)) orelse return null;
             if (host.len != count) return error.InvalidPhysicalTransferSize;
+            self.invalidateManagedTerminalEvidence();
             const allocation = (try self.storageFor(target, binding.backend_index, binding.allocation)) orelse return null;
             const output = try self.viewForShape(target, allocation, binding.shape);
             errdefer target.free(output);
@@ -2550,6 +2642,7 @@ pub const Frame = struct {
         } else download: {
             const functions = source.vtable.kernels orelse return null;
             if (functions.readFloat32Into == null) return null;
+            self.invalidateManagedTerminalEvidence();
             const allocation = (try self.storageFor(target, binding.backend_index, binding.allocation)) orelse return null;
             const host = (try target.hostFloat32Write(allocation.tensor)) orelse return null;
             if (host.len < count) return error.InvalidPhysicalTransferSize;
@@ -2749,6 +2842,7 @@ pub const Frame = struct {
             if (selected_route != null) return error.PreparedKernelBindingChanged;
             return null;
         }
+        self.invalidateManagedTerminalEvidence();
         const output_storage = (try self.storageFor(cb, index, kernel.output_allocation)) orelse {
             if (selected_route != null) return error.PreparedStorageUnavailable;
             return null;
@@ -3718,6 +3812,17 @@ fn regionOnlyDeclaredStorageCase(a: std.mem.Allocator, covered_primitive: bool) 
     defer a.free(alias);
     try std.testing.expectEqualSlices(f32, &.{ 1, 2, 3, 4 }, alias);
     try std.testing.expect(bound.workspace != null and bound.host_workspace.len == 32);
+    const scratch_owner = frame.storages[regions[0].workspace_allocation] orelse return error.MissingRegionScratchOwner;
+    const scratch_slot = scratch_owner.slot_authority orelse return error.MissingRegionScratchAuthority;
+    try std.testing.expectEqual(regions[0].workspace_allocation, scratch_slot.allocation);
+    try std.testing.expectEqual(regions[0].epoch, scratch_slot.epoch);
+    try std.testing.expectEqual(@as(usize, 24), scratch_slot.byte_size);
+    const scratch_region = try scratch_owner.writableRegion(2, 42, 24);
+    try std.testing.expect(scratch_owner.acceptsWritableRegion(2, 42, 24, scratch_region));
+    try std.testing.expectError(error.InvalidAllocationSlot, scratch_owner.writableRegion(2, 43, 24));
+    try std.testing.expectError(error.InvalidAllocationSlot, scratch_owner.writableRegion(2, 42, 25));
+    try std.testing.expectError(error.InvalidAllocationSlot, scratch_owner.bindAllocationSlot(2, 43, 24));
+    try std.testing.expect(!frame.storages[0].?.acceptsWritableRegion(0, 42, 16, scratch_region));
     const held = try bound.take(0);
     var held_live = true;
     defer if (held_live) cb.free(held);
@@ -3752,4 +3857,214 @@ test "region-only physical bank acquisition unwinds cold metadata and view alloc
     if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
     try std.testing.checkAllAllocationFailures(std.testing.allocator, regionOnlyDeclaredStorageCase, .{false});
     try std.testing.checkAllAllocationFailures(std.testing.allocator, regionOnlyDeclaredStorageCase, .{true});
+}
+
+const TerminalReceivingFixture = struct {
+    const operation = @import("backend_operation.zig");
+    const operation_owner = @import("operation_owner.zig");
+    fn validate(raw: *anyopaque, nonce: u64, request: operation.Request) !void {
+        const record: *operation_owner.Owner.Record = @ptrCast(@alignCast(raw));
+        const snapshot = try record.snapshot(nonce);
+        if (snapshot.source.context != request.implementation.context or snapshot.source.table != request.implementation.table or snapshot.mode != .managed or !snapshot.entered or !try snapshot.ticket.ownsGate()) return error.BackendOperationChanged;
+    }
+    fn bind(raw: *anyopaque, nonce: u64, request: operation.Request, output: *operation.TerminalEvidence) !bool {
+        try validate(raw, nonce, request);
+        const record: *operation_owner.Owner.Record = @ptrCast(@alignCast(raw));
+        try record.bindTerminalEvidence(nonce, request.implementation, output);
+        return true;
+    }
+    fn unexpectedBegin(_: *anyopaque, _: u64, _: operation.Request) !void {
+        return error.UnexpectedOperationLifecycle;
+    }
+    fn unexpectedFinish(_: *anyopaque, _: u64) !void {
+        return error.UnexpectedOperationLifecycle;
+    }
+    fn unexpectedRelease(_: *anyopaque, _: u64) void {
+        @panic("unexpected borrowed operation release");
+    }
+    const table: operation.Lease.VTable = .{ .validate = validate, .validate_active = validate, .begin = unexpectedBegin, .finish = unexpectedFinish, .drain = unexpectedFinish, .release = unexpectedRelease, .bind_terminal_evidence = bind };
+    const Probe = struct {
+        frame: *Frame,
+        expected_nonce: u64,
+        calls: usize = 0,
+        fn reserve(raw: *anyopaque, _: std.mem.Allocator, _: ops.BackendKind, _: accounting.Class, _: usize) !admission.Reservation {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+            try std.testing.expect(self.frame.managed_terminal_evidence.context != null);
+            try std.testing.expectEqual(self.expected_nonce, self.frame.managed_terminal_evidence.nonce);
+            return error.TerminalReceivingAdoptionFailure;
+        }
+    };
+    fn run(a: std.mem.Allocator) !void {
+        const owner = try operation_owner.Owner.createRetained(a);
+        defer {
+            owner.closeRetained() catch unreachable;
+            owner.releaseClosedStorage();
+        }
+        var marker: u8 = 0;
+        const cb = ops.ComputeBackend{ .ptr = &marker, .vtable = &@import("../ops/native_compute.zig").vtable_impl };
+        const implementation = route.Implementation{ .context = cb.ptr, .table = cb.vtable };
+        var graph = Graph.init(a);
+        defer graph.deinit();
+        const shape = ml.graph.Shape.init(.f32, &.{1});
+        var slots = [_]buffers.LogicalSlot{.{ .id = 0, .node_id = 0, .partition_index = 0, .backend = .native, .kind = .runtime_input, .storage = .host_f32, .desc = @import("../graph/backend_contracts.zig").TensorDesc.init(shape, .host_f32), .first_use = 0, .last_use = 0 }};
+        var indices = [_]u32{0};
+        var positions = [_]u32{0};
+        var plans = [_]?KernelPlan{null};
+        var backends = [_]ops.ComputeBackend{cb};
+        var pool = Pool{ .allocator = a, .managed_terminal_eligible = true, .plan = .{ .allocator = a, .slots = &slots, .node_slots = &indices, .node_positions = &positions, .allocations = &.{}, .transfers = &.{}, .transfer_index = .empty }, .kernels = &plans, .transfers = &.{}, .backends = &backends, .workspace_allocations = &.{} };
+        var host: [8]u8 = undefined;
+        var frame = Frame{ .pool = &pool, .storages = &.{}, .completions = &.{}, .host_workspace = &host };
+        defer frame.managed_terminal_evidence.deinit();
+        const request = operation.Request{ .implementation = implementation, .program = &graph, .mode = .managed };
+        // Start with a genuine prior healthy use, not a synthetic terminal bit.
+        const previous = try owner.prepare(&marker, request);
+        const old_snapshot = try previous.record.snapshot(previous.nonce);
+        try old_snapshot.ticket.begin();
+        try previous.record.setEntered(previous.nonce, true);
+        try previous.record.bindTerminalEvidence(previous.nonce, implementation, &frame.managed_terminal_evidence);
+        try previous.record.finishMetadata(previous.nonce);
+        try previous.record.publishTerminal(previous.nonce);
+        try previous.record.release(previous.nonce);
+        try frame.managed_terminal_evidence.validateTerminal(implementation);
+        const current = try owner.prepare(&marker, request);
+        var host_live = true;
+        defer if (host_live) {
+            current.record.finishMetadata(current.nonce) catch unreachable;
+            current.record.release(current.nonce) catch unreachable;
+        };
+        const snapshot = try current.record.snapshot(current.nonce);
+        try snapshot.ticket.begin();
+        try current.record.setEntered(current.nonce, true);
+        const token = operation.Borrowed{ .context = current.record, .nonce = current.nonce, .mode = .managed, .vtable = &table };
+        var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+        defer controller.deinit();
+        var probe = Probe{ .frame = &frame, .expected_nonce = current.nonce };
+        const capability = admission.Capability{ .identity = .{ .controller = &controller, .backend_class = .cpu }, .context = &probe, .services = &.{ .reserve = Probe.reserve } };
+        // Receiving failure occurs before adoption and must not reuse the old
+        // healthy use's fact. Original exclusive rollback clears in_use/pins.
+        var invalid = token;
+        invalid.mode = .metadata;
+        try std.testing.expectError(error.BackendOperationChanged, pool.prepareAcquiredForOperation(&frame, capability, .{ .graph = &graph, .operation = invalid }, true));
+        try std.testing.expectEqual(@as(usize, 0), probe.calls);
+        try std.testing.expect(!frame.in_use and frame.owner_pin == null);
+        try std.testing.expectError(error.PhysicalCompletionUnavailable, frame.managed_terminal_evidence.validateTerminal(implementation));
+        frame.in_use = true;
+        if (pool.prepareAcquiredForOperation(&frame, capability, .{ .graph = &graph, .operation = token }, true)) |_| {
+            return error.ExpectedTerminalReceivingAdoptionFailure;
+        } else |err| {
+            if (err == error.OutOfMemory) return err;
+            try std.testing.expectEqual(@as(anyerror, error.TerminalReceivingAdoptionFailure), err);
+        }
+        try std.testing.expectEqual(@as(usize, 1), probe.calls);
+        try std.testing.expect(!frame.in_use and frame.owner_pin == null);
+        // The failed adoption owns the NEW exact pending receiver. Only its
+        // real terminal owner may later publish the poisoned-bank proof.
+        try std.testing.expectError(error.PhysicalCompletionUnavailable, frame.managed_terminal_evidence.validateTerminal(implementation));
+        try current.record.finishMetadata(current.nonce);
+        try current.record.publishTerminal(current.nonce);
+        try current.record.release(current.nonce);
+        host_live = false;
+        try frame.managed_terminal_evidence.validateTerminal(implementation);
+        // Harmless generic probes must not erase that exact proof. None of
+        // these may call through the marker's intentionally non-provider ctx.
+        try std.testing.expect((try frame.materializeLiteral(&cb, 0)) == null);
+        try std.testing.expect((try frame.publishLiteralOutput(&cb, 0, @ptrFromInt(16))) == null);
+        try std.testing.expect((try frame.transfer(&cb, &cb, @ptrFromInt(16), 0, 0)) == null);
+        try std.testing.expect((try frame.execute(&cb, &.{}, 0, null)) == null);
+        try frame.managed_terminal_evidence.validateTerminal(implementation);
+        // Explicit old API/unattested receiving drops the prior fact before
+        // any future use; missing operation evidence never inherits credit.
+        try frame.receiveTerminalBinding(null);
+        try std.testing.expectError(error.PhysicalCompletionUnavailable, frame.managed_terminal_evidence.validateTerminal(implementation));
+    }
+};
+test "operation receiving precedes adoption failure rolls back old facts and preserves harmless physical probes" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    try TerminalReceivingFixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, TerminalReceivingFixture.run, .{});
+}
+
+const TerminalReuseFixture = struct {
+    fn run(a: std.mem.Allocator) !void {
+        const operation = @import("backend_operation.zig");
+        const operation_owner = @import("operation_owner.zig");
+        var context = try @import("../backends/compute_context.zig").BackendContext.init(a, .native, null);
+        defer context.deinit(a);
+        const backend = context.computeBackend();
+        const owner = try operation_owner.Owner.createRetained(a);
+        defer {
+            owner.closeRetained() catch unreachable;
+            owner.releaseClosedStorage();
+        }
+        var allocations = [_]buffers.PhysicalAllocation{.{ .id = 0, .kind = .tensor, .backend = .native, .storage = .host_f32, .byte_size = 16, .first_use = 0, .last_use = 0, .reusable = true }};
+        var backends = [_]ops.ComputeBackend{backend};
+        // A pure receiving-protocol fixture uses real Native storage so it
+        // needs no hardware. Production sets this immutable flag ONLY for the
+        // actual fully covered Metal profile during cold region installation.
+        var pool = Pool{ .allocator = a, .managed_terminal_eligible = true, .plan = .{ .allocator = a, .slots = &.{}, .node_slots = &.{}, .node_positions = &.{}, .allocations = &allocations, .transfers = &.{}, .transfer_index = .empty }, .kernels = &.{}, .transfers = &.{}, .backends = &backends, .workspace_allocations = &.{}, .max_frames = 1 };
+        defer pool.frames.deinit(a);
+        const frame = try Frame.create(&pool);
+        defer frame.deinit();
+        try pool.frames.append(a, frame);
+        const lease = (try frame.storageFor(&backend, 0, 0)) orelse return error.MissingTerminalReuseStorage;
+        try std.testing.expectEqual(@as(usize, 1), lease.references.load(.acquire));
+        _ = try frame.finish();
+        try std.testing.expect(!frame.in_use and !frame.retired);
+        try std.testing.expect((try frame.reusableCredit(null, null)) != null);
+        const implementation = route.Implementation{ .context = backend.ptr, .table = backend.vtable };
+        const prepared = try owner.prepare(backend.ptr, operation.Request{ .implementation = implementation, .program = null, .mode = .managed });
+        var host_live = true;
+        defer if (host_live) {
+            prepared.record.finishMetadata(prepared.nonce) catch unreachable;
+            prepared.record.publishTerminal(prepared.nonce) catch unreachable;
+            prepared.record.release(prepared.nonce) catch unreachable;
+        };
+        const snapshot = try prepared.record.snapshot(prepared.nonce);
+        try snapshot.ticket.begin();
+        try prepared.record.setEntered(prepared.nonce, true);
+        try prepared.record.bindTerminalEvidence(prepared.nonce, implementation, &frame.managed_terminal_evidence);
+        // This is the real problematic window: temporary output views are
+        // gone, sole lease ref remains, finishRecorded cleared in_use, but the
+        // actual outer profile has not finished/drained its exact operation.
+        try std.testing.expectEqual(@as(usize, 1), lease.references.load(.acquire));
+        try std.testing.expect(!frame.in_use);
+        try std.testing.expect((try frame.reusableCredit(null, null)) == null);
+        try std.testing.expect((try pool.acquire()) == null);
+        var controller = @import("../runtime/tier/memory.zig").AdmissionController{};
+        defer controller.deinit();
+        const identity = admission.Identity{ .controller = &controller, .backend_class = .cpu };
+        try std.testing.expect((try pool.claimWarm(identity)) == null);
+        // A mere host/gate transition still does not publish terminal proof.
+        try prepared.record.finishMetadata(prepared.nonce);
+        try std.testing.expect((try frame.reusableCredit(null, null)) == null);
+        try std.testing.expect((try pool.acquire()) == null);
+        try prepared.record.publishTerminal(prepared.nonce);
+        try prepared.record.release(prepared.nonce);
+        host_live = false;
+        try std.testing.expect((try frame.reusableCredit(null, null)) != null);
+        // Published facts must still name this actual backend and nonce.
+        const saved_nonce = frame.managed_terminal_evidence.nonce;
+        frame.managed_terminal_evidence.nonce = 0;
+        try std.testing.expect((try frame.reusableCredit(null, null)) == null);
+        frame.managed_terminal_evidence.nonce = saved_nonce;
+        var foreign: u8 = 0;
+        frame.managed_terminal_evidence.implementation = .{ .context = &foreign, .table = backend.vtable };
+        try std.testing.expect((try frame.reusableCredit(null, null)) == null);
+        frame.managed_terminal_evidence.implementation = implementation;
+        var warm = (try pool.claimWarm(identity)) orelse return error.MissingTerminalWarmClaim;
+        try std.testing.expect(warm.frame == frame);
+        warm.release();
+        const reused = (try pool.acquire()) orelse return error.MissingTerminalReusedFrame;
+        try std.testing.expect(reused == frame);
+        // The legacy raw receiving wrapper cleared the old terminal fact;
+        // current unbound use follows its original contract, never stale credit.
+        try std.testing.expect(frame.managed_terminal_evidence.implementation == null);
+        _ = try reused.finish();
+    }
+};
+test "pending exact managed operation blocks warm credit and sole-bank reuse until actual terminal publication" {
+    if (comptime @import("build_options").enable_wasm) return error.SkipZigTest;
+    try TerminalReuseFixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, TerminalReuseFixture.run, .{});
 }

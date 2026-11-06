@@ -149,6 +149,13 @@ schedules retain the original compatibility route. Validate source stamps again
 under the gate before starting numerical work, and release quota callbacks only
 after leaving that gate.
 
+A region accepting dispatch does not prove GPU completion. Receive an actual
+operation's terminal evidence before acquiring its banks, and publish that
+evidence only after the provider finishes or drains that exact operation.
+Unknown mixed work, transfers and failed drains retain quarantine. Region scratch
+views bind their real allocation slot and epoch just as output views do; an
+allocated buffer alone does not grant writable workspace authority.
+
 ## Qualification and accounting
 
 Freeze the original programs before replacement. Compare original bits and

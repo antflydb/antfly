@@ -48506,6 +48506,23 @@ const CompleteCudaProgramBudget = struct {
     fn cleanup(self: *const @This()) @import("../../execution/cleanup_context.zig").Context {
         return .{ .boundary = &self.epoch };
     }
+    // This admitted test caller owns the actual receiver B. A prepared Set's
+    // construction epoch alone never gives an unrelated operation numerical
+    // cleanup authority. Other existing recipe fixtures keep their old entry.
+    fn runWithReceiver(self: *const @This(), comptime bind_receiver: bool, executable: *@import("../../execution/executable.zig").Executable, allocator: std.mem.Allocator, options: @import("../../graph/interpreter.zig").ExecuteOptions) !@import("../../graph/runtime.zig").Result {
+        if (!bind_receiver) return executable.run(allocator, options);
+        if (options.backend_operation != null or options.region_execution_profile != null) return error.UnexpectedCudaFixtureOperation;
+        const operation = @import("../../execution/backend_operation.zig");
+        var receiver = try operation.enter(executable.runtime.default_backend.*, executable.graph, null, .managed);
+        defer receiver.deinitChecked() catch platform.inference_process_supervisor.restartWorker();
+        if (!try receiver.bindCleanupEpoch(&self.epoch)) return error.BackendOperationCleanupUnavailable;
+        var bound_options = options;
+        bound_options.backend_operation = receiver.token() orelse return error.MissingBackendOperation;
+        var result = try executable.run(allocator, bound_options);
+        errdefer result.deinitWithCleanup(&executable.runtime, self.cleanup());
+        try receiver.finish();
+        return result;
+    }
     fn deinit(self: *@This()) void {
         if (!self.open) return;
         self.open = false;
@@ -48847,7 +48864,7 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
         for (input.asFloat32Mut(), 0..) |*value, index| value.* = @as(f32, @floatFromInt(@as(i32, @intCast(index % 9)) - 4 + @as(i32, @intCast(iteration)))) / 8;
         var audit = @import("../../execution/transfer_audit.zig").Audit{ .forbid_device_host_access = true };
         try @import("../../execution/transfer_audit.zig").begin(&audit);
-        var result = executable.run(a, .{ .runtime_inputs = weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability(), .collect_partition_stats = true, .activation_readbacks = .forbidden }) catch |err| {
+        var result = budget.?.runWithReceiver(recipe == .rounded_mirror, &executable, a, .{ .runtime_inputs = weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability(), .collect_partition_stats = true, .activation_readbacks = .forbidden }) catch |err| {
             @import("../../execution/transfer_audit.zig").end();
             return err;
         };
@@ -48903,7 +48920,7 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
     try std.testing.expect(bounded.physical_peak <= @max(initial_banks.physical_peak, initial_banks.physical_live + budget.?.physical.backend_scratch_bytes));
     // The existing frame is pinned by a real public output. A second frame may
     // not consume already-moved tokens or silently invoke a producer/SDK alloc.
-    if (executable.run(a, .{ .runtime_inputs = weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() })) |unexpected| {
+    if (budget.?.runWithReceiver(recipe == .rounded_mirror, &executable, a, .{ .runtime_inputs = weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() })) |unexpected| {
         var owned = unexpected;
         owned.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
         return error.ExpectedPerFormatHeldOutputBankRefusal;
@@ -48912,7 +48929,7 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
     try std.testing.expect(budget.?.domain.controller.snapshot().backend_scratch_bytes >= budget.?.physical.backend_scratch_bytes);
     held.?.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
     held = null;
-    var recovery = try executable.run(a, .{ .runtime_inputs = weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() });
+    var recovery = try budget.?.runWithReceiver(recipe == .rounded_mirror, &executable, a, .{ .runtime_inputs = weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() });
     var recovery_live = true;
     defer if (recovery_live) recovery.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
     {
@@ -48942,7 +48959,7 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
 
         compute.resident_training_cache = true;
         defer compute.resident_training_cache = false;
-        if (executable.run(a, .{ .runtime_inputs = weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() })) |unexpected| {
+        if (budget.?.runWithReceiver(recipe == .rounded_mirror, &executable, a, .{ .runtime_inputs = weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() })) |unexpected| {
             var cleanup = unexpected;
             cleanup.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
             return error.ExpectedPreparedPolicyRefusal;
@@ -48953,7 +48970,7 @@ fn qualifyCompleteCudaProgramRecipe(comptime format: CompleteCudaProgramFormat, 
         if (recipe == .dequant_vendor) {
             compute.tuned_route_gates.q4_0_cublas_prefill = false;
             defer compute.tuned_route_gates.q4_0_cublas_prefill = true;
-            if (executable.run(a, .{ .runtime_inputs = weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() })) |unexpected| {
+            if (budget.?.runWithReceiver(recipe == .rounded_mirror, &executable, a, .{ .runtime_inputs = weights, .host_inputs = &host, .prepared_routes = routes, .storage_admission = budget.?.capability() })) |unexpected| {
                 var cleanup = unexpected;
                 cleanup.deinitWithCleanup(&executable.runtime, budget.?.cleanup());
                 return error.ExpectedDequantVendorPolicyRefusal;

@@ -43,6 +43,9 @@ pub const Owner = struct {
         source: kernel.Implementation = undefined,
         mode: operation.Mode = .legacy_unknown_frame,
         entered: bool = false,
+        // Intrusive stable Frame nodes, registered only under an entered
+        // managed owner. Generic metadata finish never publishes completion.
+        terminal_observers: ?*operation.TerminalEvidence = null,
         cleanup_epoch: ?retirement_sink.Epoch = null,
         pub const Snapshot = struct {
             ticket: gate_mod.Gate.Ticket,
@@ -71,6 +74,99 @@ pub const Owner = struct {
         }
         /// Pins the actual record array independently of the provider body.
         /// Call while this operation is still entered, before taking its Ticket.
+        /// Only providers with actual completed SDK work call this. Publication
+        /// occurs after finishMetadata has ended the exact operation gate.
+        pub fn publishTerminal(self: *Record, nonce: u64) !void {
+            while (true) {
+                self.lock();
+                self.gate.validateNonce(self.index, nonce) catch |err| {
+                    self.mutex.unlock();
+                    return err;
+                };
+                const ticket = self.ticket orelse {
+                    self.mutex.unlock();
+                    return error.BackendOperationConsumed;
+                };
+                if (ticket.nonce != nonce or self.mode != .managed or self.entered or (ticket.ownsGate() catch true)) {
+                    self.mutex.unlock();
+                    return error.BackendOperationInactive;
+                }
+                const node = self.terminal_observers orelse {
+                    self.mutex.unlock();
+                    return;
+                };
+                // Destruction owns node then record. Never block in the
+                // reverse order: release record so unlink can make progress.
+                if (!node.mutex.tryLock()) {
+                    self.mutex.unlock();
+                    std.atomic.spinLoopHint();
+                    continue;
+                }
+                const source = node.implementation orelse unreachable;
+                std.debug.assert(node.context == @as(*anyopaque, @ptrCast(self)) and node.nonce == nonce and source.context == self.source.context and source.table == self.source.table);
+                self.terminal_observers = node.next;
+                node.next = null;
+                node.context = null;
+                node.detach = null;
+                node.terminal = true;
+                var retained = ticket;
+                const owner = self.owner;
+                self.mutex.unlock();
+                node.mutex.unlock();
+                // Host lease still keeps the record/provider root alive. Only
+                // metadata references leave here, outside both metadata locks.
+                try retained.release();
+                owner.releaseStorage();
+            }
+        }
+        pub fn bindTerminalEvidence(self: *Record, nonce: u64, implementation: kernel.Implementation, node: *operation.TerminalEvidence) !void {
+            node.lock();
+            defer node.mutex.unlock();
+            if (node.context != null or node.detach != null or node.implementation != null) return error.InvalidOperationTerminalEvidence;
+            self.lock();
+            defer self.mutex.unlock();
+            const value = try self.snapshotLocked(nonce);
+            if (value.source.context != implementation.context or value.source.table != implementation.table or value.mode != .managed) return error.BackendOperationChanged;
+            if (!value.entered or !try value.ticket.ownsGate()) return error.BackendOperationInactive;
+            if (self.owner.storage_allocator == null) return error.BackendOperationStorageUnavailable;
+            _ = try value.ticket.retain();
+            const old = self.owner.storage_references.fetchAdd(1, .monotonic);
+            std.debug.assert(old != 0 and old != std.math.maxInt(usize));
+            node.context = self;
+            node.nonce = nonce;
+            node.implementation = implementation;
+            node.terminal = false;
+            node.detach = detachTerminal;
+            node.next = self.terminal_observers;
+            self.terminal_observers = node;
+        }
+        fn detachTerminal(node: *operation.TerminalEvidence) void {
+            // Node mutex is held by deinit, and its own Ticket+StoragePin
+            // keep this exact record/nonce alive until unlink completes.
+            const self: *Record = @ptrCast(@alignCast(node.context.?));
+            self.lock();
+            self.gate.validateNonce(self.index, node.nonce) catch @panic("stale terminal observer");
+            var link = &self.terminal_observers;
+            while (link.* != node) {
+                const current = link.* orelse @panic("missing terminal observer");
+                link = &current.next;
+            }
+            link.* = node.next;
+            var ticket = self.ticket orelse @panic("missing terminal ticket");
+            std.debug.assert(ticket.nonce == node.nonce);
+            const owner = self.owner;
+            node.context = null;
+            node.next = null;
+            node.detach = null;
+            node.implementation = null;
+            node.nonce = 0;
+            node.terminal = false;
+            self.mutex.unlock();
+            node.mutex.unlock();
+            ticket.release() catch @panic("terminal observer ticket release");
+            owner.releaseStorage();
+        }
+
         pub fn retainStorage(self: *Record, nonce: u64) !StoragePin {
             self.lock();
             defer self.mutex.unlock();
@@ -246,6 +342,7 @@ pub const Owner = struct {
         value.source = request.implementation;
         value.mode = request.mode;
         value.entered = false;
+        std.debug.assert(value.terminal_observers == null);
         return .{ .record = value, .nonce = ticket.nonce };
     }
     pub const StoragePin = struct {
@@ -581,4 +678,112 @@ test "retained operation storage rejects sealed close boundary without consuming
     try std.testing.expectError(error.RetirementEpochSealed, owner.holdStorageUntilCleanup(.{ .boundary = &epoch }));
     try std.testing.expect(owner.close_epoch == null);
     try std.testing.expectEqual(@as(usize, 1), owner.storage_references.load(.acquire));
+}
+
+const TerminalEvidenceFixture = struct {
+    fn run(a: std.mem.Allocator) !void {
+        // Only the cold Owner header may allocate; all receiving/terminal
+        // transitions run with the next actual allocation forced to fail.
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 1 });
+        const owner = try Owner.createRetained(failing.allocator());
+        var root_live = true;
+        defer if (root_live) {
+            owner.closeRetained() catch unreachable;
+            owner.releaseClosedStorage();
+        };
+        var marker: u8 = 0;
+        var foreign: u8 = 0;
+        const implementation = kernel.Implementation{ .context = &marker, .table = &marker };
+        const request = operation.Request{ .implementation = implementation, .program = null, .mode = .managed };
+        // Distinct stable Frame-sized nodes retain terminal facts, not the
+        // bounded 64 operation records. Exercise more than that actual limit.
+        var nodes: [gate_mod.Gate.capacity + 17]operation.TerminalEvidence = @splat(.{});
+        defer for (&nodes) |*node| node.deinit();
+        for (&nodes) |*node| {
+            const prepared = try owner.prepare(&marker, request);
+            var host_live = true;
+            defer if (host_live) {
+                prepared.record.finishMetadata(prepared.nonce) catch unreachable;
+                prepared.record.release(prepared.nonce) catch unreachable;
+            };
+            try std.testing.expectError(error.BackendOperationInactive, prepared.record.bindTerminalEvidence(prepared.nonce, implementation, node));
+            const snapshot = try prepared.record.snapshot(prepared.nonce);
+            try snapshot.ticket.begin();
+            try prepared.record.setEntered(prepared.nonce, true);
+            try std.testing.expectError(error.BackendOperationChanged, prepared.record.bindTerminalEvidence(prepared.nonce, .{ .context = &foreign, .table = &marker }, node));
+            try std.testing.expectError(error.BackendOperationConsumed, prepared.record.bindTerminalEvidence(prepared.nonce + 1, implementation, node));
+            try prepared.record.bindTerminalEvidence(prepared.nonce, implementation, node);
+            try std.testing.expectError(error.PhysicalCompletionUnavailable, node.validateTerminal(implementation));
+            try std.testing.expectError(error.BackendOperationInactive, prepared.record.publishTerminal(prepared.nonce));
+            // Represents the provider's actual successful wait/cancel proof:
+            // finish metadata, publish to stable receivers, then release host.
+            try prepared.record.finishMetadata(prepared.nonce);
+            try prepared.record.publishTerminal(prepared.nonce);
+            try prepared.record.release(prepared.nonce);
+            host_live = false;
+            try std.testing.expectEqual(@as(usize, 1), owner.storage_references.load(.acquire));
+            try node.validateTerminal(implementation);
+            try std.testing.expect(node.context == null and node.detach == null);
+        }
+        try owner.closeRetained();
+        owner.releaseClosedStorage();
+        root_live = false;
+        for (&nodes) |*node| {
+            try node.validateTerminal(implementation);
+            try std.testing.expectError(error.BackendOperationChanged, node.validateTerminal(.{ .context = &marker, .table = &foreign }));
+        }
+    }
+};
+test "managed operation terminal latches release bounded records across more than 64 stable frames and provider close" {
+    try TerminalEvidenceFixture.run(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, TerminalEvidenceFixture.run, .{});
+}
+
+test "unlinked mixed work and generic metadata finish never receive terminal proof" {
+    const owner = try Owner.createRetained(std.testing.allocator);
+    defer {
+        owner.closeRetained() catch unreachable;
+        owner.releaseClosedStorage();
+    }
+    var marker: u8 = 0;
+    const implementation = kernel.Implementation{ .context = &marker, .table = &marker };
+    const prepared = try owner.prepare(&marker, .{ .implementation = implementation, .program = null, .mode = .managed });
+    const snapshot = try prepared.record.snapshot(prepared.nonce);
+    try snapshot.ticket.begin();
+    try prepared.record.setEntered(prepared.nonce, true);
+    var pending = operation.TerminalEvidence{};
+    defer pending.deinit();
+    var detached = operation.TerminalEvidence{};
+    defer detached.deinit();
+    try prepared.record.bindTerminalEvidence(prepared.nonce, implementation, &pending);
+    try prepared.record.bindTerminalEvidence(prepared.nonce, implementation, &detached);
+    // A real primitive/transfer invalidates this Frame receiver before writes;
+    // later terminal publication cannot touch the unlinked node's address.
+    detached.deinit();
+    try prepared.record.finishMetadata(prepared.nonce);
+    try std.testing.expectError(error.PhysicalCompletionUnavailable, pending.validateTerminal(implementation));
+    try std.testing.expectError(error.PhysicalCompletionUnavailable, detached.validateTerminal(implementation));
+    try prepared.record.publishTerminal(prepared.nonce);
+    try prepared.record.release(prepared.nonce);
+    try pending.validateTerminal(implementation);
+    try std.testing.expectError(error.PhysicalCompletionUnavailable, detached.validateTerminal(implementation));
+}
+
+test "failed unproven host finish stays unknown after provider close and receiver detach is metadata only" {
+    const owner = try Owner.createRetained(std.testing.allocator);
+    var marker: u8 = 0;
+    const implementation = kernel.Implementation{ .context = &marker, .table = &marker };
+    const prepared = try owner.prepare(&marker, .{ .implementation = implementation, .program = null, .mode = .managed });
+    const snapshot = try prepared.record.snapshot(prepared.nonce);
+    try snapshot.ticket.begin();
+    try prepared.record.setEntered(prepared.nonce, true);
+    var node = operation.TerminalEvidence{};
+    // Generic cleanup has no provider terminal proof. The live receiver pins
+    // only metadata through close and must remain unknown, not guess success.
+    try prepared.record.bindTerminalEvidence(prepared.nonce, implementation, &node);
+    try prepared.record.finishAndRelease(prepared.nonce);
+    try owner.closeRetained();
+    owner.releaseClosedStorage();
+    defer node.deinit();
+    try std.testing.expectError(error.PhysicalCompletionUnavailable, node.validateTerminal(implementation));
 }

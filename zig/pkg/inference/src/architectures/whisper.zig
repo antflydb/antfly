@@ -960,6 +960,7 @@ pub const PreparedSingleToken = struct {
     allocator: std.mem.Allocator,
     backend: ComputeBackend,
     schedule: *@import("../execution/dense_decoder_schedule.zig").Schedule,
+    source_data: *const anyopaque,
     self_slabs: []Slab,
     token_node: @import("ml").graph.NodeId,
     position_node: @import("ml").graph.NodeId,
@@ -978,18 +979,13 @@ pub const PreparedSingleToken = struct {
     const Author = struct {
         b: *schedule_mod.Builder,
         cb: *const ComputeBackend,
+        source_data: *const anyopaque,
         fn weight(self: Author, value: CT) !NodeId {
-            const plane = try schedule_mod.residentPlane(self.cb, value);
-            if (plane.descriptor.shape.dtype != .f32 or plane.descriptor.quant_format != null) return error.UnsupportedDenseSchedule;
-            return self.b.parameter(plane.descriptor.shape, value, true);
-        }
-        fn residentWeight(self: Author, value: CT) !NodeId {
-            const plane = try schedule_mod.residentPlane(self.cb, value);
-            if (plane.descriptor.shape.dtype != .f32 or plane.descriptor.quant_format != null) return error.UnsupportedDenseSchedule;
-            return self.b.residentWeight(plane.descriptor.shape, value);
+            const plane = try @import("../ops/native_compute.zig").NativeCompute.heldF32WeightPrimary(self.cb, self.source_data, value);
+            return self.b.residentWeight(value, plane);
         }
         fn linear(self: Author, x: NodeId, value: Linear, rows: usize, width: usize, out: usize) !NodeId {
-            const w = try self.residentWeight(value.w);
+            const w = try self.weight(value.w);
             const b = if (value.b) |bias| try self.weight(bias) else null;
             return self.b.linearRows(x, w, b, rows, width, out);
         }
@@ -998,18 +994,18 @@ pub const PreparedSingleToken = struct {
         }
     };
 
-    pub fn init(cb: *const ComputeBackend, a: std.mem.Allocator, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights) !?PreparedSingleToken {
+    pub fn init(cb: *const ComputeBackend, source_data: *const anyopaque, a: std.mem.Allocator, config: Config, encoder: CT, rows: usize, weights: *const PreparedDecoderWeights) !?PreparedSingleToken {
         const Native = @import("../ops/native_compute.zig");
         if (cb.vtable != &Native.vtable_impl or cb.vtable.addLayerNormSum != null or weights.cross == null or weights.weights.layers.len != config.decoder_layers or weights.cross.?.len != config.decoder_layers) return null;
         for (weights.weights.layers) |w| if (w.qkv_slots != null) return null;
-        const embed_shape = (try schedule_mod.residentPlane(cb, weights.weights.embed)).descriptor.shape;
-        const position_shape = (try schedule_mod.residentPlane(cb, weights.weights.positions)).descriptor.shape;
+        const embed_shape = (try Native.NativeCompute.heldF32WeightPrimary(cb, source_data, weights.weights.embed)).descriptor.shape;
+        const position_shape = (try Native.NativeCompute.heldF32WeightPrimary(cb, source_data, weights.weights.positions)).descriptor.shape;
         if (embed_shape.rank() != 2 or position_shape.rank() != 2 or embed_shape.dims[1] != config.d_model or position_shape.dims[1] != config.d_model) return null;
         const geometry = try CacheGeometry.init(config, rows);
         if (config.decoder_attention_heads == 0 or config.d_model % config.decoder_attention_heads != 0 or rows > std.math.maxInt(i32) or geometry.capacity > std.math.maxInt(i32) or config.d_model > std.math.maxInt(i32) or config.decoder_ffn_dim > std.math.maxInt(i32) or config.vocab_size > std.math.maxInt(i32) or embed_shape.dims[0] <= 0 or position_shape.dims[0] <= 0) return null;
         // Reject opaque/reduced model inputs before constructing or mutating KV.
         for (weights.fetcher.handles.items) |ct| {
-            const plane = schedule_mod.residentPlane(cb, ct) catch return null;
+            const plane = try Native.NativeCompute.heldF32WeightPrimary(cb, source_data, ct);
             if (plane.descriptor.shape.dtype != .f32 or plane.descriptor.quant_format != null) return null;
         }
         const slabs = try a.alloc(Slab, config.decoder_layers);
@@ -1038,10 +1034,10 @@ pub const PreparedSingleToken = struct {
         }
         var b = schedule_mod.Builder.init(a, cb);
         defer b.deinit();
-        const author = Author{ .b = &b, .cb = cb };
+        const author = Author{ .b = &b, .cb = cb, .source_data = source_data };
         for (weights.cross.?, slabs) |cross, slab| {
-            const k_desc = try schedule_mod.projectionDescriptor(cb, encoder, cross.k.w, cross.k.b, slab.cross_k, rows, config.d_model, config.d_model);
-            const v_desc = try schedule_mod.projectionDescriptor(cb, encoder, cross.v.w, cross.v.b, slab.cross_v, rows, config.d_model, config.d_model);
+            const k_desc = try schedule_mod.projectionDescriptor(cb, source_data, encoder, cross.k.w, cross.k.b, slab.cross_k, rows, config.d_model, config.d_model);
+            const v_desc = try schedule_mod.projectionDescriptor(cb, source_data, encoder, cross.v.w, cross.v.b, slab.cross_v, rows, config.d_model, config.d_model);
             if (!Native.NativeCompute.canApplyDenseProjectionInto(cb, &k_desc, if (cross.k.b) |bias| &.{ encoder, cross.k.w, bias } else &.{ encoder, cross.k.w }, slab.cross_k) or !Native.NativeCompute.canApplyDenseProjectionInto(cb, &v_desc, if (cross.v.b) |bias| &.{ encoder, cross.v.w, bias } else &.{ encoder, cross.v.w }, slab.cross_v)) return error.UnsupportedDenseSchedule;
         }
         const token_node = try b.hostParameter(@import("ml").graph.Shape.init(.i64, &.{1}));
@@ -1062,16 +1058,16 @@ pub const PreparedSingleToken = struct {
             try b.output(k);
             try b.output(v);
             const slab_shape = @import("ml").graph.Shape.init(.f32, &.{ @intCast(geometry.capacity), @intCast(config.d_model) });
-            const self_k = try b.parameter(slab_shape, slab.k, false);
-            const self_v = try b.parameter(slab_shape, slab.v, false);
+            const self_k = try b.parameter(slab_shape, slab.k);
+            const self_v = try b.parameter(slab_shape, slab.v);
             const self_attention = try b.prefix(q, self_k, self_v, config.decoder_attention_heads, config.decoderHeadDim(), geometry.capacity);
             const self_out = try author.linear(self_attention, w.o, 1, config.d_model, config.d_model);
             const after_self = try b.add(self_out, sum);
             const cross_norm = try author.norm(after_self, w.cross_ln, config.d_model);
             const cross_q = try author.linear(cross_norm, w.cross_q, 1, config.d_model, config.d_model);
             const cross_shape = @import("ml").graph.Shape.init(.f32, &.{ @intCast(rows), @intCast(config.d_model) });
-            const cross_k = try b.parameter(cross_shape, slab.cross_k, false);
-            const cross_v = try b.parameter(cross_shape, slab.cross_v, false);
+            const cross_k = try b.parameter(cross_shape, slab.cross_k);
+            const cross_v = try b.parameter(cross_shape, slab.cross_v);
             const cross_attention = try b.prefix(cross_q, cross_k, cross_v, config.decoder_attention_heads, config.decoderHeadDim(), rows);
             const cross_out = try author.linear(cross_attention, w.cross_o, 1, config.d_model, config.d_model);
             sum = try b.add(cross_out, after_self);
@@ -1082,7 +1078,7 @@ pub const PreparedSingleToken = struct {
         }
         if (pending) |p| sum = try b.add(p, sum);
         const norm = try author.norm(sum, weights.weights.final_ln, config.d_model);
-        const logits = try b.linear(norm, try author.residentWeight(weights.weights.lm_head), null, config.d_model, config.vocab_size);
+        const logits = try b.linear(norm, try author.weight(weights.weights.lm_head), null, config.d_model, config.vocab_size);
         try b.output(logits);
         const cache_layers = try a.alloc(DecodeCache.LayerCache, config.decoder_layers);
         errdefer a.free(cache_layers);
@@ -1093,7 +1089,7 @@ pub const PreparedSingleToken = struct {
         errdefer a.free(self_mask);
         @memset(self_mask, 1);
         const schedule = try schedule_mod.Schedule.create(&b);
-        return .{ .allocator = a, .backend = cb.withoutSynchronousBorrows(), .schedule = schedule, .self_slabs = slabs, .token_node = token_node, .position_node = position_node, .cache_layers = cache_layers, .encoder_mask = encoder_mask, .self_mask = self_mask, .token_rows = @intCast(embed_shape.dims[0]), .position_rows = @intCast(position_shape.dims[0]) };
+        return .{ .allocator = a, .backend = cb.withoutSynchronousBorrows(), .schedule = schedule, .source_data = source_data, .self_slabs = slabs, .token_node = token_node, .position_node = position_node, .cache_layers = cache_layers, .encoder_mask = encoder_mask, .self_mask = self_mask, .token_rows = @intCast(embed_shape.dims[0]), .position_rows = @intCast(position_shape.dims[0]) };
     }
     fn bindInputs(self: *PreparedSingleToken, capability: ?@import("../execution/storage_admission.zig").Capability, current: @import("../execution/cleanup_context.zig").Context, enter: bool) !void {
         const Tensor = @import("../backends/tensor.zig").Tensor;
@@ -1219,8 +1215,8 @@ pub const DecodeCache = struct {
                 const slab = program.self_slabs[layer];
                 const Native = @import("../ops/native_compute.zig").NativeCompute;
                 const schedule_mod = @import("../execution/dense_decoder_schedule.zig");
-                const k_descriptor = try schedule_mod.projectionDescriptor(cb, encoder_hidden, k, k_b, slab.cross_k, enc_seq, d_model, d_model);
-                const v_descriptor = try schedule_mod.projectionDescriptor(cb, encoder_hidden, v, v_b, slab.cross_v, enc_seq, d_model, d_model);
+                const k_descriptor = try schedule_mod.projectionDescriptor(cb, program.source_data, encoder_hidden, k, k_b, slab.cross_k, enc_seq, d_model, d_model);
+                const v_descriptor = try schedule_mod.projectionDescriptor(cb, program.source_data, encoder_hidden, v, v_b, slab.cross_v, enc_seq, d_model, d_model);
                 if (!try Native.applyDenseProjectionInto(cb, &k_descriptor, if (k_b) |bias| &.{ encoder_hidden, k, bias } else &.{ encoder_hidden, k }, slab.cross_k)) return error.PreparedDenseProjectionChanged;
                 if (!try Native.applyDenseProjectionInto(cb, &v_descriptor, if (v_b) |bias| &.{ encoder_hidden, v, bias } else &.{ encoder_hidden, v }, slab.cross_v)) return error.PreparedDenseProjectionChanged;
                 k_cross = slab.cross_k;

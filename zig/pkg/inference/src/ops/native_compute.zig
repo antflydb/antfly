@@ -4370,6 +4370,25 @@ pub const NativeCompute = struct {
         return first.kind == second.kind and first.q8_activation == second.q8_activation and !originalPairNeedsTasks(self, descriptor, first, second);
     }
 
+    /// Borrow only one exact retained immutable F32 weight primary. This is
+    /// not complete Model storage coverage or new allocator/workspace credit.
+    /// The caller retains its actual Model/store and witness through use, with
+    /// the same strict source stamps required by authored decoder reception.
+    pub fn heldF32WeightPrimary(backend: *const ops.ComputeBackend, expected_data: *const anyopaque, witness: CT) !@import("../execution/storage_ownership.zig").Plane {
+        if (backend.vtable != &vtable_impl) return error.UnsupportedNativeWeightPreparation;
+        const self: *NativeCompute = @ptrCast(@alignCast(backend.ptr));
+        if (@as(*const anyopaque, @ptrCast(self.data)) != expected_data) return error.ForeignNativeWeightModel;
+        ResidentWeightPreparation.lock(self.data);
+        defer ResidentWeightPreparation.unlock(self.data);
+        const owner = self.weight_retirement orelse return error.NativeWeightPreparationChanged;
+        platform.sync.lockYielding(&owner.mutex);
+        defer owner.mutex.unlock();
+        if (owner.attached_compute != self or owner.data != self.data) return error.NativeWeightPreparationChanged;
+        const source = try self.heldF32WeightSourceLocked(witness, false);
+        const name = toBuf(witness).weight_handle.?.name();
+        return authoredResidentF32PlaneFromLoaded(name, witness, @import("ml").graph.Shape.init(.f32, source.tensor.shape), source);
+    }
+
     /// Cold binding of the existing cached-handle stamp, without new witness
     /// arrays, value reads, preparation or allocation. All witnesses must still
     /// be the actual retained F32 source before any missing stamp is published.
@@ -4393,14 +4412,14 @@ pub const NativeCompute = struct {
         platform.sync.lockYielding(&owner.mutex);
         defer owner.mutex.unlock();
         if (owner.attached_compute != self or owner.data != self.data) return error.NativeWeightPreparationChanged;
-        for (witnesses) |witness| try self.heldF32WeightSourceLocked(witness, cold);
+        for (witnesses) |witness| _ = try self.heldF32WeightSourceLocked(witness, cold);
         if (cold) for (witnesses) |witness| {
             const handle = toBuf(witness).weight_handle.?;
             if (handle.source_stamp.kind == .missing) handle.source_stamp = nativeCacheSourceStampLocked(self.data, handle.name());
         };
     }
 
-    fn heldF32WeightSourceLocked(self: *NativeCompute, witness: CT, comptime cold: bool) !void {
+    fn heldF32WeightSourceLocked(self: *NativeCompute, witness: CT, comptime cold: bool) !*const LoadedWeight {
         const view = toBuf(witness);
         const handle = view.weight_handle orelse return error.NativeWeightPreparationChanged;
         if (!handle.cached or handle.references == 0 or !view.cached_weight or !view.whole_named_weight or view.weight_retirement != self.weight_retirement or self.weight_handles.get(handle.name()) != witness) return error.NativeWeightPreparationChanged;
@@ -4422,6 +4441,7 @@ pub const NativeCompute = struct {
         if (elements <= 0) return unsupported;
         const bytes = std.math.mul(usize, @intCast(elements), @sizeOf(f32)) catch return unsupported;
         if (source.data.len != bytes or view.data.len != elements or @intFromPtr(view.data.ptr) != @intFromPtr(source.data.ptr) or view.logical_shape == null or !std.mem.eql(i64, view.logical_shape.?, source.shape)) return error.NativeWeightPreparationChanged;
+        return loaded;
     }
 
     /// Ordinary cache initialization into an already owned dense destination.
@@ -53286,7 +53306,15 @@ fn runAssignedKernelOp(ctx: *anyopaque, request: ops.kernel_descriptor.Invocatio
         .transpose, .broadcast => unreachable,
         .concat => |geometry| try concatDenseInto(dense_inputs[0], dense_inputs[1], output, geometry),
         .slice => |slice| try sliceDenseInto(dense_inputs[0], output, try slice.plan(descriptor.input_shapes[0], descriptor.output_shape)),
-        .gather => |gather| if (packed_row_route) |selected| try selected.execute(request, output) else try gatherAxisInto(dense_inputs[0], if (descriptor.input_shapes[1].dtype == .f32) try @import("index_metadata.zig").Reader.init(.f32, std.mem.sliceAsBytes(dense_inputs[1])) else try IndexReader.init(request.inputs[1]), output, gather.geometry, true),
+        .gather => |gather| {
+            if (packed_row_route) |selected| {
+                // This owner already retires its mapped source after use.
+                try selected.execute(request, output);
+            } else {
+                defer maybeDiscardMappedWeightAfterUse(self, request.inputs[0]);
+                try gatherAxisInto(dense_inputs[0], if (descriptor.input_shapes[1].dtype == .f32) try @import("index_metadata.zig").Reader.init(.f32, std.mem.sliceAsBytes(dense_inputs[1])) else try IndexReader.init(request.inputs[1]), output, gather.geometry, true);
+            }
+        },
         .dot => |dot| denseDotInto(dense_inputs[0], dense_inputs[1], output, dot),
         .reduction => |reduction| reduceInto(dense_inputs[0], output, reduction.geometry, reduction.mode),
         .rope => |rope_request| ropeDenseInto(dense_inputs[0], output, rope_request),
@@ -60802,6 +60830,7 @@ fn nativeHeldSourceCase(a: std.mem.Allocator) !void {
     const witnesses = [_]CT{ resident, lazy };
     try std.testing.expect(toBuf(resident).weight_handle.?.source_stamp.kind == .missing);
     try std.testing.expectError(error.NativeWeightPreparationChanged, NativeCompute.validateHeldF32WeightSources(&cb, &store, &witnesses));
+    try std.testing.expectError(error.NativeWeightPreparationChanged, NativeCompute.heldF32WeightPrimary(&cb, &store, resident));
     const ordinary = try cb.fromFloat32Shape(&bits, &.{ 2, 2 });
     defer cb.free(ordinary);
     try std.testing.expectError(error.NativeWeightPreparationChanged, NativeCompute.stampHeldF32WeightSources(&cb, &store, &.{ resident, ordinary }));
@@ -60810,27 +60839,59 @@ fn nativeHeldSourceCase(a: std.mem.Allocator) !void {
     compute.allocator = failing.allocator();
     const stamped = NativeCompute.stampHeldF32WeightSources(&cb, &store, &witnesses);
     const received = NativeCompute.validateHeldF32WeightSources(&cb, &store, &witnesses);
+    const resident_primary = NativeCompute.heldF32WeightPrimary(&cb, &store, resident);
+    const lazy_primary = NativeCompute.heldF32WeightPrimary(&cb, &store, lazy);
     compute.allocator = a;
     try stamped;
     try received;
+    const primary = try resident_primary;
+    const pinned_primary = try lazy_primary;
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expectEqualDeep(try NativeCompute.authoredResidentF32Plane(&cb, "resident", resident), primary);
+    try std.testing.expectEqualDeep(primary, pinned_primary);
+    try std.testing.expect(primary.role == .primary and primary.descriptor.shape.dtype == .f32 and primary.writable == null);
+    try std.testing.expectEqual(@intFromPtr(&bits), primary.backing.?.base);
+    try std.testing.expectEqual(@as(usize, 16), primary.logical_bytes);
+    try std.testing.expectEqual(@as(usize, 16), primary.readable_bytes);
+    const Partial = struct {
+        count: usize = 0,
+        fn emit(raw: *anyopaque, report: @import("../execution/storage_ownership.zig").Report) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (report == .plane and report.plane.role == .primary) self.count += 1;
+        }
+    };
+    var partial: Partial = .{};
+    try std.testing.expectEqual(@import("../execution/storage_ownership.zig").Coverage.unknown, try storageOwnershipOp(&compute, resident, .{ .context = &partial, .visit = Partial.emit }));
+    try std.testing.expectEqual(@as(usize, 1), partial.count);
+    try std.testing.expectError(error.NativeWeightPreparationChanged, NativeCompute.heldF32WeightPrimary(&cb, &store, ordinary));
+    const offset = toBuf(resident).view_base_offset;
+    toBuf(resident).view_base_offset = 1;
+    const alias = NativeCompute.heldF32WeightPrimary(&cb, &store, resident);
+    toBuf(resident).view_base_offset = offset;
+    try std.testing.expectError(error.NativeWeightPreparationChanged, alias);
     try std.testing.expect(toBuf(resident).weight_handle.?.source_stamp.kind == .resident);
     try std.testing.expect(toBuf(lazy).weight_handle.?.source_stamp.kind == .immutable_lazy);
     store.resident_weights.getPtr("resident").?.source_version += 1;
     try std.testing.expectError(error.NativeWeightPreparationChanged, NativeCompute.validateHeldF32WeightSources(&cb, &store, &witnesses));
+    try std.testing.expectError(error.NativeWeightPreparationChanged, NativeCompute.heldF32WeightPrimary(&cb, &store, resident));
     store.resident_weights.getPtr("resident").?.source_version -= 1;
     const lazy_entry = store.lazy_weights.getPtr("lazy").?;
     const pins = lazy_entry.pin_count;
     lazy_entry.pin_count = 0;
     const unpinned = NativeCompute.validateHeldF32WeightSources(&cb, &store, &witnesses);
+    const unpinned_primary = NativeCompute.heldF32WeightPrimary(&cb, &store, lazy);
     lazy_entry.pin_count = pins;
     try std.testing.expectError(error.NativeWeightPreparationChanged, unpinned);
+    try std.testing.expectError(error.NativeWeightPreparationChanged, unpinned_primary);
     try NativeCompute.validateHeldF32WeightSources(&cb, &store, &witnesses);
     try std.testing.expectError(error.ForeignNativeWeightModel, NativeCompute.validateHeldF32WeightSources(&cb, @ptrFromInt(16), &witnesses));
+    try std.testing.expectError(error.ForeignNativeWeightModel, NativeCompute.heldF32WeightPrimary(&cb, @ptrFromInt(16), resident));
     var copied_table = vtable_impl;
     std.mem.doNotOptimizeAway(&copied_table);
     try std.testing.expect(@intFromPtr(&copied_table) != @intFromPtr(&vtable_impl));
     const foreign = ops.ComputeBackend{ .ptr = @ptrFromInt(16), .vtable = &copied_table };
     try std.testing.expectError(error.UnsupportedNativeWeightPreparation, NativeCompute.validateHeldF32WeightSources(&foreign, &store, &witnesses));
+    try std.testing.expectError(error.UnsupportedNativeWeightPreparation, NativeCompute.heldF32WeightPrimary(&foreign, &store, @ptrFromInt(16)));
     try std.testing.expectEqualSlices(f32, &bits, getData(resident));
     try std.testing.expectEqualSlices(f32, &bits, getData(lazy));
 }
@@ -60841,4 +60902,120 @@ test "Native held F32 source stamps revalidate actual resident and pinned lazy o
 
 test "Native held F32 source witnesses unwind every cold allocation failure" {
     try std.testing.checkAllAllocationFailures(std.testing.allocator, nativeHeldSourceCase, .{});
+}
+
+fn nativeHeldGatherDiscardCase(a: std.mem.Allocator) !void {
+    const Shape = @import("ml").graph.Shape;
+    const route = @import("../execution/kernel_route.zig");
+    const Probe = struct {
+        entry: ?*LazyWeightEntry = null,
+        active_discards: usize = 0,
+        retired_discards: usize = 0,
+        fn discard(raw: *anyopaque, name: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            std.debug.assert(std.mem.eql(u8, name, "mapped-source.weight"));
+            if (self.entry.?.pin_count != 0) self.active_discards += 1 else self.retired_discards += 1;
+        }
+    };
+    var controller = run_memory.AdmissionController{};
+    controller.configureSharedLimits(.{ .host_limit_bytes = 1024 });
+    defer controller.deinit();
+    var probe: Probe = .{};
+    // A genuine loaded, pinned lazy source uses the actual TensorStore discard
+    // service. No other store callback is reached while its payload is loaded.
+    var table: tensor_store_mod.TensorStore.VTable = undefined;
+    table.discardTensorFileCache = Probe.discard;
+    var store = WeightStore{ .allocator = a, .resident_weights = .empty, .lazy_weights = .empty, .tensor_store = .{ .ptr = &probe, .vtable = &table }, .tier_cache = tier_cache_mod.SharedCache.init(.{ .host_limit_bytes = 1024 }) };
+    defer store.lazy_weights.deinit(a);
+    defer deinitPrefetchQueue(&store);
+    try store.tier_cache.?.configureAdmission(a, &controller, .cpu, .{ .host_limit_bytes = 1024 }, .{});
+    defer store.tier_cache.?.deinitAdmission();
+    var bits = [_]f32{ 1, -2, 3, 4, 5, -6 };
+    const source = tensor_mod.Tensor{ .data = std.mem.sliceAsBytes(&bits), .shape = &.{ 2, 3 }, .dtype = .f32, .name = "weight", .allocator = a, .owns_data = false, .owns_shape = false };
+    try store.lazy_weights.put(a, "weight", .{ .tensor_ref = .{ .name = "weight", .source_name = "mapped-source.weight" }, .loaded = .{ .tensor = source }, .loaded_bytes = 24, .active_tier = .host });
+    probe.entry = store.lazy_weights.getPtr("weight").?;
+    var compute = NativeCompute.init(a, &store, null);
+    defer compute.deinit();
+    const cb = compute.computeBackend();
+    const weight = try cb.getWeight("weight");
+    defer cb.free(weight);
+    try std.testing.expect(probe.entry.?.pin_count > 0);
+    try NativeCompute.stampHeldF32WeightSources(&cb, &store, &.{weight});
+    const primary = try NativeCompute.heldF32WeightPrimary(&cb, &store, weight);
+    const implementation = route.Implementation{ .context = &compute, .table = &vtable_impl };
+    const index_shape = Shape.init(.i64, &.{1});
+    const index_slot = route.OutputSlot{ .node = 1, .allocation = 1, .epoch = 42, .logical = index_shape, .writable_bytes = 8 };
+    const index_lease = (try ops.physical_storage.Lease.create(a, cb, 8)).?;
+    defer index_lease.release();
+    try index_lease.bindAllocationSlot(1, 42, 8);
+    const indices = (try physicalTensorViewOp(&compute, .{ .storage = index_lease, .shape = &.{1}, .dtype = .i64 })).?;
+    defer cb.free(indices);
+    const ingress = (try createNativeHostInputOp(&compute, .{ .allocator = a, .implementation = implementation, .requirements = (try nativeHostInputRequirementsOp(&compute, index_shape)).?, .slot = index_slot })).?;
+    defer ingress.deinit();
+    const ids = [_]i64{1};
+    const index_authority = route.AssignedOutput{ .slot = index_slot, .region = try index_lease.writableRegion(1, 42, 8) };
+    try ingress.write(indices, index_authority, std.mem.sliceAsBytes(&ids));
+    const descriptor = ops.kernel_descriptor.Descriptor{ .operation = .{ .gather = .{ .axis = 0, .geometry = try kernel_geometry.GatherAxis.init(std.math.maxInt(usize), &.{ 2, 3 }, 0) } }, .input_count = 2, .input_shapes = .{ Shape.init(.f32, &.{ 2, 3 }), index_shape, undefined }, .output_shape = Shape.init(.f32, &.{ 1, 3 }) };
+    const slot = route.OutputSlot{ .node = 2, .allocation = 0, .epoch = 42, .logical = descriptor.output_shape, .writable_bytes = 12 };
+    const facts = [_]route.Binding{ .{ .resident = .{ .logical = primary.descriptor.shape, .planes = &.{primary}, .implementation = implementation } }, .{ .tensor = .{ .value = indices, .implementation = implementation } } };
+    var selected = (try prepareKernelRouteOp(&compute, .{ .allocator = a, .implementation = implementation, .descriptor = &descriptor, .inputs = &facts, .output = slot })) orelse return error.MissingHeldGatherRoute;
+    defer selected.deinit();
+    try std.testing.expect(@import("../execution/assigned_kernel_route.zig").isDirect(&selected));
+    const lease = (try ops.physical_storage.Lease.create(a, cb, 12)).?;
+    defer lease.release();
+    try lease.bindAllocationSlot(0, 42, 12);
+    const output = (try physicalTensorViewOp(&compute, .{ .storage = lease, .shape = &.{ 1, 3 } })).?;
+    defer cb.free(output);
+    const authority = route.AssignedOutput{ .slot = slot, .region = try lease.writableRegion(0, 42, 12) };
+    const inputs = [_]CT{ weight, indices };
+    var invocation = ops.kernel_descriptor.Invocation{ .descriptor = &descriptor, .inputs = &inputs, .prepared_route = &selected, .assigned_output = &authority };
+    // Probe-only legality does not read mapped values or emit use boundaries.
+    try std.testing.expect(try runAssignedKernelOp(&compute, invocation));
+    try std.testing.expectEqual(@as(usize, 0), probe.active_discards);
+    // The original rate limiter suppresses both real operations equally.
+    store.last_file_cache_pressure_probe_ns.store(std.math.maxInt(u64), .release);
+    const quiet = try cb.embeddingLookup(weight, &ids, 1, 3);
+    defer cb.free(quiet);
+    invocation.output = output;
+    try std.testing.expect(try runAssignedKernelOp(&compute, invocation));
+    try std.testing.expectEqualSlices(f32, getData(quiet), getData(output));
+    try std.testing.expectEqual(@as(usize, 0), probe.active_discards);
+    // Let the actual admitted cache/controller observe its process pressure;
+    // this latches the same existing policy for a still-pinned lazy source.
+    controller.configureProcessMemoryLimit(2, .explicit);
+    store.last_file_cache_pressure_probe_ns.store(0, .release);
+    const original = try cb.embeddingLookup(weight, &ids, 1, 3);
+    defer cb.free(original);
+    try std.testing.expect(store.discard_file_cache_under_pressure.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 1), probe.active_discards);
+    try std.testing.expect(probe.entry.?.pin_count > 0);
+    store.discard_file_cache_under_pressure.store(false, .release);
+    store.last_file_cache_pressure_probe_ns.store(0, .release);
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    compute.allocator = failing.allocator();
+    const dispatched = runAssignedKernelOp(&compute, invocation);
+    compute.allocator = a;
+    try std.testing.expect(try dispatched);
+    try std.testing.expect(!failing.has_induced_failure);
+    try std.testing.expect(store.discard_file_cache_under_pressure.load(.acquire));
+    try std.testing.expectEqual(@as(usize, 2), probe.active_discards);
+    try std.testing.expectEqual(@as(usize, 0), probe.retired_discards);
+    try std.testing.expectEqualSlices(f32, getData(original), getData(output));
+    // An ordinary owned F32 source is the same generic Direct operation, but
+    // it carries no named mapped-source policy or discard callback.
+    const ordinary = try cb.fromFloat32Shape(&bits, &.{ 2, 3 });
+    defer cb.free(ordinary);
+    const ordinary_facts = [_]route.Binding{ .{ .tensor = .{ .value = ordinary, .implementation = implementation } }, facts[1] };
+    var ordinary_route = (try prepareKernelRouteOp(&compute, .{ .allocator = a, .implementation = implementation, .descriptor = &descriptor, .inputs = &ordinary_facts, .output = slot })) orelse return error.MissingOrdinaryGatherRoute;
+    defer ordinary_route.deinit();
+    invocation.inputs = &.{ ordinary, indices };
+    invocation.prepared_route = &ordinary_route;
+    try std.testing.expect(try runAssignedKernelOp(&compute, invocation));
+    try std.testing.expectEqual(@as(usize, 2), probe.active_discards);
+    try std.testing.expectEqualSlices(f32, getData(original), getData(output));
+}
+
+test "Direct F32 gather keeps original pinned mapped-source discard policy counts without allocations" {
+    try nativeHeldGatherDiscardCase(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, nativeHeldGatherDiscardCase, .{});
 }

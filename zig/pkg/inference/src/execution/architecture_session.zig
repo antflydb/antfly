@@ -5097,12 +5097,12 @@ fn buildColdNativeWhisper(self: *ColdNativeWhisper, session: Session, allocator:
         },
     };
     self.weights = try whisper_arch.PreparedDecoderWeights.initWithSource(cb, metadata.allocator(), config, true, .{ .expected_data = data, .domain = domain });
+    try NativeCompute.stampHeldF32WeightSources(cb, data, self.weights.?.fetcher.handles.items);
     for (self.weights.?.fetcher.handles.items) |weight| {
-        const plane = @import("dense_decoder_schedule.zig").residentPlane(cb, weight) catch return false;
+        const plane = try NativeCompute.heldF32WeightPrimary(cb, data, weight);
         if (plane.descriptor.shape.dtype != .f32 or plane.descriptor.quant_format != null) return false;
     }
-    try NativeCompute.stampHeldF32WeightSources(cb, data, self.weights.?.fetcher.handles.items);
-    self.program = (try whisper_arch.PreparedSingleToken.init(cb, metadata.allocator(), config, self.encoder.?, geometry.encoder_rows, &self.weights.?)) orelse return false;
+    self.program = (try whisper_arch.PreparedSingleToken.init(cb, data, metadata.allocator(), config, self.encoder.?, geometry.encoder_rows, &self.weights.?)) orelse return false;
     try self.program.?.schedule.setHostWorkspaceAllocator(allocator);
     var requirements = @import("prepared_storage_admission.zig").Builder{ .allocator = metadata.allocator() };
     defer requirements.deinit();
@@ -18564,28 +18564,22 @@ fn nativeWhisperAssignedSourceCase(a: std.mem.Allocator, admitted: bool) !void {
     var decoder = (try whisperNativeDecoder(session, a, null, &hidden, 2)).?;
     var decoder_open = true;
     defer if (decoder_open) decoder.deinit();
-    if (decoder.cache.native_program == null) {
-        // Unexpected compatibility in this positive fixture must reveal the
-        // SAME cold constructor's original error-return trace. Release the
-        // actual numerical decoder/gate/B before making that cold query;
-        // never retry or substitute numerical execution after dispatch.
-        decoder.deinit();
-        decoder_open = false;
-        try std.testing.expect(session.execution_gate.?.tryLock());
-        session.execution_gate.?.unlock();
-        var diagnostic_cleanup = try ReceiverCleanup.beginForOwnedGate(session);
-        defer diagnostic_cleanup.finish();
-        const diagnostic_config = owner.arch_config.whisper;
-        const diagnostic_geometry = try whisper_arch.CacheGeometry.init(diagnostic_config, 2);
-        var diagnostic_base = try incrementalBasePermit(session, diagnostic_config, diagnostic_geometry, false, false);
-        defer diagnostic_base.deinit();
-        const attempted = (try prepareColdNativeWhisper(session, a, null, diagnostic_config, diagnostic_geometry, &diagnostic_base, .{ .host = &hidden })) orelse return error.NativeWhisperColdPreparationDeclined;
-        defer attempted.destroy(.{ .boundary = diagnostic_cleanup.boundary() });
-        return error.NativeWhisperColdPreparedButNotInstalled;
-    }
     try std.testing.expect(decoder.cache.native_program != null);
     const program = &decoder.cache.native_program.?;
     const frame = program.schedule.frame.?;
+    const immutable = program.schedule.root.immutable_bindings orelse return error.MissingWhisperSourceBindings;
+    for (immutable.entries) |binding| {
+        try std.testing.expect(binding.value == .resident);
+        const facts = binding.value.resident;
+        try std.testing.expect(facts.planes.len == 1 and facts.planes[0].role == .primary and facts.planes[0].descriptor.shape.dtype == .f32 and facts.planes[0].writable == null);
+    }
+    var gather_routes: usize = 0;
+    for (program.schedule.steps) |node| if (program.schedule.descriptors[node].?.operation == .gather) {
+        const selected = program.schedule.selected.pool.preparedKernelRoute(node) orelse return error.MissingWhisperGatherRoute;
+        try std.testing.expect(@import("assigned_kernel_route.zig").isDirect(selected));
+        gather_routes += 1;
+    };
+    try std.testing.expectEqual(@as(usize, 2), gather_routes);
     try std.testing.expect(frame.native_program_storage_sealed and frame.storage_admission == null);
     try std.testing.expectEqual(@as(usize, 1), frame.scope_backends);
     if (domain) |value| {

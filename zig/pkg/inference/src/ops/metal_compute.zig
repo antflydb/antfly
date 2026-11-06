@@ -1030,7 +1030,11 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
             if (metal_runtime.antfly_metal_unbind_packed_use_service(provider.raw_decode_runtime, raw, nonce) != 0) return error.PackedProjectionUseScopeChanged;
         }
         const state: *operation_owner_mod.Owner.Record = @ptrCast(@alignCast(raw));
-        try state.finishAndRelease(nonce);
+        if (record.mode == .managed) {
+            try state.finishMetadata(nonce);
+            try state.publishTerminal(nonce);
+            try state.release(nonce);
+        } else try state.finishAndRelease(nonce);
     }
     fn operationDrain(raw: *anyopaque, nonce: u64) !void {
         const record = try operationRecord(raw, nonce);
@@ -1051,12 +1055,24 @@ pub const MetalCompute = if (build_options.enable_metal) struct {
         }
         const state: *operation_owner_mod.Owner.Record = @ptrCast(@alignCast(raw));
         try state.finishMetadata(nonce);
+        if (record.mode == .managed and record.entered) try state.publishTerminal(nonce);
     }
     fn operationRelease(raw: *anyopaque, nonce: u64) void {
         const record: *operation_owner_mod.Owner.Record = @ptrCast(@alignCast(raw));
         record.release(nonce) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
     }
-    const operation_vtable = operation_mod.Lease.VTable{ .validate = operationValidate, .validate_active = operationValidateActive, .begin = operationBegin, .finish = operationFinish, .drain = operationDrain, .release = operationRelease, .cleanup_epoch = &operation_owner_mod.cleanup_epoch_services };
+    fn bindOperationTerminalEvidence(raw: *anyopaque, nonce: u64, request: operation_mod.Request, output: *operation_mod.TerminalEvidence) !bool {
+        const record = try operationRecord(raw, nonce);
+        try validateOperationSnapshot(&record, request);
+        if (record.mode != .managed or !record.entered or !try record.ticket.ownsGate()) return false;
+        const compute: *MetalCompute = @ptrCast(@alignCast(request.implementation.context));
+        const profile = compute.packed_projection_profile orelse return false;
+        if (profile.packed_owner == null or profile.program != request.program or profile.token.context != raw or profile.token.nonce != nonce) return false;
+        const state: *operation_owner_mod.Owner.Record = @ptrCast(@alignCast(raw));
+        try state.bindTerminalEvidence(nonce, request.implementation, output);
+        return true;
+    }
+    const operation_vtable = operation_mod.Lease.VTable{ .validate = operationValidate, .validate_active = operationValidateActive, .begin = operationBegin, .finish = operationFinish, .drain = operationDrain, .release = operationRelease, .cleanup_epoch = &operation_owner_mod.cleanup_epoch_services, .bind_terminal_evidence = bindOperationTerminalEvidence };
     fn currentEngineOperation(raw: *anyopaque) ?operation_mod.Borrowed {
         const self: *MetalCompute = @ptrCast(@alignCast(raw));
         // This compute owns this request scope explicitly; never look up another

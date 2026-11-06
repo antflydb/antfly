@@ -458,7 +458,7 @@ pub const Runtime = struct {
                 var physical_epoch = if (options.storage_admission) |cap| if (cap.services.takeBacking != null) try retainPhysicalCleanupEpoch(cap, backend_operation) else null else null;
                 defer if (physical_epoch) |*epoch| epoch.release();
                 const physical_cleanup = @import("../execution/cleanup_context.zig").Context{ .operation = backend_operation, .boundary = if (physical_epoch) |*epoch| epoch else null };
-                const frame = if (selected_pool) |pool| try pool.acquirePreparedWithRegions(options.storage_admission, options.physical_frame_claim, options.region_claims) else null;
+                const frame = if (selected_pool) |pool| try pool.acquirePreparedWithRegionsAndOperation(options.storage_admission, options.physical_frame_claim, options.region_claims, graph, backend_operation) else null;
                 if (options.prepared_routes != null and frame == null) return error.PreparedPhysicalFrameUnavailable;
                 var frame_finished = false;
                 defer if (frame) |active| {

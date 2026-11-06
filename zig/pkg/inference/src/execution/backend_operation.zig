@@ -28,6 +28,42 @@ pub const CleanupEpochServices = struct {
     retain: *const fn (*anyopaque, u64) anyerror!?@import("retirement_sink.zig").Epoch,
 };
 
+/// Independent metadata evidence for one exact managed operation. It owns no
+/// provider, request stack, cleanup Epoch, or numerical resource. Terminal
+/// validation never invokes SDK work and never grants execution authority.
+pub const TerminalEvidence = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    context: ?*anyopaque = null,
+    nonce: u64 = 0,
+    implementation: ?kernel.Implementation = null,
+    next: ?*TerminalEvidence = null,
+    terminal: bool = false,
+    // detach is called with mutex held. It must unlink under the actual
+    // record exclusion, unlock this node, then release independent metadata.
+    detach: ?*const fn (*TerminalEvidence) void = null,
+    pub fn lock(self: *TerminalEvidence) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+    }
+    pub fn validateTerminal(self: *TerminalEvidence, implementation: kernel.Implementation) !void {
+        self.lock();
+        defer self.mutex.unlock();
+        const source = self.implementation orelse return error.PhysicalCompletionUnavailable;
+        if (implementation.context != source.context or implementation.table != source.table) return error.BackendOperationChanged;
+        if (!self.terminal or self.context != null or self.nonce == 0) return error.PhysicalCompletionUnavailable;
+    }
+    pub fn deinit(self: *TerminalEvidence) void {
+        self.lock();
+        if (self.detach) |unlink| {
+            unlink(self);
+            return;
+        }
+        self.implementation = null;
+        self.nonce = 0;
+        self.terminal = false;
+        self.mutex.unlock();
+    }
+};
+
 pub const Lease = struct {
     context: *anyopaque,
     nonce: u64,
@@ -60,6 +96,7 @@ pub const Lease = struct {
         /// retained and the provider's checked teardown waits for its handlers.
         release: *const fn (*anyopaque, u64) void,
         cleanup_epoch: ?*const CleanupEpochServices = null,
+        bind_terminal_evidence: ?*const fn (*anyopaque, u64, Request, *TerminalEvidence) anyerror!bool = null,
     };
 
     pub fn borrow(self: *const Lease) ?Borrowed {
@@ -126,6 +163,11 @@ pub const Borrowed = struct {
     nonce: u64,
     mode: Mode,
     vtable: *const Lease.VTable,
+    pub fn bindTerminalEvidence(self: Borrowed, request: Request, output: *TerminalEvidence) !bool {
+        try self.validate(request);
+        const bind = self.vtable.bind_terminal_evidence orelse return false;
+        return bind(self.context, self.nonce, request, output);
+    }
     pub fn retainCleanupEpoch(self: Borrowed) !?@import("retirement_sink.zig").Epoch {
         if (self.nonce == 0) return error.BackendOperationConsumed;
         if (self.mode == .metadata) return null;

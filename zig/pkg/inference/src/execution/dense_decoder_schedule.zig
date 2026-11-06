@@ -60,28 +60,30 @@ pub const Builder = struct {
         self.planes.deinit(a);
         self.graph.deinit();
     }
-    pub fn parameter(self: *Builder, shape: Shape, value: CT, immutable: bool) !Node {
+    pub fn parameter(self: *Builder, shape: Shape, value: CT) !Node {
+        return self.parameterWithPlane(shape, value, try residentPlane(&self.backend, value));
+    }
+    fn parameterWithPlane(self: *Builder, shape: Shape, value: CT, observed: @import("storage_ownership.zig").Plane) !Node {
         var b = ml.graph.Builder.init(&self.graph);
         var name: [40]u8 = undefined;
         const id = try b.parameter(try std.fmt.bufPrint(&name, "dense.input.{d}", .{self.graph.nodeCount()}), shape);
         try self.descriptors.append(self.graph.allocator, null);
         try self.values.append(self.graph.allocator, value);
-        const binding: route.Binding = if (immutable) .{ .tensor = .{ .value = value, .implementation = .{ .context = self.backend.ptr, .table = self.backend.vtable } } } else block: {
+        const binding: route.Binding = block: {
             const plane = try self.graph.allocator.create(@import("storage_ownership.zig").Plane);
             errdefer self.graph.allocator.destroy(plane);
-            plane.* = try residentPlane(&self.backend, value);
+            plane.* = observed;
             try self.planes.append(self.graph.allocator, plane);
             break :block .{ .resident = .{ .logical = shape, .planes = @as([*]const @import("storage_ownership.zig").Plane, @ptrCast(plane))[0..1], .implementation = .{ .context = self.backend.ptr, .table = self.backend.vtable } } };
         };
         try self.bindings.append(self.graph.allocator, .{ .node_id = id, .value = binding });
         return id;
     }
-    /// Native F32 linear consumes an actual resident source plane through the
-    /// existing dense Into route. Its retained cache weight owner remains the
-    /// architecture's responsibility, with source stamps revalidated at entry.
-    /// Gather keeps its original tensor fact and packed-row selector.
-    pub fn residentWeight(self: *Builder, shape: Shape, value: CT) !Node {
-        const node = try self.parameter(shape, value, false);
+    /// An actual typed held-source proof, not a partial generic storage report.
+    /// The architecture retains the immutable witness and Model/store owner;
+    /// the existing F32 Direct route receives only this borrowed primary.
+    pub fn residentWeight(self: *Builder, value: CT, plane: @import("storage_ownership.zig").Plane) !Node {
+        const node = try self.parameterWithPlane(plane.descriptor.shape, value, plane);
         const binding = self.bindings.pop().?;
         std.debug.assert(binding.node_id == node and binding.value == .resident);
         try self.immutable_resident.append(self.graph.allocator, binding);
@@ -165,8 +167,8 @@ pub fn residentPlane(cb: *const ops.ComputeBackend, value: CT) !@import("storage
     return plane;
 }
 
-pub fn projectionDescriptor(cb: *const ops.ComputeBackend, input: CT, weight: CT, bias: ?CT, destination: CT, rows: usize, width: usize, out: usize) !ops.kernel_descriptor.Descriptor {
-    return .{ .operation = .{ .linear = try ops.kernel_descriptor.Linear.init(rows, width, out, bias != null) }, .input_count = if (bias != null) 3 else 2, .output_shape = (try residentPlane(cb, destination)).descriptor.shape, .input_shapes = .{ (try residentPlane(cb, input)).descriptor.shape, (try residentPlane(cb, weight)).descriptor.shape, if (bias) |b| (try residentPlane(cb, b)).descriptor.shape else undefined } };
+pub fn projectionDescriptor(cb: *const ops.ComputeBackend, expected_data: *const anyopaque, input: CT, weight: CT, bias: ?CT, destination: CT, rows: usize, width: usize, out: usize) !ops.kernel_descriptor.Descriptor {
+    return .{ .operation = .{ .linear = try ops.kernel_descriptor.Linear.init(rows, width, out, bias != null) }, .input_count = if (bias != null) 3 else 2, .output_shape = (try residentPlane(cb, destination)).descriptor.shape, .input_shapes = .{ (try residentPlane(cb, input)).descriptor.shape, (try @import("../ops/native_compute.zig").NativeCompute.heldF32WeightPrimary(cb, expected_data, weight)).descriptor.shape, if (bias) |b| (try @import("../ops/native_compute.zig").NativeCompute.heldF32WeightPrimary(cb, expected_data, b)).descriptor.shape else undefined } };
 }
 
 pub const Schedule = struct {
@@ -220,14 +222,8 @@ pub const Schedule = struct {
         self.root.coverage_reachable = self.analysis.reachable;
         self.root.coverage_backend = self.backend;
         self.root.native_frame_dispatch = true;
-        var immutable: std.ArrayList(route.InputBinding) = .empty;
-        defer immutable.deinit(a);
-        var dynamic: std.ArrayList(route.InputBinding) = .empty;
-        defer dynamic.deinit(a);
-        for (self.bindings) |binding| if (binding.value == .tensor) try immutable.append(a, binding) else try dynamic.append(a, binding);
-        try immutable.appendSlice(a, builder.immutable_resident.items);
-        try self.root.configureRoutes(immutable.items);
-        self.selected = (try self.root.prepareRoutesWithPolicy(dynamic.items, .compatibility_regions)) orelse return error.UnsupportedDenseSchedule;
+        try self.root.configureRoutes(builder.immutable_resident.items);
+        self.selected = (try self.root.prepareRoutesWithPolicy(self.bindings, .compatibility_regions)) orelse return error.UnsupportedDenseSchedule;
         errdefer self.selected.release();
         if (self.selected.pool.payload_coverage != .complete or self.selected.pool.regions.len != 0) return error.UnsupportedDenseSchedule;
         self.frame = null;
