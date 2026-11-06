@@ -5746,6 +5746,12 @@ pub const Reader = struct {
         if (entry.compressed_obj_stream_id) |obj_stream_id| {
             return try self.readCompressedObject(ptr, obj_stream_id, entry.compressed_index orelse return error.InvalidObjectStream, projection, null);
         }
+        return self.readUncompressedIndirectObjectProjected(ptr, entry, projection);
+    }
+
+    fn readUncompressedIndirectObjectProjected(self: *const Reader, ptr: syntax.ObjRef, entry: XrefEntry, projection: syntax.Projection) anyerror!syntax.Object {
+        std.debug.assert(entry.compressed_obj_stream_id == null);
+        if (!entry.in_use) return error.ObjectNotInUse;
         if (entry.offset >= self.bytes.len) return error.InvalidObjectOffset;
         if (projection == .required_resources or projection == .resource_container)
             if (self.metadata_frames) |frames| frames.deinit();
@@ -5858,7 +5864,7 @@ pub const Reader = struct {
             // Reject these before entering their container: a length pointing
             // back into its own object stream must not recurse through headers.
             if (entry.compressed_obj_stream_id != null) return error.InvalidStreamLength;
-            var value = try scalar_reader.readIndirectObjectProjected(reference, .integer);
+            var value = try scalar_reader.readUncompressedIndirectObjectProjected(reference, entry, .integer);
             defer value.deinit(self.alloc);
             if (value.asInteger()) |length| {
                 if (length < 0) return error.InvalidStreamLength;
@@ -37932,7 +37938,7 @@ test "reader indirect length references reject cycles and invalid lengths" {
         .{ .extra = &.{ "9 0 R", "8 0 R" }, .reference = 8, .expected = error.InvalidStreamLength },
         .{ .extra = &.{"-1"}, .reference = 8, .expected = error.InvalidStreamLength },
         .{ .extra = &.{"2"}, .reference = 8, .expected = error.MissingEndStream },
-        .{ .extra = &.{"9223372036854775807"}, .reference = 8, .expected = error.UnexpectedEof },
+        .{ .extra = &.{"9223372036854775807"}, .reference = 8, .expected = if (@bitSizeOf(usize) < 64) error.InvalidStreamLength else error.UnexpectedEof },
         .{ .extra = &.{}, .reference = 7, .expected = error.InvalidStreamLength },
         .{ .extra = &.{}, .reference = 400, .expected = error.ObjectNotFound },
     };
