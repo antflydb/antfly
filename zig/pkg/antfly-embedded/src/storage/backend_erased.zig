@@ -890,6 +890,12 @@ pub const NamespaceWriteTxn = struct {
         append_put: ?*const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror!void,
         open_cursor: ?*const fn (Allocator, *anyopaque, backend_types.Namespace) anyerror!Cursor = null,
+        /// Optional: marks the pending commit as a background/ride-along
+        /// publication that must not force its own durable sync (it becomes
+        /// durable whenever the next real durable boundary runs). Absent for
+        /// backends with no such distinction (every commit is durable).
+        /// See `NamespaceWriteTxn.setDurableHint`.
+        set_durable: ?*const fn (*anyopaque, bool) void = null,
     };
     const BoundaryAbi = runtime_callback_abi.Boundary(VTable);
 
@@ -901,6 +907,16 @@ pub const NamespaceWriteTxn = struct {
     pub fn commit(self: *NamespaceWriteTxn) !void {
         try BoundaryAbi.call("commit", self.boundary_dispatch, self.vtable.commit, .{ self.allocator, self.ptr });
         self.* = undefined;
+    }
+
+    /// Call before `commit()`. `durable = false` asks the backend to ride
+    /// this commit along on the next durable boundary instead of forcing
+    /// its own (safe only for background/maintenance work the caller can
+    /// afford to redo after a crash, never for a publication a caller is
+    /// waiting on). A no-op for backends that do not implement it, which
+    /// always commit durably regardless.
+    pub fn setDurableHint(self: *NamespaceWriteTxn, durable: bool) void {
+        if (self.vtable.set_durable) |f| f(self.ptr, durable);
     }
 
     pub fn get(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8) ![]const u8 {
@@ -2006,6 +2022,10 @@ pub fn namespaceWriteTxnFrom(
             errdefer cursor.close();
             return try cursorFromWithParent(alloc, cursor, parentReleaseFor(parent));
         }
+
+        pub fn setDurable(ptr: *anyopaque, durable: bool) void {
+            unbox(ptr).handle.setDurable(durable);
+        }
     };
 
     return .{
@@ -2020,6 +2040,7 @@ pub fn namespaceWriteTxnFrom(
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
             .open_cursor = if (@hasDecl(Handle, "openCursor")) vt.openCursor else null,
+            .set_durable = if (@hasDecl(Handle, "setDurable")) vt.setDurable else null,
         },
     };
 }

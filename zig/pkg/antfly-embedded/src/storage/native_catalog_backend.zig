@@ -68,11 +68,12 @@ pub const Mutation = struct {
 /// file's native index-catalog root.
 pub const Sink = struct {
     ptr: *anyopaque,
-    /// Apply every mutation in `mutations`, in order, as ONE durable commit
-    /// (one `syncData`/checkpoint publication at the underlying
-    /// native-catalog layer), or none of them on failure. `mutations` is
-    /// only valid for the duration of the call.
-    submit: *const fn (ptr: *anyopaque, scope: []const u8, mutations: []const Mutation) anyerror!void,
+    /// Apply every mutation in `mutations`, in order, as ONE native
+    /// transaction (one `syncData`/checkpoint publication if `durable`, or
+    /// a visible-but-not-yet-synced ride-along commit otherwise -- see
+    /// `NamespaceTxn.setDurable`), or none of them on failure. `mutations`
+    /// is only valid for the duration of the call.
+    submit: *const fn (ptr: *anyopaque, scope: []const u8, mutations: []const Mutation, durable: bool) anyerror!void,
     /// Loads every entry currently committed under this sink's scope, to
     /// seed the in-memory mirror on open. Called once, synchronously, from
     /// `Backend.init`. The returned slice and every entry's bytes are
@@ -242,6 +243,10 @@ pub const Backend = struct {
         pending: std.ArrayListUnmanaged(Mutation) = .empty,
         pending_arena: std.heap.ArenaAllocator,
         closed: bool = false,
+        // See `setDurable`. Defaults to durable: every existing caller that
+        // never calls `setDurable(false)` keeps committing durably, exactly
+        // as before this field existed.
+        durable: bool = true,
 
         fn open(backend: *Backend, read_only: bool) !NamespaceTxn {
             lockBackend(backend);
@@ -283,19 +288,42 @@ pub const Backend = struct {
             self.teardown();
         }
 
+        /// Marks this (still-open) write transaction's eventual commit as a
+        /// background/ride-along publication: it becomes visible to this
+        /// backend's own readers immediately on commit, same as any other,
+        /// but does not force its own durable sync -- it rides along on the
+        /// next durable commit against the same underlying `.aflite` file
+        /// (primary write, another index's durable commit, or an explicit
+        /// idle-flush/close sync), per
+        /// `native.NativeFile.commitTransactionWithDurability`'s deferred-
+        /// publication path. Call before `commit()`. Never call this for a
+        /// publication a caller is waiting on to be durably acknowledged --
+        /// only for work that is safe to redo after a crash (segment merge/
+        /// compaction, retirement cleanup, catch-up for async consumers).
+        /// This is the WS2-shaped helper the design doc's "background work
+        /// must never pay its own fsync" note asks for ahead of
+        /// `Store.stageRideAlong`; once that lands, this flag is exactly
+        /// what it should set instead.
+        pub fn setDurable(self: *NamespaceTxn, durable: bool) void {
+            self.durable = durable;
+        }
+
         pub fn commit(self: *NamespaceTxn) !void {
             if (self.closed) return error.ReadOnly;
             if (self.read_only) return error.ReadOnly;
             const rc = self.rc orelse return error.ReadOnly;
 
-            // Durable first: readers (via the backend-state swap below) must
-            // never observe a mutation this backend has not yet durably
-            // committed through the sink. On failure, the in-memory clone
-            // in `rc` is simply discarded by `teardown`/`abort` -- the
-            // caller's errdefer pattern (`errdefer txn.abort()` after
-            // `try txn.commit()`) handles that.
+            // Durable-first (when durable): readers (via the backend-state
+            // swap below) must never observe a mutation this backend has not
+            // yet durably committed through the sink. On failure, the
+            // in-memory clone in `rc` is simply discarded by
+            // `teardown`/`abort` -- the caller's errdefer pattern
+            // (`errdefer txn.abort()` after `try txn.commit()`) handles that.
+            // When `!self.durable`, the sink still applies the mutations (so
+            // this backend's own readers see them right away) but does not
+            // force a sync; see `setDurable`.
             if (self.pending.items.len != 0) {
-                try self.backend.sink.submit(self.backend.sink.ptr, self.backend.scope, self.pending.items);
+                try self.backend.sink.submit(self.backend.sink.ptr, self.backend.scope, self.pending.items, self.durable);
             }
 
             lockBackend(self.backend);
@@ -442,6 +470,8 @@ const TestSink = struct {
     allocator: Allocator,
     entries: std.ArrayListUnmanaged(Entry) = .empty,
     submit_calls: usize = 0,
+    durable_submit_calls: usize = 0,
+    non_durable_submit_calls: usize = 0,
 
     fn deinit(self: *TestSink) void {
         for (self.entries.items) |e| {
@@ -459,10 +489,11 @@ const TestSink = struct {
         return null;
     }
 
-    fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const Mutation) anyerror!void {
+    fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const Mutation, durable: bool) anyerror!void {
         const self: *TestSink = @ptrCast(@alignCast(ptr));
         _ = scope;
         self.submit_calls += 1;
+        if (durable) self.durable_submit_calls += 1 else self.non_durable_submit_calls += 1;
         for (mutations) |m| {
             if (m.is_delete) {
                 if (self.findIndex(m.namespace, m.key)) |i| {
@@ -589,7 +620,7 @@ test "native catalog backend seeds its mirror from the sink on open" {
     defer test_sink.deinit();
     try TestSink.submit(&test_sink, "idx1", &.{
         .{ .namespace = "meta", .key = "k", .value = "preexisting" },
-    });
+    }, true);
     test_sink.submit_calls = 0;
 
     var backend = try Backend.init(a, .{ .sink = test_sink.sink(), .scope = "idx1" });
@@ -635,13 +666,50 @@ test "native catalog backend read transactions are snapshot isolated across a co
     try std.testing.expectEqualStrings("after", try read_after.get(.{}, "k"));
 }
 
+test "native catalog backend setDurable makes a ride-along commit visible without marking it durable" {
+    const a = std.testing.allocator;
+    var test_sink = TestSink{ .allocator = a };
+    defer test_sink.deinit();
+
+    var backend = try Backend.init(a, .{ .sink = test_sink.sink(), .scope = "idx1" });
+    defer backend.close();
+    var runtime = try backend.runtimeNamespaceStore(a);
+    defer runtime.deinit();
+
+    {
+        var txn = try runtime.beginWrite();
+        txn.setDurableHint(false);
+        try txn.put(.{ .name = "meta" }, "merge-result", "ride-along");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), test_sink.submit_calls);
+    try std.testing.expectEqual(@as(usize, 0), test_sink.durable_submit_calls);
+    try std.testing.expectEqual(@as(usize, 1), test_sink.non_durable_submit_calls);
+
+    // Ride-along commits are still immediately visible to this backend's
+    // own readers; only the sink's own durability bookkeeping differs.
+    {
+        var txn = try runtime.beginRead();
+        defer txn.abort();
+        try std.testing.expectEqualStrings("ride-along", try txn.get(.{ .name = "meta" }, "merge-result"));
+    }
+
+    // Omitting setDurable keeps the default: durable.
+    {
+        var txn = try runtime.beginWrite();
+        try txn.put(.{ .name = "meta" }, "ack-result", "foreground");
+        try txn.commit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), test_sink.durable_submit_calls);
+}
+
 test "native catalog backend sink failure aborts the transaction without publishing" {
     const a = std.testing.allocator;
     var test_sink = TestSink{ .allocator = a };
     defer test_sink.deinit();
 
     const FailingSink = struct {
-        fn submit(_: *anyopaque, _: []const u8, _: []const Mutation) anyerror!void {
+        fn submit(_: *anyopaque, _: []const u8, _: []const Mutation, _: bool) anyerror!void {
             return error.InjectedSyncFault;
         }
     };

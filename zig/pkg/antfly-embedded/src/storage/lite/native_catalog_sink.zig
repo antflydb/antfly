@@ -117,11 +117,19 @@ pub const Sink = struct {
         return .{ .ptr = self, .submit = submit, .loadAllAlloc = loadAllAlloc };
     }
 
-    fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation) anyerror!void {
+    fn submit(ptr: *anyopaque, scope: []const u8, mutations: []const native_catalog_backend.Mutation, durable: bool) anyerror!void {
         const self: *Sink = @ptrCast(@alignCast(ptr));
         if (mutations.len == 0) return;
         var ctx = ApplyCtx{ .scope = scope, .mutations = mutations, .allocator = self.allocator };
-        try self.store.submitIndexMutation(&ctx, ApplyCtx.apply, true);
+        // `durable` threads straight through to docstore.Store's own
+        // group-commit queue, exactly as lite/index_storage.zig's
+        // appendFileAbsolute already does for its own caller-supplied `sync`
+        // flag: `durable=false` makes the mutation visible through the next
+        // native checkpoint read without forcing its own `syncData` (see
+        // native.zig's commitTransactionWithDurability's deferred-
+        // publication path) -- the ride-along commit this backend's
+        // `NamespaceTxn.setDurable(false)` asks for.
+        try self.store.submitIndexMutation(&ctx, ApplyCtx.apply, durable);
     }
 
     fn loadAllAlloc(ptr: *anyopaque, allocator: Allocator, scope: []const u8) anyerror![]native_catalog_backend.Entry {

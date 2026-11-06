@@ -1269,6 +1269,19 @@ pub const PersistentIndex = struct {
             return error.ReadOnly;
         }
 
+        /// Marks this (still-open) write transaction as a background/
+        /// ride-along publication ahead of `commit()`: safe only for work
+        /// a caller can afford to redo after a crash (segment merge,
+        /// retirement cleanup, async-consumer catch-up), never for a
+        /// publication a caller is waiting on to be durably acknowledged.
+        /// A no-op on backends with no such distinction (`.lsm`/`.mem`
+        /// always commit durably); real on `.native_catalog` (see
+        /// `native_catalog_backend.zig`'s `NamespaceTxn.setDurable`). This
+        /// is the helper WS2's `Store.stageRideAlong` is meant to replace.
+        pub fn setDurable(self: *MainTxn, durable: bool) void {
+            if (self.write) |*txn| txn.setDurableHint(durable);
+        }
+
         pub fn get(self: *MainTxn, keyspace: MainKeyspace, key: []const u8) ![]const u8 {
             const namespace = runtimeNamespace(keyspace);
             if (self.read) |*txn| return try txn.get(namespace, key);
@@ -3373,6 +3386,11 @@ pub const PersistentIndex = struct {
 
         var txn = try self.beginWriteMainTxn();
         errdefer txn.abort();
+        // Merge/compaction: safe to redo after a crash (the pre-merge
+        // segments stay active until this commits), so this never needs its
+        // own durable sync -- it rides along on the next real durable
+        // boundary. See MainTxn.setDurable.
+        txn.setDurable(false);
 
         if (require_active) {
             const active_ids = try self.loadActiveSegmentIds(&txn, self.alloc);
