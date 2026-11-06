@@ -687,6 +687,8 @@ pub const ExecutionCapabilities = struct {
     /// Maximum sum of bucket-padded token rows in one encoder cohort.
     text_batch_padded_tokens: usize = 0,
     cooperative_steps: bool = false,
+    /// F16 shared prefix storage is protected by the model execution scope and KV lock.
+    cooperative_prompt_cache: bool = false,
     max_active_requests: usize = 1,
     max_batch_rows: usize = 1,
     /// Mixed prefill/decode padding is excluded unless explicitly qualified.

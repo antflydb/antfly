@@ -4283,6 +4283,18 @@ pub const NativeGenerationPipeline = struct {
     }
 
     fn lockExecution(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) !ExecutionScope {
+        return self.lockExecutionPhase(mutex, .step);
+    }
+
+    fn lockKvMetadata(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex) !ExecutionScope {
+        // Backends without an explicit stream-drain contract keep the normal
+        // request transition. The CUDA cooperative scope can advance host KV
+        // tables without resetting an otherwise unchanged execution owner.
+        return self.lockExecutionPhase(mutex, if (self.prompt_cache != null and self.cb.execution_batch_drain != null and
+            platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_KV_METADATA_SCOPE", true)) .metadata else .step);
+    }
+
+    fn lockExecutionPhase(self: *const NativeGenerationPipeline, mutex: *std.atomic.Mutex, phase: @import("../ops/execution_scope.zig").Phase) !ExecutionScope {
         const shared = self.execution_lock == mutex;
         const waiters = if (shared) self.execution_phase_waiters else null;
         if (waiters) |count| _ = count.fetchAdd(1, .acq_rel);
@@ -4291,6 +4303,7 @@ pub const NativeGenerationPipeline = struct {
         if (control.io == null) control.io = self.io;
         var scope = try ExecutionScope.acquire(control, .{
             .mutex = mutex,
+            .phase = phase,
             .lane = if (shared) self.execution_gate else null,
             .interactive = waiters != null,
             .contention_wait_ns = self.execution_contention_wait_ns,
@@ -6143,6 +6156,8 @@ pub const NativeGenerationPipeline = struct {
         var cached_prompt_tokens: usize = 0;
         var prefill_ids = token_ids[0..seq_len];
         if (self.prompt_cache) |cache| {
+            var cache_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+            defer if (cache_scope) |*scope| scope.deinit();
             const cache_eligible =
                 config.prompt_cache_enabled and
                 config.prompt_cache_key != null and
@@ -6327,6 +6342,8 @@ pub const NativeGenerationPipeline = struct {
         }
 
         if (self.prompt_cache) |cache| {
+            var cache_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+            defer if (cache_scope) |*scope| scope.deinit();
             if (config.prompt_cache_enabled and prepared_multimodal_prompt == null and prepared_qwen3vl_prompt == null and decode_state.kv_manager == cache.managerPtr()) {
                 if (config.prompt_cache_key) |cache_key| {
                     if (decode_state.sequence_id) |sequence_id| {
@@ -6490,7 +6507,7 @@ pub const NativeGenerationPipeline = struct {
                     prefill_greedy_token = null;
                     var continued_decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
                     const kv_mutation_mutex = batchKvMutationMutex(self.execution_lock, decode_state.kv_lock);
-                    var execution_scope = if (kv_mutation_mutex) |mutex| try self.lockExecution(mutex) else null;
+                    var execution_scope = if (kv_mutation_mutex) |mutex| try self.lockKvMetadata(mutex) else null;
                     defer if (execution_scope) |*scope| scope.deinit();
                     _ = try continued_decode_runtime.appendGeneratedToken();
                 }
@@ -7018,6 +7035,8 @@ pub const NativeGenerationPipeline = struct {
         // page-aligns that valid prefix and is a no-op for non-radix modes.
         if (tokens_generated > 0) {
             if (self.prompt_cache) |cache| {
+                var cache_scope = if (self.execution_lock) |mutex| try self.lockExecution(mutex) else null;
+                defer if (cache_scope) |*scope| scope.deinit();
                 const cache_eligible =
                     config.prompt_cache_enabled and
                     config.prompt_cache_key != null and
@@ -8876,7 +8895,7 @@ pub const NativeGenerationPipeline = struct {
             if (config.kv_cache_mode == .select_v1) try decode_state.compactSelectedGlobalDonors(self.gpt_config, self.execution_control);
             {
                 const kv_mutation_mutex = batchKvMutationMutex(self.execution_lock, decode_state.kv_lock);
-                var execution_scope = if (kv_mutation_mutex) |mutex| try self.lockExecution(mutex) else null;
+                var execution_scope = if (kv_mutation_mutex) |mutex| try self.lockKvMetadata(mutex) else null;
                 defer if (execution_scope) |*scope| scope.deinit();
                 _ = try decode_runtime.appendGeneratedToken();
             }
@@ -17817,6 +17836,54 @@ test "shared batch KV mutations use the model execution lock" {
     try std.testing.expect(batchKvMutationMutex(&execution_mutex, &kv_mutex) == &execution_mutex);
     try std.testing.expect(batchKvMutationMutex(&execution_mutex, null) == null);
     try std.testing.expect(batchKvMutationMutex(null, &kv_mutex) == null);
+}
+
+test "execution scope KV metadata requires an attached cache and drain capability" {
+    const Probe = struct {
+        entries: usize = 0,
+        drains: usize = 0,
+        fn enter(raw: *anyopaque, _: u64) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.entries += 1;
+        }
+        fn drain(raw: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.drains += 1;
+        }
+    };
+    var probe = Probe{};
+    var mutex: std.atomic.Mutex = .unlocked;
+    var cache = runtime.kv.prompt_cache.PromptPrefixCache.init(std.testing.allocator);
+    defer cache.deinit();
+    var pipeline = NativeGenerationPipeline{
+        .allocator = std.testing.allocator,
+        .cb = .{ .ptr = &probe, .vtable = undefined, .execution_enter = Probe.enter, .execution_batch_drain = Probe.drain, .execution_owner = 1 },
+        .gpt_config = .{},
+        .tokenizer = undefined,
+        .execution_lock = &mutex,
+    };
+    {
+        var scope = try pipeline.lockKvMetadata(&mutex);
+        defer scope.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, 1), probe.entries);
+    try std.testing.expectEqual(@as(usize, 0), probe.drains);
+    pipeline.prompt_cache = &cache;
+    {
+        var scope = try pipeline.lockKvMetadata(&mutex);
+        defer scope.deinit();
+    }
+    const enabled = platform.env.getenvBoolDefault("ANTFLY_INFERENCE_CUDA_KV_METADATA_SCOPE", true);
+    try std.testing.expectEqual(@as(usize, if (enabled) 1 else 2), probe.entries);
+    try std.testing.expectEqual(@as(usize, if (enabled) 1 else 0), probe.drains);
+    pipeline.cb.execution_batch_drain = null;
+    {
+        var scope = try pipeline.lockKvMetadata(&mutex);
+        defer scope.deinit();
+    }
+    try std.testing.expectEqual(@as(usize, if (enabled) 2 else 3), probe.entries);
+    try std.testing.expect(mutex.tryLock());
+    mutex.unlock();
 }
 
 test "cuda prefill first token coalesces only short eligible legacy prompts" {

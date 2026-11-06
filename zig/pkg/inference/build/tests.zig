@@ -268,10 +268,16 @@ pub fn addDefault(ctx: Context, suite: Suite, checks: Checks) *std.Build.Step {
     while (batch_imports.next()) |entry| batch_root.addImport(entry.key_ptr.*, entry.value_ptr.*);
     batch_root.link_libc = true;
     // Focused aarch64 CPU/CUDA builds peak at 1 GiB; reserve 2 GiB for cold CI.
-    const batch_tests = b.addTest(.{ .max_rss = 2 * 1024 * 1024 * 1024, .root_module = batch_root, .filters = &.{ "execution scope", "execution owner transitions", "execution resource release", "execution batch", "cooperative decode batches", "cooperative decode publication", "runtime.scheduler.native_generate", "test_0" } });
+    const batch_tests = b.addTest(.{ .max_rss = 2 * 1024 * 1024 * 1024, .root_module = batch_root, .filters = &.{ "execution scope", "execution owner transitions", "execution resource release", "execution batch", "cooperative decode batches", "cooperative decode publication", "generation cooperative execution", "generation admission work", "prompt cache", "runtime.scheduler.native_generate", "test_0" } });
     const run_batch_tests = ctx.addRunArtifact(batch_tests);
     test_step.dependOn(&run_batch_tests.step);
     ctx.step("test-execution-batch", "Verify cohort budgets, scope retirement and decode arithmetic without a GPU").dependOn(&run_batch_tests.step);
+    const placement_tests = b.addTest(.{ .max_rss = 6 * 1024 * 1024 * 1024, .root_module = batch_root, .filters = &.{"generation placement"} });
+    ctx.step("test-generation-placement", "Verify worker placement metadata without loading models").dependOn(&ctx.addRunArtifact(placement_tests).step);
+    const head_tests = b.addTest(.{ .max_rss = 6 * 1024 * 1024 * 1024, .root_module = batch_root, .filters = &.{"CUDA E4B paired head hardware arithmetic"} });
+    const run_head = ctx.addRunArtifact(head_tests);
+    run_head.setEnvironmentVariable("ANTFLY_TEST_CUDA_GEMMA_PAIRED_HEAD", "1");
+    ctx.step("test-gemma-paired-head", "Verify paired Gemma output-head arithmetic on CUDA hardware").dependOn(&run_head.step);
     const lifecycle_root = b.createModule(.{ .root_source_file = ctx.path("src/test_cuda_allocation_lifecycle.zig"), .target = ctx.target, .optimize = ctx.optimize });
     var lifecycle_imports = suite.tests.root_module.import_table.iterator();
     while (lifecycle_imports.next()) |entry| lifecycle_root.addImport(entry.key_ptr.*, entry.value_ptr.*);

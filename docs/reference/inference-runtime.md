@@ -224,14 +224,30 @@ CUDA text requests share two active slots and interleave scheduler steps.
 Enabling `inference.generation_batching.mode: on` additionally combines two
 ready decode requests into one forward when the backend declares support.
 Each step binds its owners' memory budget while holding the model mutex.
-Graph, draft, prefix-cache, selected-KV and multimodal routes retain exclusive
-ownership. The shipped `configs/inference-read-pool-40g.json` enables both
+F16 prefix-cache requests in CUDA's `simple` and `block_hash` modes can share
+execution when the backend declares that capability, including streaming
+requests. CUDA radix caching remains disabled. Other KV dtypes, graph, draft,
+selected-KV and multimodal routes retain exclusive ownership. The shipped
+`configs/inference-read-pool-40g.json` enables both
 controls, with `max_step_items: 2` and `max_decode_wait_us: 0`: it batches ready
 requests without waiting to fill a batch. No request flag is needed. Setting
 `generation_batching.mode: off` restores one-row cooperative execution;
 disabling cooperative execution restores exclusive generation. Other runtime
 configurations retain their existing defaults. See the
 [measurements and tradeoffs](../design/inference/cuda-generation-batching.md).
+
+Managed generation placement uses the authenticated, private worker protocol
+`POST /ai/v1/_placement/generate` (version 1, advertised by the models discovery
+response header `X-Antfly-Generation-Placement-Version`). It tokenizes supported
+text requests against an already loaded model and reports uncached prompt work,
+cache reuse, queued work and active scheduler context. Probing never loads a
+model, attaches KV, or refreshes cache residency. Colony combines these estimates
+with locally reserved work to prefer useful cache locality without routing every
+request into a busy replica. Probes have a bounded candidate count and timeout;
+unsupported requests, mixed worker versions or incomplete evidence retain
+ordinary routing. Pool, namespace, capability and admission rules still apply.
+This protocol performs no KV transfer between workers.
+
 Compatible EmbeddingGemma 2 CUDA text requests also combine automatically under
 the default arithmetic policy, with at most four rows and 8,192 bucket-padded
 tokens per cohort. Nearby lengths share attention masks with at most 25%

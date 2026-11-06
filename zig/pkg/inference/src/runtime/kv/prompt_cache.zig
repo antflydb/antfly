@@ -300,6 +300,57 @@ pub const PromptPrefixCache = struct {
         return cfg.page_size_tokens;
     }
 
+    /// Read-only scheduling estimate. Never attaches KV, refreshes TTL/LRU,
+    /// increments hit counters or evicts entries. Admission revalidates reuse.
+    pub fn peekLongestPrefix(self: *PromptPrefixCache, namespace: []const u8, tokens: []const i64, max_tokens: usize) usize {
+        return self.peekLongestPrefixForPool(namespace, tokens, max_tokens, null);
+    }
+
+    pub fn peekLongestPrefixForPool(self: *PromptPrefixCache, namespace: []const u8, tokens: anytype, max_tokens: usize, expected: ?pool_mod.KvPoolConfig) usize {
+        spinLock(&self.mutex);
+        defer self.mutex.unlock();
+        if (!self.config.enabled or self.pool_id == null or namespace.len > max_namespace_bytes) return 0;
+        if (expected) |wanted| if (self.pool_config == null or !self.pool_config.?.compatible(wanted)) return 0;
+        const page = self.pageSize() orelse return 0;
+        const limit = (@min(max_tokens, tokens.len) / page) * page;
+        const now = nowMs();
+        var matched: usize = 0;
+        switch (self.config.mode) {
+            .simple => {
+                for (self.entries.items) |entry| {
+                    if (entry.expires_at_ms <= now or !std.mem.eql(u8, namespace, entry.namespace)) continue;
+                    matched = @max(matched, @min(limit, (commonPrefixTokens(tokens, entry.tokens) / page) * page));
+                }
+            },
+            .block_hash => {
+                var previous = zeroHash();
+                while (matched + page <= limit) {
+                    const part = tokens[matched .. matched + page];
+                    const hash = blockHash(self.pool_config.?, namespace, previous, part);
+                    const index = self.block_hash_index.get(hash) orelse break;
+                    const entry = self.block_hash_entries.items[index];
+                    if (entry.expires_at_ms <= now or commonPrefixTokens(part, entry.tokens) != part.len) break;
+                    matched += page;
+                    previous = hash;
+                }
+            },
+            .radix => {
+                var parent: ?RadixNodeId = null;
+                while (matched + page <= limit) {
+                    const id = self.findRadixChildWithPolicy(parent, namespace, tokens[matched .. matched + page], false) orelse break;
+                    const node = self.radixNode(id) orelse break;
+                    if (node.expires_at_ms <= now) break;
+                    const count = @min(node.tokens.len, limit - matched);
+                    const edge = (commonPrefixTokens(node.tokens[0..count], tokens[matched .. matched + count]) / page) * page;
+                    matched += edge;
+                    if (edge < node.tokens.len) break;
+                    parent = id;
+                }
+            },
+        }
+        return matched;
+    }
+
     pub fn attachLongestPrefix(
         self: *PromptPrefixCache,
         namespace: []const u8,
@@ -696,19 +747,23 @@ pub const PromptPrefixCache = struct {
         namespace: []const u8,
         first_page: []const i64,
     ) ?RadixNodeId {
+        return self.findRadixChildWithPolicy(parent, namespace, first_page, true);
+    }
+
+    fn findRadixChildWithPolicy(self: *PromptPrefixCache, parent: ?RadixNodeId, namespace: []const u8, first_page: anytype, record_collision: bool) ?RadixNodeId {
         const config = self.pool_config orelse return null;
-        const hash = radixEdgeHash(config, namespace, parent, first_page);
+        const hash = radixEdgeHashTokens(config, namespace, parent, first_page);
         const id = self.radix_edge_index.get(hash) orelse return null;
         const node = self.radixNode(id) orelse {
-            self.radix_collision_guards += 1;
+            if (record_collision) self.radix_collision_guards += 1;
             return null;
         };
         if (node.parent != parent or
             !std.mem.eql(u8, node.namespace, namespace) or
             node.tokens.len < first_page.len or
-            !std.mem.eql(i64, node.tokens[0..first_page.len], first_page))
+            commonPrefixTokens(node.tokens[0..first_page.len], first_page) != first_page.len)
         {
-            self.radix_collision_guards += 1;
+            if (record_collision) self.radix_collision_guards += 1;
             return null;
         }
         return id;
@@ -1269,7 +1324,7 @@ pub const PromptPrefixCache = struct {
     }
 };
 
-fn commonPrefixTokens(a: []const i64, b: []const i64) usize {
+fn commonPrefixTokens(a: anytype, b: anytype) usize {
     const limit = @min(a.len, b.len);
     var idx: usize = 0;
     while (idx < limit and a[idx] == b[idx]) : (idx += 1) {}
@@ -1288,7 +1343,7 @@ fn zeroHash() Hash {
     return @as([std.crypto.hash.sha2.Sha256.digest_length]u8, @splat(0));
 }
 
-fn blockHash(config: pool_mod.KvPoolConfig, namespace: []const u8, previous_hash: Hash, tokens: []const i64) Hash {
+fn blockHash(config: pool_mod.KvPoolConfig, namespace: []const u8, previous_hash: Hash, tokens: anytype) Hash {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update(&previous_hash);
     updateHashU64(&hasher, @backingInt(config.backend));
@@ -1311,6 +1366,10 @@ fn blockHash(config: pool_mod.KvPoolConfig, namespace: []const u8, previous_hash
 }
 
 fn radixEdgeHash(config: pool_mod.KvPoolConfig, namespace: []const u8, parent: ?RadixNodeId, first_page: []const i64) Hash {
+    return radixEdgeHashTokens(config, namespace, parent, first_page);
+}
+
+fn radixEdgeHashTokens(config: pool_mod.KvPoolConfig, namespace: []const u8, parent: ?RadixNodeId, first_page: anytype) Hash {
     var hasher = std.crypto.hash.sha2.Sha256.init(.{});
     hasher.update("antfly-radix-edge-v1");
     updateHashU64(&hasher, if (parent) |id| @as(u64, id) else std.math.maxInt(u64));
@@ -2002,4 +2061,62 @@ test "prompt cache mode changes clear unreachable entries" {
     cache.configure(radix_config);
     try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
     try std.testing.expectEqual(@as(usize, 0), cache.stats().live_bytes);
+}
+
+test "prompt cache placement peek preserves ownership counters and namespace boundaries" {
+    for ([_]Mode{ .simple, .block_hash, .radix }) |mode| {
+        var cache = PromptPrefixCache.init(std.testing.allocator);
+        defer cache.deinit();
+        cache.configure(.{ .enabled = true, .mode = mode, .min_tokens = 2 });
+        const pool = (try cache.ensurePool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 2 })).?;
+        const sequence = try cache.manager.attachSequence(pool);
+        try cache.manager.appendTokens(sequence, 4);
+        try cache.storeFromSequence("tenant", &.{ 1, 2, 3, 4 }, sequence);
+        const before = cache.stats();
+        const sequences_before = cache.manager.sequences.items.len;
+        const tick_before = cache.tick;
+        const encoded: []const i32 = &.{ 1, 2, 3, 4, 5 };
+        try std.testing.expectEqual(@as(usize, 4), cache.peekLongestPrefixForPool("tenant", encoded, 5, null));
+        var incompatible = cache.pool_config.?;
+        incompatible.dtype = .f16;
+        try std.testing.expectEqual(@as(usize, 0), cache.peekLongestPrefixForPool("tenant", encoded, 5, incompatible));
+        try std.testing.expectEqual(@as(usize, 4), cache.peekLongestPrefix("tenant", &.{ 1, 2, 3, 4, 5 }, 5));
+        try std.testing.expectEqual(@as(usize, 2), cache.peekLongestPrefix("tenant", &.{ 1, 2, 3, 4, 5 }, 3));
+        try std.testing.expectEqual(@as(usize, 2), cache.peekLongestPrefix("tenant", &.{ 1, 2, 9, 4 }, 4));
+        try std.testing.expectEqual(@as(usize, 0), cache.peekLongestPrefix("other", &.{ 1, 2, 3, 4 }, 4));
+        try std.testing.expectEqualDeep(before, cache.stats());
+        try std.testing.expectEqual(sequences_before, cache.manager.sequences.items.len);
+        try std.testing.expectEqual(tick_before, cache.tick);
+        for (cache.entries.items) |*entry| entry.expires_at_ms = 0;
+        for (cache.block_hash_entries.items) |*entry| entry.expires_at_ms = 0;
+        for (cache.radix_nodes.items) |*entry| entry.expires_at_ms = 0;
+        try std.testing.expectEqual(@as(usize, 0), cache.peekLongestPrefix("tenant", &.{ 1, 2, 3, 4 }, 4));
+        try std.testing.expectEqualDeep(before, cache.stats());
+        cache.configure(.{ .enabled = false, .mode = mode });
+        try std.testing.expectEqual(@as(usize, 0), cache.peekLongestPrefix("tenant", &.{ 1, 2, 3, 4 }, 4));
+    }
+}
+
+test "prompt cache cooperative eviction preserves attached owners" {
+    for ([_]Mode{ .simple, .block_hash, .radix }) |mode| {
+        var cache = PromptPrefixCache.init(std.testing.allocator);
+        defer cache.deinit();
+        cache.configure(.{ .enabled = true, .mode = mode, .min_tokens = 2, .max_bytes = 1 << 20 });
+        const pool_id = (try cache.ensurePool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_layers_packed = 1, .num_kv_heads = 1, .head_dim = 2 })).?;
+        const source = try cache.manager.attachSequence(pool_id);
+        try cache.manager.appendTokens(source, 4);
+        try cache.storeFromSequence("tenant", &.{ 1, 2, 3, 4 }, source);
+        const hit = (try cache.attachLongestPrefix("tenant", &.{ 1, 2, 3, 4 }, 4)).?;
+        try cache.manager.releaseSequence(source);
+        const pool = cache.manager.getPool(pool_id).?;
+        try std.testing.expectEqual(@as(u32, 2), pool.blockInfo(0).?.refcount);
+        cache.configure(.{ .enabled = true, .mode = mode, .min_tokens = 2, .max_bytes = 1 });
+        try std.testing.expectEqual(@as(usize, 0), cache.stats().live_entries);
+        try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(0).?.refcount);
+        try std.testing.expectEqual(@as(u32, 1), pool.blockInfo(1).?.refcount);
+        try cache.manager.appendTokens(hit.sequence_id, 1);
+        cache.releaseAttachedPrefix(hit);
+        try std.testing.expectEqual(@as(u32, 0), pool.blockInfo(0).?.refcount);
+        try std.testing.expectEqual(@as(u32, 0), pool.blockInfo(1).?.refcount);
+    }
 }
