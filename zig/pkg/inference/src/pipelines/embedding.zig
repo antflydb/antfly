@@ -41,7 +41,6 @@ const session_factory = @import("../architectures/session_factory.zig");
 const gemma2_content = @import("embedding_gemma2_content.zig");
 const gpt_arch = @import("../architectures/gpt.zig");
 const decoder_gated_runtime = @import("../backends/decoder_gated_runtime.zig");
-const resident_ops = @import("../graph/resident_ops.zig");
 const embedding_trace = @import("../embedding_trace.zig");
 const qwen_batch = @import("qwen_embedding_batch.zig");
 const metal_runtime = @import("../backends/metal_runtime.zig");
@@ -4565,38 +4564,8 @@ pub const EmbeddingPipeline = struct {
         expected_dim: usize,
         expected_batch: usize,
     ) !ResidentPooled {
-        return @import("../execution/backend_operation.zig").callOpaque(outputs.backend.*, outputs.backend.operationToken(), selectResidentProjectedInputImpl, .{ self, outputs, expected_dim, expected_batch });
-    }
-
-    fn selectResidentProjectedInputImpl(
-        self: *EmbeddingPipeline,
-        outputs: *session_mod.ResidentOutputs,
-        expected_dim: usize,
-        expected_batch: usize,
-    ) !ResidentPooled {
         _ = self;
-        for (outputs.outputs) |output| {
-            const shape = try outputs.backend.tensorShape(output, outputs.allocator);
-            defer outputs.allocator.free(shape);
-            if (shape.len == 2 and
-                shape[0] == @as(i64, @intCast(expected_batch)) and
-                shape[1] == @as(i64, @intCast(expected_dim)))
-            {
-                return .{ .value = output, .backend = outputs.backend, .owns_value = false };
-            }
-        }
-        for (outputs.outputs) |output| {
-            const shape = try outputs.backend.tensorShape(output, outputs.allocator);
-            defer outputs.allocator.free(shape);
-            if (shape.len == 3 and
-                shape[0] == @as(i64, @intCast(expected_batch)) and
-                shape[2] == @as(i64, @intCast(expected_dim)))
-            {
-                if (shape[1] <= 0) return error.ShapeMismatch;
-                return try residentClsPool(outputs.allocator, outputs.backend, output, expected_batch, @intCast(shape[1]), expected_dim);
-            }
-        }
-        return error.UnsupportedResidentProjectionInput;
+        return sequence_pool.selectProjectionInput(outputs.allocator, outputs.backend, outputs.outputs, expected_dim, expected_batch);
     }
 
     fn finishResidentTextRows(self: *EmbeddingPipeline, outputs: *session_mod.ResidentOutputs, mask: []const i32, batch: usize, sequence: usize, normalize: bool) ![][]f32 {
@@ -4647,8 +4616,6 @@ pub const EmbeddingPipeline = struct {
 
     const residentMaskedMeanPool = sequence_pool.maskedMean;
 
-    const residentClsPool = sequence_pool.cls;
-
     const residentLastTokenPool = sequence_pool.last;
 
     fn resident2DToEmbeddings(
@@ -4668,64 +4635,19 @@ pub const EmbeddingPipeline = struct {
         return self.resident2DToEmbeddingsWithWidth(outputs, batch, normalize, null);
     }
     fn resident2DToEmbeddingsWithWidth(self: *EmbeddingPipeline, outputs: *session_mod.ResidentOutputs, batch: usize, normalize: bool, width: ?usize) ![][]f32 {
-        return @import("../execution/backend_operation.zig").callOpaque(outputs.backend.*, outputs.backend.operationToken(), resident2DToEmbeddingsWithNormalizationImpl, .{ self, outputs, batch, normalize, width });
+        return sequence_pool.finishDenseHostRows(self.allocator, outputs.backend, outputs.outputs, batch, normalize, width, self.finalRowPolicy());
     }
 
-    fn resident2DToEmbeddingsWithNormalizationImpl(
-        self: *EmbeddingPipeline,
-        outputs: *session_mod.ResidentOutputs,
-        batch: usize,
-        normalize: bool,
-        requested_width: ?usize,
-    ) ![][]f32 {
-        if (outputs.outputs.len == 0) return error.NoOutputTensors;
-        const shape = try outputs.backend.tensorShape(outputs.outputs[0], self.allocator);
-        defer self.allocator.free(shape);
-        if (shape.len == 0) return error.UnexpectedOutputShape;
-
-        const proj_dim: usize = @intCast(shape[shape.len - 1]);
-        if (proj_dim == 0) return error.ShapeMismatch;
-        const output_width = requested_width orelse proj_dim;
-        if (output_width == 0 or output_width > proj_dim) return error.ShapeMismatch;
-        const resident_output = if (normalize)
-            try resident_ops.l2NormalizeLastDim(self.allocator, outputs.backend, outputs.outputs[0], shape)
-        else
-            outputs.outputs[0];
-        defer if (normalize) outputs.backend.free(resident_output);
-
-        const data = try outputs.backend.toFloat32(resident_output, self.allocator);
-        defer self.allocator.free(data);
-        return self.copyPooledTextRows(data, batch, proj_dim, requested_width);
+    fn finalRowPolicy(self: *const EmbeddingPipeline) sequence_pool.RowPolicy {
+        return .{ .normalize_prefix = self.config.normalize or self.config.resident_embedding_gemma2, .require_finite_nonzero = self.config.resident_embedding_gemma2 };
     }
 
-    /// Both original resident readback and declared final-host output share the
-    /// same F32 copy/prefix-normalization order. Full width is never renormalized.
-    fn copyPooledTextRows(self: *EmbeddingPipeline, data: []const f32, batch: usize, proj_dim: usize, requested_width: ?usize) ![][]f32 {
-        const output_width = requested_width orelse proj_dim;
-        if (output_width == 0 or output_width > proj_dim or data.len != try std.math.mul(usize, batch, proj_dim)) return error.ShapeMismatch;
-        const embeddings = try self.allocator.alloc([]f32, batch);
-        var initialized: usize = 0;
-        errdefer {
-            for (embeddings[0..initialized]) |embedding| self.allocator.free(embedding);
-            self.allocator.free(embeddings);
-        }
-
-        for (0..batch) |b| {
-            const embedding = try self.allocator.alloc(f32, output_width);
-            embeddings[b] = embedding;
-            initialized += 1;
-            try self.copyPooledTextRow(data[b * proj_dim ..][0..proj_dim], embedding, proj_dim);
-        }
-
-        return embeddings;
+    fn copyPooledTextRows(self: *EmbeddingPipeline, data: []const f32, batch: usize, physical_width: usize, width: ?usize) ![][]f32 {
+        return sequence_pool.copyDenseRows(self.allocator, data, batch, physical_width, width, self.finalRowPolicy());
     }
 
     fn copyPooledTextRow(self: *EmbeddingPipeline, data: []const f32, target: []f32, physical_width: usize) !void {
-        @memcpy(target, data[0..target.len]);
-        // Keep the original F32 prefix then L2 order for both allocated raw
-        // rows and the final escrow. Full width is never normalized twice.
-        if (target.len != physical_width and (self.config.normalize or self.config.resident_embedding_gemma2)) linalg.l2Normalize(target, target.len);
-        if (self.config.resident_embedding_gemma2) try validateEmbeddingGemma2Vector(target);
+        return sequence_pool.copyDenseRow(data, target, physical_width, self.finalRowPolicy());
     }
 
     fn extractVision3D(self: *EmbeddingPipeline, output: *const Tensor, batch: usize, normalize: bool) ![][]f32 {
@@ -4756,14 +4678,7 @@ pub const EmbeddingPipeline = struct {
     }
 };
 
-fn validateEmbeddingGemma2Vector(values: []const f32) !void {
-    var squares: f64 = 0;
-    for (values) |value| {
-        if (!std.math.isFinite(value)) return error.NonFiniteEmbeddingOutput;
-        squares += @as(f64, value) * value;
-    }
-    if (squares == 0) return error.ZeroEmbeddingOutput;
-}
+const validateEmbeddingGemma2Vector = sequence_pool.validateFiniteNonzeroRow;
 
 test "EmbeddingGemma2 rejects nonfinite and zero output vectors" {
     try validateEmbeddingGemma2Vector(&.{ 0.6, 0.8 });

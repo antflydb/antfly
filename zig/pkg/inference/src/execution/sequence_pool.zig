@@ -37,6 +37,92 @@ pub const Value = struct {
     }
 };
 
+/// Task-selected final row semantics. Physical width normalization remains
+/// separate from prefix normalization, so full-width rows are never repeated.
+pub const RowPolicy = struct {
+    normalize_prefix: bool = false,
+    require_finite_nonzero: bool = false,
+};
+
+pub fn validateFiniteNonzeroRow(values: []const f32) !void {
+    var squares: f64 = 0;
+    for (values) |value| {
+        if (!std.math.isFinite(value)) return error.NonFiniteEmbeddingOutput;
+        squares += @as(f64, value) * value;
+    }
+    if (squares == 0) return error.ZeroEmbeddingOutput;
+}
+
+pub fn copyDenseRow(data: []const f32, target: []f32, physical_width: usize, policy: RowPolicy) !void {
+    if (target.len > physical_width or data.len < target.len) return error.ShapeMismatch;
+    @memcpy(target, data[0..target.len]);
+    if (target.len != physical_width and policy.normalize_prefix) @import("inference_linalg").l2Normalize(target, target.len);
+    if (policy.require_finite_nonzero) try validateFiniteNonzeroRow(target);
+}
+
+/// One owner for final row allocation, exact prefix copy and postcopy policy.
+/// Validation remains per-row before allocating the next row.
+pub fn copyDenseRows(allocator: std.mem.Allocator, data: []const f32, batch: usize, physical_width: usize, requested_width: ?usize, policy: RowPolicy) ![][]f32 {
+    const width = requested_width orelse physical_width;
+    if (width == 0 or width > physical_width or data.len != try std.math.mul(usize, batch, physical_width)) return error.ShapeMismatch;
+    const rows = try allocator.alloc([]f32, batch);
+    var initialized: usize = 0;
+    errdefer {
+        for (rows[0..initialized]) |row| allocator.free(row);
+        allocator.free(rows);
+    }
+    for (rows, 0..) |*row, index| {
+        row.* = try allocator.alloc(f32, width);
+        initialized += 1;
+        try copyDenseRow(data[index * physical_width ..][0..physical_width], row.*, physical_width, policy);
+    }
+    return rows;
+}
+
+/// Prefer an encoder's already pooled result before selecting CLS from a
+/// token-major result. Returned aliases retain their original source owner.
+pub fn selectProjectionInput(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, outputs: []const ops.CT, width: usize, batch: usize) !Value {
+    return @import("backend_operation.zig").callOpaque(backend.*, backend.operationToken(), selectProjectionInputImpl, .{ allocator, backend, outputs, width, batch });
+}
+fn selectProjectionInputImpl(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, outputs: []const ops.CT, width: usize, batch: usize) !Value {
+    for (outputs) |output| {
+        const shape = try backend.tensorShape(output, allocator);
+        defer allocator.free(shape);
+        if (shape.len == 2 and shape[0] == @as(i64, @intCast(batch)) and shape[1] == @as(i64, @intCast(width)))
+            return .{ .value = output, .backend = backend, .owns_value = false };
+    }
+    for (outputs) |output| {
+        const shape = try backend.tensorShape(output, allocator);
+        defer allocator.free(shape);
+        if (shape.len == 3 and shape[0] == @as(i64, @intCast(batch)) and shape[2] == @as(i64, @intCast(width))) {
+            if (shape[1] <= 0) return error.ShapeMismatch;
+            return cls(allocator, backend, output, batch, @intCast(shape[1]), width);
+        }
+    }
+    return error.UnsupportedResidentProjectionInput;
+}
+
+/// Original resident L2, then full host readback, then requested prefix copy.
+/// Input tensor and backend stay borrowed through the synchronous call.
+pub fn finishDenseHostRows(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, outputs: []const ops.CT, batch: usize, normalize: bool, width: ?usize, policy: RowPolicy) ![][]f32 {
+    return @import("backend_operation.zig").callOpaque(backend.*, backend.operationToken(), finishDenseHostRowsImpl, .{ allocator, backend, outputs, batch, normalize, width, policy });
+}
+fn finishDenseHostRowsImpl(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, outputs: []const ops.CT, batch: usize, normalize: bool, requested_width: ?usize, policy: RowPolicy) ![][]f32 {
+    if (outputs.len == 0) return error.NoOutputTensors;
+    const shape = try backend.tensorShape(outputs[0], allocator);
+    defer allocator.free(shape);
+    if (shape.len == 0) return error.UnexpectedOutputShape;
+    const physical_width = std.math.cast(usize, shape[shape.len - 1]) orelse return error.ShapeMismatch;
+    if (physical_width == 0) return error.ShapeMismatch;
+    const width = requested_width orelse physical_width;
+    if (width == 0 or width > physical_width) return error.ShapeMismatch;
+    const value = if (normalize) try @import("../graph/resident_ops.zig").l2NormalizeLastDim(allocator, backend, outputs[0], shape) else outputs[0];
+    defer if (normalize) backend.free(value);
+    const data = try backend.toFloat32(value, allocator);
+    defer allocator.free(data);
+    return copyDenseRows(allocator, data, batch, physical_width, requested_width, policy);
+}
+
 pub fn maskedMean(
     allocator: std.mem.Allocator,
     backend: *const ops.ComputeBackend,
@@ -340,18 +426,7 @@ pub fn finishHostRowsWithCleanup(allocator: std.mem.Allocator, backend: *const o
     try submission.finish();
     const host = try backend.toFloat32(value, allocator);
     defer allocator.free(host);
-    if (host.len != try std.math.mul(usize, batch, width)) return error.ShapeMismatch;
-    const rows = try allocator.alloc([]f32, batch);
-    var initialized: usize = 0;
-    errdefer {
-        for (rows[0..initialized]) |row| allocator.free(row);
-        allocator.free(rows);
-    }
-    for (rows, 0..) |*row, index| {
-        row.* = try allocator.dupe(f32, host[index * width ..][0..width]);
-        initialized += 1;
-    }
-    return rows;
+    return copyDenseRows(allocator, host, batch, width, null, .{});
 }
 
 fn checkPoolingBackend(kind: @import("../backends/backends.zig").BackendType) !void {
@@ -593,4 +668,97 @@ test "sequence pooling explicit cleanup rejects missing current boundary before 
     const backend: ops.ComputeBackend = .{ .ptr = &unused_context, .vtable = undefined };
     const missing: Cleanup = .{};
     try std.testing.expectError(error.MissingCurrentCleanupEpoch, finishHostRowsWithCleanup(std.testing.allocator, &backend, undefined, &.{}, 1, 1, .last, false, &missing));
+}
+
+fn checkDenseResultRows(allocator: std.mem.Allocator, backend: *const ops.ComputeBackend, comptime check_negatives: bool) !void {
+    const values = [_]f32{ 3, 4, 12, 9, 0, 0, -5, 12, 0, 1, 2, 3 };
+    const tokens = try backend.ensureDeviceResidentOwned(try backend.fromFloat32Shape(&values, &.{ 2, 2, 3 }));
+    defer backend.free(tokens);
+    const already_pooled = [_]f32{ 8, 15, 0, 0, 7, 24 };
+    const pooled = try backend.ensureDeviceResidentOwned(try backend.fromFloat32Shape(&already_pooled, &.{ 2, 3 }));
+    defer backend.free(pooled);
+    const audit_mod = @import("transfer_audit.zig");
+    var selection_audit = audit_mod.Audit{ .forbid_device_host_access = true };
+    const preferred = blk: {
+        try audit_mod.begin(&selection_audit);
+        defer audit_mod.end();
+        break :blk try selectProjectionInput(allocator, backend, &.{ tokens, pooled }, 3, 2);
+    };
+    defer preferred.deinit();
+    try std.testing.expect(preferred.value == pooled and !preferred.owns_value);
+    try std.testing.expectEqual(@as(u64, 0), selection_audit.download_calls);
+    const plain = try finishDenseHostRows(allocator, backend, &.{preferred.value}, 2, false, null, .{});
+    defer {
+        for (plain) |row| allocator.free(row);
+        allocator.free(plain);
+    }
+    try std.testing.expectEqualSlices(f32, already_pooled[0..3], plain[0]);
+    try std.testing.expectEqualSlices(f32, already_pooled[3..6], plain[1]);
+    var cls_audit = audit_mod.Audit{ .forbid_device_host_access = true };
+    const selected = blk: {
+        try audit_mod.begin(&cls_audit);
+        defer audit_mod.end();
+        break :blk try selectProjectionInput(allocator, backend, &.{tokens}, 3, 2);
+    };
+    defer selected.deinit();
+    try std.testing.expect(selected.owns_value);
+    try std.testing.expectEqual(@as(u64, 0), cls_audit.download_calls);
+    var export_audit = audit_mod.Audit{};
+    const prefix = blk: {
+        try audit_mod.begin(&export_audit);
+        defer audit_mod.end();
+        break :blk try finishDenseHostRows(allocator, backend, &.{selected.value}, 2, true, 2, .{ .normalize_prefix = true, .require_finite_nonzero = true });
+    };
+    defer {
+        for (prefix) |row| allocator.free(row);
+        allocator.free(prefix);
+    }
+    for ([_]f32{ 0.6, 0.8 }, prefix[0]) |wanted, actual| try std.testing.expectApproxEqAbs(wanted, actual, 2e-6);
+    for ([_]f32{ -5.0 / 13.0, 12.0 / 13.0 }, prefix[1]) |wanted, actual| try std.testing.expectApproxEqAbs(wanted, actual, 2e-6);
+    if (backend.kind() != .native) try std.testing.expectEqual(@as(u64, 1), export_audit.download_calls);
+    if (check_negatives) {
+        try std.testing.expectError(error.ShapeMismatch, finishDenseHostRows(allocator, backend, &.{selected.value}, 2, false, 4, .{}));
+        try std.testing.expectError(error.UnsupportedResidentProjectionInput, selectProjectionInput(allocator, backend, &.{tokens}, 4, 2));
+    }
+    // Repeat another producer/export while previous caller-owned rows are held.
+    const second = try finishDenseHostRows(allocator, backend, &.{pooled}, 2, false, 1, .{});
+    defer {
+        for (second) |row| allocator.free(row);
+        allocator.free(second);
+    }
+    try std.testing.expectEqualSlices(f32, &.{8}, second[0]);
+    try std.testing.expectEqualSlices(f32, &.{0}, second[1]);
+    for ([_]f32{ 0.6, 0.8 }, prefix[0]) |wanted, actual| try std.testing.expectApproxEqAbs(wanted, actual, 2e-6);
+}
+fn checkDenseResultBackend(backend: ops.ComputeBackend, _: ops.ComputeBackend) !void {
+    try checkDenseResultRows(std.testing.allocator, &backend, true);
+}
+fn checkDenseResultOom(allocator: std.mem.Allocator) !void {
+    const native = @import("../ops/native_compute.zig");
+    var store = native.WeightStore{ .allocator = allocator, .resident_weights = .empty, .lazy_weights = .empty };
+    defer store.deinitOwned();
+    var compute = native.NativeCompute.init(allocator, &store, null);
+    defer compute.deinit();
+    const backend = compute.computeBackend();
+    try checkDenseResultRows(allocator, &backend, false);
+}
+test "dense result rows Native preserve pooled priority CLS resident normalization and held outputs" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onNative(helper.noWeights, checkDenseResultBackend);
+}
+test "dense result rows Metal preserve pooled priority CLS resident normalization and held outputs" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onMetal(helper.noWeights, checkDenseResultBackend);
+}
+test "dense result rows CUDA preserve pooled priority CLS resident normalization and held outputs" {
+    const helper = @import("../ops/media_residency_test.zig");
+    try helper.onCuda(helper.noWeights, checkDenseResultBackend);
+}
+test "dense result rows Native unwind every allocation failure" {
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(std.testing.allocator, checkDenseResultOom, .{});
+}
+test "dense final row validation precedes allocation of the next row" {
+    var allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 2 });
+    try std.testing.expectError(error.ZeroEmbeddingOutput, copyDenseRows(allocator.allocator(), &.{ 0, 0, 3, 4 }, 2, 2, null, .{ .require_finite_nonzero = true }));
+    try std.testing.expectError(error.NonFiniteEmbeddingOutput, copyDenseRows(std.testing.allocator, &.{std.math.nan(f32)}, 1, 1, null, .{ .require_finite_nonzero = true }));
 }

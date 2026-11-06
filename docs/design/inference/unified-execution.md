@@ -277,6 +277,10 @@ preparation API do not by themselves complete these remaining requirements:
   through typed format adapters. Debug captures are optional; ordinary output
   avoids the unused normalization readback and final host-vector duplicate.
   Host position addition, ordered pooling and native kernel schedules remain.
+  Resident projection inputs and final dense-row materialization use the shared
+  sequence-pooling owner. Tasks supply pooling, prefix width, normalization and
+  finite-output requirements; the execution owner preserves full-width resident
+  normalization before export and the original prefix-copy order.
 - Metal installs synchronous assigned pair/QKV regions for complete row-one F32
   projection heads through the production partition executor. Source pins,
   output leases and actual operation ownership are explicit. Mixed graphs,
