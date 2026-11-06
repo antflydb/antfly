@@ -21,14 +21,36 @@ const segment = @import("../segment.zig");
 const A = std.mem.Allocator;
 const Admission = segment.SegmentReader.Admission;
 const magic = "AFTSADM1";
+const bound_magic = "AFTSADM2";
+const bindings = @import("doc_ordinal_binding.zig");
+const values = @import("native_publication_value.zig");
+const bound_header_bytes = 8 + 8 + 8 + 4 + @sizeOf(Footer) + 4;
 const Footer = segment.SegmentReader.NativeCatalogFooter;
 const header_bytes = magic.len + 6 * 8 + 4 + 21 + @sizeOf(Footer) + 2;
 pub const maximum_bytes = 16 * 1024 * 1024;
 
 pub const Owned = struct {
     arena: std.heap.ArenaAllocator,
-    metadata: Admission,
+    metadata: ?Admission,
     footer: Footer,
+    bound_column: ?[]const u8 = null,
+
+    pub fn initReader(self: *const Owned, a: A, source: @import("../segment_source.zig").Source) !segment.SegmentReader {
+        var reader = if (self.metadata) |metadata|
+            try segment.SegmentReader.initNativeCatalogAdmission(a, source, metadata, self.footer)
+        else blk: {
+            const actual = try segment.SegmentReader.nativeCatalogFooter(source);
+            if (!std.mem.eql(u8, &actual, &self.footer)) return error.InvalidSegmentAdmission;
+            break :blk try segment.SegmentReader.initSource(a, source);
+        };
+        errdefer reader.deinit();
+        if (self.bound_column) |column| {
+            var binding = try bindings.copySealed(a, source, column, reader.doc_count);
+            defer binding.deinit();
+            try reader.attachOrdinalBinding(binding);
+        }
+        return reader;
+    }
 
     pub fn deinit(self: *Owned) void {
         self.arena.deinit();
@@ -83,6 +105,12 @@ pub fn encode(a: A, id: u64, metadata: Admission, footer: Footer) !?[]u8 {
 /// descriptors fail closed; they must never silently remove an active segment.
 pub fn decode(a: A, bytes: []const u8, id: u64, source_bytes: u64) !?Owned {
     if (std.mem.eql(u8, bytes, &.{1})) return null;
+    if (bytes.len >= bound_magic.len and std.mem.eql(u8, bytes[0..bound_magic.len], bound_magic))
+        return try decodeBound(a, bytes, id, source_bytes);
+    return decodeLegacy(a, bytes, id, source_bytes);
+}
+
+fn decodeLegacy(a: A, bytes: []const u8, id: u64, source_bytes: u64) !?Owned {
     if (bytes.len < header_bytes + 4 or bytes.len > maximum_bytes or
         !std.mem.eql(u8, bytes[0..magic.len], magic) or
         std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little) != std.hash.Crc32.hash(bytes[0 .. bytes.len - 4])) return error.InvalidSegmentAdmission;
@@ -128,6 +156,112 @@ pub fn decode(a: A, bytes: []const u8, id: u64, source_bytes: u64) !?Owned {
     metadata.fields = fields;
     metadata.validate() catch return error.InvalidSegmentAdmission;
     return .{ .arena = arena, .metadata = metadata, .footer = footer };
+}
+
+/// Fixed-size native metadata prepared before writer admission. Binding fills
+/// only the identity column and checksum; posting bytes are never rewritten.
+pub const PreparedBinding = struct {
+    builder: values.Builder,
+    column_offset: usize,
+    count: u32,
+
+    pub fn binding(self: *const PreparedBinding) !bindings.Binding {
+        var value = self.builder.value();
+        defer value.deinit();
+        return bindings.Binding.capturePrepared(value, self.column_offset, self.count);
+    }
+    pub fn bind(self: *PreparedBinding, ordinals: []const u32) !void {
+        if (ordinals.len != self.count) return error.InvalidSegment;
+        const bytes = try self.builder.bytes();
+        try bindings.encodeInto(bytes[self.column_offset .. bytes.len - 4], ordinals);
+        std.mem.writeInt(u32, bytes[bytes.len - 4 ..][0..4], std.hash.Crc32.hash(bytes[0 .. bytes.len - 4]), .little);
+        try self.builder.seal();
+    }
+    pub fn deinit(self: *PreparedBinding) void {
+        self.builder.deinit();
+        self.* = undefined;
+    }
+};
+
+/// Large navigation directories may use ordinary source admission, but the
+/// identity column is mandatory. A one-byte fallback would lose document IDs.
+pub fn prepareBound(resources: @import("immutable_artifact.zig").BuildResources, id: u64, metadata: Admission, footer: Footer) !PreparedBinding {
+    return prepareBoundWithNavigationLimit(resources, id, metadata, footer, 256 * 1024);
+}
+
+fn prepareBoundWithNavigationLimit(resources: @import("immutable_artifact.zig").BuildResources, id: u64, metadata: Admission, footer: Footer, navigation_limit: usize) !PreparedBinding {
+    if (resources.native_metadata_revision < 16) return error.Unsupported;
+    try metadata.validate();
+    const a = resources.allocator;
+    const navigation = try encode(a, id, metadata, footer);
+    defer if (navigation) |bytes| a.free(bytes);
+    const nav: []const u8 = if (navigation) |bytes| if (bytes.len <= navigation_limit) bytes else &.{} else &.{};
+    const column_length = try bindings.encodedLength(metadata.doc_count);
+    const offset = try std.math.add(usize, bound_header_bytes, nav.len);
+    const length = try std.math.add(usize, try std.math.add(usize, offset, column_length), 4);
+    if (length > maximum_bytes) return error.ResourceBudgetExceeded;
+    var builder = try resources.createPublicationValue(length);
+    errdefer builder.deinit();
+    const bytes = try builder.bytes();
+    var writer = Writer{ .bytes = bytes };
+    writer.copy(bound_magic);
+    writer.integer(u64, id);
+    writer.integer(u64, metadata.bytes);
+    writer.integer(u32, metadata.doc_count);
+    writer.copy(&footer);
+    writer.integer(u32, @intCast(nav.len));
+    writer.copy(nav);
+    std.debug.assert(writer.position == offset);
+    bytes[offset] = 1;
+    std.mem.writeInt(u32, bytes[offset + 1 ..][0..4], metadata.doc_count, .big);
+    return .{ .builder = builder, .column_offset = offset, .count = metadata.doc_count };
+}
+
+/// Re-encode a sealed binding when a deletion snapshot changes without
+/// replacing its posting payload. Authoritative IDs must survive this path.
+pub fn encodeBound(a: A, id: u64, metadata: Admission, footer: Footer, column: []const u8) ![]u8 {
+    try bindings.validate(column, metadata.doc_count);
+    const navigation = try encode(a, id, metadata, footer);
+    defer if (navigation) |raw| a.free(raw);
+    const nav: []const u8 = if (navigation) |raw| if (raw.len <= 256 * 1024) raw else &.{} else &.{};
+    const length = try std.math.add(usize, try std.math.add(usize, bound_header_bytes, nav.len), try std.math.add(usize, column.len, 4));
+    if (length > maximum_bytes) return error.ResourceBudgetExceeded;
+    const bytes = try a.alloc(u8, length);
+    var writer: Writer = .{ .bytes = bytes };
+    writer.copy(bound_magic);
+    writer.integer(u64, id);
+    writer.integer(u64, metadata.bytes);
+    writer.integer(u32, metadata.doc_count);
+    writer.copy(&footer);
+    writer.integer(u32, @intCast(nav.len));
+    writer.copy(nav);
+    writer.copy(column);
+    writer.integer(u32, std.hash.Crc32.hash(bytes[0 .. length - 4]));
+    return bytes;
+}
+
+fn decodeBound(a: A, bytes: []const u8, id: u64, source_bytes: u64) !Owned {
+    if (bytes.len < bound_header_bytes + 9 or bytes.len > maximum_bytes or
+        std.mem.readInt(u32, bytes[bytes.len - 4 ..][0..4], .little) != std.hash.Crc32.hash(bytes[0 .. bytes.len - 4])) return error.InvalidSegmentAdmission;
+    var input = Reader{ .bytes = bytes[8 .. bytes.len - 4] };
+    if (try input.integer(u64) != id or try input.integer(u64) != source_bytes) return error.InvalidSegmentAdmission;
+    const count = try input.integer(u32);
+    const footer = (try input.take(@sizeOf(Footer)))[0..@sizeOf(Footer)].*;
+    if (std.mem.readInt(u64, footer[0..8], .big) != count) return error.InvalidSegmentAdmission;
+    const nav_length = try input.integer(u32);
+    const nav = try input.take(nav_length);
+    bindings.validate(input.bytes, count) catch return error.InvalidSegmentAdmission;
+    var result: Owned = if (nav.len != 0) blk: {
+        // Nested envelopes are deliberately forbidden; only AD1 navigation.
+        if (nav.len < magic.len or !std.mem.eql(u8, nav[0..magic.len], magic)) return error.InvalidSegmentAdmission;
+        const owned = (try decodeLegacy(a, nav, id, source_bytes)) orelse return error.InvalidSegmentAdmission;
+        break :blk owned;
+    } else .{ .arena = std.heap.ArenaAllocator.init(a), .metadata = null, .footer = footer };
+    errdefer result.deinit();
+    if (!std.mem.eql(u8, &result.footer, &footer)) return error.InvalidSegmentAdmission;
+    if (result.metadata) |metadata| if (metadata.doc_count != count) return error.InvalidSegmentAdmission;
+    result.bound_column = try result.arena.allocator().dupe(u8, input.bytes);
+    return result;
 }
 
 const Writer = struct {
@@ -220,7 +354,7 @@ test "segment admission roundtrip owns metadata and performs no source reads bef
         .length = fixture.bytes.len,
         .read_into = Source.read,
         .close = Source.close,
-    } }, owned.?.metadata);
+    } }, owned.?.metadata.?);
     defer reader.deinit();
     owned.?.deinit();
     owned = null;
@@ -264,7 +398,7 @@ test "segment admission allocation failures unwind decoded and reconstituted own
         fn run(alloc: A, input: Fixture) !void {
             var owned = (try decode(alloc, input.descriptor, 17, input.bytes.len)).?;
             defer owned.deinit();
-            var reader = try segment.SegmentReader.initNativeCatalogAdmission(alloc, .{ .contiguous = input.bytes }, owned.metadata, owned.footer);
+            var reader = try segment.SegmentReader.initNativeCatalogAdmission(alloc, .{ .contiguous = input.bytes }, owned.metadata.?, owned.footer);
             defer reader.deinit();
             const captured = try reader.admission(alloc);
             defer captured.deinit(alloc);
@@ -301,7 +435,7 @@ test "segment admission avoids per field reads while fencing replacement and pre
     defer ordinary.deinit();
     const ordinary_reads = source.reads;
     source.reads = 0;
-    var admitted = try segment.SegmentReader.initNativeCatalogAdmission(a, source.source(), owned.metadata, owned.footer);
+    var admitted = try segment.SegmentReader.initNativeCatalogAdmission(a, source.source(), owned.metadata.?, owned.footer);
     defer admitted.deinit();
     const admitted_reads = source.reads;
     std.debug.print("SEGMENT_ADMISSION fields=32 ordinary_reads={d} admitted_reads={d}\n", .{ ordinary_reads, admitted_reads });
@@ -325,17 +459,128 @@ test "segment admission avoids per field reads while fencing replacement and pre
     try std.testing.expect(admitted.invertedFieldStatsAt(std.math.maxInt(usize)) == null);
     var wrong_footer = owned.footer;
     wrong_footer[40] ^= 1;
-    try std.testing.expectError(error.InvalidSegmentAdmission, segment.SegmentReader.initNativeCatalogAdmission(a, source.source(), owned.metadata, wrong_footer));
+    try std.testing.expectError(error.InvalidSegmentAdmission, segment.SegmentReader.initNativeCatalogAdmission(a, source.source(), owned.metadata.?, wrong_footer));
     const corrupt = try a.dupe(u8, fixture.bytes);
     defer a.free(corrupt);
-    const section = owned.metadata.fields[owned.metadata.fields.len - 1].sections[0];
+    const section = owned.metadata.?.fields[owned.metadata.?.fields.len - 1].sections[0];
     corrupt[@intCast(section.offset)] ^= 1;
     // A changed payload with an unchanged footer must still fail AFSM page or
     // section validation, even when an enclosing provider accepts those bytes.
-    var bad = segment.SegmentReader.initNativeCatalogAdmission(a, .{ .contiguous = corrupt }, owned.metadata, owned.footer) catch |err| {
+    var bad = segment.SegmentReader.initNativeCatalogAdmission(a, .{ .contiguous = corrupt }, owned.metadata.?, owned.footer) catch |err| {
         try std.testing.expectEqual(error.CrcMismatch, err);
         return;
     };
     defer bad.deinit();
     try std.testing.expectError(error.CrcMismatch, bad.invertedIndexScoped(a, "column31"));
+}
+
+test "segment admission bound identities survive producer close with and without cached navigation" {
+    const a = std.testing.allocator;
+    const fixture = try Fixture.create(a);
+    defer fixture.deinit(a);
+    var original = (try decode(a, fixture.descriptor, 17, fixture.bytes.len)).?;
+    defer original.deinit();
+    const Lease = struct {
+        references: usize = 1,
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references -= 1;
+        }
+    };
+    var lease: Lease = .{};
+    const resources: @import("immutable_artifact.zig").BuildResources = .{
+        .native_metadata_revision = 16,
+        .ptr = &lease,
+        .allocator = a,
+        .io = std.testing.io,
+        .resource_manager = null,
+        .retain_fn = Lease.retain,
+        .release_fn = Lease.release,
+    };
+    for ([_]usize{ 0, maximum_bytes }) |limit| {
+        var prepared = try prepareBoundWithNavigationLimit(resources, 17, original.metadata.?, original.footer, limit);
+        var live = true;
+        defer if (live) prepared.deinit();
+        var binding = try prepared.binding();
+        defer binding.deinit();
+        try std.testing.expectError(error.NativePublicationValueNotBound, binding.ordinal(0));
+        try std.testing.expectError(error.InvalidSegment, prepared.bind(&.{7}));
+        try std.testing.expectError(error.InvalidSegment, prepared.bind(&.{ 7, 0 }));
+        try prepared.bind(&.{ 701, 902 });
+        var value = prepared.builder.value();
+        defer value.deinit();
+        const encoded = try value.read();
+        var decoded = (try decode(a, encoded, 17, fixture.bytes.len)).?;
+        defer decoded.deinit();
+        try std.testing.expectEqual(limit != 0, decoded.metadata != null);
+        var reader = try decoded.initReader(a, .{ .contiguous = fixture.bytes });
+        defer reader.deinit();
+        decoded.deinit();
+        // Reset only for the defer; the reader owns its independent column.
+        decoded = .{ .arena = std.heap.ArenaAllocator.init(a), .metadata = null, .footer = original.footer };
+        prepared.deinit();
+        live = false;
+        try std.testing.expectEqual(@as(?u32, 701), try reader.docOrdinal(0));
+        try std.testing.expectEqual(@as(?u32, 902), try reader.docOrdinal(1));
+        try std.testing.expectEqualStrings("one", (try reader.storedDoc(0)).?.id);
+        for (0..encoded.len) |end| try std.testing.expectError(error.InvalidSegmentAdmission, decode(a, encoded[0..end], 17, fixture.bytes.len));
+        try std.testing.expectError(error.InvalidSegmentAdmission, decode(a, encoded, 18, fixture.bytes.len));
+        const corrupt = try a.dupe(u8, encoded);
+        defer a.free(corrupt);
+        corrupt[bound_header_bytes + std.mem.readInt(u32, encoded[bound_header_bytes - 4 ..][0..4], .little)] = 0;
+        std.mem.writeInt(u32, corrupt[corrupt.len - 4 ..][0..4], std.hash.Crc32.hash(corrupt[0 .. corrupt.len - 4]), .little);
+        try std.testing.expectError(error.InvalidSegmentAdmission, decode(a, corrupt, 17, fixture.bytes.len));
+    }
+    try std.testing.expectEqual(@as(usize, 1), lease.references);
+}
+
+test "segment admission bound allocation failures release all producer decoder and reader owners" {
+    const a = std.testing.allocator;
+    const fixture = try Fixture.create(a);
+    defer fixture.deinit(a);
+    const Sweep = struct {
+        const Lease = struct {
+            references: usize = 1,
+            fn retain(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.references += 1;
+            }
+            fn release(raw: *anyopaque) void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                self.references -= 1;
+            }
+        };
+        fn run(alloc: A, input: Fixture) !void {
+            var lease: Lease = .{};
+            defer std.debug.assert(lease.references == 1);
+            const resources: @import("immutable_artifact.zig").BuildResources = .{
+                .native_metadata_revision = 16,
+                .ptr = &lease,
+                .allocator = alloc,
+                .io = std.testing.io,
+                .resource_manager = null,
+                .retain_fn = Lease.retain,
+                .release_fn = Lease.release,
+            };
+            var original = (try decode(alloc, input.descriptor, 17, input.bytes.len)).?;
+            defer original.deinit();
+            var prepared = try prepareBound(resources, 17, original.metadata.?, original.footer);
+            defer prepared.deinit();
+            var binding = try prepared.binding();
+            defer binding.deinit();
+            try prepared.bind(&.{ 10, 20 });
+            var value = prepared.builder.value();
+            defer value.deinit();
+            var decoded = (try decode(alloc, try value.read(), 17, input.bytes.len)).?;
+            defer decoded.deinit();
+            var reader = try decoded.initReader(alloc, .{ .contiguous = input.bytes });
+            defer reader.deinit();
+            try std.testing.expectEqual(@as(?u32, 20), try reader.docOrdinal(1));
+        }
+    };
+    try @import("antfly_platform").allocator.checkAllAllocationFailures(a, Sweep.run, .{fixture});
 }

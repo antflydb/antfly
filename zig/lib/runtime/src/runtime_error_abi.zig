@@ -1013,6 +1013,9 @@ pub const Detail = enum(c_int) {
     unsupported_sql_execution,
     lite_replay_backlog_exceeded,
     invalid_native_replay_admission,
+    native_publication_value_not_bound,
+    native_publication_value_already_bound,
+    invalid_native_publication_value,
 };
 
 pub const Status = extern struct {
@@ -1030,6 +1033,9 @@ pub const Status = extern struct {
 
 pub fn statusFromError(err: anyerror) Status {
     return switch (err) {
+        error.NativePublicationValueNotBound => status(.internal, .native_publication_value_not_bound),
+        error.NativePublicationValueAlreadyBound => status(.internal, .native_publication_value_already_bound),
+        error.InvalidNativePublicationValue => status(.internal, .invalid_native_publication_value),
         error.SqlStatementReadUnavailable => status(.retryable, .sql_statement_read_unavailable),
         error.UnsupportedSqlExecution => status(.unsupported, .unsupported_sql_execution),
         error.ConflictingPrivacyProducerOptions => status(.invalid_argument, .conflicting_privacy_producer_options),
@@ -1988,6 +1994,9 @@ pub fn errorFromStatus(value: Status) anyerror {
 
 fn detailErrorName(comptime detail: Detail) []const u8 {
     return switch (detail) {
+        .native_publication_value_not_bound => "NativePublicationValueNotBound",
+        .native_publication_value_already_bound => "NativePublicationValueAlreadyBound",
+        .invalid_native_publication_value => "InvalidNativePublicationValue",
         .invalid_document_source => "InvalidDocumentSource",
         .unsupported_document_format => "UnsupportedDocumentFormat",
         .document_source_limit_exceeded => "DocumentSourceLimitExceeded",
@@ -3442,4 +3451,13 @@ test "privacy failures retain identity and retry classes across runtime callback
     }
     try std.testing.expectEqual(@backingInt(Code.retryable), statusFromError(error.PrivacyStale).code);
     try std.testing.expectEqual(@backingInt(Code.corrupt), statusFromError(error.InvalidPrivacyReceipt).code);
+}
+
+test "native publication parameters preserve terminal errors across runtime boundaries" {
+    for ([_]anyerror{ error.NativePublicationValueNotBound, error.NativePublicationValueAlreadyBound, error.InvalidNativePublicationValue }) |err| {
+        const transported = statusFromError(err);
+        try std.testing.expectEqual(@backingInt(Code.internal), transported.code);
+        try std.testing.expect(errorHasStableDetail(err));
+        try std.testing.expectEqual(err, errorFromStatus(transported));
+    }
 }

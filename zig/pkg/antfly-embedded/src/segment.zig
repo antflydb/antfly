@@ -758,6 +758,9 @@ pub const SegmentReader = struct {
     fields: []FieldInfo,
     fields_sorted: bool = false,
 
+    /// Native metadata owns authoritative identities independently of postings.
+    /// Every independently owned reader retains its own binding reference.
+    ordinal_binding: ?@import("storage/doc_ordinal_binding.zig").Binding = null,
     native: ?*Native = null,
     deferred: ?*const fn (Allocator, SegmentSource) anyerror!SegmentReader = null,
 
@@ -1107,6 +1110,7 @@ pub const SegmentReader = struct {
                 if (!std.meta.eql(try reader.invertedFieldStats(expected.name), expected.inverted_stats) or actual.sections.len != expected.sections.len) return error.InvalidSegment;
                 for (expected.sections) |section| if (!reader.hasSection(expected.name, section.section_type)) return error.InvalidSegment;
             }
+            if (self.ordinal_binding) |binding| try reader.attachOrdinalBinding(binding);
             return reader;
         }
         const base = self.native orelse return error.InvalidSegment;
@@ -1128,6 +1132,7 @@ pub const SegmentReader = struct {
         var bound = self.*;
         bound.alloc = alloc;
         bound.native = native;
+        if (self.ordinal_binding) |binding| bound.ordinal_binding = binding.retained();
         return bound;
     }
 
@@ -1353,7 +1358,18 @@ pub const SegmentReader = struct {
         };
     }
 
+    /// This may be attached while the metadata producer is still unsealed;
+    /// publication must seal it before making this reader visible.
+    pub fn attachOrdinalBinding(self: *SegmentReader, binding: @import("storage/doc_ordinal_binding.zig").Binding) !void {
+        if (binding.count != self.doc_count) return error.InvalidSegment;
+        const owned = binding.retained();
+        if (self.ordinal_binding) |*old| old.deinit();
+        self.ordinal_binding = owned;
+    }
+
     pub fn deinit(self: *SegmentReader) void {
+        if (self.ordinal_binding) |*binding| binding.deinit();
+        self.ordinal_binding = null;
         if (self.native) |native| {
             if (!native.borrowed_navigation) {
                 for (self.fields) |field| for (field.sections) |section| {
@@ -1390,6 +1406,8 @@ pub const SegmentReader = struct {
 
     /// Get section data for a field by name and type.
     pub fn getSection(self: *const SegmentReader, field_name: []const u8, section_type: SectionType) !?[]const u8 {
+        if (section_type == .doc_ordinals and std.mem.eql(u8, field_name, doc_ordinals_field))
+            if (self.ordinal_binding) |*binding| return try binding.column();
         if (self.native) |native| {
             const entry = native.range.findSection(field_name, section_type) orelse return null;
             if (entry.length == 0) return null;
@@ -2202,6 +2220,7 @@ pub const SegmentReader = struct {
     }
 
     pub fn docOrdinal(self: *const SegmentReader, doc_idx: u32) !?u32 {
+        if (self.ordinal_binding) |*binding| return binding.ordinal(doc_idx);
         if (self.native) |native| {
             const view = (try native.range.sectionView(doc_ordinals_field, .doc_ordinals)) orelse return null;
             if (view.length < 5) return error.InvalidSegment;
@@ -6443,6 +6462,10 @@ const OrdinalReader = struct {
     count: u32 = 0,
     fn init(reader: *const SegmentReader) !OrdinalReader {
         const View = @import("segment_source.zig").View;
+        if (reader.ordinal_binding) |*binding| {
+            const bytes = try binding.column();
+            return .{ .view = try View.init(.{ .contiguous = bytes }, 0, bytes.len), .count = binding.count };
+        }
         const view = if (reader.native) |native| blk: {
             const section = (try native.range.sectionView(doc_ordinals_field, .doc_ordinals)) orelse return .{};
             break :blk try View.init(native.metadata_cache.?.borrowedSource(), section.offset, section.length);
@@ -13377,4 +13400,55 @@ test "privacy wide segment directories use sorted navigation and reject duplicat
     defer a.free(invalid);
     try std.testing.expectError(error.InvalidSegment, SegmentReader.init(a, invalid));
     try std.testing.expectError(error.InvalidSegment, RangeSegmentReader.init(a, .{ .contiguous = invalid }, .{}));
+}
+
+test "native document ordinal binding overrides inline identities for queries cursors and merges" {
+    const a = std.testing.allocator;
+    const bindings = @import("storage/doc_ordinal_binding.zig");
+    const values = @import("storage/native_publication_value.zig");
+    var writer = SegmentWriter.init(a);
+    defer writer.deinit();
+    try writer.addStoredDoc("first", "{}");
+    try writer.addStoredDoc("second", "{}");
+    try writer.addDocOrdinals(&.{ 1, 2 });
+    const bytes = try writer.build();
+    defer a.free(bytes);
+    var builder = try values.Builder.create(a, try bindings.encodedLength(2));
+    var producer_live = true;
+    defer if (producer_live) builder.deinit();
+    const column = try builder.bytes();
+    column[0] = 1;
+    std.mem.writeInt(u32, column[1..5], 2, .big);
+    var value = builder.value();
+    defer value.deinit();
+    var binding = try bindings.Binding.capturePrepared(value, 0, 2);
+    defer binding.deinit();
+    var native = try SegmentReader.initSource(a, .{ .contiguous = bytes });
+    defer native.deinit();
+    var heap = try SegmentReader.init(a, bytes);
+    defer heap.deinit();
+    try std.testing.expectEqual(@as(?u32, 1), try heap.docOrdinal(0));
+    try native.attachOrdinalBinding(binding);
+    try heap.attachOrdinalBinding(binding);
+    try std.testing.expectError(error.NativePublicationValueNotBound, native.docOrdinal(0));
+    try std.testing.expectError(error.NativePublicationValueNotBound, DocOrdinalCursor.init(&heap));
+    try bindings.encodeInto(column, &.{ 41, 89 });
+    try builder.seal();
+    builder.deinit();
+    producer_live = false;
+    var query = try native.bindSource(a, .{ .contiguous = bytes });
+    defer query.deinit();
+    // Closing the base binding must not invalidate the independent query reader.
+    native.ordinal_binding.?.deinit();
+    native.ordinal_binding = null;
+    var cursor = try DocOrdinalCursor.init(&query);
+    try std.testing.expectEqual(@as(?u32, 41), try query.docOrdinal(0));
+    try std.testing.expectEqual(@as(?u32, 89), try heap.docOrdinal(1));
+    try std.testing.expectEqual(@as(?u32, 89), try cursor.get(1));
+    const merged = try mergeSegmentInputs(a, &.{.{ .reader = &query }});
+    defer a.free(merged);
+    var merged_reader = try SegmentReader.init(a, merged);
+    defer merged_reader.deinit();
+    try std.testing.expectEqual(@as(?u32, 41), try merged_reader.docOrdinal(0));
+    try std.testing.expectEqual(@as(?u32, 89), try merged_reader.docOrdinal(1));
 }

@@ -1168,17 +1168,22 @@ The naming recommendation is:
 
 ## Native throughput and online compaction
 
-Native owners create revision-15 files (`AFLITE\x0fP`) with packed records and
+Native owners create revision-16 files (`AFLITE\x10P`) with packed records and
 durable page ownership. Existing revision-3 signatures (`AFLITE\x03N` for
 unpacked records and `AFLITE\x03P` for packed records) remain readable. Writable
-owners migrate revisions 3, 7, 8, 9, 10, 11, 12, 13 and 14 through an atomic compact-generation replacement;
+owners migrate revisions 3, 7, 8, 9, 10, 11, 12, 13, 14 and 15 through an atomic compact-generation replacement;
 read-only opens preserve the existing encoding. The Zig `page_reuse = false`
 option preserves revision-3 creation/open behavior. Raw native primitives also
 retain their revision-3 default for compatibility. Revision 2 remains unsupported,
-and older binaries reject the revision-15 signature before checkpoint selection.
+and older binaries reject the revision-16 signature before checkpoint selection.
 Unreleased revision-4/5/6 prototypes are rejected rather than mixing reader,
-logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-15 image.
+logical-identity, and recovery-agenda contracts; revision-3 migration creates a bound revision-16 image.
 
+
+Revision 16 adds native-owned document-ordinal columns for prepared text
+publication, independently of immutable posting bytes. Older inline ordinal
+sections remain readable. Active metadata and its ordinal column publish in
+the same native transaction as primary document identities.
 
 Revision 15 adds authenticated per-checkpoint physical postimage manifests.
 Eligible synced native transactions write their pages, allocator seal, manifest

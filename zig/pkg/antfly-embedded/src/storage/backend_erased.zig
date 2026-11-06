@@ -938,6 +938,7 @@ pub const NamespaceWriteTxn = struct {
         get: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror![]const u8,
         get_many_sorted: ?*const fn (*anyopaque, backend_types.Namespace, []const []const u8, []?[]const u8) anyerror!void = null,
         put: *const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void,
+        put_prepared_value: ?*const fn (*anyopaque, backend_types.Namespace, []const u8, @import("native_publication_value.zig").Value) anyerror!void = null,
         append_put: ?*const fn (*anyopaque, backend_types.Namespace, []const u8, []const u8) anyerror!void = null,
         delete: *const fn (*anyopaque, backend_types.Namespace, []const u8) anyerror!void,
         open_cursor: ?*const fn (Allocator, *anyopaque, backend_types.Namespace) anyerror!Cursor = null,
@@ -985,6 +986,11 @@ pub const NamespaceWriteTxn = struct {
 
     pub fn put(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
         try BoundaryAbi.call("put", self.boundary_dispatch, self.vtable.put, .{ self.ptr, namespace, key, value });
+    }
+
+    pub fn putPreparedValue(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8, value: @import("native_publication_value.zig").Value) !void {
+        const operation = self.vtable.put_prepared_value orelse return error.Unsupported;
+        try BoundaryAbi.call("put_prepared_value", self.boundary_dispatch, operation, .{ self.ptr, namespace, key, value });
     }
 
     pub fn appendPut(self: *NamespaceWriteTxn, namespace: backend_types.Namespace, key: []const u8, value: []const u8) !void {
@@ -2084,6 +2090,10 @@ pub fn namespaceWriteTxnFrom(
             try unbox(ptr).handle.put(try mapNamespace(namespace), key, value);
         }
 
+        fn putPreparedValue(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8, value: @import("native_publication_value.zig").Value) anyerror!void {
+            try unbox(ptr).handle.putPreparedValue(try mapNamespace(namespace), key, value);
+        }
+
         pub fn appendPut(ptr: *anyopaque, namespace: backend_types.Namespace, key: []const u8, value: []const u8) anyerror!void {
             try unbox(ptr).handle.appendPut(try mapNamespace(namespace), key, value);
         }
@@ -2113,6 +2123,7 @@ pub fn namespaceWriteTxnFrom(
             .get = vt.get,
             .get_many_sorted = if (@hasDecl(Handle, "getManySorted")) vt.getManySorted else null,
             .put = vt.put,
+            .put_prepared_value = if (@hasDecl(Handle, "putPreparedValue")) vt.putPreparedValue else null,
             .append_put = if (@hasDecl(Handle, "appendPut")) vt.appendPut else null,
             .delete = vt.delete,
             .open_cursor = if (@hasDecl(Handle, "openCursor")) vt.openCursor else null,

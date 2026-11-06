@@ -890,3 +890,8 @@ pub const storage_source_value_identity = @import("storage/source_value_identity
 pub const storage_lite_path_admission = @import("storage/lite/path_admission.zig");
 pub const storage_lite_replay_admission = @import("storage/lite/replay_admission.zig");
 pub const storage_segment_admission = @import("storage/segment_admission.zig");
+
+pub const storage_native_publication_value = @import("storage/native_publication_value.zig");
+pub const storage_lite_namespace_store = @import("storage/lite/namespace_store.zig");
+
+pub const storage_doc_ordinal_binding = @import("storage/doc_ordinal_binding.zig");

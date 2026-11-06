@@ -50,11 +50,28 @@ pub const Prepared = struct {
 /// Independently retained preparation resources. This capability borrows no
 /// DB, Store, schema/index entry, primary snapshot or publication admission.
 pub const BuildResources = struct {
+    native_metadata_revision: u32 = 0,
     ptr: *anyopaque,
     allocator: std.mem.Allocator,
     io: std.Io,
     resource_manager: ?*@import("resource_manager.zig").ResourceManager,
     release_fn: *const fn (*anyopaque) void,
+    retain_fn: *const fn (*anyopaque) void,
+    pub fn valueOwner(self: BuildResources) @import("native_publication_value.zig").Owner {
+        return .{ .ptr = self.ptr, .retain_fn = self.retain_fn, .release_fn = self.release_fn };
+    }
+    /// Fixed publication metadata owns an independent resource reference and
+    /// keeps its quota until the last reader releases the sealed value.
+    pub fn createPublicationValue(self: BuildResources, length: usize) !@import("native_publication_value.zig").Builder {
+        const Builder = @import("native_publication_value.zig").Builder;
+        if (self.resource_manager) |manager| {
+            const bytes = try Builder.budgetedBytes(@import("resource_manager.zig").Reservation, length);
+            var credit = try manager.reserveWithoutReclaim(.lite_docstore_snapshot_cache, bytes);
+            errdefer credit.release();
+            return try Builder.createBudgeted(self.allocator, length, self.valueOwner(), credit);
+        }
+        return try Builder.createWithOwner(self.allocator, length, self.valueOwner());
+    }
     pub fn deinit(self: *BuildResources) void {
         self.release_fn(self.ptr);
         self.* = undefined;

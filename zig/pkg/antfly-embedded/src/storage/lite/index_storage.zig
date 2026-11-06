@@ -443,6 +443,10 @@ const NativeArtifactStager = struct {
     prefix: []u8,
     const vtable: immutable_artifact.Stager.VTable = .{ .stage = stage, .acquire_build_resources = acquireBuildResources, .deinit = deinit };
 
+    fn retainBuildResources(raw: *anyopaque) void {
+        const registry: *artifacts.Registry = @ptrCast(@alignCast(raw));
+        registry.retainOwner();
+    }
     fn releaseBuildResources(raw: *anyopaque) void {
         const registry: *artifacts.Registry = @ptrCast(@alignCast(raw));
         registry.releaseOwner();
@@ -455,7 +459,7 @@ const NativeArtifactStager = struct {
         // close. It cannot extend an externally supplied manager's lifetime.
         if (owner.resource_manager != null and !owner.resource_manager_transfers_on_close) return null;
         self.registry.retainOwner();
-        return .{ .ptr = self.registry, .allocator = self.registry.allocator, .io = self.registry.io(), .resource_manager = owner.resource_manager, .release_fn = releaseBuildResources };
+        return .{ .native_metadata_revision = if (owner.file.header.indexed_reclamation) owner.file.header.indexed_revision else 3, .ptr = self.registry, .allocator = self.registry.allocator, .io = self.registry.io(), .resource_manager = owner.resource_manager, .release_fn = releaseBuildResources, .retain_fn = retainBuildResources };
     }
 
     fn stage(raw: *anyopaque, bytes: []const u8) !immutable_artifact.Prepared {
@@ -4688,4 +4692,83 @@ test "lite resident immutable sources retain owned bytes without durable range l
     for (bytes) |byte| try std.testing.expectEqual(@as(u8, 'a'), byte);
     try second.readInto(0, &bytes);
     for (bytes) |byte| try std.testing.expectEqual(@as(u8, 'b'), byte);
+}
+
+test "native publication values retain real backend accounting after every producer closes" {
+    const a = std.testing.allocator;
+    const backend_mod = @import("backend.zig");
+    const values = @import("../native_publication_value.zig");
+    const resources_mod = @import("../resource_manager.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-bound-resources.aflite");
+    defer a.free(path);
+    var backend = try backend_mod.Handle.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .exclusive = true, .reclamation = .{ .enabled = false } });
+    var backend_live = true;
+    defer if (backend_live) backend.deinit();
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, backend.native_docstore.?);
+    var stager = (try adapter.storage().acquireImmutableStager(a)).?;
+    var stager_live = true;
+    defer if (stager_live) stager.deinit();
+    var resources = (try stager.acquireBuildResources()).?;
+    var resources_live = true;
+    defer if (resources_live) resources.deinit();
+    const manager = resources.resource_manager.?;
+    const before = manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes;
+    var builder = try resources.createPublicationValue(8);
+    var builder_live = true;
+    defer if (builder_live) builder.deinit();
+    var value = builder.value();
+    defer value.deinit();
+    const charge = try values.Builder.budgetedBytes(resources_mod.Reservation, 8);
+    try std.testing.expectEqual(before + charge, manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes);
+    resources.deinit();
+    resources_live = false;
+    stager.deinit();
+    stager_live = false;
+    backend.deinit();
+    backend_live = false;
+    // The value's own owner retains the registry, transferred ResourceManager
+    // and reservation. No live Store, backend or preparation resource remains.
+    try builder.write(0, "identity");
+    try builder.seal();
+    builder.deinit();
+    builder_live = false;
+    try std.testing.expectEqual(@as(u64, @intCast(charge)), manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes);
+    try std.testing.expectEqualStrings("identity", try value.read());
+}
+
+test "native ordinal column keeps the actual source accounting owner after backend teardown" {
+    const a = std.testing.allocator;
+    const bindings = @import("../doc_ordinal_binding.zig");
+    const backend_mod = @import("backend.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try testPath(a, tmp, "native-ordinal-owner.aflite");
+    defer a.free(path);
+    var backend = try backend_mod.Handle.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .exclusive = true, .reclamation = .{ .enabled = false } });
+    var backend_live = true;
+    defer if (backend_live) backend.deinit();
+    backend.native_docstore.?.maintenance_start_suppressed = true;
+    var adapter = Store.init(a, backend.native_docstore.?);
+    const storage = adapter.storage();
+    var bytes: [13]u8 = undefined;
+    try bindings.encodeInto(&bytes, &.{ 47, 91 });
+    try storage.writeFileAbsolute("/indexes/text/segments/identity.seg", &bytes);
+    var source = (try storage.openResidentImmutableSource(a, "/indexes/text/segments/identity.seg")).?;
+    var source_live = true;
+    defer if (source_live) source.close();
+    const manager = source.resourceManager().?;
+    const before = manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes;
+    var binding = try bindings.copySealed(a, source, &bytes, 2);
+    defer binding.deinit();
+    try std.testing.expect(manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes > before);
+    source.close();
+    source_live = false;
+    backend.deinit();
+    backend_live = false;
+    try std.testing.expectEqual(@as(?u32, 47), try binding.ordinal(0));
+    try std.testing.expectEqual(@as(?u32, 91), try binding.ordinal(1));
+    try std.testing.expect(manager.sliceStats(.lite_docstore_snapshot_cache).used_bytes > 0);
 }

@@ -351,3 +351,37 @@ Exact-commit Debug validation for this stage is recorded in
 [owned-native-publication-debug.json](owned-native-publication-debug.json).
 It qualifies the listed correctness and ownership checks; foreground integration
 and final end-to-end performance qualification are still pending.
+
+### Native document identity binding
+
+Revision 16 separates the authoritative ordinal column from immutable posting
+bytes. `native_publication_value.Value` owns a fixed address and length. Its
+producer initializes the buffer before preparing namespace mutations, then seals
+it with release ordering after primary identity assignment. Reads and native
+namespace staging require the matching acquire-ordered seal. An unbound buffer
+fails before host publication; it never produces a retryable post-commit error.
+
+The `AFTSADM2` active marker contains the segment ID, physical length, exact AFSM
+footer, optional `AFTSADM1` navigation and mandatory ordinal column, protected by
+an outer checksum. Large navigation falls back to source admission while keeping
+the identity column. Readers accept legacy inline ordinals. Scalar lookup,
+ordinal cursors, query-bound readers and compaction all prefer the native binding.
+Deletion-only replacements retain the column and republish it with their bitmap.
+Compaction can fold it back into an ordinary inline column.
+
+`prepareNativeTextSegment` retains owned preparation resources and copies keys in
+physical segment order. `prepareNativePublication` allocates the final metadata
+buffer and replacement snapshot before native writer admission. The owner binds
+its authoritative ordinals before `commitNativePublications`. Primary changes,
+metadata, activation and all participating indexes then share the host commit.
+The ordinary document batch and SQL paths still need to consume this prepared
+foreground capability; this component alone does not unify those entry points
+or implement publication cohorts.
+
+Publication values retain the native resource owner and charge their complete
+buffer/state reservation until their final snapshot reference disappears.
+Decoded columns retain the actual source accounting owner, including sources
+reused from retired runtimes. Namespace cursor snapshots retain their own value
+references; overwriting a pending key cannot invalidate an existing cursor.
+The namespace's inode, file namespace and generation witness remains exact even
+when the value is bound later.

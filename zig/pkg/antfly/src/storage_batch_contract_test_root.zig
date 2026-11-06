@@ -26,10 +26,14 @@ test {
     _ = @import("antfly_local_sources").storage_persistent;
     _ = @import("antfly_local_sources").storage_wal;
     _ = @import("antfly_local_sources").storage_lite_index_storage;
+    _ = @import("antfly_local_sources").storage_native_publication_value;
+    _ = @import("antfly_local_sources").storage_doc_ordinal_binding;
+    _ = @import("antfly_local_sources").storage_lite_namespace_store;
     _ = @import("antfly_local_sources").storage_lite_native;
     _ = @import("antfly_local_sources").storage_lite_commit_proof;
     _ = @import("antfly_local_sources").storage_db_catalog_index_manager;
     _ = @import("antfly_local_sources").index;
+    _ = @import("antfly_local_sources").storage_segment_admission;
     _ = @import("antfly_local_sources").storage_db_result_collectors;
     _ = @import("antfly_local_sources").storage_db_enrichment_enrichment_runtime;
     _ = @import("antfly_local_sources").storage_db_artifact_chunk_vector_publication;

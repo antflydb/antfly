@@ -990,7 +990,9 @@ pub const PreparedReplaySegment = struct {
     artifact: immutable_artifact.Prepared,
     key_range: SegmentKeyRange,
     alloc: Allocator,
+    ordinals: ?NativeOrdinalPreparation = null,
     pub fn deinit(self: *@This()) void {
+        if (self.ordinals) |*plan| plan.deinit();
         self.artifact.deinit();
         self.key_range.deinit(self.alloc);
         self.* = undefined;
@@ -1001,6 +1003,55 @@ pub fn prepareReplaySegment(alloc: Allocator, stager: immutable_artifact.Stager,
     var range = try extractSegmentKeyRange(alloc, bytes);
     errdefer range.deinit(alloc);
     return .{ .artifact = try stager.stage(bytes), .key_range = range, .alloc = alloc };
+}
+
+/// Owned foreground identities follow physical segment order, including
+/// index sorting. Assignment changes only native metadata, never posting bytes.
+pub const NativeOrdinalPreparation = struct {
+    resources: immutable_artifact.BuildResources,
+    keys: [][]u8,
+    assigned: []u32,
+    metadata: ?segment_admission.PreparedBinding = null,
+    segment_id: ?u64 = null,
+
+    pub fn bind(self: *NativeOrdinalPreparation, ordinals: []const u32) !void {
+        const metadata = if (self.metadata) |*value| value else return error.InvalidDerivedApplyState;
+        try metadata.bind(ordinals);
+    }
+    pub fn deinit(self: *NativeOrdinalPreparation) void {
+        if (self.metadata) |*metadata| metadata.deinit();
+        for (self.keys) |key| self.resources.allocator.free(key);
+        self.resources.allocator.free(self.keys);
+        self.resources.allocator.free(self.assigned);
+        self.resources.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn prepareNativeTextSegment(alloc: Allocator, stager: immutable_artifact.Stager, bytes: []const u8) !PreparedReplaySegment {
+    var result = try prepareReplaySegment(alloc, stager, bytes);
+    errdefer result.deinit();
+    var resources = (try stager.acquireBuildResources()) orelse return error.Unsupported;
+    errdefer resources.deinit();
+    if (resources.native_metadata_revision < 16) return error.Unsupported;
+    const a = resources.allocator;
+    var reader = try segment_mod.SegmentReader.init(a, bytes);
+    defer reader.deinit();
+    const keys = try a.alloc([]u8, reader.doc_count);
+    var initialized: usize = 0;
+    errdefer {
+        for (keys[0..initialized]) |key| a.free(key);
+        a.free(keys);
+    }
+    for (keys, 0..) |*key, i| {
+        const stored = (try reader.storedDoc(@intCast(i))) orelse return error.InvalidSegment;
+        key.* = try a.dupe(u8, stored.id);
+        initialized += 1;
+    }
+    const assigned = try a.alloc(u32, reader.doc_count);
+    @memset(assigned, 0);
+    result.ordinals = .{ .resources = resources, .keys = keys, .assigned = assigned };
+    return result;
 }
 
 /// Meta keys in persistent storage.
@@ -1570,7 +1621,10 @@ pub const PersistentIndex = struct {
         defer if (!published) {
             // The native host rolls back uncommitted aliases atomically.
             // A possibly committed alias remains for fresh-owner reconciliation.
-            for (replacements[0..initialized]) |*replacement| replacement.data.deinit(self.alloc);
+            for (replacements[0..initialized]) |*replacement| {
+                if (replacement.prepared_reader) |*reader| reader.deinit();
+                replacement.data.deinit(self.alloc);
+            }
         };
         const captured = self.writer.acquireSnapshot();
         defer captured.release();
@@ -1591,6 +1645,12 @@ pub const PersistentIndex = struct {
             const source = try entry.data.native.retainOwned();
             replacements[initialized] = .{ .id = info.seg_id, .data = .fromNative(source), .deleted = &deleted[i] };
             initialized += 1;
+            if (entry.reader.ordinal_binding) |binding| {
+                var reader = try replacements[initialized - 1].data.initReader(self.alloc);
+                errdefer reader.deinit();
+                try reader.attachOrdinalBinding(binding);
+                replacements[initialized - 1].prepared_reader = reader;
+            }
         }
         for (segments) |*segment| {
             replacements[initialized] = while (true) {
@@ -1621,6 +1681,22 @@ pub const PersistentIndex = struct {
                 break .{ .id = id, .data = .fromNative(source) };
             };
             initialized += 1;
+            if (segment.ordinals) |*plan| {
+                if (detached == null) return error.InvalidDerivedApplyState;
+                var reader = try replacements[initialized - 1].data.initReader(self.alloc);
+                errdefer reader.deinit();
+                const navigation = try reader.admission(self.alloc);
+                defer navigation.deinit(self.alloc);
+                if (plan.metadata) |*previous| previous.deinit();
+                plan.metadata = null;
+                plan.segment_id = null;
+                plan.metadata = try segment_admission.prepareBound(plan.resources, replacements[initialized - 1].id, navigation, try segment_mod.SegmentReader.nativeCatalogFooter(reader.source()));
+                plan.segment_id = replacements[initialized - 1].id;
+                var binding = try plan.metadata.?.binding();
+                defer binding.deinit();
+                try reader.attachOrdinalBinding(binding);
+                replacements[initialized - 1].prepared_reader = reader;
+            }
         }
         var publication: ?index_mod.IndexWriter.PreparedSegmentReplacement = if (count != 0)
             try self.writer.prepareSegmentsManyData(old_ids, replacements)
@@ -1637,7 +1713,7 @@ pub const PersistentIndex = struct {
             try self.updateActiveSegments(&txn, replacement.id, .add);
         }
         try saveNextSegmentId(&txn, self.writer.next_segment_id);
-        if (publication) |*prepared| try self.savePreparedSegmentAdmissions(&txn, prepared);
+        if (publication) |*prepared| try self.savePreparedSegmentAdmissionsWithBindings(&txn, prepared, segments);
         if (checkpoint) |point| {
             const encoded = ReplayFragment.encode(point);
             try txn.put(.meta, meta_replay_fragment, &encoded);
@@ -2178,7 +2254,7 @@ pub const PersistentIndex = struct {
                     // Descriptor and active ID belong to this same catalog
                     // transaction. Payloads retain independent native range
                     // leases and authentication. No source pointers are cached.
-                    break :blk segment_mod.SegmentReader.initNativeCatalogAdmission(alloc, segment_data.?.source(), owned.metadata, owned.footer) catch |err| switch (err) {
+                    break :blk owned.initReader(alloc, segment_data.?.source()) catch |err| switch (err) {
                         error.InvalidSegment => return error.InvalidSegmentAdmission,
                         else => return err,
                     };
@@ -3877,7 +3953,50 @@ pub const PersistentIndex = struct {
         return index_mod.SegmentData.fromOwnedHeap(try self.alloc.dupe(u8, segment_bytes));
     }
 
+    /// Split/export consumers require a self-contained segment. Materialize
+    /// native identities only at this cold portability boundary, preserving
+    /// physical document order so the independent deletion bitmap stays valid.
     fn readSegmentBytesAlloc(self: *PersistentIndex, txn: *MainTxn, alloc: Allocator, seg_id: u64) ![]u8 {
+        const raw = try self.readRawSegmentBytesAlloc(txn, alloc, seg_id);
+        var raw_transferred = false;
+        defer if (!raw_transferred) alloc.free(raw);
+        const marker_key = activeSegmentMetaKey(seg_id);
+        const marker = txn.get(.meta, &marker_key) catch |err| switch (err) {
+            error.NotFound => {
+                raw_transferred = true;
+                return raw;
+            },
+            else => return err,
+        };
+        var admission = (try segment_admission.decode(alloc, marker, seg_id, raw.len)) orelse {
+            raw_transferred = true;
+            return raw;
+        };
+        defer admission.deinit();
+        if (admission.bound_column == null) {
+            raw_transferred = true;
+            return raw;
+        }
+        var reader = try admission.initReader(alloc, .{ .contiguous = raw });
+        defer reader.deinit();
+        const portable = try segment_mod.mergeSegmentInputs(alloc, &.{.{ .reader = &reader }});
+        errdefer alloc.free(portable);
+        var output = try segment_mod.SegmentReader.init(alloc, portable);
+        defer output.deinit();
+        if (output.doc_count != reader.doc_count) return error.InvalidSegment;
+        var identities = std.heap.ArenaAllocator.init(alloc);
+        defer identities.deinit();
+        for (0..reader.doc_count) |i| {
+            _ = identities.reset(.retain_capacity);
+            const doc: u32 = @intCast(i);
+            const before = (try reader.storedIdScoped(identities.allocator(), doc)) orelse return error.InvalidSegment;
+            const after = (try output.storedIdScoped(identities.allocator(), doc)) orelse return error.InvalidSegment;
+            if (!std.mem.eql(u8, before, after) or try reader.docOrdinal(doc) != try output.docOrdinal(doc)) return error.InvalidSegment;
+        }
+        return portable;
+    }
+
+    fn readRawSegmentBytesAlloc(self: *PersistentIndex, txn: *MainTxn, alloc: Allocator, seg_id: u64) ![]u8 {
         const seg_key = std.mem.toBytes(std.mem.nativeToBig(u64, seg_id));
         if (txn.get(.segments, &seg_key)) |segment_bytes| {
             return try alloc.dupe(u8, segment_bytes);
@@ -4283,9 +4402,32 @@ pub const PersistentIndex = struct {
     /// descriptors retain ordinary source admission. Optional allocation
     /// pressure may omit acceleration, but storage errors abort publication.
     fn savePreparedSegmentAdmissions(self: *PersistentIndex, txn: *MainTxn, publication: *const index_mod.IndexWriter.PreparedSegmentReplacement) !void {
+        return self.savePreparedSegmentAdmissionsWithBindings(txn, publication, &.{});
+    }
+
+    fn savePreparedSegmentAdmissionsWithBindings(self: *PersistentIndex, txn: *MainTxn, publication: *const index_mod.IndexWriter.PreparedSegmentReplacement, late_segments: []PreparedReplaySegment) !void {
         if (self.segment_files == null or self.segment_files.?.storage.vtable.open_leased_immutable_source == null) return;
         for (publication.snapshot.segments[publication.carried_count..]) |segment| {
             if (segment.data != .native) continue;
+            const marker_key = activeSegmentMetaKey(segment.id);
+            const late = for (late_segments) |*candidate| {
+                if (candidate.ordinals) |*plan| if (plan.segment_id == segment.id) break plan;
+            } else null;
+            if (late) |plan| {
+                var value = plan.metadata.?.builder.value();
+                defer value.deinit();
+                const namespace_txn = if (txn.write) |*write| write else return error.ReadOnly;
+                try namespace_txn.putPreparedValue(runtimeNamespace(.meta), &marker_key, value);
+                continue;
+            }
+            if (segment.reader.ordinal_binding) |*binding| {
+                const metadata = try segment.reader.admission(self.alloc);
+                defer metadata.deinit(self.alloc);
+                const encoded = try segment_admission.encodeBound(self.alloc, segment.id, metadata, try segment_mod.SegmentReader.nativeCatalogFooter(segment.data.source()), try binding.column());
+                defer self.alloc.free(encoded);
+                try txn.put(.meta, &marker_key, encoded);
+                continue;
+            }
             const metadata = segment.reader.admission(self.alloc) catch |err| switch (err) {
                 error.OutOfMemory, error.ResourceBudgetExceeded, error.InvalidSegment => continue,
                 else => return err,
@@ -4297,7 +4439,6 @@ pub const PersistentIndex = struct {
                 else => return err,
             } orelse continue;
             defer self.alloc.free(encoded);
-            const marker_key = activeSegmentMetaKey(segment.id);
             try txn.put(.meta, &marker_key, encoded);
         }
     }
@@ -8648,4 +8789,101 @@ test "native owned publication preparation never commits a collision frontier" {
     const prepared = try index.prepareNativePublication(&segments, &.{}, null, null);
     defer prepared.deinit();
     try std.testing.expectEqualDeep(checkpoint, docs.file.activeCheckpoint());
+}
+
+test "native foreground identity binding publishes once and survives reopen deletion and merge" {
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/native-identity-binding.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false, .page_reuse = true } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    docs.file.externally_locked = true;
+    var storage = lite_indexes.Store.init(a, &docs);
+    const opts: PersistentIndexOptions = .{ .path = "/indexes/text", .io = std.testing.io, .main_backend = .lsm, .main_lsm_storage = storage.storage(), .wal_backend = .lsm, .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true };
+    var index = try PersistentIndex.open(a, opts);
+    var index_live = true;
+    defer if (index_live) index.close();
+    var primary_store = try @import("docstore.zig").DocStore.openRuntime(a, docs.backendStore());
+    defer primary_store.close();
+    const Primary = struct {
+        store: *@import("docstore.zig").DocStore,
+        fn commit(raw: *anyopaque, participant: @import("native_publication.zig").Participant) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            try self.store.putBatchWithPublications(std.testing.io, &.{.{ .key = "doc:a", .value = "alpha" }}, &.{}, null, .{}, null, participant);
+        }
+    };
+    var primary: Primary = .{ .store = &primary_store };
+    const bytes = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(bytes);
+    // An unsealed identity cannot commit primary bytes or make postings visible.
+    for (0..2) |attempt| {
+        var stager = (try index.acquireReplayStager(a)).?;
+        defer stager.deinit();
+        var staged = [_]PreparedReplaySegment{try prepareNativeTextSegment(a, stager, bytes)};
+        defer staged[0].deinit();
+        const before = docs.file.activeCheckpoint().commit_sequence;
+        const prepared = try index.prepareNativePublication(&staged, &.{}, null, null);
+        defer prepared.deinit();
+        try std.testing.expectEqualStrings("doc:a", staged[0].ordinals.?.keys[0]);
+        try std.testing.expectEqual(before, docs.file.activeCheckpoint().commit_sequence);
+        if (attempt == 0) {
+            try std.testing.expectError(error.NativePublicationValueNotBound, PersistentIndex.commitNativePublications(&.{prepared}, .{ .ptr = &primary, .commit_fn = Primary.commit }));
+            try std.testing.expectEqual(before, docs.file.activeCheckpoint().commit_sequence);
+            try std.testing.expect((try docs.file.getDocumentAlloc(a, "doc:a")) == null);
+            try std.testing.expectEqual(@as(usize, 0), index.snapshot().segments.len);
+        } else {
+            try staged[0].ordinals.?.bind(&.{913});
+            try PersistentIndex.commitNativePublications(&.{prepared}, .{ .ptr = &primary, .commit_fn = Primary.commit });
+            try std.testing.expectEqual(before + 1, docs.file.activeCheckpoint().commit_sequence);
+            try std.testing.expectEqual(@as(?u32, 913), try index.snapshot().segments[0].reader.docOrdinal(0));
+        }
+    }
+    index.close();
+    index_live = false;
+    index = try PersistentIndex.open(a, opts);
+    index_live = true;
+    try std.testing.expectEqual(@as(?u32, 913), try index.snapshot().segments[0].reader.docOrdinal(0));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    // Portable segment consumers (mixed splits) receive an inline column.
+    var exported = try index.readStoredSegment(a, index.snapshot().segments[0].id);
+    defer exported.deinit(a);
+    var portable_reader = try segment_mod.SegmentReader.init(a, exported.segment_bytes);
+    defer portable_reader.deinit();
+    try std.testing.expectEqual(@as(?u32, 913), try portable_reader.docOrdinal(0));
+    // Whole-segment handoff must retain the same identities too.
+    var child_opts = opts;
+    child_opts.path = "/indexes/child";
+    var child = try PersistentIndex.open(a, child_opts);
+    var child_live = true;
+    defer if (child_live) child.close();
+    try std.testing.expectEqual(@as(usize, 1), try index.handoffRightOnlySegmentsToChild(&child, "doc:0"));
+    try std.testing.expectEqual(@as(?u32, 913), try child.snapshot().segments[0].reader.docOrdinal(0));
+    child.close();
+    child_live = false;
+    child = try PersistentIndex.open(a, child_opts);
+    child_live = true;
+    try std.testing.expectEqual(@as(?u32, 913), try child.snapshot().segments[0].reader.docOrdinal(0));
+    const old = index.acquireSnapshot();
+    defer old.release();
+    try std.testing.expect(try index.deleteById("doc:a"));
+    try std.testing.expectEqual(@as(?u32, 913), try index.snapshot().segments[0].reader.docOrdinal(0));
+    index.close();
+    index_live = false;
+    index = try PersistentIndex.open(a, opts);
+    index_live = true;
+    try std.testing.expectEqual(@as(?u32, 913), try index.snapshot().segments[0].reader.docOrdinal(0));
+    try std.testing.expectEqual(@as(usize, 0), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+    try std.testing.expectEqual(@as(usize, 1), try persistentSearchHitCount(a, old, "alpha"));
+    // Real compaction consumes the bound ordinal through the ordinary merger.
+    const merged = try segment_mod.mergeSegmentInputs(a, &.{.{ .reader = &old.segments[0].reader }});
+    defer a.free(merged);
+    var merged_reader = try segment_mod.SegmentReader.init(a, merged);
+    defer merged_reader.deinit();
+    try std.testing.expectEqual(@as(?u32, 913), try merged_reader.docOrdinal(0));
+    try std.testing.expect((try docs.file.check()).valid);
 }

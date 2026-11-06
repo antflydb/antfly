@@ -1175,9 +1175,10 @@ const revision11_magic = "AFLITE\x0bP";
 const revision12_magic = "AFLITE\x0cP";
 const revision13_magic = "AFLITE\x0dP";
 const revision14_magic = "AFLITE\x0eP";
-const indexed_magic = "AFLITE\x0fP";
+const revision15_magic = "AFLITE\x0fP";
+const indexed_magic = "AFLITE\x10P";
 pub const format_version: u32 = 3;
-pub const indexed_format_version: u32 = 15;
+pub const indexed_format_version: u32 = 16;
 pub const default_page_size: u32 = 4096;
 
 test "lite reclamation catalog snapshots visit live indexes rather than history" {
@@ -13882,7 +13883,7 @@ pub fn inspectBytes(raw: []const u8) InspectReport {
 
 pub fn encodeHeader(out: *[header_size]u8, header: Header) void {
     @memset(out, 0);
-    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) (if (header.indexed_revision == 7) previous_indexed_magic else if (header.indexed_revision == 8) revision8_magic else if (header.indexed_revision == 9) revision9_magic else if (header.indexed_revision == 10) revision10_magic else if (header.indexed_revision == 11) revision11_magic else if (header.indexed_revision == 12) revision12_magic else if (header.indexed_revision == 13) revision13_magic else if (header.indexed_revision == 14) revision14_magic else indexed_magic) else if (header.packed_records) magic else unpacked_v3_magic);
+    @memcpy(out[magic_offset..][0..magic.len], if (header.indexed_reclamation) (if (header.indexed_revision == 7) previous_indexed_magic else if (header.indexed_revision == 8) revision8_magic else if (header.indexed_revision == 9) revision9_magic else if (header.indexed_revision == 10) revision10_magic else if (header.indexed_revision == 11) revision11_magic else if (header.indexed_revision == 12) revision12_magic else if (header.indexed_revision == 13) revision13_magic else if (header.indexed_revision == 14) revision14_magic else if (header.indexed_revision == 15) revision15_magic else indexed_magic) else if (header.packed_records) magic else unpacked_v3_magic);
     std.mem.writeInt(u32, out[version_offset..][0..4], if (header.indexed_reclamation) header.indexed_revision else format_version, .little);
     std.mem.writeInt(u32, out[page_size_offset..][0..4], header.page_size, .little);
     std.mem.writeInt(u32, out[header_size_offset..][0..4], header_size, .little);
@@ -13914,12 +13915,13 @@ pub fn decodeHeader(raw: []const u8) !Header {
     const revision12 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision12_magic);
     const revision13 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision13_magic);
     const revision14 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision14_magic);
-    const indexed_reclamation = previous_indexed or revision8 or revision9 or revision10 or revision11 or revision12 or revision13 or revision14 or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
+    const revision15 = std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], revision15_magic);
+    const indexed_reclamation = previous_indexed or revision8 or revision9 or revision10 or revision11 or revision12 or revision13 or revision14 or revision15 or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], indexed_magic);
     const has_packed_records = indexed_reclamation or std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], magic);
     if (!has_packed_records and !std.mem.eql(u8, header_raw[magic_offset..][0..magic.len], unpacked_v3_magic)) return error.InvalidNativeMagic;
 
     const version = std.mem.readInt(u32, header_raw[version_offset..][0..4], .little);
-    if (version != (if (previous_indexed) @as(u32, 7) else if (revision8) @as(u32, 8) else if (revision9) @as(u32, 9) else if (revision10) @as(u32, 10) else if (revision11) @as(u32, 11) else if (revision12) @as(u32, 12) else if (revision13) @as(u32, 13) else if (revision14) @as(u32, 14) else if (indexed_reclamation) indexed_format_version else format_version)) return error.UnsupportedNativeFormatVersion;
+    if (version != (if (previous_indexed) @as(u32, 7) else if (revision8) @as(u32, 8) else if (revision9) @as(u32, 9) else if (revision10) @as(u32, 10) else if (revision11) @as(u32, 11) else if (revision12) @as(u32, 12) else if (revision13) @as(u32, 13) else if (revision14) @as(u32, 14) else if (revision15) @as(u32, 15) else if (indexed_reclamation) indexed_format_version else format_version)) return error.UnsupportedNativeFormatVersion;
 
     const encoded_header_size = std.mem.readInt(u32, header_raw[header_size_offset..][0..4], .little);
     if (encoded_header_size != header_size) return error.InvalidNativeHeaderSize;
@@ -14581,7 +14583,7 @@ fn headerChecksum(raw: []const u8) u32 {
     var crc = Crc32.init();
     crc.update(raw[0..active_checkpoint_offset]);
     crc.update(raw[active_checkpoint_offset + 1 .. checkpoint_slots_offset]);
-    const end = if (std.mem.eql(u8, raw[0..indexed_magic.len], indexed_magic)) durability_witnesses_end else if (std.mem.eql(u8, raw[0..revision14_magic.len], revision14_magic) or std.mem.eql(u8, raw[0..revision8_magic.len], revision8_magic) or std.mem.eql(u8, raw[0..revision9_magic.len], revision9_magic) or std.mem.eql(u8, raw[0..revision10_magic.len], revision10_magic) or std.mem.eql(u8, raw[0..revision11_magic.len], revision11_magic) or std.mem.eql(u8, raw[0..revision12_magic.len], revision12_magic) or std.mem.eql(u8, raw[0..revision13_magic.len], revision13_magic)) logical_generations_end else checkpoint_slots_end;
+    const end = if (std.mem.eql(u8, raw[0..indexed_magic.len], indexed_magic) or std.mem.eql(u8, raw[0..revision15_magic.len], revision15_magic)) durability_witnesses_end else if (std.mem.eql(u8, raw[0..revision14_magic.len], revision14_magic) or std.mem.eql(u8, raw[0..revision8_magic.len], revision8_magic) or std.mem.eql(u8, raw[0..revision9_magic.len], revision9_magic) or std.mem.eql(u8, raw[0..revision10_magic.len], revision10_magic) or std.mem.eql(u8, raw[0..revision11_magic.len], revision11_magic) or std.mem.eql(u8, raw[0..revision12_magic.len], revision12_magic) or std.mem.eql(u8, raw[0..revision13_magic.len], revision13_magic)) logical_generations_end else checkpoint_slots_end;
     crc.update(raw[end..header_checksum_offset]);
     return crc.final();
 }

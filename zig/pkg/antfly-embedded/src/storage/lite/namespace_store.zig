@@ -139,6 +139,8 @@ pub const Backend = struct {
         return erased.namespaceBatchFrom(a, txn, NS, mapNamespace);
     }
 };
+const PreparedValue = @import("../native_publication_value.zig").Value;
+
 const State = struct {
     backend: *Backend,
     read_mutex: std.atomic.Mutex = .unlocked,
@@ -150,6 +152,7 @@ const State = struct {
     file_namespace: [32]u8,
     writable: bool,
     pending: std.StringHashMapUnmanaged(native.CatalogMutation) = .empty,
+    bound_values: std.StringHashMapUnmanaged(PreparedValue) = .empty,
     participant: ?publication.Participant = null,
     mutations: []native.CatalogMutation = &.{},
     fn a(self: *State) A {
@@ -167,6 +170,8 @@ const State = struct {
     fn destroy(self: *State) void {
         const backend = self.backend;
         if (self.snapshot) |*snapshot| snapshot.close();
+        var values = self.bound_values.valueIterator();
+        while (values.next()) |value| value.deinit();
         self.arena.deinit();
         if (self.budget) |*budget| budget.deinit();
         backend.alloc.destroy(self);
@@ -180,6 +185,11 @@ const State = struct {
         try self.stageView(host.view());
     }
     fn stageView(self: *State, view: publication.View) !void {
+        // Mutation descriptors already reference these fixed buffers. Acquire
+        // every immutable seal before publishing any of their bytes. Neither
+        // descriptor rebinding nor allocation occurs under writer admission.
+        var values = self.bound_values.valueIterator();
+        while (values.next()) |value| _ = try value.read();
         try view.publishNamespace(.{
             .inode = self.inode,
             .file_namespace = self.file_namespace,
@@ -258,7 +268,10 @@ const Txn = struct {
         defer state.read_mutex.unlock();
         const snapshot = if (state.snapshot) |*value| value else return error.TransactionClosed;
         const full = try state.key(ns, key);
-        if (state.pending.get(full)) |change| return if (change.is_delete) error.NotFound else change.value;
+        if (state.pending.get(full)) |change| {
+            if (change.is_delete) return error.NotFound;
+            return if (state.bound_values.get(full)) |value| try value.read() else change.value;
+        }
         return (try snapshot.getIndexCatalogRecordAlloc(state.a(), full)) orelse error.NotFound;
     }
     pub fn put(self: *Txn, ns: NS, key: []const u8, value: []const u8) !void {
@@ -267,6 +280,27 @@ const Txn = struct {
         const full = try self.state.key(ns, key);
         const owned = try self.state.a().dupe(u8, value);
         try self.state.pending.put(self.state.a(), full, .{ .key = full, .value = owned });
+        if (self.state.bound_values.fetchRemove(full)) |removed| {
+            var previous = removed.value;
+            previous.deinit();
+        }
+    }
+    pub fn putPreparedValue(self: *Txn, ns: NS, key: []const u8, value: PreparedValue) !void {
+        const state = self.state;
+        if (!state.writable) return error.ReadOnly;
+        if (state.snapshot == null) return error.TransactionClosed;
+        const full = try state.key(ns, key);
+        // After both reservations succeed, replacement cannot fail and owns
+        // exactly one reference. An allocation error preserves the old value.
+        try state.pending.ensureUnusedCapacity(state.a(), 1);
+        try state.bound_values.ensureUnusedCapacity(state.a(), 1);
+        const entry = state.bound_values.getOrPutAssumeCapacity(full);
+        // The incoming borrowed handle may alias this overlay's sole owned
+        // reference. Retain before releasing a replaced binding.
+        const retained = value.retained();
+        if (entry.found_existing) entry.value_ptr.deinit();
+        entry.value_ptr.* = retained;
+        state.pending.putAssumeCapacity(full, .{ .key = full, .value = value.initialization_view });
     }
     pub fn appendPut(self: *Txn, ns: NS, key: []const u8, value: []const u8) !void {
         return self.put(ns, key, value);
@@ -276,6 +310,10 @@ const Txn = struct {
         if (self.state.snapshot == null) return error.TransactionClosed;
         const full = try self.state.key(ns, key);
         try self.state.pending.put(self.state.a(), full, .{ .key = full, .is_delete = true });
+        if (self.state.bound_values.fetchRemove(full)) |removed| {
+            var previous = removed.value;
+            previous.deinit();
+        }
     }
     pub fn prepareNativePublication(self: *Txn) !publication.Prepared {
         const state = self.state;
@@ -323,24 +361,29 @@ const Txn = struct {
         const prefix = try state.namespacePrefix(ns);
         var base = try snapshot.indexCatalogCursor(snapshot.activeCheckpoint(), prefix);
         errdefer base.deinit();
-        var pending = std.ArrayListUnmanaged(native.CatalogMutation).empty;
+        var pending = std.ArrayListUnmanaged(Cursor.Pending).empty;
+        errdefer for (pending.items) |*entry| if (entry.value) |*value| value.deinit();
         var values = state.pending.valueIterator();
         while (values.next()) |value| if (std.mem.startsWith(u8, value.key, prefix)) {
-            try pending.append(state.a(), value.*);
+            var entry: Cursor.Pending = .{ .change = value.*, .value = if (state.bound_values.get(value.key)) |bound| bound.retained() else null };
+            errdefer if (entry.value) |*bound| bound.deinit();
+            try pending.append(state.a(), entry);
+            entry.value = null;
         };
-        std.mem.sort(native.CatalogMutation, pending.items, {}, struct {
-            fn less(_: void, l: native.CatalogMutation, r: native.CatalogMutation) bool {
-                return std.mem.lessThan(u8, l.key, r.key);
+        std.mem.sort(Cursor.Pending, pending.items, {}, struct {
+            fn less(_: void, l: Cursor.Pending, r: Cursor.Pending) bool {
+                return std.mem.lessThan(u8, l.change.key, r.change.key);
             }
         }.less);
         return .{ .state = state, .base = base, .prefix = prefix, .pending = pending.items, .scratch = std.heap.ArenaAllocator.init(if (state.budget) |*budget| budget.allocator() else state.backend.alloc) };
     }
 };
 const Cursor = struct {
+    const Pending = struct { change: native.CatalogMutation, value: ?PreparedValue = null };
     state: *State,
     base: native.CatalogCursor,
     prefix: []const u8,
-    pending: []const native.CatalogMutation,
+    pending: []Pending,
     scratch: std.heap.ArenaAllocator,
     position: ?[]const u8 = null,
     keys_only: bool = false,
@@ -348,6 +391,7 @@ const Cursor = struct {
         self.keys_only = true;
     }
     pub fn close(self: *Cursor) void {
+        for (self.pending) |*entry| if (entry.value) |*value| value.deinit();
         self.base.deinit();
         self.scratch.deinit();
         self.* = undefined;
@@ -393,21 +437,24 @@ const Cursor = struct {
         // replay an entire journal record on each continuation.
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            const order = std.mem.order(u8, self.pending[mid].key, bound);
+            const order = std.mem.order(u8, self.pending[mid].change.key, bound);
             const before = order == .lt or (order == .eq and if (forward) strict else !strict);
             if (before) lo = mid + 1 else hi = mid;
         }
         var change: ?usize = if (forward) (if (lo < self.pending.len) lo else null) else (if (lo > 0) lo - 1 else null);
         while (true) {
             const disk_key: ?[]const u8 = if (disk) |entry| (if (std.mem.startsWith(u8, entry.key, self.prefix)) entry.key else null) else null;
-            const changed: ?native.CatalogMutation = if (change) |i| self.pending[i] else null;
+            const changed: ?native.CatalogMutation = if (change) |i| self.pending[i].change else null;
             const use_change = if (changed) |entry| if (disk_key) |key| blk: {
                 const order = std.mem.order(u8, entry.key, key);
                 break :blk order == .eq or if (forward) order == .lt else order == .gt;
             } else true else false;
             if (use_change) {
                 const entry = changed.?;
-                if (!entry.is_delete) return self.result(a, entry.key, entry.value);
+                if (!entry.is_delete) {
+                    const value = if (self.keys_only) &.{} else if (self.pending[change.?].value) |bound_value| try bound_value.read() else entry.value;
+                    return self.result(a, entry.key, value);
+                }
                 if (change) |i| change = if (forward) (if (i + 1 < self.pending.len) i + 1 else null) else (if (i > 0) i - 1 else null);
                 if (disk_key) |key| if (std.mem.eql(u8, key, entry.key)) {
                     disk.?.deinit(self.base.index.file.allocator);
@@ -454,4 +501,266 @@ pub fn openIfSupported(a: A, owner: *docs.Store, root: []const u8, read_only: bo
     }
     keep = true;
     return store;
+}
+
+test "native namespace binding refuses unbound publication and commits after producer and backend close" {
+    const a = std.testing.allocator;
+    const values = @import("../native_publication_value.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bound-native-publication.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var first = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    var first_live = true;
+    defer if (first_live) first.close();
+    first.maintenance_start_suppressed = true;
+    var backend = try Backend.open(a, &first, "/indexes/bound", false);
+    var backend_live = true;
+    defer if (backend_live) backend.deinit();
+    const ns: NS = .{ .name = "meta" };
+    var builder = try values.Builder.create(a, 8);
+    var builder_live = true;
+    defer if (builder_live) builder.deinit();
+    var value = builder.value();
+    defer value.deinit();
+    var pending = try backend.beginWrite();
+    var pending_live = true;
+    defer if (pending_live) pending.abort();
+    try pending.putPreparedValue(ns, "identity", value);
+    try std.testing.expectError(error.NativePublicationValueNotBound, pending.get(ns, "identity"));
+    {
+        var cursor = try pending.openCursor(ns);
+        defer cursor.close();
+        try std.testing.expectError(error.NativePublicationValueNotBound, cursor.first());
+        cursor.setKeysOnly();
+        const key = (try cursor.first()) orelse return error.MissingBoundKey;
+        try std.testing.expectEqualStrings("identity", key.key);
+        try std.testing.expectEqual(@as(usize, 0), key.value.len);
+        try std.testing.expectError(error.TransactionCursorActive, pending.prepareNativePublication());
+    }
+    var prepared = try pending.prepareNativePublication();
+    pending_live = false;
+    defer prepared.deinit();
+    backend.deinit();
+    backend_live = false;
+    first.close();
+    first_live = false;
+    var second = try docs.Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer second.close();
+    second.maintenance_start_suppressed = true;
+    const before = second.file.activeCheckpoint();
+    {
+        var batch = try second.beginBatch();
+        defer batch.abort();
+        try batch.put("primary", "committed");
+        try batch.setNativePublication(prepared.participant);
+        try std.testing.expectError(error.NativePublicationValueNotBound, batch.commit());
+    }
+    try std.testing.expectEqualDeep(before, second.file.activeCheckpoint());
+    try std.testing.expect((try second.file.getDocumentAlloc(a, "primary")) == null);
+    try builder.write(0, "identity");
+    try builder.seal();
+    builder.deinit();
+    builder_live = false;
+    {
+        var batch = try second.beginBatch();
+        errdefer batch.abort();
+        try batch.put("primary", "committed");
+        try batch.setNativePublication(prepared.participant);
+        try batch.commit();
+    }
+    try std.testing.expectEqual(before.commit_sequence + 1, second.file.activeCheckpoint().commit_sequence);
+    var reopened = try Backend.open(a, &second, "/indexes/bound", false);
+    defer reopened.deinit();
+    var read = try reopened.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("identity", try read.get(ns, "identity"));
+    const primary = (try second.file.getDocumentAlloc(a, "primary")).?;
+    defer a.free(primary);
+    try std.testing.expectEqualStrings("committed", primary);
+    try std.testing.expect((try second.file.check()).valid);
+}
+
+test "native namespace binding cursor retains its value across pending overwrite and delete" {
+    const a = std.testing.allocator;
+    const values = @import("../native_publication_value.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bound-native-cursor.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    var backend = try Backend.open(a, &store, "/indexes/bound-cursor", false);
+    defer backend.deinit();
+    const ns: NS = .{ .name = "meta" };
+    for ([_]bool{ false, true }) |delete| {
+        var pending = try backend.beginWrite();
+        var pending_live = true;
+        defer if (pending_live) pending.abort();
+        {
+            var builder = try values.Builder.create(a, 8);
+            defer builder.deinit();
+            try builder.write(0, "original");
+            try builder.seal();
+            var value = builder.value();
+            defer value.deinit();
+            try pending.putPreparedValue(ns, "identity", value);
+        }
+        {
+            var cursor = try pending.openCursor(ns);
+            defer cursor.close();
+            if (delete) try pending.delete(ns, "identity") else try pending.put(ns, "identity", "replacement");
+            if (delete) try std.testing.expectError(error.NotFound, pending.get(ns, "identity")) else try std.testing.expectEqualStrings("replacement", try pending.get(ns, "identity"));
+            const original = (try cursor.first()) orelse return error.MissingCapturedBinding;
+            try std.testing.expectEqualStrings("original", original.value);
+        }
+        try pending.commit();
+        pending_live = false;
+        var read = try backend.beginRead();
+        defer read.abort();
+        if (delete) try std.testing.expectError(error.NotFound, read.get(ns, "identity")) else try std.testing.expectEqualStrings("replacement", try read.get(ns, "identity"));
+    }
+}
+
+test "native namespace binding replacement retains an aliased sole owner" {
+    const a = std.testing.allocator;
+    const values = @import("../native_publication_value.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bound-native-alias.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    var backend = try Backend.open(a, &store, "/indexes/bound-alias", false);
+    defer backend.deinit();
+    var pending = try Txn.create(Backend.cast(backend.ptr), true);
+    defer pending.abort();
+    const ns: NS = .{ .name = "meta" };
+    {
+        var builder = try values.Builder.create(a, 8);
+        defer builder.deinit();
+        try builder.write(0, "original");
+        try builder.seal();
+        var value = builder.value();
+        defer value.deinit();
+        try pending.putPreparedValue(ns, "identity", value);
+    }
+    const key = try pending.state.key(ns, "identity");
+    const borrowed = pending.state.bound_values.get(key).?;
+    try pending.putPreparedValue(ns, "identity", borrowed);
+    try std.testing.expectEqualStrings("original", try pending.get(ns, "identity"));
+}
+
+test "native namespace binding cannot refresh a stale namespace witness by sealing later" {
+    const a = std.testing.allocator;
+    const values = @import("../native_publication_value.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bound-native-stale.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    var backend = try Backend.open(a, &store, "/indexes/bound-stale", false);
+    defer backend.deinit();
+    const ns: NS = .{ .name = "meta" };
+    var builder = try values.Builder.create(a, 8);
+    defer builder.deinit();
+    var value = builder.value();
+    defer value.deinit();
+    var pending = try backend.beginWrite();
+    var pending_live = true;
+    defer if (pending_live) pending.abort();
+    try pending.putPreparedValue(ns, "identity", value);
+    var prepared = try pending.prepareNativePublication();
+    pending_live = false;
+    defer prepared.deinit();
+    {
+        var foreign = try backend.beginWrite();
+        errdefer foreign.abort();
+        try foreign.put(ns, "foreign", "new generation");
+        try foreign.commit();
+    }
+    try builder.write(0, "identity");
+    try builder.seal();
+    const before = store.file.activeCheckpoint();
+    {
+        var batch = try store.beginBatch();
+        defer batch.abort();
+        try batch.put("primary", "must not commit");
+        try batch.setNativePublication(prepared.participant);
+        try std.testing.expectError(error.FileBusy, batch.commit());
+    }
+    try std.testing.expectEqualDeep(before, store.file.activeCheckpoint());
+    try std.testing.expect((try store.file.getDocumentAlloc(a, "primary")) == null);
+    var read = try backend.beginRead();
+    defer read.abort();
+    try std.testing.expectEqualStrings("new generation", try read.get(ns, "foreign"));
+    try std.testing.expectError(error.NotFound, read.get(ns, "identity"));
+}
+
+test "native namespace binding allocation failures release parameter and cursor ownership" {
+    const a = std.testing.allocator;
+    const values = @import("../native_publication_value.zig");
+    const Probe = struct {
+        references: usize = 1,
+        fn retain(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references += 1;
+        }
+        fn release(raw: *anyopaque) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.references -= 1;
+        }
+        fn run(fault: A, store: *docs.Store, value: PreparedValue) !void {
+            var backend = try Backend.open(fault, store, "/indexes/bound-allocations", false);
+            defer backend.deinit();
+            var pending = try backend.beginWrite();
+            var pending_live = true;
+            defer if (pending_live) pending.abort();
+            const ns: NS = .{ .name = "meta" };
+            try pending.putPreparedValue(ns, "left", value);
+            try pending.putPreparedValue(ns, "right", value);
+            {
+                var cursor = try pending.openCursor(ns);
+                defer cursor.close();
+                const first = (try cursor.first()) orelse return error.MissingBoundKey;
+                try std.testing.expectEqualStrings("left", first.key);
+                try std.testing.expectEqualStrings("original", first.value);
+                try pending.put(ns, "left", "replacement");
+                const next = (try cursor.next()) orelse return error.MissingBoundKey;
+                try std.testing.expectEqualStrings("right", next.key);
+                try std.testing.expectEqualStrings("original", next.value);
+            }
+            var prepared = try pending.prepareNativePublication();
+            pending_live = false;
+            defer prepared.deinit();
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/bound-native-allocation-faults.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    var owner: Probe = .{};
+    var builder = try values.Builder.createWithOwner(a, 8, .{ .ptr = &owner, .retain_fn = Probe.retain, .release_fn = Probe.release });
+    var builder_live = true;
+    defer if (builder_live) builder.deinit();
+    try builder.write(0, "original");
+    try builder.seal();
+    var value = builder.value();
+    var value_live = true;
+    defer if (value_live) value.deinit();
+    builder.deinit();
+    builder_live = false;
+    const checkpoint = store.file.activeCheckpoint();
+    try std.testing.checkAllAllocationFailures(a, Probe.run, .{ &store, value });
+    try std.testing.expectEqualDeep(checkpoint, store.file.activeCheckpoint());
+    value.deinit();
+    value_live = false;
+    try std.testing.expectEqual(@as(usize, 1), owner.references);
 }
