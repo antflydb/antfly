@@ -160,8 +160,24 @@ export class StandaloneSourcesClient extends SourceTransport {
     );
   }
 
-  sync(options: { restart?: boolean; signal?: AbortSignal } = {}): Promise<SourceSyncJob> {
-    return this.request("POST", "/v1/sync", { restart: options.restart ?? false }, options.signal);
+  sync(
+    options: {
+      sourceId?: string;
+      restart?: boolean;
+      requestKey?: string;
+      signal?: AbortSignal;
+    } = {}
+  ): Promise<SourceSyncJob> {
+    return this.request(
+      "POST",
+      "/v1/sync",
+      {
+        source_id: options.sourceId,
+        restart: options.restart ?? false,
+        request_key: options.requestKey,
+      },
+      options.signal
+    );
   }
   /** Apply durable purge intents independently of ingestion credentials. */
   runPurges(signal?: AbortSignal): Promise<SourceSyncJob> {
