@@ -748,7 +748,7 @@ test "index backend resolver forwards the native catalog sink override" {
     // breaking every real Lite open with error.MissingNativeCatalogSink.
     const storage: lsm_backend_mod.Storage = undefined;
     const TestSink = struct {
-        fn submit(_: *anyopaque, _: []const u8, _: []const @import("../native_catalog_backend.zig").Mutation) anyerror!void {}
+        fn submit(_: *anyopaque, _: []const u8, _: []const @import("../native_catalog_backend.zig").Mutation, _: bool) anyerror!void {}
         fn loadAllAlloc(_: *anyopaque, allocator: std.mem.Allocator, _: []const u8) anyerror![]@import("../native_catalog_backend.zig").Entry {
             return allocator.alloc(@import("../native_catalog_backend.zig").Entry, 0);
         }

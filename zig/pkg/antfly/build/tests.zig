@@ -7431,6 +7431,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.maintenance.",
             "storage.mem_backend.",
             "storage.mem_ordered.",
+            "storage.native_catalog_backend.",
             "storage.object_storage.",
             "storage.persistent.",
             "storage.persistent_vopr.",
@@ -7461,6 +7462,7 @@ pub fn addTests(b: *std.Build, options: AddTestsOptions) AddTestsResult {
             "storage.vopr_durable_job_lane.",
             "storage.wal.",
             "storage.wal_vopr.",
+            "storage.write_amplification_trace.",
         },
     };
     const unit_storage_db_core_shard_index = 3;

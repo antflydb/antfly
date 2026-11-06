@@ -26,6 +26,13 @@ test {
     _ = @import("antfly_local_sources").storage_lite_secret_store;
     _ = @import("antfly_local_sources").storage_lite_paths;
     _ = @import("antfly_local_sources").storage_lite_restore_staging;
+    // Force the crash-consistency sweep (not otherwise reachable: it is a
+    // pure test file production code never imports) into lite-storage-test's
+    // compiled selection, same as write_amplification_bench_test.zig already
+    // needed per docs/design/lite-performance/README.md. WS4 needs this
+    // target to actually exercise the full-text crash sweep.
+    _ = @import("antfly_local_sources").storage_lite_crash_consistency_test;
+    _ = @import("antfly_local_sources").storage_lite_crash_sim_io;
 }
 
 /// Implementation source choices for this compilation root.
