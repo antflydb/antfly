@@ -2252,6 +2252,22 @@ pub const PersistentIndex = struct {
         };
     }
 
+    /// WS4 phase 2: syncs this index's `.native_catalog` backend's own
+    /// in-memory read mirror with mutations an external transaction
+    /// already committed durably (see `native_catalog_backend.zig`'s
+    /// `Backend.applyExternallyCommittedMutations`, which this forwards
+    /// to) -- the step a caller using `commit_participant.View.
+    /// putIndexCatalog` instead of this index's own `MainTxn` must run
+    /// after that commit succeeds, so this index's own reads (segment
+    /// ranges, the active set, the seal) see it. A no-op, not an error,
+    /// on every other backend.
+    pub fn applyExternallyCommittedMutationsIfNativeCatalog(self: *PersistentIndex, mutations: []const native_catalog_backend.Mutation) !void {
+        switch (self.main_store_owner) {
+            .native_catalog => |backend| try backend.applyExternallyCommittedMutations(mutations),
+            .mem, .lsm => {},
+        }
+    }
+
     /// A small ("inline") segment publication prepared for a
     /// `.native_catalog` index, built OUTSIDE any lock and without
     /// committing anything: `prepareInlineSegmentPublication` below
