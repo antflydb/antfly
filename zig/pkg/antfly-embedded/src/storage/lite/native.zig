@@ -1795,7 +1795,7 @@ fn slotPhysicalPage(slot_index: u8) u64 {
 /// commits fall back to the historical "sync data, then sync the slot"
 /// order and are marked `presynced` (recovery trusts them unconditionally,
 /// as today).
-pub const max_single_sync_pages: usize = 256;
+pub const max_single_sync_pages: usize = 1024;
 
 pub const PageKind = enum(u8) {
     data = 1,
@@ -4582,7 +4582,6 @@ const PageWriteBatch = struct {
         if (payload.len > self.file.maxPagePayloadBytes()) return error.PageTooLarge;
         const page = try self.reserve(page_id);
         encodePage(page, kind, payload);
-        self.noteManifestEntry(page_id, page);
     }
 
     fn appendValue(self: *PageWriteBatch, page_id: u64, next: u64, chunk: []const u8) !void {
@@ -4591,17 +4590,6 @@ const PageWriteBatch = struct {
         var prefix: [value_page_header_size]u8 = undefined;
         std.mem.writeInt(u64, &prefix, next, .little);
         encodePageParts(page, .value, &prefix, chunk);
-        self.noteManifestEntry(page_id, page);
-    }
-
-    /// `page` is the just-encoded on-disk bytes for `page_id`, still sitting
-    /// in this batch's pending buffer; its CRC (already computed by
-    /// `encodePage`/`encodePageParts`) is read back out rather than
-    /// recomputed, so the manifest entry can never disagree with what is
-    /// about to be written.
-    fn noteManifestEntry(self: *PageWriteBatch, page_id: u64, page: []const u8) void {
-        const builder = self.file.transaction_manifest orelse return;
-        builder.note(self.file.allocator, page_id, std.mem.readInt(u32, page[page_crc_offset..][0..4], .little));
     }
 
     fn flush(self: *PageWriteBatch) !void {
@@ -4636,6 +4624,18 @@ const PageWriteBatch = struct {
                 zig017_return_error = zig017_err;
                 return zig017_err;
             });
+            // This loop is the choke point every PageWriteBatch-staged data
+            // page passes through on its way to disk (appendPage/appendValue
+            // only stage bytes into `buffer`; this is where they are
+            // actually written), so recording the manifest entry here --
+            // instead of at every staging call site -- cannot miss one
+            // regardless of which higher-level writer staged it, and
+            // regardless of whether this write happens during staging, a
+            // non-durable commit, or the eventual durable one.
+            if (NativeFile.manifest_commits_enabled) {
+                for (self.page_ids[start..end], start..end) |page_id, i|
+                    file.manifest_builder.note(file.allocator, page_id, std.mem.readInt(u32, self.buffer[i * size ..][page_crc_offset..][0..4], .little));
+            }
             start = end;
         }
         for (self.page_ids[0..count], 0..) |page_id, i|
@@ -4875,15 +4875,28 @@ pub const NativeFile = struct {
     transaction_writes: ?*TransactionWrites = null,
     flushing_transaction: bool = false,
     transaction_pages: ?*PageAllocator = null,
-    /// Set only around a durable `commitTransactionWithDurability` call
-    /// (never a mid-transaction `flushTransactionWrites`), so every page
-    /// `PageWriteBatch` physically writes during this commit -- documents,
-    /// catalog/index pages, allocator/free-map ledger pages, value chains --
-    /// is recorded with the exact CRC it was just encoded with. When the
-    /// commit stays within `max_single_sync_pages`, this lets the commit
-    /// write one `.commit_manifest` page and publish with a single fsync
-    /// instead of presyncing data before the slot write.
-    transaction_manifest: ?*ManifestBuilder = null,
+    /// Accumulates (page_id, crc) for every data page `PageWriteBatch`
+    /// physically writes since the *last durable checkpoint publish* --
+    /// across staging (`stageMutation`'s eager external-value writes,
+    /// which happen well before any commit function runs), every
+    /// intervening non-durable (`commitTransactionWithDurability(false)`)
+    /// commit, and the eventual durable commit's own writes. A non-durable
+    /// commit is only made durable by a later durable commit's single sync
+    /// barrier, so that barrier's manifest must cover everything written
+    /// since the last durable point, not just its own commit's writes, or
+    /// a torn page from an earlier non-durable commit would verify as
+    /// fine. Reset only inside `publishCheckpoint`, right after a durable
+    /// publish actually succeeds (regardless of whether it used a manifest
+    /// or fell back to presynced): that is the new "last durable
+    /// checkpoint" baseline, so tracking restarts from there.
+    manifest_builder: ManifestBuilder = .{},
+    /// Set by `commitTransactionWithDurability` immediately before calling
+    /// `flushTransactionWrites`, true only for a commit that might end up
+    /// durably publishing (not deferred, not no_sync, manifest commits
+    /// enabled): `flushTransactionWrites` reserves `manifest_builder`'s
+    /// page under this flag, since only the commit that will actually call
+    /// `tryBuildCommitManifest` needs one reserved.
+    allow_manifest_reservation: bool = false,
     durable_header: ?Header = null,
     last_synced_header: ?Header = null,
     change_capture: ?*ChangeCapture = null,
@@ -5224,6 +5237,7 @@ pub const NativeFile = struct {
         if (self.reader_fence) |fence| self.reader_coordinator.?.unregister(fence);
         if (self.transaction_writes) |writes| writes.deinit(self.allocator);
         self.transaction_writes = null;
+        self.manifest_builder.deinit(self.allocator);
         const io = self.runtimeIo();
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
         self.page_cache.deinit(self.allocator);
@@ -11901,6 +11915,7 @@ pub const NativeFile = struct {
     fn flushTransactionWrites(self: *NativeFile) anyerror!void {
         if (self.flushing_transaction) return;
         const writes = self.transaction_writes orelse return;
+        const debug_starting_page_count = if (builtin.is_test) writes.pages.next_page_id else 0;
         try self.finishCatalogAppends(writes);
         self.flushing_transaction = true;
         self.transaction_pages = &writes.pages;
@@ -11939,12 +11954,39 @@ pub const NativeFile = struct {
         // persistAllocator finalizes page_count, so -- if this commit turns
         // out to be manifest-eligible -- that page is already part of the
         // free-map/ledger's own covered range rather than a count bumped on
-        // after the fact. Skipped once this commit is already too big to
-        // qualify, so an always-large commit never pays for an unused page.
-        if (self.transaction_manifest) |builder| {
-            if (!self.no_sync and !builder.overflowed) builder.reserved_page = try writes.pages.allocate();
+        // after the fact. Only the commit that might actually durably
+        // publish reserves (allow_manifest_reservation), only once per
+        // window (reserved_page == null): an intermediate flush inside a
+        // large transaction (TransactionWrites.max_keys chunking) or an
+        // earlier non-durable commit in the same since-last-durable window
+        // must not each abandon their own reservation.
+        if (self.allow_manifest_reservation and !self.no_sync and
+            !self.manifest_builder.overflowed and self.manifest_builder.reserved_page == null)
+        {
+            self.manifest_builder.reserved_page = try writes.pages.allocate();
         }
         try self.persistAllocator(&writes.pages, &next);
+        if (manifest_commits_enabled) try self.manifest_builder.noteReused(self.allocator, &writes.pages.reused);
+        // Every page this flush allocated and should have written
+        // (excluding the reserved manifest page itself, not yet written at
+        // this point) must already be in manifest_builder -- unless
+        // overflowed already latched (entries.count() crossed
+        // max_single_sync_pages partway through this very flush, which
+        // `note` stops recording from, by design: tryBuildCommitManifest
+        // sees `overflowed` and falls back to presynced regardless of what
+        // got missed after that point). A gap while NOT overflowed is
+        // exactly the bug class that made an earlier version of this
+        // feature unsafe (WS1 b): a page the manifest would need to list
+        // but never would have.
+        if (builtin.is_test and manifest_commits_enabled and !self.manifest_builder.overflowed) {
+            var page_id = debug_starting_page_count;
+            while (page_id < next.page_count) : (page_id += 1) {
+                if (page_id == self.manifest_builder.reserved_page) continue;
+                std.debug.assert(self.manifest_builder.entries.contains(page_id));
+            }
+            var reused_it = writes.pages.reused.keyIterator();
+            while (reused_it.next()) |page| std.debug.assert(self.manifest_builder.entries.contains(page.*));
+        }
         try self.publishCheckpoint(next, false);
         self.transaction_writes = null;
         writes.deinit(self.allocator);
@@ -12014,30 +12056,15 @@ pub const NativeFile = struct {
         const previous = self.transaction_header orelse return error.InvalidTransactionState;
         // A deferred (non-durable) commit never calls publishCheckpoint or
         // tryBuildCommitManifest below -- it only stages `next` into
-        // self.header and returns, with no durability barrier at all. A
-        // page flushTransactionWrites reserved for a manifest would then
-        // never be consumed (not even by tryBuildCommitManifest's own
-        // placeholder-filler fallback, since that function never runs), yet
-        // persistAllocator would already have folded it into page_count:
-        // the file's physical length would then fall short of what a later
-        // durable commit, inheriting this staged `next`, claims. Known
-        // before flushTransactionWrites runs (durable/no_sync/
-        // externally_locked never depend on what this transaction wrote),
-        // so the manifest-tracking window opens only when it could matter.
+        // self.header and returns, with no durability barrier at all. Its
+        // writes still accumulate into self.manifest_builder (that is the
+        // whole point of the since-last-durable-checkpoint window), but it
+        // must not reserve a manifest page of its own: flushTransactionWrites
+        // reserves one under allow_manifest_reservation, only for a commit
+        // that might actually durably publish.
         const deferred_publication = !durable and !self.no_sync and !self.externally_locked;
-        // Tracks every page PageWriteBatch physically writes from here until
-        // just before publishCheckpoint, so a commit that stays within
-        // max_single_sync_pages can publish with one fsync (a manifest page
-        // recovery re-verifies) instead of the historical presync-then-slot-
-        // sync order. Scoped to this function, never to a mid-transaction
-        // flushTransactionWrites: those neither durability-barrier nor
-        // publish anything, so there is nothing for a manifest to cover.
-        var manifest_builder: ManifestBuilder = .{};
-        if (!deferred_publication and manifest_commits_enabled) self.transaction_manifest = &manifest_builder;
-        defer {
-            self.transaction_manifest = null;
-            manifest_builder.deinit(self.allocator);
-        }
+        self.allow_manifest_reservation = !deferred_publication and manifest_commits_enabled;
+        defer self.allow_manifest_reservation = false;
         try self.flushTransactionWrites();
         var next = self.activeCheckpoint();
         const changed = next.commit_sequence != previous.checkpoints[previous.active_checkpoint].commit_sequence;
@@ -12070,38 +12097,48 @@ pub const NativeFile = struct {
             return;
         }
         if (changed) {
-            const manifest_prepared = try self.tryBuildCommitManifest(&manifest_builder, &next);
+            const manifest_prepared = if (manifest_commits_enabled) try self.tryBuildCommitManifest(&next) else false;
             if (!manifest_prepared) try self.syncIfRequired();
             try self.publishCheckpoint(next, manifest_prepared);
         } else try self.sync();
     }
 
-    /// WS1(b) single-fsync commits are disabled pending further
-    /// investigation: a large bulk-indexed commit (20,000 documents, one
-    /// transaction) was measured allocating ~41,000 pages but only 31 of
-    /// them ever reached `ManifestBuilder.note` (confirmed via
-    /// `note_calls == entries.count()`, i.e. not an overflow cap -- `note`
-    /// is simply never called for the other ~40,970). Every direct
-    /// production write path was audited (`PageAllocator.writePage`,
-    /// `PageWriteBatch.appendPage`/`appendValue`, `NativeFile.writePage`,
-    /// ledger/metadata writes via `writeLedgerPage`, `appendPageToFile`'s
-    /// one production caller in `DocumentIndexBulkBuilder.appendNode` which
-    /// is gated by `self.pages != null` and so already routes through the
-    /// tracked `writeDocumentIndexNode` path for a real commit) and each
-    /// appeared to flow through the hook -- the actual bypass was not
-    /// found. Because this commit's tracked entry count (31) stayed under
-    /// `max_single_sync_pages`, it would otherwise have published a
-    /// `presynced = false` slot whose manifest lists a small fraction of
-    /// the pages the commit actually wrote: a crash tearing any of the
-    /// other ~40,970 pages would verify as fine, since nothing in the
-    /// manifest names them. That is a crash-consistency hole the design's
-    /// non-negotiable "every acknowledged commit must survive power loss"
-    /// rule cannot tolerate while the gap is unexplained, so the feature
-    /// is switched off here rather than shipped partially working. The
-    /// verification/recovery side (`verifyManifest`, `recoverActiveCheckpoint`,
-    /// the v8 slot/manifest page formats) is unaffected and stays covered
-    /// by its own tests; flipping this back to `true` once the tracking
-    /// gap is found and fixed is the only change needed to re-enable it.
+    /// WS1(b) single-fsync commits. A first attempt measured a
+    /// 20,000-document bulk-indexed commit allocating ~41,000 pages while
+    /// only 31 ever reached `ManifestBuilder.note` -- not an overflow cap,
+    /// `note` was simply never called for the rest. That cause is fixed:
+    /// the tracking window only opened inside
+    /// `commitTransactionWithDurability` itself, but most of a
+    /// transaction's page writes (external document/catalog values) happen
+    /// eagerly inside `stageMutation`, called synchronously from
+    /// `putDocument`/`putCatalogRecord` well before that window ever opens
+    /// -- so the window missed almost everything. `manifest_builder` is
+    /// now a persistent, file-lifetime field (never a per-commit local)
+    /// that `PageWriteBatch.flushCount`'s hook always writes into when this
+    /// flag is on, reset only in `publishCheckpoint` right after a durable
+    /// publish succeeds. That also gives the window its correct "since the
+    /// last durable checkpoint" scope for non-durable
+    /// (`commitTransactionWithDurability(false)`) commits: verified with a
+    /// dedicated test that tears an *earlier* non-durable commit's own page
+    /// and confirms the eventual durable commit's manifest catches it.
+    ///
+    /// Still disabled, though, on a second finding: the debug cross-check
+    /// in `flushTransactionWrites` (every page `PageAllocator.reused`
+    /// reports for this flush must have a `manifest_builder` entry) fired
+    /// against real DB-layer traffic (`storage.lite.backend.test.lite
+    /// backend native engine can back db primary documents`) -- a page the
+    /// allocator reused for this commit was never noted, meaning either a
+    /// second, still-unfound write path bypasses the tracking hook, or
+    /// reusing a page without ever writing to it in the same commit is
+    /// itself a legitimate pattern this assert wrongly treats as a bug.
+    /// Which of those it is was not determined before time ran out. Until
+    /// it is, this flag stays off: the recovery/verification side
+    /// (`verifyManifest`, `recoverActiveCheckpoint`, the v8 slot/manifest
+    /// page formats, the compact appended-range encoding) is unaffected
+    /// and stays covered by its own tests, and the debug assert (gated on
+    /// this same flag, so inert while it is false) is exactly the tool to
+    /// rerun once someone picks this back up -- it already reproduces
+    /// against `make zig-test`-level traffic, not just a synthetic repro.
     const manifest_commits_enabled = false;
 
     /// Builds and writes a `.commit_manifest` page covering every page this
@@ -12127,7 +12164,8 @@ pub const NativeFile = struct {
     /// reservation, no entries, too many entries, or the encoded manifest
     /// would not fit one page) falls back to the historical
     /// presync-then-slot-sync order with a clean slot, not a stale one.
-    fn tryBuildCommitManifest(self: *NativeFile, builder: *ManifestBuilder, next: *CheckpointSlot) !bool {
+    fn tryBuildCommitManifest(self: *NativeFile, next: *CheckpointSlot) !bool {
+        const builder = &self.manifest_builder;
         next.manifest_page = 0;
         next.manifest_crc = 0;
         next.manifest_page_count = 0;
@@ -12151,7 +12189,12 @@ pub const NativeFile = struct {
             entries[i] = .{ .page_id = kv.key_ptr.*, .crc = kv.value_ptr.* };
             i += 1;
         }
-        const payload = try encodeManifestPayloadAlloc(self.allocator, entries);
+        const payload = encodeManifestPayloadAlloc(self.allocator, entries, &builder.reused_pages, manifest_page_id) catch |err| switch (err) {
+            // Not actually one contiguous appended run: fall back exactly
+            // like "too big to fit one page", never a hard error.
+            error.InvalidNativeManifestRange => return false,
+            else => return err,
+        };
         defer self.allocator.free(payload);
         if (payload.len > self.maxPagePayloadBytes()) return false;
         var page_buf: [max_page_size]u8 = undefined;
@@ -12253,6 +12296,15 @@ pub const NativeFile = struct {
         self.header.checkpoints[next_slot] = checkpoint;
         self.header.active_checkpoint = next_slot;
         self.checkpoint_publication_uncertain = false;
+        // This checkpoint is now the last durable one, whether it ended up
+        // presynced (manifest rejected or never attempted) or not: either
+        // way, whatever manifest_builder accumulated describes writes that
+        // are now covered by *this* durable publish, not the next one.
+        // Tracking restarts clean from here.
+        if (manifest_commits_enabled) {
+            self.manifest_builder.deinit(self.allocator);
+            self.manifest_builder = .{};
+        }
         self.last_synced_header = self.header;
         if (self.ledger) |state| {
             self.retirement_activity_bytes +|= state.released_data_pages *| self.header.page_size;
@@ -12380,6 +12432,12 @@ pub const NativeFile = struct {
     }
 };
 
+/// `manifest` is the same choke point as `PageWriteBatch.flushCount`'s own
+/// tracking: this free function writes directly to a raw `std.Io.File`
+/// rather than through a `PageWriteBatch`, so it must note its own entry
+/// rather than relying on that batch's loop to catch it. `null` is only
+/// correct for callers with no commit-manifest concept at all (vacuum's
+/// from-scratch image rebuild, test-only direct construction).
 fn appendPageToFile(
     allocator: Allocator,
     file: std.Io.File,
@@ -12388,6 +12446,7 @@ fn appendPageToFile(
     next_page_id: *u64,
     kind: PageKind,
     contents: []const u8,
+    manifest: ?*ManifestBuilder,
 ) !u64 {
     if (contents.len > page_size - page_header_size) return error.PageTooLarge;
     const page_id = next_page_id.*;
@@ -12395,6 +12454,7 @@ fn appendPageToFile(
     defer allocator.free(page);
     encodePage(page, kind, contents);
     try file.writePositionalAll(io, page, page_id * @as(u64, @intCast(page_size)));
+    if (manifest) |builder| builder.note(allocator, page_id, std.mem.readInt(u32, page[page_crc_offset..][0..4], .little));
     next_page_id.* += 1;
     return page_id;
 }
@@ -12454,7 +12514,7 @@ const DocumentIndexBulkBuilder = struct {
         if (self.pages) |pages| return self.owner.writeDocumentIndexNode(pages, node);
         const encoded = try encodeDocumentIndexNode(self.owner.allocator, node);
         defer self.owner.allocator.free(encoded);
-        return try appendPageToFile(self.owner.allocator, self.file, self.owner.runtimeIo(), self.owner.header.page_size, self.next_page_id, .document_index, encoded);
+        return try appendPageToFile(self.owner.allocator, self.file, self.owner.runtimeIo(), self.owner.header.page_size, self.next_page_id, .document_index, encoded, if (NativeFile.manifest_commits_enabled) &self.owner.manifest_builder else null);
     }
 
     fn add(self: *DocumentIndexBulkBuilder, key: []const u8, document_page_id: u64) !void {
@@ -12597,7 +12657,8 @@ fn appendValuePagesToFile(
         defer allocator.free(payload);
         std.mem.writeInt(u64, payload[0..8], next_value_page, .little);
         @memcpy(payload[value_page_header_size..][0..len], value[offset..][0..len]);
-        _ = try appendPageToFile(allocator, file, io, page_size, next_page_id, .value, payload);
+        // No commit-manifest concept here: unused in production (no callers).
+        _ = try appendPageToFile(allocator, file, io, page_size, next_page_id, .value, payload, null);
         offset += len;
     }
     return root_page_id;
@@ -12614,7 +12675,9 @@ fn appendFreeMapPageToFile(
 ) !u64 {
     const payload = try encodeFreeMapAlloc(allocator, @intCast(page_size), covered_page_count, free_pages);
     defer allocator.free(payload);
-    return try appendPageToFile(allocator, file, io, page_size, next_page_id, .free_map, payload);
+    // Only used by vacuum's from-scratch image rebuild (presynced=true,
+    // no commit-manifest concept there).
+    return try appendPageToFile(allocator, file, io, page_size, next_page_id, .free_map, payload, null);
 }
 
 fn catalogRootPage(slot: CheckpointSlot, root: CatalogRoot) u64 {
@@ -13149,16 +13212,24 @@ pub const max_page_size: usize = 65536;
 
 const ManifestEntry = struct { page_id: u64, crc: u32 };
 
-/// Accumulates one commit's (page_id, crc) pairs as `PageWriteBatch` writes
-/// them, keyed by page id so a page rewritten more than once before the
-/// commit publishes keeps only its final CRC (the only one that will still
-/// be on disk when recovery checks it). `overflowed` latches permanently
-/// once tracking fails or the commit exceeds `max_single_sync_pages`: a
-/// commit that cannot build a trustworthy manifest falls back to the
-/// presynced two-sync path instead of risking an under- or over-complete
-/// one.
+/// Accumulates every page written since the last durable checkpoint (see
+/// `NativeFile.manifest_builder`'s doc comment), keyed by page id so a page
+/// rewritten more than once keeps only its final CRC (the only one that
+/// will still be on disk when recovery checks it). `overflowed` latches
+/// permanently once tracking fails or the window exceeds
+/// `max_single_sync_pages`: a window that cannot build a trustworthy
+/// manifest falls back to the presynced two-sync path instead of risking
+/// an under- or over-complete one.
 const ManifestBuilder = struct {
     entries: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    /// Page ids in `entries` that came from the allocator's free-page reuse
+    /// rather than a fresh `next_page_id` bump, merged in from each
+    /// `PageAllocator.reused` as the window's commits flush. `entries` minus
+    /// this set is expected to be exactly one contiguous run (every id the
+    /// allocator hands out fresh only ever increases), which lets the
+    /// encoded manifest name that whole run with one range and a flat CRC
+    /// array instead of a (page_id, crc) pair per page.
+    reused_pages: std.AutoHashMapUnmanaged(u64, void) = .empty,
     overflowed: bool = false,
     /// A page id `flushTransactionWrites` reserves through the transaction's
     /// own `PageAllocator` before `persistAllocator` finalizes
@@ -13172,6 +13243,7 @@ const ManifestBuilder = struct {
 
     fn deinit(self: *ManifestBuilder, allocator: Allocator) void {
         self.entries.deinit(allocator);
+        self.reused_pages.deinit(allocator);
     }
 
     fn note(self: *ManifestBuilder, allocator: Allocator, page_id: u64, crc: u32) void {
@@ -13182,17 +13254,84 @@ const ManifestBuilder = struct {
         };
         if (self.entries.count() > max_single_sync_pages) self.overflowed = true;
     }
+
+    /// Merges one `PageAllocator`'s own reuse set into the window-wide one.
+    /// Called once per `flushTransactionWrites` (every commit or
+    /// intermediate flush in the window uses its own fresh `PageAllocator`,
+    /// each with its own `reused` set) so the final `reused_pages` covers
+    /// the whole since-last-durable-checkpoint window, not just the last
+    /// flush.
+    fn noteReused(self: *ManifestBuilder, allocator: Allocator, reused: *const std.AutoHashMapUnmanaged(u64, void)) !void {
+        if (self.overflowed) return;
+        var it = reused.keyIterator();
+        while (it.next()) |page| self.reused_pages.put(allocator, page.*, {}) catch {
+            self.overflowed = true;
+            return;
+        };
+    }
 };
 
-fn encodeManifestPayloadAlloc(allocator: Allocator, entries: []const ManifestEntry) ![]u8 {
-    const out = try allocator.alloc(u8, 4 + entries.len * manifest_entry_size);
-    errdefer allocator.free(out);
-    std.mem.writeInt(u32, out[0..4], @intCast(entries.len), .little);
-    var offset: usize = 4;
+/// Fixed header before the appended CRC array and the reused (page_id, crc)
+/// pairs: range_start (u64), appended_count (u32), reused_count (u32).
+const manifest_header_size: usize = 16;
+
+/// A fresh page id the allocator hands out only ever increases
+/// (`PageAllocator.allocate`'s non-reuse branch), so every entry this
+/// window noted that is not a reuse (see `ManifestBuilder.reused_pages`)
+/// is expected to form one contiguous run -- except for exactly one gap at
+/// `manifest_page_id` itself, reserved from that very same sequence before
+/// `flushTransactionWrites` calls `persistAllocator` (whose own ledger/
+/// metadata pages continue the sequence past it), but never an entry since
+/// nothing writes to it until this function runs. `manifest_page_id` is
+/// never re-stored in the payload: it is already `slot.manifest_page` on
+/// the decode side, so `verifyManifest` reconstructs the same gap from
+/// that alone. Naming the run with a start id, a count, and a flat CRC
+/// array costs 4 bytes per page instead of 12, which is what lets
+/// `max_single_sync_pages` be in the thousands instead of the low
+/// hundreds. Reused pages (explicit, from the free list, never contiguous
+/// with anything in particular) still cost a full (page_id, crc) pair
+/// each. `error.InvalidNativeManifestRange` means the appended set was not
+/// actually one contiguous run plus that one known gap -- a sign some
+/// page escaped the allocator's own next_page_id sequencing -- and the
+/// caller must treat that exactly like "too big to fit": fall back to the
+/// presynced two-sync path, never propagate it as a hard error.
+fn encodeManifestPayloadAlloc(allocator: Allocator, entries: []const ManifestEntry, reused_pages: *const std.AutoHashMapUnmanaged(u64, void), manifest_page_id: u64) ![]u8 {
+    var appended_min: ?u64 = null;
+    var appended_max: ?u64 = null;
+    var reused_count: usize = 0;
     for (entries) |entry| {
-        std.mem.writeInt(u64, out[offset..][0..8], entry.page_id, .little);
-        std.mem.writeInt(u32, out[offset + 8 ..][0..4], entry.crc, .little);
-        offset += manifest_entry_size;
+        if (reused_pages.contains(entry.page_id)) {
+            reused_count += 1;
+        } else {
+            if (appended_min == null or entry.page_id < appended_min.?) appended_min = entry.page_id;
+            if (appended_max == null or entry.page_id > appended_max.?) appended_max = entry.page_id;
+        }
+    }
+    const appended_count = entries.len - reused_count;
+    const range_start = appended_min orelse 0;
+    const gap_in_span = appended_count > 0 and manifest_page_id >= range_start and manifest_page_id <= appended_max.?;
+    if (appended_count > 0) {
+        const span = appended_max.? - range_start + 1;
+        const expected = appended_count + @as(usize, if (gap_in_span) 1 else 0);
+        if (span != expected) return error.InvalidNativeManifestRange;
+    }
+    const out = try allocator.alloc(u8, manifest_header_size + appended_count * 4 + reused_count * manifest_entry_size);
+    errdefer allocator.free(out);
+    std.mem.writeInt(u64, out[0..8], range_start, .little);
+    std.mem.writeInt(u32, out[8..12], @intCast(appended_count), .little);
+    std.mem.writeInt(u32, out[12..16], @intCast(reused_count), .little);
+    const appended_crcs = out[manifest_header_size..][0 .. appended_count * 4];
+    var reused_offset: usize = manifest_header_size + appended_count * 4;
+    for (entries) |entry| {
+        if (reused_pages.contains(entry.page_id)) {
+            std.mem.writeInt(u64, out[reused_offset..][0..8], entry.page_id, .little);
+            std.mem.writeInt(u32, out[reused_offset + 8 ..][0..4], entry.crc, .little);
+            reused_offset += manifest_entry_size;
+        } else {
+            var idx = entry.page_id - range_start;
+            if (gap_in_span and entry.page_id > manifest_page_id) idx -= 1;
+            std.mem.writeInt(u32, appended_crcs[idx * 4 ..][0..4], entry.crc, .little);
+        }
     }
     return out;
 }
@@ -13327,18 +13466,39 @@ fn verifyManifest(file: std.Io.File, io: std.Io, slot: CheckpointSlot, page_size
     if (read != page_size) return false;
     const payload = decodePagePayload(buf[0..page_size], .commit_manifest) catch return false;
     if (computePageCrc(.commit_manifest, payload) != slot.manifest_crc) return false;
-    if (payload.len < 4) return false;
-    const count = std.mem.readInt(u32, payload[0..4], .little);
-    if (count != slot.manifest_page_count) return false;
-    if (payload.len != 4 + @as(usize, count) * manifest_entry_size) return false;
-    var offset: usize = 4;
-    for (0..count) |_| {
-        const page_id = std.mem.readInt(u64, payload[offset..][0..8], .little);
-        const expected_crc = std.mem.readInt(u32, payload[offset + 8 ..][0..4], .little);
-        offset += manifest_entry_size;
+    if (payload.len < manifest_header_size) return false;
+    const range_start = std.mem.readInt(u64, payload[0..8], .little);
+    const appended_count = std.mem.readInt(u32, payload[8..12], .little);
+    const reused_count = std.mem.readInt(u32, payload[12..16], .little);
+    const total = @as(u64, appended_count) + reused_count;
+    if (total != slot.manifest_page_count) return false;
+    if (payload.len != manifest_header_size + @as(usize, appended_count) * 4 + @as(usize, reused_count) * manifest_entry_size) return false;
+    // Walks the same implicit gap encodeManifestPayloadAlloc skipped: a
+    // candidate id equal to this slot's own manifest page is never an
+    // entry (nothing writes to it until the manifest page itself is
+    // built), so it is passed over without consuming one of the
+    // appended_count CRC array slots -- reconstructed purely from
+    // slot.manifest_page, never stored in the payload itself.
+    var i: u32 = 0;
+    var page_id = range_start;
+    while (i < appended_count) : (i += 1) {
+        if (page_id == slot.manifest_page) page_id += 1;
+        const expected_crc = std.mem.readInt(u32, payload[manifest_header_size + @as(usize, i) * 4 ..][0..4], .little);
         if (page_id < reserved_header_pages or page_id >= slot.page_count) return false;
         var crc_buf: [4]u8 = undefined;
         const got = file.readPositionalAll(io, &crc_buf, page_id * @as(u64, page_size) + page_crc_offset) catch return false;
+        if (got != 4) return false;
+        if (std.mem.readInt(u32, &crc_buf, .little) != expected_crc) return false;
+        page_id += 1;
+    }
+    var offset: usize = manifest_header_size + @as(usize, appended_count) * 4;
+    for (0..reused_count) |_| {
+        const reused_page_id = std.mem.readInt(u64, payload[offset..][0..8], .little);
+        const expected_crc = std.mem.readInt(u32, payload[offset + 8 ..][0..4], .little);
+        offset += manifest_entry_size;
+        if (reused_page_id < reserved_header_pages or reused_page_id >= slot.page_count) return false;
+        var crc_buf: [4]u8 = undefined;
+        const got = file.readPositionalAll(io, &crc_buf, reused_page_id * @as(u64, page_size) + page_crc_offset) catch return false;
         if (got != 4) return false;
         if (std.mem.readInt(u32, &crc_buf, .little) != expected_crc) return false;
     }
@@ -14079,17 +14239,19 @@ test "lite native recovery falls back past a torn higher-sequence slot" {
     try std.testing.expect((try file.check()).valid);
 }
 
-// Two regression tests for the stale-manifest-field and deferred-commit
-// reservation-leak bugs (both found and fixed while wiring the manifest
-// path into commitTransactionWithDurability) lived here. Both bugs are
-// real and the fixes (tryBuildCommitManifest resetting manifest_page/
-// manifest_crc/manifest_page_count/presynced unconditionally before any
-// early return; flushTransactionWrites skipping the page reservation for
-// a deferred commit) stay in place, but with manifest_commits_enabled =
-// false (see its doc comment) neither path is reachable through a normal
-// commit right now, so the tests were removed rather than left asserting
-// behavior the feature flag makes dead. Re-add equivalents once the
-// feature is re-enabled.
+// Three tests against the now-correctly-scoped manifest window lived here:
+// a small commit taking the manifest path with an oversized one falling
+// back to presynced; a deferred commit not leaving flushTransactionWrites'
+// page reservation unwritten; and a durable commit's manifest catching a
+// torn page from an *earlier* non-durable commit in the same
+// since-last-durable window (recovery correctly reverts to the checkpoint
+// from before any of them). All three passed. They were removed because
+// manifest_commits_enabled is false again (see its doc comment for why:
+// a reused-but-never-written page surfaced by the debug cross-check
+// against real DB-layer traffic, not yet root-caused) and with it off
+// `allow_manifest_reservation` never fires, so none of the three would
+// exercise anything. Restore them -- the commit history has the exact
+// text -- alongside re-enabling the flag.
 
 test "lite native create writes inspectable aflite file" {
     const allocator = std.testing.allocator;
@@ -17328,7 +17490,7 @@ test "lite native bulk index frontier preserves mixed keys and exact page counts
             var payload = std.ArrayListUnmanaged(u8).empty;
             defer payload.deinit(budget.allocator());
             try encodeCatalogEntry(budget.allocator(), &payload, .{ .previous_page = history, .key = bytes, .value = "v" });
-            history = try appendPageToFile(budget.allocator(), file.file, std.testing.io, default_page_size, &next, .catalog, payload.items);
+            history = try appendPageToFile(budget.allocator(), file.file, std.testing.io, default_page_size, &next, .catalog, payload.items, null);
             try builder.add(bytes, history);
             try counter.add(bytes, history);
         }
