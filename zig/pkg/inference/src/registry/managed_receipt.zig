@@ -70,6 +70,20 @@ pub const ValidatedReceipt = struct {
     }
 };
 
+/// Authenticate the bytes actually consumed by a metadata/tokenizer parser.
+/// Canonical aliases inherit the strongest consistent checksum at validation.
+pub fn verifyArtifactBytes(artifact: *const ValidatedArtifact, bytes: []const u8) !void {
+    if (artifact.size != bytes.len) return error.InvalidManagedDownload;
+    if (artifact.sha256) |expected| {
+        if (expected.len != 64) return error.ChecksumMismatch;
+        var decoded: [32]u8 = undefined;
+        _ = std.fmt.hexToBytes(&decoded, expected) catch return error.ChecksumMismatch;
+        var actual: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &actual, .{});
+        if (!std.mem.eql(u8, &decoded, &actual)) return error.ChecksumMismatch;
+    }
+}
+
 /// Re-hash an artifact that has already passed receipt path and size
 /// validation against a pinned SHA-256 identity.
 ///
@@ -100,6 +114,8 @@ pub const ArtifactStamp = struct {
 
 pub fn verifyValidatedArtifactSha256AndStamp(io: std.Io, artifact: *const ValidatedArtifact, expected_hex: []const u8) !ArtifactStamp {
     if (expected_hex.len != 64) return error.ChecksumMismatch;
+    var expected: [32]u8 = undefined;
+    _ = std.fmt.hexToBytes(&expected, expected_hex) catch return error.ChecksumMismatch;
 
     var file = try std.Io.Dir.cwd().openFile(io, artifact.canonical_path, .{});
     defer file.close(io);
@@ -119,8 +135,7 @@ pub fn verifyValidatedArtifactSha256AndStamp(io: std.Io, artifact: *const Valida
 
     var digest: [std.crypto.hash.sha2.Sha256.digest_length]u8 = undefined;
     hasher.final(&digest);
-    const actual_hex = std.fmt.bytesToHex(digest, .lower);
-    if (!std.mem.eql(u8, &actual_hex, expected_hex)) return error.ChecksumMismatch;
+    if (!std.mem.eql(u8, &digest, &expected)) return error.ChecksumMismatch;
     const verified = ArtifactStamp.fromStat(try file.stat(io));
     if (!std.meta.eql(ArtifactStamp.fromStat(stat), verified)) return error.ModelArtifactsChanging;
     return verified;
@@ -184,7 +199,8 @@ pub fn artifactPathIsSafe(path: []const u8) bool {
     return true;
 }
 
-fn pathIsWithinRoot(root: []const u8, path: []const u8) bool {
+pub fn pathIsWithinRoot(root: []const u8, path: []const u8) bool {
+    if (root.len == 0) return false;
     if (!std.mem.startsWith(u8, path, root) or path.len <= root.len) return false;
     if (std.fs.path.isSep(root[root.len - 1])) return true;
     return std.fs.path.isSep(path[root.len]);
@@ -343,6 +359,11 @@ fn loadValidatedSource(
     try path_index.ensureTotalCapacity(allocator, @intCast(parsed.value.artifacts.len));
     var initialized: usize = 0;
     errdefer for (artifacts[0..initialized]) |artifact| allocator.free(artifact.canonical_path);
+    // Relative names may alias one physical file. They must agree on its
+    // digest, and a checksum-free alias must not weaken a checked sibling.
+    var canonical_groups: std.StringHashMapUnmanaged(usize) = .empty;
+    defer canonical_groups.deinit(allocator);
+    try canonical_groups.ensureTotalCapacity(allocator, @intCast(parsed.value.artifacts.len));
 
     var has_supported_payload = false;
     for (parsed.value.artifacts, 0..) |artifact, index| {
@@ -362,6 +383,15 @@ fn loadValidatedSource(
         errdefer allocator.free(canonical_path);
         const stat = try cwd.statFile(io, canonical_path, .{ .follow_symlinks = false });
         if (stat.kind != .file or stat.size != artifact.size) return error.InvalidManagedDownload;
+        const canonical = canonical_groups.getOrPutAssumeCapacity(canonical_path);
+        if (canonical.found_existing) {
+            const prior = &artifacts[canonical.value_ptr.*];
+            if (prior.sha256) |left| {
+                if (artifact.sha256) |right| {
+                    if (!std.ascii.eqlIgnoreCase(left, right)) return error.InvalidManagedDownload;
+                }
+            } else prior.sha256 = artifact.sha256;
+        } else canonical.value_ptr.* = index;
 
         artifacts[index] = .{
             .path = artifact.path,
@@ -378,6 +408,10 @@ fn loadValidatedSource(
         }
     }
     if (!has_supported_payload) return error.InvalidManagedDownload;
+    // A linear second pass also covers aliases encountered before a digest.
+    for (artifacts) |*artifact| {
+        artifact.sha256 = artifacts[canonical_groups.get(artifact.canonical_path).?].sha256;
+    }
     switch (source) {
         .completion => if (try publicationBlockedPaths(cwd, io, in_progress_path, plan_path)) {
             return error.IncompleteManagedDownload;
