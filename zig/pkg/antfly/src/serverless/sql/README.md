@@ -447,3 +447,18 @@ Invalid plans and malformed admission requests return permanent HTTP 400 errors
 on native and hosted listeners. Native gateway clients stop on permanent 4xx
 admission responses without failing over or quarantining healthy workers; missing
 queries and transient provider failures retain their bounded recovery behavior.
+
+The native result bridge borrows one authenticated exchange block until the next
+pull advances past it. Full blocks need no caller row or selection allocation;
+partial pulls retain a bounded coordinate view. The existing spill block adapter
+preserves primitive vectors, exact decimal views, dictionary identities, arrays,
+and SQL/JSON null distinctions. Forwarding decode keeps JSON in validated wire
+form until a scalar consumer demands it. Retaining operators copy into their own
+stores before advancing; cursor close retires lazy caches before block metadata.
+Result manifests, source cancellation and allocation failures use the same bounded
+ownership path. An allocation regression compares this transfer against the
+former eager scalar-row cloning pattern for wide JSON results.
+
+Local join-aggregate reduction declines distributed cursors, whose join has
+already executed remotely. COUNT and grouped aggregates consume their result
+batches through the ordinary aggregate path without inspecting local children.

@@ -194,7 +194,11 @@ const Owner = struct {
     previous_manifest: ?state.Output = null,
     manifest_arena: ?std.heap.ArenaAllocator = null,
     data: ?@import("exchange.zig").Data = null,
-    block: ?local.sql_spill.ColumnarBlock = null,
+    // A borrowed codec lease keeps lazy JSON caches and native vector traits
+    // alive until the next pull advances beyond the current exchange block.
+    block: ?local.sql_spill.Sequential.InputBlock = null,
+    batch: ?local.sql_execution_batch.Batch = null,
+    positions: [@import("exchange.zig").max_block_rows]usize = undefined,
     row: usize = 0,
     fn canceled(raw: *const anyopaque) bool {
         const self: *const Owner = @ptrCast(@alignCast(raw));
@@ -202,30 +206,37 @@ const Owner = struct {
     }
     fn next(raw: *anyopaque, a: A, maximum: usize) !local.sql_execution_batch.Batch {
         const self: *Owner = @ptrCast(@alignCast(raw));
-        var rows: std.ArrayList([]const scalar.Datum) = .empty;
-        while (rows.items.len < maximum) {
+        if (maximum == 0) return .{ .rows = &.{} };
+        while (true) {
             try self.service.context.ensureActive();
-            if (self.block) |block| {
-                if (self.row < block.count()) {
-                    const cells = try a.alloc(scalar.Datum, block.values.len);
-                    for (cells, 0..) |*cell, column| cell.* = try local.sql_operators.cloneDatum(a, try block.cell(self.row, column));
-                    try rows.append(a, cells);
-                    self.row += 1;
-                    continue;
+            if (self.block) |*block| {
+                const count = block.view().count();
+                if (self.row < count) {
+                    if (self.batch == null) self.batch = try block.view().batch(self.block_arena.allocator(), false);
+                    const length = @min(maximum, count - self.row);
+                    const result = if (self.row == 0 and length == count) self.batch.? else selected: {
+                        for (self.positions[0..length], self.row..) |*position, row| position.* = row;
+                        break :selected try self.batch.?.select(a, self.positions[0..length]);
+                    };
+                    // Advance only after descriptors are admitted. Consumers
+                    // finish borrowing this slice before asking for another.
+                    self.row += length;
+                    return result;
                 }
                 block.deinit();
                 self.block = null;
+                self.batch = null;
             }
             if (self.data) |*data| {
-                self.block = try data.nextBlock(&self.block_arena, @import("exchange.zig").max_object_bytes);
-                if (self.block != null) {
+                if (try data.nextBlockForForwarding(&self.block_arena, self.a, @import("exchange.zig").max_object_bytes)) |encoded| {
+                    self.block = .{ .borrowed = .{ .a = self.a, .arena = .init(self.a), .encoded = encoded } };
                     self.row = 0;
                     continue;
                 }
                 self.data = null;
             }
             if (self.page == self.pages.len) {
-                if (self.previous_manifest == null and self.manifest == self.manifests.len) break;
+                if (self.previous_manifest == null and self.manifest == self.manifests.len) return .{ .rows = &.{} };
                 // Copy the borrowed link before resetting the previous page arena.
                 const link = self.previous_manifest orelse self.manifests[self.manifest];
                 const next_key = try self.a.dupe(u8, link.key);
@@ -245,11 +256,10 @@ const Owner = struct {
             self.data = try self.service.exchange_store.read(self.decode.allocator(), self.pages[self.page], 0, @import("exchange.zig").max_object_bytes);
             self.page += 1;
         }
-        return .{ .rows = rows.items };
     }
     fn close(raw: *anyopaque) void {
         const self: *Owner = @ptrCast(@alignCast(raw));
-        if (self.block) |block| block.deinit();
+        if (self.block) |*block| block.deinit();
         if (self.manifest_arena) |*arena| arena.deinit();
         self.block_arena.deinit();
         self.decode.deinit();
@@ -280,4 +290,200 @@ test "distributed SQL paged WAL parallelism is independent of base scan rows" {
     try std.testing.expectEqual(try normal.taskCount(), try selected.taskCount());
     cap.min_splits = 1000;
     try std.testing.expectEqual(@as(u32, 1000), (try bridge.input(a, table, &.{"id"}, cap, null)).splits);
+}
+
+const ResultFixture = struct {
+    const exchange = @import("exchange.zig");
+    const Batch = local.sql_execution_batch.Batch;
+    const Datum = scalar.Datum;
+    fn open(a: A, objects: exchange.Store, pages: []const state.Output, manifests: []const state.Output) !*Owner {
+        const owner = try a.create(Owner);
+        owner.* = .{ .a = a, .arena = .init(a), .decode = .init(a), .block_arena = .init(a), .request = .{}, .parent_context = .{}, .service = .{ .a = a, .state_store = .{ .client = objects.client, .bucket = objects.bucket, .prefix = objects.prefix, .now_ms = 0 }, .exchange_store = objects, .tenant = @splat('a'), .owner = "result-test", .role = .query_only, .source = undefined, .retention = undefined } };
+        errdefer Owner.close(owner);
+        const work = owner.arena.allocator();
+        const copied_pages = try work.dupe(state.Output, pages);
+        for (copied_pages) |*page| page.key = try work.dupe(u8, page.key);
+        owner.pages = copied_pages;
+        const copied_manifests = try work.dupe(state.Output, manifests);
+        for (copied_manifests) |*page| page.key = try work.dupe(u8, page.key);
+        owner.manifests = copied_manifests;
+        return owner;
+    }
+    fn manifest(a: A, objects: exchange.Store, page: runtime.Service.ResultPage) !state.Output {
+        const bytes = try std.json.Stringify.valueAlloc(a, page, .{});
+        const hash = local.serverless_external_source_mod.lake_catalog.types.digestHex(bytes);
+        const key = try std.fmt.allocPrint(a, "{s}/manifest/{s}", .{ objects.prefix, hash });
+        var writer = objects.client;
+        writer.allocator = a;
+        var saved = try writer.putObject(objects.bucket, key, bytes, .{});
+        saved.deinit(a);
+        return .{ .key = key, .hash = hash, .bytes = bytes.len, .rows = page.rows };
+    }
+    /// Match the former bridge's eager scalar-row materialization for comparison.
+    fn cloned(a: A, batch: Batch) !Batch {
+        const rows = try a.alloc([]const Datum, batch.len());
+        for (rows, 0..) |*row, index| {
+            const cells = try a.alloc(Datum, batch.width());
+            for (cells, 0..) |*cell, column| cell.* = try local.sql_operators.cloneDatum(a, try batch.cell(a, index, column));
+            row.* = cells;
+        }
+        return .{ .rows = rows };
+    }
+};
+
+test "distributed SQL result bridge borrows typed slices and preserves array decimal dictionary and JSON identity" {
+    const a = std.testing.allocator;
+    var seed = std.heap.ArenaAllocator.init(a);
+    defer seed.deinit();
+    const sa = seed.allocator();
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    const objects: ResultFixture.exchange.Store = .{ .client = memory.client(), .bucket = "result", .prefix = "test" };
+    var numeric: local.sql_numeric_value.Context = .{ .alloc = sa };
+    const number = try local.sql_numeric_value.parse(&numeric, "9007199254740993.1200");
+    const array = try local.sql_array_value.Value.init(.int64, &.{.{ .length = 2, .lower = -3 }}, &.{ scalar.Datum.json(.{ .integer = 9007199254740993 }), .{} }, .{});
+    const payload = try sa.alloc(u8, 8192);
+    @memset(payload, 'x');
+    var json: std.json.Value = .{ .object = .empty };
+    try json.object.put(sa, "payload", .{ .string = payload });
+    const rows = try sa.alloc(local.sql_operators.Row, 520);
+    for (rows, 0..) |*row, index| {
+        const cells = try sa.dupe(scalar.Datum, &.{ scalar.Datum.json(.{ .integer = @intCast(index) }), scalar.Datum.typedNumeric(&number.value), scalar.Datum.json(json), scalar.Datum.typedArray(&array), scalar.Datum.json(.{ .string = "dictionary" }), .{}, scalar.Datum.json(.null) });
+        row.* = .{ .values = cells, .keys = &.{}, .ordinal = index };
+    }
+    const output = try objects.put(sa, @splat('a'), 1000000, &.{rows}, 16 << 20);
+    const owner = try ResultFixture.open(a, objects, &.{output}, &.{});
+    defer Owner.close(owner);
+    try std.testing.expectEqual(@as(usize, 0), (try Owner.next(owner, std.testing.failing_allocator, 0)).len());
+    try std.testing.expect(owner.block == null);
+    const first = try Owner.next(owner, std.testing.failing_allocator, 256);
+    try std.testing.expectEqual(@as(usize, 256), first.len());
+    try std.testing.expect(first != .rows);
+    try std.testing.expect(try first.frozenJson(0, 2) != null);
+    try std.testing.expectEqual(@as(usize, 0), owner.block.?.view().encoded.?.json_owner.?.retained_capacity.load(.acquire));
+    const primitive = (try first.physicalColumn(sa, 0)).?;
+    try std.testing.expectEqual(@as(i64, 255), try primitive.vector.integerAt(primitive.rowAt(255)));
+    const decimal = (try first.decimalColumnSelected(sa, 1, null)).?;
+    try std.testing.expectEqual(@as(i128, 90071992547409931200), decimal.physical.vector.values.decimal128.values[0]);
+    try std.testing.expectEqual(@as(u16, 4), decimal.scales[0]);
+    const dictionary = (try first.dictionaryColumn(sa, 4)).?;
+    try std.testing.expectEqualStrings("dictionary", (try dictionary.cell(sa, 0, 0)).value.string);
+    try std.testing.expect((try first.cell(sa, 0, 5)).sql_null);
+    try std.testing.expect(!(try first.cell(sa, 0, 6)).sql_null);
+    try std.testing.expectEqual(@as(i32, -3), (try first.cell(sa, 0, 3)).array.?.dimensions[0].lower);
+    const second = try Owner.next(owner, sa, 7);
+    try std.testing.expectEqual(@as(usize, 7), second.len());
+    try std.testing.expectEqual(@as(i64, 256), (try second.cell(sa, 0, 0)).value.integer);
+    const selected = (try second.physicalColumnSelected(sa, 0, &.{ 6, 0, 3 })).?;
+    try std.testing.expectEqual(@as(i64, 262), try selected.vector.integerAt(selected.rowAt(0)));
+    try std.testing.expectEqual(@as(i64, 256), try selected.vector.integerAt(selected.rowAt(1)));
+    try std.testing.expect(try second.frozenJson(6, 2) != null);
+    // A failed partial descriptor allocation must not consume a row.
+    try std.testing.expectError(error.OutOfMemory, Owner.next(owner, std.testing.failing_allocator, 1));
+    try std.testing.expectEqual(@as(usize, 7), owner.row);
+    const resumed = try Owner.next(owner, sa, 1);
+    try std.testing.expectEqual(@as(i64, 263), (try resumed.cell(sa, 0, 0)).value.integer);
+    var count: usize = 264;
+    while (true) {
+        const batch = try Owner.next(owner, sa, 4096);
+        if (batch.len() == 0) break;
+        for (0..batch.len()) |row| try std.testing.expectEqual(@as(i64, @intCast(count + row)), (try batch.cell(sa, row, 0)).value.integer);
+        count += batch.len();
+    }
+    try std.testing.expectEqual(@as(usize, 520), count);
+    try std.testing.expectEqual(@as(usize, 0), (try Owner.next(owner, sa, 1)).len());
+}
+
+test "distributed SQL result bridge manifests cancellation and allocation failures retain bounded ownership" {
+    const a = std.testing.allocator;
+    var seed = std.heap.ArenaAllocator.init(a);
+    defer seed.deinit();
+    const sa = seed.allocator();
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    const objects: ResultFixture.exchange.Store = .{ .client = memory.client(), .bucket = "result", .prefix = "test" };
+    const first = try objects.put(sa, @splat('a'), 1000000, &.{&.{.{ .values = &.{scalar.Datum.json(.{ .string = "first" })}, .keys = &.{}, .ordinal = 0 }}}, 1 << 20);
+    const second = try objects.put(sa, @splat('b'), 1000000, &.{&.{.{ .values = &.{scalar.Datum.json(.{ .string = "second" })}, .keys = &.{}, .ordinal = 0 }}}, 1 << 20);
+    const empty = try objects.put(sa, @splat('c'), 1000000, &.{&.{}}, 1 << 20);
+    const tail = try ResultFixture.manifest(sa, objects, .{ .pages = &.{second}, .rows = 1 });
+    const head = try ResultFixture.manifest(sa, objects, .{ .pages = &.{ empty, first }, .rows = 1, .previous = tail });
+    const Walk = struct {
+        fn run(allocator: A, store: ResultFixture.exchange.Store, manifest: state.Output) !void {
+            const owner = try ResultFixture.open(allocator, store, &.{}, &.{manifest});
+            defer Owner.close(owner);
+            var work = std.heap.ArenaAllocator.init(allocator);
+            defer work.deinit();
+            for ([_][]const u8{ "first", "second" }) |expected| {
+                _ = work.reset(.free_all);
+                const batch = try Owner.next(owner, work.allocator(), 17);
+                try std.testing.expectEqual(@as(usize, 1), batch.len());
+                try std.testing.expectEqualStrings(expected, (try batch.cell(work.allocator(), 0, 0)).value.string);
+            }
+            try std.testing.expectEqual(@as(usize, 0), (try Owner.next(owner, work.allocator(), 17)).len());
+        }
+    };
+    try Walk.run(a, objects, head);
+    try std.testing.checkAllAllocationFailures(a, Walk.run, .{ objects, head });
+    const owner = try ResultFixture.open(a, objects, &.{first}, &.{});
+    defer Owner.close(owner);
+    var cancelled = true;
+    owner.service.context.cancellation = .{ .ptr = &cancelled, .is_cancelled_fn = struct {
+        fn check(raw: *const anyopaque) bool {
+            return @as(*const bool, @ptrCast(@alignCast(raw))).*;
+        }
+    }.check };
+    const before = memory.operationCount();
+    try std.testing.expectError(error.Canceled, Owner.next(owner, sa, 256));
+    try std.testing.expectEqual(before, memory.operationCount());
+    cancelled = false;
+    try std.testing.expectEqual(@as(usize, 1), (try Owner.next(owner, sa, 1)).len());
+    // Retire a partly consumed block during cursor close, including lazy caches.
+    _ = try owner.batch.?.cell(sa, 0, 0);
+}
+
+test "distributed SQL result bridge forwards wide JSON with bounded pull allocations" {
+    const a = std.testing.allocator;
+    var seed = std.heap.ArenaAllocator.init(a);
+    defer seed.deinit();
+    const sa = seed.allocator();
+    var memory = @import("objectstore").MemoryClient.init(a);
+    defer memory.deinit();
+    const objects: ResultFixture.exchange.Store = .{ .client = memory.client(), .bucket = "result", .prefix = "test" };
+    const text = try sa.alloc(u8, 16 * 1024);
+    @memset(text, 'x');
+    var json: std.json.Value = .{ .object = .empty };
+    try json.object.put(sa, "payload", .{ .string = text });
+    const rows = try sa.alloc(local.sql_operators.Row, 512);
+    for (rows, 0..) |*row, index| row.* = .{ .values = &.{scalar.Datum.json(json)}, .keys = &.{}, .ordinal = index };
+    const output = try objects.put(sa, @splat('a'), 1000000, &.{rows}, 16 << 20);
+    var pull_bytes: [2]usize = undefined;
+    var elapsed_ns: [2]u64 = undefined;
+    for ([_]bool{ true, false }, 0..) |clone_rows, mode| {
+        const owner = try ResultFixture.open(a, objects, &.{output}, &.{});
+        var closed = false;
+        defer if (!closed) Owner.close(owner);
+        var counted = std.testing.FailingAllocator.init(a, .{});
+        var pull = std.heap.ArenaAllocator.init(counted.allocator());
+        defer pull.deinit();
+        var destination = local.sql_typed_store.Store.init(a);
+        defer destination.deinit();
+        const started = @import("antfly_platform").time.monotonicNs();
+        while (true) {
+            _ = pull.reset(.free_all);
+            var batch = try Owner.next(owner, pull.allocator(), 256);
+            if (batch.len() == 0) break;
+            if (clone_rows) batch = try ResultFixture.cloned(pull.allocator(), batch);
+            try destination.appendBatch(batch);
+        }
+        elapsed_ns[mode] = @import("antfly_platform").time.monotonicNs() - started;
+        Owner.close(owner);
+        closed = true;
+        try std.testing.expectEqual(@as(usize, 512), destination.len);
+        const retained = try destination.cell(sa, 511, 0);
+        try std.testing.expectEqualStrings(text, retained.value.object.get("payload").?.string);
+        pull_bytes[mode] = counted.allocated_bytes;
+    }
+    std.debug.print("result bridge rows=512 payload=16384 cloned_pull_bytes={d} typed_pull_bytes={d} cloned_ns={d} typed_ns={d}\n", .{ pull_bytes[0], pull_bytes[1], elapsed_ns[0], elapsed_ns[1] });
+    try std.testing.expect(pull_bytes[0] > 8 * 1024 * 1024);
+    try std.testing.expect(pull_bytes[1] < 16 * 1024);
 }

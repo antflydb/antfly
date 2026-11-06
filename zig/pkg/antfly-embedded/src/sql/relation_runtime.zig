@@ -2632,7 +2632,9 @@ fn Engine(comptime Context: type) type {
             }
             fn openAggregatePartials(ptr: *anyopaque, a: Allocator, _: catalog.Table, recipe: @import("aggregate_materialization.zig").Recipe) !?catalog.AggregatePartialCursor {
                 const self: *Adapter = @ptrCast(@alignCast(ptr));
-                if (self.opened or self.iterator.apply_mode or self.iterator.recursive_id != null or outerMask(self.iterator.node) != 0) return null;
+                // A distributed relation already owns its join. This shortcut may
+                // inspect local build/probe children only for local iterators.
+                if (self.opened or self.iterator.remote_join != null or self.iterator.apply_mode or self.iterator.recursive_id != null or outerMask(self.iterator.node) != 0) return null;
                 const plan = (try @import("join_aggregate.zig").Plan.prove(self.engine.context.arena, self.iterator.node, recipe)) orelse return null;
                 const build_side: u1 = if (self.iterator.flipped_join) 0 else 1;
                 if (!try self.iterator.right.?.sampleReduction(plan.keys[build_side])) return null;
