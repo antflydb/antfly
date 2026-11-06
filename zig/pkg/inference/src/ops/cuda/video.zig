@@ -1134,10 +1134,15 @@ test "video CUDA kernel cost by depth and tone" {
         for (0..4) |round| {
             const start = @import("antfly_platform").time.monotonicNs();
             const output = try preprocess.patches(&cb, .{ .device = buffer.ptr, .pitch = pitch, .width = width, .height = height, .timestamp_us = 0, .matrix = if (case.tone != 0) 9 else 1, .full_range = 0, .high_depth = case.high, .tone = case.tone }, 960, 544, 16, .{ 0, 0, 0 }, .{ 1, 1, 1 });
-            try compute.ctx.synchronize();
+            // Reading results back is the only proof the kernel has finished.
+            const values = try cb.toFloat32(output, a);
+            defer a.free(values);
             const elapsed = @import("antfly_platform").time.monotonicNs() - start;
             cb.free(output);
-            if (round != 0) std.debug.print("video kernel bench {s}: {d:.2} ms for 960x544 from 4K\n", .{ case.name, @as(f64, @floatFromInt(elapsed)) / 1e6 });
+            var sum: f64 = 0;
+            for (values) |value| sum += value;
+            try std.testing.expect(std.math.isFinite(sum));
+            if (round != 0) std.debug.print("video kernel bench {s}: {d:.2} ms for 960x544 from 4K, including readback\n", .{ case.name, @as(f64, @floatFromInt(elapsed)) / 1e6 });
         }
     }
 }
