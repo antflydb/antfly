@@ -448,6 +448,15 @@ const QueuedMutex = struct {
     /// they hold the gate (see `lockForLease`). Bounded; overflow only means
     /// a handoff is skipped.
     lease_tickets: [16]u64 = undefined,
+    /// The Store/NativeFile each `lease_tickets` entry's caller will use,
+    /// same index (WS2). Two Connections to the same path may each own a
+    /// separate Owner/Store, sharing only this `PathGate` for the kernel
+    /// lease; a same-process queue position alone does not mean the
+    /// waiter's writes funnel through the same native commit queue as the
+    /// current holder's, so `retainForWaiter` checks this too before
+    /// handing off a lease whose write may not be durable yet. `null`
+    /// (identity unknown) never matches.
+    lease_ticket_stores: [16]?*anyopaque = undefined,
     lease_ticket_count: usize = 0,
 
     /// Upper bound on one chain of handoffs. Readers in other processes are
@@ -460,7 +469,14 @@ const QueuedMutex = struct {
 
     /// Caller holds the mutex. Keeps `lease` for the next queued thread when
     /// that is cheaper and fair; otherwise returns false and the caller closes.
-    pub fn retainForWaiter(self: *QueuedMutex, io: std.Io, lease: *native.PathWriterLock) bool {
+    /// `store` identifies the calling side's own Store/NativeFile (WS2):
+    /// the handoff only proceeds when the next holder registered
+    /// (`lockForLease`) with this same identity, since otherwise its
+    /// writes do not funnel through this process's single native commit
+    /// queue and may stage against a tip this call's own write has not
+    /// yet made durable. Pass `null` only when the identity is genuinely
+    /// unavailable; that always refuses the handoff.
+    pub fn retainForWaiter(self: *QueuedMutex, io: std.Io, lease: *native.PathWriterLock, store: ?*anyopaque) bool {
         if (self.retained != null) return false;
         const age = std.Io.Clock.awake.now(io).nanoseconds - lease.acquired_ns;
         if (age >= retain_quantum_ns) return false;
@@ -471,7 +487,8 @@ const QueuedMutex = struct {
             // to take the lease. Anyone else might need the kernel lock free.
             const next_holder = self.serving +% 1;
             if (self.next == next_holder) return false;
-            if (std.mem.indexOfScalar(u64, self.lease_tickets[0..self.lease_ticket_count], next_holder) == null) return false;
+            const at = std.mem.indexOfScalar(u64, self.lease_tickets[0..self.lease_ticket_count], next_holder) orelse return false;
+            if (store == null or self.lease_ticket_stores[at] != store) return false;
         }
         if (age >= contended_quantum_ns and lease.othersWaiting()) return false;
         if (lease.reader_registration_batch) |batch| batch.end();
@@ -506,8 +523,13 @@ const QueuedMutex = struct {
     }
 
     /// Like `lockUncancelable`, for a caller that takes the path lease next,
-    /// so the current holder may hand its lease over directly.
-    pub fn lockForLease(self: *QueuedMutex, io: std.Io) void {
+    /// so the current holder may hand its lease over directly. `store`
+    /// identifies this caller's own Store/NativeFile (WS2): see
+    /// `retainForWaiter`. Pass `null` if genuinely unavailable -- that
+    /// Store can still be handed off to when nobody is marked for lease
+    /// handoff at all, just never through the early, possibly-undurable
+    /// `retainForWaiter` path.
+    pub fn lockForLease(self: *QueuedMutex, io: std.Io, store: ?*anyopaque) void {
         self.state.lockUncancelable(io);
         defer self.state.unlock(io);
         const ticket = self.next;
@@ -515,6 +537,7 @@ const QueuedMutex = struct {
         const marked = self.lease_ticket_count < self.lease_tickets.len;
         if (marked) {
             self.lease_tickets[self.lease_ticket_count] = ticket;
+            self.lease_ticket_stores[self.lease_ticket_count] = store;
             self.lease_ticket_count += 1;
         }
         while (ticket != self.serving) self.ready.waitUncancelable(io, &self.state);
@@ -522,6 +545,7 @@ const QueuedMutex = struct {
             const tickets = self.lease_tickets[0..self.lease_ticket_count];
             const at = std.mem.indexOfScalar(u64, tickets, ticket).?;
             tickets[at] = tickets[tickets.len - 1];
+            self.lease_ticket_stores[at] = self.lease_ticket_stores[self.lease_ticket_count - 1];
             self.lease_ticket_count -= 1;
         }
     }
@@ -604,11 +628,15 @@ test "capi path gate hands a writer lease to the next queued thread and drops it
     defer std.testing.allocator.free(path);
     const io = h.handleLockIo();
     var gate: QueuedMutex = .{};
+    // This test exercises the generic handoff mechanism, not cross-Store
+    // identity (WS2), so every side here shares one dummy identity.
+    var dummy_store: u8 = 0;
+    const same_store: ?*anyopaque = &dummy_store;
 
     // Nobody queued: the lease is not kept.
     gate.lockUncancelable(io);
     var lone = try native.fairWriterLockWithIo(alloc, io, threaded.io(), path, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
-    try std.testing.expect(!gate.retainForWaiter(io, &lone));
+    try std.testing.expect(!gate.retainForWaiter(io, &lone, same_store));
     lone.close();
     gate.unlock(io);
 
@@ -631,7 +659,7 @@ test "capi path gate hands a writer lease to the next queued thread and drops it
             if (queued > 1) break;
             try io.sleep(.fromMilliseconds(1), .awake);
         }
-        try std.testing.expect(!gate.retainForWaiter(io, &lease));
+        try std.testing.expect(!gate.retainForWaiter(io, &lease, same_store));
         lease.close();
         gate.unlock(io);
         plain.join();
@@ -639,10 +667,11 @@ test "capi path gate hands a writer lease to the next queued thread and drops it
 
     const Waiter = struct {
         gate: *QueuedMutex,
+        store: ?*anyopaque,
         took: bool = false,
         fn run(self: *@This()) void {
             const wio = h.handleLockIo();
-            self.gate.lockForLease(wio);
+            self.gate.lockForLease(wio, self.store);
             defer self.gate.unlock(wio);
             if (self.gate.takeRetained()) |kept| {
                 var lease = kept;
@@ -653,7 +682,7 @@ test "capi path gate hands a writer lease to the next queued thread and drops it
     };
     gate.lockUncancelable(io);
     var lease = try native.fairWriterLockWithIo(alloc, io, threaded.io(), path, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
-    var waiter: Waiter = .{ .gate = &gate };
+    var waiter: Waiter = .{ .gate = &gate, .store = same_store };
     const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
     while (true) {
         gate.state.lockUncancelable(io);
@@ -662,7 +691,7 @@ test "capi path gate hands a writer lease to the next queued thread and drops it
         if (queued > 1) break;
         try io.sleep(.fromMilliseconds(1), .awake);
     }
-    try std.testing.expect(gate.retainForWaiter(io, &lease));
+    try std.testing.expect(gate.retainForWaiter(io, &lease, same_store));
     gate.unlock(io);
     thread.join();
     try std.testing.expect(waiter.took);
@@ -675,6 +704,66 @@ test "capi path gate hands a writer lease to the next queued thread and drops it
     try std.testing.expect(gate.retained == null);
     var probe = try native.tryFairWriterLockWithIo(alloc, io, path);
     probe.close();
+}
+
+test "capi path gate never hands an early lease to a waiter on a different Store" {
+    // WS2 regression: two Connections to the same path can each own a
+    // separate Owner/Store (the "separate handles" scenario), sharing only
+    // this PathGate for the kernel lease. A same-process queue position on
+    // gate.mutex alone used to be treated as proof the waiter's writes
+    // funnel through the handing-off side's native commit queue -- true
+    // only when they share a Store. retainForWaiter must refuse the early
+    // handoff whenever the identities differ (or either is unknown), even
+    // though the generic "someone is queued for the lease" condition that
+    // retainForWaiter otherwise checks is satisfied.
+    if (h.builtin.single_threaded or h.builtin.os.tag == .freestanding) return error.SkipZigTest;
+    var threaded = std.Io.Threaded.init(std.testing.allocator, .{ .concurrent_limit = .limited(4) });
+    defer threaded.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/handoff-cross-store.aflite", .{tmp.sub_path});
+    defer std.testing.allocator.free(path);
+    const io = h.handleLockIo();
+    var gate: QueuedMutex = .{};
+    var holder_store: u8 = 0;
+    var waiter_store: u8 = 0;
+
+    const Waiter = struct {
+        gate: *QueuedMutex,
+        store: ?*anyopaque,
+        took: bool = false,
+        fn run(self: *@This()) void {
+            const wio = h.handleLockIo();
+            self.gate.lockForLease(wio, self.store);
+            defer self.gate.unlock(wio);
+            if (self.gate.takeRetained()) |kept| {
+                var lease = kept;
+                self.took = true;
+                lease.close();
+            }
+        }
+    };
+    for ([_]?*anyopaque{ &waiter_store, null }) |store_case| {
+        gate.lockUncancelable(io);
+        var lease = try native.fairWriterLockWithIo(alloc, io, threaded.io(), path, std.Io.Clock.awake.now(io).nanoseconds + std.time.ns_per_s);
+        var waiter: Waiter = .{ .gate = &gate, .store = store_case };
+        const thread = try std.Thread.spawn(.{}, Waiter.run, .{&waiter});
+        while (true) {
+            gate.state.lockUncancelable(io);
+            const queued = gate.next -% gate.serving;
+            gate.state.unlock(io);
+            if (queued > 1) break;
+            try io.sleep(.fromMilliseconds(1), .awake);
+        }
+        // The waiter is genuinely queued and marked for lease handoff, but
+        // its identity (&waiter_store, or unknown) never matches the
+        // holder's (&holder_store): no early handoff.
+        try std.testing.expect(!gate.retainForWaiter(io, &lease, &holder_store));
+        lease.close();
+        gate.unlock(io);
+        thread.join();
+        try std.testing.expect(!waiter.took);
+    }
 }
 
 // Connections in one process queue on a canonical file gate. The kernel
@@ -2744,10 +2833,25 @@ pub const Connection = struct {
     test_admission_sleep: if (h.builtin.is_test) ?struct { ptr: *anyopaque, sleep: *const fn (*anyopaque, std.Io.Duration) std.Io.Cancelable!void } else void = if (h.builtin.is_test) null else {},
     test_path_lease_busy: if (h.builtin.is_test) ?struct { ptr: *anyopaque, notify: *const fn (*anyopaque) void } else void = if (h.builtin.is_test) null else {},
 
+    /// Identifies this Connection's own Store/NativeFile, for
+    /// `QueuedMutex.lockForLease`/`retainForWaiter` (WS2): two Connections
+    /// to the same path may each have their own Owner and therefore their
+    /// own Store, sharing only `self.gate` for the kernel-level lease, so a
+    /// same-process queue position on `self.gate.mutex` alone does not mean
+    /// the holder and the waiter share one native commit queue. `null` if
+    /// unavailable (no live root attached yet) -- callers must treat that
+    /// as "never match" rather than guess.
+    pub fn storeIdentity(self: *const Connection) ?*anyopaque {
+        const root = self.current orelse return null;
+        const backend = root.owned_lite_backend orelse return null;
+        const store = backend.native_docstore orelse return null;
+        return store;
+    }
+
     pub fn acquire(self: *Connection) !native.PathWriterLock {
         const io = h.handleLockIo();
         const gate_started = std.Io.Clock.awake.now(io).nanoseconds;
-        self.gate.mutex.lockForLease(io);
+        self.gate.mutex.lockForLease(io, self.storeIdentity());
         {
             const waited: u64 = @intCast(@max(0, std.Io.Clock.awake.now(io).nanoseconds - gate_started));
             const stats = &self.owner.publication_stats;
