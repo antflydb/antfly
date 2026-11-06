@@ -309,14 +309,16 @@ Landing order:
 
 ## 5. Acceptance gates (1 KB documents, one document per transaction)
 
+Throughput gates compare against SQLite in the same run of `scripts/bench/lite_sqlite_comparison.py` on the same quiet host, with a ReleaseFast `libantfly`. Sync and byte gates are build-independent and checked in Debug.
+
 | Metric | Baseline | Target |
 |---|---|---|
 | Primary calling-path syncs/update | 3.0 | ≤ 1.0 with 1 writer; ≤ 0.25 with 8 |
 | Primary bytes/update | about 60 KB | ≤ 40 KB with 1 writer; ≤ 12 KB with 8 |
-| Primary throughput | 743 / 473 writes/s | ≥ 8k with 1 writer; 8 writers ≥ 1.5× one writer |
+| Primary throughput | 743 / 473 writes/s | ≥ SQLite WAL/FULL on the same host (17,630 / 17,255 on wolfspider); 8 writers above 1 writer |
 | Indexed calling-path syncs/update | 36.4 | ≤ 1.0 with 1 writer; ≤ 0.3 with 8 |
 | Indexed bytes/update | about 393 KB | ≤ 64 KB |
-| Indexed throughput | 102 / 43 writes/s | ≥ 1,000 (stretch ≥ 4,000), rising with writers |
+| Indexed throughput | 102 / 43 writes/s | ≥ SQLite + FTS5 on the same host (11,349 / 10,522 on wolfspider); 8 writers above 1 writer |
 | Primary-only background work | 418 turns / 1,612 leases / 418 refreshes | 0 / 0 / 0 |
 
 ## 6. Required crash and recovery tests
