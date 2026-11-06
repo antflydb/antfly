@@ -1454,6 +1454,34 @@ fn unchangedPublishedInstall(allocator: std.mem.Allocator, io: std.Io, destinati
     return true;
 }
 
+/// Recover only published directory renames. The catalog lock owns this
+/// operation; it never touches private staging or takes another model lock.
+/// This lets an unrelated pull repair a killed publisher without lock inversion.
+pub fn recoverManagedPublication(allocator: std.mem.Allocator, io: std.Io, destination: []const u8) !void {
+    const backup = try managedSiblingPath(allocator, destination, managed_download_backup_suffix);
+    defer allocator.free(backup);
+    const cwd = std.Io.Dir.cwd();
+    if (!try pathExists(cwd, io, backup)) return;
+    const destination_exists = try pathExists(cwd, io, destination);
+    var current = if (destination_exists) managed_receipt.loadValidated(allocator, io, destination) catch |err| switch (@as(anyerror, err)) {
+        error.InvalidManagedDownload, error.IncompleteManagedDownload, error.InvalidModelArtifactPath, error.InvalidModelArtifactKind, error.ModelArtifactOutsideRoot, error.FileNotFound, error.NotDir, error.IsDir, error.SymLinkLoop, error.StreamTooLong => null,
+        // Allocation/operational failure is not evidence to discard a directory.
+        else => return err,
+    } else null;
+    defer if (current) |*receipt| receipt.deinit();
+    if (current != null) {
+        try removeTreeIfExists(cwd, io, backup);
+    } else {
+        // Validate managed backups before restoring; an unmanaged legacy
+        // installation remains valid rollback state for its first managed pull.
+        var receipt = try managed_receipt.loadValidated(allocator, io, backup);
+        defer if (receipt) |*value| value.deinit();
+        if (destination_exists) try removeTreeIfExists(cwd, io, destination);
+        try std.Io.Dir.rename(cwd, backup, cwd, destination, io);
+    }
+    try syncManagedDirectory(io, std.fs.path.dirname(destination) orelse ".");
+}
+
 /// A pull transaction built beside the published model directory.
 ///
 /// Downloads never mutate the active cache. Verified existing artifacts are
@@ -1486,23 +1514,7 @@ pub const ManagedModelTransaction = struct {
         };
 
         const cwd = std.Io.Dir.cwd();
-        const destination_exists = try pathExists(cwd, io, transaction.destination);
-        const backup_exists = try pathExists(cwd, io, transaction.backup);
-        var recovered_publication = false;
-        if (backup_exists) {
-            if (!destination_exists) {
-                try std.Io.Dir.rename(cwd, transaction.backup, cwd, transaction.destination, io);
-            } else if (managedDownloadState(allocator, io, transaction.destination) == .complete) {
-                try removeTreeIfExists(cwd, io, transaction.backup);
-            } else {
-                try removeTreeIfExists(cwd, io, transaction.destination);
-                try std.Io.Dir.rename(cwd, transaction.backup, cwd, transaction.destination, io);
-            }
-            recovered_publication = true;
-        }
-        if (recovered_publication) {
-            try syncManagedDirectory(io, std.fs.path.dirname(transaction.destination) orelse ".");
-        }
+        try recoverManagedPublication(allocator, io, destination);
 
         if (!try pathExists(cwd, io, transaction.staging)) {
             try cwd.createDirPath(io, transaction.staging);
@@ -5763,4 +5775,19 @@ test "Qwen3-VL safetensors generated descriptor preserves legacy and staged re-p
 
 test "Qwen3-VL reranker generated descriptor preserves legacy and staged re-pulls" {
     try testGeneratedBundlePublication(qwen3vl_catalog.reranker_bundle_manifest, "model.safetensors");
+}
+
+test "managed model transaction recovers an unmanaged legacy backup" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, ".legacy.antfly-download-backup");
+    try tmp.dir.writeFile(io, .{ .sub_path = ".legacy.antfly-download-backup/model.gguf", .data = "legacy" });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    const destination = try std.fs.path.join(a, &.{ root, "legacy" });
+    defer a.free(destination);
+    try recoverManagedPublication(a, io, destination);
+    try tmp.dir.access(io, "legacy/model.gguf", .{});
 }

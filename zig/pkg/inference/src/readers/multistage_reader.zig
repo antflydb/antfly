@@ -46,7 +46,7 @@ const AssetResolver = struct {
         self.* = undefined;
     }
 
-    fn resolve(self: *const AssetResolver, relative: []const u8) ![]u8 {
+    fn resolve(self: *AssetResolver, relative: []const u8) ![]u8 {
         if (!metadata_mod.isSafeRelativeAssetPath(relative))
             return error.InvalidMetadata;
         const canonical = (self.published.resolve(relative) catch |err| switch (err) {
@@ -180,7 +180,7 @@ pub const LoadedMultiStageReader = struct {
 
     fn collectComponentPaths(
         allocator: std.mem.Allocator,
-        asset_resolver: *const AssetResolver,
+        asset_resolver: *AssetResolver,
         metadata: *const metadata_mod.MultiStageMetadata,
     ) ![]const []const u8 {
         var paths = std.ArrayListUnmanaged([]const u8).empty;
@@ -220,7 +220,7 @@ pub const LoadedMultiStageReader = struct {
     fn loadFromDirWithSessionManager(
         allocator: std.mem.Allocator,
         model_path: []const u8,
-        asset_resolver: *const AssetResolver,
+        asset_resolver: *AssetResolver,
         metadata: *const metadata_mod.MultiStageMetadata,
         component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
         preflight: *PreflightAssets,
@@ -417,7 +417,7 @@ const PreflightAssets = struct {
 
     fn load(
         allocator: std.mem.Allocator,
-        asset_resolver: *const AssetResolver,
+        asset_resolver: *AssetResolver,
         metadata: *const metadata_mod.MultiStageMetadata,
         component_loader: *const model_manager_mod.ModelManager.ComponentLoader,
     ) !PreflightAssets {
@@ -485,7 +485,7 @@ const PreflightAssets = struct {
 
 fn validateStageProcessorPath(
     allocator: std.mem.Allocator,
-    asset_resolver: *const AssetResolver,
+    asset_resolver: *AssetResolver,
     stage: *const metadata_mod.StageMetadata,
 ) !void {
     const processor_dir = stage.processor_dir orelse return;
@@ -528,7 +528,7 @@ fn loadPostProcessor(stage: metadata_mod.StageMetadata) !multistage_ocr.Detectio
 
 fn loadStagePreprocessConfig(
     allocator: std.mem.Allocator,
-    asset_resolver: *const AssetResolver,
+    asset_resolver: *AssetResolver,
     metadata: *const metadata_mod.MultiStageMetadata,
     stage: *const metadata_mod.StageMetadata,
     session: backends.Session,

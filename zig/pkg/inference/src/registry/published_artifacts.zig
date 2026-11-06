@@ -24,6 +24,7 @@ pub const PublishedArtifacts = struct {
     root: []const u8,
     receipt: ?managed.ValidatedReceipt,
     publication: ?[32]u8,
+    verified_stamps: []?managed.ArtifactStamp = &.{},
     canonical_index: std.StringHashMapUnmanaged(usize) = .empty,
 
     pub fn init(a: std.mem.Allocator, io: std.Io, root: []const u8, expected: ?Expected) !PublishedArtifacts {
@@ -34,9 +35,12 @@ pub const PublishedArtifacts = struct {
         var index = std.StringHashMapUnmanaged(usize).empty;
         errdefer index.deinit(a);
         if (receipt) |value| for (value.artifacts, 0..) |artifact, i| try index.put(a, artifact.canonical_path, i);
-        return .{ .allocator = a, .io = io, .root = root, .receipt = receipt, .publication = publication, .canonical_index = index };
+        const verified = try a.alloc(?managed.ArtifactStamp, if (receipt) |value| value.artifacts.len else 0);
+        @memset(verified, null);
+        return .{ .allocator = a, .io = io, .root = root, .receipt = receipt, .publication = publication, .canonical_index = index, .verified_stamps = verified };
     }
     pub fn deinit(self: *PublishedArtifacts) void {
+        self.allocator.free(self.verified_stamps);
         self.canonical_index.deinit(self.allocator);
         if (self.receipt) |*receipt| receipt.deinit();
     }
@@ -76,25 +80,40 @@ pub const PublishedArtifacts = struct {
         try self.verifyBytes(relative, bytes);
         return bytes;
     }
-    pub fn verifyFile(self: *const PublishedArtifacts, relative: []const u8) !void {
+    /// Verification belongs to one reader acquisition, not path resolution.
+    /// Reuse it across graph collection, backend retries and shared external
+    /// tensors only while the opened file's complete identity is unchanged.
+    fn verifyIndex(self: *PublishedArtifacts, index: usize) !void {
+        const artifact = &self.receipt.?.artifacts[index];
+        const expected = artifact.sha256 orelse return;
+        const stamp = managed.ArtifactStamp.fromStat(try std.Io.Dir.cwd().statFile(self.io, artifact.canonical_path, .{ .follow_symlinks = false }));
+        if (self.verified_stamps[index]) |prior| if (std.meta.eql(prior, stamp)) return;
+        self.verified_stamps[index] = try managed.verifyValidatedArtifactSha256AndStamp(self.io, artifact, expected);
+    }
+    pub fn verifyFile(self: *PublishedArtifacts, relative: []const u8) !void {
         if (self.receipt) |*receipt| {
-            const artifact = receipt.find(relative) orelse return error.InvalidManagedDownload;
-            if (artifact.sha256) |expected| try managed.verifyValidatedArtifactSha256(self.io, artifact, expected);
+            const index = receipt.path_index.get(relative) orelse return error.InvalidManagedDownload;
+            try self.verifyIndex(index);
         }
     }
     /// ONNX external tensors are consumed by a component loader, not by
     /// read(). They must belong to the same receipt as the graph itself.
-    pub fn verifyPath(self: *const PublishedArtifacts, path: []const u8) !void {
-        if (self.receipt) |*receipt| {
+    pub fn verifyPath(self: *PublishedArtifacts, path: []const u8) !void {
+        if (self.receipt != null) {
             const canonical = try managed.resolveRegularFilePath(self.allocator, self.io, path);
             defer self.allocator.free(canonical);
             const index = self.canonical_index.get(canonical) orelse return error.InvalidManagedDownload;
-            const artifact = &receipt.artifacts[index];
-            if (artifact.sha256) |expected| try managed.verifyValidatedArtifactSha256(self.io, artifact, expected);
+            try self.verifyIndex(index);
         }
     }
     pub fn verify(self: *const PublishedArtifacts) !void {
         if (!std.meta.eql(self.publication, try managed.publicationGeneration(self.allocator, self.io, self.root))) return error.ModelArtifactsChanging;
+        // A path verified earlier must still name those bytes when construction
+        // finishes. Do not reuse a digest across replacement or in-place writes.
+        for (self.verified_stamps, 0..) |maybe_stamp, index| if (maybe_stamp) |expected| {
+            const current = managed.ArtifactStamp.fromStat(try std.Io.Dir.cwd().statFile(self.io, self.receipt.?.artifacts[index].canonical_path, .{ .follow_symlinks = false }));
+            if (!std.meta.eql(expected, current)) return error.ModelArtifactsChanging;
+        };
     }
 };
 
@@ -126,4 +145,46 @@ test "model selection published artifacts reject unlisted and escaping files" {
     try std.testing.expectError(error.FileTooLarge, published.read("model.onnx", 2));
     try tmp.dir.writeFile(io, .{ .sub_path = "model/model.onnx", .data = "changed" });
     try std.testing.expectError(error.ChecksumMismatch, published.read("model.onnx", 128));
+}
+
+test "model selection reader acquisition hashes each unchanged artifact once" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    const Probe = struct {
+        var opens: usize = 0;
+        var original: @FieldType(std.Io.VTable, "dirOpenFile") = undefined;
+        fn open(raw: ?*anyopaque, dir: std.Io.Dir, path: []const u8, options: std.Io.Dir.OpenFileOptions) std.Io.File.OpenError!std.Io.File {
+            if (std.mem.endsWith(u8, path, "model.onnx")) opens += 1;
+            return original(raw, dir, path, options);
+        }
+    };
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.onnx", .data = "weights" });
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash("weights", &digest, .{});
+    const json = try std.json.Stringify.valueAlloc(a, .{ .version = @as(u32, 2), .artifacts = .{.{ .path = "model.onnx", .size = @as(u64, 7), .sha256 = std.fmt.bytesToHex(digest, .lower) }} }, .{});
+    defer a.free(json);
+    try tmp.dir.writeFile(io, .{ .sub_path = managed.complete_filename, .data = json });
+    const root = try tmp.dir.realPathFileAlloc(io, ".", a);
+    defer a.free(root);
+    var table = io.vtable.*;
+    Probe.original = table.dirOpenFile;
+    table.dirOpenFile = Probe.open;
+    const counted_io = std.Io{ .userdata = io.userdata, .vtable = &table };
+    var published = try PublishedArtifacts.init(a, counted_io, root, null);
+    defer published.deinit();
+    Probe.opens = 0;
+    try published.verifyFile("model.onnx");
+    try published.verifyFile("model.onnx");
+    const path = (try published.resolve("model.onnx")).?;
+    defer a.free(path);
+    try published.verifyPath(path); // Shared ONNX external tensors use the same proof.
+    try published.verify();
+    try std.testing.expectEqual(@as(usize, 1), Probe.opens);
+    try io.sleep(std.Io.Duration.fromMilliseconds(2), .awake);
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.onnx", .data = "changed" });
+    try std.testing.expectError(error.ModelArtifactsChanging, published.verify());
+    try std.testing.expectError(error.ChecksumMismatch, published.verifyFile("model.onnx"));
+    try std.testing.expectEqual(@as(usize, 2), Probe.opens);
 }

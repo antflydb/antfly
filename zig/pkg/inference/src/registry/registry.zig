@@ -684,7 +684,7 @@ pub const ModelRegistry = struct {
             else
                 false;
             if (cached) {
-                var publication = try @import("catalog_publication.zig").Publication.begin(self.allocator, io, resolved_models_dir);
+                var publication = try @import("catalog_publication.zig").Publication.begin(self.allocator, io, resolved_models_dir, std.mem.trimStart(u8, dest[resolved_models_dir.len..], "/"));
                 defer publication.deinit();
                 try download.finishVerifiedManagedInstall(self.allocator, io, dest);
                 try publication.finish();
@@ -694,7 +694,7 @@ pub const ModelRegistry = struct {
 
         var transaction = blk: {
             // begin() can restore a backup after an interrupted publication.
-            var publication = try @import("catalog_publication.zig").Publication.begin(self.allocator, io, resolved_models_dir);
+            var publication = try @import("catalog_publication.zig").Publication.begin(self.allocator, io, resolved_models_dir, std.mem.trimStart(u8, dest[resolved_models_dir.len..], "/"));
             defer publication.deinit();
             var pending = try download.ManagedModelTransaction.begin(self.allocator, io, dest);
             errdefer pending.deinit(io);
@@ -828,7 +828,7 @@ pub const ModelRegistry = struct {
                 try io.checkCancel();
             }
         }
-        var publication = try @import("catalog_publication.zig").Publication.begin(self.allocator, io, resolved_models_dir);
+        var publication = try @import("catalog_publication.zig").Publication.begin(self.allocator, io, resolved_models_dir, std.mem.trimStart(u8, dest[resolved_models_dir.len..], "/"));
         defer publication.deinit();
         try transaction.commit(io);
         try publication.finish();
@@ -3383,4 +3383,35 @@ test "model selection registry pull publishes catalog generations and recovers c
     const preserved = (try cache.resolveSelection(a, io, root, pin, null)).?;
     defer a.free(preserved.path);
     try std.testing.expectEqual(selected.publication, preserved.publication);
+}
+
+test "model selection unrelated failed pull recovers the journaled publication" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "models/acme/first");
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/acme/first/model.gguf", .data = "decoder" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/acme/first/.antfly-download-complete.json", .data =
+        \\{"version":2,"source":{"owner":"acme","name":"first","variant":"gguf","resolved_revision":"0123456789abcdef0123456789abcdef01234567"},"artifacts":[{"path":"model.gguf","size":7}]}
+    });
+    const root = try tmp.dir.realPathFileAlloc(io, "models", a);
+    defer a.free(root);
+    const publication = @import("catalog_publication.zig");
+    var interrupted = try publication.Publication.begin(a, io, root, "acme/first");
+    // Simulate process death between the two publication renames.
+    try std.Io.Dir.rename(tmp.dir, "models/acme/first", tmp.dir, "models/acme/.first.antfly-download-backup", io);
+    interrupted.deinit();
+    try std.testing.expectError(error.ModelArtifactsChanging, publication.read(a, io, root));
+    var registry = ModelRegistry.init(a, root);
+    defer registry.deinit();
+    // Recovery must precede B's network operation; even its failure must leave
+    // A restored, rather than turning the interrupted publication into a 404.
+    registry.pullWithProgress(io, "other/model:onnx", .{ .base_url = "http://127.0.0.1:1" }, null, null, .auto, .{}) catch {};
+    try std.testing.expectEqual(.publication, (try publication.read(a, io, root)).kind);
+    var cache = @import("selection.zig").Cache.init(a);
+    defer cache.deinit();
+    const selected = (try cache.resolveSelection(a, io, root, "acme/first:gguf@0123456789abcdef0123456789abcdef01234567", null)).?;
+    defer a.free(selected.path);
+    try std.testing.expect(std.mem.endsWith(u8, selected.path, "/acme/first"));
 }

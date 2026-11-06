@@ -6971,10 +6971,24 @@ pub const Node = struct {
 
         const model_path_selection = try self.resolveModelSelection(io, if (model_name.len > 0) model_name else null, "embedders");
 
+        defer self.allocator.free(model_path_selection.path);
+        return self.embedDenseJsonFromSelection(allocator, io, deadline_ns, model_path_selection, input, media_admission, &reserved_units);
+    }
+
+    fn embedDenseJsonFromSelection(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        deadline_ns: ?u64,
+        model_path_selection: ResolvedModel,
+        input: std.json.Value,
+        media_admission: ReadRequestAdmission,
+        reserved_units: *usize,
+    ) ![][]f32 {
+        const control = self.bindModelSelection(model_path_selection, .{ .io = io, .deadline_ns = deadline_ns });
         const model_path = model_path_selection.path;
-        defer self.allocator.free(model_path);
         try ensureDirectEmbeddingDeadline(deadline_ns);
-        var admission_manifest = try self.embeddingManifestSelected(allocator, model_path_selection, null);
+        var admission_manifest = try self.embeddingManifestSelected(allocator, model_path_selection, control);
         defer admission_manifest.deinit();
         if (admission_manifest.hasCapability("sparse")) return error.UnsupportedEmbeddingProvider;
         const executor_contract = try resolvedInferenceExecutorContract(self, "embed", &admission_manifest);
@@ -6982,12 +6996,12 @@ pub const Node = struct {
 
         if (hasGroupedEmbeddingInput(input)) {
             const audio_admission = audioDecodeAdmission(self, media_admission.resident_byte_cap);
-            if (media_shape.has_audio) {
-                const required_units = @max(reserved_units, audio_admission.units);
-                try self.growAdmissionUnits(reserved_units, required_units);
-                reserved_units = required_units;
+            if (denseEmbedRequestMediaShape(input).has_audio) {
+                const required_units = @max(reserved_units.*, audio_admission.units);
+                try self.growAdmissionUnits(reserved_units.*, required_units);
+                reserved_units.* = required_units;
             }
-            return self.embedGroupsFromPath(allocator, io, model_path, &admission_manifest, executor_contract, input, .{ .max_audio_decode_working_bytes = audio_admission.max_decode_working_bytes }, .{ .deadline_ns = deadline_ns }, .{ .media = media_admission, .reserved_units = &reserved_units });
+            return self.embedGroupsFromPath(allocator, io, model_path, &admission_manifest, executor_contract, input, .{ .max_audio_decode_working_bytes = audio_admission.max_decode_working_bytes }, control, .{ .media = media_admission, .reserved_units = reserved_units });
         }
 
         var media_budget = RequestMediaBudget.init(media_admission.byte_cap);
@@ -6997,7 +7011,7 @@ pub const Node = struct {
             &admission_manifest,
             input,
             &media_budget,
-            .{ .io = io, .control = .{ .deadline_ns = deadline_ns } },
+            .{ .io = io, .control = control },
         );
         defer parsed.deinit(allocator);
         return try self.embedParsedDenseInputsDirect(
@@ -7007,8 +7021,8 @@ pub const Node = struct {
             media_admission,
             &admission_manifest,
             &parsed,
-            &reserved_units,
-            .{ .deadline_ns = deadline_ns },
+            reserved_units,
+            control,
             executor_contract,
             .RETRIEVAL_DOCUMENT,
             null,
@@ -25784,11 +25798,11 @@ pub const Node = struct {
                 const has_visual = listing.manifest.visual_model_path != null or listing.manifest.visual_projection_path != null;
                 const has_audio = listing.manifest.audio_model_path != null or listing.manifest.audio_projection_path != null;
                 if (!manifestMatchesModelListingTask(task, listing.kind, &listing.manifest)) continue;
-                const listed = try listed_model_names.getOrPut(a, entry.name);
+                const listed = try listed_model_names.getOrPut(a, entry.path);
                 if (listed.found_existing) continue;
 
                 if (model_count > 0) try body.append(a, ',');
-                try jsonEncodeString(&body, a, entry.name);
+                try jsonEncodeString(&body, a, entry.path);
                 try body.append(a, ':');
                 // Discovery does not parse chat templates (that is what made this handler
                 // slow), so only models already loaded can report a template failure.
@@ -25840,10 +25854,10 @@ pub const Node = struct {
             for (rejected_listings.items) |rejected| {
                 const entry = discovered[rejected.entry_index];
                 if (!std.mem.eql(u8, rejectedListingTask(entry), task)) continue;
-                const listed = try listed_model_names.getOrPut(a, entry.name);
+                const listed = try listed_model_names.getOrPut(a, entry.path);
                 if (listed.found_existing) continue;
                 if (model_count > 0) try body.append(a, ',');
-                try jsonEncodeString(&body, a, entry.name);
+                try jsonEncodeString(&body, a, entry.path);
                 try body.appendSlice(a, ":{\"compatibility\":\"incompatible\",\"error\":{\"code\":");
                 try jsonEncodeString(&body, a, @errorName(rejected.err));
                 try body.appendSlice(a, ",\"message\":\"the model directory could not be read; repair or re-pull it\"}}");
@@ -25974,19 +25988,22 @@ pub const Node = struct {
                 if ((is_read and definition.read == null) or (!is_read and definition.extract == null)) continue;
                 const scope = if (is_read) "readers" else "extractors";
                 const task = if (is_read) "read" else "extract";
-                try catalog.value.object.getPtr(scope).?.object.put(ca, entry.name, try self.documentCatalogInfo(ca, definition, task));
+                try catalog.value.object.getPtr(scope).?.object.put(ca, entry.path, try self.documentCatalogInfo(ca, definition, task));
             }
         }
-        // Discovery and execution consume the same selector ownership table.
+        // Descriptors retain installation identity until ownership is finalized.
+        // A same-named installation in another scope cannot supply its contract.
         for (task_names) |task| {
             const models = catalog.value.object.getPtr(task).?;
             for (discovered, inventory.names) |entry, names| {
-                const descriptor = models.object.get(entry.name) orelse continue;
+                const descriptor = models.object.get(entry.path) orelse continue;
                 for (names) |selector| {
                     const owner = (inventory.lookup(selector, task) catch continue) orelse continue;
                     if (std.mem.eql(u8, owner, entry.path)) try models.object.put(ca, selector, descriptor);
                 }
             }
+            // Paths are private descriptor keys, never public model IDs.
+            for (discovered) |entry| _ = models.object.swapRemove(entry.path);
             for (selection_mod.tasks, inventory.owners) |scope, owners| {
                 if (!std.mem.eql(u8, task, scope)) continue;
                 var iterator = owners.iterator();
@@ -50899,6 +50916,47 @@ test "model selection Decide embedding aliases follow ordered execution scopes" 
     const preferred = try node.resolveRequestModelSelection(a, io, "acme/demo:safetensors@" ++ revision, "deciders");
     defer a.free(preferred.path);
     try std.testing.expect(std.mem.endsWith(u8, preferred.path, "/extractors/acme/first"));
+    const updated_body = try node.listModelsJsonAlloc(a, io);
+    defer a.free(updated_body);
+    var updated = try std.json.parseFromSlice(std.json.Value, a, updated_body, .{});
+    defer updated.deinit();
+    for ([_][]const u8{ "acme/demo", "acme/demo:safetensors", "acme/demo:safetensors@" ++ revision, "acme/demo@" ++ revision }) |selector| {
+        // The preferred extractor does not implement Decide. A losing
+        // embedder cannot supply a descriptor for the same public name.
+        try std.testing.expect(!updated.value.object.get("deciders").?.object.contains(selector));
+        try std.testing.expect(updated.value.object.get("embedders").?.object.contains(selector));
+    }
+    // Private installation keys must never leak into a public catalog.
+    try std.testing.expect(std.mem.indexOf(u8, updated_body, root) == null);
+    // If the winning installation does implement Decide, its own contract
+    // must be published even when another scope has the same canonical pin.
+    const winner_metadata = "{\"type\":\"embedder\",\"embedding_style\":\"embedding_gemma2\",\"tasks\":[\"embed\",\"decide\"],\"inputs\":[\"text\"],\"capabilities\":[\"embedding_similarity\",\"winner_contract\"]}";
+    inline for (.{ .{ "config.json", config }, .{ "model_manifest.json", winner_metadata }, .{ "model.safetensors", "\x02\x00\x00\x00\x00\x00\x00\x00{}" } }) |file| {
+        const path = try std.fs.path.join(a, &.{ "models/extractors/acme/first", file[0] });
+        defer a.free(path);
+        try tmp.dir.writeFile(io, .{ .sub_path = path, .data = file[1] });
+    }
+    const winner_receipt = try std.json.Stringify.valueAlloc(a, .{
+        .version = @as(u32, 2),
+        .source = .{ .owner = "acme", .name = "demo", .variant = "safetensors", .resolved_revision = revision },
+        .artifacts = .{ .{ .path = "model.safetensors", .size = 10 }, .{ .path = "config.json", .size = config.len }, .{ .path = "model_manifest.json", .size = winner_metadata.len } },
+    }, .{});
+    defer a.free(winner_receipt);
+    try tmp.dir.writeFile(io, .{ .sub_path = "models/extractors/acme/first/.antfly-download-complete.json", .data = winner_receipt });
+    const winner_body = try node.listModelsJsonAlloc(a, io);
+    defer a.free(winner_body);
+    var winner = try std.json.parseFromSlice(std.json.Value, a, winner_body, .{});
+    defer winner.deinit();
+    for ([_][]const u8{ "acme/demo", "acme/demo:safetensors", "acme/demo:safetensors@" ++ revision, "acme/demo@" ++ revision }) |selector| {
+        const winning_info = winner.value.object.get("deciders").?.object.get(selector).?;
+        const embedding_info = winner.value.object.get("embedders").?.object.get(selector).?;
+        const winning_json = try std.json.Stringify.valueAlloc(a, winning_info, .{});
+        defer a.free(winning_json);
+        const embedding_json = try std.json.Stringify.valueAlloc(a, embedding_info, .{});
+        defer a.free(embedding_json);
+        try std.testing.expect(std.mem.indexOf(u8, winning_json, "winner_contract") != null);
+        try std.testing.expect(std.mem.indexOf(u8, embedding_json, "winner_contract") == null);
+    }
 }
 
 test "model selection qualified classification and transcriber warmup preserve the selected receipt" {
@@ -50915,6 +50973,13 @@ test "model selection qualified classification and transcriber warmup preserve t
     const selected = try node.resolveRequestModelSelection(a, io, "acme/demo:gguf:Q4_0@0123456789abcdef0123456789abcdef01234567", "extractors");
     defer a.free(selected.path);
     try installModelSelectionFixture(tmp.dir, leaf, "gguf:Q4_0", "ffffffffffffffffffffffffffffffffffffffff");
+    var reserved: usize = 0;
+    for ([_][]const u8{ "\"text\"", "{\"content\":[{\"type\":\"text\",\"text\":\"test\"}]}" }) |json| {
+        var input = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer input.deinit();
+        const admission = requestMediaAdmission(&node, denseEmbedRequestMediaShape(input.value));
+        try std.testing.expectError(error.ModelArtifactsChanging, node.embedDenseJsonFromSelection(a, io, null, selected, input.value, admission, &reserved));
+    }
     try std.testing.expectError(error.ModelArtifactsChanging, node.classifyQualifiedSpanTexts(a, selected, &.{"test"}, &.{ "yes", "no" }, false));
     try std.testing.expectError(error.ModelArtifactsChanging, node.warmSelectedTranscriber(a, .{ .name = "acme/demo", .kind = .transcriber }, selected));
 }
@@ -50994,7 +51059,7 @@ test "model selection catalog token keeps warm lookup filesystem work constant" 
         }
         const root = try tmp.dir.realPathFileAlloc(io, "models", a);
         defer a.free(root);
-        var publication = try publisher.Publication.begin(a, io, root);
+        var publication = try publisher.Publication.begin(a, io, root, "fixture");
         try publication.finish();
         publication.deinit();
         var cache = selection_mod.Cache.init(a);
@@ -51015,7 +51080,7 @@ test "model selection catalog token keeps warm lookup filesystem work constant" 
         try std.testing.expect(Probe.count < 16);
         std.debug.print("model selection warm stat calls: models={d} stats={d}\n", .{ n, Probe.count });
         // Missing selectors must refresh immediately after a publication too.
-        var change = try publisher.Publication.begin(a, io, root);
+        var change = try publisher.Publication.begin(a, io, root, "fixture");
         try std.testing.expectError(error.ModelArtifactsChanging, cache.resolve(a, io, root, requested, "generators"));
         const leaf = "models/generators/acme/new";
         try installModelSelectionFixture(tmp.dir, leaf, "gguf:Q8_0", "ffffffffffffffffffffffffffffffffffffffff");
@@ -51065,7 +51130,7 @@ test "model selection active catalog publication reports a retryable HTTP error"
     defer a.free(root);
     var node = try Node.init(a, .{ .models_dir = root });
     defer node.deinit();
-    var publication = try @import("../registry/catalog_publication.zig").Publication.begin(a, io, root);
+    var publication = try @import("../registry/catalog_publication.zig").Publication.begin(a, io, root, "fixture");
     defer publication.deinit();
     var request = try httpx.Request.init(a, .GET, "/ai/v1/models");
     defer request.deinit();

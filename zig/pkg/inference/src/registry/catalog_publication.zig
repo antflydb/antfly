@@ -50,6 +50,45 @@ pub fn require(a: std.mem.Allocator, io: std.Io, root: []const u8, expected: Gen
     if (!std.meta.eql(expected, try read(a, io, root))) return error.ModelArtifactsChanging;
 }
 
+const Journal = struct { version: u8 = 1, destination: []const u8 };
+
+// The journal names a destination relative to the store, never an arbitrary
+// filesystem path. Prove its existing parent stays in the canonical store too.
+fn journalDestination(a: std.mem.Allocator, io: std.Io, root: []const u8, relative: []const u8) ![]u8 {
+    const receipt = @import("managed_receipt.zig");
+    if (!receipt.artifactPathIsSafe(relative)) return error.ModelArtifactsChanging;
+    const canonical_root = try std.Io.Dir.cwd().realPathFileAlloc(io, root, a);
+    defer a.free(canonical_root);
+    const destination = try std.fs.path.join(a, &.{ canonical_root, relative });
+    defer a.free(destination);
+    const canonical = try receipt.resolveRequestedFilePath(a, io, destination);
+    errdefer a.free(canonical);
+    if (!std.mem.startsWith(u8, canonical, canonical_root) or canonical.len <= canonical_root.len or
+        (!std.fs.path.isSep(canonical_root[canonical_root.len - 1]) and !std.fs.path.isSep(canonical[canonical_root.len]))) return error.ModelArtifactsChanging;
+    return canonical;
+}
+
+fn recoverInterrupted(a: std.mem.Allocator, io: std.Io, root: []const u8, path: []const u8) !void {
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(4096)) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer a.free(bytes);
+    if (bytes.len == 71 and std.mem.startsWith(u8, bytes, "stable:")) {
+        for (bytes[7..]) |c| if (!std.ascii.isHex(c)) return error.ModelArtifactsChanging;
+        return;
+    }
+    var parsed = std.json.parseFromSlice(Journal, a, bytes, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return error.ModelArtifactsChanging,
+    };
+    defer parsed.deinit();
+    if (parsed.value.version != 1) return error.ModelArtifactsChanging;
+    const destination = try journalDestination(a, io, root, parsed.value.destination);
+    defer a.free(destination);
+    try download.recoverManagedPublication(a, io, destination);
+}
+
 pub const Publication = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -57,14 +96,22 @@ pub const Publication = struct {
     lock: std.Io.File,
     finished: bool = false,
 
-    pub fn begin(a: std.mem.Allocator, io: std.Io, root: []const u8) !Publication {
+    pub fn begin(a: std.mem.Allocator, io: std.Io, root: []const u8, relative_destination: []const u8) !Publication {
         const lock_path = try std.fs.path.join(a, &.{ root, ".antfly-catalog.lock" });
         defer a.free(lock_path);
         const lock = try std.Io.Dir.cwd().createFile(io, lock_path, .{ .truncate = false, .lock = .exclusive });
         errdefer lock.close(io);
         const path = try std.fs.path.join(a, &.{ root, filename });
         errdefer a.free(path);
-        try download.writeFileAtomically(a, io, path, "publishing\n");
+        // Never overwrite evidence of an earlier interrupted publication.
+        // Recover its named directory while the namespace lock is exclusive.
+        try recoverInterrupted(a, io, root, path);
+        const destination = try journalDestination(a, io, root, relative_destination);
+        defer a.free(destination);
+        const journal = try std.json.Stringify.valueAlloc(a, Journal{ .destination = relative_destination }, .{});
+        defer a.free(journal);
+        if (journal.len > 4096) return error.ModelArtifactsChanging;
+        try download.writeFileAtomically(a, io, path, journal);
         return .{ .allocator = a, .io = io, .path = path, .lock = lock };
     }
     pub fn finish(self: *Publication) !void {
@@ -94,7 +141,7 @@ test "model selection catalog publication fences interrupted and concurrent muta
     const root = try tmp.dir.realPathFileAlloc(io, ".", a);
     defer a.free(root);
     try std.testing.expectEqual(.legacy, (try read(a, io, root)).kind);
-    var first = try Publication.begin(a, io, root);
+    var first = try Publication.begin(a, io, root, "fixture");
     try std.testing.expectError(error.ModelArtifactsChanging, read(a, io, root));
     try first.finish();
     const prior = try read(a, io, root);
@@ -102,12 +149,53 @@ test "model selection catalog publication fences interrupted and concurrent muta
     try std.testing.expectEqual(.publication, prior.kind);
     // Simulate a killed publisher. Taking its OS lock and finishing the next
     // publication restores a stable generation rather than serving stale data.
-    var aborted = try Publication.begin(a, io, root);
+    var aborted = try Publication.begin(a, io, root, "fixture");
     aborted.deinit();
     try std.testing.expectError(error.ModelArtifactsChanging, read(a, io, root));
-    var recovery = try Publication.begin(a, io, root);
+    var recovery = try Publication.begin(a, io, root, "fixture");
     try recovery.finish();
     recovery.deinit();
     const next = try read(a, io, root);
     try std.testing.expect(!std.meta.eql(prior, next));
+}
+
+test "model selection publication journal rejects escaping and malformed recovery" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "store");
+    const root = try tmp.dir.realPathFileAlloc(io, "store", a);
+    defer a.free(root);
+    try std.testing.expectError(error.ModelArtifactsChanging, Publication.begin(a, io, root, "../outside"));
+    for ([_][]const u8{
+        "{\"version\":1,\"destination\":\"../outside\"}",
+        "publishing\n",
+        "{\"version\":2,\"destination\":\"fixture\"}",
+    }) |journal| {
+        try tmp.dir.writeFile(io, .{ .sub_path = "store/" ++ filename, .data = journal });
+        try std.testing.expectError(error.ModelArtifactsChanging, Publication.begin(a, io, root, "fixture"));
+        try std.testing.expectError(error.ModelArtifactsChanging, read(a, io, root));
+    }
+}
+
+test "model selection failed journal recovery retains the namespace fence" {
+    const a = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "store/acme/.model.antfly-download-backup");
+    try tmp.dir.writeFile(io, .{ .sub_path = "store/acme/.model.antfly-download-backup/.antfly-download-complete.json", .data = "{}" });
+    const root = try tmp.dir.realPathFileAlloc(io, "store", a);
+    defer a.free(root);
+    var interrupted = try Publication.begin(a, io, root, "acme/model");
+    interrupted.deinit();
+    try std.testing.expectError(error.InvalidManagedDownload, Publication.begin(a, io, root, "unrelated"));
+    try std.testing.expectError(error.ModelArtifactsChanging, read(a, io, root));
+    try tmp.dir.access(io, "store/acme/.model.antfly-download-backup/.antfly-download-complete.json", .{});
+    try tmp.dir.createDirPath(io, "outside");
+    try tmp.dir.symLink(io, "../outside", "store/escape", .{});
+    // Repairing a journal must never follow an escaping parent symlink.
+    try tmp.dir.writeFile(io, .{ .sub_path = "store/" ++ filename, .data = "{\"version\":1,\"destination\":\"escape/model\"}" });
+    try std.testing.expectError(error.ModelArtifactsChanging, Publication.begin(a, io, root, "unrelated"));
 }

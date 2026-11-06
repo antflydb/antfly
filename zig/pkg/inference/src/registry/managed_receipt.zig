@@ -82,6 +82,23 @@ pub fn verifyValidatedArtifactSha256(
     artifact: *const ValidatedArtifact,
     expected_hex: []const u8,
 ) !void {
+    _ = try verifyValidatedArtifactSha256AndStamp(io, artifact, expected_hex);
+}
+
+/// Filesystem identity of the opened, hashed bytes. Access time is excluded:
+/// reading a file must not invalidate verification within the same acquisition.
+pub const ArtifactStamp = struct {
+    inode: @FieldType(std.Io.File.Stat, "inode"),
+    size: u64,
+    kind: std.Io.File.Kind,
+    modified: std.Io.Timestamp,
+    changed: std.Io.Timestamp,
+    pub fn fromStat(stat: std.Io.File.Stat) ArtifactStamp {
+        return .{ .inode = stat.inode, .size = stat.size, .kind = stat.kind, .modified = stat.mtime, .changed = stat.ctime };
+    }
+};
+
+pub fn verifyValidatedArtifactSha256AndStamp(io: std.Io, artifact: *const ValidatedArtifact, expected_hex: []const u8) !ArtifactStamp {
     if (expected_hex.len != 64) return error.ChecksumMismatch;
 
     var file = try std.Io.Dir.cwd().openFile(io, artifact.canonical_path, .{});
@@ -104,6 +121,9 @@ pub fn verifyValidatedArtifactSha256(
     hasher.final(&digest);
     const actual_hex = std.fmt.bytesToHex(digest, .lower);
     if (!std.mem.eql(u8, &actual_hex, expected_hex)) return error.ChecksumMismatch;
+    const verified = ArtifactStamp.fromStat(try file.stat(io));
+    if (!std.meta.eql(ArtifactStamp.fromStat(stat), verified)) return error.ModelArtifactsChanging;
+    return verified;
 }
 
 const ReceiptSource = enum {
