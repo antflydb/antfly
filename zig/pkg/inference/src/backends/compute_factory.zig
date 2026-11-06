@@ -232,7 +232,7 @@ pub fn closeMetalWeightsWithCleanup(allocator: std.mem.Allocator, weights: *Meta
     if (weights.jina_lora_adapter) |adapter| adapter.destroy();
     if (weights.tensor_store) |store| store.deinit();
     if (weights.tier_cache) |*tier_cache|
-        tier_cache.deinitAdmission();
+        tier_cache.deinitAdmissionWithCleanup(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
 }
 
 pub fn prepareMetalProvider(allocator: std.mem.Allocator, weights: *MetalWeights, jit: MetalJitOptions) !void {

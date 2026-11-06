@@ -2484,6 +2484,26 @@ pub const Session = struct {
     /// Called only by the existing BeforeExecution contract: the FIFO ready
     /// owner holds no enclosing numerical/provider/model lane. A finite request
     /// deadline is required for retries; generic/lazy preparation never waits.
+    /// Explicit cold prepared-invocation phase, before acquiring Model/lane,
+    /// an operation/profile, or numerical admission. The actual imported model
+    /// supplies its retained cache Domain; raw receivers keep compatibility.
+    pub fn prepareProjectionPackBeforeExecution(self: *const Session, receiver: *const ops.ComputeBackend, graph: *const @import("ml").graph.Graph, request: @import("dense_projection_pack.zig").Request, cleanup: @import("../execution/cleanup_context.zig").Context, control: ?InferenceExecutionControl) !?@import("../execution/region_execution_profile.zig").Claim {
+        if (cleanup.boundary == null and !cleanup.outside_execution) return null;
+        if (!try @import("imported_onnx_session.zig").managedProjectionPackReceiver(self.*, receiver)) return null;
+        if (control) |active| try active.check();
+        const admission = self.run_admission orelse return null;
+        const model = self.model_lifetime orelse return null;
+        const domain = model.retainAdmissionDomain(admission.controller) orelse return null;
+        defer domain.release();
+        if (cleanup.operation != null or receiver.operationToken() != null) return error.ProjectionPackPreparationUnderOperation;
+        if (cleanup.boundary) |epoch| if (try epoch.isSealed()) return error.RetirementEpochSealed;
+        if (comptime @import("build_options").enable_metal) {
+            try @import("../ops/metal_compute.zig").MetalCompute.prepareProjectionPackOutsideExecution(receiver, graph, request, &domain, cleanup);
+            if (control) |active| try active.check();
+            return try @import("../ops/metal_compute.zig").MetalCompute.claimPreparedProjectionProfile(receiver, graph, request);
+        } else return null;
+    }
+
     noinline fn prepareBeforeExecution(self: *const Session, shapes: ShapeInputs, allocator: std.mem.Allocator, control: ?InferenceExecutionControl, prepared: *?invocation.PreparedInvocation, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
         while (true) {
             if (control) |active| try active.check();

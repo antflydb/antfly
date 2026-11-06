@@ -281,11 +281,20 @@ preparation API do not by themselves complete these remaining requirements:
   sequence-pooling owner. Tasks supply pooling, prefix width, normalization and
   finite-output requirements; the execution owner preserves full-width resident
   normalization before export and the original prefix-copy order.
-- Metal installs synchronous assigned pair/QKV regions for complete row-one F32
-  projection heads through the production partition executor. Source pins,
-  output leases and actual operation ownership are explicit. Mixed graphs,
-  direct decoder APIs and multirow packed caches retain their original owners;
-  these regions receive no complete-payload quota credit.
+- Metal installs synchronous assigned pair/QKV regions for complete F32
+  projection heads through the production partition executor. Row-one regions
+  use the existing source ownership. Managed multirow heads can prepare one
+  immutable packed weight/bias pair after the original compatibility call has
+  established source slots. The actual Source cold phase funds both host
+  metadata and backend roots outside execution gates, then creates a fresh
+  request-bound profile. Dispatch retains the original direct GEMM/split policy
+  and waits its exact private command buffer before publishing outputs.
+  Each reuse retains its actual operation ticket, independently owned metadata
+  and cleanup boundary; SDK payload death and model-close cleanup both gate
+  refunds. Models sharing a backend and admission Domain share the same cache
+  binding, counted once by held-model conservation snapshots. Mixed graphs,
+  MPS/MPP selectors, raw receivers and direct decoder APIs retain compatibility
+  ownership. These regions receive no complete-payload quota credit.
 - CUDA prepared projections describe eligible BF16-rounded output separately
   from F32 publication, activation conversion and vendor workspace. Cold
   preparation loads the original widening program; dispatch retains the

@@ -143,7 +143,7 @@ pub const ImportedOnnxSession = struct {
         self.allocator.free(self.input_node_ids);
         self.program.deinit();
 
-        self.shared_backend_ctx.release();
+        self.shared_backend_ctx.releaseWithCleanup(cleanup);
         self.allocator.destroy(self);
     }
 };
@@ -641,6 +641,65 @@ pub fn createSessionWithOptions(
     };
 }
 
+/// Managed loader attachment for the actual imported model and shared provider.
+/// Shape specializations share this cache; they never invent another Domain.
+pub fn configureManagedCacheAdmission(session: Session, allocator: std.mem.Allocator, controller: *@import("../runtime/tier/memory.zig").AdmissionController, backend_class: @import("../runtime/tier/memory.zig").BackendClass, limits: @import("../runtime/tier/memory.zig").Limits, resident: @import("../runtime/tier/memory.zig").AdmissionAmounts) !bool {
+    _ = allocator; // managed cache retirement metadata uses its canonical owner
+    if (session.vtable != &imported_session_vtable) return false;
+    const model = session.model_lifetime orelse return error.ForeignManagedCacheModel;
+    if (model.owner != session.ptr) return error.ForeignManagedCacheModel;
+    const self: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    if (session.model_lifetime != &self.model_lifetime or session.shared_compute_context != self.shared_backend_ctx) return error.ForeignManagedCacheModel;
+    return self.shared_backend_ctx.configureManagedMetalCache(controller, backend_class, limits, resident);
+}
+pub fn installCacheRetirementDomain(session: Session, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !bool {
+    if (session.vtable != &imported_session_vtable) return false;
+    const model = session.model_lifetime orelse return error.ForeignManagedCacheModel;
+    if (model.owner != session.ptr) return error.ForeignManagedCacheModel;
+    const self: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    if (session.model_lifetime != &self.model_lifetime or session.shared_compute_context != self.shared_backend_ctx) return error.ForeignManagedCacheModel;
+    return self.shared_backend_ctx.installManagedMetalCacheDomain(pin);
+}
+/// Complete root-model/provider relationship for the explicit cold phase.
+/// A shape specialization may borrow its shared provider, never another model.
+pub fn managedProjectionPackReceiver(session: Session, receiver: *const ops_mod.ComputeBackend) !bool {
+    if (session.vtable != &imported_session_vtable) return false;
+    const model = session.model_lifetime orelse return error.ForeignManagedCacheModel;
+    if (model.owner != session.ptr) return error.ForeignManagedCacheModel;
+    const self: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    if (session.model_lifetime != &self.model_lifetime or session.shared_compute_context != self.shared_backend_ctx) return error.ForeignManagedCacheModel;
+    const admission = session.run_admission orelse return false;
+    if (admission.backend_class != .gpu) return false;
+    const shared = self.shared_backend_ctx;
+    const cache = (try shared.managedMetalCache()) orelse return false;
+    const actual = shared.computeBackend();
+    if (receiver.ptr != actual.ptr or receiver.vtable != actual.vtable) return error.ForeignManagedCacheBackend;
+    _ = cache;
+    const pin = model.retainAdmissionDomain(admission.controller) orelse return false;
+    defer pin.release();
+    return shared.matchesManagedMetalCache(&pin, admission.limits);
+}
+
+/// Compatibility amount view; callers aggregating Models must deduplicate
+/// sharedCacheAdmissionSnapshot identities while keeping those Models alive.
+pub fn managedCacheAdmissionAmounts(session: Session) ?@import("../runtime/tier/memory.zig").AdmissionAmounts {
+    return if (managedCacheAdmissionSnapshot(session)) |snapshot| snapshot.amounts else null;
+}
+
+pub fn managedCacheAdmissionSnapshot(session: Session) ?@import("../runtime/tier/cache.zig").AdmissionSnapshot {
+    if (session.vtable != &imported_session_vtable) return null;
+    const model = session.model_lifetime orelse return null;
+    if (model.owner != session.ptr) return null;
+    const self: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    if (session.model_lifetime != &self.model_lifetime or session.shared_compute_context != self.shared_backend_ctx) return null;
+    const admission = session.run_admission orelse return null;
+    const pin = model.retainAdmissionDomain(admission.controller) orelse return null;
+    defer pin.release();
+    const cache = (self.shared_backend_ctx.managedMetalCache() catch return null) orelse return null;
+    if (!cache.retirementDomainMatches(&pin)) return null;
+    return cache.admissionSnapshot();
+}
+
 const invocation_services = prepared_mod.Services{ .accepts = acceptsPreparedInvocation, .prepare = prepareInvocation, .prepare_into = prepareInvocationInto, .prepare_into_with_cleanup = prepareInvocationIntoWithCleanup };
 
 fn acceptsPreparedInvocation(session: Session) bool {
@@ -697,7 +756,7 @@ fn prepareInvocationIntoWithCleanup(session: *const Session, shapes: session_mod
             if (!InvocationInputFacts.needsResidentStorage(shapes) and (@import("../execution/cuda_owned_coverage.zig").services(target.cb) != null or root_pool.metal_frame_dispatch))
                 try prepareDevicePhysicalInvocation(prepared, session, target, root_pool, shapes, allocator, cleanup, if (control) |*value| value else null)
             else
-                try preparePhysicalInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, cleanup);
+                try preparePhysicalInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, cleanup, control);
         }
     }
     return;
@@ -899,6 +958,18 @@ fn releaseResidentContext(owner: *anyopaque, _: std.mem.Allocator) void {
     const context: *SharedBackendContext = @ptrCast(@alignCast(owner));
     context.release();
 }
+
+fn acceptsResidentContextCleanup(outputs: *const ResidentOutputs) bool {
+    if (outputs.deinit_backend_owner != releaseResidentContext or outputs.backend_owner_cleanup_services != &resident_context_cleanup_services) return false;
+    const raw = outputs.backend_owner orelse return false;
+    const context: *SharedBackendContext = @ptrCast(@alignCast(raw));
+    return outputs.backend == context.stableBackend();
+}
+fn releaseResidentContextWithCleanup(raw: *anyopaque, _: std.mem.Allocator, current: @import("../execution/cleanup_context.zig").Context) void {
+    const context: *SharedBackendContext = @ptrCast(@alignCast(raw));
+    context.releaseWithCleanup(current);
+}
+const resident_context_cleanup_services = ResidentOutputs.BackendOwnerCleanupServices{ .accepts = acceptsResidentContextCleanup, .deinit = releaseResidentContextWithCleanup };
 
 pub const ExecutionStats = struct {
     strategy: graph_runtime_mod.Strategy,
@@ -1189,6 +1260,9 @@ fn runConcreteWithOutputs(
         const profile = region_execution_profile.?;
         if (profile_succeeded) profile.finishSubmission() catch @import("antfly_platform").inference_process_supervisor.restartWorker() else profile.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
     };
+    if (profile_owned) if (storage_capability) |capability| if (capability.currentCleanupEpoch()) |epoch| {
+        try region_execution_profile.?.bindOwnedCleanupEpoch(epoch);
+    };
     var operation_scope: @import("../execution/backend_operation.zig").Scope = undefined;
     try @import("../execution/backend_operation.zig").enterInto(&self.cb, self.executable.graph, if (region_execution_profile) |profile| profile.operation_lease else self.cb.operationToken(), if (region_execution_profile != null or (if (prepared_routes) |routes| routes.pool.requiresManagedExecution() else false)) .managed else .legacy_unknown_frame, &operation_scope);
     var operation_succeeded = false;
@@ -1336,6 +1410,10 @@ fn runConcreteObservedWithOutputs(
         .backend = self.shared_backend_ctx.stableBackend(),
         .backend_owner = self.shared_backend_ctx.retain(),
         .deinit_backend_owner = releaseResidentContext,
+        .backend_owner_cleanup_services = if (comptime build_options.enable_metal)
+            if (self.shared_backend_ctx.ctx == .metal_hosted and self.shared_backend_ctx.ctx.metal_hosted.weight_store.tier_cache != null) &resident_context_cleanup_services else null
+        else
+            null,
         .allocator = exec_result.allocator,
     };
 }
@@ -4943,19 +5021,37 @@ test "Native owned input banks and layout same-binary AA AB BA performance evide
     }
 }
 
+fn prepareProjectionPackBeforeProfile(session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, cleanup: @import("../execution/cleanup_context.zig").Context, control: ?InferenceExecutionControl) !?@import("../execution/region_execution_profile.zig").Claim {
+    if (comptime !build_options.enable_metal) return null;
+    if (!try managedProjectionPackReceiver(session.*, &target.cb)) return null;
+    if (root_pool.immutable_bindings == null) return null;
+    const request = collected: {
+        var metadata = try @import("../execution/backend_operation.zig").enter(target.cb, target.executable.graph, null, .metadata);
+        defer metadata.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        break :collected try metal_compute_mod.MetalCompute.collectProjectionPackRequest(&target.cb, target.executable.graph, root_pool);
+    };
+    if (request) |value| return try session.prepareProjectionPackBeforeExecution(&target.cb, target.executable.graph, value, cleanup, control);
+    return null;
+}
+
 fn selectPhysicalInvocation(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, inputs: []const kernel_routes.InputBinding, allocator: std.mem.Allocator) !void {
     return selectPhysicalInvocationWithCleanup(prepared, session, target, root_pool, inputs, allocator, .{});
 }
 
 inline fn selectPhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, inputs: []const kernel_routes.InputBinding, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
-    return selectPhysicalInvocationControlled(prepared, session, target, root_pool, inputs, allocator, cleanup);
+    return selectPhysicalInvocationControlled(prepared, session, target, root_pool, inputs, allocator, cleanup, null);
 }
-fn selectPhysicalInvocationControlled(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, inputs: []const kernel_routes.InputBinding, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
+fn selectPhysicalInvocationControlled(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, inputs: []const kernel_routes.InputBinding, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context, control: ?InferenceExecutionControl) !void {
     var known = true;
     for (inputs) |fact| if (fact.value == .unknown) {
         known = false;
     };
-    prepared.region_execution_profile = if (known) try @import("../execution/region_execution_profile.zig").acquire(target.cb, target.executable.graph) else null;
+    // Source preparation is outside Model/lane/FIFO/backend gates here.
+    // Retire metadata authority before supplier callbacks, then acquire a NEW
+    // profile and revalidate native source generations during region selection.
+    prepared.region_execution_profile = if (known) try prepareProjectionPackBeforeProfile(session, target, root_pool, cleanup, control) else null;
+    if (known and prepared.region_execution_profile == null)
+        prepared.region_execution_profile = try @import("../execution/region_execution_profile.zig").acquire(target.cb, target.executable.graph);
     const profile = if (prepared.region_execution_profile) |claim| claim.profile else .unknown;
     var selection_policy: @import("../execution/region_route.zig").SelectionPolicy = .select_regions;
     while (true) {
@@ -4966,7 +5062,15 @@ fn selectPhysicalInvocationControlled(prepared: *prepared_mod.PreparedInvocation
         if (session.run_admission) |admission| prepared.frame_claim = try pool.claimWarm(.{ .controller = admission.controller, .backend_class = admission.backend_class });
         const acquisition = try pool.claimRegions(allocator, if (prepared.frame_claim) |*claim| claim else null, inputs);
         switch (acquisition) {
-            .no_regions => {},
+            .no_regions => {
+                // A private packed prefill frame is meaningful only when its
+                // exact complete region was selected. Compatibility work must
+                // keep the original frame/selector policy.
+                if (prepared.region_execution_profile) |*claim| if (claim.policy_key == 2) {
+                    try claim.deinitChecked();
+                    prepared.region_execution_profile = null;
+                };
+            },
             .ready => |claims| prepared.region_claims = claims,
             .reprepare => {
                 // Exact warm payload disappeared before quota. Choose
@@ -5013,33 +5117,33 @@ noinline fn prepareDevicePhysicalInvocation(prepared: *prepared_mod.PreparedInvo
         try facts.init(target, shapes, allocator, null);
     }
     defer facts.deinit();
-    return selectPhysicalInvocationControlled(prepared, session, target, root_pool, facts.inputs, allocator, cleanup);
+    return selectPhysicalInvocationControlled(prepared, session, target, root_pool, facts.inputs, allocator, cleanup, if (control) |active| active.* else null);
 }
 
 fn preparePhysicalInvocation(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator) !void {
-    return preparePhysicalInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, .{});
+    return preparePhysicalInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, .{}, null);
 }
 
-fn preparePhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
-    if (InvocationInputFacts.needsResidentStorage(shapes)) return preparePhysicalResidentInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, cleanup);
+fn preparePhysicalInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context, control: ?InferenceExecutionControl) !void {
+    if (InvocationInputFacts.needsResidentStorage(shapes)) return preparePhysicalResidentInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, cleanup, control);
     var facts: InvocationInputFacts = undefined;
     try facts.init(target, shapes, allocator, null);
     defer facts.deinit();
-    try selectPhysicalInvocationWithCleanup(prepared, session, target, root_pool, facts.inputs, allocator, cleanup);
+    try selectPhysicalInvocationControlled(prepared, session, target, root_pool, facts.inputs, allocator, cleanup, control);
 }
 
 // Resident planes remain allocation-free for ordinary small input sets, but
 // their large scratch frame is never entered for a dense host invocation.
 noinline fn preparePhysicalResidentInvocation(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator) !void {
-    return preparePhysicalResidentInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, .{});
+    return preparePhysicalResidentInvocationWithCleanup(prepared, session, target, root_pool, shapes, allocator, .{}, null);
 }
 
-noinline fn preparePhysicalResidentInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context) !void {
+noinline fn preparePhysicalResidentInvocationWithCleanup(prepared: *prepared_mod.PreparedInvocation, session: *const Session, target: *ImportedOnnxSession, root_pool: *@import("../execution/physical_buffers.zig").Pool, shapes: session_mod.ShapeInputs, allocator: std.mem.Allocator, cleanup: @import("../execution/cleanup_context.zig").Context, control: ?InferenceExecutionControl) !void {
     var storage: InvocationInputFacts.ResidentStorage = undefined;
     var facts: InvocationInputFacts = undefined;
     try facts.init(target, shapes, allocator, &storage);
     defer facts.deinit();
-    try selectPhysicalInvocationWithCleanup(prepared, session, target, root_pool, facts.inputs, allocator, cleanup);
+    try selectPhysicalInvocationControlled(prepared, session, target, root_pool, facts.inputs, allocator, cleanup, control);
 }
 
 /// Borrow the variant's already-owned host signature only after matching the
@@ -5870,6 +5974,17 @@ test "complete Imported Metal Frame encoder owns shared ingress aliases outputs 
     var input = try Tensor.initFloat32(a, "x", &.{ rows, width }, &values);
     defer input.deinit();
     session.run_admission = .{ .controller = controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 1024 * 1024 * 1024, .static_workspace_kind = .estimate, .check_live_memory = false };
+    // Exercise the actual managed loader delegation for this real imported
+    // model/provider before any prepared profile is acquired.
+    const architecture = @import("../execution/architecture_session.zig");
+    try architecture.configureSharedCacheAdmissionForSession(session, a, controller, .gpu, session.run_admission.?.limits, .{});
+    const cache_domain = session.model_lifetime.?.retainAdmissionDomain(controller) orelse return error.MissingCacheRetirementDomain;
+    defer cache_domain.release();
+    try architecture.installNativeCacheRetirementDomainForSession(session, &cache_domain);
+    const managed_cache = (try impl.shared_backend_ctx.managedMetalCache()) orelse return error.MissingImportedManagedCache;
+    try std.testing.expect(managed_cache.admission != null);
+    try std.testing.expect(managed_cache.admission.?.controller == controller);
+    try std.testing.expectEqual(@as(usize, 0), managedCacheAdmissionAmounts(session).?.backend_weight_bytes);
     var proof = (try prepared_mod.prepare(session, .{ .tensors = &.{input} }, a, null)).?;
     var proof_open = true;
     defer if (proof_open) proof.deinit();
@@ -6362,4 +6477,157 @@ test "complete Imported Metal constant chain admits Shared staging Private liter
     }
     _ = @import("../execution/resource_retirement.zig").poll();
     try std.testing.expectEqual(memory.AdmissionAmounts{}, controller.snapshot());
+}
+
+test "imported managed cache attachment rejects copied public tables before invalid owner access" {
+    var copied = imported_session_vtable;
+    std.mem.doNotOptimizeAway(&copied);
+    try std.testing.expect(@intFromPtr(&copied) != @intFromPtr(&imported_session_vtable));
+    const foreign = Session{ .ptr = @ptrFromInt(16), .vtable = &copied };
+    var controller: @import("../runtime/tier/memory.zig").AdmissionController = .{};
+    try std.testing.expect(!try configureManagedCacheAdmission(foreign, std.testing.allocator, &controller, .gpu, .{}, .{}));
+    try std.testing.expect(managedCacheAdmissionAmounts(foreign) == null);
+    const unused_backend: ops_mod.ComputeBackend = .{ .ptr = @ptrFromInt(16), .vtable = undefined };
+    try std.testing.expect(!try managedProjectionPackReceiver(foreign, &unused_backend));
+}
+
+test "actual Imported Metal cache attachment is concurrent idempotent and rejects foreign model headers" {
+    if (comptime !build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+    const a = std.testing.allocator;
+    var graph = Graph.init(a);
+    defer graph.deinit();
+    var builder = ml.graph.Builder.init(&graph);
+    const x = try builder.parameter("x", Shape.init(.f32, &.{ 2, 4 }));
+    try graph.markOutput(try builder.neg(x));
+    const encoded = try onnx_graph.exportGraph(a, &graph, .{});
+    defer a.free(encoded);
+    var directory = std.testing.tmpDir(.{});
+    defer directory.cleanup();
+    try directory.dir.writeFile(std.testing.io, .{ .sub_path = "managed-cache.onnx", .data = encoded });
+    const path = try std.fs.path.join(a, &.{ ".zig-cache", "tmp", directory.sub_path[0..], "managed-cache.onnx" });
+    defer a.free(path);
+    const domain = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer domain.release();
+    const pin = domain.pin();
+    defer pin.release();
+    var session = try createSessionWithOptions(a, path, .metal, .{ .graph_runtime_strategy = .partitioned });
+    var session_open = true;
+    defer if (session_open) session.close();
+    session.model_lifetime.?.admission_domain = domain.pin();
+    session.run_admission = .{ .controller = &domain.controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    const Attach = struct {
+        session: Session,
+        pin: *const @import("../runtime/tier/admission_domain.zig").Pin,
+        start: std.atomic.Value(bool) = .init(false),
+        errors: [2]?anyerror = @splat(null),
+        fn run(self: *@This(), index: usize) void {
+            while (!self.start.load(.acquire)) std.atomic.spinLoopHint();
+            self.attach() catch |err| {
+                self.errors[index] = err;
+            };
+        }
+        fn attach(self: *@This()) !void {
+            if (!try configureManagedCacheAdmission(self.session, std.testing.allocator, self.pin.controller(), .gpu, .{}, .{})) return error.MissingImportedManagedCache;
+            // Acquire publication must never expose a partially initialized
+            // binding, including when the other attachment is still running.
+            const actual: *ImportedOnnxSession = @ptrCast(@alignCast(self.session.ptr));
+            const published = (try actual.shared_backend_ctx.managedMetalCache()) orelse return; // competing first attach may conservatively decline
+            const installed = published.admission orelse return error.MissingImportedManagedCache;
+            if (!installed.pure_final_metadata or installed.controller != self.pin.controller() or installed.backend_class != .gpu or !std.meta.eql(installed.limits, @as(@import("../runtime/tier/memory.zig").Limits, .{}))) return error.IncompleteImportedManagedCache;
+            if (!try installCacheRetirementDomain(self.session, self.pin)) return error.MissingImportedManagedCache;
+        }
+    };
+    const initial: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    try std.testing.expect((try initial.shared_backend_ctx.managedMetalCache()) == null);
+    var attach = Attach{ .session = session, .pin = &pin };
+    const first = try std.Thread.spawn(.{}, Attach.run, .{ &attach, 0 });
+    const second = std.Thread.spawn(.{}, Attach.run, .{ &attach, 1 }) catch |err| {
+        attach.start.store(true, .release);
+        first.join();
+        return err;
+    };
+    attach.start.store(true, .release);
+    first.join();
+    second.join();
+    for (attach.errors) |failure| if (failure) |err| return err;
+    try attach.attach(); // retry after the competing cold owner has released
+    const actual: *ImportedOnnxSession = @ptrCast(@alignCast(session.ptr));
+    const cache = (try actual.shared_backend_ctx.managedMetalCache()) orelse return error.MissingImportedManagedCache;
+    const binding = cache.admission.?;
+    try attach.attach();
+    try std.testing.expect(cache.admission.? == binding and cache.retirementDomainMatches(&pin));
+    try std.testing.expect(try managedProjectionPackReceiver(session, &actual.cb));
+    const other = try @import("../runtime/tier/admission_domain.zig").Domain.create();
+    defer other.release();
+    const other_pin = other.pin();
+    defer other_pin.release();
+    try std.testing.expect(try installCacheRetirementDomain(session, &other_pin));
+    try std.testing.expect(cache.retirementDomainMatches(&pin) and !cache.retirementDomainMatches(&other_pin));
+    // An operator policy change neither rebinds cache credit nor licenses a
+    // packed source. The original owner still reports its real live amounts.
+    session.run_admission.?.limits.backend_limit_bytes = 1;
+    try std.testing.expect(try configureManagedCacheAdmission(session, a, &domain.controller, .gpu, session.run_admission.?.limits, .{}));
+    try std.testing.expect(cache.admission.? == binding);
+    try std.testing.expect(!try managedProjectionPackReceiver(session, &actual.cb));
+    try std.testing.expect(managedCacheAdmissionAmounts(session) != null);
+    var forged = session;
+    forged.ptr = @ptrFromInt(16); // real canonical table+Model, wrong opaque owner
+    try std.testing.expectError(error.ForeignManagedCacheModel, configureManagedCacheAdmission(forged, a, &domain.controller, .gpu, .{}, .{}));
+    try std.testing.expectError(error.ForeignManagedCacheModel, installCacheRetirementDomain(forged, &pin));
+    try std.testing.expectError(error.ForeignManagedCacheModel, managedProjectionPackReceiver(forged, &actual.cb));
+    try std.testing.expect(managedCacheAdmissionAmounts(forged) == null);
+
+    // A second actual imported Model shares this provider but owns a foreign
+    // Domain. It remains usable without adopting that cache admission view.
+    var sibling = try createSessionWithOptions(a, path, .metal, .{ .graph_runtime_strategy = .partitioned, .shared_backend_ctx = actual.shared_backend_ctx });
+    var sibling_open = true;
+    defer if (sibling_open) sibling.close();
+    sibling.model_lifetime.?.admission_domain = other.pin();
+    sibling.run_admission = .{ .controller = &other.controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    try std.testing.expect(try configureManagedCacheAdmission(sibling, a, &other.controller, .gpu, .{}, .{}));
+    try std.testing.expect(try installCacheRetirementDomain(sibling, &other_pin));
+    const sibling_impl: *ImportedOnnxSession = @ptrCast(@alignCast(sibling.ptr));
+    try std.testing.expect(sibling_impl.shared_backend_ctx == actual.shared_backend_ctx);
+    try std.testing.expect(!try managedProjectionPackReceiver(sibling, &sibling_impl.cb));
+    try std.testing.expect(managedCacheAdmissionAmounts(sibling) == null);
+    // Actual managers may give multiple Models the SAME resource Domain. That
+    // is legitimate shared-cache ownership, and its census identity appears once.
+    var same = try createSessionWithOptions(a, path, .metal, .{ .graph_runtime_strategy = .partitioned, .shared_backend_ctx = actual.shared_backend_ctx });
+    defer same.close();
+    same.model_lifetime.?.admission_domain = domain.pin();
+    same.run_admission = .{ .controller = &domain.controller, .backend_class = .gpu, .limits = .{}, .static_workspace_bytes = 0, .check_live_memory = false };
+    try std.testing.expect(try configureManagedCacheAdmission(same, a, &domain.controller, .gpu, .{}, .{}));
+    try std.testing.expect(try installCacheRetirementDomain(same, &pin));
+    const same_impl: *ImportedOnnxSession = @ptrCast(@alignCast(same.ptr));
+    try std.testing.expect(try managedProjectionPackReceiver(same, &same_impl.cb));
+    const original_snapshot = managedCacheAdmissionSnapshot(session) orelse return error.MissingImportedManagedCache;
+    const same_snapshot = managedCacheAdmissionSnapshot(same) orelse return error.MissingImportedManagedCache;
+    try std.testing.expectEqual(original_snapshot.identity, same_snapshot.identity);
+    try std.testing.expectEqualDeep(original_snapshot.amounts, same_snapshot.amounts);
+    try std.testing.expect(managedCacheAdmissionSnapshot(sibling) == null);
+    session.close();
+    session_open = false;
+    try std.testing.expect(cache.retirementDomainMatches(&pin));
+    var input = try Tensor.initFloat32(a, "x", &.{ 2, 4 }, &.{ 1, 2, 3, 4, 5, 6, 7, 8 });
+    defer input.deinit();
+    const outputs = try sibling.run(&.{input}, a);
+    defer {
+        for (outputs) |*value| value.deinit();
+        a.free(outputs);
+    }
+    try std.testing.expectEqualSlices(f32, &.{ -1, -2, -3, -4, -5, -6, -7, -8 }, outputs[0].asFloat32());
+    try std.testing.expect(cache.retirementDomainMatches(&pin));
+    sibling.close();
+    sibling_open = false;
+    const final_snapshot = managedCacheAdmissionSnapshot(same) orelse return error.MissingImportedManagedCache;
+    try std.testing.expectEqual(original_snapshot.identity, final_snapshot.identity);
+    const same_outputs = try same.run(&.{input}, a);
+    defer {
+        for (same_outputs) |*value| value.deinit();
+        a.free(same_outputs);
+    }
+    try std.testing.expectEqualSlices(f32, &.{ -1, -2, -3, -4, -5, -6, -7, -8 }, same_outputs[0].asFloat32());
+    // This fixture owns no packed payload. The combined packed fixture checks
+    // real SDK/Charge retention across the same two-Model lifetime boundary.
 }

@@ -20041,6 +20041,74 @@ pub const FrameError = error{
     CommandBufferFailed,
 };
 
+/// Private frame custody for an already exclusive managed operation. The
+/// retained exact command buffer prevents a later frame from reusing its ID.
+/// This owner never adopts an ambient recording or submitted frame.
+pub const AssignedDenseFrame = struct {
+    runtime: *RawMetalDecodeRuntime,
+    command: ?*anyopaque,
+    phase: enum { recording, submitted, finished } = .recording,
+
+    pub fn begin(runtime: ?*RawMetalDecodeRuntime) !AssignedDenseFrame {
+        const current = runtime orelse return error.RuntimeUnavailable;
+        if (hasActiveFrame(current) or hasSubmittedFrame(current)) return error.AssignedDenseExternalFrame;
+        try beginFrame(current);
+        // The caller holds its actual exclusive managed operation throughout
+        // creation. No other producer can replace this newly created frame.
+        errdefer cancelFrame(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        const command = antfly_metal_retain_active_frame(current) orelse return error.AssignedDenseFrameCustodyUnavailable;
+        return .{ .runtime = current, .command = command };
+    }
+
+    pub fn isRecording(self: *const AssignedDenseFrame) bool {
+        return self.phase == .recording;
+    }
+    fn validatePhase(self: *const AssignedDenseFrame, runtime: ?*RawMetalDecodeRuntime, phase: @FieldType(AssignedDenseFrame, "phase")) !void {
+        if (runtime != self.runtime or self.phase != phase or self.command == null or phase == .finished) return error.AssignedDenseFrameChanged;
+        if (antfly_metal_owned_frame_matches(self.runtime, self.command.?, if (phase == .recording) 1 else 2) == 0) return error.AssignedDenseFrameChanged;
+    }
+    pub fn validate(self: *const AssignedDenseFrame, runtime: ?*RawMetalDecodeRuntime) !void {
+        try self.validatePhase(runtime, .recording);
+    }
+    fn releaseTerminal(self: *AssignedDenseFrame) void {
+        if (self.command) |command| antfly_metal_release_owned_frame(command);
+        self.command = null;
+        self.phase = .finished;
+    }
+    pub fn finish(self: *AssignedDenseFrame) !void {
+        try self.validatePhase(self.runtime, .recording);
+        // Native submit reports errors only before commit/publication.
+        try submitFrame(self.runtime);
+        self.phase = .submitted;
+        try self.validatePhase(self.runtime, .submitted);
+        // Native wait drains and releases its submitted command even when
+        // terminal GPU status is CommandBufferFailed. Retire our extra pin then.
+        const terminal = waitFrame(self.runtime);
+        self.releaseTerminal();
+        try terminal;
+    }
+    pub fn drain(self: *AssignedDenseFrame) !void {
+        switch (self.phase) {
+            .finished => return,
+            .recording => {
+                try self.validatePhase(self.runtime, .recording);
+                try cancelFrame(self.runtime);
+                self.releaseTerminal();
+            },
+            .submitted => {
+                try self.validatePhase(self.runtime, .submitted);
+                const terminal = waitFrame(self.runtime);
+                self.releaseTerminal();
+                try terminal;
+            },
+        }
+    }
+};
+
+pub extern fn antfly_metal_retain_active_frame(runtime: *RawMetalDecodeRuntime) ?*anyopaque;
+pub extern fn antfly_metal_owned_frame_matches(runtime: *RawMetalDecodeRuntime, command: *anyopaque, phase: u32) c_int;
+pub extern fn antfly_metal_release_owned_frame(command: *anyopaque) void;
+
 pub fn beginFrame(runtime: ?*RawMetalDecodeRuntime) FrameError!void {
     return switch (termite_metal_decode_runtime_begin_frame(runtime)) {
         0 => {},
@@ -50762,6 +50830,95 @@ pub fn tryApplyDenseRuntimeLinearAssigned(self: anytype, slot: usize, input: Met
 
 /// Packed region outputs and intermediate are the caller's admitted ranges.
 /// This shares the allocating bridge's exact packed matmul/split body.
+/// Typed metadata around one immutable native pack. SDK-root retirement is
+/// owned by dense_projection_pack.Owner; references here must be transferred
+/// into that owner or released on the cold construction/error path.
+pub const PackedProjectionEntry = struct {
+    runtime: *RawMetalDecodeRuntime,
+    handle: *anyopaque,
+    request: @import("dense_projection_pack.zig").Request,
+
+    /// Only the accepted cold receiver may supply these independently funded
+    /// standalone SDK roots. Native create validates actual device/extents and
+    /// retains them; no temporary MetalTensor/header allocation is introduced.
+    pub fn create(runtime: ?*RawMetalDecodeRuntime, request: @import("dense_projection_pack.zig").Request, roots: [2]*anyopaque) !PackedProjectionEntry {
+        const current = runtime orelse return error.RuntimeUnavailable;
+        _ = try request.layout();
+        if (hasActiveFrame(current) or hasSubmittedFrame(current)) return error.AssignedDenseExternalFrame;
+        if (roots[0] == roots[1]) return error.InvalidPackedProjectionRoot;
+        // The immutable entry can outlive this provider. Reuse the existing
+        // process-unique retirement identity so a recycled runtime address
+        // cannot attest an old retained entry. End publication before packing.
+        {
+            var origin: u64 = 0;
+            const pending = antfly_metal_output_retirement_begin(current, &origin, @import("../execution/resource_retirement.zig").Queue.createIdentity);
+            if (pending < 0) return error.InvalidResourceRetirement;
+            defer antfly_metal_output_retirement_end(current);
+            if (pending != 0 or origin == 0) return error.AssignedDenseExternalFrame;
+        }
+        var entry: ?*anyopaque = null;
+        const status = antfly_metal_packed_projection_create(current, request.count, &request.slots, &request.generations, &request.declarations, request.width, &request.widths, roots[0], roots[1], &entry);
+        if (status != 0) {
+            if (entry) |partial| antfly_metal_packed_projection_release(partial);
+            return error.PackedProjectionPreparationFailed;
+        }
+        return .{ .runtime = current, .handle = entry orelse return error.PackedProjectionPreparationFailed, .request = request };
+    }
+    pub fn matches(self: *const PackedProjectionEntry, runtime: ?*RawMetalDecodeRuntime) bool {
+        return runtime == self.runtime and antfly_metal_packed_projection_matches(self.runtime, self.handle) != 0;
+    }
+    pub fn retain(self: PackedProjectionEntry) !PackedProjectionEntry {
+        var retained = self;
+        retained.handle = antfly_metal_packed_projection_retain(self.handle) orelse return error.PackedProjectionUnavailable;
+        return retained;
+    }
+    pub fn release(self: PackedProjectionEntry) void {
+        antfly_metal_packed_projection_release(self.handle);
+    }
+    pub fn buffers(self: *const PackedProjectionEntry) ![2]*anyopaque {
+        var weight: ?*anyopaque = null;
+        var bias: ?*anyopaque = null;
+        if (antfly_metal_packed_projection_buffers(self.handle, &weight, &bias) != 0) return error.PackedProjectionUnavailable;
+        return .{ weight orelse return error.PackedProjectionUnavailable, bias orelse return error.PackedProjectionUnavailable };
+    }
+
+    /// The prepared selection already committed. No decline/replay is legal
+    /// after entering the original native packed matmul/split body.
+    pub fn applyAssigned(self: *const PackedProjectionEntry, frame: *const AssignedDenseFrame, input: MetalTensor, rows: usize, outputs: []const MetalTensor, workspace: MetalTensor) !void {
+        try frame.validate(self.runtime);
+        if (!self.matches(self.runtime) or rows <= 1 or outputs.len != self.request.count) return error.PreparedPackedProjectionChanged;
+        const layout = try self.request.layout();
+        if (!denseRegionShape(input, rows, layout.width) or !assignedWorkspaceFits(workspace, rows, layout.total_width)) return error.PreparedPackedProjectionChanged;
+        var handles: [3]?*anyopaque = @splat(null);
+        var offsets: [3]usize = @splat(0);
+        const input_device = input.device orelse return error.PreparedPackedProjectionChanged;
+        const scratch_device = workspace.device orelse return error.PreparedPackedProjectionChanged;
+        if (input_device.ref.runtime != @as(*anyopaque, @ptrCast(self.runtime)) or scratch_device.ref.runtime != input_device.ref.runtime) return error.PreparedPackedProjectionChanged;
+        for (outputs, 0..) |output, index| {
+            const device = output.device orelse return error.PreparedPackedProjectionChanged;
+            if (device.ref.runtime != input_device.ref.runtime or !denseRegionShape(output, rows, layout.widths[index])) return error.PreparedPackedProjectionChanged;
+            handles[index] = output.deviceHandle();
+            offsets[index] = output.deviceByteOffset();
+        }
+        if (antfly_metal_apply_packed_projection_assigned(self.runtime, self.handle, input.deviceHandle(), input.deviceByteOffset(), rows, &handles, &offsets, workspace.deviceHandle(), workspace.deviceByteOffset()) != 0) return error.AssignedDenseRegionDispatchFailed;
+    }
+};
+
+pub extern fn antfly_metal_projection_pack_available(runtime: ?*RawMetalDecodeRuntime, count: usize, slots: [*]const usize, width: usize, widths: [*]const usize) c_int;
+pub extern fn antfly_metal_packed_projection_metadata_bytes() usize;
+pub extern fn antfly_metal_packed_use_service_metadata_bytes() usize;
+pub extern fn antfly_metal_bind_packed_use_service(runtime: ?*RawMetalDecodeRuntime, context: *anyopaque, nonce: u64, prepare: *const fn (*anyopaque, u64, *anyopaque, u32) callconv(.c) c_int) c_int;
+pub extern fn antfly_metal_unbind_packed_use_service(runtime: ?*RawMetalDecodeRuntime, context: *anyopaque, nonce: u64) c_int;
+pub extern fn antfly_metal_packed_projection_publish(runtime: ?*RawMetalDecodeRuntime, entry: *anyopaque, owner: *anyopaque) c_int;
+pub extern fn antfly_metal_packed_projection_forget(runtime: ?*RawMetalDecodeRuntime, entry: *anyopaque) c_int;
+pub extern fn antfly_metal_packed_projection_create(runtime: *RawMetalDecodeRuntime, count: usize, slots: [*]const usize, generations: [*]const u64, declarations: [*]const u64, width: usize, widths: [*]const usize, weight: ?*anyopaque, bias: ?*anyopaque, entry: *?*anyopaque) c_int;
+pub extern fn antfly_metal_packed_projection_retain(entry: *anyopaque) ?*anyopaque;
+pub extern fn antfly_metal_packed_projection_release(entry: *anyopaque) void;
+pub extern fn antfly_metal_packed_projection_matches(runtime: *RawMetalDecodeRuntime, entry: *anyopaque) c_int;
+pub extern fn antfly_metal_packed_projection_is_cached(runtime: ?*RawMetalDecodeRuntime, entry: *anyopaque) c_int;
+pub extern fn antfly_metal_packed_projection_buffers(entry: *anyopaque, weight: *?*anyopaque, bias: *?*anyopaque) c_int;
+pub extern fn antfly_metal_apply_packed_projection_assigned(runtime: *RawMetalDecodeRuntime, entry: *anyopaque, input: ?*anyopaque, input_offset: usize, rows: usize, outputs: [*]const ?*anyopaque, offsets: [*]const usize, workspace: ?*anyopaque, workspace_offset: usize) c_int;
+
 pub fn tryApplyDenseRuntimeLinearPairAssigned(self: anytype, slot_a: usize, slot_b: usize, input: MetalTensor, rows: usize, in_dim: usize, out_dim: usize, first: MetalTensor, second: MetalTensor, workspace: ?MetalTensor) !bool {
     const runtime = self.raw_decode_runtime orelse return false;
     if (!input.isDevice() or !first.isDevice() or !second.isDevice() or rows == 0 or in_dim == 0 or out_dim == 0 or slot_a >= decoder_runtime_linear_slot_capacity or slot_b >= decoder_runtime_linear_slot_capacity) return false;
@@ -52230,4 +52387,57 @@ test "prepared Host RMS activation add multiply refuse missing Phase before SDK 
     for (try normalized.toHostSlice()) |value| try std.testing.expect(std.math.isFinite(value));
     for (try activated.toHostSlice()) |value| try std.testing.expect(std.math.isFinite(value));
     try std.testing.expectEqual(before, runtimeMemorySnapshot(runtime).compute_encoder_count);
+}
+
+test "assigned dense private frame rejects ambient custody and drains only its exact command" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    defer _ = termite_metal_decode_runtime_reset_state(runtime);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+    {
+        try beginFrame(runtime);
+        defer cancelFrame(runtime) catch unreachable;
+        try std.testing.expectError(error.AssignedDenseExternalFrame, AssignedDenseFrame.begin(runtime));
+        try std.testing.expect(hasActiveFrame(runtime));
+    }
+    var owner = try AssignedDenseFrame.begin(runtime);
+    defer owner.drain() catch unreachable;
+    try owner.validate(runtime);
+    try std.testing.expect(owner.isRecording());
+    try std.testing.expectError(error.AssignedDenseFrameChanged, owner.validate(null));
+    const original = owner.command.?;
+    // The pinned cancelled command cannot be confused with its replacement.
+    try cancelFrame(runtime);
+    try beginFrame(runtime);
+    defer if (owner.command != null) {
+        cancelFrame(runtime) catch unreachable;
+        owner.releaseTerminal();
+    };
+    try std.testing.expect(antfly_metal_owned_frame_matches(runtime, original, 1) == 0);
+    try std.testing.expectError(error.AssignedDenseFrameChanged, owner.validate(runtime));
+    try std.testing.expectError(error.AssignedDenseFrameChanged, owner.drain());
+    try std.testing.expect(hasActiveFrame(runtime));
+    try cancelFrame(runtime);
+    owner.releaseTerminal(); // actual original command was cancelled above
+    try owner.drain();
+}
+
+test "assigned dense private frame finishes submission before releasing exact command custody" {
+    if (!build_options.enable_metal or !metalDeviceAvailable()) return error.SkipZigTest;
+    const runtime = termite_metal_decode_runtime_create() orelse return error.SkipZigTest;
+    defer termite_metal_decode_runtime_destroy(runtime);
+    defer _ = termite_metal_decode_runtime_reset_state(runtime);
+    if (termite_metal_decode_runtime_ready(runtime) == 0) return error.SkipZigTest;
+    var owner = try AssignedDenseFrame.begin(runtime);
+    defer owner.drain() catch unreachable;
+    try owner.finish();
+    try std.testing.expect(owner.command == null and !owner.isRecording());
+    try std.testing.expect(!hasActiveFrame(runtime) and !hasSubmittedFrame(runtime));
+    try owner.drain();
+    try beginFrame(runtime);
+    defer cancelFrame(runtime) catch unreachable;
+    try std.testing.expectError(error.AssignedDenseFrameChanged, owner.validate(runtime));
+    try owner.drain();
+    try std.testing.expect(hasActiveFrame(runtime));
 }

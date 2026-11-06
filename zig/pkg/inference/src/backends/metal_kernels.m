@@ -1483,6 +1483,7 @@ typedef struct antfly_metal_workspace_root_operations {
     bool _armed;
     // Pure metadata only. The Group's metadata pin keeps this exact owner
     // valid through actual SDK death; no model/provider/IO/arena is captured.
+    void *_packed_owner; // borrowed exact entry; creator survives every cached alias
     void *_workspace_root;
     const antfly_metal_workspace_root_operations *_workspace_operations;
     uint64_t _workspace_references; // unfunded compatibility tag only; Root owns charged refs
@@ -1517,6 +1518,39 @@ static char antfly_metal_retirement_witness_key;
 static os_unfair_lock antfly_metal_retirement_witness_lock = OS_UNFAIR_LOCK_INIT;
 
 struct antfly_metal_retirement_arena;
+static void *antfly_metal_packed_owner_tag(id<MTLBuffer> buffer) {
+    if (buffer == nil) return NULL;
+    os_unfair_lock_lock(&antfly_metal_retirement_witness_lock);
+    AntflyMetalRetirementWitness *witness = objc_getAssociatedObject(buffer, &antfly_metal_retirement_witness_key);
+    void *entry = NULL;
+    for (; witness != nil; witness = witness->_next) if (witness->_packed_owner) { entry = witness->_packed_owner; break; }
+    os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock);
+    return entry;
+}
+static bool antfly_metal_packed_owner_tag_set(id<MTLBuffer> buffer, void *entry, bool clear) {
+    if (buffer == nil || !entry) return false;
+    os_unfair_lock_lock(&antfly_metal_retirement_witness_lock);
+    AntflyMetalRetirementWitness *witness = objc_getAssociatedObject(buffer, &antfly_metal_retirement_witness_key);
+    bool found = false;
+    for (; witness != nil; witness = witness->_next) {
+        if (clear) {
+            if (witness->_packed_owner == entry) { witness->_packed_owner = NULL; found = true; }
+        } else if (witness->_armed && !witness->_workspace_tag && !witness->_workspace_root) {
+            if (!witness->_packed_owner || witness->_packed_owner == entry) { witness->_packed_owner = entry; found = true; }
+            break;
+        }
+    }
+    os_unfair_lock_unlock(&antfly_metal_retirement_witness_lock);
+    return found;
+}
+
+typedef struct {
+    void *context;
+    uint64_t nonce;
+    int (*prepare)(void *, uint64_t, void *, uint32_t);
+} antfly_metal_packed_use_service;
+size_t antfly_metal_packed_use_service_metadata_bytes(void) { return sizeof(antfly_metal_packed_use_service); }
+
 typedef struct antfly_metal_prepared_retirement_witnesses {
     CFMutableArrayRef values;
     bool published;
@@ -2389,7 +2423,8 @@ typedef struct termite_metal_decode_runtime {
     // Independent final tensor drops synchronize with frame retirement only.
     os_unfair_lock retirement_lock;
     os_unfair_lock retirement_publication_lock;
-    uint64_t retirement_origin_identity;
+    _Atomic(uint64_t) retirement_origin_identity;
+    antfly_metal_packed_use_service packed_use_service;
     antfly_metal_retirement_node *active_frame_retirement_nodes;
     antfly_metal_retirement_node *submitted_frame_retirement_nodes;
     pthread_t active_frame_retirement_owner;
@@ -2753,6 +2788,33 @@ static void antfly_metal_publish_active_frame(termite_metal_decode_runtime *runt
     }
     (void)previous;
 }
+// An owned scope retains the exact CB, so pointer reuse cannot turn an
+// unrelated later frame into its recording/submitted authority.
+void *antfly_metal_retain_active_frame(termite_metal_decode_runtime *runtime) {
+    if (!runtime) return NULL;
+    id<MTLCommandBuffer> cb;
+    {
+        ANTFLY_METAL_PUBLICATION_SCOPE(runtime);
+        ANTFLY_METAL_RETIREMENT_SCOPE(runtime);
+        if (runtime->submitted_frame_cb != nil || !runtime->active_frame_retirement_owner_valid ||
+            !pthread_equal(runtime->active_frame_retirement_owner, pthread_self())) return NULL;
+        cb = runtime->active_frame_cb;
+    }
+    return cb == nil ? NULL : (__bridge_retained void *)cb;
+}
+int antfly_metal_owned_frame_matches(termite_metal_decode_runtime *runtime, void *handle, uint32_t phase) {
+    if (!runtime || !handle) return 0;
+    ANTFLY_METAL_PUBLICATION_SCOPE(runtime);
+    ANTFLY_METAL_RETIREMENT_SCOPE(runtime);
+    id<MTLCommandBuffer> cb = (__bridge id<MTLCommandBuffer>)handle;
+    if (phase == 1) return runtime->active_frame_cb == cb && runtime->submitted_frame_cb == nil &&
+        runtime->active_frame_retirement_owner_valid && pthread_equal(runtime->active_frame_retirement_owner, pthread_self());
+    if (phase == 2) return runtime->submitted_frame_cb == cb && runtime->active_frame_cb == nil;
+    return 0;
+}
+void antfly_metal_release_owned_frame(void *handle) {
+    if (handle) CFRelease(handle);
+}
 // The last CB reference can dispose handlers and associated retirement
 // witnesses. Detach ownership under locks; perform final ARC release outside.
 static void antfly_metal_clear_submitted_frame_cb(termite_metal_decode_runtime *runtime) {
@@ -2837,6 +2899,7 @@ static _Atomic(uint64_t) *antfly_metal_binding_generation_slot(termite_metal_dec
     }
 }
 static void antfly_metal_binding_generations_init(termite_metal_decode_runtime *runtime) {
+    atomic_init(&runtime->retirement_origin_identity, 0);
     atomic_init(&runtime->prepared_binding_generation, 2);
     atomic_init(&runtime->retired_prepared_bindings, 0);
     for (size_t slot=0; slot<TERMITE_METAL_LINEAR_SLOT_CAPACITY; ++slot) atomic_init(&runtime->linear_binding_generations[slot], 0);
@@ -20428,6 +20491,17 @@ static MPSMatrixMultiplication *termite_metal_decode_runtime_cached_gemm_mps_mm(
     return mm;
 }
 
+static int antfly_metal_prepare_packed_root_use(termite_metal_decode_runtime *, id<MTLBuffer>, uint32_t);
+static int antfly_metal_prepare_packed_slot_mutation(termite_metal_decode_runtime *runtime, size_t slot) {
+    for (size_t i = 0; i < TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY; ++i)
+        if (i == slot || runtime->dense_qkv_packed_k_slots[i] == slot || runtime->dense_qkv_packed_v_slots[i] == slot)
+            if (antfly_metal_prepare_packed_root_use(runtime, runtime->dense_qkv_packed_weight_buffers[i], 2) < 0) return -1;
+    for (size_t i = 0; i < TERMITE_METAL_LINEAR_SLOT_CAPACITY; ++i)
+        if (i == slot || runtime->dense_pair_packed_b_slots[i] == slot)
+            if (antfly_metal_prepare_packed_root_use(runtime, runtime->dense_pair_packed_weight_buffers[i], 2) < 0) return -1;
+    return 0;
+}
+
 static void termite_metal_decode_runtime_invalidate_dense_qkv_pack_slot(
     termite_metal_decode_runtime *runtime,
     size_t slot
@@ -20602,6 +20676,277 @@ static bool termite_metal_decode_runtime_cached_dense_qkv_mps_matrices(
     return true;
 }
 
+static void antfly_metal_publish_projection_pack(termite_metal_decode_runtime *runtime,
+    size_t count, const size_t *slots, size_t in_dim, const size_t *widths,
+    id<MTLBuffer> packed, id<MTLBuffer> packed_bias) {
+    if (count == 2) {
+        const size_t a_slot = slots[0], b_slot = slots[1], out_dim = widths[0];
+    runtime->dense_pair_packed_weight_buffers[a_slot] = packed;
+    runtime->dense_pair_packed_bias_buffers[a_slot] = packed_bias;
+    runtime->dense_pair_packed_mps_mm[a_slot] = nil;
+    runtime->dense_pair_packed_b_slots[a_slot] = b_slot;
+    runtime->dense_pair_packed_in_dims[a_slot] = in_dim;
+    runtime->dense_pair_packed_out_dims[a_slot] = out_dim;
+    runtime->dense_pair_packed_mps_rows[a_slot] = 0;
+    } else {
+        const size_t q_slot = slots[0], k_slot = slots[1], v_slot = slots[2];
+        const size_t q_out_dim = widths[0], kv_out_dim = widths[1];
+    runtime->dense_qkv_packed_weight_buffers[q_slot] = packed;
+    runtime->dense_qkv_packed_bias_buffers[q_slot] = packed_bias;
+    runtime->dense_qkv_packed_mps_mm[q_slot] = nil;
+    runtime->dense_qkv_packed_mps_left[q_slot] = nil;
+    runtime->dense_qkv_packed_mps_right[q_slot] = nil;
+    runtime->dense_qkv_packed_mps_result[q_slot] = nil;
+    runtime->dense_qkv_packed_mps_left_buffers[q_slot] = nil;
+    runtime->dense_qkv_packed_mps_result_buffers[q_slot] = nil;
+    runtime->dense_qkv_packed_mps_left_offsets[q_slot] = 0;
+    runtime->dense_qkv_packed_mps_result_offsets[q_slot] = 0;
+    runtime->dense_qkv_packed_k_slots[q_slot] = k_slot;
+    runtime->dense_qkv_packed_v_slots[q_slot] = v_slot;
+    runtime->dense_qkv_packed_in_dims[q_slot] = in_dim;
+    runtime->dense_qkv_packed_q_out_dims[q_slot] = q_out_dim;
+    runtime->dense_qkv_packed_kv_out_dims[q_slot] = kv_out_dim;
+    runtime->dense_qkv_packed_mps_rows[q_slot] = 0;
+    }
+}
+
+// One packing order serves compatibility caches and independently owned
+// immutable entries: all weight slabs, then all F32 bias slabs.
+static int antfly_metal_encode_projection_pack(
+    termite_metal_decode_runtime *runtime, id<MTLCommandBuffer> command_buffer,
+    size_t count, const size_t *slots, size_t width, const size_t *widths,
+    size_t element_bytes, id<MTLBuffer> packed, id<MTLBuffer> bias
+) {
+    if (!runtime || command_buffer == nil || !slots || !widths || count < 2 || count > 3 ||
+        (element_bytes != 2 && element_bytes != 4) || !width) return -1;
+    size_t weights[3], biases[3], weight_offsets[3], bias_offsets[3];
+    size_t weight_bytes = 0, bias_bytes = 0;
+    for (size_t i = 0; i < count; ++i) {
+        if (slots[i] >= TERMITE_METAL_LINEAR_SLOT_CAPACITY || !widths[i] ||
+            !termite_metal_size_mul3(widths[i], width, element_bytes, &weights[i]) ||
+            !termite_metal_size_mul(widths[i], sizeof(float), &biases[i])) return -1;
+        weight_offsets[i] = weight_bytes;
+        bias_offsets[i] = bias_bytes;
+        if (!termite_metal_size_add(weight_bytes, weights[i], &weight_bytes) ||
+            !termite_metal_size_add(bias_bytes, biases[i], &bias_bytes) ||
+            runtime->linear_weight_buffers[slots[i]].length < weights[i] ||
+            runtime->linear_bias_buffers[slots[i]].length < biases[i]) return -1;
+    }
+    if (packed == nil || bias == nil || packed == bias || packed.length < weight_bytes || bias.length < bias_bytes) return -1;
+    for (size_t i = 0; i < count; ++i) {
+        if (packed == runtime->linear_weight_buffers[slots[i]] || packed == runtime->linear_bias_buffers[slots[i]] ||
+            bias == runtime->linear_weight_buffers[slots[i]] || bias == runtime->linear_bias_buffers[slots[i]]) return -1;
+    }
+    id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
+    if (blit == nil) return -3;
+    for (size_t i = 0; i < count; ++i)
+        [blit copyFromBuffer:runtime->linear_weight_buffers[slots[i]] sourceOffset:0 toBuffer:packed destinationOffset:weight_offsets[i] size:weights[i]];
+    for (size_t i = 0; i < count; ++i)
+        [blit copyFromBuffer:runtime->linear_bias_buffers[slots[i]] sourceOffset:0 toBuffer:bias destinationOffset:bias_offsets[i] size:biases[i]];
+    [blit endEncoding];
+    return 0;
+}
+
+typedef struct {
+    _Atomic(size_t) references;
+    CFTypeRef weight;
+    CFTypeRef bias;
+    termite_metal_decode_runtime *provider;
+    uint64_t origin;
+    void *owner_context;
+    size_t count;
+    size_t slots[3];
+    uint64_t generations[3];
+    uint64_t declarations[3];
+    size_t width;
+    size_t widths[3];
+} AntflyMetalPackedProjection;
+size_t antfly_metal_packed_projection_metadata_bytes(void) { return sizeof(AntflyMetalPackedProjection); }
+void *antfly_metal_packed_projection_retain(void *handle) {
+    if (!handle) return NULL;
+    AntflyMetalPackedProjection *entry = handle;
+    size_t refs = atomic_load_explicit(&entry->references, memory_order_relaxed);
+    do { if (!refs || refs == SIZE_MAX) abort(); }
+    while (!atomic_compare_exchange_weak_explicit(&entry->references, &refs, refs + 1, memory_order_relaxed, memory_order_relaxed));
+    return handle;
+}
+void antfly_metal_packed_projection_release(void *handle) {
+    if (!handle) return;
+    AntflyMetalPackedProjection *entry = handle;
+    size_t previous = atomic_fetch_sub_explicit(&entry->references, 1, memory_order_acq_rel);
+    if (!previous) abort();
+    if (previous != 1) return;
+    CFTypeRef weight = entry->weight;
+    CFTypeRef bias = entry->bias;
+    antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)weight, entry, true);
+    antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)bias, entry, true);
+    free(entry);
+    // Both SDK deaths may satisfy the final charged metadata witness. The
+    // native requested header must already be gone before either signal.
+    if (weight) CFRelease(weight);
+    if (bias) CFRelease(bias);
+}
+// Creator retirement revokes the borrowed endpoint even when an explicitly
+// retained cold native handle outlives it. Such a handle may retire SDK roots,
+// but can never launch through a dead Zig Owner.
+void antfly_metal_packed_projection_release_owner(void *handle) {
+    if (!handle) return;
+    AntflyMetalPackedProjection *entry = handle;
+    entry->owner_context = NULL;
+    antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)entry->weight, entry, true);
+    antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)entry->bias, entry, true);
+    antfly_metal_packed_projection_release(handle);
+}
+static void antfly_metal_packed_projection_cleanup(AntflyMetalPackedProjection **entry) {
+    if (*entry) antfly_metal_packed_projection_release(*entry);
+}
+
+int antfly_metal_bind_packed_use_service(termite_metal_decode_runtime *runtime, void *context, uint64_t nonce,
+    int (*prepare)(void *, uint64_t, void *, uint32_t)) {
+    if (!runtime || !context || !nonce || !prepare) return -1;
+    antfly_metal_packed_use_service *service = &runtime->packed_use_service;
+    if (service->context && (service->context != context || service->nonce != nonce || service->prepare != prepare)) return -1;
+    *service = (antfly_metal_packed_use_service){ context, nonce, prepare };
+    return 0;
+}
+int antfly_metal_unbind_packed_use_service(termite_metal_decode_runtime *runtime, void *context, uint64_t nonce) {
+    if (!runtime) return -1;
+    antfly_metal_packed_use_service *service = &runtime->packed_use_service;
+    if (!service->context) return 0;
+    if (service->context != context || service->nonce != nonce) return -1;
+    *service = (antfly_metal_packed_use_service){0};
+    return 0;
+}
+static int antfly_metal_prepare_packed_entry_use(termite_metal_decode_runtime *runtime, AntflyMetalPackedProjection *entry, uint32_t kind) {
+    if (!entry) return 1;
+    if (entry->provider != runtime || !entry->origin || entry->origin != atomic_load_explicit(&runtime->retirement_origin_identity, memory_order_acquire)) return kind == 1 ? 0 : 2;
+    const antfly_metal_packed_use_service service = runtime->packed_use_service;
+    if (!entry->owner_context) return -1;
+    if (!service.context || !service.prepare) return kind == 1 ? 0 : 2;
+    return service.prepare(service.context, service.nonce, entry->owner_context, kind);
+}
+static int antfly_metal_prepare_packed_root_use(termite_metal_decode_runtime *runtime, id<MTLBuffer> buffer, uint32_t kind) {
+    return antfly_metal_prepare_packed_entry_use(runtime, antfly_metal_packed_owner_tag(buffer), kind);
+}
+
+int antfly_metal_packed_projection_matches(termite_metal_decode_runtime *runtime, void *handle) {
+    if (!runtime || !handle) return 0;
+    AntflyMetalPackedProjection *entry = handle;
+    if (entry->provider != runtime || entry->origin == 0 || entry->origin != atomic_load_explicit(&runtime->retirement_origin_identity, memory_order_acquire) || entry->count < 2 || entry->count > 3 ||
+        ((__bridge id<MTLBuffer>)entry->weight).device != runtime->device || ((__bridge id<MTLBuffer>)entry->bias).device != runtime->device) return 0;
+    for (size_t i = 0; i < entry->count; ++i) {
+        const size_t slot = entry->slots[i];
+        if (!antfly_metal_linear_slot_prepared(runtime, slot) ||
+            runtime->linear_weight_dtypes[slot] != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 ||
+            runtime->linear_in_dims[slot] != entry->width || runtime->linear_out_dims[slot] != entry->widths[i] ||
+            antfly_metal_prepared_binding_generation(runtime, 1, slot) != entry->generations[i] ||
+            antfly_metal_prepared_declaration(runtime, 1, slot) != entry->declarations[i]) return 0;
+    }
+    return 1;
+}
+int antfly_metal_packed_projection_buffers(void *handle, void **weight, void **bias) {
+    if (!handle || !weight || !bias) return -1;
+    AntflyMetalPackedProjection *entry = handle;
+    *weight = (void *)entry->weight;
+    *bias = (void *)entry->bias;
+    return 0;
+}
+// Physical compatibility retains are independent of logical slot generations.
+// Keep the creator alive until every exact alias is gone; clearing a source's
+// declaration alone does not end an SDK root or establish its future B.
+int antfly_metal_packed_projection_is_cached(termite_metal_decode_runtime *runtime, void *handle) {
+    if (!runtime || !handle) return 0;
+    AntflyMetalPackedProjection *entry = handle;
+    if (entry->provider != runtime || !entry->origin || entry->origin != atomic_load_explicit(&runtime->retirement_origin_identity, memory_order_acquire)) return 0;
+    int roots = 0;
+    for (size_t i = 0; i < TERMITE_METAL_LINEAR_SLOT_CAPACITY; ++i) {
+        if (runtime->dense_pair_packed_weight_buffers[i] == (__bridge id<MTLBuffer>)entry->weight) roots |= 1;
+        if (runtime->dense_pair_packed_bias_buffers[i] == (__bridge id<MTLBuffer>)entry->bias) roots |= 2;
+    }
+    for (size_t i = 0; i < TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY; ++i) {
+        if (runtime->dense_qkv_packed_weight_buffers[i] == (__bridge id<MTLBuffer>)entry->weight) roots |= 1;
+        if (runtime->dense_qkv_packed_bias_buffers[i] == (__bridge id<MTLBuffer>)entry->bias) roots |= 2;
+    }
+    return roots;
+}
+
+// The caller owns independent funding for BOTH supplied roots. This function
+// never allocates SDK payload. After terminal packing the compatibility cache
+// retains these same funded roots, rather than creating another physical pack.
+int antfly_metal_packed_projection_create(
+    termite_metal_decode_runtime *runtime, size_t count, const size_t *slots,
+    const uint64_t *generations, const uint64_t *declarations,
+    size_t width, const size_t *widths, void *weight_handle, void *bias_handle,
+    void **result
+) {
+    if (result) *result = NULL;
+    if (!runtime || !result || !slots || !generations || !declarations || !widths ||
+        !weight_handle || !bias_handle || count < 2 || count > 3 || width == 0 || width > UINT32_MAX ||
+        atomic_load_explicit(&runtime->retirement_origin_identity, memory_order_acquire) == 0 || runtime->active_frame_cb != nil || runtime->submitted_frame_cb != nil) return -1;
+    @autoreleasepool {
+        AntflyMetalPackedProjection *entry __attribute__((cleanup(antfly_metal_packed_projection_cleanup))) = calloc(1, sizeof(*entry));
+        if (!entry) return -2;
+        atomic_init(&entry->references, 1);
+        entry->provider = runtime;
+        entry->origin = atomic_load_explicit(&runtime->retirement_origin_identity, memory_order_acquire);
+        entry->count = count;
+        entry->width = width;
+        entry->weight = CFRetain(weight_handle);
+        entry->bias = CFRetain(bias_handle);
+        for (size_t i = 0; i < count; ++i) {
+            if (widths[i] == 0 || widths[i] > UINT32_MAX || !generations[i] || !declarations[i] || (declarations[i] & 1u)) return -1;
+            for (size_t j = 0; j < i; ++j) if (slots[i] == slots[j]) return -1;
+            entry->slots[i] = slots[i];
+            entry->generations[i] = generations[i];
+            entry->declarations[i] = declarations[i];
+            entry->widths[i] = widths[i];
+        }
+        if ((count == 2 && widths[0] != widths[1]) || (count == 3 && widths[1] != widths[2]) ||
+            !antfly_metal_packed_projection_matches(runtime, entry)) return -1;
+        id<MTLCommandBuffer> cb = termite_metal_new_command_buffer(runtime->queue, "prepared_projection_pack");
+        if (cb == nil) return -2;
+        const int encoded = antfly_metal_encode_projection_pack(runtime, cb, count, slots, width, widths, sizeof(float), (__bridge id<MTLBuffer>)entry->weight, (__bridge id<MTLBuffer>)entry->bias);
+        if (encoded != 0) return encoded;
+        antfly_metal_commit(cb);
+        antfly_metal_wait(cb);
+        if (cb.status != MTLCommandBufferStatusCompleted) return -4;
+        if (!antfly_metal_packed_projection_matches(runtime, entry)) return -1;
+        *result = entry;
+        entry = NULL;
+        return 0;
+    }
+}
+
+int antfly_metal_packed_projection_publish(termite_metal_decode_runtime *runtime, void *handle, void *owner_context) {
+    if (!owner_context || !antfly_metal_packed_projection_matches(runtime, handle)) return -1;
+    AntflyMetalPackedProjection *entry = handle;
+    if (entry->owner_context && entry->owner_context != owner_context) return -1;
+    if (!antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)entry->weight, entry, false) ||
+        !antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)entry->bias, entry, false)) return -1;
+    for (size_t i = 0; i < entry->count; ++i) if (antfly_metal_prepare_packed_slot_mutation(runtime, entry->slots[i]) != 0) return -1;
+    entry->owner_context = owner_context;
+    for (size_t i = 0; i < entry->count; ++i) {
+        termite_metal_decode_runtime_invalidate_dense_qkv_pack_slot(runtime, entry->slots[i]);
+        termite_metal_decode_runtime_invalidate_dense_pair_pack_slot(runtime, entry->slots[i]);
+    }
+    antfly_metal_publish_projection_pack(runtime, entry->count, entry->slots, entry->width, entry->widths,
+        (__bridge id<MTLBuffer>)entry->weight, (__bridge id<MTLBuffer>)entry->bias);
+    return 0;
+}
+int antfly_metal_packed_projection_forget(termite_metal_decode_runtime *runtime, void *handle) {
+    if (!runtime || !handle) return -1;
+    AntflyMetalPackedProjection *entry = handle;
+    if (entry->provider != runtime || entry->origin != atomic_load_explicit(&runtime->retirement_origin_identity, memory_order_acquire)) return -1;
+    // Caller preflighted the final current B while excluding future uses.
+    for (size_t i = 0; i < entry->count; ++i) {
+        termite_metal_decode_runtime_invalidate_dense_qkv_pack_slot(runtime, entry->slots[i]);
+        termite_metal_decode_runtime_invalidate_dense_pair_pack_slot(runtime, entry->slots[i]);
+    }
+    antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)entry->weight, entry, true);
+    antfly_metal_packed_owner_tag_set((__bridge id<MTLBuffer>)entry->bias, entry, true);
+    return 0;
+}
+
 static int termite_metal_decode_runtime_ensure_dense_qkv_packed_weight(
     termite_metal_decode_runtime *runtime,
     id<MTLCommandBuffer> command_buffer,
@@ -20649,8 +20994,11 @@ static int termite_metal_decode_runtime_ensure_dense_qkv_packed_weight(
         runtime->dense_qkv_packed_q_out_dims[q_slot] == q_out_dim &&
         runtime->dense_qkv_packed_kv_out_dims[q_slot] == kv_out_dim)
     {
-        return 0;
+        const int use = antfly_metal_prepare_packed_root_use(runtime, runtime->dense_qkv_packed_weight_buffers[q_slot], 1);
+        if (use < 0) return -20;
+        if (use > 0) return 0;
     }
+    if (antfly_metal_prepare_packed_root_use(runtime, runtime->dense_qkv_packed_weight_buffers[q_slot], 2) < 0) return -20;
     size_t cached_bytes = 0;
     for (size_t slot = 0; slot < TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY; ++slot) {
         if (slot == q_slot) continue;
@@ -20667,32 +21015,11 @@ static int termite_metal_decode_runtime_ensure_dense_qkv_packed_weight(
     id<MTLBuffer> packed = antfly_observe_metal_buffer([runtime->device newBufferWithLength:packed_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
     id<MTLBuffer> packed_bias = antfly_observe_metal_buffer([runtime->device newBufferWithLength:packed_bias_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
     if (packed == nil || packed_bias == nil) return -2;
-    id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
-    if (blit == nil) return -3;
-    [blit copyFromBuffer:runtime->linear_weight_buffers[q_slot] sourceOffset:0 toBuffer:packed destinationOffset:0 size:q_bytes];
-    [blit copyFromBuffer:runtime->linear_weight_buffers[k_slot] sourceOffset:0 toBuffer:packed destinationOffset:q_bytes size:kv_bytes];
-    [blit copyFromBuffer:runtime->linear_weight_buffers[v_slot] sourceOffset:0 toBuffer:packed destinationOffset:q_bytes + kv_bytes size:kv_bytes];
-    [blit copyFromBuffer:runtime->linear_bias_buffers[q_slot] sourceOffset:0 toBuffer:packed_bias destinationOffset:0 size:q_bias_bytes];
-    [blit copyFromBuffer:runtime->linear_bias_buffers[k_slot] sourceOffset:0 toBuffer:packed_bias destinationOffset:q_bias_bytes size:kv_bias_bytes];
-    [blit copyFromBuffer:runtime->linear_bias_buffers[v_slot] sourceOffset:0 toBuffer:packed_bias destinationOffset:q_bias_bytes + kv_bias_bytes size:kv_bias_bytes];
-    [blit endEncoding];
+    const size_t slots[] = { q_slot, k_slot, v_slot };
+    const size_t widths[] = { q_out_dim, kv_out_dim, kv_out_dim };
+    if (antfly_metal_encode_projection_pack(runtime, command_buffer, 3, slots, in_dim, widths, weight_element_bytes, packed, packed_bias) != 0) return -3;
 
-    runtime->dense_qkv_packed_weight_buffers[q_slot] = packed;
-    runtime->dense_qkv_packed_bias_buffers[q_slot] = packed_bias;
-    runtime->dense_qkv_packed_mps_mm[q_slot] = nil;
-    runtime->dense_qkv_packed_mps_left[q_slot] = nil;
-    runtime->dense_qkv_packed_mps_right[q_slot] = nil;
-    runtime->dense_qkv_packed_mps_result[q_slot] = nil;
-    runtime->dense_qkv_packed_mps_left_buffers[q_slot] = nil;
-    runtime->dense_qkv_packed_mps_result_buffers[q_slot] = nil;
-    runtime->dense_qkv_packed_mps_left_offsets[q_slot] = 0;
-    runtime->dense_qkv_packed_mps_result_offsets[q_slot] = 0;
-    runtime->dense_qkv_packed_k_slots[q_slot] = k_slot;
-    runtime->dense_qkv_packed_v_slots[q_slot] = v_slot;
-    runtime->dense_qkv_packed_in_dims[q_slot] = in_dim;
-    runtime->dense_qkv_packed_q_out_dims[q_slot] = q_out_dim;
-    runtime->dense_qkv_packed_kv_out_dims[q_slot] = kv_out_dim;
-    runtime->dense_qkv_packed_mps_rows[q_slot] = 0;
+    antfly_metal_publish_projection_pack(runtime, 3, slots, in_dim, widths, packed, packed_bias);
     return 0;
 }
 
@@ -20737,10 +21064,11 @@ static int termite_metal_decode_runtime_ensure_dense_pair_packed_weight(
     const uint8_t weight_dtype = runtime->linear_weight_dtypes[a_slot];
     if (runtime->linear_weight_dtypes[b_slot] != weight_dtype) return -1;
     const size_t weight_element_bytes = weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F16 ? sizeof(uint16_t) : sizeof(float);
-    const size_t projection_bytes = out_dim * in_dim * weight_element_bytes;
-    const size_t packed_bytes = projection_bytes * 2;
-    const size_t bias_bytes = out_dim * sizeof(float);
-    const size_t packed_bias_bytes = bias_bytes * 2;
+    size_t projection_bytes, packed_bytes, bias_bytes, packed_bias_bytes;
+    if (!termite_metal_size_mul3(out_dim, in_dim, weight_element_bytes, &projection_bytes) ||
+        !termite_metal_size_mul(projection_bytes, 2, &packed_bytes) ||
+        !termite_metal_size_mul(out_dim, sizeof(float), &bias_bytes) ||
+        !termite_metal_size_mul(bias_bytes, 2, &packed_bias_bytes)) return -1;
     if (runtime->dense_pair_packed_weight_buffers[a_slot] != nil &&
         runtime->dense_pair_packed_weight_buffers[a_slot].length >= packed_bytes &&
         runtime->dense_pair_packed_bias_buffers[a_slot] != nil &&
@@ -20749,26 +21077,57 @@ static int termite_metal_decode_runtime_ensure_dense_pair_packed_weight(
         runtime->dense_pair_packed_in_dims[a_slot] == in_dim &&
         runtime->dense_pair_packed_out_dims[a_slot] == out_dim)
     {
-        return 0;
+        const int use = antfly_metal_prepare_packed_root_use(runtime, runtime->dense_pair_packed_weight_buffers[a_slot], 1);
+        if (use < 0) return -20;
+        if (use > 0) return 0;
     }
+    if (antfly_metal_prepare_packed_root_use(runtime, runtime->dense_pair_packed_weight_buffers[a_slot], 2) < 0) return -20;
     id<MTLBuffer> packed = antfly_observe_metal_buffer([runtime->device newBufferWithLength:packed_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
     id<MTLBuffer> packed_bias = antfly_observe_metal_buffer([runtime->device newBufferWithLength:packed_bias_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
     if (packed == nil || packed_bias == nil) return -2;
-    id<MTLBlitCommandEncoder> blit = termite_metal_tracked_blit_command_encoder(command_buffer);
-    if (blit == nil) return -3;
-    [blit copyFromBuffer:runtime->linear_weight_buffers[a_slot] sourceOffset:0 toBuffer:packed destinationOffset:0 size:projection_bytes];
-    [blit copyFromBuffer:runtime->linear_weight_buffers[b_slot] sourceOffset:0 toBuffer:packed destinationOffset:projection_bytes size:projection_bytes];
-    [blit copyFromBuffer:runtime->linear_bias_buffers[a_slot] sourceOffset:0 toBuffer:packed_bias destinationOffset:0 size:bias_bytes];
-    [blit copyFromBuffer:runtime->linear_bias_buffers[b_slot] sourceOffset:0 toBuffer:packed_bias destinationOffset:bias_bytes size:bias_bytes];
-    [blit endEncoding];
+    const size_t slots[] = { a_slot, b_slot };
+    const size_t widths[] = { out_dim, out_dim };
+    if (antfly_metal_encode_projection_pack(runtime, command_buffer, 2, slots, in_dim, widths, weight_element_bytes, packed, packed_bias) != 0) return -3;
 
-    runtime->dense_pair_packed_weight_buffers[a_slot] = packed;
-    runtime->dense_pair_packed_bias_buffers[a_slot] = packed_bias;
-    runtime->dense_pair_packed_mps_mm[a_slot] = nil;
-    runtime->dense_pair_packed_b_slots[a_slot] = b_slot;
-    runtime->dense_pair_packed_in_dims[a_slot] = in_dim;
-    runtime->dense_pair_packed_out_dims[a_slot] = out_dim;
-    runtime->dense_pair_packed_mps_rows[a_slot] = 0;
+    antfly_metal_publish_projection_pack(runtime, 2, slots, in_dim, widths, packed, packed_bias);
+    return 0;
+}
+
+// Missing current-B evidence never authorizes reading/dropping a charged
+// pack to make room for raw work. Use the original packing/launch schedule in
+// temporary, frame-retained legacy buffers and leave charged cache roots alone.
+static int antfly_metal_acquire_direct_projection_pack(termite_metal_decode_runtime *runtime,
+    id<MTLCommandBuffer> cb, size_t count, const size_t *slots, size_t width,
+    const size_t *widths, id<MTLBuffer> *weight_out, id<MTLBuffer> *bias_out) {
+    id<MTLBuffer> old = count == 2 ? runtime->dense_pair_packed_weight_buffers[slots[0]] : runtime->dense_qkv_packed_weight_buffers[slots[0]];
+    const int use = antfly_metal_prepare_packed_root_use(runtime, old, 1);
+    if (use < 0) return -20;
+    id<MTLBuffer> weight, bias;
+    if (use == 0) {
+        size_t weight_bytes = 0, bias_bytes = 0;
+        for (size_t i = 0; i < count; ++i) {
+            size_t w, b;
+            if (!termite_metal_size_mul3(width, widths[i], sizeof(float), &w) ||
+                !termite_metal_size_mul(widths[i], sizeof(float), &b) ||
+                !termite_metal_size_add(weight_bytes, w, &weight_bytes) ||
+                !termite_metal_size_add(bias_bytes, b, &bias_bytes)) return -1;
+        }
+        weight = antfly_observe_metal_buffer([runtime->device newBufferWithLength:weight_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        bias = antfly_observe_metal_buffer([runtime->device newBufferWithLength:bias_bytes options:MTLResourceStorageModePrivate], ANTFLY_BUFFER_OWNED);
+        if (weight == nil || bias == nil || antfly_metal_encode_projection_pack(runtime, cb, count, slots, width, widths, sizeof(float), weight, bias) != 0) return -2;
+    } else if (count == 2) {
+        if (termite_metal_decode_runtime_ensure_dense_pair_packed_weight(runtime, cb, slots[0], slots[1], width, widths[0]) != 0) return -2;
+        weight = runtime->dense_pair_packed_weight_buffers[slots[0]];
+        bias = runtime->dense_pair_packed_bias_buffers[slots[0]];
+    } else {
+        if (termite_metal_decode_runtime_ensure_dense_qkv_packed_weight(runtime, cb, slots[0], slots[1], slots[2], width, widths[0], widths[1]) != 0) return -2;
+        weight = runtime->dense_qkv_packed_weight_buffers[slots[0]];
+        bias = runtime->dense_qkv_packed_bias_buffers[slots[0]];
+    }
+    if (termite_metal_decode_runtime_retain_frame_resource(runtime, weight) != 0 ||
+        termite_metal_decode_runtime_retain_frame_resource(runtime, bias) != 0) return -3;
+    *weight_out = weight;
+    *bias_out = bias;
     return 0;
 }
 
@@ -21043,6 +21402,7 @@ int termite_metal_decode_runtime_clear_linear_slot(termite_metal_decode_runtime 
 
 
     termite_metal_ocr_residency_track(runtime,slot,nil);
+    if (antfly_metal_prepare_packed_slot_mutation(runtime, slot) != 0) return -20;
     antfly_metal_binding_generation_advance(runtime,1,slot);
     runtime->linear_weight_buffers[slot] = nil;
     antfly_metal_binding_generation_advance(runtime,1,slot);
@@ -38882,6 +39242,7 @@ static int termite_metal_decode_runtime_prepare_linear_storage(
         if (bias_buffer == nil) return -4;
         // Publish only after both allocations succeed. Failed replacement
         // leaves the old slot and its cached matrix views intact.
+        if (antfly_metal_prepare_packed_slot_mutation(runtime, slot) != 0) return -20;
         antfly_metal_binding_generation_advance(runtime,1,slot);
         runtime->linear_weight_buffers[slot] = weight_buffer;
         termite_metal_ocr_residency_track(runtime,slot,weight_buffer);
@@ -39032,6 +39393,7 @@ int termite_metal_decode_runtime_prepare_linear_f16(
         id<MTLBuffer> weight_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight, expected_weight_bytes);
         id<MTLBuffer> bias_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bias_bytes);
         if (weight_buffer == nil || bias_buffer == nil) return -5;
+        if (antfly_metal_prepare_packed_slot_mutation(runtime, slot) != 0) return -20;
         antfly_metal_binding_generation_advance(runtime,1,slot);
         runtime->linear_weight_buffers[slot] = weight_buffer;
         termite_metal_ocr_residency_track(runtime,slot,weight_buffer);
@@ -39072,6 +39434,7 @@ int termite_metal_decode_runtime_prepare_linear_bf16(
         id<MTLBuffer> weight_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, weight, expected_weight_bytes);
         id<MTLBuffer> bias_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bias_bytes);
         if (weight_buffer == nil || bias_buffer == nil) return -5;
+        if (antfly_metal_prepare_packed_slot_mutation(runtime, slot) != 0) return -20;
         antfly_metal_binding_generation_advance(runtime,1,slot);
         runtime->linear_weight_buffers[slot] = weight_buffer;
         termite_metal_ocr_residency_track(runtime,slot,weight_buffer);
@@ -39117,6 +39480,7 @@ int termite_metal_decode_runtime_prepare_linear_bf16_no_copy(
         if (weight_buffer == nil) return -5;
         id<MTLBuffer> bias_buffer = termite_metal_make_private_buffer_with_bytes(runtime->device, runtime->queue, bias, bias_bytes);
         if (bias_buffer == nil) return -6;
+        if (antfly_metal_prepare_packed_slot_mutation(runtime, slot) != 0) return -20;
         antfly_metal_binding_generation_advance(runtime,1,slot);
         runtime->linear_weight_buffers[slot] = weight_buffer;
         termite_metal_ocr_residency_track(runtime,slot,weight_buffer);
@@ -45802,7 +46166,8 @@ static int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_dev
     void *assigned_v_handle,
     size_t assigned_v_offset,
     void *assigned_packed_handle,
-    size_t assigned_packed_offset
+    size_t assigned_packed_offset,
+    void *immutable_pack
 ) {
     const bool assigned = assigned_q_handle != NULL || assigned_k_handle != NULL || assigned_v_handle != NULL || assigned_packed_handle != NULL;
     if (assigned && (assigned_q_handle == NULL || assigned_k_handle == NULL || assigned_v_handle == NULL || assigned_packed_handle == NULL)) return -1;
@@ -45827,6 +46192,9 @@ static int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_dev
         return -6;
     }
     const bool direct_packed_dense = direct_packed_dense_requested && weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32;
+    AntflyMetalPackedProjection *entry = immutable_pack;
+    if (entry != NULL && (!assigned || !direct_packed_dense || !antfly_metal_packed_projection_matches(runtime, immutable_pack) ||
+        entry->count != 3 || entry->width != in_dim || entry->slots[0] != q_slot || entry->slots[1] != k_slot || entry->slots[2] != v_slot || entry->widths[0] != q_out_dim || entry->widths[1] != kv_out_dim || entry->widths[2] != kv_out_dim)) return -19;
     // A planned encoder can be closed before the MPS transition below. Rejecting
     // it here makes GLiNER abandon the whole fused DeBERTa layer instead of using
     // its already-prepared F16 QKV mirrors.
@@ -45880,21 +46248,24 @@ static int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_dev
                 if (termite_metal_decode_runtime_retain_frame_resource(runtime, ranges[i].buffer) != 0) return -18;
             }
         }
+        if (entry && ((__bridge id<MTLBuffer>)entry->weight == q_output_buffer || (__bridge id<MTLBuffer>)entry->bias == q_output_buffer ||
+            (__bridge id<MTLBuffer>)entry->weight == k_output_buffer || (__bridge id<MTLBuffer>)entry->bias == k_output_buffer ||
+            (__bridge id<MTLBuffer>)entry->weight == v_output_buffer || (__bridge id<MTLBuffer>)entry->bias == v_output_buffer ||
+            (__bridge id<MTLBuffer>)entry->weight == packed_output_buffer || (__bridge id<MTLBuffer>)entry->bias == packed_output_buffer)) return -19;
         if (!assigned && termite_metal_decode_runtime_retain_frame_resource(runtime, input_buffer) != 0) return -14;
         if (direct_packed_dense) {
             if (runtime->linear_multi_row_pipeline == nil ||
                 runtime->linear_multi_row_reduce_pipeline == nil ||
                 runtime->linear_multi_row_tiled_f32_pipeline == nil ||
                 runtime->dense_qkv_split_pipeline == nil) return -15;
-            if (termite_metal_decode_runtime_ensure_dense_qkv_packed_weight(
-                    runtime,
-                    command_buffer,
-                    q_slot,
-                    k_slot,
-                    v_slot,
-                    in_dim,
-                    q_out_dim,
-                    kv_out_dim) != 0) return -15;
+            id<MTLBuffer> packed_weight = entry ? (__bridge id<MTLBuffer>)entry->weight : nil;
+            id<MTLBuffer> packed_bias = entry ? (__bridge id<MTLBuffer>)entry->bias : nil;
+            if (entry == NULL) {
+                const size_t slots[] = { q_slot, k_slot, v_slot };
+                const size_t widths[] = { q_out_dim, kv_out_dim, kv_out_dim };
+                if (antfly_metal_acquire_direct_projection_pack(runtime, command_buffer, 3, slots, in_dim, widths, &packed_weight, &packed_bias) != 0) return -20;
+            } else if (termite_metal_decode_runtime_retain_frame_resource(runtime, packed_weight) != 0 ||
+                termite_metal_decode_runtime_retain_frame_resource(runtime, packed_bias) != 0) return -19;
 	            termite_metal_linear_params linear_params = {
 	                .rows = (uint32_t)rows,
 	                .in_dim = (uint32_t)in_dim,
@@ -45910,8 +46281,8 @@ static int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_dev
                     input_buffer,
                     input_offset,
                     input_bytes,
-                    runtime->dense_qkv_packed_weight_buffers[q_slot],
-                    runtime->dense_qkv_packed_bias_buffers[q_slot],
+                    packed_weight,
+                    packed_bias,
                     packed_output_buffer, packed_output_offset,
                     packed_output_bytes,
                     -16) != 0) return -16;
@@ -45931,7 +46302,7 @@ static int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_dev
                 false,
                 false);
             antfly_metal_set_compute_pipeline(linear_encoder, (direct_linear_pipeline));
-            termite_metal_bind_four_buffers(linear_encoder, input_buffer, input_offset, runtime->dense_qkv_packed_weight_buffers[q_slot], 0, runtime->dense_qkv_packed_bias_buffers[q_slot], 0, packed_output_buffer, packed_output_offset, &linear_params, sizeof(linear_params));
+            termite_metal_bind_four_buffers(linear_encoder, input_buffer, input_offset, packed_weight, 0, packed_bias, 0, packed_output_buffer, packed_output_offset, &linear_params, sizeof(linear_params));
 	            if (use_tiled32_m16) {
 	                antfly_metal_dispatch_threadgroups(linear_encoder, MTLSizeMake((total_out_dim + 31u) / 32u, (rows + 15u) / 16u, 1), MTLSizeMake(8u, 16u, 1));
 	            } else if (use_tiled32) {
@@ -46063,7 +46434,7 @@ int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_device(
     void **k_output_handle,
     void **v_output_handle
 ) {
-    return termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_device_with_destinations(runtime, q_slot, k_slot, v_slot, input_handle, input_offset, rows, in_dim, q_out_dim, kv_out_dim, q_output_handle, k_output_handle, v_output_handle, NULL, 0, NULL, 0, NULL, 0, NULL, 0);
+    return termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_device_with_destinations(runtime, q_slot, k_slot, v_slot, input_handle, input_offset, rows, in_dim, q_out_dim, kv_out_dim, q_output_handle, k_output_handle, v_output_handle, NULL, 0, NULL, 0, NULL, 0, NULL, 0, NULL);
 }
 
 int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_assigned_device(
@@ -46089,7 +46460,7 @@ int termite_metal_decode_runtime_apply_dense_linear_qkv_slots_assigned_device(
     void *q_output_handle = NULL;
     void *k_output_handle = NULL;
     void *v_output_handle = NULL;
-    return termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_device_with_destinations(runtime, q_slot, k_slot, v_slot, input_handle, input_offset, rows, in_dim, q_out_dim, kv_out_dim, &q_output_handle, &k_output_handle, &v_output_handle, assigned_q_handle, assigned_q_offset, assigned_k_handle, assigned_k_offset, assigned_v_handle, assigned_v_offset, assigned_packed_handle, assigned_packed_offset);
+    return termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_device_with_destinations(runtime, q_slot, k_slot, v_slot, input_handle, input_offset, rows, in_dim, q_out_dim, kv_out_dim, &q_output_handle, &k_output_handle, &v_output_handle, assigned_q_handle, assigned_q_offset, assigned_k_handle, assigned_k_offset, assigned_v_handle, assigned_v_offset, assigned_packed_handle, assigned_packed_offset, NULL);
 }
 
 static int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device_with_destinations(
@@ -46108,7 +46479,8 @@ static int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_de
     void *assigned_b_handle,
     size_t assigned_b_offset,
     void *assigned_packed_handle,
-    size_t assigned_packed_offset
+    size_t assigned_packed_offset,
+    void *immutable_pack
 ) {
     const bool assigned = assigned_a_handle != NULL || assigned_b_handle != NULL || assigned_packed_handle != NULL;
     if (assigned && (assigned_a_handle == NULL || assigned_b_handle == NULL || assigned_packed_handle == NULL)) return -1;
@@ -46130,6 +46502,9 @@ static int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_de
         return -6;
     }
     const bool direct_packed_dense = termite_metal_direct_packed_dense_enabled() && weight_dtype == TERMITE_METAL_DENSE_LINEAR_DTYPE_F32;
+    AntflyMetalPackedProjection *entry = immutable_pack;
+    if (entry != NULL && (!assigned || !direct_packed_dense || !antfly_metal_packed_projection_matches(runtime, immutable_pack) ||
+        entry->count != 2 || entry->width != in_dim || entry->slots[0] != a_slot || entry->slots[1] != b_slot || entry->widths[0] != out_dim || entry->widths[1] != out_dim)) return -19;
     if (runtime->active_planned_compute_encoder != nil &&
         !direct_packed_dense &&
         weight_dtype != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32_MPS) return -2;
@@ -46170,19 +46545,23 @@ static int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_de
                 if (termite_metal_decode_runtime_retain_frame_resource(runtime, ranges[i].buffer) != 0) return -18;
             }
         }
-	        if (!assigned && termite_metal_decode_runtime_retain_frame_resource(runtime, input_buffer) != 0) return -13;
+	        if (entry && ((__bridge id<MTLBuffer>)entry->weight == a_output_buffer || (__bridge id<MTLBuffer>)entry->bias == a_output_buffer ||
+            (__bridge id<MTLBuffer>)entry->weight == b_output_buffer || (__bridge id<MTLBuffer>)entry->bias == b_output_buffer ||
+            (__bridge id<MTLBuffer>)entry->weight == packed_output_buffer || (__bridge id<MTLBuffer>)entry->bias == packed_output_buffer)) return -19;
+        if (!assigned && termite_metal_decode_runtime_retain_frame_resource(runtime, input_buffer) != 0) return -13;
 	        if (direct_packed_dense) {
 	            if (runtime->linear_multi_row_pipeline == nil ||
 	                runtime->linear_multi_row_reduce_pipeline == nil ||
 	                runtime->linear_multi_row_tiled_f32_pipeline == nil ||
 	                runtime->dense_pair_split_pipeline == nil) return -14;
-	            if (termite_metal_decode_runtime_ensure_dense_pair_packed_weight(
-	                    runtime,
-	                    command_buffer,
-                    a_slot,
-                    b_slot,
-                    in_dim,
-                    out_dim) != 0) return -14;
+	            id<MTLBuffer> packed_weight = entry ? (__bridge id<MTLBuffer>)entry->weight : nil;
+            id<MTLBuffer> packed_bias = entry ? (__bridge id<MTLBuffer>)entry->bias : nil;
+            if (entry == NULL) {
+                const size_t slots[] = { a_slot, b_slot };
+                const size_t widths[] = { out_dim, out_dim };
+                if (antfly_metal_acquire_direct_projection_pack(runtime, command_buffer, 2, slots, in_dim, widths, &packed_weight, &packed_bias) != 0) return -20;
+            } else if (termite_metal_decode_runtime_retain_frame_resource(runtime, packed_weight) != 0 ||
+                termite_metal_decode_runtime_retain_frame_resource(runtime, packed_bias) != 0) return -19;
             termite_metal_linear_params linear_params = {
                 .rows = (uint32_t)rows,
                 .in_dim = (uint32_t)in_dim,
@@ -46198,8 +46577,8 @@ static int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_de
                     input_buffer,
                     input_offset,
                     input_bytes,
-                    runtime->dense_pair_packed_weight_buffers[a_slot],
-                    runtime->dense_pair_packed_bias_buffers[a_slot],
+                    packed_weight,
+                    packed_bias,
                     packed_output_buffer, packed_output_offset,
                     packed_output_bytes,
                     -15) != 0) return -15;
@@ -46219,7 +46598,7 @@ static int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_de
                 false,
                 false);
             antfly_metal_set_compute_pipeline(linear_encoder, (direct_linear_pipeline));
-            termite_metal_bind_four_buffers(linear_encoder, input_buffer, input_offset, runtime->dense_pair_packed_weight_buffers[a_slot], 0, runtime->dense_pair_packed_bias_buffers[a_slot], 0, packed_output_buffer, packed_output_offset, &linear_params, sizeof(linear_params));
+            termite_metal_bind_four_buffers(linear_encoder, input_buffer, input_offset, packed_weight, 0, packed_bias, 0, packed_output_buffer, packed_output_offset, &linear_params, sizeof(linear_params));
 	            if (use_tiled32_m16) {
 	                antfly_metal_dispatch_threadgroups(linear_encoder, MTLSizeMake((total_out_dim + 31u) / 32u, (rows + 15u) / 16u, 1), MTLSizeMake(8u, 16u, 1));
 	            } else if (use_tiled32) {
@@ -46326,7 +46705,7 @@ int termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device(
     void **a_output_handle,
     void **b_output_handle
 ) {
-    return termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device_with_destinations(runtime, a_slot, b_slot, input_handle, input_offset, rows, in_dim, out_dim, a_output_handle, b_output_handle, NULL, 0, NULL, 0, NULL, 0);
+    return termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device_with_destinations(runtime, a_slot, b_slot, input_handle, input_offset, rows, in_dim, out_dim, a_output_handle, b_output_handle, NULL, 0, NULL, 0, NULL, 0, NULL);
 }
 
 int termite_metal_decode_runtime_apply_dense_linear_pair_slots_assigned_device(
@@ -46347,7 +46726,59 @@ int termite_metal_decode_runtime_apply_dense_linear_pair_slots_assigned_device(
 ) {
     void *a_output_handle = NULL;
     void *b_output_handle = NULL;
-    return termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device_with_destinations(runtime, a_slot, b_slot, input_handle, input_offset, rows, in_dim, out_dim, &a_output_handle, &b_output_handle, assigned_a_handle, assigned_a_offset, assigned_b_handle, assigned_b_offset, assigned_packed_handle, assigned_packed_offset);
+    return termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device_with_destinations(runtime, a_slot, b_slot, input_handle, input_offset, rows, in_dim, out_dim, &a_output_handle, &b_output_handle, assigned_a_handle, assigned_a_offset, assigned_b_handle, assigned_b_offset, assigned_packed_handle, assigned_packed_offset, NULL);
+}
+
+// Metadata only: preserve the original direct-F32 eligibility and QKV
+// packing-cache policy before independent cold funding is attempted.
+int antfly_metal_projection_pack_available(termite_metal_decode_runtime *runtime,
+    size_t count, const size_t *slots, size_t width, const size_t *widths) {
+    if (!runtime || !slots || !widths || (count != 2 && count != 3) ||
+        !termite_metal_direct_packed_dense_enabled() || width == 0 || width > UINT32_MAX) return 0;
+    if (runtime->linear_multi_row_pipeline == nil || runtime->linear_multi_row_reduce_pipeline == nil ||
+        runtime->linear_multi_row_tiled_f32_pipeline == nil ||
+        (count == 2 && (runtime->dense_pair_split_pipeline == nil || runtime->dense_pair_split_bias_pipeline == nil)) ||
+        (count == 3 && (runtime->dense_qkv_split_pipeline == nil || runtime->dense_qkv_split_bias_pipeline == nil))) return 0;
+    size_t bytes = 0;
+    for (size_t i = 0; i < count; ++i) {
+        size_t weight_bytes, bias_bytes;
+        if (!widths[i] || widths[i] > UINT32_MAX || !antfly_metal_linear_slot_prepared(runtime, slots[i]) ||
+            runtime->linear_weight_dtypes[slots[i]] != TERMITE_METAL_DENSE_LINEAR_DTYPE_F32 ||
+            runtime->linear_in_dims[slots[i]] != width || runtime->linear_out_dims[slots[i]] != widths[i] ||
+            !termite_metal_size_mul3(width, widths[i], sizeof(float), &weight_bytes) ||
+            !termite_metal_size_mul(widths[i], sizeof(float), &bias_bytes) ||
+            !termite_metal_size_add(bytes, weight_bytes, &bytes) || !termite_metal_size_add(bytes, bias_bytes, &bytes)) return 0;
+        for (size_t j = 0; j < i; ++j) if (slots[i] == slots[j]) return 0;
+    }
+    if (count == 2) return widths[0] == widths[1];
+    if (widths[1] != widths[2] || slots[0] >= TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY) return 0;
+    for (size_t slot = 0; slot < TERMITE_METAL_DENSE_QKV_PACK_CACHE_CAPACITY; ++slot) {
+        if (slot == slots[0]) continue;
+        if (!termite_metal_size_add(bytes, runtime->dense_qkv_packed_weight_buffers[slot].length, &bytes) ||
+            !termite_metal_size_add(bytes, runtime->dense_qkv_packed_bias_buffers[slot].length, &bytes)) return 0;
+    }
+    return bytes <= termite_metal_dense_qkv_pack_cache_max_bytes();
+}
+
+// Exact immutable roots replace only the mutable packing lookup. Original
+// direct GEMM, tiled/reduce selection, bias order and split remain shared.
+int antfly_metal_apply_packed_projection_assigned(
+    termite_metal_decode_runtime *runtime, void *handle, void *input_handle,
+    size_t input_offset, size_t rows, void *const *outputs,
+    const size_t *offsets, void *scratch, size_t scratch_offset
+) {
+    if (!outputs || !offsets || !scratch || rows <= 1 ||
+        !termite_metal_direct_packed_dense_enabled() || !antfly_metal_packed_projection_matches(runtime, handle)) return -1;
+    AntflyMetalPackedProjection *entry = handle;
+    if (antfly_metal_prepare_packed_entry_use(runtime, entry, 1) <= 0) return -20;
+    void *a = NULL, *b = NULL, *c = NULL;
+    if (entry->count == 2)
+        return termite_metal_decode_runtime_apply_dense_linear_pair_slots_scratch_device_with_destinations(runtime,
+            entry->slots[0], entry->slots[1], input_handle, input_offset, rows, entry->width, entry->widths[0],
+            &a, &b, outputs[0], offsets[0], outputs[1], offsets[1], scratch, scratch_offset, handle);
+    return termite_metal_decode_runtime_apply_dense_linear_qkv_slots_scratch_device_with_destinations(runtime,
+        entry->slots[0], entry->slots[1], entry->slots[2], input_handle, input_offset, rows, entry->width, entry->widths[0], entry->widths[1],
+        &a, &b, &c, outputs[0], offsets[0], outputs[1], offsets[1], outputs[2], offsets[2], scratch, scratch_offset, handle);
 }
 
 static int termite_metal_encode_quant_q_plus_kv_pair_descriptors(

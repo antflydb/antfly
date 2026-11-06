@@ -117,6 +117,9 @@ pub const BackendContext = union(enum) {
     }
 
     pub fn deinit(self: *BackendContext, allocator: std.mem.Allocator) void {
+        self.deinitWithCleanup(allocator, .{ .outside_execution = true });
+    }
+    pub fn deinitWithCleanup(self: *BackendContext, allocator: std.mem.Allocator, current: @import("../execution/cleanup_context.zig").Context) void {
         switch (self.*) {
             .cuda => |compute| {
                 if (comptime build_options.enable_cuda) compute.deinit() else unreachable;
@@ -134,12 +137,12 @@ pub const BackendContext = union(enum) {
             },
             .metal_hosted => |*ctx| {
                 if (comptime build_options.enable_metal) {
-                    ctx.compute.computeBackend().deinit();
+                    ctx.compute.deinitWithCleanup(current);
                 } else {
                     unreachable;
                 }
                 allocator.destroy(ctx.compute);
-                deinitGpuHostedWeightStore(allocator, ctx.weight_store, .metal);
+                deinitGpuHostedWeightStoreWithCleanup(allocator, ctx.weight_store, .metal, current);
                 allocator.destroy(ctx.weight_store);
             },
             .wasm => |*ctx| {
@@ -278,6 +281,9 @@ pub const SharedBackendContext = struct {
     ctx: BackendContext,
     backend: ops_mod.ComputeBackend,
     ref_count: std.atomic.Value(usize) = std.atomic.Value(usize).init(1),
+    /// Published only after stable admission metadata is fully initialized.
+    /// Readers hold an actual Model/SharedContext pin through their snapshot.
+    managed_metal_cache: std.atomic.Value(?*@import("../runtime/tier/cache.zig").SharedCache) = .init(null),
 
     pub fn init(allocator: std.mem.Allocator, requested: BackendType, io: ?std.Io) !*SharedBackendContext {
         return initWithOptions(allocator, requested, io, .{});
@@ -310,10 +316,92 @@ pub const SharedBackendContext = struct {
     }
 
     pub fn release(self: *SharedBackendContext) void {
+        self.releaseWithCleanup(.{ .outside_execution = true });
+    }
+    pub fn releaseWithCleanup(self: *SharedBackendContext, current: @import("../execution/cleanup_context.zig").Context) void {
         if (self.ref_count.fetchSub(1, .acq_rel) != 1) return;
         self.operations.assertIdle();
-        self.ctx.deinit(self.allocator);
+        // Last SharedContext reference: no pinned reader can remain here.
+        self.managed_metal_cache.store(null, .release);
+        self.ctx.deinitWithCleanup(self.allocator, current);
         self.allocator.destroy(self);
+    }
+
+    /// Actual provider-owned cache, shared with every shape specialization.
+    /// A copied backend header cannot grant model/cache authority.
+    pub fn managedMetalCache(self: *SharedBackendContext) !?*@import("../runtime/tier/cache.zig").SharedCache {
+        if (comptime !build_options.enable_metal) return null;
+        const metal = switch (self.ctx) {
+            .metal_hosted => |value| value,
+            else => return null,
+        };
+        const actual = metal.compute.computeBackend();
+        if (self.backend.ptr != actual.ptr or self.backend.vtable != actual.vtable) return error.ForeignManagedCacheBackend;
+        return self.managed_metal_cache.load(.acquire);
+    }
+    pub fn configureManagedMetalCache(self: *SharedBackendContext, controller: *@import("../runtime/tier/memory.zig").AdmissionController, backend_class: @import("../runtime/tier/memory.zig").BackendClass, limits: @import("../runtime/tier/memory.zig").Limits, resident: @import("../runtime/tier/memory.zig").AdmissionAmounts) !bool {
+        if (comptime !build_options.enable_metal) return false;
+        const metal = switch (self.ctx) {
+            .metal_hosted => |value| value,
+            else => return false,
+        };
+        const actual = metal.compute.computeBackend();
+        if (self.backend.ptr != actual.ptr or self.backend.vtable != actual.vtable) return error.ForeignManagedCacheBackend;
+        if (backend_class != .gpu) return false;
+        if (self.managed_metal_cache.load(.acquire) != null) return true;
+        // Serialize first publication against actual Session numerical entry.
+        // This try-only engine scope precedes residency, never waits for a raw
+        // operation, and establishes no private command buffer or Model gate.
+        var scope = @import("../execution/backend_operation.zig").enter(self.backend, null, null, .managed) catch |err| switch (err) {
+            error.QueueFull, error.UnknownExternalOperationFrame => return true,
+            else => return err,
+        };
+        defer scope.deinitChecked() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        metal.weight_store.prefetch.lock();
+        defer metal.weight_store.prefetch.unlock();
+        // Another loaded component may share this exact provider. Never
+        // replace or reinterpret its already installed cache/policy/Domain.
+        if (metal.weight_store.tier_cache) |*cache| {
+            if (cache.admission) |binding| {
+                // A raw binding does not own process-lifetime retirement
+                // metadata. Leave it on its original compatibility path.
+                if (binding.pure_final_metadata) self.managed_metal_cache.store(cache, .release);
+                return true;
+            }
+            if (cache.host_bytes != 0 or cache.backend_bytes != 0) return true;
+        }
+        const budget = @import("../runtime/tier/cache.zig").Budget{ .host_limit_bytes = limits.host_limit_bytes, .backend_limit_bytes = limits.backend_limit_bytes };
+        if (metal.weight_store.tier_cache == null) metal.weight_store.tier_cache = @import("../runtime/tier/cache.zig").SharedCache.init(budget);
+        const cache = &(metal.weight_store.tier_cache.?);
+        cache.configureHardBudget(budget);
+        try cache.configureManagedAdmissionOutsideExecution(controller, backend_class, limits, .{ .host_limit_bytes = resident.host_weight_bytes, .backend_limit_bytes = resident.backend_weight_bytes });
+        self.managed_metal_cache.store(cache, .release);
+        return true;
+    }
+
+    pub fn installManagedMetalCacheDomain(self: *SharedBackendContext, pin: *const @import("../runtime/tier/admission_domain.zig").Pin) !bool {
+        if (comptime !build_options.enable_metal) return false;
+        if (self.ctx != .metal_hosted) return false;
+        const cache = (try self.managedMetalCache()) orelse return true;
+        // Controller/class/limits are immutable after release publication;
+        // Domain mutation and matching use the binding's own mutex.
+        const binding = cache.admission orelse return false;
+        if (binding.controller != pin.controller() or cache.retirementDomainMatches(pin)) return true;
+        cache.installRetirementDomainOutsideExecution(pin) catch |err| switch (err) {
+            error.ForeignAdmissionDomain => return true, // another actual Domain owns this shared cache
+            else => return err,
+        };
+        return true;
+    }
+    /// Shared components may share the same actual resource Domain. A foreign
+    /// Domain or operator policy keeps compatibility instead of adopting credit.
+    pub fn matchesManagedMetalCache(self: *SharedBackendContext, pin: *const @import("../runtime/tier/admission_domain.zig").Pin, limits: @import("../runtime/tier/memory.zig").Limits) !bool {
+        if (comptime !build_options.enable_metal) return false;
+        const cache = (try self.managedMetalCache()) orelse return false;
+        // Controller/class/limits are immutable after release publication;
+        // Domain mutation and matching use the binding's own mutex.
+        const binding = cache.admission orelse return false;
+        return binding.controller == pin.controller() and binding.backend_class == .gpu and std.meta.eql(binding.limits, limits) and cache.retirementDomainMatches(pin);
     }
 
     pub fn computeBackend(self: *SharedBackendContext) ops_mod.ComputeBackend {
@@ -392,6 +480,9 @@ fn initGpuHostedWeightStore(allocator: std.mem.Allocator, requested: BackendType
 }
 
 fn deinitGpuHostedWeightStore(allocator: std.mem.Allocator, weight_store: *GpuWeightStore, hosted_backend: BackendType) void {
+    deinitGpuHostedWeightStoreWithCleanup(allocator, weight_store, hosted_backend, .{ .outside_execution = true });
+}
+fn deinitGpuHostedWeightStoreWithCleanup(allocator: std.mem.Allocator, weight_store: *GpuWeightStore, hosted_backend: BackendType, current: @import("../execution/cleanup_context.zig").Context) void {
     if (comptime !build_options.enable_metal) {
         return;
     }
@@ -399,13 +490,14 @@ fn deinitGpuHostedWeightStore(allocator: std.mem.Allocator, weight_store: *GpuWe
 
     if (hosted_backend == .metal) {
         if (comptime build_options.enable_metal) {
-            metal_compute_mod.deinitSharedNativeProvider(weight_store);
+            metal_compute_mod.deinitSharedNativeProviderWithCleanup(weight_store, current);
             metal_compute_mod.deinitPackedExpertViews(weight_store, allocator);
             metal_compute_mod.deinitPrefetchQueue(weight_store);
         }
     }
     weight_store.lazy_weights.deinit(allocator);
     if (weight_store.tensor_store) |*store| store.deinit();
+    if (weight_store.tier_cache) |*cache| cache.deinitAdmissionWithCleanup(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
 }
 
 test "backend context native uses native compute backend" {

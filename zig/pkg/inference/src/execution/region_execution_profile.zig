@@ -40,6 +40,9 @@ pub const Claim = struct {
         /// Metadata/reference retirement. Before begin this performs no SDK
         /// work; after finish CB handlers retain independent owner references.
         release: *const fn (*anyopaque) void,
+        /// Only the actual outer profile owner may establish its owned
+        /// operation's current B. Nested scopes continue to confirm exact B.
+        bind_cleanup_epoch: ?*const fn (*anyopaque, *const @import("retirement_sink.zig").Epoch) anyerror!void = null,
     };
     pub fn validate(self: *const Claim, request: Request) !void {
         if (!self.held) return error.RegionExecutionProfileConsumed;
@@ -60,6 +63,10 @@ pub const Claim = struct {
             return err;
         };
         return true;
+    }
+    pub fn bindOwnedCleanupEpoch(self: *Claim, epoch: *const @import("retirement_sink.zig").Epoch) !void {
+        if (!self.held or self.phase != .active) return error.RegionExecutionProfileConsumed;
+        if (self.vtable.bind_cleanup_epoch) |bind| try bind(self.context, epoch);
     }
     pub fn finishSubmission(self: *Claim) !void {
         if (!self.held or self.phase != .active) return error.RegionExecutionProfileConsumed;
@@ -283,4 +290,41 @@ test "Runtime profile finish failure drains the actual numerical output before d
     try std.testing.expectEqual(@as(usize, 1), probe.drains);
     try std.testing.expectEqual(@as(usize, 1), probe.releases);
     try std.testing.expect(!claim.held);
+}
+
+test "execution profile binds current cleanup only through the actual active owner" {
+    const Sink = @import("retirement_sink.zig");
+    const Fixture = struct {
+        calls: usize = 0,
+        epoch_nonce: u64 = 0,
+        fn validate(_: *anyopaque, _: Request) !void {}
+        fn scope(_: *anyopaque) !void {}
+        fn release(_: *anyopaque) void {}
+        fn bind(raw: *anyopaque, epoch: *const Sink.Epoch) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (try epoch.isSealed()) return error.RetirementEpochSealed;
+            self.calls += 1;
+            self.epoch_nonce = epoch.nonce;
+        }
+        const table = Claim.VTable{ .validate = validate, .begin = scope, .finish = scope, .drain = scope, .release = release, .bind_cleanup_epoch = bind };
+    };
+    var graph = @import("ml").graph.Graph.init(std.testing.allocator);
+    defer graph.deinit();
+    var sink = try Sink.Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    var fixture: Fixture = .{};
+    var claim = Claim{ .context = &fixture, .implementation = .{ .context = &fixture, .table = &Fixture.table }, .program = &graph, .profile = .synchronous, .policy_key = 2, .vtable = &Fixture.table };
+    defer claim.deinitChecked() catch unreachable;
+    try std.testing.expectError(error.RegionExecutionProfileConsumed, claim.bindOwnedCleanupEpoch(&epoch));
+    try std.testing.expectEqual(@as(usize, 0), fixture.calls);
+    try std.testing.expect(try claim.ensureScope(.{ .operation = .graph_execution, .implementation = claim.implementation, .program = &graph }));
+    try claim.bindOwnedCleanupEpoch(&epoch);
+    try std.testing.expectEqual(@as(usize, 1), fixture.calls);
+    try std.testing.expectEqual(epoch.nonce, fixture.epoch_nonce);
+    try claim.finishSubmission();
+    try std.testing.expectError(error.RegionExecutionProfileConsumed, claim.bindOwnedCleanupEpoch(&epoch));
 }

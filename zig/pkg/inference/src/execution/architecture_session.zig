@@ -6291,6 +6291,7 @@ pub fn configureSharedCacheAdmissionForSession(
     limits: runtime.tier.memory.Limits,
     resident: runtime.tier.memory.AdmissionAmounts,
 ) !void {
+    if (try @import("../backends/imported_onnx_session.zig").configureManagedCacheAdmission(session, allocator, controller, backend_class, limits, resident)) return;
     if (session.vtable != &arch_vtable) return;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     // Packed Laya trunk entries are charged as KV memory on the device that
@@ -6316,7 +6317,7 @@ pub fn configureSharedCacheAdmissionForSession(
     };
     const cache = tier_cache orelse return;
     cache.configureHardBudget(hard_budget);
-    if (self.backend_type == .native) {
+    if (self.backend_type == .native or self.backend_type == .metal) {
         try cache.configureManagedAdmissionOutsideExecution(controller, backend_class, limits, .{
             .host_limit_bytes = resident.host_weight_bytes,
             .backend_limit_bytes = resident.backend_weight_bytes,
@@ -6340,20 +6341,29 @@ pub fn configureSharedCacheAdmissionForSession(
     }
 }
 
-/// Actual loader cold resource-owner handoff. Full canonical table validation
-/// precedes any cast; the only persistent new value is the real Domain pin.
+/// Actual loader cold resource-owner handoff for canonical Native/Metal caches.
+/// Full canonical table validation precedes any cast. The retained Domain is
+/// provenance only, never permission to grow a cache under numerical ownership.
+/// The historical exported name is retained for existing loader callers.
 pub fn installNativeCacheRetirementDomainForSession(session: Session, pin: *const runtime.tier.admission_domain.Pin) !void {
+    if (try @import("../backends/imported_onnx_session.zig").installCacheRetirementDomain(session, pin)) return;
     if (session.vtable != &arch_vtable) return;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
-    if (self.backend_type != .native) return;
-    if (self.backend_data.native.tier_cache) |*cache| try cache.installRetirementDomainOutsideExecution(pin);
+    switch (self.backend_type) {
+        .native => if (self.backend_data.native.tier_cache) |*cache| try cache.installRetirementDomainOutsideExecution(pin),
+        .metal => if (build_options.enable_metal) {
+            if (gpuBackendData(self).tier_cache) |*cache| try cache.installRetirementDomainOutsideExecution(pin);
+        },
+        else => {},
+    }
 }
 
 /// Exact admission ownership held by a session's tier cache above the model
 /// load lease baseline. This remains separate from the LoadedModel lease so a
 /// cache can grow and evict entries without rewriting model ownership.
-pub fn sharedCacheAdmissionAmounts(session: Session) runtime.tier.memory.AdmissionAmounts {
-    if (session.vtable != &arch_vtable) return .{};
+pub fn sharedCacheAdmissionSnapshot(session: Session) ?runtime.tier.cache.AdmissionSnapshot {
+    if (@import("../backends/imported_onnx_session.zig").managedCacheAdmissionSnapshot(session)) |snapshot| return snapshot;
+    if (session.vtable != &arch_vtable) return null;
     const self: *ArchSession = @ptrCast(@alignCast(session.ptr));
     const tier_cache: ?*runtime.tier.cache.SharedCache = switch (self.backend_type) {
         .native => if (self.backend_data.native.tier_cache) |*cache| cache else null,
@@ -6364,7 +6374,12 @@ pub fn sharedCacheAdmissionAmounts(session: Session) runtime.tier.memory.Admissi
         .pjrt => if (self.backend_data.pjrt.native.tier_cache) |*cache| cache else null,
         .cuda, .wasm => null,
     };
-    return if (tier_cache) |cache| cache.admissionAmounts() else .{};
+    return if (tier_cache) |cache| cache.admissionSnapshot() else null;
+}
+/// Per-session view for compatibility. Aggregates retaining multiple Models
+/// must deduplicate sharedCacheAdmissionSnapshot identities before summing.
+pub fn sharedCacheAdmissionAmounts(session: Session) runtime.tier.memory.AdmissionAmounts {
+    return if (sharedCacheAdmissionSnapshot(session)) |snapshot| snapshot.amounts else .{};
 }
 
 /// Release one backend-owned, unpinned host-cache entry without unloading the

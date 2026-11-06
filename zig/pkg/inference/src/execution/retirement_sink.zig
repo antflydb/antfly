@@ -182,7 +182,22 @@ pub const Epoch = struct {
         _ = try self.validateLocked();
         return .{ .context = record, .nonce = self.nonce, .register = register };
     }
+    /// Intrusive ownership publication which must not run a callback inline
+    /// under the caller's metadata mutex. Sealing and registration are checked
+    /// atomically by this SAME actual epoch owner; existing boundary() retains
+    /// its original completed-epoch immediate cleanup behavior.
+    pub fn boundaryBeforeSeal(self: Epoch) !retirement.Charge.DeferredBoundary {
+        var result = try self.boundary();
+        result.register = registerBeforeSeal;
+        return result;
+    }
+    fn registerBeforeSeal(raw: *anyopaque, nonce: u64, node: *retirement.Node) !void {
+        return registerImpl(raw, nonce, node, false);
+    }
     fn register(raw: *anyopaque, nonce: u64, node: *retirement.Node) !void {
+        return registerImpl(raw, nonce, node, true);
+    }
+    fn registerImpl(raw: *anyopaque, nonce: u64, node: *retirement.Node, allow_sealed: bool) !void {
         const record: *Owner.Record = @ptrCast(@alignCast(raw));
         const owner = record.owner;
         owner.lock();
@@ -201,6 +216,10 @@ pub const Epoch = struct {
             record.tail = node;
             owner.mutex.unlock();
             return;
+        }
+        if (!allow_sealed) {
+            owner.mutex.unlock();
+            return error.RetirementEpochSealed;
         }
         // A callback may release the last external epoch/sink pin or reenter
         // registration. Keep this record and owner alive until it returns.
@@ -609,4 +628,34 @@ test "copied owned baseline identity survives actual sink destruction and addres
     try std.testing.expectEqual(@as(u8, 2), result.preexisting_owned_payloads.count);
     try std.testing.expectEqual(old_identity, result.preexisting_owned_payloads.records[0].identity);
     try std.testing.expectEqual(@as(u64, 17), result.preexisting_owned_payloads.records[0].host_scratch_payload_bytes);
+}
+
+test "pre-seal boundary registration rejects completed epoch without inline callback" {
+    const Probe = struct {
+        calls: usize = 0,
+        fn ended(raw: *anyopaque) callconv(.c) void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            self.calls += 1;
+        }
+    };
+    var sink = try Ref.create();
+    defer sink.release();
+    var guard = try sink.enter();
+    defer guard.finish();
+    var epoch = try guard.retainEpoch();
+    defer epoch.release();
+    const before_seal = try epoch.boundaryBeforeSeal();
+    var probe: Probe = .{};
+    var first = retirement.Node{ .context = &probe, .release_fn = Probe.ended };
+    try before_seal.register(before_seal.context, before_seal.nonce, &first);
+    try std.testing.expectEqual(@as(usize, 0), probe.calls);
+    guard.finish();
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    var rejected = retirement.Node{ .context = &probe, .release_fn = Probe.ended };
+    try std.testing.expectError(error.RetirementEpochSealed, before_seal.register(before_seal.context, before_seal.nonce, &rejected));
+    try std.testing.expectEqual(@as(usize, 1), probe.calls);
+    // Existing completed-boundary contract is unchanged and still immediate.
+    const ordinary = try epoch.boundary();
+    try ordinary.register(ordinary.context, ordinary.nonce, &rejected);
+    try std.testing.expectEqual(@as(usize, 2), probe.calls);
 }

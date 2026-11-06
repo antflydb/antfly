@@ -377,6 +377,40 @@ pub const PreparedCharge = struct {
         self.owner = null;
         return owner;
     }
+    /// One actual cache component already owns its exact quota in the existing
+    /// tier ledger. Move that retained component; never reserve it a second time.
+    pub fn armCacheBacking(self: *PreparedCharge, backing: *?@import("../runtime/tier/cache.zig").PhysicalBacking) !*Charge {
+        const owner = self.owner orelse return error.PreparedChargeAlreadyArmed;
+        const retained = backing.* orelse return error.MissingResourceRetirementLease;
+        const pin = try retained.retainAdmissionDomain();
+        std.debug.assert(owner.quota == .unarmed);
+        owner.quota = .{ .cache_component = .{ retained, null } };
+        owner.domain = pin;
+        backing.* = null;
+        self.owner = null;
+        return owner;
+    }
+
+    /// Host project metadata and backend SDK payload were funded atomically
+    /// in the SAME real cache transaction. Keep both exact components until
+    /// actual SDK death and final current-B retirement, without new quota.
+    pub fn armCacheBackings(self: *PreparedCharge, backings: *?[2]@import("../runtime/tier/cache.zig").PhysicalBacking) !*Charge {
+        const owner = self.owner orelse return error.PreparedChargeAlreadyArmed;
+        const retained = backings.* orelse return error.MissingResourceRetirementLease;
+        if (retained[0].controller() != retained[1].controller()) return error.ForeignAdmissionDomain;
+        const pin = try retained[0].retainAdmissionDomain();
+        errdefer pin.release();
+        const other = try retained[1].retainAdmissionDomain();
+        defer other.release();
+        if (pin.owner != other.owner) return error.ForeignAdmissionDomain;
+        std.debug.assert(owner.quota == .unarmed);
+        owner.quota = .{ .cache_component = .{ retained[0], retained[1] } };
+        owner.domain = pin;
+        backings.* = null;
+        self.owner = null;
+        return owner;
+    }
+
     /// Like arm(), but for an exact independently owned physical partition.
     /// All shell/group/boundary metadata was allocated during cold prepare.
     pub fn armReservation(self: *PreparedCharge, reservation: *?@import("storage_admission.zig").Reservation, domain: *?admission.Pin) !*Charge {
@@ -406,6 +440,7 @@ pub const Charge = struct {
         unarmed,
         run: memory.AdmissionLease,
         storage: @import("storage_admission.zig").Reservation,
+        cache_component: [2]?@import("../runtime/tier/cache.zig").PhysicalBacking,
     },
     domain: ?admission.Pin,
     // Production records/groups always use independent process allocator. The private override
@@ -479,8 +514,20 @@ pub const Charge = struct {
             .unarmed => null,
             .run => |lease| lease.controller,
             .storage => |reservation| reservation.identity.controller,
+            .cache_component => |backings| backings[0].?.controller(),
         };
     }
+    /// Validate both packed roots BEFORE the caller drops either SDK retain.
+    /// This capability is no numerical permission and stores no creation B.
+    pub fn validateCacheCleanup(self: *const Charge, current: @import("cleanup_context.zig").Context) !void {
+        switch (self.quota) {
+            .cache_component => |backings| for (backings) |backing| {
+                if (backing) |value| try value.validateCleanup(current);
+            },
+            else => return error.NotCacheComponentCharge,
+        }
+    }
+
     pub const DeferredBoundary = struct {
         context: *anyopaque,
         nonce: u64,
@@ -531,7 +578,7 @@ pub const Charge = struct {
     pub fn shrinkStorageBytes(self: *Charge, bytes: usize) void {
         switch (self.quota) {
             .storage => |*reservation| reservation.retainBytes(bytes),
-            .unarmed, .run => @panic("non-storage charge cannot impersonate a backing reservation"),
+            .unarmed, .run, .cache_component => @panic("non-storage charge cannot impersonate a backing reservation"),
         }
     }
     /// Borrow identity/domain metadata while a physical owner pins this
@@ -539,19 +586,19 @@ pub const Charge = struct {
     pub fn storageReservation(self: *Charge) ?*@import("storage_admission.zig").Reservation {
         return switch (self.quota) {
             .storage => |*value| value,
-            .unarmed, .run => null,
+            .unarmed, .run, .cache_component => null,
         };
     }
     pub fn storageAmountsForBytes(self: *const Charge, bytes: usize) memory.AdmissionAmounts {
         return switch (self.quota) {
             .storage => |*value| value.amountsForBytes(bytes),
-            .unarmed, .run => @panic("non-storage quota cannot impersonate physical backing"),
+            .unarmed, .run, .cache_component => @panic("non-storage quota cannot impersonate physical backing"),
         };
     }
     pub fn storageBytes(self: *const Charge) ?usize {
         return switch (self.quota) {
             .storage => |reservation| reservation.reservedBytes(),
-            .unarmed, .run => null,
+            .unarmed, .run, .cache_component => null,
         };
     }
     /// Explicit ownership for an actual backing owner or an outer operation
@@ -646,7 +693,13 @@ pub const Charge = struct {
             .unarmed => {},
             .run => |*lease| lease.release(),
             .storage => |*reservation| reservation.release(),
+            .cache_component => {}, // host quota also owns the metadata below
+
         }
+        const cache_backings = switch (self.quota) {
+            .cache_component => |backings| backings,
+            else => null,
+        };
         const domain = self.domain;
         const allocator = self.metadata;
         if (self.prepared_backend) |*prepared| prepared.deinit(allocator);
@@ -656,6 +709,9 @@ pub const Charge = struct {
             allocator.free(groups);
         }
         allocator.destroy(self);
+        if (cache_backings) |backings| for (backings) |backing| {
+            if (backing) |value| value.releaseAfterMetadataDeathOutsideExecution();
+        };
         if (domain) |value| value.release();
     }
 };

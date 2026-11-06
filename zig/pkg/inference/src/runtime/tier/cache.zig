@@ -73,6 +73,17 @@ pub const ReserveError = error{
     ResourceTemporarilyUnavailable,
 };
 
+/// New two-tier ledger metadata has a binding lifetime, not an entry lifetime.
+/// It owns only independent host quota and process allocator records; no Model
+/// or PhysicalBacking self-reference. All leases release outside binding locks.
+const BindingMetadata = struct {
+    next: ?*BindingMetadata = null,
+    shell_lease: ?memory.AdmissionLease = null,
+    array_lease: ?memory.AdmissionLease = null,
+    shell_bytes: usize = 0,
+    array_bytes: usize = 0,
+};
+
 /// Exact process-wide ownership for physical cache growth beyond bytes already
 /// covered by the model's resident lease. The binding is heap-stable because a
 /// backend session may move its SharedCache value while it is being built.
@@ -97,6 +108,10 @@ const AdmissionBinding = struct {
     flush_in_flight: bool = false,
     physical_references: std.atomic.Value(usize) = .init(1),
     physical_component_bytes: usize = 0,
+    physical_backend_component_bytes: usize = 0,
+    metadata_records: ?*BindingMetadata = null,
+    array_metadata: ?*BindingMetadata = null,
+    metadata_host_bytes: usize = 0,
     pending_physical: ?*retirement.Node = null,
     pure_final_metadata: bool = false,
     final_domain: ?domain.Pin = null,
@@ -365,18 +380,28 @@ const AdmissionBinding = struct {
         defer self.mutex.unlock();
         self.host_bytes = self.physical_component_bytes;
         self.independent_host_bytes = self.physical_component_bytes;
-        self.backend_bytes = 0;
-        self.independent_backend_bytes = 0;
+        self.backend_bytes = self.physical_backend_component_bytes;
+        self.independent_backend_bytes = self.physical_backend_component_bytes;
         self.revision +|= 1;
     }
-    fn releasePhysicalComponent(self: *@This(), bytes: usize) void {
+    fn physicalComponentPtr(self: *@This(), tier: ResidencyTier) *usize {
+        return switch (tier) {
+            .host => &self.physical_component_bytes,
+            .backend => &self.physical_backend_component_bytes,
+            .disk => unreachable,
+        };
+    }
+    fn releasePhysicalComponent(self: *@This(), tier: ResidencyTier, bytes: usize) void {
         self.lock();
         defer self.mutex.unlock();
         std.debug.assert(self.deferred_releases);
-        std.debug.assert(bytes <= self.physical_component_bytes and bytes <= self.host_bytes and bytes <= self.independent_host_bytes);
-        self.physical_component_bytes -= bytes;
-        self.host_bytes -= bytes;
-        self.independent_host_bytes -= bytes;
+        const physical = self.physicalComponentPtr(tier);
+        const actual = self.actualPtr(tier).?;
+        const independent = self.independentPtr(tier).?;
+        std.debug.assert(bytes <= physical.* and bytes <= actual.* and bytes <= independent.*);
+        physical.* -= bytes;
+        actual.* -= bytes;
+        independent.* -= bytes;
         self.revision +|= 1;
     }
 
@@ -417,21 +442,53 @@ const AdmissionBinding = struct {
         std.debug.assert(self.pending_physical == null);
         self.credits.deinit(self.allocator);
         const allocator = self.allocator;
+        var metadata_records = self.metadata_records;
+        self.metadata_records = null;
+        self.array_metadata = null;
         const old_domain = self.final_domain;
         self.final_domain = null;
         self.mutex.unlock();
         allocator.destroy(self);
+        while (metadata_records) |record| {
+            metadata_records = record.next;
+            var shell = record.shell_lease;
+            var array = record.array_lease;
+            allocator.destroy(record);
+            if (array) |*lease| lease.release();
+            if (shell) |*lease| lease.release();
+        }
         if (old_domain) |pin| pin.release();
     }
 };
 
-/// Exact already-backed component retained by an existing physical CPU owner.
+/// Exact already-backed component retained by an actual physical owner.
 /// It grants no numerical capability and owns no separate quota token. Only
 /// physical death decrements the existing ledger; the owner's actual-B Node
 /// must release this reference after its own metadata and outer gates end.
 pub const PhysicalBacking = struct {
     binding: *AdmissionBinding,
     bytes: usize,
+    tier: ResidencyTier = .host,
+
+    /// Partition ONE existing physical component; no ledger/reservation growth.
+    /// Both nonoverlapping pieces retain this same actual binding independently.
+    pub fn takePart(self: *@This(), bytes: usize) !PhysicalBacking {
+        if (bytes == 0 or bytes > self.bytes) return error.InvalidPhysicalBackingPart;
+        self.binding.retainPhysicalReference();
+        self.bytes -= bytes;
+        return .{ .binding = self.binding, .bytes = bytes, .tier = self.tier };
+    }
+    pub fn controller(self: @This()) *memory.AdmissionController {
+        return self.binding.controller;
+    }
+    /// Pure provenance pin only. Suppliers still run exclusively at the real
+    /// Source outside boundary, never while holding metadata/numerical gates.
+    pub fn retainAdmissionDomain(self: @This()) !domain.Pin {
+        self.binding.lock();
+        defer self.binding.mutex.unlock();
+        if (!self.binding.pure_final_metadata) return error.MissingCacheRetirementDomain;
+        return (self.binding.final_domain orelse return error.MissingCacheRetirementDomain).retain();
+    }
 
     /// Moves an actual cache creator ref to its existing outside settlement
     /// boundary. No physical death/quota/ref mutation occurs at publication.
@@ -444,18 +501,25 @@ pub const PhysicalBacking = struct {
         if (try epoch.isSealed()) return error.RetirementEpochSealed;
         if (!self.binding.pure_final_metadata or self.binding.final_domain == null) return error.MissingCacheRetirementDomain;
     }
-    /// CPU payload is already dead. No supplier callback: managed binding
+    /// Actual payload (including every SDK retain) is already dead. No supplier callback: managed binding
     /// installation permanently selected deferred reductions before use.
     /// Caller has ended actual B and destroyed ALL payload and owner metadata.
     /// May refund exact tokens; never invoke under cache/Model/lane ownership.
     pub fn releaseAfterMetadataDeathOutsideExecution(self: @This()) void {
         const binding = self.binding;
-        binding.releasePhysicalComponent(self.bytes);
+        binding.releasePhysicalComponent(self.tier, self.bytes);
         // Exact reductions settle through the existing outside Source/Manager
         // flush. Explicit outside destruction may still hold a Native metadata
         // lock; it never invokes a growth/shrink supplier here.
         binding.releasePhysicalReference();
     }
+};
+
+/// Identity is valid only during a census that retains every actual Model /
+/// shared-context owner. It is not a persistent ID, payload pin or quota.
+pub const AdmissionSnapshot = struct {
+    identity: usize,
+    amounts: memory.AdmissionAmounts,
 };
 
 pub const SharedCache = struct {
@@ -526,6 +590,16 @@ pub const SharedCache = struct {
         self.admission.?.pure_final_metadata = true;
     }
 
+    /// Exact pure provenance for shared-context callers. No supplier runs and
+    /// this never authorizes numerical entry or an outside-execution phase.
+    pub fn retirementDomainMatches(self: *SharedCache, pin: *const domain.Pin) bool {
+        const binding = self.admission orelse return false;
+        binding.lock();
+        defer binding.mutex.unlock();
+        return binding.pure_final_metadata and !binding.final_queued and binding.controller == pin.controller() and
+            (if (binding.final_domain) |actual| actual.owner == pin.owner else false);
+    }
+
     pub fn installRetirementDomainOutsideExecution(self: *SharedCache, pin: *const domain.Pin) !void {
         const binding = self.admission orelse return;
         binding.lock();
@@ -562,6 +636,7 @@ pub const SharedCache = struct {
     pub const PreparedGrowth = struct {
         cache: *SharedCache,
         binding: ?*AdmissionBinding,
+        metadata_allocator: ?std.mem.Allocator = null,
         tier: ResidencyTier,
         bytes: usize,
         // Physical quota may include an existing owner's exact metadata which
@@ -581,6 +656,9 @@ pub const SharedCache = struct {
         pin: ?domain.Pin = null,
         replacement: std.ArrayListUnmanaged(AdmissionCredit) = .empty,
         old_metadata: std.ArrayListUnmanaged(AdmissionCredit) = .empty,
+        old_array_metadata: ?*BindingMetadata = null,
+        old_array_lease: ?memory.AdmissionLease = null,
+        old_array_domain: ?domain.Pin = null,
         committed: bool = false,
 
         fn logicalBytes(self: *const @This()) usize {
@@ -614,6 +692,27 @@ pub const SharedCache = struct {
             self.funded = true;
         }
 
+        const CommitState = struct { next: usize, independent: usize, desired: usize };
+        fn commitStateLocked(self: *const @This(), binding: *AdmissionBinding) !CommitState {
+            const next = try std.math.add(usize, binding.actualPtr(self.tier).?.*, self.bytes);
+            const independent = try std.math.add(usize, binding.independentPtr(self.tier).?.*, self.independent_bytes);
+            const desired = binding.desiredCredit(self.tier, next, independent);
+            if (desired -| binding.creditedPtr(self.tier).?.* != self.credit_bytes) return error.PreparedCacheGrowthChanged;
+            if (self.credit_bytes != 0 and (self.lease == null or self.pin == null or self.shell.owner == null)) return error.InvalidPreparedCacheGrowth;
+            return .{ .next = next, .independent = independent, .desired = desired };
+        }
+        fn applyCommitLocked(self: *@This(), binding: *AdmissionBinding, state: CommitState) void {
+            if (self.credit_bytes != 0) {
+                binding.credits.appendAssumeCapacity(.{ .lease = self.lease.?, .tier = self.tier, .independent = self.independent, .shell = self.shell, .pin = self.pin });
+                self.lease = null;
+                self.shell = .{ .owner = null };
+                self.pin = null;
+            }
+            binding.actualPtr(self.tier).?.* = state.next;
+            binding.independentPtr(self.tier).?.* = state.independent;
+            binding.creditedPtr(self.tier).?.* = state.desired;
+        }
+
         /// Actual caller revalidates source/key/layout/policy under the SAME
         /// cache metadata exclusion BEFORE this final ledger commit. There is
         /// no supplier/allocation/callback from this function.
@@ -625,14 +724,8 @@ pub const SharedCache = struct {
                 binding.lock();
                 defer binding.mutex.unlock();
                 if (binding.flush_in_flight or binding.revision >= std.math.maxInt(u64) - 1 or binding.revision != self.expected_revision) return error.PreparedCacheGrowthChanged;
-                const actual = binding.actualPtr(self.tier).?;
-                const credited = binding.creditedPtr(self.tier).?;
-                const next = try std.math.add(usize, actual.*, self.bytes);
-                const next_independent = try std.math.add(usize, binding.independentPtr(self.tier).?.*, self.independent_bytes);
-                const desired = binding.desiredCredit(self.tier, next, next_independent);
-                if (desired -| credited.* != self.credit_bytes) return error.PreparedCacheGrowthChanged;
+                const state = try self.commitStateLocked(binding);
                 if (self.credit_bytes != 0) {
-                    if (self.lease == null or self.pin == null or self.shell.owner == null) return error.InvalidPreparedCacheGrowth;
                     if (self.replacement.capacity != 0) {
                         // Array entries move, never duplicate ownership. The
                         // obsolete array is freed only after ALL gates unlock.
@@ -641,16 +734,20 @@ pub const SharedCache = struct {
                         self.old_metadata = binding.credits;
                         binding.credits = self.replacement;
                         self.replacement = .empty;
+                        self.old_array_metadata = binding.array_metadata;
+                        if (binding.array_metadata) |old| {
+                            self.old_array_lease = old.array_lease;
+                            old.array_lease = null;
+                            self.old_array_domain = binding.final_domain.?.retain();
+                            binding.metadata_host_bytes -= old.array_bytes;
+                        }
+                        // This legacy caller keeps its original common-ledger
+                        // metadata scope; it cannot inherit the old array token.
+                        binding.array_metadata = null;
                     } else if (binding.credits.items.len == binding.credits.capacity) return error.PreparedCacheGrowthChanged;
-                    binding.credits.appendAssumeCapacity(.{ .lease = self.lease.?, .tier = self.tier, .independent = self.independent, .shell = self.shell, .pin = self.pin });
-                    self.lease = null;
-                    self.shell = .{ .owner = null };
-                    self.pin = null;
-                    credited.* = desired;
                 }
+                self.applyCommitLocked(binding, state);
                 binding.deferred_releases = true;
-                actual.* = next;
-                binding.independentPtr(self.tier).?.* = next_independent;
                 binding.revision +|= 1;
             }
             if (self.logicalBytes() != 0) cache.noteResidentUnchecked(self.tier, self.logicalBytes());
@@ -659,7 +756,7 @@ pub const SharedCache = struct {
         pub fn validatePhysicalBacking(self: *const @This()) !void {
             const binding = self.binding orelse return error.MissingCacheRetirementDomain;
             const physical = if (self.physical_component_bytes != 0) self.physical_component_bytes else self.bytes;
-            if (self.tier != .host or self.independent_bytes != physical or physical == 0 or !binding.pure_final_metadata or binding.final_domain == null) return error.MissingCacheRetirementDomain;
+            if ((self.tier != .host and self.tier != .backend) or self.independent_bytes != physical or physical == 0 or !binding.pure_final_metadata or binding.final_domain == null) return error.MissingCacheRetirementDomain;
         }
         /// Same actual cache exclusion spans validation/commit/attach. This
         /// existing physical owner now pins the SAME token ledger, not a copy.
@@ -677,11 +774,12 @@ pub const SharedCache = struct {
             std.debug.assert(bytes > 0 and bytes <= total);
             const binding = self.binding.?;
             binding.lock();
-            std.debug.assert(bytes <= binding.independent_host_bytes - binding.physical_component_bytes);
-            binding.physical_component_bytes += bytes;
+            const physical = binding.physicalComponentPtr(self.tier);
+            std.debug.assert(bytes <= binding.independentPtr(self.tier).?.* - physical.*);
+            physical.* += bytes;
             binding.retainPhysicalReference();
             binding.mutex.unlock();
-            return .{ .binding = binding, .bytes = bytes };
+            return .{ .binding = binding, .bytes = bytes, .tier = self.tier };
         }
 
         /// CPU preparation is transactional. If it fails before publishing
@@ -707,6 +805,13 @@ pub const SharedCache = struct {
                         self.replacement = binding.credits;
                         binding.credits = self.old_metadata;
                         self.old_metadata = .empty;
+                        binding.array_metadata = self.old_array_metadata;
+                        if (self.old_array_metadata) |old| {
+                            old.array_lease = self.old_array_lease;
+                            self.old_array_lease = null;
+                            binding.metadata_host_bytes += old.array_bytes;
+                        }
+                        self.old_array_metadata = null;
                     }
                 }
                 actual.* -= self.bytes;
@@ -735,14 +840,222 @@ pub const SharedCache = struct {
             self.shell.destroyUnused();
             if (self.pin) |pin| pin.release();
             self.pin = null;
-            if (self.binding) |binding| {
-                self.replacement.deinit(binding.allocator);
-                self.old_metadata.deinit(binding.allocator);
+            if (self.metadata_allocator) |allocator| {
+                self.replacement.deinit(allocator);
+                self.old_metadata.deinit(allocator);
             }
             self.replacement = .empty;
             self.old_metadata = .empty;
+            if (self.old_array_lease) |*lease| lease.release();
+            self.old_array_lease = null;
+            if (self.old_array_domain) |pin| pin.release();
+            self.old_array_domain = null;
+            self.old_array_metadata = null;
         }
     };
+
+    /// One cold host-metadata plus backend-payload transaction. Both suppliers
+    /// finish outside execution; one binding lock validates/publishes both.
+    pub const PreparedPhysicalGrowth = struct {
+        parts: [2]PreparedGrowth,
+        metadata_allocator: std.mem.Allocator,
+        metadata: ?*BindingMetadata = null,
+        old_array_metadata: ?*BindingMetadata = null,
+        old_array_lease: ?memory.AdmissionLease = null,
+        old_array_domain: ?domain.Pin = null,
+        replacement_required: usize,
+        replacement: std.ArrayListUnmanaged(AdmissionCredit) = .empty,
+        old_metadata: std.ArrayListUnmanaged(AdmissionCredit) = .empty,
+        replaced: bool = false,
+        published_metadata: bool = false,
+        committed: bool = false,
+
+        pub fn fundingMetadataBytes(self: *const @This()) !usize {
+            var count: usize = 0;
+            for (self.parts) |part| if (part.credit_bytes != 0) {
+                count += 1;
+            };
+            if (count == 0 and self.replacement_required == 0) return 0;
+            const shells = try std.math.mul(usize, count, try retirement.PreparedCharge.requestedMetadataBytes(0));
+            const array = try std.math.mul(usize, self.replacement_required, @sizeOf(AdmissionCredit));
+            return std.math.add(usize, @sizeOf(BindingMetadata), try std.math.add(usize, shells, array));
+        }
+        pub fn fundOutsideExecution(self: *@This(), pin: *const domain.Pin) !void {
+            if (self.committed) return error.InvalidPreparedCacheGrowth;
+            errdefer self.finishOutsideExecution();
+            const binding = self.parts[0].binding orelse return error.MissingCacheRetirementDomain;
+            if (self.metadata != null or pin.controller() != binding.controller) return error.ForeignAdmissionDomain;
+            const metadata_bytes = try self.fundingMetadataBytes();
+            if (metadata_bytes != 0) {
+                const node = try self.metadata_allocator.create(BindingMetadata);
+                node.* = .{};
+                self.metadata = node;
+                node.array_bytes = try std.math.mul(usize, self.replacement_required, @sizeOf(AdmissionCredit));
+                node.shell_bytes = (try self.fundingMetadataBytes()) - node.array_bytes;
+                node.shell_lease = binding.controller.tryAcquire(binding.backend_class, binding.limits, .{ .host_weight_bytes = node.shell_bytes }, true) catch |err| return switch (err) {
+                    error.ResourceTemporarilyUnavailable => error.ResourceTemporarilyUnavailable,
+                    else => error.MemoryBudgetExceeded,
+                };
+                if (node.array_bytes != 0) node.array_lease = binding.controller.tryAcquire(binding.backend_class, binding.limits, .{ .host_weight_bytes = node.array_bytes }, true) catch |err| return switch (err) {
+                    error.ResourceTemporarilyUnavailable => error.ResourceTemporarilyUnavailable,
+                    else => error.MemoryBudgetExceeded,
+                };
+                try node.shell_lease.?.retain(.{ .host_weight_bytes = node.shell_bytes });
+                if (node.array_lease) |*lease| try lease.retain(.{ .host_weight_bytes = node.array_bytes });
+            }
+            if (self.replacement_required != 0) try self.replacement.ensureTotalCapacityPrecise(binding.allocator, self.replacement_required);
+            for (&self.parts) |*part| try part.fundOutsideExecution(pin);
+        }
+        pub fn validatePhysicalBacking(self: *const @This()) !void {
+            for (self.parts) |*part| try part.validatePhysicalBacking();
+        }
+        pub fn commit(self: *@This()) !void {
+            if (self.committed) return error.PreparedCacheGrowthAlreadyCommitted;
+            const cache = self.parts[0].cache;
+            const binding = self.parts[0].binding orelse return error.MissingCacheRetirementDomain;
+            binding.lock();
+            defer binding.mutex.unlock();
+            var count: usize = 0;
+            var states: [2]PreparedGrowth.CommitState = undefined;
+            for (&self.parts, 0..) |*part, index| {
+                if (!part.funded or part.committed or cache.admission != binding or part.binding != binding or binding.flush_in_flight or binding.final_queued or binding.revision >= std.math.maxInt(u64) - 1 or binding.revision != part.expected_revision or cache.host_bytes != part.expected_host or cache.backend_bytes != part.expected_backend or !cache.canFitAdditional(part.tier, part.logicalBytes())) return error.PreparedCacheGrowthChanged;
+                states[index] = try part.commitStateLocked(binding);
+                if (part.credit_bytes != 0) count += 1;
+            }
+            const node = self.metadata;
+            if (node) |record| {
+                if (record.shell_lease == null or (record.array_bytes != 0 and record.array_lease == null)) return error.InvalidPreparedCacheGrowth;
+            } else if (count != 0 or self.replacement.capacity != 0) return error.InvalidPreparedCacheGrowth;
+            const next_metadata = try std.math.add(usize, binding.metadata_host_bytes, if (node) |record| try std.math.add(usize, record.shell_bytes, record.array_bytes) else 0);
+            const required = try std.math.add(usize, binding.credits.items.len, count);
+            if ((if (self.replacement.capacity != 0) self.replacement.capacity else binding.credits.capacity) < required) return error.PreparedCacheGrowthChanged;
+            // Every fallible check precedes either ledger publication.
+            if (self.replacement.capacity != 0) {
+                self.replacement.appendSliceAssumeCapacity(binding.credits.items);
+                self.old_metadata = binding.credits;
+                binding.credits = self.replacement;
+                self.replacement = .empty;
+                self.replaced = true;
+                self.old_array_metadata = binding.array_metadata;
+                if (binding.array_metadata) |old| {
+                    self.old_array_lease = old.array_lease;
+                    old.array_lease = null;
+                    self.old_array_domain = binding.final_domain.?.retain();
+                }
+                binding.array_metadata = node;
+            }
+            binding.metadata_host_bytes = next_metadata - (if (self.old_array_metadata) |old| old.array_bytes else 0);
+            if (node) |record| {
+                record.next = binding.metadata_records;
+                binding.metadata_records = record;
+                self.published_metadata = true;
+                self.metadata = null; // binding owns metadata, never an entry
+            }
+            for (&self.parts, states) |*part, state| {
+                part.applyCommitLocked(binding, state);
+                if (part.logicalBytes() != 0) cache.noteResidentUnchecked(part.tier, part.logicalBytes());
+                part.committed = true;
+            }
+            binding.deferred_releases = true;
+            binding.revision +|= 1;
+            self.committed = true;
+        }
+        /// No SDK entry or physical component may have published yet. Same
+        /// actual exclusion spans commit/SDK setup/this exact rollback.
+        pub fn rollbackUnpublishedLocked(self: *@This()) !void {
+            if (!self.committed) return error.InvalidPreparedCacheGrowth;
+            const cache = self.parts[0].cache;
+            const binding = self.parts[0].binding.?;
+            binding.lock();
+            defer binding.mutex.unlock();
+            if (cache.admission != binding or binding.flush_in_flight or binding.revision != self.parts[0].expected_revision +% 1) return error.PreparedCacheGrowthChanged;
+            if (self.published_metadata) {
+                const metadata = binding.metadata_records orelse return error.PreparedCacheGrowthChanged;
+                binding.metadata_records = metadata.next;
+                metadata.next = null;
+                self.metadata = metadata;
+                binding.metadata_host_bytes -= metadata.shell_bytes + metadata.array_bytes;
+                self.published_metadata = false;
+            }
+            if (self.old_array_metadata) |old| {
+                old.array_lease = self.old_array_lease;
+                self.old_array_lease = null;
+                binding.metadata_host_bytes += old.array_bytes;
+            }
+            var index = self.parts.len;
+            while (index != 0) {
+                index -= 1;
+                const part = &self.parts[index];
+                if (part.credit_bytes != 0) {
+                    const credit = binding.credits.pop().?;
+                    std.debug.assert(credit.tier == part.tier);
+                    part.lease = credit.lease;
+                    part.pin = credit.pin;
+                    part.shell = credit.shell;
+                    binding.creditedPtr(part.tier).?.* -= part.credit_bytes;
+                }
+                binding.actualPtr(part.tier).?.* -= part.bytes;
+                binding.independentPtr(part.tier).?.* -= part.independent_bytes;
+                switch (part.tier) {
+                    .host => cache.host_bytes -= part.logicalBytes(),
+                    .backend => cache.backend_bytes -= part.logicalBytes(),
+                    .disk => unreachable,
+                }
+                part.committed = false;
+            }
+            if (self.replaced) {
+                self.replacement = binding.credits;
+                binding.credits = self.old_metadata;
+                self.old_metadata = .empty;
+                self.replaced = false;
+                binding.array_metadata = self.old_array_metadata;
+                self.old_array_metadata = null;
+            }
+            binding.revision +|= 1;
+            self.committed = false;
+        }
+        pub fn retainCommittedPhysicalBackings(self: *const @This()) [2]PhysicalBacking {
+            std.debug.assert(self.committed);
+            return .{ self.parts[0].retainCommittedPhysicalBacking(), self.parts[1].retainCommittedPhysicalBacking() };
+        }
+        pub fn finishOutsideExecution(self: *@This()) void {
+            for (&self.parts) |*part| part.finishOutsideExecution();
+            self.replacement.deinit(self.metadata_allocator);
+            self.old_metadata.deinit(self.metadata_allocator);
+            self.replacement = .empty;
+            self.old_metadata = .empty;
+            if (self.old_array_lease) |*lease| lease.release();
+            self.old_array_lease = null;
+            if (self.old_array_domain) |pin| pin.release();
+            self.old_array_domain = null;
+            self.old_array_metadata = null;
+            if (self.metadata) |node| {
+                var shell = node.shell_lease;
+                var array = node.array_lease;
+                self.metadata_allocator.destroy(node);
+                if (array) |*lease| lease.release();
+                if (shell) |*lease| lease.release();
+            }
+            self.metadata = null;
+        }
+    };
+    pub fn snapshotPhysicalGrowthLocked(self: *SharedCache, host_metadata_bytes: usize, backend_logical_bytes: usize, backend_physical_bytes: usize) !PreparedPhysicalGrowth {
+        var parts = [2]PreparedGrowth{
+            try self.snapshotPhysicalOwnerGrowthForTierLocked(.host, 0, host_metadata_bytes),
+            try self.snapshotPhysicalOwnerGrowthForTierLocked(.backend, backend_logical_bytes, backend_physical_bytes),
+        };
+        const binding = self.admission orelse return error.MissingCacheRetirementDomain;
+        binding.lock();
+        defer binding.mutex.unlock();
+        if (!binding.pure_final_metadata or binding.final_domain == null or binding.flush_in_flight or parts[0].expected_revision != binding.revision or parts[1].expected_revision != binding.revision) return error.PreparedCacheGrowthChanged;
+        var count: usize = 0;
+        for (&parts) |*part| {
+            if (part.credit_bytes != 0) count += 1;
+            part.replacement_required = 0; // shared destination prepared once
+        }
+        const required = try std.math.add(usize, binding.credits.items.len, count);
+        return .{ .parts = parts, .metadata_allocator = binding.allocator, .replacement_required = if (required > binding.credits.capacity) try std.math.ceilPowerOfTwo(usize, required) else 0 };
+    }
 
     /// Value-only recipe collected under the actual caller's cache exclusion
     /// (Native prefetch/quantized owner). Model pin alone is NOT that proof.
@@ -767,12 +1080,17 @@ pub const SharedCache = struct {
     /// SAME retention policy bytes; independently declared owner metadata is
     /// additionally backed by the actual Domain, never borrowed from a floor.
     pub fn snapshotPhysicalOwnerGrowthLocked(self: *SharedCache, logical_bytes: usize, physical_bytes: usize) !PreparedGrowth {
-        return self.snapshotGrowthWithLogicalBytesLocked(.host, physical_bytes, physical_bytes, logical_bytes);
+        return self.snapshotPhysicalOwnerGrowthForTierLocked(.host, logical_bytes, physical_bytes);
+    }
+    /// Independently charged physical packed/cache representations. Backend
+    /// roots retain their exact ledger just as Native host components do.
+    pub fn snapshotPhysicalOwnerGrowthForTierLocked(self: *SharedCache, tier: ResidencyTier, logical_bytes: usize, physical_bytes: usize) !PreparedGrowth {
+        return self.snapshotGrowthWithLogicalBytesLocked(tier, physical_bytes, physical_bytes, logical_bytes);
     }
     fn snapshotGrowthWithLogicalBytesLocked(self: *SharedCache, tier: ResidencyTier, bytes: usize, independent_bytes: usize, logical_bytes: usize) !PreparedGrowth {
         if (tier == .disk or bytes == 0 or independent_bytes > bytes or logical_bytes > bytes) return error.InvalidPreparedCacheGrowth;
         if (!self.canFitAdditional(tier, logical_bytes)) return error.MemoryBudgetExceeded;
-        var result = PreparedGrowth{ .cache = self, .binding = self.admission, .tier = tier, .bytes = bytes, .logical_bytes = logical_bytes, .independent = independent_bytes == bytes, .independent_bytes = independent_bytes, .expected_host = self.host_bytes, .expected_backend = self.backend_bytes };
+        var result = PreparedGrowth{ .cache = self, .binding = self.admission, .metadata_allocator = if (self.admission) |binding| binding.allocator else null, .tier = tier, .bytes = bytes, .logical_bytes = logical_bytes, .independent = independent_bytes == bytes, .independent_bytes = independent_bytes, .expected_host = self.host_bytes, .expected_backend = self.backend_bytes };
         const binding = self.admission orelse return result;
         binding.lock();
         defer binding.mutex.unlock();
@@ -799,7 +1117,7 @@ pub const SharedCache = struct {
         const next = try std.math.add(usize, binding.host_bytes, metadata_bytes);
         const next_independent = try std.math.add(usize, binding.independent_host_bytes, physical);
         if (next_independent > next) return error.InvalidPreparedCacheGrowth;
-        return .{ .cache = self, .binding = binding, .tier = .host, .bytes = metadata_bytes, .logical_bytes = 0, .independent = true, .independent_bytes = physical, .physical_component_bytes = physical, .expected_host = self.host_bytes, .expected_backend = self.backend_bytes, .expected_revision = binding.revision, .credit_bytes = binding.desiredCredit(.host, next, next_independent) -| binding.host_credited_bytes, .replacement_required = if (binding.credits.items.len == binding.credits.capacity) binding.credits.items.len + 1 else 0 };
+        return .{ .cache = self, .binding = binding, .metadata_allocator = binding.allocator, .tier = .host, .bytes = metadata_bytes, .logical_bytes = 0, .independent = true, .independent_bytes = physical, .physical_component_bytes = physical, .expected_host = self.host_bytes, .expected_backend = self.backend_bytes, .expected_revision = binding.revision, .credit_bytes = binding.desiredCredit(.host, next, next_independent) -| binding.host_credited_bytes, .replacement_required = if (binding.credits.items.len == binding.credits.capacity) binding.credits.items.len + 1 else 0 };
     }
 
     /// Query the serving owner's current physical host-pressure signal. This
@@ -875,9 +1193,22 @@ pub const SharedCache = struct {
     /// Logical cache removal of an independently retained physical component.
     /// Its exact PhysicalBacking performs the ledger decrement at actual death.
     pub fn noteLogicalPhysicalOwnerRemoval(self: *SharedCache, bytes: usize) void {
-        std.debug.assert(bytes <= self.host_bytes);
-        self.host_bytes -= bytes;
-        self.host_evictions +|= 1;
+        self.noteLogicalPhysicalOwnerRemovalForTier(.host, bytes);
+    }
+    pub fn noteLogicalPhysicalOwnerRemovalForTier(self: *SharedCache, tier: ResidencyTier, bytes: usize) void {
+        switch (tier) {
+            .host => {
+                std.debug.assert(bytes <= self.host_bytes);
+                self.host_bytes -= bytes;
+                self.host_evictions +|= 1;
+            },
+            .backend => {
+                std.debug.assert(bytes <= self.backend_bytes);
+                self.backend_bytes -= bytes;
+                self.backend_evictions +|= 1;
+            },
+            .disk => unreachable,
+        }
     }
 
     pub fn noteRelease(self: *SharedCache, tier: ResidencyTier, bytes: usize) void {
@@ -1077,14 +1408,17 @@ pub const SharedCache = struct {
     /// Admission credits owned by physical cache bytes above the session's
     /// resident model baseline. The binding lock makes this an exact ownership
     /// snapshot suitable for idle-domain conservation checks.
-    pub fn admissionAmounts(self: *SharedCache) memory.AdmissionAmounts {
-        const binding = self.admission orelse return .{};
+    pub fn admissionSnapshot(self: *SharedCache) ?AdmissionSnapshot {
+        const binding = self.admission orelse return null;
         binding.lock();
         defer binding.mutex.unlock();
-        return .{
-            .host_weight_bytes = binding.host_credited_bytes,
+        return .{ .identity = @intFromPtr(binding), .amounts = .{
+            .host_weight_bytes = binding.host_credited_bytes + binding.metadata_host_bytes,
             .backend_weight_bytes = binding.backend_credited_bytes,
-        };
+        } };
+    }
+    pub fn admissionAmounts(self: *SharedCache) memory.AdmissionAmounts {
+        return if (self.admissionSnapshot()) |value| value.amounts else .{};
     }
 
     pub fn isOverBudget(self: *const SharedCache, tier: ResidencyTier) bool {
@@ -1691,4 +2025,170 @@ test "Native existing Binding revision exhaustion never certifies a recycled raw
     try std.testing.expectEqual(std.math.maxInt(u64), cache.admission.?.revision);
     try std.testing.expectError(error.PreparedCacheGrowthChanged, stale.commit());
     try std.testing.expectError(error.ResourceTemporarilyUnavailable, cache.snapshotPhysicalOwnerGrowthLocked(0, 16));
+}
+
+test "backend physical cache components are independent of source floor and survive actual current B and owner close" {
+    for ([_]usize{ 31, 32 }) |limit| {
+        const old = try domain.Domain.create();
+        defer old.release();
+        const pin = old.pin();
+        defer pin.release();
+        var cache = SharedCache.init(.{ .backend_limit_bytes = 16 });
+        defer cache.deinitAdmission();
+        // The source floor cannot lend its bytes to this independent packed copy.
+        try cache.configureManagedAdmissionOutsideExecution(pin.controller(), .gpu, .{ .backend_limit_bytes = limit }, .{ .backend_limit_bytes = 64 });
+        try cache.installRetirementDomainOutsideExecution(&pin);
+        var growth = try cache.snapshotPhysicalOwnerGrowthForTierLocked(.backend, 16, 32);
+        defer growth.finishOutsideExecution();
+        if (limit == 31) {
+            try std.testing.expectError(error.MemoryBudgetExceeded, growth.fundOutsideExecution(&pin));
+            try std.testing.expectEqual(@as(usize, 0), cache.backend_bytes);
+            try std.testing.expectEqual(@as(usize, 0), pin.controller().snapshot().backend_weight_bytes);
+            continue;
+        }
+        try growth.fundOutsideExecution(&pin);
+        try growth.validatePhysicalBacking();
+        try growth.commit();
+        const weight = growth.retainCommittedPhysicalBackingPart(24);
+        const bias = growth.retainCommittedPhysicalBackingPart(8);
+        cache.noteLogicalPhysicalOwnerRemovalForTier(.backend, 16);
+        var sink = try @import("../../execution/retirement_sink.zig").Ref.create();
+        defer sink.release();
+        var guard = try sink.enter();
+        defer guard.finish();
+        var epoch = try guard.retainEpoch();
+        defer epoch.release();
+        try cache.deinitAdmissionWithCleanup(.{ .boundary = &epoch });
+        guard.finish();
+        try std.testing.expectEqual(@as(usize, 32), pin.controller().snapshot().backend_weight_bytes);
+        weight.releaseAfterMetadataDeathOutsideExecution();
+        // Existing ledger settles after actual final component metadata dies.
+        // Never claim a partial callback refund while another component lives.
+        try std.testing.expectEqual(@as(usize, 32), pin.controller().snapshot().backend_weight_bytes);
+        bias.releaseAfterMetadataDeathOutsideExecution();
+        try std.testing.expectEqual(@as(usize, 0), pin.controller().snapshot().backend_weight_bytes);
+    }
+}
+
+test "two tier physical cache transaction denies either exact cap without publishing the other tier" {
+    const metadata = @sizeOf(BindingMetadata) + 2 * (try retirement.PreparedCharge.requestedMetadataBytes(0)) + 2 * @sizeOf(AdmissionCredit);
+    const limits = [_]memory.Limits{
+        .{ .host_limit_bytes = metadata + 15, .backend_limit_bytes = 32 },
+        .{ .host_limit_bytes = metadata + 16, .backend_limit_bytes = 31 },
+        .{ .host_limit_bytes = metadata + 16, .backend_limit_bytes = 32 },
+    };
+    for (limits, 0..) |limit, index| {
+        const owner = try domain.Domain.create();
+        defer owner.release();
+        const pin = owner.pin();
+        defer pin.release();
+        var cache = SharedCache.init(.{ .host_limit_bytes = 16, .backend_limit_bytes = 16 });
+        defer cache.deinitAdmission();
+        try cache.configureManagedAdmissionOutsideExecution(pin.controller(), .gpu, limit, .{ .backend_limit_bytes = 64 });
+        try cache.installRetirementDomainOutsideExecution(&pin);
+        var growth = try cache.snapshotPhysicalGrowthLocked(16, 16, 32);
+        defer growth.finishOutsideExecution();
+        if (index != 2) {
+            try std.testing.expectError(error.MemoryBudgetExceeded, growth.fundOutsideExecution(&pin));
+            try std.testing.expectEqual(@as(usize, 0), cache.host_bytes);
+            try std.testing.expectEqual(@as(usize, 0), cache.backend_bytes);
+            try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, pin.controller().snapshot());
+            continue;
+        }
+        try growth.fundOutsideExecution(&pin);
+        try growth.validatePhysicalBacking();
+        try growth.commit();
+        try std.testing.expectEqual(@as(usize, 0), cache.host_bytes);
+        try std.testing.expectEqual(@as(usize, 16), cache.backend_bytes);
+        try std.testing.expectEqual(metadata + 16, pin.controller().snapshot().host_weight_bytes);
+        try std.testing.expectEqual(@as(usize, 32), pin.controller().snapshot().backend_weight_bytes);
+        // A failed cold constructor rolls back BOTH exact unpublished changes.
+        try growth.rollbackUnpublishedLocked();
+        growth.finishOutsideExecution();
+        try std.testing.expectEqual(@as(usize, 0), cache.host_bytes);
+        try std.testing.expectEqual(@as(usize, 0), cache.backend_bytes);
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, pin.controller().snapshot());
+        var replacement = try cache.snapshotPhysicalGrowthLocked(16, 16, 32);
+        defer replacement.finishOutsideExecution();
+        try replacement.fundOutsideExecution(&pin);
+        try replacement.commit();
+        const backing = replacement.retainCommittedPhysicalBackings();
+        cache.noteLogicalPhysicalOwnerRemovalForTier(.backend, 16);
+        try cache.deinitAdmissionWithCleanup(.{ .outside_execution = true });
+        try std.testing.expectEqual(metadata + 16, pin.controller().snapshot().host_weight_bytes);
+        try std.testing.expectEqual(@as(usize, 32), pin.controller().snapshot().backend_weight_bytes);
+        for (backing) |part| part.releaseAfterMetadataDeathOutsideExecution();
+        try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, pin.controller().snapshot());
+    }
+}
+
+fn twoTierCacheAllocationFailureCase(a: std.mem.Allocator) !void {
+    const owner = try domain.Domain.create();
+    defer owner.release();
+    const pin = owner.pin();
+    defer pin.release();
+    var cache = SharedCache.init(.{ .host_limit_bytes = 64, .backend_limit_bytes = 64 });
+    defer cache.deinitAdmission();
+    // Test-only injectable metadata allocator; this actual binding is fully
+    // destroyed before the test allocator leaves, including every failure.
+    const metadata = @sizeOf(BindingMetadata) + 2 * (try retirement.PreparedCharge.requestedMetadataBytes(0)) + 2 * @sizeOf(AdmissionCredit);
+    try cache.configureAdmission(a, pin.controller(), .gpu, .{ .host_limit_bytes = metadata + 16, .backend_limit_bytes = 64 }, .{});
+    cache.admission.?.pure_final_metadata = true;
+    try cache.installRetirementDomainOutsideExecution(&pin);
+    var growth = try cache.snapshotPhysicalGrowthLocked(16, 16, 32);
+    defer growth.finishOutsideExecution();
+    try growth.fundOutsideExecution(&pin);
+    try growth.commit();
+    try growth.rollbackUnpublishedLocked();
+    growth.finishOutsideExecution();
+    try std.testing.expectEqualDeep(memory.AdmissionAmounts{}, pin.controller().snapshot());
+}
+
+test "two tier cache preparation metadata OOM leaves no partial host backend token or Domain custody" {
+    try platform.allocator.checkAllAllocationFailures(std.testing.allocator, twoTierCacheAllocationFailureCase, .{});
+}
+
+test "managed shared cache Domain provenance is exact and does not rebind to a foreign model" {
+    const first = try domain.Domain.create();
+    defer first.release();
+    const other = try domain.Domain.create();
+    defer other.release();
+    const pin = first.pin();
+    defer pin.release();
+    const foreign = other.pin();
+    defer foreign.release();
+    var cache = SharedCache.init(.{});
+    defer cache.deinitAdmission();
+    try cache.configureManagedAdmissionOutsideExecution(pin.controller(), .gpu, .{}, .{});
+    try std.testing.expect(!cache.retirementDomainMatches(&pin));
+    try cache.installRetirementDomainOutsideExecution(&pin);
+    try std.testing.expect(cache.retirementDomainMatches(&pin));
+    try std.testing.expect(!cache.retirementDomainMatches(&foreign));
+    try std.testing.expectError(error.ForeignAdmissionDomain, cache.installRetirementDomainOutsideExecution(&foreign));
+    try std.testing.expect(cache.retirementDomainMatches(&pin));
+}
+
+test "cache admission snapshot identifies actual shared binding only within a held owner census" {
+    const owner = try domain.Domain.create();
+    defer owner.release();
+    const pin = owner.pin();
+    defer pin.release();
+    var first = SharedCache.init(.{});
+    defer first.deinitAdmission();
+    var second = SharedCache.init(.{});
+    defer second.deinitAdmission();
+    try first.configureManagedAdmissionOutsideExecution(pin.controller(), .gpu, .{}, .{});
+    try second.configureManagedAdmissionOutsideExecution(pin.controller(), .gpu, .{}, .{});
+    try first.installRetirementDomainOutsideExecution(&pin);
+    try second.installRetirementDomainOutsideExecution(&pin);
+    try first.reserve(.backend, 8);
+    const one = first.admissionSnapshot().?;
+    const shared = (&first).admissionSnapshot().?;
+    const different = second.admissionSnapshot().?;
+    try std.testing.expectEqual(one.identity, shared.identity);
+    try std.testing.expect(one.identity != different.identity);
+    try std.testing.expectEqualDeep(first.admissionAmounts(), one.amounts);
+    try std.testing.expectEqual(@as(usize, 8), one.amounts.backend_weight_bytes);
+    first.noteRelease(.backend, 8);
+    try first.flushReleasedOutsideExecution();
 }

@@ -106,7 +106,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     embeddinggemma2_linear_cache_bytes: usize = 0,
     linear_slot_owner_epoch: u64 = 1,
     linear_slot_index_mutex: std.atomic.Mutex = .unlocked,
-    operations: @import("../execution/operation_owner.zig").Owner = .{},
+    operations: *@import("../execution/operation_owner.zig").Owner,
     // Atomic marks own no caller metadata. The provider already owns the
     // corresponding SDK payload and fallback clones until actual retirement.
     private_retirement_dirty: std.atomic.Value(bool) = .init(false),
@@ -354,16 +354,24 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
 
     /// A null census preserves complete preparation for open or custom stores.
     pub fn createWithKernelJitOptionsAndPipelineFormats(options: metal_runtime.MetalJitOptions, formats: ?u16) !MetalNativeProvider {
+        const operations = try @import("../execution/operation_owner.zig").Owner.createRetained(@import("antfly_platform").allocator.processAllocator(@import("antfly_platform").allocator.concurrentFallback()));
+        var operations_moved = false;
+        defer if (!operations_moved) {
+            operations.closeRetained() catch unreachable;
+            operations.releaseClosedStorage();
+        };
         const endpoint = try @import("metal_runtime_lifetime.zig").Lifetime.prepare();
         const raw_provider = metal_runtime.termite_metal_provider_create();
         const raw_decode_runtime = metal_runtime.termite_metal_decode_runtime_create_for_quant_formats(formats orelse std.math.maxInt(u16));
         endpoint.bindEndpointAddress(if (raw_decode_runtime) |runtime| @intFromPtr(runtime) else 0);
         var result = MetalNativeProvider{
+            .operations = operations,
             .raw_provider = raw_provider,
             .raw_decode_runtime = raw_decode_runtime,
             .workspace_endpoint = endpoint,
             .workspace_creators = @import("metal_workspace_ownership.zig").Creators.init(endpoint),
         };
+        operations_moved = true;
         errdefer result.deinitOwned();
         // Non-generative Metal graphs (embedding, vision, and audio encoders)
         // have no later regime transition hook. Generation explicitly switches
@@ -722,6 +730,11 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
     }
     pub fn deinitOwnedWithCleanup(self: *MetalNativeProvider, current: @import("../execution/cleanup_context.zig").Context) void {
         self.validateWorkspaceRetirement(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        // The metadata root is released AFTER all close locks, independently
+        // of any B-use pins which may outlive this provider's body.
+        const operation_storage = self.operations;
+        operation_storage.holdStorageUntilCleanup(current) catch @import("antfly_platform").inference_process_supervisor.restartWorker();
+        defer operation_storage.releaseClosedStorage();
         // Release the synchronous JIT session before provider, cache, or
         // pipeline dependencies are released.
         while (!self.linear_slot_index_mutex.tryLock()) std.atomic.spinLoopHint();
@@ -730,7 +743,7 @@ pub const MetalNativeProvider = if (build_options.enable_metal) struct {
             std.log.err("Metal provider checked teardown failed: {s}", .{@errorName(err)});
             @import("antfly_platform").inference_process_supervisor.restartWorker();
         };
-        self.operations.assertIdle();
+        self.operations.closeRetained() catch @import("antfly_platform").inference_process_supervisor.restartWorker();
         // Completed handlers have retired submitted pins before quiesce returns.
         // Idle profile metadata may survive; live captured/armed pins may not.
         var owned_slots = self.embeddinggemma2_linear_cache.valueIterator();
