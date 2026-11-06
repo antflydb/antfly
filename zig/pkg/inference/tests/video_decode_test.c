@@ -21,7 +21,9 @@ static int selection = 1, consume_result = 1;
 static unsigned reservations, releases, live_budgets;
 static int admit_decoder = 1, fail_create = 0;
 static cudaVideoCodec created_codec;
-static int fake_reserve(void *user, unsigned width, unsigned height, unsigned surfaces) {
+static unsigned last_sample_bytes = 0;
+static int fake_reserve(void *user, unsigned width, unsigned height, unsigned surfaces, unsigned sample_bytes) {
+    last_sample_bytes = sample_bytes;
     (void)user; assert(width && height && surfaces);
     if (!admit_decoder) return 0;
     reservations++; live_budgets++; return 1;
@@ -145,7 +147,7 @@ int main(void) {
     f.video_signal_description.transfer_characteristics = 18;
     f.video_signal_description.color_primaries = 9;
     f.video_signal_description.matrix_coefficients = 9;
-    assert(sequence(&d, &f) == 4 && created_format == cudaVideoSurfaceFormat_P016 && d.bit_depth == 10 && d.transfer == 18);
+    assert(sequence(&d, &f) == 4 && created_format == cudaVideoSurfaceFormat_P016 && d.bit_depth == 10 && d.transfer == 18 && last_sample_bytes == 2);
     fake_destroy(d.decoder); release_budget(&d);
     d = decoder(); f.bit_depth_chroma_minus8 = 0;
     assert(sequence(&d, &f) == 0 && d.failed == 2);

@@ -23,7 +23,7 @@
 // It must finish reading before returning. No pixels ever cross the host ABI.
 typedef int (*frame_callback)(void *, uint64_t, unsigned, unsigned, unsigned,
                              int64_t, unsigned, unsigned, unsigned, unsigned);
-typedef int (*reserve_decoder)(void *, unsigned, unsigned, unsigned);
+typedef int (*reserve_decoder)(void *, unsigned, unsigned, unsigned, unsigned);
 typedef void (*release_decoder)(void *);
 typedef struct {
     void *library, *user;
@@ -133,7 +133,7 @@ static int sequence(void *opaque, CUVIDEOFORMAT *f) {
     c.display_area.left = f->display_area.left; c.display_area.top = f->display_area.top;
     c.display_area.right = f->display_area.right; c.display_area.bottom = f->display_area.bottom;
     if (!d->reserve_budget || !d->release_budget ||
-        !d->reserve_budget(d->budget_user, f->coded_width, f->coded_height * (bit_depth == 10 ? 2 : 1), c.ulNumDecodeSurfaces)) {
+        !d->reserve_budget(d->budget_user, f->coded_width, f->coded_height, c.ulNumDecodeSurfaces, bit_depth == 10 ? 2 : 1)) {
         d->failed = 6; return 0;
     }
     d->budget_live = 1;

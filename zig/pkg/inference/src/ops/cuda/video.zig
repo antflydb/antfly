@@ -32,15 +32,15 @@ extern fn antfly_nvdec_close(*anyopaque) void;
 extern fn antfly_nvdec_begin(*anyopaque, ?*anyopaque, *anyopaque, Callback, u32, u32, c_int, c_int, c_int, c_int, c_int, u32, u32) c_int;
 extern fn antfly_nvdec_finish(*anyopaque) void;
 
-extern fn antfly_nvdec_set_budget(*anyopaque, *anyopaque, *const fn (*anyopaque, u32, u32, u32) callconv(.c) c_int, *const fn (*anyopaque) callconv(.c) void) void;
+extern fn antfly_nvdec_set_budget(*anyopaque, *anyopaque, *const fn (*anyopaque, u32, u32, u32, u32) callconv(.c) c_int, *const fn (*anyopaque) callconv(.c) void) void;
 
-fn reserveDecoder(raw: *anyopaque, width: u32, height: u32, surfaces: u32) callconv(.c) c_int {
+fn reserveDecoder(raw: *anyopaque, width: u32, height: u32, surfaces: u32, sample_bytes: u32) callconv(.c) c_int {
     const ctx: *context.CudaContext = @ptrCast(@alignCast(raw));
     const bytes = @import("video_cache_budget.zig").envelope(width, height, surfaces) catch |err| {
         ctx.video_cache_budget.failure = err;
         return 0;
     };
-    ctx.video_cache_budget.reserve(&ctx.device_allocations, bytes) catch |err| {
+    ctx.video_cache_budget.reserve(&ctx.device_allocations, bytes * sample_bytes) catch |err| {
         ctx.video_cache_budget.failure = err;
         return 0;
     };
