@@ -4580,7 +4580,9 @@ const PageWriteBatch = struct {
 
     fn appendPage(self: *PageWriteBatch, page_id: u64, kind: PageKind, payload: []const u8) !void {
         if (payload.len > self.file.maxPagePayloadBytes()) return error.PageTooLarge;
-        encodePage(try self.reserve(page_id), kind, payload);
+        const page = try self.reserve(page_id);
+        encodePage(page, kind, payload);
+        self.noteManifestEntry(page_id, page);
     }
 
     fn appendValue(self: *PageWriteBatch, page_id: u64, next: u64, chunk: []const u8) !void {
@@ -4589,6 +4591,17 @@ const PageWriteBatch = struct {
         var prefix: [value_page_header_size]u8 = undefined;
         std.mem.writeInt(u64, &prefix, next, .little);
         encodePageParts(page, .value, &prefix, chunk);
+        self.noteManifestEntry(page_id, page);
+    }
+
+    /// `page` is the just-encoded on-disk bytes for `page_id`, still sitting
+    /// in this batch's pending buffer; its CRC (already computed by
+    /// `encodePage`/`encodePageParts`) is read back out rather than
+    /// recomputed, so the manifest entry can never disagree with what is
+    /// about to be written.
+    fn noteManifestEntry(self: *PageWriteBatch, page_id: u64, page: []const u8) void {
+        const builder = self.file.transaction_manifest orelse return;
+        builder.note(self.file.allocator, page_id, std.mem.readInt(u32, page[page_crc_offset..][0..4], .little));
     }
 
     fn flush(self: *PageWriteBatch) !void {
@@ -4862,6 +4875,15 @@ pub const NativeFile = struct {
     transaction_writes: ?*TransactionWrites = null,
     flushing_transaction: bool = false,
     transaction_pages: ?*PageAllocator = null,
+    /// Set only around a durable `commitTransactionWithDurability` call
+    /// (never a mid-transaction `flushTransactionWrites`), so every page
+    /// `PageWriteBatch` physically writes during this commit -- documents,
+    /// catalog/index pages, allocator/free-map ledger pages, value chains --
+    /// is recorded with the exact CRC it was just encoded with. When the
+    /// commit stays within `max_single_sync_pages`, this lets the commit
+    /// write one `.commit_manifest` page and publish with a single fsync
+    /// instead of presyncing data before the slot write.
+    transaction_manifest: ?*ManifestBuilder = null,
     durable_header: ?Header = null,
     last_synced_header: ?Header = null,
     change_capture: ?*ChangeCapture = null,
@@ -12978,6 +13000,32 @@ const manifest_entry_size: usize = 12; // u64 page_id + u32 crc
 pub const max_page_size: usize = 65536;
 
 const ManifestEntry = struct { page_id: u64, crc: u32 };
+
+/// Accumulates one commit's (page_id, crc) pairs as `PageWriteBatch` writes
+/// them, keyed by page id so a page rewritten more than once before the
+/// commit publishes keeps only its final CRC (the only one that will still
+/// be on disk when recovery checks it). `overflowed` latches permanently
+/// once tracking fails or the commit exceeds `max_single_sync_pages`: a
+/// commit that cannot build a trustworthy manifest falls back to the
+/// presynced two-sync path instead of risking an under- or over-complete
+/// one.
+const ManifestBuilder = struct {
+    entries: std.AutoHashMapUnmanaged(u64, u32) = .empty,
+    overflowed: bool = false,
+
+    fn deinit(self: *ManifestBuilder, allocator: Allocator) void {
+        self.entries.deinit(allocator);
+    }
+
+    fn note(self: *ManifestBuilder, allocator: Allocator, page_id: u64, crc: u32) void {
+        if (self.overflowed) return;
+        self.entries.put(allocator, page_id, crc) catch {
+            self.overflowed = true;
+            return;
+        };
+        if (self.entries.count() > max_single_sync_pages) self.overflowed = true;
+    }
+};
 
 fn encodeManifestPayloadAlloc(allocator: Allocator, entries: []const ManifestEntry) ![]u8 {
     const out = try allocator.alloc(u8, 4 + entries.len * manifest_entry_size);
