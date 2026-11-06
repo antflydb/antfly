@@ -673,22 +673,20 @@ pub fn main(allocator: std.mem.Allocator, io: std.Io, args: []const []const u8) 
             .gpu
         else
             .cpu;
-    var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
-    budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
-    if (draft_model) |loaded| {
-        budget_limits = session_factory.widenBudgetLimitsForSession(loaded.session, budget_limits);
-    }
-    budget_limits = try applyBudgetOverrides(budget_limits, opts);
+    var automatic_limits = runtime.tier.memory.defaultLimitsForBackend(budget_backend_class);
+    var budget_sessions: [2]backends.Session = undefined;
+    budget_sessions[0] = model.session;
+    var budget_session_count: usize = 1;
     if (draft_model) |loaded| {
         const draft_budget_backend_class: runtime.tier.memory.BackendClass = switch (draft_backend_kind.?) {
             .native => .cpu,
             else => .gpu,
         };
-        var draft_budget_limits = runtime.tier.memory.defaultLimitsForBackend(draft_budget_backend_class);
-        draft_budget_limits = session_factory.widenBudgetLimitsForSession(loaded.session, draft_budget_limits);
-        draft_budget_limits = try applyBudgetOverrides(draft_budget_limits, opts);
-        budget_limits = runtime.tier.memory.maxCompositeLimits(budget_limits, draft_budget_limits);
+        automatic_limits = runtime.tier.memory.maxCompositeLimits(automatic_limits, runtime.tier.memory.defaultLimitsForBackend(draft_budget_backend_class));
+        budget_sessions[1] = loaded.session;
+        budget_session_count = 2;
     }
+    const budget_limits = try session_factory.resolveBudgetLimitsForSessions(budget_sessions[0..budget_session_count], automatic_limits, try budgetOverrideLimits(opts));
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
     print("budget: host={d}MiB backend={d}MiB combined={d}MiB\n", .{
         budget_limits.host_limit_bytes / (1024 * 1024),
@@ -8272,14 +8270,18 @@ fn printUsage() void {
     , .{});
 }
 
-fn applyBudgetOverrides(defaults: runtime.tier.memory.Limits, opts: Options) !runtime.tier.memory.Limits {
+fn budgetOverrideLimits(opts: Options) !runtime.tier.memory.Limits {
     return (runtime.tier.memory.BudgetOverridesMib{
         .host = opts.host_budget_mb,
         .backend = opts.backend_budget_mb,
         .combined = opts.combined_budget_mb,
         .kv = opts.kv_budget_mb,
         .scratch = opts.scratch_budget_mb,
-    }).apply(defaults);
+    }).toByteLimits();
+}
+
+fn applyBudgetOverrides(defaults: runtime.tier.memory.Limits, opts: Options) !runtime.tier.memory.Limits {
+    return runtime.tier.memory.applyLimitOverrides(defaults, try budgetOverrideLimits(opts));
 }
 
 fn graphModeEnabled() bool {
@@ -9405,4 +9407,22 @@ test "cuda gemma prefill prewarm defaults on with bidirectional env overrides" {
     try std.testing.expectEqual(@as(c_int, 0), unsetenv("ANTFLY_INFERENCE_CUDA_DISABLE_GEMMA_PREFILL_PREWARM"));
     try std.testing.expectEqual(@as(c_int, 0), setenv("ANTFLY_INFERENCE_DISABLE_GEMMA_PREFILL_PREWARM", "1", 1));
     try std.testing.expect(!cudaGemmaPrefillPrewarmEnabled());
+}
+
+test "native generation raw budget overrides preserve omitted composite and scratch provenance" {
+    const mib = runtime.tier.memory.bytes_per_mib;
+    var opts: Options = .{ .model_dir = "unused", .prompt = "unused", .host_budget_mb = 3 };
+    const raw = try budgetOverrideLimits(opts);
+    try std.testing.expectEqual(@as(usize, 3 * mib), raw.host_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 0), raw.combined_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 0), raw.scratch_limit_bytes);
+    const applied = try applyBudgetOverrides(.{ .backend_limit_bytes = 7 * mib }, opts);
+    try std.testing.expectEqual(@as(usize, 10 * mib), applied.combined_limit_bytes);
+    opts.combined_budget_mb = 4;
+    opts.scratch_budget_mb = 2;
+    const explicit = try budgetOverrideLimits(opts);
+    try std.testing.expectEqual(@as(usize, 4 * mib), explicit.combined_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 2 * mib), explicit.scratch_limit_bytes);
+    opts.host_budget_mb = std.math.maxInt(usize);
+    try std.testing.expectError(error.Overflow, budgetOverrideLimits(opts));
 }

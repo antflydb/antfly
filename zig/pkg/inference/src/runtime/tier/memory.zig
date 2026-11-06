@@ -3222,8 +3222,10 @@ pub fn estimateGptGenerationForKvPolicy(
     const view_metadata_bytes = @import("../kv/view_metadata.zig").hostBytes(@max(total_tokens, replay_capacity), generation_kv_page_size_tokens, false) catch return error.ResourceLimitExceeded;
     // Both canonical KV owners retain their prepared deltas until the paired
     // table/total/view publication completes. Their real temporary ID spills
-    // coexist with the state-owned view history and each other.
-    const owner_spill_bytes = @import("../kv/writable_blocks.zig").spillHostBytes(total_tokens, max_tokens, replay_capacity, generation_kv_page_size_tokens, false) catch return error.ResourceLimitExceeded;
+    // coexist with the state-owned view history and each other. A full prompt
+    // can now use the same transaction, so bound the larger of a prompt
+    // publication and one generated burst; they never prepare simultaneously.
+    const owner_spill_bytes = @import("../kv/writable_blocks.zig").spillHostBytes(total_tokens, @max(prompt_tokens, max_tokens), replay_capacity, generation_kv_page_size_tokens, false) catch return error.ResourceLimitExceeded;
     const paired_spill_bytes = std.math.mul(usize, 2, owner_spill_bytes) catch return error.ResourceLimitExceeded;
     const host_metadata_bytes = std.math.add(usize, view_metadata_bytes, paired_spill_bytes) catch return error.ResourceLimitExceeded;
 
@@ -4655,7 +4657,12 @@ test "generation budget downshifts target and draft together" {
         .{ .backend = .metal, .kv_dtype = .f16, .config = cfg },
         .{ .backend = .metal, .kv_dtype = .f16, .config = cfg },
     };
+    // Keep the original operator cap. The independent host view/history and
+    // both full-prompt prepared-owner spill envelopes also occupy scratch.
     var budget = RunBudget.init(.{ .scratch_limit_bytes = 50_000 });
+    const rejected_component = try estimateGptGeneration(.metal, .f16, cfg, 200, 1, 64);
+    const rejected_scratch = try std.math.add(usize, rejected_component.scratch_bytes, rejected_component.host_metadata_bytes);
+    try std.testing.expect(try std.math.mul(usize, 2, rejected_scratch) > budget.limits.scratch_limit_bytes);
 
     const selected = try reserveGptGenerationAtLargestChunk(
         &budget,
@@ -4664,8 +4671,8 @@ test "generation budget downshifts target and draft together" {
         1,
         200,
     );
-    try std.testing.expectEqual(@as(usize, 64), selected);
-    const selected_component = try estimateGptGeneration(.metal, .f16, cfg, 200, 1, 64);
+    try std.testing.expectEqual(@as(usize, 32), selected);
+    const selected_component = try estimateGptGeneration(.metal, .f16, cfg, 200, 1, 32);
     const selected_total = try std.math.add(usize, selected_component.scratch_bytes, selected_component.host_metadata_bytes);
     try std.testing.expectEqual(try std.math.mul(usize, 2, selected_total), budget.scratchTotalBytes());
 }
@@ -5648,10 +5655,14 @@ test "generation host metadata adds both simultaneous prepared KV spill owners t
     const cfg = gpt_mod.Config{ .hidden_size = 4, .num_hidden_layers = 1, .num_attention_heads = 1, .num_key_value_heads = 1, .intermediate_size = 8, .vocab_size = 16 };
     const estimate = try estimateGptGeneration(.native, .f32, cfg, 24000, 1, 1);
     const view_bytes = try @import("../kv/view_metadata.zig").hostBytes(24001, generation_kv_page_size_tokens, false);
-    const owner_spills = try @import("../kv/writable_blocks.zig").spillHostBytes(24001, 1, 0, generation_kv_page_size_tokens, false);
+    const generated_spills = try @import("../kv/writable_blocks.zig").spillHostBytes(24001, 1, 0, generation_kv_page_size_tokens, false);
+    const owner_spills = try @import("../kv/writable_blocks.zig").spillHostBytes(24001, 24000, 0, generation_kv_page_size_tokens, false);
     // One generated token cannot spill the acquired-ID inline array. The
     // independently large front-retirement array must still be declared.
-    try std.testing.expectEqual(@as(usize, (1501 + 1) * @sizeOf(@import("../kv/block.zig").KvBlockId)), owner_spills);
+    try std.testing.expectEqual(@as(usize, (1501 + 1) * @sizeOf(@import("../kv/block.zig").KvBlockId)), generated_spills);
+    // A full 24000-row prefill also spills its acquired-page IDs. Prompt and
+    // generated phases are sequential; one maximum bound covers both owners.
+    try std.testing.expectEqual(@as(usize, (1501 + 1502) * @sizeOf(@import("../kv/block.zig").KvBlockId)), owner_spills);
     try std.testing.expectEqual(try std.math.add(usize, view_bytes, try std.math.mul(usize, 2, owner_spills)), estimate.host_metadata_bytes);
     try std.testing.expect(estimate.host_metadata_bytes > view_bytes);
     var below = RunBudget.init(.{ .host_limit_bytes = estimate.host_metadata_bytes - 1 });

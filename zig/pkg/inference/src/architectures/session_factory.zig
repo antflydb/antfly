@@ -131,6 +131,7 @@ pub const getGlinerDecisionIdentity = implementation.getGlinerDecisionIdentity;
 pub const TestGlinerBoundaryMetalOwner = implementation.TestGlinerBoundaryMetalOwner;
 pub const getLayaConfig = implementation.getLayaConfig;
 pub const widenBudgetLimitsForSession = implementation.widenBudgetLimitsForSession;
+pub const resolveBudgetLimitsForSessions = implementation.resolveBudgetLimitsForSessions;
 pub const configureReservedGenerationWorkspace = implementation.configureReservedGenerationWorkspace;
 pub const configureSharedCacheAdmissionForSession = implementation.configureSharedCacheAdmissionForSession;
 pub const installNativeCacheRetirementDomainForSession = implementation.installNativeCacheRetirementDomainForSession;

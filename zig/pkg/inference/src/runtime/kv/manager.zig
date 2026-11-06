@@ -81,30 +81,75 @@ pub const KvManager = struct {
         return id;
     }
 
-    pub fn attachSequence(self: *KvManager, pool_id: block.KvPoolId) !SequenceId {
+    /// Unpublished metadata ownership under the caller's exclusive KV lock.
+    /// No numerical endpoint may use this sequence until commit. Prepared
+    /// mutation cleanup must run before abort recycles the inactive slot.
+    pub const PendingAttachment = struct {
+        manager: *KvManager,
+        sequence_id: SequenceId,
+        active: bool = true,
+
+        fn state(self: *@This()) *SequenceState {
+            std.debug.assert(self.active);
+            const row = &self.manager.sequences.items[self.sequence_id - 1];
+            std.debug.assert(!row.active);
+            return row;
+        }
+
+        pub fn canPreparePrefillAppend(self: *@This(), count: usize) bool {
+            if (count == 0) return false;
+            const row = self.state();
+            const storage = self.manager.getPoolMut(row.pool_id) orelse return false;
+            return writable.canPrepareAppend(storage, &row.block_table, &row.reserved_tail_blocks, true, null);
+        }
+
+        pub fn preparePrefillAppend(self: *@This(), count: usize, reserve_to: usize) !writable.PreparedAppend {
+            const row = self.state();
+            const storage = self.manager.getPoolMut(row.pool_id) orelse return error.InvalidPoolId;
+            return writable.prepareAppend(storage, &row.block_table, &row.reserved_tail_blocks, self.manager.allocator, count, reserve_to, null, self.sequence_id, true, null);
+        }
+
+        pub fn commit(self: *@This()) void {
+            self.state().active = true;
+            self.active = false;
+        }
+
+        pub fn abort(self: *@This()) void {
+            if (!self.active) return;
+            const row = self.state();
+            // The unpublished endpoint never ran, so cleanup is metadata-only.
+            // Staged page ownership belongs to the earlier deferred plan abort.
+            std.debug.assert(row.block_table.blocks.items.len == 0 and row.reserved_tail_blocks.items.len == 0);
+            self.manager.free_sequence_indices.appendAssumeCapacity(self.sequence_id - 1);
+            self.active = false;
+        }
+    };
+
+    pub fn prepareAttachment(self: *KvManager, pool_id: block.KvPoolId) !PendingAttachment {
         if (pool_id >= self.pools.items.len) return error.InvalidPoolId;
         if (self.recycledSequenceIndex()) |idx| {
             const id: SequenceId = @intCast(idx + 1);
             const seq_state = &self.sequences.items[idx];
             seq_state.id = id;
             seq_state.pool_id = pool_id;
-            seq_state.active = true;
             seq_state.compacted = false;
             seq_state.block_table.reset();
             seq_state.reserved_tail_blocks.clearRetainingCapacity();
-            return id;
+            return .{ .manager = self, .sequence_id = id };
         }
         const next = try std.math.add(usize, self.sequences.items.len, 1);
         const id = std.math.cast(SequenceId, next) orelse return error.KvSequenceLimitExceeded;
         // Reserve every future retirement slot before publishing this ID.
-        // Valid retirement/reuse never allocates, including destructor cleanup.
         try self.free_sequence_indices.ensureTotalCapacity(self.allocator, next);
         try self.sequences.ensureUnusedCapacity(self.allocator, 1);
-        self.sequences.appendAssumeCapacity(.{
-            .id = id,
-            .pool_id = pool_id,
-        });
-        return id;
+        self.sequences.appendAssumeCapacity(.{ .id = id, .pool_id = pool_id, .active = false });
+        return .{ .manager = self, .sequence_id = id };
+    }
+
+    pub fn attachSequence(self: *KvManager, pool_id: block.KvPoolId) !SequenceId {
+        var pending = try self.prepareAttachment(pool_id);
+        pending.commit();
+        return pending.sequence_id;
     }
 
     pub fn attachSequenceWithSharedPrefix(self: *KvManager, pool_id: block.KvPoolId, source_sequence_id: SequenceId, shared_token_count: usize) !SequenceId {
@@ -263,6 +308,30 @@ pub const KvManager = struct {
         const storage = self.getPoolMut(state.pool_id) orelse return error.InvalidPoolId;
         const window: ?usize = if (state.compacted) null else if (storage.config.sliding_window_size) |value| @as(usize, value) else null;
         return writable.prepareAppend(storage, &state.block_table, &state.reserved_tail_blocks, self.allocator, count, reserve_to, window, sequence_id, true, null);
+    }
+
+    pub fn canPreparePrefillAppend(self: *KvManager, sequence_id: SequenceId, count: usize) bool {
+        return self.canPrepareGeneratedAppend(sequence_id, count);
+    }
+
+    /// Prefill preserves the full original rows: window trimming belongs to
+    /// generated decode, not a partial or full prompt publication.
+    pub fn preparePrefillAppend(self: *KvManager, sequence_id: SequenceId, count: usize, reserve_to: usize) !writable.PreparedAppend {
+        const row = try self.sequenceMut(sequence_id);
+        const storage = self.getPoolMut(row.pool_id) orelse return error.InvalidPoolId;
+        return writable.prepareAppend(storage, &row.block_table, &row.reserved_tail_blocks, self.allocator, count, reserve_to, null, sequence_id, true, null);
+    }
+
+    pub fn canPrepareTruncate(self: *KvManager, sequence_id: SequenceId) bool {
+        const row = self.sequenceMut(sequence_id) catch return false;
+        const storage = self.getPoolMut(row.pool_id) orelse return false;
+        return writable.canPrepareTruncate(storage);
+    }
+
+    pub fn prepareTruncate(self: *KvManager, sequence_id: SequenceId, count: usize) !writable.PreparedTruncate {
+        const row = try self.sequenceMut(sequence_id);
+        const storage = self.getPoolMut(row.pool_id) orelse return error.InvalidPoolId;
+        return writable.prepareTruncate(storage, &row.block_table, &row.reserved_tail_blocks, self.allocator, count);
     }
 
     pub fn logicalBlocksWithReservationsCount(self: *const KvManager, sequence_id: SequenceId) !usize {
@@ -1418,4 +1487,40 @@ test "canonical generated append unique tail stays allocation free and custom pr
     defer storage.vtable = original_table;
     try std.testing.expect(!manager.canPrepareGeneratedAppend(sequence, 1));
     try std.testing.expectEqual(@as(?usize, 4), manager.tokenCount(sequence));
+}
+
+test "manager pending attachment abort preserves unpublished slot and prepared prompt ownership" {
+    const a = std.testing.allocator;
+    var manager = KvManager.init(a);
+    defer manager.deinit();
+    const pool = try manager.addPool(.{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1, .sliding_window_size = 2 });
+    var pending = try manager.prepareAttachment(pool);
+    const id = pending.sequence_id;
+    try std.testing.expectError(error.InvalidSequenceId, manager.sequenceMut(id));
+    try std.testing.expect(pending.canPreparePrefillAppend(7));
+    {
+        var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+        manager.allocator = failing.allocator();
+        defer manager.allocator = a;
+        try std.testing.expectError(error.OutOfMemory, pending.preparePrefillAppend(7, 0));
+        try std.testing.expectError(error.InvalidSequenceId, manager.sequenceMut(id));
+    }
+    {
+        var plan = try pending.preparePrefillAppend(7, 0);
+        defer plan.abort();
+        try std.testing.expectEqual(@as(usize, 7), plan.futureTokenCount());
+        try std.testing.expectError(error.InvalidSequenceId, manager.sequenceMut(id));
+    }
+    pending.abort();
+    pending.abort();
+    var recovered = try manager.prepareAttachment(pool);
+    defer recovered.abort();
+    try std.testing.expectEqual(id, recovered.sequence_id);
+    var plan = try recovered.preparePrefillAppend(7, 0);
+    defer plan.abort();
+    plan.commit();
+    recovered.commit();
+    try std.testing.expectEqual(@as(usize, 7), manager.tokenCount(id).?);
+    // The prompt must remain untrimmed despite a two-row decode window.
+    try std.testing.expectEqual(@as(usize, 4), (try manager.sequenceMut(id)).block_table.blocks.items.len);
 }

@@ -971,14 +971,18 @@ pub const BudgetOverrides = struct {
     kv_limit_bytes: usize = 0,
     scratch_limit_bytes: usize = 0,
 
-    pub fn apply(self: @This(), defaults: runtime.tier.memory.Limits) runtime.tier.memory.Limits {
-        return runtime.tier.memory.applyLimitOverrides(defaults, .{
+    pub fn limits(self: @This()) runtime.tier.memory.Limits {
+        return .{
             .host_limit_bytes = self.host_limit_bytes,
             .backend_limit_bytes = self.backend_limit_bytes,
             .combined_limit_bytes = self.combined_limit_bytes,
             .kv_limit_bytes = self.kv_limit_bytes,
             .scratch_limit_bytes = self.scratch_limit_bytes,
-        });
+        };
+    }
+
+    pub fn apply(self: @This(), defaults: runtime.tier.memory.Limits) runtime.tier.memory.Limits {
+        return runtime.tier.memory.applyLimitOverrides(defaults, self.limits());
     }
 };
 
@@ -6236,10 +6240,7 @@ pub const Node = struct {
             .native => .cpu,
             .metal, .cuda => .gpu,
         };
-        const budget_limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(
-            model.session,
-            self.defaultGenerationLimits(budget_backend_class),
-        ));
+        const budget_limits = try session_factory.resolveBudgetLimitsForSessions(&.{model.session}, self.defaultGenerationLimits(budget_backend_class), self.config.generation_budget_overrides.limits());
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         const prompt_estimate = try countPromptTokens(allocator, model_path, model, gpt_config, messages, max_tokens, preflight.enable_thinking, preflight.grammar != null);
         const prompt_tokens = prompt_estimate.token_count;
@@ -8866,7 +8867,7 @@ pub const Node = struct {
         const control = self.extractionExecutionControl(null);
         const media = try generation.nativeGenerationMediaAdmissionForBackend(a, model.model_dir, &.{.{ .role = "user", .content = "", .image_bytes = &.{fixture} }}, cfg, if (model.session.backend() == .cuda) .cuda else .generic);
         const one = try model_manager_mod.projectorRunAdmissionAmounts(model.manifest, if (model.session.backend() == .cuda) .cuda else .metal, media);
-        const limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(model.session, self.defaultGenerationLimits(.gpu)));
+        const limits = try session_factory.resolveBudgetLimitsForSessions(&.{model.session}, self.defaultGenerationLimits(.gpu), self.config.generation_budget_overrides.limits());
         const width = qwen3vl_projector.maxResidentVisionBatchItems(if (model.session.backend() == .cuda) .cuda else .metal);
         var amounts = one;
         // One extra envelope covers retained serial and paired batch outputs.
@@ -9320,7 +9321,7 @@ pub const Node = struct {
         const messages = [_]generation.Message{.{ .role = "user", .content = prompt, .image_bytes = &.{image}, .content_parts = &.{ .{ .image = 0 }, .{ .text = prompt } } }};
         const estimate = try countPromptTokens(a, model_path, model, cfg, &messages, max_tokens, false, false);
         try validateMeasuredReadPrompt(try resolvedInferenceExecutorContract(self, "read", &model.manifest), estimate.token_count, @intCast(max_tokens));
-        const limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(model.session, self.defaultGenerationLimits(.gpu)));
+        const limits = try session_factory.resolveBudgetLimitsForSessions(&.{model.session}, self.defaultGenerationLimits(.gpu), self.config.generation_budget_overrides.limits());
         var local_budget = runtime.tier.memory.RunBudget.init(limits);
         const components = [_]runtime.tier.memory.GptGenerationBudgetComponent{.{ .backend = backend, .kv_dtype = kv_dtype, .config = cfg, .workspace_capacity = model.session.generationWorkspaceCapacity() }};
         const ceiling = try runtime.tier.memory.reserveGptGenerationAtLargestChunk(&local_budget, &components, estimate.token_count, @intCast(max_tokens), estimate.token_count);
@@ -9797,7 +9798,7 @@ pub const Node = struct {
         const control = self.bindExecutionControl(items[0].control.io, .{ .ptr = &group_control, .check_fn = executor_microbatch.ExecutionControl.check });
         const io = items[0].control.io orelse return error.MissingIo;
 
-        const limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(model.session, self.defaultGenerationLimits(.gpu)));
+        const limits = try session_factory.resolveBudgetLimitsForSessions(&.{model.session}, self.defaultGenerationLimits(.gpu), self.config.generation_budget_overrides.limits());
         var budget = runtime.tier.memory.RunBudget.init(limits);
         var memory = LightOnCohortMemory{ .backend = backend, .share_decoder_scratch = backend == .cuda, .decoder_rows = @min(items.len, self.lightOnReaderRows()) };
         var coordinator = runtime.scheduler.native_generate.NativeGenerateCoordinator.init(allocator);
@@ -15057,12 +15058,7 @@ pub const Node = struct {
                 .native => .cpu,
                 .metal, .cuda => .gpu,
             };
-            const admission_limits = self.config.generation_budget_overrides.apply(
-                session_factory.widenBudgetLimitsForSession(
-                    model.session,
-                    self.defaultGenerationLimits(backend_class),
-                ),
-            );
+            const admission_limits = try session_factory.resolveBudgetLimitsForSessions(&.{model.session}, self.defaultGenerationLimits(backend_class), self.config.generation_budget_overrides.limits());
             const admission_amounts = model_manager_mod.projectorRunAdmissionAmounts(
                 model.manifest,
                 backend_kind,
@@ -16773,20 +16769,22 @@ pub const Node = struct {
                 .gpu
             else
                 .cpu;
-        var budget_limits = self.defaultGenerationLimits(budget_backend_class);
-        budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
+        var generation_sessions: [2]backends_mod.Session = undefined;
+        generation_sessions[0] = model.session;
+        var generation_session_count: usize = 1;
+        var automatic_budget_limits = self.defaultGenerationLimits(budget_backend_class);
         if (draft_model_for_generation) |draft_model| {
+            generation_sessions[1] = draft_model.session;
+            generation_session_count = 2;
             const draft_budget_class: runtime.tier.memory.BackendClass =
                 if (draft_backend_kind.? == .native) .cpu else .gpu;
-            const draft_budget_limits = self.config.generation_budget_overrides.apply(
-                session_factory.widenBudgetLimitsForSession(
-                    draft_model.session,
-                    self.defaultGenerationLimits(draft_budget_class),
-                ),
-            );
-            budget_limits = runtime.tier.memory.maxCompositeLimits(budget_limits, draft_budget_limits);
+            automatic_budget_limits = runtime.tier.memory.maxCompositeLimits(automatic_budget_limits, self.defaultGenerationLimits(draft_budget_class));
         }
-        budget_limits = self.config.generation_budget_overrides.apply(budget_limits);
+        const budget_limits = try session_factory.resolveBudgetLimitsForSessions(
+            generation_sessions[0..generation_session_count],
+            automatic_budget_limits,
+            self.config.generation_budget_overrides.limits(),
+        );
         var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
         const native_host_reservation: usize = if (native_transfer) |transfer|
             if (transfer.prepare) |request| blk: {
@@ -16972,12 +16970,9 @@ pub const Node = struct {
         }
         const target_backend_class: runtime.tier.memory.BackendClass =
             if (backend_kind == .native) .cpu else .gpu;
-        const target_admission_limits = self.config.generation_budget_overrides.apply(
-            session_factory.widenBudgetLimitsForSession(
-                model.session,
-                self.defaultGenerationLimits(target_backend_class),
-            ),
-        );
+        // Both resident workspaces coexist in the actual process controller.
+        // Each request uses the same resolved composite floor and exact overrides.
+        const target_admission_limits = budget_limits;
         var admission_requests: [2]model_manager_mod.GenerationAdmissionRequest = undefined;
         admission_requests[0] = .{
             .session = model.session,
@@ -17007,12 +17002,7 @@ pub const Node = struct {
                 .session = draft_model_for_generation.?.session,
                 .resources = .{
                     .backend_class = draft_backend_class,
-                    .limits = self.config.generation_budget_overrides.apply(
-                        session_factory.widenBudgetLimitsForSession(
-                            draft_model_for_generation.?.session,
-                            self.defaultGenerationLimits(draft_backend_class),
-                        ),
-                    ),
+                    .limits = budget_limits,
                     .amounts = try runtime.tier.memory.AdmissionAmounts.fromEstimate(estimate),
                 },
             };
@@ -19161,10 +19151,7 @@ pub const Node = struct {
                     .native => .cpu,
                     .metal, .cuda => .gpu,
                 };
-                const budget_limits = self.config.generation_budget_overrides.apply(session_factory.widenBudgetLimitsForSession(
-                    model.session,
-                    self.defaultGenerationLimits(budget_backend_class),
-                ));
+                const budget_limits = try session_factory.resolveBudgetLimitsForSessions(&.{model.session}, self.defaultGenerationLimits(budget_backend_class), self.config.generation_budget_overrides.limits());
                 var leases = try ctx.allocator.alloc(runtime.scheduler.native_generate.Lease, group_indices.items.len);
                 for (leases) |*lease| lease.* = .{ .request_id = 0, .reserved_units = 0, .prompt_bytes = 0, .max_tokens = 0, .prefill_chunk_size = 0, .active_requests_snapshot = 0 };
                 const standalone_prefill_plans = try ctx.allocator.alloc(
@@ -36643,6 +36630,9 @@ test "budget overrides apply selectively" {
     try std.testing.expectEqual(@as(usize, 350), applied.combined_limit_bytes);
     try std.testing.expectEqual(@as(usize, 400), applied.kv_limit_bytes);
     try std.testing.expectEqual(@as(usize, 600), applied.scratch_limit_bytes);
+    const explicit = BudgetOverrides{ .host_limit_bytes = 150, .combined_limit_bytes = 350, .scratch_limit_bytes = 600 };
+    try std.testing.expectEqualDeep(runtime.tier.memory.Limits{ .host_limit_bytes = 150, .combined_limit_bytes = 350, .scratch_limit_bytes = 600 }, explicit.limits());
+    try std.testing.expectEqualDeep(runtime.tier.memory.Limits{}, (BudgetOverrides{}).limits());
 }
 
 test "generation batching keeps the experimental CUDA envelope default-off" {

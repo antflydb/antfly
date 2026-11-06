@@ -675,8 +675,7 @@ fn runLocalChat(allocator: std.mem.Allocator, io: std.Io, opts: Options) !void {
     );
 
     const budget_class: runtime.tier.memory.BackendClass = if (backend_kind != .native) .gpu else .cpu;
-    var budget_limits = runtime.tier.memory.defaultLimitsForBackend(budget_class);
-    budget_limits = session_factory.widenBudgetLimitsForSession(model.session, budget_limits);
+    const budget_limits = try session_factory.resolveBudgetLimitsForSessions(&.{model.session}, runtime.tier.memory.defaultLimitsForBackend(budget_class), .{});
     var run_budget = runtime.tier.memory.RunBudget.init(budget_limits);
     run_budget.reserveEstimate(try runtime.tier.memory.estimateGptGeneration(
         backend_kind,

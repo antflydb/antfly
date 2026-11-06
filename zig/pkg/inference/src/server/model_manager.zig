@@ -3144,13 +3144,12 @@ pub const ModelManager = struct {
         self: *const ModelManager,
         backend_runtime: backends.BackendRuntime,
         session: backends.Session,
-    ) runtime.tier.memory.Limits {
-        var limits = backends.defaultMemoryLimits(
+    ) !runtime.tier.memory.Limits {
+        const limits = try session_factory.resolveBudgetLimitsForSessions(&.{session}, backends.defaultMemoryLimits(
             backend_runtime.backend,
             self.process_memory_limit_bytes,
-        );
-        limits = session_factory.widenBudgetLimitsForSession(session, limits);
-        return backends.clampPhysicalMemoryLimits(backend_runtime.backend, runtime.tier.memory.applyLimitOverrides(limits, self.admission_limit_overrides), self.process_memory_limit_bytes);
+        ), self.admission_limit_overrides);
+        return backends.clampPhysicalMemoryLimits(backend_runtime.backend, limits, self.process_memory_limit_bytes);
     }
 
     /// Lazily loaded composite-model components participate in the same
@@ -6206,14 +6205,14 @@ test "CUDA A4B serving reuses retained workspace and unwinds failed requests" {
         };
         defer workspace.borrowed.deinit();
         const session = backends.Session{ .ptr = &workspace, .vtable = undefined, .generation_workspace = &workspace };
-        const strict_host_limits = session_factory.widenBudgetLimitsForSession(session, .{ .host_limit_bytes = 1024, .backend_limit_bytes = 9 * 1024 * 1024 * 1024 });
+        const strict_host_limits = try session_factory.resolveBudgetLimitsForSessions(&.{session}, .{ .backend_limit_bytes = 9 * 1024 * 1024 * 1024 }, .{ .host_limit_bytes = 1024 });
         try std.testing.expectEqual(@as(usize, 1024), strict_host_limits.host_limit_bytes);
         const replay_capacity = platform.env.getenvUsize("ANTFLY_INFERENCE_CUDA_CAPTURE_FORCE_KV_CAPACITY") orelse 0;
         const view_metadata = try @import("../runtime/kv/view_metadata.zig").hostBytes(@max(@as(usize, 2049), replay_capacity), memory.generation_kv_page_size_tokens, false);
-        const owner_spills = try @import("../runtime/kv/writable_blocks.zig").spillHostBytes(2049, 1, replay_capacity, memory.generation_kv_page_size_tokens, false);
+        const owner_spills = try @import("../runtime/kv/writable_blocks.zig").spillHostBytes(2049, 2048, replay_capacity, memory.generation_kv_page_size_tokens, false);
         const host_metadata = try std.math.add(usize, view_metadata, try std.math.mul(usize, 2, owner_spills));
         const operator_host_limit = @max(@as(usize, 1024), host_metadata);
-        const limits = session_factory.widenBudgetLimitsForSession(session, .{ .host_limit_bytes = operator_host_limit, .backend_limit_bytes = 9 * 1024 * 1024 * 1024 });
+        const limits = try session_factory.resolveBudgetLimitsForSessions(&.{session}, .{ .backend_limit_bytes = 9 * 1024 * 1024 * 1024 }, .{ .host_limit_bytes = operator_host_limit });
         try std.testing.expectEqual(operator_host_limit, limits.host_limit_bytes);
         try std.testing.expectEqual(@as(usize, @intCast(config.memory_budget_bytes)), limits.backend_limit_bytes);
         try std.testing.expectEqual(limits.host_limit_bytes + limits.backend_limit_bytes, limits.combined_limit_bytes);
@@ -6404,7 +6403,7 @@ const SessionLoadHost = struct {
 
     fn attachAdmission(context: *anyopaque, session: *backends.Session, backend_runtime: backends.BackendRuntime, resident: runtime.tier.memory.AdmissionAmounts, man: ?*const manifest_mod.ModelManifest) !void {
         const manager: *ModelManager = @ptrCast(@alignCast(context));
-        try attachSessionRunAdmission(manager.allocator, session, manager.admissionController(), backend_runtime, manager.admissionLimitsForSession(backend_runtime, session.*), resident, man);
+        try attachSessionRunAdmission(manager.allocator, session, manager.admissionController(), backend_runtime, try manager.admissionLimitsForSession(backend_runtime, session.*), resident, man);
         if (session.run_admission) |*admission| admission.denial_observer = .{ .context = manager, .record = ModelManager.observeSessionAdmissionDenied };
         try manager.attachSessionResourcePin(session);
     }

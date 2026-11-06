@@ -6197,6 +6197,56 @@ fn archSessionHandle(impl: *ArchSession) Session {
     };
 }
 
+/// Resolve automatic policy once for the complete concurrently resident
+/// session set, then preserve the actual operator overrides. Numeric defaults
+/// (including nonzero automatic scratch) never stand in for override provenance.
+pub fn resolveBudgetLimitsForSessions(
+    sessions: []const Session,
+    automatic_defaults: runtime.tier.memory.Limits,
+    operator_overrides: runtime.tier.memory.Limits,
+) !runtime.tier.memory.Limits {
+    const memory = runtime.tier.memory;
+    var limits = automatic_defaults;
+    var workspace_floor: memory.Limits = .{};
+    var prepaid_scratch: usize = 0;
+    for (sessions, 0..) |session, index| {
+        if (session.generation_workspace) |workspace| {
+            var duplicate = false;
+            for (sessions[0..index]) |previous| if (previous.generation_workspace == workspace) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) continue;
+            inline for (std.meta.fields(memory.Limits)) |field| {
+                @field(workspace_floor, field.name) = try std.math.add(usize, @field(workspace_floor, field.name), @field(workspace.floor, field.name));
+            }
+            prepaid_scratch = try std.math.add(usize, prepaid_scratch, workspace.capacity.backend_scratch_bytes);
+        } else {
+            limits = widenBudgetLimitsForSession(session, limits);
+        }
+    }
+    limits = memory.maxCompositeLimits(limits, workspace_floor);
+    if (prepaid_scratch != 0) {
+        // Zero means unlimited. A finite device floor must not create a
+        // combined cap for an originally unbounded host+combined policy.
+        if (automatic_defaults.host_limit_bytes == 0 and automatic_defaults.combined_limit_bytes == 0) {
+            limits.combined_limit_bytes = 0;
+        } else {
+            limits.combined_limit_bytes = @max(limits.combined_limit_bytes, limits.host_limit_bytes +| limits.backend_limit_bytes);
+        }
+    }
+    limits = memory.applyLimitOverrides(limits, operator_overrides);
+    if (prepaid_scratch != 0 and operator_overrides.scratch_limit_bytes == 0) {
+        const host_allowance = if (limits.host_limit_bytes != 0) limits.host_limit_bytes else limits.combined_limit_bytes;
+        if (host_allowance == 0) {
+            limits.scratch_limit_bytes = 0;
+        } else {
+            limits = try memory.withAutomaticScratchFloor(limits, 0, host_allowance, prepaid_scratch);
+        }
+    }
+    return limits;
+}
+
 pub fn widenBudgetLimitsForSession(
     session: Session,
     limits: runtime.tier.memory.Limits,
@@ -18210,4 +18260,51 @@ test "Native cache source versions bind exact maintained slots refuse live sourc
     try std.testing.expectError(error.NativeWeightSourceVersionExhausted, replaceBlasResidentWeight(session, name, .{ .tensor = source }));
     try std.testing.expectEqual(std.math.maxInt(u64), data.resident_weights.get(name).?.source_version);
     try std.testing.expect(data.resident_weights.get(name).?.tensor.data.ptr == source.data.ptr);
+}
+
+test "session budget resolver distinguishes nonzero automatic scratch from explicit overrides and sums distinct workspaces" {
+    const memory = runtime.tier.memory;
+    const byte_unit = memory.bytes_per_mib;
+    const first_scratch = 1024 * byte_unit;
+    const second_scratch = 2048 * byte_unit;
+    const host = 64 * byte_unit;
+    var first = memory.ReservedGenerationWorkspace{ .floor = .{ .backend_limit_bytes = first_scratch, .scratch_limit_bytes = first_scratch }, .capacity = .{ .backend_scratch_bytes = first_scratch } };
+    defer first.borrowed.deinit();
+    var second = memory.ReservedGenerationWorkspace{ .floor = .{ .backend_limit_bytes = second_scratch, .scratch_limit_bytes = second_scratch }, .capacity = .{ .backend_scratch_bytes = second_scratch } };
+    defer second.borrowed.deinit();
+    const one = Session{ .ptr = &first, .vtable = undefined, .generation_workspace = &first };
+    const two = Session{ .ptr = &second, .vtable = undefined, .generation_workspace = &second };
+    const sessions = [_]Session{ one, two, one };
+    const automatic: memory.Limits = .{ .host_limit_bytes = host, .scratch_limit_bytes = 512 * byte_unit };
+    const resolved = try resolveBudgetLimitsForSessions(&sessions, automatic, .{});
+    const prepaid = first_scratch + second_scratch;
+    const factory_defaults = memory.defaultLimitsForBackendWithProcessLimit(.gpu, 0);
+    try std.testing.expect(factory_defaults.scratch_limit_bytes != 0);
+    const from_factory = try resolveBudgetLimitsForSessions(&sessions, factory_defaults, .{ .host_limit_bytes = host });
+    try std.testing.expectEqual(@max(factory_defaults.scratch_limit_bytes, prepaid + host), from_factory.scratch_limit_bytes);
+    try std.testing.expectEqual(@as(usize, prepaid + host), resolved.scratch_limit_bytes);
+    try std.testing.expectEqual(@as(usize, prepaid), resolved.backend_limit_bytes);
+    try std.testing.expectEqual(@as(usize, prepaid + host), resolved.combined_limit_bytes);
+    var controller: memory.AdmissionController = .{};
+    defer controller.deinit();
+    var resident = try controller.tryAcquire(.gpu, .{}, .{ .backend_scratch_bytes = prepaid }, false);
+    defer resident.release();
+    var amounts = memory.AdmissionAmounts{ .host_scratch_bytes = host, .backend_scratch_bytes = first_scratch };
+    var credit = try first.acquire(&amounts);
+    defer credit.release();
+    {
+        var request = try controller.tryAcquire(.gpu, resolved, amounts, false);
+        defer request.release();
+        try std.testing.expectEqual(@as(usize, prepaid + host), controller.snapshot().scratchTotalBytes());
+    }
+    const strict = try resolveBudgetLimitsForSessions(&sessions, automatic, .{ .scratch_limit_bytes = prepaid + host - 1 });
+    try std.testing.expectEqual(@as(usize, prepaid + host - 1), strict.scratch_limit_bytes);
+    try std.testing.expectError(error.ResourceTemporarilyUnavailable, controller.tryAcquire(.gpu, strict, amounts, false));
+    const below_floor = try resolveBudgetLimitsForSessions(&sessions, automatic, .{ .scratch_limit_bytes = 1, .combined_limit_bytes = 2 });
+    try std.testing.expectEqual(@as(usize, 1), below_floor.scratch_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 2), below_floor.combined_limit_bytes);
+    const unbounded = try resolveBudgetLimitsForSessions(&sessions, .{ .scratch_limit_bytes = 512 * byte_unit }, .{});
+    try std.testing.expectEqual(@as(usize, 0), unbounded.host_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 0), unbounded.combined_limit_bytes);
+    try std.testing.expectEqual(@as(usize, 0), unbounded.scratch_limit_bytes);
 }

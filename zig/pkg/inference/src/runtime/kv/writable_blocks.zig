@@ -200,6 +200,85 @@ pub const PreparedAppend = struct {
     }
 };
 
+pub fn canPrepareTruncate(storage: *const storage_mod.KvStorage) bool {
+    return storage.hasCanonicalHostBlockOwnership() and storage.config.page_size_tokens != 0;
+}
+
+/// Logical tail retirement owns only a sorted copy of the removed ID span.
+/// Physical encoded tails and shared readers remain unchanged. As with append,
+/// defer abort() even after commit: temporary frees follow paired publication.
+pub const PreparedTruncate = struct {
+    storage: *storage_mod.KvStorage,
+    table: *tables.SequenceBlockTable,
+    allocator: std.mem.Allocator,
+    logical: usize,
+    reserved: usize,
+    tokens: usize,
+    tail: u16,
+    shared: u32,
+    old_logical: usize,
+    retired: usize = 0,
+    inline_ids: [append_inline_capacity]block.KvBlockId = undefined,
+    spill_ids: ?[]block.KvBlockId = null,
+    active: bool = true,
+
+    fn items(self: *@This()) []block.KvBlockId {
+        return if (self.spill_ids) |ids| ids else &self.inline_ids;
+    }
+    pub fn futureLogicalBlockCount(self: *const @This()) usize {
+        return self.logical;
+    }
+    pub fn futureReservedBlockCount(self: *const @This()) usize {
+        return self.reserved;
+    }
+    pub fn futureTokenCount(self: *const @This()) usize {
+        return self.tokens;
+    }
+    pub fn idsChanged(self: *const @This()) bool {
+        return self.old_logical != self.logical;
+    }
+    pub fn abort(self: *@This()) void {
+        self.active = false;
+        if (self.spill_ids) |ids| self.allocator.free(ids);
+        self.spill_ids = null;
+    }
+    pub fn commit(self: *@This()) void {
+        std.debug.assert(self.active);
+        self.table.blocks.items.len = self.logical;
+        self.table.tail_tokens = self.tail;
+        self.table.shared_prefix_blocks = self.shared;
+        const pool = self.storage.hostPool().?;
+        for (self.items()[0..self.retired]) |id| _ = pool.releaseRef(self.allocator, id) catch @panic("invalid prepared KV truncate ref");
+        self.active = false;
+    }
+};
+
+/// count retains the original API's REMOVE semantics, saturating at empty.
+pub fn prepareTruncate(storage: *storage_mod.KvStorage, table: *tables.SequenceBlockTable, reserved: *std.ArrayListUnmanaged(block.KvBlockId), allocator: std.mem.Allocator, count: usize) !PreparedTruncate {
+    if (!canPrepareTruncate(storage)) return error.SharedKvWriteUnsupported;
+    const page: usize = storage.config.page_size_tokens;
+    if (table.tail_tokens > page) return error.InvalidKvShape;
+    const before = if (table.blocks.items.len == 0) 0 else try std.math.add(usize, try std.math.mul(usize, table.blocks.items.len - 1, page), table.tail_tokens);
+    const unchanged = count == 0 or before == 0;
+    const after = before -| count;
+    const logical = if (unchanged) table.blocks.items.len else if (after == 0) 0 else try std.math.divCeil(usize, after, page);
+    var plan = PreparedTruncate{ .storage = storage, .table = table, .allocator = allocator, .logical = logical, .reserved = reserved.items.len, .tokens = after, .tail = if (unchanged) table.tail_tokens else if (after == 0) 0 else @intCast(if (after % page == 0) page else after % page), .shared = if (unchanged) table.shared_prefix_blocks else @intCast(@min(@as(usize, table.shared_prefix_blocks), logical)), .old_logical = table.blocks.items.len, .retired = table.blocks.items.len - logical };
+    errdefer plan.abort();
+    if (plan.retired > plan.inline_ids.len) plan.spill_ids = try allocator.alloc(block.KvBlockId, plan.retired);
+    const ids = plan.items()[0..plan.retired];
+    @memcpy(ids, table.blocks.items[logical..]);
+    std.mem.sort(block.KvBlockId, ids, {}, std.sort.asc(block.KvBlockId));
+    var cursor: usize = 0;
+    while (cursor < ids.len) {
+        var end = cursor + 1;
+        while (end < ids.len and ids[end] == ids[cursor]) : (end += 1) {}
+        const info = storage.blockInfo(ids[cursor]) orelse return error.InvalidBlockId;
+        if (info.refcount < end - cursor) return error.InvalidBlockRefcount;
+        cursor = end;
+    }
+    return plan;
+}
+
 pub fn prepareAppend(storage: *storage_mod.KvStorage, table: *tables.SequenceBlockTable, reserved: *std.ArrayListUnmanaged(block.KvBlockId), allocator: std.mem.Allocator, count: usize, reserve_to: usize, window: ?usize, sequence: u32, host_copy_allowed: bool, provider: ?CopyProvider) !PreparedAppend {
     if (count == 0 or !canPrepareAppend(storage, table, reserved, host_copy_allowed, provider)) return error.SharedKvWriteUnsupported;
     const page: usize = storage.config.page_size_tokens;
@@ -774,4 +853,86 @@ test "prepared KV spill declaration counts only literal out of line owner arrays
     try std.testing.expectError(error.InvalidPoolId, spillHostBytes(1, 1, 0, 0, false));
     try std.testing.expectError(error.Overflow, spillHostBytes(std.math.maxInt(usize), 1, 0, 1, false));
     try std.testing.expectError(error.Overflow, spillHostBytes(1, 1, std.math.maxInt(usize), 1, false));
+}
+
+test "prepared KV truncate keeps old encoded rows reservations and shared refs until commit" {
+    const Fixture = struct {
+        fn check(a: std.mem.Allocator) !void {
+            var storage = try storage_mod.initHost(a, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 2, .num_kv_heads = 1, .head_dim = 1 });
+            defer storage.deinit(a);
+            var table: tables.SequenceBlockTable = .{};
+            defer table.deinit(a);
+            var reserved: std.ArrayListUnmanaged(block.KvBlockId) = .empty;
+            defer reserved.deinit(a);
+            defer {
+                for (table.blocks.items) |id| _ = storage.releaseRef(a, id) catch unreachable;
+                for (reserved.items) |id| _ = storage.releaseRef(a, id) catch unreachable;
+            }
+            for (0..12) |_| _ = try appendAcquired(&storage, &table, a);
+            table.tail_tokens = 1;
+            try reserved.ensureTotalCapacity(a, 2);
+            for (0..2) |_| reserved.appendAssumeCapacity(try storage.acquire(a));
+            const last = table.last().?;
+            try storage.writeToken(last, 0, 0, &.{3}, &.{7});
+            try storage.retain(last);
+            defer _ = storage.releaseRef(a, last) catch unreachable;
+            const first = table.blocks.items[0];
+            {
+                var abandoned = try prepareTruncate(&storage, &table, &reserved, a, 100);
+                defer abandoned.abort();
+                try std.testing.expectEqual(@as(usize, 23), table.tokenCount(2));
+                try std.testing.expectEqual(@as(usize, 12), table.blocks.items.len);
+                try std.testing.expectEqual(@as(usize, 0), abandoned.futureTokenCount());
+                try std.testing.expectEqual(@as(usize, 2), abandoned.futureReservedBlockCount());
+                try std.testing.expectEqual(@as(u32, 2), storage.blockInfo(last).?.refcount);
+            }
+            var prepared = try prepareTruncate(&storage, &table, &reserved, a, 22);
+            defer prepared.abort();
+            try std.testing.expect(prepared.idsChanged());
+            try std.testing.expectEqual(@as(usize, 1), prepared.futureTokenCount());
+            try std.testing.expectEqual(@as(usize, 23), table.tokenCount(2));
+            prepared.commit();
+            prepared.abort();
+            try std.testing.expectEqualSlices(block.KvBlockId, &.{first}, table.blocks.items);
+            try std.testing.expectEqual(@as(u16, 1), table.tail_tokens);
+            try std.testing.expectEqual(@as(usize, 2), reserved.items.len);
+            try std.testing.expectEqual(@as(u32, 1), storage.blockInfo(last).?.refcount);
+            const held = try storage.readToken(last, 0, 0);
+            try std.testing.expectEqualSlices(f32, &.{3}, held.k);
+            try std.testing.expectEqualSlices(f32, &.{7}, held.v);
+        }
+    };
+    try Fixture.check(std.testing.allocator);
+    try std.testing.checkAllAllocationFailures(std.testing.allocator, Fixture.check, .{});
+}
+
+test "prepared KV in-page truncate changes visibility without allocation or encoded row mutation" {
+    const a = std.testing.allocator;
+    var storage = try storage_mod.initHost(a, .{ .backend = .native, .dtype = .f32, .page_size_tokens = 8, .num_kv_heads = 1, .head_dim = 1 });
+    defer storage.deinit(a);
+    var table: tables.SequenceBlockTable = .{};
+    defer table.deinit(a);
+    var reserved: std.ArrayListUnmanaged(block.KvBlockId) = .empty;
+    defer reserved.deinit(a);
+    const id = try appendAcquired(&storage, &table, a);
+    defer _ = storage.releaseRef(a, id) catch unreachable;
+    table.tail_tokens = 3;
+    try storage.writeToken(id, 0, 2, &.{3}, &.{7});
+    var failing = std.testing.FailingAllocator.init(a, .{ .fail_index = 0 });
+    var prepared = try prepareTruncate(&storage, &table, &reserved, failing.allocator(), 1);
+    defer prepared.abort();
+    try std.testing.expect(!prepared.idsChanged());
+    prepared.commit();
+    try std.testing.expectEqual(@as(u16, 2), table.tail_tokens);
+    try std.testing.expectEqualSlices(f32, &.{3}, (try storage.readToken(id, 0, 2)).k);
+    try std.testing.expectEqual(@as(usize, 0), failing.allocations);
+    var zero = try prepareTruncate(&storage, &table, &reserved, failing.allocator(), 0);
+    defer zero.abort();
+    zero.commit();
+    try std.testing.expectEqual(@as(u16, 2), table.tail_tokens);
+    const copied = storage.vtable.*;
+    var foreign = storage;
+    foreign.vtable = &copied;
+    try std.testing.expect(!canPrepareTruncate(&foreign));
+    try std.testing.expectError(error.SharedKvWriteUnsupported, prepareTruncate(&foreign, &table, &reserved, a, 1));
 }
