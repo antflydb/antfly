@@ -404,6 +404,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_lite_native;
     _ = @import("antfly_local_sources").storage_lite_path_lock_wait;
     _ = @import("antfly_local_sources").storage_lite_writer_queue;
+    _ = @import("antfly_local_sources").storage_lite_write_amplification_bench_test;
     _ = @import("antfly_local_sources").storage_lite_paths;
     _ = @import("antfly_local_sources").storage_lite_read_workspace;
     _ = @import("antfly_local_sources").storage_lite_reader_epochs;
@@ -485,6 +486,7 @@ comptime {
     _ = @import("antfly_local_sources").storage_vector_member_bindings;
     _ = @import("vector_member_bindings_bench.zig");
     _ = @import("antfly_local_sources").storage_wal;
+    _ = @import("antfly_local_sources").storage_write_amplification_trace;
     _ = @import("vopr_durable_job_lane.zig");
     _ = @import("wal_vopr.zig");
     // Ordered-artifact and transfer modules are included in the same audited

@@ -759,6 +759,60 @@ test "lite reclamation shrinking observes partially live packed records" {
     try std.testing.expect((try store.checkWithCancel(null)).valid);
 }
 
+test "startMaintenanceAssumeLocked skips the ledger-rebase check once the cheap byte threshold alone forces a start" {
+    const a = std.testing.allocator;
+
+    // Case 1: reclamation enabled and the checkpoint is already past
+    // minimum_reclaim_bytes. `maintenance_policy.options.enabled and
+    // checkpoint_bytes >= minimum_reclaim_bytes` alone forces a start
+    // regardless of `retirement`'s value, so retirementNeedsServiceWithCancel's
+    // ledger load (native.zig's loadLedgerWithCancel, a real per-commit
+    // cost even when it finds nothing to do -- see the no-consumer wakeup
+    // target in docs/design/lite-performance/lite-single-commit-write-path.md
+    // §3.6) must be skipped entirely here, not merely cheap.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "retirement-check-skip-above-threshold.aflite");
+        defer a.free(path);
+        var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = true, .minimum_reclaim_bytes = 4096, .assessment_bytes = 64 * 1024 * 1024 } });
+        defer store.close();
+        const value = try a.alloc(u8, 128 * 1024);
+        defer a.free(value);
+        @memset(value, 'v');
+        var write = try store.beginWrite();
+        try write.put("large", value);
+        try write.commit();
+        try std.testing.expectEqual(@as(u64, 0), store.test_retirement_check_count.load(.acquire));
+        // The skip must still start maintenance (the pre-existing combined
+        // condition this change preserves), not silently drop it.
+        try std.testing.expect(store.maintenance_started.load(.acquire));
+    }
+
+    // Case 2: reclamation disabled, so the cheap threshold can never force
+    // a start on its own; the ledger-rebase check must still run exactly
+    // as it did before this change.
+    {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+        const path = try testPath(a, tmp, "retirement-check-runs-when-not-cheaply-due.aflite");
+        defer a.free(path);
+        var store = try Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false, .minimum_reclaim_bytes = 4096, .assessment_bytes = 64 * 1024 * 1024 } });
+        defer store.close();
+        var write = try store.beginWrite();
+        try write.put("small", "value");
+        try write.commit();
+        // Not pinning an exact count: startMaintenance() is called from
+        // more than one site per commit (submitScopedMutation's defer,
+        // releaseWriterSlot's defer), and each re-runs the check while
+        // maintenance never actually starts (disabled here), so the count
+        // reflects those call sites, not a single check per commit. The
+        // guarantee this preserves is simply that the check still runs at
+        // least once when the cheap threshold doesn't already decide it.
+        try std.testing.expect(store.test_retirement_check_count.load(.acquire) > 0);
+    }
+}
+
 test "lite reclamation capacity reserve sustains bounded overwrites" {
     const a = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
@@ -1507,6 +1561,14 @@ pub const Store = struct {
     maintenance_start_suppressed: bool = false,
     test_maintenance_hook: if (@import("builtin").is_test) ?MaintenanceTestHook else void = if (@import("builtin").is_test) null else {},
     test_maintenance_cycles: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
+    /// Count and total elapsed ns of startMaintenanceAssumeLocked's
+    /// `retirementNeedsServiceWithCancel` ledger-rebase check, measured so
+    /// its per-write cost on the no-consumer path can be reported without
+    /// changing native.zig (which WS1 owns). Every commit calls
+    /// startMaintenance(), which calls that check unconditionally until
+    /// `maintenance_started` flips true; see submitScopedMutation's defer.
+    test_retirement_check_count: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
+    test_retirement_check_ns: if (@import("builtin").is_test) std.atomic.Value(u64) else void = if (@import("builtin").is_test) .init(0) else {},
     admission_refresh_size: u64 = 0,
     admission_artifact_revision: u64 = 0,
     disk_admission_limit: ?u64 = null,
@@ -2011,8 +2073,31 @@ pub const Store = struct {
     fn startMaintenanceAssumeLocked(self: *Store) void {
         if (self.read_only or self.maintenance_start_suppressed or self.maintenance_cancel.requested.load(.acquire) or
             self.maintenance_future != null) return;
-        const retirement = self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false;
-        if (!retirement and (!self.maintenance_policy.options.enabled or self.file.activeCheckpoint().page_count *| self.file.header.page_size < self.maintenance_policy.options.minimum_reclaim_bytes)) return;
+        // retirementNeedsServiceWithCancel loads (and, once the checkpoint's
+        // free-map root has moved, rebases) the allocator ledger -- a real
+        // per-commit cost (native.zig's loadLedgerWithCancel /
+        // allocator_work.journal_rebase_ns), even when the answer ends up
+        // "nothing to do" (see the no-consumer wakeup target in
+        // docs/design/lite-performance/lite-single-commit-write-path.md
+        // §3.6). `retirement`'s value is only ever consulted below when the
+        // cheap byte-threshold check doesn't already force a start on its
+        // own: when maintenance is enabled and the checkpoint is already
+        // past minimum_reclaim_bytes, the combined condition below starts
+        // maintenance unconditionally, so the ledger load is skipped
+        // entirely in that case -- this is exactly equivalent to the
+        // previous unconditional check, not a new heuristic.
+        const cheap_already_due = self.maintenance_policy.options.enabled and
+            self.file.activeCheckpoint().page_count *| self.file.header.page_size >= self.maintenance_policy.options.minimum_reclaim_bytes;
+        if (!cheap_already_due) {
+            const retirement_check_started = if (@import("builtin").is_test) std.Io.Clock.awake.now(self.file.runtime()).nanoseconds else 0;
+            const retirement = self.file.retirementNeedsServiceWithCancel(&self.maintenance_cancel) catch false;
+            if (@import("builtin").is_test) {
+                const elapsed: u64 = @intCast(@max(0, std.Io.Clock.awake.now(self.file.runtime()).nanoseconds - retirement_check_started));
+                _ = self.test_retirement_check_count.fetchAdd(1, .release);
+                _ = self.test_retirement_check_ns.fetchAdd(elapsed, .release);
+            }
+            if (!retirement) return;
+        }
         self.maintenance_future = self.file.runtime().concurrent(maintenanceLoop, .{self}) catch |err| {
             self.maintenance_policy.status.state = .deferred;
             self.maintenance_policy.status.reason = .concurrency_unavailable;

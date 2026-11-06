@@ -1034,7 +1034,6 @@ const EnrichmentAppendContext = struct {
     artifact_publication_dispatcher: ?ArtifactPublicationDispatcher = null,
     clock: platform_clock.Clock = platform_clock.Clock.real(),
     store: *docstore_mod.DocStore,
-    applied_sequence_checkpoint_path: ?[]const u8,
     index_repair_checkpoint: ?index_repair_state.Location = null,
     shard_manager: *shard_mod.ShardManager,
     index_manager: *index_manager_mod.IndexManager,
@@ -1061,7 +1060,6 @@ const EnrichmentAppendContext = struct {
         return .{
             .alloc = self.alloc,
             .store = self.store,
-            .applied_sequence_checkpoint_path = self.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = self.index_repair_checkpoint,
             .shard_manager = self.shard_manager,
             .change_journal = self.change_journal,
@@ -5349,7 +5347,6 @@ pub const DB = struct {
             .resource_manager = resource_manager,
             .store = async_resources.store,
             .relational_base_rows = relationalColumns(self) != null,
-            .applied_sequence_checkpoint_path = async_resources.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = async_resources.index_repair_checkpoint,
             .index_manager = async_resources.index_manager,
             .apply_mutex = async_resources.apply_mutex,
@@ -5596,7 +5593,6 @@ pub const DB = struct {
             .read_only = openModeRequiresReadOnlyBackends(self.open_mode),
             .clock = runtime_cfg.clock orelse self.backend_runtime.clock(),
             .store = resources.store,
-            .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = resources.index_repair_checkpoint,
             .shard_manager = resources.shard_manager,
             .index_manager = resources.index_manager,
@@ -5765,7 +5761,6 @@ pub const DB = struct {
             .root_incarnation = self.root_incarnation,
             .artifact_publication_dispatcher = self.local_execution.artifact_publication_dispatcher,
             .store = resources.store,
-            .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
             .index_repair_checkpoint = resources.index_repair_checkpoint,
             .shard_manager = resources.shard_manager,
             .index_manager = resources.index_manager,
@@ -5841,7 +5836,6 @@ pub const DB = struct {
                 .alloc = self.runtime_alloc,
                 .io = self.backend_runtime.io(),
                 .store = batch_resources.store,
-                .applied_sequence_checkpoint_path = batch_resources.applied_sequence_checkpoint_path,
                 .shard_manager = batch_resources.shard_manager,
                 .change_journal = batch_resources.change_journal,
                 .replay_source = batch_resources.replay_source,
@@ -6129,6 +6123,17 @@ pub const DB = struct {
         // Stop background workers before tearing down stores, runtimes, and
         // index state they may inspect.
         self.async_context.background_closing.store(true, .release);
+        // WS6: a coalesced applied-sequence flush still pending when close
+        // starts gets exactly one more chance to run now, while the store is
+        // still fully live. `background_closing` is now true, so
+        // publishManagedProgress's status gate treats this drain as forced
+        // (deterministic status-at-close) rather than waiting on the
+        // ordinary interval. Best-effort: close must proceed even if this
+        // fails (the DB is going away either way; the next open recomputes
+        // status from progress and catalog).
+        if (executor_ready) self.flushAppliedSequencesForIdle() catch |err| {
+            std.log.warn("close-time applied-sequence flush failed err={s}", .{@errorName(err)});
+        };
         self.native_query_warming.stop(self.backend_runtime);
         self.local_execution.schema_reconcile.stop();
         self.stopArtifactRepairMetadataWorker();
@@ -17568,8 +17573,6 @@ pub const DB = struct {
         // may keep index data in a separate namespace and need not create
         // this filesystem directory as a side effect of opening an index.
         try self.core.index_manager.createGenerationDirectory(shadow_index_path);
-        const shadow_checkpoint_path = try std.fmt.allocPrint(alloc, "{s}/applied-sequences", .{shadow_base});
-        defer alloc.free(shadow_checkpoint_path);
         if (options.capacity_check) |check| try check.bindCandidateRoot(shadow_base);
         if (resume_requires_ready_manifest) {
             _ = index_generation_manifest.validateReadyWithStorage(
@@ -17622,7 +17625,6 @@ pub const DB = struct {
         // Otherwise their native base build silently recreates payload copies.
         shadow_manager.source_payload_store = self.core.index_manager.source_payload_store;
         shadow_manager.setIo(self.backend_runtime.io());
-        shadow_manager.setAppliedSequenceCheckpointPath(shadow_checkpoint_path);
         shadow_manager.registerReplacementIndex(self.core.store, cfg) catch |err| {
             shadow_manager.transferLsmOwnerCloneStatsTo(self.core.index_manager) catch |transfer_err| {
                 std.log.warn("failed to preserve unopened shadow LSM clone attribution index={s} err={s}", .{
@@ -17665,7 +17667,6 @@ pub const DB = struct {
             .io = self.backend_runtime.io(),
             .store = self.core.store,
             .relational_base_rows = relationalColumns(self) != null,
-            .applied_sequence_checkpoint_path = shadow_checkpoint_path,
             .index_manager = &shadow_manager,
             .apply_mutex = self.async_context.apply_mutex,
             .dense_bulk_session_scope = .external,
@@ -17679,14 +17680,7 @@ pub const DB = struct {
         var build_floor_sequence: u64 = if (resume_building)
             persisted_build_floor_sequence
         else if (resume_candidate)
-            try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
-                shadow_manager.generation_storage,
-                alloc,
-                shadow_manager.checkpointIo(),
-                self.core.store,
-                shadow_checkpoint_path,
-                cfg.name,
-            )
+            try apply_state.loadAppliedSequence(alloc, self.core.store, cfg.name)
         else
             0;
         var expected_snapshot_coverage: ?u64 = null;
@@ -17876,7 +17870,7 @@ pub const DB = struct {
         }
         if (completed_snapshot_build) {
             try checkArtifactRepairCancelled(options);
-            try self.saveShadowReplacementAppliedSequence(alloc, &shadow_manager, shadow_checkpoint_path, index_ref, build_floor_sequence);
+            try self.saveShadowReplacementAppliedSequence(alloc, &shadow_manager, index_ref, build_floor_sequence);
             if (options.capacity_check) |check| {
                 try check.current(try repairCandidateStorageBytes(alloc, cfg, &shadow_manager, shadow_base));
             }
@@ -17904,7 +17898,6 @@ pub const DB = struct {
         const initial_catch_up = try self.catchUpShadowReplacementUntil(
             alloc,
             &shadow_manager,
-            shadow_checkpoint_path,
             index_ref,
             initial_catch_up_target,
             options,
@@ -17994,7 +17987,6 @@ pub const DB = struct {
             const convergence_catch_up = try self.catchUpShadowReplacementUntil(
                 alloc,
                 &shadow_manager,
-                shadow_checkpoint_path,
                 index_ref,
                 convergence_target,
                 options,
@@ -18169,7 +18161,6 @@ pub const DB = struct {
         const activation_catch_up = self.catchUpShadowReplacementUntil(
             alloc,
             &shadow_manager,
-            shadow_checkpoint_path,
             index_ref,
             final_target,
             options,
@@ -18408,7 +18399,6 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         shadow_manager: *index_manager_mod.IndexManager,
-        shadow_checkpoint_path: ?[]const u8,
         index_ref: index_manager_mod.ManagedIndexRef,
         target_sequence: u64,
         options: types.ArtifactRepairRunOptions,
@@ -18422,18 +18412,10 @@ pub const DB = struct {
         const cooperative = deadline_ns == null and options.yield_check != null;
         var batch_ctx = self.batchContext();
         batch_ctx.index_manager = shadow_manager;
-        batch_ctx.applied_sequence_checkpoint_path = shadow_checkpoint_path;
         batch_ctx.async_context = null;
         batch_ctx.dense_bulk_session_scope = .external;
 
-        var applied = try apply_state.loadAppliedSequenceWithCheckpointWithStorage(
-            shadow_manager.generation_storage,
-            alloc,
-            shadow_manager.checkpointIo(),
-            self.core.store,
-            shadow_checkpoint_path,
-            index_ref.name,
-        );
+        var applied = try apply_state.loadAppliedSequence(alloc, self.core.store, index_ref.name);
         while (applied < target_sequence) {
             try checkArtifactRepairCancelled(options);
             if (index_ref.kind == .algebraic) {
@@ -18505,7 +18487,7 @@ pub const DB = struct {
                 break :blk applied;
             };
             if (advanced <= applied) return .{ .applied_sequence = applied };
-            try self.saveShadowReplacementAppliedSequence(alloc, shadow_manager, shadow_checkpoint_path, index_ref, advanced);
+            try self.saveShadowReplacementAppliedSequence(alloc, shadow_manager, index_ref, advanced);
             applied = advanced;
             if (cooperative and applied < target_sequence and options.yield_check.?.requested()) {
                 return .{ .applied_sequence = applied, .yielded = true };
@@ -18559,10 +18541,10 @@ pub const DB = struct {
         self: *DB,
         alloc: Allocator,
         shadow_manager: *index_manager_mod.IndexManager,
-        shadow_checkpoint_path: ?[]const u8,
         index_ref: index_manager_mod.ManagedIndexRef,
         sequence: u64,
     ) !void {
+        _ = alloc;
         try shadow_manager.checkpointLsmWalForManagedIndex(index_ref);
         const update = apply_state.AppliedSequenceUpdate{
             .index_name = index_ref.name,
@@ -18572,14 +18554,7 @@ pub const DB = struct {
         const updates = [_]apply_state.AppliedSequenceUpdate{update};
         try savePhysicalProjectionMetadataForAppliedSequenceUpdates(shadow_manager, &updates);
         try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(shadow_manager, &updates);
-        try apply_state.saveAppliedSequenceUpdateWithCheckpointWithStorage(
-            shadow_manager.generation_storage,
-            alloc,
-            shadow_manager.checkpointIo(),
-            self.core.store,
-            shadow_checkpoint_path,
-            update,
-        );
+        try apply_state.saveAppliedSequenceUpdate(self.core.store, update);
     }
 
     fn finalizeShadowNativePostingGeneration(
@@ -33075,7 +33050,7 @@ pub const DB = struct {
     fn refreshArtifactProjections(self: *DB, scratch: Allocator, document: []const u8, plan: *const index_manager_mod.IndexManager.WritePlanSnapshot, limits: @import("artifact_completion_progress.zig").Limits) !void {
         const completion = @import("artifact_completion_progress.zig");
         var requests: completion.AdoptionRequests = .{};
-        try completion.refreshProjectionsWithAdoption(scratch, self.core.store, self.core.index_manager, self.core.applied_sequence_checkpoint_path, self.root_incarnation, document, plan, limits, &requests);
+        try completion.refreshProjectionsWithAdoption(scratch, self.core.store, self.core.index_manager, self.root_incarnation, document, plan, limits, &requests);
         if (requests.count == 0) return;
         // Use the revision-tracked scheduler directory for O(1) deduplication,
         // not a checkpoint-file scan per document. Creation still performs its
@@ -36947,7 +36922,7 @@ pub const DB = struct {
             // and an empty durable native snapshot. Missing certificates and
             // unfinished generations still require ordinary materialization.
             if (checkpoint.published_count == null and checkpoint.status == .clean) {
-                const previous = apply_state.loadProjectionCheckpointWithSidecar(self.alloc, self.core.index_manager.checkpointIo(), self.core.store, self.core.applied_sequence_checkpoint_path, entry.config.name) catch null;
+                const previous = apply_state.loadProjectionCheckpoint(self.alloc, self.core.store, entry.config.name) catch null;
                 if (previous) |certificate| {
                     const native_snapshot = entry.index.nativeServingSnapshot();
                     if (certificate.status == .clean and certificate.published_count == @as(?u64, 0) and
@@ -42315,20 +42290,13 @@ pub const DB = struct {
             // lagging or partial projection exclude a newer primary value.
             if (!entry.coversPrimaryDocuments() or entry.backfill_active.load(.acquire) != 0) return error.IndexRebuilding;
             // Retained/restored owners may have a persisted checkpoint newer
-            // than a newly attached worker's in-memory observation.
+            // than a newly attached worker's in-memory observation. Progress
+            // v2 lives in the primary KV store itself, so the ordinary read
+            // above already observes it; there is no longer a separate
+            // out-of-band (raw-storage, lease-bypassing) checkpoint location
+            // to additionally consult here.
             var applied = try self.core.loadAppliedSequence(alloc, entry.config.name);
             if (self.executor.appliedSequence(entry.config.name)) |live| applied = @max(applied, live);
-            if (applied < self.core.nextDerivedSequence() and self.retained_remote_query_lease != null) {
-                if (self.primary_lsm_storage) |storage| {
-                    const checkpoint_path = try apply_state.checkpointPathAlloc(alloc, self.core.path);
-                    defer alloc.free(checkpoint_path);
-                    const retained = apply_state.loadProjectionCheckpointFromStorage(alloc, storage, checkpoint_path, entry.config.name) catch |err| switch (err) {
-                        error.FileNotFound => null,
-                        else => return err,
-                    };
-                    if (retained) |checkpoint| applied = @max(applied, checkpoint.applied_sequence);
-                }
-            }
             // The global tail also includes work for unrelated projections.
             // Match the existing readiness/debt contract: inspect replay hints
             // only on the slow path where a global sequence gap exists.
@@ -48652,7 +48620,7 @@ fn acquireNeighborContextGraphSource(ptr: *anyopaque, index_name: []const u8) !e
         return error.GraphMaintenanceInProgress;
     const entry = ctx.index_manager.graphIndex(index_name) orelse return error.IndexNotFound;
     const tip = ctx.store.lastReplaySequence(0);
-    const applied = try loadManagedAppliedSequenceContext(ctx.alloc, ctx.index_manager, ctx.store, ctx.applied_sequence_checkpoint_path, ref);
+    const applied = try loadManagedAppliedSequenceContext(ctx.alloc, ctx.index_manager, ctx.store, ref);
     const from = @max(@max(applied, entry.neighbor_source_sequence), try entry.index.artifactRebuildSequence());
     if (entry.neighbor_refresh.sequence != 0 and entry.neighbor_refresh.sequence <= from)
         entry.clearNeighborRefresh();
@@ -52886,7 +52854,7 @@ fn expireGraphTtlCandidateContext(ttl_ctx: *TtlCleanupContext, candidate: GraphT
         defer replay_snapshot.abort();
         break :blk try ctx.store.lastReplaySequenceFromTxn(&replay_snapshot, 0);
     };
-    const source_applied = loadManagedAppliedSequenceContext(ctx.alloc, ctx.index_manager, ctx.store, ctx.applied_sequence_checkpoint_path, .{ .name = candidate.index_name, .kind = .graph }) catch |err| switch (err) {
+    const source_applied = loadManagedAppliedSequenceContext(ctx.alloc, ctx.index_manager, ctx.store, .{ .name = candidate.index_name, .kind = .graph }) catch |err| switch (err) {
         error.InvalidDerivedApplyState => 0,
         else => return err,
     };
@@ -55591,7 +55559,6 @@ fn replayPendingDerivedBatchesContext(ctx: *const BatchExecutionContext) !void {
             ctx.alloc,
             ctx.index_manager,
             ctx.store,
-            ctx.applied_sequence_checkpoint_path,
             index_ref,
         );
         const target_sequence = try ctx.replay_source.latestMatchingSequence(
@@ -55660,7 +55627,6 @@ fn canAdvanceDerivedReplayTargetContext(
         .io = ctx.io,
         .store = ctx.store,
         .relational_base_rows = ctx.relational_base_rows,
-        .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
         .index_manager = ctx.index_manager,
         .apply_mutex = ctx.apply_mutex,
         .snapshot_replay_admission = ctx.snapshot_replay_admission,
@@ -55693,7 +55659,6 @@ fn applyDerivedBatchToIndexReplayContext(
         .alloc = ctx.alloc,
         .io = ctx.io,
         .store = ctx.store,
-        .applied_sequence_checkpoint_path = ctx.applied_sequence_checkpoint_path,
         .index_manager = ctx.index_manager,
         .apply_mutex = ctx.apply_mutex,
         .snapshot_replay_admission = ctx.snapshot_replay_admission,
@@ -55773,7 +55738,7 @@ fn saveAppliedSequencesBatchLockedContext(
             // Only an already-certified empty publication may carry its zero
             // count across a source-only native commit. Ordinary native
             // ingest keeps the count-sidecar optimization.
-            try ctx.index_manager.preserveCertifiedEmptyDenseCheckpoint(ctx.alloc, ctx.store, ctx.applied_sequence_checkpoint_path, update.index_name);
+            try ctx.index_manager.preserveCertifiedEmptyDenseCheckpoint(ctx.store, update.index_name);
         } else {
             generic_updates.appendAssumeCapacity(update);
         }
@@ -55788,11 +55753,19 @@ fn saveAppliedSequencesBatchLockedContext(
                     update.sequence,
                 ) or lifecycle_completed;
             }
-            if (lifecycle_completed) try DB.saveIndexStatusSnapshots(
+            // No generic consumer advanced, so there is no progress v2 record
+            // to write here; a completed dense lifecycle, or this running as
+            // part of DB.close's drain, still deserves an immediate (not
+            // interval-gated) status refresh.
+            const closing_status_force = lifecycle_completed or active_async_ctx.background_closing.load(.acquire);
+            try publishManagedProgress(
                 ctx.alloc,
                 ctx.store,
                 ctx.index_manager,
-                enriched_updates,
+                &.{},
+                false,
+                if (closing_status_force) enriched_updates else &.{},
+                closing_status_force,
             );
         }
         return;
@@ -55804,39 +55777,32 @@ fn saveAppliedSequencesBatchLockedContext(
         // snapshot.
         try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
         try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
-        try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
-            ctx.index_manager.generation_storage,
-            ctx.alloc,
-            ctx.index_manager.checkpointIo(),
-            ctx.store,
-            ctx.applied_sequence_checkpoint_path,
-            generic_updates.items,
-        );
         var authoritative_lifecycle_completed = false;
         for (enriched_updates) |update| {
             const completed_now = try finalizeCoveredDenseProjectionCheckpoint(active_async_ctx, update.index_name, update.sequence);
             authoritative_lifecycle_completed = authoritative_lifecycle_completed or
                 (completed_now and ctx.index_manager.densePostingWalAuthoritativeByName(update.index_name));
         }
-        try DB.saveIndexStatusSnapshots(
+        // WS6: one progress commit replaces the separate legacy status
+        // commit(s) that used to follow here, carrying the new v2 progress
+        // record for every generic update plus (interval-gated, or forced by
+        // a completed lifecycle or a DB.close drain) a piggybacked status
+        // refresh.
+        const closing_status_force = authoritative_lifecycle_completed or active_async_ctx.background_closing.load(.acquire);
+        try publishManagedProgress(
             ctx.alloc,
             ctx.store,
             ctx.index_manager,
-            if (authoritative_lifecycle_completed) enriched_updates else generic_updates.items,
+            generic_updates.items,
+            true,
+            if (closing_status_force) enriched_updates else generic_updates.items,
+            closing_status_force,
         );
         return;
     }
     try checkpointManagedProjectionEffectsForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
     try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
-    try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
-        ctx.index_manager.generation_storage,
-        ctx.alloc,
-        ctx.index_manager.checkpointIo(),
-        ctx.store,
-        ctx.applied_sequence_checkpoint_path,
-        generic_updates.items,
-    );
-    try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, generic_updates.items);
+    try publishManagedProgress(ctx.alloc, ctx.store, ctx.index_manager, generic_updates.items, true, generic_updates.items, false);
 }
 
 const appliedSequenceUpdatesWithConfigHashes = local_mutation.appliedSequenceUpdatesWithConfigHashes;
@@ -55881,6 +55847,96 @@ fn checkpointManagedProjectionEffectsForAppliedSequenceUpdates(
             // the source watermark unchanged for replay.
             try index_manager.ensureDensePostingCoverageByName(update.index_name, update.sequence);
         }
+    }
+}
+
+var status_persist_count: std.atomic.Value(u64) = .init(0);
+
+/// Count of durable status-snapshot writes actually committed (piggybacked
+/// into a progress commit or, rarely, standalone), as opposed to updates
+/// where status derivation ran but the interval/force gate skipped the
+/// write. Test-only instrumentation for the "at most once per interval"
+/// requirement.
+pub fn statusPersistCountForTest() u64 {
+    return status_persist_count.load(.monotonic);
+}
+
+pub fn resetStatusPersistCountForTest() void {
+    status_persist_count.store(0, .monotonic);
+}
+
+/// The one authoritative progress commit (WS6) for a batch of applied-
+/// sequence updates on a shared consumer set: every update's v2 progress
+/// record, plus — at most once per `IndexManager.status_persist_interval_ns`,
+/// or always when `force_status` is set (an explicit sync or close drain) —
+/// a piggybacked derived `IndexStatusSnapshot` for `status_targets`, land in
+/// exactly one `apply_state.contributeProgress` commit.
+///
+/// This does not replace the physical per-backend effects
+/// (`checkpointManagedProjectionEffectsForAppliedSequenceUpdates`,
+/// `savePhysicalProjectionMetadataForAppliedSequenceUpdates`). Callers must
+/// still run those first: progress v2 must never claim a boundary the
+/// physical effects have not reached. `lsm_wal_checkpointed` records only
+/// that `checkpointLsmWalForManagedIndex` was called for `updates` in this
+/// same pass; the WAL checkpoint marker itself lives on the per-index
+/// backend's own pager and is not readable back from this KV record.
+///
+/// Progress v2 is now the sole durable record of a consumer's applied
+/// sequence/identity: there is no separate legacy checkpoint commit left to
+/// keep in sync, so this call *is* the one docstore-side commit for the
+/// flush pass that reaches it.
+fn publishManagedProgress(
+    alloc: Allocator,
+    store: *docstore_mod.DocStore,
+    index_manager: *index_manager_mod.IndexManager,
+    updates: []const apply_state.AppliedSequenceUpdate,
+    lsm_wal_checkpointed: bool,
+    status_targets: []const apply_state.AppliedSequenceUpdate,
+    force_status: bool,
+) !void {
+    if (updates.len == 0 and status_targets.len == 0) return;
+
+    const progress = try alloc.alloc(apply_state.Progress, updates.len);
+    defer alloc.free(progress);
+    for (updates, 0..) |update, i| {
+        progress[i] = .{
+            .consumer = update.index_name,
+            .sequence = update.sequence,
+            .status = update.status,
+            .generation = update.generation,
+            .config_hash = update.config_hash,
+            .published_count = update.published_count,
+            .lsm_wal_checkpointed_through = if (lsm_wal_checkpointed) update.sequence else 0,
+        };
+    }
+
+    // Owned, heap-stable backing for every candidate status value: pointers
+    // into it are handed to `contributeProgress` as borrowed `StatusWrite`
+    // slices, so it must outlive that call (freed by `defer`, after use).
+    const status_values = try alloc.alloc([DB.index_status_encoded_len]u8, status_targets.len);
+    defer alloc.free(status_values);
+    var status_writes = std.ArrayListUnmanaged(apply_state.StatusWrite).empty;
+    defer {
+        for (status_writes.items) |write| alloc.free(@constCast(write.key));
+        status_writes.deinit(alloc);
+    }
+    const now_ns = platform_time.awakeNs(index_manager.checkpointIo());
+    const due = status_targets.len > 0 and index_manager.statusPersistDue(now_ns, force_status);
+    if (due) {
+        for (status_targets, 0..) |update, i| {
+            const status_snapshot = DB.collectLiveIndexStatusSnapshot(index_manager, update.index_name) orelse continue;
+            const key = try DB.indexStatusKeyAlloc(alloc, update.index_name);
+            errdefer alloc.free(key);
+            DB.encodeIndexStatusSnapshot(status_snapshot, &status_values[i]);
+            try status_writes.append(alloc, .{ .key = key, .value = &status_values[i] });
+        }
+    }
+
+    if (progress.len == 0 and status_writes.items.len == 0) return;
+    try apply_state.contributeProgress(alloc, store, progress, status_writes.items);
+    if (status_writes.items.len > 0) {
+        index_manager.markStatusPersisted(now_ns);
+        _ = status_persist_count.fetchAdd(1, .monotonic);
     }
 }
 
@@ -56223,7 +56279,6 @@ fn applyDerivedBatchToIndex(self: *DB, batch: derived_types.DerivedBatch, index_
         .io = self.backend_runtime.io(),
         .store = resources.store,
         .relational_base_rows = relationalColumns(self) != null,
-        .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
         .snapshot_replay_admission = resources.snapshot_replay_admission,
@@ -57482,7 +57537,6 @@ fn applyDerivedBatchToIndexReplay(ctx_ptr: *anyopaque, batch: derived_types.Deri
         .io = self.backend_runtime.io(),
         .store = resources.store,
         .relational_base_rows = relationalColumns(self) != null,
-        .applied_sequence_checkpoint_path = resources.applied_sequence_checkpoint_path,
         .index_manager = resources.index_manager,
         .apply_mutex = resources.apply_mutex,
         .snapshot_replay_admission = resources.snapshot_replay_admission,
@@ -58193,7 +58247,7 @@ fn finishGraphMergeImport(db: anytype, existing_lease: ?*index_manager_mod.Index
         // The rebuild lease already owns the catalog exclusively. Publish
         // coverage without reacquiring the catalog through the generic helper.
         try entry.index.checkpointLsmWalAfterDurableBoundary();
-        try apply_state.saveAppliedSequenceUpdateWithCheckpoint(db.alloc, db.core.index_manager.checkpointIo(), db.core.store, db.core.applied_sequence_checkpoint_path, .{
+        try apply_state.saveAppliedSequenceUpdate(db.core.store, .{
             .index_name = identity.name,
             .sequence = @max(applied, record.value.replay_sequence),
             .config_hash = types.indexConfigHash(entry.config),
@@ -58417,10 +58471,6 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
     defer dest_indexes.deinit();
     dest_indexes.setIo(self.core.index_manager.io);
     dest_indexes.setRelaxedSplitDurability(true);
-    const dest_applied_sequence_checkpoint_path = try apply_state.checkpointPathAlloc(self.alloc, dest_dir);
-    defer self.alloc.free(dest_applied_sequence_checkpoint_path);
-    dest_indexes.setAppliedSequenceCheckpointPath(dest_applied_sequence_checkpoint_path);
-
     try clearSplitMetadataFromStore(self.alloc, dest_store);
     try clearSystemMetadataFromSplitDestination(self.alloc, dest_store);
     try copyIdentityMetadataToStore(self.alloc, self.core.store, dest_store);
@@ -58460,7 +58510,7 @@ fn prepareSplitDestination(self: *DB, byte_range: types.ByteRange, dest_dir: []c
 
     const configs = try self.core.listIndexes(self.alloc);
     defer types.freeIndexConfigs(self.alloc, configs);
-    try registerSplitDestinationIndexesDirect(self.alloc, dest_store, dest_applied_sequence_checkpoint_path, &dest_indexes, configs, replay_floor -| 1);
+    try registerSplitDestinationIndexesDirect(self.alloc, dest_store, &dest_indexes, configs, replay_floor -| 1);
     const collect_skip_doc_keys = true;
     var split_handoffs = try self.core.collectSplitIndexHandoffs(
         &dest_indexes,
@@ -58561,7 +58611,6 @@ fn collectSplitFrontierDocKeys(alloc: Allocator, store: *docstore_mod.DocStore, 
 fn registerSplitDestinationIndexesDirect(
     alloc: Allocator,
     dest_store: *docstore_mod.DocStore,
-    applied_sequence_checkpoint_path: ?[]const u8,
     dest_indexes: *index_manager_mod.IndexManager,
     configs: []const types.IndexConfig,
     applied_sequence: u64,
@@ -58579,13 +58628,7 @@ fn registerSplitDestinationIndexesDirect(
         };
     }
     try savePhysicalProjectionMetadataForAppliedSequenceUpdates(dest_indexes, updates);
-    try apply_state.saveAppliedSequencesWithCheckpoint(
-        alloc,
-        dest_indexes.checkpointIo(),
-        dest_store,
-        applied_sequence_checkpoint_path,
-        updates,
-    );
+    try apply_state.saveAppliedSequences(dest_store, updates);
 }
 
 fn streamRangeIntoSplitDestinationDirect(
@@ -60434,7 +60477,6 @@ fn canAdvanceDerivedToTargetAsync(ctx_ptr: *anyopaque, index_ref: index_manager_
         ctx.alloc,
         ctx.index_manager,
         ctx.store,
-        ctx.applied_sequence_checkpoint_path,
         index_ref,
     );
     if (persisted_applied >= target_sequence) {
@@ -61573,26 +61615,23 @@ fn finalizeCoveredDenseProjectionCheckpointClaimed(
         .published_count = serving_count,
     };
     try ctx.index_manager.saveDenseProjectionCheckpointMetadata(index_name, clean_checkpoint);
-    try apply_state.saveProjectionCheckpointWithSidecarWithStorage(
-        ctx.index_manager.generation_storage,
-        ctx.alloc,
-        ctx.index_manager.checkpointIo(),
-        ctx.store,
-        ctx.applied_sequence_checkpoint_path,
-        index_name,
-        clean_checkpoint,
-    );
+    try apply_state.saveProjectionCheckpoint(ctx.store, index_name, clean_checkpoint);
     // Stable-tip finalization can race ahead of the applied-sequence flush
     // which normally refreshes this advisory restart snapshot. Persist the
     // live cardinality at the lifecycle boundary itself so a later failed
     // open never falls back to the empty creation-time snapshot. The clean
     // projection marker remains correctness authority; status-cache failure
-    // must not roll it back or fail an otherwise complete user write.
-    DB.saveIndexStatusSnapshots(
+    // must not roll it back or fail an otherwise complete user write. A
+    // lifecycle completion is forced through regardless of the ordinary
+    // status-persist interval.
+    publishManagedProgress(
         ctx.alloc,
         ctx.store,
         ctx.index_manager,
+        &.{},
+        false,
         &.{.{ .index_name = index_name, .sequence = applied_sequence }},
+        true,
     ) catch |err| {
         std.log.warn("dense status snapshot persistence deferred index={s} sequence={} err={s}", .{
             index_name,
@@ -61749,7 +61788,7 @@ fn flushFinishedDenseAppliedSequenceLocked(
     const save_start_ns = monotonicTimeNs();
     var posting_publish_ns: u64 = 0;
     var projection_metadata_ns: u64 = 0;
-    var checkpoint_file_ns: u64 = 0;
+    const checkpoint_file_ns: u64 = 0;
     var status_snapshot_ns: u64 = 0;
     // Checkpointing managed projection effects reaches into live index
     // backends. Hold a shared apply lease so concurrent persistence remains
@@ -61788,24 +61827,26 @@ fn flushFinishedDenseAppliedSequenceLocked(
             const metadata_started = monotonicTimeNs();
             try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, enriched_updates);
             projection_metadata_ns +|= elapsedSince(metadata_started);
-            const checkpoint_started = monotonicTimeNs();
-            try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
-                ctx.index_manager.generation_storage,
-                ctx.alloc,
-                ctx.index_manager.checkpointIo(),
-                ctx.store,
-                ctx.applied_sequence_checkpoint_path,
-                enriched_updates,
-            );
-            checkpoint_file_ns +|= elapsedSince(checkpoint_started);
         }
         const lifecycle_completed_now = try finalizeCoveredDenseProjectionCheckpoint(ctx, pending.owned_name, pending.sequence);
         lifecycle_completed.* = lifecycle_completed_now or lifecycle_completed.*;
-        if (!hbc_authoritative or lifecycle_completed_now) {
-            const status_started = monotonicTimeNs();
-            try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
-            status_snapshot_ns +|= elapsedSince(status_started);
-        }
+        // WS6: one progress commit carries the v2 record for this consumer
+        // (when it took the generic, non-HBC-authoritative path above) and a
+        // piggybacked status refresh (interval-gated, or forced through by a
+        // completed lifecycle or a DB.close drain), replacing what used to
+        // be a separate status commit here.
+        const closing_status_force = lifecycle_completed_now or ctx.background_closing.load(.acquire);
+        const status_started = monotonicTimeNs();
+        try publishManagedProgress(
+            ctx.alloc,
+            ctx.store,
+            ctx.index_manager,
+            if (hbc_authoritative) &.{} else enriched_updates,
+            !hbc_authoritative,
+            if (!hbc_authoritative or closing_status_force) enriched_updates else &.{},
+            closing_status_force,
+        );
+        status_snapshot_ns +|= elapsedSince(status_started);
         break :blk elapsedSince(save_start_ns);
     };
 
@@ -61848,7 +61889,7 @@ fn flushPendingAppliedSequencesLocked(
     const sync_ns: u64 = 0;
     var posting_publish_ns: u64 = 0;
     var projection_metadata_ns: u64 = 0;
-    var checkpoint_file_ns: u64 = 0;
+    const checkpoint_file_ns: u64 = 0;
     var status_snapshot_ns: u64 = 0;
 
     const save_start_ns = monotonicTimeNs();
@@ -61877,16 +61918,6 @@ fn flushPendingAppliedSequencesLocked(
             const metadata_started = monotonicTimeNs();
             try savePhysicalProjectionMetadataForAppliedSequenceUpdates(ctx.index_manager, generic_updates.items);
             projection_metadata_ns +|= elapsedSince(metadata_started);
-            const checkpoint_started = monotonicTimeNs();
-            try apply_state.saveAppliedSequencesWithCheckpointWithStorage(
-                ctx.index_manager.generation_storage,
-                ctx.alloc,
-                ctx.index_manager.checkpointIo(),
-                ctx.store,
-                ctx.applied_sequence_checkpoint_path,
-                generic_updates.items,
-            );
-            checkpoint_file_ns +|= elapsedSince(checkpoint_started);
         }
         var authoritative_lifecycle_completed = false;
         for (enriched_updates) |update| {
@@ -61895,16 +61926,32 @@ fn flushPendingAppliedSequencesLocked(
             authoritative_lifecycle_completed = authoritative_lifecycle_completed or
                 (completed_now and ctx.index_manager.densePostingWalAuthoritativeByName(update.index_name));
         }
-        if (generic_updates.items.len > 0) {
-            const status_started = monotonicTimeNs();
-            try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, generic_updates.items);
-            status_snapshot_ns +|= elapsedSince(status_started);
-        }
-        if (authoritative_lifecycle_completed) {
-            const status_started = monotonicTimeNs();
-            try DB.saveIndexStatusSnapshots(ctx.alloc, ctx.store, ctx.index_manager, enriched_updates);
-            status_snapshot_ns +|= elapsedSince(status_started);
-        }
+        // WS6: one progress commit replaces what used to be up to two
+        // separate status commits here (one for the generic updates, a
+        // second if an HBC-authoritative lifecycle also completed this
+        // pass), plus the v2 progress record for every generic update.
+        //
+        // `force` here means "the caller needs this watermark flushed now
+        // for synchronous visibility" (it fires on an ordinary write under
+        // most sync levels, not only at shutdown) and must not itself force
+        // a status write, or every write would defeat the status-persist
+        // interval. A completed lifecycle, or this flush running as part of
+        // DB.close's drain (`background_closing`, set before any close-time
+        // flush runs, distinct from the generic per-write `force`), forces
+        // status through deterministically; otherwise it rides the interval
+        // gate inside `publishManagedProgress`.
+        const closing_status_force = authoritative_lifecycle_completed or ctx.background_closing.load(.acquire);
+        const status_started = monotonicTimeNs();
+        try publishManagedProgress(
+            ctx.alloc,
+            ctx.store,
+            ctx.index_manager,
+            generic_updates.items,
+            generic_updates.items.len > 0,
+            enriched_updates,
+            closing_status_force,
+        );
+        status_snapshot_ns +|= elapsedSince(status_started);
         break :blk elapsedSince(save_start_ns);
     };
     ctx.applied_sequence_coalescer.clearPending(ctx.alloc);
@@ -100075,6 +100122,128 @@ test "db batch persists per-index applied sequence watermark" {
     try std.testing.expectEqualStrings("ft_v1", owner_stats[1].name);
 }
 
+test "db batch publishes managed progress through the real write path (WS6)" {
+    // A synchronous `.full_index` write drives more than one internal flush
+    // pass (pre-existing coalescing granularity, unrelated to WS6), so this
+    // cannot assert an absolute "exactly one commit per write" count end to
+    // end. What WS6 actually guarantees — that every consumer touched by
+    // one flush pass lands in the same single `contributeProgress` commit,
+    // instead of a separate apply_state checkpoint plus up to two separate
+    // status commits per pass — is proven directly, deterministically, at
+    // the unit level by apply_state's "writes exactly one commit for a
+    // batch of consumers" test. This is the integration half: confirming
+    // the real write path actually reaches `contributeProgress` and that
+    // its v2 record is readable afterward.
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    var db = try DB.open(alloc, path_tmp.path(), .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+    apply_state.resetProgressCommitCountForTest();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+        .sync_level = .full_index,
+    });
+    try std.testing.expect(apply_state.progressCommitCount() >= 1);
+    const progress = (try apply_state.loadProgress(alloc, db.core.store, "ft_v1")).?;
+    try std.testing.expectEqual(try db.core.loadAppliedSequence(alloc, "ft_v1"), progress.applied_sequence);
+}
+
+test "db status snapshot persists at most once per interval across a write loop (WS6)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = path_tmp.path().ptr;
+    defer cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    // 1,000 real, durably-synced writes can themselves take long enough
+    // wall-clock time to cross the default 5s interval many times over —
+    // that is a property of this test's I/O, not of the gate. Pin the
+    // interval to something the loop cannot plausibly cross so the
+    // assertion below is about the gate, not about how fast this machine's
+    // disk happens to be.
+    db.core.index_manager.status_persist_interval_ns = 3600 * std.time.ns_per_s;
+
+    apply_state.resetProgressCommitCountForTest();
+    resetStatusPersistCountForTest();
+
+    var key_buf: [32]u8 = undefined;
+    for (0..1000) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "doc:{d}", .{i});
+        try db.batch(.{
+            .writes = &.{
+                .{ .key = key, .value = "{\"title\":\"alpha\"}" },
+            },
+            .sync_level = .full_index,
+        });
+    }
+
+    // Every publication still gets its own progress commit (no coalescing
+    // of the authoritative watermark across unrelated writes): at least one
+    // per write.
+    try std.testing.expect(apply_state.progressCommitCount() >= 1000);
+    // ...but the derived status snapshot, which is cheap to recompute and
+    // not needed for recovery, piggybacks on at most one of those commits
+    // per `status_persist_interval_ns`.
+    try std.testing.expectEqual(@as(u64, 1), statusPersistCountForTest());
+    try std.testing.expect(try db.core.loadAppliedSequence(alloc, "ft_v1") >= 1000);
+}
+
+test "db close deterministically flushes a pending status refresh (WS6)" {
+    const alloc = std.testing.allocator;
+
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+
+    {
+        var db = try DB.open(alloc, path_tmp.path(), .{});
+        defer db.close();
+
+        try db.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+
+        // An interval long enough that nothing inside this test's own
+        // duration would naturally cross it.
+        db.core.index_manager.status_persist_interval_ns = 3600 * std.time.ns_per_s;
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:a", .value = "{\"title\":\"alpha\"}" }},
+            .sync_level = .full_index,
+        });
+        const first_status = (try db.loadIndexStatusSnapshot(alloc, "ft_v1")).?;
+        try std.testing.expectEqual(@as(u64, 1), first_status.doc_count);
+
+        // Within the interval: the persisted snapshot must not move yet.
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:b", .value = "{\"title\":\"beta\"}" }},
+            .sync_level = .full_index,
+        });
+        const still_stale_status = (try db.loadIndexStatusSnapshot(alloc, "ft_v1")).?;
+        try std.testing.expectEqual(@as(u64, 1), still_stale_status.doc_count);
+
+        // db.close() (via deinitWrapperState's close-time drain) must force
+        // one final status refresh through regardless of the interval, not
+        // leave the persisted snapshot stale for the next open.
+    }
+
+    var reopened = try DB.open(alloc, path_tmp.path(), .{ .open_mode = .writer_no_replay, .start_index_workers = false });
+    defer reopened.close();
+    const closed_status = (try reopened.loadIndexStatusSnapshot(alloc, "ft_v1")).?;
+    try std.testing.expectEqual(@as(u64, 2), closed_status.doc_count);
+}
+
 test "db managed projection checkpoints persist status and config identity" {
     const alloc = std.testing.allocator;
 
@@ -109475,14 +109644,7 @@ test "db progressive managed admission serves a checkpointed partial generation"
         // count was never written for the newest source boundary.
         var missing_checkpoint = advanced_checkpoint;
         missing_checkpoint.published_count = null;
-        try apply_state.saveProjectionCheckpointWithSidecar(
-            alloc,
-            db.core.index_manager.checkpointIo(),
-            db.core.store,
-            db.core.applied_sequence_checkpoint_path,
-            cfg.name,
-            missing_checkpoint,
-        );
+        try apply_state.saveProjectionCheckpoint(db.core.store, cfg.name, missing_checkpoint);
         try std.testing.expect(entry.validateRecoveredNativeServingCertificate(missing_checkpoint));
         const missing_stats = try db.stats(alloc);
         defer types.freeDBStats(alloc, missing_stats);
@@ -109492,14 +109654,7 @@ test "db progressive managed admission serves a checkpointed partial generation"
             try std.testing.expectEqual(target_before, index_stats.doc_count);
         }
         entry.recovered_native_serving_certificate = null;
-        try apply_state.saveProjectionCheckpointWithSidecar(
-            alloc,
-            db.core.index_manager.checkpointIo(),
-            db.core.store,
-            db.core.applied_sequence_checkpoint_path,
-            cfg.name,
-            advanced_checkpoint,
-        );
+        try apply_state.saveProjectionCheckpoint(db.core.store, cfg.name, advanced_checkpoint);
     }
     // A later live write can happen to reach the invalid certificate's
     // cardinality. Status may observe it, but only a publication boundary may
@@ -109892,14 +110047,7 @@ test "db progressive managed admission serves a checkpointed partial generation"
     const restart_checkpoint = try db.core.loadProjectionCheckpoint(alloc, cfg.name);
     var mismatched_restart_checkpoint = restart_checkpoint;
     mismatched_restart_checkpoint.published_count = target_before + 1;
-    try apply_state.saveProjectionCheckpointWithSidecar(
-        alloc,
-        db.core.index_manager.checkpointIo(),
-        db.core.store,
-        db.core.applied_sequence_checkpoint_path,
-        cfg.name,
-        mismatched_restart_checkpoint,
-    );
+    try apply_state.saveProjectionCheckpoint(db.core.store, cfg.name, mismatched_restart_checkpoint);
     db.close();
     db = try DB.open(alloc, std.mem.span(path), .{
         .start_optional_runtime_workers = false,
@@ -113912,9 +114060,11 @@ test "db dense artifact rebuild trusts clean projection checkpoint without artif
             .status = .clean,
             .generation = 3,
         });
-        const checkpoint_path = db.core.applied_sequence_checkpoint_path orelse return error.TestUnexpectedResult;
+        // A progress-v2 record that disagrees with HBC's own generation (a
+        // stale/foreign write, or a write from a different incarnation)
+        // must never override the native metadata that is actually serving.
         const mirrored_ahead_sequence: u64 = 1000;
-        try apply_state.saveProjectionCheckpointWithSidecar(alloc, db.core.index_manager.checkpointIo(), db.core.store, checkpoint_path, "dense_idx", .{
+        try apply_state.saveProjectionCheckpoint(db.core.store, "dense_idx", .{
             .applied_sequence = mirrored_ahead_sequence,
             .status = .clean,
             .generation = 99,
@@ -113959,7 +114109,7 @@ test "db dense artifact rebuild trusts clean projection checkpoint without artif
     try std.testing.expectEqual(stats.indexes[0].replay_target_sequence -| checkpoint.applied_sequence, stats.indexes[0].checkpoint_replay_tail_sequence_count);
 }
 
-test "db dense projection checkpoint prefers hbc metadata over corrupt sidecar" {
+test "db dense projection checkpoint prefers hbc metadata over a corrupt progress v2 record" {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -114001,11 +114151,12 @@ test "db dense projection checkpoint prefers hbc metadata over corrupt sidecar" 
             .denseIndex("dense_idx").?.index.experimentalPostingDurableAppliedSequence() orelse
             return error.TestUnexpectedResult;
 
-        const checkpoint_path = db.core.applied_sequence_checkpoint_path orelse return error.TestUnexpectedResult;
-        try writeRawProjectionCheckpointSidecarForTest(checkpoint_path, "not-a-derived-apply-checkpoint");
+        // Corrupt the progress v2 record directly (no more separate sidecar
+        // file to corrupt independently of the primary store).
+        try db.core.store.putBatch(&.{.{ .key = "\x00\x00__metadata__:progress:v2:dense_idx", .value = "not-a-progress-v2-record" }}, &.{});
         try std.testing.expectError(
             error.InvalidDerivedApplyState,
-            apply_state.loadProjectionCheckpointWithSidecar(alloc, db.core.index_manager.checkpointIo(), db.core.store, checkpoint_path, "dense_idx"),
+            apply_state.loadProjectionCheckpoint(alloc, db.core.store, "dense_idx"),
         );
     }
 
@@ -115124,7 +115275,7 @@ test "db external dense ingest finalizes an exactly covered rebuilding checkpoin
     try std.testing.expectEqual(@as(u64, 1), checkpoint.generation);
 }
 
-test "db corrupt projection sidecar degrades non-dense checkpoint and quarantines writes" {
+test "db corrupt progress v2 record degrades non-dense checkpoint and quarantines writes" {
     const alloc = std.testing.allocator;
 
     var path_tmp = try TestDirectory.init("db");
@@ -115153,8 +115304,7 @@ test "db corrupt projection sidecar degrades non-dense checkpoint and quarantine
             .config_hash = types.indexConfigHash(text_cfg),
         });
 
-        const checkpoint_path = db.core.applied_sequence_checkpoint_path orelse return error.TestUnexpectedResult;
-        try writeRawProjectionCheckpointSidecarForTest(checkpoint_path, "not-a-derived-apply-checkpoint");
+        try db.core.store.putBatch(&.{.{ .key = "\x00\x00__metadata__:progress:v2:ft_idx", .value = "not-a-progress-v2-record" }}, &.{});
     }
 
     {
@@ -119407,7 +119557,7 @@ test "db graph ttl source retirement ignores abandoned replay reservations witho
         break :blk try db.core.store.lastReplaySequenceFromTxn(&txn, 0);
     };
     try std.testing.expect(committed_tip > 0);
-    try std.testing.expectEqual(committed_tip, try loadManagedAppliedSequenceContext(alloc, db.core.index_manager, db.core.store, batch_ctx.applied_sequence_checkpoint_path, .{ .name = "relations_graph", .kind = .graph }));
+    try std.testing.expectEqual(committed_tip, try loadManagedAppliedSequenceContext(alloc, db.core.index_manager, db.core.store, .{ .name = "relations_graph", .kind = .graph }));
     // A mutation can reserve its sequence and fail before the primary commit.
     // With no workers, no executor can certify this nonexistent replay debt.
     const abandoned = db.core.store.reserveNextReplaySequence(1);
@@ -132501,6 +132651,73 @@ test "db native snapshot rejects an external physical root before creating artif
     const snapshot_parent = try std.fmt.allocPrint(alloc, "{s}.snapshots", .{path});
     defer alloc.free(snapshot_parent);
     try std.testing.expect(!try snapshotPathExists(std.testing.io, snapshot_parent));
+}
+
+test "db external-backend reader observes a writer's latest durable progress v2 record" {
+    // searchLockedWithExecutionContextImpl's logical-value completeness
+    // check used to have a raw-storage fallback here, gated on
+    // `retained_remote_query_lease != null`: a reader attached to a
+    // retained/leased generation (an external physical root sharing the
+    // writer's backing store, exactly like this test's reader) could not
+    // trust its own ordinary read of the applied-sequence watermark. That
+    // was a v1 property, not a cross-process MVCC staleness one: v1 kept
+    // two independently written representations of the same progress (a
+    // scalar KV key, updated through the ordinary docstore write path, and
+    // an "enriched" checkpoint written only to an external file sidecar
+    // via a separate I/O path), and the two could legitimately disagree.
+    // Only the file representation was guaranteed to travel with, and
+    // match, the retained generation's physical content, so the fallback
+    // read it directly through raw storage, bypassing the docstore.
+    //
+    // Progress v2 merges both representations into one record, written
+    // and read through exactly one path (`contributeProgress`/
+    // `loadProgress`, a fresh read each call). There is no longer a second,
+    // independently timed representation that could diverge from it, so
+    // the fallback's raw-storage bypass has nothing left to reconcile.
+    // This test proves the replacement directly: a reader opened with
+    // `physical_root_mode = .external_backend` against the writer's exact
+    // backing store (the same relationship `retained_remote_query_lease`
+    // establishes) observes the writer's latest durable applied sequence
+    // through the ordinary v2 read, with no raw-storage bypass needed.
+    const alloc = std.testing.allocator;
+    var path_tmp = try TestDirectory.init("db");
+    defer path_tmp.cleanup();
+    const path = std.mem.span(path_tmp.path().ptr);
+    defer cleanupTempDir(path);
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    var runtime_store = try backend.runtimeStore(alloc, .{ .name = "progress-v2-external-reader" });
+    defer runtime_store.deinit();
+
+    var writer = try DB.open(alloc, path, .{
+        .primary_backend = .{ .mem = .{} },
+        .primary_runtime_store = &runtime_store,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer writer.close();
+    try writer.addIndex(.{ .name = "ft_v1", .kind = .full_text, .config_json = "{}" });
+    try writer.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"body\":\"alpha\"}" }},
+        .sync_level = .full_index,
+    });
+    const writer_applied = try writer.core.loadAppliedSequence(alloc, "ft_v1");
+    try std.testing.expect(writer_applied > 0);
+
+    var reader = try DB.open(alloc, path, .{
+        .primary_backend = .{ .mem = .{} },
+        .primary_runtime_store = &runtime_store,
+        .physical_root_mode = .external_backend,
+        .open_mode = .query_readonly,
+        .start_index_workers = false,
+        .start_optional_runtimes = false,
+        .ttl_cleanup = .{ .enabled = false },
+    });
+    defer reader.close();
+    const reader_observed = try apply_state.loadAppliedSequence(alloc, reader.core.store, "ft_v1");
+    try std.testing.expectEqual(writer_applied, reader_observed);
 }
 
 test "native restore backend configuration is resolved exactly once" {

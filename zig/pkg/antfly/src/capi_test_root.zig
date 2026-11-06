@@ -21,4 +21,5 @@ pub const capi = @import("antfly_local_sources").capi_db;
 test {
     _ = capi;
     _ = @import("capi/db_test.zig");
+    _ = @import("antfly_local_sources").storage_lite_write_amplification_bench_test;
 }
