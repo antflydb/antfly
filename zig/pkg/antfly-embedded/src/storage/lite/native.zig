@@ -4978,6 +4978,26 @@ pub const NativeFile = struct {
     reader_window_depth: usize = 0,
     reader_window_lock: ?std.Io.File = null,
     epoch_window: ?@import("reader_epochs.zig").Frontier = null,
+    /// Reader-epoch namespace directory, opened once and kept across many
+    /// commits instead of being resolved/opened/closed from scratch on every
+    /// one (see docs/design/lite-performance/throughput-profile.md
+    /// §4.1/§5.1 -- this used to be the single largest foreground cost on a
+    /// primary-only single writer, ~46% of sampled time, more than the
+    /// commit's own fsync+pwrite+pread). Invalidated and reopened whenever
+    /// `header.reader_epoch_namespace` no longer matches
+    /// `reader_namespace_binding` (covers every rebind site, e.g.
+    /// `bindPrivateEpochNamespace`/`adoptIndexPublicationHeader`, without
+    /// needing to patch each one) and closed in `close`.
+    reader_namespace: ?@import("reader_epochs.zig").CachedNamespace = null,
+    reader_namespace_binding: [32]u8 = @splat(0),
+    /// `reader_epochs.directoryFingerprint` captured immediately after the
+    /// scan that produced `reader_frontier_cache`, while still holding that
+    /// commit's exclusive data-file lock. The next commit compares its own
+    /// (also lock-held) fingerprint against this before deciding a full
+    /// `reader_epochs.scanCached` is needed; see that function's own comment
+    /// for why an unchanged fingerprint makes the cached frontier stale-safe.
+    reader_namespace_fingerprint: ?i96 = null,
+    reader_frontier_cache: @import("reader_epochs.zig").Frontier = .{},
     minimum_metadata_reader_sequence: ?u64 = null,
     reader_window_previous_metadata_frontier: ?u64 = null,
     reader_window_previous_frontier: ?u64 = null,
@@ -5370,6 +5390,8 @@ pub const NativeFile = struct {
         self.manifest_builder.deinit(self.allocator);
         const io = self.runtimeIo();
         deinitNamespaceDirectory(self.allocator, &self.namespace_directory_cache);
+        if (self.reader_namespace) |cached| cached.close(self.allocator, io);
+        self.reader_namespace = null;
         self.page_cache.deinit(self.allocator);
         self.invalidateLedger();
         if (self.writer_lock_file) |lock_file| {
@@ -5885,8 +5907,49 @@ pub const NativeFile = struct {
         const lock = try acquireDataRewriteLock(self.runtime(), self.path);
         errdefer lock.file.close(self.runtime());
         if (self.activeCheckpoint().free_map_root_page != 0 and (try lock.file.stat(self.runtime())).inode != (try self.file.stat(self.runtime())).inode) return error.EnrichmentSourceChanged;
-        if (self.header.indexed_reclamation) self.epoch_window = try @import("reader_epochs.zig").scan(self.allocator, self.runtime(), self.path, self.header.reader_epoch_namespace, (try self.file.stat(self.runtime())).inode);
+        if (self.header.indexed_reclamation) self.epoch_window = try self.scanReaderEpochsCached();
         return lock;
+    }
+
+    /// `reader_namespace`, opened once and reopened only if
+    /// `header.reader_epoch_namespace` has changed since it was cached (a
+    /// rebind). No syscalls when the cache already matches.
+    fn ensureReaderNamespaceCache(self: *NativeFile) !@import("reader_epochs.zig").CachedNamespace {
+        const epochs = @import("reader_epochs.zig");
+        const io = self.runtime();
+        if (self.reader_namespace) |cached| {
+            if (std.mem.eql(u8, &self.reader_namespace_binding, &self.header.reader_epoch_namespace)) return cached;
+            cached.close(self.allocator, io);
+            self.reader_namespace = null;
+            self.reader_namespace_fingerprint = null;
+        }
+        const cached = try epochs.openCached(self.allocator, io, self.path, self.header.reader_epoch_namespace);
+        self.reader_namespace = cached;
+        self.reader_namespace_binding = self.header.reader_epoch_namespace;
+        self.reader_namespace_fingerprint = null;
+        return cached;
+    }
+
+    /// The reuse frontier for this commit, amortizing `reader_epochs.zig`'s
+    /// namespace open/scan across commits instead of paying its full cost on
+    /// every one. Caller already holds the exclusive data-file lock
+    /// (`acquireDataRewriteLock`, above) -- that lock is what makes trusting
+    /// an unchanged `directoryFingerprint` safe without rescanning; see that
+    /// function's own comment for the full argument. The first call (or any
+    /// call after a rebind) always pays for one real
+    /// `reader_epochs.scanCached`; every call after that is a single
+    /// `fstat`-equivalent as long as no reader has joined or left since.
+    fn scanReaderEpochsCached(self: *NativeFile) !@import("reader_epochs.zig").Frontier {
+        const epochs = @import("reader_epochs.zig");
+        const io = self.runtime();
+        const cached = try self.ensureReaderNamespaceCache();
+        const fp = try epochs.directoryFingerprint(io, cached);
+        if (self.reader_namespace_fingerprint) |previous| if (previous == fp) return self.reader_frontier_cache;
+        const inode = (try self.file.stat(io)).inode;
+        const frontier = try epochs.scanCached(io, cached, inode);
+        self.reader_frontier_cache = frontier;
+        self.reader_namespace_fingerprint = try epochs.directoryFingerprint(io, cached);
+        return frontier;
     }
     fn beginReaderWindow(self: *NativeFile) !bool {
         const coordinator = self.reader_coordinator orelse return false;
@@ -11333,12 +11396,29 @@ pub const NativeFile = struct {
                 _ = try self.validateIndexedAllocator(checkpoint, state, self.allocator_cancel_token);
                 self.free_pages_verified = true;
             }
-            const coordinated = try self.beginReaderWindow();
+            // Nothing for the reuse-lock machinery to gain this commit: no
+            // page is already free to hand out (`state.free_pages == 0`) and
+            // no retirement backlog exists to promote (all three heaps
+            // empty, so `drainRetirement` below would immediately break out
+            // of every one of its loops regardless of the frontier it had).
+            // Skip the whole cross-process reuse-lock acquisition --
+            // `acquireDataRewriteLock` plus the reader-epoch scan -- for a
+            // purely additive (append-only) commit; a later commit that
+            // actually retires something (free_pages or any heap becomes
+            // non-empty) stops skipping on its own, so this can never starve
+            // retirement. Never skip while a window from an *outer*,
+            // already-open nested call is live (`reader_window_depth != 0`):
+            // that window is already open for free, so there is no cost to
+            // avoid and no reason to bypass it.
+            const has_retirement_backlog = state.free_pages != 0 or state.heap.count() != 0 or
+                state.metadata_heap.count() != 0 or state.chains_heap.count() != 0;
+            const skip_reuse_lock = !has_retirement_backlog and self.reader_window_depth == 0;
+            const coordinated = if (skip_reuse_lock) false else try self.beginReaderWindow();
             errdefer if (coordinated) self.endReaderWindow();
-            const lock = if (!coordinated) self.acquireEpochReuseLock() catch |err| switch (err) {
+            const lock = if (skip_reuse_lock or coordinated) null else self.acquireEpochReuseLock() catch |err| switch (err) {
                 error.WouldBlock => null,
                 else => return err,
-            } else null;
+            };
             errdefer if (lock) |held| {
                 held.file.close(self.runtimeIo());
                 self.epoch_window = null;
