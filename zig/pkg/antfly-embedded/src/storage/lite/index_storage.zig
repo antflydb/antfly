@@ -441,7 +441,22 @@ const NativeArtifactStager = struct {
     alloc: Allocator,
     registry: *artifacts.Registry,
     prefix: []u8,
-    const vtable: immutable_artifact.Stager.VTable = .{ .stage = stage, .deinit = deinit };
+    const vtable: immutable_artifact.Stager.VTable = .{ .stage = stage, .acquire_build_resources = acquireBuildResources, .deinit = deinit };
+
+    fn releaseBuildResources(raw: *anyopaque) void {
+        const registry: *artifacts.Registry = @ptrCast(@alignCast(raw));
+        registry.releaseOwner();
+    }
+    fn acquireBuildResources(raw: *anyopaque) !?immutable_artifact.BuildResources {
+        const self: *@This() = @ptrCast(@alignCast(raw));
+        const owner = self.registry.beginCallback() orelse return error.ReadOnly;
+        defer self.registry.endCallback();
+        // Keeping the registry alive retains a backend-owned manager after
+        // close. It cannot extend an externally supplied manager's lifetime.
+        if (owner.resource_manager != null and !owner.resource_manager_transfers_on_close) return null;
+        self.registry.retainOwner();
+        return .{ .ptr = self.registry, .allocator = self.registry.allocator, .io = self.registry.io(), .resource_manager = owner.resource_manager, .release_fn = releaseBuildResources };
+    }
 
     fn stage(raw: *anyopaque, bytes: []const u8) !immutable_artifact.Prepared {
         const self: *@This() = @ptrCast(@alignCast(raw));

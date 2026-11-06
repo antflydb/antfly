@@ -1574,6 +1574,9 @@ pub const Store = struct {
     next_writer_ticket: u64 = 0,
     serving_writer_ticket: u64 = 0,
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
+    /// Set only by the backend which transfers this manager to the artifact
+    /// registry on close. External managers require their caller's lifetime.
+    resource_manager_transfers_on_close: bool = false,
 
     pub const MaintenancePhase = enum { assessment, copy, verification };
     pub const MaintenanceTestHook = struct {

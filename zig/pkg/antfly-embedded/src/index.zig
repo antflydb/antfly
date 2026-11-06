@@ -2808,6 +2808,23 @@ pub const IndexWriter = struct {
         }
 
         pub fn publish(self: *PreparedSegmentReplacement) void {
+            self.publishImpl(false);
+        }
+
+        /// A native commit can activate several independent indexes. Keep
+        /// readers behind this fence until every group snapshot is installed.
+        /// The caller owns the writer's lifecycle through the finishing phase.
+        pub fn publishRetainingExternalVisibility(self: *PreparedSegmentReplacement) void {
+            std.debug.assert(self.external_visibility_owned);
+            self.publishImpl(true);
+        }
+
+        pub fn finishExternalVisibility(self: *PreparedSegmentReplacement) void {
+            std.debug.assert(!self.active);
+            self.releaseExternalVisibility();
+        }
+
+        fn publishImpl(self: *PreparedSegmentReplacement, retain_external_visibility: bool) void {
             std.debug.assert(self.active);
             const writer = self.writer.?;
             const old = @atomicLoad(*IndexSnapshot, &writer.current, .acquire);
@@ -2827,7 +2844,7 @@ pub const IndexWriter = struct {
             writer.next_segment_id = @max(writer.next_segment_id, self.next_segment_id);
             writer.next_epoch += 1;
             writer.publishSnapshot(self.snapshot);
-            self.releaseExternalVisibility();
+            if (!retain_external_visibility) self.releaseExternalVisibility();
             old.release();
             writer.mu.unlock();
             self.staging_alloc.free(self.detached_revisions);
@@ -6537,4 +6554,39 @@ test "detached index publication abort owns its lifetime after writer shutdown" 
     writer.deinit();
     writer_live = false;
     prepared.abort();
+}
+
+test "group activation retains every external fence until all snapshots are installed" {
+    const a = std.testing.allocator;
+    var first = try IndexWriter.init(a);
+    defer first.deinit();
+    var second = try IndexWriter.init(a);
+    defer second.deinit();
+    const bytes = try buildTestSegmentWithIds(a, &.{.{ .id = "old", .terms = &.{.{ .term = "alpha", .freq = 1, .norm = 10 }} }});
+    defer a.free(bytes);
+    try first.addSegment(bytes);
+    try second.addSegment(bytes);
+    var first_plan = try first.prepareSegmentsManyData(&.{1}, &.{});
+    defer first_plan.abort();
+    var second_plan = try second.prepareSegmentsManyData(&.{1}, &.{});
+    defer second_plan.abort();
+    first_plan.guardExternalVisibility();
+    second_plan.guardExternalVisibility();
+    first_plan.publishRetainingExternalVisibility();
+    defer first_plan.finishExternalVisibility();
+    try std.testing.expectEqual(@as(usize, 0), first.current.segments.len);
+    try std.testing.expectEqual(@as(usize, 1), second.current.segments.len);
+    try std.testing.expect(!first.external_visibility_gate.tryLock());
+    try std.testing.expect(!second.external_visibility_gate.tryLock());
+    second_plan.publishRetainingExternalVisibility();
+    defer second_plan.finishExternalVisibility();
+    try std.testing.expectEqual(@as(usize, 0), second.current.segments.len);
+    try std.testing.expect(!first.external_visibility_gate.tryLock());
+    try std.testing.expect(!second.external_visibility_gate.tryLock());
+    // Memory activation has already released both writer mutexes. Only the
+    // reader fences remain until the coordinator finishes the whole group.
+    try std.testing.expect(first.mu.tryLock());
+    first.mu.unlock();
+    try std.testing.expect(second.mu.tryLock());
+    second.mu.unlock();
 }

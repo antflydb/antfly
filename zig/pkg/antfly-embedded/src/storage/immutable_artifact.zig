@@ -13,6 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+const std = @import("std");
 const abi = @import("../runtime_callback_abi.zig");
 const Source = @import("../segment_source.zig").Source;
 
@@ -46,6 +47,20 @@ pub const Prepared = struct {
     }
 };
 
+/// Independently retained preparation resources. This capability borrows no
+/// DB, Store, schema/index entry, primary snapshot or publication admission.
+pub const BuildResources = struct {
+    ptr: *anyopaque,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    resource_manager: ?*@import("resource_manager.zig").ResourceManager,
+    release_fn: *const fn (*anyopaque) void,
+    pub fn deinit(self: *BuildResources) void {
+        self.release_fn(self.ptr);
+        self.* = undefined;
+    }
+};
+
 /// Captured under catalog admission, used after releasing that admission.
 /// Owns no mutable index, primary snapshot or borrowed DB/runtime pointer.
 pub const Stager = struct {
@@ -54,9 +69,14 @@ pub const Stager = struct {
     dispatch: Boundary.Dispatch = Boundary.local_dispatch,
     pub const VTable = struct {
         stage: *const fn (*anyopaque, []const u8) anyerror!Prepared,
+        acquire_build_resources: ?*const fn (*anyopaque) anyerror!?BuildResources = null,
         deinit: *const fn (*anyopaque) void,
     };
     const Boundary = abi.Boundary(VTable);
+    pub fn acquireBuildResources(self: Stager) !?BuildResources {
+        const operation = self.vtable.acquire_build_resources orelse return null;
+        return Boundary.call("acquire_build_resources", self.dispatch, operation, .{self.ptr});
+    }
     pub fn stage(self: Stager, bytes: []const u8) !Prepared {
         return Boundary.call("stage", self.dispatch, self.vtable.stage, .{ self.ptr, bytes });
     }

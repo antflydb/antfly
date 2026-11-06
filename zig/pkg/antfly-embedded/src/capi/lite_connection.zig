@@ -2830,6 +2830,18 @@ pub const Owner = struct {
         if (failed) {
             if (schedule.text_merge_caps.count() >= 64) schedule.text_merge_caps.clearRetainingCapacity();
             try schedule.text_merge_caps.put(alloc, pending.config_hash, @intCast(@max(2, pending.task.source.len / 2)));
+            // The failed private worker still owes a merge. Recording its
+            // smaller cap does not make an idle namespace runnable. Requeue
+            // that debt explicitly rather than waiting for an unrelated write
+            // or an opportunistic idle poll to rediscover it.
+            schedule.artifact_pending = true;
+            schedule.next_artifact_ns = 0;
+            self.runnable_sources.notify(h.handleLockIo(), .{ .table_id = pending.database.core.identity_namespace.table_id, .incarnation = pending.database.root_incarnation });
+            self.maintenance_pending = true;
+            // Keep the work runnable without turning persistent memory
+            // pressure into a zero-delay private-worker retry loop.
+            self.maintenance_turn_deferred = true;
+            self.wake.set(h.handleLockIo());
         } else _ = schedule.text_merge_caps.remove(pending.config_hash);
     }
 
@@ -6845,6 +6857,8 @@ test "capi native asynchronous text merge preserves resource retry hints across 
     defer test_private_merge_budget_failures.store(0, .release);
     const pending = try seedPausedPrivateMerge(&fixture);
     const attempted = pending.task.source.len;
+    const table_id = pending.database.core.identity_namespace.table_id;
+    const incarnation = pending.database.root_incarnation;
     // The actor must yield immediately; waiting or assisting here would block
     // the very lane which stages the independent construction's result.
     try pending.database.initOptionalTextMergeRuntime(.{ .enabled = true, .max_pending_segments = 1, .max_pending_bytes = 0, .manual_producer_assistance = true, .defer_producer_to_owner = true });
@@ -6866,6 +6880,10 @@ test "capi native asynchronous text merge preserves resource retry hints across 
     }
     try std.testing.expect(rejected);
     try std.testing.expect(owner.pending_text_merge == null);
+    const schedule = owner.maintenance_schedules.get(.{ .table_id = table_id, .incarnation = incarnation }) orelse return error.MissingMergeRetrySchedule;
+    try std.testing.expect(schedule.artifact_pending);
+    try std.testing.expectEqual(@as(i96, 0), schedule.next_artifact_ns);
+    try std.testing.expectEqual(@as(i64, 100), owner.maintenanceWaitMillisForTest(true));
     test_pause_private_merge.store(true, .release);
     for (0..64) |_| {
         owner.maintenance_pending = true;

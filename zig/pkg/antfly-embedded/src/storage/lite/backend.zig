@@ -761,6 +761,7 @@ fn initNativeSingleFile(
     errdefer allocator.destroy(store);
 
     store.* = store_owner;
+    store.resource_manager_transfers_on_close = owned_resource_manager != null;
     close_store_owner = false;
     errdefer store.close();
 

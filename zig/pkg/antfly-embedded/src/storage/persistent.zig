@@ -1386,9 +1386,119 @@ pub const PersistentIndex = struct {
         metadata: ?ReplayPublicationMetadata,
         committer: ?@import("native_publication.zig").Committer,
     ) ![]index_mod.IndexWriter.DeleteInfo {
+        if (committer) |primary| {
+            const prepared = try self.prepareNativePublication(segments, delete_keys, checkpoint, metadata);
+            defer prepared.deinit();
+            try commitNativePublications(&.{prepared}, primary);
+            return prepared.takeDeleteInfos();
+        }
         self.lockStorage();
         defer self.unlockStorage();
-        return self.publishPreparedNativeLocked(segments, delete_keys, checkpoint, metadata, committer);
+        return self.publishPreparedNativeLocked(segments, delete_keys, checkpoint, metadata, null);
+    }
+
+    /// A prepared index replacement retains the caller's index-lifetime fence
+    /// and local storage serialization, but no native transaction, reader pin
+    /// or file writer admission. Acquire multiple indexes in catalog order.
+    /// Artifacts and metadata must outlive the handle. A caller can combine
+    /// several indexes and primary effects through commitNativePublications.
+    pub const PreparedNativePublication = struct {
+        index: *PersistentIndex,
+        namespace: @import("native_publication.zig").Prepared,
+        snapshot: ?index_mod.IndexWriter.PreparedSegmentReplacement,
+        replacements: []index_mod.ReplacementSegmentData,
+        segments: []PreparedReplaySegment,
+        metadata: ?ReplayPublicationMetadata,
+        infos: []index_mod.IndexWriter.DeleteInfo,
+        activated: bool = false,
+        staged: bool = false,
+
+        fn stage(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            if (self.activated or self.staged) return error.InvalidDerivedApplyState;
+            // A failed stage belongs to an aborted transaction. Recreate the
+            // handle rather than attempting to bind the snapshot twice.
+            self.staged = true;
+            try self.namespace.participant.apply(view);
+            if (self.snapshot) |*candidate| try candidate.bind(&self.index.writer);
+            for (self.segments) |segment| try segment.artifact.stageLink(view);
+            if (self.snapshot) |*candidate| candidate.guardExternalVisibility();
+            if (self.metadata) |joined| try joined.participant.apply(view);
+        }
+
+        fn activate(self: *@This()) void {
+            std.debug.assert(self.staged and !self.activated);
+            if (self.snapshot) |*candidate| candidate.publishRetainingExternalVisibility();
+            self.activated = true;
+        }
+
+        pub fn takeDeleteInfos(self: *@This()) []index_mod.IndexWriter.DeleteInfo {
+            std.debug.assert(self.activated);
+            const result = self.infos;
+            self.infos = &.{};
+            return result;
+        }
+
+        pub fn deinit(self: *@This()) void {
+            const index = self.index;
+            self.namespace.deinit();
+            if (!self.activated) {
+                if (self.snapshot) |*candidate| candidate.abort();
+                for (self.replacements) |*replacement| replacement.data.deinit(index.alloc);
+            }
+            index.alloc.free(self.replacements);
+            index.freeDeleteInfos(self.infos);
+            index.unlockStorage();
+            index.alloc.destroy(self);
+        }
+    };
+
+    pub fn prepareNativePublication(
+        self: *PersistentIndex,
+        segments: []PreparedReplaySegment,
+        delete_keys: []const []const u8,
+        checkpoint: ?ReplayFragment.Checkpoint,
+        metadata: ?ReplayPublicationMetadata,
+    ) !*PreparedNativePublication {
+        self.lockStorage();
+        errdefer self.unlockStorage();
+        const result = try self.alloc.create(PreparedNativePublication);
+        errdefer self.alloc.destroy(result);
+        _ = try self.publishPreparedNativeLocked(segments, delete_keys, checkpoint, metadata, result);
+        return result;
+    }
+
+    /// Exactly one host commit for all prepared indexes and its primary writes.
+    /// Every allocation precedes this call. Host failure never activates a
+    /// subset, and an uncertain result fences every potentially changed index.
+    pub fn commitNativePublications(prepared: []const *PreparedNativePublication, primary: @import("native_publication.zig").Committer) !void {
+        for (prepared, 0..) |candidate, i| {
+            if (candidate.staged or candidate.activated) return error.InvalidDerivedApplyState;
+            for (prepared[0..i]) |previous| if (previous.index == candidate.index) return error.InvalidDerivedApplyState;
+        }
+        const Group = struct {
+            items: []const *PreparedNativePublication,
+            fn stage(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
+                const self: *@This() = @ptrCast(@alignCast(raw));
+                for (self.items) |item| try PreparedNativePublication.stage(item, view);
+            }
+        };
+        var group: Group = .{ .items = prepared };
+        var progress: backend_types.CommitProgress = .{};
+        const parent_progress = backend_types.commit_progress;
+        backend_types.commit_progress = &progress;
+        defer backend_types.commit_progress = parent_progress;
+        primary.commit(.{ .ptr = &group, .stage = Group.stage }) catch |err| {
+            if (progress.maybe_applied) {
+                if (parent_progress) |parent| parent.maybe_applied = true;
+                for (prepared) |item| if (item.index.segment_files) |files| files.storage.fenceUncertainPublication();
+            }
+            return err;
+        };
+        for (prepared) |item| item.activate();
+        // All snapshots are installed before any reader can cross a group's
+        // external visibility fence. This phase cannot fail or allocate.
+        for (prepared) |item| if (item.snapshot) |*candidate| candidate.finishExternalVisibility();
     }
 
     /// Shared physical publication for replay and ordinary foreground index
@@ -1399,7 +1509,7 @@ pub const PersistentIndex = struct {
         delete_keys: []const []const u8,
         checkpoint: ?ReplayFragment.Checkpoint,
         metadata: ?ReplayPublicationMetadata,
-        committer: ?@import("native_publication.zig").Committer,
+        detached: ?*PreparedNativePublication,
     ) ![]index_mod.IndexWriter.DeleteInfo {
         if (metadata != null) {
             const point = checkpoint orelse return error.InvalidDerivedApplyState;
@@ -1431,7 +1541,7 @@ pub const PersistentIndex = struct {
                                 !std.mem.eql(u8, &previous.position.fingerprint, &point.position.fingerprint)) return error.InvalidDerivedApplyState;
                             if (previous.position.next_item > point.position.next_item) return error.EnrichmentWaitCanceled;
                             if (previous.position.next_item == point.position.next_item) {
-                                if (committer != null) return error.EnrichmentWaitCanceled;
+                                if (detached != null) return error.EnrichmentWaitCanceled;
                                 return self.alloc.alloc(index_mod.IndexWriter.DeleteInfo, 0);
                             }
                         }
@@ -1442,9 +1552,10 @@ pub const PersistentIndex = struct {
         const infos = try self.writer.prepareDeleteInfos(self.alloc, delete_keys);
         errdefer self.freeDeleteInfos(infos);
         const count = infos.len + segments.len;
-        if (count == 0 and checkpoint == null and metadata == null and committer == null) return infos;
+        if (count == 0 and checkpoint == null and metadata == null and detached == null) return infos;
         const replacements = try self.alloc.alloc(index_mod.ReplacementSegmentData, count);
-        defer self.alloc.free(replacements);
+        var replacements_transferred = false;
+        defer if (!replacements_transferred) self.alloc.free(replacements);
         const deleted = try self.alloc.alloc(roaring.RoaringBitmap, infos.len);
         var deleted_count: usize = 0;
         defer {
@@ -1494,6 +1605,10 @@ pub const PersistentIndex = struct {
                     collided_ids[collided_count] = id;
                     collided_count += 1;
                     if (collided_count == collided_ids.len) {
+                        // Owned preparation must never publish a separate
+                        // durable frontier reservation. The in-memory frontier
+                        // has advanced for the next bounded attempt.
+                        if (detached != null) return error.EnrichmentWaitCanceled;
                         var reservation = try self.beginWriteMainTxn();
                         errdefer reservation.abort();
                         try self.checkReplayAliasCollisions(&reservation, collided_ids[0..collided_count]);
@@ -1538,6 +1653,25 @@ pub const PersistentIndex = struct {
             }
             try txn.put(.meta, projection_seal.metadata_key, &try next.encode());
         };
+        if (publication) |*prepared| try prepared.detach();
+        if (detached) |result| {
+            const namespace_txn = if (txn.write) |*value| value else return error.ReadOnly;
+            const prepared_namespace = try namespace_txn.prepareNativePublication();
+            txn.write = null;
+            result.* = .{
+                .index = self,
+                .namespace = prepared_namespace,
+                .snapshot = publication,
+                .replacements = replacements,
+                .segments = segments,
+                .metadata = metadata,
+                .infos = infos,
+            };
+            publication = null;
+            replacements_transferred = true;
+            published = true;
+            return infos;
+        }
         const Participation = struct {
             segments: []PreparedReplaySegment,
             metadata: ?ReplayPublicationMetadata,
@@ -1559,41 +1693,9 @@ pub const PersistentIndex = struct {
             .metadata = metadata,
             .snapshot_publication = if (publication) |*prepared| prepared else null,
             .target_writer = &self.writer,
-            .guard_visibility = metadata != null or committer != null,
+            .guard_visibility = metadata != null,
         };
-        if (publication) |*prepared| try prepared.detach();
-        if (committer) |primary| {
-            // Detachment consumes only the namespace transaction; its immutable
-            // write set remains owned until the synchronous primary returns.
-            const namespace_txn = if (txn.write) |*value| value else return error.ReadOnly;
-            var prepared_namespace = try namespace_txn.prepareNativePublication();
-            txn.write = null;
-            defer prepared_namespace.deinit();
-            const Joined = struct {
-                namespace: @import("native_publication.zig").Participant,
-                artifacts: @import("native_publication.zig").Participant,
-                fn stage(raw: *anyopaque, view: @import("native_publication.zig").View) !void {
-                    const joined: *@This() = @ptrCast(@alignCast(raw));
-                    try joined.namespace.apply(view);
-                    try joined.artifacts.apply(view);
-                }
-            };
-            var joined: Joined = .{ .namespace = prepared_namespace.participant, .artifacts = .{ .ptr = &participation, .stage = Participation.stage } };
-            var progress: backend_types.CommitProgress = .{};
-            const parent_progress = backend_types.commit_progress;
-            backend_types.commit_progress = &progress;
-            defer backend_types.commit_progress = parent_progress;
-            primary.commit(.{ .ptr = &joined, .stage = Joined.stage }) catch |err| {
-                uncertain = progress.maybe_applied;
-                if (uncertain) {
-                    if (parent_progress) |parent| parent.maybe_applied = true;
-                    files.storage.fenceUncertainPublication();
-                }
-                return err;
-            };
-        } else {
-            try self.commitPreparedPublicationWithParticipant(&txn, &uncertain, .{ .ptr = &participation, .stage = Participation.stage });
-        }
+        try self.commitPreparedPublicationWithParticipant(&txn, &uncertain, .{ .ptr = &participation, .stage = Participation.stage });
         if (publication) |*prepared| prepared.publish();
         published = true;
         return infos;
@@ -8412,4 +8514,138 @@ test "lite direct native replay publishes metadata and artifacts in one checkpoi
     defer a.free(primary_value);
     try std.testing.expectEqualStrings("beta", primary_value);
     try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "native prepared group commits primary and two indexes atomically with stale and failure refusal" {
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/prepared-native-group.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .no_sync = true, .io = std.testing.io, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    docs.file.externally_locked = true;
+    var storage = lite_indexes.Store.init(a, &docs);
+    var indexes: [2]PersistentIndex = undefined;
+    var opened: usize = 0;
+    defer for (indexes[0..opened]) |*index| index.close();
+    const paths = [_][*:0]const u8{ "/indexes/first", "/indexes/second" };
+    const alpha = try buildSimpleSegment(a, "doc:a", "alpha");
+    defer a.free(alpha);
+    const beta = try buildSimpleSegment(a, "doc:a", "beta");
+    defer a.free(beta);
+    for (&indexes, paths) |*index, root| {
+        index.* = try PersistentIndex.open(a, .{ .path = root, .io = std.testing.io, .main_backend = .lsm, .main_lsm_storage = storage.storage(), .wal_backend = .lsm, .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true });
+        opened += 1;
+        try index.indexSegment(alpha);
+    }
+    var primary_store = try @import("docstore.zig").DocStore.openRuntime(a, docs.backendStore());
+    defer primary_store.close();
+    const Primary = struct {
+        store: *@import("docstore.zig").DocStore,
+        fail: bool,
+        fn commit(raw: *anyopaque, participant: @import("native_publication.zig").Participant) !void {
+            const self: *@This() = @ptrCast(@alignCast(raw));
+            const Joined = struct {
+                participant: @import("native_publication.zig").Participant,
+                fail: bool,
+                fn stage(ctx: *anyopaque, view: @import("native_publication.zig").View) !void {
+                    const joined: *@This() = @ptrCast(@alignCast(ctx));
+                    try joined.participant.apply(view);
+                    if (joined.fail) return error.InjectedFailure;
+                }
+            };
+            var joined: Joined = .{ .participant = participant, .fail = self.fail };
+            try self.store.putBatchWithPublications(std.testing.io, &.{.{ .key = "doc:a", .value = "beta" }}, &.{}, null, .{}, null, .{ .ptr = &joined, .stage = Joined.stage });
+        }
+    };
+    var primary: Primary = .{ .store = &primary_store, .fail = true };
+    // Recreate failed handles; the logical artifacts remain reusable.
+    for (0..3) |attempt| {
+        var first_stager = (try indexes[0].acquireReplayStager(a)).?;
+        defer first_stager.deinit();
+        var second_stager = (try indexes[1].acquireReplayStager(a)).?;
+        defer second_stager.deinit();
+        var first_segments = [_]PreparedReplaySegment{try prepareReplaySegment(a, first_stager, beta)};
+        defer first_segments[0].deinit();
+        var second_segments = [_]PreparedReplaySegment{try prepareReplaySegment(a, second_stager, beta)};
+        defer second_segments[0].deinit();
+        var before: u64 = undefined;
+        {
+            const first = try indexes[0].prepareNativePublication(&first_segments, &.{"doc:a"}, null, null);
+            defer first.deinit();
+            const second = try indexes[1].prepareNativePublication(&second_segments, &.{"doc:a"}, null, null);
+            defer second.deinit();
+            if (attempt == 1) {
+                // Foreign metadata changes after preparation invalidate the exact
+                // second namespace. The first namespace must roll back too.
+                var foreign = try indexes[1].beginWriteMainTxn();
+                defer foreign.abort();
+                try foreign.put(.meta, "foreign-change", "new");
+                try foreign.commit();
+            }
+            before = docs.file.activeCheckpoint().commit_sequence;
+            if (attempt == 0) {
+                try std.testing.expectError(error.InjectedFailure, PersistentIndex.commitNativePublications(&.{ first, second }, .{ .ptr = &primary, .commit_fn = Primary.commit }));
+            } else if (attempt == 1) {
+                primary.fail = false;
+                try std.testing.expectError(error.FileBusy, PersistentIndex.commitNativePublications(&.{ first, second }, .{ .ptr = &primary, .commit_fn = Primary.commit }));
+            } else {
+                try PersistentIndex.commitNativePublications(&.{ first, second }, .{ .ptr = &primary, .commit_fn = Primary.commit });
+            }
+        }
+        try std.testing.expectEqual(before + @as(u64, if (attempt == 2) 1 else 0), docs.file.activeCheckpoint().commit_sequence);
+        if (attempt == 2) {
+            const value = (try docs.file.getDocumentAlloc(a, "doc:a")).?;
+            defer a.free(value);
+            try std.testing.expectEqualStrings("beta", value);
+        } else try std.testing.expect((try docs.file.getDocumentAlloc(a, "doc:a")) == null);
+        for (&indexes) |*index| {
+            try std.testing.expectEqual(@as(usize, if (attempt == 2) 0 else 1), try persistentSearchHitCount(a, index.snapshot(), "alpha"));
+            try std.testing.expectEqual(@as(usize, if (attempt == 2) 1 else 0), try persistentSearchHitCount(a, index.snapshot(), "beta"));
+        }
+    }
+    try std.testing.expect((try docs.file.check()).valid);
+}
+
+test "native owned publication preparation never commits a collision frontier" {
+    const a = std.testing.allocator;
+    const lite_docs = @import("lite/docstore.zig");
+    const lite_indexes = @import("lite/index_storage.zig");
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/prepared-collision-frontier.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var docs = try lite_docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer docs.close();
+    docs.maintenance_start_suppressed = true;
+    docs.file.externally_locked = true;
+    var storage = lite_indexes.Store.init(a, &docs);
+    var index = try PersistentIndex.open(a, .{ .path = "/indexes/text", .io = std.testing.io, .main_backend = .lsm, .main_lsm_storage = storage.storage(), .wal_backend = .lsm, .wal_storage = storage.storage(), .main_no_sync = true, .wal_no_sync = true });
+    defer index.close();
+    const start = index.writer.next_segment_id;
+    const files = &index.segment_files.?;
+    for (0..64) |offset| {
+        const occupied = try files.pathAlloc(start + offset);
+        defer a.free(occupied);
+        try files.storage.writeFileAbsolute(occupied, "occupied unpublished alias");
+    }
+    const beta = try buildSimpleSegment(a, "doc:a", "beta");
+    defer a.free(beta);
+    var stager = (try index.acquireReplayStager(a)).?;
+    defer stager.deinit();
+    var segments = [_]PreparedReplaySegment{try prepareReplaySegment(a, stager, beta)};
+    defer segments[0].deinit();
+    const checkpoint = docs.file.activeCheckpoint();
+    try std.testing.expectError(error.EnrichmentWaitCanceled, index.prepareNativePublication(&segments, &.{}, null, null));
+    try std.testing.expectEqualDeep(checkpoint, docs.file.activeCheckpoint());
+    try std.testing.expectEqual(start + 64, index.writer.next_segment_id);
+    // A new bounded preparation starts beyond the occupied prefix. Neither
+    // attempt needs an independent durability boundary for ID allocation.
+    const prepared = try index.prepareNativePublication(&segments, &.{}, null, null);
+    defer prepared.deinit();
+    try std.testing.expectEqualDeep(checkpoint, docs.file.activeCheckpoint());
 }

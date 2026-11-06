@@ -89,6 +89,26 @@ fn retainPooled(identity: ArtifactIdentity) ?*State {
     return state;
 }
 
+// Weak, allocation-free and bounded independently of the number of live
+// artifacts. Full bytes are compared after the digest; native page addresses
+// cannot authorize resident reuse because they may be recycled without leases.
+var resident_pool_mutex: std.atomic.Mutex = .unlocked;
+var resident_pool: [128]?*OwnedBytes = @splat(null);
+
+fn findResident(candidate: *OwnedBytes) ?Source {
+    platform_sync.lockYielding(&resident_pool_mutex);
+    defer resident_pool_mutex.unlock();
+    for (resident_pool) |slot| if (slot) |existing| {
+        if (existing == candidate or existing.data.len != candidate.data.len or
+            !std.mem.eql(u8, &existing.identity, &candidate.identity) or
+            !std.mem.eql(u8, existing.registry.path, candidate.registry.path) or
+            !std.mem.eql(u8, existing.data, candidate.data)) continue;
+        _ = existing.references.fetchAdd(1, .monotonic);
+        return existing.rawSource();
+    };
+    return null;
+}
+
 /// A file owner may retain immutable artifact Sources across runtime teardown.
 /// Entries hold neither a DB nor a primary snapshot. Exact pooled identities
 /// remain protected by their durable artifact leases for the retained lifetime.
@@ -98,7 +118,8 @@ pub const WorkingSet = struct {
     const max_bytes = 128 * 1024 * 1024;
     pub const max_range_bytes = 128 * 1024 * 1024;
     const lifetime_ns = 5 * std.time.ns_per_s;
-    entries: [max_entries]?*State = @splat(null),
+    const Entry = union(enum) { native: *State, resident: *OwnedBytes };
+    entries: [max_entries]?Entry = @splat(null),
     count: usize = 0,
     inode: ?u64 = null,
     bytes: u64 = 0,
@@ -108,11 +129,13 @@ pub const WorkingSet = struct {
     pub fn clear(self: *WorkingSet) void {
         // Release outside both pool and registry mutexes: final release may
         // retire its marker and resource-accounting owner.
-        for (self.entries[0..self.count]) |entry| {
-            const state = entry.?;
-            State.releaseUse(state);
-            State.close(state);
-        }
+        for (self.entries[0..self.count]) |entry| switch (entry.?) {
+            .native => |state| {
+                State.releaseUse(state);
+                State.close(state);
+            },
+            .resident => |bytes| bytes.deinit(),
+        };
         self.* = .{};
     }
 
@@ -124,28 +147,52 @@ pub const WorkingSet = struct {
     pub fn capture(self: *WorkingSet, registry: *Registry, inode: u64, generation_bytes: u64, now_ns: u64) void {
         self.observe(inode, now_ns);
         if (self.count == max_entries) return;
-        // Source references are protected by the pool mutex. Registry owns
-        // list membership; each state's lifetime mutex protects active uses.
-        @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
-        defer source_pool_mutex.unlock();
-        const io = registry.io();
-        registry.mutex.lockUncancelable(io);
-        defer registry.mutex.unlock(io);
-        var next = registry.first;
-        var visited: usize = 0;
-        while (next) |state| {
-            next = state.next;
-            visited += 1;
-            if (visited > max_entries or self.count == max_entries) break;
-            self.captureState(state, inode, generation_bytes, now_ns);
-        }
-        // A pooled hit can belong to a detached prior registry. Remember only
-        // bounded copied identities here, never raw State pointers or strong
-        // Registry references. Resolve them while holding the pool mutex.
-        for (registry.borrowed[0..registry.borrowed_count]) |identity| {
-            if (self.count == max_entries) break;
-            if (source_pool.getContext(identity, identity)) |state|
+        {
+            // Source references are protected by the pool mutex. Registry owns
+            // list membership; each state's lifetime mutex protects active uses.
+            @import("antfly_platform").sync.lockYielding(&source_pool_mutex);
+            defer source_pool_mutex.unlock();
+            const io = registry.io();
+            registry.mutex.lockUncancelable(io);
+            defer registry.mutex.unlock(io);
+            var next = registry.first;
+            var visited: usize = 0;
+            while (next) |state| {
+                next = state.next;
+                visited += 1;
+                if (visited > max_entries or self.count == max_entries) break;
                 self.captureState(state, inode, generation_bytes, now_ns);
+            }
+            // A pooled hit can belong to a detached prior registry. Remember only
+            // bounded copied identities here, never raw State pointers or strong
+            // Registry references. Resolve them while holding the pool mutex.
+            for (registry.borrowed[0..registry.borrowed_count]) |identity| {
+                if (self.count == max_entries) break;
+                if (source_pool.getContext(identity, identity)) |state|
+                    self.captureState(state, inode, generation_bytes, now_ns);
+            }
+        }
+        platform_sync.lockYielding(&resident_pool_mutex);
+        defer resident_pool_mutex.unlock();
+        for (resident_pool) |slot| {
+            if (self.count == max_entries) break;
+            const bytes = slot orelse continue;
+            if (bytes.registry.inode != inode or !std.mem.eql(u8, bytes.registry.path, registry.path)) continue;
+            var duplicate = false;
+            for (self.entries[0..self.count]) |entry| if (entry.? == .resident and entry.?.resident == bytes) {
+                duplicate = true;
+                break;
+            };
+            if (duplicate) continue;
+            const charge = bytes.rawSource().ranges.retention_overhead_bytes;
+            if (charge > max_bytes -| self.bytes) continue;
+            _ = bytes.references.fetchAdd(1, .monotonic);
+            self.entries[self.count] = .{ .resident = bytes };
+            self.count += 1;
+            self.bytes += charge;
+            self.inode = inode;
+            // Resident data pins no file pages, so it adds no range charge.
+            if (self.expires_ns == 0) self.expires_ns = now_ns +| lifetime_ns;
         }
     }
 
@@ -154,7 +201,7 @@ pub const WorkingSet = struct {
         const identity = state.pool_identity orelse return;
         if (identity.inode != inode) return;
         var duplicate = false;
-        for (self.entries[0..self.count]) |entry| if (entry.? == state) {
+        for (self.entries[0..self.count]) |entry| if (entry.? == .native and entry.?.native == state) {
             duplicate = true;
             break;
         };
@@ -169,7 +216,7 @@ pub const WorkingSet = struct {
         if (charge > max_bytes -| self.bytes or state.value.length > @min(generation_bytes, max_range_bytes) -| self.range_bytes) return;
         state.source_references += 1;
         state.active_uses += 1;
-        self.entries[self.count] = state;
+        self.entries[self.count] = .{ .native = state };
         self.count += 1;
         self.bytes += charge;
         self.range_bytes += state.value.length;
@@ -188,6 +235,7 @@ pub const OwnedBytes = struct {
     const decode_limit = 1024 * 1024;
     pub const maximum_length = 256 * 1024;
     sealed: bool = false,
+    pool_slot: ?usize = null,
     alloc: Allocator,
     data: []u8,
     registry: *Registry,
@@ -231,6 +279,18 @@ pub const OwnedBytes = struct {
 
     pub fn source(self: *@This()) Source {
         std.debug.assert(self.sealed);
+        platform_sync.lockYielding(&resident_pool_mutex);
+        if (self.pool_slot == null) {
+            for (&resident_pool, 0..) |*slot, i| if (slot.* == null) {
+                slot.* = self;
+                self.pool_slot = i;
+                break;
+            };
+        }
+        resident_pool_mutex.unlock();
+        return self.rawSource();
+    }
+    fn rawSource(self: *@This()) Source {
         return .{ .ranges = .{
             .ptr = self,
             .length = self.data.len,
@@ -319,7 +379,16 @@ pub const OwnedBytes = struct {
     }
     fn close(raw: *anyopaque) void {
         const self: *@This() = @ptrCast(@alignCast(raw));
-        if (self.references.fetchSub(1, .acq_rel) != 1) return;
+        platform_sync.lockYielding(&resident_pool_mutex);
+        if (self.references.fetchSub(1, .acq_rel) != 1) {
+            resident_pool_mutex.unlock();
+            return;
+        }
+        if (self.pool_slot) |slot| {
+            std.debug.assert(resident_pool[slot] == self);
+            resident_pool[slot] = null;
+        }
+        resident_pool_mutex.unlock();
         std.debug.assert(self.decoded_users == 0);
         if (self.decoded_cache) |cache| cache.deinit();
         if (self.residency) |*credit| credit.release();
@@ -335,6 +404,7 @@ pub const Registry = struct {
     allocator: Allocator,
     io_impl: std.Io.Threaded,
     path: [:0]u8,
+    inode: u64,
     marker_namespace_safe: bool = false,
     store: ?*docs.Store,
     publication_guard: ?std.Io.File = null,
@@ -358,7 +428,8 @@ pub const Registry = struct {
         const path = try std.Io.Dir.cwd().realPathFileAlloc(store.file.runtime(), store.file.path, allocator);
         errdefer allocator.free(path);
         const marker_namespace_safe = !store.read_only and try @import("reader_epochs.zig").namespaceMatches(allocator, store.file.runtime(), path, store.file.header.reader_epoch_namespace);
-        self.* = .{ .allocator = allocator, .io_impl = limits.initService(allocator), .path = path, .store = store, .marker_namespace_safe = marker_namespace_safe };
+        const inode = (try store.file.file.stat(store.file.runtime())).inode;
+        self.* = .{ .allocator = allocator, .io_impl = limits.initService(allocator), .path = path, .inode = inode, .store = store, .marker_namespace_safe = marker_namespace_safe };
         errdefer self.io_impl.deinit();
         self.coordinator = store.file.reader_coordinator;
         if (self.coordinator) |coordinator| coordinator.retain();
@@ -644,6 +715,11 @@ pub const Registry = struct {
         errdefer bytes.deinit();
         try pin.readIndexValueInto(value, 0, bytes.data);
         bytes.seal();
+        if (findResident(bytes)) |existing| {
+            bytes.deinit();
+            owner.recordArtifactSourceOpen(true);
+            return existing;
+        }
         owner.recordArtifactSourceOpen(false);
         return bytes.source();
     }
@@ -1615,4 +1691,87 @@ test "lite artifact path aliases retain snapshot protection across orphan cleanu
         try std.testing.expectEqualSlices(u8, bytes[4096..][0..actual.len], &actual);
         try std.testing.expect((try writer.file.check()).valid);
     }
+}
+
+test "lite resident source handoff shares exact bytes across runtime close and rejects digest collisions" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/resident-handoff.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var first = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    var first_live = true;
+    defer if (first_live) first.close();
+    first.maintenance_start_suppressed = true;
+    try first.file.putIndexCatalogRecord("/segment", "unchanged postings");
+    const first_registry = try first.artifactRegistry();
+    var source = (try first_registry.openResident("/segment")).?;
+    const pointer = source.ranges.ptr;
+    const identity = source.ranges.immutable_identity.?;
+    var source_live = true;
+    defer if (source_live) source.close();
+    var working: WorkingSet = .{};
+    defer working.clear();
+    working.capture(first_registry, first_registry.inode, 0, 1);
+    try std.testing.expectEqual(@as(usize, 1), working.count);
+    try std.testing.expectEqual(@as(u64, 0), working.range_bytes);
+    source.close();
+    source_live = false;
+    first.close();
+    first_live = false;
+    var second = try docs.Store.openWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer second.close();
+    second.maintenance_start_suppressed = true;
+    const registry = try second.artifactRegistry();
+    var reused = (try registry.openResident("/segment")).?;
+    defer reused.close();
+    try std.testing.expectEqual(pointer, reused.ranges.ptr);
+    working.capture(registry, registry.inode, 0, working.expires_ns);
+    try std.testing.expectEqual(@as(usize, 1), working.count);
+    // A root or pathname can be reused, while its content has changed.
+    try second.file.putIndexCatalogRecord("/segment", "different postings");
+    var changed = (try registry.openResident("/segment")).?;
+    defer changed.close();
+    try std.testing.expect(changed.ranges.ptr != pointer);
+    const collision = try OwnedBytes.copy(registry, null, "different postings");
+    defer collision.deinit();
+    collision.identity = identity;
+    try std.testing.expect(findResident(collision) == null);
+    var bytes: [18]u8 = undefined;
+    try reused.readInto(0, &bytes);
+    try std.testing.expectEqualStrings("unchanged postings", &bytes);
+    working.observe(registry.inode + 1, working.expires_ns);
+    try std.testing.expectEqual(@as(usize, 0), working.count);
+}
+
+test "lite resident source handoff bounds weak registration and retained memory without file ranges" {
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}/resident-handoff-bounds.aflite", .{tmp.sub_path});
+    defer a.free(path);
+    var store = try docs.Store.createWithOptions(a, path, .{ .io = std.testing.io, .no_sync = true, .reclamation = .{ .enabled = false } });
+    defer store.close();
+    store.maintenance_start_suppressed = true;
+    const registry = try store.artifactRegistry();
+    var sources: [130]Source = undefined;
+    var initialized: usize = 0;
+    defer for (sources[0..initialized]) |*source| source.close();
+    for (&sources, 0..) |*source, i| {
+        var bytes: [8]u8 = undefined;
+        std.mem.writeInt(u64, &bytes, i, .little);
+        const owned = try OwnedBytes.copy(registry, null, &bytes);
+        source.* = owned.source();
+        initialized += 1;
+    }
+    const checkpoint = store.file.activeCheckpoint();
+    var working: WorkingSet = .{};
+    defer working.clear();
+    working.capture(registry, registry.inode, 0, 1);
+    try std.testing.expect(working.count != 0 and working.count <= WorkingSet.max_entries);
+    try std.testing.expect(working.bytes <= WorkingSet.max_bytes);
+    try std.testing.expectEqual(@as(u64, 0), working.range_bytes);
+    try std.testing.expectEqualDeep(checkpoint, store.file.activeCheckpoint());
+    working.observe(registry.inode, working.expires_ns);
+    try std.testing.expectEqual(@as(usize, 0), working.count);
 }

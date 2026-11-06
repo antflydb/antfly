@@ -206,10 +206,11 @@ service; physical deletion remains the condition for returning replay credits.
 
 The direct backend is an architectural prerequisite, not evidence that the
 primary/index durability gap has closed. An intermediate 128-update diagnostic
-still recorded 544 foreground syncs. Combining foreground primary and index
-publication, batching posting deltas, completing semantic retirement separation,
-and introducing the crash-tested one-sync protocol remain outstanding. No new
-end-to-end or optimized performance qualification is claimed by this stage.
+still recorded 544 foreground syncs. That receipt predates the checked one-sync
+protocol and typed semantic retirement, described in
+[native-commit-proofs.md](native-commit-proofs.md). Combining foreground primary
+and index publication and batching posting deltas remain outstanding. The direct
+namespace stage itself makes no end-to-end or optimized performance claim.
 
 Current-stage Debug validation and explicit qualification limits are recorded in
 [direct-native-namespaces-debug.json](direct-native-namespaces-debug.json).
@@ -284,3 +285,64 @@ the generic mapped/heap fallback remains available when both are absent.
 This removes durable lease publications for small artifacts when maintenance
 reconstructs a runtime. It does not remove the need to bind primary and index
 updates together or to compose posting deltas before freezing segments.
+
+## Owned text builds and grouped native activation
+
+Native text projection plans now retain an independent build-resource capability.
+It owns the IO service and ResourceManager lifetime, an analysis-cache reference,
+and deep copies of analyzer, sort and spool configuration. Building a captured
+window requires no live DB, index entry, Store or primary snapshot. A regression
+closes all those owners before building multilingual postings. Foreign providers
+without this optional capability keep their existing fenced build path.
+
+`PersistentIndex.prepareNativePublication` separates namespace, artifact and
+replacement-snapshot preparation from the primary commit. Its handle closes the
+native metadata transaction and detaches the writer snapshot before returning.
+The caller retains index lifecycle admission and local storage serialization;
+multiple indexes must be acquired in consistent catalog order. This is a
+synchronous publication capability, not a lifetime-independent cached runtime.
+
+`commitNativePublications` stages all handles through one primary committer.
+Exact namespace witnesses and detached snapshot/deletion revisions are checked
+inside the host transaction. Failure activates none of the indexes. Uncertainty
+fences every possibly affected index and preserves the host's outcome. After
+success, all replacement snapshots are installed before any external reader
+fence is released. Both activation phases are allocation-free and infallible.
+Existing replay-with-primary publication uses this path too.
+
+A two-index regression covers injected failure, a foreign mutation to the
+second namespace, and successful primary/index publication in one checkpoint.
+An independent index test checks the intermediate activation state: after the
+first snapshot is installed, readers of both indexes remain fenced until the
+second installation completes.
+
+Foreground primary/text routing and an ordered same-index request cohort remain
+separate integration work. This API intentionally refuses duplicate target
+indexes in one group: logical effects for a shared index must be composed before
+preparing its single replacement. It does not make separately prepared stale
+replacements composable, nor does it establish end-to-end performance.
+
+
+Resident sources also participate in bounded handoff. An allocation-free weak
+pool holds at most 128 entries and owns no references itself. Reuse requires the
+same database path, digest, length and full content comparison; native page
+addresses are insufficient because resident copies retain no page leases.
+Registration and final release share a mutex, preventing resurrection after the
+last reference. A file owner's working set may retain these copies alongside
+leased ranges within its existing memory/count/expiry limits. Resident copies
+add no physical range charge. Changing bytes cannot reuse an old decoded cache,
+including under an artificially forced digest collision.
+
+
+Detached builds require an owned resource lifetime as well as copied config.
+The native backend explicitly marks managers it transfers to the registry on
+close. A borrowed external ResourceManager cannot establish that guarantee, so
+its stager declines detached building and retains the fenced compatibility path.
+Positive and negative ownership regressions cover both cases.
+
+When a private merge exhausts its build budget, recording a smaller merge width
+also makes that namespace's artifact debt runnable and wakes the owner. The
+owner applies a 100 ms retry delay, so persistent pressure cannot cause a
+zero-delay worker loop. Progress no longer depends on a later write or an idle
+poll rediscovering the debt. The regression checks both explicit scheduling and
+the bounded delay before verifying the smaller retry.
